@@ -100,7 +100,7 @@ fn rename_usage_table(db: &crate::Database, from: &'static str, to: &'static str
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
         crate::persistence::sql_runtime::SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             &format!("ALTER TABLE {from} RENAME TO {to}"),
             &[],
         )

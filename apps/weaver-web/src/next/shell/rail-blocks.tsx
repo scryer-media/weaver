@@ -502,9 +502,11 @@ function PanelRowContent({
 export const PanelListBlock = memo(function PanelListBlock({
   eyebrow,
   items,
+  testId,
 }: {
   eyebrow: string;
   items: readonly PanelListItem[];
+  testId?: string;
 }) {
   const { pathname } = useLocation();
   const row = (item: PanelListItem, nested: boolean) => (
@@ -521,7 +523,7 @@ export const PanelListBlock = memo(function PanelListBlock({
   );
   return (
     <RailBlock eyebrow={eyebrow} position="middle" className="gap-0">
-      <nav aria-label={eyebrow} className="flex flex-col">
+      <nav aria-label={eyebrow} data-testid={testId} className="flex flex-col">
         {items.map((item) => {
           if (item.children === undefined) {
             return row(item, false);

@@ -1184,8 +1184,9 @@ mod tests {
         let walk = QueueWalk::read(&state, selection.needs(input.sort_field));
         let plan = PagePlan::plan(&walk, &input, ROWS);
 
-        // "show 0001" finds ids 10..=19 through the display name.
-        let searched: Vec<u64> = (10..=19).collect();
+        // Each word matches anywhere in the name, as LIKE '%0001%' does:
+        // "show 0001" finds Show.00001 and Show.00010..=00019.
+        let searched: Vec<u64> = std::iter::once(1).chain(10..=19).collect();
         let in_category: Vec<u64> = searched.iter().copied().filter(|id| id % 3 != 1).collect();
         let mut expected: Vec<u64> = in_category
             .iter()

@@ -43,7 +43,7 @@ impl Database {
             // ambiguous connection drop is not retried (which would duplicate the
             // api_keys row), unlike the read-path `fetch_optional`.
             let row = SqlRuntime::execute_returning(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO api_keys (name, key_hash, scope, created_at)
                  VALUES ({}, {}, {}, {})
                  RETURNING id",
@@ -125,7 +125,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM api_keys WHERE id = {}",
                 &[SqlArg::I64(id)],
             )
@@ -139,7 +139,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE api_keys SET last_used_at = {} WHERE id = {}",
                 &[SqlArg::I64(now), SqlArg::I64(id)],
             )

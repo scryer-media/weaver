@@ -9,6 +9,7 @@ import {
   UPDATE_SCRIPT_INSTANCE_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { testIds } from "@/next/testids";
 import { RecordEditor, type EditorSection } from "../../../components/RecordEditor";
 import { CheckBox, SecondaryButton, TextField } from "../../../components/controls";
 import { Icon } from "../../../components/icons";
@@ -661,6 +662,7 @@ export function ScriptInstanceEditor({
   return (
     <>
     <RecordEditor
+      testId={testIds.dialog("pp-job")}
       open
       title={editing ? editing.name : t("next.postProcessing.createInstance")}
       note={

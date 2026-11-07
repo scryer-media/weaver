@@ -7987,7 +7987,7 @@ async fn a_corrupted_checkpoint_is_logged_and_the_torrent_starts_fresh() {
     rig.db
         .run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE graph_nodes SET facts = {} WHERE job_id = {} AND node_id = 0",
                 &[SqlArg::Bytes(vec![0xff; 4]), SqlArg::I64(job_id.0 as i64)],
             )
@@ -8046,7 +8046,7 @@ async fn a_checkpoint_the_database_fails_to_read_holds_the_restore_until_it_read
         rig.db
             .run_sql_blocking(async move {
                 SqlRuntime::execute(
-                    datastore.read_exec(),
+                    datastore.write_exec(),
                     &format!("ALTER TABLE {from} RENAME TO {to}"),
                     &[] as &[SqlArg],
                 )
@@ -8200,7 +8200,7 @@ async fn a_restart_that_cannot_read_its_files_fetches_again_and_does_not_fail() 
     rig.db
         .run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE graph_nodes SET facts = {} WHERE job_id = {} AND node_id = 0",
                 &[SqlArg::Bytes(vec![0xff; 4]), SqlArg::I64(job_id.0 as i64)],
             )
@@ -8265,7 +8265,7 @@ async fn a_checkpoint_the_database_refuses_ends_unpacking_and_holds_no_write_up(
         .run_sql_blocking(async move {
             for event in ["INSERT", "UPDATE"] {
                 SqlRuntime::execute(
-                    datastore.read_exec(),
+                    datastore.write_exec(),
                     &format!(
                         "CREATE TRIGGER refuse_graph_nodes_{event} BEFORE {event} ON graph_nodes \
                          BEGIN SELECT RAISE(ABORT, 'refused for good'); END"

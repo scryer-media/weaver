@@ -316,34 +316,46 @@ func dockerComposeUp(services ...string) error {
 			return err
 		}
 	}
-	const maxPortBindRetries = 2
+	// Two retries cover the transient causes below: a host port another
+	// process took between allocation and bind, or one API call the engine
+	// dropped under load. A third failure in a row is not transient.
+	const maxComposeUpRetries = 2
 	for attempt := 0; ; attempt++ {
 		log.Printf("starting docker services: %s", strings.Join(services, ", "))
 		args := append(dockerComposeArgs("up", "-d", "--quiet-pull"), services...)
 		cmd := containerengine.Command(args...)
 		cmd.Dir = e2eDir()
 		err := runExternalCommand(cmd, "docker compose up")
-		if err == nil || !isDockerHostPortBindCollision(err) || attempt == maxPortBindRetries {
+		if err == nil || attempt == maxComposeUpRetries {
+			return err
+		}
+		portCollision := isDockerHostPortBindCollision(err)
+		if !portCollision && !isContainerEngineAPITransportFailure(err) {
 			return err
 		}
 		// The failed attempt may have created some services already. A retry
-		// with new ports must recreate them, and the engine refuses to recreate
-		// a container another one shares a network namespace with (capture
-		// runs in weaver's), so remove what this attempt started first.
+		// must recreate them, and the engine refuses to recreate a container
+		// another one shares a network namespace with (capture runs in
+		// weaver's), so remove what this attempt started first.
 		rm := containerengine.Command(dockerComposeRetryCleanupArgs(services...)...)
 		rm.Dir = e2eDir()
 		if rmErr := runExternalCommand(rm, "docker compose rm"); rmErr != nil {
 			return fmt.Errorf("%w; remove services before retry: %v", err, rmErr)
 		}
+		if !portCollision {
+			// The ports were not the problem; keep them.
+			log.Printf("container engine API dropped a compose call; retrying compose with the same runtime ports (attempt %d/%d)", attempt+1, maxComposeUpRetries)
+			continue
+		}
 		if retryErr := reallocateRuntimePortsForDockerRetry(); retryErr != nil {
 			return fmt.Errorf("%w; reallocate runtime ports for retry: %v", err, retryErr)
 		}
-		log.Printf("docker host-port collision; retrying compose with fresh runtime ports (attempt %d/%d)", attempt+1, maxPortBindRetries)
+		log.Printf("docker host-port collision; retrying compose with fresh runtime ports (attempt %d/%d)", attempt+1, maxComposeUpRetries)
 	}
 }
 
 // dockerComposeRetryCleanupArgs stops and removes the given services'
-// containers, and only those, so a port-collision retry starts them afresh.
+// containers, and only those, so a compose up retry starts them afresh.
 func dockerComposeRetryCleanupArgs(services ...string) []string {
 	return append(dockerComposeArgs("rm", "--force", "--stop"), services...)
 }

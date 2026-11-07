@@ -270,7 +270,7 @@ impl Database {
         };
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+            let changed = SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
             Ok(changed > 0)
         })
     }
@@ -396,7 +396,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE torrents SET outputs = {} WHERE job_id = {}",
                 &[SqlArg::OptText(outputs), SqlArg::I64(id)],
             )
@@ -556,7 +556,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE torrents SET unpack_in_force = {} WHERE job_id = {}",
                 &args,
             )
@@ -626,7 +626,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE torrents SET storage_dir = {} WHERE job_id = {}",
                 &args,
             )
@@ -653,7 +653,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE torrents SET \
                  upload_limit = CASE WHEN {} = 1 THEN {} ELSE upload_limit END, \
                  download_limit = CASE WHEN {} = 1 THEN {} ELSE download_limit END \
@@ -730,7 +730,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE torrents SET seed_mode = {}, seed_verified = NULL WHERE job_id = {}",
                 &args,
             )
@@ -829,7 +829,7 @@ impl Database {
         let sql = format!("UPDATE torrents SET {column} = {{}} WHERE job_id = {{}}");
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+            let changed = SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
             Ok(changed > 0)
         })
     }

@@ -230,6 +230,10 @@ pub(crate) fn validate_payload_checksum(
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn execute_sql(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     sql: &str,
@@ -283,6 +287,10 @@ async fn has_weaver_schema_objects(pool: &SqlitePool) -> Result<bool, StateError
     Ok(count > 0)
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn ensure_migration_ledger_shape(pool: &SqlitePool) -> Result<(), StateError> {
     sqlx::query(
         r#"
@@ -431,6 +439,10 @@ fn validate_known_migrations(
 // ending (GitHub's Windows runner checks out with `core.autocrlf=true`), so
 // they hash the same SQL in a different form. Healing them keeps a database
 // from bouncing between the released binary and a from-source build.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn heal_line_ending_checksums(
     pool: &SqlitePool,
     catalog: &CompiledMigrationCatalog,
@@ -464,6 +476,10 @@ async fn detect_install_kind(
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn apply_baseline(
     pool: &SqlitePool,
     catalog: &CompiledMigrationCatalog,
@@ -535,6 +551,10 @@ async fn apply_version_range(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn apply_single_migration(
     pool: &SqlitePool,
     migration: &CompiledMigration,
@@ -583,6 +603,10 @@ async fn apply_single_migration(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn insert_applied_migration(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     migration: &CompiledMigration,
@@ -605,6 +629,10 @@ async fn insert_applied_migration(
     mirror_schema_version(tx, migration.version).await
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn mirror_schema_version(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     version: i64,
@@ -625,6 +653,10 @@ async fn mirror_schema_version(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn cleanup_legacy_queue_event_storage(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<(), StateError> {
@@ -643,6 +675,10 @@ async fn cleanup_legacy_queue_event_storage(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn backfill_persisted_nzb_blobs(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     table: &str,
@@ -695,6 +731,10 @@ async fn backfill_persisted_nzb_blobs(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn refresh_active_job_hashes(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<(), StateError> {
@@ -741,6 +781,10 @@ async fn refresh_active_job_hashes(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn backfill_job_history_hashes(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<(), StateError> {
@@ -980,6 +1024,10 @@ async fn upgrade_to_schema_25(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: the migration run, alone at startup before the gate exists"
+)]
 async fn restart_active_jobs_drop_active_segments_v28(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
 ) -> Result<(), StateError> {

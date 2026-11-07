@@ -700,7 +700,7 @@ fn database_restore_marker(db: &Database) -> Result<Option<String>, BackupServic
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "CREATE TABLE IF NOT EXISTS weaver_internal_metadata (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
@@ -725,7 +725,7 @@ fn set_database_restore_marker(db: &Database, restore_id: &str) -> Result<(), Ba
     let restore_id = restore_id.to_string();
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "CREATE TABLE IF NOT EXISTS weaver_internal_metadata (
                 key TEXT PRIMARY KEY NOT NULL,
                 value TEXT NOT NULL
@@ -734,7 +734,7 @@ fn set_database_restore_marker(db: &Database, restore_id: &str) -> Result<(), Ba
         )
         .await?;
         SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "INSERT INTO weaver_internal_metadata (key, value)
              VALUES ({}, {})
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -777,7 +777,7 @@ fn clear_database_restore_marker(
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "DELETE FROM weaver_internal_metadata WHERE key = {}",
             &[SqlArg::Text(DATABASE_RESTORE_MARKER_KEY.into())],
         )

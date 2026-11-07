@@ -767,6 +767,35 @@ func isHostPortBindCollisionMessage(message string, kind containerengine.Kind) b
 	return false
 }
 
+func isContainerEngineAPITransportFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	return isContainerEngineAPITransportMessage(err.Error())
+}
+
+// isContainerEngineAPITransportMessage reports whether a compose command
+// failed on the client's connection to the engine API rather than on
+// anything a service did. The docker API client, which compose and the
+// podman machine socket both go through, prefixes every transport failure
+// with "error during connect"; a dropped engine socket otherwise shows as an
+// EOF, reset or broken pipe on the socket path.
+func isContainerEngineAPITransportMessage(message string) bool {
+	message = strings.ToLower(message)
+	if strings.Contains(message, "error during connect") {
+		return true
+	}
+	if !strings.Contains(message, ".sock") {
+		return false
+	}
+	for _, marker := range []string{": eof", "unexpected eof", "connection reset by peer", "broken pipe"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
+}
+
 func validateRuntimePortState(state runtimePortState) error {
 	ports := []int{
 		state.NNTPPort,

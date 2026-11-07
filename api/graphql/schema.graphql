@@ -932,6 +932,11 @@ type GlobalQueueState {
 	torrentsPaused: Boolean!
 	speedLimitBytesPerSec: Int
 	downloadBlock: DownloadBlock!
+	"""
+	When a timed pause resumes downloads on its own, in epoch milliseconds.
+	Null when no resume is scheduled.
+	"""
+	resumeAtEpochMs: Int
 }
 
 """
@@ -1989,9 +1994,10 @@ type MutationRoot {
 	"""
 	reorderQueueItem(id: Int!, kind: QueueMoveKind!, offset: Int): Boolean!
 	"""
-	Pause all download dispatch globally.
+	Pause all download dispatch globally. With `resumeAfterSecs`, downloads
+	resume on their own after that many seconds (1 to 30 days).
 	"""
-	pauseAll: Boolean!
+	pauseAll(resumeAfterSecs: Int): Boolean!
 	"""
 	Resume all download dispatch globally.
 	"""

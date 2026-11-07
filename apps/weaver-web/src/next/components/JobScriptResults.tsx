@@ -10,6 +10,7 @@ import { WV } from "../data/palette";
 import { countLabel } from "../i18n/labels";
 import { DetailBlock, Square, Tag } from "./chrome";
 import { Icon } from "./icons";
+import { jobIds } from "@/next/testids";
 
 /**
  * A job's script runs, grouped by the event that started them.
@@ -80,7 +81,7 @@ const QUIET_ACTION = "cursor-pointer text-wv-dim hover:text-wv-fg";
 export function ScriptStatusMark({ status }: { status: string }) {
   const tone = STATUS_TONE[status] ?? QUIET_TONE;
   return (
-    <span className="flex flex-none items-center gap-[7px]">
+    <span data-testid={jobIds.scriptRunStatus(status)} className="flex flex-none items-center gap-[7px]">
       <Square color={tone.color} />
       <span className={cn("font-wv-mono text-[11px]", tone.text)}>{status}</span>
     </span>
@@ -145,7 +146,7 @@ export function ScriptRunOutput({ run }: { run: ScriptRunOutputSource }) {
 
 function RunOutput({ result }: { result: ScriptResult }) {
   return (
-    <div className="flex min-w-0 flex-col gap-2 border-t border-wv-hairline py-[10px] pl-5">
+    <div data-testid={jobIds.scriptRun} className="flex min-w-0 flex-col gap-2 border-t border-wv-hairline py-[10px] pl-5">
       <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1">
         <span className="flex min-w-0 items-center gap-[10px]">
           <ScriptRunName run={result} />
@@ -165,7 +166,7 @@ function EventRuns({ event, results }: { event: string; results: ScriptResult[] 
   const [open, setOpen] = useState(true);
   const label = `${event} (${results.length})`;
   return (
-    <div role="group" aria-label={label} className="flex min-w-0 flex-col border-t border-wv-hairline">
+    <div role="group" aria-label={label} data-testid={jobIds.scriptEventGroup(event)} className="flex min-w-0 flex-col border-t border-wv-hairline">
       <button
         type="button"
         aria-expanded={open}

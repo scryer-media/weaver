@@ -3,6 +3,7 @@
 
 import net from "node:net";
 import { expect, test as base, type APIRequestContext, type Page } from "@playwright/test";
+import { testIds } from "./support/testids";
 
 type ExpectedHttpError = {
   method: string;
@@ -210,18 +211,18 @@ export function weaverRoute(path: string): string {
 }
 
 export async function openNavigation(page: Page) {
-  // The primary navigation is the one that reaches Downloads; a settings page
-  // also shows its own panel list as a navigation landmark, and below the
-  // rail breakpoint the drawer renders a second copy of the rail.
-  const navigation = page
-    .getByRole("navigation")
-    .filter({ has: page.getByRole("link", { name: "Downloads" }), visible: true });
-  if (await navigation.isVisible()) return navigation;
-
-  const trigger = page.getByRole("button", { name: "Open navigation" });
-  await expect(trigger).toBeVisible();
-  await trigger.click();
-  await expect(navigation).toBeVisible();
+  // The primary navigation is the shell's; below the rail breakpoint the
+  // drawer renders a second copy of the rail, and only one is visible.
+  // Exactly one of the rail and its drawer trigger shows at any width; wait
+  // for whichever it is, then open the drawer only when the trigger showed.
+  const navigation = page.getByTestId(testIds.shellNav).filter({ visible: true });
+  const trigger = page.getByTestId(testIds.shellOpenNavigation).filter({ visible: true });
+  const shown = navigation.or(trigger);
+  await expect(shown).toHaveCount(1);
+  if ((await shown.getAttribute("data-testid")) === testIds.shellOpenNavigation) {
+    await trigger.click();
+    await expect(navigation).toBeVisible();
+  }
   return navigation;
 }
 

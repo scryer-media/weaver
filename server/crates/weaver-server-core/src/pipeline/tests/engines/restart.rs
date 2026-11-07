@@ -1638,6 +1638,12 @@ async fn change_checkpoint(pipeline: &Pipeline, sql: &'static str) {
                     .matches("{}")
                     .map(|_| crate::persistence::sql_runtime::SqlArg::I64(JOB.0 as i64))
                     .collect();
+                // SQLite checks a RENAME COLUMN against the schema this
+                // connection last read, and another connection of the pool
+                // may have renamed it since. Reading the schema first brings
+                // the connection up to date.
+                tx.execute("SELECT count(*) FROM sqlite_schema", &[])
+                    .await?;
                 tx.execute(sql, &args).await?;
                 Ok(())
             })

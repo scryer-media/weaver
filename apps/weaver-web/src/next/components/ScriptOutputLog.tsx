@@ -28,7 +28,7 @@ export function outputLines(output: string): string[] {
   return lines;
 }
 
-export function ScriptOutputLog({ output, label }: { output: string; label: string }) {
+export function ScriptOutputLog({ output, label, testId }: { output: string; label: string; testId?: string }) {
   const lines = useMemo(
     () => outputLines(output).map((raw, index) => parseLogLine(index, raw)),
     [output],
@@ -44,6 +44,7 @@ export function ScriptOutputLog({ output, label }: { output: string; label: stri
   return (
     <div
       ref={scrollerRef}
+      data-testid={testId}
       role="region"
       aria-label={label}
       tabIndex={0}

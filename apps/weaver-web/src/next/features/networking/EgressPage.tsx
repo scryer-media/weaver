@@ -41,6 +41,7 @@ import {
 import { LimitControl, SplitControl } from "./limits";
 import { bindingLabel, formatLimit, stateLabel, StatusMark } from "./presentation";
 import { TestViaDialog } from "./TestViaDialog";
+import { testIds } from "../../testids";
 
 const NEW_EGRESS: Egress = {
   id: -1,
@@ -531,6 +532,7 @@ export function EgressEditor({
     <>
       <RecordEditor
         open
+        testId={testIds.dialog("egress")}
         title={editing.id >= 0 ? editing.name : t("next.networking.egress.add")}
         note={editing.id >= 0 ? bindingLabel(t, editing.bindingKind) : t("next.networking.egress.newNote")}
         error={error}

@@ -477,3 +477,214 @@ async fn a_parking_lane_releases_its_idle_thread_memory_once() {
         "one park, one release"
     );
 }
+
+// A session that expires part-way through a pipelined batch keeps its lane:
+// the blocking client reads the replies queued behind the 480, logs in again
+// on the same socket, and the lane goes on issuing BODY commands there. The
+// expired articles come back unanswered, with the connection kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_session_keeps_its_lane_after_an_in_place_reauth() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let recorder = Arc::clone(&seen);
+    let (done_tx, mut done_rx) = oneshot::channel::<()>();
+    // Fires once the server has answered the in-place login, so the lane's
+    // next lease reaches it only after its first batch has drained.
+    let (reauthed_tx, mut reauthed_rx) = oneshot::channel::<()>();
+    let reauthed_tx = Arc::new(std::sync::Mutex::new(Some(reauthed_tx)));
+    // Every connection the lane opens is served, so a redial could never
+    // stall the lane; the count says whether one happened.
+    let server = tokio::spawn(async move {
+        let mut handlers = Vec::new();
+        loop {
+            tokio::select! {
+                accepted = listener.accept() => {
+                    let (socket, _) = accepted.unwrap();
+                    let recorder = Arc::clone(&recorder);
+                    let reauthed_tx = Arc::clone(&reauthed_tx);
+                    handlers.push(tokio::spawn(async move {
+                        let (reader, mut writer) = socket.into_split();
+                        writer.write_all(b"200 fixture ready\r\n").await.unwrap();
+                        let mut lines = BufReader::new(reader).lines();
+                        let mut bodies = 0usize;
+                        let mut passes = 0usize;
+                        while let Ok(Some(line)) = lines.next_line().await {
+                            recorder.lock().unwrap().push(line.clone());
+                            let reply: &[u8] = if line.starts_with("AUTHINFO USER") {
+                                b"381 password\r\n"
+                            } else if line.starts_with("AUTHINFO PASS") {
+                                passes += 1;
+                                if passes == 2 {
+                                    // Answer first, then tell the test.
+                                    writer.write_all(b"281 ok\r\n").await.unwrap();
+                                    if let Some(tx) = reauthed_tx.lock().unwrap().take() {
+                                        let _ = tx.send(());
+                                    }
+                                    continue;
+                                }
+                                b"281 ok\r\n"
+                            } else if line == "CAPABILITIES" {
+                                b"101 Capabilities\r\nVERSION 2\r\nREADER\r\nPIPELINING\r\n.\r\n"
+                            } else if line.starts_with("BODY ") {
+                                bodies += 1;
+                                // The second and third BODY of the first batch
+                                // meet an expired session.
+                                if matches!(bodies, 2 | 3) {
+                                    b"480 authentication required\r\n"
+                                } else {
+                                    b"430 no such article\r\n"
+                                }
+                            } else if line == "QUIT" {
+                                let _ = writer.write_all(b"205 bye\r\n").await;
+                                break;
+                            } else {
+                                b"500 unsupported\r\n"
+                            };
+                            if writer.write_all(reply).await.is_err() {
+                                break;
+                            }
+                        }
+                    }));
+                }
+                _ = &mut done_rx => break,
+            }
+        }
+        let connections = handlers.len();
+        for handler in handlers {
+            handler.await.unwrap();
+        }
+        connections
+    });
+    let nntp = Arc::new(weaver_nntp::NntpClient::new(
+        weaver_nntp::client::NntpClientConfig::single(
+            weaver_nntp::ServerConfig {
+                host: "127.0.0.1".into(),
+                port,
+                tls: false,
+                username: Some("user".into()),
+                password: Some("pass".into()),
+                ..Default::default()
+            },
+            1,
+        ),
+    ));
+    let (event_tx, mut events) = mpsc::channel(16);
+    let (refill_tx, mut refills) = mpsc::channel(16);
+    let (parked_tx, mut parks) = mpsc::channel(16);
+    let client = Arc::clone(&nntp);
+    let worker = tokio::task::spawn_blocking(move || {
+        let mut cached = None;
+        run_owned_blocking_download_lane(
+            &mut cached,
+            OwnedLaneRun {
+                nntp: client,
+                state: test_admitted_state(JobId(42)),
+                event_tx,
+                refill_tx,
+                parked_tx,
+                initial_lease: test_lease(
+                    JobId(42),
+                    0,
+                    vec![],
+                    (0..4).map(|segment| tail_work(segment, 0)).collect(),
+                ),
+            },
+        );
+    });
+    let mut results = Vec::new();
+    let mut successor = Some(test_lease(JobId(42), 0, vec![], vec![tail_work(4, 0)]));
+    // The first refill is held until the in-place login has been answered;
+    // every later one is told there is nothing more.
+    let mut held_refill = None;
+    let mut reauthed = false;
+    let park = loop {
+        tokio::select! {
+            Some(request) = refills.recv() => {
+                if successor.is_some() && held_refill.is_none() && !reauthed {
+                    held_refill = Some(request);
+                } else {
+                    let _ = request.response_tx.send(DownloadLaneRefillResponse {
+                        lease: successor.take(),
+                        park_reason: LaneParkReason::NoWork,
+                    });
+                }
+            }
+            Ok(()) = &mut reauthed_rx, if !reauthed => {
+                reauthed = true;
+                if let Some(request) = held_refill.take() {
+                    let _ = request.response_tx.send(DownloadLaneRefillResponse {
+                        lease: successor.take(),
+                        park_reason: LaneParkReason::NoWork,
+                    });
+                }
+            }
+            Some(event) = events.recv() => {
+                let OwnedDownloadLaneEvent::BatchComplete { results: batch, ack, .. } = event else {
+                    panic!("unexpected acquisition failure");
+                };
+                results.extend(batch);
+                if let Some(ack) = ack {
+                    ack.send(()).unwrap();
+                }
+            }
+            Some(park) = parks.recv() => break park,
+        }
+    };
+    assert_eq!(park.reason, LaneParkReason::NoWork);
+    worker.await.unwrap();
+    done_tx.send(()).unwrap();
+    assert_eq!(
+        server.await.unwrap(),
+        1,
+        "the lane never redials after an in-place re-auth"
+    );
+
+    results.sort_by_key(|result| result.segment_id.segment_number);
+    let kinds = results
+        .iter()
+        .map(|result| match &result.data {
+            Err(DownloadError::Fetch(failure)) => failure.kind,
+            Err(other) => panic!("every fixture BODY fails to fetch: {other:?}"),
+            Ok(_) => panic!("no fixture BODY carries an article"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        vec![
+            DownloadFailureKind::ArticleNotFound,
+            DownloadFailureKind::Unanswered,
+            DownloadFailureKind::Unanswered,
+            DownloadFailureKind::ArticleNotFound,
+            DownloadFailureKind::ArticleNotFound,
+        ]
+    );
+    for result in &results {
+        let observation = result.lane_observation.as_ref().unwrap();
+        assert!(
+            !observation.connection_discarded,
+            "segment {} kept the connection",
+            result.segment_id.segment_number
+        );
+    }
+    let seen = seen.lock().unwrap().clone();
+    let at = |prefix: &str| {
+        seen.iter()
+            .enumerate()
+            .filter(|(_, line)| line.starts_with(prefix))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>()
+    };
+    let passes = at("AUTHINFO PASS");
+    let bodies = at("BODY ");
+    assert_eq!(
+        passes.len(),
+        2,
+        "one login at setup, one in place; saw {seen:?}"
+    );
+    assert_eq!(bodies.len(), 5, "saw {seen:?}");
+    assert!(
+        bodies[3] < passes[1] && passes[1] < bodies[4],
+        "the in-place login follows the drained batch; saw {seen:?}"
+    );
+}

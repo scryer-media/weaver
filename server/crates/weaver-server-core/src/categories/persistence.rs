@@ -13,7 +13,7 @@ impl Database {
         let args = CategoryRecord::from_config(category).into_args()?;
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 &format!(
                     "INSERT INTO categories ({CATEGORY_COLUMNS}) VALUES ({{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}}, {{}})"
                 ),
@@ -31,7 +31,7 @@ impl Database {
         args.rotate_left(1);
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE categories
                     SET name = {}, dest_dir = {}, aliases = {}, seeding = {}, torrent_route = {}, unpack = {}, upload_cap = {}
                   WHERE id = {}",
@@ -46,7 +46,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM categories WHERE id = {}",
                 &[SqlArg::I64(i64::from(id))],
             )

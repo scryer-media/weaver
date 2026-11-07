@@ -168,6 +168,10 @@ impl Database {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: a read-only check on the read lane, it writes nothing; Postgres has no writer gate"
+    )]
     pub(crate) fn validate_backup_catalog(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         match datastore {
@@ -184,6 +188,10 @@ impl Database {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: a read-only check on the read lane, it writes nothing; Postgres has no writer gate"
+    )]
     pub(crate) fn validate_logical_backup_import(
         &self,
         expected: &BTreeMap<String, TablePartMetadata>,
@@ -222,6 +230,10 @@ impl Database {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a read-only export snapshot, it writes nothing; Postgres has no writer gate"
+)]
 async fn export_sqlite(
     database_path: &Path,
     tables_dir: &Path,
@@ -264,6 +276,10 @@ async fn export_sqlite(
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate"
+)]
 async fn export_postgres(
     pool: sqlx::PgPool,
     tables_dir: &Path,
@@ -805,6 +821,10 @@ fn topological_order(
 
 // Import is intentionally in this module so export and restore share the same
 // typed row contract.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: backup import on the live database, outside the gate by ruling, idle at the time"
+)]
 async fn import_sqlite(
     pool: sqlx::SqlitePool,
     tables_dir: &Path,
@@ -919,6 +939,10 @@ async fn import_sqlite(
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate"
+)]
 async fn import_postgres(
     pool: sqlx::PgPool,
     tables_dir: &Path,
@@ -1160,6 +1184,10 @@ fn validate_manifest_tables(
     )))
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: backup import on the live database, outside the gate by ruling, idle at the time"
+)]
 async fn import_sqlite_table(
     conn: &mut sqlx::SqliteConnection,
     table: &str,
@@ -1236,6 +1264,10 @@ async fn import_sqlite_table(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate"
+)]
 async fn import_postgres_table(
     tx: &mut sqlx::Transaction<'_, Postgres>,
     table: &str,
@@ -1482,6 +1514,10 @@ fn postgres_cast(kind: &str) -> &'static str {
     }
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: backup import on the live database, outside the gate by ruling, idle at the time"
+)]
 async fn repair_sqlite_sequences(conn: &mut sqlx::SqliteConnection) -> Result<(), StateError> {
     let has_sequence_table: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master
@@ -1539,6 +1575,10 @@ async fn validate_postgres_counts(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: Postgres, no writer gate"
+)]
 async fn repair_postgres_sequences(
     tx: &mut sqlx::Transaction<'_, Postgres>,
 ) -> Result<(), StateError> {

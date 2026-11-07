@@ -391,7 +391,7 @@ impl Database {
         };
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE active_jobs SET post_processing_summary = 'running',
                         post_processing_started = {},
                         script_results_json = {}
@@ -419,7 +419,7 @@ impl Database {
         let started = to_json(&started)?;
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE active_jobs SET post_processing_started = {} WHERE job_id = {}",
                 &[SqlArg::Text(started), SqlArg::I64(job_id)],
             )
@@ -444,7 +444,7 @@ impl Database {
         };
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE active_jobs SET script_results_json = {} WHERE job_id = {}",
                 &[SqlArg::OptText(results), SqlArg::I64(job_id)],
             )
@@ -465,7 +465,7 @@ impl Database {
         let facts = to_json(facts)?;
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE active_jobs SET post_processing_outcome = {} WHERE job_id = {}",
                 &[SqlArg::Text(facts), SqlArg::I64(job_id)],
             )
@@ -543,7 +543,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE active_jobs SET post_processing_summary = 'interrupted'
                   WHERE post_processing_summary = 'running'",
                 &[],

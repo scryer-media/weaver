@@ -352,6 +352,10 @@ fn rewrite_backup_db_artifact_blocking(rewrite: BackupDbRewrite) -> Result<(), B
     })?
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: writes a backup file on its own connection, never the live database"
+)]
 async fn rewrite_backup_db_artifact(rewrite: BackupDbRewrite) -> Result<(), BackupServiceError> {
     let BackupDbRewrite {
         backup_db_path,
@@ -484,6 +488,10 @@ fn rewrite_path_with_roots(path: &str, roots: &[PathRemap]) -> String {
         .map_or_else(|| path.to_string(), |path| path.display().to_string())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: writes a backup file on its own connection, never the live database"
+)]
 async fn set_or_insert_setting(
     conn: &mut Transaction<'_, Sqlite>,
     key: &str,

@@ -40,7 +40,7 @@ fn fetch_text(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> String {
 fn execute(db: &Database, sql: &'static str, args: Vec<SqlArg>) {
     let datastore = db.datastore();
     db.run_sql_blocking_read(async move {
-        SqlRuntime::execute(datastore.read_exec(), sql, &args).await?;
+        SqlRuntime::execute(datastore.write_exec(), sql, &args).await?;
         Ok(())
     })
     .unwrap()
@@ -986,7 +986,7 @@ fn open_applies_sqlite_file_pragmas() {
     assert_eq!(mmap_size, 16 * 1024 * 1024);
 
     let wal_autocheckpoint = fetch_i64(&db, "PRAGMA wal_autocheckpoint", vec![]);
-    assert_eq!(wal_autocheckpoint, 4000);
+    assert_eq!(wal_autocheckpoint, 0);
 
     let journal_size_limit = fetch_i64(&db, "PRAGMA journal_size_limit", vec![]);
     assert_eq!(journal_size_limit, 64 * 1024 * 1024);

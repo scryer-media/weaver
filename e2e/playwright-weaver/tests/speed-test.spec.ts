@@ -11,6 +11,7 @@ import { directLeg, ladderLeg, rung } from "./support/network-flow";
 import { DIRECT_HOST, NetworkWorld, PROXIED_HOST } from "./support/network-scenario";
 import { type FixtureEvent, directEvents, fixtureEvents, fixtureMark, fixtureState, setFixtureNzb } from "./support/proxy-fixture";
 import { queueState, resumeAll, waitPaused } from "./support/schedules";
+import { networkIds, testIds } from "./support/testids";
 
 // The speed test (plan 169) driven from Networking -> Speed test: Usenet and
 // bandwidth runs over laddered and split routes, the rung and leg overrides,
@@ -165,40 +166,43 @@ class SpeedPage {
   readonly runs: Locator;
 
   constructor(readonly page: Page) {
-    this.route = page.getByRole("region", { name: "Route", exact: true });
-    this.test = page.getByRole("region", { name: "Speed test", exact: true });
-    this.runs = page.getByRole("region", { name: "Runs", exact: true });
+    this.route = page.getByTestId(testIds.section("speed-route"));
+    this.test = page.getByTestId(testIds.section("speed-test"));
+    this.runs = page.getByTestId(testIds.section("speed-runs"));
   }
 
   async open(server: number, host = PROXIED_HOST): Promise<void> {
     await this.page.goto(weaverRoute(`/settings/networking/speed?consumer=server:${server}`));
-    await expect(this.test.getByRole("button", { name: "Route", exact: true })).toContainText(host);
-    await expect(this.test.getByRole("radio", { name: "Bandwidth", exact: true })).toHaveAttribute("aria-checked", "true");
+    await expect(this.test.getByTestId(networkIds.speedConsumer)).toContainText(host);
+    await expect(this.kind("BANDWIDTH")).toHaveAttribute("aria-checked", "true");
+  }
+
+  // One side of the Bandwidth/Usenet switch, by the kind of test it picks.
+  kind(kind: "BANDWIDTH" | "USENET"): Locator {
+    return this.test.getByTestId(testIds.option(networkIds.speedKind, kind));
   }
 
   // A Usenet run of the NZB at `url`, allowed `maxDuration` seconds: by
   // default long enough to drain it.
   async useNzbUrl(url: string, maxDuration = 900): Promise<void> {
-    await this.test.getByRole("radio", { name: "Usenet", exact: true }).click();
-    await expect(this.test.getByRole("radio", { name: "Usenet", exact: true })).toHaveAttribute("aria-checked", "true");
-    await this.test.getByRole("button", { name: "NZB", exact: true }).click();
-    await this.page.getByRole("menu", { name: "NZB", exact: true }).getByRole("menuitemradio", { name: "URL", exact: true }).click();
-    await this.test.getByRole("textbox", { name: "NZB URL", exact: true }).fill(url);
-    const duration = this.test.getByRole("spinbutton", { name: "Max duration", exact: true });
+    await this.kind("USENET").click();
+    await expect(this.kind("USENET")).toHaveAttribute("aria-checked", "true");
+    await this.test.getByTestId(networkIds.speedNzb).click();
+    await this.page.getByTestId(testIds.menu(networkIds.speedNzb)).getByTestId(testIds.option(networkIds.speedNzb, "URL")).click();
+    await this.test.getByTestId(networkIds.speedNzbUrl).fill(url);
+    const duration = this.test.getByTestId(networkIds.speedMaxDuration);
     await duration.fill(String(maxDuration));
     await duration.press("Tab");
     await expect(duration).toHaveValue(String(maxDuration));
   }
 
   get runButton(): Locator {
-    return this.test.getByRole("button", { name: "Run", exact: true });
+    return this.test.getByTestId(networkIds.speedRun);
   }
 
   // The Up/Down switch that takes leg `position` (1-based) down for the next run.
   async takeLegDown(position: number): Promise<void> {
-    const down = this.route
-      .getByRole("radiogroup", { name: `Leg ${position}`, exact: true })
-      .getByRole("radio", { name: "Down", exact: true });
+    const down = this.route.getByTestId(networkIds.switchSide(networkIds.legSwitch(position - 1), "down"));
     await down.click();
     await expect(down).toHaveAttribute("aria-checked", "true");
   }
@@ -206,15 +210,17 @@ class SpeedPage {
   // Press Run and read the one-line refusal it is answered with.
   async runRefused(message: string): Promise<void> {
     await this.runButton.click();
-    await expect(this.test.getByRole("alert")).toHaveText(message);
+    // copy-is-claim: the refusal sentence is what the page answers a refused start with
+    await expect(this.test.getByTestId(networkIds.speedRefusal)).toHaveText(message);
   }
 
   // A bandwidth run against Cloudflare. The run picks its own connections
   // and length.
   async useCloudflare(): Promise<void> {
-    await this.test.getByRole("radio", { name: "Bandwidth", exact: true }).click();
-    await expect(this.test.getByRole("radio", { name: "Bandwidth", exact: true })).toHaveAttribute("aria-checked", "true");
-    await expect(this.test.getByRole("button", { name: "Provider", exact: true })).toContainText("Cloudflare");
+    await this.kind("BANDWIDTH").click();
+    await expect(this.kind("BANDWIDTH")).toHaveAttribute("aria-checked", "true");
+    // The provider's name is the daemon's, not the page's.
+    await expect(this.test.getByTestId(networkIds.speedProvider)).toContainText("Cloudflare");
   }
 
   // Press Run and return the id the start answered with.
@@ -228,14 +234,14 @@ class SpeedPage {
   }
 
   row(id: number): Locator {
-    return this.runs.locator(`[data-row-id="${id}"]`);
+    return this.runs.getByTestId(testIds.row("speed-runs", String(id)));
   }
 
   // Wait for run `id` to reach `status` in the Runs table.
-  async finished(id: number, status: "Completed" | "Cancelled" | "Failed"): Promise<Locator> {
+  async finished(id: number, status: "COMPLETED" | "CANCELLED" | "FAILED"): Promise<Locator> {
     const row = this.row(id);
-    await expect(row.getByText(/^(Completed|Cancelled|Failed)$/)).toBeVisible({ timeout: 0 });
-    await expect(row).toContainText(status);
+    await expect(row.getByTestId(networkIds.speedRunFinished)).toBeVisible({ timeout: 0 });
+    await expect(row.getByTestId(networkIds.speedRunStatus(status))).toBeVisible();
     return row;
   }
 
@@ -248,24 +254,24 @@ class SpeedPage {
   }
 }
 
-// The Downloads page's queue control, in a tab of its own beside the speed page.
-async function downloadsTab(page: Page): Promise<Locator> {
+// The Downloads page's queue control, in a tab of its own beside the speed page:
+// the button it shows while the queue runs, and the one while it is paused.
+async function downloadsTab(page: Page): Promise<{ pause: Locator; resume: Locator }> {
   const tab = await page.context().newPage();
   await tab.goto(weaverRoute("/"));
-  return tab.getByRole("banner").getByRole("button", { name: /^(Pause all|Resume all)$/ });
+  return { pause: tab.getByTestId(testIds.queuePauseAll), resume: tab.getByTestId(testIds.queueResumeAll) };
 }
 
-const diagram = (detail: Locator) =>
-  detail.getByRole("group", { name: "Egress interfaces connect through route legs and proxies to endpoints", exact: true });
+const diagram = (detail: Locator) => detail.getByTestId(networkIds.flowDiagram);
 const connectionRows = (detail: Locator) =>
-  detail.getByRole("table", { name: "Connections", exact: true }).getByRole("row").filter({ has: detail.page().getByRole("cell") });
+  detail.getByTestId(networkIds.speedTable("connections")).getByTestId(networkIds.speedTableRow("connections"));
 
 test("ST01 a Usenet run measures through the proxy rung, the same run with that rung down goes direct, and a job on the route moves the same bytes", async ({ cleanPage: page, request }) => {
   const parts = 32;
   const { a, connect1, server } = await ladderedServer();
   const nzb = await servedNzb(request, "st01-agreement", parts);
   const queueControl = await downloadsTab(page);
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+  await expect(queueControl.pause).toBeVisible({ timeout: 0 });
   const speed = new SpeedPage(page);
   await speed.open(server);
   await speed.useNzbUrl(nzb.url);
@@ -274,7 +280,7 @@ test("ST01 a Usenet run measures through the proxy rung, the same run with that 
   const before = await bytesDownloaded(request);
   const mark1 = await fixtureMark(request);
   const first = await speed.run();
-  const firstRow = await speed.finished(first, "Completed");
+  const firstRow = await speed.finished(first, "COMPLETED");
   const run1 = await speedTestRun(request, first);
   expect(run1).toMatchObject({ status: "COMPLETED", kind: "USENET", consumer: `server:${server}`, failure: null });
   const result1 = run1.result!;
@@ -289,11 +295,12 @@ test("ST01 a Usenet run measures through the proxy rung, the same run with that 
   }
   expect(connectedOn(await fixtureEvents(request, mark1), "connect1").length).toBeGreaterThan(0);
 
-  const result = speed.test.getByRole("region", { name: "Result", exact: true });
-  await expect(result.getByText("Downloaded", { exact: true })).toBeVisible();
-  await expect(result.getByText("Decoded", { exact: true })).toBeVisible();
+  // A Usenet result shows what came off the wire and what it decoded to.
+  const result = speed.test.getByTestId(networkIds.speedResult);
+  await expect(result).toContainText(figure(sizeLabel(result1.bytes)));
+  await expect(result).toContainText(figure(sizeLabel(result1.usenet!.decodedBytes)));
   await expect(firstRow).toContainText(PROXIED_HOST);
-  await expect(firstRow).toContainText("Usenet · URL");
+  await expect(firstRow.getByTestId(networkIds.speedRunKind("usenet-url"))).toBeVisible();
   await expect(firstRow).toContainText(rateLabel(result1.averageBps));
   await expect(firstRow).toContainText(sizeLabel(result1.bytes));
   await expect(firstRow).toContainText(sizeLabel(result1.usenet!.decodedBytes));
@@ -302,22 +309,20 @@ test("ST01 a Usenet run measures through the proxy rung, the same run with that 
   for (const row of await connectionRows(firstDetail).all()) {
     await expect(row).toContainText(`${a.name} > ${connect1.name}`);
   }
-  await expect(diagram(firstDetail).getByText("Down", { exact: true })).toHaveCount(0);
+  await expect(diagram(firstDetail).getByTestId(networkIds.flowBoxDown)).toHaveCount(0);
 
   // The run gave the queue back, and booked exactly its bytes.
   expect((await queueState(request)).isPaused).toBe(false);
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+  await expect(queueControl.pause).toBeVisible({ timeout: 0 });
   const afterRun1 = await expectBooked(request, before, result1.bytes, "run 1");
 
   // Run 2: the same test with the proxy rung taken down.
-  const down = speed.route
-    .getByRole("radiogroup", { name: "Leg 1 rung 1", exact: true })
-    .getByRole("radio", { name: "Down", exact: true });
+  const down = speed.route.getByTestId(networkIds.switchSide(networkIds.rungSwitch(0, 0), "down"));
   await down.click();
   await expect(down).toHaveAttribute("aria-checked", "true");
   const mark2 = await fixtureMark(request);
   const second = await speed.run();
-  const secondRow = await speed.finished(second, "Completed");
+  const secondRow = await speed.finished(second, "COMPLETED");
   const run2 = await speedTestRun(request, second);
   expect(run2).toMatchObject({ status: "COMPLETED", failure: null });
   expect(run2.tested.overrides.downRungs).toEqual([{ leg: 0, rung: 0 }]);
@@ -333,9 +338,10 @@ test("ST01 a Usenet run measures through the proxy rung, the same run with that 
   expect(connectedOn(events2, "connect1")).toEqual([]);
   expect(directEvents(events2).some(event => event.kind === "direct-nntp")).toBe(true);
 
-  await expect(secondRow).toContainText("leg 1 rung 1");
+  await expect(secondRow.getByTestId(networkIds.speedRunDown("rung-0-0"))).toBeVisible();
   const secondDetail = await speed.detail(second);
-  await expect(diagram(secondDetail).getByText("Down", { exact: true })).toHaveCount(1);
+  await expect(diagram(secondDetail).getByTestId(networkIds.flowBoxDown)).toHaveCount(1);
+  await expect(diagram(secondDetail).getByTestId(networkIds.flowRung(0, 0, "DOWN"))).toHaveCount(1);
   await expect(connectionRows(secondDetail)).toHaveCount(result2.connections.length);
   for (const row of await connectionRows(secondDetail).all()) {
     await expect(row).toContainText(a.name);
@@ -370,23 +376,23 @@ test("ST02 a run started while the queue is paused leaves it paused", async ({ c
   const { server } = await ladderedServer();
   const nzb = await servedNzb(request, "st02-paused", 16);
   const queueControl = await downloadsTab(page);
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
-  await queueControl.click();
-  await expect(queueControl).toHaveText("Resume all", { timeout: 0 });
+  await expect(queueControl.pause).toBeVisible({ timeout: 0 });
+  await queueControl.pause.click();
+  await expect(queueControl.resume).toBeVisible({ timeout: 0 });
   await waitPaused(request, true, "queue paused from the Downloads page");
 
   const speed = new SpeedPage(page);
   await speed.open(server);
   await speed.useNzbUrl(nzb.url);
   const id = await speed.run();
-  await speed.finished(id, "Completed");
+  await speed.finished(id, "COMPLETED");
   expect(await speedTestRun(request, id)).toMatchObject({ status: "COMPLETED", failure: null });
   // The run did not pause the queue, so it does not resume it.
   expect((await queueState(request)).isPaused).toBe(true);
-  await expect(queueControl).toHaveText("Resume all", { timeout: 0 });
+  await expect(queueControl.resume).toBeVisible({ timeout: 0 });
 
-  await queueControl.click();
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+  await queueControl.resume.click();
+  await expect(queueControl.pause).toBeVisible({ timeout: 0 });
   await waitPaused(request, false, "queue resumed from the Downloads page");
 });
 
@@ -397,29 +403,31 @@ test("ST03 cancelling a run ends it Cancelled and resumes the queue it paused", 
   await world.holdChaosSession();
   await world.setChaos("slow_body=1500");
   const queueControl = await downloadsTab(page);
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+  await expect(queueControl.pause).toBeVisible({ timeout: 0 });
 
   const speed = new SpeedPage(page);
   await speed.open(server);
   await speed.useNzbUrl(nzb.url);
   const id = await speed.run();
-  const progress = speed.test.getByRole("region", { name: "Progress", exact: true });
-  await expect(progress.getByText("Measuring", { exact: true })).toBeVisible({ timeout: 0 });
+  const progress = speed.test.getByTestId(networkIds.speedProgress);
+  await expect(progress.getByTestId(networkIds.speedPhase("measuring"))).toBeVisible({ timeout: 0 });
   // The run paused the queue to measure.
-  await expect(queueControl).toHaveText("Resume all", { timeout: 0 });
+  await expect(queueControl.resume).toBeVisible({ timeout: 0 });
   // One run at a time: the page cannot start another, and a start from the
   // API is refused naming the one running.
   await expect(speed.runButton).toBeDisabled();
   expect(await startRefusal(request, server, nzb.url)).toEqual({
     code: "SPEED_TEST_ALREADY_RUNNING", message: `speed test ${id} is still running; cancel it or wait for it to finish`,
   });
-  await progress.getByRole("button", { name: "Cancel test", exact: true }).click();
+  await progress.getByTestId(networkIds.speedCancel).click();
 
-  await speed.finished(id, "Cancelled");
-  await expect(speed.test.getByRole("region", { name: "Result", exact: true }).getByRole("status")).toHaveText("Cancelled");
+  await speed.finished(id, "CANCELLED");
+  const cancelled = speed.test.getByTestId(networkIds.speedResult).getByTestId(networkIds.speedOutcome("CANCELLED"));
+  await expect(cancelled).toBeVisible();
+  await expect(cancelled).toHaveAttribute("role", "status");
   expect(await speedTestRun(request, id)).toMatchObject({ status: "CANCELLED", failure: null });
   expect((await queueState(request)).isPaused).toBe(false);
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+  await expect(queueControl.pause).toBeVisible({ timeout: 0 });
 });
 
 const CLOUDFLARE_HOST = "speed.cloudflare.com";
@@ -427,7 +435,7 @@ const CLOUDFLARE_HOST = "speed.cloudflare.com";
 test("ST04 a bandwidth run against Cloudflare measures through the proxy rung and books nothing as downloaded", async ({ cleanPage: page, request }) => {
   const { a, connect1, server } = await ladderedServer();
   const queueControl = await downloadsTab(page);
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+  await expect(queueControl.pause).toBeVisible({ timeout: 0 });
   const speed = new SpeedPage(page);
   await speed.open(server);
   await speed.useCloudflare();
@@ -435,7 +443,7 @@ test("ST04 a bandwidth run against Cloudflare measures through the proxy rung an
   const before = await bytesDownloaded(request);
   const mark = await fixtureMark(request);
   const id = await speed.run();
-  const row = await speed.finished(id, "Completed");
+  const row = await speed.finished(id, "COMPLETED");
   const run = await speedTestRun(request, id);
   expect(run).toMatchObject({ status: "COMPLETED", kind: "BANDWIDTH", consumer: `server:${server}`, failure: null });
   const result = run.result!;
@@ -472,7 +480,7 @@ test("ST04 a bandwidth run against Cloudflare measures through the proxy rung an
 
   // The run gave the queue back and booked none of its bytes as downloaded.
   expect((await queueState(request)).isPaused).toBe(false);
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+  await expect(queueControl.pause).toBeVisible({ timeout: 0 });
   expect(await bytesDownloaded(request) - before).toBe(0);
 });
 
@@ -497,7 +505,7 @@ test("ST05 a two-leg route splits the connections, a leg taken down gives them a
 
   // Run 1: both legs, two connections each.
   const first = await speed.run();
-  await speed.finished(first, "Completed");
+  await speed.finished(first, "COMPLETED");
   const run1 = await speedTestRun(request, first);
   expect(run1).toMatchObject({ status: "COMPLETED", failure: null });
   expect(run1.tested.legs).toMatchObject([{ position: 0, down: false }, { position: 1, down: false }]);
@@ -518,7 +526,7 @@ test("ST05 a two-leg route splits the connections, a leg taken down gives them a
   // Run 2: leg 2 taken down, so every connection is leg 1's.
   await speed.takeLegDown(2);
   const second = await speed.run();
-  const secondRow = await speed.finished(second, "Completed");
+  const secondRow = await speed.finished(second, "COMPLETED");
   const run2 = await speedTestRun(request, second);
   expect(run2).toMatchObject({ status: "COMPLETED", failure: null });
   expect(run2.tested.legs).toMatchObject([{ position: 0, down: false }, { position: 1, down: true }]);
@@ -528,31 +536,33 @@ test("ST05 a two-leg route splits the connections, a leg taken down gives them a
   for (const connection of result2.connections) {
     expect(connection).toMatchObject({ leg: 0, path: { egressId: a.id, rung: 0, proxyIds: [connect1.id] } });
   }
-  await expect(secondRow).toContainText("leg 2");
+  await expect(secondRow.getByTestId(networkIds.speedRunDown("leg-1"))).toBeVisible();
   const secondDetail = await speed.detail(second);
   await expect(connectionRows(secondDetail)).toHaveCount(4);
   await expect(connectionRows(secondDetail).filter({ hasText: b.name })).toHaveCount(0);
   // The detail draws leg 2 down, and its direct way with it.
-  await expect(diagram(secondDetail)).toContainText("Down · 0/0 open");
-  await expect(diagram(secondDetail)).toContainText("Direct · Down");
+  const downLeg = diagram(secondDetail).getByTestId(networkIds.flowLeg(1, "DOWN"));
+  await expect(downLeg).toHaveCount(1);
+  await expect(downLeg).toContainText("0/0");
+  await expect(diagram(secondDetail).getByTestId(networkIds.flowDirect(1, "DOWN"))).toHaveCount(1);
 
   // Both legs down: the start is refused and nothing runs.
   const runsBefore = (await speedTestRuns(request)).length;
   await speed.takeLegDown(1);
-  await speed.runRefused("Leave at least one leg up.");
+  await speed.runRefused("Leave at least one leg up."); // copy-is-claim: the refusal sentence is what the page answers a refused start with
   expect((await speedTestRuns(request)).length).toBe(runsBefore);
   expect((await queueState(request)).isPaused).toBe(false);
 
   // Compare mode: two runs ticked in the Runs table are shown side by side.
-  await page.getByRole("button", { name: "Compare", exact: true }).click();
-  await speed.runs.getByRole("checkbox", { name: `Compare run ${first}`, exact: true }).check();
-  await speed.runs.getByRole("checkbox", { name: `Compare run ${second}`, exact: true }).check();
-  const compare = page.getByRole("region", { name: "Compare", exact: true });
+  await page.getByTestId(testIds.tableAction("speed-runs")).click();
+  await speed.runs.getByTestId(networkIds.speedCompareRun(first)).check();
+  await speed.runs.getByTestId(networkIds.speedCompareRun(second)).check();
+  const compare = page.getByTestId(networkIds.speedCompare);
   await expect(compare).toBeVisible();
   // The compared results set the figure and its unit in separate elements.
   await expect(compare).toContainText(figure(rateLabel(result1.averageBps)));
   await expect(compare).toContainText(figure(rateLabel(result2.averageBps)));
-  await expect(compare.getByRole("table", { name: "Connections", exact: true })).toHaveCount(2);
+  await expect(compare.getByTestId(networkIds.speedTable("connections"))).toHaveCount(2);
 });
 
 // The seeded reference posting, the shape of the public 100 MB speed test
@@ -573,7 +583,7 @@ test("ST06 a Usenet run of the seeded 100 MB posting over a plaintext direct leg
 
   const before = await bytesDownloaded(request);
   const id = await speed.run();
-  const row = await speed.finished(id, "Completed");
+  const row = await speed.finished(id, "COMPLETED");
   const run = await speedTestRun(request, id);
   expect(run).toMatchObject({ status: "COMPLETED", kind: "USENET", consumer: `server:${server}`, failure: null });
   const result = run.result!;
@@ -595,7 +605,8 @@ test("ST06 a Usenet run of the seeded 100 MB posting over a plaintext direct leg
   await expect(row).toContainText(DIRECT_HOST);
   await expect(row).toContainText(sizeLabel(result.bytes));
   const detail = await speed.detail(id);
-  await expect(detail.getByText("Plaintext", { exact: true })).toBeVisible();
+  // copy-is-claim: the transport cell says plaintext in the page's words; TLS would name its cipher suite
+  await expect(detail.getByTestId(networkIds.speedTableCell("articles", "transport"))).toHaveText("Plaintext");
   await expect(connectionRows(detail)).toHaveCount(4);
   expect((await queueState(request)).isPaused).toBe(false);
   await expectBooked(request, before, result.bytes, "the fixture run");
@@ -605,24 +616,25 @@ test("ST07 a run whose NZB URL does not serve an NZB fails, says why, and leaves
   const { server } = await ladderedServer();
   const port = (await fixtureState(request)).ports.http;
   const queueControl = await downloadsTab(page);
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+  await expect(queueControl.pause).toBeVisible({ timeout: 0 });
   const speed = new SpeedPage(page);
   await speed.open(server);
   await speed.useNzbUrl(`http://download.proxy.test:${port}/not-an-nzb.nzb`);
 
   const before = await bytesDownloaded(request);
   const id = await speed.run();
-  const row = await speed.finished(id, "Failed");
+  const row = await speed.finished(id, "FAILED");
   const run = await speedTestRun(request, id);
   expect(run).toMatchObject({ status: "FAILED", kind: "USENET" });
   // A cause with no sentence of its own is shown in the daemon's words.
   expect(run.failure, "the failure names its cause").toMatchObject({ code: "OTHER" });
   expect(run.failure!.message, "the failure names its cause").toBeTruthy();
-  const result = speed.test.getByRole("region", { name: "Result", exact: true });
-  await expect(result.getByRole("alert")).toHaveText(`Failed · ${run.failure!.message}`);
-  await expect(row).toContainText("Failed");
+  const failed = speed.test.getByTestId(networkIds.speedResult).getByTestId(networkIds.speedOutcome("FAILED"));
+  await expect(failed).toHaveAttribute("role", "alert");
+  // The daemon's own words end the line.
+  await expect(failed).toHaveText(new RegExp(`${run.failure!.message.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&")}$`));
   expect((await queueState(request)).isPaused).toBe(false);
-  await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+  await expect(queueControl.pause).toBeVisible({ timeout: 0 });
   expect(await bytesDownloaded(request) - before).toBe(0);
 });
 
@@ -638,7 +650,7 @@ test("ST08 a run reaching its maximum duration completes with what it measured",
   fs.writeFileSync(hold, "");
   try {
     const queueControl = await downloadsTab(page);
-    await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+    await expect(queueControl.pause).toBeVisible({ timeout: 0 });
     const speed = new SpeedPage(page);
     await speed.open(server);
     await speed.useNzbUrl(nzb.url, maxDuration);
@@ -648,7 +660,7 @@ test("ST08 a run reaching its maximum duration completes with what it measured",
     await expect.poll(async () => (await speedTestRun(request, id)).result?.usenet?.delivered ?? 0,
       { timeout: 0, message: "this run delivered an article before advancing its deadline" }).toBeGreaterThan(0);
     advanceClock(maxDuration * 1000);
-    await speed.finished(id, "Completed");
+    await speed.finished(id, "COMPLETED");
     const run = await speedTestRun(request, id);
     expect(run).toMatchObject({ status: "COMPLETED", failure: null });
     const result = run.result!;
@@ -658,7 +670,7 @@ test("ST08 a run reaching its maximum duration completes with what it measured",
     expect(result.usenet!.articlesRequested).toBeLessThan(parts);
     expect(result.usenet!.missing).toBe(0);
     expect((await queueState(request)).isPaused).toBe(false);
-    await expect(queueControl).toHaveText("Pause all", { timeout: 0 });
+    await expect(queueControl.pause).toBeVisible({ timeout: 0 });
     // Only delivered articles are booked; the one cut off by the deadline is not.
     await expectBooked(request, before, result.bytes, "the deadline run");
   } finally {
@@ -679,7 +691,7 @@ test("ST09 a run books against the server's download quota, stops at it, and is 
 
   const before = await bytesDownloaded(request);
   const id = await speed.run();
-  await speed.finished(id, "Completed");
+  await speed.finished(id, "COMPLETED");
   const run = await speedTestRun(request, id);
   expect(run).toMatchObject({ status: "COMPLETED", failure: null });
   const result = run.result!;
@@ -692,13 +704,14 @@ test("ST09 a run books against the server's download quota, stops at it, and is 
   expect(quota.usedBytes, "the run's bytes are the quota's").toBe(result.bytes);
   await expectBooked(request, before, result.bytes, "the quota run");
   const detail = await speed.detail(id);
-  await expect(detail.getByText("has used its download quota").first()).toBeVisible();
+  // The connection's error is the daemon's, as the API reported it above.
+  await expect(detail.getByTestId(networkIds.speedTableCell("connections", "error")).filter({ hasText: "has used its download quota" })).not.toHaveCount(0);
 
   // With the quota used up, a run is refused before it starts.
   await world.updateServer(server, { downloadQuota: serverQuota(quota.usedBytes) });
   await expect.poll(async () => (await serverQuotaUsed(request, server)).blocked, { timeout: 0, message: "quota blocked" }).toBe(true);
   const runsBefore = (await speedTestRuns(request)).length;
-  await speed.runRefused(`${PROXIED_HOST} has used its download quota.`);
+  await speed.runRefused(`${PROXIED_HOST} has used its download quota.`); // copy-is-claim: the refusal sentence is what the page answers a blocked start with
   expect((await speedTestRuns(request)).length).toBe(runsBefore);
   expect(await startRefusal(request, server, nzb.url)).toMatchObject({ code: "SPEED_TEST_QUOTA_BLOCKED" });
 });

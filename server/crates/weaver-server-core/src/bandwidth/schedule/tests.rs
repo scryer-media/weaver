@@ -995,7 +995,7 @@ async fn failed_initial_hold_reports_readiness_and_retries_after_repair() {
     )]));
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
-        crate::persistence::sql_runtime::SqlRuntime::execute(datastore.read_exec(),
+        crate::persistence::sql_runtime::SqlRuntime::execute(datastore.write_exec(),
             "CREATE TRIGGER reject_watch_pause BEFORE INSERT ON settings WHEN NEW.key = 'watch_folder.scanning_paused' BEGIN SELECT RAISE(FAIL, 'injected write failure'); END", &[]).await?;
         Ok(())
     }).unwrap();
@@ -1013,7 +1013,7 @@ async fn failed_initial_hold_reports_readiness_and_retries_after_repair() {
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
         crate::persistence::sql_runtime::SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "DROP TRIGGER reject_watch_pause",
             &[],
         )
@@ -1046,7 +1046,7 @@ async fn failed_watch_folder_resume_does_not_pause_scanning() {
     let watch_folder = WatchFolderService::new(db.clone(), handle.clone(), config.clone());
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
-        crate::persistence::sql_runtime::SqlRuntime::execute(datastore.read_exec(),
+        crate::persistence::sql_runtime::SqlRuntime::execute(datastore.write_exec(),
             "CREATE TRIGGER reject_watch_pause BEFORE INSERT ON settings WHEN NEW.key = 'watch_folder.scanning_paused' BEGIN SELECT RAISE(FAIL, 'injected write failure'); END", &[]).await?;
         Ok(())
     }).unwrap();
@@ -1119,7 +1119,7 @@ async fn initial_metadata_failure_pauses_intake_until_recovery() {
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
         crate::persistence::sql_runtime::SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "ALTER TABLE settings RENAME TO unavailable_settings",
             &[],
         )
@@ -1149,7 +1149,7 @@ async fn initial_metadata_failure_pauses_intake_until_recovery() {
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
         crate::persistence::sql_runtime::SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "ALTER TABLE unavailable_settings RENAME TO settings",
             &[],
         )

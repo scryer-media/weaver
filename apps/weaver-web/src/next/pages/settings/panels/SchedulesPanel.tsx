@@ -16,6 +16,7 @@ import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
+import { settingsIds, testIds } from "../../../testids";
 import { SCHEDULE_TRACKS, type ScheduleTrack } from "../../../data/schedule-tracks";
 import {
   profileName,
@@ -213,6 +214,7 @@ export function SchedulesPanel() {
           size="table"
           checked={schedule.enabled}
           label={t("next.schedules.enabledAria", { time: schedule.time })}
+          testId={settingsIds.scheduleEnabled}
           onChange={(next) => void toggle(schedule, next)}
         />
       </span>,
@@ -271,6 +273,7 @@ export function SchedulesPanel() {
 
       <RecordEditor
         open={editingId !== null}
+        testId={testIds.dialog("schedule")}
         title={
           editingId === "new"
             ? t("next.schedules.add")
@@ -415,6 +418,7 @@ export function SchedulesPanel() {
 
       <ConfirmDialog
         open={confirmRemove !== null}
+        testId={testIds.dialog("schedule-remove")}
         title={t("next.schedules.remove")}
         note={confirmRemove?.time}
         busy={busy}

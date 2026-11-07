@@ -28,6 +28,10 @@ fn build_integration_events_pg_sql(row_count: usize) -> String {
     )
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+)]
 async fn bulk_insert_integration_events_tx(
     tx: &mut SqlTx<'_>,
     events: &[IntegrationEventRow],
@@ -282,7 +286,7 @@ impl Database {
                             args.push(SqlArg::OptI64(event.item_id.map(|value| value as i64)));
                             args.push(SqlArg::Text(event.payload_json.clone()));
                         }
-                        SqlRuntime::execute(datastore.read_exec(), &sql, &args).await?;
+                        SqlRuntime::execute(datastore.write_exec(), &sql, &args).await?;
                     }
                     crate::runtime::perf_probe::record_sql_op(
                         "postgres",
@@ -298,8 +302,12 @@ impl Database {
     pub fn delete_all_integration_events(&self) -> Result<(), StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            SqlRuntime::execute(datastore.read_exec(), "DELETE FROM integration_events", &[])
-                .await?;
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "DELETE FROM integration_events",
+                &[],
+            )
+            .await?;
             Ok(())
         })
     }

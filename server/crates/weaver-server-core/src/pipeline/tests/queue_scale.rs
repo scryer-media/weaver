@@ -531,7 +531,7 @@ async fn a_failed_file_row_read_blocks_the_job_and_resume_reads_again() {
     let rename = |db: &Database, sql: &'static str| {
         let datastore = db.datastore();
         db.run_sql_blocking(async move {
-            SqlRuntime::execute(datastore.read_exec(), sql, &[]).await?;
+            SqlRuntime::execute(datastore.write_exec(), sql, &[]).await?;
             Ok(())
         })
         .unwrap();

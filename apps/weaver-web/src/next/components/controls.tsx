@@ -7,6 +7,7 @@ import { usePasswordManagerIgnore } from "@/lib/password-manager";
 import { cn } from "@/lib/utils";
 import { Icon, type IconName } from "./icons";
 import { Menu, MenuCheckItem, MenuItem } from "./Menu";
+import { testIds } from "@/next/testids";
 
 /* ------------------------------------------------------------------ buttons */
 
@@ -24,6 +25,7 @@ export function PrimaryButton({
   className,
   title,
   type = "button",
+  testId,
 }: {
   children: ReactNode;
   /** A leading icon, named by the action. */
@@ -34,10 +36,12 @@ export function PrimaryButton({
   title?: string;
   /** `submit` only inside a real form, where Enter should press it. */
   type?: "button" | "submit";
+  testId?: string;
 }) {
   return (
     <button
       type={type}
+      data-testid={testId}
       title={title}
       onClick={onClick}
       disabled={disabled}
@@ -65,6 +69,7 @@ export function SecondaryButton({
   className,
   title,
   size = "default",
+  testId,
 }: {
   children: ReactNode;
   /** A leading icon, named by the action. */
@@ -75,10 +80,12 @@ export function SecondaryButton({
   title?: string;
   /** `compact` is the 32px action a detail header carries four of. */
   size?: "default" | "compact";
+  testId?: string;
 }) {
   return (
     <button
       type="button"
+      data-testid={testId}
       title={title}
       onClick={onClick}
       disabled={disabled}
@@ -107,6 +114,7 @@ export function DangerButton({
   className,
   size = "default",
   solid = false,
+  testId,
 }: {
   children: ReactNode;
   /** A leading icon, named by the action. */
@@ -117,10 +125,12 @@ export function DangerButton({
   size?: "default" | "compact";
   /** Filled red, for the most destructive of two destructive choices side by side. */
   solid?: boolean;
+  testId?: string;
 }) {
   return (
     <button
       type="button"
+      data-testid={testId}
       onClick={onClick}
       disabled={disabled}
       className={cn(
@@ -159,6 +169,7 @@ export function Toggle({
   label,
   size = "form",
   disabled,
+  testId,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
@@ -166,6 +177,7 @@ export function Toggle({
   label: string;
   size?: "form" | "table";
   disabled?: boolean;
+  testId?: string;
 }) {
   const t = useTranslate();
   const table = size === "table";
@@ -185,6 +197,7 @@ export function Toggle({
       <button
         type="button"
         role="switch"
+        data-testid={testId}
         aria-checked={checked}
         aria-label={label}
         disabled={disabled}
@@ -225,6 +238,7 @@ export function CheckBox({
   label,
   disabled = false,
   className,
+  testId,
 }: {
   checked: boolean;
   onChange: (next: boolean) => void;
@@ -232,11 +246,13 @@ export function CheckBox({
   label: string;
   disabled?: boolean;
   className?: string;
+  testId?: string;
 }) {
   return (
     <button
       type="button"
       role="checkbox"
+      data-testid={testId}
       aria-checked={checked}
       aria-label={label}
       disabled={disabled}
@@ -270,6 +286,7 @@ export function Segmented<T extends string>({
   label,
   size = "form",
   className,
+  testId,
 }: {
   value: T;
   /** An option can be shown and not offered, such as a test a feed cannot run. */
@@ -279,11 +296,13 @@ export function Segmented<T extends string>({
   /** `compact` is the 28px mono variant the pagination bar's row count takes. */
   size?: "form" | "compact";
   className?: string;
+  testId?: string;
 }) {
   const compact = size === "compact";
   return (
     <div
       role="radiogroup"
+      data-testid={testId}
       aria-label={label}
       className={cn(
         "flex border border-wv-control",
@@ -298,6 +317,7 @@ export function Segmented<T extends string>({
             key={option.value}
             type="button"
             role="radio"
+            data-testid={testId === undefined ? undefined : testIds.option(testId, option.value)}
             aria-checked={active}
             disabled={option.disabled}
             onClick={() => onChange(option.value)}
@@ -378,6 +398,7 @@ export function Select<T extends string>({
   menuClassName,
   disabled = false,
   placeholder,
+  testId,
 }: {
   value: T;
   options: readonly { value: T; label: string; icon?: ReactNode }[];
@@ -390,6 +411,7 @@ export function Select<T extends string>({
   className?: string;
   menuClassName?: string;
   disabled?: boolean;
+  testId?: string;
 }) {
   const { placement, setPlacement, triggerRef, open } = usePinnedMenu();
   const current = options.find((option) => option.value === value);
@@ -400,6 +422,7 @@ export function Select<T extends string>({
         ref={triggerRef}
         type="button"
         data-wv-menu-trigger=""
+        data-testid={testId}
         disabled={disabled}
         aria-haspopup="listbox"
         aria-expanded={open}
@@ -413,7 +436,10 @@ export function Select<T extends string>({
       >
         {icon ? <Icon name={icon} size={13} className="-mr-1 flex-none text-wv-muted" /> : null}
         {current?.icon}
-        <span className={cn("min-w-0 flex-1 truncate text-left", !current && placeholder && "text-wv-muted")}>
+        <span
+          data-testid={testId === undefined ? undefined : testIds.selected(testId, value)}
+          className={cn("min-w-0 flex-1 truncate text-left", !current && placeholder && "text-wv-muted")}
+        >
           {current?.label ?? placeholder ?? value}
         </span>
         <Icon name="dropdown" size={13} className="flex-none text-wv-muted" />
@@ -422,6 +448,7 @@ export function Select<T extends string>({
         open={open}
         onDismiss={() => setPlacement(null)}
         label={label}
+        testId={testId === undefined ? undefined : testIds.menu(testId)}
         className={cn("fixed overflow-y-auto", menuClassName)}
         style={placement ?? undefined}
       >
@@ -429,6 +456,7 @@ export function Select<T extends string>({
           <MenuItem
             key={option.value}
             selected={option.value === value}
+            testId={testId === undefined ? undefined : testIds.option(testId, option.value)}
             onSelect={() => {
               onChange(option.value);
               setPlacement(null);
@@ -458,6 +486,7 @@ export function MultiSelect<T extends string>({
   className,
   menuClassName,
   disabled = false,
+  testId,
 }: {
   values: readonly T[];
   options: readonly { value: T; label: string }[];
@@ -469,6 +498,7 @@ export function MultiSelect<T extends string>({
   className?: string;
   menuClassName?: string;
   disabled?: boolean;
+  testId?: string;
 }) {
   const { placement, setPlacement, triggerRef, open } = usePinnedMenu();
   const chosen = options.filter((option) => values.includes(option.value));
@@ -479,6 +509,7 @@ export function MultiSelect<T extends string>({
         ref={triggerRef}
         type="button"
         data-wv-menu-trigger=""
+        data-testid={testId}
         disabled={disabled}
         aria-haspopup="menu"
         aria-expanded={open}
@@ -499,6 +530,7 @@ export function MultiSelect<T extends string>({
         open={open}
         onDismiss={() => setPlacement(null)}
         label={label}
+        testId={testId === undefined ? undefined : testIds.menu(testId)}
         className={cn("fixed overflow-y-auto", menuClassName)}
         style={placement ?? undefined}
       >
@@ -508,6 +540,7 @@ export function MultiSelect<T extends string>({
             <MenuCheckItem
               key={option.value}
               checked={checked}
+              testId={testId === undefined ? undefined : testIds.option(testId, option.value)}
               onToggle={() =>
                 onChange(
                   options
@@ -617,6 +650,7 @@ export function TextField({
   autoFocus,
   secret,
   list,
+  testId,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -636,12 +670,14 @@ export function TextField({
   id?: string;
   autoComplete?: string;
   autoFocus?: boolean;
+  testId?: string;
 }) {
   const ignore = usePasswordManagerIgnore({ secret, type, autoComplete });
   return (
     <input
       ref={ref}
       id={id}
+      data-testid={testId}
       autoComplete={autoComplete}
       {...ignore}
       autoFocus={autoFocus}
@@ -673,6 +709,7 @@ export function Slider({
   onChange,
   label,
   display,
+  testId,
 }: {
   value: number;
   min: number;
@@ -682,6 +719,7 @@ export function Slider({
   label: string;
   /** Right-hand readout; `0` conventionally reads "Unlimited". */
   display: string;
+  testId?: string;
 }) {
   const id = useId();
   return (
@@ -689,6 +727,7 @@ export function Slider({
       <input
         id={id}
         type="range"
+        data-testid={testId}
         aria-label={label}
         min={min}
         max={max}
@@ -728,6 +767,7 @@ export function NumberField({
   className,
   disabled,
   precision = 0,
+  testId,
 }: {
   value: number;
   onChange: (next: number) => void;
@@ -740,6 +780,7 @@ export function NumberField({
   disabled?: boolean;
   /** Decimal places the committed value keeps. */
   precision?: number;
+  testId?: string;
 }) {
   const [draft, setDraft] = useState<string | null>(null);
 
@@ -770,6 +811,7 @@ export function NumberField({
       <input
         {...ignore}
         type="number"
+        data-testid={testId}
         aria-label={label}
         min={min}
         max={max}
@@ -810,6 +852,7 @@ export function TextArea({
   className,
   secret,
   onBlur,
+  testId,
 }: {
   value: string;
   onChange: (next: string) => void;
@@ -820,11 +863,13 @@ export function TextArea({
   /** Keep password managers out, for key material. */
   secret?: boolean;
   onBlur?: () => void;
+  testId?: string;
 }) {
   const ignore = usePasswordManagerIgnore({ secret, type: "textarea" });
   return (
     <textarea
       {...ignore}
+      data-testid={testId}
       aria-label={label}
       placeholder={placeholder}
       rows={rows}
@@ -850,16 +895,19 @@ export function TimeField({
   onChange,
   label,
   className,
+  testId,
 }: {
   value: string;
   onChange: (next: string) => void;
   label: string;
   className?: string;
+  testId?: string;
 }) {
   const ignore = usePasswordManagerIgnore({ type: "time" });
   return (
     <input
       {...ignore}
+      data-testid={testId}
       type="time"
       aria-label={label}
       value={value}

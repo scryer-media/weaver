@@ -35,4 +35,30 @@ disallowed-methods = [
     { path = "weaver_tunnel::egress::SocketEgress::join_multicast", reason = "join through the proxy runtime, so the groups sit on their route" },
     { path = "weaver_nntp::route_dialer::AddressPlanned::new", reason = "take the server's dialer from its route in the proxy runtime" },
     { path = "weaver_tunnel::pipe::Egress::new", reason = "take the egress from the route in the proxy runtime" },
+    # Every SQLite write takes the writer gate. Only the persistence runtime
+    # writes; everything else sends its statement through
+    # `StoreDatastore::write_exec()` and reads through `read_exec()`. Reads
+    # (`fetch_one`, `fetch_all`, `fetch_optional`) stay open: a write that
+    # returns rows (`INSERT ... RETURNING`) is caught at run time by the
+    # read-lane classifier in persistence/sql_runtime.rs. Each exception carries
+    # `#[expect(clippy::disallowed_methods, reason = "writer gate: ...")]` and is
+    # pinned by the write guard test in
+    # server/crates/weaver-server-core/src/persistence/write_guard_tests.rs.
+    { path = "sqlx::query::Query::execute", reason = "write through StoreDatastore::write_exec(), so the statement takes the writer gate; reads go through read_exec()" },
+    { path = "sqlx::query::Query::execute_many", reason = "write through StoreDatastore::write_exec(), so the statement takes the writer gate; reads go through read_exec()" },
+    { path = "sqlx::Executor::execute", reason = "write through StoreDatastore::write_exec(), so the statement takes the writer gate; reads go through read_exec()" },
+    { path = "sqlx::Executor::execute_many", reason = "write through StoreDatastore::write_exec(), so the statement takes the writer gate; reads go through read_exec()" },
+    { path = "sqlx::RawSql::execute", reason = "write through StoreDatastore::write_exec(), so the statement takes the writer gate; reads go through read_exec()" },
+    { path = "sqlx::RawSql::execute_many", reason = "write through StoreDatastore::write_exec(), so the statement takes the writer gate; reads go through read_exec()" },
+    { path = "sqlx::Pool::begin", reason = "begin with StoreDatastore::write_exec().run_in_transaction(), so the transaction takes the writer gate" },
+    { path = "sqlx::Pool::try_begin", reason = "begin with StoreDatastore::write_exec().run_in_transaction(), so the transaction takes the writer gate" },
+    { path = "sqlx::Pool::begin_with", reason = "begin with StoreDatastore::write_exec().run_in_transaction(), so the transaction takes the writer gate" },
+    { path = "sqlx::Pool::try_begin_with", reason = "begin with StoreDatastore::write_exec().run_in_transaction(), so the transaction takes the writer gate" },
+    { path = "sqlx::Connection::begin", reason = "begin with StoreDatastore::write_exec().run_in_transaction(), so the transaction takes the writer gate" },
+    { path = "sqlx::Connection::begin_with", reason = "begin with StoreDatastore::write_exec().run_in_transaction(), so the transaction takes the writer gate" },
+    { path = "sqlx::Acquire::begin", reason = "begin with StoreDatastore::write_exec().run_in_transaction(), so the transaction takes the writer gate" },
+    { path = "sqlx::Transaction::commit", reason = "begin with StoreDatastore::write_exec().run_in_transaction(), so the transaction takes the writer gate" },
+    { path = "sqlx::Pool::acquire", reason = "write through StoreDatastore::write_exec(), so the connection never writes outside the writer gate" },
+    { path = "sqlx::Pool::try_acquire", reason = "write through StoreDatastore::write_exec(), so the connection never writes outside the writer gate" },
+    { path = "sqlx::Acquire::acquire", reason = "write through StoreDatastore::write_exec(), so the connection never writes outside the writer gate" },
 ]

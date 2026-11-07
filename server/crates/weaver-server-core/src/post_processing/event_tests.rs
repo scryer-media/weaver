@@ -416,7 +416,7 @@ async fn malformed_payload_is_quarantined_without_poisoning_another_job() {
     let malformed = bad.clone();
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "UPDATE script_event_queue SET payload = {} WHERE run_id = {}",
             &[SqlArg::Text("{}".into()), SqlArg::Text(malformed)],
         )
@@ -682,7 +682,7 @@ async fn failed_terminal_write_retries_before_claiming_more_and_retains_only_its
         .unwrap();
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
-        SqlRuntime::execute(datastore.read_exec(), "CREATE TRIGGER fail_script_finish BEFORE UPDATE OF state ON script_event_queue WHEN NEW.state = 'done' BEGIN SELECT RAISE(ABORT, 'test finish failure'); END", &[]).await?;
+        SqlRuntime::execute(datastore.write_exec(), "CREATE TRIGGER fail_script_finish BEFORE UPDATE OF state ON script_event_queue WHEN NEW.state = 'done' BEGIN SELECT RAISE(ABORT, 'test finish failure'); END", &[]).await?;
         Ok(())
     }).unwrap();
     assert!(drain_queue(db.clone()).await.is_err());
@@ -698,7 +698,7 @@ async fn failed_terminal_write_retries_before_claiming_more_and_retains_only_its
     let datastore = db.datastore();
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
-            datastore.read_exec(),
+            datastore.write_exec(),
             "DROP TRIGGER fail_script_finish",
             &[],
         )

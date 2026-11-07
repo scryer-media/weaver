@@ -18,6 +18,7 @@ import {
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
 import { Square } from "../../../components/chrome";
+import { settingsIds, testIds } from "@/next/testids";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { SecondaryButton, Toggle } from "../../../components/controls";
 import { Icon, type IconName } from "../../../components/icons";
@@ -48,6 +49,7 @@ import {
 } from "../framework";
 import { ScriptInstanceEditor, type InstanceEditorTarget } from "./ScriptInstanceEditor";
 import { ScriptTestDialog } from "./ScriptTestDialog";
+import { jobIds } from "@/next/testids";
 
 /**
  * Scripts: what weaver runs on a download and on the events around it.
@@ -331,7 +333,7 @@ export function ScriptConfigurationPanel() {
           control: {
             kind: "custom",
             control: (
-              <div className="flex min-w-0 flex-wrap items-center gap-3">
+              <div data-testid={jobIds.scriptDirectory} className="flex min-w-0 flex-wrap items-center gap-3">
                 <PathField
                   label={t("next.postProcessing.directory")}
                   value={scriptDirectory}
@@ -404,14 +406,16 @@ function RowAction({
   title,
   disabled = false,
   onClick,
+  testId,
 }: {
   icon: IconName;
   title: string;
   disabled?: boolean;
   onClick: () => void;
+  testId?: string;
 }) {
   return (
-    <SecondaryButton className="h-7 px-2" title={title} disabled={disabled} onClick={onClick}>
+    <SecondaryButton className="h-7 px-2" title={title} disabled={disabled} onClick={onClick} testId={testId}>
       <Icon name={icon} size={13} />
     </SecondaryButton>
   );
@@ -616,6 +620,7 @@ export function ScriptListPanel() {
         <span key="enabled" {...own}>
           <Toggle
             size="table"
+            testId={settingsIds.ppJobEnabled}
             checked={instance.enabled}
             label={t("next.postProcessing.enabledFor", { name: instance.name })}
             onChange={(next) => void toggle(instance, next)}
@@ -626,24 +631,28 @@ export function ScriptListPanel() {
             <RowAction
               icon="reset"
               title={t("next.postProcessing.reapply")}
+              testId={settingsIds.ppJobReapply}
               onClick={() => ask({ kind: "reapply", instance })}
             />
           ) : null}
           <RowAction
             icon="moveUp"
             title={t("next.postProcessing.moveUp")}
+            testId={settingsIds.ppJobMoveUp}
             disabled={working || index === 0}
             onClick={() => void move(instance, -1)}
           />
           <RowAction
             icon="moveDown"
             title={t("next.postProcessing.moveDown")}
+            testId={settingsIds.ppJobMoveDown}
             disabled={working || index === group.instances.length - 1}
             onClick={() => void move(instance, 1)}
           />
           <RowAction
             icon="test"
             title={t("next.postProcessing.test")}
+            testId={settingsIds.ppJobTest}
             onClick={() => {
               setError(null);
               setStatus(null);
@@ -653,6 +662,7 @@ export function ScriptListPanel() {
           <RowAction
             icon="remove"
             title={t("action.delete")}
+            testId={settingsIds.ppJobDelete}
             onClick={() => ask({ kind: "delete", instance })}
           />
         </span>,
@@ -757,6 +767,7 @@ export function ScriptListPanel() {
       ) : null}
 
       <ConfirmDialog
+        testId={testIds.dialog("pp-job-delete")}
         open={confirm?.kind === "delete"}
         title={t("next.postProcessing.deleteTitle")}
         note={confirm?.instance.name}
@@ -767,6 +778,7 @@ export function ScriptListPanel() {
         onDismiss={() => setConfirm(null)}
       />
       <ConfirmDialog
+        testId={testIds.dialog("pp-job-reapply")}
         open={confirm?.kind === "reapply"}
         title={t("next.postProcessing.reapply")}
         note={confirm?.instance.name}

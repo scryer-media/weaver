@@ -303,7 +303,7 @@ impl Database {
         let store = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                store.read_exec(),
+                store.write_exec(),
                 "INSERT INTO network_bandwidth (id, download_bps, upload_bps, usenet_split_pct)
                  VALUES (1, {}, {}, {})
                  ON CONFLICT(id) DO UPDATE SET download_bps = excluded.download_bps,

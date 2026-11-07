@@ -35,6 +35,7 @@ import { Pagination } from "../components/Pagination";
 import { StorageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useNextData } from "../data/next-data";
+import { testIds } from "../testids";
 import { sameElements, sameEntries, sameItems, shallowEqual, useSettled } from "../data/settled";
 import {
   batchTarget,
@@ -152,7 +153,7 @@ function PauseAllControl({ paused, resumeAt }: { paused: boolean; resumeAt: numb
   }
   if (paused) {
     return (
-      <button type="button" onClick={() => void resumeAll({})} className={PAUSED_BUTTON}>
+      <button type="button" data-testid={testIds.queueResumeAll} onClick={() => void resumeAll({})} className={PAUSED_BUTTON}>
         <Icon name="resume" size={14} className="-ml-[2px] mr-[7px] flex-none" />
         {t("next.downloads.resumeAll")}
       </button>
@@ -161,7 +162,7 @@ function PauseAllControl({ paused, resumeAt }: { paused: boolean; resumeAt: numb
 
   return (
     <div className="relative flex">
-      <SecondaryButton icon="pause" onClick={() => void pauseAll({})}>
+      <SecondaryButton icon="pause" onClick={() => void pauseAll({})} testId={testIds.queuePauseAll}>
         {t("next.downloads.pauseAll")}
       </SecondaryButton>
       <button
@@ -225,6 +226,7 @@ function TimedResumeButton({ resumeAt, onResume }: { resumeAt: number; onResume:
   return (
     <button
       type="button"
+      data-testid={testIds.queueResumeTimed}
       onClick={onResume}
       aria-label={`${resumeNow} (${countdown})`}
       className={cn("group", PAUSED_BUTTON)}
@@ -881,6 +883,7 @@ export function DownloadsPage() {
           ) : queue.summary.totalItems === 0 && jobs.length === 0 ? (
             <EmptyState
               centered
+              testId={testIds.queueEmpty}
               title={t("next.downloads.emptyTitle")}
               body={t("next.downloads.emptyBody")}
               action={<PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>}

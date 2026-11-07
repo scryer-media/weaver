@@ -664,7 +664,7 @@ mod tests {
     fn execute_sql(db: &Database, sql: &'static str, args: Vec<SqlArg>) {
         let datastore = db.datastore();
         db.run_sql_blocking(async move {
-            SqlRuntime::execute(datastore.read_exec(), sql, &args).await?;
+            SqlRuntime::execute(datastore.write_exec(), sql, &args).await?;
             Ok(())
         })
         .unwrap();

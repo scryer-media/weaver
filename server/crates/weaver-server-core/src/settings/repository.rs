@@ -261,7 +261,7 @@ impl Database {
         args.extend([SqlArg::I64(now_ms), SqlArg::I64(i64::from(rule.id))]);
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE tracker_rules
                     SET host_pattern = {}, seeding = {}, never_pause = {}, unpack = {}, client = {}, torrent_route = {},
                         dht = {}, pex = {}, lsd = {}, encryption = {}, upload_cap = {}, forced = {},
@@ -281,7 +281,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "DELETE FROM tracker_rules WHERE id = {}",
                 &[SqlArg::I64(i64::from(id))],
             )
@@ -364,7 +364,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE tracker_rules SET bound = NULL, updated_at_ms = {} WHERE id = {}",
                 &[SqlArg::I64(now_ms), SqlArg::I64(i64::from(id))],
             )

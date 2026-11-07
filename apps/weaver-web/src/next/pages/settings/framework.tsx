@@ -35,6 +35,7 @@ import {
 import { FormRow } from "@/next/components/rows";
 import type { IconName } from "@/next/components/icons";
 import { cn } from "@/lib/utils";
+import { testIds } from "@/next/testids";
 import { filterBlocks, type SearchRegistry } from "./search";
 
 /**
@@ -163,6 +164,7 @@ export interface FieldSpec {
 /** Draw one field's control. Shared by the panels and by the record editor. */
 export function FieldControlView({ spec }: { spec: FieldSpec }) {
   const control = spec.control;
+  const testId = testIds.field(spec.id);
   switch (control.kind) {
     case "toggle":
       return (
@@ -171,6 +173,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           onChange={control.onChange}
           label={spec.label}
           disabled={control.disabled}
+          testId={testId}
         />
       );
     case "select":
@@ -181,6 +184,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           onChange={control.onChange}
           label={spec.label}
           className={control.className}
+          testId={testId}
         />
       );
     case "multiselect":
@@ -192,6 +196,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           label={spec.label}
           placeholder={control.placeholder}
           className={control.className}
+          testId={testId}
         />
       );
     case "segmented":
@@ -201,6 +206,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           options={control.options}
           onChange={control.onChange}
           label={spec.label}
+          testId={testId}
         />
       );
     case "text": {
@@ -226,6 +232,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           autoComplete={control.autoComplete}
           secret={control.secret}
           className={control.className ?? "w-[268px] max-w-full"}
+          testId={testId}
         />
       );
     }
@@ -239,6 +246,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           placeholder={control.placeholder}
           pick={control.pick}
           browseFrom={control.browseFrom}
+          testId={testId}
         />
       );
     case "number":
@@ -252,6 +260,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           step={control.step}
           suffix={control.suffix}
           precision={control.precision}
+          testId={testId}
         />
       );
     case "textarea":
@@ -263,6 +272,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           rows={control.rows}
           placeholder={control.placeholder}
           secret={control.secret}
+          testId={testId}
         />
       );
     case "time":
@@ -271,6 +281,7 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           value={control.value}
           onChange={control.onChange}
           label={spec.label}
+          testId={testId}
         />
       );
     case "slider":
@@ -283,11 +294,12 @@ export function FieldControlView({ spec }: { spec: FieldSpec }) {
           onChange={control.onChange}
           label={spec.label}
           display={control.display}
+          testId={testId}
         />
       );
     case "static":
       return (
-        <div className="max-w-[380px] text-right font-wv-mono text-[12px] break-all text-wv-muted">
+        <div data-testid={testId} className="max-w-[380px] text-right font-wv-mono text-[12px] break-all text-wv-muted">
           {control.value}
         </div>
       );
@@ -310,7 +322,7 @@ export function FieldRows({ fields }: { fields: readonly FieldSpec[] }) {
 /** One field's row; a field a panel kept from its last render is not drawn again. */
 const FieldRow = memo(function FieldRow({ field }: { field: FieldSpec }) {
   const row = (
-    <FormRow label={field.label} help={field.help}>
+    <FormRow label={field.label} help={field.help} helpTestId={testIds.fieldHelp(field.id)}>
       <FieldControlView spec={field} />
     </FormRow>
   );
@@ -532,8 +544,8 @@ function BlockList({ blocks }: { blocks: readonly SettingsBlock[] }) {
 /** One block; a block a panel kept from its last render is not drawn again. */
 const BlockView = memo(function BlockView({ block }: { block: SettingsBlock }) {
   return (
-    <section aria-label={block.title} className="flex flex-none flex-col">
-      <SectionHeader label={block.title} tag={block.tag} note={block.note} />
+    <section aria-label={block.title} data-testid={testIds.section(block.id)} className="flex flex-none flex-col">
+      <SectionHeader label={block.title} tag={block.tag} note={block.note} noteTestId={testIds.sectionNote(block.id)} />
       {block.kind === "section" ? (
         <FieldRows fields={block.fields} />
       ) : null}
@@ -567,6 +579,7 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
       <div
         key={disclosure ? undefined : entry.id}
         data-row-id={entry.id}
+        data-testid={testIds.row(block.id, entry.id)}
         {...(interactive
           ? {
               role: "button",
@@ -642,6 +655,7 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
           {block.rows.length === 0 && groups.length === 0 && block.failure !== undefined ? (
             <div
               role="alert"
+              data-testid={testIds.tableEmpty(block.id)}
               className={`flex items-center gap-4 px-4 sm:px-6 py-5 text-[13px] text-wv-error-text${
                 block.add === undefined ? "" : " border-b border-wv-hairline"
               }`}
@@ -653,6 +667,7 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
             </div>
           ) : block.rows.length === 0 && groups.length === 0 ? (
             <div
+              data-testid={testIds.tableEmpty(block.id)}
               className={`px-4 sm:px-6 py-5 text-[13px] text-wv-muted${
                 block.add === undefined ? "" : " border-b border-wv-hairline"
               }`}
@@ -663,7 +678,7 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
             <>
               {block.rows.map(row)}
               {groups.map((group) => (
-                <section key={group.id} aria-label={group.title}>
+                <section key={group.id} aria-label={group.title} data-testid={testIds.rowGroup(block.id, group.id)}>
                   <div className="flex items-center gap-[10px] border-b border-wv-hairline px-4 sm:px-6 pb-2 pt-4">
                     <Eyebrow>{group.title}</Eyebrow>
                     {group.note === undefined ? null : (
@@ -685,14 +700,14 @@ function SettingsTable({ block }: { block: SettingsTableModel }) {
       {/* Outside the scroller, so it centres on the width in view and not on the table's. */}
       {block.add === undefined ? null : (
         <div className="flex flex-none justify-center px-4 sm:px-6 py-3">
-          <PrimaryButton icon="add" onClick={block.add.onClick} disabled={block.add.disabled}>
+          <PrimaryButton icon="add" onClick={block.add.onClick} disabled={block.add.disabled} testId={testIds.tableAdd(block.id)}>
             {block.add.label}
           </PrimaryButton>
         </div>
       )}
       {block.action === undefined ? null : (
         <div className="flex flex-none justify-center px-4 sm:px-6 py-3">
-          <PrimaryButton icon={block.action.icon} onClick={block.action.onClick}>
+          <PrimaryButton icon={block.action.icon} onClick={block.action.onClick} testId={testIds.tableAction(block.id)}>
             {block.action.label}
           </PrimaryButton>
         </div>
@@ -708,7 +723,7 @@ export interface PanelFlags {
   dirty: boolean;
   busy: boolean;
   /** Replaces the status bar's "All changes saved" — a result, or a failure. */
-  status: string | null;
+  status: ReactNode;
   /** Colour the status line as a failure rather than as progress. */
   failed: boolean;
 }
@@ -894,7 +909,7 @@ export function usePanelState({
 }: {
   dirty: boolean;
   busy?: boolean;
-  status?: string | null;
+  status?: ReactNode;
   failed?: boolean;
   save: () => void;
   revert: () => void;
@@ -938,7 +953,7 @@ export function usePanelState({
  * Revert have nothing to act on — but a sync report or a failed delete still
  * belongs in the status bar.
  */
-export function usePanelStatus(status: string | null, failed = false): void {
+export function usePanelStatus(status: ReactNode, failed = false): void {
   const { setFlags } = useShell();
   const active = useSettingsPanelActive();
 
