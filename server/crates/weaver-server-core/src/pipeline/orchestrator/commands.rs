@@ -426,7 +426,7 @@ impl Pipeline {
         // Refusal was decided atomically when the API recorded this intent.
         // A later phase transition must not revoke an accepted cancellation.
         if !self.jobs.contains_key(&job_id) {
-            return Err(crate::SchedulerError::JobNotFound(job_id));
+            return self.begin_cancel_unread_job(job_id, origin);
         }
         if let Some(update) = self.shared_state.queue.read(|inner| {
             inner
@@ -484,7 +484,7 @@ impl Pipeline {
         let created_at = now - elapsed_secs;
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.optional_recovery_bytes();
+            self.optional_recovery_bytes(state);
         let health = health_milli(total, state.failed_bytes);
         let row = crate::JobHistoryRow {
             protocol: crate::jobs::Protocol::Nzb,
@@ -525,6 +525,71 @@ impl Pipeline {
                 post_processing_done,
                 working_dir: state.working_dir.clone(),
                 staging_dir: state.staging_dir.clone(),
+            },
+        ))
+    }
+
+    // The cancel of a job out of the window whose stored state could not be
+    // read back: it never ran here, so its queue row holds all its history
+    // row needs, and the cancel reads nothing of its NZB. Its row leaves
+    // with the archive, and the slot it held is released as for any row
+    // that left.
+    fn begin_cancel_unread_job(
+        &mut self,
+        job_id: JobId,
+        origin: crate::jobs::handle::CancellationOrigin,
+    ) -> Result<(crate::JobHistoryRow, CancelledJobCleanup), crate::SchedulerError> {
+        if !self.window_unreadable.contains(&job_id) {
+            return Err(crate::SchedulerError::JobNotFound(job_id));
+        }
+        let info = self
+            .shared_state
+            .queue
+            .read(|inner| inner.job(job_id).map(|row| row.info(&inner.globals)))
+            .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
+        let working_dir = info
+            .output_dir
+            .clone()
+            .map(PathBuf::from)
+            .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
+        self.db.cancel_event_scripts(job_id.0);
+        if origin.is_user() {
+            self.shared_state.cancel_active_job_work(job_id);
+        }
+        let row = crate::JobHistoryRow {
+            job_id: job_id.0,
+            job_hash: info.job_hash.map(|hash| hash.to_vec()),
+            name: info.name,
+            status: "cancelled".to_string(),
+            error_message: origin
+                .is_user()
+                .then(|| crate::jobs::model::OPERATOR_CANCELLED_ERROR.to_string()),
+            total_bytes: info.total_bytes,
+            downloaded_bytes: info.downloaded_bytes,
+            optional_recovery_bytes: info.optional_recovery_bytes,
+            optional_recovery_downloaded_bytes: info.optional_recovery_downloaded_bytes,
+            failed_bytes: info.failed_bytes,
+            health: info.health,
+            category: info.category,
+            output_dir: info.output_dir,
+            nzb_path: None,
+            created_at: (info.created_at_epoch_ms / 1000.0) as i64,
+            completed_at: timestamp_secs() as i64,
+            metadata: if info.metadata.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&info.metadata).ok()
+            },
+            server_attribution: None,
+            protocol: info.protocol,
+        };
+        Ok((
+            row,
+            CancelledJobCleanup {
+                job_id,
+                post_processing_done: None,
+                working_dir,
+                staging_dir: None,
             },
         ))
     }

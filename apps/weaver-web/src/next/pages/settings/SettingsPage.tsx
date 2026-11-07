@@ -137,7 +137,7 @@ export function SettingsPage() {
     <NextShell
       title={panel ? t(panel.label) : t("nav.settings")}
       titleTag={panel?.tag === "beta" ? <BetaTag /> : undefined}
-      note={panel ? t(panel.note) : undefined}
+      note={panel?.note ? t(panel.note) : undefined}
       railMiddle={<PanelListBlock eyebrow={t("nav.settings")} items={railItems} />}
       statusRight={<span className={statusTone}>{statusRight}</span>}
       controls={

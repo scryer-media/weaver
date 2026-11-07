@@ -108,22 +108,37 @@ impl Pipeline {
     }
 
     pub(crate) fn persist_active_runtime(&self, job_id: JobId) {
-        self.persist_active_runtime_at(job_id, None);
+        let _ = self.persist_active_runtime_at(job_id, None);
     }
 
     // [`Self::persist_active_runtime`] that also records `output_dir` as the
-    // job's output location in the same ordered write.
+    // job's output location in the same ordered write. A moving job's row
+    // names the destination it moves into, so a restart finds the delivery
+    // there. The receiver answers once the write has committed.
     pub(crate) fn persist_active_runtime_at(
         &self,
         job_id: JobId,
         output_dir: Option<std::path::PathBuf>,
-    ) {
-        let Some(values) = self.active_runtime_values(job_id) else {
-            return;
-        };
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+        let values = self.active_runtime_values(job_id)?;
         #[cfg(test)]
         RUNTIME_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let output_dir = output_dir.map(|dir| dir.to_string_lossy().into_owned());
+        let output_dir = output_dir
+            .or_else(|| match values.status {
+                "moving" => self.reserved_complete_destinations.get(&job_id).cloned(),
+                _ => None,
+            })
+            .map(|dir| dir.to_string_lossy().into_owned());
+        // The moving row keeps what the delivery ruled, in the same
+        // statement: a restart from here on has no graph to ask.
+        let post_processing_outcome = (values.status == "moving")
+            .then(|| {
+                self.fresh_post_processing_facts(
+                    job_id,
+                    crate::post_processing::model::PipelineOutcome::Succeeded,
+                )
+            })
+            .and_then(|facts| serde_json::to_string(&facts).ok());
         let ActiveRuntimeValues {
             status,
             download_state,
@@ -141,29 +156,33 @@ impl Pipeline {
         // fire-and-forget task: two rapid runtime transitions for the same job
         // (last-write-wins columns: run_state / paused_resume_* / status) must
         // land in enqueue order, or a restored job could resume stale state.
-        if let Err(error) =
-            self.db
-                .try_queue_job_write(job_id, "set_active_job_runtime", move |db| {
-                    db.set_active_job_runtime_at(
-                        job_id,
-                        output_dir.as_deref(),
-                        status,
-                        download_state,
-                        post_state,
-                        run_state,
-                        error.as_deref(),
-                        queued_repair_at_epoch_ms,
-                        queued_extract_at_epoch_ms,
-                        paused_resume_status,
-                        paused_resume_download_state,
-                        paused_resume_post_state,
-                    )
-                })
-        {
-            tracing::error!(
-                error = %error,
-                "failed to queue active job runtime write"
-            );
+        match self
+            .db
+            .try_queue_job_write_committed(job_id, "set_active_job_runtime", move |db| {
+                db.set_active_job_runtime_at(
+                    job_id,
+                    output_dir.as_deref(),
+                    post_processing_outcome.as_deref(),
+                    status,
+                    download_state,
+                    post_state,
+                    run_state,
+                    error.as_deref(),
+                    queued_repair_at_epoch_ms,
+                    queued_extract_at_epoch_ms,
+                    paused_resume_status,
+                    paused_resume_download_state,
+                    paused_resume_post_state,
+                )
+            }) {
+            Ok(committed) => Some(committed),
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "failed to queue active job runtime write"
+                );
+                None
+            }
         }
     }
 
@@ -258,7 +277,10 @@ impl Pipeline {
         new_post_state: crate::jobs::model::PostState,
         new_run_state: crate::jobs::model::RunState,
         persist_status: Option<&'static str>,
-    ) {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+        // A moving row is the one durable mark that the delivery has begun:
+        // a restart must resume the move into the recorded destination, never
+        // fetch the job again.
         fn should_persist_runtime_to_db(
             old_run_state: crate::jobs::model::RunState,
             new_status: &JobStatus,
@@ -270,6 +292,7 @@ impl Pipeline {
                     | JobStatus::Partial
                     | JobStatus::Failed { .. }
                     | JobStatus::Paused
+                    | JobStatus::Moving
             ) || matches!(
                 (old_run_state, new_run_state),
                 (
@@ -280,9 +303,7 @@ impl Pipeline {
         }
 
         let failpoint_name = {
-            let Some(state) = self.jobs.get(&job_id) else {
-                return;
-            };
+            let state = self.jobs.get(&job_id)?;
             if state.run_state != new_run_state
                 && matches!(new_run_state, crate::jobs::model::RunState::Paused)
             {
@@ -307,10 +328,8 @@ impl Pipeline {
                 }
             }
         };
-        let (transitioned, persisted_snapshot_changed, persist_runtime_to_db, moved) = {
-            let Some(state) = self.jobs.get_mut(&job_id) else {
-                return;
-            };
+        let (transitioned, persisted_snapshot_changed, persist_runtime_to_db, moved, old_run_state) = {
+            let state = self.jobs.get_mut(&job_id)?;
             let old_status = state.status.clone();
             let old_download_state = state.download_state;
             let old_post_state = state.post_state;
@@ -380,10 +399,17 @@ impl Pipeline {
                 persisted_snapshot_changed,
                 persist_runtime_to_db,
                 (old_post_state, new_post_state),
+                old_run_state,
             )
         };
 
+        let paused = matches!(new_run_state, crate::jobs::model::RunState::Paused);
+        if paused != matches!(old_run_state, crate::jobs::model::RunState::Paused) {
+            self.hold_extraction_clock(job_id);
+        }
+
         self.metrics.post_state_moved(moved.0, moved.1);
+        let mut committed = None;
         if let Some(persist_status) = persist_status {
             let changed_label = if persisted_snapshot_changed {
                 "changed"
@@ -397,7 +423,7 @@ impl Pipeline {
                 std::time::Duration::from_nanos(1),
             );
             if persist_runtime_to_db {
-                self.persist_active_runtime(job_id);
+                committed = self.persist_active_runtime_at(job_id, None);
             } else {
                 crate::runtime::perf_probe::record_owned(
                     format!("pipeline.persist_active_runtime.skipped.transient.{persist_status}"),
@@ -409,6 +435,7 @@ impl Pipeline {
             crate::e2e_failpoint::maybe_delay(name);
             crate::e2e_failpoint::maybe_trip(name);
         }
+        committed
     }
 
     pub(crate) async fn reconcile_job_progress(&mut self, job_id: JobId) {
@@ -416,10 +443,14 @@ impl Pipeline {
     }
 
     pub(crate) fn transition_completed_runtime(&mut self, job_id: JobId) {
-        // The job rules on what it delivered.
-        let status = self
-            .graph_terminal_status(job_id)
-            .unwrap_or(JobStatus::Complete);
+        // The job rules on what it delivered: its graph while it has one,
+        // else what the graph ruled before a restart.
+        let status = self.graph_terminal_status(job_id).unwrap_or_else(|| {
+            match self.delivered_verdict(job_id) {
+                Some(verdict) if verdict.partial => JobStatus::Partial,
+                _ => JobStatus::Complete,
+            }
+        });
         let persisted = status.persisted_status();
         self.transition_postprocessing_status(job_id, status, Some(persisted));
     }
@@ -560,7 +591,7 @@ impl Pipeline {
         job_id: JobId,
         new_status: JobStatus,
         persist_status: Option<&'static str>,
-    ) {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
         let (new_download_state, new_post_state, new_run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&new_status);
         self.transition_runtime_snapshot(
@@ -570,6 +601,37 @@ impl Pipeline {
             new_post_state,
             new_run_state,
             persist_status,
-        );
+        )
+    }
+}
+
+impl Pipeline {
+    // A graph job kept while its extraction is stopped spends none of its
+    // extraction deadline: while the job is paused, or every download is,
+    // by hand, by schedule or for a speed test.
+    pub(crate) fn hold_extraction_clock(&mut self, job_id: JobId) {
+        let paused = self.shared_state.is_paused()
+            || self.jobs.get(&job_id).is_some_and(|state| {
+                matches!(state.run_state, crate::jobs::model::RunState::Paused)
+            });
+        if let Some(graph) = match self.graph_jobs.get_mut(&job_id) {
+            Some(graph) => Some(graph),
+            None => self.retiring_graph_jobs.get_mut(&job_id),
+        } {
+            graph.hold_clock(paused);
+        }
+    }
+
+    // Every download paused or resumed: each graph job's clock follows.
+    pub(crate) fn hold_extraction_clocks(&mut self) {
+        let jobs: Vec<JobId> = self
+            .graph_jobs
+            .keys()
+            .chain(self.retiring_graph_jobs.keys())
+            .copied()
+            .collect();
+        for job_id in jobs {
+            self.hold_extraction_clock(job_id);
+        }
     }
 }

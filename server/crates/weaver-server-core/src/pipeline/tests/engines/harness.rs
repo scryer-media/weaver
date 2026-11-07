@@ -41,6 +41,10 @@ pub(in crate::pipeline) struct Post {
     pub(in crate::pipeline) name: String,
     pub(in crate::pipeline) role: FileRole,
     pub(in crate::pipeline) bytes: Vec<u8>,
+    // The smallest article this file is posted in. A poster cuts a file
+    // whose leading structure must arrive whole in articles that hold it,
+    // whatever the rest of the post uses.
+    pub(in crate::pipeline) least_article: usize,
 }
 
 impl Post {
@@ -49,11 +53,17 @@ impl Post {
             name: name.to_string(),
             role: FileRole::from_filename(name),
             bytes,
+            least_article: 0,
         }
     }
 
+    // The article size this file is posted in where the post uses `size`.
+    pub(in crate::pipeline) fn article(&self, size: usize) -> usize {
+        size.max(self.least_article)
+    }
+
     pub(in crate::pipeline) fn articles(&self, size: usize) -> impl Iterator<Item = &[u8]> {
-        self.bytes.chunks(size)
+        self.bytes.chunks(self.article(size))
     }
 }
 
@@ -91,6 +101,20 @@ pub(in crate::pipeline) fn par2_volumes(
     par2_volumes_sliced(base, files, ARTICLE as u64, blocks, volumes)
 }
 
+// An index and the volumes par2cmdline writes for `blocks` recovery blocks
+// when told no volume count: sizes doubling from one, the last taking the
+// rest, so 53 blocks are `vol00+01`, `vol01+02`, `vol03+04`, `vol07+08`,
+// `vol15+16` and `vol31+22`. The index first, the volumes in block order,
+// sliced at `slice` bytes.
+pub(in crate::pipeline::tests) fn par2_doubling(
+    base: &str,
+    files: &[(&str, &[u8])],
+    slice: u64,
+    blocks: u32,
+) -> Vec<Post> {
+    par2_created(base, files, slice, blocks, None)
+}
+
 // The same, sliced at `slice` bytes rather than ARTICLE.
 pub(in crate::pipeline::tests) fn par2_volumes_sliced(
     base: &str,
@@ -99,9 +123,27 @@ pub(in crate::pipeline::tests) fn par2_volumes_sliced(
     blocks: u32,
     volumes: u32,
 ) -> Vec<Post> {
+    par2_created(base, files, slice, blocks, Some(volumes))
+}
+
+// The set the creator writes, in `volumes` volumes or, with none, in the
+// doubling sizes it picks itself.
+fn par2_created(
+    base: &str,
+    files: &[(&str, &[u8])],
+    slice: u64,
+    blocks: u32,
+    volumes: Option<u32>,
+) -> Vec<Post> {
     use par2_rs::create::{BlockSizing, Par2Creator, Par2CreatorOptions, RecoveryAmount};
 
-    let source = tempfile::tempdir().unwrap();
+    // Fixture generation uses hard links when publishing parity files.
+    // Filesystem lanes can keep that oracle on local storage while TMPDIR
+    // puts every job file on the capability-limited mount under test.
+    let source = match std::env::var_os("WEAVER_TEST_FIXTURE_DIR") {
+        Some(dir) => tempfile::tempdir_in(dir).unwrap(),
+        None => tempfile::tempdir().unwrap(),
+    };
     let inputs = files
         .iter()
         .map(|(name, bytes)| {
@@ -120,7 +162,7 @@ pub(in crate::pipeline::tests) fn par2_volumes_sliced(
     );
     options.block_sizing = BlockSizing::Bytes(slice);
     options.recovery_amount = RecoveryAmount::Count(blocks);
-    options.volume_count = Some(volumes);
+    options.volume_count = volumes;
     let creator = Par2Creator::new(options);
     let created = creator.create(&creator.plan().unwrap()).unwrap();
     let mut posts: Vec<Post> = created
@@ -513,6 +555,10 @@ pub(in crate::pipeline::tests) struct Scenario {
     // Every batch the download queue hands out is served as workers fetching
     // these posts at once: one article of each in turn, in this order.
     pub(in crate::pipeline::tests) together: Vec<u32>,
+    // Once the queue hands out an article of one of these posts, every
+    // article it holds of them arrives at once, last first, as the fetches
+    // of many workers land out of order.
+    pub(in crate::pipeline::tests) reversed: Vec<u32>,
     // A restarted run serves these articles first, in this order, each once
     // the queue holds it.
     pub(in crate::pipeline::tests) first: Vec<(u32, u32)>,
@@ -547,6 +593,7 @@ impl Scenario {
             article: ARTICLE,
             backwards: false,
             together: Vec::new(),
+            reversed: Vec::new(),
             first: Vec::new(),
             uuencoded: false,
             leased: false,
@@ -620,6 +667,13 @@ impl Scenario {
     // order, then the second of each, and so on.
     pub(in crate::pipeline::tests) fn together(mut self, posts: &[u32]) -> Self {
         self.together = posts.to_vec();
+        self
+    }
+
+    // Whatever the queue holds of `posts` arrives at once, last first, from
+    // the first time it hands one of them out.
+    pub(in crate::pipeline::tests) fn reversed(mut self, posts: &[u32]) -> Self {
+        self.reversed = posts.to_vec();
         self
     }
 
@@ -796,6 +850,14 @@ pub(in crate::pipeline::tests) struct GraphView {
     // What the job's report showed at each look, its status and whether it
     // was fetching repair data, each change once.
     pub(in crate::pipeline::tests) shown: Vec<(JobStatus, bool)>,
+    // The job's report at the last look.
+    pub(in crate::pipeline::tests) report: Option<crate::jobs::handle::JobInfo>,
+    // The bytes still to come and the bytes wanted the job's report showed
+    // at each look, each change once.
+    pub(in crate::pipeline::tests) remaining: Vec<(u64, u64)>,
+    // Across each restart: the bytes still to come and wanted the report
+    // showed as the pipeline went down, and as the new one restored the job.
+    pub(in crate::pipeline::tests) restored_remaining: Vec<((u64, u64), (u64, u64))>,
     // At each look, for every root member a set covers: its name, whether
     // its sets proved it (every one covering it ruled clean or repaired and
     // none is out), and whether the root still keeps its checksums.
@@ -831,6 +893,10 @@ pub(in crate::pipeline::tests) struct Outcome {
     pub(in crate::pipeline::tests) validated_password: Option<String>,
     // The metadata the job's history row keeps, as stored.
     pub(in crate::pipeline::tests) history_metadata: Option<String>,
+    // The job's history row, as stored.
+    pub(in crate::pipeline::tests) history: Option<crate::JobHistoryRow>,
+    // How many times each job stage's duration was observed, by stage name.
+    pub(in crate::pipeline::tests) stages_timed: Vec<(&'static str, u64)>,
 }
 
 // The kind of every object a graph run's tree held, by its name, sorted.
@@ -1044,11 +1110,16 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
     let rejections = pipeline.metrics.extraction_rejections();
     let metrics = pipeline.metrics.raw_snapshot();
     let validated_password = pipeline.db.validated_archive_password(JOB.0).unwrap();
-    let history_metadata = pipeline
-        .db
-        .get_job_history(JOB.0)
-        .unwrap()
-        .and_then(|row| row.metadata);
+    let history = pipeline.db.get_job_history(JOB.0).unwrap();
+    let history_metadata = history.as_ref().and_then(|row| row.metadata.clone());
+    let stages_timed = pipeline
+        .metrics
+        .job_lifecycle
+        .snapshot()
+        .stage_duration
+        .into_iter()
+        .map(|(stage, histogram)| (stage, histogram.count))
+        .collect();
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
         status,
@@ -1067,6 +1138,8 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
         metrics,
         validated_password,
         history_metadata,
+        history,
+        stages_timed,
     })
 }
 
@@ -1208,6 +1281,21 @@ fn handed_out(
             break;
         }
     }
+    let reversed = |work: &DownloadWork| {
+        scenario
+            .reversed
+            .contains(&work.segment_id.file_id.file_index)
+    };
+    if !all && batch.first().is_some_and(reversed) {
+        batch.extend(queue.extract_matching(reversed));
+        batch.sort_by_key(|work| {
+            std::cmp::Reverse((
+                work.segment_id.segment_number,
+                work.segment_id.file_id.file_index,
+            ))
+        });
+        return Some((batch, None));
+    }
     if scenario.together.is_empty() {
         batch.reverse();
     } else {
@@ -1310,7 +1398,7 @@ async fn serve_from(
     }
     let intact = !scenario.spoils(server, (file, ordinal));
     let post = &scenario.posts[file as usize];
-    let offset = ordinal as usize * scenario.article;
+    let offset = ordinal as usize * post.article(scenario.article);
     let posted = post
         .articles(scenario.article)
         .nth(ordinal as usize)
@@ -1459,10 +1547,15 @@ pub(in crate::pipeline::tests) fn observe(
     };
     let looked = std::time::Instant::now();
     if let Some(report) = pipeline.job_report(JOB) {
-        let shown = (report.status, report.fetching_repair_data);
+        let shown = (report.status.clone(), report.fetching_repair_data);
         if view.shown.last() != Some(&shown) {
             view.shown.push(shown);
         }
+        let remaining = (report.remaining_bytes, report.wanted_bytes);
+        if view.remaining.last() != Some(&remaining) {
+            view.remaining.push(remaining);
+        }
+        view.report = Some(report);
     }
     let tree = job.tree();
     if let Some(namespace) = tree.namespace(weaver_graph::NodeId::ROOT) {
@@ -1772,3 +1865,5 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
         files,
     }
 }
+
+mod remaining_walk;

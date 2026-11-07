@@ -16,6 +16,20 @@
 // a name the database gives another. A member whose first byte arrives
 // while its name is shut opens its file under the internal directory and
 // moves to its name the same way.
+//
+// The rule holds name by name, so a move waiting for one member never stops
+// another opening at its own. After a crash the restore reads, for each
+// member, the names the last committed checkpoint gives it: where its file
+// sat and the one it wants. Each such name stays out of every other
+// member's reach until a checkpoint that stops giving it has committed: a
+// member's file sits there, its waiting move wants it, or it is shut as a
+// name the member left, the last also when the ledger moved the member off
+// a name before its file ever reached it. A new file opens at its name only
+// when no other member holds that name in any of these ways, and only when
+// that name is the one the ledger keeps for it; the next checkpoint then
+// records it there. So whatever stopped, the bytes a restore finds at a
+// name are those of the member the database gives that name, and a restored
+// move never finds another member's file in its way.
 
 use std::path::Path;
 
@@ -37,16 +51,42 @@ pub(crate) fn restored_at<'a>(
     working_dir: &Path,
     output_name: &'a str,
     on_disk: Option<&'a str>,
-) -> &'a str {
-    match on_disk {
-        Some(sat)
-            if Leaf::path_at(working_dir, sat).exists()
-                || !Leaf::path_at(working_dir, output_name).exists() =>
-        {
-            sat
-        }
-        _ => output_name,
+) -> Result<&'a str, super::super::leaf::LeafError> {
+    let exists = |name: &str| {
+        let path = Leaf::path_at(working_dir, name);
+        path.try_exists()
+            .map_err(|source| super::super::leaf::LeafError::Io { path, source })
+    };
+    if let Some(sat) = on_disk
+        && (exists(sat)? || !exists(output_name)?)
+    {
+        return Ok(sat);
     }
+    Ok(output_name)
+}
+
+// How many files opened under a waiting name, and how many files moved on
+// disk, on this thread: a job's writer runs on its pipeline's thread, so a
+// test reads its own job's, across every writer a restart makes.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Tally {
+    pub(crate) waiting_opens: u64,
+    pub(crate) moves: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static TALLY: std::cell::Cell<Tally> = std::cell::Cell::default();
+}
+
+#[cfg(test)]
+fn count(change: impl FnOnce(&mut Tally)) {
+    TALLY.with(|tally| {
+        let mut now = tally.get();
+        change(&mut now);
+        tally.set(now);
+    });
 }
 
 // A member whose file waits to move to the name it wants.
@@ -103,14 +143,23 @@ impl NamespaceWriter {
             .collect()
     }
 
-    // A new file for the member, at its name when nothing sits there and
-    // no pending move can change the allocation. Otherwise it waits under
-    // the internal directory until a checkpoint records its ownership and
-    // intended name: a crash must not expose an unrecorded temporary name.
-    pub(super) fn new_leaf(&mut self, node: NodeId, member: MemberId, name: &str) -> Leaf {
-        if !self.moves_waiting() && self.free_at(name, (node, member)) {
+    // A new file for the member, at its name when that name is free for it
+    // and is the one it keeps. A name the ledger gave only while the one the
+    // member wants is leaving (`held_off`) changes once that one is vacated,
+    // so a file opened there would be left at a name no checkpoint may ever
+    // record. Otherwise it waits under the internal directory until a
+    // checkpoint records its ownership and intended name.
+    pub(super) fn new_leaf(
+        &mut self,
+        (node, member): (NodeId, MemberId),
+        name: &str,
+        held_off: bool,
+    ) -> Leaf {
+        if !held_off && self.free_at(name, (node, member)) {
             return Leaf::at(&self.working_dir, name);
         }
+        #[cfg(test)]
+        count(|tally| tally.waiting_opens += 1);
         let waiting = waiting_name(&self.working_dir, node, member, name);
         let mut leaf = Leaf::at(&self.working_dir, &waiting);
         leaf.intend(name);
@@ -197,14 +246,47 @@ impl NamespaceWriter {
     }
 
     // Remove every file that goes which the checkpoints through
-    // `committed` stop naming.
+    // `committed` stop naming, then every directory that leaves empty:
+    // a directory member that goes, and each directory above what went.
     fn remove_left(&mut self, committed: u64) -> Result<(), WriteError> {
-        let (gone, kept) = std::mem::take(&mut self.leaving)
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.leaving)
             .into_iter()
             .partition(|(_, stamp)| stamp.is_some_and(|stamp| stamp <= committed));
         self.leaving = kept;
+        let mut emptied = std::collections::BTreeSet::new();
         for (leaf, _) in gone {
-            leaf.remove()?;
+            let name = leaf.name().trim_end_matches('/').to_owned();
+            if Leaf::is_directory(leaf.name()) {
+                emptied.insert(name.clone());
+            } else {
+                leaf.remove()?;
+            }
+            emptied.extend(above(&name));
+        }
+        self.remove_emptied(emptied)
+    }
+
+    // Remove each of `emptied`, deepest first, that is empty. A directory
+    // still holding something stays, and so does one a member sits at or
+    // waits to move to, and the internal directory.
+    fn remove_emptied(
+        &self,
+        emptied: std::collections::BTreeSet<String>,
+    ) -> Result<(), WriteError> {
+        let mut emptied: Vec<String> = emptied.into_iter().collect();
+        emptied.sort_by_key(|name| std::cmp::Reverse(name.matches('/').count()));
+        for name in emptied {
+            let held = key(&name) == key(INTERNAL_DIR)
+                || self.files.values().any(|files| {
+                    files.leaves.values().any(|other| {
+                        std::iter::once(other.name())
+                            .chain(other.wants())
+                            .any(|at| Leaf::is_directory(at) && key(at) == key(&name))
+                    })
+                });
+            if !held {
+                Leaf::at(&self.working_dir, &format!("{name}/")).remove()?;
+            }
         }
         Ok(())
     }
@@ -230,15 +312,18 @@ impl NamespaceWriter {
                 continue;
             }
             let dir = self.working_dir.clone();
-            let left = self
+            let leaf = self
                 .files
                 .get_mut(&waiting.node)
-                .and_then(|files| files.leaves.get_mut(&waiting.member))
-                .map(|leaf| leaf.move_on(&dir))
-                .transpose()?
-                .flatten();
+                .and_then(|files| files.leaves.get_mut(&waiting.member));
+            #[cfg(test)]
+            if leaf.as_ref().is_some_and(|leaf| leaf.on_disk()) {
+                count(|tally| tally.moves += 1);
+            }
+            let left = leaf.map(|leaf| leaf.move_on(&dir)).transpose()?.flatten();
             if let Some(left) = left {
                 self.left.insert(key(&left), None);
+                self.remove_emptied(above(left.trim_end_matches('/')).collect())?;
                 moved = true;
                 // Select the actual moved payload, before recording its new location.
                 crate::e2e_failpoint::fire_rename(&wants);
@@ -272,15 +357,15 @@ impl NamespaceWriter {
         member: MemberId,
         output_name: &str,
         on_disk: Option<&str>,
-    ) -> Leaf {
-        let at = restored_at(&self.working_dir, output_name, on_disk);
-        let mut leaf = Leaf::found(&self.working_dir, at);
+    ) -> Result<Leaf, WriteError> {
+        let at = restored_at(&self.working_dir, output_name, on_disk)?;
+        let mut leaf = Leaf::found(&self.working_dir, at)?;
         let Some(sat) = on_disk else {
-            return leaf;
+            return Ok(leaf);
         };
         if at != sat {
             self.left.insert(key(sat), None);
-            return leaf;
+            return Ok(leaf);
         }
         leaf.intend(output_name);
         self.moves.push(Waiting {
@@ -288,37 +373,60 @@ impl NamespaceWriter {
             member,
             stamp: Some(0),
         });
-        leaf
+        Ok(leaf)
     }
 
-    // Whether a file may enter `name`: no other member's file sits there,
-    // and no file left it that the database may still place there. A name a
-    // file left stays shut until the checkpoint recording that move commits:
-    // were another file to enter it sooner and the job stop first, the
-    // restored row of the file that left would still say it sits there, and
-    // restore would open the newcomer's bytes as that file.
+    // Whether a file may enter `name`: no other member's file sits there or
+    // waits to move there, and no member left it that the database may
+    // still place there. A name a member left stays shut until the
+    // checkpoint recording that commits: were another file to enter it
+    // sooner and the job stop first, the restored row of the member that
+    // left would still give it that name, and restore would open the
+    // newcomer's bytes as that member's file, or its move would find them in
+    // the way. The directories the name runs through are held the same way:
+    // a name is shut while one of them is, and taken while another member's
+    // file sits at one or waits to move to one. A directory is shared, so
+    // two directory members may sit at one name.
     fn free_at(&self, name: &str, mover: (NodeId, MemberId)) -> bool {
+        let directory = Leaf::is_directory(name);
         let name = key(name);
+        let above: Vec<&str> = name.match_indices('/').map(|(at, _)| &name[..at]).collect();
         let committed = self.committed;
-        let shut = self
-            .left
-            .get(&name)
-            .is_some_and(|left| left.is_none_or(|left| left > committed));
+        let shut = std::iter::once(name.as_str())
+            .chain(above.iter().copied())
+            .any(|path| {
+                self.left
+                    .get(path)
+                    .is_some_and(|left| left.is_none_or(|left| left > committed))
+            });
         if shut {
             return false;
         }
         // With no file waiting to move, every file sits at the name the
-        // ledger gave its member, and the ledger gives a name to one member.
+        // ledger gave its member, and the ledger gives a name to one member
+        // and never a file a directory's path.
         if self.moves.is_empty() {
             return true;
         }
         !self.files.iter().any(|(node, files)| {
-            files
-                .leaves
-                .iter()
-                .any(|(member, leaf)| (*node, *member) != mover && key(leaf.name()) == name)
+            files.leaves.iter().any(|(member, leaf)| {
+                (*node, *member) != mover
+                    && std::iter::once(leaf.name())
+                        .chain(leaf.wants())
+                        .any(|held| {
+                            let at = key(held);
+                            let file = !Leaf::is_directory(held);
+                            (at == name && (file || !directory))
+                                || (file && above.contains(&at.as_str()))
+                        })
+            })
         })
     }
+}
+
+// The directories `name` runs through.
+fn above(name: &str) -> impl Iterator<Item = String> + '_ {
+    name.match_indices('/').map(|(at, _)| name[..at].to_owned())
 }
 
 // Where a member's file waits for its name, under the directory finalize

@@ -408,7 +408,6 @@ export function BackupPanel() {
     {
       id: "restorePassword",
       label: t("next.backup.password"),
-      help: t("next.backup.restorePasswordHelp"),
       control: {
         kind: "text",
         type: "password",

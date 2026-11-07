@@ -98,17 +98,19 @@ pub async fn seed_job(pipeline: &mut Pipeline, job: crate::JobInfo) {
         )
         .await
         .unwrap();
-    let state = pipeline.jobs.get_mut(&job.job_id).unwrap();
-    state.status = job.status.clone();
-    state.download_state = job.download_state;
-    state.post_state = job.post_state;
-    state.run_state = job.run_state;
-    state.downloaded_bytes = job.downloaded_bytes;
-    state.failed_bytes = job.failed_bytes;
-    if state.status == JobStatus::Paused {
-        state.paused_resume_status = Some(JobStatus::Queued);
-        state.paused_resume_download_state = Some(crate::DownloadState::Queued);
-        state.paused_resume_post_state = Some(crate::PostState::Idle);
+    // A fixture past the queue window is its row alone.
+    if let Some(state) = pipeline.jobs.get_mut(&job.job_id) {
+        state.status = job.status.clone();
+        state.download_state = job.download_state;
+        state.post_state = job.post_state;
+        state.run_state = job.run_state;
+        state.downloaded_bytes = job.downloaded_bytes;
+        state.failed_bytes = job.failed_bytes;
+        if state.status == JobStatus::Paused {
+            state.paused_resume_status = Some(JobStatus::Queued);
+            state.paused_resume_download_state = Some(crate::DownloadState::Queued);
+            state.paused_resume_post_state = Some(crate::PostState::Idle);
+        }
     }
     // The row carries what the dispatcher would report for it, so a dispatch
     // pass finds nothing stale and never replaces the seeded job with the

@@ -1042,9 +1042,20 @@ fn render_jobs(out: &mut Encoder, jobs: &[JobInfo], mode: PerJobSeries) {
             ],
             1,
         );
+        // The byte gauges on the ratio's base while the download runs: what
+        // it is out to bring, and what of that is done, so downloaded over
+        // total is the ratio.
+        let (total, downloaded) = if job.wanted_bytes > 0 {
+            (
+                job.wanted_bytes,
+                job.wanted_bytes - job.remaining_bytes.min(job.wanted_bytes),
+            )
+        } else {
+            (job.total_bytes, job.downloaded_bytes)
+        };
         out.sample_f64(&f::JOB_PROGRESS_RATIO, id, job.progress);
-        out.sample(&f::JOB_TOTAL_BYTES, id, job.total_bytes);
-        out.sample(&f::JOB_DOWNLOADED_BYTES, id, job.downloaded_bytes);
+        out.sample(&f::JOB_TOTAL_BYTES, id, total);
+        out.sample(&f::JOB_DOWNLOADED_BYTES, id, downloaded);
         out.sample(
             &f::JOB_OPTIONAL_RECOVERY_BYTES,
             id,

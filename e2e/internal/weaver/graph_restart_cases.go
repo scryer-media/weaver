@@ -169,16 +169,22 @@ func runAdmissionCapKeepsTheRestQueued(ctx *restartCaseContext) (restartCaseResu
 	// the three behind them stay queued for as long as the hold lasts.
 	var held map[int]admissionRow
 	if err := ctx.pollFor("the admission cap filled", func() (bool, error) {
-		rows, _, err := observe()
+		rows, finished, err := observe()
 		if err != nil {
 			return false, err
 		}
 		held = rows
-		admitted := 0
+		admitted, ended := 0, len(finished)
 		for _, row := range rows {
 			if row.Admitted {
 				admitted++
 			}
+			if row.Status == "failed" || row.Status == "cancelled" {
+				ended++
+			}
+		}
+		if admitted < admissionCap && len(ids)-ended < admissionCap {
+			return false, fmt.Errorf("%d of %d jobs ended before the cap filled", ended, len(ids))
 		}
 		return admitted >= admissionCap, nil
 	}); err != nil {
@@ -421,7 +427,7 @@ func runWarmDialNeverExceedsTheSeatCap(ctx *restartCaseContext) (restartCaseResu
 	// End disruption once a seat's worth of sessions has disconnected and
 	// at least one replacement dial is observed. Permanent per-line drops
 	// cannot complete a BODY and must not remain enabled until completion.
-	if err := ctx.pollFor("disconnects and replacement dials", func() (bool, error) {
+	if err := ctx.pollJob("disconnects and replacement dials", caseDBPath(ctx), jobID, func() (bool, error) {
 		connections, err := readConnections()
 		return connections.Accepted-connections.Active >= int64(seatCap) && connections.Attempted > int64(seatCap), err
 	}); err != nil {
@@ -513,7 +519,7 @@ func runJobWithoutCheckpointAdmittedAfresh(ctx *restartCaseContext) (restartCase
 	dbPath := caseDBPath(ctx)
 	// Admission writes the first checkpoint; once it has, removing its rows
 	// leaves the job exactly as a stop before that write would have.
-	if err := ctx.pollFor(fmt.Sprintf("job %d's first checkpoint", jobID), func() (bool, error) {
+	if err := ctx.pollJob(fmt.Sprintf("job %d's first checkpoint", jobID), dbPath, jobID, func() (bool, error) {
 		rows, err := graphNodeRows(dbPath, jobID)
 		return rows > 0, err
 	}); err != nil {
@@ -608,7 +614,7 @@ func (ctx *restartCaseContext) seedUpgradeJobs(checkpointed bool) (upgradeSeed, 
 		}
 		active = append(active, id)
 		if checkpointed {
-			if err := ctx.pollFor(fmt.Sprintf("job %d's first checkpoint", id), func() (bool, error) {
+			if err := ctx.pollJob(fmt.Sprintf("job %d's first checkpoint", id), dbPath, id, func() (bool, error) {
 				rows, err := graphNodeRows(dbPath, id)
 				return rows > 0, err
 			}); err != nil {
@@ -623,7 +629,7 @@ func (ctx *restartCaseContext) seedUpgradeJobs(checkpointed bool) (upgradeSeed, 
 			if err := liftPrimaryHold(); err != nil {
 				return upgradeSeed{}, err
 			}
-			if err := ctx.pollFor(fmt.Sprintf("job %d parked after checkpoint", id), func() (bool, error) {
+			if err := ctx.pollJob(fmt.Sprintf("job %d parked after checkpoint", id), dbPath, id, func() (bool, error) {
 				rows, err := readAdmissionRows(dbPath, []int{id})
 				row, present := rows[id]
 				return present && row.Status == "paused" && !row.Admitted, err

@@ -91,6 +91,9 @@ type Scenario struct {
 	// canonical runs leave it out. The value says why: the behavior it pins is
 	// one weaver does not deliver yet.
 	Disabled string `json:"disabled,omitempty"`
+	// YencHeaderLies rewrite the headers of seeded articles after posting,
+	// leaving their bodies and the NZB as posted.
+	YencHeaderLies []ScenarioYencHeaderLie `json:"yencHeaderLies,omitempty"`
 }
 
 type ScenarioRuntimeAssertions struct {
@@ -100,6 +103,7 @@ type ScenarioRuntimeAssertions struct {
 	DirectUnpack        *ScenarioDirectUnpackAssertion        `json:"directUnpack,omitempty"`
 	QueueLiveness       *ScenarioQueueLivenessAssertion       `json:"queueLiveness,omitempty"`
 	Log                 *ScenarioLogAssertion                 `json:"log,omitempty"`
+	ArchiveModes        []ScenarioArchiveModeAssertion        `json:"archiveModes,omitempty"`
 }
 
 // ScenarioLogAssertion pins what weaver said about a job in its own log. The
@@ -312,7 +316,17 @@ func Run(args []string, programName string) {
 		return
 	}
 
+	startHarnessRun(args[0])
+
 	switch args[0] {
+	case "filesystem":
+		cleanup := mustActivateContainerEngine()
+		err := cmdFilesystem()
+		cleanup()
+		if err != nil {
+			log.Fatal(err)
+		}
+		return
 	case "doctor":
 		if err := cmdDoctor(os.Stdout); err != nil {
 			os.Exit(1)
@@ -427,7 +441,8 @@ Commands:
   verify                STAT articles in NNTP server, search indexer
   status                Check health of all e2e services
   scenarios             List all available test scenarios
-  full                  Seed fixtures, then run functional, chaos, Docker restart, and managed restart phases
+  full                  Run all required functional, chaos, restart, product-behavior, and filesystem gates
+  filesystem            Run storage and delivery regressions on Unraid-style and portable FUSE mounts
   full real-usenet      Opt-in real-provider downloads; private/real-network holds .env, eight WG configs, and the SAB test NZB
   release-gate [flow]   Run the independent Weaver product-behavior release gate
   release-console [run] Serve the latest or selected Weaver release-gate artifacts
@@ -953,6 +968,9 @@ func discoverRuntimePortState() (runtimePortState, error) {
 }
 
 func dockerComposeArgs(args ...string) []string {
+	if len(args) > 0 && (args[0] == "up" || args[0] == "run" || args[0] == "create") {
+		claimComposeProject(composeProject())
+	}
 	composeArgs := []string{"compose", "-p", composeProject()}
 	if envBool(nntpSeedImageActiveEnv, false) {
 		composeArgs = append(
@@ -1507,8 +1525,21 @@ var canonicalFixtureSlugs = []string{
 	"uu-mixed-yenc",
 	"uu-preamble-tail",
 	"uu-missing-middle",
+	// Lying yEnc headers. Nyuu posts these honestly and the seeder files the
+	// articles again with the lie told, see internal/weaver/yenc_header_lies.go.
+	"yenc-lie-field-size",
+	"yenc-lie-field-size-lost",
+	"yenc-lie-size-large",
+	"yenc-lie-end-below-begin",
+	"yenc-lie-overlap-par2",
 	"zip-corrupted",
 	"zip-encrypted",
+	"zip-store-encrypted-single",
+	"zip-store-encrypted-multi-member",
+	"zip-store-encrypted-descriptor",
+	"zip-store-encrypted-lying-header",
+	"zip-store-encrypted-nested-seek",
+	"zip-store-encrypted-nested-no-seek",
 	"zip-unencrypted",
 	"zip-deflate-lost-article",
 	"zip-cp437-empty-dirs",

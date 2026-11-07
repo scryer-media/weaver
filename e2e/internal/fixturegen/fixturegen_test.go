@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"hash/crc32"
 	"os"
@@ -21,6 +22,41 @@ import (
 
 // repoRoot is the harness root as seen from this package.
 const repoRoot = "../.."
+
+func TestCommittedFixtureLedgerHasNoPlaceholderDigests(t *testing.T) {
+	ledger, _, err := corpus.LoadLedger(repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, file := range ledger.Files {
+		if !file.Salted && file.BLAKE3 == strings.Repeat("0", 64) {
+			t.Errorf("%s still has a placeholder digest; generate the fixture before committing its ledger", file.Path)
+		}
+	}
+}
+
+func TestCommittedScenarioOraclesHaveNoPlaceholderDigests(t *testing.T) {
+	paths, err := filepath.Glob(filepath.Join(repoRoot, "testdata", "*", corpus.ScenarioFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(paths) == 0 {
+		t.Fatal("no committed scenarios found")
+	}
+	for _, path := range paths {
+		var scenario struct {
+			ExpectedOutputBLAKE3 map[string]string `json:"expectedOutputBLAKE3"`
+		}
+		if err := json.Unmarshal(read(t, path), &scenario); err != nil {
+			t.Fatal(err)
+		}
+		for name, digest := range scenario.ExpectedOutputBLAKE3 {
+			if digest == strings.Repeat("0", 64) {
+				t.Errorf("%s: %s still has a placeholder output digest", path, name)
+			}
+		}
+	}
+}
 
 func TestPayloadIsDeterministicAndSeedDependent(t *testing.T) {
 	dir := t.TempDir()

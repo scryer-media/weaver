@@ -24,6 +24,51 @@ async fn a_recovery_volume_whose_head_was_lost_is_spent() {
     assert!(graph.files["lantern beacon/lantern.bin"] == data);
 }
 
+// A consumed input that cannot be removed, held open by a scanner or
+// refused by a share, costs the delivery nothing: the job completes with
+// its payload delivered, and the input stays in the working directory.
+// The input is made a directory with an entry in it, which no file
+// removal takes away on any host or under any user.
+#[tokio::test]
+async fn a_consumed_input_that_cannot_be_removed_stays_and_the_job_completes() {
+    let data = payload(4 * ARTICLE, 47);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
+    let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+    *crate::pipeline::completion::finalize::BEFORE_SPENT_REMOVAL
+        .lock()
+        .unwrap() = Some(Box::new(move |spent: &[std::path::PathBuf]| {
+        let pinned = spent
+            .iter()
+            .find(|path| path.is_file())
+            .expect("a recovery set is spent before delivery")
+            .clone();
+        std::fs::remove_file(&pinned).unwrap();
+        std::fs::create_dir(&pinned).unwrap();
+        std::fs::write(pinned.join("held"), b"held").unwrap();
+        let _ = pinned_tx.send(pinned.file_name().unwrap().to_owned());
+    }));
+    let graph = run(&Scenario::new(posts)).await;
+    let pinned = pinned_rx
+        .try_recv()
+        .expect("the delivery removed its consumed inputs");
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert_eq!(
+        graph.files.keys().cloned().collect::<Vec<_>>(),
+        vec!["lantern beacon/lantern.bin".to_string()],
+    );
+    assert!(graph.files["lantern beacon/lantern.bin"] == data);
+    let left = format!("/{}/held", pinned.to_string_lossy());
+    assert!(
+        graph
+            .retained_files
+            .keys()
+            .any(|path| path.ends_with(&left)),
+        "the consumed input left the working directory: {:?}",
+        graph.retained_files.keys().collect::<Vec<_>>()
+    );
+}
+
 // While the root fetches recovery volumes for a lost article the job shows
 // it is fetching repair data, not repairing; once the repair run is out it
 // shows repairing, and is no longer fetching.

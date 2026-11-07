@@ -580,6 +580,7 @@ impl Pipeline {
                 crate::events::model::PipelineEvent::GlobalResumed
             });
         }
+        self.hold_extraction_clocks();
         self.publish_download_block();
     }
 
@@ -588,6 +589,11 @@ impl Pipeline {
         block.scheduled_speed_limit = self
             .scheduled_bandwidth
             .and_then(|scheduled| scheduled.download_bps);
+        let in_force = self.global_rate(crate::bandwidth::Direction::Download);
+        block.speed_limit_in_force = in_force;
+        block.speed_limit_by_schedule = self.scheduled_bandwidth.is_some_and(|scheduled| {
+            scheduled.limit(crate::bandwidth::Direction::Download) == in_force
+        });
         self.shared_state.set_download_block(block);
     }
 }

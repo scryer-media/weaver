@@ -543,6 +543,7 @@ async fn drive_stream(
     let mut reads = 0;
     for (step, &article) in articles.iter().enumerate() {
         if Some(step) == after {
+            pipeline.flush_graph_checkpoint(JOB);
             retire_pipeline_database(pipeline).await;
             (pipeline, _, _) = new_direct_pipeline(&root).await;
             scenario.prepare(&mut pipeline);
@@ -609,7 +610,7 @@ async fn drive_stream(
         .enumerate()
         .filter(|(_, post)| post.role.is_recovery() && !post.name.contains(".vol"))
     {
-        for ordinal in 0..post.bytes.len().div_ceil(scenario.article) {
+        for ordinal in 0..post.articles(scenario.article).count() {
             if articles.contains(&(file as u32, ordinal as u32)) {
                 continue;
             }
@@ -760,7 +761,7 @@ async fn explicit_article_body(
         return;
     }
     let post = &scenario.posts[file as usize];
-    let offset = ordinal as usize * scenario.article;
+    let offset = ordinal as usize * post.article(scenario.article);
     let body = post
         .articles(scenario.article)
         .nth(ordinal as usize)

@@ -59,6 +59,10 @@ pub(crate) struct WalkedRow {
     category: Option<u32>,
     total_bytes: u64,
     downloaded_bytes: u64,
+    // The declared bytes still to come and the declared bytes the job is
+    // out to bring, as its report says them.
+    remaining: u64,
+    wanted: u64,
     progress: f64,
     rate: u64,
     propagating: bool,
@@ -107,8 +111,10 @@ impl WalkedRow {
         self.download_rank() == 1 || self.rate > 0
     }
 
+    // The recovery a job holds back until a loss asks for it is not still
+    // to come, so a clean post's download ends at zero.
     fn remaining_bytes(&self) -> u64 {
-        self.total_bytes.saturating_sub(self.downloaded_bytes)
+        self.remaining
     }
 
     // Counted in the queue's bytes still to fetch: whatever waits for or
@@ -210,6 +216,8 @@ impl QueueWalk {
                 category,
                 total_bytes: job.total_bytes,
                 downloaded_bytes: job.downloaded_bytes,
+                remaining: job.remaining_bytes.min(job.wanted_bytes),
+                wanted: job.wanted_bytes,
                 progress: job_progress(job),
                 rate: job
                     .phase_progress
@@ -240,6 +248,8 @@ impl QueueWalk {
                 category,
                 total_bytes: job.total_bytes,
                 downloaded_bytes: job.downloaded_bytes,
+                remaining: job.remaining_bytes.min(job.wanted_bytes),
+                wanted: job.wanted_bytes,
                 progress: job_progress(job),
                 rate: view
                     .phase_progress()
@@ -332,9 +342,65 @@ impl QueueWalk {
     }
 }
 
+/// Lowercases and turns the release-name separators `.`, `_` and `-` into
+/// single spaces, so `The_Office-S02` and `the office s02` read alike.
+fn normalize_search_text(text: &str) -> String {
+    let lowered = text.to_lowercase();
+    lowered
+        .split(|c: char| c.is_whitespace() || matches!(c, '.' | '_' | '-'))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// A queue search: words in any order, every one required, each a
+/// LIKE-style pattern where `%` or `*` stands for any run of characters.
+/// `office s02` and `s02 office` both find `The.Office.S02E01`, and
+/// `office%1080` finds it too.
+struct SearchQuery {
+    /// Each word split at its wildcards; the pieces must appear in order.
+    words: Vec<Vec<String>>,
+}
+
+impl SearchQuery {
+    fn parse(search: &str) -> Option<Self> {
+        let words: Vec<Vec<String>> = normalize_search_text(search)
+            .split(' ')
+            .map(|word| {
+                word.split(['%', '*'])
+                    .filter(|piece| !piece.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|pieces| !pieces.is_empty())
+            .collect();
+        (!words.is_empty()).then_some(Self { words })
+    }
+
+    /// Whether every word matches at least one of the texts, which must
+    /// already be normalised.
+    fn matches_all(&self, texts: &[&str]) -> bool {
+        self.words
+            .iter()
+            .all(|pieces| texts.iter().any(|text| like_contains(text, pieces)))
+    }
+}
+
+/// SQL `LIKE '%a%b%'`: the pieces appear in `text` in order.
+fn like_contains(text: &str, pieces: &[String]) -> bool {
+    let mut rest = text;
+    for piece in pieces {
+        match rest.find(piece.as_str()) {
+            Some(at) => rest = &rest[at + piece.len()..],
+            None => return false,
+        }
+    }
+    true
+}
+
 /// Which rows a page or a batch keeps. One predicate serves both.
 pub(crate) struct QueueSelection<'a> {
-    search: Option<String>,
+    search: Option<SearchQuery>,
     protocol: Option<ProtocolGql>,
     states: Option<&'a [QueueItemState]>,
     priorities: Option<&'a [QueuePriority]>,
@@ -376,10 +442,7 @@ impl<'a> QueueSelection<'a> {
         categories: Option<&'a Vec<String>>,
     ) -> Self {
         Self {
-            search: search
-                .map(str::trim)
-                .filter(|search| !search.is_empty())
-                .map(str::to_lowercase),
+            search: search.and_then(SearchQuery::parse),
             protocol,
             states: non_empty(states),
             priorities: non_empty(priorities),
@@ -411,21 +474,29 @@ impl<'a> QueueSelection<'a> {
         {
             return false;
         }
-        let Some(search) = self.search.as_deref() else {
+        let Some(search) = self.search.as_ref() else {
             return true;
         };
         let Some((name, original_title)) = row.titles.as_ref() else {
             return false;
         };
-        if name.to_lowercase().contains(search) {
+        let plain_name = normalize_search_text(name);
+        if search.matches_all(&[plain_name.as_str()]) {
             return true;
         }
         let display_title =
             weaver_server_core::ingest::derive_release_name(Some(original_title), Some(name));
-        queue_page_display_name(original_title, name, &display_title)
-            .to_lowercase()
-            .contains(search)
-            || display_title.to_lowercase().contains(search)
+        let display_name = normalize_search_text(&queue_page_display_name(
+            original_title,
+            name,
+            &display_title,
+        ));
+        let display_title = normalize_search_text(&display_title);
+        search.matches_all(&[
+            plain_name.as_str(),
+            display_name.as_str(),
+            display_title.as_str(),
+        ])
     }
 
     // Categories: the stage state counts are taken after.
@@ -658,8 +729,10 @@ impl EtaTotals {
             if !row.counts_toward_eta() {
                 continue;
             }
-            total_bytes += row.total_bytes;
-            downloaded_bytes += row.downloaded_bytes;
+            // Both in the declared bytes the remaining counts, so the bytes
+            // the time-left speed samples move as the remaining falls.
+            total_bytes += row.wanted;
+            downloaded_bytes += row.wanted - row.remaining;
             if row.leads() {
                 if !page.is_empty() {
                     leads.push(index);
@@ -930,6 +1003,41 @@ mod tests {
     use super::*;
     use weaver_server_core::{DownloadState, JobStatus, PipelineMetrics, PostState, RunState};
 
+    fn search_finds(search: &str, name: &str) -> bool {
+        let query = SearchQuery::parse(search).expect("a non-empty search");
+        query.matches_all(&[normalize_search_text(name).as_str()])
+    }
+
+    #[test]
+    fn search_words_match_in_any_order_across_separators() {
+        let name = "The_Office-S02E01.1080p.WEB-DL";
+        for search in [
+            "office s02",
+            "s02 office",
+            "OFFICE",
+            "office.s02",
+            "office web dl",
+            "web-dl",
+            "the_office",
+        ] {
+            assert!(search_finds(search, name), "{search} missed");
+        }
+        for search in ["offce", "office s03", "office 720p"] {
+            assert!(!search_finds(search, name), "{search} matched");
+        }
+    }
+
+    #[test]
+    fn search_wildcards_follow_like() {
+        let name = "The.Office.S02E01.1080p.WEB-DL";
+        for search in ["office%1080", "office*1080", "s0%e01", "%web%", "the%dl"] {
+            assert!(search_finds(search, name), "{search} missed");
+        }
+        // The pieces of a pattern must appear in order.
+        assert!(!search_finds("1080%office", name));
+        assert!(SearchQuery::parse(" % * . _ ").is_none());
+    }
+
     fn job(id: u64, status: JobStatus, category: Option<&str>, total_bytes: u64) -> JobInfo {
         let (download_state, run_state, post_state) = match status {
             JobStatus::Downloading => (
@@ -969,6 +1077,9 @@ mod tests {
             total_files: 1,
             completed_files: 0,
             file_remaining_bytes: Vec::new(),
+            file_parked_bytes: Vec::new(),
+            remaining_bytes: total_bytes,
+            wanted_bytes: total_bytes,
             remaining_par_files: 0,
             password: None,
             category: category.map(str::to_string),
@@ -1367,5 +1478,32 @@ mod tests {
         assert_eq!(cache.reads(), 1);
         cache.attach(db.clone(), 8, &mut page).await.unwrap();
         assert_eq!(cache.reads(), 2, "a new revision reads again");
+    }
+
+    #[test]
+    fn time_left_counts_what_each_job_still_has_to_come() {
+        // The download has every wanted article; only recovery held back
+        // until a loss asks for it is undone. The queued job has some of its
+        // files left. Time left counts only what is still to come.
+        let mut downloading = job(1, JobStatus::Downloading, None, 1_000);
+        downloading.downloaded_bytes = 870;
+        downloading.wanted_bytes = 900;
+        downloading.remaining_bytes = 0;
+        let mut queued = job(2, JobStatus::Queued, None, 500);
+        queued.wanted_bytes = 400;
+        queued.remaining_bytes = 150;
+        let state = SharedPipelineState::new(PipelineMetrics::new(), vec![downloading, queued]);
+        let walk = QueueWalk::read(&state, WalkNeeds::default());
+        let plan = PagePlan::plan(&walk, &page_input(0, 10), ROWS);
+
+        assert_eq!(plan.remaining_bytes, 150);
+        assert_eq!(plan.eta_total_bytes, 1_300);
+        assert_eq!(plan.eta_downloaded_bytes, 1_150);
+        let through: Vec<(u64, u64)> = plan
+            .eta_through
+            .iter()
+            .map(|eta| (eta.id, eta.bytes_through))
+            .collect();
+        assert_eq!(through, vec![(1, 0), (2, 150)]);
     }
 }

@@ -4,8 +4,11 @@
 // What the evidence in hand says of one described file, before anything is
 // read back. Two arms come from the grid: each slice's CRC32 against the
 // set's, and the whole member's CRC32 against the one the slices fold to.
-// The third arm, the MD5s, needs the bytes, so it is the readback's. One
-// damaged verdict from any arm vetoes the others.
+// The third arm, the MD5s, needs the bytes, so it is the readback's. A
+// whole member that folds wrong over bytes every article vouched for vetoes
+// the slices: the witness whose account it contradicts is the one that
+// proved them. Damage an article already owned to vouches for nothing else,
+// so it vetoes nothing, and only the slices it touches are read back.
 
 use par2_rs::{FileId, Par2FileSet};
 use weaver_graph::{ByteRange, MemberId, SliceVerdict};
@@ -25,6 +28,8 @@ pub(super) struct Evidence {
     slices: Vec<SliceVerdict>,
     damaged: u64,
     pub(super) whole: SliceVerdict,
+    // Every article the whole folds from vouched for its bytes.
+    vouched: bool,
     // The member's length is exactly the described one.
     pub(super) exact: bool,
 }
@@ -43,6 +48,7 @@ impl Evidence {
                 slices: Vec::new(),
                 damaged: 0,
                 whole: SliceVerdict::Unknown,
+                vouched: false,
                 exact: false,
             };
         };
@@ -52,6 +58,7 @@ impl Evidence {
             slices: vec![SliceVerdict::Unknown; count],
             damaged: 0,
             whole: SliceVerdict::Unknown,
+            vouched: false,
             exact: length == Some(described),
         };
         evidence.refold(
@@ -108,14 +115,11 @@ impl Evidence {
                 self.damaged -= u64::from(was == SliceVerdict::Damaged);
             }
         }
+        let folded = grid.fold(member, WHOLE, 0, ByteRange::new(0, described));
+        self.vouched = folded.is_some_and(|folded| folded.verified);
         self.whole = match expected_whole {
             Some(_) if described == 0 && exact => SliceVerdict::Intact,
-            Some(expected) if exact => grid::verdict(
-                grid.fold(member, WHOLE, 0, ByteRange::new(0, described)),
-                described,
-                0,
-                expected,
-            ),
+            Some(expected) if exact => grid::verdict(folded, described, 0, expected),
             _ => SliceVerdict::Unknown,
         };
     }
@@ -142,12 +146,12 @@ impl Evidence {
                 .all(|slice| *slice == SliceVerdict::Intact)
     }
 
-    // Per-slice verdicts with the veto applied: a whole-member mismatch
-    // leaves no slice proven.
+    // Per-slice verdicts with the veto applied: a whole-member mismatch over
+    // vouched bytes leaves no slice proven.
     pub(super) fn vetoed(&self) -> impl Iterator<Item = SliceVerdict> + '_ {
         #[cfg(test)]
         VETOED_READS.with(|reads| reads.set(reads.get() + 1));
-        let veto = self.whole == SliceVerdict::Damaged;
+        let veto = self.whole == SliceVerdict::Damaged && self.vouched;
         self.slices.iter().map(move |slice| match slice {
             SliceVerdict::Intact if veto => SliceVerdict::Unknown,
             other => *other,

@@ -1694,3 +1694,85 @@ async fn job_has_all_fields() {
     assert!(std::path::Path::new(job["outputDir"].as_str().unwrap()).is_dir());
     assert!(job["error"].is_null());
 }
+
+// The jobs the pipeline holds installed, once its window has settled on the
+// first `window` rows.
+async fn installed_jobs(h: &TestHarness, window: usize) -> Vec<u64> {
+    let mut changes = h.handle.subscribe_job_changes();
+    loop {
+        changes.mark_unchanged();
+        let diagnostics = h.handle.pipeline_diagnostics().await.unwrap();
+        if diagnostics.jobs.len() == window {
+            let mut ids: Vec<u64> = diagnostics.jobs.iter().map(|job| job.job_id).collect();
+            ids.sort_unstable();
+            return ids;
+        }
+        changes.changed().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_job_past_the_queue_window_answers_from_its_row_and_installs_nothing() {
+    const WINDOW: usize = 100;
+    const QUEUED: usize = WINDOW + 10;
+    let h = TestHarness::new().await;
+    let mut ids = Vec::with_capacity(QUEUED);
+    for index in 0..QUEUED {
+        ids.push(h.submit_test_nzb(&format!("window-{index}")).await);
+    }
+    let installed = installed_jobs(&h, WINDOW).await;
+    assert_eq!(installed, ids[..WINDOW]);
+    let past = *ids.last().unwrap();
+
+    // The queue page lists every row in queue order.
+    let resp = h
+        .execute(&format!(
+            r#"{{ queuePage(input: {{ pageIndex: 0, pageSize: {QUEUED} }}) {{ totalCount items {{ id }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(
+        data["queuePage"]["totalCount"].as_u64(),
+        Some(QUEUED as u64)
+    );
+    let listed: Vec<u64> = data["queuePage"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(listed, ids);
+
+    // The detail of a job past the window comes from its row and the
+    // database.
+    let resp = h
+        .execute(&format!(
+            r#"{{ jobDetailSnapshot(jobId: {past}) {{ queueItem {{ id state }} historyItem {{ id }} jobEvents {{ kind }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(
+        data["jobDetailSnapshot"]["queueItem"]["id"].as_u64(),
+        Some(past)
+    );
+    assert_eq!(
+        data["jobDetailSnapshot"]["queueItem"]["state"].as_str(),
+        Some("QUEUED")
+    );
+    assert!(data["jobDetailSnapshot"]["historyItem"].is_null());
+    // Its events are the ones an installed queued job shows.
+    let first = ids[0];
+    let resp = h
+        .execute(&format!(
+            r#"{{ jobDetailSnapshot(jobId: {first}) {{ jobEvents {{ kind }} }} }}"#
+        ))
+        .await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        data["jobDetailSnapshot"]["jobEvents"],
+        response_data(&resp)["jobDetailSnapshot"]["jobEvents"]
+    );
+    assert_eq!(installed_jobs(&h, WINDOW).await, ids[..WINDOW]);
+}

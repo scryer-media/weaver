@@ -5,6 +5,7 @@
 // the opt-in real-provider runner supplies an exact host/port allowlist.
 import net from "node:net";
 import http from "node:http";
+import https from "node:https";
 import dgram from "node:dgram";
 import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
@@ -94,6 +95,45 @@ export function parsePassthrough(text) {
   });
 }
 
+// Comma list of public HTTPS names the fixture answers for and serves itself,
+// so a flow measures against a target it owns instead of the real service.
+export function parseServedHosts(text) {
+  const names = String(text ?? "").split(",").map(name => name.trim().toLowerCase()).filter(Boolean);
+  for (const name of names) if (!/^[a-z0-9-]+(\.[a-z0-9-]+)+$/.test(name)) throw new Error(`invalid served host ${name}`);
+  return [...new Set(names)];
+}
+
+// The certificate and key the served hosts answer with, read from the files
+// the harness wrote for the run.
+function servedTls(served) {
+  if (!served.length) return null;
+  const cert = process.env.PROXY_FIXTURE_TLS_CERT;
+  const key = process.env.PROXY_FIXTURE_TLS_KEY;
+  if (!cert || !key) throw new Error("served hosts need PROXY_FIXTURE_TLS_CERT and PROXY_FIXTURE_TLS_KEY");
+  return { cert: readFileSync(cert), key: readFileSync(key) };
+}
+
+// The bandwidth endpoint a served host offers: GET /__down?bytes=N answers N
+// bytes, the way Cloudflare's speed test does.
+const DOWN_LIMIT = 10 * 1024 ** 3;
+const DOWN_CHUNK = Buffer.alloc(64 * 1024);
+function serveDown(url, response) {
+  const bytes = Number(url.searchParams.get("bytes"));
+  if (!Number.isInteger(bytes) || bytes < 0 || bytes > DOWN_LIMIT) { response.writeHead(400).end(); return; }
+  response.writeHead(200, { "content-type": "application/octet-stream", "content-length": String(bytes), "cache-control": "no-store" });
+  let left = bytes;
+  const pump = () => {
+    while (left > 0 && !response.destroyed) {
+      const piece = left >= DOWN_CHUNK.length ? DOWN_CHUNK : DOWN_CHUNK.subarray(0, left);
+      left -= piece.length;
+      // Wait for the client to take what is queued; a closed one never drains.
+      if (!response.write(piece)) { response.once("drain", pump); return; }
+    }
+    if (!response.destroyed) response.end();
+  };
+  pump();
+}
+
 export async function startProxyFixture(options = {}) {
   const ip = options.ip ?? process.env.PROXY_FIXTURE_IP;
   if (!net.isIPv4(ip)) throw new Error("PROXY_FIXTURE_IP must be an IPv4 address");
@@ -106,8 +146,10 @@ export async function startProxyFixture(options = {}) {
   const publicTargets = parsePublicTargets(options.publicTargets ? JSON.stringify(options.publicTargets) : process.env.PROXY_FIXTURE_PUBLIC_TARGETS);
   const passthrough = parsePassthrough(options.passthrough ? JSON.stringify(options.passthrough) : process.env.PROXY_FIXTURE_PASSTHROUGH);
   const publicOnly = Boolean(options.publicOnly);
+  const served = options.served ?? parseServedHosts(process.env.PROXY_FIXTURE_SERVED_HOSTS);
+  const tls = options.tls ?? servedTls(served);
   const ports = {
-    primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, nntp: 119, http: 8089, control: 8090,
+    primary: 8081, secondary: 8082, tertiary: 8083, dns: 53, nntp: 119, http: 8089, https: 443, control: 8090,
     ...Object.fromEntries(extraRoutes.map(name => [name, EXTRA_ROUTES[name].port])),
     ...options.ports,
   };
@@ -197,7 +239,10 @@ export async function startProxyFixture(options = {}) {
     const fixtureDns = (host === ip || addresses.includes(host)) && port === ports.dns;
     const passed = !publicOnly && passthrough.some(target => target.port === port
       && (target.host === host.toLowerCase() || (target.host === "*" && net.isIPv4(host))));
-    if ((!publicTarget && !fixtureTarget && !fixtureDns && !passed) || !routes[route].up) {
+    // A served host, asked for by name or by the address the fixture answered.
+    const servedTarget = served.length > 0 && port === ports.https
+      && (served.includes(host.toLowerCase()) || host === ip || addresses.includes(host));
+    if ((!publicTarget && !fixtureTarget && !fixtureDns && !passed && !servedTarget) || !routes[route].up) {
       reply(false); client.end(); return;
     }
     record("connected", { route, host, port, client: peer });
@@ -205,7 +250,8 @@ export async function startProxyFixture(options = {}) {
     const targetHost = publicTarget ? publicTarget.addresses[0]
       : passed ? host
       : port === ports.nntp ? (options.nntpHost ?? "nntp") : "127.0.0.1";
-    const targetPort = publicTarget || passed ? port : port === ports.nntp ? (options.nntpPort ?? 119) : port;
+    const targetPort = publicTarget ? publicTarget.port : passed ? port : port === ports.nntp ? (options.nntpPort ?? 119)
+      : servedTarget ? ports.https : port;
     pipe(client, targetHost, targetPort, route);
     client.resume();
   }
@@ -306,7 +352,8 @@ export async function startProxyFixture(options = {}) {
     const name = labels.join(".").toLowerCase();
     const type = query.readUInt16BE(cursor + 1);
     const fixture = name.endsWith(".proxy.test");
-    const local = hosts[name] ?? publicTargets.find(target => target.host === name)?.addresses;
+    const local = hosts[name] ?? publicTargets.find(target => target.host === name)?.addresses
+      ?? (served.includes(name) ? addresses : undefined);
     // Resolve only infrastructure names through the container's own resolvers.
     // Every destination name above is answered locally, even when direct.
     if (!local && ["nntp", "nntp2", "weaver-postgres"].includes(name)) {
@@ -389,6 +436,14 @@ export async function startProxyFixture(options = {}) {
     if (pathname === "/probe.nzb") { response.writeHead(200, { "content-type": "application/x-nzb" }).end(nzb); return; }
     response.writeHead(404).end();
   }), "http");
+  if (served.length) await listen(https.createServer(tls, (request, response) => {
+    const url = new URL(request.url ?? "/", "https://fixture.invalid");
+    record(request.socket.remoteAddress === "127.0.0.1" ? "routed-https" : "direct-https", { path: url.pathname, host: request.headers.host });
+    if (request.method === "GET" && served.includes(String(request.headers.host ?? "").replace(/:\d+$/, "").toLowerCase()) && url.pathname === "/__down") {
+      serveDown(url, response); return;
+    }
+    response.writeHead(404).end();
+  }), "https");
   await listen(http.createServer(async (request, response) => {
     response.setHeader("content-type", "application/json");
     if (request.method === "GET") {

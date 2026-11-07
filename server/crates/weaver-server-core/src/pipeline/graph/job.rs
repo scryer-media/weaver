@@ -34,7 +34,7 @@ use super::namespace::{Coming, NamespaceWriter, SetState, WriteError};
 use super::root::intake::Decoded;
 use super::root::phase::{self, Activity, RootPhase};
 use super::root::sample;
-use super::root::source::{Class, Move};
+use super::root::source::{Class, Inconsistent, Move};
 use super::root::{ArticleRoot, Ask};
 use super::status::RepairSlots;
 use crate::operations::disk::CapacityReader;
@@ -44,6 +44,10 @@ use crate::pipeline::ExtractionError;
 pub(crate) enum GraphError {
     #[error("the namespace write path failed")]
     Write(#[from] WriteError),
+    // The job's own record contradicts itself: it fails, and every other
+    // job runs on.
+    #[error("the graph job's record is inconsistent")]
+    Inconsistent(#[from] Inconsistent),
 }
 
 impl GraphError {
@@ -51,7 +55,12 @@ impl GraphError {
     // extractors class theirs, a refusal as the refusal, anything else
     // terminal.
     pub(crate) fn to_extraction(&self) -> ExtractionError {
-        let Self::Write(write) = self;
+        let write = match self {
+            Self::Write(write) => write,
+            Self::Inconsistent(inconsistent) => {
+                return ExtractionError::terminal(format!("{self}: {inconsistent}"));
+            }
+        };
         let message = format!("{self}: {write}");
         match write {
             WriteError::Leaf(LeafError::Io { source, .. }) => {
@@ -118,6 +127,8 @@ pub(crate) enum Note {
     Landed(VolumeIndex),
     // A set's repair came back and was applied, rebuilding these slices.
     Repaired(u64),
+    // An archive was given up on as an archive for this member.
+    GivenBack(super::namespace::GivenBack),
 }
 
 // A root member as the post lists it.
@@ -210,7 +221,14 @@ impl GraphJob {
 
     // What the job did since this was last asked.
     pub(crate) fn take_notes(&mut self) -> Vec<Note> {
-        std::mem::take(&mut self.notes)
+        let mut notes = std::mem::take(&mut self.notes);
+        notes.extend(
+            self.writer
+                .take_given_back()
+                .into_iter()
+                .map(Note::GivenBack),
+        );
+        notes
     }
 
     // The phase the job last reported, if it reported one.
@@ -354,6 +372,17 @@ impl GraphJob {
         &self.writer
     }
 
+    // The job paused or resumed: its extraction deadline does not run
+    // while it is paused.
+    pub(crate) fn hold_clock(&mut self, paused: bool) {
+        self.writer.hold_clock(paused);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clock_held(&self) -> bool {
+        self.writer.clock_held()
+    }
+
     pub(crate) fn pending(&self) -> &Pending {
         &self.pending
     }
@@ -390,16 +419,60 @@ impl GraphJob {
         self.root.checksums_held(VolumeIndex(member.0))
     }
 
-    // Seam for status: each posted file's encoded bytes not yet downloaded,
-    // in the post's file order.
+    // Seam for status: each posted file's encoded bytes still to come, in
+    // the post's file order. A parked article is not still to come: it is
+    // fetched only once something asks for it.
     pub(crate) fn remaining_bytes(&self) -> Vec<u64> {
         self.root.map.remaining()
+    }
+
+    // Seam for status: each posted file's encoded bytes not yet in hand nor
+    // lost for good, parked or not, in the post's file order.
+    pub(crate) fn waiting_bytes(&self) -> Vec<u64> {
+        self.root.map.waiting()
+    }
+
+    // Seam for status: each posted file's encoded bytes held back until
+    // something asks for them, in the post's file order.
+    pub(crate) fn parked_bytes(&self) -> Vec<u64> {
+        self.root.map.parked()
+    }
+
+    // Seam for status: the encoded bytes the download is out to bring, as
+    // the post declares them: every article but those parked until
+    // something asks for them.
+    pub(crate) fn wanted_bytes(&self) -> u64 {
+        self.root.map.wanted_bytes()
+    }
+
+    // Seam for status: the bytes still to come and out to bring of the
+    // posted recovery file at `file_index` that nothing has decided on yet.
+    // One whose first bytes do not open a PAR2 or PAR3 volume is data, said
+    // by its first article.
+    pub(crate) fn undecided_recovery(&self, file_index: u32) -> Option<(u64, u64)> {
+        let front = self.namespace().first_bytes(MemberId(file_index));
+        if !weaver_graph::sniff::may_open_par(front) {
+            return None;
+        }
+        self.root.map.undecided(VolumeIndex(file_index))
+    }
+
+    // Seam for status: the posted file at `file_index` has an article
+    // neither in hand nor lost for good, parked or not.
+    pub(crate) fn file_waiting(&self, file_index: u32) -> bool {
+        self.root.map.volume_waiting(VolumeIndex(file_index))
     }
 
     // Seam for status: how many posted files the download has brought
     // whole, every article in hand.
     pub(crate) fn whole_file_count(&self) -> usize {
         self.root.map.whole_count()
+    }
+
+    // Seam for status: the encoded bytes in hand of the posted file at
+    // `file_index`, as the post declares them.
+    pub(crate) fn arrived_bytes(&self, file_index: u32) -> u64 {
+        self.root.map.arrived_bytes(VolumeIndex(file_index))
     }
 
     // Seam for status: the job is fetching repair data. Its payload is in,
@@ -525,10 +598,13 @@ impl GraphJob {
         self.tree.spends(NodeId::ROOT, member)
     }
 
-    // Seam for status: the files that hold the bytes of every root member
-    // the job spends, its own file or what the object that consumed it kept
-    // of it. Once the job delivers they are not part of the release.
-    pub(crate) fn spent_files(&self) -> Vec<PathBuf> {
+    // Hand storage to completion. The graph only classifies what was
+    // consumed; its adapter releases every handle before returning paths
+    // completion may remove. A logical volume close is not an OS close.
+    pub(crate) fn release_delivery_files(&mut self) -> Result<Vec<PathBuf>, &'static str> {
+        if self.work_pending() || self.runs.live() || self.moves_waiting() {
+            return Err("graph storage is still in use before delivery");
+        }
         let mut files: Vec<PathBuf> = self
             .writer
             .files(NodeId::ROOT)
@@ -541,7 +617,10 @@ impl GraphJob {
                 .then(|| self.writer.kept_file(child, volume))
                 .flatten()
         }));
-        files
+        self.writer.release_handles();
+        files.sort();
+        files.dedup();
+        Ok(files)
     }
 
     // Articles the queues do not hold were fetched by an earlier run.
@@ -553,19 +632,57 @@ impl GraphJob {
     // it where its neighbours showed it is not, so what came was never the
     // article's bytes. The root waits on it again, and the copy that comes
     // is taken as its first.
-    pub(crate) fn send_back(&mut self, volume: VolumeIndex, ordinal: u32) {
-        self.unarrive(volume, ordinal);
+    pub(crate) fn send_back(
+        &mut self,
+        volume: VolumeIndex,
+        ordinal: u32,
+    ) -> Result<(), GraphError> {
+        self.unarrive(volume, ordinal)
     }
 
     // The root waits on an arrived article again, and what its bytes
     // covered of their member is covered no more, so no member reads as its
-    // own bytes that may never have been.
-    fn unarrive(&mut self, volume: VolumeIndex, ordinal: u32) {
+    // own bytes that may never have been. What uncovering it forgets past
+    // it in the object bound to its volume, a cipher's tail made under keys
+    // it fed, is read back first, under those keys, and said again once it
+    // is uncovered: it waits there for the keys the article's next copy
+    // makes.
+    fn unarrive(&mut self, volume: VolumeIndex, ordinal: u32) -> Result<(), GraphError> {
         let range = self.root.map.arrived_range(volume, ordinal);
+        let tail = match (range, self.tree.child_of(NodeId::ROOT, MemberId(volume.0))) {
+            (Some(range), Some((child, bound))) => Some(self.writer.read_tail(
+                &mut self.tree,
+                &mut *self.builder,
+                child,
+                &[(bound, range)],
+            )?),
+            _ => None,
+        };
         self.root.map.unarrive(volume, ordinal);
         if let Some(range) = range {
             self.tree.uncover(NodeId::ROOT, volume, range);
         }
+        if let Some(tail) = tail {
+            let mut out = Vec::new();
+            self.writer.say_tail(
+                &mut self.tree,
+                &mut *self.builder,
+                &self.root,
+                tail,
+                &mut out,
+            )?;
+            self.heard(out)?;
+        }
+        Ok(())
+    }
+
+    // The volume's articles the root holds intact, at the ranges they were
+    // placed at.
+    pub(crate) fn placed_intact(
+        &self,
+        volume: VolumeIndex,
+    ) -> impl Iterator<Item = (u32, weaver_graph::ByteRange)> + '_ {
+        self.root.map.placed_intact(volume)
     }
 
     // Whether the root holds the article or has ruled it lost.
@@ -625,7 +742,7 @@ impl GraphJob {
     pub(crate) fn take_in(&mut self, decoded: Decoded, limit: usize) -> Result<bool, GraphError> {
         let volume = decoded.volume;
         let member = MemberId(volume.0);
-        let length = decoded.length;
+        let length = self.root.accepted_length(&decoded);
         let Some(arrival) = self.root.receive(decoded) else {
             return Ok(false);
         };

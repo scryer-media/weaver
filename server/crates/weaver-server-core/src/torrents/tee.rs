@@ -153,17 +153,24 @@ pub(crate) enum Unrestored {
     Rows(#[from] crate::pipeline::graph::checkpoint::CheckpointError),
     #[error(transparent)]
     Job(#[from] RestoreFailure),
+    #[error(transparent)]
+    Storage(#[from] crate::pipeline::graph::leaf::LeafError),
 }
 
 impl Unrestored {
     // The rows are not a checkpoint this build makes a job of, found before
-    // the rebuild touches a file (`GraphRestoreError::not_this_builds`).
+    // the rebuild touches a file, or records the rebuild found contradicting
+    // themselves, which would fault again on every start
+    // (`GraphRestoreError::not_this_builds`).
     pub(crate) fn not_this_builds(&self) -> bool {
         matches!(
             self,
             Self::Rows(_)
                 | Self::Job(
-                    RestoreFailure::Tree(_) | RestoreFailure::Root(_) | RestoreFailure::Post(_)
+                    RestoreFailure::Tree(_)
+                        | RestoreFailure::Root(_)
+                        | RestoreFailure::Post(_)
+                        | RestoreFailure::Step(GraphError::Inconsistent(_))
                 )
         )
     }
@@ -194,7 +201,7 @@ impl Tee {
         let files = parts.plan.root_files(&parts.layout);
         let mut snapshot = checkpoint::snapshot(&rows)?;
         retry_from_top(&mut snapshot.passwords);
-        crate::pipeline::graph::restore::sweep_unnamed(&parts.work, &snapshot, &[]);
+        crate::pipeline::graph::restore::sweep_unnamed(&parts.work, &snapshot, &[])?;
         let job = GraphJob::restore(&snapshot, &files, parts.job_id.0, storage, 0)?.job;
         // The next checkpoint writes only what it changes of these.
         job.pending().written(rows);
@@ -506,7 +513,7 @@ impl Tee {
         self.asked.send_modify(|asked| *asked += 1);
         let mut job = self.locked();
         while !job.pending().control().cancelled()
-            && checkpoint_job(&mut job, self.job_id, db, mail, Vec::new(), None)?
+            && checkpoint_job(&mut job, self.job_id, db, mail, Vec::new(), None, true)?
         {}
         Ok(())
     }
@@ -533,9 +540,10 @@ impl Tee {
     }
 
     // The files the job spends rather than hands over: the archive volumes
-    // it consumed and its recovery data.
-    pub(crate) fn spent(&self) -> Vec<PathBuf> {
-        self.locked().spent_files()
+    // it consumed and its recovery data. Every handle the job holds is
+    // closed first, so what unpacking made can move and its directory go.
+    pub(crate) fn spent(&self) -> Result<Vec<PathBuf>, &'static str> {
+        self.locked().release_delivery_files()
     }
 
     // The job's runs and repairs stopped, and waited on until each has said

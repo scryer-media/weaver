@@ -173,7 +173,24 @@ impl Pipeline {
         };
         let mut held = Self::held_parts(&self.uu_files, &self.unanchored_parked, job_id);
         held.extend(held_parts.iter().map(HeldPart::segment_id));
-        let (assembly, download_queue) = Self::build_job_assembly(job_id, &state.spec, skip, &held);
+        let (mut assembly, download_queue) =
+            Self::build_job_assembly(job_id, &state.spec, skip, &held);
+        // A graph root brought back holds the articles it placed. Each one's
+        // placement is recorded again, so an article that arrives now is
+        // checked against its neighbours exactly as it would have been
+        // before the job left the pipeline.
+        if let Some(graph) = &graph {
+            for file in assembly.files_mut() {
+                let volume = weaver_graph::VolumeIndex(file.file_id().file_index);
+                for (ordinal, range) in graph.placed_intact(volume) {
+                    if file.has_segment(ordinal)
+                        && let Ok(len) = u32::try_from(range.end - range.start)
+                    {
+                        file.record_placement(ordinal, range.start, len);
+                    }
+                }
+            }
+        }
         state.articles = JobArticles::Active(Box::new(ActiveArticles {
             assembly,
             download_queue,
@@ -199,6 +216,10 @@ impl Pipeline {
     // still out is disowned. The caller removes a job that leaves.
     pub(crate) fn release_job_articles(&mut self, job_id: JobId) {
         let graph = self.graph_jobs.get(&job_id);
+        if let (Some(graph), Some(state)) = (graph, self.jobs.get(&job_id)) {
+            let figures = Self::graph_remaining(graph, &state.spec);
+            self.released_remaining.insert(job_id, figures);
+        }
         let held = Self::held_parts(&self.uu_files, &self.unanchored_parked, job_id);
         let summaries = self
             .jobs
@@ -296,6 +317,14 @@ impl Pipeline {
             !self.checkpoint_progress_articles.contains_key(&job_id),
             "a drained job has no article in flight for its checkpoint"
         );
+        // What the graph holds in RAM, bytes of a member whose front has not
+        // yet said what it is among them, goes to scratch as a stop pages
+        // it, so the checkpoint names it and the resumed job reads it back.
+        if let Some(graph) = self.graph_jobs.get_mut(&job_id)
+            && let Err(error) = graph.page_out_holds()
+        {
+            warn!(job_id = job_id.0, %error, "could not page graph holds out for a pause");
+        }
         self.checkpoint_graph_job(job_id);
         self.release_job_articles(job_id);
         self.segment_terminal_states
@@ -371,7 +400,12 @@ impl Pipeline {
         let pending = graph.pending().clone();
         if !pending.control().cancelled()
             && pending
-                .await_commit(pending.stamp(), job_id.0, &self.graph_runs.written())
+                .await_commit(
+                    pending.stamp(),
+                    job_id.0,
+                    &self.graph_runs.written(),
+                    &self.db,
+                )
                 .is_none()
         {
             graph.owe_mail(pending.stamp());

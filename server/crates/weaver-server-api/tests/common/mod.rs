@@ -45,6 +45,7 @@ pub struct TestHarness {
     // the trusted-network list is observable from a test.
     pub security: weaver_server_core::security::RuntimeSecurityConfig,
     pub update_check: weaver_server_core::update_check::UpdateCheckService,
+    pub log_buffer: weaver_server_core::runtime::log_buffer::LogRingBuffer,
     _scheduler_task: JoinHandle<()>,
     _tempdir: tempfile::TempDir,
 }
@@ -191,6 +192,8 @@ impl TestHarness {
                 None,
                 proxies,
             );
+        let log_buffer =
+            weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity();
         let schema = build_schema(SchemaContext {
             handle: handle.clone(),
             pipeline_state: shared_state.clone(),
@@ -206,8 +209,7 @@ impl TestHarness {
             update_check: update_check.clone(),
             application_upgrade,
             schedules: shared_schedules,
-            log_buffer:
-                weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity(),
+            log_buffer: log_buffer.clone(),
             system_runtime: SystemRuntimeContext {
                 profile: Arc::new(StdRwLock::new(
                     weaver_server_core::runtime::system_profile::SystemProfile {
@@ -257,6 +259,7 @@ impl TestHarness {
             auth_cache,
             security,
             update_check,
+            log_buffer,
             _scheduler_task: scheduler_task,
             _tempdir: tempdir,
         }

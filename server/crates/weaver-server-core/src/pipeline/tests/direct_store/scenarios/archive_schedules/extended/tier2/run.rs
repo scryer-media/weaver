@@ -23,6 +23,83 @@ use super::*;
 use crate::history::HistoryFailureKind;
 use crate::pipeline::tests::engines::harness::{JOB, finished};
 
+// The most disk one run may hold, counted as allocated blocks under its
+// scratch directory. Every tier-two run goes through `drive`, so no cell can
+// run without it: a post whose headers talk the job into a file far larger
+// than anything posted fails here, with the size it reached, before it
+// fills the disk.
+pub(in super::super) const SCRATCH_BUDGET: u64 = 256 * 1024 * 1024;
+
+// One run's scratch directory: removed when the run ends, whichever way it
+// ends, a failed assertion and a panic included.
+struct Scratch {
+    dir: Option<tempfile::TempDir>,
+    // The most the run has held at any check.
+    peak: std::cell::Cell<u64>,
+}
+
+impl Scratch {
+    fn new() -> Self {
+        Self {
+            dir: Some(tempfile::tempdir().unwrap()),
+            peak: std::cell::Cell::new(0),
+        }
+    }
+
+    fn root(&self) -> &tempfile::TempDir {
+        self.dir.as_ref().expect("held until dropped")
+    }
+
+    // Fails the run once its scratch holds more than the budget.
+    fn check(&self, at: &str, trace: &[String]) {
+        let held = allocated(self.root().path());
+        self.peak.set(self.peak.get().max(held));
+        assert!(
+            held <= SCRATCH_BUDGET,
+            "tier-two run holds {held} bytes on disk {at}, over its budget of {SCRATCH_BUDGET}: {trace:?}"
+        );
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if let Some(dir) = self.dir.take() {
+            let path = dir.path().to_owned();
+            if dir.close().is_err() {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+}
+
+// The bytes `path` occupies on disk: the blocks allocated to each file under
+// it, so a sparse file counts only what was written into it.
+fn allocated(path: &std::path::Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    let own = {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            meta.blocks() * 512
+        }
+        #[cfg(not(unix))]
+        {
+            meta.len()
+        }
+    };
+    if !meta.is_dir() {
+        return own;
+    }
+    std::fs::read_dir(path).map_or(own, |entries| {
+        own + entries
+            .flatten()
+            .map(|entry| allocated(&entry.path()))
+            .sum::<u64>()
+    })
+}
+
 // What one run left behind.
 pub(in super::super) struct Ran {
     pub status: Option<JobStatus>,
@@ -216,8 +293,9 @@ async fn drive(
             unavailable(pipeline, turns, file, article).await;
         }
     };
-    let root = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, complete) = new_direct_pipeline(&root).await;
+    let scratch = Scratch::new();
+    let root = scratch.root();
+    let (mut pipeline, _, complete) = new_direct_pipeline(root).await;
     one_server(&mut pipeline);
     let output = complete.join(crate::jobs::working_dir::sanitize_dirname(&spec.name));
     let index_first = interruption.loss().is_some_and(|(_, first)| first);
@@ -251,7 +329,7 @@ async fn drive(
                 trace.push(format!("{action:?} at {step}: status={status:?}"));
                 retire_pipeline_database(pipeline).await;
                 let restored;
-                (pipeline, restored) = restore(&root, &spec, &mut trace).await;
+                (pipeline, restored) = restore(root, &spec, &mut trace).await;
                 one_server(&mut pipeline);
                 if !restored {
                     retired = Some(status);
@@ -278,6 +356,7 @@ async fn drive(
             }
         }
         trace.push(format!("arrive slot {slot}"));
+        scratch.check(&format!("after slot {slot}"), &trace);
     }
     if !index_first && retired.is_none() {
         deliver_index(&mut pipeline, &mut turns).await;
@@ -299,6 +378,7 @@ async fn drive(
             trace.push(format!("requested {file}:{article}"));
             serve(&mut pipeline, &mut turns, file, article).await;
         }
+        scratch.check("after the requested articles", &trace);
         if turns.release(&mut pipeline).await {
             continue;
         }
@@ -386,6 +466,8 @@ async fn drive(
     trace.push(format!(
         "terminal {status:?}; published (name, size, posted size)={sizes:?}"
     ));
+    scratch.check("once the job settled", &trace);
+    eprintln!("scratch peak {} bytes", scratch.peak.get());
     pipeline.db.flush_write_queue().await.unwrap();
     let failure_kind = pipeline
         .db

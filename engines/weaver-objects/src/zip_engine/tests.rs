@@ -805,6 +805,95 @@ fn an_entry_whose_local_header_names_another_file_is_refused_unsaid() {
 }
 
 #[test]
+fn stale_local_sizes_use_the_directory_for_plain_and_encrypted_members() {
+    use ::zip::unstable::write::FileOptionsExt;
+
+    let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    for options in [
+        stored,
+        stored
+            .with_deprecated_encryption(PASSWORD.as_bytes())
+            .unwrap(),
+        stored.with_aes_encryption(AesMode::Aes256, PASSWORD),
+    ] {
+        let original = archive(options);
+        let directory = ZipArchive::new(Cursor::new(&original)).unwrap();
+        for size in [0u32, 1, 768_000] {
+            let mut bytes = original.clone();
+            // Both the stored and deflated body have a stale local bound.
+            for index in [2, 3] {
+                let entry = directory.by_index_data(index).unwrap();
+                let at = entry.header_start() as usize;
+                bytes[at + 18..at + 22].copy_from_slice(&size.to_le_bytes());
+                bytes[at + 22..at + 26].copy_from_slice(&size.to_le_bytes());
+            }
+            let mut engine = ZipEngine::new();
+            engine.offer_password(PASSWORD, &mut Vec::new());
+            assert_eq!(run(&mut engine, vec![bytes]), plain_said());
+        }
+    }
+}
+
+#[test]
+fn a_stale_local_size_does_not_hide_corrupt_plaintext() {
+    let mut bytes = plain();
+    let directory = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+    let at = directory.by_index_data(2).unwrap().header_start() as usize;
+    bytes[at + 22..at + 26].copy_from_slice(&768_000u32.to_le_bytes());
+    let body = bytes
+        .windows(NOTES.len())
+        .position(|part| part == NOTES)
+        .unwrap();
+    bytes[body + 3] ^= 0x20;
+    let said = run(&mut ZipEngine::new(), vec![bytes]);
+    assert_eq!(
+        said[said.len() - 2..],
+        [Said::Retract(1), Said::Refuse(Why::Unrepairable)]
+    );
+    assert!(!said.contains(&Said::Closed(1)));
+}
+
+#[test]
+fn a_stale_local_size_does_not_hide_corrupt_zipcrypto() {
+    use ::zip::unstable::write::FileOptionsExt;
+
+    let options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .with_deprecated_encryption(PASSWORD.as_bytes())
+        .unwrap();
+    let mut bytes = archive(options);
+    let mut directory = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+    let file = directory.by_index_raw(2).unwrap();
+    let at = file.header_start() as usize;
+    let body = file.data_start().unwrap() as usize;
+    drop(file);
+    drop(directory);
+    bytes[at + 22..at + 26].copy_from_slice(&768_000u32.to_le_bytes());
+    bytes[body + 12 + 3] ^= 0x20;
+    let mut engine = ZipEngine::new();
+    engine.offer_password(PASSWORD, &mut Vec::new());
+    let said = run(&mut engine, vec![bytes]);
+    assert_eq!(
+        said[said.len() - 2..],
+        [Said::Retract(1), Said::NeedsPassword]
+    );
+    assert!(!said.contains(&Said::Closed(1)));
+}
+
+#[test]
+fn a_stale_local_size_does_not_allow_a_different_method() {
+    let mut bytes = plain();
+    let directory = ZipArchive::new(Cursor::new(&bytes)).unwrap();
+    let at = directory.by_index_data(3).unwrap().header_start() as usize;
+    bytes[at + 8..at + 10].copy_from_slice(&0u16.to_le_bytes());
+    bytes[at + 22..at + 26].copy_from_slice(&768_000u32.to_le_bytes());
+    let mut expected = plain_said();
+    expected.truncate(5);
+    expected.push(Said::Refuse(Why::InvalidArchive));
+    assert_eq!(run(&mut ZipEngine::new(), vec![bytes]), expected);
+}
+
+#[test]
 fn duplicate_names_are_rejected_without_announcing_a_member() {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     let options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
@@ -859,5 +948,40 @@ fn a_run_says_each_files_header_checksum_and_none_for_a_directory() {
     assert_eq!(
         checksums(&emits),
         vec![(1, crc(NOTES)), (2, crc(&second()))]
+    );
+}
+
+// A deflated member reaches the sink in pieces of a quarter megabyte, not
+// in the few kilobytes the zip library's readers hand back at a time.
+#[test]
+fn a_deflated_member_is_said_in_quarter_megabyte_pieces() {
+    let data = payload(17, 4 * super::run::EMIT_BYTES + 5);
+    let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+    let deflated = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+    writer.start_file("movie.mkv", deflated).unwrap();
+    writer.write_all(&data).unwrap();
+    let archive = writer.finish().unwrap().into_inner();
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    ZipEngine::new().start().run(
+        Gate::whole(vec![archive]),
+        &mut sink,
+        weaver_graph::Budget::default(),
+    );
+    let pieces = emits
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Bytes { .. }))
+        .count();
+    assert_eq!(pieces, data.len().div_ceil(super::run::EMIT_BYTES));
+    assert_eq!(
+        said(&emits),
+        vec![
+            Said::Member(0, "movie.mkv".into(), Some(data.len() as u64)),
+            Said::Bytes(0, data),
+            Said::Closed(0),
+        ]
     );
 }

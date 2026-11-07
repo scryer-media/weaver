@@ -412,6 +412,8 @@ fn view(state: TorrentState) -> TorrentView {
         progress: 0.5,
         total_bytes: 10,
         have_bytes: 5,
+        wanted_bytes: 10,
+        wanted_have_bytes: 5,
         uploaded_bytes: 0,
         downloaded_bytes: 5,
         run_uploaded_bytes: 0,

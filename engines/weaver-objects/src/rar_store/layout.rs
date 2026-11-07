@@ -18,8 +18,9 @@ use unrar_rs::{
     ArchiveFormat, IneligibilityReason, MalformedReason, MemberEligibility, RarVolumeFacts,
     StoredLayoutBuilder, StoredMember,
 };
-use weaver_graph::{ByteRange, Emit, Handed, MemberId, RecoveryKind, VolumeIndex, Why};
+use weaver_graph::{ByteRange, Coverage, Emit, Handed, MemberId, RecoveryKind, VolumeIndex, Why};
 
+use super::walk::Walk;
 use super::{Entry, Lock, Piece, RarStore, Volume, claim};
 use crate::runs::CrcRuns;
 
@@ -94,6 +95,72 @@ fn lays(index: VolumeIndex, found: &Volume) -> Option<(&RarVolumeFacts, bool)> {
     Some((facts, found.walk.ended && !found.walk.is_last()))
 }
 
+// A layout and, for each volume it holds, the facts it took it on: their
+// stamp and how many members they list.
+pub(super) struct Laid {
+    builder: StoredLayoutBuilder,
+    added: BTreeMap<u32, (u64, usize)>,
+}
+
+impl std::ops::Deref for Laid {
+    type Target = StoredLayoutBuilder;
+
+    fn deref(&self) -> &StoredLayoutBuilder {
+        &self.builder
+    }
+}
+
+impl Laid {
+    fn new(format: ArchiveFormat) -> Self {
+        Self {
+            builder: StoredLayoutBuilder::new(format),
+            added: BTreeMap::new(),
+        }
+    }
+
+    // Add a volume on its walk's facts, or say the layout refuses them.
+    // unrar-rs takes a volume it holds again only on headers whose member
+    // snapshots, one per member and drawn from the members and the format
+    // alone, equal the ones it took it on. So it takes it again unchanged
+    // on the very facts it took it on, and refuses facts listing another
+    // number of members, without either being asked.
+    fn add(&mut self, index: u32, walk: &Walk) -> bool {
+        let Some(facts) = walk.facts.as_ref() else {
+            return false;
+        };
+        let known = match self.added.get(&index) {
+            Some(&(stamp, _)) if stamp == walk.stamp => Some(true),
+            Some(&(_, members)) if members != facts.members.len() => Some(false),
+            _ => None,
+        };
+        let added = match known {
+            Some(added) => {
+                #[cfg(test)]
+                {
+                    // Taking a volume it holds again changes nothing either
+                    // way, so asking costs the test only time.
+                    assert_eq!(
+                        added,
+                        self.builder.add_volume(index, facts).is_ok(),
+                        "the layout answers as known"
+                    );
+                    super::counts::bump(|counts| counts.known += 1);
+                }
+                added
+            }
+            None => {
+                #[cfg(test)]
+                super::counts::bump(|counts| counts.asked.push((index, walk.stamp)));
+                self.builder.add_volume(index, facts).is_ok()
+            }
+        };
+        if added {
+            self.added.insert(index, (walk.stamp, facts.members.len()));
+        }
+        added
+    }
+}
+
 // How many volumes a layout holds: always the first ones, in order.
 fn laid(layout: &StoredLayoutBuilder) -> u32 {
     layout.header_frontier().map_or(0, |last| last + 1)
@@ -106,15 +173,18 @@ fn laid(layout: &StoredLayoutBuilder) -> u32 {
 // laid afresh.
 fn stands(
     volumes: &BTreeMap<VolumeIndex, Volume>,
-    layout: &mut StoredLayoutBuilder,
+    layout: &mut Laid,
     touched: &BTreeSet<VolumeIndex>,
 ) -> bool {
     let laid = laid(layout);
     touched.range(..VolumeIndex(laid)).all(|index| {
-        let Some((facts, on)) = volumes.get(index).and_then(|found| lays(*index, found)) else {
+        let Some(found) = volumes.get(index) else {
             return false;
         };
-        (on || index.0 + 1 == laid) && !facts.is_solid && layout.add_volume(index.0, facts).is_ok()
+        let Some((facts, on)) = lays(*index, found) else {
+            return false;
+        };
+        (on || index.0 + 1 == laid) && !facts.is_solid && layout.add(index.0, &found.walk)
     })
 }
 
@@ -180,13 +250,11 @@ impl RarStore {
 
     // A layout laid afresh over the first `through` volumes, as one kept
     // over them was before anything was added past them.
-    fn laid_afresh(&self, format: ArchiveFormat, through: u32) -> StoredLayoutBuilder {
-        let mut layout = StoredLayoutBuilder::new(format);
+    fn laid_afresh(&self, format: ArchiveFormat, through: u32) -> Laid {
+        let mut layout = Laid::new(format);
         for (index, found) in self.volumes.range(..VolumeIndex(through)) {
-            if let Some(facts) = found.walk.facts.as_ref() {
-                // Each was added before on these same headers.
-                let _ = layout.add_volume(index.0, facts);
-            }
+            // Each was added before on these same headers.
+            layout.add(index.0, &found.walk);
         }
         layout
     }
@@ -204,7 +272,7 @@ impl RarStore {
         let mut layout = kept.unwrap_or_else(|| {
             #[cfg(test)]
             super::counts::bump(|counts| counts.layouts += 1);
-            StoredLayoutBuilder::new(format)
+            Laid::new(format)
         });
         let from = laid(&layout);
         let end = match reach(&self.volumes, &layout, from) {
@@ -218,12 +286,7 @@ impl RarStore {
         };
         let mut refusal = None;
         for (index, found) in self.volumes.range(VolumeIndex(from)..VolumeIndex(end)) {
-            let added = found
-                .walk
-                .facts
-                .as_ref()
-                .is_some_and(|facts| layout.add_volume(index.0, facts).is_ok());
-            if !added {
+            if !layout.add(index.0, &found.walk) {
                 refusal = Some(Emit::Refuse(Why::Unsupported));
                 break;
             }
@@ -311,6 +374,7 @@ impl RarStore {
             complete: dir,
             hash_key: None,
             trial: None,
+            condemned_on: Coverage::new(),
             out: Arc::default(),
             plain_runs: CrcRuns::default(),
             parts: Default::default(),

@@ -22,16 +22,16 @@ mod record;
 mod walk;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map};
 use std::ops::Bound;
 use std::sync::Arc;
 
-use unrar_rs::{ArchiveFormat, EncryptedStore, StoredLayoutBuilder};
+use unrar_rs::{ArchiveFormat, EncryptedStore};
 use weaver_graph::{
     ByteRange, Claim, Coverage, Delivery, Emit, Extent, Kind, Located, MemberId, Object, Placement,
-    Posting, Pull, Seek, Standing, VolumeIndex, Weight, Why,
+    Posting, Provenance, Pull, Seek, Standing, VolumeIndex, Weight, Why,
 };
 use zeroize::Zeroizing;
 
@@ -69,6 +69,9 @@ pub(crate) struct Volume {
     // What the volume's front stated when it was bound, before any of its
     // bytes reached the walk: what places a sibling beside it meanwhile.
     front: Option<unrar_rs::RarVolumeFacts>,
+    // Cleared at touch, before a walk, and when a damaged delivery wants
+    // more header bytes. Payload-only arrivals reuse the encoded metadata.
+    facts: std::sync::Mutex<Option<weaver_graph::Sealed<facts::VolumeFacts>>>,
 }
 
 impl Volume {
@@ -81,7 +84,15 @@ impl Volume {
             kept: Kept::default(),
             walk: Walk::default(),
             front: None,
+            facts: std::sync::Mutex::new(None),
         }
+    }
+
+    fn invalidate_facts(&mut self) {
+        *self
+            .facts
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner()) = None;
     }
 
     // What the volume's headers have stated so far: what its walk read once
@@ -132,6 +143,11 @@ mod counts {
         pub(crate) walks: usize,
         pub(crate) layouts: usize,
         pub(crate) names: usize,
+        // Volumes the layout was asked to take, each with the stamp of the
+        // facts it was asked on, and how often it was not asked since its
+        // answer was known.
+        pub(crate) asked: Vec<(u32, u64)>,
+        pub(crate) known: usize,
     }
 
     thread_local! {
@@ -197,6 +213,11 @@ struct Entry {
     // The candidate that keyed the file when nothing proved it: on trial,
     // a whole-file checksum that fails on verified bytes condemns it.
     trial: Option<usize>,
+    // What the file's bytes were when a checksum condemned the candidate on
+    // trial over them, by offset: bytes a repair rewrites since were
+    // posted wrong, and the checksum that condemned it may have failed on
+    // them and not on a wrong key.
+    condemned_on: Coverage,
     out: Arc<Out>,
     // The plaintext's runs for the whole-file CRC, and every part's packed
     // runs, by piece, for its own.
@@ -231,6 +252,14 @@ impl Entry {
     // which checks the CRC32 it is stated.
     fn judges_its_checksum(&self) -> bool {
         self.uses_mac
+    }
+
+    // Whether a repair rewriting `stream` rewrites bytes a candidate was
+    // condemned over as they were posted.
+    fn rewrites_condemned(&self, stream: ByteRange) -> bool {
+        self.condemned_on
+            .overlapping(stream)
+            .any(|run| run.provenance != Provenance::Repaired)
     }
 }
 
@@ -277,7 +306,7 @@ pub struct RarStore {
     formats: [BTreeSet<VolumeIndex>; 3],
     // The layout kept: extended past its tail as volumes are read, laid
     // afresh only where a volume it holds changed what it said.
-    layout: Option<StoredLayoutBuilder>,
+    layout: Option<layout::Laid>,
     entries: Vec<Entry>,
     candidates: Vec<Candidate>,
     // The candidate that opened the headers.
@@ -285,6 +314,9 @@ pub struct RarStore {
     asked: bool,
     // The candidate on trial a checksum condemned during this delivery.
     wrong_key: Option<usize>,
+    // A repair rewrote bytes of a file no candidate keys that a candidate
+    // was condemned over as they were posted, since the job was last quiet.
+    rewritten: bool,
     // Files a condemned candidate keyed, with the cipher and record they
     // stood under, until every part of them has been posted again: their
     // bytes read back as they were posted.
@@ -297,6 +329,18 @@ pub struct RarStore {
     stale: bool,
     // The object gave its set up; it says nothing more.
     gone: bool,
+    // Moved wherever anything `place` reads may change: a look at what
+    // changed, a volume touched, a condemned file's cipher taken or let go.
+    // Data that only passes through moves nothing.
+    placed: u64,
+}
+
+// Every store's placement numbers, so no two stores, a store restored in
+// place of another included, ever share one.
+static PLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_placed() -> u64 {
+    PLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 impl Default for RarStore {
@@ -327,13 +371,20 @@ impl RarStore {
             headers_open: None,
             asked: false,
             wrong_key: None,
+            rewritten: false,
             condemned: BTreeMap::new(),
             damage_said: HashSet::new(),
             recovery_said: BTreeSet::new(),
             gaps_said: BTreeSet::new(),
             stale: false,
             gone: false,
+            placed: next_placed(),
         }
+    }
+
+    // Something `place` reads may have changed.
+    fn moved(&mut self) {
+        self.placed = next_placed();
     }
 
     // A volume newly held lies under no piece: a layout maps only volumes
@@ -355,7 +406,11 @@ impl RarStore {
     // Something the walk or the layout reads of a volume changed, or the
     // volume came or went: look at it again.
     fn touch(&mut self, volume: VolumeIndex) {
+        if let Some(found) = self.volumes.get_mut(&volume) {
+            found.invalidate_facts();
+        }
         self.dirty.insert(volume);
+        self.moved();
     }
 
     // File what a volume's walk says of the set, as it stands now: whether
@@ -443,6 +498,8 @@ impl RarStore {
         }
         let mut reached = BTreeMap::new();
         while !self.gone && (std::mem::take(&mut self.stale) | !self.dirty.is_empty()) {
+            // The walks, the layout and the keys change only here.
+            self.moved();
             let touched = std::mem::take(&mut self.dirty);
             self.walk(&touched, &mut reached, out);
             // The layout holds to every volume touched so far, those the
@@ -484,6 +541,9 @@ impl RarStore {
                 counts.walked.insert(volume.0);
             });
             let before = found.walk.reach().unwrap_or(0);
+            // Password changes can schedule a walk without touching the
+            // volume. The walk can change parsed facts or wanted ranges.
+            found.invalidate_facts();
             let step = found.walk.step(
                 &mut found.kept,
                 found.length,
@@ -660,10 +720,11 @@ impl Object for RarStore {
         loop {
             let found = self.volume(volume);
             let generation = found.kept.generation();
-            if found
+            if let Some(at) = found
                 .kept
                 .absorb(range, delivery.bytes, delivery.provenance)
             {
+                found.walk.changed_from(at);
                 self.touch(volume);
             }
             self.settle(Some((volume, range)), out);
@@ -690,12 +751,18 @@ impl Object for RarStore {
             if delivery.provenance.is_damaged() && !found.closed {
                 let hole = found.walk.hole(&found.kept, false);
                 if range.contains(hole) {
+                    let wanted = found.kept.generation();
                     found.kept.want(ByteRange::new(hole, range.end));
+                    if found.kept.generation() != wanted {
+                        found.invalidate_facts();
+                    }
                 }
             }
             if found.kept.generation() == generation {
                 break;
             }
+            // A range wanted anew is the store's own now, not held.
+            self.moved();
         }
         self.route(
             volume,
@@ -751,8 +818,16 @@ impl Object for RarStore {
     // Nothing more will arrive. A set whose first volume never came has
     // lost its first bytes: no header says what any volume after it holds.
     // Otherwise a member still damaged, a password still asked for, or a
-    // member named and never placed leaves the set unread.
+    // member named and never placed leaves the set unread. A repair that
+    // rewrote bytes a candidate was condemned over first has every candidate
+    // tried again on them, once the repair is done: nothing reads them again
+    // while it still writes.
     fn quiet(&mut self, standing: &dyn Standing, out: &mut Vec<Emit>) {
+        if std::mem::take(&mut self.rewritten) {
+            self.acquit(out);
+            self.settle(None, out);
+            return;
+        }
         let first = self.volumes.get(&VolumeIndex(0));
         let why = match first.is_none_or(|found| found.name.is_none()) {
             true => Some(Why::FirstBytesLost),
@@ -798,6 +873,10 @@ impl Object for RarStore {
 
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         self.place(volume, range, out);
+    }
+
+    fn placement(&self) -> Option<u64> {
+        Some(self.placed)
     }
 
     fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {

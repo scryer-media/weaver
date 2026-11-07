@@ -8,9 +8,10 @@
 use std::io::Write;
 
 use super::harness::{
-    ARTICLE, Claim, Outcome, Post, Scenario, assert_fetched_once, kinds, par2_set, payload,
+    ARTICLE, Claim, JOB, Outcome, Post, Scenario, assert_fetched_once, kinds, par2_set, payload,
     repair_and_terminal_events, run,
 };
+use crate::events::model::PipelineEvent;
 use crate::history::HistoryFailureKind;
 use crate::jobs::model::JobStatus;
 use crate::pipeline::graph::lines::Lines;
@@ -648,6 +649,26 @@ async fn a_tar_whose_second_header_is_damaged_is_partial_with_its_first_entry() 
         refused.len() == 1 && refused[0].contains("kind=tar member=lantern.tar why=unrepairable"),
         "{refused:?}"
     );
+    // The job's event history says the tar was given up on, once.
+    let demoted: Vec<_> = graph
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            PipelineEvent::ArchiveDemoted {
+                job_id,
+                member,
+                container,
+                reason,
+            } => Some((
+                *job_id,
+                member.as_str(),
+                container.as_str(),
+                reason.as_str(),
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(demoted, [(JOB, "lantern.tar", "tar", "unrepairable")]);
     assert!(
         graph.files[&delivered("lantern.mkv")] == first,
         "lantern.mkv bytes"

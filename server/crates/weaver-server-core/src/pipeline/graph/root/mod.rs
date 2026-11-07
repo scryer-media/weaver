@@ -25,10 +25,12 @@ pub(crate) mod window;
 #[cfg(test)]
 pub(super) mod tests;
 
+use std::collections::BTreeSet;
+
 use weaver_graph::{ByteRange, NodeId, Pull, Purpose, Seek, Segment, VolumeIndex, Weight, When};
 
 use self::intake::{Checksums, Decoded};
-use self::source::{ArticleMap, Class};
+use self::source::{ArticleMap, Class, Inconsistent};
 use self::window::{Bid, Window};
 use crate::pipeline::graph::job::RootFile;
 use crate::pipeline::graph::namespace::{Arrival, Segments};
@@ -80,6 +82,7 @@ impl ArticleRoot {
         if self.map.holds_intact(decoded.volume, decoded.ordinal) {
             return None;
         }
+        let length = self.accepted_length(&decoded);
         let decoded = decoded.declared();
         let range = decoded.range();
         self.map.arrived(
@@ -89,7 +92,7 @@ impl ArticleRoot {
             decoded.declared_end,
             decoded.intact,
         );
-        if let Some(length) = decoded.length {
+        if let Some(length) = length {
             self.map.set_length(decoded.volume, length);
         }
         if decoded.positioned {
@@ -100,6 +103,20 @@ impl ArticleRoot {
             self.map.set_ordered_only(decoded.volume);
         }
         Some(decoded.into_arrival())
+    }
+
+    // The file length the article declares, when it can be the file's:
+    // one the post's articles can reach with parts the size of this one's,
+    // and no less than where this one ends. Otherwise it sizes nothing and
+    // bounds no part.
+    pub(crate) fn accepted_length(&self, decoded: &Decoded) -> Option<u64> {
+        let own_end = decoded
+            .declared_end
+            .unwrap_or(decoded.offset + decoded.bytes.len() as u64);
+        let part = own_end.saturating_sub(decoded.offset);
+        decoded.length.filter(|length| {
+            own_end <= *length && self.map.reachable(decoded.volume, part, *length)
+        })
     }
 
     // Answer one round of seeks. A deferred seek parks; a recovery seek is
@@ -123,6 +140,7 @@ impl ArticleRoot {
             }
         }
         let drawn = self.window.draw(queued);
+        let mut applied = BTreeSet::new();
         let answers = asks
             .iter()
             .map(|ask| {
@@ -134,11 +152,22 @@ impl ArticleRoot {
                         self.window.rank(ask.seek.volume).map(Class::Window)
                     }
                 };
+                if let Some(Class::Window(rank)) = class {
+                    applied.insert((
+                        ask.seek.volume,
+                        ask.seek.range.start,
+                        ask.seek.range.end,
+                        rank,
+                    ));
+                }
                 self.map.seek(ask.seek.volume, ask.seek.range, class)
             })
             .collect();
         // Bids no seek of this round carried still move their articles.
         for (bid, rank) in drawn {
+            if applied.contains(&(bid.volume, bid.range.start, bid.range.end, rank)) {
+                continue;
+            }
             self.map
                 .seek(bid.volume, bid.range, Some(Class::Window(rank)));
         }
@@ -156,10 +185,10 @@ impl ArticleRoot {
     }
 
     // The ranges of lost articles that can now be marked damaged.
-    pub(crate) fn damage(&mut self) -> Vec<(VolumeIndex, ByteRange)> {
+    pub(crate) fn damage(&mut self) -> Result<Vec<(VolumeIndex, ByteRange)>, Inconsistent> {
         let mut out = Vec::new();
-        self.map.take_damage(&mut out);
-        out
+        self.map.take_damage(&mut out)?;
+        Ok(out)
     }
 }
 

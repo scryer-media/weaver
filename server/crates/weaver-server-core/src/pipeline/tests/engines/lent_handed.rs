@@ -36,7 +36,7 @@ fn posts(volumes: Vec<(String, Vec<u8>)>) -> Vec<Post> {
 // The last article of the post at `file`.
 fn last_article(scenario: &Scenario, file: u32) -> (u32, u32) {
     let post = &scenario.posts[file as usize];
-    (file, post.bytes.len().div_ceil(scenario.article) as u32 - 1)
+    (file, post.articles(scenario.article).count() as u32 - 1)
 }
 
 fn repair_out(pipeline: &Pipeline) -> bool {

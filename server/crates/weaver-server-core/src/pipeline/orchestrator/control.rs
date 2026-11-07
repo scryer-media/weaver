@@ -2,13 +2,57 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::jobs::handle::RestoreJobRequest;
 use crate::pipeline::queue::Change;
 
 // How many restores one turn installs.
 pub(crate) const RESTORE_BATCH: usize = 32;
 
+// A restore whose row carries a pause installs paused, to go back to what it
+// was.
+fn paused_restore(mut request: RestoreJobRequest, paused: bool) -> RestoreJobRequest {
+    if paused && request.status != JobStatus::Paused {
+        request.paused_resume_status = Some(request.status.clone());
+        request.paused_resume_download_state = request.download_state;
+        request.paused_resume_post_state = request.post_state;
+        request.status = JobStatus::Paused;
+        request.run_state = Some(crate::RunState::Paused);
+    }
+    request
+}
+
 impl Pipeline {
+    // Runs the queue's intents as a turn does, then hears every database
+    // answer the turn asked for, as the loop would: a direct caller sees
+    // the jobs installed, and the slots taken and let go, with the turn the
+    // loop runs after a slot commits or a restart's last batch installs. A
+    // batch with more behind it, like a slot write that failed, is left for
+    // the caller's next turn.
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn apply_queue_intents(&mut self) {
+        loop {
+            self.run_queue_intents().await;
+            let mut walk_again = false;
+            while self.db_replies_out() {
+                let reply = self.db_reply_rx.recv().await.expect("database replies");
+                let installs = matches!(reply, crate::pipeline::db_reply::DbReply::Installs(_));
+                walk_again |= matches!(
+                    reply,
+                    crate::pipeline::db_reply::DbReply::Slot {
+                        committed: true,
+                        ..
+                    }
+                );
+                self.handle_db_reply(reply).await;
+                walk_again |= installs && !self.restores_waiting;
+            }
+            if !walk_again {
+                return;
+            }
+        }
+    }
+
+    pub(crate) async fn run_queue_intents(&mut self) {
         self.answer_diagnostics_request();
         self.apply_queue_globals().await;
         // The walks below visit every row. They run when an intent was
@@ -27,91 +71,117 @@ impl Pipeline {
                 .values()
                 .any(|(ready_at, _)| *ready_at <= now);
         self.queue_walk_mark = Some(mark);
-        if !self.reconcile_nzb_admission(walk).await {
+        if !self.reconcile_nzb_admission(walk) {
             self.settle_reprocess_pending().await;
             return;
         }
         crate::pipeline::queue::count_walk();
+        // The queue window: the jobs it ranks first in dispatch order. A job
+        // out of it waits as its row and its database rows alone.
+        let (ranked, gone) = self.shared_state.queue.read(|inner| {
+            (
+                self.queue_window_ranks(inner),
+                self.forget_gone_parked(inner),
+            )
+        });
+        self.drop_parked(gone);
         // Installing a job is its add, whether it comes from intake or from a
         // restart, under any pause and with every slot taken; only a shutdown
         // installs nothing. Admission decides only whether its articles go
         // out. A restore whose row carries a pause installs parked.
-        // A restart's restores install a bounded batch a turn: the jobs
-        // holding a slot first, wherever they stand, then the rest in queue
-        // order, so the jobs that download start while the rest install.
-        let restores = self.shared_state.queue.write(|inner| {
+        // A restart's restores, and the jobs entering the window, install a
+        // bounded batch a turn: the jobs holding a slot first, wherever they
+        // stand, then the rest in queue order, so the jobs that download
+        // start while the rest install. A restore out of the window is not
+        // installed: its job is read back from the database once it enters.
+        let (tickets, entering, parking) = self.shared_state.queue.write(|inner| {
             if inner.globals.shutting_down {
-                return Change::unchanged(Vec::new());
+                return Change::unchanged((Vec::new(), Vec::new(), Vec::new()));
             }
-            let mut holders: Vec<usize> = self
-                .nzb_admitted
-                .iter()
-                .filter_map(|id| inner.job_position(*id))
-                .filter(|position| inner.jobs[*position].intents.restore.is_some())
-                .collect();
-            holders.sort_unstable();
-            let order: Vec<usize> = holders
-                .into_iter()
-                .chain(
-                    (0..inner.jobs.len())
-                        .filter(|position| inner.jobs[*position].intents.restore.is_some())
-                        .filter(|position| !self.nzb_admitted.contains(&inner.jobs[*position].id)),
-                )
-                .take(RESTORE_BATCH)
-                .collect();
-            Change::unchanged(
-                order
+            let enters = |row: &crate::pipeline::queue::JobRow| {
+                (row.intents.restore.is_some() || self.window_parked(row.id))
+                    && !self.window_unreadable.contains(&row.id)
+                    && self.in_queue_window(&ranked, row)
+            };
+            // One batch is read at a time; the next is taken once it is in.
+            let order: Vec<usize> = if self.installing.is_empty() {
+                let mut holders: Vec<usize> = self
+                    .nzb_admitted
+                    .iter()
+                    .filter_map(|id| inner.job_position(*id))
+                    .filter(|position| enters(&inner.jobs[*position]))
+                    .collect();
+                holders.sort_unstable();
+                holders
                     .into_iter()
-                    .filter_map(|position| {
-                        let row = &mut inner.jobs[position];
-                        let paused = row.intents.paused == Some(true);
-                        row.intents.restore.take().map(|mut request| {
-                            if paused && request.status != JobStatus::Paused {
-                                request.paused_resume_status = Some(request.status.clone());
-                                request.paused_resume_download_state = request.download_state;
-                                request.paused_resume_post_state = request.post_state;
-                                request.status = JobStatus::Paused;
-                                request.run_state = Some(crate::RunState::Paused);
-                            }
-                            request
-                        })
-                    })
-                    .collect::<Vec<_>>(),
-            )
+                    .chain((0..inner.jobs.len()).filter(|position| {
+                        let row = &inner.jobs[*position];
+                        !self.nzb_admitted.contains(&row.id) && enters(row)
+                    }))
+                    .take(RESTORE_BATCH)
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            let mut tickets = Vec::new();
+            let mut entering = Vec::new();
+            for position in order {
+                let row = &mut inner.jobs[position];
+                let paused = row.intents.paused == Some(true);
+                match row.intents.restore.take() {
+                    Some(request) => tickets.push(paused_restore(request, paused)),
+                    None => entering.push((row.id, paused)),
+                }
+            }
+            let mut parking = Vec::new();
+            for row in &mut inner.jobs {
+                if row.intents.restore.is_some() && !self.in_queue_window(&ranked, row) {
+                    let request = row.intents.restore.take().expect("restore ticket");
+                    let articles = match &request.restart {
+                        Some(read) => read
+                            .summaries
+                            .0
+                            .iter()
+                            .map(|file| u64::from(file.remaining))
+                            .sum(),
+                        None => request
+                            .spec
+                            .files
+                            .iter()
+                            .map(|file| file.segments.len() as u64)
+                            .sum(),
+                    };
+                    row.report.restoring = false;
+                    parking.push((row.id, articles));
+                }
+            }
+            if parking.is_empty() {
+                Change::unchanged((tickets, entering, parking))
+            } else {
+                Change::changed((tickets, entering, parking))
+            }
         });
-        // A full batch may have left more behind; the next turn looks.
-        self.restores_waiting = restores.len() == RESTORE_BATCH;
-        self.queue_walk_due |= self.restores_waiting;
-        if !restores.is_empty() {
-            self.download_dispatch_wake = true;
+        // A full batch may have left more behind; the next turn looks. While
+        // a batch is out the pass stands as it was, and its answer brings the
+        // next walk.
+        if self.installing.is_empty() {
+            self.restores_waiting = tickets.len() + entering.len() == RESTORE_BATCH;
+            self.queue_walk_due |= self.restores_waiting;
+        }
+        if !parking.is_empty() {
+            for (id, articles) in &parking {
+                self.park_window_job(*id, *articles);
+            }
+            self.update_queue_metrics();
+            self.restate_wait_reasons(parking.iter().map(|(id, _)| *id));
+        }
+        if !tickets.is_empty() {
             self.restore_pass
                 .get_or_insert_with(|| (Instant::now(), 0))
-                .1 += restores.len();
+                .1 += tickets.len();
         }
-        for request in restores {
-            let id = request.job_id;
-            if let Err(error) = self.install_restored_job(request).await {
-                error!(job_id = id.0, %error, "failed to install restore ticket");
-            }
-            // An installed job is a new candidate for a slot.
-            self.queue_walk_due = true;
-            self.report_job(id);
-            self.shared_state.queue.write(|inner| {
-                if let Some(row) = inner.job_mut(id) {
-                    row.report.restoring = false;
-                }
-                Change::changed(())
-            });
-        }
-        if !self.restores_waiting
-            && let Some((started, installed)) = self.restore_pass.take()
-        {
-            info!(
-                installed,
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "installed every job a restart restored"
-            );
-        }
+        self.read_install_batch(tickets, entering);
+        self.note_restore_pass_done();
         let mut deferred = false;
         let admissions = self.shared_state.queue.write(|inner| {
             if inner.globals.shutting_down {
@@ -134,11 +204,37 @@ impl Pipeline {
             )
         });
         self.queue_walk_due |= deferred || !admissions.is_empty();
+        let mut parked_adds = Vec::new();
         for (id, job) in admissions {
             let reprocess = job
                 .restart
                 .as_ref()
                 .is_some_and(|restart| restart.reprocess);
+            // The arrival's scripts run for every add as it is taken in,
+            // whether the job is installed or waits out of the window.
+            if !reprocess {
+                self.raise_added_script_event_for_add(id, &job);
+            }
+            // A fresh add out of the window is persisted already; it waits
+            // as its row until it enters.
+            let installs = job.restart.is_some()
+                || self.shared_state.queue.read(|inner| {
+                    inner
+                        .job(id)
+                        .is_none_or(|row| self.in_queue_window(&ranked, row))
+                });
+            if !installs {
+                let mut spec = job.spec;
+                let summaries = spec.drop_article_lists();
+                let articles = summaries
+                    .0
+                    .iter()
+                    .map(|file| u64::from(file.remaining))
+                    .sum();
+                self.park_window_job(id, articles);
+                parked_adds.push(id);
+                continue;
+            }
             self.install_prepared_add(id, job);
             self.nzb_reprocess_pending.remove(&id);
             if reprocess && self.nzb_admitted.contains(&id) {
@@ -146,6 +242,10 @@ impl Pipeline {
             } else if reprocess {
                 self.nzb_reprocess_pending.insert(id);
             }
+        }
+        if !parked_adds.is_empty() {
+            self.update_queue_metrics();
+            self.restate_wait_reasons(parked_adds.into_iter());
         }
         let (order, pending) = self.shared_state.queue.read(|inner| {
             (
@@ -171,7 +271,10 @@ impl Pipeline {
             .collect();
         if installed_order != self.job_order {
             self.job_order = installed_order;
-            self.persist_queue_order(&order).await;
+        }
+        if order != self.stored_queue_order {
+            self.persist_queue_order(&order);
+            self.stored_queue_order = order;
         }
         use crate::jobs::handle::CancellationOrigin;
         for origin in [
@@ -184,7 +287,9 @@ impl Pipeline {
             let ids: BTreeSet<_> = pending
                 .iter()
                 .filter_map(|(id, intents, _)| {
-                    (intents.cancelled == Some(origin) && self.jobs.contains_key(id)).then_some(*id)
+                    (intents.cancelled == Some(origin)
+                        && (self.jobs.contains_key(id) || self.window_unreadable.contains(id)))
+                    .then_some(*id)
                 })
                 .collect();
             for id in &ids {
@@ -214,14 +319,8 @@ impl Pipeline {
                 if !paused && !self.nzb_admitted.contains(&job_id) {
                     continue;
                 }
-                if paused
-                    && let Err(error) = self
-                        .db_blocking(move |db| db.set_nzb_pause_release(job_id, true))
-                        .await
-                {
-                    error!(job_id = job_id.0, %error, "failed to persist NZB pause release");
-                    self.queue_walk_due = true;
-                    continue;
+                if paused {
+                    self.queue_pause_release_write(job_id, true);
                 }
                 let result = if paused {
                     self.pause_job_runtime(job_id)
@@ -236,25 +335,12 @@ impl Pipeline {
                             self.emit_download_finished_if_active(job_id);
                         } else {
                             // Keep the interrupted-pause marker until the resumed
-                            // lifecycle has committed. A crash in between restores
-                            // a paused job instead of leaking an occupied slot.
-                            let result = match self.db.flush_write_queue().await {
-                                Ok(()) => {
-                                    self.db_blocking(move |db| {
-                                        db.set_nzb_pause_release(job_id, false)
-                                    })
-                                    .await
-                                }
-                                Err(error) => Err(error),
-                            };
-                            match result {
-                                Ok(()) => {
-                                    self.nzb_pause_releases.remove(&job_id);
-                                }
-                                Err(error) => {
-                                    error!(job_id = job_id.0, %error, "failed to settle NZB resume")
-                                }
-                            }
+                            // lifecycle has committed: its clear goes behind the
+                            // resume's writes on the job's lane. A crash in
+                            // between restores a paused job instead of leaking an
+                            // occupied slot.
+                            self.queue_pause_release_write(job_id, false);
+                            self.nzb_pause_releases.remove(&job_id);
                         }
                         self.emit_job_event(if paused {
                             PipelineEvent::JobPaused { job_id }
@@ -264,12 +350,8 @@ impl Pipeline {
                     }
                     Err(error) => {
                         warn!(job_id = job_id.0, paused, %error, "pipeline refused the job's pause intent");
-                        if paused
-                            && let Err(error) = self
-                                .db_blocking(move |db| db.set_nzb_pause_release(job_id, false))
-                                .await
-                        {
-                            error!(job_id = job_id.0, %error, "failed to withdraw NZB pause release");
+                        if paused {
+                            self.queue_pause_release_write(job_id, false);
                         }
                         if !paused
                             && self.jobs.get(&job_id).is_some_and(|state| {
@@ -278,14 +360,7 @@ impl Pipeline {
                         {
                             // A refused resume must return its newly acquired
                             // slot once any recovery work has quiesced.
-                            if let Err(error) = self
-                                .db_blocking(move |db| db.set_nzb_pause_release(job_id, true))
-                                .await
-                            {
-                                error!(job_id = job_id.0, %error, "failed to persist refused NZB resume");
-                                self.queue_walk_due = true;
-                                continue;
-                            }
+                            self.queue_pause_release_write(job_id, true);
                             self.nzb_pause_releases.insert(job_id);
                         }
                         refused = true;
@@ -343,32 +418,164 @@ impl Pipeline {
                 self.queue_walk_due = true;
             }
         }
+        self.evict_outside_window(&ranked);
+    }
+
+    // The job's interrupted-pause marker, written on its lane behind every
+    // write already queued for it, so the marker a restart reads is the
+    // last one set. A write the lane could not take is logged; the marker
+    // the database keeps errs toward a job restored paused.
+    fn queue_pause_release_write(&self, job_id: JobId, pending: bool) {
+        if let Err(error) =
+            self.db
+                .try_queue_job_write(job_id, "set_nzb_pause_release", move |db| {
+                    db.set_nzb_pause_release(job_id, pending)
+                })
+        {
+            error!(job_id = job_id.0, pending, %error, "failed to queue the NZB pause release marker");
+        }
+    }
+
+    // Restate the wait reason the rows of the jobs named store.
+    fn restate_wait_reasons(&self, ids: impl Iterator<Item = JobId>) {
+        self.shared_state.queue.write(|inner| {
+            for id in ids {
+                if let Some(row) = inner.job_mut(id) {
+                    let reason = self.stored_wait_reason(row);
+                    row.report.job.download_wait_reason = reason.map(str::to_owned);
+                }
+            }
+            Change::changed(())
+        });
+    }
+
+    // Read a batch of installs off the pipeline thread: the restores a
+    // restart handed over, and the jobs entering the window, read back from
+    // their rows first. The batch comes back as a [`DbReply::Installs`].
+    fn read_install_batch(
+        &mut self,
+        tickets: Vec<RestoreJobRequest>,
+        entering: Vec<(JobId, bool)>,
+    ) {
+        if tickets.is_empty() && entering.is_empty() {
+            return;
+        }
+        let tickets: Vec<_> = tickets
+            .into_iter()
+            .map(|request| {
+                self.installing.insert(request.job_id);
+                (self.install_seat(request.job_id), request)
+            })
+            .collect();
+        let entering: Vec<_> = entering
+            .into_iter()
+            .map(|(id, paused)| {
+                self.installing.insert(id);
+                (id, paused, self.install_seat(id))
+            })
+            .collect();
+        let loads = self.parked_loads(entering.iter().map(|(id, _, _)| *id).collect());
+        let replies = self.db_reply_tx.clone();
+        tokio::spawn(async move {
+            let mut entries = Vec::new();
+            for (seat, request) in tickets {
+                entries.push(crate::jobs::service::InstallEntry::Ticket(
+                    crate::jobs::service::read_install(seat, request).await,
+                ));
+            }
+            for ((job_id, paused, seat), (_, loaded)) in
+                entering.into_iter().zip(loads.read().await)
+            {
+                let read = match loaded {
+                    Ok(Some(request)) => Ok(Some(
+                        crate::jobs::service::read_install(seat, paused_restore(request, paused))
+                            .await,
+                    )),
+                    Ok(None) => Ok(None),
+                    Err(error) => Err(error),
+                };
+                entries.push(crate::jobs::service::InstallEntry::Entered { job_id, read });
+            }
+            let _ = replies.send(crate::pipeline::db_reply::DbReply::Installs(entries));
+        });
+    }
+
+    // A batch of installs was read: put each job in place.
+    pub(crate) fn install_batch_read(&mut self, entries: Vec<crate::jobs::service::InstallEntry>) {
+        let mut restores = Vec::new();
+        for entry in entries {
+            match entry {
+                crate::jobs::service::InstallEntry::Ticket(read) => restores.push((read, false)),
+                crate::jobs::service::InstallEntry::Entered { job_id, read } => {
+                    self.installing.remove(&job_id);
+                    if let Some(read) = self.take_parked_load(job_id, read) {
+                        restores.push((read, true));
+                    }
+                }
+            }
+        }
+        if !restores.is_empty() {
+            self.download_dispatch_wake = true;
+        }
+        for (read, entered) in restores {
+            let id = read.job_id();
+            self.installing.remove(&id);
+            if let Err(error) = self.install_read(read) {
+                error!(job_id = id.0, %error, "failed to install restore ticket");
+            }
+            if entered {
+                self.settle_window_entry(id);
+            } else if let Some(values) = self.active_runtime_values(id) {
+                self.window_stored.insert(id, values);
+            }
+            self.report_job(id);
+            self.shared_state.queue.write(|inner| {
+                if let Some(row) = inner.job_mut(id) {
+                    row.report.restoring = false;
+                }
+                Change::changed(())
+            });
+        }
+        // An install joins the end of the installed order; it takes its
+        // row's place at once, before any dispatch reads the order.
+        let mut installed = std::mem::take(&mut self.job_order);
+        self.shared_state.queue.read(|inner| {
+            installed.sort_by_key(|id| inner.job_position(*id).unwrap_or(usize::MAX));
+        });
+        self.job_order = installed;
+        // An installed job is a new candidate for a slot, and its intents
+        // are applied by the next walk, which also takes the next batch.
+        self.queue_walk_due = true;
+        self.note_restore_pass_done();
+    }
+
+    fn note_restore_pass_done(&mut self) {
+        if !self.restores_waiting
+            && self.installing.is_empty()
+            && let Some((started, installed)) = self.restore_pass.take()
+        {
+            info!(
+                installed,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "installed every job a restart restored"
+            );
+        }
     }
 
     // Stores the queue's order by writing a new position only for the rows
     // whose stored one no longer sorts where the row stands. The write goes
     // through the ordered writer queue, which the shutdown drain flushes
     // within its bound and warns about if it cannot.
-    async fn persist_queue_order(&mut self, order: &[JobId]) {
+    fn persist_queue_order(&mut self, order: &[JobId]) {
         if self
             .queue_positions_lost
             .swap(false, std::sync::atomic::Ordering::AcqRel)
         {
             self.queue_positions = None;
         }
-        let persisted = match self.queue_positions.take() {
-            Some(persisted) => persisted,
-            None => match self
-                .db_blocking(|db| db.load_active_job_queue_positions())
-                .await
-            {
-                Ok(persisted) => persisted,
-                Err(error) => {
-                    error!(%error, "failed to read stored queue order");
-                    HashMap::new()
-                }
-            },
-        };
+        // Positions read at start-up are kept current here; once a write has
+        // failed they are unknown, and every position is written again.
+        let persisted = self.queue_positions.take().unwrap_or_default();
         let writes = queue_position_writes(order, &persisted);
         let mut positions: HashMap<JobId, i64> = order
             .iter()
@@ -380,7 +587,7 @@ impl Pipeline {
             return;
         }
         // A write that does not commit leaves the database holding other
-        // positions than these, so the next order change reads them back.
+        // positions than these, so the next order change writes them all.
         let lost = Arc::clone(&self.queue_positions_lost);
         match self
             .db
@@ -389,7 +596,7 @@ impl Pipeline {
                     .inspect_err(|_| lost.store(true, std::sync::atomic::Ordering::Release))
             }) {
             Ok(()) => self.queue_positions = Some(positions),
-            // Read back from the database before the next order is written.
+            // Unknown until the next order writes every position.
             Err(error) => error!(%error, "failed to persist queue order"),
         }
     }

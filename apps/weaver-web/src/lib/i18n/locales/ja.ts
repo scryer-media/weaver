@@ -17,6 +17,7 @@ const ja: LocaleDictionary = {
   "applicationUpgrade.install": "v{{version}} をインストール",
   "applicationUpgrade.notEligible": "このインストールは Weaver 内から更新できません（{{reason}}）。",
   "applicationUpgrade.failed": "v{{version}} への更新に失敗しました: {{error}}",
+  "applicationUpgrade.githubUnavailable": "GitHub は一時的に利用できません。しばらくしてから更新を再試行してください。",
   "applicationUpgrade.completed": "v{{version}} に更新しました。",
   "applicationUpgrade.phase.checking": "リリースを確認しています…",
   "applicationUpgrade.phase.downloading": "v{{version}} をダウンロードしています…",

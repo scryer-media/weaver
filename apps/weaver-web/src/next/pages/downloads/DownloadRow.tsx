@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { memo, useContext, useMemo } from "react";
+import { memo, useContext, useMemo, useRef } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
 import type { TorrentSummaryData } from "@/lib/torrents";
-import { statusToken } from "@/lib/status-tokens";
+import { isActiveStatus, statusToken } from "@/lib/status-tokens";
 import { cn } from "@/lib/utils";
 import { Square } from "@/next/components/chrome";
 import { CheckBox } from "@/next/components/controls";
@@ -64,7 +64,9 @@ export const DownloadRow = memo(function DownloadRow({
 }) {
   const t = useTranslate();
   const progress = useJobProgress(job);
-  const rate = useDownloadRate(job);
+  const liveRate = useDownloadRate(job);
+  // A held download moves nothing, whatever the last rate the daemon sent.
+  const rate = useHeldRate(held === null ? liveRate : 0, held === null && isActiveStatus(progress.status) ? progress.status : null);
   const name = formatJobReleaseName(job);
   const isPaused = statusToken(job.status) === "paused";
   // The phase the label names, or failing that the last one with a bar; a
@@ -231,4 +233,25 @@ function RowIconButton({
       <Icon name={icon} size={15} />
     </button>
   );
+}
+
+/**
+ * The rate an active row shows. A rate-limited job waits between articles,
+ * and the ticks it spends waiting carry no rate; the row keeps the last one
+ * it had while it stays in the same status, so its speed line stays put. A
+ * new status starts from its own rate, never one carried over from the last.
+ */
+function useHeldRate(rate: number, activeStatus: string | null): number {
+  const last = useRef<{ status: string | null; rate: number }>({ status: null, rate: 0 });
+  if (activeStatus === null) {
+    last.current = { status: null, rate: 0 };
+    return rate;
+  }
+  if (last.current.status !== activeStatus) {
+    last.current = { status: activeStatus, rate: 0 };
+  }
+  if (rate > 0) {
+    last.current.rate = rate;
+  }
+  return last.current.rate;
 }

@@ -8,7 +8,10 @@
 // Bytes decide wherever a kind has a signature, so a member keeps its kind
 // under an obfuscated name. A name decides only once the bytes have ruled
 // out every signature: tar, bzip2 and zip by their extensions too, and raw
-// deflate, brotli and SFV, which have no signature, by theirs alone. The one
+// deflate, brotli and SFV, which have no signature, by theirs alone, but
+// for one: a small text member whose lines are all `name CRC32` entries is
+// an SFV under any name, when no member beside it is named a listing or
+// recovery data (`sniff_among`). The one
 // name that outranks a signature is a numbered piece's, `name.001` onward,
 // whichever piece it is and whatever its bytes open: it founds the split
 // store first, whose pieces join into one file, and that file's own front
@@ -60,6 +63,108 @@ pub fn sniff(name: &str, first_bytes: &[u8], length: Option<u64>) -> Sniff {
             .map_or(Sniff::Leaf, Sniff::Object),
         verdict => verdict,
     }
+}
+
+// What a member is among the members beside it: what `sniff` says, and an
+// SFV for a member it leaves a leaf whose front reads as a listing, when no
+// member beside it is named a listing or recovery data. A listing named as
+// one is the job's listing, and a recovery set outranks any listing, so a
+// nameless one is looked for only when neither is posted.
+pub fn sniff_among<'a>(
+    name: &str,
+    first_bytes: &[u8],
+    length: Option<u64>,
+    mut beside: impl Iterator<Item = &'a str>,
+) -> Sniff {
+    match sniff(name, first_bytes, length) {
+        Sniff::Leaf
+            if listing_by_content(first_bytes, length)
+                && !beside.any(names_listing_or_recovery) =>
+        {
+            Sniff::Object(Kind::Sfv)
+        }
+        said => said,
+    }
+}
+
+fn names_listing_or_recovery(name: &str) -> bool {
+    let name = trimmed(name);
+    names_recovery(name)
+        || [".sfv", ".par2", ".par3"]
+            .iter()
+            .any(|extension| has_extension(name, extension))
+}
+
+// A listing is a line per file; a member past this is not one.
+const MAX_SFV_BYTES: u64 = 1024 * 1024;
+
+// How much of a member's front is read to tell a listing.
+const SFV_PROBE_BYTES: usize = 10_000;
+
+// Stop inspecting after this many valid entries: that is enough
+// evidence that the sampled text is an SFV listing, without making malformed
+// content later in a long sample relevant to the decision.
+const SFV_PROBE_CONFIDENCE_ENTRIES: usize = 10;
+
+// Whether a member of a known, small length reads as a listing from its
+// front: the lines the front holds whole, at most `SFV_PROBE_BYTES` of
+// them. A line the front cuts off says nothing yet.
+fn listing_by_content(first_bytes: &[u8], length: Option<u64>) -> bool {
+    let Some(length) = length.filter(|length| *length <= MAX_SFV_BYTES) else {
+        return false;
+    };
+    let mut probe = &first_bytes[..first_bytes.len().min(SFV_PROBE_BYTES)];
+    if (probe.len() as u64) < length {
+        let Some(end) = probe.iter().rposition(|byte| *byte == b'\n') else {
+            return false;
+        };
+        probe = &probe[..=end];
+    }
+    looks_like_sfv_probe(probe)
+}
+
+// The byte allowlist applied before trying to interpret a probe as
+// text: selected ASCII controls plus printable and extended text bytes, but
+// never DEL or binary controls.
+fn is_sfv_text_byte(byte: u8) -> bool {
+    matches!(byte, 7 | 8 | 9 | 10 | 12 | 13 | 27) || (byte >= b' ' && byte != 0x7f)
+}
+
+// A conservative SFV signature. This is only a
+// discovery check; the SFV object still parses every line of it.
+fn looks_like_sfv_probe(bytes: &[u8]) -> bool {
+    if bytes.iter().any(|byte| !is_sfv_text_byte(*byte)) {
+        return false;
+    }
+    let Ok(contents) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+
+    let mut valid_entries = 0usize;
+    for raw_line in contents.split('\n') {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with(';') {
+            continue;
+        }
+        // Require literal spaces before an exactly
+        // eight-digit hexadecimal CRC32; tabs and abbreviated CRCs do not
+        // identify an otherwise obfuscated file as a listing.
+        let Some((name, checksum)) = line.rsplit_once(' ') else {
+            return false;
+        };
+        if name.trim().is_empty()
+            || checksum.len() != 8
+            || !checksum.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return false;
+        }
+        valid_entries += 1;
+        if valid_entries == SFV_PROBE_CONFIDENCE_ENTRIES {
+            return true;
+        }
+    }
+
+    valid_entries > 0
 }
 
 // What the first bytes alone say a member is: the kind whose signature they
@@ -161,6 +266,7 @@ const fn signature(kind: Kind, stands: Stands, magic: &'static [u8]) -> Signatur
 const SEVEN_Z_SIGNATURE: [u8; 6] = [0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C];
 const SEVEN_Z_SIGNATURE_HEADER_LEN: usize = 32;
 const PAR2_MAGIC: &[u8; 8] = b"PAR2\0PKT";
+const PAR3_MAGIC: &[u8; 8] = b"PAR3\0PKT";
 const PAR2_PACKET_ALIGNMENT: u64 = 4;
 const PAR2_PACKET_HEADER_BYTES: usize = 64;
 const USTAR_MAGIC_AT: usize = 257;
@@ -248,7 +354,7 @@ const SIGNATURES: &[Signature] = &[
         holds: par2_header_looks_valid,
         ruled_out: |_| false,
     },
-    signature(Kind::Par3, Stands::Recurs, b"PAR3\x00PKT"),
+    signature(Kind::Par3, Stands::Recurs, PAR3_MAGIC),
     // A RAR5 recovery volume. A RAR3 one opens with parity and is known by
     // its name alone.
     signature(Kind::RarRecovery, Stands::AtHead, b"Rar!\x1aRev"),
@@ -425,6 +531,16 @@ fn named(name: &str) -> Option<Kind> {
         .filter(|(_, claims)| *claims == Claims::ByName)
         .map(|(kind, _)| kind)
         .or_else(|| numbered_piece(name).then_some(Kind::Split))
+}
+
+// Whether a member's first bytes may still open a PAR2 or PAR3 volume:
+// none yet may, and any that differ from both magics cannot, however many
+// more come.
+pub fn may_open_par(first_bytes: &[u8]) -> bool {
+    [PAR2_MAGIC, PAR3_MAGIC].iter().any(|magic| {
+        let seen = first_bytes.len().min(magic.len());
+        first_bytes[..seen] == magic[..seen]
+    })
 }
 
 // Whether a posted name is a recovery volume's, as PAR creators spell them:
@@ -976,6 +1092,138 @@ mod tests {
         assert_eq!(
             sniff("a.sfv", &[0xFF, 0xFE, 0x41], Some(3)),
             object(Kind::Sfv)
+        );
+    }
+
+    fn among(name: &str, bytes: &[u8], length: Option<u64>, beside: &[&str]) -> Sniff {
+        sniff_among(name, bytes, length, beside.iter().copied())
+    }
+
+    const LISTING: &[u8] = b"; made by hand\r\n\r\nepisode.mkv 1a2b3c4d\r\nsample.mkv 00FF00ff\n";
+
+    #[test]
+    fn a_nameless_listing_is_an_sfv_by_its_lines() {
+        let length = Some(LISTING.len() as u64);
+        assert_eq!(
+            among(
+                "oBfU5CaTeD-0001",
+                LISTING,
+                length,
+                &["episode.mkv", "oBfU5CaTeD-0001"]
+            ),
+            object(Kind::Sfv)
+        );
+        // Whatever name it has: a name that founds nothing says nothing.
+        assert_eq!(among("notes.txt", LISTING, length, &[]), object(Kind::Sfv));
+    }
+
+    // A listing named as one, or a recovery set, posted beside it: the
+    // nameless one is a leaf.
+    #[test]
+    fn a_named_listing_or_recovery_beside_it_leaves_a_nameless_listing_a_leaf() {
+        let length = Some(LISTING.len() as u64);
+        for beside in [
+            "episode.sfv",
+            "EPISODE.SFV\"",
+            "episode.par2",
+            "episode.vol00+01.par2",
+            "episode.par3",
+            "episode.p01",
+            "episode.rev",
+        ] {
+            assert_eq!(
+                among("5wXn1TLm", LISTING, length, &[beside]),
+                Sniff::Leaf,
+                "{beside}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_that_is_not_every_line_an_entry_is_a_leaf() {
+        for text in [
+            &b"episode.mkv\t1a2b3c4d\n"[..],
+            b"episode.mkv 1a2b3c4\n",
+            b"episode.mkv 1a2b3c4g\n",
+            b" 1a2b3c4d\n",
+            b"episode.mkv 1a2b3c4d\nnot an entry\n",
+            b"; only a comment\n\n",
+            b"episode.mkv 1a2b3c4d\x00\n",
+            b"episode.mkv 1a2b3c4d\x7f\n",
+        ] {
+            assert_eq!(
+                among("5wXn1TLm", text, Some(text.len() as u64), &[]),
+                Sniff::Leaf,
+                "{text:?}"
+            );
+        }
+    }
+
+    // `count` entries, a line each.
+    fn entries(count: usize) -> Vec<u8> {
+        (0..count)
+            .flat_map(|index| format!("episode.part{index:02}.rar 1a2b3c4d\n").into_bytes())
+            .collect()
+    }
+
+    // A listing is small, and its length known: past a mebibyte, or of a
+    // length not known, it is a leaf.
+    #[test]
+    fn a_listing_of_no_known_small_length_is_a_leaf() {
+        let text = entries(12);
+        assert!(text.len() > VERDICT_BYTES, "every signature ruled out");
+        assert_eq!(among("5wXn1TLm", &text, None, &[]), Sniff::Leaf);
+        assert_eq!(
+            among("5wXn1TLm", &text, Some(MAX_SFV_BYTES + 1), &[]),
+            Sniff::Leaf
+        );
+        assert_eq!(
+            among("5wXn1TLm", &text, Some(MAX_SFV_BYTES), &[]),
+            object(Kind::Sfv)
+        );
+    }
+
+    // A front that cuts a line off is read up to the last line it holds
+    // whole; ten entries are enough whatever text follows them.
+    #[test]
+    fn a_front_is_read_to_its_last_whole_line() {
+        let mut text = entries(10);
+        text.extend_from_slice(b"not an entry\nepisode.part10.r");
+        let length = Some(text.len() as u64 + 20);
+        assert_eq!(among("5wXn1TLm", &text, length, &[]), object(Kind::Sfv));
+        let mut cut = entries(3);
+        cut.extend_from_slice(b"episode.part03.rar 1a2b");
+        assert_eq!(
+            among("5wXn1TLm", &cut, Some(cut.len() as u64 + 4), &[]),
+            object(Kind::Sfv)
+        );
+        assert_eq!(
+            among("5wXn1TLm", b"episode.mkv 1a2b", Some(100), &[]),
+            Sniff::Leaf,
+            "no line whole yet"
+        );
+        let mut binary = entries(3);
+        binary.extend_from_slice(b"episode.\x01mkv 1a2b3c4d\n");
+        assert_eq!(
+            among("5wXn1TLm", &binary, Some(binary.len() as u64 + 8), &[]),
+            Sniff::Leaf,
+            "a binary byte in a whole line rules it out"
+        );
+    }
+
+    // A signature, or a name that founds a kind, outranks the lines.
+    #[test]
+    fn a_signature_or_a_founding_name_outranks_a_listing() {
+        let length = Some(LISTING.len() as u64);
+        assert_eq!(
+            among("episode.br", LISTING, length, &[]),
+            object(Kind::Brotli)
+        );
+        let mut xz = XZ.to_vec();
+        xz.extend_from_slice(LISTING);
+        assert_eq!(
+            among("5wXn1TLm", &xz, Some(xz.len() as u64), &[]),
+            object(Kind::Xz)
         );
     }
 

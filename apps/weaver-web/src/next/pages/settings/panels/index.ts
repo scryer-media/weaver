@@ -39,8 +39,8 @@ export interface PanelDefinition {
   group?: PanelGroup;
   /** Translation key of the panel's name. */
   label: string;
-  /** Translation key of the mono subtitle beside the panel's title in the top bar. */
-  note: string;
+  /** Translation key of the mono subtitle beside the panel's title in the top bar, when it carries something the name does not. */
+  note?: string;
   /** Right-hand rail tag; `"count:providers"` resolves to the server count. */
   tag?: "beta" | "count:providers";
   /** The rail icon, from `ICONS`. */
@@ -52,7 +52,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
   {
     slug: "general",
     label: "next.settings.panel.general",
-    note: "next.settings.panel.generalNote",
     icon: "general",
     Component: GeneralPanel,
   },
@@ -67,21 +66,18 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
   {
     slug: "security",
     label: "next.settings.panel.security",
-    note: "next.settings.panel.securityNote",
     icon: "security",
     Component: SecurityPanel,
   },
   {
     slug: "rss",
     label: "next.settings.panel.rss",
-    note: "next.settings.panel.rssNote",
     icon: "rss",
     Component: RssPanel,
   },
   {
     slug: "categories",
     label: "next.settings.panel.categories",
-    note: "next.settings.panel.categoriesNote",
     icon: "categories",
     Component: CategoriesPanel,
   },
@@ -96,7 +92,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     slug: "networking/overview",
     group: "networking",
     label: "settings.networkOverview",
-    note: "settings.networkingDesc",
     icon: "networkOverview",
     Component: NetworkingPanel,
   },
@@ -104,7 +99,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     slug: "networking/egress",
     group: "networking",
     label: "settings.networkEgress",
-    note: "settings.networkingDesc",
     icon: "egress",
     Component: NetworkingPanel,
   },
@@ -112,7 +106,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     slug: "networking/proxies",
     group: "networking",
     label: "settings.proxies",
-    note: "settings.networkingDesc",
     icon: "proxies",
     Component: NetworkingPanel,
   },
@@ -120,7 +113,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     slug: "networking/routes",
     group: "networking",
     label: "settings.networkRoutes",
-    note: "settings.networkingDesc",
     icon: "routes",
     Component: NetworkingPanel,
   },
@@ -128,14 +120,12 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     slug: "networking/speed",
     group: "networking",
     label: "next.networking.speed.title",
-    note: "settings.networkingDesc",
     icon: "speedTest",
     Component: NetworkingPanel,
   },
   {
     slug: "schedules",
     label: "next.settings.panel.schedules",
-    note: "next.settings.panel.schedulesNote",
     icon: "schedules",
     Component: SchedulesPanel,
   },
@@ -143,7 +133,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     slug: "scripts/configuration",
     group: "scripts",
     label: "next.settings.panel.scriptsConfiguration",
-    note: "next.settings.panel.scriptsNote",
     tag: "beta",
     icon: "scriptConfiguration",
     Component: ScriptConfigurationPanel,
@@ -152,7 +141,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     slug: "scripts/secrets",
     group: "scripts",
     label: "next.settings.panel.secrets",
-    note: "next.settings.panel.secretsNote",
     tag: "beta",
     icon: "secrets",
     Component: SecretsPanel,
@@ -161,7 +149,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     slug: "scripts/list",
     group: "scripts",
     label: "next.settings.panel.scriptJobs",
-    note: "next.settings.panel.scriptsNote",
     tag: "beta",
     icon: "scriptList",
     Component: ScriptListPanel,
@@ -170,7 +157,6 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
     slug: "scripts/runs",
     group: "scripts",
     label: "next.settings.panel.scriptRuns",
-    note: "next.settings.panel.scriptRunsNote",
     tag: "beta",
     icon: "scriptRuns",
     Component: ScriptRunsPanel,
@@ -178,14 +164,12 @@ export const SETTINGS_PANELS: readonly PanelDefinition[] = [
   {
     slug: "watch-folder",
     label: "next.settings.panel.watchFolder",
-    note: "next.settings.panel.watchFolderNote",
     icon: "watchFolder",
     Component: WatchFolderPanel,
   },
   {
     slug: "backup",
     label: "next.settings.panel.backup",
-    note: "next.settings.panel.backupNote",
     icon: "backup",
     Component: BackupPanel,
   },

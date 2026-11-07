@@ -714,7 +714,6 @@ export function ProxyEditor({
     {
       id: "enabled",
       label: t("next.proxies.enabled"),
-      help: t("next.proxies.enabledHelp"),
       control: { kind: "toggle", value: form.enabled, onChange: (next) => patch({ enabled: next }) },
     },
   ];
@@ -1052,7 +1051,7 @@ export function ProxyEditor({
       <RecordEditor
         open
         title={editingId === "new" ? t("next.proxies.add") : (editing?.name ?? t("next.proxies.proxy"))}
-        note={editingId === "new" ? t("next.proxies.newNote") : proxyLabels[form.kind]}
+        note={editingId === "new" ? undefined : proxyLabels[form.kind]}
         width={620}
         sections={sections}
         error={error}

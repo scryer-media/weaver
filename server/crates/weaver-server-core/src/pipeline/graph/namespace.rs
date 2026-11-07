@@ -162,6 +162,16 @@ struct Acknowledging {
     closed: BTreeSet<(NodeId, MemberId)>,
 }
 
+// An archive given up on as an archive: its members are delivered or
+// withheld as their bytes stand. Named by the first member given back.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GivenBack {
+    pub(crate) member: String,
+    // The kind of object that gave it back; empty when none held it.
+    pub(crate) container: String,
+    pub(crate) why: Why,
+}
+
 pub(crate) struct NamespaceWriter {
     // The job's process-wide id, which with a node id names a namespace to
     // the holds accountant that every job shares.
@@ -190,8 +200,9 @@ pub(crate) struct NamespaceWriter {
     // Members whose files wait to move to the names the ledger gave them,
     // in the order it gave them.
     moves: Vec<moves::Waiting>,
-    // The names files left, by the ledger's key, each with the checkpoint
-    // that records it left once one is taken.
+    // The names members left that the database may still give them, by the
+    // ledger's key, each with the checkpoint that records they left once
+    // one is taken.
     left: BTreeMap<String, Option<u64>>,
     // Every file that goes, each with the checkpoint that stops naming it
     // once one is taken. Until that checkpoint commits, the one the
@@ -210,12 +221,40 @@ pub(crate) struct NamespaceWriter {
     // first piece of a file once the whole return is down: a later slice of
     // the same return may still rewrite the front of a piece beside it.
     refused_in_batch: BTreeSet<(NodeId, MemberId)>,
+    // Archives given up on since the job last asked, for its events.
+    given_back: Vec<GivenBack>,
+    // The archives already given up on: the object that gave its members
+    // back (true), or the namespace whose members nothing held (false). One
+    // archive is one event however many volumes it had.
+    given_up: BTreeSet<(NodeId, bool)>,
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
+    // Each held volume's object, volume and placement number when a pass
+    // last asked where its holds go: while the object says the same number,
+    // it places them as it did then, and nothing of them goes down.
+    asked: BTreeMap<(NodeId, VolumeIndex), (NodeId, VolumeIndex, u64)>,
     // Where the time a member write takes on disk is published, when the
     // job runs in a pipeline.
     metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+}
+
+// A cipher's tail read back before the ranges that fed its keys are
+// uncovered: the node it is of, the read's serial, and its staged pieces
+// with each one's provenance.
+pub(crate) struct Tail {
+    node: NodeId,
+    serial: u64,
+    staged: loan::Repaired,
+    sources: Vec<Provenance>,
+}
+
+impl Tail {
+    // A tail not to be said: the step failed before it.
+    pub(crate) fn drop_read(self, tree: &mut Tree) {
+        tree.again_done();
+        let _ = self.staged.discard();
+    }
 }
 
 impl NamespaceWriter {
@@ -246,9 +285,12 @@ impl NamespaceWriter {
             effects: Vec::new(),
             acknowledging: None,
             refused_in_batch: BTreeSet::new(),
+            given_back: Vec::new(),
+            given_up: BTreeSet::new(),
             #[cfg(test)]
             diagnostics: Vec::new(),
             placements: Vec::new(),
+            asked: BTreeMap::new(),
             metrics: None,
         }
     }
@@ -269,15 +311,68 @@ impl NamespaceWriter {
         self
     }
 
+    // The members given back since this was last asked.
+    pub(crate) fn take_given_back(&mut self) -> Vec<GivenBack> {
+        std::mem::take(&mut self.given_back)
+    }
+
     // The breach of the job's extraction budget, once one stands.
     pub(crate) fn refusal(&self) -> Option<&ExtractionFailure> {
         self.caps.refusal()
+    }
+
+    // The job paused or resumed: its extraction deadline does not run
+    // while it is paused.
+    pub(crate) fn hold_clock(&mut self, paused: bool) {
+        self.caps.hold_clock(paused);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clock_held(&self) -> bool {
+        self.caps.clock_held()
     }
 
     // How many member reads every repair so far needed: the evidence fed as
     // bytes passed settles the rest without one.
     pub(crate) fn read_backs(&self) -> u64 {
         self.read_backs
+    }
+
+    // Completion takes over the filesystem only after all storage owners
+    // give up their handles, including consumed volumes and partial files.
+    // Coverage and names stay available for the terminal report.
+    pub(crate) fn release_handles(&mut self) {
+        self.envelopes.release_handles();
+        let nodes: Vec<_> = self.files.keys().copied().collect();
+        for node in nodes {
+            let files = self.files.get_mut(&node).expect("listed namespace");
+            if let Some(scratch) = &mut files.scratch {
+                scratch.release_handle();
+            }
+            let members: Vec<_> = files.leaves.keys().copied().collect();
+            for member in members {
+                files
+                    .leaves
+                    .get_mut(&member)
+                    .expect("listed member")
+                    .release_handle();
+            }
+        }
+        for (leaf, _) in &mut self.leaving {
+            leaf.release_handle();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_files(&self) -> Vec<PathBuf> {
+        self.files
+            .values()
+            .flat_map(|files| files.leaves.values().chain(files.scratch.iter()))
+            .chain(self.leaving.iter().map(|(leaf, _)| leaf))
+            .filter(|leaf| leaf.is_open())
+            .map(|leaf| leaf.path().to_path_buf())
+            .chain(self.envelopes.open_files())
+            .collect()
     }
 
     // Every member of the namespace with a file of its own, and its path.
@@ -413,7 +508,7 @@ impl NamespaceWriter {
         self.caps.admit_member(tree, node, member)?;
         if Leaf::is_directory(&output_name) {
             self.settle(tree, builder, segments, node, member, out)?;
-            Leaf::at(&self.working_dir, &output_name).create_directory()?;
+            self.leaf(tree, node, member)?.create_directory()?;
         } else if length == Some(0) {
             return self.shut(tree, builder, segments, node, member, out);
         }
@@ -677,9 +772,15 @@ impl NamespaceWriter {
             };
             self.caps.admit_name(new)?;
             self.intend(*node, *member, new);
-            // A name no file of the member sits at is free once the ledger
-            // moved the member off it.
+            // A name no file of the member sits at is free in the ledger
+            // once it moved the member off it. The database may still give
+            // it the member, as its name or the one its file waits for, so
+            // no file enters it until the checkpoint saying otherwise has
+            // committed.
             if !self.sits_at(*node, *member, old) {
+                if !Leaf::is_directory(old) {
+                    self.left.insert(weaver_graph::names::key(old), None);
+                }
                 tree.vacated(old, &mut freed);
             }
         }
@@ -801,7 +902,7 @@ impl NamespaceWriter {
                 .holds
                 .take(held_volume(arrival.member), arrival.range());
         }
-        let held: Vec<(u64, Bytes)> = placements
+        let held: Vec<(u64, Evidenced)> = placements
             .iter()
             .filter_map(|placement| match placement {
                 Placement::Held { range } => range.intersect(arrival.range()),
@@ -810,7 +911,6 @@ impl NamespaceWriter {
             .map(|piece| {
                 let bytes = arrival
                     .bytes
-                    .bytes()
                     .slice(index(piece.start - arrival.offset)..index(piece.end - arrival.offset));
                 (piece.start, bytes)
             })
@@ -845,7 +945,7 @@ impl NamespaceWriter {
         {
             return Ok(());
         }
-        let held = vec![(range.start, Bytes::from(bytes))];
+        let held = vec![(range.start, Bytes::from(bytes).into())];
         self.hold_for(tree, builder, child, (node, member), held, effects)
     }
 
@@ -859,7 +959,7 @@ impl NamespaceWriter {
         builder: &mut dyn Builder,
         child: NodeId,
         (node, member): (NodeId, MemberId),
-        held: Vec<(u64, Bytes)>,
+        held: Vec<(u64, Evidenced)>,
         effects: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let mut breached = Vec::new();
@@ -878,7 +978,7 @@ impl NamespaceWriter {
             effects,
         );
         for (offset, bytes) in breached {
-            self.write_file(tree, node, member, offset, &bytes.into())?;
+            self.write_file(tree, node, member, offset, &bytes)?;
         }
         Ok(())
     }
@@ -998,7 +1098,10 @@ impl NamespaceWriter {
             // Handed over as the member's, by `apply_each`.
             Effect::Folded { .. } => {}
             Effect::Refused { node, member, why } | Effect::NeedsEngine { node, member, why } => {
-                self.refuse(tree, *node, *member, *why);
+                // A member handed to an engine is read by it: the archive was
+                // not given up on.
+                let given_up = matches!(effect, Effect::Refused { .. });
+                self.refuse(tree, *node, *member, *why, given_up);
                 // The engine the refusal handed the member to took it over.
                 if matches!(effect, Effect::NeedsEngine { .. })
                     && let Some((engine, _)) = tree.child_of(*node, *member)
@@ -1115,23 +1218,140 @@ impl NamespaceWriter {
             // Every effect before it is applied, so what the object reads
             // back of its members is on disk. Each run's effects are
             // applied before the next run goes, as each delivery's are.
+            // What it reads back is staged on disk a piece at a time, and
+            // read from there a piece at a time as it is said again.
             Effect::Again { node, ranges } => {
-                let runs = tree.again_read(*node, ranges, &self.placing(builder));
-                for (volume, posted) in runs {
-                    let mut effects = Vec::new();
-                    tree.replay_piece(
-                        *node,
-                        volume,
-                        posted,
-                        &mut self.placing(builder),
-                        &mut effects,
-                    );
-                    self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
-                }
+                let mut staged = loan::Repaired::again(&self.working_dir, *node)?;
+                let mut sources = Vec::new();
+                let serial = tree.again_read(
+                    *node,
+                    ranges,
+                    &self.placing(builder),
+                    &mut |volume, posted| {
+                        staged.write(MemberId(volume.0), posted.offset, &posted.bytes);
+                        sources.push(posted.provenance);
+                    },
+                );
+                let replayed = match staged.failed() {
+                    Some(error) => Err(WriteError::from(error)),
+                    None => self.again_staged(
+                        tree,
+                        builder,
+                        segments,
+                        (serial, *node),
+                        &staged,
+                        sources,
+                        out,
+                    ),
+                };
+                tree.again_done();
+                let removed = staged.discard();
+                replayed?;
+                removed?;
             }
         }
         out.push(effect);
         Ok(())
+    }
+
+    // Each staged piece of an `Effect::Again`, said again in the order it
+    // was read, its effects applied before the next piece goes.
+    #[allow(clippy::too_many_arguments)]
+    fn again_staged(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (serial, node): (u64, NodeId),
+        staged: &loan::Repaired,
+        sources: Vec<Provenance>,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        // One slice per staged piece: no piece is longer than a slice.
+        const _: () = assert!(weaver_graph::AGAIN_PIECE <= READ_BACK);
+        for ((volume, offset, bytes), provenance) in staged.slices().zip(sources) {
+            let posted = Posted {
+                offset,
+                bytes: bytes?.into(),
+                provenance,
+            };
+            let mut effects = Vec::new();
+            tree.replay_again(
+                serial,
+                node,
+                VolumeIndex(volume.0),
+                posted,
+                &mut self.placing(builder),
+                &mut effects,
+            );
+            self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
+        }
+        Ok(())
+    }
+
+    // What uncovering ranges of a node's volume forgets past them, a
+    // cipher's tail made under keys they fed, read back while those keys
+    // still stand and staged on disk, to be said again by `say_tail` once
+    // the ranges are uncovered.
+    pub(crate) fn read_tail(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        node: NodeId,
+        ranges: &[(VolumeIndex, ByteRange)],
+    ) -> Result<Tail, WriteError> {
+        let mut staged = loan::Repaired::again(&self.working_dir, node)?;
+        let mut sources = Vec::new();
+        let serial = tree.again_tail(
+            node,
+            ranges,
+            &self.placing(builder),
+            &mut |volume, posted| {
+                staged.write(MemberId(volume.0), posted.offset, &posted.bytes);
+                sources.push(posted.provenance);
+            },
+        );
+        if let Some(error) = staged.failed() {
+            tree.again_done();
+            let _ = staged.discard();
+            return Err(error.into());
+        }
+        Ok(Tail {
+            node,
+            serial,
+            staged,
+            sources,
+        })
+    }
+
+    // A tail `read_tail` staged, said again in the order it was read.
+    pub(crate) fn say_tail(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        tail: Tail,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let Tail {
+            node,
+            serial,
+            staged,
+            sources,
+        } = tail;
+        let said = self.again_staged(
+            tree,
+            builder,
+            segments,
+            (serial, node),
+            &staged,
+            sources,
+            out,
+        );
+        tree.again_done();
+        let removed = staged.discard();
+        said?;
+        Ok(removed?)
     }
 
     // A member its object gave back is a leaf, and its file is what the
@@ -1291,13 +1511,13 @@ impl NamespaceWriter {
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let (node, member) = (arrival.node, arrival.member);
-        if self.keep_held(node, member, arrival.offset, arrival.bytes.bytes().clone())? {
+        if self.keep_held(node, member, arrival.offset, arrival.bytes.clone())? {
             if let Some(owner) = self.settle(tree, builder, segments, node, member, out)? {
                 let mut effects = Vec::new();
                 self.capture(tree, builder, owner, &arrival, &mut effects)?;
                 return self.apply_each(tree, builder, segments, effects, write, out);
             }
-            self.refuse(tree, node, member, Why::HoldsBreached);
+            self.refuse(tree, node, member, Why::HoldsBreached, true);
             self.write_file(tree, node, member, arrival.offset, &arrival.bytes)?;
             out.push(Effect::Refused {
                 node,
@@ -1316,7 +1536,7 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
         offset: u64,
-        bytes: Bytes,
+        bytes: Evidenced,
     ) -> Result<bool, WriteError> {
         let free_disk = self.free_disk_bytes();
         let outcome =
@@ -1362,7 +1582,7 @@ impl NamespaceWriter {
         member: MemberId,
     ) -> Result<(), WriteError> {
         for (offset, bytes) in self.take_held(node, member, ALL)? {
-            self.write_file(tree, node, member, offset, &bytes.into())?;
+            self.write_file(tree, node, member, offset, &bytes)?;
         }
         Ok(())
     }
@@ -1388,14 +1608,11 @@ impl NamespaceWriter {
         said: Option<&Coverage>,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        let held: Vec<ByteRange> = self
+        let held = self
             .files
             .get(&node)
-            .map(|files| files.holds.held_ranges(held_volume(member)))
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|hold| hold.intersect(range))
-            .collect();
+            .map(|files| files.holds.held_in(held_volume(member), range))
+            .unwrap_or_default();
         for hold in held {
             for piece in self.take_held(node, member, hold)? {
                 self.replay_piece(tree, builder, segments, (node, member), piece, said, out)?;
@@ -1412,7 +1629,7 @@ impl NamespaceWriter {
         builder: &mut dyn Builder,
         segments: &dyn Segments,
         (node, member): (NodeId, MemberId),
-        (offset, bytes): (u64, Bytes),
+        (offset, bytes): (u64, Evidenced),
         said: Option<&Coverage>,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
@@ -1437,10 +1654,10 @@ impl NamespaceWriter {
                 node,
                 member,
                 offset: piece.start,
-                bytes: bytes.slice(start..end).into(),
+                bytes: bytes.slice(start..end),
                 provenance,
             };
-            self.route_as_brought(tree, builder, segments, arrival, out)?;
+            self.route_held_as_brought(tree, builder, segments, arrival, out)?;
         }
         Ok(())
     }
@@ -1504,12 +1721,40 @@ impl NamespaceWriter {
                 let Some((child, volume)) = tree.child_of(parent, member) else {
                     continue;
                 };
-                let held = self
-                    .files
-                    .get(&parent)
-                    .map(|files| files.holds.held_ranges(held))
-                    .unwrap_or_default();
-                for range in held {
+                let ranges = |writer: &Self| {
+                    writer
+                        .files
+                        .get(&parent)
+                        .map(|files| files.holds.held_ranges(held))
+                        .unwrap_or_default()
+                };
+                // Asked already, of an object whose map has not moved since:
+                // every hold was held by that same map, at the last pass or
+                // as it came.
+                let placement = tree.placement(child);
+                let unmoved = placement.is_some()
+                    && self.asked.get(&(parent, held)).copied()
+                        == placement.map(|number| (child, volume, number));
+                if unmoved {
+                    #[cfg(test)]
+                    for range in &ranges(self) {
+                        placements.clear();
+                        tree.locate(child, volume, *range, &mut placements);
+                        assert!(
+                            placements
+                                .iter()
+                                .all(|placement| matches!(placement, Placement::Held { .. })),
+                            "a hold the unmoved map places: {range:?}"
+                        );
+                    }
+                    continue;
+                }
+                if let Some(number) = placement {
+                    self.asked.insert((parent, held), (child, volume, number));
+                }
+                for range in ranges(self) {
+                    #[cfg(test)]
+                    tests::RELEASE_LOCATED.with(|located| located.set(located.get() + 1));
                     placements.clear();
                     tree.locate(child, volume, range, &mut placements);
                     if placements
@@ -1532,7 +1777,7 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
         range: ByteRange,
-    ) -> Result<Vec<(u64, Bytes)>, WriteError> {
+    ) -> Result<Vec<(u64, Evidenced)>, WriteError> {
         let Some(files) = self.files.get_mut(&node) else {
             return Ok(Vec::new());
         };
@@ -1547,7 +1792,7 @@ impl NamespaceWriter {
                     Bytes::from(buffer)
                 }
             };
-            held.push((piece.range.start, bytes));
+            held.push((piece.range.start, Evidenced::with(bytes, piece.evidence)));
         }
         Ok(held)
     }
@@ -1570,7 +1815,7 @@ impl NamespaceWriter {
             .saturating_add(bytes.len() as u64)
             .max(record.length.unwrap_or(0));
         self.admit_file(tree, node, member, end)?;
-        let leaf = self.leaf(node, member, &record.output_name)?;
+        let leaf = self.leaf(tree, node, member)?;
         let started = std::time::Instant::now();
         // The leaf folds the digest the member's stated check needs, from
         // the evidence the bytes came with, hashing only bytes no level above
@@ -1587,8 +1832,13 @@ impl NamespaceWriter {
             None => leaf.write(offset, bytes, record.length)?,
         }
         let took = started.elapsed();
+        // Every byte to its length is in: the file takes that length, or
+        // reaches as far as bytes landed past a length its articles
+        // declared, as the tree closes the member. A post's `=ybegin size=`
+        // never cuts the parts after it.
         if let Some(length) = record.length.filter(|_| record.is_complete()) {
-            leaf.close(length)?;
+            let reached = record.coverage.runs().last().map_or(0, |run| run.range.end);
+            leaf.close(length.max(reached))?;
         }
         if let Some(metrics) = &self.metrics {
             metrics.disk_write_latency_us.store(
@@ -1623,9 +1873,8 @@ impl NamespaceWriter {
         if length > 0 && !written {
             return Ok(());
         }
-        let output_name = record.output_name.clone();
         self.admit_file(tree, node, member, length)?;
-        self.leaf(node, member, &output_name)?.close(length)?;
+        self.leaf(tree, node, member)?.close(length)?;
         Ok(())
     }
 
@@ -1785,22 +2034,41 @@ impl NamespaceWriter {
     }
 
     // The member is a leaf because something gave it back or never took
-    // it. Said once, when the reason is new.
-    fn refuse(&mut self, tree: &Tree, node: NodeId, member: MemberId, why: Why) {
-        if self.files_mut(node).refuse(member, why) == Some(why) {
-            return;
-        }
+    // it. Said once, when the reason is new. When `given_up`, the archive it
+    // belonged to is noted for the job's events, once per archive.
+    fn refuse(&mut self, tree: &Tree, node: NodeId, member: MemberId, why: Why, given_up: bool) {
+        // Said before: an engine handed the member gives it back for the
+        // reason it was handed over for.
+        let said = self.files_mut(node).refuse(member, why) == Some(why);
         // The object that gave the member back, if one had it.
-        let kind = tree
-            .refused_by(node, member)
+        let object = tree.refused_by(node, member);
+        let kind = object
             .and_then(|object| tree.kind(object))
             .map(|kind| kind.to_string())
             .unwrap_or_default();
+        let name = member_name(tree, node, member);
+        // Noted whether or not the reason is new: a member handed to an
+        // engine already holds the reason the engine gives it back for.
+        // Members nothing held are one archive per namespace.
+        let archive = match object {
+            Some(object) => (object, true),
+            None => (node, false),
+        };
+        if given_up && self.given_up.insert(archive) {
+            self.given_back.push(GivenBack {
+                member: name.clone(),
+                container: kind.clone(),
+                why,
+            });
+        }
+        if said {
+            return;
+        }
         tracing::info!(
             job_id = self.scope,
             node = node.0,
             kind = %kind,
-            member = %member_name(tree, node, member),
+            member = %name,
             why = %why_name(why),
             "object refused"
         );
@@ -1816,18 +2084,25 @@ impl NamespaceWriter {
             .get_or_insert_with(node, || Files::new(namespace, Arc::clone(accountant)))
     }
 
+    // The member's file, opened where `new_leaf` says when it has none.
     fn leaf(
         &mut self,
+        tree: &Tree,
         node: NodeId,
         member: MemberId,
-        output_name: &str,
     ) -> Result<&mut Leaf, WriteError> {
         let opened = self
             .files
             .get(&node)
             .is_some_and(|files| files.leaves.contains_key(&member));
         if !opened {
-            let leaf = self.new_leaf(node, member, output_name);
+            let output_name = tree
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .map(|record| record.output_name.clone())
+                .ok_or(WriteError::UnknownMember { node, member })?;
+            let held_off = tree.held_off(node, member);
+            let leaf = self.new_leaf((node, member), &output_name, held_off);
             self.files_mut(node).leaves.insert(member, leaf);
         }
         Ok(self
@@ -2255,6 +2530,8 @@ pub(crate) use verification::{Verification, Verified};
 pub(crate) use loan::replay::{Replay, Replayed};
 pub(crate) use loan::{Loan, Returned};
 pub(crate) use moves::restored_at;
+#[cfg(test)]
+pub(crate) use moves::{TALLY, Tally};
 pub(crate) use recovery::{Coming, Lender, SetState};
 #[cfg(test)]
 mod tests;

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::collections::BTreeSet;
+
 use super::*;
 use crate::testing::payload;
 
@@ -122,6 +124,148 @@ fn bytes_in_any_order_decipher_once_their_seed_is_in() {
     // What is left: the final block, which seals the padding, and each block
     // an arrival started inside.
     assert_eq!(stream.kept(), kept.len());
+}
+
+// Frames of a stream cut where article boundaries fall, off the block grid.
+fn frames(len: usize, frame: usize) -> Vec<ByteRange> {
+    (0..len)
+        .step_by(frame)
+        .map(|start| ByteRange::new(start as u64, (start + frame).min(len) as u64))
+        .collect()
+}
+
+// Frames arriving last first: each frame's blocks decipher from its own
+// first whole block in one call, and the block after it, which waited for
+// it, in one more. What waits is a frame's edge, never its body.
+#[test]
+fn frames_arriving_backwards_decipher_in_two_calls_each_and_stage_only_edges() {
+    let (plain, cipher) = posted(64 * 1024 + 5);
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    for range in frames(cipher.len(), 4099).into_iter().rev() {
+        let bytes = &cipher[range.start as usize..range.end as usize];
+        let came = out.deliver(&mut stream, range.start, bytes, Provenance::Fresh);
+        assert!(
+            !came.is_empty() && came.len() <= 2,
+            "{range}: {}",
+            came.len()
+        );
+        assert!(stream.staged_runs() <= 1, "{range}");
+    }
+    assert_eq!(out.bytes, plain);
+    assert_eq!(stream.staged_runs(), 0);
+}
+
+// Kept, the staged blocks are the map of each block by its offset, as they
+// always were, whatever runs hold them, and they come back as they went.
+#[test]
+fn staged_blocks_are_kept_as_a_map_by_offset() {
+    let (plain, cipher) = posted(200);
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    out.deliver(&mut stream, 5, &cipher[5..100], Provenance::Fresh);
+    out.deliver(&mut stream, 120, &cipher[120..], Provenance::Fresh);
+    let staged = &stream.chain.staged;
+    let map: BTreeMap<u64, Block> = staged.iter().map(|(at, block)| (at, *block)).collect();
+    assert_eq!(
+        map.keys().copied().collect::<Vec<_>>(),
+        vec![0, 16, 96, 112, 128]
+    );
+    let kept = rmp_serde::to_vec(staged).unwrap();
+    assert_eq!(kept, rmp_serde::to_vec(&map).unwrap());
+    let back: Staged = rmp_serde::from_slice(&kept).unwrap();
+    assert!(back.iter().eq(staged.iter()));
+}
+
+// In order, each arrival deciphers in one call, and what is kept is a seed
+// per arrival and per stride, never one per block.
+#[test]
+fn arrivals_in_order_decipher_in_one_call_each_and_keep_only_seeds() {
+    let (plain, cipher) = two_strides();
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    let strides = cipher.len() / STRIDE as usize;
+    for (index, range) in frames(cipher.len(), 768_013).into_iter().enumerate() {
+        let bytes = &cipher[range.start as usize..range.end as usize];
+        let came = out.deliver(&mut stream, range.start, bytes, Provenance::Fresh);
+        assert_eq!(came.len(), 1, "{range}");
+        assert!(
+            stream.kept() <= index + strides + 2,
+            "{range}: {}",
+            stream.kept()
+        );
+        assert!(stream.staged_runs() <= 1, "{range}");
+    }
+    assert_eq!(out.bytes, plain);
+}
+
+// The cipher blocks staged and the decipher calls made since the last look.
+fn counted() -> (usize, usize) {
+    COUNTED.with(|counted| counted.replace((0, 0)))
+}
+
+// An article in order, on the block grid or off it, stages at most its two
+// edge blocks and deciphers in one call: its body goes to the cipher from
+// the bytes it came in.
+#[test]
+fn an_article_in_order_stages_only_its_edges_and_deciphers_once() {
+    let (plain, cipher) = two_strides();
+    for frame in [768_000, 768_013] {
+        let mut stream = cbc(&plain, &cipher);
+        let mut out = Out::default();
+        counted();
+        for range in frames(cipher.len(), frame) {
+            let bytes = &cipher[range.start as usize..range.end as usize];
+            out.deliver(&mut stream, range.start, bytes, Provenance::Fresh);
+            let (staged, deciphered) = counted();
+            assert!(staged <= 2, "{frame} {range}: {staged} staged");
+            assert_eq!(deciphered, 1, "{frame} {range}");
+        }
+        assert_eq!(out.bytes, plain);
+    }
+}
+
+// A repair read back over what came out, a slice at a time, is written as
+// it is given: each slice deciphers in one call and stages at most its edge
+// blocks. A block an article was cut inside keeps its cut through it, so a
+// span un-said from there still comes out again whole.
+#[test]
+fn a_repair_over_what_came_out_deciphers_once_and_keeps_its_cuts() {
+    let (plain, cipher) = two_strides();
+    let mut stream = cbc(&plain, &cipher);
+    let mut out = Out::default();
+    for range in frames(cipher.len(), 768_013) {
+        let bytes = &cipher[range.start as usize..range.end as usize];
+        out.deliver(&mut stream, range.start, bytes, Provenance::Fresh);
+    }
+    counted();
+    for range in frames(cipher.len(), 1 << 20) {
+        let bytes = &cipher[range.start as usize..range.end as usize];
+        out.deliver(&mut stream, range.start, bytes, Provenance::Repaired);
+        let (staged, deciphered) = counted();
+        assert!(staged <= 2, "{range}: {staged} staged");
+        assert_eq!(deciphered, 1, "{range}");
+    }
+    let (plain_len, cipher_len) = (plain.len() as u64, cipher.len() as u64);
+    assert_eq!(out.bytes, plain);
+    assert_eq!(
+        out.coverage.placed(ByteRange::new(0, plain_len)),
+        Some(Provenance::Repaired)
+    );
+    let seam = 768_013;
+    let from = block_floor(seam);
+    out.coverage.erase(ByteRange::new(from, plain_len));
+    out.padding
+        .forget(plain_len, ByteRange::new(from, cipher_len));
+    let said = out.deliver(
+        &mut stream,
+        seam,
+        &cipher[seam as usize..],
+        Provenance::Repaired,
+    );
+    assert_eq!(said.first().map(|plain| plain.offset), Some(from));
+    assert!(out.coverage.verified(ByteRange::new(0, plain_len)));
+    assert_eq!(out.bytes, plain);
 }
 
 // A span un-said from inside a block, as its owner un-says it: from the
@@ -381,4 +525,69 @@ fn a_stream_of_partial_blocks_is_refused() {
         Cbc::new(&KEY, IV, 16, 17),
         Err(CryptError::Overlong { .. })
     ));
+}
+
+// A member's record of thousands of runs with gaps between them: what the
+// cipher asks of it, block by block, answers as a map of every byte does,
+// for blocks before the first run, in a gap, in a run, across a boundary
+// and past the last run.
+#[test]
+fn placed_agrees_with_a_byte_map_over_thousands_of_runs() {
+    let mut seed = 0x2545_f491_4f6c_dd1du64;
+    let mut next = |bound: u64| {
+        seed = seed
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        (seed >> 33) % bound
+    };
+    let kinds = [
+        Provenance::Fresh,
+        Provenance::Repaired,
+        Provenance::Damaged,
+        Provenance::Refuted,
+        Provenance::Lost,
+    ];
+    let mut coverage = Coverage::new();
+    let mut bytes: Vec<Option<Provenance>> = Vec::new();
+    let mut at = 5;
+    for _ in 0..4000 {
+        at += next(4);
+        let range = ByteRange::at(at, 1 + next(40));
+        let provenance = kinds[next(kinds.len() as u64) as usize];
+        bytes.resize(range.end as usize, None);
+        bytes[range.start as usize..range.end as usize].fill(Some(provenance));
+        coverage.write(range, provenance);
+        at = range.end;
+    }
+    assert!(
+        coverage.runs().count() > 2000,
+        "{}",
+        coverage.runs().count()
+    );
+    let byte = |offset: u64| bytes.get(offset as usize).copied().flatten();
+    let mut starts: Vec<u64> = (0..at + 3 * BLOCK).step_by(BLOCK as usize).collect();
+    starts.extend((0..at + 40).step_by(11));
+    for run in coverage.runs() {
+        for edge in [run.range.start, run.range.end] {
+            starts.extend([edge.saturating_sub(1), edge, edge + 1]);
+        }
+    }
+    for start in starts {
+        for len in [1, 2, BLOCK, 3 * BLOCK, 50] {
+            let range = ByteRange::at(start, len);
+            let all: Vec<Option<Provenance>> = (range.start..range.end).map(byte).collect();
+            let placed = all
+                .iter()
+                .copied()
+                .collect::<Option<Vec<Provenance>>>()
+                .map(|all| all.into_iter().fold(Provenance::Fresh, worse));
+            let first = (range.start..range.end).find(|offset| byte(*offset).is_some());
+            assert_eq!(coverage.placed(range), placed, "placed {range:?}");
+            assert_eq!(
+                coverage.first_placed(range),
+                first,
+                "first_placed {range:?}"
+            );
+        }
+    }
 }

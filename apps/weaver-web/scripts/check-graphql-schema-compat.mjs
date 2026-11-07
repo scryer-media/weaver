@@ -43,8 +43,8 @@ export function formatSchemaCompatibilityChanges(changes) {
   return sections.join("\n\n");
 }
 
-export function hasSchemaCompatibilityFailure(changes) {
-  return changes.breaking.length > 0 || changes.dangerous.length > 0;
+export function hasSchemaCompatibilityFailure(changes, { allowDangerous = false } = {}) {
+  return changes.breaking.length > 0 || (!allowDangerous && changes.dangerous.length > 0);
 }
 
 function formatChangeSection(title, changes) {
@@ -55,10 +55,11 @@ function formatChangeSection(title, changes) {
 }
 
 async function main(args) {
-  const [oldSchemaPath, newSchemaPath] = args;
-  if (!oldSchemaPath || !newSchemaPath || args.length !== 2) {
+  const [oldSchemaPath, newSchemaPath, ...options] = args;
+  const allowDangerous = options.length === 1 && options[0] === "--allow-dangerous";
+  if (!oldSchemaPath || !newSchemaPath || (options.length !== 0 && !allowDangerous)) {
     console.error(
-      "usage: node scripts/check-graphql-schema-compat.mjs OLD_SCHEMA NEW_SCHEMA",
+      "usage: node scripts/check-graphql-schema-compat.mjs OLD_SCHEMA NEW_SCHEMA [--allow-dangerous]",
     );
     return 2;
   }
@@ -68,12 +69,17 @@ async function main(args) {
     readFile(newSchemaPath, "utf8"),
   ]);
   const changes = findSchemaCompatibilityChanges(oldSdl, newSdl);
-  if (hasSchemaCompatibilityFailure(changes)) {
+  if (hasSchemaCompatibilityFailure(changes, { allowDangerous })) {
     console.error("GraphQL API compatibility check failed.");
     console.error(`Old schema: ${oldSchemaPath}`);
     console.error(`New schema: ${newSchemaPath}`);
     console.error(formatSchemaCompatibilityChanges(changes));
     return 1;
+  }
+
+  if (allowDangerous && changes.dangerous.length > 0) {
+    console.warn("GraphQL dangerous changes explicitly permitted by --allow-dangerous:");
+    console.warn(formatChangeSection("Dangerous changes", changes.dangerous));
   }
 
   console.log(

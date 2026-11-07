@@ -101,13 +101,15 @@ export function useSpeedLimitDialog() {
 }
 
 /**
- * The limit actually in force: a schedule's limit while one holds, otherwise
- * the configured limit. Null is unlimited; zero lets nothing through.
+ * The limit the daemon holds the wire to now: the tighter of the configured
+ * limit and a schedule's. Null is unlimited; zero lets nothing through.
  */
 export function useSpeedLimitInForce() {
-  const { speedLimit, downloadBlock } = useNextData("speedLimit", "downloadBlock");
-  const scheduled = downloadBlock.scheduledSpeedLimit;
-  return { inForce: scheduled ?? speedLimit, bySchedule: scheduled !== null };
+  const { downloadBlock } = useNextData("downloadBlock");
+  return {
+    inForce: downloadBlock.speedLimitInForce,
+    bySchedule: downloadBlock.speedLimitBySchedule,
+  };
 }
 
 /** The queue header's button: the limit in force, opening the dialog. */
@@ -119,6 +121,8 @@ export function SpeedLimitControl() {
     <>
       <SecondaryButton
         icon="bandwidth"
+        // A limit in force reads as a warning: yellow outline, not a fill.
+        className={inForce !== null ? "border-wv-warn text-wv-warn hover:border-wv-warn-hover" : undefined}
         title={bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle")}
         onClick={openDialog}
       >

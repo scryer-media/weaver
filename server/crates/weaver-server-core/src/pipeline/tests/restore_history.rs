@@ -367,7 +367,7 @@ async fn delete_history_batch_keeps_complete_output_dir() {
     assert!(
         pipeline
             .db
-            .list_job_history(&crate::HistoryFilter::default())
+            .list_job_history(&crate::HistoryFilter::default(), crate::HistoryRows::All)
             .unwrap()
             .is_empty()
     );
@@ -611,7 +611,7 @@ async fn job_failed_event_publishes_after_history_archive_commits() {
     );
     let listed = pipeline
         .db
-        .list_job_history(&crate::HistoryFilter::default())
+        .list_job_history(&crate::HistoryFilter::default(), crate::HistoryRows::All)
         .unwrap();
     assert!(listed.iter().any(|row| row.job_id == job_id.0));
 }
@@ -993,7 +993,7 @@ async fn job_completed_event_publishes_after_history_archive_commits() {
     );
     let listed = pipeline
         .db
-        .list_job_history(&crate::HistoryFilter::default())
+        .list_job_history(&crate::HistoryFilter::default(), crate::HistoryRows::All)
         .unwrap();
     assert!(listed.iter().any(|row| row.job_id == job_id.0));
 }

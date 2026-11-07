@@ -52,9 +52,9 @@ func liftPrimaryHold() error {
 }
 
 // pollFor reads `check` until it holds. Every wait in these cases ends on the
-// state it reads; the case timeout only ends a wait that never resolves.
+// state it reads, never on elapsed time; the enclosing runner bounds a wait
+// that never resolves.
 func (ctx *restartCaseContext) pollFor(what string, check func() (bool, error)) error {
-	deadline := time.Now().Add(ctx.Timeout)
 	for {
 		done, err := check()
 		if err != nil {
@@ -63,11 +63,29 @@ func (ctx *restartCaseContext) pollFor(what string, check func() (bool, error)) 
 		if done {
 			return nil
 		}
-		if !time.Now().Before(deadline) {
-			return fmt.Errorf("never saw %s", what)
-		}
 		time.Sleep(chaosPollInterval)
 	}
+}
+
+// pollJob is pollFor for a wait on one job's state short of its end: it
+// also ends, failing with the state the job ended in, when the job ends
+// first, as the state it waits for can no longer come.
+func (ctx *restartCaseContext) pollJob(what, dbPath string, jobID int, check func() (bool, error)) error {
+	return ctx.pollFor(what, func() (bool, error) {
+		done, err := check()
+		if err == nil && !done {
+			err = endedFirst(dbPath, jobID)
+		}
+		return done, err
+	})
+}
+
+func endedFirst(dbPath string, jobID int) error {
+	status, ok := restartJobStatusFromDB(dbPath, jobID)
+	if status = normalizeDBStatus(status); ok && (dbStatusTerminal(status) || status == "cancelled") {
+		return fmt.Errorf("job %d ended %s first", jobID, status)
+	}
+	return nil
 }
 
 // graphQLMutate posts one operation and fails on a transport error or any

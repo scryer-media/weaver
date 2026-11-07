@@ -191,6 +191,16 @@ impl JobSpec {
         })
     }
 
+    // The declared bytes a run starts out to bring: every file but the
+    // recovery volumes, which a run parks unless a loss asks for them.
+    pub fn wanted_bytes(&self) -> u64 {
+        self.files
+            .iter()
+            .filter(|file| !file.role.is_recovery())
+            .map(|file| FileSummary::of(file).bytes)
+            .sum()
+    }
+
     // Whether a file's article list was let go: a restart keeps only the
     // files of a job it restores, and a job that runs reads them back on
     // install.
@@ -830,6 +840,9 @@ pub struct JobState {
     pub paused_resume_post_state: Option<PostState>,
     // Last terminal error associated with this job.
     pub failure_error: Option<String>,
+    // What the graph ruled of a delivery restored after its final move
+    // began, read back from the job's row; the graph itself is not restored.
+    pub delivered: Option<crate::post_processing::model::DeliveredVerdict>,
     // Per-job working directory (subdirectory under intermediate_dir).
     // All download/decode/verify/repair/extract I/O happens here.
     pub working_dir: PathBuf,
@@ -1075,6 +1088,25 @@ impl JobState {
             .map(|index| self.file_summary(index).bytes)
             .sum();
         (recovery, 0)
+    }
+
+    // The bytes still to come and the bytes wanted of a job no graph root
+    // speaks for, as the post declares them: every file but the recovery
+    // volumes, which a run parks unless a loss asks for them, each counting
+    // its articles not yet in hand at their share of its bytes.
+    pub fn unstarted_remaining(&self) -> (u64, u64) {
+        (0..self.spec.files.len())
+            .filter(|index| !self.spec.files[*index].role.is_recovery())
+            .map(|index| self.file_summary(index))
+            .fold((0u64, 0u64), |(remaining, wanted), file| {
+                let left = if file.articles == 0 {
+                    0
+                } else {
+                    (u128::from(file.bytes) * u128::from(file.remaining.min(file.articles))
+                        / u128::from(file.articles)) as u64
+                };
+                (remaining + left, wanted + file.bytes)
+            })
     }
 
     pub fn total_file_count(&self) -> usize {

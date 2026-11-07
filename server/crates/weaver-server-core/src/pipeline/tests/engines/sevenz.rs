@@ -457,8 +457,10 @@ async fn a_damaged_lzma2_7z_under_par2_is_repaired_in_the_stream_and_decoded() {
         "{:?}",
         kinds(&graph)
     );
-    // An 11-slice archive (661 bytes): the count follows its size.
-    assert_eq!(graph.reads, 20, "the slices the repair read back");
+    // An 11-slice archive (661 bytes): the count follows its size. The
+    // damaged article vouched for nothing, so only the rebuild reads the ten
+    // good slices, once.
+    assert_eq!(graph.reads, 10, "the slices the repair read back");
 }
 
 // How many candidates each node was offered.

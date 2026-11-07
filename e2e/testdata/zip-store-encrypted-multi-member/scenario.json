@@ -1,0 +1,26 @@
+{
+  "slug": "zip-store-encrypted-multi-member",
+  "title": "zip-store-encrypted-multi-member.2026.TEST",
+  "description": "Two incompressible multi-article members and one empty member, all encrypted and stored; every output is pinned independently.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password",
+  "segment_size": 768000,
+  "expectedOutputBLAKE3": {
+    "empty.bin": "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262",
+    "extras/bonus.mkv": "ea4db232ef2548d6c6906d8cf0c97f34358d8c83f51e026064f305c7ff43f904",
+    "feature.mkv": "8d3de71a518f9bfb6a290d350c2cf1b3cab0a56ad2249d60216ab0ee1b95c2a3"
+  },
+  "exactOutputFiles": true,
+  "runtimeAssertions": {
+    "archiveModes": [
+      {
+        "archive": "archive.zip",
+        "requireKind": "zip",
+        "forbidKinds": [
+          "zip_engine"
+        ]
+      }
+    ]
+  }
+}

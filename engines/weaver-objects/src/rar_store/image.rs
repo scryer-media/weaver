@@ -8,6 +8,7 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use bytes::Bytes;
+use weaver_graph::Provenance;
 
 use crate::kept::Kept;
 
@@ -16,15 +17,28 @@ pub(super) struct SparseImage {
     position: u64,
 }
 
+// Whether the walk may read a run: one that arrived damaged once the volume
+// is closed, one that arrived clean at once, and a loss never, since no
+// bytes of the volume are there, whatever a copy since sent back left.
+pub(super) fn readable(provenance: Provenance, closed: bool) -> bool {
+    provenance.arrived() && (closed || !provenance.is_damaged())
+}
+
 impl SparseImage {
-    // The runs a walk may trust: every one once the volume is closed, and
-    // until then none that arrived damaged.
+    // The runs a walk may trust, as `readable` says.
     pub(super) fn of(kept: &Kept, closed: bool) -> Self {
+        Self::past(kept, closed, 0)
+    }
+
+    // The runs a walk may trust that end past `from`: a walk reading on
+    // from there reads nothing before it.
+    pub(super) fn past(kept: &Kept, closed: bool, from: u64) -> Self {
         Self {
             runs: kept
-                .runs()
-                .into_iter()
-                .filter(|(_, _, provenance)| closed || !provenance.is_damaged())
+                .runs_from(from)
+                .filter(|(range, _, provenance)| {
+                    (from == 0 || range.end > from) && readable(*provenance, closed)
+                })
                 .map(|(range, bytes, _)| (range.start, Bytes::copy_from_slice(bytes)))
                 .collect(),
             position: 0,

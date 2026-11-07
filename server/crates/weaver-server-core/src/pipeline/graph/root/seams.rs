@@ -122,7 +122,14 @@ impl Pipeline {
                 if counts { bytes } else { 0 },
             );
         }
+        // A job restored mid-phase takes up that phase's stage clock again.
+        let reported = graph.reported_phase();
+        self.released_remaining.remove(&job_id);
         self.graph_jobs.insert(job_id, graph);
+        if let Some(phase) = reported {
+            self.time_graph_stage(job_id, phase);
+        }
+        self.hold_extraction_clock(job_id);
         self.adopt_held_parts(held_parts);
         let result = self.start_graph_runs(job_id);
         self.after_graph_result(job_id, result);
@@ -172,6 +179,7 @@ impl Pipeline {
         let result = graph.intake(decoded, &mut self.graph_status.repairs, limit);
         // A copy the root dropped committed nothing.
         if let Ok(true) = result {
+            graph.pending().delivered(committed);
             self.metrics
                 .bytes_committed
                 .fetch_add(committed, std::sync::atomic::Ordering::Relaxed);
@@ -200,11 +208,14 @@ impl Pipeline {
     // An article of a graph job the decoder withdrew, its placement refuted
     // by its neighbours, is sent back to the root for another copy.
     pub(in crate::pipeline) fn graph_article_sent_back(&mut self, segment_id: SegmentId) {
-        if let Some(graph) = self.graph_jobs.get_mut(&segment_id.file_id.job_id) {
-            graph.send_back(
+        let job_id = segment_id.file_id.job_id;
+        if let Some(graph) = self.graph_jobs.get_mut(&job_id)
+            && let Err(error) = graph.send_back(
                 VolumeIndex(segment_id.file_id.file_index),
                 segment_id.segment_number,
-            );
+            )
+        {
+            self.after_graph_result(job_id, Err(error));
         }
     }
 
@@ -321,6 +332,10 @@ impl Pipeline {
                 || self.retiring_graph_jobs.contains_key(&job_id))
         {
             self.pause_graph_checkpoint(job_id, control, *revision, error);
+            return;
+        }
+        if let Heard::CheckpointDue { control } = &said.heard {
+            self.graph_checkpoint_due(job_id, control);
             return;
         }
         if let Some(graph) = self.retiring_graph_jobs.get_mut(&job_id) {
@@ -484,7 +499,7 @@ impl Pipeline {
         self.wake_repair_waiters();
         self.after_graph_step(job_id);
         // The step's bytes are written: the checkpoint can say so.
-        self.checkpoint_graph_job(job_id);
+        self.step_graph_checkpoint(job_id);
     }
 
     // Lend the job's due repairs under the repair slots every graph job

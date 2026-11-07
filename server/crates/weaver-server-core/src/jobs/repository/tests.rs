@@ -251,28 +251,36 @@ fn archive_job_moves_to_history() {
     assert!(jobs.is_empty());
 
     // History should have the entry.
-    let hist = db.list_job_history(&HistoryFilter::default()).unwrap();
+    let hist = db
+        .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
+        .unwrap();
     assert_eq!(hist.len(), 1);
     assert_eq!(hist[0].name, "test.nzb");
     assert_eq!(hist[0].output_dir, history.output_dir);
     assert!(hist[0].metadata.as_ref().unwrap().contains("script-value"));
     assert!(db.job_script_effects(1).unwrap().marked_bad);
     assert_eq!(
-        db.count_job_history(&HistoryFilter {
-            metadata_equals: Some(HistoryMetadataEquals {
-                key: "archive_key".to_string(),
-                value: "archive-value".to_string(),
-            }),
-            ..Default::default()
-        })
+        db.count_job_history(
+            &HistoryFilter {
+                metadata_equals: Some(HistoryMetadataEquals {
+                    key: "archive_key".to_string(),
+                    value: "archive-value".to_string(),
+                }),
+                ..Default::default()
+            },
+            crate::HistoryRows::All
+        )
         .unwrap(),
         1
     );
     assert_eq!(
-        db.count_job_history(&HistoryFilter {
-            metadata_has_key: Some(crate::history::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string()),
-            ..Default::default()
-        })
+        db.count_job_history(
+            &HistoryFilter {
+                metadata_has_key: Some(crate::history::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string()),
+                ..Default::default()
+            },
+            crate::HistoryRows::All
+        )
         .unwrap(),
         0
     );

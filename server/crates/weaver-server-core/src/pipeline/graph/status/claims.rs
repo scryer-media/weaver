@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use weaver_graph::{Member, MemberId, NodeId, Sniff, Tree, Why, known_type};
 
 use crate::jobs::model::JobStatus;
+use crate::pipeline::graph::leaf::Leaf;
 use crate::post_processing::model::PipelineFailureStage;
 
 use super::Failure;
@@ -363,7 +364,12 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
     // that withholds it, it is withheld; a volume of an object that refused
     // it is delivered as it stands, unless the object disclaimed it
     // (`Why::disclaims`); and otherwise it is whole when its bytes are.
+    // A directory is no file of the delivery: it holds files, and is
+    // neither whole nor short of its own.
     fn leaf(&mut self, node: NodeId, member: &Member, short: bool) {
+        if Leaf::is_directory(&member.output_name) {
+            return;
+        }
         let claim = Claim::of(member);
         let name = member.output_name.clone();
         if claim != Claim::Complete && (short || (self.unrepaired)(node, member.id)) {
@@ -433,11 +439,12 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
     // A leaf whose name and front say an object of some kind reads it: a
     // container that no object opened, so no file of the delivery.
     fn unopened(&self, node: NodeId, member: &Member) -> bool {
-        let front = self
-            .tree
-            .namespace(node)
-            .map_or(&[][..], |namespace| namespace.first_bytes(member.id));
-        matches!(member.said(front), Sniff::Object(_))
+        self.tree.namespace(node).is_some_and(|namespace| {
+            matches!(
+                member.said(namespace.first_bytes(member.id), namespace),
+                Sniff::Object(_)
+            )
+        })
     }
 
     // Some volume of `node` is short and a failed repair covers it.

@@ -104,6 +104,7 @@ interface LiveMetricsSnapshot {
     isPaused: boolean;
     torrentsPaused?: boolean;
     speedLimitBytesPerSec: number | null;
+    resumeAtEpochMs?: number | null;
     downloadBlock: DownloadBlockState;
   };
   providerHoldoffs?: ProviderHoldoff[];
@@ -129,6 +130,8 @@ export interface NextData {
   isPaused: boolean;
   /** Whether every torrent is held paused. */
   torrentsPaused: boolean;
+  /** When a timed pause resumes on its own, in epoch milliseconds; null when none is set. */
+  resumeAt: number | null;
   /** The configured download limit in bytes per second; null is no limit, and 0 lets nothing through. */
   speedLimit: number | null;
   downloadBlock: DownloadBlockState;
@@ -169,6 +172,8 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
   windowEndsAtEpochMs: null,
   timezoneName: "",
   scheduledSpeedLimit: null,
+  speedLimitInForce: null,
+  speedLimitBySchedule: false,
 };
 
 const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
@@ -377,6 +382,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const downloadBlock = useSettled(globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK, shallowEqual);
   const isPaused = globalState?.isPaused ?? false;
   const torrentsPaused = globalState?.torrentsPaused ?? false;
+  const resumeAt = globalState?.resumeAtEpochMs ?? null;
   const speedLimit = globalState?.speedLimitBytesPerSec ?? null;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
   const refreshCategories = useCallback(
@@ -424,6 +430,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       peakSpeed,
       isPaused,
       torrentsPaused,
+      resumeAt,
       speedLimit,
       downloadBlock,
       queue,
@@ -448,6 +455,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       providersLoaded,
       queue,
       refreshCategories,
+      resumeAt,
       refreshHistoryCount,
       speed,
       speedLimit,

@@ -124,6 +124,10 @@ impl Pipeline {
         let admission_db = db.clone();
         let nzb_pause_releases =
             tokio::task::spawn_blocking(move || admission_db.load_nzb_pause_releases()).await??;
+        let positions_db = db.clone();
+        let queue_positions =
+            tokio::task::spawn_blocking(move || positions_db.load_active_job_queue_positions())
+                .await??;
         let download_stall_recovery = download::download_stall_recovery_from_env_value(
             std::env::var(download::DOWNLOAD_STALL_RECOVERY_ENV).ok(),
         );
@@ -195,6 +199,7 @@ impl Pipeline {
         let (move_done_tx, move_done_rx) = mpsc::channel(32);
         let (failed_release_tx, failed_release_rx) = mpsc::channel(32);
         let (job_activated_tx, job_activated_rx) = mpsc::channel(32);
+        let (db_reply_tx, db_reply_rx) = mpsc::unbounded_channel();
         let (terminal_post_processing_done_tx, terminal_post_processing_done_rx) =
             mpsc::channel(32);
         let script_effects_rx = db.subscribe_script_effects();
@@ -267,16 +272,25 @@ impl Pipeline {
             nzb_seen: HashSet::new(),
             nzb_pause_releases,
             nzb_reprocess_pending: HashSet::new(),
+            nzb_admitting: HashSet::new(),
+            nzb_releasing: HashSet::new(),
+            installing: HashSet::new(),
             queue_walk_mark: None,
             queue_walk_due: false,
             restores_waiting: false,
             restore_pass: None,
+            window_parked: HashMap::new(),
+            window_parked_articles: 0,
+            window_stored: HashMap::new(),
+            window_due: HashSet::new(),
+            window_unreadable: HashSet::new(),
             dispatch_hold_watch: Vec::new(),
-            queue_positions: None,
+            queue_positions: Some(queue_positions),
             queue_positions_lost: Arc::default(),
             semantic_terminal_causes: HashMap::new(),
             pipeline_failure_stages: HashMap::new(),
             job_order: Vec::new(),
+            stored_queue_order: Vec::new(),
             active_downloads: 0,
             active_download_connections: 0,
             active_completion_critical_connections: 0,
@@ -328,6 +342,8 @@ impl Pipeline {
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
             blocked_restores: HashMap::new(),
+            crash_marks: Default::default(),
+            moves_to_resume: Vec::new(),
             download_done_tx,
             download_done_rx,
             download_refill_tx,
@@ -349,6 +365,8 @@ impl Pipeline {
             nntp_handoff_drained_rx,
             job_activated_tx,
             job_activated_rx,
+            db_reply_tx,
+            db_reply_rx,
             move_done_tx,
             move_done_rx,
             failed_release_tx,
@@ -389,6 +407,7 @@ impl Pipeline {
             reconcile_signatures: HashMap::new(),
             download_restart_durable_lead_retry_after: HashMap::new(),
             checkpoint_progress_articles: HashMap::new(),
+            released_remaining: HashMap::new(),
             download_lane_owners: HashMap::new(),
             #[cfg(test)]
             audit_lane_holdings: false,
@@ -472,23 +491,31 @@ impl Pipeline {
         Ok(pipeline)
     }
 
-    pub(crate) async fn db_blocking<F, R>(&self, f: F) -> R
+    #[track_caller]
+    pub(crate) fn db_blocking<F, R>(&self, f: F) -> impl std::future::Future<Output = R> + use<F, R>
     where
         F: FnOnce(&crate::Database) -> R + Send + 'static,
         R: Send + 'static,
     {
+        #[cfg(test)]
+        actor_db::count(std::panic::Location::caller());
         let db = self.db.clone();
-        let started = Instant::now();
-        let result = tokio::task::spawn_blocking(move || {
-            let task_started = Instant::now();
-            let result = f(&db);
-            crate::runtime::perf_probe::record("pipeline.db_blocking.task", task_started.elapsed());
+        async move {
+            let started = Instant::now();
+            let result = tokio::task::spawn_blocking(move || {
+                let task_started = Instant::now();
+                let result = f(&db);
+                crate::runtime::perf_probe::record(
+                    "pipeline.db_blocking.task",
+                    task_started.elapsed(),
+                );
+                result
+            })
+            .await
+            .expect("db task panicked");
+            crate::runtime::perf_probe::record("pipeline.db_blocking.await", started.elapsed());
             result
-        })
-        .await
-        .expect("db task panicked");
-        crate::runtime::perf_probe::record("pipeline.db_blocking.await", started.elapsed());
-        result
+        }
     }
 
     pub(crate) fn db_fire_and_forget<F>(&self, f: F)
@@ -598,6 +625,60 @@ impl Pipeline {
         ) as u32
     }
 
+    // The recovery volumes' size and what of them came: the graph's articles
+    // in hand for a graph job, the assembly's otherwise. The one figure the
+    // live report and the history row both read.
+    pub(crate) fn optional_recovery_bytes(&self, state: &JobState) -> (u64, u64) {
+        let (total, assembled) = state.optional_recovery_bytes();
+        let Some(graph) = self.graph_jobs.get(&state.job_id) else {
+            return (total, assembled);
+        };
+        let arrived: u64 = (0u32..)
+            .zip(&state.spec.files)
+            .filter(|(_, file)| file.role.is_recovery())
+            .map(|(index, _)| graph.arrived_bytes(index))
+            .sum();
+        (total, arrived.min(total))
+    }
+
+    // The job's bytes still to come and the bytes it is out to bring, both
+    // as the post declares them: what its graph root waits on, the recovery
+    // it parked left out. A paused job holds no root and says what its root
+    // last said; a job that never ran says what a run starts out to bring.
+    pub(crate) fn remaining_figures(&self, state: &JobState) -> (u64, u64) {
+        if let Some(graph) = self.graph_jobs.get(&state.job_id) {
+            return Self::graph_remaining(graph, &state.spec);
+        }
+        if let Some(figures) = self.released_remaining.get(&state.job_id) {
+            return *figures;
+        }
+        state.unstarted_remaining()
+    }
+
+    // What the root says, less each file named as recovery that the root
+    // has not yet decided on: from the start until its first article is
+    // read, it counts as held back, as it did before the job ran, so the
+    // figures do not rise by the recovery and fall again a moment later.
+    pub(crate) fn graph_remaining(
+        graph: &crate::pipeline::graph::job::GraphJob,
+        spec: &crate::jobs::model::JobSpec,
+    ) -> (u64, u64) {
+        let (held_remaining, held_wanted) = (0u32..)
+            .zip(&spec.files)
+            .filter(|(_, file)| file.role.is_recovery())
+            .filter_map(|(index, _)| graph.undecided_recovery(index))
+            .fold((0u64, 0u64), |(remaining, wanted), (left, posted)| {
+                (remaining + left, wanted + posted)
+            });
+        let wanted = graph.wanted_bytes().saturating_sub(held_wanted);
+        let remaining: u64 = graph
+            .remaining_bytes()
+            .iter()
+            .sum::<u64>()
+            .saturating_sub(held_remaining);
+        (remaining.min(wanted), wanted)
+    }
+
     pub(crate) fn effective_downloaded_bytes(state: &JobState) -> u64 {
         state
             .downloaded_bytes
@@ -621,6 +702,7 @@ impl Pipeline {
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
         self.checkpoint_progress_articles.remove(&job_id);
+        self.released_remaining.remove(&job_id);
         self.propagation_ready_at.remove(&job_id);
     }
 
@@ -852,8 +934,14 @@ impl Pipeline {
         interval
     }
 
-    async fn handle_terminal_post_processing_event(&mut self, event: TerminalPostProcessingEvent) {
+    pub(in crate::pipeline) async fn handle_terminal_post_processing_event(
+        &mut self,
+        event: TerminalPostProcessingEvent,
+    ) {
         match event {
+            TerminalPostProcessingEvent::ScriptsAdmitted(admitted) => {
+                self.handle_terminal_scripts_admitted(admitted);
+            }
             TerminalPostProcessingEvent::QueueAdmitted(job_id) => {
                 self.handle_queue_scripts_admitted(job_id);
             }
@@ -926,7 +1014,7 @@ impl Pipeline {
                         Some(said) = self.graph_runs.recv() => self.graph_run_said(said),
                     }
                 }
-                self.apply_queue_intents().await;
+                self.run_queue_intents().await;
                 // A recorded cancel is settled before exit: its archive decides
                 // the job, and that answer returns on the done channel.
                 // No cancel is taken once shutdown starts, so the ones to wait
@@ -955,7 +1043,7 @@ impl Pipeline {
                 }
                 break;
             }
-            self.apply_queue_intents().await;
+            self.run_queue_intents().await;
             // Whether this turn was woken by, or found, anything other than a
             // periodic tick. Only such a turn can have changed what the job
             // snapshot shows or what dispatch would hand out.
@@ -1048,7 +1136,9 @@ impl Pipeline {
                 let drive = self.has_work_to_drive();
                 // While a restart's restores wait, the wait does not block:
                 // whatever is ready is heard first, else the next batch goes.
+                // A batch out is waited on as any answer is.
                 let restoring = self.restores_waiting;
+                let next_batch = restoring && self.installing.is_empty();
                 turn_timer.pause();
                 macro_rules! turn_select {
                     ($($biased:tt)?) => {
@@ -1107,6 +1197,10 @@ impl Pipeline {
                                 turn_timer.resume();
                                 self.handle_job_activated(done);
                             }
+                            Some(reply) = self.db_reply_rx.recv() => {
+                                turn_timer.resume();
+                                self.handle_db_reply(reply).await;
+                            }
                             Some(done) = self.move_done_rx.recv() => {
                                 turn_timer.resume();
                                 let reported_job = done.job_id;
@@ -1120,8 +1214,16 @@ impl Pipeline {
                             Ok(()) = self.script_effects_rx.changed() => {
                                 turn_timer.resume();
                                 for job_id in self.db.take_script_effects() {
-                                    self.apply_queue_script_effects(JobId(job_id));
-                                    self.report_job(JobId(job_id));
+                                    let job_id = JobId(job_id);
+                                    // A job out of the queue window is called
+                                    // in, and its install applies them.
+                                    if self.window_parked(job_id) {
+                                        self.window_due.insert(job_id);
+                                        self.queue_walk_due = true;
+                                        continue;
+                                    }
+                                    self.apply_queue_script_effects(job_id);
+                                    self.report_job(job_id);
                                 }
                             }
                             Some(event) = self.terminal_post_processing_done_rx.recv() => {
@@ -1216,14 +1318,14 @@ impl Pipeline {
                                 count_periodic_tick();
                                 self.reconcile_candidate_jobs().await;
                             }
-                            () = std::future::ready(()), if restoring => {
+                            () = std::future::ready(()), if next_batch => {
                                 turn_timer.resume();
                                 idle_tick = true;
                             }
                         }
                     };
                 }
-                if restoring {
+                if next_batch {
                     turn_select!(biased)
                 } else {
                     turn_select!()
@@ -1712,14 +1814,19 @@ impl Pipeline {
     fn checkpoint_graph_holds(&mut self) {
         let jobs: Vec<JobId> = self.graph_jobs.keys().copied().collect();
         for job_id in jobs {
+            // The steps no checkpoint has read yet are taken before the
+            // page-out, so a failed one leaves the checkpoint of every step.
+            self.take_stepped_graph_checkpoint(job_id);
             let Some(graph) = self.graph_jobs.get_mut(&job_id) else {
                 continue;
             };
             if let Err(error) = graph.page_out_holds() {
                 warn!(job_id = job_id.0, %error, "could not page graph holds out at shutdown");
+                self.flush_graph_checkpoint(job_id);
                 continue;
             }
             self.checkpoint_graph_job(job_id);
+            self.flush_graph_checkpoint(job_id);
         }
     }
 
@@ -1840,4 +1947,30 @@ pub(crate) fn timestamp_secs() -> u64 {
 
 pub(crate) fn is_terminal_status(status: &JobStatus) -> bool {
     status.finished()
+}
+
+// Counts the database calls the actor awaits, by call site, so a test can
+// pin which turns make none.
+#[cfg(test)]
+pub(crate) mod actor_db {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    static CALLS: Mutex<BTreeMap<(&'static str, u32), u64>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn count(caller: &'static std::panic::Location<'static>) {
+        *CALLS
+            .lock()
+            .expect("actor db counter poisoned")
+            .entry((caller.file(), caller.line()))
+            .or_default() += 1;
+    }
+
+    pub(crate) fn total() -> u64 {
+        CALLS
+            .lock()
+            .expect("actor db counter poisoned")
+            .values()
+            .sum()
+    }
 }

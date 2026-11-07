@@ -278,6 +278,16 @@ pub struct QueueItem {
     pub downloaded_bytes: u64,
     pub optional_recovery_bytes: u64,
     pub optional_recovery_downloaded_bytes: u64,
+    /// Declared bytes still to come: every article neither in hand nor lost,
+    /// less the recovery held back until a loss asks for it. Reaches 0 when
+    /// the download has brought everything it wants.
+    #[serde(default)]
+    pub remaining_bytes: u64,
+    /// Declared bytes the download is out to bring: the post less the
+    /// recovery still held back. `progressPercent` is this less
+    /// `remainingBytes`, over this.
+    #[serde(default)]
+    pub wanted_bytes: u64,
     #[serde(default)]
     pub phase_progress: Vec<QueuePhaseProgress>,
     pub failed_bytes: u64,
@@ -328,6 +338,7 @@ pub struct QueueSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct GlobalQueueState {
     pub is_paused: bool,
     /// Whether the operator's or the schedule's pause of every torrent is in
@@ -336,6 +347,19 @@ pub struct GlobalQueueState {
     pub torrents_paused: bool,
     pub speed_limit_bytes_per_sec: Option<u64>,
     pub download_block: DownloadBlock,
+}
+
+#[async_graphql::ComplexObject]
+impl GlobalQueueState {
+    /// When a timed pause resumes downloads on its own, in epoch milliseconds.
+    /// Null when no resume is scheduled.
+    async fn resume_at_epoch_ms(&self, ctx: &async_graphql::Context<'_>) -> Option<u64> {
+        let coordinator = ctx.data_opt::<crate::ScheduledResumeCoordinator>()?;
+        match coordinator.resume_at().await {
+            0 => None,
+            secs => Some(secs.saturating_mul(1000)),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
@@ -1416,6 +1440,8 @@ fn queue_item_from_display(
         downloaded_bytes: info.downloaded_bytes,
         optional_recovery_bytes: info.optional_recovery_bytes,
         optional_recovery_downloaded_bytes: info.optional_recovery_downloaded_bytes,
+        remaining_bytes: info.remaining_bytes,
+        wanted_bytes: info.wanted_bytes,
         phase_progress: info
             .phase_progress
             .iter()
@@ -1474,6 +1500,8 @@ pub fn queue_item_from_submission(
         downloaded_bytes: 0,
         optional_recovery_bytes: 0,
         optional_recovery_downloaded_bytes: 0,
+        remaining_bytes: submitted.summary.wanted_bytes,
+        wanted_bytes: submitted.summary.wanted_bytes,
         phase_progress: Vec::new(),
         failed_bytes: 0,
         health: 1000,

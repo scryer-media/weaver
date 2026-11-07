@@ -51,9 +51,9 @@ pub trait Volumes: Send + Sync {
     // The volume's length, once it is closed.
     fn len(&self, volume: VolumeIndex) -> Option<u64>;
 
-    // Whether no read of the volume waits: it is closed, and every byte of
-    // it is in or will never come. Work on a lent pool reads only such
-    // volumes. A view that cannot tell says no.
+    // Whether no read of the volume waits or fails: it is closed, and every
+    // byte of it is in. Work on a lent pool reads only such volumes. A view
+    // that cannot tell says no.
     fn settled(&self, _volume: VolumeIndex) -> bool {
         false
     }
@@ -89,6 +89,15 @@ pub struct Budget {
 pub trait Pool: Send + Sync {
     // `work` on `workers` threads at once, returning once every one has.
     fn spread(&self, workers: usize, work: &(dyn Fn() + Sync));
+
+    // `caller` on the calling thread, which may wait on downloads, while
+    // `work` runs beside it: each call of the `more` it is handed starts
+    // `work` on one more thread. Returns once `caller` and every `work` it
+    // started have. A pool that lends no thread beside its caller starts
+    // none, and the caller is left to do the work itself.
+    fn spread_beside(&self, _work: &(dyn Fn() + Sync), caller: &mut dyn FnMut(&dyn Fn())) {
+        caller(&|| {});
+    }
 }
 
 // Threads started for the work alone, for an owner that lends none.
@@ -100,6 +109,14 @@ impl Pool for Own {
             for _ in 0..workers {
                 scope.spawn(work);
             }
+        });
+    }
+
+    fn spread_beside(&self, work: &(dyn Fn() + Sync), caller: &mut dyn FnMut(&dyn Fn())) {
+        std::thread::scope(|scope| {
+            caller(&|| {
+                scope.spawn(work);
+            });
         });
     }
 }

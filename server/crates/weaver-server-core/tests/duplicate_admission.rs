@@ -244,7 +244,7 @@ fn nzbget_hidden_history_keeps_duplicate_identity() {
     let states = db.nzbget_history_states(&[job_id.0]).unwrap();
     assert!(states[&job_id.0].hidden);
 
-    // The hidden row is still history: the web listing keeps it and the
+    // The hidden row is still history: the row stays in the table and the
     // duplicate identity it owns still blocks the same release.
     assert!(db.get_job_history(job_id.0).unwrap().is_some());
     assert!(db.duplicate_snapshot(job_id).unwrap().is_some());

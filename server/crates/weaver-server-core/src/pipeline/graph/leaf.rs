@@ -102,10 +102,10 @@ impl Leaf {
     // `output_name`. Whether the file is there is read once, here: nothing
     // has been given a name since the restore began, so what sits at the
     // name is the leaf's own file.
-    pub(crate) fn found(dir: &Path, output_name: &str) -> Self {
+    pub(crate) fn found(dir: &Path, output_name: &str) -> Result<Self, LeafError> {
         let mut leaf = Self::at(dir, output_name);
-        leaf.on_disk = leaf.path.exists();
-        leaf
+        leaf.on_disk = leaf.path.try_exists().map_err(LeafError::io(&leaf.path))?;
+        Ok(leaf)
     }
 
     // The leaf for a file at `output_name` under `dir` that another leaf
@@ -193,9 +193,9 @@ impl Leaf {
     }
 
     // Write `bytes` at `offset`, folding nothing: a file whose bytes no
-    // check is stated for. The first write creates the file, marked
-    // sparse, and sizes it to `length` when the length is known, so the
-    // blocks are reserved in one step instead of growing write by write.
+    // check is stated for. Writes grow the file only as far as their bytes.
+    // A declared length must not allocate unwritten space on a mount that
+    // stores ordinary files instead of sparse ones; close sets the final size.
     pub(crate) fn write(
         &mut self,
         offset: u64,
@@ -531,13 +531,20 @@ impl Leaf {
         Ok(())
     }
 
+    // Give the filesystem back its handle without changing length or
+    // coverage. A spent or partial file need not have closed at a whole
+    // length, but must still release its handle before unlink or delivery.
+    pub(crate) fn release_handle(&mut self) {
+        self.file = None;
+    }
+
     // The member starts over: the file stays, so the name stays reserved on
     // disk, but none of its bytes do.
     pub(crate) fn truncate(&mut self) -> Result<(), LeafError> {
         self.revision += 1;
         self.written.clear();
         self.change(0, u64::MAX);
-        if self.file.is_none() && !self.path.exists() {
+        if self.file.is_none() && !self.path.try_exists().map_err(LeafError::io(&self.path))? {
             return Ok(());
         }
         let file = self.open(None)?;
@@ -558,8 +565,18 @@ impl Leaf {
             return Ok(None);
         };
         let path = dir.join(relative_path(&wants));
-        let had_file = self.file.take().is_some() || self.path.exists();
-        if had_file && path != self.path {
+        self.release_handle();
+        // Ownership comes from this leaf, not a best-effort lookup. A
+        // missing owned file must fail the move, and a file this leaf never
+        // made must not be taken merely because its old name now exists.
+        let had_file = self.on_disk;
+        if had_file && path != self.path && self.directory {
+            // A directory is shared and holds no bytes of its own: it is
+            // made where it is wanted, whoever else already made it, and
+            // the empty one it waited in goes.
+            std::fs::create_dir_all(&path).map_err(LeafError::io(&path))?;
+            remove_directory(&self.path)?;
+        } else if had_file && path != self.path {
             create_parent(&path)?;
             crate::runtime::fs::rename_path_exclusive(&self.path, &path)
                 .map_err(LeafError::io(&self.path))?;
@@ -569,9 +586,16 @@ impl Leaf {
         Ok(Some(std::mem::replace(&mut self.name, wants)))
     }
 
-    // The member is gone with its subtree.
+    // The member is gone with its subtree. A directory goes only once
+    // nothing is left in it.
     pub(crate) fn remove(mut self) -> Result<(), LeafError> {
         self.file = None;
+        if self.directory {
+            return remove_directory(&self.path);
+        }
+        if !self.on_disk {
+            return Ok(());
+        }
         match std::fs::remove_file(&self.path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(LeafError::Io {
                 path: self.path,
@@ -581,18 +605,12 @@ impl Leaf {
         }
     }
 
-    fn open(&mut self, length: Option<u64>) -> Result<&File, LeafError> {
+    fn open(&mut self, _length: Option<u64>) -> Result<&File, LeafError> {
         if self.file.is_none() {
             create_parent(&self.path)?;
             let file =
                 create_sparse(&self.path, &PlatformMarker).map_err(LeafError::io(&self.path))?;
             self.on_disk = true;
-            if let Some(length) = length {
-                let current = file.metadata().map_err(LeafError::io(&self.path))?.len();
-                if current < length {
-                    file.set_len(length).map_err(LeafError::io(&self.path))?;
-                }
-            }
             self.file = Some(file);
         }
         Ok(self.file.as_ref().expect("opened above"))
@@ -626,6 +644,25 @@ fn relative_path(output_name: &str) -> PathBuf {
         }
     }
     safe
+}
+
+// Remove the directory at `path` unless something is still in it: a
+// directory is shared, and what another member wrote into it stays.
+fn remove_directory(path: &Path) -> Result<(), LeafError> {
+    match std::fs::remove_dir(path) {
+        Err(error)
+            if !matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Err(LeafError::Io {
+                path: path.to_path_buf(),
+                source: error,
+            })
+        }
+        _ => Ok(()),
+    }
 }
 
 fn create_parent(path: &Path) -> Result<(), LeafError> {
@@ -697,6 +734,78 @@ fn joined_digest(first: Option<Digest>, second: Option<Digest>, len_second: u64)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_a_missing_owned_file_keeps_the_old_name_and_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut leaf = Leaf::at(dir.path(), "source.bin");
+        leaf.write(0, b"source", None).unwrap();
+        leaf.close(6).unwrap();
+        std::fs::remove_file(leaf.path()).unwrap();
+        leaf.intend("destination.bin");
+
+        assert!(leaf.move_on(dir.path()).is_err());
+        assert_eq!(leaf.name(), "source.bin");
+        assert_eq!(leaf.wants(), Some("destination.bin"));
+        assert!(!dir.path().join("destination.bin").exists());
+    }
+
+    #[test]
+    fn moving_an_unwritten_leaf_never_takes_someone_elses_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut leaf = Leaf::at(dir.path(), "source.bin");
+        std::fs::write(leaf.path(), b"another owner").unwrap();
+        leaf.intend("destination.bin");
+
+        leaf.move_on(dir.path()).unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("source.bin")).unwrap(),
+            b"another owner"
+        );
+        assert!(!dir.path().join("destination.bin").exists());
+        assert_eq!(leaf.name(), "destination.bin");
+    }
+
+    #[test]
+    fn removing_an_unwritten_leaf_preserves_another_owners_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let leaf = Leaf::at(dir.path(), "source.bin");
+        std::fs::write(leaf.path(), b"another owner").unwrap();
+        leaf.remove().unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("source.bin")).unwrap(),
+            b"another owner"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn truncation_propagates_inspection_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("loop", dir.path().join("loop")).unwrap();
+        let mut leaf = Leaf::at(dir.path(), "loop");
+        assert!(leaf.truncate().is_err());
+    }
+
+    #[test]
+    fn a_write_does_not_preallocate_the_declared_unwritten_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut leaf = Leaf::at(dir.path(), "payload.bin");
+        leaf.write(0, b"a", Some(1 << 30)).unwrap();
+        assert_eq!(leaf.len().unwrap(), 1);
+        leaf.write(1, b"b", None).unwrap();
+        leaf.close(2).unwrap();
+        assert_eq!(std::fs::read(leaf.path()).unwrap(), b"ab");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restoring_a_leaf_propagates_inspection_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink("loop", dir.path().join("loop")).unwrap();
+        assert!(Leaf::found(dir.path(), "loop").is_err());
+        assert!(!Leaf::found(dir.path(), "missing").unwrap().on_disk());
+    }
 
     fn bytes(len: usize, seed: u8) -> Vec<u8> {
         (0..len)

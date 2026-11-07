@@ -774,6 +774,10 @@ pub struct TorrentView {
     pub progress: f64,
     pub total_bytes: u64,
     pub have_bytes: u64,
+    /// The bytes of the files it wants, and how many of them are on disk;
+    /// a file turned off counts in neither.
+    pub wanted_bytes: u64,
+    pub wanted_have_bytes: u64,
     /// Payload sent and received over every run, kept through pauses and
     /// restarts (libtorrent `torrent_status::all_time_upload` and
     /// `all_time_download`).
@@ -2576,7 +2580,8 @@ impl TorrentService {
     // torrent's files are claimed as a move claims them, so its directory
     // stays where it is with no lock its reads and writes wait on; while a
     // move has them, this waits for the move to end, which marks the
-    // torrent. False until it placed them.
+    // torrent. False until it placed them, and while its job still uses
+    // its storage, so the next settle asks again.
     async fn unpacked(&self, job_id: JobId, store: &Arc<TorrentStore>, tee: &Arc<Tee>) -> bool {
         let claimed = self
             .with_torrent(job_id, |torrent| {
@@ -2590,12 +2595,25 @@ impl TorrentService {
         if !matches!(claimed, Ok(true)) {
             return false;
         }
+        let releasing = Arc::clone(tee);
+        let spent = match tokio::task::spawn_blocking(move || releasing.spent()).await {
+            Ok(Ok(spent)) => spent,
+            Ok(Err(why)) => {
+                tracing::warn!(job_id = job_id.0, why, "a torrent's unpacked files wait on its job");
+                self.unclaim_outputs(job_id).await;
+                return false;
+            }
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
+                self.unclaim_outputs(job_id).await;
+                return false;
+            }
+        };
         tee.stop_checkpoints();
         tee.forget();
         let work = tee.work().to_path_buf();
         let (planned, tee) = (Arc::clone(store), Arc::clone(tee));
         let planned = tokio::task::spawn_blocking(move || {
-            let spent = tee.spent();
             let files = planned.files();
             let listed: Vec<PathBuf> = files.names().flatten().map(Path::to_path_buf).collect();
             plan_outputs(tee.work(), &files.dir(), &listed, &spent)
@@ -5999,6 +6017,8 @@ impl TorrentService {
             },
             total_bytes: total,
             have_bytes: have,
+            wanted_bytes: wanted,
+            wanted_have_bytes: wanted_have,
             uploaded_bytes: counters.uploaded_bytes,
             downloaded_bytes: counters.downloaded_bytes,
             run_uploaded_bytes: reading.run.1,
@@ -6749,6 +6769,8 @@ fn report(view: TorrentView, status: JobStatus, now_ms: i64) -> JobReport {
         progress: view.progress,
         total_bytes: view.total_bytes,
         downloaded_bytes: view.have_bytes,
+        wanted_bytes: view.wanted_bytes,
+        remaining_bytes: view.wanted_bytes.saturating_sub(view.wanted_have_bytes),
         category: view.category,
         output_dir: view.storage_dir,
         wait_reason: view.detail,

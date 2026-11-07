@@ -89,7 +89,13 @@ fn compile_windows_resources() {
         return;
     }
 
-    embed_resource::compile("resources/windows/weaver.rc", embed_resource::NONE)
-        .manifest_required()
-        .unwrap_or_else(|error| panic!("failed to embed Windows application manifest: {error}"));
+    let resource_dir =
+        PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").expect("missing crate manifest directory"))
+            .join("resources/windows");
+    embed_resource::compile(
+        resource_dir.join("weaver.rc"),
+        embed_resource::ParamsIncludeDirs([&resource_dir]),
+    )
+    .manifest_required()
+    .unwrap_or_else(|error| panic!("failed to embed Windows application manifest: {error}"));
 }

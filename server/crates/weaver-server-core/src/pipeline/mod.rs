@@ -8,6 +8,7 @@ pub mod archive;
 mod capacity;
 mod completion;
 pub(crate) use completion::finalize::claim_complete_destination_path;
+mod db_reply;
 mod decode;
 pub mod diagnostics;
 pub mod download;
@@ -21,6 +22,8 @@ mod orchestrator;
 mod post_health;
 mod progress;
 pub mod queue;
+mod queue_window;
+pub(crate) use queue_window::waits_its_turn;
 mod server_attribution;
 mod support_facts;
 #[cfg(any(test, feature = "test-support"))]
@@ -515,6 +518,11 @@ pub(super) struct DownloadLaneObservation {
     // Whether byte pressure was clear when the batch was leased. Samples
     // taken under pressure say nothing about the depth under test.
     pub(super) pressure_clear: bool,
+    // The lane held a full rung of articles, in flight and queued behind,
+    // when this response was read. A response read with less waited on the
+    // lane's next lease, so its time says how late the work came as well as
+    // how fast the server is.
+    pub(super) fed: bool,
     pub(super) batch_complete: bool,
     pub(super) batch_clean: bool,
     pub(super) unresolved_count: u64,
@@ -803,12 +811,28 @@ pub(super) struct MoveToCompleteDone {
 }
 
 pub(super) enum TerminalPostProcessingEvent {
+    ScriptsAdmitted(TerminalScriptsAdmitted),
     QueueAdmitted(JobId),
     QueueDone(JobId, Result<(), crate::StateError>),
     AddedScriptsDone(JobId, Result<(), crate::StateError>),
     Started(JobId),
     Done(TerminalPostProcessingDone),
     CancelJobsDone(orchestrator::CancelJobsDone),
+}
+
+// What the script settings said when a job's terminal pass began: read off
+// the actor, so the turn that hears a move finish reads no setting itself.
+pub(super) struct TerminalScriptsAdmitted {
+    pub(super) job_id: JobId,
+    pub(super) facts: crate::post_processing::model::PostProcessingFacts,
+    pub(super) primary_failure: Option<String>,
+    pub(super) admission: Result<
+        Option<crate::post_processing::executor::PostProcessingJobAdmission>,
+        crate::StateError,
+    >,
+    // Whether a queue script could have an event of the job queued or
+    // running, asked only when the admission runs no script of its own.
+    pub(super) queue_events_may_hold: bool,
 }
 
 pub(super) struct TerminalPostProcessingDone {
@@ -1301,6 +1325,12 @@ pub struct Pipeline {
     pub(crate) nzb_seen: HashSet<JobId>,
     pub(crate) nzb_pause_releases: HashSet<JobId>,
     pub(crate) nzb_reprocess_pending: HashSet<JobId>,
+    // The slots whose take or release is out on the writer, not yet
+    // committed. Both count as held.
+    pub(crate) nzb_admitting: HashSet<JobId>,
+    pub(crate) nzb_releasing: HashSet<JobId>,
+    // The jobs whose install reads are out.
+    pub(crate) installing: HashSet<JobId>,
     // What the last walk over every queue row saw, and whether it left
     // anything for the next turn to look at again.
     pub(crate) queue_walk_mark: Option<nzb_admission::QueueWalkMark>,
@@ -1312,6 +1342,18 @@ pub struct Pipeline {
     // When a restart's installs began, and how many have gone in since: the
     // pass is logged once, when the last restore is in.
     pub(crate) restore_pass: Option<(Instant, usize)>,
+    // The queue window (`queue_window`): the jobs out of it, each with the
+    // articles it still counts toward the queue's depth, and their sum.
+    pub(crate) window_parked: HashMap<JobId, u64>,
+    pub(crate) window_parked_articles: u64,
+    // The runtime columns an installed job's active row is known to hold,
+    // so leaving the window writes only what changed.
+    pub(crate) window_stored: HashMap<JobId, completion::finalize::ActiveRuntimeValues>,
+    // Jobs out of the window that a script's directives call back in.
+    pub(crate) window_due: HashSet<JobId>,
+    // Jobs out of the window whose rows could not be read back; a restart
+    // reads them again.
+    pub(crate) window_unreadable: HashSet<JobId>,
     // Each row's stored queue position as last written, loaded from the
     // database on the first order change.
     pub(crate) queue_positions: Option<HashMap<JobId, i64>>,
@@ -1330,6 +1372,9 @@ pub struct Pipeline {
         HashMap<JobId, crate::post_processing::model::PipelineFailureStage>,
     // Job dispatch order (FIFO by submission). First Downloading job is active.
     pub(super) job_order: Vec<JobId>,
+    // The whole queue's order, installed jobs and parked ones alike, as it
+    // was last stored: a reorder among parked jobs is stored too.
+    pub(super) stored_queue_order: Vec<JobId>,
     // Number of in-flight article downloads (primary + recovery).
     pub(super) active_downloads: usize,
     // Number of NNTP connection tasks currently fetching articles.
@@ -1436,6 +1481,12 @@ pub struct Pipeline {
     pub(super) pending_completion_checks: VecDeque<JobId>,
     // Presence gates every attempt to resume a partially restored job.
     pub(crate) blocked_restores: HashMap<JobId, crate::jobs::handle::RestoreJobRequest>,
+    // The jobs whose work crashed the daemon on its last run, each parked
+    // paused as it installs instead of being restored into the same panic.
+    pub(crate) crash_marks: crate::runtime::panic_trap::CrashMarks,
+    // Jobs installed mid-move, whose move resumes once their install batch
+    // is in place.
+    pub(crate) moves_to_resume: Vec<JobId>,
     // Channels for pipeline stage results.
     pub(super) download_done_tx: mpsc::Sender<DownloadResult>,
     pub(super) download_done_rx: mpsc::Receiver<DownloadResult>,
@@ -1484,6 +1535,9 @@ pub struct Pipeline {
     pub(super) nntp_handoff_drained_rx: mpsc::Receiver<u64>,
     // Channel for background final-move results.
     pub(super) job_activated_tx: mpsc::Sender<activation::JobActivated>,
+    // Where the database answers the turn: see [`db_reply`].
+    pub(super) db_reply_tx: mpsc::UnboundedSender<db_reply::DbReply>,
+    pub(super) db_reply_rx: mpsc::UnboundedReceiver<db_reply::DbReply>,
     pub(super) job_activated_rx: mpsc::Receiver<activation::JobActivated>,
     pub(super) move_done_tx: mpsc::Sender<MoveToCompleteDone>,
     pub(super) move_done_rx: mpsc::Receiver<MoveToCompleteDone>,
@@ -1570,6 +1624,10 @@ pub struct Pipeline {
     pub(super) download_restart_durable_lead_retry_after: HashMap<JobId, Instant>,
     // The one over-limit article reserved until its result is processed or returned.
     pub(super) checkpoint_progress_articles: HashMap<JobId, (u64, SegmentId)>,
+    // The bytes still to come and the bytes wanted of each paused job, as its
+    // graph root last said them before its articles were released, so a
+    // paused job reports the figures it stopped at.
+    pub(super) released_remaining: HashMap<JobId, (u64, u64)>,
     pub(super) download_lane_owners: HashMap<u64, DownloadLaneOwner>,
     // Set by the download-dispatch test fixtures: every dispatch pass and
     // every lane result batch then checks that the in-flight gauges are what

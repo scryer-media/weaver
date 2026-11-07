@@ -208,8 +208,9 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //   resident           what those namespaces keep in memory for their
 //                      members, against the memory limit
 //   deadline           the wall clock since the first member an object
-//                      produced reached its namespace; the posts' own
-//                      writes are not under it
+//                      produced reached its namespace, less the time the
+//                      job spent paused; the posts' own writes are not
+//                      under it
 //   disk reserve       the free space a write would leave, against the
 //                      reading the holds already take
 //   content policy     the operator's unacceptable extensions, on every
@@ -222,6 +223,9 @@ pub(crate) struct Caps {
     // When extraction began: the first time an object's namespace was
     // charged. A job queued or paused before then has spent none of it.
     started: Option<Instant>,
+    // When the job paused, while it is paused: the clock stands still
+    // until it resumes.
+    paused: Option<Instant>,
     debits: CapacityDebits,
     // How far each member an object produced is written.
     extents: BTreeMap<(NodeId, MemberId), u64>,
@@ -253,6 +257,7 @@ impl Caps {
             policy,
             declared,
             started: None,
+            paused: None,
             debits: CapacityDebits::default(),
             extents: BTreeMap::new(),
             written: 0,
@@ -294,7 +299,11 @@ impl Caps {
             return Ok(());
         }
         let started = *self.started.get_or_insert_with(Instant::now);
-        if started.elapsed() > Duration::from_secs(self.limits.max_seconds) {
+        let spent = match self.paused {
+            Some(paused) => paused.saturating_duration_since(started),
+            None => started.elapsed(),
+        };
+        if spent > Duration::from_secs(self.limits.max_seconds) {
             let detail = format!(
                 "extraction exceeded the {} second deadline",
                 self.limits.max_seconds
@@ -302,6 +311,28 @@ impl Caps {
             return Err(self.breach(ExtractionRejectionReason::Deadline, detail));
         }
         Ok(())
+    }
+
+    // The job paused or resumed. The time it spends paused is not
+    // extraction: on resume the clock moves on by the pause, so the
+    // deadline counts only the time the job ran.
+    pub(crate) fn hold_clock(&mut self, paused: bool) {
+        let now = Instant::now();
+        match (paused, self.paused) {
+            (true, None) => self.paused = Some(now),
+            (false, Some(at)) => {
+                self.paused = None;
+                if let Some(started) = self.started.as_mut() {
+                    *started = now - at.saturating_duration_since(*started);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clock_held(&self) -> bool {
+        self.paused.is_some()
     }
 
     // A namespace places `name`. A directory carries no extension.

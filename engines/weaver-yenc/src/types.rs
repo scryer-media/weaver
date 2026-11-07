@@ -110,6 +110,9 @@ pub struct YencMetadata {
     pub begin: Option<u64>,
     // End byte offset in the original file (1-based, inclusive), multi-part only.
     pub end: Option<u64>,
+    // A `=ypart end=` written below its `begin=`, kept out of [`Self::end`]
+    // until the decoded length can say whether the two were exchanged.
+    pub end_below_begin: Option<u64>,
     // Header damage that was tolerated while parsing this article.
     pub defects: YencHeaderDefects,
 }
@@ -132,6 +135,29 @@ impl YencMetadata {
     // file it cannot locate itself in.
     pub fn file_offset_is_known(&self) -> bool {
         !self.defects.invalid_ypart_begin
+    }
+
+    // Turn a `=ypart` range written the wrong way round the right way, once
+    // the body has decoded to `decoded` bytes. Only an exact exchange is
+    // turned: `begin - end + 1` must be the decoded length, and the smaller
+    // field must be a real 1-based offset. Any other end below begin stays
+    // unusable and the part is placed by its begin, as before. nzbfast places
+    // the same shape at the smaller field (`crates/nzbkit-base/src/yenc.rs:917`);
+    // SABnzbd appends it after the part before it, which for an exchanged
+    // pair is the same place (`sabnzbd/nzb/file.py:268-291`).
+    //
+    // Returns whether the range was turned, so the caller can move the
+    // article's checksums to where its bytes now go.
+    pub fn settle_exchanged_range(&mut self, decoded: u64) -> bool {
+        let (Some(begin), Some(end)) = (self.begin, self.end_below_begin.take()) else {
+            return false;
+        };
+        if end == 0 || begin - end + 1 != decoded {
+            return false;
+        }
+        self.begin = Some(end);
+        self.end = Some(begin);
+        true
     }
 
     pub fn article_file_offset(&self) -> u64 {
@@ -207,6 +233,7 @@ mod tests {
             total: Some(10),
             begin: Some(1),
             end: Some(100),
+            end_below_begin: None,
             defects: YencHeaderDefects::default(),
         };
         let cloned = meta.clone();
@@ -225,6 +252,7 @@ mod tests {
             total: None,
             begin: None,
             end: None,
+            end_below_begin: None,
             defects: YencHeaderDefects::default(),
         };
         let debug = format!("{:?}", meta);

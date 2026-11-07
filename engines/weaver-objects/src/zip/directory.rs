@@ -47,7 +47,10 @@ impl Zip {
         let mut end = found;
         // Where the records after the directory start.
         let mut after = at;
-        let mut read = vec![tail];
+        // The end record runs from its signature to the tail's end: only
+        // it stands under the map, not the rest of the window it was
+        // searched for in, which is the last member's bytes.
+        let mut read = vec![ByteRange::new(at, total)];
         if found.wide {
             let range = ByteRange::new(at.saturating_sub(LOCATOR_LEN), at);
             let Some(bytes) = self.need(range) else {
@@ -223,6 +226,10 @@ impl Zip {
             }
             let header = &centrals[index].header;
             let said = Said::of(header);
+            // A directory holds nothing to decrypt: its encryption
+            // header, if a writer gave it one, is the envelope's.
+            let encrypted = header.encrypted() && header.shape != Shape::Directory;
+            let streams = member.is_some() && (length > 0 || encrypted);
             map.entries.push(Entry {
                 header: headers[index],
                 member,
@@ -230,8 +237,10 @@ impl Zip {
                 checksum: said.checksum,
                 length,
                 crc: header.crc,
+                crc_known: true,
                 data: None,
-                streams: length > 0,
+                cipher: (streams && encrypted).then(|| super::crypto::Cipher::new(header)),
+                streams,
                 expected: Some(header.clone()),
             });
         }
@@ -269,6 +278,15 @@ impl Zip {
                 let entry = &mut map.entries[index];
                 entry.expected = None;
                 entry.data = data;
+                if let (Some(cipher), Some(data)) = (&mut entry.cipher, data) {
+                    let header = ByteRange::new(data - super::crypto::HEADER, data);
+                    cipher.header = self
+                        .kept
+                        .verified(header)
+                        .then(|| self.kept.read(header))
+                        .flatten()
+                        .and_then(|bytes| bytes.try_into().ok());
+                }
                 self.basis.push((range, crc));
             }
         }
@@ -390,6 +408,17 @@ impl Zip {
             out.push(Emit::Retract(MemberId(id as u32)));
             self.grid.forget(MemberId(id as u32));
         }
+        // A member that stands keeps its keys, its proof and what waits for
+        // its replay: the header they were made under is the new map's.
+        let (mut old, mut new) = (old, new);
+        for id in (0..new.members.len().min(old.members.len()))
+            .filter(|id| moved.binary_search(id).is_err())
+        {
+            let (was, is) = (old.members[id], new.members[id]);
+            if new.entries[is].cipher.is_some() {
+                new.entries[is].cipher = old.entries[was].cipher.take();
+            }
+        }
         let mut was = std::mem::take(&mut self.members);
         self.members = (0..new.members.len())
             .map(|id| match moved.binary_search(&id) {
@@ -406,6 +435,7 @@ impl Zip {
                 name: entry.name.clone(),
                 length: entry.length,
                 checksum: entry.checksum,
+                encrypted: entry.cipher.is_some(),
             };
             say(member, said, &mut self.members[id], out);
         }
@@ -442,12 +472,15 @@ pub(super) struct Said {
     pub(super) name: String,
     pub(super) length: u64,
     pub(super) checksum: Option<u32>,
+    pub(super) encrypted: bool,
 }
 
 impl Said {
     pub(super) fn of(header: &records::Header) -> Self {
         let directory = header.shape == Shape::Directory;
         Self {
+            // A directory is never decrypted, whatever its flags say.
+            encrypted: header.encrypted() && !directory,
             name: records::member_name(header.name.clone(), header.shape),
             length: if directory { 0 } else { header.length },
             // The header's CRC32 is the member's own unless a key went
@@ -466,7 +499,7 @@ fn say(member: MemberId, said: Said, out_said: &mut Out, out: &mut Vec<Emit>) {
     if let Some(crc32) = said.checksum {
         out.push(Emit::Checksum { member, crc32 });
     }
-    if said.length == 0 {
+    if said.length == 0 && !said.encrypted {
         out_said.closed = true;
         out.push(Emit::MemberClosed(member));
     }
@@ -492,7 +525,12 @@ fn local(kept: &mut Kept, map: &Map, index: usize) -> Local {
     let Some(expected) = &entry.expected else {
         return Local::Waiting;
     };
-    let streams = entry.streams.then_some(entry.length);
+    let prefix = if entry.cipher.is_some() {
+        super::crypto::HEADER
+    } else {
+        0
+    };
+    let streams = entry.streams.then_some(entry.length + prefix);
     let (header, stretch_end) = (entry.header, map.stretch_end(index));
     let fixed = ByteRange::new(header, (header + LOCAL_LEN).min(stretch_end));
     let Some(bytes) = kept.read(fixed) else {
@@ -507,7 +545,7 @@ fn local(kept: &mut Kept, map: &Map, index: usize) -> Local {
     if data + streams.unwrap_or(0) > stretch_end {
         return Local::Unsupported;
     }
-    let range = ByteRange::new(header, data);
+    let range = ByteRange::new(header, data + prefix);
     kept.want(range);
     let Some(bytes) = kept.read(range) else {
         return Local::Waiting;
@@ -521,7 +559,7 @@ fn local(kept: &mut Kept, map: &Map, index: usize) -> Local {
     Local::Agreed {
         range,
         crc: crc32(bytes),
-        data: streams.map(|_| data),
+        data: streams.map(|_| data + prefix),
     }
 }
 
@@ -534,7 +572,15 @@ fn moved(old: &Map, new: &Map) -> Vec<usize> {
             let member = MemberId(id as u32);
             match (old.entry(member), new.entry(member)) {
                 (Some(was), Some(is)) => {
-                    was.name != is.name
+                    // An encrypted member stands only under the cipher
+                    // header its plaintext was made under.
+                    was.cipher.as_ref().map(|cipher| cipher.header)
+                        != is.cipher.as_ref().map(|cipher| cipher.header)
+                        || was
+                            .cipher
+                            .as_ref()
+                            .is_some_and(|cipher| cipher.header.is_none())
+                        || was.name != is.name
                         || was.length != is.length
                         || was.checksum != is.checksum
                         || was.crc != is.crc

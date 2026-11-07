@@ -184,7 +184,6 @@ export function WatchFolderPanel() {
               {
                 id: "pollIntervalSecs",
                 label: t("next.watchFolder.pollInterval"),
-                help: t("next.watchFolder.pollIntervalHelp"),
                 control: {
                   kind: "number" as const,
                   value: values.pollIntervalSecs,
@@ -220,7 +219,6 @@ export function WatchFolderPanel() {
         {
           id: "scanningPaused",
           label: t("next.watchFolder.pauseScanning"),
-          help: t("next.watchFolder.pauseScanningHelp"),
           control: {
             kind: "toggle",
             value: values.scanningPaused,

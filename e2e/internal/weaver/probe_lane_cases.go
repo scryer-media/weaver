@@ -123,13 +123,13 @@ func runHealthProbeWaitsForOwnedLane(ctx *restartCaseContext) (restartCaseResult
 		return restartCaseResult{}, err
 	}
 	jobField := regexp.MustCompile(fmt.Sprintf(`\bjob_id=%d\b`, jobID))
-	if err := ctx.pollFor("this job's armed health probe behind the held second BODY", func() (bool, error) {
+	if err := ctx.pollJob("this job's armed health probe behind the held second BODY", dbPath, jobID, func() (bool, error) {
 		log, err := os.ReadFile(ctx.caseLogPath)
 		if err != nil {
 			return false, err
 		}
 		armed := false
-		for _, line := range strings.Split(stripANSIEscapeSequences(string(log)), "\n") {
+		for _, line := range strings.Split(cleanWeaverLog(string(log)), "\n") {
 			if jobField.MatchString(line) && strings.Contains(line, "health probe armed: STAT sampling") {
 				armed = true
 				break

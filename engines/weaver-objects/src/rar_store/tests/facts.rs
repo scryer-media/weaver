@@ -86,11 +86,15 @@ fn a_rar_with_recovery_records_restored_says_each_once() {
 
 // The key tuple is what the header states, and the blob holds neither the
 // key, the hash key nor the password.
+fn holds(facts: &Facts, bytes: &[u8]) -> bool {
+    contains(&facts.bytes, bytes) || facts.parts.iter().any(|part| contains(&part.bytes, bytes))
+}
+
 fn keyless(options: &Options) {
     let volumes = named(write(&items(), options));
     let kdf = KdfCache::new();
     for facts in every_cut(&volumes, 700, true) {
-        assert!(!contains(&facts.bytes, PASSWORD.as_bytes()));
+        assert!(!holds(&facts, PASSWORD.as_bytes()));
         let kept: StoreFacts = facts.read(Kind::RarStore).expect("decodes");
         for entry in &kept.entries {
             match entry.keying {
@@ -98,13 +102,13 @@ fn keyless(options: &Options) {
                     let material = kdf
                         .derive_material_rar5(PASSWORD, &tuple.salt, tuple.kdf_count_lg2)
                         .expect("derives");
-                    assert!(!contains(&facts.bytes, &material.key));
-                    assert!(!contains(&facts.bytes, &material.hash_key));
+                    assert!(!holds(&facts, &material.key));
+                    assert!(!holds(&facts, &material.hash_key));
                 }
                 Some(KeyTuple::Rar4(salt)) => {
                     let (key, iv) = kdf.derive_key_rar4(PASSWORD, salt.as_ref());
-                    assert!(!contains(&facts.bytes, &key));
-                    assert!(!contains(&facts.bytes, &iv));
+                    assert!(!holds(&facts, &key));
+                    assert!(!holds(&facts, &iv));
                 }
                 None => panic!("an encrypted member records its key tuple"),
             }
@@ -143,7 +147,7 @@ fn facts_of_the_previous_version_are_refused() {
     let mut object = store();
     object.bound(VolumeIndex(0), &volumes[0].0, &volumes[0].1, None);
     let mut facts = object.facts();
-    assert_eq!(facts.version, 3);
+    assert_eq!(facts.version, 4);
     assert!(crate::restore(&facts, weaver_graph::Budget::default()).is_ok());
     facts.version = 2;
     assert!(matches!(

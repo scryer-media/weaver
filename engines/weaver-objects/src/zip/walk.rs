@@ -19,6 +19,16 @@ use crate::grid::crc32;
 // The bytes that say what a header is.
 const SIGNATURE_LEN: u64 = 4;
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub(super) struct Descriptor {
+    at: u64,
+    member: MemberId,
+    crc: u32,
+    compressed: u64,
+    length: u64,
+    wide: bool,
+}
+
 impl Zip {
     // Keep a range the walk reads in the normal order; its bytes once in.
     fn read_ahead(&mut self, range: ByteRange) -> Option<Vec<u8>> {
@@ -28,6 +38,9 @@ impl Zip {
 
     pub(super) fn walk(&mut self, out: &mut Vec<Emit>) {
         loop {
+            if !self.read_descriptor(out) {
+                return;
+            }
             let map = self.map.get_or_insert_with(Map::default);
             if map.end.is_some() {
                 return;
@@ -75,6 +88,16 @@ impl Zip {
             let length = self.announce(member, &header, out);
             let data = cursor + len;
             let compressed = header.compressed;
+            // A directory holds nothing to decrypt: its encryption header,
+            // if a writer gave it one, is the envelope's.
+            let cipher = (header.encrypted() && header.shape != records::Shape::Directory)
+                .then(|| super::crypto::Cipher::new(&header));
+            let prefix = if cipher.is_some() {
+                super::crypto::HEADER
+            } else {
+                0
+            };
+            self.want(ByteRange::at(data, prefix), false);
             let Some(map) = &mut self.map else {
                 return;
             };
@@ -86,11 +109,23 @@ impl Zip {
                 checksum: said.checksum,
                 length,
                 crc: header.crc,
-                data: Some(data),
-                streams: length > 0,
-                expected: Some(header),
+                crc_known: !header.deferred() || header.crc != 0,
+                data: Some(data + prefix),
+                cipher,
+                streams: length > 0 || prefix > 0,
+                expected: Some(header.clone()),
             });
             map.frontier = data + compressed;
+            if header.deferred() {
+                map.descriptor = Some(Descriptor {
+                    at: map.frontier,
+                    member,
+                    crc: header.crc,
+                    compressed,
+                    length,
+                    wide: records::local_zip64(&bytes),
+                });
+            }
             // What follows the data, a directory entry's included, is the
             // envelope's.
             if length == 0 {
@@ -105,12 +140,78 @@ impl Zip {
             map.frontier += by;
         }
     }
+
+    fn read_descriptor(&mut self, out: &mut Vec<Emit>) -> bool {
+        let Some(descriptor) = self.map.as_ref().and_then(|map| map.descriptor.clone()) else {
+            return true;
+        };
+        let body = if descriptor.wide { 20 } else { 12 };
+        let mut range = ByteRange::at(descriptor.at, body);
+        let Some(mut bytes) = self.read_ahead(range) else {
+            return false;
+        };
+        let matches = |bytes: &[u8], at: usize| {
+            let crc = records::u32_at(bytes, at)?;
+            let (compressed, length) = if descriptor.wide {
+                (
+                    records::u64_at(bytes, at + 4),
+                    records::u64_at(bytes, at + 12),
+                )
+            } else {
+                (
+                    records::u32_at(bytes, at + 4).map(u64::from),
+                    records::u32_at(bytes, at + 8).map(u64::from),
+                )
+            };
+            ((descriptor.crc == 0 || crc == descriptor.crc)
+                && compressed == Some(descriptor.compressed)
+                && length == Some(descriptor.length))
+            .then_some(crc)
+        };
+        // The signature is optional, and its value is also a possible
+        // CRC. Match the unsigned fields before interpreting that word.
+        let crc = match matches(&bytes, 0) {
+            Some(crc) => crc,
+            None if records::u32_at(&bytes, 0) == Some(0x0807_4b50) => {
+                range = ByteRange::at(descriptor.at, body + 4);
+                let Some(signed) = self.read_ahead(range) else {
+                    return false;
+                };
+                bytes = signed;
+                let Some(crc) = matches(&bytes, 4) else {
+                    self.say_damaged(range, out);
+                    return false;
+                };
+                crc
+            }
+            None => {
+                self.say_damaged(range, out);
+                return false;
+            }
+        };
+        self.basis.push((range, crc32(&bytes)));
+        if let Some(map) = &mut self.map {
+            map.frontier = range.end;
+            map.descriptor = None;
+            let index = map.members[descriptor.member.0 as usize];
+            map.entries[index].crc = crc;
+            map.entries[index].crc_known = true;
+        }
+        self.record(
+            descriptor.member,
+            descriptor.length,
+            Vec::new().into(),
+            weaver_graph::Provenance::Fresh,
+            out,
+        );
+        true
+    }
 }
 
 // Why the walk cannot stream an entry, if it cannot. One whose extent the
 // header does not say stops the walk whatever it holds.
 fn walk_refusal(header: &records::Header) -> Option<Why> {
-    if header.deferred() {
+    if header.deferred() && (!header.encrypted() || header.compressed == 0) {
         return Some(Why::UnboundedEntry);
     }
     refusal(header)

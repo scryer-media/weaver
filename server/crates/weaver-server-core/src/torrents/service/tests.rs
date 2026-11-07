@@ -450,6 +450,8 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         progress: 0.25,
         total_bytes: 4000,
         have_bytes: 1000,
+        wanted_bytes: 4000,
+        wanted_have_bytes: 1000,
         uploaded_bytes: 0,
         downloaded_bytes: 1000,
         run_uploaded_bytes: 0,
@@ -503,6 +505,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         |view: TorrentView, now: i64| report(view.clone(), job_status(&view), now).job_info();
     let info = job_info(view.clone(), EPOCH_MS + 1000);
     assert_eq!(info.status, JobStatus::Downloading);
+    assert_eq!((info.wanted_bytes, info.remaining_bytes), (4000, 3000));
     assert_eq!(
         crate::jobs::handle::job_download_rates(std::slice::from_ref(&info)),
         [(JobId(7), 500)]
@@ -6409,6 +6412,48 @@ async fn the_stored_levels_and_toggles_reach_the_session_through_one_reconcile()
     rig.service.apply_picking().await;
     assert!(!handle.sequential());
     assert!(handle.first_last_piece_first());
+    rig.service.stop().await;
+}
+
+// A file turned off is not wanted: the queue's row wants only the other
+// files' bytes, and what is still to come of them, not the whole torrent.
+#[tokio::test(start_paused = true)]
+async fn a_file_turned_off_counts_in_neither_the_wanted_nor_the_remaining_bytes() {
+    use FilePriority::*;
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let bytes = metainfo(
+        "trio",
+        &[
+            ("trio/a.bin", &[1; 3072]),
+            ("trio/b.bin", &[2; 3072]),
+            ("trio/c.bin", &[3; 3072]),
+        ],
+        1024,
+        false,
+    );
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(bytes))
+        })
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(2, Ignored)])
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.total_bytes, view.wanted_bytes, view.wanted_have_bytes),
+        (3 * 3072, 2 * 3072, 0)
+    );
+    let info = report(view.clone(), job_status(&view), EPOCH_MS).job_info();
+    assert_eq!(
+        (info.total_bytes, info.wanted_bytes, info.remaining_bytes),
+        (3 * 3072, 2 * 3072, 2 * 3072)
+    );
     rig.service.stop().await;
 }
 

@@ -25,6 +25,12 @@ mod heartbeat;
 mod http;
 mod job_debug_layer;
 mod logging;
+// The static x86_64 musl build's memmove; tests check it on any x86_64.
+#[cfg(all(
+    target_arch = "x86_64",
+    any(test, all(target_os = "linux", target_env = "musl"))
+))]
+mod memmove;
 mod restart;
 mod shutdown;
 #[cfg(windows)]
@@ -47,7 +53,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::{EnvFilter, Layer, Registry};
 
 use crate::args::{Cli, Command};
-use crate::logging::{LocalTimer, LogColor, LogFormat};
+use crate::logging::{JsonRecord, JsonSpanFields, LocalTimer, LogColor, LogFormat};
 
 const LOG_FILE_ENV: &str = "WEAVER_LOG_FILE";
 const DOTENV_FILE: &str = ".env";
@@ -175,8 +181,12 @@ async fn async_main() {
 
     let log_ring_buffer =
         weaver_server_core::runtime::log_buffer::LogRingBuffer::with_default_capacity();
+    // The ring buffer behind the web log viewer always holds JSON records,
+    // whatever stdout is set to: the viewer draws each line from its record
+    // and shows the record itself on selection.
     let buffer_layer = tracing_subscriber::fmt::layer()
-        .with_timer(LocalTimer)
+        .fmt_fields(JsonSpanFields)
+        .event_format(JsonRecord)
         .with_writer(LogBufferWriter(log_ring_buffer.clone()))
         .with_ansi(false);
     let env_log_file = std::env::var_os(LOG_FILE_ENV).map(PathBuf::from);
@@ -225,14 +235,13 @@ async fn async_main() {
         }
         None => None,
     };
-    // The in-memory ring buffer always keeps the human-readable line format:
-    // the web log viewer parses it, so a JSON stdout must not reformat it.
     let mut layers: Vec<Box<dyn Layer<Registry> + Send + Sync>> = vec![Box::new(buffer_layer)];
     layers.push(match log_format {
         LogFormat::Json => Box::new(
             tracing_subscriber::fmt::layer()
-                .with_timer(LocalTimer)
-                .json(),
+                .fmt_fields(JsonSpanFields)
+                .event_format(JsonRecord)
+                .with_ansi(false),
         ),
         LogFormat::Text => Box::new(
             tracing_subscriber::fmt::layer()
@@ -244,9 +253,10 @@ async fn async_main() {
         layers.push(match log_format {
             LogFormat::Json => Box::new(
                 tracing_subscriber::fmt::layer()
-                    .with_timer(LocalTimer)
-                    .json()
-                    .with_writer(writer),
+                    .fmt_fields(JsonSpanFields)
+                    .event_format(JsonRecord)
+                    .with_writer(writer)
+                    .with_ansi(false),
             ),
             LogFormat::Text => Box::new(
                 tracing_subscriber::fmt::layer()
@@ -468,6 +478,9 @@ async fn async_main() {
         drop(log_file_guard.take());
         std::process::exit(1);
     }
+    // From here a panic leaves its marker in the data folder, which the
+    // next start reads before it restores any job.
+    weaver_server_core::runtime::panic_trap::arm(&data_dir, env!("CARGO_PKG_VERSION"));
     let canonical_data_dir = match std::fs::canonicalize(&data_dir) {
         Ok(path) => path,
         Err(error) => {
@@ -592,15 +605,13 @@ fn install_e2e_network_time_scale() {
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let payload = info
-            .payload()
-            .downcast_ref::<&str>()
-            .copied()
-            .or_else(|| info.payload().downcast_ref::<String>().map(String::as_str))
-            .unwrap_or("<non-string panic payload>");
+        use weaver_server_core::runtime::panic_trap;
+        let payload = panic_trap::payload_text(info.payload());
+        let job = panic_trap::current_job().map(|job| job.0);
 
         if let Some(location) = info.location() {
             error!(
+                job_id = job,
                 panic.message = payload,
                 panic.file = location.file(),
                 panic.line = location.line(),
@@ -608,7 +619,15 @@ fn install_panic_hook() {
                 "unexpected panic"
             );
         } else {
-            error!(panic.message = payload, "unexpected panic");
+            error!(job_id = job, panic.message = payload, "unexpected panic");
+        }
+
+        // The marker the next start parks the job by. The abort that
+        // follows is unchanged: this only leaves word of it behind.
+        if let Some(trap) = panic_trap::armed()
+            && let Err(error) = trap.record(info)
+        {
+            error!(%error, "the crash marker could not be written");
         }
 
         default_hook(info);

@@ -54,6 +54,18 @@ pub(super) struct Owner {
     // When set, every delivery comes with the CRC32 of each article of this
     // size it holds, cut where the delivery is cut, as a decoder hands it.
     pub articles: Option<u64>,
+    // The store's placement number when held bytes were last asked after,
+    // as a namespace's release pass keeps it: while it stands, every hold
+    // stays held, which each pass checks.
+    asked: Option<u64>,
+    // A pass found the number standing with bytes held: a namespace would
+    // have asked the store nothing.
+    skipped: bool,
+    // What was going on when held bytes went down after a pass the number
+    // let skip: the call, the volume it was about, and the volume the
+    // bytes were held in.
+    pub gated: Vec<(&'static str, usize, VolumeIndex)>,
+    doing: (&'static str, usize),
 }
 
 impl Owner {
@@ -79,6 +91,10 @@ impl Owner {
             bound: vec![false; count],
             next: 0,
             articles: None,
+            asked: None,
+            skipped: false,
+            gated: Vec::new(),
+            doing: ("found", first),
         };
         let (name, bytes) = &owner.volumes[first];
         let front = &bytes[..bytes.len().min(FRONT)];
@@ -121,6 +137,7 @@ impl Owner {
     // The volume's length said as `length`, whatever its bytes run to, as
     // a producer says one it learned anew.
     pub fn sized_as(&mut self, volume: usize, length: u64) {
+        self.doing = ("size", volume);
         let mut out = Vec::new();
         self.object
             .sized(VolumeIndex(volume as u32), length, &mut out);
@@ -145,6 +162,7 @@ impl Owner {
             .bound(VolumeIndex(volume as u32), &name, &[], None);
         self.bound[volume] = true;
         self.size(volume);
+        self.doing = ("bind", volume);
         self.settle();
     }
 
@@ -185,6 +203,7 @@ impl Owner {
         bytes: Option<&[u8]>,
     ) {
         self.bind(volume);
+        self.doing = ("deliver", volume);
         self.push(VolumeIndex(volume as u32), range, provenance, bytes);
         self.settle();
     }
@@ -229,6 +248,12 @@ impl Owner {
             match placement {
                 Placement::Held { range } => {
                     assert_eq!(range.start, at, "held pieces are in volume order");
+                    // Held bytes stand at their offsets, as the tree keeps
+                    // them in the volume's file: a later copy replaces what
+                    // it covers.
+                    self.held.retain(|(was, held, ..)| {
+                        *was != volume || held.start < range.start || held.end > range.end
+                    });
                     self.held.push((volume, *range, provenance, piece.to_vec()));
                 }
                 Placement::Envelope { envelope, range } => {
@@ -262,6 +287,10 @@ impl Owner {
                 self.object.pulled(seek, self.pull, &mut out);
                 self.apply(out);
             }
+            let number = self.object.placement();
+            let unmoved = number.is_some() && number == self.asked;
+            self.skipped |= unmoved && !self.held.is_empty();
+            self.asked = number;
             for (volume, range, provenance, bytes) in std::mem::take(&mut self.held) {
                 let mut placements = Vec::new();
                 self.object.locate(volume, range, &mut placements);
@@ -271,6 +300,13 @@ impl Owner {
                 {
                     self.held.push((volume, range, provenance, bytes));
                 } else {
+                    assert!(
+                        !unmoved,
+                        "{range:?} of {volume:?} placed with the placement number unmoved"
+                    );
+                    if std::mem::take(&mut self.skipped) {
+                        self.gated.push((self.doing.0, self.doing.1, volume));
+                    }
                     changed = true;
                     self.push(volume, range, provenance, Some(&bytes));
                 }
@@ -304,6 +340,7 @@ impl Owner {
 
     pub fn close(&mut self, volume: usize) {
         self.bind(volume);
+        self.doing = ("close", volume);
         let mut out = Vec::new();
         self.object
             .volume_closed(VolumeIndex(volume as u32), &mut out);
@@ -346,6 +383,7 @@ impl Owner {
     }
 
     pub fn offer(&mut self, secret: &str) {
+        self.doing = ("password", 0);
         let mut out = Vec::new();
         self.object.offer_password(secret, &mut out);
         self.apply(out);

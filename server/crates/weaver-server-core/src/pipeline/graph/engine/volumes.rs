@@ -13,7 +13,7 @@
 // from its own failure leaves it to its owner to say why it ended. Nothing
 // here polls: every change to the shelf wakes the reads waiting on it.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +21,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use weaver_graph::{ByteRange, Coverage, Lost, VolumeIndex, Volumes};
 
-use crate::pipeline::graph::envelope::Shelf;
+use crate::pipeline::graph::envelope::{ReadFiles, Shelf};
 use crate::pipeline::graph::leaf::read_exact_at;
 
 #[derive(Debug, thiserror::Error)]
@@ -49,9 +49,9 @@ impl From<Unreadable> for io::Error {
 pub(crate) struct RunVolumes {
     shelf: Arc<Shelf>,
     generation: u64,
-    // The run's own handles, so a read never holds the shelf's lock while
-    // it touches the disk.
-    files: Mutex<BTreeMap<u32, File>>,
+    // The run's handles are registered with the storage owner for draining.
+    // A read never holds the shelf's state lock while it touches the disk.
+    files: Arc<ReadFiles>,
     // The lost spans reads failed on that the run has not read on past.
     lost: Mutex<BTreeSet<(u32, u64, u64)>>,
     stopped: AtomicBool,
@@ -70,9 +70,9 @@ impl std::fmt::Debug for RunVolumes {
 impl RunVolumes {
     pub(crate) fn new(shelf: Arc<Shelf>, generation: u64) -> Self {
         Self {
+            files: shelf.reader_files(),
             shelf,
             generation,
-            files: Mutex::default(),
             lost: Mutex::default(),
             stopped: AtomicBool::new(false),
         }
@@ -88,6 +88,14 @@ impl RunVolumes {
 
     fn stopped(&self) -> bool {
         self.stopped.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(super) fn open_files(&self) -> usize {
+        self.files
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
     }
 
     // Whether a read failed because nothing will bring its bytes, and the
@@ -206,12 +214,13 @@ impl Volumes for RunVolumes {
         Some(length)
     }
 
+    // A volume with bytes nothing will bring is not settled: a read of them
+    // fails, and work on the pool reads only what is all in.
     fn settled(&self, volume: VolumeIndex) -> bool {
         let state = self.shelf.lock();
         state.kept.get(&volume.0).is_some_and(|kept| {
-            kept.closed.is_some_and(|length| {
-                kept.settled || kept.coverage.verified(ByteRange::new(0, length))
-            })
+            kept.closed
+                .is_some_and(|length| kept.coverage.verified(ByteRange::new(0, length)))
         })
     }
 
@@ -228,6 +237,12 @@ impl Volumes for RunVolumes {
         };
         let len = usize::try_from(len).expect("a read fits the buffer it fills");
         let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+        // The owner can revoke access after wait_for returns. Check again
+        // while holding the cache lock, so draining it waits for this read
+        // and a late reader cannot reopen a file after the drain.
+        if !self.current() {
+            return Err(Unreadable::Stopped.into());
+        }
         let file = match files.entry(volume.0) {
             std::collections::btree_map::Entry::Occupied(found) => found.into_mut(),
             std::collections::btree_map::Entry::Vacant(slot) => slot.insert(File::open(path)?),

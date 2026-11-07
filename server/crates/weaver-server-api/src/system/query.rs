@@ -303,7 +303,7 @@ impl SystemQuery {
             ..result
         }
     }
-    /// Return recent log lines from the in-memory ring buffer.
+    /// Return recent log records from the in-memory ring buffer.
     #[graphql(guard = "AdminGuard")]
     async fn service_logs(
         &self,
@@ -311,9 +311,9 @@ impl SystemQuery {
         #[graphql(default = 250)] limit: i32,
     ) -> Result<ServiceLogsPayload> {
         let buffer = ctx.data::<LogRingBuffer>()?;
-        let lines = weaver_server_core::operations::snapshot_service_logs(buffer, limit);
-        let count = lines.len() as i32;
-        Ok(ServiceLogsPayload { lines, count })
+        let records = weaver_server_core::operations::snapshot_service_logs(buffer, limit);
+        let count = records.len() as i32;
+        Ok(ServiceLogsPayload { records, count })
     }
     /// The live log filter directives.
     #[graphql(guard = "AdminGuard")]

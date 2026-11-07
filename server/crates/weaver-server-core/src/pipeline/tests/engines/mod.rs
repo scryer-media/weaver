@@ -66,9 +66,17 @@
 //
 // Files are indexed as the posts are listed; ordinals count from zero.
 
+mod accounting;
 mod binding_order;
 mod caps;
 mod checkpoint_cost;
+mod classic_par2_index;
+mod classic_rar_crypt;
+mod classic_sfv;
+mod classic_sfv_nameless;
+mod classic_streams;
+mod classic_uu;
+mod classic_zip64;
 mod dead_posts;
 mod deep;
 mod delivery;
@@ -117,5 +125,6 @@ mod split;
 mod stage_events;
 mod streams;
 mod unnamed_index;
+mod withheld_par2;
 mod zip;
 mod zip_par3;

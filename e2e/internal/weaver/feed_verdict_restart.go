@@ -100,7 +100,7 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 	}
 	dbPath := caseDBPath(ctx)
 	var committed restartFeedVerdict
-	if err := ctx.pollFor("committed abandoned-file verdict", func() (bool, error) {
+	if err := ctx.pollJob("committed abandoned-file verdict", dbPath, jobID, func() (bool, error) {
 		committed, err = readRestartFeedVerdict(dbPath, jobID)
 		return committed.Version == 1 && committed.Reason != "" && reflect.DeepEqual(committed.AbandonedFiles, []int{abandonedIndex}), err
 	}); err != nil {
@@ -109,7 +109,7 @@ func runCommittedFeedVerdictRestart(ctx *restartCaseContext) (restartCaseResult,
 	if err := pauseQueueItemGraphQL(ctx.weaverURL, jobID); err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.pollFor("persisted pause after feed verdict", func() (bool, error) {
+	if err := ctx.pollJob("persisted pause after feed verdict", dbPath, jobID, func() (bool, error) {
 		status, ok := restartJobStatusFromDB(dbPath, jobID)
 		return ok && status == "PAUSED", nil
 	}); err != nil {
@@ -258,8 +258,11 @@ func requireFeedVerdictAbsence(proof checkpointEvidence, verdict restartFeedVerd
 		if row.FileIndex != index {
 			continue
 		}
-		if row.Length == nil || *row.Length != length || !row.Coverage.Covers(0, length) {
-			return fmt.Errorf("abandoned file does not cover its encoded lost bounds")
+		// The verdict refuses future dispatch, including work still in flight
+		// when it commits. Those articles may still be Waiting at the crash;
+		// full lost coverage is only known once they have all settled.
+		if row.Length != nil && *row.Length != length {
+			return fmt.Errorf("abandoned file has unexpected encoded lost bounds")
 		}
 		for _, run := range row.Coverage.Runs {
 			if run.Provenance != "lost" || run.End <= run.Start || run.End > length {

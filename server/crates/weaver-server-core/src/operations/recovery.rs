@@ -22,6 +22,9 @@ pub struct RecoveredServerState {
     pub initial_history: Vec<JobInfo>,
     pub to_restore: Vec<RestoreCandidate>,
     pub initial_holds: crate::jobs::HoldSet,
+    // The jobs that crashed the daemon on its last run, each parked paused
+    // as it installs.
+    pub crashed: crate::runtime::panic_trap::CrashMarks,
     // What recovery leaves until the server answers; `spawn` runs it once.
     pub after_boot: AfterBoot,
 }
@@ -70,6 +73,101 @@ impl AfterBoot {
     }
 }
 
+// A job's files from its stored NZB, read and parsed once, with the
+// summaries of the article lists let go. A read that fails is the outer
+// error; a missing or unreadable NZB is the inner one.
+pub(crate) fn read_stored_files(
+    db: &Database,
+    job_id: crate::jobs::ids::JobId,
+    recovered: &crate::RecoveredJob,
+) -> Result<
+    Result<(crate::JobSpec, crate::jobs::model::FileSummaries), ingest::PersistedNzbError>,
+    crate::StateError,
+> {
+    let missing = || {
+        ingest::PersistedNzbError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("persisted NZB missing from database for job {}", job_id.0),
+        ))
+    };
+    Ok(db
+        .load_active_job_persisted_nzb(job_id)?
+        .and_then(|(_, nzb_zstd)| nzb_zstd)
+        .filter(|nzb_zstd| !nzb_zstd.is_empty())
+        .ok_or_else(missing)
+        .and_then(|nzb_zstd| ingest::parse_persisted_nzb_bytes(&nzb_zstd))
+        .map(|nzb| {
+            let mut spec = ingest::nzb_to_spec(
+                &nzb,
+                &recovered.nzb_path,
+                recovered.category.clone(),
+                recovered.metadata.clone(),
+            );
+            drop(nzb);
+            let summaries = spec.drop_article_lists();
+            (spec, summaries)
+        }))
+}
+
+// The restore of a job from its active row and the files of its stored NZB.
+pub(crate) fn restore_request(
+    job_id: crate::jobs::ids::JobId,
+    recovered: crate::RecoveredJob,
+    mut spec: crate::JobSpec,
+    summaries: crate::jobs::model::FileSummaries,
+) -> RestoreJobRequest {
+    let runtime = crate::pipeline::StoredRuntimeValues::of(&recovered);
+    // Apply a persisted password override on top of the NZB-derived
+    // password ('' = explicitly none).
+    match recovered.password_override.as_deref() {
+        None => {}
+        Some("") => spec.password = None,
+        Some(password) => spec.password = Some(password.to_string()),
+    }
+    let status = job_status_from_persisted_str(&recovered.status, recovered.error.as_deref());
+    let download_state = recovered
+        .download_state
+        .as_deref()
+        .and_then(DownloadState::parse);
+    let post_state = recovered.post_state.as_deref().and_then(PostState::parse);
+    let run_state = recovered.run_state.as_deref().and_then(RunState::parse);
+    let paused_resume_status = recovered
+        .paused_resume_status
+        .as_deref()
+        .map(|status| job_status_from_persisted_str(status, None));
+    let paused_resume_download_state = recovered
+        .paused_resume_download_state
+        .as_deref()
+        .and_then(DownloadState::parse);
+    let paused_resume_post_state = recovered
+        .paused_resume_post_state
+        .as_deref()
+        .and_then(PostState::parse);
+    RestoreJobRequest {
+        job_id,
+        job_hash: recovered.nzb_hash,
+        spec,
+        detected_archives: recovered.detected_archives,
+        file_identities: recovered.file_identities,
+        status,
+        download_state,
+        post_state,
+        run_state,
+        queued_repair_at_epoch_ms: recovered.queued_repair_at_epoch_ms,
+        queued_extract_at_epoch_ms: recovered.queued_extract_at_epoch_ms,
+        paused_resume_status,
+        paused_resume_download_state,
+        paused_resume_post_state,
+        working_dir: recovered.output_dir,
+        restart: Some(crate::RestartRead {
+            runtime,
+            summaries,
+            created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
+            reentry: false,
+        }),
+    }
+}
+
 pub struct RestoreCandidate {
     pub job_id: crate::jobs::ids::JobId,
     // Manual queue-order position persisted at reorder time; `None` sorts by
@@ -108,6 +206,18 @@ pub async fn recover_server_state(
         .filter(|recovered| recovered.output_dir.starts_with(intermediate_dir))
         .map(|recovered| recovered.output_dir.clone())
         .collect();
+    // A moving job's row names its destination; the working directory it
+    // is still moving out of is its own all the same.
+    for (job_id, _) in active_jobs
+        .iter()
+        .filter(|(_, recovered)| recovered.status == "moving")
+    {
+        if let Some(working_dir) =
+            crate::jobs::working_dir::find_job_working_dir(intermediate_dir, *job_id)?
+        {
+            referenced_intermediate_dirs.insert(working_dir);
+        }
+    }
 
     // Split recovered jobs into finished (history) vs in-progress (to restore).
     let mut initial_history = Vec::new();
@@ -162,6 +272,9 @@ pub async fn recover_server_state(
             completed_files: 0,
             remaining_par_files: 0,
             file_remaining_bytes: Vec::new(),
+            file_parked_bytes: Vec::new(),
+            remaining_bytes: 0,
+            wanted_bytes: 0,
             password: None,
             category: recovered.category,
             metadata: recovered.metadata,
@@ -181,87 +294,24 @@ pub async fn recover_server_state(
     // a job waiting its turn lets them go again. A read that fails stops the
     // start, as the read of every row did; only a missing or unreadable NZB
     // archives the job.
+    // A job's work that panicked would panic again as the job is restored,
+    // so the markers the panic left are read before any job is.
+    let restoring: HashSet<crate::jobs::ids::JobId> =
+        in_progress.iter().map(|(job_id, _)| *job_id).collect();
+    let crashed = crate::runtime::panic_trap::boot_marks(data_dir, |job| restoring.contains(&job));
+
     let parsed = in_progress
         .par_iter()
-        .map(|(job_id, recovered)| {
-            let missing = || {
-                ingest::PersistedNzbError::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    format!("persisted NZB missing from database for job {}", job_id.0),
-                ))
-            };
-            Ok(db
-                .load_active_job_persisted_nzb(*job_id)?
-                .and_then(|(_, nzb_zstd)| nzb_zstd)
-                .filter(|nzb_zstd| !nzb_zstd.is_empty())
-                .ok_or_else(missing)
-                .and_then(|nzb_zstd| ingest::parse_persisted_nzb_bytes(&nzb_zstd))
-                .map(|nzb| {
-                    let mut spec = ingest::nzb_to_spec(
-                        &nzb,
-                        &recovered.nzb_path,
-                        recovered.category.clone(),
-                        recovered.metadata.clone(),
-                    );
-                    drop(nzb);
-                    let summaries = spec.drop_article_lists();
-                    (spec, summaries)
-                }))
-        })
+        .map(|(job_id, recovered)| read_stored_files(db, *job_id, recovered))
         .collect::<Vec<Result<_, crate::StateError>>>();
 
     for ((job_id, recovered), parsed) in in_progress.into_iter().zip(parsed) {
         match parsed? {
-            Ok((mut spec, summaries)) => {
-                let runtime = crate::pipeline::StoredRuntimeValues::of(&recovered);
-                // Apply a persisted password override on top of the
-                // NZB-derived password ('' = explicitly none).
-                match recovered.password_override.as_deref() {
-                    None => {}
-                    Some("") => spec.password = None,
-                    Some(password) => spec.password = Some(password.to_string()),
-                }
-                let status =
-                    job_status_from_persisted_str(&recovered.status, recovered.error.as_deref());
-                let download_state = recovered
-                    .download_state
-                    .as_deref()
-                    .and_then(DownloadState::parse);
-                let post_state = recovered.post_state.as_deref().and_then(PostState::parse);
-                let run_state = recovered.run_state.as_deref().and_then(RunState::parse);
-                let paused_resume_status = recovered
-                    .paused_resume_status
-                    .as_deref()
-                    .map(|status| job_status_from_persisted_str(status, None));
-                let paused_resume_download_state = recovered
-                    .paused_resume_download_state
-                    .as_deref()
-                    .and_then(DownloadState::parse);
-                let paused_resume_post_state = recovered
-                    .paused_resume_post_state
-                    .as_deref()
-                    .and_then(PostState::parse);
+            Ok((spec, summaries)) => {
                 to_restore.push(RestoreCandidate {
                     job_id,
                     queue_position: recovered.queue_position,
-                    request: RestoreJobRequest {
-                        job_id,
-                        job_hash: recovered.nzb_hash,
-                        spec,
-                        detected_archives: recovered.detected_archives,
-                        file_identities: recovered.file_identities,
-                        status,
-                        download_state,
-                        post_state,
-                        run_state,
-                        queued_repair_at_epoch_ms: recovered.queued_repair_at_epoch_ms,
-                        queued_extract_at_epoch_ms: recovered.queued_extract_at_epoch_ms,
-                        paused_resume_status,
-                        paused_resume_download_state,
-                        paused_resume_post_state,
-                        working_dir: recovered.output_dir,
-                        restart: Some(crate::RestartRead { runtime, summaries }),
-                    },
+                    request: restore_request(job_id, recovered, spec, summaries),
                 });
             }
             Err(error) => {
@@ -283,10 +333,13 @@ pub async fn recover_server_state(
     }
 
     // Also load archived job history from SQLite so the UI can show completed/failed jobs.
-    match db.list_job_history(&HistoryFilter {
-        limit: Some(FINISHED_JOBS_RUNTIME_CAP as u32),
-        ..HistoryFilter::default()
-    }) {
+    match db.list_job_history(
+        &HistoryFilter {
+            limit: Some(FINISHED_JOBS_RUNTIME_CAP as u32),
+            ..HistoryFilter::default()
+        },
+        crate::HistoryRows::All,
+    ) {
         Ok(history_rows) => {
             for row in history_rows {
                 if let Some(output_dir) = row.output_dir.as_ref() {
@@ -342,6 +395,9 @@ pub async fn recover_server_state(
                     completed_files: 0,
                     remaining_par_files: 0,
                     file_remaining_bytes: Vec::new(),
+                    file_parked_bytes: Vec::new(),
+                    remaining_bytes: 0,
+                    wanted_bytes: 0,
                     password: None,
                     category: row.category,
                     metadata: row
@@ -408,6 +464,7 @@ pub async fn recover_server_state(
         initial_history,
         to_restore,
         initial_holds,
+        crashed,
         after_boot: AfterBoot {
             db: db.clone(),
             below: crate::jobs::ids::JobId(next_job_id),
@@ -602,6 +659,39 @@ mod tests {
             Ok(())
         })
         .unwrap();
+    }
+
+    // A start reads the crash markers before it restores a job: one for a
+    // job it restores waits for that job's install, one for a job that is
+    // gone and one outside any job are logged and removed.
+    #[tokio::test]
+    async fn recovery_keeps_only_the_crash_markers_of_jobs_it_restores() {
+        let temp = TempDir::new().unwrap();
+        let db = Database::open_in_memory().unwrap();
+        let nzb_path = temp.path().join("job-1.nzb");
+        db.create_active_job(&sample_active_job(1, nzb_path, temp.path().join("job-1")))
+            .unwrap();
+        let trap = crate::runtime::panic_trap::Trap::new(temp.path(), "test");
+        let restored = trap.write(Some(JobId(1)), "in its work", None).unwrap();
+        let gone = trap.write(Some(JobId(9)), "long gone", None).unwrap();
+        let daemon = trap.write(None, "outside", None).unwrap();
+
+        let mut recovered =
+            recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
+                .await
+                .unwrap();
+
+        assert_eq!(recovered.to_restore.len(), 1);
+        assert!(restored.exists());
+        assert!(!gone.exists());
+        assert!(!daemon.exists());
+        assert!(recovered.crashed.take(JobId(9)).is_none());
+        let mark = recovered
+            .crashed
+            .take(JobId(1))
+            .expect("the restored job's marker waits");
+        assert_eq!(mark.reason(), "crashed the daemon: in its work");
+        assert!(recovered.crashed.is_empty());
     }
 
     #[tokio::test]

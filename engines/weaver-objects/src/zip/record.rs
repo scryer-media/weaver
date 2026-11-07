@@ -9,7 +9,7 @@
 // read the directory, is said from what was kept.
 
 use weaver_graph::{
-    Algorithm, ByteRange, Emit, Evidenced, MemberId, Provenance, Segment, SliceVerdict,
+    Algorithm, ByteRange, Emit, Evidenced, MemberId, Placement, Provenance, Segment, SliceVerdict,
 };
 
 use super::Zip;
@@ -21,6 +21,7 @@ impl Zip {
         range: ByteRange,
         bytes: &Evidenced,
         provenance: Provenance,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
         let Some(map) = &self.map else {
@@ -38,12 +39,21 @@ impl Zip {
         for (member, part, start) in parts {
             let slice =
                 bytes.slice((part.start - range.start) as usize..(part.end - range.start) as usize);
-            self.record(member, part.start - start, slice, provenance, out);
+            self.decrypt_record(member, part.start - start, slice, provenance, read, out);
         }
+        self.emit_kept_encrypted(read, out);
     }
 
     // What the object kept of a member's data, said once the data is placed.
     pub(super) fn emit_kept(&mut self, member: MemberId, out: &mut Vec<Emit>) {
+        if self
+            .map
+            .as_ref()
+            .and_then(|map| map.entry(member))
+            .is_some_and(|entry| entry.cipher.is_some())
+        {
+            return;
+        }
         let Some(span) = self
             .map
             .as_ref()
@@ -84,7 +94,7 @@ impl Zip {
         }
     }
 
-    fn record(
+    pub(super) fn record(
         &mut self,
         member: MemberId,
         offset: u64,
@@ -92,11 +102,11 @@ impl Zip {
         provenance: Provenance,
         out: &mut Vec<Emit>,
     ) {
-        let Some((length, expected)) = self
+        let Some((length, expected, crc_known)) = self
             .map
             .as_ref()
             .and_then(|map| map.entry(member))
-            .map(|entry| (entry.length, entry.crc))
+            .map(|entry| (entry.length, entry.crc, entry.crc_known))
         else {
             return;
         };
@@ -105,7 +115,8 @@ impl Zip {
             return;
         };
         // Bytes said already, as they were, are not said again.
-        if said.coverage.covered(range)
+        if !bytes.is_empty()
+            && said.coverage.covered(range)
             && said
                 .coverage
                 .overlapping(range)
@@ -131,17 +142,55 @@ impl Zip {
         });
         let whole = ByteRange::new(0, length);
         let folded = self.grid.fold(member, WHOLE, 0, whole);
-        let verdict = grid::verdict(folded, length, 0, expected);
+        let verdict = if crc_known {
+            grid::verdict(folded, length, 0, expected)
+        } else {
+            SliceVerdict::Unknown
+        };
+        let mut retry = false;
+        let mut encrypted = false;
+        let mut doubted = false;
+        if let Some(map) = &mut self.map {
+            let index = map.members[member.0 as usize];
+            if let Some(cipher) = &mut map.entries[index].cipher {
+                encrypted = true;
+                if verdict == SliceVerdict::Intact {
+                    cipher.proven = true;
+                } else if verdict == SliceVerdict::Damaged
+                    && !cipher.proven
+                    && folded.is_some_and(|folded| folded.verified)
+                {
+                    // Another candidate to try: this one may be a false
+                    // positive. The only one passing the check byte stays,
+                    // and the bytes are said damaged for a repair; a later
+                    // password can still be tried against them.
+                    if cipher.alternative(&self.candidates) {
+                        cipher.retry = true;
+                        retry = true;
+                    } else {
+                        doubted = true;
+                    }
+                }
+            }
+        }
+        if doubted && !self.asked {
+            self.asked = true;
+            out.push(Emit::NeedsPassword);
+        }
         let Some(said) = self.members.get_mut(member.0 as usize) else {
             return;
         };
         said.coverage.write(range, provenance);
-        if !said.closed && said.coverage.covered(whole) {
+        if !retry
+            && (!encrypted || verdict == SliceVerdict::Intact)
+            && !said.closed
+            && said.coverage.covered(whole)
+        {
             said.closed = true;
             out.push(Emit::MemberClosed(member));
         }
         match verdict {
-            SliceVerdict::Damaged if !said.damaged => {
+            SliceVerdict::Damaged if !said.damaged && !retry => {
                 said.damaged = true;
                 let mut extents = Vec::new();
                 self.member_extent(member, whole, &mut extents);
@@ -152,6 +201,61 @@ impl Zip {
             }
             SliceVerdict::Intact => said.damaged = false,
             _ => {}
+        }
+        if retry
+            || (encrypted
+                && crc_known
+                && folded.is_none()
+                && self.members[member.0 as usize].coverage.covered(whole))
+        {
+            let mut extents = Vec::new();
+            self.member_extent(member, whole, &mut extents);
+            out.extend(extents.into_iter().map(|extent| Emit::Again {
+                volume: extent.volume,
+                range: extent.range,
+            }));
+            if retry {
+                self.asked = false;
+            }
+        }
+    }
+
+    // A member whose whole CRC fails over verified bytes under a candidate
+    // nothing proved, kept for want of another: a new password retries it.
+    pub(super) fn retry_doubted(&mut self, out: &mut Vec<Emit>) {
+        let Some(map) = &mut self.map else {
+            return;
+        };
+        let mut again = Vec::new();
+        for entry in &mut map.entries {
+            let (Some(member), Some(cipher)) = (entry.member, &mut entry.cipher) else {
+                continue;
+            };
+            if cipher.open.is_none()
+                || cipher.proven
+                || cipher.retry
+                || !entry.crc_known
+                || !cipher.alternative(&self.candidates)
+            {
+                continue;
+            }
+            let whole = ByteRange::new(0, entry.length);
+            let folded = self.grid.fold(member, WHOLE, 0, whole);
+            if grid::verdict(folded, entry.length, 0, entry.crc) != SliceVerdict::Damaged
+                || !folded.is_some_and(|folded| folded.verified)
+            {
+                continue;
+            }
+            cipher.retry = true;
+            again.push((member, whole));
+        }
+        for (member, whole) in again {
+            let mut extents = Vec::new();
+            self.member_extent(member, whole, &mut extents);
+            out.extend(extents.into_iter().map(|extent| Emit::Again {
+                volume: extent.volume,
+                range: extent.range,
+            }));
         }
     }
 }

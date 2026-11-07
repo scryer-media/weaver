@@ -24,6 +24,10 @@ pub struct JobReport {
     pub progress: f64,
     pub total_bytes: u64,
     pub downloaded_bytes: u64,
+    // The bytes the job wants, and what of them is still to come; a part
+    // left out on purpose counts in neither.
+    pub wanted_bytes: u64,
+    pub remaining_bytes: u64,
     pub phase_progress: Vec<JobPhaseProgress>,
     pub category: Option<String>,
     pub output_dir: Option<String>,
@@ -75,6 +79,9 @@ impl JobReport {
             output_dir: self.output_dir,
             server_attribution: Vec::new(),
             file_remaining_bytes: Vec::new(),
+            file_parked_bytes: Vec::new(),
+            remaining_bytes: self.remaining_bytes,
+            wanted_bytes: self.wanted_bytes,
             download_wait_reason: self.wait_reason,
             download_retry_at_epoch_ms: None,
             created_at_epoch_ms: self.created_at_ms as f64,

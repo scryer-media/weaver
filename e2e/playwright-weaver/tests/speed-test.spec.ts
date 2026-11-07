@@ -451,8 +451,9 @@ test("ST04 a bandwidth run against Cloudflare measures through the proxy rung an
     expect(connection.path, "every connection dials the proxy rung").toMatchObject({ egressId: a.id, rung: 0, proxyIds: [connect1.id] });
     expect(connection.error).toBeNull();
   }
-  // The rung carried the TLS session to Cloudflare, asked for by name or by
-  // the address the fixture resolved it to, and nothing went direct.
+  // The rung carried the TLS session to the Cloudflare name, which the
+  // fixture answers and serves itself, asked for by name or by the fixture
+  // address it resolved to, and nothing went direct.
   const events = await fixtureEvents(request, mark);
   const carried = connectedOn(events, "connect1").filter(event => event.port === 443
     && (event.host === CLOUDFLARE_HOST || /^\d+\.\d+\.\d+\.\d+$/.test(event.host ?? "")));

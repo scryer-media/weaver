@@ -212,6 +212,43 @@ async fn metrics_refresh_advances_without_pipeline_turns() {
 }
 
 #[tokio::test]
+async fn moving_progress_advances_without_another_pipeline_turn() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    tokio::time::pause();
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    let job_id = JobId(99);
+    pipeline.shared_state.queue.write(|inner| {
+        inner.push_job(crate::pipeline::queue::JobRow::new(finished_job_info(
+            job_id,
+        )));
+        crate::pipeline::queue::Change::changed(())
+    });
+    assert!(!pipeline.shared_state.queue.driving());
+    let counters = pipeline.phase_begin(job_id, JobPhase::Moving, Some(100));
+    assert!(pipeline.shared_state.queue.driving());
+    let mut changes = handle.subscribe_job_changes();
+    for completed in [25, 60, 100] {
+        counters.completed_bytes.store(completed, Ordering::Relaxed);
+        tokio::time::advance(Duration::from_millis(250)).await;
+        loop {
+            let phase = pipeline
+                .shared_state
+                .get_job(job_id)
+                .unwrap()
+                .phase_progress;
+            if phase[0].completed_bytes == completed {
+                assert_eq!(phase[0].phase, JobPhase::Moving);
+                assert_eq!(phase[0].total_bytes, 100);
+                assert_eq!(phase[0].progress_percent, completed as f32);
+                break;
+            }
+            changes.changed().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn phase_end_removes_only_the_ended_phase_snapshot() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _intermediate_dir, _complete_dir) = new_direct_pipeline(&temp_dir).await;
@@ -611,6 +648,7 @@ async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
     let dest = done.dest.clone();
     assert!(done.result.is_ok());
     pipeline.handle_move_to_complete_done(done).await;
+    settle_script_admissions(&mut pipeline).await;
     let expected_dest = complete_dir.join(format!(
         "{}.#{}",
         crate::jobs::working_dir::sanitize_dirname(job_name),

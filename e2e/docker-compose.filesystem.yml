@@ -1,0 +1,22 @@
+# Opt-in real FUSE fixture. Build its image from the exact Weaver image under
+# test with services/filesystem/Dockerfile and WEAVER_IMAGE as a build argument.
+# Layer this over docker-compose.yml only for an isolated filesystem lane.
+# Profiles: unraid = exclusive rename refused, ordinary links available;
+# portable = links/metadata refused too, and file gaps physically allocated.
+# This models capabilities and open-file lifetime, not Unraid's shfs itself.
+services:
+  weaver:
+    image: ${E2E_FILESYSTEM_IMAGE:?build a filesystem fixture image first}
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+      - label:disable
+    environment:
+      WEAVER_FS_PROFILE: ${E2E_FILESYSTEM_PROFILE:-unraid}
+    volumes:
+      - weaver-filesystem-backing:/fs-fixture/backing
+volumes:
+  weaver-filesystem-backing:

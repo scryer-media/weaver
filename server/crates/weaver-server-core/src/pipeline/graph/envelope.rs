@@ -19,7 +19,7 @@ pub(crate) mod durable;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 
 use weaver_graph::{ByteRange, Coverage, Marks, NodeId, Placement, Provenance, VolumeIndex};
 
@@ -42,7 +42,10 @@ pub(crate) struct Shelf {
     node: NodeId,
     state: Mutex<Shelved>,
     changed: Condvar,
+    readers: Mutex<Vec<Weak<ReadFiles>>>,
 }
+
+pub(crate) type ReadFiles = Mutex<BTreeMap<u32, std::fs::File>>;
 
 #[derive(Debug, Default)]
 pub(crate) struct Shelved {
@@ -127,6 +130,7 @@ impl Envelopes {
                 node,
                 state: Mutex::default(),
                 changed: Condvar::new(),
+                readers: Mutex::default(),
             })
         }))
     }
@@ -295,6 +299,37 @@ impl Envelopes {
         result
     }
 
+    // End storage access before completion unlinks consumed volumes or
+    // moves outputs. Keep the facts for reporting, but invalidate readers
+    // and drain their handles before returning storage to completion.
+    pub(crate) fn release_handles(&mut self) {
+        for shelf in self.shelves.values() {
+            shelf.update(|state| {
+                state.generation += 1;
+                for kept in state.kept.values_mut() {
+                    kept.leaf.release_handle();
+                }
+            });
+            shelf.release_readers();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_files(&self) -> Vec<PathBuf> {
+        self.shelves
+            .values()
+            .flat_map(|shelf| {
+                shelf
+                    .lock()
+                    .kept
+                    .values()
+                    .filter(|kept| kept.leaf.is_open())
+                    .map(|kept| kept.path().to_path_buf())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
     // The node is gone, and its envelopes with it. A run still reading them
     // is stopped first. Their files are returned, not removed: the last
     // checkpoint the database holds may still name them.
@@ -307,6 +342,7 @@ impl Envelopes {
             state.generation += 1;
             std::mem::take(&mut state.kept)
         });
+        shelf.release_readers();
         kept.into_values().map(|kept| kept.leaf).collect()
     }
 }
@@ -315,9 +351,7 @@ impl Envelopes {
 // waits on a shelf nothing will write again.
 impl Drop for Envelopes {
     fn drop(&mut self) {
-        for shelf in self.shelves.values() {
-            shelf.update(|state| state.generation += 1);
-        }
+        self.release_handles();
     }
 }
 
@@ -329,6 +363,28 @@ thread_local! {
 }
 
 impl Shelf {
+    pub(crate) fn reader_files(&self) -> Arc<ReadFiles> {
+        let files = Arc::new(ReadFiles::default());
+        let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+        readers.retain(|reader| reader.strong_count() != 0);
+        readers.push(Arc::downgrade(&files));
+        files
+    }
+
+    // Invalidate the generation first, then drain every run, including
+    // superseded ones still held by a worker. Never hold the state lock
+    // here: readers check their generation under their file-cache lock.
+    fn release_readers(&self) {
+        let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+        readers.retain(|reader| {
+            let Some(files) = reader.upgrade() else {
+                return false;
+            };
+            files.lock().unwrap_or_else(PoisonError::into_inner).clear();
+            true
+        });
+    }
+
     pub(crate) fn lock(&self) -> MutexGuard<'_, Shelved> {
         #[cfg(test)]
         LOCKED.with_borrow_mut(|locked| locked.push(self.node));

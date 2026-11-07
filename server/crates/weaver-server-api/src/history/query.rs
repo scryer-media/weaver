@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::history::types::{history_delete_row_state_from_core, history_table_item_from_row};
 use crate::jobs::types::load_duplicate_summaries_chunked;
+use weaver_server_core::HistoryRows;
 
 enum HistoryQueryPlan {
     Empty,
@@ -50,7 +51,10 @@ impl HistoryQuery {
             // page that contains a live job's row comes back short by that many
             // rows rather than pulling the next row forward. The cursor stays a
             // plain row offset, which is what the next page is decoded against.
-            let rows = exclude_live_rows(db.list_job_history(&history_filter)?, &live_jobs);
+            let rows = exclude_live_rows(
+                db.list_job_history(&history_filter, HistoryRows::Shown)?,
+                &live_jobs,
+            );
             let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
             let duplicate_summaries = load_duplicate_summaries_chunked(
                 &db,
@@ -142,7 +146,7 @@ impl HistoryQuery {
         // The count answers for the same rows the list returns, so the rows the
         // list excludes as still-live are taken off it too.
         let count = tokio::task::spawn_blocking(move || {
-            let counted = db.count_job_history(&history_filter)?;
+            let counted = db.count_job_history(&history_filter, HistoryRows::Shown)?;
             let live = count_live_rows_matching(&db, &history_filter, &live_jobs)?;
             Ok::<_, weaver_server_core::StateError>(counted.saturating_sub(live))
         })
@@ -399,7 +403,10 @@ async fn load_history_page(
         let page = if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
             build_history_page_sql(&db, plan, &live_in_history)?
         } else {
-            let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
+            let rows = db.list_job_history(
+                &weaver_server_core::HistoryFilter::default(),
+                HistoryRows::Shown,
+            )?;
             build_history_page(exclude_live_rows(rows, &live_in_history), input)
         };
         attach_history_page_badges(&db, page)
@@ -545,9 +552,18 @@ fn build_history_page_sql(
     // Counts are always computed over the entire (unfiltered-by-status) set, just
     // like the Rust path computes them before applying the status filter.
     let counts = HistoryPageCounts {
-        all: db.count_job_history(&excluding_live(weaver_server_core::HistoryFilter::default()))?,
-        success: db.count_job_history(&excluding_live(success_history_filter()))?,
-        failure: db.count_job_history(&excluding_live(failure_history_filter()))?,
+        all: db.count_job_history(
+            &excluding_live(weaver_server_core::HistoryFilter::default()),
+            HistoryRows::Shown,
+        )?,
+        success: db.count_job_history(
+            &excluding_live(success_history_filter()),
+            HistoryRows::Shown,
+        )?,
+        failure: db.count_job_history(
+            &excluding_live(failure_history_filter()),
+            HistoryRows::Shown,
+        )?,
     };
 
     // The status filter selects which rows are paginated and counted for
@@ -562,20 +578,21 @@ fn build_history_page_sql(
     // plan only exists when no category filter is set, so there is nothing to
     // leave out of them here.
     let mut category_counts: Vec<HistoryCategoryCount> = db
-        .count_job_history_by_category(&excluding_live(
-            weaver_server_core::HistoryFilter::default(),
-        ))?
+        .count_job_history_by_category(
+            &excluding_live(weaver_server_core::HistoryFilter::default()),
+            HistoryRows::Shown,
+        )?
         .into_iter()
         .map(|(category, count)| HistoryCategoryCount { category, count })
         .collect();
     category_counts.sort_by(|left, right| left.category.cmp(&right.category));
 
-    let total_count = db.count_job_history(&items_filter)?;
+    let total_count = db.count_job_history(&items_filter, HistoryRows::Shown)?;
 
     items_filter.limit = Some(plan.page_size as u32);
     items_filter.offset =
         Some(u32::try_from(plan.page_index.saturating_mul(plan.page_size)).unwrap_or(u32::MAX));
-    let rows = db.list_job_history(&items_filter)?;
+    let rows = db.list_job_history(&items_filter, HistoryRows::Shown)?;
     let items = rows
         .into_iter()
         .map(|row| history_table_item_from_row(&row, None))
@@ -632,8 +649,9 @@ fn live_jobs_in_history(
         item_ids: Some(live_jobs.iter().copied().collect()),
         ..Default::default()
     };
+    // An exclusion list: an id that is hidden anyway changes nothing.
     Ok(db
-        .list_job_history(&filter)?
+        .list_job_history(&filter, HistoryRows::All)?
         .into_iter()
         .map(|row| row.job_id)
         .collect())
@@ -667,7 +685,8 @@ fn count_live_rows_matching(
         offset: None,
         ..filter.clone()
     };
-    db.count_job_history(&filter)
+    // Taken off a count of shown rows, so it counts shown rows too.
+    db.count_job_history(&filter, HistoryRows::Shown)
 }
 
 fn load_history_delete_states(
@@ -1024,6 +1043,9 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         completed_files: 0,
         remaining_par_files: 0,
         file_remaining_bytes: Vec::new(),
+        file_parked_bytes: Vec::new(),
+        remaining_bytes: 0,
+        wanted_bytes: 0,
         password: None,
         category: row.category.clone(),
         metadata,
@@ -1105,7 +1127,10 @@ mod tests {
 
     fn rust_page(db: &Database, input: HistoryPageInput, live: &HashSet<u64>) -> HistoryPage {
         let rows = db
-            .list_job_history(&weaver_server_core::HistoryFilter::default())
+            .list_job_history(
+                &weaver_server_core::HistoryFilter::default(),
+                HistoryRows::Shown,
+            )
             .unwrap();
         build_history_page(exclude_live_rows(rows, live), input)
     }
@@ -1428,7 +1453,10 @@ mod tests {
 
         // The list surfaces share the exclusion, so they agree with the page.
         let rows = db
-            .list_job_history(&weaver_server_core::HistoryFilter::default())
+            .list_job_history(
+                &weaver_server_core::HistoryFilter::default(),
+                HistoryRows::Shown,
+            )
             .unwrap();
         let list_ids: Vec<u64> = exclude_live_rows(rows, &live)
             .iter()
@@ -1440,7 +1468,7 @@ mod tests {
         let all = weaver_server_core::HistoryFilter::default();
         assert_eq!(count_live_rows_matching(&db, &all, &live).unwrap(), 1);
         assert_eq!(
-            db.count_job_history(&all).unwrap()
+            db.count_job_history(&all, HistoryRows::Shown).unwrap()
                 - count_live_rows_matching(&db, &all, &live).unwrap(),
             6
         );

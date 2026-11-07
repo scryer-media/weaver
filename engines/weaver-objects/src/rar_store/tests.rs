@@ -6,7 +6,7 @@ mod facts;
 mod owner;
 mod recovery_contracts;
 mod settle;
-mod writer;
+pub(crate) mod writer;
 
 use std::io::Cursor;
 use std::num::NonZeroUsize;
@@ -18,7 +18,7 @@ use weaver_graph::{
     VolumeIndex, Weight, Why,
 };
 
-use super::RarStore;
+use super::{RarStore, walk};
 use crate::keys::{CAPACITY, Keys};
 use crate::testing::payload;
 use owner::Owner;
@@ -979,6 +979,109 @@ fn a_wrong_rar4_key_on_unverified_bytes_is_damage_until_repaired() {
     posted_whole(&owner);
 }
 
+// Where a single RAR4 volume's bytes go: each range in volume order, with
+// whether it is a file's data.
+fn rar4_data(volumes: &[Vec<u8>]) -> Vec<(ByteRange, bool)> {
+    let whole = ByteRange::new(0, volumes[0].len() as u64);
+    let mut walked = Owner::named(store(), volumes.to_vec());
+    walked.offer(PASSWORD);
+    walked.deliver(0, whole);
+    let mut placements = Vec::new();
+    walked.object.locate(VolumeIndex(0), whole, &mut placements);
+    let mut at = 0;
+    let mut data = Vec::new();
+    for placement in &placements {
+        let range = ByteRange::at(at, placement.len());
+        data.push((range, matches!(placement, Placement::Member { .. })));
+        at = range.end;
+    }
+    data
+}
+
+// A RAR4 volume posted with a byte of the first file's data wrong, its
+// checksums passing as a post made after the recovery set was: the file's
+// own checksum fails on bytes as they were posted, condemning the one
+// candidate on trial, until a repair rewrites them. Returns the owner and
+// the range the repair rewrites.
+fn rar4_posted_wrong(secret: &str) -> (Owner, ByteRange) {
+    let volumes = write(&items(), &encrypted(Version::Rar4, false));
+    let data = rar4_data(&volumes);
+    let (wrong, _) = *data.iter().find(|(_, member)| *member).expect("file data");
+    let mut posted = volumes[0][wrong.start as usize..wrong.end as usize].to_vec();
+    posted[0] ^= 0x5a;
+    let mut owner = Owner::named(store(), volumes);
+    owner.offer(secret);
+    for (range, _) in &data {
+        let bytes = (*range == wrong).then_some(posted.as_slice());
+        owner.deliver_as(0, *range, Provenance::Fresh, bytes);
+    }
+    owner.close(0);
+    assert!(
+        owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. })),
+        "condemned: {:?}",
+        owner.said
+    );
+    assert!(owner.members.values().all(|got| !got.closed));
+    (owner, wrong)
+}
+
+// The one candidate was condemned over bytes posted wrong. Once a repair
+// rewrites them and the job is quiet, it is tried again on them, and opens
+// every file.
+#[test]
+fn a_rar4_key_condemned_over_bytes_posted_wrong_opens_them_once_repaired() {
+    let (mut owner, wrong) = rar4_posted_wrong(PASSWORD);
+    owner.deliver_as(0, wrong, Provenance::Repaired, None);
+    // The tree hands held bytes back to a store that places them anew.
+    owner.quiet();
+    owner.settle();
+    assert!(
+        !owner.said.contains(&Emit::Refuse(Why::Encrypted)),
+        "{:?}",
+        owner.said
+    );
+    owner.said.retain(|emit| {
+        !matches!(
+            emit,
+            Emit::NeedsPassword | Emit::Again { .. } | Emit::Damaged { .. }
+        )
+    });
+    no_trouble(&owner);
+    streamed(&owner);
+}
+
+// A wrong candidate condemned over bytes posted wrong is tried again once
+// they are repaired, condemned again by the same checksum, and the set
+// needs a password.
+#[test]
+fn a_wrong_rar4_key_condemned_over_bytes_posted_wrong_is_condemned_again_once_repaired() {
+    let (mut owner, wrong) = rar4_posted_wrong("not-the-passphrase");
+    owner.deliver_as(0, wrong, Provenance::Repaired, None);
+    owner.said.clear();
+    owner.quiet();
+    owner.settle();
+    assert!(
+        owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. })),
+        "tried again: {:?}",
+        owner.said
+    );
+    assert!(!owner.said.contains(&Emit::Refuse(Why::Encrypted)));
+    assert!(owner.members.values().all(|got| !got.closed));
+    owner.said.clear();
+    owner.quiet();
+    assert!(
+        owner.said.contains(&Emit::Refuse(Why::Encrypted)),
+        "{:?}",
+        owner.said
+    );
+}
+
 #[test]
 fn every_rar4_candidate_wrong_on_verified_bytes_needs_a_password() {
     let volumes = write(&items(), &encrypted(Version::Rar4, false));
@@ -1108,6 +1211,35 @@ fn two_stores_with_one_password_and_salt_derive_once() {
         }
         assert!(counts[0].1 > 0, "{version:?} {headers}");
         assert_eq!(counts[0], counts[1], "{version:?} {headers}");
+    }
+}
+
+// A later volume's first two articles trade places: the second's bytes stand
+// at the volume's front, and the first's, with the volume's signature, sit
+// in a range that was lost. Nothing of a lost range is read, whatever bytes
+// a copy left there, so no member header is taken from it and no member is
+// said to run past the volume's end.
+#[test]
+fn a_lost_range_is_never_read_for_headers() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split(version));
+        let real = volumes[1].clone();
+        let length = real.len() as u64;
+        let mut owner = Owner::named(store(), volumes);
+        for volume in [0, 2] {
+            owner.frames(volume, 1000);
+            owner.close(volume);
+        }
+        let front = ByteRange::new(0, 768);
+        let lost = ByteRange::new(768, 1536);
+        owner.deliver_as(1, front, Provenance::Fresh, Some(&real[768..1536]));
+        owner.deliver_as(1, lost, Provenance::Lost, Some(&real[..768]));
+        owner.deliver(1, ByteRange::new(lost.end, length));
+        owner.close(1);
+        let past = owner.said.iter().any(|emit| {
+            matches!(emit, Emit::Damaged { volume: VolumeIndex(1), range } if range.end > length)
+        });
+        assert!(!past, "{version:?} {:?}", owner.said);
     }
 }
 
@@ -1904,4 +2036,373 @@ fn a_stored_split_file_handed_its_evidence_is_judged_without_hashing_its_data() 
             .all(|verdict| *verdict == weaver_graph::SliceVerdict::Intact),
         "{with:?}"
     );
+}
+
+// A namespace asks a store where its held bytes go only once the store's
+// placement number has moved since it last asked. Each kind of change that
+// places held bytes moves it: the walk reaching them, the layout linking
+// their volume from another, a password opening their file, a close reading
+// the header that names them, and a volume bound. The owner checks at every
+// pass that no hold is placed while the number stands, and notes each one
+// placed after a pass the number would have let skip.
+#[test]
+fn every_change_that_places_held_bytes_moves_the_placement_number() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let mut owner = Owner::named(store(), write(&items(), &Options::new(version)));
+        owner.backwards(0, 777);
+        owner.close(0);
+        streamed(&owner);
+        assert!(
+            owner.gated.contains(&("deliver", 0, VolumeIndex(0))),
+            "{version:?} walk: {:?}",
+            owner.gated
+        );
+
+        let mut owner = Owner::named(store(), write(&items(), &split(version)));
+        for volume in [2, 0, 1] {
+            owner.frames(volume, 1000);
+        }
+        for volume in [2, 0, 1] {
+            owner.close(volume);
+        }
+        streamed(&owner);
+        assert!(
+            owner.gated.contains(&("deliver", 1, VolumeIndex(2))),
+            "{version:?} layout: {:?}",
+            owner.gated
+        );
+
+        let mut owner = Owner::named(store(), write(&items(), &split_encrypted(version, false)));
+        for volume in [1, 2, 0] {
+            owner.backwards(volume, 1500);
+        }
+        owner.offer(PASSWORD);
+        for volume in 0..3 {
+            owner.close(volume);
+        }
+        owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+        streamed(&owner);
+        assert!(
+            owner.gated.iter().any(|(doing, ..)| *doing == "password"),
+            "{version:?} password: {:?}",
+            owner.gated
+        );
+
+        let real = write(&items(), &Options::new(version)).remove(0);
+        let [(_, alpha), (_, beta), _] = &files()[..] else {
+            unreachable!("three files")
+        };
+        let alpha_end = (find(&real, &alpha[..64]) + alpha.len()) as u64;
+        let beta_at = find(&real, &beta[..64]) as u64;
+        let article = ByteRange::new(alpha_end - 100, beta_at + 100);
+        let length = real.len() as u64;
+        let mut owner = Owner::named(store(), vec![real]);
+        owner.deliver(0, ByteRange::new(0, article.start));
+        owner.deliver_as(0, article, Provenance::Damaged, None);
+        owner.deliver(0, ByteRange::new(article.end, length));
+        assert_eq!(owner.held(), 1, "{version:?}");
+        owner.close(0);
+        assert_eq!(owner.held(), 0, "{version:?}");
+        assert_eq!(owner.member("beta.bin").bytes, *beta, "{version:?}");
+        assert_eq!(
+            owner.gated,
+            [("close", 0, VolumeIndex(0))],
+            "{version:?} close"
+        );
+
+        // A volume bound or adopted changes what the store places of it:
+        // the number moves with it. The namespace hands a member's holds to
+        // its object as it binds it, past any pass.
+        let volumes = write(&items(), &split(version));
+        let mut owner = Owner::named(store(), volumes);
+        let number = owner.object.placement();
+        owner
+            .object
+            .bound(VolumeIndex(1), "alpha.part2.rar", &[], None);
+        assert_ne!(owner.object.placement(), number, "{version:?} bind");
+    }
+}
+
+// Bytes that only pass through, data past every header, move nothing: a
+// namespace holding bytes of the volume asks the store nothing more.
+#[test]
+fn data_that_only_passes_through_leaves_the_placement_number_standing() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &split(version));
+        let mut owner = Owner::named(store(), volumes);
+        owner.frames(0, 1000);
+        owner.close(0);
+        let first = find(&owner.volumes[2].1, &files()[1].1[3_000..3_064]) as u64;
+        owner.deliver(2, ByteRange::new(first, first + 100));
+        let number = owner.object.placement();
+        assert!(owner.held() > 0, "{version:?}");
+        for at in (first + 100..first + 1_000).step_by(100) {
+            owner.deliver(2, ByteRange::new(at, at + 100));
+            assert_eq!(owner.object.placement(), number, "{version:?} at {at}");
+        }
+        owner.frames(1, 1000);
+        owner.frames(2, 1000);
+        for volume in 1..3 {
+            owner.close(volume);
+        }
+        streamed(&owner);
+    }
+}
+
+// Where the volume's walk reads on from, and where its headers reach.
+fn cursor(owner: &Owner) -> (Option<u64>, Option<u64>) {
+    let found = &owner.object.volumes[&VolumeIndex(0)];
+    (found.walk.cursor.resumes_at(), found.walk.reach())
+}
+
+// A volume arriving front to back is walked from its signature once: every
+// later walk reads on from the header the last one stopped at, at or past
+// where the headers reached, and reads no header before it. Each walk is
+// checked against one from the signature as it runs.
+#[test]
+fn a_volume_arriving_in_order_is_walked_from_its_signature_once() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &Options::new(version));
+        let length = volumes[0].len() as u64;
+        let mut owner = Owner::named(store(), volumes);
+        walk::began::take();
+        let mut start = 0;
+        let mut walks = 0;
+        while start < length {
+            let end = (start + 500).min(length);
+            let (_, reach) = cursor(&owner);
+            owner.deliver(0, ByteRange::new(start, end));
+            for began in walk::began::take() {
+                walks += 1;
+                if let Some(reach) = reach {
+                    assert!(
+                        began >= reach,
+                        "{version:?} began at {began}, reach {reach}"
+                    );
+                }
+            }
+            start = end;
+        }
+        owner.close(0);
+        let began = walk::began::take();
+        assert!(walks > 3, "{version:?} {walks}");
+        assert!(
+            began.iter().all(|at| *at > 0),
+            "{version:?} close {began:?}"
+        );
+        streamed(&owner);
+    }
+}
+
+// A RAR5 walk reading on from its cursor is handed only the runs past it;
+// a RAR4 one every run in hand, each walk. Every walk is checked against
+// one from the signature over every run as it runs.
+#[test]
+fn a_resumed_rar5_walk_images_only_the_runs_past_its_cursor() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &Options::new(version));
+        let length = volumes[0].len() as u64;
+        let mut owner = Owner::named(store(), volumes);
+        walk::began::take();
+        walk::imaged::take();
+        let mut start = 0;
+        while start < length {
+            let end = (start + 500).min(length);
+            owner.deliver(0, ByteRange::new(start, end));
+            start = end;
+        }
+        owner.close(0);
+        let began = walk::began::take();
+        let imaged = walk::imaged::take();
+        assert_eq!(began.len(), imaged.len(), "{version:?}");
+        assert!(
+            began
+                .iter()
+                .zip(&imaged)
+                .all(|(began, imaged)| *imaged == 0 || imaged == began),
+            "{version:?} {began:?} {imaged:?}"
+        );
+        match version {
+            Version::Rar5 => assert!(imaged.iter().any(|at| *at > 0), "{imaged:?}"),
+            _ => assert!(imaged.iter().all(|at| *at == 0), "{imaged:?}"),
+        }
+        streamed(&owner);
+    }
+}
+
+// Each of the four things that make a step begin at the signature images
+// every run in hand: no resume, another password than the cursor last
+// stepped with, a Quick Open locator, a volume not read as RAR5.
+#[test]
+fn a_walk_images_every_run_unless_it_truly_reads_on_from_a_rar5_cursor() {
+    let volumes = write(&items(), &Options::new(Version::Rar5));
+    let mut owner = Owner::named(store(), volumes);
+    owner.frames(0, 500);
+    let walk = &mut owner.object.volumes.get_mut(&VolumeIndex(0)).unwrap().walk;
+    let resumes = walk.cursor.resumes_at().expect("a cursor");
+    assert!(resumes > 0);
+    assert_eq!(walk.image_from(None), resumes);
+    // (b) another password than the last step's
+    assert_eq!(walk.image_from(Some(PASSWORD)), 0);
+    // (c) a Quick Open locator, either way the headers state one
+    let facts = walk.facts.clone().unwrap();
+    walk.facts.as_mut().unwrap().has_locator = true;
+    assert_eq!(walk.image_from(None), 0);
+    walk.facts = Some(facts.clone());
+    walk.facts.as_mut().unwrap().quick_open_offset = Some(resumes + 1);
+    assert_eq!(walk.image_from(None), 0);
+    // (d) a volume read as RAR4, or not read at all
+    walk.facts = Some(facts.clone());
+    walk.facts.as_mut().unwrap().format = 4;
+    assert_eq!(walk.image_from(None), 0);
+    walk.facts = None;
+    assert_eq!(walk.image_from(None), 0);
+    walk.facts = Some(facts);
+    assert_eq!(walk.image_from(None), resumes);
+    // (a) no resume
+    walk.cursor.restart();
+    assert_eq!(walk.image_from(None), 0);
+}
+
+// Headers enciphered: the walks before the password stop at the
+// encryption header with a resume keyed with no password, and the first
+// walk under the password reads from the signature over every run.
+#[test]
+fn a_walk_under_a_new_password_images_every_run() {
+    let volumes = write(&items(), &encrypted(Version::Rar5, true));
+    let mut owner = Owner::named(store(), volumes);
+    owner.frames(0, 500);
+    assert!(cursor(&owner).0.is_some());
+    walk::began::take();
+    walk::imaged::take();
+    owner.offer(PASSWORD);
+    let began = walk::began::take();
+    let imaged = walk::imaged::take();
+    // The walk the offer schedules still steps with no password and reads
+    // on; the one the opened headers schedule steps under it, and its
+    // cursor's resume does not hold.
+    assert_eq!(began.first(), imaged.first(), "{began:?} {imaged:?}");
+    let keyed = began
+        .iter()
+        .zip(&imaged)
+        .position(|(began, imaged)| *began > 0 && *imaged == 0);
+    assert_eq!(keyed, Some(1), "{began:?} {imaged:?}");
+    owner.close(0);
+    owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+    no_trouble(&owner);
+    streamed(&owner);
+}
+
+// A repair whose first changed byte lies before the cursor walks the volume
+// again from its signature: here wrong file headers, read once the volume
+// closed, are repaired, and the walk reads the set as a fresh one does, the
+// header bytes now verified.
+#[test]
+fn a_header_repaired_behind_the_cursor_walks_again_from_the_signature() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let real = write(&items(), &Options::new(version)).remove(0);
+        let mut other = items();
+        other[0] = Item::File("alphz.bin", files()[0].1.clone());
+        let wrong = write(&other, &Options::new(version)).remove(0);
+        let length = real.len() as u64;
+        let mut owner = Owner::named(store(), vec![real.clone()]);
+        owner.deliver_as(
+            0,
+            ByteRange::new(0, length),
+            Provenance::Damaged,
+            Some(&wrong),
+        );
+        owner.close(0);
+        let at = find(&real, b"alpha.bin") as u64;
+        let header = ByteRange::new(at.saturating_sub(40), at + 9);
+        let (resumes, _) = cursor(&owner);
+        assert!(
+            resumes.is_some_and(|resumes| resumes > header.end),
+            "{version:?}"
+        );
+        walk::began::take();
+        walk::imaged::take();
+        owner.deliver_as(0, header, Provenance::Repaired, None);
+        assert_eq!(walk::began::take().first(), Some(&0), "{version:?}");
+        assert_eq!(walk::imaged::take().first(), Some(&0), "{version:?}");
+        let found = &owner.object.volumes[&VolumeIndex(0)];
+        assert!(
+            found.kept.verified(ByteRange::new(at, at + 9)),
+            "{version:?}"
+        );
+        owner.deliver_as(0, ByteRange::new(0, length), Provenance::Repaired, None);
+        owner.close(0);
+        streamed(&owner);
+    }
+}
+
+// A header the walk stopped at, kept out of it as damaged, is repaired: the
+// walk reads on from it and from nothing before.
+#[test]
+fn a_header_repaired_at_the_cursor_reads_on_from_it() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let volumes = write(&items(), &Options::new(version));
+        let real = volumes[0].clone();
+        let at = find(&real, b"beta.bin");
+        let mut bad = real.clone();
+        bad[at] ^= 0x20;
+        let length = real.len() as u64;
+        let mut owner = Owner::named(store(), volumes);
+        let header = ByteRange::new(at as u64 - 40, at as u64 + 8);
+        owner.deliver(0, ByteRange::new(0, header.start));
+        owner.deliver_as(
+            0,
+            header,
+            Provenance::Damaged,
+            Some(&bad[header.start as usize..header.end as usize]),
+        );
+        owner.deliver(0, ByteRange::new(header.end, length));
+        let (resumes, reach) = cursor(&owner);
+        let resumes = resumes.expect("a cursor");
+        assert!(resumes > 0 && resumes <= at as u64, "{version:?} {resumes}");
+        assert_eq!(reach, Some(resumes), "{version:?} stopped at the header");
+        walk::began::take();
+        owner.deliver_as(0, header, Provenance::Repaired, None);
+        let began = walk::began::take();
+        assert_eq!(began.first(), Some(&resumes), "{version:?} {began:?}");
+        owner.close(0);
+        streamed(&owner);
+    }
+}
+
+// The same bytes again, as a repair: only how far they are trusted changes,
+// before the cursor, and the walk reads from the signature again, so what
+// it says of damage and verification is a fresh walk's.
+#[test]
+fn a_repair_behind_the_cursor_that_changes_only_trust_walks_again_from_the_signature() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let real = write(&items(), &Options::new(version)).remove(0);
+        let length = real.len() as u64;
+        let mut owner = Owner::named(store(), vec![real.clone()]);
+        owner.deliver_as(0, ByteRange::new(0, length), Provenance::Damaged, None);
+        owner.close(0);
+        let at = find(&real, b"beta.bin") as u64;
+        let header = ByteRange::new(at - 40, at + 8);
+        let (resumes, _) = cursor(&owner);
+        assert!(
+            resumes.is_some_and(|resumes| resumes > header.end),
+            "{version:?}"
+        );
+        let found = &owner.object.volumes[&VolumeIndex(0)];
+        assert!(
+            !found.kept.verified(ByteRange::new(at, at + 8)),
+            "{version:?}"
+        );
+        walk::began::take();
+        owner.deliver_as(0, header, Provenance::Repaired, None);
+        assert_eq!(walk::began::take().first(), Some(&0), "{version:?}");
+        let found = &owner.object.volumes[&VolumeIndex(0)];
+        assert!(
+            found.kept.verified(ByteRange::new(at, at + 8)),
+            "{version:?}"
+        );
+        owner.deliver_as(0, ByteRange::new(0, length), Provenance::Repaired, None);
+        owner.close(0);
+        streamed(&owner);
+    }
 }

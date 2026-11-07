@@ -569,9 +569,12 @@ func ensureRestartFixturesSeeded(slugs []string) error {
 }
 
 func ensureRestartInfrastructure() {
-	log.Println("starting restart-suite infrastructure with fresh NNTP build...")
-	if err := ensureNNTPHealthBinary(); err != nil {
-		log.Fatalf("build NNTP healthcheck for restart suite: %v", err)
+	log.Println("starting restart-suite infrastructure...")
+	// Every service started here is pull_policy: never on an image these
+	// ensure calls prepare, or a digest-pinned registry image, so the up
+	// below never builds.
+	if err := ensureLocalWeaverNNTPImage(); err != nil {
+		log.Fatalf("prepare NNTP fixture image for restart suite: %v", err)
 	}
 	if err := ensureNyuuImageBuilt(); err != nil {
 		log.Fatalf("build nyuu image for restart suite: %v", err)
@@ -580,10 +583,10 @@ func ensureRestartInfrastructure() {
 	if weaverUsesPostgresDatastore() {
 		services = append(services, "weaver-postgres")
 	}
-	args := append(dockerComposeArgs("up", "-d", "--build", "--quiet-pull"), services...)
+	args := append(dockerComposeArgs("up", "-d", "--quiet-pull"), services...)
 	cmd := containerengine.Command(args...)
 	cmd.Dir = e2eDir()
-	if err := runExternalCommand(cmd, "docker compose up --build for restart suite"); err != nil {
+	if err := runExternalCommand(cmd, "docker compose up for restart suite"); err != nil {
 		log.Fatalf("start restart-suite infrastructure: %v", err)
 	}
 	if err := refreshRuntimePortEnvFromRunningStack(); err != nil {
@@ -2077,10 +2080,9 @@ func activeSubmittedJobCount(snapshot restartDBSnapshot, jobIDs []int) int {
 
 func waitForDelayHookRestartPoint(ctx *restartCaseContext, jobIDs []int, hook string, timeout time.Duration) (restartDBSnapshot, error) {
 	deadline := time.Now().Add(timeout)
-	needle := fmt.Sprintf("hook=\"%s\"", hook)
 	var last restartDBSnapshot
 	for time.Now().Before(deadline) {
-		hookObserved := logContains(ctx.caseLogPath, needle)
+		hookObserved := logHasDelayHook(ctx.caseLogPath, hook)
 		snapshot, err := captureRestartDBSnapshot(filepath.Join(ctx.CaseDir, "weaver.db"))
 		if err == nil {
 			last = snapshot
@@ -2104,7 +2106,42 @@ func logContains(logPath string, needle string) bool {
 	if err != nil {
 		return false
 	}
-	return strings.Contains(stripANSIEscapeSequences(string(data)), needle)
+	return strings.Contains(cleanWeaverLog(string(data)), needle)
+}
+
+// logHasDelayHook reports whether the log at logPath records the named delay
+// hook tripping.
+func logHasDelayHook(logPath, hook string) bool {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return false
+	}
+	return weaverLogHasField(cleanWeaverLog(string(data)), "hook", hook)
+}
+
+// weaverLogHasField reports whether a cleaned log holds a line whose field
+// key carries value: `key=value` as a JSON record renders a plain string, or
+// `key="value"` as the text format and a Debug field write it. The match
+// starts at a line start or a space and ends at a space or the line end, so
+// one name never matches another that merely begins with it.
+func weaverLogHasField(clean, key, value string) bool {
+	for _, token := range []string{key + "=" + value, key + "=" + strconv.Quote(value)} {
+		for from := 0; ; {
+			at := strings.Index(clean[from:], token)
+			if at < 0 {
+				break
+			}
+			start := from + at
+			end := start + len(token)
+			opens := start == 0 || clean[start-1] == ' ' || clean[start-1] == '\t' || clean[start-1] == '\n'
+			closes := end == len(clean) || clean[end] == ' ' || clean[end] == '\t' || clean[end] == '\n' || clean[end] == '\r'
+			if opens && closes {
+				return true
+			}
+			from = start + 1
+		}
+	}
+	return false
 }
 
 func stripANSIEscapeSequences(line string) string {
@@ -2265,7 +2302,11 @@ func classifyRestartResult(profile restartProfile, pass bool, passSummary string
 }
 
 func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCaseResult, error) {
-	if err := ctx.startWeaverWithOptions("", 8, restartExtractDelayEnv); err != nil {
+	segments, err := nzbSegments("rar5-multi-member")
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	if err := ctx.startWeaverWithOptions("", 8, "WEAVER_E2E_HOLD=status.enter_extracting"); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug("rar5-multi-member")
@@ -2273,18 +2314,15 @@ func runDownloadCompletedFileSurvivesRestart(ctx *restartCaseContext) (restartCa
 		return restartCaseResult{}, err
 	}
 
-	// The restart point is the extracting-phase delay hook, not "the database
-	// has a row and the job is not terminal yet". The case asserts that nothing
-	// is refetched after the restart, which only holds once every article is
-	// already durable; and a bare "not terminal yet" predicate matches the
-	// instant the job is queued, so on a fixture this small the job can reach a
-	// terminal status while the pre-crash evidence is still being captured, and
-	// the case silently turns into a check of what survives in history. Parking
-	// the process inside the extraction delay pins both ends: downloads are
-	// complete and the job provably cannot terminalize before the kill. An
-	// archive's engine starts reading while its volumes still arrive, so the
-	// hook fires once every volume it reads is in, not at the engine's start.
-	if _, err := waitForDelayHookRestartPoint(ctx, []int{jobID}, "status.enter_extracting", 3*time.Minute); err != nil {
+	// Hold extraction until the crash, while the checkpoint writer continues.
+	// In-memory completion is not a durable checkpoint after write batching.
+	if err := ctx.pollJob("completed-download checkpoint", caseDBPath(ctx), jobID, func() (bool, error) {
+		if !logHasDelayHook(ctx.caseLogPath, "status.enter_extracting") {
+			return false, nil
+		}
+		rows, err := readJobFileCoverage(caseDBPath(ctx), jobID)
+		return completedDownloadCheckpoint(segments, rows), err
+	}); err != nil {
 		return restartCaseResult{}, fmt.Errorf("wait for completed-download restart point: %w", err)
 	}
 	if err := ctx.killWeaverForRestart(); err != nil {
@@ -3148,9 +3186,31 @@ func runVerificationReconcilesStaleExtractingRuntime(ctx *restartCaseContext) (r
 	), nil
 }
 
-// runDirectStorePar2AliasClaimantCompletesAfterRestart kills the process as
-// the job enters verification, with one connection so the late-sorted,
-// extensionless PAR2 index arrives after every archive volume. The restart
+// The worker hold leaves the actor and database writer running. Verification
+// alone is not a durability barrier: wait for this job's committed coverage and
+// recorded backing files before killing it.
+func waitForAliasCheckpoint(ctx *restartCaseContext, jobID int, hook string, segments []nzbSegmentRef, ranges map[string]decodedRange) error {
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if err := managedWeaverExit(ctx.weaver); err != nil {
+			return err
+		}
+		if logHasDelayHook(ctx.caseLogPath, hook) {
+			evidence, err := readCheckpointEvidence(caseDBPath(ctx), jobID)
+			if err != nil {
+				return fmt.Errorf("read held PAR2 alias checkpoint: %w", err)
+			}
+			if len(directDurableArticles(segments, ranges, evidence)) > 0 {
+				return nil
+			}
+		}
+		<-ticker.C
+	}
+}
+
+// runDirectStorePar2AliasClaimantCompletesAfterRestart holds the verification
+// worker while the graph checkpoint commits, then kills the process. The restart
 // resumes from the graph checkpoint: it fetches none of the articles the
 // checkpoint held whole, names the volumes from what is on disk, and
 // completes with the expected output.
@@ -3164,18 +3224,19 @@ func runDirectStorePar2AliasClaimantCompletesAfterRestart(ctx *restartCaseContex
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.startWeaverWithConnections("status.enter_verifying", 1); err != nil {
+	const hook = "repair.task_start"
+	if err := ctx.startWeaverWithOptions("", 1, "WEAVER_E2E_HOLD="+hook); err != nil {
 		return restartCaseResult{}, err
 	}
 	jobID, err := ctx.submitSlug(slug)
 	if err != nil {
 		return restartCaseResult{}, err
 	}
-	if err := ctx.waitForCrash(5*time.Minute, jobID); err != nil {
+	if err := waitForAliasCheckpoint(ctx, jobID, hook, segments, ranges); err != nil {
 		return restartCaseResult{}, err
 	}
-	if !logContains(ctx.caseLogPath, "status.enter_verifying") {
-		return restartCaseResult{}, fmt.Errorf("expected verifying failpoint evidence in log before PAR2 alias restart")
+	if err := ctx.killWeaverForRestart(); err != nil {
+		return restartCaseResult{}, err
 	}
 
 	dbPath := filepath.Join(ctx.CaseDir, "weaver.db")

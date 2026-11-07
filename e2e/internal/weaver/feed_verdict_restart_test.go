@@ -51,7 +51,7 @@ func TestFeedVerdictRequiresPersistedLossWithoutBacking(t *testing.T) {
 				case "coverage":
 					proof.Coverage = nil
 				case "bounds":
-					proof.Coverage[0].Coverage.Runs[0].End = 11
+					proof.Coverage[0].Coverage.Runs[0].End = 13
 				case "verified":
 					proof.Coverage[0].Coverage.Runs[0].Provenance = "fresh"
 				case "damaged":

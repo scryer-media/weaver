@@ -997,6 +997,72 @@ async fn a_withdrawn_article_no_longer_covers_what_it_wrote() {
     assert_only_the_bad_part_is_fetched_again(&mut pipeline, file_id, &path).await;
 }
 
+// Ordinal 1 arrives first and claims where ordinal 0 belongs; ordinal 0 then
+// claims where ordinal 1 belongs. The two contradict each other, and the one
+// the NZB cannot vouch for is refused, whether or not the process restarted
+// between the two arrivals: a restored job knows where its intact articles
+// were placed.
+async fn assert_a_crossed_neighbour_is_refused(pipeline: &mut Pipeline, file_id: NzbFileId) {
+    deliver_part(pipeline, file_id, 0, 4, b"aaaa").await;
+    let file = pipeline.jobs[&file_id.job_id]
+        .articles
+        .active()
+        .unwrap()
+        .assembly
+        .file(file_id)
+        .unwrap();
+    assert_eq!(file.placement_of(1), Some((0, 4)));
+    assert_eq!(
+        file.placement_of(0),
+        None,
+        "the crossed article is placed nowhere"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_crossed_neighbour_is_refused_on_the_live_path() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _) = setup(&temp, 40233, &[8, 8]).await;
+    deliver_part(&mut pipeline, file_id, 1, 0, b"bbbb").await;
+    assert_a_crossed_neighbour_is_refused(&mut pipeline, file_id).await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_crossed_neighbour_is_refused_after_a_restart() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _) = setup(&temp, 40234, &[8, 8]).await;
+    let job_id = file_id.job_id;
+    deliver_part(&mut pipeline, file_id, 1, 0, b"bbbb").await;
+    let working_dir = pipeline.jobs[&job_id].working_dir.clone();
+    pipeline.drain().await;
+
+    // The process stops with ordinal 1 written and in the checkpoint.
+    retire_pipeline_database(pipeline).await;
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    pipeline
+        .restore_job(crate::RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: segmented_job_spec("yenc compatibility", "sample.bin", &[8, 8]),
+            detected_archives: Default::default(),
+            file_identities: Default::default(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+            restart: None,
+        })
+        .await
+        .unwrap();
+    assert_a_crossed_neighbour_is_refused(&mut pipeline, file_id).await;
+}
+
 // An article held for the one before it is kept across a pause, as every
 // article that arrived is: it spills to the job's spool as the job parks, is
 // not asked for again when the job is resumed and built afresh, and is placed

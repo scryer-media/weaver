@@ -14,6 +14,7 @@ pub mod log_buffer;
 pub mod log_delivery;
 pub mod log_file;
 pub mod log_filter;
+pub mod panic_trap;
 pub(crate) mod perf_probe;
 pub mod postprocess_pool;
 pub mod process_metrics;

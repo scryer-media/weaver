@@ -100,8 +100,9 @@ impl Pipeline {
         // A graph job's short delivery names the stage that left it short,
         // and a repair that could not rebuild a member says why.
         let graph_shortfall = matches!(state.status, JobStatus::Partial)
-            .then(|| self.graph_shortfall(job_id))
-            .flatten();
+            .then(|| self.delivered_verdict(job_id))
+            .flatten()
+            .map(|verdict| (verdict.shortfall_stage, verdict.shortfall_message));
         let shortfall = graph_shortfall
             .as_ref()
             .map(|(stage, _)| *stage)
@@ -144,7 +145,7 @@ impl Pipeline {
         let created_at = now - elapsed_secs;
         let total = state.spec.total_bytes;
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.optional_recovery_bytes();
+            self.optional_recovery_bytes(state);
         let (failed_bytes, health, terminal_discards) = settled.unwrap_or_else(|| {
             (
                 state.failed_bytes,
@@ -180,7 +181,7 @@ impl Pipeline {
         };
 
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
-            state.optional_recovery_bytes();
+            self.optional_recovery_bytes(state);
         let (download_state, post_state, run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&state.status);
         let finished = JobInfo {
@@ -214,6 +215,9 @@ impl Pipeline {
             completed_files: self.completed_file_count(state),
             remaining_par_files: 0,
             file_remaining_bytes: Vec::new(),
+            file_parked_bytes: Vec::new(),
+            remaining_bytes: 0,
+            wanted_bytes: 0,
             password: state.spec.password.clone(),
             category: state.spec.category.clone(),
             metadata: state.spec.metadata.clone(),

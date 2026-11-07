@@ -224,3 +224,22 @@ async fn path_storage_is_admin_only() {
         .await;
     assert!(!response.errors.is_empty());
 }
+
+#[tokio::test]
+async fn service_logs_carry_each_record_and_its_text_line() {
+    use std::io::Write;
+    let h = TestHarness::new().await;
+    let record = r#"{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs","fields":{"message":"job added","job_id":7}}"#;
+    let mut buffer = h.log_buffer.clone();
+    buffer.write_all(format!("{record}\n").as_bytes()).unwrap();
+
+    let response = h.execute("{ serviceLogs { records lines count } }").await;
+    assert_no_errors(&response);
+    let logs = &response_data(&response)["serviceLogs"];
+    assert_eq!(logs["count"], 1);
+    assert_eq!(logs["records"][0].as_str(), Some(record));
+    assert_eq!(
+        logs["lines"][0].as_str(),
+        Some("2026-11-03T08:10:00.123456-07:00  INFO weaver::jobs: job added job_id=7")
+    );
+}

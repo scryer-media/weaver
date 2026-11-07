@@ -26,10 +26,11 @@ pub(crate) struct Cli {
     #[arg(long, value_name = "PATH", global = true)]
     pub(crate) log_file: Option<PathBuf>,
 
-    /// Log record format for stdout and the log file: `text` or `json`.
+    /// Log record format for stdout and the log file: `json` (the default) or
+    /// `text`.
     ///
-    /// Also settable with WEAVER_LOG_FORMAT. The in-app log viewer always
-    /// receives the text format. Colouring is controlled separately by
+    /// Also settable with WEAVER_LOG_FORMAT. The in-app log viewer shows the
+    /// same lines whichever is chosen. Colouring is controlled separately by
     /// WEAVER_LOG_COLOR (`auto`, `always`, `never`; `auto` colours only an
     /// interactive terminal and honours NO_COLOR), and the default log level is
     /// INFO unless RUST_LOG says otherwise.

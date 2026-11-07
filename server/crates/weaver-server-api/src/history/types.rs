@@ -319,6 +319,8 @@ pub enum EventKind {
     ExtractionProgress,
     ExtractionComplete,
     ExtractionFailed,
+    // An archive given up on as an archive for one of its members.
+    ArchiveDemoted,
     MoveToCompleteStarted,
     MoveToCompleteFinished,
     SegmentRetryScheduled,
@@ -375,6 +377,7 @@ impl std::str::FromStr for EventKind {
             "ExtractionProgress" => Ok(Self::ExtractionProgress),
             "ExtractionComplete" => Ok(Self::ExtractionComplete),
             "ExtractionFailed" => Ok(Self::ExtractionFailed),
+            "ArchiveDemoted" => Ok(Self::ArchiveDemoted),
             "MoveToCompleteStarted" => Ok(Self::MoveToCompleteStarted),
             "MoveToCompleteFinished" => Ok(Self::MoveToCompleteFinished),
             "SegmentRetryScheduled" => Ok(Self::SegmentRetryScheduled),

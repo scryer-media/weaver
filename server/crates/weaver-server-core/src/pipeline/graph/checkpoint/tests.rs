@@ -254,6 +254,139 @@ fn encoding(facts: &RootFacts) -> Encoding {
     )
 }
 
+// The borrowed full-snapshot encoder, independent of incremental owned conversions.
+pub(super) fn borrowed_node_rows(
+    node: &NodeRecord,
+    files: impl Fn(MemberId) -> FileState,
+    password: Option<i64>,
+) -> GraphCheckpoint {
+    let id = i64::from(node.node.0);
+    let mut out = GraphCheckpoint::default();
+    if let (Some(kind), Some(facts)) = (node.kind, &node.facts) {
+        let volumes: Vec<(u32, u32)> = node
+            .volumes
+            .iter()
+            .map(|(volume, member)| (volume.0, member.0))
+            .collect();
+        out.nodes.push(super::NodeRow {
+            node: id,
+            parent: node.parent.map(|parent| i64::from(parent.0)),
+            parent_member: node.volumes.first().map(|(_, member)| i64::from(member.0)),
+            volumes: rmp_serde::to_vec(&volumes).ok(),
+            window: node
+                .window
+                .map(|window| (window.start as i64, window.end as i64)),
+            kind: kind.to_string(),
+            state: super::state_name(node.state).to_owned(),
+            reason: node.reason.map(|why| super::why_name(why).to_owned()),
+            facts_version: i64::from(facts.version),
+            facts: facts.bytes.clone(),
+            winning_password: password,
+        });
+        out.parts.extend(facts.parts.iter().map(|part| PartRow {
+            node: id,
+            part: part.key as i64,
+            bytes: Arc::clone(&part.bytes),
+        }));
+    }
+    out.crypt
+        .extend(node.crypt.iter().map(|crypt| super::CryptRow {
+            node: id,
+            member: i64::from(crypt.member.0),
+            run_start: crypt.run_start,
+            seed: crypt.seed.to_vec(),
+        }));
+    out.members.extend(node.members.iter().map(|member| {
+        let state = files(member.member);
+        super::MemberRow {
+            node: id,
+            member: i64::from(member.member.0),
+            name: member.name.clone(),
+            output_name: member.output_name.clone(),
+            crc32: member.crc32.map(i64::from),
+            length: member.length.map(|length| length as i64),
+            closed: member.closed,
+            bound: member.bound_to.map(|object| i64::from(object.0)),
+            owner: member.owner.map(super::pair),
+            given_up: member.given_up.map(super::pair),
+            buried: member.buried,
+            undecided: member.undecided,
+            has_file: state.has_file,
+            on_disk: state.on_disk,
+            refused: state.refused.map(|why| super::why_name(why).to_owned()),
+            copy_of: member.copy_of.map(|into| i64::from(into.0)),
+            refuted_kind: member.refuted.map(|kind| kind.to_string()),
+        }
+    }));
+    out.coverage
+        .extend(node.coverage.iter().map(|run| super::CoverageRow {
+            node: id,
+            member: i64::from(run.member.0),
+            start: run.start as i64,
+            end: run.end as i64,
+            provenance: super::provenance_name(run.provenance).to_owned(),
+            verified: false,
+        }));
+    out.members.sort_by_key(Row::key);
+    out.coverage.sort_by_key(Row::key);
+    out.crypt.sort_by_key(Row::key);
+    out.parts.sort_by_key(Row::key);
+    out
+}
+
+#[test]
+fn owned_record_conversions_match_the_borrowed_full_snapshot_encoder() {
+    let mut taken = full();
+    taken.tree.nodes[0].members[0].output_name = "renamed.bin".to_string();
+    taken.tree.nodes[0].members[1].output_name.clear();
+    taken.files.insert(
+        (NodeId::ROOT, MemberId(0)),
+        FileState {
+            has_file: true,
+            on_disk: Some("staged.bin".to_string()),
+            refused: None,
+        },
+    );
+    taken
+        .files
+        .insert((NodeId::ROOT, MemberId(1)), FileState::default());
+    for node in &mut taken.tree.nodes {
+        if let Some(facts) = &mut node.facts {
+            facts.parts.push(Part {
+                key: u64::MAX,
+                bytes: Arc::from([8, 9].as_slice()),
+            });
+        }
+    }
+    for node in &taken.tree.nodes {
+        let password = taken.passwords.get(&node.node).map(|index| *index as i64);
+        let state = |member| {
+            taken
+                .files
+                .get(&(node.node, member))
+                .cloned()
+                .unwrap_or_default()
+        };
+        let expected = borrowed_node_rows(node, state, password);
+        let mut actual = super::own_rows(node.clone(), password);
+        for member in node.members.clone() {
+            let coverage = node
+                .coverage
+                .iter()
+                .filter(|run| run.member == member.member)
+                .cloned()
+                .collect();
+            let files = state(member.member);
+            let rows = super::member_rows(i64::from(node.node.0), member, coverage, files);
+            actual.members.extend(rows.members);
+            actual.coverage.extend(rows.coverage);
+        }
+        actual.members.sort_by_key(Row::key);
+        actual.coverage.sort_by_key(Row::key);
+        assert_eq!(actual, expected, "node {:?}", node.node);
+    }
+}
+
 // Every row of the snapshot, each table in key order.
 fn rows(taken: &Snapshot) -> GraphCheckpoint {
     let encoding = encoding(&taken.root);
@@ -291,7 +424,7 @@ fn rows(taken: &Snapshot) -> GraphCheckpoint {
         out.holds.extend(hold_rows(node.node, &holds));
     }
     out.parts
-        .extend(part_rows(i64::from(NodeId::ROOT.0), &parts));
+        .extend(part_rows(i64::from(NodeId::ROOT.0), parts));
     out.nodes.sort_by_key(Row::key);
     out.members.sort_by_key(Row::key);
     out.coverage.sort_by_key(Row::key);
@@ -425,7 +558,8 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
             article: None,
         });
     let restored = snapshot(&rows).unwrap();
-    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
     fn files(root: &std::path::Path, at: &std::path::Path, into: &mut Vec<String>) {
         for entry in std::fs::read_dir(root.join(at)).unwrap() {
             let entry = entry.unwrap();
@@ -442,6 +576,63 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
     left.sort();
     assert_eq!(left, named);
     assert!(!dir.path().join("stray").exists());
+}
+
+// A directory member the checkpoint names stays, but what is in it is the
+// job's only as far as the checkpoint names it: a file a committed
+// checkpoint took back from it, or one written after the last that
+// committed, goes like any other.
+#[test]
+fn a_restore_sweeps_inside_a_directory_its_checkpoint_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut taken = full();
+    taken.tree.nodes[1].members[0].output_name = "folder/".to_owned();
+    std::fs::create_dir_all(dir.path().join("folder/deeper")).unwrap();
+    std::fs::write(dir.path().join("folder/obsolete.txt"), b"bytes").unwrap();
+    std::fs::write(dir.path().join("folder/deeper/late.bin"), b"bytes").unwrap();
+    let rows = rows(&taken);
+    let restored = snapshot(&rows).unwrap();
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
+    assert!(dir.path().join("folder").is_dir());
+    assert!(!dir.path().join("folder/obsolete.txt").exists());
+    assert!(!dir.path().join("folder/deeper").exists());
+}
+
+// One archive names the directory "Folder/" and the file "folder/b.bin"
+// in it (a Windows-made archive whose entries disagree in case). On a
+// case-insensitive disk the file is written into the one directory, which
+// sits on disk as "Folder". The checkpoint names both; a restore must keep
+// the file. Only meaningful where the disk folds case.
+#[test]
+fn a_restore_keeps_a_named_file_whose_directory_differs_in_case() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("Folder")).unwrap();
+    std::fs::write(dir.path().join("Folder/b.bin"), b"bytes").unwrap();
+    if !dir.path().join("folder/b.bin").exists() {
+        // A case-sensitive disk keeps two paths; nothing to test.
+        return;
+    }
+    let mut taken = full();
+    taken.tree.nodes[1].members[0].output_name = "Folder/".to_owned();
+    taken.tree.nodes[1].members.push(member(1, "folder/b.bin"));
+    taken.files.insert(
+        (NodeId(1), MemberId(1)),
+        FileState {
+            has_file: true,
+            on_disk: None,
+            refused: None,
+        },
+    );
+    let rows = rows(&taken);
+    let restored = snapshot(&rows).unwrap();
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
+    assert!(dir.path().join("Folder").is_dir());
+    assert!(
+        dir.path().join("Folder/b.bin").exists(),
+        "the restore removed a file its checkpoint names"
+    );
 }
 
 // A member's file the checkpoint says waits to move, gone from where it sat
@@ -462,10 +653,12 @@ fn a_restore_keeps_a_file_that_moved_before_its_checkpoint_said_so() {
             dir.path(),
             "set.par2",
             Some(waiting.as_str())
-        ),
+        )
+        .unwrap(),
         "set.par2"
     );
-    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts);
+    crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &restored, &rows.held_parts)
+        .unwrap();
     assert!(dir.path().join("set.par2").exists());
     assert!(!dir.path().join(&waiting).exists());
 
@@ -476,8 +669,40 @@ fn a_restore_keeps_a_file_that_moved_before_its_checkpoint_said_so() {
             dir.path(),
             "set.par2",
             Some(waiting.as_str())
-        ),
+        )
+        .unwrap(),
         waiting
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_restore_inspection_error_stops_cleanup_before_any_file_is_removed() {
+    use weaver_graph::names::INTERNAL_DIR;
+    let dir = tempfile::tempdir().unwrap();
+    let taken = full();
+    std::os::unix::fs::symlink(INTERNAL_DIR, dir.path().join(INTERNAL_DIR)).unwrap();
+    std::fs::write(dir.path().join("set.par2"), b"destination").unwrap();
+    std::fs::write(
+        dir.path().join("unclaimed.bin"),
+        b"preserve until inspected",
+    )
+    .unwrap();
+
+    assert!(crate::pipeline::graph::restore::sweep_unnamed(dir.path(), &taken, &[]).is_err());
+    assert_eq!(
+        std::fs::read(dir.path().join("set.par2")).unwrap(),
+        b"destination"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("unclaimed.bin")).unwrap(),
+        b"preserve until inspected"
+    );
+    assert!(
+        std::fs::symlink_metadata(dir.path().join(INTERNAL_DIR))
+            .unwrap()
+            .file_type()
+            .is_symlink()
     );
 }
 
@@ -623,6 +848,105 @@ fn a_pending_writes_what_the_database_does_not_hold() {
     let delta = restored.take().0.unwrap();
     assert_eq!(delta.rows(), 1, "{delta:?}");
     assert_eq!(root_parts(&delta), BTreeMap::from([(stale.part, None)]));
+}
+
+#[test]
+fn touched_flags_merge_every_combination_without_losing_other_sources() {
+    let flags = |bits| super::Touched {
+        own: bits & 1 != 0,
+        members: bits & 2 != 0,
+        files: bits & 4 != 0,
+        kept: bits & 8 != 0,
+    };
+    for first in 0..16 {
+        for second in 0..16 {
+            let mut merged = flags(first);
+            merged.merge(flags(second));
+            assert_eq!(merged, flags(first | second));
+        }
+    }
+}
+
+#[test]
+fn the_touched_visitor_keeps_sources_separate_until_the_caller_merges_them() {
+    let (job, _dir, _) = fifty_members();
+    let now = job.generations();
+    let collect = |at| {
+        let mut all: BTreeMap<NodeId, super::Touched> = BTreeMap::new();
+        job.visit_touched_since(at, |node, touched| {
+            all.entry(node).or_default().merge(touched);
+        });
+        all
+    };
+    assert!(collect(now).is_empty());
+    let tree = collect(super::Generations { tree: 0, ..now });
+    assert!(!tree.is_empty());
+    assert!(tree.values().all(|flags| !flags.files && !flags.kept));
+    let files = collect(super::Generations { files: 0, ..now });
+    assert!(!files.is_empty());
+    assert!(files.values().all(|flags| *flags
+        == super::Touched {
+            files: true,
+            ..super::Touched::default()
+        }));
+    let both = collect(super::Generations {
+        tree: 0,
+        files: 0,
+        ..now
+    });
+    assert!(both[&NodeId::ROOT].members && both[&NodeId::ROOT].files);
+}
+
+#[test]
+fn the_first_capture_deletes_restored_node_and_member_ids_no_tree_can_have() {
+    let (job, _dir) = long_post(20);
+    let fresh = Pending::default();
+    assert!(fresh.put(&job, Vec::new()));
+    let mut rows = held(&fresh.take().0.unwrap());
+    let root = i64::from(NodeId::ROOT.0);
+    let member = rows.members[0].clone();
+    let coverage = rows.coverage[0].clone();
+    let node = rows.nodes[0].clone();
+    let invalid = [-1, i64::from(u32::MAX) + 1];
+    for id in invalid {
+        rows.nodes.push(super::NodeRow {
+            node: id,
+            ..node.clone()
+        });
+        rows.members.push(super::MemberRow {
+            node: id,
+            ..member.clone()
+        });
+        rows.coverage.push(super::CoverageRow {
+            node: id,
+            ..coverage.clone()
+        });
+        rows.members.push(super::MemberRow {
+            member: id,
+            ..member.clone()
+        });
+        rows.coverage.push(super::CoverageRow {
+            member: id,
+            ..coverage.clone()
+        });
+    }
+    let pending = Pending::default();
+    pending.written(rows);
+    assert!(pending.put(&job, Vec::new()));
+    let delta = pending.take().0.unwrap();
+    assert_eq!(delta.rows(), 10, "{delta:?}");
+    for id in invalid {
+        assert_eq!(delta.nodes.get(&id), Some(&None));
+        assert_eq!(delta.members.get(&(id, member.member)), Some(&None));
+        assert_eq!(
+            delta.coverage.get(&(id, coverage.member, coverage.start)),
+            Some(&None)
+        );
+        assert_eq!(delta.members.get(&(root, id)), Some(&None));
+        assert_eq!(delta.coverage.get(&(root, id, coverage.start)), Some(&None));
+    }
+    assert!(!pending.put(&job, Vec::new()));
+    assert!(pending.take().0.is_none());
 }
 
 #[test]
@@ -944,4 +1268,443 @@ fn a_restored_member_that_closed_before_its_front_said_is_decided() {
     let (restored, _mail) = restored(&read, &files, dir.path());
     assert!(!restored.job.tree().is_undecided(NodeId::ROOT, member));
     assert!(!restored.job.tree().deciding(NodeId::ROOT));
+}
+
+// Keep the paused clock under the test's control while SQLite works on its
+// own thread. An idle runtime would otherwise advance to the next timer.
+struct ClockHeld(tokio::task::JoinHandle<()>);
+
+impl ClockHeld {
+    fn new() -> Self {
+        Self(tokio::spawn(async {
+            loop {
+                tokio::task::yield_now().await;
+            }
+        }))
+    }
+}
+
+impl Drop for ClockHeld {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+fn checkpoint_database() -> (crate::Database, crate::jobs::ids::JobId) {
+    let db = crate::Database::open_in_memory().unwrap();
+    let job = crate::jobs::ids::JobId(4282);
+    db.create_active_job(&crate::ActiveJob {
+        job_id: job,
+        nzb_hash: [0xA6; 32],
+        nzb_path: "checkpoint.nzb".into(),
+        nzb_zstd: crate::ingest::compress_nzb_bytes(
+            br#"<?xml version="1.0"?><nzb xmlns="http://www.newzbin.com/DTD/2003/nzb"/>"#,
+        )
+        .unwrap(),
+        output_dir: "checkpoint".into(),
+        created_at: 1_700_000_000,
+        category: None,
+        metadata: Vec::new(),
+        status: "queued",
+        download_state: "queued",
+        post_state: "idle",
+        run_state: "active",
+        paused_resume_status: None,
+        paused_resume_download_state: None,
+        paused_resume_post_state: None,
+        password_override: None,
+        supplied_password_candidates: Vec::new(),
+    })
+    .unwrap();
+    (db, job)
+}
+
+fn writes(db: &crate::Database) -> usize {
+    db.graph_checkpoint_writes
+        .load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[tokio::test(start_paused = true)]
+async fn small_steps_share_one_transaction_and_restore_every_members_bytes() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, dir, files) = fifty_members();
+    let pending = Pending::default();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    let now = tokio::time::Instant::now();
+    for volume in 0..50 {
+        arrive(&mut job, volume, 1);
+        pending.put(&job, Vec::new());
+        pending.queue(&db, id, &mail, false);
+        db.flush_write_queue().await.unwrap();
+    }
+    assert_eq!(
+        writes(&db),
+        0,
+        "an idle database does not flush small steps"
+    );
+    assert_eq!(tokio::time::Instant::now(), now);
+    pending.queue(&db, id, &mail, true);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+    let read = snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap();
+    let (restored, _mail) = restored(&read, &files, dir.path());
+    let fresh = Pending::default();
+    fresh.put(&job, Vec::new());
+    assert_eq!(read, snapshot(&held(&fresh.take().0.unwrap())).unwrap());
+    for volume in 0..50 {
+        let member = MemberId(root_member(&job, volume) as u32);
+        assert_eq!(
+            restored.job.writer().file_state(NodeId::ROOT, member),
+            job.writer().file_state(NodeId::ROOT, member)
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join(format!("member{volume:02}.bin"))).unwrap(),
+            vec![volume as u8; 128]
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_oldest_small_step_writes_once_when_its_age_is_due() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, _dir) = long_post(1);
+    let pending = Pending::default();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 0);
+    tokio::time::advance(std::time::Duration::from_secs(4)).await;
+    intake(&mut job, 1);
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    let timer = pending.slot().timer.take().unwrap();
+    tokio::time::advance(std::time::Duration::from_secs(2)).await;
+    timer.await.unwrap();
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+    let committed = pending.slot().committed;
+    assert_eq!(committed, pending.stamp());
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn age_and_force_share_one_write_behind_an_in_flight_checkpoint() {
+    let _clock = ClockHeld::new();
+    for age_first in [false, true] {
+        let (db, id) = checkpoint_database();
+        let (mut job, _dir) = long_post(1);
+        let pending = Pending::default();
+        let (mail, mut heard) = tokio::sync::mpsc::unbounded_channel();
+        pending.put(&job, Vec::new());
+        // Hold the first immutable payload after take, before its SQL and
+        // acknowledgement, without blocking the runtime that drives the timer.
+        let (first, first_stamp) = pending.take();
+        let first = first.unwrap();
+        let writer = pending.clone();
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        db.try_queue_write("held_graph_checkpoint", move |db| {
+            entered.send(()).unwrap();
+            released.recv().unwrap();
+            let whole = first.whole;
+            db.save_graph_checkpoint(id, Arc::new(first))?;
+            writer.committed(first_stamp, whole);
+            Ok(())
+        })
+        .unwrap();
+        waiting.await.unwrap();
+
+        for ordinal in 1..4 {
+            intake(&mut job, ordinal);
+            pending.put(&job, Vec::new());
+            pending.queue(&db, id, &mail, false);
+        }
+        let stamp = pending.stamp();
+        // Keep the timer handle so taking the queued delta cannot cancel
+        // the age callback whose ordering this test controls.
+        let timer = pending.slot().timer.take().unwrap();
+        if age_first {
+            tokio::time::advance(super::CHECKPOINT_AGE).await;
+            timer.await.unwrap();
+            assert_eq!(pending.await_commit(stamp, id.0, &mail, &db), None);
+        } else {
+            assert_eq!(pending.await_commit(stamp, id.0, &mail, &db), None);
+            tokio::time::advance(super::CHECKPOINT_AGE).await;
+            timer.await.unwrap();
+        }
+        assert_eq!(writes(&db), 0);
+        assert!(heard.try_recv().is_err());
+        release.send(()).unwrap();
+        let said = heard.recv().await.unwrap();
+        assert_eq!(said.generation, stamp);
+        assert!(
+            matches!(said.heard, super::Heard::Written { stamp: Some(written), .. } if written == stamp)
+        );
+        db.flush_write_queue().await.unwrap();
+        assert_eq!(writes(&db), 2, "age_first={age_first}");
+        assert!(heard.try_recv().is_err());
+        let fresh = Pending::default();
+        fresh.put(&job, Vec::new());
+        assert_eq!(
+            snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap(),
+            snapshot(&held(&fresh.take().0.unwrap())).unwrap()
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn awaiting_a_stamp_forces_its_write_without_advancing_time() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (job, _dir) = long_post(1);
+    let pending = Pending::default();
+    let (mail, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 0);
+    let now = tokio::time::Instant::now();
+    let stamp = pending.stamp();
+    assert_eq!(pending.await_commit(stamp, id.0, &mail, &db), None);
+    let said = heard.recv().await.unwrap();
+    assert!(
+        matches!(said.heard, super::Heard::Written { stamp: Some(written), .. } if written == stamp)
+    );
+    assert_eq!(writes(&db), 1);
+    assert_eq!(tokio::time::Instant::now(), now);
+}
+
+#[tokio::test(start_paused = true)]
+async fn dirty_bytes_at_the_barrier_force_a_write() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    // The post declares one byte per article; each actually covers 64.
+    let (mut job, _dir, _) = job_with(&[file("member00.bin", &[1, 1])], Vec::new());
+    arrive(&mut job, 0, 0);
+    let pending = Pending::default();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.slot().dirty_bytes = super::CHECKPOINT_BYTES - 64;
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 0);
+    arrive(&mut job, 0, 1);
+    pending.put(&job, Vec::new());
+    assert_eq!(pending.slot().dirty_bytes, super::CHECKPOINT_BYTES);
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+    assert_eq!(pending.slot().dirty_bytes, 0);
+}
+
+#[test]
+fn dirty_coverage_counts_new_ranges_without_recounting_splits_or_provenance() {
+    let rows = |ranges: &[(i64, i64)]| -> Vec<super::CoverageRow> {
+        ranges
+            .iter()
+            .map(|&(start, end)| super::CoverageRow {
+                node: 7,
+                member: 3,
+                start,
+                end,
+                provenance: "fresh".into(),
+                verified: false,
+            })
+            .collect()
+    };
+    let before = rows(&[(10, 20), (30, 40)]);
+    for (ranges, expected) in [
+        (vec![(0, 50)], 30),
+        (vec![(10, 15), (15, 20), (30, 40)], 0),
+        (vec![(0, 5), (12, 18), (35, 45), (50, 60)], 20),
+        (vec![(0, 10), (20, 30), (40, 50)], 30),
+        (vec![], 0),
+    ] {
+        let mut after = rows(&ranges);
+        for row in &mut after {
+            row.provenance = "repaired".into();
+            row.verified = true;
+        }
+        assert_eq!(
+            super::added_coverage(&before, &after),
+            expected,
+            "{ranges:?}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_dropped_writer_leaves_only_committed_coverage_to_restore() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, dir, files) = fifty_members();
+    let pending = Pending::default();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, true);
+    db.flush_write_queue().await.unwrap();
+    let committed = db.load_graph_checkpoint(id).unwrap().unwrap();
+    arrive(&mut job, 7, 1);
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    let timer = pending.slot().timer.as_ref().unwrap().abort_handle();
+    drop(pending);
+    tokio::time::advance(super::CHECKPOINT_AGE).await;
+    while !timer.is_finished() {
+        tokio::task::yield_now().await;
+    }
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+    let read = db.load_graph_checkpoint(id).unwrap().unwrap();
+    assert_eq!(read, committed);
+    let (restored, _mail) = restored(&snapshot(&read).unwrap(), &files, dir.path());
+    assert!(
+        restored
+            .job
+            .tree()
+            .record(NodeId::ROOT)
+            .unwrap()
+            .coverage
+            .iter()
+            .all(|coverage| coverage.end == 64)
+    );
+}
+
+// A job's steps between checkpoints take none: the write they join waits
+// on the first of them, and the run mail hears once it is due, not before.
+#[tokio::test(start_paused = true)]
+async fn steps_take_no_checkpoint_until_their_write_is_due() {
+    use crate::pipeline::graph::engine::Heard;
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, _dir) = long_post(1);
+    let pending = Pending::default();
+    let (mail, mut heard) = tokio::sync::mpsc::unbounded_channel();
+    assert!(
+        pending.stepped(id, &mail),
+        "the first checkpoint is due at once"
+    );
+    pending.put(&job, Vec::new());
+    let first = tokio::time::Instant::now();
+    for ordinal in 1..20 {
+        intake(&mut job, ordinal);
+        pending.delivered(1_000);
+        assert!(!pending.stepped(id, &mail));
+    }
+    assert_eq!(pending.tally().checkpoints, 1);
+    assert!(heard.try_recv().is_err());
+    tokio::time::advance(super::CHECKPOINT_AGE).await;
+    let said = heard.recv().await.unwrap();
+    assert!(
+        matches!(&said.heard, Heard::CheckpointDue { control } if control.same(&pending.control()))
+    );
+    assert_eq!(tokio::time::Instant::now(), first + super::CHECKPOINT_AGE);
+    assert!(pending.stepped(id, &mail));
+    pending.put(&job, Vec::new());
+    assert!(!pending.unread_steps());
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1, "one write takes every step");
+    assert_eq!(pending.tally().checkpoints, 2);
+    let read = snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap();
+    let fresh = Pending::default();
+    fresh.put(&job, Vec::new());
+    assert_eq!(read, snapshot(&held(&fresh.take().0.unwrap())).unwrap());
+    assert!(heard.try_recv().is_err());
+}
+
+// A step whose bytes take the job's dirty bytes to the threshold is due at
+// once, with no wake.
+#[tokio::test(start_paused = true)]
+async fn a_step_that_reaches_the_byte_threshold_is_due_at_once() {
+    let _clock = ClockHeld::new();
+    let (mut job, _dir) = long_post(1);
+    let pending = Pending::default();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    let id = crate::jobs::ids::JobId(0);
+    pending.put(&job, Vec::new());
+    pending.take();
+    intake(&mut job, 1);
+    pending.delivered(super::CHECKPOINT_BYTES - 1);
+    assert!(!pending.stepped(id, &mail));
+    intake(&mut job, 2);
+    pending.delivered(1);
+    assert!(pending.stepped(id, &mail));
+}
+// A post of four files of two 64-byte articles each, nothing in yet.
+fn four_members() -> (GraphJob, tempfile::TempDir, Vec<RootFile>) {
+    let files: Vec<RootFile> = (0..4)
+        .map(|index| file(&format!("member{index:02}.bin"), &[64, 64]))
+        .collect();
+    let (job, dir, _) = job_with(&files, Vec::new());
+    (job, dir, files)
+}
+
+// What a crash costs a job: the articles on disk that no write queued for
+// the database names. Two are in when a checkpoint commits and two more
+// arrive whose change waits for its barrier; the job a restore makes from
+// the database has the first two only, and the job says the other two are
+// what a crash now would fetch again.
+#[tokio::test(start_paused = true)]
+async fn a_crash_costs_only_the_articles_since_the_committed_checkpoint() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, dir, files) = four_members();
+    arrive(&mut job, 0, 0);
+    arrive(&mut job, 1, 0);
+    let pending = job.pending().clone();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, true);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1);
+    assert_eq!(job.on_disk(), [(0, 0), (1, 0)].into_iter().collect());
+    assert_eq!(job.in_memory(), Vec::<(u32, u32)>::new());
+    arrive(&mut job, 2, 0);
+    arrive(&mut job, 3, 0);
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 1, "the change waits for its barrier");
+    assert_eq!(job.in_memory(), vec![(2, 0), (3, 0)]);
+    let read = snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap();
+    let (restored, _mail) = restored(&read, &files, dir.path());
+    assert_eq!(
+        restored.job.on_disk(),
+        [(0, 0), (1, 0)].into_iter().collect()
+    );
+    assert_eq!(restored.job.in_memory(), Vec::<(u32, u32)>::new());
+}
+
+// A forced write takes every change: once it is queued a crash costs
+// nothing the job has on disk, before the write has run and after.
+#[tokio::test(start_paused = true)]
+async fn a_forced_write_leaves_a_crash_nothing_to_fetch_again() {
+    let _clock = ClockHeld::new();
+    let (db, id) = checkpoint_database();
+    let (mut job, dir, files) = four_members();
+    arrive(&mut job, 0, 0);
+    let pending = job.pending().clone();
+    let (mail, _heard) = tokio::sync::mpsc::unbounded_channel();
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, true);
+    db.flush_write_queue().await.unwrap();
+    arrive(&mut job, 1, 0);
+    arrive(&mut job, 2, 0);
+    pending.put(&job, Vec::new());
+    pending.queue(&db, id, &mail, false);
+    assert_eq!(job.in_memory(), vec![(1, 0), (2, 0)]);
+    pending.queue(&db, id, &mail, true);
+    assert_eq!(job.in_memory(), Vec::<(u32, u32)>::new());
+    db.flush_write_queue().await.unwrap();
+    assert_eq!(writes(&db), 2);
+    assert_eq!(job.in_memory(), Vec::<(u32, u32)>::new());
+    let read = snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap();
+    let (restored, _mail) = restored(&read, &files, dir.path());
+    assert_eq!(restored.job.on_disk(), job.on_disk());
 }

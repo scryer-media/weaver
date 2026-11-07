@@ -44,6 +44,9 @@ pub(super) enum Mode {
     LockedEngine,
     // The store is built as an engine whose run refuses.
     RefusingEngine,
+    // The store hands its volumes to an engine for Unsupported,
+    // and the engine's run refuses them for Unsupported too.
+    HandoffRefused,
 }
 
 #[derive(Clone)]
@@ -80,6 +83,12 @@ impl Builder for Fakes {
                 ..Echoes::default()
             }
             .build(kind, id),
+            (Kind::RarEngine, Mode::HandoffRefused) => Some(Box::new(LockedEngine {
+                refuses: true,
+                password: None,
+                offers: Arc::clone(&self.offers),
+                starts: Arc::clone(&self.starts),
+            })),
             _ => None,
         }
     }
@@ -204,6 +213,7 @@ impl Object for Store {
         match self.mode {
             Mode::Refuse | Mode::Hold | Mode::Staging => out.push(Emit::Refuse(Why::Unsupported)),
             Mode::NeedsEngine => out.push(Emit::NeedsEngine(Why::Compressed)),
+            Mode::HandoffRefused => out.push(Emit::NeedsEngine(Why::Unsupported)),
             _ => {}
         }
     }

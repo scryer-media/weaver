@@ -235,3 +235,45 @@ test("with no later phase running there is no stack to hold the download bar up"
   const state = advanceJobProgress(NO_PROGRESS_STATE, "VERIFYING", [], 5, download);
   assert.deepEqual(kinds(state.bars), []);
 });
+
+test("moving advances while a download with unused repair bytes reads complete", () => {
+  const download = { completedBytes: 870, totalBytes: 1_000, progressPercent: 87 };
+  const moving = { ...phase("MOVING", 0), startedAtEpochMs: 1, updatedAtEpochMs: 5_001 };
+  let state = advanceJobProgress(NO_PROGRESS_STATE, "MOVING", [moving], 0, download);
+  for (const completed of [0, 25, 60, 100]) {
+    state = advanceJobProgress(state, "MOVING", [{ ...moving, completedBytes: completed, progressPercent: completed }], completed, download);
+    assert.deepEqual(kinds(state.bars), ["DOWNLOADING", "MOVING"]);
+    assert.equal(state.bars[0].progressPercent, 100);
+    assert.equal(state.bars[0].completedBytes, 870);
+    assert.equal(state.bars[1].progressPercent, completed);
+  }
+});
+
+test("a held download bar completes as soon as moving starts", () => {
+  const download = { completedBytes: 870, totalBytes: 1_000, progressPercent: 87 };
+  const fetching = { ...phase("DOWNLOADING", 87), startedAtEpochMs: 1, updatedAtEpochMs: 5_001 };
+  const previous = advanceJobProgress(NO_PROGRESS_STATE, "DOWNLOADING", [fetching], 0, download);
+  assert.equal(previous.bars[0].progressPercent, 87);
+  const moving = advanceJobProgress(previous, "MOVING", [phase("MOVING", 0)], 1, download);
+  assert.equal(moving.bars[0].progressPercent, 100);
+});
+
+test("completed jobs show a full download even while phase bars are held", () => {
+  const download = { completedBytes: 870, totalBytes: 1_000, progressPercent: 87 };
+  const fetching = { ...phase("DOWNLOADING", 87), startedAtEpochMs: 1, updatedAtEpochMs: 5_001 };
+  const previous = advanceJobProgress(NO_PROGRESS_STATE, "DOWNLOADING", [fetching], 0, download);
+  for (const status of ["COMPLETE", "COMPLETED", "POST_PROCESSING", "FINALIZING"]) {
+    const completed = advanceJobProgress(previous, status, [], 1, download);
+    assert.equal(completed.bars[0].progressPercent, 100, status);
+  }
+});
+
+test("a held download bar reaches 100% while extraction finishes", () => {
+  const fetching = { ...phase("DOWNLOADING", 87), startedAtEpochMs: 1, updatedAtEpochMs: 5_001 };
+  const download = { completedBytes: 870, totalBytes: 1_000, progressPercent: 87 };
+  const previous = advanceJobProgress(NO_PROGRESS_STATE, "DOWNLOADING", [fetching], 0, download);
+  const completed = advanceJobProgress(previous, "DOWNLOADING", [phase("EXTRACTING", 60)], 1,
+    { ...download, progressPercent: 100 });
+  assert.equal(completed.bars[0].progressPercent, 100);
+  assert.equal(completed.bars[0].completedBytes, 87);
+});

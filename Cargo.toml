@@ -18,7 +18,7 @@ exclude = ["fuzz"]
 resolver = "2"
 
 [workspace.package]
-version = "0.16.5"
+version = "0.16.10"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/scryer-media/weaver"
@@ -201,7 +201,7 @@ par3-rs = { version = "=0.8.1", default-features = false }
 # has been read, and an extraction merges the continuation headers it read.
 # 0.15.0 states a RAR5 member's hash-MAC flag, opens `rar rc`-rebuilt RAR4 -hp
 # volumes, and chains continuation volumes by split header, not by name.
-unrar-rs = { version = "0.15.1", default-features = false, features = ["crypto-aws-lc"] }
+unrar-rs = { version = "0.15.2", default-features = false, features = ["crypto-aws-lc"] }
 scryer-release-parser = { git = "https://github.com/scryer-media/scryer", tag = "scryer-v0.18.21", default-features = false }
 
 [profile.release]

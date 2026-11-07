@@ -42,12 +42,6 @@ const QUEUE_TOTALS_INPUT = queuePageInput(
   1,
 );
 
-/** The tightest limit in force: the one set by hand or the one a schedule sets. */
-function speedLimitInForce(manual: number | null, scheduled: number | null): number | null {
-  const limits = [manual, scheduled].filter((limit): limit is number => limit != null && limit > 0);
-  return limits.length === 0 ? null : Math.min(...limits);
-}
-
 function downloadsWord(t: Translate, state: ReturnType<typeof downloadsState>["state"], egressName: string) {
   switch (state) {
     case "paused":
@@ -65,10 +59,9 @@ function downloadsWord(t: Translate, state: ReturnType<typeof downloadsState>["s
 
 export function OverviewDashboard() {
   const t = useTranslate();
-  const { speed, peakSpeed, speedLimit, downloadBlock, isPaused, queue, providers } = useNextData(
+  const { speed, peakSpeed, downloadBlock, isPaused, queue, providers } = useNextData(
     "speed",
     "peakSpeed",
-    "speedLimit",
     "downloadBlock",
     "isPaused",
     "queue",
@@ -87,16 +80,26 @@ export function OverviewDashboard() {
   const etaSample = useMemo(
     () =>
       page.etaTotalBytes > page.etaDownloadedBytes
-        ? [{ id: 0, status: "DOWNLOADING", totalBytes: page.etaTotalBytes, downloadedBytes: page.etaDownloadedBytes }]
+        ? [
+            {
+              id: 0,
+              status: "DOWNLOADING",
+              totalBytes: page.etaTotalBytes,
+              downloadedBytes: page.etaDownloadedBytes,
+              remainingBytes: page.etaTotalBytes - page.etaDownloadedBytes,
+            },
+          ]
         : [],
     [page.etaDownloadedBytes, page.etaTotalBytes],
   );
-  const etaSpeed = useStableEtaSpeed(etaSample, speed);
+  // The limit the daemon holds the wire to, as the queue header shows it.
+  const limit = downloadBlock.speedLimitInForce;
+  const etaConditions = useMemo(() => ({ paused: isPaused, speedLimit: limit ?? 0 }), [isPaused, limit]);
+  const etaSpeed = useStableEtaSpeed(etaSample, speed, etaConditions);
   const remaining = page.remainingBytes;
 
   const speedNow = splitSpeed(speed);
   const peak = splitSpeed(peakSpeed);
-  const limit = speedLimitInForce(speedLimit, downloadBlock.scheduledSpeedLimit);
   const total = usage?.total ?? null;
   const today = splitBytes(total?.today.bytes ?? 0);
   const finished = usage?.finishedToday ?? { complete: 0, partial: 0, failed: 0 };

@@ -761,10 +761,10 @@ async fn a_7z_holding_a_symlink_inside_a_stored_rar_delivers_its_file_and_drops_
     .await;
 }
 
-// A directory entry is placed, not refused: it is listed among the whole
-// deliveries under its own name.
+// A directory entry is placed, not refused, and is no file of the delivery:
+// only the file under it is whole.
 #[tokio::test]
-async fn a_rar_whose_member_is_a_directory_entry_delivers_the_file_and_lists_the_directory_whole() {
+async fn a_rar_whose_member_is_a_directory_entry_delivers_the_file_and_places_the_directory() {
     let scenario = Scenario::new(beside(posts(&directory_rar())));
     run_expecting(
         &scenario,
@@ -772,13 +772,12 @@ async fn a_rar_whose_member_is_a_directory_entry_delivers_the_file_and_lists_the
             status: Some(Status::Complete),
             kind: None,
             files: with_quill(vec![file("gallery/beacon.bin", Some(body()))]),
-            whole: &["gallery/", "gallery/beacon.bin", "quill.mkv"],
+            whole: &["gallery/beacon.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
             refused: &[],
             delivered: &[
-                "name=gallery/ from=gallery/ depth=1 whole=true",
                 "name=gallery/beacon.bin from=gallery/beacon.bin depth=1 whole=true",
                 QUILL,
             ],
@@ -788,7 +787,7 @@ async fn a_rar_whose_member_is_a_directory_entry_delivers_the_file_and_lists_the
 }
 
 #[tokio::test]
-async fn a_rar_whose_member_is_a_directory_entry_inside_a_stored_rar_delivers_the_file_and_lists_the_directory_whole()
+async fn a_rar_whose_member_is_a_directory_entry_inside_a_stored_rar_delivers_the_file_and_places_the_directory()
  {
     let scenario = Scenario::new(beside(nest(&directory_rar())));
     run_expecting(
@@ -797,13 +796,12 @@ async fn a_rar_whose_member_is_a_directory_entry_inside_a_stored_rar_delivers_th
             status: Some(Status::Complete),
             kind: None,
             files: with_quill(vec![file("gallery/beacon.bin", Some(body()))]),
-            whole: &["gallery/", "gallery/beacon.bin", "quill.mkv"],
+            whole: &["gallery/beacon.bin", "quill.mkv"],
             damaged: &[],
             unrepaired: &[],
             withheld: &[],
             refused: &[],
             delivered: &[
-                "name=gallery/ from=gallery/ depth=2 whole=true",
                 "name=gallery/beacon.bin from=gallery/beacon.bin depth=2 whole=true",
                 QUILL,
             ],

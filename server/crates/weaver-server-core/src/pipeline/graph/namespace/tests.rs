@@ -25,6 +25,12 @@ mod windows;
 thread_local! {
     // How many members a pass over the holds asked what is held of them.
     pub(super) static RELEASE_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // How many held ranges a pass asked their object to place.
+    pub(crate) static RELEASE_LOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STORE_DELIVERIES: std::cell::RefCell<Option<Vec<(ByteRange, Provenance)>>> = const { std::cell::RefCell::new(None) };
+    // Each delivery the pretend 7z store heard, with the CRC32 its bytes
+    // came proven by, when every byte of them was.
+    static LATE_HEARD: std::cell::RefCell<Vec<(ByteRange, Option<u64>)>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 const SIGNATURE: &[u8] = b"Rar!\x1a\x07\x00";
@@ -53,6 +59,11 @@ impl Object for Store {
         _: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
+        STORE_DELIVERIES.with_borrow_mut(|seen| {
+            if let Some(seen) = seen {
+                seen.push((delivery.range(), delivery.provenance));
+            }
+        });
         if delivery.bytes.windows(7).any(|window| window == b"RETRACT") {
             out.push(Emit::Retract(MemberId(0)));
             return;
@@ -149,6 +160,20 @@ fn map_at() -> ByteRange {
 // no place and is held; once it has, the body is "inner.bin".
 struct Late {
     mapped: bool,
+    // Its placement numbers: this one while unmapped, the next once mapped.
+    number: u64,
+}
+
+static LATE_NUMBERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+impl Late {
+    fn new() -> Self {
+        let number = LATE_NUMBERS.fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        Self {
+            mapped: false,
+            number,
+        }
+    }
 }
 
 impl Object for Late {
@@ -166,6 +191,12 @@ impl Object for Late {
         out: &mut Vec<Emit>,
     ) {
         let range = ByteRange::at(delivery.offset, delivery.bytes.len() as u64);
+        let crc32 = weaver_graph::Algorithm::Crc32;
+        let proven = delivery
+            .bytes
+            .proven(crc32)
+            .then(|| delivery.bytes.digest(crc32).value);
+        LATE_HEARD.with_borrow_mut(|heard| heard.push((range, proven)));
         if !self.mapped && range.intersect(map_at()) == Some(map_at()) {
             self.mapped = true;
             out.push(Emit::Member {
@@ -190,6 +221,10 @@ impl Object for Late {
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
+
+    fn placement(&self) -> Option<u64> {
+        Some(self.number + u64::from(self.mapped))
+    }
 
     fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         if let Some(header) = range.intersect(ByteRange::new(0, body().start)) {
@@ -243,7 +278,7 @@ impl Builder for Build {
                 length: self.inner,
                 checksum_on_repair: self.checksum_on_repair,
             })),
-            Kind::SevenZipStore => Some(Box::new(Late { mapped: false })),
+            Kind::SevenZipStore => Some(Box::new(Late::new())),
             Kind::Xz => Some(Box::new(streams::Decoded::new(Arc::clone(&self.heard)))),
             Kind::Par2 => Some(Box::new(Par {
                 volume: None,
@@ -294,6 +329,7 @@ impl Segments for Source {
 #[derive(Default)]
 struct Seen {
     report_error: bool,
+    proof: Option<ByteRange>,
     fed: Vec<Segment>,
     read: Option<Vec<u8>>,
     volume: Option<Vec<u8>>,
@@ -427,6 +463,14 @@ impl Recovery for Par {
 
     fn outcome(&self) -> Option<RepairOutcome> {
         self.last
+    }
+
+    fn proves(&self, _: MemberId, length: u64) -> ByteRange {
+        self.seen
+            .lock()
+            .unwrap()
+            .proof
+            .unwrap_or(ByteRange::new(0, length))
     }
 }
 
@@ -707,6 +751,36 @@ fn routed_deliveries_reuse_the_writer_s_effect_room() {
     assert_eq!(job.file("notes.bin"), b"Raws, world");
 }
 
+// Members nothing held, each refused for breaching the holds, are one
+// archive given up on in their namespace: one event.
+#[test]
+fn members_nothing_held_breaching_the_holds_are_one_event() {
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 4,
+        scratch_total: 0,
+        scratch_ceiling: 0,
+        disk_reserve: 0,
+    });
+    let first = job.member("pack.r00", None);
+    let second = job.member("pack.r01", None);
+    for member in [first, second] {
+        job.send(member, 0, b"Ra", Provenance::Fresh);
+        job.send(member, 10, b"tail..", Provenance::Fresh);
+        assert_eq!(
+            job.writer.refused(NodeId::ROOT, member),
+            Some(Why::HoldsBreached)
+        );
+    }
+    assert_eq!(
+        job.writer.take_given_back(),
+        [super::GivenBack {
+            member: "pack.r00".to_string(),
+            container: String::new(),
+            why: Why::HoldsBreached,
+        }]
+    );
+}
+
 #[test]
 fn a_breach_refuses_the_member_to_a_leaf_which_receives_every_byte() {
     let mut job = Job::new(HoldBudgets {
@@ -882,8 +956,8 @@ fn a_member_closes_exactly_when_covered_at_its_length() {
         std::fs::metadata(job.dir.path().join("video.mkv"))
             .unwrap()
             .len(),
-        9,
-        "a known length is reserved on the first write"
+        3,
+        "unwritten declared bytes must not allocate space on a non-sparse mount"
     );
     job.send(member, 6, b"end", Provenance::Fresh);
     assert!(job.is_open(NodeId::ROOT, member));
@@ -1046,6 +1120,43 @@ fn bytes_held_before_a_store_knows_its_map_reach_the_member_once_it_does() {
     assert_eq!(posted, whole);
 }
 
+// Held bytes go down again with the checksum the source took of them when
+// they came, whether they stayed in memory or were paged to scratch and
+// read back: the object below is handed them proven, as a first delivery
+// is, and hashes nothing of them again.
+#[test]
+fn held_bytes_go_down_again_with_the_source_s_checksums() {
+    for resident_limit in [u64::MAX, 2] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        });
+        let member = job.member("a.7z", Some(map_at().end));
+        let mut front = seven_z().to_vec();
+        front.extend_from_slice(b"hello");
+        job.send(member, 0, &front, Provenance::Fresh);
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+        let paged = job.accountant.usage().scratch;
+        assert_eq!(paged > 0, resident_limit == 2, "limit {resident_limit}");
+        LATE_HEARD.with_borrow_mut(Vec::clear);
+
+        job.send(member, map_at().start, MAP, Provenance::Fresh);
+
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+        assert_eq!(job.file("inner.bin"), b"hello");
+        let replayed: Vec<_> = LATE_HEARD
+            .with_borrow(Clone::clone)
+            .into_iter()
+            .filter(|(range, _)| *range == body())
+            .collect();
+        assert_eq!(
+            replayed,
+            vec![(body(), Some(u64::from(SOURCE_CRC)))],
+            "limit {resident_limit}: the held body comes back proven by the source"
+        );
+    }
+}
+
 // A pass over the holds asks only the volumes that hold bytes: of six
 // hundred members and two stores waiting on their maps, a delivery to a
 // plain member asks the two stores, and each map then releases its own.
@@ -1075,6 +1186,45 @@ fn a_pass_over_the_holds_asks_only_the_volumes_that_hold_bytes() {
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
     job.send(stores[1], map_at().start, MAP, Provenance::Fresh);
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+}
+
+// A pass asks a store where its held bytes go only once the store's
+// placement number moved: deliveries that move nothing locate nothing, and
+// the map that moves it releases the body, written as it came.
+#[test]
+fn a_pass_locates_held_bytes_only_once_their_object_s_map_moved() {
+    let mut job = Job::new(PLENTY);
+    let plain: Vec<MemberId> = (0..20)
+        .map(|index| job.member(&format!("f{index}.bin"), Some(4)))
+        .collect();
+    let store = job.member("a.7z", Some(map_at().end));
+    let mut front = seven_z().to_vec();
+    front.extend_from_slice(b"hello");
+    job.send(store, 0, &front, Provenance::Fresh);
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    job.send(plain[0], 0, b"data", Provenance::Fresh);
+    RELEASE_ASKED.set(0);
+    RELEASE_LOCATED.set(0);
+
+    for member in &plain[1..] {
+        job.send(*member, 0, b"data", Provenance::Fresh);
+    }
+
+    assert_eq!(
+        RELEASE_ASKED.get(),
+        plain.len() - 1,
+        "each pass asks the store"
+    );
+    assert_eq!(RELEASE_LOCATED.get(), 0, "and locates nothing");
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), body().len());
+    job.send(store, map_at().start, MAP, Provenance::Fresh);
+    assert_eq!(
+        RELEASE_LOCATED.get(),
+        1,
+        "the map moved it: the body is located"
+    );
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0);
+    assert_eq!(job.file("inner.bin"), b"hello");
 }
 
 // The ledger confines every name to the working dir: a name that would
@@ -1316,7 +1466,7 @@ fn a_committed_leaf_move_rejects_an_unowned_destination() {
 fn an_exclusive_leaf_move_preserves_case_only_renaming() {
     let directory = tempfile::tempdir().unwrap();
     std::fs::write(directory.path().join("BEACON.BIN"), b"owned").unwrap();
-    let mut leaf = Leaf::at(directory.path(), "BEACON.BIN");
+    let mut leaf = Leaf::found(directory.path(), "BEACON.BIN").unwrap();
     // The name ledger intentionally keeps an already-equivalent spelling.
     // Exercise the filesystem operation with an actual leaf move intent.
     leaf.intend("beacon.bin");
@@ -1348,7 +1498,7 @@ fn a_file_waits_off_a_name_another_file_still_sits_at() {
     let (first, second) = (MemberId(1), MemberId(2));
     for (member, name, bytes) in [(first, "x.bin", b"alpha"), (second, "y.bin", b"bravo")] {
         std::fs::write(job.dir.path().join(name), bytes).expect("file");
-        let leaf = Leaf::at(job.dir.path(), name);
+        let leaf = Leaf::found(job.dir.path(), name).unwrap();
         job.writer
             .files_mut(NodeId::ROOT)
             .leaves
@@ -1374,6 +1524,203 @@ fn a_file_waits_off_a_name_another_file_still_sits_at() {
     assert_eq!(job.file("y.bin"), b"alpha");
     assert_eq!(job.file("z.bin"), b"bravo");
     assert!(!job.dir.path().join("x.bin").exists());
+}
+
+#[test]
+fn delivery_releases_partial_and_retired_files_without_changing_their_bytes() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("partial.bin", Some(10));
+    job.send(member, 0, b"front", Provenance::Fresh);
+    let mut retired = Leaf::at(job.dir.path(), "retired.bin");
+    retired.write(0, b"old", None).unwrap();
+    job.writer.discard(retired).unwrap();
+    let mut scratch = Leaf::at(job.dir.path(), ".weaver-chunks/scratch");
+    scratch.write(0, b"held", None).unwrap();
+    job.writer.files_mut(NodeId::ROOT).scratch = Some(scratch);
+    assert_eq!(job.writer.open_files().len(), 3);
+    let partial = job.file("partial.bin");
+    job.writer.release_handles();
+    assert!(job.writer.open_files().is_empty());
+    assert_eq!(job.file("partial.bin"), partial);
+    assert_eq!(job.file("retired.bin"), b"old");
+    assert_eq!(job.file(".weaver-chunks/scratch"), b"held");
+    assert_eq!(job.root().get(member).unwrap().coverage.bytes_covered(), 5);
+    // Releasing the handle does not bypass the checkpoint that owns removal.
+    job.commit();
+    assert!(!job.dir.path().join("retired.bin").exists());
+    assert_eq!(job.file("partial.bin"), partial);
+}
+
+// Whether the member's file waits under the internal directory.
+fn waits(job: &Job, member: MemberId) -> bool {
+    job.writer.files[&NodeId::ROOT].leaves[&member]
+        .name()
+        .starts_with(weaver_graph::names::INTERNAL_DIR)
+}
+
+// A move waiting for one member holds the names it involves, never the
+// rest: a member whose name nothing holds opens its file there at once.
+#[test]
+fn a_free_name_opens_at_once_while_another_members_move_waits() {
+    let mut job = Job::new(PLENTY);
+    let first = job.member("3f9a.bin", Some(5));
+    job.send(first, 0, b"alpha", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, first, "show.mkv")
+        .expect("rename");
+    assert!(job.writer.moves_waiting());
+    let second = job.member("extra.bin", Some(5));
+    job.send(second, 0, b"bravo", Provenance::Fresh);
+    assert!(!waits(&job, second));
+    assert_eq!(job.file("extra.bin"), b"bravo");
+    assert_eq!(job.writer.file_state(NodeId::ROOT, second).on_disk, None);
+    job.commit();
+    assert_eq!(job.file("show.mkv"), b"alpha");
+    assert_eq!(job.file("extra.bin"), b"bravo");
+    assert!(!job.dir.path().join("3f9a.bin").exists());
+}
+
+// The name a waiting move wants is that member's: a file for another member
+// at that name waits off it, and once the move has run both files stand
+// where they belong, neither written over.
+#[test]
+fn a_name_a_waiting_move_wants_is_held_for_it() {
+    let mut job = Job::new(PLENTY);
+    let (first, second) = (MemberId(1), MemberId(2));
+    std::fs::write(job.dir.path().join("x.bin"), b"alpha").expect("file");
+    job.writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .insert(first, Leaf::at(job.dir.path(), "x.bin"));
+    job.writer.intend(NodeId::ROOT, first, "y.bin");
+    let leaf = job.writer.new_leaf((NodeId::ROOT, second), "y.bin", false);
+    job.writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .insert(second, leaf);
+    assert!(waits(&job, second));
+    assert_eq!(
+        job.writer.files[&NodeId::ROOT].leaves[&second].wants(),
+        Some("y.bin")
+    );
+}
+
+// A name a file left stays shut until the checkpoint recording it left has
+// committed, and so does every name that runs through it as a directory.
+#[test]
+fn a_left_name_and_the_names_under_it_stay_shut_until_recorded() {
+    let mut job = Job::new(PLENTY);
+    let first = MemberId(1);
+    std::fs::write(job.dir.path().join("box"), b"alpha").expect("file");
+    job.writer
+        .files_mut(NodeId::ROOT)
+        .leaves
+        .insert(first, Leaf::found(job.dir.path(), "box").unwrap());
+    job.writer.intend(NodeId::ROOT, first, "crate.bin");
+    job.writer.recorded(1);
+    assert!(job.writer.commit_moves(&mut job.tree, 1).expect("commit"));
+    assert_eq!(job.file("crate.bin"), b"alpha");
+    assert!(job.writer.moves.is_empty());
+    for (member, name) in [(MemberId(2), "box"), (MemberId(3), "box/inner.bin")] {
+        let leaf = job.writer.new_leaf((NodeId::ROOT, member), name, false);
+        assert!(
+            leaf.name().starts_with(weaver_graph::names::INTERNAL_DIR),
+            "{name}"
+        );
+    }
+    job.writer.recorded(2);
+    assert!(job.writer.commit_moves(&mut job.tree, 2).expect("commit"));
+    assert!(!job.writer.moves_waiting());
+    for (member, name) in [(MemberId(4), "box"), (MemberId(5), "box/inner.bin")] {
+        let leaf = job.writer.new_leaf((NodeId::ROOT, member), name, false);
+        assert_eq!(leaf.name(), name);
+    }
+}
+
+// A member renamed twice before its file moved: the database still gives
+// it the first new name, as the one its file waits for, until a checkpoint
+// saying otherwise commits. A file for another member given that name
+// meanwhile waits off it, so a restore from the earlier checkpoint finds
+// nothing in the way of the move it holds to.
+#[test]
+fn a_name_the_database_still_gives_a_renamed_member_stays_shut() {
+    let mut job = Job::new(PLENTY);
+    let first = job.member("3f9a.bin", Some(5));
+    job.send(first, 0, b"alpha", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, first, "x.bin")
+        .expect("rename");
+    job.writer.recorded(1);
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, first, "y.bin")
+        .expect("rename");
+    let second = job.member("x.bin", Some(5));
+    assert_eq!(job.root().get(second).unwrap().output_name, "x.bin");
+    job.send(second, 0, b"bravo", Provenance::Fresh);
+    assert!(!job.dir.path().join("x.bin").exists());
+    assert!(waits(&job, second));
+    job.commit();
+    assert_eq!(job.file("y.bin"), b"alpha");
+    assert_eq!(job.file("x.bin"), b"bravo");
+    assert!(!job.dir.path().join("3f9a.bin").exists());
+}
+
+// A file opened at its name while another member's move waits, then the
+// job stops before the checkpoint covering that move commits. Restored from
+// the checkpoint, each member's bytes are where the database gives them:
+// the new file at its name, the waiting one where it sat, and the move then
+// runs over nothing.
+#[test]
+fn a_restore_finds_a_file_opened_while_a_move_waited_at_its_name() {
+    let mut job = Job::new(PLENTY);
+    let first = job.member("3f9a.bin", Some(5));
+    job.send(first, 0, b"alpha", Provenance::Fresh);
+    let mut build = job.build();
+    job.writer
+        .rename(&mut job.tree, &mut build, NodeId::ROOT, first, "show.mkv")
+        .expect("rename");
+    let second = job.member("extra.bin", Some(5));
+    job.send(second, 0, b"bravo", Provenance::Fresh);
+    let first_file = job.writer.file_state(NodeId::ROOT, first);
+    let second_file = job.writer.file_state(NodeId::ROOT, second);
+    assert_eq!(first_file.on_disk.as_deref(), Some("3f9a.bin"));
+    assert_eq!(second_file.on_disk, None);
+    job.writer.recorded(1);
+
+    job.writer = NamespaceWriter::new(
+        1,
+        job.dir.path().to_path_buf(),
+        Arc::clone(&job.accountant),
+        CapacityReader::unknown(),
+    );
+    job.writer
+        .restore_file(&job.tree, NodeId::ROOT, first, &first_file)
+        .unwrap();
+    job.writer
+        .restore_file(&job.tree, NodeId::ROOT, second, &second_file)
+        .unwrap();
+    for (member, name, bytes) in [
+        (first, "3f9a.bin", b"alpha"),
+        (second, "extra.bin", b"bravo"),
+    ] {
+        assert_eq!(job.writer.files[&NodeId::ROOT].leaves[&member].name(), name);
+        let mut read = Vec::new();
+        assert!(
+            job.writer
+                .read_posted(&job.tree, member, ByteRange::new(0, 5), &mut read)
+        );
+        assert_eq!(read, bytes);
+    }
+    assert_eq!(
+        job.writer.files[&NodeId::ROOT].leaves[&first].wants(),
+        Some("show.mkv")
+    );
+    job.commit();
+    assert_eq!(job.file("show.mkv"), b"alpha");
+    assert_eq!(job.file("extra.bin"), b"bravo");
+    assert!(!job.dir.path().join("3f9a.bin").exists());
 }
 
 #[test]
@@ -1453,7 +1800,11 @@ fn the_segment_feed_is_evidence_unless_the_bytes_are_damage() {
 // The first three bytes of the signature leave the member undecided; the
 // rest binds it to the store, and the held front goes down after it.
 fn bound_store(job: &mut Job) -> (MemberId, NodeId) {
-    let member = job.member("pack.bin", None);
+    bound_store_at(job, "pack.bin")
+}
+
+fn bound_store_at(job: &mut Job, name: &str) -> (MemberId, NodeId) {
+    let member = job.member(name, None);
     job.send(member, 0, &SIGNATURE[..3], Provenance::Fresh);
     let mut rest = SIGNATURE[3..].to_vec();
     rest.extend_from_slice(b"hello");
@@ -1944,6 +2295,207 @@ fn a_shallower_member_that_claims_a_written_name_moves_the_deeper_file_aside() {
     assert!(!job.dir.path().join("3f9a.bin").exists());
 }
 
+// The store says each of `emits` of its namespace, in order.
+fn store_says(job: &mut Job, child: NodeId, emits: Vec<Emit>) {
+    let mut build = job.build();
+    for emit in emits {
+        job.writer
+            .said(
+                &mut job.tree,
+                &mut build,
+                &Source,
+                child,
+                emit,
+                &mut job.out,
+            )
+            .expect("said");
+    }
+}
+
+// A whole member of the store: announced, written and closed.
+fn store_file(member: u32, name: &str, bytes: &'static [u8]) -> Vec<Emit> {
+    vec![
+        Emit::Member {
+            member: MemberId(member),
+            name: name.into(),
+            length: Some(bytes.len() as u64),
+        },
+        Emit::Bytes {
+            member: MemberId(member),
+            offset: 0,
+            bytes: Bytes::from_static(bytes).into(),
+            provenance: Provenance::Fresh,
+        },
+        Emit::MemberClosed(MemberId(member)),
+    ]
+}
+
+// Two stores side by side: the first ranks higher, so its names win.
+fn two_stores(job: &mut Job) -> (NodeId, NodeId) {
+    let (_, higher) = bound_store(job);
+    let (_, lower) = bound_store_at(job, "pack2.bin");
+    (higher, lower)
+}
+
+fn directory(member: u32, name: &str) -> Vec<Emit> {
+    vec![
+        Emit::Member {
+            member: MemberId(member),
+            name: name.into(),
+            length: Some(0),
+        },
+        Emit::MemberClosed(MemberId(member)),
+    ]
+}
+
+// The lower store wrote its file "folder"; the higher one then names the
+// directory "folder/" and a file in it. The file moves aside, and the
+// directory and what goes in it wait for that move instead of being made
+// over the file.
+#[test]
+fn a_directory_named_over_a_written_file_waits_for_the_file_to_move() {
+    let mut job = Job::new(PLENTY);
+    let (higher, lower) = two_stores(&mut job);
+    store_says(&mut job, lower, store_file(1, "folder", b"data"));
+    assert_eq!(job.file("folder"), b"data");
+    let mut emits = directory(1, "folder/");
+    emits.extend(store_file(2, "folder/b.bin", b"hi"));
+    store_says(&mut job, higher, emits);
+    job.commit();
+    let file = job.tree.namespace(lower).unwrap().get(MemberId(1)).unwrap();
+    assert_eq!(file.output_name, "folder (1)");
+    assert_eq!(job.file("folder (1)"), b"data");
+    assert!(job.dir.path().join("folder").is_dir());
+    assert_eq!(job.file("folder/b.bin"), b"hi");
+}
+
+// Two archives hold one directory, and the lower one wrote it and a file
+// in it first. The directory is shared: neither moves, so the file stays
+// where its name says.
+#[test]
+fn a_directory_two_archives_hold_is_shared_and_never_moves() {
+    let mut job = Job::new(PLENTY);
+    let (higher, lower) = two_stores(&mut job);
+    let mut emits = directory(1, "folder/");
+    emits.extend(store_file(2, "folder/b.bin", b"data"));
+    store_says(&mut job, lower, emits);
+    store_says(&mut job, higher, directory(1, "folder/"));
+    job.commit();
+    for node in [higher, lower] {
+        let namespace = job.tree.namespace(node).unwrap();
+        assert_eq!(namespace.get(MemberId(1)).unwrap().output_name, "folder/");
+    }
+    assert_eq!(job.file("folder/b.bin"), b"data");
+    assert!(!job.dir.path().join("folder (1)").exists());
+}
+
+// One archive holds a file "folder", another "folder/b.bin" and no entry
+// for the directory. Both cannot be on disk; the file moves aside, and
+// both are written.
+#[test]
+fn a_file_and_a_path_through_its_name_are_both_written() {
+    let mut job = Job::new(PLENTY);
+    let (higher, lower) = two_stores(&mut job);
+    store_says(&mut job, higher, store_file(1, "folder", b"data"));
+    store_says(&mut job, lower, store_file(1, "folder/b.bin", b"hi"));
+    job.commit();
+    let file = job
+        .tree
+        .namespace(higher)
+        .unwrap()
+        .get(MemberId(1))
+        .unwrap();
+    assert_eq!(file.output_name, "folder (1)");
+    assert_eq!(job.file("folder (1)"), b"data");
+    assert_eq!(job.file("folder/b.bin"), b"hi");
+}
+
+// A repaired header takes back a directory the store had announced. The
+// directory goes once the checkpoint that stops naming it commits, unless
+// another archive still holds it or something is still in it.
+#[test]
+fn a_retracted_directory_goes_unless_something_still_holds_it() {
+    let mut job = Job::new(PLENTY);
+    let (higher, lower) = two_stores(&mut job);
+    let mut emits = directory(1, "alone/");
+    emits.extend(directory(2, "shared/"));
+    emits.extend(directory(3, "full/"));
+    emits.extend(store_file(4, "full/kept.bin", b"kept"));
+    store_says(&mut job, lower, emits);
+    store_says(&mut job, higher, directory(1, "shared/"));
+    job.commit();
+    store_says(
+        &mut job,
+        lower,
+        [1, 2, 3]
+            .map(|member| Emit::Retract(MemberId(member)))
+            .to_vec(),
+    );
+    job.commit();
+    assert!(!job.dir.path().join("alone").exists());
+    assert!(job.dir.path().join("shared").is_dir());
+    assert_eq!(job.file("full/kept.bin"), b"kept");
+}
+
+// Commit until no move waits, returning the first commit error instead of
+// panicking, so the test can say what the job would see.
+fn commit_or_error(job: &mut Job) -> Result<(), WriteError> {
+    while job.writer.moves_waiting() {
+        let stamp = job.writer.committed + 1;
+        job.writer.recorded(stamp);
+        job.writer.commit_moves(&mut job.tree, stamp)?;
+    }
+    Ok(())
+}
+
+// A file "folder" in the higher archive moved aside for the lower archive's
+// "folder/b.bin" (no directory entry). The lower archive then gives up while
+// b.bin is still open: its name is released, so the file takes "folder"
+// back. b.bin goes at the commit, but the implicit directory "folder" it
+// made stays, so the take-back rename meets an empty directory.
+#[test]
+fn a_file_takes_back_a_name_an_implicit_directory_held() {
+    let mut job = Job::new(PLENTY);
+    let (higher, lower) = two_stores(&mut job);
+    store_says(&mut job, higher, store_file(1, "folder", b"data"));
+    store_says(
+        &mut job,
+        lower,
+        vec![
+            Emit::Member {
+                member: MemberId(1),
+                name: "folder/b.bin".into(),
+                length: Some(4),
+            },
+            Emit::Bytes {
+                member: MemberId(1),
+                offset: 0,
+                bytes: Bytes::from_static(b"hi").into(),
+                provenance: Provenance::Fresh,
+            },
+        ],
+    );
+    commit_or_error(&mut job).expect("first commit");
+    assert_eq!(job.file("folder (1)"), b"data");
+    assert!(job.dir.path().join("folder/b.bin").exists());
+    store_says(&mut job, lower, vec![Emit::Refuse(Why::Compressed)]);
+    let committed = commit_or_error(&mut job);
+    let file = job
+        .tree
+        .namespace(higher)
+        .unwrap()
+        .get(MemberId(1))
+        .unwrap()
+        .output_name
+        .clone();
+    assert!(
+        committed.is_ok(),
+        "take-back commit failed: {committed:?}; ledger name {file:?}; folder is_dir={}",
+        job.dir.path().join("folder").is_dir()
+    );
+    assert_eq!(job.file(&file), b"data");
+}
+
 #[test]
 fn a_recovery_object_in_the_tree_is_fed_and_its_renames_move_the_file() {
     let mut job = Job::new(PLENTY);
@@ -2151,6 +2703,40 @@ fn a_member_given_back_logs_object_refused() {
     );
 }
 
+// Every reason an object can give a member back for reaches the job's
+// events, with the member and the archive that gave it back; the same
+// reason again says nothing new.
+#[test]
+fn every_reason_a_member_is_given_back_for_is_noted_once() {
+    for why in crate::pipeline::graph::checkpoint::REASONS {
+        let mut job = Job::new(PLENTY);
+        let (_, child) = bound_store(&mut job);
+        for _ in 0..2 {
+            let mut build = job.build();
+            job.writer
+                .said(
+                    &mut job.tree,
+                    &mut build,
+                    &Source,
+                    child,
+                    Emit::Refuse(why),
+                    &mut job.out,
+                )
+                .expect("refuse");
+        }
+        assert_eq!(
+            job.writer.take_given_back(),
+            [super::GivenBack {
+                member: "pack.bin".to_string(),
+                container: "rar_store".to_string(),
+                why,
+            }],
+            "{why:?}"
+        );
+        assert!(job.writer.take_given_back().is_empty(), "{why:?}");
+    }
+}
+
 // A set binding a member by what its bytes told it is said once, as the
 // name the set describes it by.
 #[test]
@@ -2236,6 +2822,60 @@ async fn the_deadline_runs_from_the_first_produced_member_not_from_admission() {
         job.writer.refusal().map(ExtractionFailure::reason),
         Some(ExtractionRejectionReason::Deadline)
     );
+}
+
+// Time the job spends paused is not extraction: a job paused past the
+// deadline after its first produced member writes on once it resumes.
+#[tokio::test(start_paused = true)]
+async fn the_deadline_does_not_run_while_the_job_is_paused() {
+    use crate::pipeline::extraction::ExtractionLimits;
+    use crate::post_processing::model::PostProcessingSettings;
+
+    const DEADLINE: u64 = 60;
+    let limits = ExtractionLimits {
+        max_job_bytes: u64::MAX,
+        max_member_bytes: u64::MAX,
+        max_entries: u64::MAX,
+        max_ratio: u64::MAX,
+        ratio_floor_bytes: u64::MAX,
+        max_seconds: DEADLINE,
+        min_free_bytes: 0,
+        max_memory_bytes: u64::MAX,
+    };
+    let policy = PostProcessingSettings {
+        unacceptable_extensions: Vec::new(),
+        ..PostProcessingSettings::default()
+    };
+    let mut job = Job::new(PLENTY);
+    job.inner = 10;
+    job.writer = job.writer.capped(Caps::new(
+        Arc::new(limits),
+        Ok(Arc::new(policy)),
+        Vec::new(),
+    ));
+
+    let store = job.member("show.rar", None);
+    let mut front = SIGNATURE.to_vec();
+    front.extend_from_slice(b"hello");
+    job.send(store, 0, &front, Provenance::Fresh);
+    assert!(job.writer.refusal().is_none());
+
+    job.writer.hold_clock(true);
+    tokio::time::advance(std::time::Duration::from_secs(DEADLINE + 1)).await;
+    job.writer.hold_clock(false);
+    let arrival = Arrival {
+        node: NodeId::ROOT,
+        member: store,
+        offset: front.len() as u64,
+        bytes: Bytes::from_static(b"world").into(),
+        provenance: Provenance::Fresh,
+    };
+    let mut build = job.build();
+    let written = job
+        .writer
+        .deliver(&mut job.tree, &mut build, &Source, arrival, &mut job.out);
+    assert!(written.is_ok());
+    assert!(job.writer.refusal().is_none());
 }
 
 // The stated checksum is checked whatever shape the writes left the fold
@@ -2403,7 +3043,12 @@ fn unrelated_candidate_and_shared_scratch_activity_do_not_invalidate_repair_loan
             .run(weaver_graph::Budget::default(), &Default::default());
         assert!(
             !job.writer
-                .keep_held(NodeId::ROOT, other, 25000, Bytes::from_static(b"held"))
+                .keep_held(
+                    NodeId::ROOT,
+                    other,
+                    25000,
+                    Bytes::from_static(b"held").into()
+                )
                 .unwrap()
         );
         job.send(other, 20000, b"new", Provenance::Fresh);
@@ -2433,7 +3078,12 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
         let member = job.member("payload.bin", Some(8));
         assert!(
             !job.writer
-                .keep_held(NodeId::ROOT, member, 0, Bytes::from_static(b"original"))
+                .keep_held(
+                    NodeId::ROOT,
+                    member,
+                    0,
+                    Bytes::from_static(b"original").into()
+                )
                 .unwrap()
         );
         job.tree
@@ -2460,7 +3110,7 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
         assert!(!job.writer.moved_since(&job.tree, &returned));
         assert!(
             !job.writer
-                .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new"))
+                .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new").into())
                 .unwrap()
         );
         assert!(
@@ -2486,7 +3136,12 @@ fn a_returned_ruling_stands_on_the_ranges_it_read_and_only_those() {
         let arrive = |job: &mut Job, offset: u64, bytes: &'static [u8]| {
             assert!(
                 !job.writer
-                    .keep_held(NodeId::ROOT, member, offset, Bytes::from_static(bytes))
+                    .keep_held(
+                        NodeId::ROOT,
+                        member,
+                        offset,
+                        Bytes::from_static(bytes).into()
+                    )
                     .unwrap()
             );
             job.tree
@@ -2650,4 +3305,113 @@ fn worker_diagnostics_are_published_only_for_current_acknowledgment() {
             );
         }
     }
+}
+
+// The only file under the implicit directory "folder" is renamed out of it
+// (a recovery object names the member): nothing goes, so remove_left never
+// sees the directory. The file "folder (1)" takes "folder" back and meets
+// the empty directory left behind.
+#[test]
+fn a_file_takes_back_a_name_a_renamed_file_left_as_an_empty_directory() {
+    let mut job = Job::new(PLENTY);
+    let (higher, lower) = two_stores(&mut job);
+    store_says(&mut job, higher, store_file(1, "folder", b"data"));
+    store_says(&mut job, lower, store_file(1, "folder/b.bin", b"hi"));
+    commit_or_error(&mut job).expect("first commit");
+    assert_eq!(job.file("folder (1)"), b"data");
+    let mut build = job.build();
+    let renamed = job
+        .writer
+        .rename(&mut job.tree, &mut build, lower, MemberId(1), "other.bin")
+        .expect("rename");
+    assert_eq!(renamed, "other.bin");
+    let committed = commit_or_error(&mut job);
+    let file = job
+        .tree
+        .namespace(higher)
+        .unwrap()
+        .get(MemberId(1))
+        .unwrap()
+        .output_name
+        .clone();
+    assert!(
+        committed.is_ok(),
+        "take-back commit failed: {committed:?}; ledger name {file:?}; folder is_dir={}",
+        job.dir.path().join("folder").is_dir()
+    );
+    assert_eq!(job.file(&file), b"data");
+    assert_eq!(job.file("other.bin"), b"hi");
+}
+
+// One archive gives up while the other still has an open file in the
+// shared implicit directory: the directory and that file stay.
+#[test]
+fn a_give_up_keeps_a_directory_another_archives_open_file_sits_in() {
+    let mut job = Job::new(PLENTY);
+    let (higher, lower) = two_stores(&mut job);
+    let open = |member: u32, name: &str, bytes: &'static [u8]| {
+        vec![
+            Emit::Member {
+                member: MemberId(member),
+                name: name.into(),
+                length: Some(8),
+            },
+            Emit::Bytes {
+                member: MemberId(member),
+                offset: 0,
+                bytes: Bytes::from_static(bytes).into(),
+                provenance: Provenance::Fresh,
+            },
+        ]
+    };
+    store_says(&mut job, higher, open(1, "folder/keep.bin", b"keep"));
+    store_says(&mut job, lower, open(1, "folder/sub/b.bin", b"gone"));
+    commit_or_error(&mut job).expect("first commit");
+    store_says(&mut job, lower, vec![Emit::Refuse(Why::Compressed)]);
+    commit_or_error(&mut job).expect("give-up commit");
+    assert!(!job.dir.path().join("folder/sub").exists());
+    assert!(job.file("folder/keep.bin").starts_with(b"keep"));
+    // The still-open file writes on into the kept directory.
+    store_says(
+        &mut job,
+        higher,
+        vec![Emit::Bytes {
+            member: MemberId(1),
+            offset: 4,
+            bytes: Bytes::from_static(b"more").into(),
+            provenance: Provenance::Fresh,
+        }],
+    );
+    assert_eq!(job.file("folder/keep.bin"), b"keepmore");
+}
+
+// A give-up empties "Folder/x" while the other archive holds the directory
+// member "folder/" (other case): on a case-folding disk that is one
+// directory, and it stays.
+#[test]
+fn a_give_up_keeps_a_directory_held_under_another_case() {
+    let mut job = Job::new(PLENTY);
+    let (higher, lower) = two_stores(&mut job);
+    store_says(&mut job, higher, directory(1, "folder/"));
+    store_says(
+        &mut job,
+        lower,
+        vec![
+            Emit::Member {
+                member: MemberId(1),
+                name: "Folder/x.bin".into(),
+                length: Some(4),
+            },
+            Emit::Bytes {
+                member: MemberId(1),
+                offset: 0,
+                bytes: Bytes::from_static(b"hi").into(),
+                provenance: Provenance::Fresh,
+            },
+        ],
+    );
+    commit_or_error(&mut job).expect("first commit");
+    store_says(&mut job, lower, vec![Emit::Refuse(Why::Compressed)]);
+    commit_or_error(&mut job).expect("give-up commit");
+    assert!(job.dir.path().join("folder").is_dir());
 }

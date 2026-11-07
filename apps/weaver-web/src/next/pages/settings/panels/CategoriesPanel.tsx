@@ -213,7 +213,7 @@ export function CategoriesPanel() {
       <RecordEditor
         open={editingId !== null}
         title={editingId === "new" ? t("next.categories.add") : (editing?.name ?? t("next.categories.category"))}
-        note={editingId === "new" ? t("next.categories.newNote") : `#${editing?.id ?? ""}`}
+        note={editingId === "new" ? undefined : `#${editing?.id ?? ""}`}
         error={error}
         busy={busy}
         onSave={() => void save()}

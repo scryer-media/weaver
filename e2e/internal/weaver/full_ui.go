@@ -89,6 +89,7 @@ var fullPhaseDefinitions = []fullPhaseDefinition{
 	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite},
 	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres},
 	{name: "Product Behavior Gate", command: "release-gate", slug: "product-behavior", skipSeed: true, datastore: weaverDatastoreSQLite},
+	{name: "Filesystem Gate", command: "filesystem", slug: "filesystem", skipSeed: true, datastore: weaverDatastoreSQLite},
 }
 
 // functionalFullPhase selects the fast iteration loop: the SQLite functional
@@ -228,6 +229,7 @@ type fullRunManifest struct {
 
 type fullRunPhaseEntry struct {
 	Name             string `json:"name"`
+	Command          string `json:"command,omitempty"`
 	Datastore        string `json:"datastore"`
 	Project          string `json:"project"`
 	RootDir          string `json:"root_dir"`
@@ -395,6 +397,17 @@ func (d *fullDashboard) setPhaseRunning(name string, detail string) {
 	defer d.mu.Unlock()
 	if phase, ok := d.phases[name]; ok {
 		phase.Status = "running"
+		phase.Detail = detail
+	}
+	d.scheduleRenderLocked()
+}
+
+// setPhaseDetail says what a phase is waiting on before it runs, leaving
+// its status as it is.
+func (d *fullDashboard) setPhaseDetail(name string, detail string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if phase, ok := d.phases[name]; ok {
 		phase.Detail = detail
 	}
 	d.scheduleRenderLocked()
@@ -1161,9 +1174,9 @@ const (
 	// the other phases share the rest, so the default runs the gate beside
 	// three other suites.
 	defaultFullPhaseJobs = 4
-	// A full run's release gate shares the engine with the other phases, so
-	// it runs narrower than a standalone gate unless the operator sets a width.
-	fullRunReleaseGateJobs = 6
+	// Playwright flows have their own concurrency within the gate's suite
+	// slot, unless the operator explicitly sets a width.
+	fullRunReleaseGateJobs = 10
 )
 
 // fullPhaseJobs is how many suites of a full run execute at once, set with
@@ -1265,16 +1278,19 @@ func runFullPipeline(
 			}
 
 			setupStarted := time.Now()
-			weaverBin, err := ensureE2EWeaverBinary()
-			if err != nil {
-				setupErr := fmt.Errorf("prepare e2e weaver binary: %w", err)
-				phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
-				dashboard.markPhaseResult(phase.Name, "fail")
-				return
+			if phase.Command != "filesystem" {
+				weaverBin, err := ensureE2EWeaverBinary()
+				if err != nil {
+					setupErr := fmt.Errorf("prepare e2e weaver binary: %w", err)
+					phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
+					dashboard.markPhaseResult(phase.Name, "fail")
+					return
+				}
+				phase.WeaverBin = weaverBin
 			}
-			phase.WeaverBin = weaverBin
 			if fullPhaseNeedsLocalWeaverImage(phase) && awaitWeaverImage != nil {
 				setupStarted = time.Now()
+				dashboard.setPhaseDetail(phase.Name, "waiting for Weaver image")
 				if err := awaitWeaverImage(); err != nil {
 					setupErr := fmt.Errorf("prepare local Weaver image: %w", err)
 					phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
@@ -1627,6 +1643,15 @@ func cleanupFullPhaseContext(phase *fullPhaseContext) error {
 	if phase.Cleaned {
 		return nil
 	}
+	if phase.Command == "filesystem" {
+		// The fixture owns its containers directly, without a Compose stack.
+		// Retry its exact recorded cleanup if the child was interrupted.
+		if err := cleanupFilesystemGateAt(phase.RunDir); err != nil {
+			return err
+		}
+		phase.Cleaned = true
+		return nil
+	}
 	var errs []error
 	if err := capturePhaseDiagnostics(phase); err != nil {
 		errs = append(errs, fmt.Errorf("capture diagnostics: %w", err))
@@ -1941,6 +1966,7 @@ func writeFullRunManifest(path, tempRoot string, phases []*fullPhaseContext) err
 	for _, phase := range phases {
 		manifest.Phases = append(manifest.Phases, fullRunPhaseEntry{
 			Name:             phase.Name,
+			Command:          phase.Command,
 			Datastore:        normalizedWeaverDatastoreForPhase(phase.Datastore),
 			Project:          phase.Project,
 			RootDir:          phase.RootDir,
@@ -2002,6 +2028,11 @@ func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*ful
 		retained := index < 3
 		teardown := !manifest.StacksReleased && !(retained && manifest.KeepStacks)
 		if retained && !teardown {
+			if manifest.StacksReleased && !manifest.KeepStacks {
+				if err := dropFullRunDownloads(manifest); err != nil {
+					errs = append(errs, err)
+				}
+			}
 			continue
 		}
 		phases := manifest.Phases
@@ -2012,6 +2043,7 @@ func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*ful
 		for _, entry := range phases {
 			phase := &fullPhaseContext{
 				Name:             entry.Name,
+				Command:          entry.Command,
 				Project:          entry.Project,
 				RootDir:          entry.RootDir,
 				RunDir:           entry.RunDir,
@@ -2028,8 +2060,30 @@ func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*ful
 			if err := markFullRunStacksReleased(filepath.Join(candidate.path, "full-run.json")); err != nil {
 				errs = append(errs, err)
 			}
+			if err := dropFullRunDownloads(manifest); err != nil {
+				errs = append(errs, err)
+			}
 		default:
 			if err := os.RemoveAll(candidate.path); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// dropFullRunDownloads removes what Weaver downloaded in each phase of a
+// retained bundle whose stacks are gone: its complete and intermediate
+// directories, nearly all of a bundle's size. The logs, database, compose
+// evidence and Playwright artifacts stay.
+func dropFullRunDownloads(manifest fullRunManifest) error {
+	var errs []error
+	for _, entry := range manifest.Phases {
+		if strings.TrimSpace(entry.RunDir) == "" {
+			continue
+		}
+		for _, dir := range []string{"complete", "intermediate"} {
+			if err := os.RemoveAll(filepath.Join(entry.RunDir, "weaver", dir)); err != nil {
 				errs = append(errs, err)
 			}
 		}

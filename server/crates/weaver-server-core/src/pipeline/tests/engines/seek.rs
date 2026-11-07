@@ -432,8 +432,9 @@ async fn a_par2_set_in_a_plain_store_repairs_the_member_beside_it() {
     let (scenario, body) = par2_in_a_store(|bytes| Post::plain("silver.horizon.rar", bytes)).await;
     let graph = run(&scenario).await;
     // The checksums the store's delivery carries settle the bad slice: the
-    // set reads back the other five to check them, and again to rebuild.
-    assert_repaired_in_store(&graph, &body, 10);
+    // set reads back the other five to check them, and the rebuild takes
+    // what that check kept.
+    assert_repaired_in_store(&graph, &body, 5);
 }
 
 // The same volume inside an xz stream: the store reads it as the stream
@@ -443,7 +444,7 @@ async fn a_par2_set_in_a_store_in_a_stream_repairs_the_member_beside_it() {
     let (scenario, body) =
         par2_in_a_store(|bytes| Post::plain("silver.horizon.rar.xz", xz(&bytes))).await;
     let graph = run(&scenario).await;
-    assert_repaired_in_store(&graph, &body, 10);
+    assert_repaired_in_store(&graph, &body, 5);
 }
 
 // Row 6c. A PAR2 volume posted as an xz stream beside its data: the volume
@@ -728,7 +729,7 @@ async fn restart(
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     match stop {
         Stop::Drained => pipeline.drain().await,
-        Stop::Crashed => {}
+        Stop::Crashed => pipeline.flush_graph_checkpoint(JOB),
     }
     let db = pipeline.db.clone();
     retire_pipeline_database(pipeline).await;

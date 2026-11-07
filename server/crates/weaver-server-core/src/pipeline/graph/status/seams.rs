@@ -14,9 +14,10 @@ use super::{
     shown_status,
 };
 use crate::events::model::PipelineEvent;
+use crate::jobs::JobPhase;
 use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::model::JobStatus;
-use crate::operations::instrumentation::StageOutcomeKind;
+use crate::operations::instrumentation::{JobStageKind, StageOutcomeKind};
 use crate::pipeline::completion::finalize::check::par2_damage_ignorable;
 use crate::pipeline::extraction::ExtractionError;
 use crate::pipeline::graph::job::{GraphJob, Note};
@@ -106,7 +107,6 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
             _ => {
                 pipeline.record_validated_archive_password(job_id);
                 pipeline.log_deliveries(job_id);
-                pipeline.remove_spent_members(job_id).await;
                 // A repair ruled before this delivery: the moment the e2e
                 // post-repair hook names, between the ruling and the move.
                 let hold = pipeline
@@ -229,25 +229,6 @@ impl Pipeline {
             }
         };
         self.transition_postprocessing_status(job_id, stalled, None);
-    }
-
-    // What the job spent is not part of the release and is removed once it
-    // delivers, before the move: recovery data, bound or named so, and the
-    // volumes an object consumed to make what it hands over, such as the
-    // pieces a join wrote out whole.
-    async fn remove_spent_members(&self, job_id: JobId) {
-        let Some(graph) = self.graph_jobs.get(&job_id) else {
-            return;
-        };
-        for path in graph.spent_files() {
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    warn!(file = %path.display(), error = %error, "could not remove a spent member");
-                }
-            }
-        }
     }
 
     // What the root's recovery objects can say of a graph job now, read
@@ -624,13 +605,26 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> Option<(PipelineFailureStage, Option<String>)> {
+        self.graph_delivered_verdict(job_id)
+            .map(|verdict| (verdict.shortfall_stage, verdict.shortfall_message))
+    }
+
+    // What a graph job's delivery came to, as its row keeps it from the
+    // moment the final move begins. `None` once the job has gone.
+    pub(in crate::pipeline) fn graph_delivered_verdict(
+        &self,
+        job_id: JobId,
+    ) -> Option<crate::post_processing::model::DeliveredVerdict> {
         let (delivery, failure) = self.graph_ruling(job_id)?;
-        Some((
-            delivery.shortfall_stage(failure.as_ref()),
-            failure
+        Some(crate::post_processing::model::DeliveredVerdict {
+            partial: delivery.status(failure.as_ref()) == JobStatus::Partial,
+            shortfall_stage: delivery.shortfall_stage(failure.as_ref()),
+            shortfall_message: failure
                 .map(|failure| failure.message)
                 .or_else(|| delivery.withheld_error()),
-        ))
+            recovery_verified: self.graph_recovery_verified(job_id),
+            unpacked: self.graph_unpacked(job_id),
+        })
     }
 
     // The status a graph job with nothing left to wait for ends in. `None`
@@ -681,6 +675,7 @@ impl Pipeline {
         for event in stage {
             self.emit_job_event(event);
         }
+        self.time_graph_stage(job_id, phase);
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -710,6 +705,36 @@ impl Pipeline {
         if let Some(hook) = hook {
             crate::e2e_failpoint::maybe_delay(hook);
             crate::e2e_failpoint::maybe_trip(hook);
+        }
+    }
+
+    // The stage clocks and phase rows of the root's phases. A phase opens
+    // its own as the root enters it; reaching a later phase closes every
+    // earlier one. A root back to downloading for recovery, then repairing
+    // again, keeps the repair it opened first.
+    pub(in crate::pipeline::graph) fn time_graph_stage(&mut self, job_id: JobId, phase: RootPhase) {
+        let order = |phase: RootPhase| match phase {
+            RootPhase::Downloading => 0,
+            RootPhase::Verifying => 1,
+            RootPhase::Repairing => 2,
+            RootPhase::Extracting => 3,
+            RootPhase::Done => 4,
+        };
+        let reached = order(phase);
+        if reached > order(RootPhase::Verifying) {
+            self.note_stage_finished(job_id, JobStageKind::Verify);
+        }
+        if reached > order(RootPhase::Repairing) {
+            self.phase_end(job_id, JobPhase::Repairing);
+        }
+        if reached > order(RootPhase::Extracting) {
+            self.phase_end(job_id, JobPhase::Extracting);
+        }
+        match phase {
+            RootPhase::Verifying => self.note_stage_started(job_id, JobStageKind::Verify),
+            RootPhase::Repairing => self.phase_begin_unsampled(job_id, JobPhase::Repairing),
+            RootPhase::Extracting => self.phase_begin_unsampled(job_id, JobPhase::Extracting),
+            RootPhase::Downloading | RootPhase::Done => {}
         }
     }
 
@@ -757,6 +782,15 @@ impl Pipeline {
                     let _ = self.event_tx.send(PipelineEvent::RepairComplete {
                         job_id,
                         slices_repaired: u32::try_from(slices).unwrap_or(u32::MAX),
+                    });
+                }
+                Note::GivenBack(given_back) => {
+                    self.emit_job_event(PipelineEvent::ArchiveDemoted {
+                        job_id,
+                        member: given_back.member,
+                        container: given_back.container,
+                        reason: crate::pipeline::graph::checkpoint::why_name(given_back.why)
+                            .to_owned(),
                     });
                 }
             }

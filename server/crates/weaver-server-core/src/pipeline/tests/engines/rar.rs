@@ -123,6 +123,34 @@ async fn a_two_volume_rar5_set_delivers_its_members() {
     assert_fetched_once(&graph);
 }
 
+// Every batch served last article first: a volume's data comes before the
+// headers that place it and is held, then goes down again once they come,
+// with the checksums the source took of it. Nothing hashes it again: the
+// run hashes as many bytes as one whose articles come in order, and the
+// member is the same bytes. Held bytes that went down bare hashed nearly
+// six times as many bytes as the run in order.
+#[tokio::test]
+async fn held_store_bytes_are_hashed_no_more_than_bytes_placed_at_once() {
+    let body = body();
+    let set = single_member_store_set(MEMBER, &body, 4);
+    let hashed = weaver_graph::evidence::counting::hashed;
+
+    let before = hashed();
+    let in_order = run(&Scenario::new(posts(set.clone()))).await;
+    let placed = hashed() - before;
+    let before = hashed();
+    let backwards = run(&Scenario::new(posts(set)).backwards()).await;
+    let held = hashed() - before;
+
+    assert_member(&in_order, &body);
+    assert_member(&backwards, &body);
+    assert_fetched_once(&backwards);
+    assert_eq!(
+        held, placed,
+        "held bytes are hashed no more than placed ones"
+    );
+}
+
 #[tokio::test]
 async fn a_four_volume_rar5_set_delivers_its_member() {
     let body = body();
@@ -245,8 +273,7 @@ fn recovery_articles(scenario: &Scenario) -> Vec<(u32, u32)> {
             )
         })
         .flat_map(|(post, file)| {
-            (0..post.bytes.len().div_ceil(scenario.article) as u32)
-                .map(move |ordinal| (file, ordinal))
+            (0..post.articles(scenario.article).count() as u32).map(move |ordinal| (file, ordinal))
         })
         .collect()
 }
@@ -367,6 +394,7 @@ fn a_graph_job_held_after_its_repair_holds_no_other_job() {
         let done = pipeline.move_done_rx.recv().await.expect("a move reports");
         assert_eq!(done.job_id, OTHER, "the held job's move is still held");
         pipeline.handle_move_to_complete_done(done).await;
+        crate::pipeline::tests::settle_script_admissions(&mut pipeline).await;
         assert_eq!(
             job_status_for_assert(&pipeline, OTHER),
             Some(JobStatus::Complete)
@@ -831,6 +859,65 @@ async fn an_encrypted_rar4_set_delivers() {
     let graph = run(&scenario).await;
     assert_member(&graph, &body);
     assert_fetched_once(&graph);
+}
+
+// The `par2-light` post of a RAR4 set with encrypted data and plain
+// headers: five stored volumes, the PAR2 set made over them before bytes
+// in the third were flipped, so the post carries them wrong with checksums
+// that pass. Returns the posts and the member.
+fn rar4_posted_with_flipped_bytes() -> (Vec<Post>, Vec<u8>) {
+    let body = payload(40 * ARTICLE, 51);
+    let volumes = encrypted_rar4_store_set(MEMBER, &body, 5, SECRET, Some([7; 8]));
+    let mut posts = with_par2(volumes);
+    let third = &mut posts[2].bytes;
+    let at = third.len() / 2;
+    for byte in &mut third[at..at + 16] {
+        *byte ^= 0x5a;
+    }
+    (posts, body)
+}
+
+// The password comes with the job, as an NZB's meta carries it. The
+// member's checksum fails on the posted bytes until the set repairs them;
+// that failure is damage, not a wrong password, and the member opens with
+// the password once they are repaired.
+#[tokio::test]
+async fn an_encrypted_rar4_set_posted_with_flipped_bytes_is_repaired_and_opens_with_its_password() {
+    let (posts, body) = rar4_posted_with_flipped_bytes();
+    let graph = run(&Scenario::new(posts).password(SECRET)).await;
+    assert_member(&graph, &body);
+    assert!(
+        matches!(
+            graph.graph().outcomes.as_slice(),
+            [Some(RepairOutcome::Repaired { .. })]
+        ),
+        "{:?}",
+        graph.graph().outcomes
+    );
+}
+
+// The same post with a wrong password: tried again on the repaired bytes,
+// it fails the member's checksum there too, and the job fails for the
+// password.
+#[tokio::test]
+async fn an_encrypted_rar4_set_posted_with_flipped_bytes_and_a_wrong_password_fails_for_the_password()
+ {
+    let (posts, _) = rar4_posted_with_flipped_bytes();
+    let graph = run(&Scenario::new(posts).password("quill-ember-wrong")).await;
+    assert!(
+        matches!(graph.status, Some(JobStatus::Failed { .. })),
+        "{:?}",
+        graph.status
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Password));
+    assert!(
+        matches!(
+            graph.graph().outcomes.as_slice(),
+            [Some(RepairOutcome::Repaired { .. })]
+        ),
+        "{:?}",
+        graph.graph().outcomes
+    );
 }
 
 // One damaged article of cipher text: the graph repairs it through the

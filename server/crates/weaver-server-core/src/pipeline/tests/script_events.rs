@@ -181,6 +181,7 @@ async fn queue_scripts_that_cannot_run_do_not_fail_the_job() {
             Err(crate::StateError::Database("settings unavailable".into())),
         )
         .await;
+    settle_script_admissions(&mut pipeline).await;
     assert!(!pipeline.queue_script_waiters.contains(&job_id));
     assert!(pipeline.queue_scripts_completed.contains(&job_id));
     assert!(

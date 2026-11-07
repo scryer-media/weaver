@@ -15,8 +15,8 @@
 use std::io::{self, Read, Seek, SeekFrom};
 
 use ::zip::ZipArchive;
-use ::zip::read::{ArchiveOffset, Config};
-use ::zip::result::ZipResult;
+use ::zip::read::{ArchiveOffset, Config, ZipFileEntry};
+use ::zip::result::{ZipError, ZipResult};
 use weaver_graph::Why;
 
 use super::{MAX_DIRECTORY_BYTES, MAX_DIRECTORY_ENTRIES};
@@ -161,6 +161,37 @@ impl Image {
         // and only the bytes in front of the directory, which the library
         // did not read the archive from, stand as zeros there.
         Ok(unsafe { ZipArchive::unsafe_new_with_metadata(self, metadata) })
+    }
+
+    // Identity, encoding and checksum still agree; only the two local size
+    // claims may be stale. The directory supplies the extraction bounds.
+    pub(super) fn check_header(&self, entry: &ZipFileEntry<'_>) -> ZipResult<()> {
+        let invalid = || ZipError::InvalidArchive("conflicting ZIP entry headers".into());
+        let at = entry
+            .central_header_start()
+            .checked_sub(self.prefix)
+            .and_then(|at| usize::try_from(at).ok())
+            .ok_or_else(invalid)?;
+        let (central, _) = records::central(&self.rest, at).ok_or_else(invalid)?;
+        let mut bytes = vec![0; records::LOCAL_LEN as usize];
+        self.joined.read_exact(entry.header_start(), &mut bytes)?;
+        let len = records::local_len(&bytes).ok_or_else(invalid)?;
+        let end = entry.header_start().checked_add(len).ok_or_else(invalid)?;
+        if end > self.prefix {
+            return Err(invalid());
+        }
+        bytes.resize(len as usize, 0);
+        self.joined.read_exact(
+            entry.header_start() + records::LOCAL_LEN,
+            &mut bytes[records::LOCAL_LEN as usize..],
+        )?;
+        let mut local = records::local(&bytes).ok_or_else(invalid)?;
+        local.compressed = central.header.compressed;
+        local.length = central.header.length;
+        if !records::agree(&local, &central.header) {
+            return Err(invalid());
+        }
+        Ok(())
     }
 
     fn len(&self) -> u64 {

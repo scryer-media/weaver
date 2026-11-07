@@ -17,7 +17,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 
-use super::{MembersMut, Node, NodeId};
+use super::{Arrived, MembersMut, Node, NodeId, Waiting};
 use crate::deliver::Why;
 use crate::marks::Marks;
 use crate::member::{MemberId, Namespace};
@@ -122,6 +122,28 @@ impl Nodes {
         if let Some(found) = self.nodes.get_mut(&node) {
             found.object = Some(object);
         }
+    }
+
+    // A delivery waits on a lent object without changing the facts it left.
+    pub(super) fn queue_lent_delivery(
+        &mut self,
+        node: NodeId,
+        arrived: &Arrived,
+        length: Option<u64>,
+    ) -> bool {
+        let Some(lent) = self
+            .nodes
+            .get_mut(&node)
+            .and_then(|found| found.lent.as_mut())
+        else {
+            return false;
+        };
+        let arrived = Arrived {
+            bytes: arrived.bytes.clone(),
+            ..*arrived
+        };
+        lent.wait(Waiting::Delivered { arrived, length });
+        true
     }
 
     // The node's own row changed: what its object knows.

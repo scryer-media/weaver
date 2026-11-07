@@ -7,13 +7,15 @@
 // the entries from it; a stored entry's data is its member's bytes once the
 // entry's local header says where they start. When nothing above can bring
 // the tail forward, it walks the local headers from the front instead.
-// Anything compressed, enciphered or of unknown extent goes to an engine,
-// before any member is said whenever the directory can say so.
+// Stored ZipCrypto entries decipher directly into their members. Compressed
+// entries, other ciphers and unknown extents go to an engine, before any
+// member is said whenever the directory can say so.
 //
 // The object is pure: no I/O, no threads, no files. Bytes it cannot place yet
 // are held by its owner, who hands them back once the map places them.
 
 mod carried;
+mod crypto;
 mod directory;
 mod geometry;
 mod map;
@@ -30,8 +32,9 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
     ByteRange, Claim, Delivery, Durable, Emit, Extent, Facts, Give, Kind, Located, MemberId,
-    Object, Placement, Pull, Seek, Standing, Take, VolumeIndex, Weight, Why,
+    Object, Placement, Posting, Pull, Seek, Standing, Take, VolumeIndex, Weight, Why,
 };
+use zeroize::Zeroizing;
 
 use crate::engine::{Format, SetName};
 use crate::grid::{Grid, crc32};
@@ -85,6 +88,10 @@ pub struct Zip {
     // Whether the container's tail was looked at for a recovery set.
     #[serde(default)]
     recovery_said: bool,
+    #[serde(skip)]
+    candidates: Vec<Zeroizing<String>>,
+    #[serde(skip)]
+    asked: bool,
     // Something changed since the object last looked.
     stale: bool,
     // The object gave its container up; it says nothing more.
@@ -97,7 +104,7 @@ impl Durable for Zip {
     // 6: every entry keeps one record's header until the other agrees.
     // 7: what each entry's member is said as, and the map a directory read
     //    again gives, until it takes over.
-    const VERSION: u16 = 7;
+    const VERSION: u16 = 8;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         self.grid.parts(take)
@@ -116,6 +123,14 @@ impl Durable for Zip {
                     .iter()
                     .filter_map(|entry| entry.member)
                     .all(|member| map.members.get(member.0 as usize).is_some())
+                && map.entries.iter().all(|entry| {
+                    entry.cipher.as_ref().is_none_or(|cipher| {
+                        cipher.sound(entry.length)
+                            && entry.data.is_none_or(|data| {
+                                data >= crypto::HEADER && data - crypto::HEADER >= entry.header
+                            })
+                    })
+                })
         };
         let mapped = self.map.as_ref().map_or(self.members.is_empty(), |map| {
             map.members.len() == self.members.len() && sound(map)
@@ -185,6 +200,8 @@ impl Zip {
         if self.opens_alone {
             if self.bound.iter().any(|volume| *volume != LAST) {
                 self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
+            } else {
+                self.walk_encrypted_front(delivery, read);
             }
             return;
         }
@@ -202,9 +219,42 @@ impl Zip {
                 self.geometry.set(VolumeIndex(0), length);
             }
             self.stale = true;
+            self.walk_encrypted_front(delivery, read);
             return;
         }
         self.resolve_last(delivery, read, out);
+    }
+
+    // A bounded ZipCrypto entry can start before a parent knows EOF.
+    // Other fronts keep waiting for their directory, which can supply
+    // extents absent from local headers without a premature refusal.
+    fn walk_encrypted_front(
+        &mut self,
+        delivery: &Delivery<'_>,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+    ) {
+        if self.walking || self.map.is_some() || self.total().is_some() {
+            return;
+        }
+        let Some(fixed) = read_through(ByteRange::at(0, records::LOCAL_LEN), delivery, read) else {
+            return;
+        };
+        let Some(length) = records::local_len(&fixed) else {
+            return;
+        };
+        let Some(bytes) = read_through(ByteRange::at(0, length), delivery, read) else {
+            return;
+        };
+        let Some(header) = records::local(&bytes) else {
+            return;
+        };
+        if header.encrypted()
+            && (!header.deferred() || header.compressed > 0)
+            && refusal(&header).is_none()
+        {
+            self.walking = true;
+            self.stale = true;
+        }
     }
 
     fn global(&self, volume: VolumeIndex, range: ByteRange) -> Option<ByteRange> {
@@ -406,11 +456,16 @@ impl Object for Zip {
         // tail names the directory, the directory names the local headers.
         loop {
             let generation = self.kept.generation();
-            if self.kept.absorb(range, delivery.bytes, delivery.provenance) {
+            if self
+                .kept
+                .absorb(range, delivery.bytes, delivery.provenance)
+                .is_some()
+            {
                 self.stale = true;
                 self.rebuild_if_changed(range, out);
             }
             self.settle(out);
+            self.open_entries(out);
             if self.gone {
                 return;
             }
@@ -418,7 +473,7 @@ impl Object for Zip {
                 break;
             }
         }
-        self.route(range, delivery.bytes, delivery.provenance, out);
+        self.route(range, delivery.bytes, delivery.provenance, read, out);
     }
 
     fn volume_closed(&mut self, _volume: VolumeIndex, out: &mut Vec<Emit>) {
@@ -453,8 +508,24 @@ impl Object for Zip {
             return;
         }
         self.install(out);
-        if let Some(why) =
-            crate::quiet::damaged(standing).or_else(|| crate::quiet::unplaced(standing))
+        if let Some(why) = crate::quiet::damaged(standing)
+            .or_else(|| {
+                self.map
+                    .as_ref()
+                    .filter(|map| {
+                        map.entries
+                            .iter()
+                            .filter(|entry| entry.member.is_some())
+                            .any(|entry| {
+                                entry
+                                    .cipher
+                                    .as_ref()
+                                    .is_some_and(|cipher| cipher.open.is_none())
+                            })
+                    })
+                    .map(|_| Why::Encrypted)
+            })
+            .or_else(|| crate::quiet::unplaced(standing))
         {
             self.give_up(Emit::Refuse(why), out);
         }
@@ -507,13 +578,78 @@ impl Object for Zip {
     fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {
         let mut placements = Vec::new();
         self.locate(volume, range, &mut placements);
+        if let (Some(global), Some(map)) = (self.global(volume, range), &mut self.map) {
+            for entry in &mut map.entries {
+                if let (Some(span), Some(member)) = (entry.span(), entry.member)
+                    && let Some(part) = span.intersect(global)
+                    && let Some(cipher) = &mut entry.cipher
+                {
+                    let from = part.start - span.start;
+                    cipher.unposted(from);
+                    let said = &mut self.members[member.0 as usize];
+                    said.coverage.erase(ByteRange::new(from, entry.length));
+                    said.closed = false;
+                    said.damaged = false;
+                }
+            }
+        }
         crate::said::unposted(&placements, &mut self.members, |out| {
             (&mut out.coverage, &mut out.closed)
         });
     }
 
+    // A cipher member's plaintext after the range was made under keys the
+    // range fed, so forgetting the range forgets it all, through the end of
+    // what the member has said.
+    fn uncovers(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        out: &mut Vec<(VolumeIndex, ByteRange)>,
+    ) {
+        out.push((volume, range));
+        let (Some(global), Some(map)) = (self.global(volume, range), &self.map) else {
+            return;
+        };
+        for entry in &map.entries {
+            let (Some(span), Some(member), Some(_)) = (entry.span(), entry.member, &entry.cipher)
+            else {
+                continue;
+            };
+            let Some(part) = span.intersect(global) else {
+                continue;
+            };
+            let after = ByteRange::new(part.end - span.start, entry.length);
+            let Some(end) = self.members[member.0 as usize]
+                .coverage
+                .overlapping(after)
+                .map(|run| run.range.end.min(entry.length))
+                .max()
+                .filter(|end| *end > after.start)
+            else {
+                continue;
+            };
+            self.to_volumes(ByteRange::new(part.end, span.start + end), out);
+        }
+    }
+
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         self.place(volume, range, out);
+    }
+
+    fn posted(
+        &self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        self.posted_over(&[(volume, range)])
+            .posted(volume, range, read, into)
+    }
+
+    fn posting(&self, ranges: &[(VolumeIndex, ByteRange)]) -> Box<dyn weaver_graph::Posting> {
+        Box::new(self.posted_over(ranges))
     }
 
     fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {
@@ -532,6 +668,19 @@ impl Object for Zip {
             self.stale = true;
             self.settle(out);
         }
+    }
+
+    fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
+        self.asked = false;
+        if !self
+            .candidates
+            .iter()
+            .any(|candidate| candidate.as_str() == secret)
+        {
+            self.candidates.push(Zeroizing::new(secret.to_owned()));
+            self.retry_doubted(out);
+        }
+        self.open_entries(out);
     }
 
     fn envelope(&self, envelope: u32, range: ByteRange) -> Option<bytes::Bytes> {
@@ -619,14 +768,19 @@ fn read_through(
 // Why the store cannot stream an entry, if it cannot. Nothing to stream is
 // never a reason.
 fn refusal(header: &records::Header) -> Option<Why> {
-    if header.shape != records::Shape::File || header.length == 0 {
+    if header.shape != records::Shape::File || (header.length == 0 && !header.encrypted()) {
         return None;
     }
-    if header.encrypted() {
-        Some(Why::Encrypted)
+    if header.aes.is_some() || header.method == 99 || header.flags & (1 << 6) != 0 {
+        Some(Why::Unsupported)
     } else if !header.stored() {
         Some(Why::Compressed)
     } else {
-        (header.compressed != header.length).then_some(Why::Unsupported)
+        (header.length.checked_add(if header.encrypted() {
+            crypto::HEADER
+        } else {
+            0
+        }) != Some(header.compressed))
+        .then_some(Why::Unsupported)
     }
 }
