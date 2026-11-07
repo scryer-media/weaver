@@ -78,6 +78,26 @@ impl DatabaseServices {
         }
     }
 
+    // A SQLite file database's checkpoint task ends here, its connection
+    // closed; Postgres has none.
+    pub(crate) fn stop_checkpointer(&self) {
+        if let Self::Sqlite(services) = self {
+            services.stop_checkpointer();
+        }
+    }
+
+    // Whether the checkpoint task has ended; `None` without one.
+    #[cfg(test)]
+    pub(crate) fn checkpointer_ended(&self) -> Option<bool> {
+        match self {
+            Self::Sqlite(services) => services
+                .checkpointer
+                .as_ref()
+                .map(|checkpointer| checkpointer.ended()),
+            Self::Postgres(_) => None,
+        }
+    }
+
     pub(crate) fn pre_migration_schema_version(&self) -> Option<i64> {
         match self {
             Self::Sqlite(services) => services.pre_migration_schema_version,
@@ -91,9 +111,9 @@ pub(crate) struct SqliteServices {
     pool: sqlx::SqlitePool,
     encryption_key: Arc<RwLock<Option<crate::persistence::encryption::EncryptionKey>>>,
     writer_gate: SqliteWriterGate,
-    // A file database's checkpoint task; the last handle to drop runs its
-    // shutdown checkpoint.
-    _checkpointer: Option<Arc<WalCheckpointer>>,
+    // A file database's checkpoint task; closing the database, or the last
+    // handle to drop, runs its shutdown checkpoint and closes its connection.
+    checkpointer: Option<Arc<WalCheckpointer>>,
     // Migration ledger maximum as it stood when this handle opened the
     // database, captured before the migration run below could move it.
     // `None` for a database nothing had ever migrated.
@@ -195,7 +215,7 @@ impl SqliteServices {
             pool,
             encryption_key: Arc::new(RwLock::new(None)),
             writer_gate: new_writer_gate(wal),
-            _checkpointer: checkpointer,
+            checkpointer,
             pre_migration_schema_version,
         })
     }
@@ -205,6 +225,14 @@ impl SqliteServices {
         &self,
     ) -> Option<&'static crate::persistence::wal_checkpoint::WalSignal> {
         self.writer_gate.wal()
+    }
+
+    // Ends the checkpoint task and closes its connection, whoever else
+    // still holds a handle; see `WalCheckpointer::stop`.
+    pub(crate) fn stop_checkpointer(&self) {
+        if let Some(checkpointer) = &self.checkpointer {
+            checkpointer.stop();
+        }
     }
 
     pub(crate) fn pool(&self) -> &sqlx::SqlitePool {
