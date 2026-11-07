@@ -539,7 +539,7 @@ async fn pausing_every_torrent_is_one_hold_apart_from_the_queues() {
 }
 
 // A follower of the torrents gets them as they are, then each change the
-// service publishes.
+// service publishes: only the torrents that moved, and the ids of the gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn torrent_updates_push_what_the_service_publishes() {
     use tokio_stream::StreamExt;
@@ -555,30 +555,102 @@ async fn torrent_updates_push_what_the_service_publishes() {
         .unwrap();
 
     let request = Request::new(format!(
-        "subscription {{ torrentUpdates(id: {id}) {{ id name state }} }}"
+        "subscription {{ torrentUpdates(id: {id}) {{ fullUpdate removedIds torrents {{ id name state }} }} }}"
     ))
     .data(CallerScope::Local)
     .data(CallerIdentity::Local([7; 32]))
     .data(rig.torrents.clone());
     let mut updates = rig.harness.schema.execute_stream(request);
-    let first = updates.next().await.unwrap();
-    assert!(first.errors.is_empty(), "{:?}", first.errors);
-    let first = first.data.into_json().unwrap();
-    assert_eq!(first["torrentUpdates"][0]["id"], id);
-    assert_eq!(first["torrentUpdates"][0]["name"], "one.mkv");
-    assert_eq!(first["torrentUpdates"][0]["state"], "STALLED");
+    let mut push = async || {
+        let next = updates.next().await.expect("the updates stay open");
+        assert!(next.errors.is_empty(), "{:?}", next.errors);
+        next.data.into_json().unwrap()["torrentUpdates"].clone()
+    };
+    let first = push().await;
+    assert_eq!(first["fullUpdate"], true);
+    assert_eq!(first["removedIds"], serde_json::json!([]));
+    assert_eq!(first["torrents"][0]["id"], id);
+    assert_eq!(first["torrents"][0]["name"], "one.mkv");
+    assert_eq!(first["torrents"][0]["state"], "STALLED");
 
     let paused = rig
         .execute(&format!("mutation {{ pauseTorrent(id: {id}) }}"))
         .await;
     assert!(paused.errors.is_empty(), "{:?}", paused.errors);
     loop {
-        let next = updates.next().await.expect("the updates stay open");
-        assert!(next.errors.is_empty(), "{:?}", next.errors);
-        if next.data.into_json().unwrap()["torrentUpdates"][0]["state"] == "PAUSED" {
+        let next = push().await;
+        assert_eq!(next["fullUpdate"], false);
+        if next["torrents"][0]["state"] == "PAUSED" {
             break;
         }
     }
+
+    let removed = rig
+        .execute(&format!(
+            "mutation {{ removeTorrent(id: {id}, confirmUnmetGoal: true) }}"
+        ))
+        .await;
+    assert!(removed.errors.is_empty(), "{:?}", removed.errors);
+    loop {
+        let next = push().await;
+        assert_eq!(next["fullUpdate"], false);
+        if next["removedIds"] == serde_json::json!([id]) {
+            assert_eq!(next["torrents"], serde_json::json!([]));
+            break;
+        }
+    }
+}
+
+// `torrents` pages as `queueItems` does: `first` after an offset cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn torrents_page_by_first_and_an_offset_cursor() {
+    let rig = rig().await;
+    for name in ["one.mkv", "two.mkv", "three.mkv"] {
+        let response = rig.execute(&submit(&metainfo(name, 3000, false), "")).await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+    }
+    let names = |query: String| {
+        let rig = &rig;
+        async move {
+            let response = rig.execute(&query).await;
+            assert!(response.errors.is_empty(), "{:?}", response.errors);
+            response.data.into_json().unwrap()["torrents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|torrent| torrent["name"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        }
+    };
+    let cursor = |offset: usize| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(format!("off:{offset}"))
+    };
+    assert_eq!(
+        names("{ torrents { name } }".to_owned()).await,
+        ["one.mkv", "two.mkv", "three.mkv"]
+    );
+    assert_eq!(
+        names("{ torrents(first: 2) { name } }".to_owned()).await,
+        ["one.mkv", "two.mkv"]
+    );
+    assert_eq!(
+        names(format!(
+            "{{ torrents(first: 2, after: \"{}\") {{ name }} }}",
+            cursor(2)
+        ))
+        .await,
+        ["three.mkv"]
+    );
+    let invalid = rig
+        .execute("{ torrents(after: \"not-a-cursor\") { name } }")
+        .await;
+    assert_eq!(
+        invalid.errors[0]
+            .extensions
+            .as_ref()
+            .and_then(|ext| ext.get("code")),
+        Some(&async_graphql::Value::String("CURSOR_INVALID".to_owned()))
+    );
 }
 
 // A tracker rule keeps the client its torrents name themselves as, and

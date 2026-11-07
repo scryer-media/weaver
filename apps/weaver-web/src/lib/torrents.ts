@@ -143,6 +143,27 @@ export interface TorrentSummaryData {
   uploadBps: number;
 }
 
+/**
+ * A `torrentUpdates` push: every followed torrent with `fullUpdate`, else
+ * the torrents that changed or came and the ids of the ones gone.
+ */
+export interface TorrentChangesData<T> {
+  fullUpdate: boolean;
+  torrents: T[];
+  removedIds: number[];
+}
+
+/** The torrents by id once `changes` lands on `held`. */
+export function applyTorrentChanges<T extends { id: number }>(
+  held: ReadonlyMap<number, T> | undefined,
+  changes: TorrentChangesData<T>,
+): Map<number, T> {
+  const next = new Map(changes.fullUpdate || !held ? [] : held);
+  for (const id of changes.removedIds) next.delete(id);
+  for (const torrent of changes.torrents) next.set(torrent.id, torrent);
+  return next;
+}
+
 /** A torrent as its detail reads it. */
 export interface TorrentData extends TorrentSummaryData {
   name: string;

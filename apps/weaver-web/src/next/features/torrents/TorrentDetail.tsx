@@ -25,6 +25,7 @@ import {
   trackerSourceKey,
   type SettingLevel,
   type TorrentActionError,
+  type TorrentChangesData,
   type TorrentData,
   type TorrentFilePriority,
   type TorrentPeerData,
@@ -62,13 +63,21 @@ const PEER_COLUMNS = {
  */
 export function useTorrent(id: number, active: boolean) {
   const { connection } = useNextData("connection");
-  const [{ data }, follow] = useSubscription<{ torrentUpdates: TorrentData[] }>({
-    query: TORRENT_UPDATES_SUBSCRIPTION,
-    variables: { id },
-    pause: !active || connection.isDisconnected,
-  });
+  // A push carries the torrent only when it moved, and its id once gone.
+  const [{ data }, follow] = useSubscription<{ torrentUpdates: TorrentChangesData<TorrentData> }, TorrentData | null>(
+    {
+      query: TORRENT_UPDATES_SUBSCRIPTION,
+      variables: { id },
+      pause: !active || connection.isDisconnected,
+    },
+    (held, pushed) => {
+      const { fullUpdate, torrents, removedIds } = pushed.torrentUpdates;
+      if (removedIds.includes(id)) return null;
+      return torrents.find((torrent) => torrent.id === id) ?? (fullUpdate ? null : (held ?? null));
+    },
+  );
   return {
-    torrent: active ? (data?.torrentUpdates[0] ?? null) : null,
+    torrent: active ? (data ?? null) : null,
     refresh: () => follow(),
   };
 }

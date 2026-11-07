@@ -4439,6 +4439,46 @@ async fn a_trackers_status_follows_its_announces() {
     rig.service.stop().await;
 }
 
+// A follower is given every torrent first, then only the torrents that
+// changed or came and the ids of the ones gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_follower_is_given_only_what_moved_after_the_first_push() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let mut views = Vec::new();
+    for (name, seed) in [("one", 1), ("two", 2)] {
+        let job_id = rig
+            .service
+            .add(request(AddSource::Metainfo(plain(name, seed))))
+            .await
+            .unwrap();
+        views.push(rig.service.torrent(job_id).await.unwrap());
+    }
+    let (one, two) = (views[0].clone(), views[1].clone());
+    let mut last = None;
+
+    let first = updates::changes(&mut last, views.clone()).unwrap();
+    assert!(first.full_update);
+    assert_eq!(first.torrents, views);
+    assert!(first.removed.is_empty());
+    assert_eq!(updates::changes(&mut last, views), None);
+
+    let mut paused = two.clone();
+    paused.state = TorrentState::Paused;
+    let moved = updates::changes(&mut last, vec![one.clone(), paused.clone()]).unwrap();
+    assert!(!moved.full_update);
+    assert_eq!(moved.torrents, [paused]);
+    assert!(moved.removed.is_empty());
+
+    let gone = updates::changes(&mut last, vec![one.clone()]).unwrap();
+    assert!(gone.torrents.is_empty());
+    assert_eq!(gone.removed, [two.job_id]);
+
+    let back = updates::changes(&mut last, vec![one, two.clone()]).unwrap();
+    assert_eq!(back.torrents, [two]);
+    assert!(back.removed.is_empty());
+}
+
 // A follower hears a tracker's answer as it lands, with nothing in the queue
 // to say so: the rig has no queue, and the beat is far past the test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4461,7 +4501,7 @@ async fn a_followed_torrent_pushes_its_trackers_answer() {
         .updates(Some(job_id), Duration::from_secs(86_400));
 
     let mut started = heard_announce(&listener).await;
-    let first = updates.next().await;
+    let first = updates.next().await.torrents;
     assert!(first[0].trackers[0].updating);
 
     let body = b"d8:completei3e10:incompletei5e8:intervali1800e5:peers0:e";
@@ -4474,7 +4514,7 @@ async fn a_followed_torrent_pushes_its_trackers_answer() {
         .await
         .unwrap();
     let working = loop {
-        let views = updates.next().await;
+        let views = updates.next().await.torrents;
         if views[0].trackers[0].status == TrackerStatus::Working {
             break views[0].trackers[0].clone();
         }
@@ -4503,7 +4543,7 @@ async fn a_magnets_trackers_read_as_announced_while_its_metainfo_is_fetched() {
 
     let mut started = heard_announce(&listener).await;
     let updating = loop {
-        let views = updates.next().await;
+        let views = updates.next().await.torrents;
         if views[0].trackers[0].updating {
             break views[0].clone();
         }
@@ -4521,7 +4561,7 @@ async fn a_magnets_trackers_read_as_announced_while_its_metainfo_is_fetched() {
         .await
         .unwrap();
     let working = loop {
-        let views = updates.next().await;
+        let views = updates.next().await.torrents;
         if views[0].trackers[0].status == TrackerStatus::Working {
             break views[0].clone();
         }
@@ -4587,10 +4627,10 @@ async fn started_and_answered(
 ) {
     let (stream, event) = heard_event(listener).await;
     assert_eq!(event.as_deref(), Some("started"));
-    while !updates.next().await[0].trackers[0].updating {}
+    while !updates.next().await.torrents[0].trackers[0].updating {}
     answer_no_peers(stream).await;
     loop {
-        let views = updates.next().await;
+        let views = updates.next().await.torrents;
         let tracker = &views[0].trackers[0];
         if !tracker.updating && tracker.status == TrackerStatus::Working {
             break;
@@ -4629,7 +4669,7 @@ async fn a_magnet_paused_or_removed_while_its_metainfo_is_fetched_stops_at_its_t
     );
     // Paused, the magnet shows no fetch's table, so the rows read from here
     // on are the next fetch's.
-    while updates.next().await[0].trackers[0].status != TrackerStatus::NotContacted {}
+    while updates.next().await.torrents[0].trackers[0].status != TrackerStatus::NotContacted {}
 
     rig.service.resume(job_id).await.unwrap();
     started_and_answered(&listener, &mut updates).await;

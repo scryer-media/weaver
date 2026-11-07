@@ -9,7 +9,8 @@ use super::service;
 use super::types::{
     ScheduleSeedingGql, Torrent, TorrentPeerGql, TorrentRouteGql, TorrentTrackerGql,
 };
-use crate::auth::ReadGuard;
+use crate::auth::{ReadGuard, graphql_error};
+use crate::jobs::types::decode_offset_cursor;
 
 #[derive(Default)]
 pub struct TorrentsQuery;
@@ -74,12 +75,25 @@ impl TorrentsQuery {
             .collect())
     }
 
+    /// Every torrent, or a category's, in the order they were added: the
+    /// `first` after the offset cursor `after`, as `queueItems` pages.
     #[graphql(guard = "ReadGuard")]
-    async fn torrents(&self, ctx: &Context<'_>, category: Option<String>) -> Result<Vec<Torrent>> {
+    async fn torrents(
+        &self,
+        ctx: &Context<'_>,
+        category: Option<String>,
+        first: Option<u32>,
+        after: Option<String>,
+    ) -> Result<Vec<Torrent>> {
+        let offset = decode_offset_cursor(after.as_deref())
+            .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
+        let limit = first.unwrap_or(u32::MAX) as usize;
         Ok(service(ctx)?
             .torrents(category.as_deref())
             .await
             .into_iter()
+            .skip(offset)
+            .take(limit)
             .map(Into::into)
             .collect())
     }

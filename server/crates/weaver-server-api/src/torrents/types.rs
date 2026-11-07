@@ -7,7 +7,7 @@ use weaver_server_core::proxies::{TorrentRouteFault, TorrentScope};
 use weaver_server_core::settings::Seeding;
 use weaver_server_core::torrents::net::Exposure;
 use weaver_server_core::torrents::service::{
-    ScheduleSeeding, SeedingLevels, TorrentRoute, TorrentView,
+    ScheduleSeeding, SeedingLevels, TorrentRoute, TorrentView, updates::TorrentChanges,
 };
 use weaver_server_core::torrents::sessions::TorrentRouteReason;
 use weaver_server_core::torrents::sessions::{PortMapped, PortmapProtocol, PortmapTransport};
@@ -616,6 +616,28 @@ pub struct Torrent {
     /// Whether each file's first and last pieces are fetched first.
     pub first_last_piece_first: bool,
     pub trackers: Vec<TorrentTrackerGql>,
+}
+
+/// What a `torrentUpdates` push carries.
+#[derive(Clone, Debug, SimpleObject)]
+#[graphql(name = "TorrentChanges")]
+pub struct TorrentChangesGql {
+    /// The first push: `torrents` is every followed torrent.
+    pub full_update: bool,
+    /// The torrents that changed or came.
+    pub torrents: Vec<Torrent>,
+    /// The ids of the torrents gone since the last push.
+    pub removed_ids: Vec<u64>,
+}
+
+impl From<TorrentChanges> for TorrentChangesGql {
+    fn from(changes: TorrentChanges) -> Self {
+        Self {
+            full_update: changes.full_update,
+            torrents: changes.torrents.into_iter().map(Into::into).collect(),
+            removed_ids: changes.removed.into_iter().map(|job_id| job_id.0).collect(),
+        }
+    }
 }
 
 impl From<TorrentView> for Torrent {

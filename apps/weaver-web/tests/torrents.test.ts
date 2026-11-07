@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import {
+  applyTorrentChanges,
   removeOutcome,
   routeExposureText,
   routeReasonText,
@@ -248,4 +249,15 @@ test("the transfer section notes its route's reason in each locale, else the ser
   assert.equal(transferNote(t, torrent({ state: "STALLED", routeReason: "SESSION_LIMIT" })), "Session limit reached");
   assert.equal(transferNote(t, torrent({ state: "STOPPED", detail: "disk gone" })), "disk gone");
   assert.equal(transferNote(t, torrent()), undefined);
+});
+
+test("a torrentUpdates push lands on the torrents held: whole when full, else what moved", () => {
+  const row = (id: number, ratio: number) => ({ id, ratio });
+  const full = applyTorrentChanges(undefined, { fullUpdate: true, torrents: [row(1, 0), row(2, 0)], removedIds: [] });
+  assert.deepEqual([...full.values()], [row(1, 0), row(2, 0)]);
+  const moved = applyTorrentChanges(full, { fullUpdate: false, torrents: [row(2, 1)], removedIds: [1] });
+  assert.deepEqual([...moved.values()], [row(2, 1)]);
+  assert.deepEqual([...full.values()], [row(1, 0), row(2, 0)]);
+  const again = applyTorrentChanges(moved, { fullUpdate: true, torrents: [row(3, 0)], removedIds: [] });
+  assert.deepEqual([...again.values()], [row(3, 0)]);
 });
