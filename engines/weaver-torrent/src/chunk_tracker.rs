@@ -54,6 +54,25 @@ struct Key {
     bucket: u32,
 }
 
+/// Whether some piece is set in `pieces` and `wanted` and clear in `have`,
+/// the raw bytes of three bitfields over the same pieces, eight bytes at a
+/// time. A byte past the end of `have` holds no piece.
+fn any_wanted_lacking(pieces: &[u8], wanted: &[u8], have: &[u8]) -> bool {
+    let n = pieces.len().min(wanted.len());
+    let byte = |at: usize| pieces[at] & wanted[at] & !have.get(at).copied().unwrap_or(0) != 0;
+    let Some(have) = have.get(..n) else {
+        return (0..n).any(byte);
+    };
+    let whole = n - n % 8;
+    let word = |bytes: &[u8], at: usize| {
+        u64::from_ne_bytes(bytes[at..at + 8].try_into().expect("eight bytes"))
+    };
+    (0..whole)
+        .step_by(8)
+        .any(|at| word(pieces, at) & word(wanted, at) & !word(have, at) != 0)
+        || (whole..n).any(byte)
+}
+
 /// The rank of `level` among the wanted levels, the highest first.
 fn level_rank(level: PiecePriority) -> Option<usize> {
     PiecePriority::WANTED_DESCENDING
@@ -1052,12 +1071,13 @@ impl ChunkTracker {
 
     /// Whether `pieces` names a piece we want and lack: a selected one we do
     /// not have (libtorrent `peer_connection::do_update_interest`).
-    pub(crate) fn wants_any_of(&self, pieces: &BS) -> bool {
-        let have = self.have.as_slice();
+    pub(crate) fn wants_any_of(&self, pieces: &BF) -> bool {
         !self.is_finished()
-            && pieces.iter_ones().any(|p| {
-                self.selected.get(p).is_some_and(|s| *s) && !have.get(p).is_some_and(|h| *h)
-            })
+            && any_wanted_lacking(
+                pieces.as_raw_slice(),
+                self.selected.as_raw_slice(),
+                self.have.as_bytes(),
+            )
     }
 
     pub fn per_file_have_bytes(&self) -> &[u64] {
@@ -1108,6 +1128,34 @@ mod tests {
             .collect();
         let pieces = file_to_piece_priorities(ct.get_lengths(), files, &levels, false);
         ct.prioritize(files, &levels, &pieces)
+    }
+
+    #[test]
+    fn wanted_lacking_matches_a_walk_bit_by_bit() {
+        let mut seed = 0x9e37_79b9_u32;
+        let mut byte = || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (seed >> 24) as u8
+        };
+        for n in 0..40usize {
+            for have_len in [n, n.saturating_sub(3), n + 2] {
+                for _ in 0..20 {
+                    let pieces: Vec<u8> = (0..n).map(|_| byte() & byte()).collect();
+                    let wanted: Vec<u8> = (0..n).map(|_| byte() | byte()).collect();
+                    let have: Vec<u8> = (0..have_len).map(|_| byte() | byte()).collect();
+                    let bit = |b: &[u8], i: usize| {
+                        b.get(i / 8).is_some_and(|v| v & (0x80 >> (i % 8)) != 0)
+                    };
+                    let walk =
+                        (0..n * 8).any(|i| bit(&pieces, i) && bit(&wanted, i) && !bit(&have, i));
+                    assert_eq!(
+                        super::any_wanted_lacking(&pieces, &wanted, &have),
+                        walk,
+                        "{n} bytes, have {have_len}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
