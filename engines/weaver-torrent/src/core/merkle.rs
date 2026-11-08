@@ -16,18 +16,62 @@ use crate::sha1w::{ISha256, Sha256};
 pub const BLOCK_SIZE: u64 = 16384;
 
 /// The SHA-256 of one block, a leaf of the tree.
+///
+/// Hashing several leaves at once, one message per lane, was measured and
+/// explicitly abandoned: two lanes of the ARMv8 SHA-256 instructions and
+/// the OpenSSL multi-buffer SHA-NI kernel each hashed leaves about a
+/// third faster than aws-lc one at a time, but it means owning crypto
+/// code and reshaping the streaming piece hash for a few percent of
+/// download CPU. Leaves stay on aws-lc's one-message digest.
 pub fn hash_block(data: &[u8]) -> Id32 {
     let mut h = Sha256::new();
     h.update(data);
     Id32::new(h.finish())
 }
 
+/// The SHA-256 starting state (FIPS 180-4 section 5.3.3).
+const SHA256_IV: [u32; 8] = [
+    0x6a09_e667,
+    0xbb67_ae85,
+    0x3c6e_f372,
+    0xa54f_f53a,
+    0x510e_527f,
+    0x9b05_688c,
+    0x1f83_d9ab,
+    0x5be0_cd19,
+];
+
+/// The block that ends every 64-byte message: the 0x80 marker, zeros, and
+/// the message length in bits, 512, big-endian (FIPS 180-4 section 5.1.1).
+const PAIR_PAD: [u8; 64] = {
+    let mut b = [0u8; 64];
+    b[0] = 0x80;
+    b[62] = 0x02;
+    b
+};
+
 /// The parent of two nodes.
+///
+/// A pair is always 64 bytes, so its padding block is always the same.
+/// The two blocks go straight to aws-lc's SHA-256 block function, the one
+/// its digest runs, without a digest context to set up and finish: about
+/// 2.5 times faster per pair. Multi-lane pair hashing was measured with
+/// the leaves (see [`hash_block`]), gained nothing over this, and was
+/// abandoned.
 pub fn hash_pair(left: &Id32, right: &Id32) -> Id32 {
-    let mut h = Sha256::new();
-    h.update(&left.0);
-    h.update(&right.0);
-    Id32::new(h.finish())
+    let mut blocks = [0u8; 128];
+    blocks[..32].copy_from_slice(&left.0);
+    blocks[32..64].copy_from_slice(&right.0);
+    blocks[64..].copy_from_slice(&PAIR_PAD);
+    let mut state = SHA256_IV;
+    // SAFETY: `state` is the eight words the function reads and updates,
+    // and `blocks` is two whole 64-byte blocks, the count passed.
+    unsafe { aws_lc_sys::SHA256_TransformBlocks(state.as_mut_ptr(), blocks.as_ptr(), 2) };
+    let mut out = [0u8; 32];
+    for (bytes, word) in out.chunks_exact_mut(4).zip(state) {
+        bytes.copy_from_slice(&word.to_be_bytes());
+    }
+    Id32::new(out)
 }
 
 /// The leaves of a tree over `n` nodes: `n` rounded up to a power of two
@@ -215,6 +259,26 @@ mod tests {
 
     fn h(byte: u8) -> Id32 {
         hash_block(&[byte])
+    }
+
+    #[test]
+    fn a_pair_hashes_as_the_sha256_of_its_64_bytes() {
+        // SHA-256 of 64 zero bytes.
+        let zero = Id32::default();
+        assert_eq!(
+            hex::encode(hash_pair(&zero, &zero).0),
+            "f5a5fd42d16a20302798ef6ed309979b43003d2320d9f0e8ea9831a92759fb4b"
+        );
+        // Against aws-lc's digest over the same bytes, on many pairs.
+        let mut node = h(7);
+        for _ in 0..256 {
+            let other = hash_block(&node.0);
+            let mut digest = Sha256::new();
+            digest.update(&node.0);
+            digest.update(&other.0);
+            assert_eq!(hash_pair(&node, &other), Id32::new(digest.finish()));
+            node = other;
+        }
     }
 
     #[test]

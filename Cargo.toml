@@ -45,6 +45,7 @@ sha1 = { version = "0.11", default-features = false, features = ["alloc"] }
 sha2 = { version = "0.11", default-features = false }
 hmac = { version = "0.13", default-features = false }
 aws-lc-rs = { version = "1.19", default-features = false, features = ["non-fips"] }
+aws-lc-sys = { version = "0.47", default-features = false }
 argon2 = { version = "0.6", default-features = false, features = ["alloc", "password-hash"] }
 getrandom = { version = "0.4", default-features = false }
 hex = { version = "0.4", default-features = false, features = ["std"] }

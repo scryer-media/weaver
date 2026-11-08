@@ -23,6 +23,7 @@ async-stream = { workspace = true }
 async-trait = { workspace = true }
 atoi = { workspace = true }
 aws-lc-rs = { workspace = true }
+aws-lc-sys = { workspace = true }
 backon = { workspace = true, features = ["tokio-sleep"] }
 base64 = { workspace = true }
 bitvec = { workspace = true }
