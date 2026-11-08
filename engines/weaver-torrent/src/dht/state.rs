@@ -574,14 +574,30 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
             candidates.offer(id, addr);
         }
         if candidates.list.is_empty() {
-            let closest: Vec<_> = self
-                .table(is_v4)
-                .read()
-                .sorted_by_distance_from(self.info_hash, now())
-                .iter()
-                .map(|n| (n.id(), n.addr()))
-                .take(SEARCH_K)
-                .collect();
+            // Good nodes first, then questionable, unknown and bad, each
+            // tier nearest first.
+            let table = self.table(is_v4).read();
+            let now = now();
+            let mut closest = Vec::with_capacity(SEARCH_K);
+            for tier in [
+                NodeStatus::Good,
+                NodeStatus::Questionable,
+                NodeStatus::Unknown,
+                NodeStatus::Bad,
+            ] {
+                if closest.len() == SEARCH_K {
+                    break;
+                }
+                closest.extend(
+                    table
+                        .closest(&self.info_hash, SEARCH_K - closest.len(), |n| {
+                            n.status(now) == tier
+                        })
+                        .iter()
+                        .map(|n| (n.id(), n.addr())),
+                );
+            }
+            drop(table);
             for (id, addr) in closest {
                 candidates.offer(Some(id), addr);
             }
@@ -890,16 +906,20 @@ impl DhtState {
         A: CompactSerialize + CompactSerializeFixedLen + FromSocketAddr,
         Node<A>: CompactSerialize + CompactSerializeFixedLen,
     {
+        // The eight good or questionable nodes of the family nearest the
+        // target, nearest first; unknown and bad nodes are not handed out.
         let it = table
-            .sorted_by_distance_from(target, now)
+            .closest(&target, 8, |n| {
+                matches!(n.status(now), NodeStatus::Good | NodeStatus::Questionable)
+                    && A::from_socket_addr(n.addr()).is_some()
+            })
             .into_iter()
             .filter_map(|r| {
                 Some(Node {
                     id: r.id(),
                     addr: A::from_socket_addr(r.addr())?,
                 })
-            })
-            .take(8);
+            });
         CompactNodeInfo::new_from_iter(it)
     }
 

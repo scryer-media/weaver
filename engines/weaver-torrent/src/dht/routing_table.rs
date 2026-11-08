@@ -222,6 +222,44 @@ impl BucketTree {
         self.iter_leaves().flat_map(|l| l.leaf.nodes.iter())
     }
 
+    // The `k` nodes nearest `target` that `keep` accepts, nearest first.
+    // Buckets split on id prefixes, so every node under the child that shares
+    // the target's bit at a split is nearer than every node under the other:
+    // walking the near child first meets the nodes in distance order, bucket
+    // by bucket, and stops once `k` are found, with no copy of the table and
+    // no sort beyond a bucket's eight.
+    fn closest(
+        &self,
+        target: &Id20,
+        k: usize,
+        mut keep: impl FnMut(&RoutingTableNode) -> bool,
+    ) -> Vec<&RoutingTableNode> {
+        let mut out = Vec::with_capacity(k);
+        let mut stack = vec![0usize];
+        while out.len() < k {
+            let Some(idx) = stack.pop() else { break };
+            let node = &self.data[idx];
+            match &node.data {
+                BucketTreeNodeData::Leaf(leaf) => {
+                    let from = out.len();
+                    out.extend(leaf.nodes.iter().filter(|n| keep(n)));
+                    out[from..].sort_unstable_by_key(|n| target.distance(&n.id));
+                    out.truncate(k);
+                }
+                BucketTreeNodeData::LeftRight(left, right) => {
+                    let (near, far) = if target.get_bit(160 - node.bits) {
+                        (*right, *left)
+                    } else {
+                        (*left, *right)
+                    };
+                    stack.push(far);
+                    stack.push(near);
+                }
+            }
+        }
+        out
+    }
+
     fn get_leaf(&self, id: &Id20) -> usize {
         let mut idx = 0;
         loop {
@@ -432,7 +470,7 @@ impl Serialize for RoutingTableNode {
     }
 }
 
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NodeStatus {
     Good,
     Questionable,
@@ -528,22 +566,14 @@ impl RoutingTable {
     pub fn len(&self) -> usize {
         self.size
     }
-    pub fn sorted_by_distance_from(&self, id: Id20, now: Instant) -> Vec<&RoutingTableNode> {
-        let mut result = Vec::with_capacity(self.size);
-        for node in self.buckets.iter() {
-            result.push(node);
-        }
-        result.sort_by_key(|n| {
-            // Query decent nodes first.
-            let status = match n.status(now) {
-                NodeStatus::Good => 0,
-                NodeStatus::Questionable => 1,
-                NodeStatus::Unknown => 2,
-                NodeStatus::Bad => 3,
-            };
-            (status, id.distance(&n.id))
-        });
-        result
+    /// The `k` nodes nearest `id` that `keep` accepts, nearest first.
+    pub fn closest(
+        &self,
+        id: &Id20,
+        k: usize,
+        keep: impl FnMut(&RoutingTableNode) -> bool,
+    ) -> Vec<&RoutingTableNode> {
+        self.buckets.closest(id, k, keep)
     }
 
     pub fn iter_buckets(&self) -> impl Iterator<Item = BucketTreeIteratorItem<'_>> + '_ {
@@ -611,13 +641,12 @@ mod tests {
         io::Cursor,
         net::{Ipv4Addr, SocketAddr, SocketAddrV4},
         str::FromStr,
-        time::Instant,
     };
 
     use crate::core::hash_id::Id20;
     use rand::RngExt;
 
-    use crate::dht::routing_table::compute_split_start_end;
+    use crate::dht::routing_table::{RoutingTableNode, compute_split_start_end};
 
     use super::{RoutingTable, generate_random_id};
 
@@ -714,14 +743,35 @@ mod tests {
         }
     }
 
+    // The walk gives exactly what copying the table, filtering it and sorting
+    // it by distance gives, for every k and filter.
     #[test]
-    fn test_sorted_by_distance_from() {
-        let id = random_id_20();
-        let rtable = generate_table(None);
-        assert_eq!(
-            rtable.sorted_by_distance_from(id, Instant::now()).len(),
-            rtable.size
-        );
+    fn closest_matches_a_full_sort() {
+        for size in [0, 1, 7, 8, 9, 64, 512] {
+            let rtable = generate_table(Some(size));
+            for _ in 0..50 {
+                let target = random_id_20();
+                let keep = |n: &RoutingTableNode| !n.id.0[19].is_multiple_of(3);
+                let mut want: Vec<_> = rtable.iter().filter(|n| keep(n)).collect();
+                want.sort_by_key(|n| target.distance(&n.id));
+                for k in [1, 8, 20, size + 1] {
+                    let got: Vec<_> = rtable
+                        .closest(&target, k, keep)
+                        .iter()
+                        .map(|n| n.id)
+                        .collect();
+                    let want: Vec<_> = want.iter().take(k).map(|n| n.id).collect();
+                    assert_eq!(got, want, "size {size} k {k} target {target:?}");
+                }
+                let own = rtable.closest(&rtable.id(), 8, |_| true);
+                let mut all: Vec<_> = rtable.iter().collect();
+                all.sort_by_key(|n| rtable.id().distance(&n.id));
+                assert_eq!(
+                    own.iter().map(|n| n.id).collect::<Vec<_>>(),
+                    all.iter().take(8).map(|n| n.id).collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]
