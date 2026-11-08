@@ -1012,9 +1012,10 @@ impl PeerStates {
             if live.bitfield.replace(piece.get_usize(), true) {
                 return Have::Known;
             }
-            self.availability.peer_has(piece.get_usize());
             let seeder = live.seeder;
             self.update_seeder_flag(live);
+            self.availability
+                .peer_has(piece.get_usize(), live.seeder.then_some(&*live.bitfield));
             if live.seeder != seeder {
                 Have::Completed
             } else {
@@ -1032,8 +1033,10 @@ impl PeerStates {
             if !live.bitfield.replace(piece.get_usize(), false) {
                 return;
             }
-            self.availability.peer_lost(piece.get_usize());
+            let seeder = live.seeder;
             self.update_seeder_flag(live);
+            self.availability
+                .peer_lost(piece.get_usize(), seeder.then_some(&*live.bitfield));
         })
     }
 
@@ -1343,6 +1346,66 @@ mod tests {
             peers.peer_has(b, piece(u32::try_from(TOTAL_PIECES).unwrap(), 3)),
             Some(Have::Gained)
         );
+    }
+
+    #[test]
+    fn a_seed_counts_once_and_a_dont_have_breaks_it_into_pieces() {
+        let peers = make_peer_states();
+        let total = u32::try_from(TOTAL_PIECES).unwrap();
+        let ranked = |peers: &PeerStates| {
+            (0..total)
+                .map(|i| peers.availability.ranked(piece(total, i)))
+                .collect::<Vec<_>>()
+        };
+        let all = crate::chunk_tracker::Moved {
+            pieces: Vec::new(),
+            all: true,
+        };
+        let (a, _rx_a) = add_live_peer(&peers, "127.0.0.1:1234");
+        let (b, _rx_b) = add_live_peer(&peers, "127.0.0.2:1235");
+        let (c, _rx_c) = add_live_peer(&peers, "127.0.0.3:1236");
+        let (d, _rx_d) = add_live_peer(&peers, "127.0.0.4:1237");
+        peers.update_bitfield(c, bitfield_of(&[2])).unwrap();
+        let all_but_last: Vec<usize> = (0..TOTAL_PIECES - 1).collect();
+        peers
+            .update_bitfield(b, bitfield_of(&all_but_last))
+            .unwrap();
+        peers.availability.take_moved();
+
+        // The first seed adds one to every piece's rank: the picker lays its
+        // order out anew.
+        peers.update_bitfield(a, full_bitfield()).unwrap();
+        assert_eq!(peers.availability.take_moved(), all);
+        assert_eq!(availability(&peers), [2, 2, 3, 2, 2, 2, 2, 1]);
+        assert_eq!(ranked(&peers), [2, 2, 3, 2, 2, 2, 2, 1]);
+
+        // A peer that gains its last piece leaves the counts for the seed.
+        assert_eq!(
+            peers.peer_has(b, piece(total, total - 1)),
+            Some(Have::Completed)
+        );
+        assert_eq!(availability(&peers), [2, 2, 3, 2, 2, 2, 2, 2]);
+        assert_eq!(ranked(&peers), [1, 1, 2, 1, 1, 1, 1, 1]);
+        peers.availability.take_moved();
+
+        // Another seed moves no piece.
+        peers.update_bitfield(d, full_bitfield()).unwrap();
+        assert_eq!(peers.availability.take_moved(), Default::default());
+        assert_eq!(availability(&peers), [3, 3, 4, 3, 3, 3, 3, 3]);
+
+        // A seed's DONT_HAVE counts the pieces it keeps one by one.
+        peers.peer_lost(a, piece(total, 3)).unwrap();
+        assert_eq!(availability(&peers), [3, 3, 4, 2, 3, 3, 3, 3]);
+        assert_eq!(ranked(&peers), [2, 2, 3, 1, 2, 2, 2, 2]);
+        peers.availability.take_moved();
+
+        // Only the last seed to leave moves the order.
+        peers.drop_peer(b).unwrap();
+        assert_eq!(peers.availability.take_moved(), Default::default());
+        peers.drop_peer(d).unwrap();
+        assert_eq!(peers.availability.take_moved(), all);
+        assert_eq!(availability(&peers), [1, 1, 2, 0, 1, 1, 1, 1]);
+        assert_eq!(ranked(&peers), [1, 1, 2, 0, 1, 1, 1, 1]);
     }
 
     #[test]

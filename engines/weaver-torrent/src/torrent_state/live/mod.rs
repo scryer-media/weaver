@@ -2965,7 +2965,7 @@ impl PeerHandler {
                                 && self.state.metadata.can_verify(p)
                                 && (!choked || allowed_fast.contains(&p))
                         },
-                        availability: |p| self.state.peers.availability.get(p),
+                        availability: |p| self.state.peers.availability.ranked(p),
                         moved: self.state.peers.availability.take_moved(),
                         num_peers: self.state.peers.stats().live as usize,
                         outstanding_requests: live.requested_inflight_count(),

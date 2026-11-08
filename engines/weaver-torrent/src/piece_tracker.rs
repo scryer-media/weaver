@@ -165,7 +165,8 @@ where
     pub priority_pieces: I,
     /// Returns true if the peer has the given piece.
     pub peer_has_piece: P,
-    /// How many connected peers have the given piece.
+    /// How many connected peers have the given piece, ranked: any seeds
+    /// count as one, as they leave the order as it is.
     pub availability: A,
     /// The pieces whose count of peers moved since the last pick: the
     /// picker reads their counts through `availability` and moves them in
