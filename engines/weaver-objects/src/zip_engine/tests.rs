@@ -495,6 +495,34 @@ fn a_wrong_password_asks_for_another_and_the_right_one_extracts() {
     assert_eq!(run(&mut engine, vec![encrypted()]), plain_said());
 }
 
+// A run with no password asks for one as soon as it meets an encrypted
+// member, with the volume still open, so the run the offer starts decrypts
+// alongside the download rather than after it.
+#[test]
+fn a_run_asks_for_a_password_before_its_volumes_close() {
+    let archive = encrypted();
+    let (last_at, last_len) = {
+        let mut directory = ZipArchive::new(Cursor::new(&archive)).unwrap();
+        let file = directory.by_index_raw(3).unwrap();
+        (
+            file.data_start().unwrap() as usize,
+            file.compressed_size() as usize,
+        )
+    };
+    let gate = Gate::with_holes(vec![archive], vec![last_at + 1..last_at + last_len - 1]);
+    let (runner, heard) = running(named(&["locked.zip"]).start(), &gate);
+    runner.join().unwrap();
+    assert_eq!(gate.len(VolumeIndex(0)), None, "the volume is still open");
+    assert_eq!(
+        said(&heard.try_iter().collect::<Vec<_>>()),
+        vec![
+            Said::Member(0, "deep/".into(), Some(0)),
+            Said::Closed(0),
+            Said::NeedsPassword,
+        ]
+    );
+}
+
 #[test]
 fn a_member_whose_checksum_fails_is_retracted_and_refused() {
     let mut archive = plain();
