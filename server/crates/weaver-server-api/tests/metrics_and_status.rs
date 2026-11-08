@@ -33,10 +33,6 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         uu_spooled_bytes: 0,
         uu_spooled_segments: 0,
         direct_write_evictions: 0,
-        direct_sets_admitted: 0,
-        direct_sets_demoted: 0,
-        direct_sets_finalized_direct: 0,
-        direct_sets_repaired_while_direct: 0,
         deobfuscated_members_renamed: 0,
         decode_pressure_soft_limit_bytes: 0,
         decode_pressure_hard_limit_bytes: 0,
@@ -99,6 +95,8 @@ fn history_snapshot(speed: u64, bytes_downloaded: u64) -> MetricsSnapshot {
         segments_failed_permanent: 0,
         parked_infrastructure_work: 0,
         nntp_generation_recovery_requeues: 0,
+        download_dispatch_stall_kicks: 0,
+        download_dispatch_stall_releases: 0,
         download_failures_article_not_found: 0,
         download_failures_capacity_unavailable: 0,
         download_failures_transient: 0,
@@ -136,6 +134,10 @@ fn history_job(job_id: u64, status: JobStatus) -> JobInfo {
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
+        file_parked_bytes: Vec::new(),
+        remaining_bytes: 0,
+        wanted_bytes: 0,
         password: None,
         category: None,
         metadata: Vec::new(),
@@ -189,6 +191,56 @@ async fn is_paused_true_after_pause_all() {
     assert_no_errors(&resp);
     let data = response_data(&resp);
     assert!(data["isPaused"].as_bool().unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn timed_pause_all_resumes_after_the_duration() {
+    let h = TestHarness::new().await;
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let resp = h
+        .execute("mutation { pauseAll(resumeAfterSecs: 1800) }")
+        .await;
+    assert_no_errors(&resp);
+    assert!(h.handle.is_globally_paused());
+
+    let resume_at = h.scheduled_resume.resume_at().await;
+    assert!(resume_at >= before + 1800);
+    assert_eq!(
+        h.db.get_setting("nzbget.scheduled_resume_at").unwrap(),
+        Some(resume_at.to_string())
+    );
+    let resp = h.execute("{ globalQueueState { resumeAtEpochMs } }").await;
+    assert_no_errors(&resp);
+    assert_eq!(
+        response_data(&resp)["globalQueueState"]["resumeAtEpochMs"].as_u64(),
+        Some(resume_at * 1000)
+    );
+
+    // The timer sleeps on the paused clock from whenever its task first runs,
+    // so the clock steps a second at a time until the queue is out of the
+    // pause rather than jumping once past a deadline it may not have set yet.
+    while h.handle.is_globally_paused() {
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+    }
+    assert_eq!(h.scheduled_resume.resume_at().await, 0);
+    let resp = h.execute("{ globalQueueState { resumeAtEpochMs } }").await;
+    assert_no_errors(&resp);
+    assert!(response_data(&resp)["globalQueueState"]["resumeAtEpochMs"].is_null());
+}
+
+#[tokio::test]
+async fn timed_pause_all_rejects_out_of_range_durations() {
+    let h = TestHarness::new().await;
+    for secs in [0, 2_592_001] {
+        let resp = h
+            .execute(&format!("mutation {{ pauseAll(resumeAfterSecs: {secs}) }}"))
+            .await;
+        assert!(!resp.errors.is_empty(), "{secs} accepted");
+    }
+    assert!(!h.handle.is_globally_paused());
 }
 
 #[tokio::test(start_paused = true)]

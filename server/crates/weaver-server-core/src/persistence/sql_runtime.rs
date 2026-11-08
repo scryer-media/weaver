@@ -5,7 +5,6 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -15,9 +14,9 @@ use sqlx::query::Query;
 use sqlx::sqlite::{SqliteArguments, SqlitePool, SqliteRow};
 use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, Postgres, Row, Sqlite, Transaction};
-use tokio::sync::Mutex;
 
 use crate::persistence::StateError;
+use crate::persistence::sqlite_writer::{SqliteWriterGate, WriterGate};
 
 const SQLITE_BUSY_RETRY_DELAYS: [Duration; 5] = [
     Duration::from_millis(50),
@@ -42,7 +41,7 @@ pub(crate) type SqlResult<T> = Result<T, StateError>;
 pub(crate) enum StoreDatastore {
     Sqlite {
         pool: SqlitePool,
-        writer_gate: Arc<Mutex<()>>,
+        writer_gate: SqliteWriterGate,
     },
     Postgres {
         pool: PgPool,
@@ -50,9 +49,26 @@ pub(crate) enum StoreDatastore {
 }
 
 impl StoreDatastore {
+    // Statements that only read. On SQLite a write handed to it trips a debug
+    // assertion: a write outside the writer gate meets the gated writer's
+    // transaction in SQLite's busy handler and fails after `busy_timeout`.
     pub(crate) fn read_exec(&self) -> SqlExec<'_, '_> {
         match self {
             Self::Sqlite { pool, .. } => SqlExec::Target(SqlTarget::Sqlite(pool)),
+            Self::Postgres { pool } => SqlExec::Target(SqlTarget::Postgres(pool)),
+        }
+    }
+
+    // The one way an autocommit write reaches the pool. On SQLite it waits
+    // its turn on the writer gate, so it never races another write, and it
+    // retries a transient busy as the gated transactions do. Postgres has no
+    // gate and is unchanged.
+    pub(crate) fn write_exec(&self) -> SqlExec<'_, '_> {
+        match self {
+            Self::Sqlite { pool, writer_gate } => SqlExec::Target(SqlTarget::SqliteWrite {
+                pool,
+                gate: writer_gate,
+            }),
             Self::Postgres { pool } => SqlExec::Target(SqlTarget::Postgres(pool)),
         }
     }
@@ -82,6 +98,10 @@ impl SqlEngine {
 
 pub(crate) enum SqlTarget<'a> {
     Sqlite(&'a SqlitePool),
+    SqliteWrite {
+        pool: &'a SqlitePool,
+        gate: &'a SqliteWriterGate,
+    },
     Postgres(&'a PgPool),
 }
 
@@ -179,6 +199,10 @@ impl SqlRuntime {
         result
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: this is the gate; it hands the connection out under the gate"
+    )]
     pub(crate) async fn run_serialized_sqlite_connection<T, Op, Fut>(
         datastore: &StoreDatastore,
         op_name: &'static str,
@@ -202,6 +226,10 @@ impl SqlRuntime {
         result
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: this is the gate, its read lane and the Postgres arm, which has no writer gate"
+    )]
     pub(crate) async fn execute(
         exec: SqlExec<'_, '_>,
         template: &str,
@@ -209,6 +237,7 @@ impl SqlRuntime {
     ) -> SqlResult<u64> {
         match exec {
             SqlExec::Target(SqlTarget::Sqlite(pool)) => {
+                debug_assert_reads(template);
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
@@ -220,6 +249,23 @@ impl SqlRuntime {
                     started.elapsed(),
                 );
                 let result = result?;
+                Ok(result.rows_affected())
+            }
+            SqlExec::Target(SqlTarget::SqliteWrite { pool, gate }) => {
+                let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
+                let result = run_gated_sqlite(gate, "execute", || async {
+                    let started = Instant::now();
+                    let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
+                    let outcome = query.execute(pool).await.map_err(db_err);
+                    crate::runtime::perf_probe::record_sql_statement(
+                        "sqlite",
+                        "execute",
+                        template,
+                        started.elapsed(),
+                    );
+                    outcome
+                })
+                .await?;
                 Ok(result.rows_affected())
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
@@ -259,6 +305,7 @@ impl SqlRuntime {
     ) -> SqlResult<Option<SqlRow>> {
         match exec {
             SqlExec::Target(SqlTarget::Sqlite(pool)) => {
+                debug_assert_reads(template);
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
@@ -274,6 +321,26 @@ impl SqlRuntime {
                     started.elapsed(),
                 );
                 result
+            }
+            SqlExec::Target(SqlTarget::SqliteWrite { pool, gate }) => {
+                let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
+                run_gated_sqlite(gate, "execute_returning", || async {
+                    let started = Instant::now();
+                    let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
+                    let outcome = query
+                        .fetch_optional(pool)
+                        .await
+                        .map(|row| row.map(SqlRow::Sqlite))
+                        .map_err(db_err);
+                    crate::runtime::perf_probe::record_sql_statement(
+                        "sqlite",
+                        "execute_returning",
+                        template,
+                        started.elapsed(),
+                    );
+                    outcome
+                })
+                .await
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
@@ -310,6 +377,7 @@ impl SqlRuntime {
     ) -> SqlResult<Option<SqlRow>> {
         match exec {
             SqlExec::Target(SqlTarget::Sqlite(pool)) => {
+                debug_assert_reads(template);
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
@@ -325,6 +393,26 @@ impl SqlRuntime {
                     started.elapsed(),
                 );
                 result
+            }
+            SqlExec::Target(SqlTarget::SqliteWrite { pool, gate }) => {
+                let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
+                run_gated_sqlite(gate, "fetch_optional", || async {
+                    let started = Instant::now();
+                    let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
+                    let outcome = query
+                        .fetch_optional(pool)
+                        .await
+                        .map(|row| row.map(SqlRow::Sqlite))
+                        .map_err(db_err);
+                    crate::runtime::perf_probe::record_sql_statement(
+                        "sqlite",
+                        "fetch_optional",
+                        template,
+                        started.elapsed(),
+                    );
+                    outcome
+                })
+                .await
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
@@ -358,6 +446,7 @@ impl SqlRuntime {
     ) -> SqlResult<Vec<SqlRow>> {
         match exec {
             SqlExec::Target(SqlTarget::Sqlite(pool)) => {
+                debug_assert_reads(template);
                 let started = Instant::now();
                 let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
                 let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
@@ -373,6 +462,26 @@ impl SqlRuntime {
                     started.elapsed(),
                 );
                 result
+            }
+            SqlExec::Target(SqlTarget::SqliteWrite { pool, gate }) => {
+                let sql = render_sql(template, PlaceholderDialect::Sqlite, args.len())?;
+                run_gated_sqlite(gate, "fetch_all", || async {
+                    let started = Instant::now();
+                    let query = bind_sqlite(sqlx::query(AssertSqlSafe(sql.as_str())), args);
+                    let outcome = query
+                        .fetch_all(pool)
+                        .await
+                        .map(|rows| rows.into_iter().map(SqlRow::Sqlite).collect())
+                        .map_err(db_err);
+                    crate::runtime::perf_probe::record_sql_statement(
+                        "sqlite",
+                        "fetch_all",
+                        template,
+                        started.elapsed(),
+                    );
+                    outcome
+                })
+                .await
             }
             SqlExec::Target(SqlTarget::Postgres(pool)) => {
                 let sql = render_sql(template, PlaceholderDialect::Postgres, args.len())?;
@@ -399,6 +508,10 @@ impl SqlRuntime {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: this is the gate; the transaction begins and commits under it, Postgres has no writer gate"
+    )]
     pub(crate) async fn run_in_transaction<T, F>(
         datastore: &StoreDatastore,
         op_name: &'static str,
@@ -466,6 +579,10 @@ impl SqlRuntime {
 }
 
 impl<'db> SqlTx<'db> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: runs on a transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+    )]
     pub(crate) async fn execute(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
         match self {
             SqlTx::Sqlite(tx) => {
@@ -585,6 +702,10 @@ impl<'db> SqlTx<'db> {
         }
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: runs on a transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+    )]
     pub(crate) async fn commit(self) -> SqlResult<()> {
         match self {
             SqlTx::Sqlite(tx) => tx.commit().await.map_err(db_err),
@@ -594,6 +715,10 @@ impl<'db> SqlTx<'db> {
 }
 
 impl SqlConn<'_> {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: runs on a connection whose owner holds the gate, or a migration's; Postgres has no writer gate"
+    )]
     pub(crate) async fn execute(&mut self, template: &str, args: &[SqlArg]) -> SqlResult<u64> {
         match self {
             SqlConn::Sqlite(conn) => {
@@ -1191,6 +1316,56 @@ fn commit_outcome_unknown(op_name: &str, error: StateError) -> StateError {
     StateError::Database(format!(
         "commit_outcome_unknown; transaction `{op_name}` lost its connection at COMMIT, so it may or may not have committed: {error}"
     ))
+}
+
+// An autocommit statement on the writer gate. A busy statement applied
+// nothing, so it is run again under the same rules as a gated transaction.
+async fn run_gated_sqlite<T, Op, Fut>(
+    gate: &WriterGate,
+    operation_name: &str,
+    operation: Op,
+) -> SqlResult<T>
+where
+    Op: FnMut() -> Fut,
+    Fut: Future<Output = SqlResult<T>>,
+{
+    let _guard = gate.lock().await;
+    run_with_sqlite_busy_retries(operation_name, operation).await
+}
+
+// Whether a statement writes: it changes rows, the schema or the file, so it
+// takes SQLite's write lock. A `WITH` writes when its body does, a `PRAGMA`
+// when it sets a value or vacuums.
+pub(crate) fn sql_writes(template: &str) -> bool {
+    let mut rest = template.trim_start();
+    while let Some(comment) = rest.strip_prefix("--") {
+        rest = comment
+            .split_once('\n')
+            .map_or("", |(_, after)| after)
+            .trim_start();
+    }
+    let upper = rest.to_ascii_uppercase();
+    let first = upper
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .next()
+        .unwrap_or("");
+    match first {
+        "SELECT" | "VALUES" | "EXPLAIN" => false,
+        "WITH" => upper
+            .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+            .any(|word| matches!(word, "INSERT" | "UPDATE" | "DELETE" | "REPLACE")),
+        "PRAGMA" => upper.contains('=') || upper.contains("INCREMENTAL_VACUUM"),
+        _ => true,
+    }
+}
+
+// The read executor is never handed a write; see `StoreDatastore::read_exec`.
+#[track_caller]
+fn debug_assert_reads(template: &str) {
+    debug_assert!(
+        !sql_writes(template),
+        "a SQLite write reached the read executor, outside the writer gate: {template}"
+    );
 }
 
 pub(crate) async fn run_with_sqlite_busy_retries<T, Op, Fut>(

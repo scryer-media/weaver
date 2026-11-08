@@ -51,6 +51,34 @@ pub(in super::super) const DAMAGES: [Damage; 8] = [
     Damage::NoChecksum,
 ];
 
+// The ways an article's yEnc headers can lie about a body that is whole:
+// the body and its checksums are the posted bytes, only the fields around
+// them are wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(in super::super) enum Header {
+    // `=ybegin size=` states this many bytes instead of the file's length.
+    Size(u64),
+    // `=ypart end=` one below `begin=`.
+    EndBelowBegin,
+    // `=ypart begin=` and `end=` exchanged.
+    Swapped,
+    // `=ypart begin=0`.
+    BeginZero,
+    // `=ypart begin=` and `end=` both moved this many bytes, down when
+    // negative.
+    Shifted(i64),
+    // `=ypart begin=` and `end=` of another article of the same file.
+    RangeOf(u32),
+    // `=yend size=` states this many bytes.
+    YendSize(u64),
+    // `part=` in `=ybegin` and `=yend`.
+    Number(u32),
+    // `total=` in `=ybegin`.
+    Total(u32),
+    // `line=` in `=ybegin`; the body keeps its own line length.
+    Line(usize),
+}
+
 impl Damage {
     // Bytes this damage may leave wrong on disk, as a superset: the
     // article's own range, and for an over-long body the range after it.
@@ -89,8 +117,6 @@ pub(in super::super) struct UuStyle {
     // The final group carries only the bytes it needs instead of a full
     // four characters.
     pub unpadded_tail: bool,
-    // The last line's length character overstates its bytes by one.
-    pub wrong_last_length: bool,
     pub end: UuEnd,
     // Bare LF line endings instead of CRLF.
     pub bare_lf: bool,
@@ -124,7 +150,6 @@ impl UuStyle {
         preamble: false,
         space_zero: false,
         unpadded_tail: false,
-        wrong_last_length: false,
         end: UuEnd::Full,
         bare_lf: false,
         line_bytes: 45,
@@ -153,6 +178,8 @@ pub(in super::super) struct Posted {
     pub role: Role,
     pub encoding: Encoding,
     pub wire: BTreeMap<u32, Wire>,
+    // Articles whose headers lie about the body they carry.
+    pub headers: BTreeMap<u32, Header>,
 }
 
 impl Posted {
@@ -169,7 +196,25 @@ impl Posted {
             role,
             encoding: Encoding::YENC,
             wire: BTreeMap::new(),
+            headers: BTreeMap::new(),
         }
+    }
+
+    // The range an article's lying `=ypart` puts its bytes at, when that is
+    // not where they belong: every decoder writes a part where its own
+    // `begin=` says, so a moved range lands the body there.
+    fn misplaced(&self, article: u32) -> Option<Range<usize>> {
+        let range = self.extent(article);
+        let claimed = match self.headers.get(&article)? {
+            Header::Shifted(by) => {
+                let start = (range.start as i64 + by).max(0) as usize;
+                start..start + range.len()
+            }
+            Header::RangeOf(other) => self.extent(*other),
+            _ => return None,
+        };
+        let claimed = claimed.start.min(self.bytes.len())..claimed.end.min(self.bytes.len());
+        (claimed != range).then_some(claimed)
     }
 
     pub(in super::super) fn articles(&self) -> u32 {
@@ -251,6 +296,13 @@ impl Posted {
                 lower.push(range);
                 continue;
             }
+            // A body laid at a range its header moved may leave its own range
+            // and the one it landed on wrong. A decoder that refuses the
+            // range leaves only its own, so nothing is certainly wrong.
+            if let Some(claimed) = self.misplaced(article) {
+                upper.push(range.clone());
+                upper.push(claimed);
+            }
             let Some(wire) = self.wire.get(&article) else {
                 continue;
             };
@@ -313,17 +365,25 @@ impl Posted {
             )];
         };
         let single = !ypart && self.articles() == 1;
-        let clean = YencArticle {
+        let mut clean = YencArticle {
             name: &self.name,
             part: (!single).then_some(part),
             line,
+            declared_line: line,
             body: data.to_vec(),
+            declared_size: if single { data.len() as u64 } else { part.size },
             yend_size: data.len() as u64,
             pcrc: (!single).then(|| checksum::crc32(data)),
             crc32: single.then(|| checksum::crc32(data)),
             cut: false,
             junk: false,
         };
+        if let Some(&lie) = self.headers.get(&article) {
+            clean.lie(lie, |other| {
+                let range = self.extent(other);
+                (range.start as u64 + 1, range.end as u64)
+            });
+        }
         let Some(Wire::Damaged(damage)) = self.wire.get(&article) else {
             return vec![clean.render()];
         };
@@ -381,8 +441,13 @@ struct Part {
 struct YencArticle<'a> {
     name: &'a str,
     part: Option<Part>,
+    // The line length the body is encoded at, and the one `=ybegin`
+    // states.
     line: usize,
+    declared_line: usize,
     body: Vec<u8>,
+    // `=ybegin size=`.
+    declared_size: u64,
     yend_size: u64,
     pcrc: Option<u32>,
     crc32: Option<u32>,
@@ -400,6 +465,38 @@ impl YencArticle<'_> {
         self.crc32 = self.crc32.map(|_| crc);
     }
 
+    // The headers told as `lie` says; `range_of` is another article's
+    // `=ypart` range.
+    fn lie(&mut self, lie: Header, range_of: impl Fn(u32) -> (u64, u64)) {
+        // A single-part article has no `=ypart` and no part numbers to lie
+        // in: only its size and line fields can.
+        let mut part = self.part.unwrap_or(Part {
+            number: 0,
+            total: 0,
+            begin: 0,
+            end: 0,
+            size: 0,
+        });
+        match lie {
+            Header::Size(size) => self.declared_size = size,
+            Header::YendSize(size) => self.yend_size = size,
+            Header::Line(line) => self.declared_line = line,
+            Header::EndBelowBegin => part.end = part.begin - 1,
+            Header::Swapped => std::mem::swap(&mut part.begin, &mut part.end),
+            Header::BeginZero => part.begin = 0,
+            Header::Shifted(by) => {
+                part.begin = part.begin.saturating_add_signed(by).max(1);
+                part.end = part.end.saturating_add_signed(by).max(1);
+            }
+            Header::RangeOf(other) => (part.begin, part.end) = range_of(other),
+            Header::Number(number) => part.number = number,
+            Header::Total(total) => part.total = total,
+        }
+        if self.part.is_some() {
+            self.part = Some(part);
+        }
+    }
+
     fn render(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self.part {
@@ -407,7 +504,13 @@ impl YencArticle<'_> {
                 out.extend_from_slice(
                     format!(
                         "=ybegin part={} total={} line={} size={} name={}\r\n=ypart begin={} end={}\r\n",
-                        part.number, part.total, self.line, part.size, self.name, part.begin, part.end
+                        part.number,
+                        part.total,
+                        self.declared_line,
+                        self.declared_size,
+                        self.name,
+                        part.begin,
+                        part.end
                     )
                     .as_bytes(),
                 );
@@ -415,7 +518,7 @@ impl YencArticle<'_> {
             None => out.extend_from_slice(
                 format!(
                     "=ybegin line={} size={} name={}\r\n",
-                    self.line, self.yend_size, self.name
+                    self.declared_line, self.declared_size, self.name
                 )
                 .as_bytes(),
             ),
@@ -533,9 +636,6 @@ fn uu_render(
     for (index, line) in lines.iter().enumerate() {
         let last = index + 1 == lines.len();
         let mut length = line.len() as u8;
-        if last && style.wrong_last_length {
-            length += 1;
-        }
         if damage == Some(Damage::Overlong) && index == damaged_line {
             length += 3;
         }
@@ -613,7 +713,33 @@ pub(in super::super) struct Post {
     pub expected: Vec<(String, Vec<u8>)>,
     // Further files a complete job may publish besides `expected`, such as
     // furniture posted beside the archive.
-    pub allowed: Vec<String>,
+    pub allowed: Vec<Allowed>,
+}
+
+// A file a job may publish besides `expected`.
+#[derive(Clone, Debug)]
+pub(in super::super) struct Allowed {
+    pub name: String,
+    // Its bytes when whole, for a file a user can open: a sample, a picture,
+    // a text. `None` for a container or furniture, which never make a job
+    // Partial however whole they are.
+    pub usable: Option<Vec<u8>>,
+}
+
+impl Allowed {
+    pub(in super::super) fn usable(name: &str, bytes: &[u8]) -> Self {
+        Self {
+            name: name.to_string(),
+            usable: Some(bytes.to_vec()),
+        }
+    }
+
+    pub(in super::super) fn unusable(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            usable: None,
+        }
+    }
 }
 
 impl Post {

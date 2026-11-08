@@ -382,13 +382,12 @@ mod tests {
     use super::*;
     use crate::settings::Config;
     use crate::{PipelineMetrics, SharedPipelineState};
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::broadcast;
 
     fn test_scheduler_handle() -> SchedulerHandle {
-        let (cmd_tx, _cmd_rx) = mpsc::channel(16);
         let (event_tx, _) = broadcast::channel(16);
         let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-        SchedulerHandle::new(cmd_tx, event_tx, state)
+        SchedulerHandle::new(event_tx, state)
     }
 
     fn shared_config(watch_folder: WatchFolderConfig) -> SharedConfig {
@@ -404,10 +403,10 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             watch_folder,
             duplicate_policy: Default::default(),
             direct_store: None,
-            direct_unpack: None,
             delivery_naming: None,
             metrics: Default::default(),
             config_path: None,

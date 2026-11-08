@@ -170,7 +170,7 @@ func Ensure(ctx context.Context, config EnsureConfig) (EnsureReport, error) {
 	}
 	sort.Strings(report.Salted)
 	if len(report.Salted) > 0 {
-		logf("%d salted path(s) are verified by presence only; their writer draws a salt and their bytes cannot be pinned",
+		logf("%d salted path(s) are verified by presence only; their writer emits variable bytes that cannot be pinned",
 			len(report.Salted))
 	}
 
@@ -315,8 +315,23 @@ func selectWanted(ledger *corpus.Ledger, profiles *corpus.Profiles, config Ensur
 
 // missingPaths returns the wanted paths that are absent, the wrong size, or —
 // with digest set — the wrong bytes.
-func missingPaths(root string, ledger *corpus.Ledger, wanted []string, digest bool) ([]string, error) {
-	var missing []string
+func missingPaths(root string, ledger *corpus.Ledger, wanted []string, digest bool) (missing []string, err error) {
+	var stamp *digestStamp
+	if digest {
+		current, err := ledgerDigest(ledger)
+		if err != nil {
+			return nil, err
+		}
+		digestStampMu.Lock()
+		defer digestStampMu.Unlock()
+		stamp = loadDigestStamp(root, current)
+		defer func() {
+			if err == nil {
+				// A stamp that cannot be saved costs the next run a re-hash.
+				_ = stamp.save(root)
+			}
+		}()
+	}
 	for _, p := range wanted {
 		entry, ok := ledger.Entry(p)
 		if !ok {
@@ -343,11 +358,11 @@ func missingPaths(root string, ledger *corpus.Ledger, wanted []string, digest bo
 		if !digest {
 			continue
 		}
-		actual, err := corpus.DigestFile(host)
+		matches, err := stamp.matches(p, host, info, entry.BLAKE3)
 		if err != nil {
 			return nil, err
 		}
-		if actual.BLAKE3 != entry.BLAKE3 {
+		if !matches {
 			missing = append(missing, p)
 		}
 	}

@@ -19,7 +19,7 @@ use weaver_server_core::operations::instrumentation::{
     JobLifecycleMetricsSnapshot, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
     ServerMetricsSnapshot,
 };
-use weaver_server_core::operations::metrics_store::JOB_STATUS_KEYS;
+use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
 use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
 use weaver_server_core::post_processing::run_metrics::{
     RunStatus, ScriptMetrics, ScriptRunMetricsSnapshot,
@@ -62,7 +62,10 @@ pub(crate) const OBSERVED_LIMITERS: [&str; 8] = [
 #[derive(Clone, Copy)]
 pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) snapshot: &'a MetricsSnapshot,
+    // The jobs exported a series of their own.
     pub(crate) jobs: &'a [JobInfo],
+    // Every job the runtime holds, counted by status.
+    pub(crate) job_counts: &'a JobStatusCounts,
     pub(crate) pipeline_paused: bool,
     pub(crate) download_block: &'a DownloadBlockState,
     pub(crate) server_health: &'a [ServerHealthInfo],
@@ -106,6 +109,7 @@ impl<'a> PrometheusRenderInput<'a> {
         Self {
             snapshot,
             jobs: &[],
+            job_counts: &JobStatusCounts::EMPTY,
             pipeline_paused: false,
             download_block,
             server_health: &[],
@@ -155,8 +159,10 @@ pub(crate) fn render_prometheus_metrics(
     server_health: &[ServerHealthInfo],
     runtime_generation: u64,
 ) -> String {
+    let job_counts = JobStatusCounts::from_statuses(jobs.iter().map(|job| &job.status));
     let mut input = PrometheusRenderInput::new(snapshot, download_block);
     input.jobs = jobs;
+    input.job_counts = &job_counts;
     input.pipeline_paused = pipeline_paused;
     input.server_health = server_health;
     input.runtime_generation = runtime_generation;
@@ -168,6 +174,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     let PrometheusRenderInput {
         snapshot,
         jobs,
+        job_counts,
         pipeline_paused,
         download_block,
         server_health,
@@ -230,11 +237,11 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     }
 
     for status in JOB_STATUS_KEYS {
-        let count = jobs
-            .iter()
-            .filter(|job| job_status_label(&job.status) == status)
-            .count();
-        out.sample(&f::PIPELINE_JOBS, &[("status", status)], count);
+        out.sample(
+            &f::PIPELINE_JOBS,
+            &[("status", status)],
+            job_counts.count(status),
+        );
     }
 
     let observed_limiter =
@@ -378,6 +385,16 @@ fn render_pipeline_totals(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         &f::GENERATION_RECOVERY_REQUEUES,
         &[],
         snapshot.nntp_generation_recovery_requeues,
+    );
+    out.sample(
+        &f::DOWNLOAD_DISPATCH_STALL_RECOVERIES,
+        &[("action", "kick")],
+        snapshot.download_dispatch_stall_kicks,
+    );
+    out.sample(
+        &f::DOWNLOAD_DISPATCH_STALL_RECOVERIES,
+        &[("action", "release")],
+        snapshot.download_dispatch_stall_releases,
     );
 
     for (kind, value) in [
@@ -943,18 +960,6 @@ fn render_stalls_and_workers(out: &mut Encoder, snapshot: &MetricsSnapshot) {
         snapshot.direct_write_evictions,
     );
 
-    for (event, value) in [
-        ("admitted", snapshot.direct_sets_admitted),
-        ("demoted", snapshot.direct_sets_demoted),
-        ("finalized_direct", snapshot.direct_sets_finalized_direct),
-        (
-            "repaired_while_direct",
-            snapshot.direct_sets_repaired_while_direct,
-        ),
-    ] {
-        out.sample(&f::DIRECT_STORE_SETS, &[("event", event)], value);
-    }
-
     out.sample(
         &f::DEOBFUSCATED_MEMBERS,
         &[],
@@ -1027,9 +1032,20 @@ fn render_jobs(out: &mut Encoder, jobs: &[JobInfo], mode: PerJobSeries) {
             ],
             1,
         );
+        // The byte gauges on the ratio's base while the download runs: what
+        // it is out to bring, and what of that is done, so downloaded over
+        // total is the ratio.
+        let (total, downloaded) = if job.wanted_bytes > 0 {
+            (
+                job.wanted_bytes,
+                job.wanted_bytes - job.remaining_bytes.min(job.wanted_bytes),
+            )
+        } else {
+            (job.total_bytes, job.downloaded_bytes)
+        };
         out.sample_f64(&f::JOB_PROGRESS_RATIO, id, job.progress);
-        out.sample(&f::JOB_TOTAL_BYTES, id, job.total_bytes);
-        out.sample(&f::JOB_DOWNLOADED_BYTES, id, job.downloaded_bytes);
+        out.sample(&f::JOB_TOTAL_BYTES, id, total);
+        out.sample(&f::JOB_DOWNLOADED_BYTES, id, downloaded);
         out.sample(
             &f::JOB_OPTIONAL_RECOVERY_BYTES,
             id,
@@ -1434,6 +1450,7 @@ fn render_job_lifecycle(out: &mut Encoder, lifecycle: &JobLifecycleMetricsSnapsh
 }
 
 fn render_pipeline_histograms(out: &mut Encoder, histograms: &PipelineHistogramsSnapshot) {
+    render_histogram(out, &f::TURN_DURATION, &[], &histograms.turn_duration);
     render_histogram(
         out,
         &f::DISK_WRITE_DURATION,
@@ -1689,6 +1706,7 @@ pub(crate) fn job_status_label(status: &JobStatus) -> &'static str {
         JobStatus::QueuedPostProcessing => "queued_post_processing",
         JobStatus::PostProcessing => "post_processing",
         JobStatus::Complete => "complete",
+        JobStatus::Partial => "partial",
         JobStatus::Failed { .. } => "failed",
         JobStatus::Paused => "paused",
     }

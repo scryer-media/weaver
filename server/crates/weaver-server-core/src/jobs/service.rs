@@ -11,85 +11,34 @@ use crate::events::model::PipelineEvent;
 use crate::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
 use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
 use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
-use crate::jobs::model::{JobSpec, JobState, JobStatus};
+use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, JobSpec, JobState, JobStatus};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
-use crate::jobs::working_dir::{compute_working_dir, stamp_working_dir};
+use crate::jobs::working_dir::{claim_working_dir, stamp_working_dir};
 use crate::pipeline::Pipeline;
 use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
 
-#[derive(Debug, Default)]
-struct RestoreSkipStats {
-    complete_files: usize,
-    complete_file_segments: usize,
-    checkpoint_segments: usize,
-    checkpoint_floor_bytes: u64,
-    clamped_checkpoint_files: usize,
-    missing_checkpoint_files: usize,
+// A row whose delivery began: every article is in hand and the job goes on
+// from its row, never from a checkpoint.
+fn delivering(status: &JobStatus) -> bool {
+    matches!(
+        status,
+        JobStatus::Moving | JobStatus::QueuedPostProcessing | JobStatus::PostProcessing
+    )
 }
 
-struct RestoreSkipPlan {
-    skip: HashSet<SegmentId>,
-    file_progress: HashMap<u32, u64>,
-    stats: RestoreSkipStats,
-}
-
-// Whole segments that a contiguous byte floor covers, and the floor those
-// segments actually account for.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct FloorCoveredSegments {
-    pub(crate) segments: Vec<SegmentId>,
-    // Never a partial segment: the end offset of the last segment lying
-    // entirely below the requested floor.
-    pub(crate) floor: u64,
-}
-
-// Walks `segments` in NZB order and returns every segment lying entirely below
-// `floor`, together with the contiguous byte floor those whole segments
-// account for.
-//
-// Clamping belongs to the caller. `build_restore_skip_plan` clamps its floor
-// to the declared file size and the partial file's on-disk length before
-// calling. Direct-store coverage floors deliberately do not: for a direct set
-// the source volume has no file at all, and file length never implies coverage.
-pub(crate) fn segments_covered_by_floor(
-    file_id: NzbFileId,
-    segments: &[crate::jobs::model::SegmentSpec],
-    floor: u64,
-) -> FloorCoveredSegments {
-    let mut covered = FloorCoveredSegments::default();
-    let mut segment_end = 0u64;
-    for segment in segments {
-        segment_end = segment_end.saturating_add(segment.bytes as u64);
-        if segment_end > floor {
-            break;
-        }
-        covered.segments.push(SegmentId {
-            file_id,
-            segment_number: segment.ordinal,
-        });
-        covered.floor = segment_end;
-    }
-    covered
-}
-
-// A redownload throws away every file the last run wrote, so the record of
-// what those files were renamed to starts over from the NZB.
-fn redownload_spec(
-    nzb: &weaver_nzb::Nzb,
-    nzb_path: &std::path::Path,
-    category: Option<String>,
-    mut metadata: Vec<(String, String)>,
-) -> JobSpec {
-    metadata.retain(|(key, _)| key != crate::ingest::FULL_FILE_NAMES_METADATA_KEY);
-    crate::ingest::nzb_to_spec(nzb, nzb_path, category, metadata)
+// What a job's queue entry says while a restore that could not go through
+// holds it paused.
+fn restore_blocked(error: impl std::fmt::Display) -> String {
+    format!("Checkpoint could not be restored: {error}")
 }
 
 impl Pipeline {
-    async fn restore_has_open_download_finalization(&self, job_id: JobId) -> bool {
-        let events = match self
-            .db_blocking(move |db| db.get_job_events(job_id.0))
-            .await
-        {
+    // Whether the job's events leave its download finalization open.
+    pub(crate) fn download_finalization_open(
+        job_id: JobId,
+        events: Result<Vec<crate::history::timeline::JobEvent>, crate::StateError>,
+    ) -> bool {
+        let events = match events {
             Ok(events) => events,
             Err(error) => {
                 error!(
@@ -122,14 +71,14 @@ impl Pipeline {
         finalization_open
     }
 
-    async fn restore_download_finalization_runtime(&mut self, job_id: JobId) -> bool {
-        if !self.restore_has_open_download_finalization(job_id).await {
+    fn restore_download_finalization_runtime(&mut self, job_id: JobId, open: bool) -> bool {
+        if !open {
             self.jobs_finalizing_download.remove(&job_id);
             return false;
         }
 
         self.jobs_finalizing_download.insert(job_id);
-        let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
+        self.emit_job_event(PipelineEvent::DownloadFinished {
             job_id,
             finalization_pending: true,
         });
@@ -138,14 +87,13 @@ impl Pipeline {
 
     fn normalize_restored_download_state(
         download_state: crate::jobs::model::DownloadState,
-        download_queue: &DownloadQueue,
-        recovery_queue: &DownloadQueue,
+        nothing_queued: bool,
     ) -> crate::jobs::model::DownloadState {
         if !matches!(download_state, crate::jobs::model::DownloadState::Checking) {
             return download_state;
         }
 
-        if download_queue.is_empty() && recovery_queue.is_empty() {
+        if nothing_queued {
             crate::jobs::model::DownloadState::Complete
         } else {
             crate::jobs::model::DownloadState::Queued
@@ -154,42 +102,39 @@ impl Pipeline {
 
     fn restored_download_state_from_status(
         status: &JobStatus,
-        download_queue: &DownloadQueue,
-        recovery_queue: &DownloadQueue,
+        nothing_queued: bool,
     ) -> crate::jobs::model::DownloadState {
         let download_state = match status {
             JobStatus::Queued => crate::jobs::model::DownloadState::Queued,
             JobStatus::Checking => crate::jobs::model::DownloadState::Checking,
-            JobStatus::Complete | JobStatus::Moving => crate::jobs::model::DownloadState::Complete,
+            JobStatus::Complete | JobStatus::Partial | JobStatus::Moving => {
+                crate::jobs::model::DownloadState::Complete
+            }
             JobStatus::Failed { .. } => crate::jobs::model::DownloadState::Failed,
             _ => {
-                if download_queue.is_empty() && recovery_queue.is_empty() {
+                if nothing_queued {
                     crate::jobs::model::DownloadState::Complete
                 } else {
                     crate::jobs::model::DownloadState::Downloading
                 }
             }
         };
-        Self::normalize_restored_download_state(download_state, download_queue, recovery_queue)
+        Self::normalize_restored_download_state(download_state, nothing_queued)
     }
 
-    fn normalize_restored_status(
-        status: JobStatus,
-        download_queue: &DownloadQueue,
-        recovery_queue: &DownloadQueue,
-    ) -> JobStatus {
+    fn normalize_restored_status(status: JobStatus, nothing_queued: bool) -> JobStatus {
         if !matches!(status, JobStatus::Checking) {
             return status;
         }
 
-        if download_queue.is_empty() && recovery_queue.is_empty() {
+        if nothing_queued {
             JobStatus::Complete
         } else {
             JobStatus::Queued
         }
     }
 
-    fn normalize_paused_resume_status(
+    pub(crate) fn normalize_paused_resume_status(
         paused_resume_status: Option<JobStatus>,
     ) -> Option<JobStatus> {
         paused_resume_status.map(|status| match status {
@@ -198,92 +143,9 @@ impl Pipeline {
         })
     }
 
-    fn is_restartable_terminal_status(status: &JobStatus) -> bool {
-        matches!(status, JobStatus::Complete | JobStatus::Failed { .. })
-    }
-
-    fn scrub_restored_par2_file_identities(
-        file_identities: &mut HashMap<u32, ActiveFileIdentity>,
-    ) -> (HashSet<String>, HashSet<u32>) {
-        let mut stale_rar_sets = HashSet::new();
-        let mut refreshed_rar_files = HashSet::new();
-
-        for identity in file_identities.values_mut() {
-            if identity.classification_source != FileIdentitySource::Par2 {
-                continue;
-            }
-
-            let target_filename = identity
-                .canonical_filename
-                .as_deref()
-                .unwrap_or(identity.current_filename.as_str());
-            if identity.current_filename != target_filename {
-                continue;
-            }
-
-            let Some(canonical_classification) =
-                Self::canonical_archive_identity_from_filename(target_filename)
-            else {
-                continue;
-            };
-            if identity.classification.as_ref() == Some(&canonical_classification) {
-                continue;
-            }
-
-            if let Some(set_name) = identity.classification.as_ref().and_then(|classification| {
-                matches!(
-                    classification.kind,
-                    crate::jobs::assembly::DetectedArchiveKind::Rar
-                )
-                .then(|| classification.set_name.clone())
-            }) && canonical_classification.set_name != set_name
-            {
-                stale_rar_sets.insert(set_name);
-            }
-
-            if matches!(
-                canonical_classification.kind,
-                crate::jobs::assembly::DetectedArchiveKind::Rar
-            ) {
-                refreshed_rar_files.insert(identity.file_index);
-            }
-
-            identity.classification = Some(canonical_classification);
-        }
-
-        (stale_rar_sets, refreshed_rar_files)
-    }
-
-    async fn load_history_row(
-        &self,
-        job_id: JobId,
-    ) -> Result<Option<crate::JobHistoryRow>, crate::SchedulerError> {
-        let db = self.db.clone();
-        tokio::task::spawn_blocking(move || {
-            db.get_job_history_profiled(
-                job_id.0,
-                "db.get_job_history.jobs_service_load_history_row",
-            )
-        })
-        .await
-        .map_err(|error| {
-            crate::SchedulerError::Internal(format!("failed to join history lookup task: {error}"))
-        })?
-        .map_err(crate::SchedulerError::State)
-    }
-
-    fn persisted_nzb_path_for_job(
-        &self,
-        job_id: JobId,
-        history_row: Option<&crate::JobHistoryRow>,
-    ) -> PathBuf {
-        history_row
-            .and_then(|row| row.nzb_path.as_deref())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(format!("job-{}.nzb", job_id.0)))
-    }
-
-    async fn persist_file_identities(
+    // Written on the job's lane: nothing the install does next reads them
+    // back.
+    fn persist_file_identities(
         &self,
         job_id: JobId,
         identities: &HashMap<u32, ActiveFileIdentity>,
@@ -293,145 +155,17 @@ impl Pipeline {
         }
         let identities = identities.values().cloned().collect::<Vec<_>>();
         if let Err(error) = self
-            .db_blocking(move |db| db.save_file_identities(job_id, &identities))
-            .await
+            .db
+            .try_queue_job_write(job_id, "save_file_identities", move |db| {
+                db.save_file_identities(job_id, &identities)
+            })
         {
             warn!(
                 job_id = job_id.0,
                 error = %error,
-                "failed to persist file identities"
+                "failed to queue the file identities write"
             );
         }
-    }
-
-    fn map_restart_nzb_error(
-        job_id: JobId,
-        error: crate::ingest::PersistedNzbError,
-    ) -> crate::SchedulerError {
-        match error {
-            crate::ingest::PersistedNzbError::Io(inner) => {
-                crate::SchedulerError::Io(std::io::Error::new(
-                    inner.kind(),
-                    format!("failed to read NZB for job {}: {inner}", job_id.0),
-                ))
-            }
-            crate::ingest::PersistedNzbError::Parse(inner) => crate::SchedulerError::Internal(
-                format!("failed to parse NZB for job {}: {inner}", job_id.0),
-            ),
-        }
-    }
-
-    fn parse_restart_nzb_bytes(
-        &self,
-        job_id: JobId,
-        nzb_zstd: &[u8],
-    ) -> Result<weaver_nzb::Nzb, crate::SchedulerError> {
-        crate::ingest::parse_persisted_nzb_bytes(nzb_zstd)
-            .map_err(|error| Self::map_restart_nzb_error(job_id, error))
-    }
-
-    fn missing_restart_nzb_error(
-        job_id: JobId,
-        nzb_path: &std::path::Path,
-    ) -> crate::SchedulerError {
-        crate::SchedulerError::Io(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!(
-                "persisted NZB missing from database for job {} ({})",
-                job_id.0,
-                nzb_path.display()
-            ),
-        ))
-    }
-
-    fn load_restart_nzb(
-        &self,
-        job_id: JobId,
-        nzb_path: &std::path::Path,
-        nzb_zstd: Option<Vec<u8>>,
-    ) -> Result<(weaver_nzb::Nzb, PathBuf, Vec<u8>), crate::SchedulerError> {
-        let Some(nzb_zstd) = nzb_zstd else {
-            return Err(Self::missing_restart_nzb_error(job_id, nzb_path));
-        };
-
-        let nzb = self.parse_restart_nzb_bytes(job_id, &nzb_zstd)?;
-        Ok((nzb, nzb_path.to_path_buf(), nzb_zstd))
-    }
-
-    fn redownload_staging_dir(&self, job_id: JobId) -> PathBuf {
-        self.complete_dir
-            .join(".weaver-staging")
-            .join(job_id.0.to_string())
-    }
-
-    async fn remove_redownload_artifacts(
-        &self,
-        job_id: JobId,
-        working_dir: &std::path::Path,
-        staging_dir: Option<&std::path::Path>,
-    ) {
-        // Redownload reuses these exact paths right away; a stale cached
-        // write handle would swallow the new download's writes.
-        crate::pipeline::close_cached_write_handles_under(working_dir).await;
-        let paths = [
-            Some(working_dir.to_path_buf()),
-            staging_dir.map(|path| path.to_path_buf()),
-            Some(self.redownload_staging_dir(job_id)),
-        ];
-
-        for path in paths.into_iter().flatten() {
-            match tokio::fs::remove_dir_all(&path).await {
-                Ok(()) => {
-                    info!(
-                        job_id = job_id.0,
-                        dir = %path.display(),
-                        "removed redownload artifact directory"
-                    );
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    warn!(
-                        job_id = job_id.0,
-                        dir = %path.display(),
-                        error = %error,
-                        "failed to remove redownload artifact directory"
-                    );
-                }
-            }
-        }
-    }
-
-    async fn delete_failed_history_entry(&mut self, job_id: JobId) {
-        self.finished_jobs.retain(|job| job.job_id != job_id);
-        let db = self.db.clone();
-        match tokio::task::spawn_blocking(move || db.delete_job_history(job_id.0)).await {
-            Ok(Ok(_)) => {}
-            Ok(Err(error)) => {
-                error!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to delete failed job history entry during restart"
-                );
-            }
-            Err(error) => {
-                error!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to join failed job history delete task during restart"
-                );
-            }
-        }
-    }
-
-    async fn reset_failed_job_runtime(&mut self, job_id: JobId) {
-        self.remove_pending_completion_check(job_id);
-        self.clear_terminal_segment_failures(job_id);
-        self.clear_par2_runtime_state(job_id);
-        self.clear_job_extraction_runtime(job_id);
-        self.clear_job_rar_runtime(job_id);
-        self.clear_job_write_backlog(job_id);
-        self.replace_failed_extraction_members(job_id, HashSet::new());
-        self.set_normalization_retried_state(job_id, false);
     }
 
     fn declared_archive_identity(
@@ -507,123 +241,22 @@ impl Pipeline {
             .collect()
     }
 
-    fn restore_current_filename<'a>(
-        file_index: u32,
-        file_spec: &'a crate::jobs::model::FileSpec,
-        file_identities: &'a HashMap<u32, ActiveFileIdentity>,
-    ) -> &'a str {
-        file_identities
-            .get(&file_index)
-            .map(|identity| identity.current_filename.as_str())
-            .unwrap_or(file_spec.filename.as_str())
-    }
-
-    async fn build_restore_skip_plan(
-        job_id: JobId,
-        spec: &JobSpec,
-        complete_files: &HashSet<NzbFileId>,
-        recovered_file_progress: &HashMap<u32, u64>,
-        file_identities: &HashMap<u32, ActiveFileIdentity>,
-        working_dir: &std::path::Path,
-    ) -> RestoreSkipPlan {
-        let mut skip = HashSet::new();
-        let mut file_progress = HashMap::new();
-        let mut stats = RestoreSkipStats::default();
-
-        for (file_index, file_spec) in spec.files.iter().enumerate() {
-            let file_index = file_index as u32;
-            let file_id = NzbFileId { job_id, file_index };
-            let file_total_bytes = file_spec
-                .segments
-                .iter()
-                .map(|segment| segment.bytes as u64)
-                .sum::<u64>();
-
-            if complete_files.contains(&file_id) {
-                stats.complete_files += 1;
-                for segment in &file_spec.segments {
-                    let segment_id = SegmentId {
-                        file_id,
-                        segment_number: segment.ordinal,
-                    };
-                    if skip.insert(segment_id) {
-                        stats.complete_file_segments += 1;
-                    }
-                }
-                file_progress.insert(file_index, file_total_bytes);
-                continue;
-            }
-
-            let Some(raw_floor) = recovered_file_progress.get(&file_index).copied() else {
-                continue;
-            };
-            if raw_floor == 0 {
-                file_progress.insert(file_index, 0);
-                continue;
-            }
-
-            let filename = Self::restore_current_filename(file_index, file_spec, file_identities);
-            let metadata = match tokio::fs::metadata(working_dir.join(filename)).await {
-                Ok(metadata) if metadata.is_file() => metadata,
-                Ok(_) | Err(_) => {
-                    stats.missing_checkpoint_files += 1;
-                    file_progress.insert(file_index, 0);
-                    continue;
-                }
-            };
-
-            let clamped_floor = raw_floor.min(file_total_bytes).min(metadata.len());
-            if clamped_floor < raw_floor.min(file_total_bytes) {
-                stats.clamped_checkpoint_files += 1;
-            }
-
-            let covered = segments_covered_by_floor(file_id, &file_spec.segments, clamped_floor);
-            for segment_id in covered.segments {
-                if skip.insert(segment_id) {
-                    stats.checkpoint_segments += 1;
-                }
-            }
-            let checkpoint_floor = covered.floor;
-
-            stats.checkpoint_floor_bytes = stats
-                .checkpoint_floor_bytes
-                .saturating_add(checkpoint_floor);
-            file_progress.insert(file_index, checkpoint_floor);
-        }
-
-        RestoreSkipPlan {
-            skip,
-            file_progress,
-            stats,
-        }
-    }
-
-    fn apply_detected_archive_identities(
-        &mut self,
-        job_id: JobId,
-        detected_archives: &HashMap<u32, DetectedArchiveIdentity>,
-    ) {
-        let Some(state) = self.jobs.get_mut(&job_id) else {
+    // Charge what a job's articles hold, at the one moment they are built:
+    // when a queued job is first handed work, or when a job that was already
+    // running before a restart is restored with them. Held until the job
+    // leaves the pipeline, and never refused: the ledger can never hold back a
+    // job that is downloading.
+    pub(crate) fn charge_job_article_memory(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
-        state.detected_archives = detected_archives.clone();
+        let permit = self
+            .process_memory_budget
+            .charge_retained(state.spec.scheduling_memory_estimate());
+        self.job_article_memory.insert(job_id, permit);
     }
 
-    pub(crate) fn check_job_memory_admission(
-        &mut self,
-        job_id: JobId,
-        spec: &JobSpec,
-    ) -> Result<crate::pipeline::ProcessMemoryPermit, crate::SchedulerError> {
-        self.process_memory_budget
-            .for_job(job_id.0)
-            .try_reserve_retained(spec.scheduling_memory_estimate())
-            .map_err(|error| {
-                crate::SchedulerError::InvalidInput(format!(
-                    "WEAVER_RESOURCE_LIMIT[nzb_metadata]: {error}"
-                ))
-            })
-    }
-
+    #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn add_job(
         &mut self,
         job_id: JobId,
@@ -632,17 +265,57 @@ impl Pipeline {
         nzb_zstd: Vec<u8>,
         options: crate::jobs::AddJobOptions,
     ) -> Result<(), crate::SchedulerError> {
-        let started = std::time::Instant::now();
-        let _profile_scope = crate::runtime::perf_probe::scope("pipeline.add_job.total");
-        let mut stage_start = std::time::Instant::now();
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
-        self.queue_scripts_completed.remove(&job_id);
+        self.shared_state
+            .queue
+            .clone()
+            .add(
+                job_id,
+                spec,
+                nzb_path,
+                nzb_zstd,
+                options,
+                self.event_tx.clone(),
+            )
+            .await?;
+        self.apply_queue_intents().await;
+        Ok(())
+    }
 
-        let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
+    pub(crate) fn admission_resources(&self) -> crate::pipeline::queue::AdmissionResources {
+        crate::pipeline::queue::AdmissionResources {
+            db: self.db.clone(),
+            intermediate_dir: self.intermediate_dir.clone(),
+            complete_dir: self.complete_dir.clone(),
+        }
+    }
+
+    pub(crate) async fn prepare_add(
+        resources: &crate::pipeline::queue::AdmissionResources,
+        job_id: JobId,
+        spec: JobSpec,
+        nzb_path: PathBuf,
+        nzb_zstd: Vec<u8>,
+        options: crate::jobs::AddJobOptions,
+    ) -> Result<crate::pipeline::queue::PreparedAdd, crate::SchedulerError> {
+        Self::prepare_admission(resources, job_id, spec, nzb_path, nzb_zstd, options, None).await
+    }
+
+    pub(crate) async fn prepare_admission(
+        resources: &crate::pipeline::queue::AdmissionResources,
+        job_id: JobId,
+        spec: JobSpec,
+        nzb_path: PathBuf,
+        nzb_zstd: Vec<u8>,
+        options: crate::jobs::AddJobOptions,
+        restart: Option<crate::pipeline::queue::RestartAdmission>,
+    ) -> Result<crate::pipeline::queue::PreparedAdd, crate::SchedulerError> {
+        let started = std::time::Instant::now();
+        let mut stage_start = started;
         if let Some(generation) = options.semantic_materialization_generation {
-            let db = self.db.clone();
+            let db = resources.db.clone();
             let current = tokio::task::spawn_blocking(move || {
                 db.semantic_materialization_is_current(job_id, generation)
             })
@@ -657,7 +330,7 @@ impl Pipeline {
             }
         }
         if let Some(generation) = options.semantic_promotion_generation {
-            let db = self.db.clone();
+            let db = resources.db.clone();
             let current = tokio::task::spawn_blocking(move || {
                 db.semantic_promotion_materialization_is_current(job_id, generation)
             })
@@ -672,13 +345,46 @@ impl Pipeline {
             }
         }
 
-        let working_dir = compute_working_dir(&self.intermediate_dir, job_id, &spec.name);
-        tokio::fs::create_dir_all(&working_dir)
-            .await
-            .map_err(crate::SchedulerError::Io)?;
-        stamp_working_dir(&self.intermediate_dir, &working_dir, job_id)
-            .await
-            .map_err(crate::SchedulerError::Io)?;
+        let reprocess = restart.as_ref().is_some_and(|restart| restart.reprocess);
+        if let Some(restart) = restart.as_ref().filter(|restart| !restart.reprocess) {
+            crate::pipeline::queue::clear_restart_artifacts(
+                resources,
+                job_id,
+                &restart.working_dir,
+            )
+            .await?;
+        }
+        let (working_dir, directory_existed) =
+            match restart.as_ref().filter(|restart| restart.reprocess) {
+                Some(restart) => {
+                    let working_dir = restart.working_dir.clone();
+                    let directory_existed = tokio::fs::try_exists(&working_dir).await?;
+                    tokio::fs::create_dir_all(&working_dir)
+                        .await
+                        .map_err(crate::SchedulerError::Io)?;
+                    (working_dir, directory_existed)
+                }
+                None => {
+                    let intermediate_dir = resources.intermediate_dir.clone();
+                    let name = spec.name.clone();
+                    let claimed = tokio::task::spawn_blocking(move || {
+                        claim_working_dir(&intermediate_dir, job_id, &name)
+                    })
+                    .await
+                    .map_err(|error| {
+                        crate::SchedulerError::Internal(format!(
+                            "working directory claim worker panicked: {error}"
+                        ))
+                    })?
+                    .map_err(crate::SchedulerError::Io)?;
+                    (claimed.path, claimed.existed)
+                }
+            };
+        if working_dir.starts_with(&resources.intermediate_dir) {
+            stamp_working_dir(&resources.intermediate_dir, &working_dir, job_id)
+                .await
+                .map_err(crate::SchedulerError::Io)?;
+        }
         crate::runtime::perf_probe::record(
             "pipeline.add_job.working_dir_ready",
             stage_start.elapsed(),
@@ -697,15 +403,17 @@ impl Pipeline {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let (assembly, download_queue, recovery_queue) =
-            Self::build_job_assembly(job_id, &spec, &HashSet::new());
-        // A bare `.7z` has no topology to wait for, so it arms off its opening
-        // bytes instead — which means the commit path has to know it is coming.
-        self.register_direct_unpack_singles(job_id, &spec);
         let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
         let initial_file_identities = file_identities.values().cloned().collect::<Vec<_>>();
         let (initial_status, initial_download_state, initial_post_state, initial_run_state) =
-            if options.initially_paused {
+            if reprocess {
+                (
+                    JobStatus::Downloading,
+                    crate::jobs::model::DownloadState::Downloading,
+                    crate::jobs::model::PostState::Idle,
+                    crate::jobs::model::RunState::Active,
+                )
+            } else if options.initially_paused {
                 (
                     JobStatus::Paused,
                     crate::jobs::model::DownloadState::Queued,
@@ -756,15 +464,17 @@ impl Pipeline {
         // active-job state. SCORE candidates additionally consume their
         // admission generation in this same transaction, closing the window
         // between a higher-score supersession and scheduler materialization.
-        let db = self.db.clone();
+        let db = resources.db.clone();
         let semantic_materialization_generation = options.semantic_materialization_generation;
         let semantic_promotion_generation = options.semantic_promotion_generation;
+        let is_restart = restart.is_some();
         let (persisted, nzb_password_candidates) = tokio::task::spawn_blocking(move || {
-            let persisted = db.materialize_active_job_with_file_identities(
+            let persisted = db.materialize_admission(
                 &active_job,
                 &initial_file_identities,
                 semantic_materialization_generation,
                 semantic_promotion_generation,
+                is_restart,
             );
             // Derived here, once, from the bytes just persisted, so no archive
             // file has to reload and re-parse the NZB to learn them. A parse
@@ -790,7 +500,8 @@ impl Pipeline {
         })?;
         match persisted {
             Err(error) => {
-                if let Err(cleanup_error) = tokio::fs::remove_dir_all(&working_dir).await
+                if !directory_existed
+                    && let Err(cleanup_error) = tokio::fs::remove_dir_all(&working_dir).await
                     && cleanup_error.kind() != std::io::ErrorKind::NotFound
                 {
                     warn!(job_id = job_id.0, error = %cleanup_error, "failed to clean working directory after active job persistence failure");
@@ -798,7 +509,8 @@ impl Pipeline {
                 return Err(error.into());
             }
             Ok(false) => {
-                if let Err(cleanup_error) = tokio::fs::remove_dir_all(&working_dir).await
+                if !directory_existed
+                    && let Err(cleanup_error) = tokio::fs::remove_dir_all(&working_dir).await
                     && cleanup_error.kind() != std::io::ErrorKind::NotFound
                 {
                     warn!(job_id = job_id.0, error = %cleanup_error, "failed to clean superseded job working directory");
@@ -818,16 +530,60 @@ impl Pipeline {
             "pipeline add_job stage"
         );
 
-        let queue_depth = download_queue.len() + recovery_queue.len();
+        Ok(crate::pipeline::queue::PreparedAdd {
+            spec,
+            options,
+            working_dir,
+            nzb_hash,
+            nzb_password_candidates,
+            restart,
+        })
+    }
 
-        stage_start = std::time::Instant::now();
-        let _ = self.event_tx.send(PipelineEvent::JobCreated {
-            job_id,
-            name: spec.name.clone(),
-            total_files: spec.files.len() as u32,
-            total_bytes: spec.total_bytes,
-        });
-
+    pub(crate) fn install_prepared_add(
+        &mut self,
+        job_id: JobId,
+        prepared: crate::pipeline::queue::PreparedAdd,
+    ) {
+        let crate::pipeline::queue::PreparedAdd {
+            spec,
+            options,
+            working_dir,
+            nzb_hash,
+            nzb_password_candidates,
+            restart,
+        } = prepared;
+        let started = std::time::Instant::now();
+        let stage_start = started;
+        self.queue_scripts_completed.remove(&job_id);
+        let reprocess = restart.as_ref().is_some_and(|restart| restart.reprocess);
+        let mut spec = spec;
+        let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
+        let par2_bytes = spec.par2_bytes();
+        // The job waits its turn holding nothing per article. Its article
+        // lists are read back from the stored NZB when it is first handed
+        // work; a reprocess fetches every article again then, as it has no
+        // checkpoint to say where any was placed.
+        let summaries = spec.drop_article_lists();
+        let queue_depth: u64 = summaries
+            .0
+            .iter()
+            .map(|file| u64::from(file.articles))
+            .sum();
+        let initial_status = if reprocess {
+            Self::reprocess_status(queue_depth)
+        } else if options.initially_paused {
+            JobStatus::Paused
+        } else {
+            JobStatus::Queued
+        };
+        let initial_download_state = crate::jobs::model::DownloadState::Queued;
+        let initial_post_state = crate::jobs::model::PostState::Idle;
+        let initial_run_state = if options.initially_paused {
+            crate::jobs::model::RunState::Paused
+        } else {
+            crate::jobs::model::RunState::Active
+        };
         // Resolve the category's shared decoded-byte counter once, here, so the
         // per-segment accounting site does a single `Relaxed` `fetch_add`
         // through an already-resolved pointer instead of a map lookup.
@@ -835,7 +591,6 @@ impl Pipeline {
             .metrics
             .job_lifecycle
             .category_bytes_counter(spec.category.as_deref());
-        let par2_bytes = spec.par2_bytes();
         let mut state = JobState {
             job_id,
             job_hash: nzb_hash,
@@ -844,8 +599,7 @@ impl Pipeline {
             download_state: initial_download_state,
             post_state: initial_post_state,
             run_state: initial_run_state,
-            assembly,
-            extraction_depth: 0,
+            articles: JobArticles::Queued(summaries),
             created_at: std::time::Instant::now(),
             created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
             queued_repair_at_epoch_ms: None,
@@ -858,29 +612,21 @@ impl Pipeline {
                 .initially_paused
                 .then_some(crate::jobs::model::PostState::Idle),
             failure_error: None,
+            delivered: None,
+            delivery_left_behind: Vec::new(),
             working_dir: working_dir.clone(),
-            downloaded_bytes: 0,
+            downloaded_bytes: restart
+                .as_ref()
+                .filter(|restart| restart.reprocess)
+                .map_or(0, |restart| restart.downloaded_bytes),
             restored_download_floor_bytes: 0,
             downloaded_wire_bytes: 0,
             server_attribution: Default::default(),
             failed_bytes: 0,
-            probe_projected_failed_bytes: 0,
             par2_bytes,
-            health_probing: false,
-            health_deferral: Default::default(),
-            health_probe_round: 0,
-            announced_checkpoints: Default::default(),
-            health_probe_failing_files: 0,
-            health_failing_files: std::collections::HashSet::new(),
-            early_recovery_requested_blocks: 0,
-            last_health_probe_failed_bytes: 0,
-            next_health_probe_failed_bytes: 1,
             support_facts: Default::default(),
             detected_archives: HashMap::new(),
             file_identities,
-            held_segments: Vec::new(),
-            download_queue,
-            recovery_queue,
             staging_dir: None,
             category_bytes: Some(category_bytes),
             nzb_password_candidates: nzb_password_candidates
@@ -888,12 +634,11 @@ impl Pipeline {
                 .unwrap_or_default(),
         };
         state.refresh_runtime_lanes_from_status();
-        self.install_repeated_articles(&state)?;
-        self.job_scheduling_memory.insert(job_id, scheduling_memory);
         self.jobs.insert(job_id, state);
         self.note_download_activity(job_id);
-        self.job_order.push(job_id);
-        self.raise_added_script_event(job_id);
+        if !self.job_order.contains(&job_id) {
+            self.job_order.push(job_id);
+        }
 
         crate::runtime::perf_probe::record(
             "pipeline.add_job.runtime_state_inserted",
@@ -907,36 +652,21 @@ impl Pipeline {
             stage = "runtime_state_inserted",
             "job added"
         );
-        Ok(())
     }
 
-    // How many of a job's payload files lead with their first article.
-    // Recovery volumes are never sampled, so they do not count toward it:
-    // counted by file index, a post that lists its recovery first would
-    // sample few payload files or none, and the gate could never run.
-    //
-    // The wave exists to sample the post, not to reshape the job. A bounded
-    // number of leading files answers "is this post still on the server" as
-    // well as every file would, and every extra file in the wave costs the
-    // direct store: the head of a later volume arrives long before the
-    // sequential frontier reaches it, so it sits in a hold for the whole
-    // stretch of volumes ahead of it. Thirty-two holds is a sample; a hold
-    // per volume of a large set is a second copy of the download.
-    const FIRST_ARTICLE_SAMPLE_FILES: usize = 32;
-
+    // The job's assembly and its download queue. Every article starts at the
+    // one neutral priority, in posted order: the job's root is the only
+    // ranker, and its classes raise what it wants and park what its objects
+    // defer. The articles in `skip` are already in hand, and those in `held`
+    // arrived and wait to be placed: neither is queued.
     pub(crate) fn build_job_assembly(
         job_id: JobId,
         spec: &JobSpec,
         skip: &HashSet<SegmentId>,
-    ) -> (JobAssembly, DownloadQueue, DownloadQueue) {
+        held: &HashSet<SegmentId>,
+    ) -> (JobAssembly, DownloadQueue) {
         let mut assembly = JobAssembly::new(job_id);
         let mut download_queue = DownloadQueue::new();
-        let mut recovery_queue = DownloadQueue::new();
-        let mut has_par2_index = false;
-        let mut has_par3_index = false;
-        let mut par2_files: Vec<(u32, u64)> = Vec::new();
-        let mut par3_files: Vec<(u32, u64)> = Vec::new();
-        let mut sampled_files = 0usize;
 
         for (file_index, file_spec) in spec.files.iter().enumerate() {
             let file_id = NzbFileId {
@@ -953,86 +683,6 @@ impl Pipeline {
                 segment_sizes,
             );
 
-            match file_spec.role {
-                weaver_model::files::FileRole::Par2 { is_index: true, .. } => has_par2_index = true,
-                weaver_model::files::FileRole::Par3 { is_index: true } => has_par3_index = true,
-                _ => {}
-            }
-
-            let priority = file_spec.role.download_priority();
-            let is_recovery = file_spec.role.is_recovery();
-
-            if is_recovery {
-                let total: u64 = file_spec.segments.iter().map(|s| s.bytes as u64).sum();
-                if matches!(file_spec.role, weaver_model::files::FileRole::Par2 { .. }) {
-                    par2_files.push((file_index as u32, total));
-                } else {
-                    par3_files.push((file_index as u32, total));
-                }
-            }
-
-            // An unclassifiable file's head segment jumps the data queue: the
-            // offset-zero article carries the archive signature and the whole
-            // identity-fingerprint window, so on an obfuscated post the head
-            // wave is what lets every file bind to a direct set within the
-            // first round trips. Planned here, into the initial order, rather
-            // than re-prioritized when identity evidence arrives — a
-            // reprioritization only reaches work still in the queue, and the
-            // heads it misses are exactly the early files whose payload is
-            // already leased, deterministically, every run. Heads are
-            // ordinary file bytes; nothing is wasted if the job turns out to
-            // be nothing special.
-            let head_segment = matches!(
-                file_spec.role,
-                weaver_model::files::FileRole::Unknown
-                    | weaver_model::files::FileRole::SplitFile { .. }
-                    | weaver_model::files::FileRole::SevenZipArchive
-                    | weaver_model::files::FileRole::SevenZipSplit { .. }
-                    | weaver_model::files::FileRole::ZipArchive
-            )
-            .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
-            .flatten();
-
-            // A 7z part's LAST segment joins the head wave, for the same reason
-            // and with the same caveat.
-            //
-            // Direct unpack cannot list an archive until it has the end header,
-            // which sits at the very end of the last part — so until those
-            // bytes land the chase is parked and the overlap it exists for has
-            // not started. One extra segment per part is a cheap way to unblock
-            // it. Planned at queue birth rather than reprioritized later
-            // because a reprioritization only reaches work still queued, and on
-            // a fast job the tail is leased before the chase is even armed.
-            //
-            // Purely an overlap optimization: boosting the wrong segment costs
-            // a little latency and nothing else, and the gated reader is
-            // correct whatever order the bytes arrive in.
-            let tail_segment = matches!(
-                file_spec.role,
-                weaver_model::files::FileRole::SevenZipArchive
-                    | weaver_model::files::FileRole::SevenZipSplit { .. }
-                    | weaver_model::files::FileRole::ZipArchive
-            )
-            .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).max())
-            .flatten();
-
-            // Every file's lowest ordinal is its first article, and first
-            // articles lead the payload: one article per file is the cheapest
-            // sample of whether the post is still on the server at all, and
-            // sampling every file beats reading one file's worth of articles
-            // before anything else is asked for.
-            //
-            // Recovery volumes stay out of the sample. Their articles are
-            // parked until something promotes them, so they cannot answer in
-            // the first round trips, and a sample that waits on an article
-            // nothing has asked for is a sample that never completes.
-            let first_segment = (!is_recovery && sampled_files < Self::FIRST_ARTICLE_SAMPLE_FILES)
-                .then(|| file_spec.segments.iter().map(|seg| seg.ordinal).min())
-                .flatten();
-            if first_segment.is_some() {
-                sampled_files += 1;
-            }
-
             // One shared group list per file; every segment's work item holds
             // a reference to it rather than its own copy.
             let groups: std::sync::Arc<[String]> =
@@ -1042,32 +692,18 @@ impl Pipeline {
                     file_id,
                     segment_number: seg.ordinal,
                 };
-                let is_first_article = first_segment == Some(seg.ordinal);
-                let priority =
-                    if head_segment == Some(seg.ordinal) || tail_segment == Some(seg.ordinal) {
-                        2
-                    } else {
-                        priority
-                    };
-                if is_first_article {
-                    download_queue.note_first_article(segment_id);
-                }
                 if skip.contains(&segment_id) {
                     let _ = file_assembly.commit_segment(seg.ordinal, seg.bytes);
-                } else {
-                    let target_queue = if is_recovery {
-                        &mut recovery_queue
-                    } else {
-                        &mut download_queue
-                    };
-                    target_queue.push(DownloadWork {
+                } else if !held.contains(&segment_id) {
+                    download_queue.push(DownloadWork {
+                        counters: None,
                         segment_id,
-                        message_id: MessageId::new(&seg.message_id),
+                        message_id: MessageId::new(seg.message_ids.in_use()),
                         groups: std::sync::Arc::clone(&groups),
-                        priority,
+                        priority: crate::pipeline::graph::NEUTRAL_PRIORITY,
                         byte_estimate: seg.bytes,
                         retry_count: 0,
-                        is_recovery,
+                        is_recovery: false,
                         completion_critical: false,
                         exclude_servers: vec![],
                         avoid_server: None,
@@ -1075,40 +711,11 @@ impl Pipeline {
                 }
             }
 
-            file_assembly.note_restored_prefix(file_assembly.received_bytes());
+            file_assembly.note_restored_ordinals();
             assembly.add_file(file_assembly);
         }
 
-        // PAR2 keeps its original indexless-volume promotion, regardless of
-        // PAR3 indexes or smaller PAR3 volumes in the same job.
-        let recovery_files = if !has_par2_index && !par2_files.is_empty() {
-            Some(&mut par2_files)
-        } else if !has_par2_index
-            && par2_files.is_empty()
-            && !has_par3_index
-            && !par3_files.is_empty()
-        {
-            Some(&mut par3_files)
-        } else {
-            None
-        };
-        if let Some(recovery_files) = recovery_files {
-            recovery_files.sort_by_key(|&(_, size)| size);
-            let promoted_file_index = recovery_files[0].0;
-
-            let items = recovery_queue.drain_all();
-            for mut item in items {
-                if item.segment_id.file_id.file_index == promoted_file_index {
-                    item.priority = 0;
-                    item.is_recovery = false;
-                    download_queue.push(item);
-                } else {
-                    recovery_queue.push(item);
-                }
-            }
-        }
-
-        (assembly, download_queue, recovery_queue)
+        (assembly, download_queue)
     }
 
     #[cfg(test)]
@@ -1119,289 +726,14 @@ impl Pipeline {
         self.reprocess_job_with_password(job_id, None).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn reprocess_job_with_password(
         &mut self,
         job_id: JobId,
         password: Option<String>,
     ) -> Result<(), crate::SchedulerError> {
-        if password.is_some() {
-            self.archive_password_winners
-                .retain(|(id, _), _| *id != job_id);
-        }
-        let in_jobs = self.jobs.contains_key(&job_id);
-
-        if in_jobs {
-            let state = self.jobs.get(&job_id).unwrap();
-            if !Self::is_restartable_terminal_status(&state.status) {
-                return Err(crate::SchedulerError::Conflict(format!(
-                    "job {} is not complete or failed",
-                    job_id.0
-                )));
-            }
-        } else {
-            let history_row = self.load_history_row(job_id).await?;
-            let (
-                nzb,
-                nzb_path,
-                nzb_zstd,
-                nzb_hash,
-                category,
-                metadata,
-                output_dir,
-                downloaded_bytes,
-            ) = if let Some(row) = history_row.as_ref() {
-                let status =
-                    crate::job_status_from_persisted_str(&row.status, row.error_message.as_deref());
-                if !Self::is_restartable_terminal_status(&status) {
-                    return Err(crate::SchedulerError::Conflict(format!(
-                        "job {} is not complete or failed",
-                        job_id.0
-                    )));
-                }
-
-                let metadata = row
-                    .metadata
-                    .as_deref()
-                    .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
-                    .unwrap_or_default();
-
-                let (preferred_nzb_path, nzb_zstd) = self
-                    .db
-                    .load_history_job_persisted_nzb(job_id.0)
-                    .map_err(crate::SchedulerError::State)?
-                    .unwrap_or_else(|| (self.persisted_nzb_path_for_job(job_id, Some(row)), None));
-                let (nzb, nzb_path, nzb_zstd) =
-                    self.load_restart_nzb(job_id, &preferred_nzb_path, nzb_zstd)?;
-                let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
-                (
-                    nzb,
-                    nzb_path,
-                    nzb_zstd,
-                    nzb_hash,
-                    row.category.clone(),
-                    metadata,
-                    row.output_dir.clone(),
-                    row.downloaded_bytes,
-                )
-            } else {
-                let history_entry = self.finished_jobs.iter().find(|job| job.job_id == job_id);
-                let Some(info) = history_entry else {
-                    return Err(crate::SchedulerError::JobNotFound(job_id));
-                };
-                if !Self::is_restartable_terminal_status(&info.status) {
-                    return Err(crate::SchedulerError::Conflict(format!(
-                        "job {} is not complete or failed",
-                        job_id.0
-                    )));
-                }
-
-                let (nzb_path, nzb_zstd) = self
-                    .db
-                    .load_history_job_persisted_nzb(job_id.0)
-                    .map_err(crate::SchedulerError::State)?
-                    .unwrap_or_else(|| {
-                        (
-                            self.persisted_nzb_path_for_job(job_id, history_row.as_ref()),
-                            None,
-                        )
-                    });
-                let (nzb, nzb_path, nzb_zstd) =
-                    self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-                let nzb_hash = crate::ingest::hash_persisted_nzb_bytes(&nzb_zstd);
-
-                (
-                    nzb,
-                    nzb_path,
-                    nzb_zstd,
-                    nzb_hash,
-                    info.category.clone(),
-                    info.metadata.clone(),
-                    info.output_dir.clone(),
-                    info.downloaded_bytes,
-                )
-            };
-
-            let mut spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
-            if let Some(password) = password.as_ref() {
-                spec.password = Some(password.clone());
-            }
-            spec.metadata
-                .retain(|(key, _)| !crate::history::attributes::is_password_attribute_key(key));
-            let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
-
-            let working_dir = output_dir
-                .as_ref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| compute_working_dir(&self.intermediate_dir, job_id, &spec.name));
-            if working_dir.starts_with(&self.intermediate_dir)
-                && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
-                && let Err(error) =
-                    stamp_working_dir(&self.intermediate_dir, &working_dir, job_id).await
-            {
-                warn!(
-                    job_id = job_id.0,
-                    dir = %working_dir.display(),
-                    error = %error,
-                    "failed to stamp reprocessed working directory as Weaver-owned"
-                );
-            }
-
-            self.db
-                .create_active_job(&crate::ActiveJob {
-                    job_id,
-                    nzb_hash,
-                    nzb_path,
-                    nzb_zstd,
-                    output_dir: working_dir.clone(),
-                    created_at: (crate::jobs::model::epoch_ms_now() / 1000.0) as u64,
-                    category: spec.category.clone(),
-                    metadata: spec.metadata.clone(),
-                    status: "downloading",
-                    download_state: "downloading",
-                    post_state: "idle",
-                    run_state: "active",
-                    paused_resume_status: None,
-                    paused_resume_download_state: None,
-                    paused_resume_post_state: None,
-                    password_override: Some(spec.password.clone().unwrap_or_default()),
-                    supplied_password_candidates: Vec::new(),
-                })
-                .map_err(crate::SchedulerError::State)?;
-
-            let all_segments = Self::all_segment_ids(job_id, &spec);
-            let (assembly, download_queue, recovery_queue) =
-                Self::build_job_assembly(job_id, &spec, &all_segments);
-            let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
-
-            // Resolve the category's shared decoded-byte counter once, here, so the
-            // per-segment accounting site does a single `Relaxed` `fetch_add`
-            // through an already-resolved pointer instead of a map lookup.
-            let category_bytes = self
-                .metrics
-                .job_lifecycle
-                .category_bytes_counter(spec.category.as_deref());
-            let par2_bytes = spec.par2_bytes();
-            let mut state = JobState {
-                job_id,
-                job_hash: nzb_hash,
-                spec,
-                status: JobStatus::Downloading,
-                download_state: crate::jobs::model::DownloadState::Downloading,
-                post_state: crate::jobs::model::PostState::Idle,
-                run_state: crate::jobs::model::RunState::Active,
-                assembly,
-                extraction_depth: 0,
-                created_at: std::time::Instant::now(),
-                created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
-                queued_repair_at_epoch_ms: None,
-                queued_extract_at_epoch_ms: None,
-                paused_resume_status: None,
-                paused_resume_download_state: None,
-                paused_resume_post_state: None,
-                failure_error: None,
-                working_dir,
-                downloaded_bytes,
-                restored_download_floor_bytes: 0,
-                downloaded_wire_bytes: 0,
-                server_attribution: Default::default(),
-                failed_bytes: 0,
-                probe_projected_failed_bytes: 0,
-                par2_bytes,
-                health_probing: false,
-                health_deferral: Default::default(),
-                health_probe_round: 0,
-                announced_checkpoints: Default::default(),
-                health_probe_failing_files: 0,
-                health_failing_files: std::collections::HashSet::new(),
-                early_recovery_requested_blocks: 0,
-                last_health_probe_failed_bytes: 0,
-                next_health_probe_failed_bytes: 1,
-                support_facts: Default::default(),
-                detected_archives: HashMap::new(),
-                file_identities,
-                held_segments: Vec::new(),
-                download_queue,
-                recovery_queue,
-                staging_dir: None,
-                category_bytes: Some(category_bytes),
-                nzb_password_candidates: Default::default(),
-            };
-            state.refresh_runtime_lanes_from_status();
-            self.install_repeated_articles(&state)?;
-            self.job_scheduling_memory.insert(job_id, scheduling_memory);
-            self.jobs.insert(job_id, state);
-            if let Some(file_identities) = self
-                .jobs
-                .get(&job_id)
-                .map(|state| state.file_identities.clone())
-            {
-                self.persist_file_identities(job_id, &file_identities).await;
-            }
-            self.note_download_activity(job_id);
-        }
-
-        if in_jobs {
-            let state = self.jobs.get(&job_id).unwrap();
-            let all_segments = Self::all_segment_ids(job_id, &state.spec);
-            let spec_clone = state.spec.clone();
-            let (assembly, download_queue, recovery_queue) =
-                Self::build_job_assembly(job_id, &spec_clone, &all_segments);
-            let file_identities;
-            {
-                let state = self.jobs.get_mut(&job_id).unwrap();
-                state.assembly = assembly;
-                state.failure_error = None;
-                state.file_identities =
-                    Self::build_initial_file_identities(&spec_clone, &HashMap::new());
-                state.download_queue = download_queue;
-                state.recovery_queue = recovery_queue;
-                state.held_segments.clear();
-                state.failed_bytes = 0;
-                file_identities = state.file_identities.clone();
-            }
-            self.transition_postprocessing_status(
-                job_id,
-                JobStatus::Downloading,
-                Some("downloading"),
-            );
-            self.note_download_activity(job_id);
-            self.persist_file_identities(job_id, &file_identities).await;
-        }
-
-        if let Some(state) = self.jobs.get_mut(&job_id) {
-            let mut metadata = state.spec.metadata.clone();
-            metadata.retain(|(key, _)| !crate::history::attributes::is_password_attribute_key(key));
-            let update = crate::jobs::JobUpdate {
-                password: password
-                    .map(crate::jobs::FieldUpdate::Set)
-                    .unwrap_or_default(),
-                metadata: crate::jobs::FieldUpdate::Set(metadata),
-                ..Default::default()
-            };
-            self.db
-                .update_active_job(job_id, &update)
-                .map_err(crate::SchedulerError::State)?;
-            update.apply_to_spec(&mut state.spec);
-        }
-        self.queue_scripts_completed.remove(&job_id);
-        self.delete_failed_history_entry(job_id).await;
-        // Reprocess replaces the assembly and file identities wholesale, so a
-        // chase describing the old ones has to go with them.
-        self.direct_unpack_forget_job(job_id);
-        self.reset_failed_job_runtime(job_id).await;
-
-        if !self.job_order.contains(&job_id) {
-            self.job_order.push(job_id);
-        }
-
-        let _ = self.event_tx.send(PipelineEvent::JobResumed { job_id });
-
-        info!(job_id = job_id.0, "reprocessing terminal job");
-
-        self.reload_metadata_from_disk(job_id).await;
-        self.check_job_completion(job_id).await;
-
-        Ok(())
+        self.restart_through_control_plane(job_id, password, true)
+            .await
     }
 
     #[cfg(test)]
@@ -1412,372 +744,244 @@ impl Pipeline {
         self.redownload_job_with_password(job_id, None).await
     }
 
+    #[cfg(test)]
     pub(crate) async fn redownload_job_with_password(
         &mut self,
         job_id: JobId,
         password: Option<String>,
     ) -> Result<(), crate::SchedulerError> {
-        if password.is_some() {
-            self.archive_password_winners
-                .retain(|(id, _), _| *id != job_id);
-        }
+        self.restart_through_control_plane(job_id, password, false)
+            .await
+    }
+
+    #[cfg(test)]
+    async fn restart_through_control_plane(
+        &mut self,
+        job_id: JobId,
+        password: Option<String>,
+        reprocess: bool,
+    ) -> Result<(), crate::SchedulerError> {
         if let Some(state) = self.jobs.get(&job_id) {
-            if !Self::is_restartable_terminal_status(&state.status) {
-                return Err(crate::SchedulerError::Conflict(format!(
-                    "job {} is not complete or failed",
-                    job_id.0
-                )));
+            if !crate::pipeline::is_terminal_status(&state.status) {
+                return Err(crate::SchedulerError::Conflict(
+                    "job is not complete or failed".into(),
+                ));
             }
-
-            let category = state.spec.category.clone();
-            let metadata = state.spec.metadata.clone();
-            let working_dir = state.working_dir.clone();
-            let staging_dir = state.staging_dir.clone();
-            let (nzb_path, nzb_zstd) = self
-                .db
-                .load_active_job_persisted_nzb(job_id)
-                .map_err(crate::SchedulerError::State)?
-                .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
-            let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-            let mut spec = redownload_spec(&nzb, &nzb_path, category, metadata);
-
-            if let Some(password) = password.clone() {
-                spec.password = Some(password);
+            let mut changes = self.shared_state.queue.subscribe();
+            self.record_job_history(job_id, None);
+            while !self
+                .shared_state
+                .queue
+                .history()
+                .iter()
+                .any(|job| job.job_id == job_id)
+            {
+                changes
+                    .changed()
+                    .await
+                    .map_err(|_| crate::SchedulerError::ChannelClosed)?;
             }
-            spec.metadata
-                .retain(|(key, _)| !crate::history::attributes::is_password_attribute_key(key));
-            self.remove_redownload_artifacts(job_id, &working_dir, staging_dir.as_deref())
-                .await;
-            self.purge_terminal_job_runtime(job_id);
-            self.db
-                .delete_active_job(job_id)
-                .map_err(crate::SchedulerError::State)?;
-            self.add_job(
-                job_id,
-                spec,
-                nzb_path,
-                nzb_zstd,
-                crate::jobs::AddJobOptions::default(),
-            )
+        }
+        self.shared_state
+            .queue
+            .clone()
+            .restart(job_id, password, reprocess, self.event_tx.clone())
             .await?;
-            self.reset_failed_job_runtime(job_id).await;
-            self.reload_metadata_from_disk(job_id).await;
-            info!(job_id = job_id.0, "re-downloading terminal job");
-            return Ok(());
-        }
-
-        let history_row = self.load_history_row(job_id).await?;
-        if let Some(row) = history_row.as_ref() {
-            let status =
-                crate::job_status_from_persisted_str(&row.status, row.error_message.as_deref());
-            if !Self::is_restartable_terminal_status(&status) {
-                return Err(crate::SchedulerError::Conflict(format!(
-                    "job {} is not complete or failed",
-                    job_id.0
-                )));
-            }
-
-            let (nzb_path, nzb_zstd) = self
-                .db
-                .load_history_job_persisted_nzb(job_id.0)
-                .map_err(crate::SchedulerError::State)?
-                .unwrap_or_else(|| (self.persisted_nzb_path_for_job(job_id, Some(row)), None));
-            let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-            let metadata = row
-                .metadata
-                .as_deref()
-                .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())
-                .unwrap_or_default();
-            let mut spec = redownload_spec(&nzb, &nzb_path, row.category.clone(), metadata);
-            if let Some(password) = password.clone() {
-                spec.password = Some(password);
-            }
-            spec.metadata
-                .retain(|(key, _)| !crate::history::attributes::is_password_attribute_key(key));
-            let working_dir = row
-                .output_dir
-                .as_deref()
-                .map(PathBuf::from)
-                .unwrap_or_else(|| compute_working_dir(&self.intermediate_dir, job_id, &spec.name));
-
-            self.remove_redownload_artifacts(job_id, &working_dir, None)
-                .await;
-            self.add_job(
-                job_id,
-                spec,
-                nzb_path,
-                nzb_zstd,
-                crate::jobs::AddJobOptions::default(),
-            )
-            .await?;
-            self.delete_failed_history_entry(job_id).await;
-            self.reset_failed_job_runtime(job_id).await;
-            self.reload_metadata_from_disk(job_id).await;
-
-            info!(job_id = job_id.0, "re-downloading terminal history job");
-
-            return Ok(());
-        }
-
-        let history_entry = self.finished_jobs.iter().find(|job| job.job_id == job_id);
-        let Some(info) = history_entry else {
-            return Err(crate::SchedulerError::JobNotFound(job_id));
-        };
-        if !Self::is_restartable_terminal_status(&info.status) {
-            return Err(crate::SchedulerError::Conflict(format!(
-                "job {} is not complete or failed",
-                job_id.0
-            )));
-        }
-
-        let (nzb_path, nzb_zstd) = self
-            .db
-            .load_history_job_persisted_nzb(job_id.0)
-            .map_err(crate::SchedulerError::State)?
-            .unwrap_or_else(|| {
-                (
-                    self.persisted_nzb_path_for_job(job_id, history_row.as_ref()),
-                    None,
-                )
-            });
-        let (nzb, nzb_path, nzb_zstd) = self.load_restart_nzb(job_id, &nzb_path, nzb_zstd)?;
-        let mut spec = redownload_spec(
-            &nzb,
-            &nzb_path,
-            info.category.clone(),
-            info.metadata.clone(),
-        );
-        if let Some(password) = password.clone() {
-            spec.password = Some(password);
-        }
-        spec.metadata
-            .retain(|(key, _)| !crate::history::attributes::is_password_attribute_key(key));
-        let working_dir = history_row
-            .as_ref()
-            .and_then(|row| row.output_dir.as_ref())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| compute_working_dir(&self.intermediate_dir, job_id, &spec.name));
-
-        self.remove_redownload_artifacts(job_id, &working_dir, None)
-            .await;
-        self.add_job(
-            job_id,
-            spec,
-            nzb_path,
-            nzb_zstd,
-            crate::jobs::AddJobOptions::default(),
-        )
-        .await?;
-        self.delete_failed_history_entry(job_id).await;
-        self.reset_failed_job_runtime(job_id).await;
-        self.reload_metadata_from_disk(job_id).await;
-
-        info!(job_id = job_id.0, "re-downloading terminal history job");
-
+        self.run_queue_intents().await;
         Ok(())
     }
 
-    pub(crate) async fn restore_par2_state_from_disk(&mut self, job_id: JobId) {
-        let files: Vec<(NzbFileId, weaver_model::files::FileRole)> = {
-            let Some(state) = self.jobs.get(&job_id) else {
-                return;
-            };
-            state
-                .assembly
-                .files()
-                .map(|f| (f.file_id(), f.role().clone()))
-                .collect()
-        };
-
-        self.par2_runtime.remove(&job_id);
-
-        for (file_id, role) in &files {
-            if matches!(
-                role,
-                weaver_model::files::FileRole::Par2 { is_index: true, .. }
-            ) {
-                self.try_load_par2_metadata(job_id, *file_id).await;
-            }
-        }
-
-        for (file_id, role) in &files {
-            if matches!(
-                role,
-                weaver_model::files::FileRole::Par2 {
-                    is_index: false,
-                    ..
-                }
-            ) {
-                self.try_merge_par2_recovery(job_id, *file_id).await;
-            }
-        }
-
-        self.reapply_promoted_recovery_queue(job_id);
-    }
-
-    async fn reload_metadata_from_disk(&mut self, job_id: JobId) {
-        self.restore_par2_state_from_disk(job_id).await;
-        match self.db.load_detected_archive_identities(job_id) {
-            Ok(detected_archives) => {
-                self.apply_detected_archive_identities(job_id, &detected_archives);
-            }
-            Err(error) => {
-                error!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to load persisted detected archive identities"
-                );
-            }
-        }
-        self.restore_rar_state_for_job(job_id).await;
-
-        let files: Vec<NzbFileId> = {
-            let Some(state) = self.jobs.get(&job_id) else {
-                return;
-            };
-            state.assembly.files().map(|file| file.file_id()).collect()
-        };
-
-        for file_id in files {
-            self.refresh_archive_state_for_completed_file(job_id, file_id, false)
-                .await;
+    // A reprocess with nothing to fetch is downloading, so the completion
+    // check moves it on; one with work is queued until its first dispatch.
+    fn reprocess_status(queued_articles: u64) -> JobStatus {
+        if queued_articles == 0 {
+            JobStatus::Downloading
+        } else {
+            JobStatus::Queued
         }
     }
 
-    pub(crate) fn all_segment_ids(job_id: JobId, spec: &JobSpec) -> HashSet<SegmentId> {
-        let mut ids = HashSet::new();
-        for (file_index, file_spec) in spec.files.iter().enumerate() {
-            let file_id = NzbFileId {
-                job_id,
-                file_index: file_index as u32,
-            };
-            for seg in &file_spec.segments {
-                ids.insert(SegmentId {
-                    file_id,
-                    segment_number: seg.ordinal,
-                });
-            }
+    // The context an install's reads run in, gathered on the pipeline
+    // thread so the reads themselves run off it.
+    pub(crate) fn install_seat(&self, job_id: JobId) -> InstallSeat {
+        // A job whose work crashed the daemon gets no graph seat: its
+        // restore would replay the job's own facts into the same panic, and
+        // under abort that panic is the daemon's. The install reads its row
+        // and parks it; nothing of the job is rebuilt.
+        let graph = self
+            .crash_marks
+            .get(job_id)
+            .is_none()
+            .then(|| self.graph_restore_seat(None, std::path::Path::new("")));
+        InstallSeat {
+            db: self.db.clone(),
+            intermediate_dir: self.intermediate_dir.clone(),
+            staging_dir: self.deterministic_extraction_staging_dir(job_id),
+            graph,
         }
-        ids
     }
 
-    pub(crate) async fn restore_job(
+    // Install a job: read what it installs from, then put it in place.
+    pub(crate) async fn install_restored_job(
         &mut self,
         request: RestoreJobRequest,
     ) -> Result<(), crate::SchedulerError> {
         if self.jobs.contains_key(&request.job_id) {
             return Err(crate::SchedulerError::JobExists(request.job_id));
         }
+        let seat = self.install_seat(request.job_id);
+        let read = read_install(seat, request).await;
+        self.install_read(read)
+    }
+
+    // Put a job in place from what its install read. A job that cannot be
+    // restored is installed blocked: retained, paused, with the reason.
+    pub(crate) fn install_read(&mut self, read: InstallRead) -> Result<(), crate::SchedulerError> {
+        let InstallRead {
+            request,
+            restart,
+            server_attribution,
+            support_facts,
+            restored,
+        } = read;
+        if self.jobs.contains_key(&request.job_id) {
+            return Err(crate::SchedulerError::JobExists(request.job_id));
+        }
+        // A job whose work crashed the daemon would restore into the same
+        // panic: its install read no graph (`install_seat`), and it is parked
+        // paused before any of it is restored, its checkpoint left as it is.
+        // Its marker stays until a resume takes it, so every start before
+        // then parks it again.
+        if let Some(reason) = self
+            .crash_marks
+            .get(request.job_id)
+            .map(|mark| mark.reason())
+        {
+            self.install_blocked_restore(request, reason, server_attribution, support_facts);
+            return Ok(());
+        }
+        let restored = match restored {
+            Ok(restored) => restored,
+            Err(error) => {
+                self.install_blocked_restore(request, error, server_attribution, support_facts);
+                return Ok(());
+            }
+        };
+        let (server_attribution, support_facts) = match (server_attribution, support_facts) {
+            (Ok(attribution), Ok(facts)) => (attribution, facts),
+            (Err(error), facts) => {
+                let error = crate::SchedulerError::from(error).to_string();
+                self.install_blocked_restore(request, error, Ok(Default::default()), facts);
+                return Ok(());
+            }
+            (attribution, Err(error)) => {
+                let error = crate::SchedulerError::from(error).to_string();
+                self.install_blocked_restore(request, error, attribution, Ok(Default::default()));
+                return Ok(());
+            }
+        };
         let original = request.clone();
-        match self.restore_job_inner(request).await {
+        let created = restart
+            .as_ref()
+            .map(|read| (read.created_at_epoch_ms, read.reentry));
+        let stored = restart.map(|read| read.runtime);
+        let blocked_with = (server_attribution.clone(), support_facts.clone());
+        match self.restore_job_inner(
+            request,
+            restored,
+            created,
+            server_attribution,
+            support_facts,
+        ) {
             Ok(()) => {
                 self.blocked_restores.remove(&original.job_id);
-                self.persist_active_runtime(original.job_id);
+                let holds = |values: &crate::pipeline::ActiveRuntimeValues| {
+                    stored.as_ref().is_some_and(|stored| stored.holds(values))
+                };
+                if !self
+                    .active_runtime_values(original.job_id)
+                    .is_some_and(|values| holds(&values))
+                {
+                    self.persist_active_runtime(original.job_id);
+                }
             }
             Err(error) => {
-                self.install_blocked_restore(original, error.to_string())
-                    .await;
+                let (attribution, facts) = blocked_with;
+                self.install_blocked_restore(
+                    original,
+                    restore_blocked(error),
+                    Ok(attribution),
+                    Ok(facts),
+                );
             }
         }
         // A blocked restore is a retained queue entry and must be published.
         Ok(())
     }
 
-    async fn install_blocked_restore(&mut self, request: RestoreJobRequest, error: String) {
+    // The jobs that crashed the daemon on its last run, read at start before
+    // any job is restored: each is parked paused as it installs.
+    pub fn park_crashed_jobs(&mut self, marks: crate::runtime::panic_trap::CrashMarks) {
+        self.crash_marks = marks;
+    }
+
+    // Installs the job paused, holding nothing, with `reason` shown as its
+    // error until a resume restores it.
+    fn install_blocked_restore(
+        &mut self,
+        request: RestoreJobRequest,
+        reason: String,
+        server_attribution: Result<
+            crate::jobs::server_attribution::JobServerAttribution,
+            crate::StateError,
+        >,
+        support_facts: Result<crate::jobs::support_facts::JobSupportFacts, crate::StateError>,
+    ) {
         let job_id = request.job_id;
-        let server_attribution = self
-            .db_blocking(move |db| db.load_active_server_attribution(job_id))
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, job_id = job_id.0, "could not load blocked job attribution");
-                Default::default()
-            });
-        let support_facts = self
-            .db_blocking(move |db| db.load_job_support_facts(job_id))
-            .await
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, job_id = job_id.0, "could not load blocked job support facts");
-                Default::default()
-            });
-        let resume = request.paused_resume_status.clone().unwrap_or_else(|| {
-            if matches!(request.status, JobStatus::Paused) {
-                JobStatus::Downloading
-            } else {
-                request.status.clone()
-            }
+        let server_attribution = server_attribution.unwrap_or_else(|error| {
+            tracing::warn!(%error, job_id = job_id.0, "could not load blocked job attribution");
+            Default::default()
         });
-        let floor = request
-            .spec
-            .files
-            .iter()
-            .enumerate()
-            .map(|(index, file)| {
-                let total: u64 = file
-                    .segments
-                    .iter()
-                    .map(|segment| u64::from(segment.bytes))
-                    .sum();
-                if request.complete_files.contains(&NzbFileId {
-                    job_id,
-                    file_index: index as u32,
-                }) {
-                    total
-                } else {
-                    request
-                        .file_progress
-                        .get(&(index as u32))
-                        .copied()
-                        .unwrap_or(0)
-                        .min(total)
-                }
-            })
-            .sum();
+        let support_facts = support_facts.unwrap_or_else(|error| {
+            tracing::warn!(%error, job_id = job_id.0, "could not load blocked job support facts");
+            Default::default()
+        });
         let identities = if request.file_identities.is_empty() {
             Self::build_initial_file_identities(&request.spec, &request.detected_archives)
         } else {
             request.file_identities.clone()
         };
+        let mut spec = request.spec.clone();
+        let summaries = spec.drop_article_lists();
         let state = JobState {
             job_id,
             job_hash: request.job_hash,
-            spec: request.spec.clone(),
+            spec,
             status: JobStatus::Paused,
             download_state: crate::jobs::model::DownloadState::Queued,
             post_state: crate::jobs::model::PostState::Idle,
             run_state: crate::jobs::model::RunState::Paused,
-            assembly: JobAssembly::new(job_id),
-            extraction_depth: 0,
+            articles: JobArticles::Queued(summaries),
             created_at: std::time::Instant::now(),
             created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
             queued_repair_at_epoch_ms: request.queued_repair_at_epoch_ms,
             queued_extract_at_epoch_ms: request.queued_extract_at_epoch_ms,
-            paused_resume_status: Some(resume),
+            paused_resume_status: request.paused_resume_status.clone(),
             paused_resume_download_state: request.paused_resume_download_state,
             paused_resume_post_state: request.paused_resume_post_state,
-            failure_error: Some(format!("Placement recovery blocked: {error}")),
+            failure_error: Some(reason),
+            delivered: None,
+            delivery_left_behind: Vec::new(),
             working_dir: request.working_dir.clone(),
             downloaded_bytes: 0,
-            restored_download_floor_bytes: floor,
+            restored_download_floor_bytes: 0,
             downloaded_wire_bytes: 0,
             server_attribution,
             failed_bytes: 0,
-            probe_projected_failed_bytes: 0,
             par2_bytes: request.spec.par2_bytes(),
-            health_probing: false,
-            health_deferral: Default::default(),
-            health_probe_round: 0,
-            announced_checkpoints: Default::default(),
-            health_probe_failing_files: 0,
-            health_failing_files: HashSet::new(),
-            early_recovery_requested_blocks: 0,
-            last_health_probe_failed_bytes: 0,
-            next_health_probe_failed_bytes: 1,
             support_facts,
             detected_archives: request.detected_archives.clone(),
             file_identities: identities,
-            held_segments: Vec::new(),
-            download_queue: DownloadQueue::new(),
-            recovery_queue: DownloadQueue::new(),
             staging_dir: None,
             category_bytes: None,
             nzb_password_candidates: Default::default(),
@@ -1800,29 +1004,30 @@ impl Pipeline {
         self.blocked_restores.insert(job_id, request);
         self.remove_pending_completion_check(job_id);
         self.update_queue_metrics();
-        // Await this write: the next startup must retain the pause even if
-        // filesystem recovery succeeds by then.
-        if let Err(persist_error) = self
-            .db_blocking(move |db| {
-                db.set_active_job_runtime(
-                    job_id,
-                    "paused",
-                    Some("queued"),
-                    Some("idle"),
-                    Some("paused"),
-                    Some(&message),
-                    queued_repair,
-                    queued_extract,
-                    resume_status,
-                    resume_download,
-                    resume_post,
-                )
-            })
-            .await
+        tracing::warn!(job_id = job_id.0, reason = %message, "placement recovery blocked; job retained paused");
+        // The next startup must retain the pause even if filesystem recovery
+        // succeeds by then: the write goes on the job's lane, ahead of any
+        // the job makes later.
+        if let Err(persist_error) =
+            self.db
+                .try_queue_job_write(job_id, "set_active_job_runtime", move |db| {
+                    db.set_active_job_runtime(
+                        job_id,
+                        "paused",
+                        Some("queued"),
+                        Some("idle"),
+                        Some("paused"),
+                        Some(&message),
+                        queued_repair,
+                        queued_extract,
+                        resume_status,
+                        resume_download,
+                        resume_post,
+                    )
+                })
         {
-            tracing::error!(job_id = job_id.0, %persist_error, "failed to persist blocked restore pause");
+            tracing::error!(job_id = job_id.0, %persist_error, "failed to queue the blocked restore pause");
         }
-        tracing::warn!(job_id = job_id.0, %error, "placement recovery blocked; job retained paused");
     }
 
     pub(crate) async fn resume_restored_job(
@@ -1830,17 +1035,19 @@ impl Pipeline {
         job_id: JobId,
     ) -> Result<(), crate::SchedulerError> {
         if let Some(mut request) = self.blocked_restores.get(&job_id).cloned() {
+            // A resume is the go-ahead to replay a job that crashed the
+            // daemon. Its marker goes before the replay, so a panic during it
+            // leaves a fresh one.
+            if let Some(mark) = self.crash_marks.take(job_id) {
+                mark.consume();
+            }
             let recovered = self
-                .db_blocking(move |db| db.load_active_jobs())
+                .db_blocking(move |db| db.load_active_job(job_id))
                 .await
                 .map_err(crate::SchedulerError::State)?
-                .remove(&job_id)
                 .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
             request.file_identities = recovered.file_identities;
-            request.file_progress = recovered.file_progress;
-            request.complete_files = recovered.complete_files;
             request.detected_archives = recovered.detected_archives;
-            request.extracted_members = recovered.extracted_members;
             request.queued_repair_at_epoch_ms = recovered.queued_repair_at_epoch_ms;
             request.queued_extract_at_epoch_ms = recovered.queued_extract_at_epoch_ms;
             request.status = JobStatus::Paused;
@@ -1849,14 +1056,15 @@ impl Pipeline {
                 .iter()
                 .position(|id| *id == job_id)
                 .unwrap_or(self.job_order.len());
+            self.release_job_articles(job_id);
             self.jobs.remove(&job_id);
             self.job_order.retain(|id| *id != job_id);
-            self.restore_job(request).await?;
+            self.install_restored_job(request).await?;
             self.job_order.retain(|id| *id != job_id);
             self.job_order
                 .insert(position.min(self.job_order.len()), job_id);
             if self.blocked_restores.contains_key(&job_id) {
-                self.publish_snapshot();
+                self.report_job(job_id);
                 return Err(crate::SchedulerError::Conflict(
                     self.jobs[&job_id].failure_error.clone().unwrap(),
                 ));
@@ -1865,19 +1073,23 @@ impl Pipeline {
         self.resume_job_runtime(job_id)
     }
 
-    async fn restore_job_inner(
+    // Put a restored job in place from what its install read.
+    fn restore_job_inner(
         &mut self,
         request: RestoreJobRequest,
+        restored: RestoredFacts,
+        // When the job was added, as its row stores it, and whether it is
+        // entering the queue window again rather than arriving.
+        created: Option<(f64, bool)>,
+        server_attribution: crate::jobs::server_attribution::JobServerAttribution,
+        support_facts: crate::jobs::support_facts::JobSupportFacts,
     ) -> Result<(), crate::SchedulerError> {
         let RestoreJobRequest {
             job_id,
             job_hash,
-            spec,
-            complete_files,
-            file_progress,
+            spec: _,
             detected_archives,
             file_identities,
-            extracted_members,
             status,
             download_state,
             post_state,
@@ -1888,207 +1100,117 @@ impl Pipeline {
             paused_resume_download_state,
             paused_resume_post_state,
             working_dir,
+            restart: _,
         } = request;
+        let RestoredFacts {
+            mut spec,
+            waiting_summaries,
+            graph,
+            staging_exists,
+            nzb_password_candidates,
+            finalization_open,
+            delivered,
+            delivery_left_behind,
+        } = restored;
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
         }
-        let scheduling_memory = self.check_job_memory_admission(job_id, &spec)?;
-        if working_dir.starts_with(&self.intermediate_dir)
-            && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
-            && let Err(error) =
-                stamp_working_dir(&self.intermediate_dir, &working_dir, job_id).await
-        {
-            tracing::warn!(
-                job_id = job_id.0,
-                dir = %working_dir.display(),
-                error = %error,
-                "failed to stamp restored working directory as Weaver-owned"
-            );
-        }
+        let fresh = crate::pipeline::waits_its_turn(&status, paused_resume_status.as_ref());
+        // A job whose row says its delivery began has every article in hand
+        // and goes on from its row, never from a checkpoint: it moves into the
+        // destination the row names, or runs its terminal pass on what was
+        // delivered. It is never fetched again.
+        let delivering = delivering(&status);
 
-        let mut file_identities = if file_identities.is_empty() {
+        // The identities the row holds; only ones that differ are written.
+        let stored_identities = file_identities.clone();
+        let file_identities = if file_identities.is_empty() {
             Self::build_initial_file_identities(&spec, &detected_archives)
         } else {
             file_identities
         };
-        // Placement replay precedes every existence/skip decision. Completed
-        // bytes can still be staged, or the filesystem mapping can be newer
-        // than a partially persisted set of file identities.
-        let recovery_dir = working_dir.clone();
-        let transactions =
-            tokio::task::spawn_blocking(move || crate::pipeline::placement::recover(&recovery_dir))
-                .await
-                .map_err(|e| crate::SchedulerError::Internal(e.to_string()))?
-                .map_err(crate::SchedulerError::Io)?;
-        for transaction in transactions.transactions {
-            for binding in transaction.bindings() {
-                let identity = file_identities
-                    .get(&binding.file_index)
-                    .cloned()
-                    .ok_or_else(|| {
-                        crate::SchedulerError::Internal(format!(
-                            "placement file index {} is missing; journal retained",
-                            binding.file_index
-                        ))
-                    })?;
-                file_identities.insert(
-                    binding.file_index,
-                    Self::apply_placement_identity(identity, binding),
-                );
+        // A job resumes from its checkpoint, which alone says which of its
+        // articles are on disk, so the queue skips exactly those. A job with
+        // no checkpoint has nothing that says what its files hold: it is
+        // admitted afresh from its spec and fetches from the start.
+        let (graph_restore, skip, held_parts) = match graph {
+            Some(restored) => {
+                self.post_probes
+                    .restore_verdict(job_id, restored.feed_verdict);
+                (Some(restored.job), restored.skip, restored.held)
             }
-            let identities: Vec<_> = file_identities.values().cloned().collect();
-            self.db_blocking(move |db| db.save_file_identities(job_id, &identities))
-                .await
-                .map_err(crate::SchedulerError::State)?;
-            tokio::task::spawn_blocking(move || transaction.finish())
-                .await
-                .map_err(|e| crate::SchedulerError::Internal(e.to_string()))?
-                .map_err(crate::SchedulerError::Io)?;
-        }
-        self.restore_pending_par3_content_names(job_id, &working_dir, &mut file_identities)
-            .map_err(crate::SchedulerError::Internal)?;
-        let (stale_rar_sets, refreshed_rar_files) =
-            Self::scrub_restored_par2_file_identities(&mut file_identities);
-        let mut restore_skip_plan = Self::build_restore_skip_plan(
-            job_id,
-            &spec,
-            &complete_files,
-            &file_progress,
-            &file_identities,
-            &working_dir,
-        )
-        .await;
-        // A direct set's source volumes have no legacy floor and no
-        // completed-file row by construction, so everything above comes back
-        // empty for them; their coverage lives in the direct checkpoint and
-        // feeds exactly the same skip set. Merged before the assembly is built,
-        // because the assembly is what turns a skipped segment into work the
-        // job does not queue.
-        let direct_restore = self
-            .restore_direct_store_coverage(
-                job_id,
-                &spec,
-                &working_dir,
-                &restore_skip_plan.file_progress,
-            )
-            .await;
-        restore_skip_plan.skip.extend(direct_restore.skip.iter());
-        for (file_index, floor) in &direct_restore.file_progress {
-            let slot = restore_skip_plan
-                .file_progress
-                .entry(*file_index)
-                .or_insert(*floor);
-            *slot = (*slot).max(*floor);
-        }
-        let (mut assembly, download_queue, recovery_queue) =
-            Self::build_job_assembly(job_id, &spec, &restore_skip_plan.skip);
-        let repair_outputs = self
-            .db
-            .load_repair_outputs(job_id)
-            .map_err(crate::SchedulerError::State)?;
-        let repair_output_indices = super::repair_outputs::restore_assembly(
-            job_id,
-            &repair_outputs,
-            &working_dir,
-            &mut assembly,
-            &mut file_identities,
-        )
-        .await
-        .map_err(crate::SchedulerError::Internal)?;
-        // A restored job resumes mid-download; its unsplit archives are still
-        // candidates, and their persisted floor is what they will arm from.
-        self.register_direct_unpack_singles(job_id, &spec);
-        let status = Self::normalize_restored_status(status, &download_queue, &recovery_queue);
-
-        let skip_ref = &restore_skip_plan.skip;
-        let mut downloaded_bytes = 0u64;
-        let mut restored_download_floor_bytes = 0u64;
-        for (fi, file_spec) in spec.files.iter().enumerate() {
-            let file_id = NzbFileId {
-                job_id,
-                file_index: fi as u32,
-            };
-            let committed_bytes_for_file: u64 = file_spec
-                .segments
+            None => (None, HashSet::new(), Vec::new()),
+        };
+        // The parts that arrived and wait to be placed are in hand too, but
+        // not yet on the job's files.
+        let held: HashSet<SegmentId> = held_parts
+            .iter()
+            .map(crate::pipeline::held::HeldPart::segment_id)
+            .collect();
+        // A job that never started waits its turn again holding nothing per
+        // article: no checkpoint, and nothing that says it was ever handed
+        // work. Every other job is built as it ran, and a paused one then
+        // lets its articles go, as a pause does.
+        let waits_its_turn = graph_restore.is_none() && (fresh || delivering);
+        // Every article not in hand is queued again.
+        let queue_depth: usize = match &waiting_summaries {
+            Some(summaries) => summaries.0.iter().map(|file| file.remaining as usize).sum(),
+            None => spec
+                .files
                 .iter()
-                .filter_map(|seg| {
-                    let sid = SegmentId {
-                        file_id,
+                .zip(0u32..)
+                .map(|(file_spec, file_index)| {
+                    file_spec
+                        .segments
+                        .iter()
+                        .filter(|seg| {
+                            let segment_id = SegmentId {
+                                file_id: NzbFileId { job_id, file_index },
+                                segment_number: seg.ordinal,
+                            };
+                            !delivering
+                                && !skip.contains(&segment_id)
+                                && !held.contains(&segment_id)
+                        })
+                        .count()
+                })
+                .sum(),
+        };
+        let nothing_queued = queue_depth == 0;
+        let status = Self::normalize_restored_status(status, nothing_queued);
+
+        // What the checkpoint settled is downloaded, and is the floor a
+        // restart resumes from.
+        let settled = &skip;
+        let downloaded_bytes: u64 = spec
+            .files
+            .iter()
+            .zip(0u32..)
+            .flat_map(|(file_spec, file_index)| {
+                file_spec.segments.iter().filter_map(move |seg| {
+                    let segment_id = SegmentId {
+                        file_id: NzbFileId { job_id, file_index },
                         segment_number: seg.ordinal,
                     };
-                    skip_ref.contains(&sid).then_some(seg.bytes as u64)
-                })
-                .sum();
-            downloaded_bytes += committed_bytes_for_file;
-            let file_total_bytes: u64 = file_spec.segments.iter().map(|seg| seg.bytes as u64).sum();
-            let file_progress_floor = restore_skip_plan
-                .file_progress
-                .get(&(fi as u32))
-                .copied()
-                .unwrap_or(0)
-                .min(file_total_bytes);
-            restored_download_floor_bytes += committed_bytes_for_file.max(file_progress_floor);
-            self.persisted_file_progress
-                .insert(file_id, file_progress_floor);
-        }
-
-        let queue_depth = download_queue.len() + recovery_queue.len();
-        let paused_resume_status = matches!(status, JobStatus::Paused)
-            .then(|| {
-                paused_resume_status.clone().or_else(|| {
-                    paused_resume_download_state
-                        .zip(paused_resume_post_state)
-                        .map(|(download_state, post_state)| {
-                            crate::jobs::model::derive_legacy_job_status(
-                                download_state,
-                                post_state,
-                                crate::jobs::model::RunState::Active,
-                                None,
-                            )
-                        })
+                    (delivering || settled.contains(&segment_id)).then_some(u64::from(seg.bytes))
                 })
             })
+            .sum();
+        let restored_download_floor_bytes = downloaded_bytes;
+        let paused_resume_status = matches!(status, JobStatus::Paused)
+            .then_some(paused_resume_status)
             .flatten();
-        let paused_resume_status = Self::normalize_paused_resume_status(paused_resume_status);
-        let restored_staging_dir = {
-            let staging_dir = self.deterministic_extraction_staging_dir(job_id);
-            tokio::fs::try_exists(&staging_dir)
-                .await
-                .unwrap_or(false)
-                .then_some(staging_dir)
-        };
+        let restored_staging_dir =
+            staging_exists.then(|| self.deterministic_extraction_staging_dir(job_id));
 
-        let server_attribution = self
-            .db_blocking(move |db| db.load_active_server_attribution(job_id))
-            .await?;
-        let support_facts = self
-            .db_blocking(move |db| db.load_job_support_facts(job_id))
-            .await?;
-        // One read of the row, decrypt of the supplied passwords and parse of
-        // the persisted NZB per restored job, off the pipeline thread, instead
-        // of one per archive file. Anything short of a parsed NZB leaves the
-        // harvest to read the row itself, as before.
-        let nzb_password_candidates = self
-            .db_blocking(
-                move |db| match db.load_active_job_password_sources(job_id) {
-                    Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
-                        crate::pipeline::persisted_nzb_password_candidates(&nzb_path, &nzb_zstd)
-                            .ok()
-                            .map(|nzb| {
-                                crate::pipeline::job_carried_password_candidates(&supplied, nzb)
-                            })
-                    }
-                    _ => None,
-                },
-            )
-            .await;
-
-        let _ = self.event_tx.send(PipelineEvent::JobCreated {
-            job_id,
-            name: spec.name.clone(),
-            total_files: spec.files.len() as u32,
-            total_bytes: spec.total_bytes,
-        });
+        if !created.is_some_and(|(_, reentry)| reentry) {
+            self.emit_job_event(PipelineEvent::JobCreated {
+                job_id,
+                name: spec.name.clone(),
+                total_files: spec.files.len() as u32,
+                total_bytes: spec.total_bytes,
+            });
+        }
 
         // Resolve the category's shared decoded-byte counter once, here, so the
         // per-segment accounting site does a single `Relaxed` `fetch_add`
@@ -2097,7 +1219,37 @@ impl Pipeline {
             .metrics
             .job_lifecycle
             .category_bytes_counter(spec.category.as_deref());
-        let par2_bytes = spec.par2_bytes();
+        let par2_bytes = match &waiting_summaries {
+            Some(summaries) => summaries.par2_bytes(&spec),
+            None => spec.par2_bytes(),
+        };
+        // A job that waits its turn holds only its summaries. Any other is
+        // built from the lists its spec holds the moment it is in place
+        // below, by the same call that builds an activated job, so what it
+        // holds until then is never read. Either way the articles the
+        // checkpoint settled are in hand, and the rest are still to fetch.
+        let in_hand = |file_index, ordinal| {
+            let segment_id = SegmentId {
+                file_id: NzbFileId { job_id, file_index },
+                segment_number: ordinal,
+            };
+            delivering || skip.contains(&segment_id) || held.contains(&segment_id)
+        };
+        let articles = JobArticles::Queued(if let Some(summaries) = waiting_summaries {
+            summaries
+        } else if waits_its_turn {
+            spec.drop_article_lists_with_in_hand(in_hand)
+        } else {
+            FileSummaries(
+                spec.files
+                    .iter()
+                    .zip(0u32..)
+                    .map(|(file, file_index)| {
+                        FileSummary::left(file, |ordinal| in_hand(file_index, ordinal))
+                    })
+                    .collect(),
+            )
+        });
         let mut state = JobState {
             job_id,
             job_hash,
@@ -2105,14 +1257,9 @@ impl Pipeline {
             status: status.clone(),
             download_state: Self::normalize_restored_download_state(
                 download_state.unwrap_or_else(|| {
-                    Self::restored_download_state_from_status(
-                        &status,
-                        &download_queue,
-                        &recovery_queue,
-                    )
+                    Self::restored_download_state_from_status(&status, nothing_queued)
                 }),
-                &download_queue,
-                &recovery_queue,
+                nothing_queued,
             ),
             post_state: post_state.unwrap_or(match &status {
                 JobStatus::AwaitingQueueScripts => {
@@ -2129,7 +1276,9 @@ impl Pipeline {
                     crate::jobs::model::PostState::QueuedPostProcessing
                 }
                 JobStatus::PostProcessing => crate::jobs::model::PostState::PostProcessing,
-                JobStatus::Complete => crate::jobs::model::PostState::Completed,
+                JobStatus::Complete | JobStatus::Partial => {
+                    crate::jobs::model::PostState::Completed
+                }
                 JobStatus::Failed { .. } => crate::jobs::model::PostState::Failed,
                 JobStatus::Paused => crate::jobs::model::PostState::Idle,
                 JobStatus::Downloading | JobStatus::Checking => crate::jobs::model::PostState::Idle,
@@ -2141,21 +1290,17 @@ impl Pipeline {
                     crate::jobs::model::RunState::Active
                 }
             }),
-            assembly,
-            extraction_depth: 0,
+            articles,
             created_at: std::time::Instant::now(),
-            created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
+            created_at_epoch_ms: created
+                .map_or_else(crate::jobs::model::epoch_ms_now, |(at, _)| at),
             queued_repair_at_epoch_ms,
             queued_extract_at_epoch_ms,
             paused_resume_status: paused_resume_status.clone(),
             paused_resume_download_state: paused_resume_download_state.or_else(|| {
-                paused_resume_status.as_ref().map(|status| {
-                    Self::restored_download_state_from_status(
-                        status,
-                        &download_queue,
-                        &recovery_queue,
-                    )
-                })
+                paused_resume_status
+                    .as_ref()
+                    .map(|status| Self::restored_download_state_from_status(status, nothing_queued))
             }),
             paused_resume_post_state: paused_resume_post_state.or_else(|| {
                 paused_resume_status.as_ref().map(|status| match status {
@@ -2165,7 +1310,9 @@ impl Pipeline {
                     JobStatus::QueuedExtract => crate::jobs::model::PostState::QueuedExtract,
                     JobStatus::Extracting => crate::jobs::model::PostState::Extracting,
                     JobStatus::Moving => crate::jobs::model::PostState::Finalizing,
-                    JobStatus::Complete => crate::jobs::model::PostState::Completed,
+                    JobStatus::Complete | JobStatus::Partial => {
+                        crate::jobs::model::PostState::Completed
+                    }
                     JobStatus::Failed { .. } => crate::jobs::model::PostState::Failed,
                     _ => crate::jobs::model::PostState::Idle,
                 })
@@ -2174,29 +1321,18 @@ impl Pipeline {
                 JobStatus::Failed { ref error } => Some(error.clone()),
                 _ => None,
             },
+            delivered: None,
+            delivery_left_behind: Vec::new(),
             working_dir,
             downloaded_bytes,
             restored_download_floor_bytes,
             downloaded_wire_bytes: 0,
             server_attribution,
             failed_bytes: 0,
-            probe_projected_failed_bytes: 0,
             par2_bytes,
-            health_probing: false,
-            health_deferral: Default::default(),
-            health_probe_round: 0,
-            announced_checkpoints: Default::default(),
-            health_probe_failing_files: 0,
-            health_failing_files: std::collections::HashSet::new(),
-            early_recovery_requested_blocks: 0,
-            last_health_probe_failed_bytes: 0,
-            next_health_probe_failed_bytes: 1,
             support_facts,
             detected_archives: HashMap::new(),
             file_identities,
-            held_segments: Vec::new(),
-            download_queue,
-            recovery_queue,
             staging_dir: restored_staging_dir,
             category_bytes: Some(category_bytes),
             nzb_password_candidates: nzb_password_candidates
@@ -2204,76 +1340,54 @@ impl Pipeline {
                 .unwrap_or_default(),
         };
         state.refresh_runtime_lanes_from_status();
-        self.install_repeated_articles(&state)?;
-        self.job_scheduling_memory.insert(job_id, scheduling_memory);
+        let repeated = if waits_its_turn {
+            None
+        } else {
+            crate::pipeline::download::repeated::RepeatedArticles::new(
+                &state.spec,
+                &state.working_dir,
+                std::sync::Arc::clone(&self.process_memory_budget),
+            )
+            .map_err(crate::SchedulerError::InvalidInput)?
+        };
         self.jobs.insert(job_id, state);
-        // After the job state exists, and before anything can decode a segment
-        // for it: `install_restored` marks the job examined, so the lazy
-        // admission seam does not rediscover the same sets from the spec and
-        // discard the coverage this restore just validated.
-        let direct_sets = direct_restore.sets;
-        let direct_accepted = direct_restore.accepted;
-        let direct_rejected = direct_restore.rejected;
-        let direct_ignored = direct_restore.ignored;
-        let direct_swept = direct_restore.swept;
-        let direct_installed = direct_restore.installed;
-        self.direct_store.install_restored(job_id, direct_sets);
-        self.reinstate_restored_identity_sets(job_id);
-        self.restore_download_finalization_runtime(job_id).await;
+        if !waits_its_turn {
+            self.activate_job_articles(job_id, &skip, graph_restore, repeated, held_parts);
+        }
+        // A paused job holds nothing per article, restored as it was paused:
+        // with nothing out, it parks at once.
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| state.run_state == crate::jobs::model::RunState::Paused)
+        {
+            self.park_job_articles(job_id);
+        }
+        self.restore_download_finalization_runtime(job_id, finalization_open);
         self.note_download_activity(job_id);
         self.job_order.push(job_id);
         if let Some(file_identities) = self
             .jobs
             .get(&job_id)
-            .map(|state| state.file_identities.clone())
+            .map(|state| &state.file_identities)
+            .filter(|identities| **identities != stored_identities)
+            .cloned()
         {
-            self.persist_file_identities(job_id, &file_identities).await;
+            self.persist_file_identities(job_id, &file_identities);
         }
-        for set_name in &stale_rar_sets {
-            self.clear_archive_set_for_source_retry(job_id, set_name);
+        // A delivery that had begun keeps what its graph ruled, read back
+        // from its row: the graph is not restored, and the terminal pass
+        // decides from this.
+        if delivering && let Some(state) = self.jobs.get_mut(&job_id) {
+            state.delivered = delivered;
+            state.delivery_left_behind = delivery_left_behind;
         }
-        self.apply_detected_archive_identities(job_id, &detected_archives);
-        if !extracted_members.is_empty() {
-            self.extracted_members.insert(job_id, extracted_members);
+        self.schedule_job_completion_check(job_id);
+        // An interrupted move goes on once the install's turn is done; its
+        // resume reads the disk, off this turn.
+        if matches!(status, JobStatus::Moving) {
+            self.moves_to_resume.push(job_id);
         }
-        // After the persisted members, which replace the job's entry: a set
-        // restored as installed finalized in the previous run and recorded its
-        // members only in memory.
-        self.reinstate_installed_direct_sets(job_id, direct_installed);
-        match self.db.load_active_job_normalization_retried(job_id) {
-            Ok(true) => {
-                self.normalization_retried.insert(job_id);
-            }
-            Ok(false) => {}
-            Err(error) => {
-                error!(
-                    job_id = job_id.0,
-                    error = %error,
-                    "failed to load persisted normalization retry state"
-                );
-            }
-        }
-        self.reload_metadata_from_disk(job_id).await;
-        // After the reload, which is where a restored described set's roster
-        // re-arms from its recovery set.
-        self.settle_restored_identity_rosters(job_id).await;
-        let mut archive_refresh_file_indices = refreshed_rar_files;
-        archive_refresh_file_indices.extend(repair_output_indices);
-        archive_refresh_file_indices.extend(
-            complete_files
-                .iter()
-                .filter(|file_id| file_id.job_id == job_id)
-                .map(|file_id| file_id.file_index),
-        );
-        for file_index in archive_refresh_file_indices {
-            self.refresh_archive_state_for_completed_file(
-                job_id,
-                NzbFileId { job_id, file_index },
-                false,
-            )
-            .await;
-        }
-        self.reconcile_job_progress(job_id).await;
         let restored_terminal_post_processing =
             self.recover_restored_terminal_post_processing(job_id);
 
@@ -2290,6 +1404,13 @@ impl Pipeline {
             .is_some_and(|state| matches!(state.status, JobStatus::Extracting))
         {
             self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
+        }
+        if self
+            .jobs
+            .get(&job_id)
+            .is_some_and(|state| matches!(state.status, JobStatus::Verifying))
+        {
+            self.metrics.verify_active.fetch_add(1, Ordering::Relaxed);
         }
 
         let (queued_repair_at_epoch_ms, queued_extract_at_epoch_ms) = self
@@ -2311,17 +1432,7 @@ impl Pipeline {
             queued_repair_at_epoch_ms = queued_repair_at_epoch_ms.unwrap_or(0.0),
             queued_extract_at_epoch_ms = queued_extract_at_epoch_ms.unwrap_or(0.0),
             queue_depth,
-            restore_skip_segments = restore_skip_plan.skip.len(),
-            complete_restore_files = restore_skip_plan.stats.complete_files,
-            complete_restore_segments = restore_skip_plan.stats.complete_file_segments,
-            checkpoint_restore_segments = restore_skip_plan.stats.checkpoint_segments,
-            checkpoint_floor_bytes = restore_skip_plan.stats.checkpoint_floor_bytes,
-            clamped_checkpoint_files = restore_skip_plan.stats.clamped_checkpoint_files,
-            missing_checkpoint_files = restore_skip_plan.stats.missing_checkpoint_files,
-            direct_accepted,
-            direct_rejected,
-            direct_ignored,
-            direct_swept,
+            restore_skip_segments = skip.len(),
             "job restored from journal"
         );
         if !restored_terminal_post_processing
@@ -2331,6 +1442,7 @@ impl Pipeline {
                     JobStatus::Paused
                         | JobStatus::Moving
                         | JobStatus::Complete
+                        | JobStatus::Partial
                         | JobStatus::Failed { .. }
                 )
             })
@@ -2341,12 +1453,306 @@ impl Pipeline {
     }
 }
 
+// What an install's reads take from the pipeline.
+pub(crate) struct InstallSeat {
+    db: crate::Database,
+    intermediate_dir: PathBuf,
+    staging_dir: PathBuf,
+    // None for a job whose work crashed the daemon: nothing of it is rebuilt.
+    graph: Option<crate::pipeline::graph::restore::RestoreSeat>,
+}
+
+// What an install read for one job, off the pipeline thread.
+pub(crate) struct InstallRead {
+    // The request as read: its file state and its working directory.
+    request: RestoreJobRequest,
+    // What a restart read of the job's row, taken off the request.
+    restart: Option<crate::RestartRead>,
+    server_attribution:
+        Result<crate::jobs::server_attribution::JobServerAttribution, crate::StateError>,
+    support_facts: Result<crate::jobs::support_facts::JobSupportFacts, crate::StateError>,
+    // What the job is put in place from, or why it cannot be restored.
+    restored: Result<RestoredFacts, String>,
+}
+
+impl InstallRead {
+    pub(crate) fn job_id(&self) -> JobId {
+        self.request.job_id
+    }
+}
+
+pub(crate) struct RestoredFacts {
+    // The spec with the article lists read back, where they were.
+    spec: JobSpec,
+    // The summaries a job waiting its turn installs with, its lists unread.
+    waiting_summaries: Option<FileSummaries>,
+    graph: Option<crate::pipeline::graph::restore::GraphRestore>,
+    staging_exists: bool,
+    nzb_password_candidates: Option<Vec<crate::jobs::ArchivePasswordCandidate>>,
+    finalization_open: bool,
+    // What the graph ruled before the delivery began, read back from the
+    // row of a job restored past its download.
+    delivered: Option<crate::post_processing::model::DeliveredVerdict>,
+    // What that delivery's move was told to leave in the working directory.
+    delivery_left_behind: Vec<PathBuf>,
+}
+
+// One job of a batch a walk installs: a restart's restore, or a job entering
+// the queue window, read back from its rows first.
+pub(crate) enum InstallEntry {
+    Ticket(InstallRead),
+    Entered {
+        job_id: JobId,
+        read: Result<Option<InstallRead>, String>,
+    },
+}
+
+async fn off_thread<R: Send + 'static>(
+    db: &crate::Database,
+    read: impl FnOnce(&crate::Database) -> R + Send + 'static,
+) -> R {
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || read(&db))
+        .await
+        .expect("install read panicked")
+}
+
+// Every read an install makes, off the pipeline thread.
+pub(crate) async fn read_install(seat: InstallSeat, mut request: RestoreJobRequest) -> InstallRead {
+    let InstallSeat {
+        db,
+        intermediate_dir,
+        staging_dir,
+        graph,
+    } = seat;
+    let job_id = request.job_id;
+    // What a restart read of the job's row. An install that changes none
+    // of its runtime columns writes nothing back. A job installed again
+    // later reads its row afresh.
+    let restart = request.restart.take();
+    // The status the job goes back to when unpaused: the stored one, else
+    // the one its stored resume lanes name, else the one its lanes at
+    // shutdown name. Read here once, so the job installs with it whether
+    // its restore succeeds or blocks.
+    request.paused_resume_status = Pipeline::normalize_paused_resume_status(
+        request.paused_resume_status.take().or_else(|| {
+            request
+                .paused_resume_download_state
+                .zip(request.paused_resume_post_state)
+                .or(request.download_state.zip(request.post_state))
+                .map(|(download_state, post_state)| {
+                    crate::jobs::model::derive_legacy_job_status(
+                        download_state,
+                        post_state,
+                        crate::jobs::model::RunState::Active,
+                        None,
+                    )
+                })
+        }),
+    );
+    let restored = read_restored(
+        &db,
+        &intermediate_dir,
+        &staging_dir,
+        graph,
+        &mut request,
+        restart.as_ref(),
+    )
+    .await;
+    let server_attribution =
+        off_thread(&db, move |db| db.load_active_server_attribution(job_id)).await;
+    let support_facts = off_thread(&db, move |db| db.load_job_support_facts(job_id)).await;
+    InstallRead {
+        request,
+        restart,
+        server_attribution,
+        support_facts,
+        restored,
+    }
+}
+
+async fn read_restored(
+    db: &crate::Database,
+    intermediate_dir: &std::path::Path,
+    staging_dir: &std::path::Path,
+    graph: Option<crate::pipeline::graph::restore::RestoreSeat>,
+    request: &mut RestoreJobRequest,
+    restart: Option<&crate::RestartRead>,
+) -> Result<RestoredFacts, String> {
+    let job_id = request.job_id;
+    // A restart reads only each job's row before it serves; the job's file
+    // rows are read here, as it installs, a batch of jobs a turn.
+    if restart.is_some() {
+        match off_thread(db, move |db| db.load_active_job(job_id)).await {
+            Ok(Some(recovered)) => {
+                request.file_identities = recovered.file_identities;
+                request.detected_archives = recovered.detected_archives;
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(restore_blocked(format!(
+                    "its file state could not be read: {error}"
+                )));
+            }
+        }
+    }
+    let root = intermediate_dir.to_path_buf();
+    let path = request.working_dir.clone();
+    request.working_dir = off_thread(db, move |db| {
+        crate::jobs::working_dir::recover_working_dir_rename(db, &root, &path, job_id)
+    })
+    .await
+    .map_err(restore_blocked)?;
+    let internal = |error: String| restore_blocked(crate::SchedulerError::Internal(error));
+    let delivering = delivering(&request.status);
+    let fresh =
+        crate::pipeline::waits_its_turn(&request.status, request.paused_resume_status.as_ref());
+    let mut spec = request.spec.clone();
+    // The summaries a job waiting its turn installs with when the restart
+    // let its lists go, and the password candidates read with the lists
+    // when they are read back.
+    let mut waiting_summaries = None;
+    let mut read_passwords = None;
+    if spec.lacks_article_lists() {
+        // Read back from the stored NZB the restart kept only the files of,
+        // with one parse that also gives the job's password candidates. A
+        // job that waits its turn reads nothing: its lists are read when it
+        // is handed a slot.
+        enum Stored {
+            Waits(FileSummaries),
+            Read(JobSpec, Option<Vec<crate::jobs::ArchivePasswordCandidate>>),
+        }
+        let category = spec.category.clone();
+        let metadata = spec.metadata.clone();
+        let summaries = restart
+            .map(|read| read.summaries.clone())
+            .filter(|summaries| fresh && summaries.0.len() == spec.files.len());
+        let stored = off_thread(db, move |db| {
+            if let Some(summaries) = summaries
+                && !db
+                    .has_graph_checkpoint(job_id)
+                    .map_err(|error| format!("checkpoint could not be read: {error}"))?
+            {
+                return Ok(Stored::Waits(summaries));
+            }
+            crate::pipeline::read_stored_spec_and_passwords(db, job_id, category, metadata)
+                .map(|(spec, passwords)| Stored::Read(spec, passwords))
+        })
+        .await
+        .map_err(internal)?;
+        match stored {
+            Stored::Waits(summaries) => waiting_summaries = Some(summaries),
+            Stored::Read(stored, passwords) => {
+                if stored.files.len() != spec.files.len()
+                    || stored
+                        .files
+                        .iter()
+                        .zip(&spec.files)
+                        .any(|(stored, kept)| stored.filename != kept.filename)
+                {
+                    return Err(internal(
+                        "stored NZB no longer matches the job's files".to_string(),
+                    ));
+                }
+                for (file, stored) in spec.files.iter_mut().zip(stored.files) {
+                    file.segments = stored.segments;
+                }
+                read_passwords = Some(passwords);
+            }
+        }
+    }
+    let working_dir = request.working_dir.clone();
+    if working_dir.starts_with(intermediate_dir)
+        && tokio::fs::try_exists(&working_dir).await.unwrap_or(false)
+        && let Err(error) = stamp_working_dir(intermediate_dir, &working_dir, job_id).await
+    {
+        tracing::warn!(
+            job_id = job_id.0,
+            dir = %working_dir.display(),
+            error = %error,
+            "failed to stamp restored working directory as Weaver-owned"
+        );
+    }
+    let graph = if waiting_summaries.is_some() || delivering {
+        None
+    } else if let Some(graph) = graph {
+        let seat = graph.for_job(spec.password.clone(), &working_dir);
+        let files = crate::pipeline::graph::restore::root_files(&spec);
+        match tokio::task::spawn_blocking(move || seat.restore(job_id, files))
+            .await
+            .map_err(|error| {
+                crate::pipeline::graph::restore::GraphRestoreError::Join(error.to_string())
+            })
+            .and_then(|restored| restored)
+        {
+            Ok(restored) => Some(restored),
+            Err(crate::pipeline::graph::restore::GraphRestoreError::NoCheckpoint(_)) => None,
+            Err(error) => return Err(internal(error.to_string())),
+        }
+    } else {
+        None
+    };
+    let staging_exists = tokio::fs::try_exists(staging_dir).await.unwrap_or(false);
+    // One read of the row, decrypt of the supplied passwords and parse of
+    // the persisted NZB per restored job, instead of one per archive file.
+    // Anything short of a parsed NZB leaves the harvest to read the row
+    // itself, as before.
+    let nzb_password_candidates = if let Some(passwords) = read_passwords {
+        passwords
+    } else if waiting_summaries.is_some() {
+        // Its NZB is parsed once it is handed a slot; the harvest reads the
+        // row itself.
+        None
+    } else {
+        off_thread(db, move |db| {
+            match db.load_active_job_password_sources(job_id) {
+                Ok(Some(((nzb_path, Some(nzb_zstd)), supplied))) => {
+                    crate::pipeline::persisted_nzb_password_candidates(&nzb_path, &nzb_zstd)
+                        .ok()
+                        .map(|nzb| crate::pipeline::job_carried_password_candidates(&supplied, nzb))
+                }
+                _ => None,
+            }
+        })
+        .await
+    };
+    let finalization_open = Pipeline::download_finalization_open(
+        job_id,
+        off_thread(db, move |db| db.get_job_events(job_id.0)).await,
+    );
+    // A delivery that had begun keeps what its graph ruled, read back from
+    // its row.
+    let (delivered, delivery_left_behind) = if delivering {
+        match off_thread(db, move |db| db.job_post_processing_facts(job_id.0)).await {
+            Ok(facts) => facts.map_or((None, Vec::new()), |facts| {
+                (facts.delivered, facts.left_behind)
+            }),
+            Err(error) => {
+                tracing::warn!(job_id = job_id.0, %error, "could not read what the delivery ruled");
+                (None, Vec::new())
+            }
+        }
+    } else {
+        (None, Vec::new())
+    };
+    Ok(RestoredFacts {
+        spec,
+        waiting_summaries,
+        graph,
+        staging_exists,
+        nzb_password_candidates,
+        finalization_open,
+        delivered,
+        delivery_left_behind,
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashSet;
 
     use super::*;
-    use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
+    use crate::jobs::ids::{JobId, NzbFileId};
     use crate::jobs::{FileSpec, JobSpec, SegmentSpec};
     use weaver_model::files::FileRole;
 
@@ -2367,173 +1773,37 @@ mod tests {
                         ordinal: 0,
                         article_number: 1,
                         bytes: 10,
-                        message_id: "one@example.com".to_string(),
+                        message_ids: crate::jobs::MessageIds::new(vec![
+                            "one@example.com".to_string(),
+                        ]),
                     },
                     SegmentSpec {
                         ordinal: 1,
                         article_number: 4,
                         bytes: 20,
-                        message_id: "four@example.com".to_string(),
+                        message_ids: crate::jobs::MessageIds::new(vec![
+                            "four@example.com".to_string(),
+                        ]),
                     },
                     SegmentSpec {
                         ordinal: 2,
                         article_number: 6,
                         bytes: 30,
-                        message_id: "six@example.com".to_string(),
+                        message_ids: crate::jobs::MessageIds::new(vec![
+                            "six@example.com".to_string(),
+                        ]),
                     },
                 ],
             }],
         }
     }
 
-    fn sparse_segment_id(job_id: JobId, segment_number: u32) -> SegmentId {
-        SegmentId {
-            file_id: NzbFileId {
-                job_id,
-                file_index: 0,
-            },
-            segment_number,
-        }
-    }
-
-    #[tokio::test]
-    async fn restore_skip_plan_uses_complete_files_without_segment_rows() {
-        let job_id = JobId(43);
-        let spec = sparse_segment_job_spec();
-        let temp_dir = tempfile::tempdir().unwrap();
-        let complete_files = HashSet::from([NzbFileId {
-            job_id,
-            file_index: 0,
-        }]);
-
-        let plan = Pipeline::build_restore_skip_plan(
-            job_id,
-            &spec,
-            &complete_files,
-            &HashMap::new(),
-            &HashMap::new(),
-            temp_dir.path(),
-        )
-        .await;
-
-        assert_eq!(plan.skip.len(), 3);
-        assert!(plan.skip.contains(&sparse_segment_id(job_id, 0)));
-        assert!(plan.skip.contains(&sparse_segment_id(job_id, 1)));
-        assert!(plan.skip.contains(&sparse_segment_id(job_id, 2)));
-        assert_eq!(plan.file_progress.get(&0), Some(&60));
-        assert_eq!(plan.stats.complete_files, 1);
-        assert_eq!(plan.stats.complete_file_segments, 3);
-    }
-
-    #[tokio::test]
-    async fn restore_skip_plan_uses_checkpointed_full_segments() {
-        let job_id = JobId(44);
-        let spec = sparse_segment_job_spec();
-        let temp_dir = tempfile::tempdir().unwrap();
-        tokio::fs::write(temp_dir.path().join("episode.bin"), vec![0u8; 60])
-            .await
-            .unwrap();
-
-        let plan = Pipeline::build_restore_skip_plan(
-            job_id,
-            &spec,
-            &HashSet::new(),
-            &HashMap::from([(0u32, 30u64)]),
-            &HashMap::new(),
-            temp_dir.path(),
-        )
-        .await;
-
-        assert_eq!(plan.skip.len(), 2);
-        assert!(plan.skip.contains(&sparse_segment_id(job_id, 0)));
-        assert!(plan.skip.contains(&sparse_segment_id(job_id, 1)));
-        assert!(!plan.skip.contains(&sparse_segment_id(job_id, 2)));
-        assert_eq!(plan.file_progress.get(&0), Some(&30));
-        assert_eq!(plan.stats.checkpoint_segments, 2);
-    }
-
-    #[tokio::test]
-    async fn restore_skip_plan_does_not_skip_partial_segment_floor() {
-        let job_id = JobId(45);
-        let spec = sparse_segment_job_spec();
-        let temp_dir = tempfile::tempdir().unwrap();
-        tokio::fs::write(temp_dir.path().join("episode.bin"), vec![0u8; 60])
-            .await
-            .unwrap();
-
-        let plan = Pipeline::build_restore_skip_plan(
-            job_id,
-            &spec,
-            &HashSet::new(),
-            &HashMap::from([(0u32, 25u64)]),
-            &HashMap::new(),
-            temp_dir.path(),
-        )
-        .await;
-
-        assert_eq!(plan.skip, HashSet::from([sparse_segment_id(job_id, 0)]));
-        assert_eq!(plan.file_progress.get(&0), Some(&10));
-        assert_eq!(plan.stats.checkpoint_segments, 1);
-    }
-
-    #[tokio::test]
-    async fn restore_skip_plan_clamps_progress_to_partial_file_size() {
-        let job_id = JobId(46);
-        let spec = sparse_segment_job_spec();
-        let temp_dir = tempfile::tempdir().unwrap();
-        tokio::fs::write(temp_dir.path().join("episode.bin"), vec![0u8; 15])
-            .await
-            .unwrap();
-
-        let plan = Pipeline::build_restore_skip_plan(
-            job_id,
-            &spec,
-            &HashSet::new(),
-            &HashMap::from([(0u32, 50u64)]),
-            &HashMap::new(),
-            temp_dir.path(),
-        )
-        .await;
-
-        assert_eq!(plan.skip, HashSet::from([sparse_segment_id(job_id, 0)]));
-        assert_eq!(plan.file_progress.get(&0), Some(&10));
-        assert_eq!(plan.stats.clamped_checkpoint_files, 1);
-    }
-
-    #[tokio::test]
-    async fn restore_skip_plan_discards_progress_when_partial_file_is_missing() {
-        let job_id = JobId(47);
-        let spec = sparse_segment_job_spec();
-        let temp_dir = tempfile::tempdir().unwrap();
-
-        let plan = Pipeline::build_restore_skip_plan(
-            job_id,
-            &spec,
-            &HashSet::new(),
-            &HashMap::from([(0u32, 50u64)]),
-            &HashMap::new(),
-            temp_dir.path(),
-        )
-        .await;
-
-        assert!(plan.skip.is_empty());
-        assert_eq!(plan.file_progress.get(&0), Some(&0));
-        assert_eq!(plan.stats.missing_checkpoint_files, 1);
-    }
-
     #[test]
     fn sparse_article_numbers_queue_dense_ordinals() {
         let job_id = JobId(41);
         let spec = sparse_segment_job_spec();
-        let mut all_ids = Pipeline::all_segment_ids(job_id, &spec)
-            .into_iter()
-            .map(|segment_id| segment_id.segment_number)
-            .collect::<Vec<_>>();
-        all_ids.sort_unstable();
-        assert_eq!(all_ids, vec![0, 1, 2]);
-
-        let (assembly, mut download_queue, recovery_queue) =
-            Pipeline::build_job_assembly(job_id, &spec, &HashSet::new());
+        let (assembly, mut download_queue) =
+            Pipeline::build_job_assembly(job_id, &spec, &HashSet::new(), &HashSet::new());
 
         let mut queued = Vec::new();
         while let Some(work) = download_queue.pop() {
@@ -2542,7 +1812,6 @@ mod tests {
         queued.sort_unstable();
 
         assert_eq!(queued, vec![0, 1, 2]);
-        assert!(recovery_queue.is_empty());
         assert_eq!(
             assembly
                 .file(NzbFileId {
@@ -2559,12 +1828,16 @@ mod tests {
     fn sparse_article_numbers_do_not_overflow_committed_assembly() {
         let job_id = JobId(42);
         let spec = sparse_segment_job_spec();
-        let committed = Pipeline::all_segment_ids(job_id, &spec);
-        let (assembly, mut download_queue, recovery_queue) =
-            Pipeline::build_job_assembly(job_id, &spec, &committed);
+        let (_, mut queue) =
+            Pipeline::build_job_assembly(job_id, &spec, &HashSet::new(), &HashSet::new());
+        let mut committed = HashSet::new();
+        while let Some(work) = queue.pop() {
+            committed.insert(work.segment_id);
+        }
+        let (assembly, mut download_queue) =
+            Pipeline::build_job_assembly(job_id, &spec, &committed, &HashSet::new());
 
         assert!(download_queue.pop().is_none());
-        assert!(recovery_queue.is_empty());
         assert!(
             assembly
                 .file(NzbFileId {

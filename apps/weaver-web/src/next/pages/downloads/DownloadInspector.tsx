@@ -245,11 +245,11 @@ export function DownloadInspector({
       </div>
 
       <div className="flex flex-none flex-col gap-[10px] border-t border-wv-hairline px-5 py-[18px]">
-        <div className="flex gap-[10px]">
+        <div className="flex flex-col gap-[10px]">
           <SupportReportActions
             jobId={job.id}
             onReport={setNotice}
-            className="min-w-0 flex-1 justify-center"
+            className="h-auto min-h-[34px] min-w-0 w-full justify-center py-2 whitespace-normal [overflow-wrap:anywhere]"
           />
         </div>
         {notice === null ? null : <div className="text-[12px] text-wv-muted">{notice}</div>}

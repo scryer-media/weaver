@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub mod attributes;
+pub(crate) mod delete_files;
 pub mod delete_queue;
 pub mod failure_kind;
 pub mod model;
@@ -17,7 +18,7 @@ pub use attributes::{
     public_history_attributes, split_history_metadata,
 };
 pub use failure_kind::HistoryFailureKind;
-pub use model::{HistoryFilter, HistoryMetadataEquals};
+pub use model::{HistoryFilter, HistoryMetadataEquals, HistoryRows};
 pub use nzbget_state::{NzbgetHistoryState, NzbgetMarkStatus};
 pub use record::{IntegrationEventRow, JobHistoryRow};
 pub use timeline::JobEvent;

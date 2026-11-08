@@ -5,10 +5,12 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { Link } from "react-router";
 import { gql, useClient } from "urql";
 import { SCRIPT_RUNS_QUERY } from "@/graphql/queries";
+import { copyText } from "@/lib/clipboard";
 import { useTranslate } from "@/lib/context/translate-context";
 import { cn } from "@/lib/utils";
 import { FireAndForgetTag, ScriptRunName, ScriptStatusMark, TruncatedTag, scriptRunName } from "../../../components/JobScriptResults";
 import { Icon } from "../../../components/icons";
+import { settingsIds } from "@/next/testids";
 import { Pagination } from "../../../components/Pagination";
 import { ScriptOutputLog } from "../../../components/ScriptOutputLog";
 import { Tabs } from "../../../components/Tabs";
@@ -132,14 +134,11 @@ function RunDetail({
   const name = scriptRunName(run);
   const adapter = run.adapter === null ? null : run.adapter === "SABNZBD" ? "SABnzbd" : "NZBGet";
   const copy = () => {
-    if (shown === null || !navigator.clipboard) {
+    if (shown === null) {
       onCopied(false);
       return;
     }
-    navigator.clipboard.writeText(shown).then(
-      () => onCopied(true),
-      () => onCopied(false),
-    );
+    void copyText(shown).then(onCopied);
   };
   return (
     <div className="flex min-w-0 flex-col gap-2">
@@ -158,12 +157,18 @@ function RunDetail({
             .join(" · ")}
         </span>
         {shown ? (
-          <SecondaryButton size="compact" icon="copy" className="ml-auto" onClick={copy}>
+          <SecondaryButton size="compact" icon="copy" className="ml-auto" onClick={copy} testId={settingsIds.scriptRunCopy}>
             {t("next.scriptRuns.copyOutput")}
           </SecondaryButton>
         ) : null}
       </div>
-      {shown ? <ScriptOutputLog output={shown} label={t("next.scriptRuns.outputOf", { name })} /> : null}
+      {shown ? (
+        <ScriptOutputLog
+          output={shown}
+          label={t("next.scriptRuns.outputOf", { name })}
+          testId={settingsIds.scriptRunOutput}
+        />
+      ) : null}
       {output?.state === "failed" ? (
         <span role="alert" className="text-[12.5px] text-wv-error-text">
           {output.message}
@@ -394,7 +399,7 @@ export function ScriptRunsPanel() {
               </Link>
             ),
             <ScriptStatusMark key="status" status={run.status} />,
-            <Cell key="exitCode" mono className="text-wv-muted">
+            <Cell key="exitCode" mono className="text-wv-muted" testId={settingsIds.scriptRunExitCode}>
               {run.exitCode ?? EM_DASH}
             </Cell>,
             <Cell key="duration" mono className="text-wv-muted">
@@ -410,6 +415,7 @@ export function ScriptRunsPanel() {
     <>
       <PanelControls>
         <Select
+          testId={settingsIds.scriptRunsTrigger}
           label={t("next.scriptRuns.filter")}
           value={kind}
           className="min-w-0 sm:min-w-[180px]"
@@ -427,7 +433,7 @@ export function ScriptRunsPanel() {
         </SecondaryButton>
       </PanelControls>
 
-      <Tabs tabs={tabs} active={status} onSelect={setStatus} />
+      <Tabs tabs={tabs} active={status} onSelect={setStatus} testId={settingsIds.scriptRunsStatus} />
 
       <SettingsBlocks blocks={blocks} loading={page === null} />
 

@@ -190,12 +190,7 @@ pub(super) fn service(
     fixture: &Fixture,
     url: &str,
     allow_private: bool,
-) -> (
-    RssService,
-    Arc<ProxyRuntime>,
-    RssFeedRow,
-    Arc<StdMutex<Vec<CapturedSubmission>>>,
-) {
+) -> (RssService, Arc<ProxyRuntime>, RssFeedRow, SchedulerHandle) {
     let db = Database::open_in_memory().unwrap();
     db.save_proxy_profile(&fixture.profile).unwrap();
     let feed = basic_auth_feed(url.into());
@@ -212,12 +207,12 @@ pub(super) fn service(
     if let Some(proxy) = &fixture.http3 {
         runtime.install_http3_fixture(fixture.profile.id, proxy.provider());
     }
-    let submissions = Arc::new(StdMutex::new(Vec::new()));
     let mut security = RuntimeSecurityConfig::default();
     security.rss_allow_private_network = allow_private;
-    let service = build_service_with_security(temp.path(), db, submissions.clone(), security);
+    let service = build_service_with_security(temp.path(), db, security);
     service.inner.handle.set_proxy_runtime(runtime.clone());
-    (service, runtime, feed, submissions)
+    let admissions = service.inner.handle.clone();
+    (service, runtime, feed, admissions)
 }
 
 async fn routed_http(kind: ProxyKind) {
@@ -473,7 +468,7 @@ async fn inherit_feed_routing(kind: ProxyKind) {
     assert_eq!(report.items_submitted, 1);
     let again = service.run_feed_sync(feed.id).await.unwrap();
     assert_eq!(again.items_submitted, 0);
-    assert_eq!(submissions.lock().unwrap().len(), 1);
+    assert_eq!(submissions.list_jobs().len(), 1);
     assert!(
         captured
             .lock()

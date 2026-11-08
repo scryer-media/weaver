@@ -232,7 +232,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE servers SET max_download_speed = {} WHERE id = {}",
                 &[SqlArg::I64(stored), SqlArg::I64(i64::from(server_id))],
             )
@@ -250,7 +250,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             let changed = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE servers SET active = {} WHERE id = {}",
                 &[SqlArg::Bool(active), SqlArg::I64(i64::from(server_id))],
             )

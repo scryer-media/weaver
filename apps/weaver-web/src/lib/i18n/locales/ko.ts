@@ -17,6 +17,7 @@ const ko: LocaleDictionary = {
   "applicationUpgrade.install": "v{{version}} 설치",
   "applicationUpgrade.notEligible": "Weaver 앱에서 이 설치를 업데이트할 수 없습니다 ({{reason}}).",
   "applicationUpgrade.failed": "v{{version}} 업데이트가 실패했습니다: {{error}}",
+  "applicationUpgrade.githubUnavailable": "현재 GitHub를 일시적으로 이용할 수 없습니다. 나중에 업데이트를 다시 시도해 주세요.",
   "applicationUpgrade.completed": "v{{version}}으로 업데이트했습니다.",
   "applicationUpgrade.phase.checking": "릴리스를 확인하고 있습니다…",
   "applicationUpgrade.phase.downloading": "v{{version}}을 다운로드하고 있습니다…",

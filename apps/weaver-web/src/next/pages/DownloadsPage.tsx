@@ -1,23 +1,25 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { memo, useCallback, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
-import { useClient, useMutation, useQuery } from "urql";
-import { executeAliasedIdMutation } from "@/graphql/aliased-mutations";
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type DragEvent } from "react";
+import { useClient, useMutation, useQuery, useSubscription, type TypedDocumentNode } from "urql";
 import {
   CANCEL_JOB_MUTATION,
+  CANCEL_QUEUE_ITEMS_MUTATION,
+  HISTORY_FACADE_EVENTS_SUBSCRIPTION,
   PAUSE_ALL_MUTATION,
   PAUSE_JOB_MUTATION,
+  PAUSE_QUEUE_ITEMS_MUTATION,
   RESUME_ALL_MUTATION,
   RESUME_JOB_MUTATION,
+  RESUME_QUEUE_ITEMS_MUTATION,
+  SET_QUEUE_ITEMS_CATEGORY_MUTATION,
+  SET_QUEUE_ITEMS_PRIORITY_MUTATION,
   SYSTEM_INFO_QUERY,
 } from "@/graphql/queries";
 import { formatJobReleaseName, type JobData } from "@/lib/job-types";
-import {
-  formatEtaFromRemainingBytes,
-  useStableEtaSpeed,
-  useStableQueueEta,
-} from "@/lib/hooks/use-stable-queue-eta";
+import { cn } from "@/lib/utils";
+import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
 import { useTranslate } from "@/lib/context/translate-context";
 import { statusToken } from "@/lib/status-tokens";
 import { BulkBar, BulkButton, BulkCluster, BulkMenu } from "../components/BulkBar";
@@ -26,15 +28,33 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { CheckBox, PrimaryButton, SecondaryButton, TextField } from "../components/controls";
 import { Icon } from "../components/icons";
 import { Menu, MenuItem } from "../components/Menu";
+import { Pagination } from "../components/Pagination";
 import { StorageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useNextData } from "../data/next-data";
+import { testIds } from "../testids";
 import { sameElements, sameEntries, sameItems, shallowEqual, useSettled } from "../data/settled";
+import {
+  batchTarget,
+  conflictCount,
+  departedId,
+  etaById as etaByIdFrom,
+  groupCounts as groupCountsFrom,
+  queuePageInput,
+  queueSelection,
+  tabCounts as tabCountsFrom,
+  withoutIds,
+  type QueueBatchTarget,
+  type QueueEventSummary,
+  type QueueSort,
+  type QueueTab,
+} from "../data/queue-page";
+import { useQueuePage } from "../data/use-live-queue";
 import { EM_DASH, formatDayClock, formatSize } from "../data/format";
 import { ratePhase } from "../data/phase-bars";
 import {
   categoryFacets,
-  facetKey,
+  countsByFacet,
   NO_FACETS,
   toggleFacet,
   type CategoryEntry,
@@ -51,13 +71,13 @@ import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
 import { AttentionBlock, CategoryListBlock, ProvidersBlock } from "../shell/rail-blocks";
 import { AddNzbDialog } from "../features/AddNzbDialog";
-import { SpeedLimitControl } from "../features/SpeedLimitDialog";
+import { SpeedLimitControl, useSpeedLimitInForce } from "../features/SpeedLimitDialog";
 import { DownloadInspector } from "./downloads/DownloadInspector";
 import { DownloadRow } from "./downloads/DownloadRow";
 import { QueueEtaContext } from "./downloads/queue-eta";
 
-type TabId = "all" | "active" | "queued" | "paused";
-type SortId = "priority" | "name" | "size" | "progress" | "eta";
+type TabId = QueueTab;
+type SortId = QueueSort;
 
 /** Each sort and the key of its label. */
 const SORT_OPTIONS: { value: SortId; label: string }[] = [
@@ -68,6 +88,8 @@ const SORT_OPTIONS: { value: SortId; label: string }[] = [
   { value: "eta", label: "next.common.timeLeft" },
 ];
 
+const PAGE_SIZES = [25, 50, 100] as const;
+
 /** The bulk edits a report names, each with its `.one`/`.other` and `Partial` keys. */
 type BulkReport = "paused" | "resumed" | "priority" | "category" | "cancelled";
 
@@ -75,54 +97,144 @@ type BulkReport = "paused" | "resumed" | "priority" | "category" | "cancelled";
 const HELD_BACK_STATUSES = new Set(["DOWNLOADING", "QUEUED", "PROPAGATING"]);
 const NO_ETAS: ReadonlyMap<number, string> = new Map();
 
-/** Group → the tab that shows it. "All" shows everything. */
-const TAB_FOR_GROUP: Record<DownloadGroup, TabId> = {
-  active: "active",
-  paused: "paused",
-  queued: "queued",
-  attention: "all",
-};
+/** What a batch mutation answers. */
+interface BatchResult {
+  matched: number;
+  applied: number;
+  refused: { id: number; code: string; message: string }[];
+}
 
 function sortJobs(
   jobs: readonly JobData[],
   sort: SortId,
   etaById: ReadonlyMap<number, string> | null,
 ): readonly JobData[] {
-  if (sort === "priority") {
-    // Server order already is priority order; leave it alone.
+  // The daemon sorts the page; within a section only time left needs ranking,
+  // and its order is queue order, which the page already holds.
+  if (sort !== "eta") {
     return jobs;
   }
-  const sorted = [...jobs];
-  switch (sort) {
-    case "name":
-      sorted.sort((left, right) =>
-        formatJobReleaseName(left).localeCompare(formatJobReleaseName(right)),
-      );
-      break;
-    case "size":
-      sorted.sort((left, right) => right.totalBytes - left.totalBytes);
-      break;
-    case "progress":
-      sorted.sort((left, right) => right.progress - left.progress);
-      break;
-    case "eta": {
-      // A job's time left counts everything queued ahead of it, so estimates
-      // grow in queue order and that order is the ranking; a small job behind a
-      // large one finishes after it. Rows without an estimate sort last.
-      const rank = new Map([...(etaById ?? NO_ETAS).keys()].map((id, index) => [id, index]));
-      sorted.sort(
-        (left, right) =>
-          (rank.get(left.id) ?? Number.MAX_SAFE_INTEGER) -
-          (rank.get(right.id) ?? Number.MAX_SAFE_INTEGER),
-      );
-      break;
-    }
+  // Rows without an estimate sort last.
+  const rank = new Map([...(etaById ?? NO_ETAS).keys()].map((id, index) => [id, index]));
+  return [...jobs].sort(
+    (left, right) =>
+      (rank.get(left.id) ?? Number.MAX_SAFE_INTEGER) - (rank.get(right.id) ?? Number.MAX_SAFE_INTEGER),
+  );
+}
+
+const PAUSE_FOR_OPTIONS: { seconds: number; label: string }[] = [
+  { seconds: 30 * 60, label: "next.downloads.pauseFor30m" },
+  { seconds: 60 * 60, label: "next.downloads.pauseFor1h" },
+  { seconds: 2 * 60 * 60, label: "next.downloads.pauseFor2h" },
+  { seconds: 8 * 60 * 60, label: "next.downloads.pauseFor8h" },
+];
+
+/** Pause all, split with a menu of timed pauses that resume on their own. */
+function PauseAllControl({ paused, resumeAt }: { paused: boolean; resumeAt: number | null }) {
+  const t = useTranslate();
+  const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
+  const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
+  const [open, setOpen] = useState(false);
+
+  if (paused && resumeAt !== null) {
+    return <TimedResumeButton resumeAt={resumeAt} onResume={() => void resumeAll({})} />;
   }
-  return sorted;
+  if (paused) {
+    return (
+      <button type="button" data-testid={testIds.queueResumeAll} onClick={() => void resumeAll({})} className={PAUSED_BUTTON}>
+        <Icon name="resume" size={14} className="-ml-[2px] mr-[7px] flex-none" />
+        {t("next.downloads.resumeAll")}
+      </button>
+    );
+  }
+
+  return (
+    <div className="relative flex">
+      <SecondaryButton icon="pause" onClick={() => void pauseAll({})} testId={testIds.queuePauseAll}>
+        {t("next.downloads.pauseAll")}
+      </SecondaryButton>
+      <button
+        type="button"
+        data-wv-menu-trigger=""
+        aria-haspopup="menu"
+        aria-expanded={open}
+        aria-label={t("next.downloads.pauseForMenu")}
+        onClick={() => setOpen((previous) => !previous)}
+        className="-ml-px flex h-[34px] cursor-pointer items-center border border-wv-control bg-wv-button px-[9px] text-wv-fg hover:border-wv-control-hover hover:bg-wv-button-hover"
+      >
+        <Icon name="dropdown" size={14} />
+      </button>
+      <Menu
+        open={open}
+        onDismiss={() => setOpen(false)}
+        label={t("next.downloads.pauseForMenu")}
+        className="top-[38px] right-0 w-[164px]"
+      >
+        {PAUSE_FOR_OPTIONS.map((option) => (
+          <MenuItem
+            key={option.seconds}
+            onSelect={() => {
+              setOpen(false);
+              void pauseAll({ resumeAfterSecs: option.seconds });
+            }}
+          >
+            {t(option.label)}
+          </MenuItem>
+        ))}
+      </Menu>
+    </div>
+  );
+}
+
+/** A paused queue's resume button: warning yellow, with the ping the update notice uses. */
+const PAUSED_BUTTON =
+  "wv-ping flex h-[34px] cursor-pointer items-center whitespace-nowrap bg-wv-warn px-[14px] text-[13px] font-medium text-wv-on-warn [--wv-ping-color:var(--color-wv-warn)] hover:bg-wv-warn-hover";
+
+/** Whole minutes left as HH:MM, rounded up so it never reads 00:00 while still paused. */
+function formatResumeCountdown(msLeft: number): string {
+  const minutes = Math.max(0, Math.ceil(msLeft / 60_000));
+  return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
+}
+
+/**
+ * A timed pause: the countdown to the automatic resume, which reads
+ * "Resume now" while hovered or focused. Both labels share one grid cell so
+ * the button keeps its width when the text swaps.
+ */
+function TimedResumeButton({ resumeAt, onResume }: { resumeAt: number; onResume: () => void }) {
+  const t = useTranslate();
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const countdown = t("next.downloads.resumingIn", { time: formatResumeCountdown(resumeAt - now) });
+  const resumeNow = t("next.downloads.resumeNow");
+
+  return (
+    <button
+      type="button"
+      data-testid={testIds.queueResumeTimed}
+      onClick={onResume}
+      aria-label={`${resumeNow} (${countdown})`}
+      className={cn("group", PAUSED_BUTTON)}
+    >
+      <Icon name="resume" size={14} className="-ml-[2px] mr-[7px] flex-none" />
+      <span className="grid">
+        <span className="col-start-1 row-start-1 tabular-nums group-hover:invisible group-focus-visible:invisible">
+          {countdown}
+        </span>
+        <span className="invisible col-start-1 row-start-1 group-hover:visible group-focus-visible:visible">
+          {resumeNow}
+        </span>
+      </span>
+    </button>
+  );
 }
 
 export function DownloadsPage() {
-  const { queue, categories: configured, speed, isPaused, downloadBlock } = useNextData();
+  const { queue, categories: configured, speed, isPaused, resumeAt, downloadBlock } = useNextData();
+  const { inForce: speedLimit } = useSpeedLimitInForce();
   const statusLabel = useStatusLabel();
   const t = useTranslate();
 
@@ -130,6 +242,8 @@ export function DownloadsPage() {
   const [tab, setTab] = useState<TabId>("all");
   const [sort, setSort] = useState<SortId>("priority");
   const [query, setQuery] = useState("");
+  const [pageIndex, setPageIndex] = useState(0);
+  const [pageSize, setPageSize] = useState<number>(50);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const [sortOpen, setSortOpen] = useState(false);
   const [uploadOpen, setUploadOpen] = useState(false);
@@ -139,20 +253,23 @@ export function DownloadsPage() {
   // dragenter and dragleave fire for every child the pointer crosses, so the
   // highlight tracks how deep inside the pane the drag is, not the last event.
   const dragDepth = useRef(0);
-  // Cancelling is not instant; hide the row until the refetch confirms it.
+  // Cancelling is not instant; hide the row until the daemon's next page drops it.
   const [removedIds, setRemovedIds] = useState<ReadonlySet<number>>(() => new Set());
   // Ticked for a bulk action; separate from the one row the inspector shows.
   const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
+  // Every job the filters match, on every page, rather than the ticked rows.
+  const [allMatching, setAllMatching] = useState(false);
   const [bulkBusy, setBulkBusy] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   // The one row whose cancel button is waiting on confirmation.
   const [confirmRowCancel, setConfirmRowCancel] = useState<number | null>(null);
+  // A selection batch the daemon refused because the queue moved since the
+  // operator confirmed it: the count it matches now, and the batch to run again.
+  const [reconfirm, setReconfirm] = useState<{ matched: number; run: () => void } | null>(null);
   const [report, setReport] = useState<string | null>(null);
 
   const client = useClient();
 
-  const [, pauseAll] = useMutation(PAUSE_ALL_MUTATION);
-  const [, resumeAll] = useMutation(RESUME_ALL_MUTATION);
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation<{ cancelJob: boolean }>(CANCEL_JOB_MUTATION);
@@ -160,70 +277,95 @@ export function DownloadsPage() {
     systemInfo: { configuredStorage: StorageVolume[] };
   }>({ query: SYSTEM_INFO_QUERY });
 
+  const selection = useMemo(() => queueSelection({ tab, facets, query }), [facets, query, tab]);
+  const input = useMemo(
+    () => queuePageInput(selection, sort, pageIndex, pageSize),
+    [pageIndex, pageSize, selection, sort],
+  );
+  const page = useQueuePage(input);
+  const pageCount = Math.max(1, Math.ceil(page.totalCount / pageSize));
+
+  // A queue that shrinks can leave the page index past the end. The page
+  // shown is the last one there is, judged only on the asked page's own
+  // count; the index follows after the render, never during it.
+  const settled = !page.isLoading && !page.stale;
+  const clampedPage = settled ? Math.min(pageIndex, pageCount - 1) : pageIndex;
+  useEffect(() => {
+    if (clampedPage !== pageIndex) setPageIndex(clampedPage);
+  }, [clampedPage, pageIndex]);
+  const showingStale = page.stale || clampedPage !== pageIndex;
+
+  /** A new filter, sort or page size starts again at the first page, with nothing ticked. */
+  const reset = (change: () => void) => {
+    change();
+    setPageIndex(0);
+    setPicked(new Set());
+    setAllMatching(false);
+  };
+
   const jobs = useMemo(
-    () => queue.jobs.filter((job) => !removedIds.has(job.id)),
-    [queue.jobs, removedIds],
+    () => page.jobs.filter((job) => !removedIds.has(job.id)),
+    [page.jobs, removedIds],
   );
 
-  const etaSpeed = useStableEtaSpeed(jobs, speed);
-  const estimates = useStableQueueEta(jobs, speed);
+  // The time-left speed samples the bytes the estimate counts across the whole
+  // queue, which the daemon totals; the page holds only its own rows.
+  const etaSample = useMemo(
+    () =>
+      page.etaTotalBytes > page.etaDownloadedBytes
+        ? [
+            {
+              id: 0,
+              status: "DOWNLOADING",
+              totalBytes: page.etaTotalBytes,
+              downloadedBytes: page.etaDownloadedBytes,
+              remainingBytes: page.etaTotalBytes - page.etaDownloadedBytes,
+            },
+          ]
+        : [],
+    [page.etaDownloadedBytes, page.etaTotalBytes],
+  );
+  const etaConditions = useMemo(() => ({ paused: isPaused, speedLimit }), [isPaused, speedLimit]);
+  const etaSpeed = useStableEtaSpeed(etaSample, speed, etaConditions);
+  const estimates = useMemo(
+    () => etaByIdFrom(page.etaThrough, etaSpeed, formatEtaFromRemainingBytes),
+    [etaSpeed, page.etaThrough],
+  );
   // Kept while every estimate reads the same, so the rows' time-left text is
   // drawn again only when some of it changes.
   const etaById = useSettled(estimates, sameEntries);
 
-  // Search narrows everything, so the category counts answer "how many rows
-  // would I see if I clicked this" rather than "how many exist somewhere".
-  const searched = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    if (needle === "") {
-      return jobs;
-    }
-    return jobs.filter(
-      (job) =>
-        job.name.toLowerCase().includes(needle)
-        || job.displayTitle.toLowerCase().includes(needle)
-        || formatJobReleaseName(job).toLowerCase().includes(needle),
-    );
-  }, [jobs, query]);
-
   const categories = useSettled(
     useMemo<CategoryEntry[]>(
-      () => categoryFacets({ configured, rows: searched, extras: queue.categories }),
-      [configured, queue.categories, searched],
+      () =>
+        categoryFacets({
+          configured,
+          counts: countsByFacet(page.categoryCounts),
+          extras: queue.categories,
+        }),
+      [configured, page.categoryCounts, queue.categories],
     ),
     sameItems,
   );
-
-  // Facets union: two of them asks for both, which is the only reading that
-  // lets a second click widen the view rather than empty it.
-  const inCategory = useMemo(() => {
-    if (facets.size === 0) {
-      return searched;
-    }
-    return searched.filter((job) => facets.has(facetKey(job)));
-  }, [facets, searched]);
 
   const grouped = useMemo(() => {
     const buckets = new Map<DownloadGroup, JobData[]>();
     for (const group of DOWNLOAD_GROUP_ORDER) {
       buckets.set(group, []);
     }
-    for (const job of inCategory) {
+    for (const job of jobs) {
       buckets.get(downloadGroup(job.status))!.push(job);
     }
     return buckets;
-  }, [inCategory]);
+  }, [jobs]);
 
   const tabCounts = useSettled(
-    useMemo(
-      () => ({
-        all: inCategory.length,
-        active: grouped.get("active")!.length,
-        queued: grouped.get("queued")!.length,
-        paused: grouped.get("paused")!.length,
-      }),
-      [grouped, inCategory.length],
-    ),
+    useMemo(() => tabCountsFrom(page.stateCounts), [page.stateCounts]),
+    shallowEqual,
+  );
+  // Each section's header counts its jobs across every page.
+  const groupCounts = useSettled(
+    useMemo(() => groupCountsFrom(page.stateCounts), [page.stateCounts]),
     shallowEqual,
   );
   // The section tick boxes read the groups and the ticks on screen through
@@ -235,23 +377,24 @@ export function DownloadsPage() {
     pickedRef.current = picked;
   });
 
-  const visibleGroups = DOWNLOAD_GROUP_ORDER.filter((group) => {
-    const rows = grouped.get(group)!;
-    if (rows.length === 0) {
-      return false;
-    }
-    return tab === "all" || TAB_FOR_GROUP[group] === tab;
-  });
+  const visibleGroups = DOWNLOAD_GROUP_ORDER.filter((group) => grouped.get(group)!.length > 0);
 
   const selected = jobs.find((job) => job.id === selectedId) ?? null;
 
-  // A ticked download that finishes or is removed leaves the queue, and with
-  // it the selection.
-  if ([...picked].some((id) => !jobs.some((job) => job.id === id))) {
-    setPicked(new Set([...picked].filter((id) => jobs.some((job) => job.id === id))));
-  }
+  // Ticks hold across pages. A ticked download leaves the selection only when
+  // it leaves the queue: finished, failed or removed.
+  const dropDeparted = useCallback(
+    (previous: unknown, response: { queueEvents: QueueEventSummary }) => {
+      const id = departedId(response.queueEvents);
+      if (id !== null) setPicked((current) => withoutIds(current, [id]));
+      return previous;
+    },
+    [],
+  );
+  useSubscription({ query: HISTORY_FACADE_EVENTS_SUBSCRIPTION }, dropDeparted);
 
   const togglePicked = useCallback((id: number) => {
+    setAllMatching(false);
     setPicked((current) => {
       const next = new Set(current);
       if (next.has(id)) {
@@ -267,6 +410,7 @@ export function DownloadsPage() {
   const toggleGroup = useCallback((group: DownloadGroup) => {
     const rows = groupedRef.current.get(group) ?? [];
     const allPicked = rows.every((job) => pickedRef.current.has(job.id));
+    setAllMatching(false);
     setPicked((current) => {
       const next = new Set(current);
       for (const job of rows) {
@@ -280,78 +424,100 @@ export function DownloadsPage() {
     });
   }, []);
 
-  const refreshQueue = queue.refresh;
+  const clearPicked = () => {
+    setPicked(new Set());
+    setAllMatching(false);
+  };
 
-  /**
-   * One aliased mutation for the whole selection, so a hundred ticked rows are
-   * one request; each alias answers for its own id.
-   */
+  const refreshQueue = page.refresh;
+  const pickedCount = allMatching ? page.totalCount : picked.size;
+  // Every row on the page is ticked and more match than are ticked.
+  const canSelectAllMatching =
+    !allMatching
+    && !showingStale
+    && jobs.length > 0
+    && jobs.every((job) => picked.has(job.id))
+    && page.totalCount > picked.size;
+
   const bulkReport = (kind: BulkReport, total: number, refused: number) =>
     refused === 0
       ? countLabel(t, `next.downloads.bulk.${kind}`, total)
       : t(`next.downloads.bulk.${kind}Partial`, { done: total - refused, total, refused });
 
-  const runOnPicked = async (
+  /**
+   * One batch for the whole selection: the ticked rows by id, or every job
+   * the filters match by the filters themselves, with the count the operator
+   * saw. The ids it carried out leave the selection, and so do those the
+   * queue no longer holds; the rest stay ticked, and the report says how many
+   * went through. A request error is named only when nothing did. When the
+   * queue moved under a selection, nothing is done and the operator is asked
+   * again with the count it matches now.
+   */
+  const runBatch = async (
     kind: BulkReport,
-    definition: Omit<Parameters<typeof executeAliasedIdMutation>[0], "client" | "ids">,
-  ) => {
-    const ids = [...picked];
+    mutation: TypedDocumentNode<Record<string, BatchResult>, Record<string, unknown>>,
+    field: string,
+    extra: Record<string, unknown> = {},
+    before?: (target: QueueBatchTarget) => void,
+    confirmed: number = page.totalCount,
+  ): Promise<ReadonlySet<number> | null> => {
+    const target = batchTarget(allMatching, picked, selection, confirmed);
     setBulkBusy(true);
-    const result = await executeAliasedIdMutation<boolean>({ client, ids, ...definition });
+    before?.(target);
+    const result = await client.mutation(mutation, { target, ...extra }).toPromise();
     setBulkBusy(false);
-    if (result.error) {
-      setReport(t("next.downloads.bulk.failed", { message: result.error.message }));
-      return;
+    const answer = result.data?.[field];
+    if (!answer) {
+      const matched = "selection" in target ? conflictCount(result.error) : null;
+      if (matched !== null) {
+        setReconfirm({
+          matched,
+          run: () => void runBatch(kind, mutation, field, extra, before, matched),
+        });
+        refreshQueue();
+        return null;
+      }
+      setReport(t("next.downloads.bulk.failed", { message: result.error?.message ?? "" }));
+      refreshQueue();
+      return null;
     }
-    const refused = ids.filter((_id, index) => result.data?.[`${definition.aliasPrefix}${index}`] !== true);
-    setPicked(new Set());
-    setReport(bulkReport(kind, ids.length, refused.length));
+    const refused = new Set(
+      answer.refused.filter((entry) => entry.code !== "NOT_FOUND").map((entry) => entry.id),
+    );
+    if ("ids" in target) {
+      setPicked((current) => new Set([...current].filter((id) => refused.has(id))));
+    } else {
+      setPicked(new Set());
+    }
+    setAllMatching(false);
+    setReport(bulkReport(kind, answer.matched, answer.refused.length));
     refreshQueue();
+    return refused;
   };
 
-  const pausePicked = () =>
-    runOnPicked("paused", { operationName: "PauseSelectedJobs", aliasPrefix: "pauseJob", fieldName: "pauseJob" });
+  const pausePicked = () => runBatch("paused", PAUSE_QUEUE_ITEMS_MUTATION, "pauseQueueItems");
+  const resumePicked = () => runBatch("resumed", RESUME_QUEUE_ITEMS_MUTATION, "resumeQueueItems");
+  const setPickedPriority = (priority: string) =>
+    runBatch("priority", SET_QUEUE_ITEMS_PRIORITY_MUTATION, "setQueueItemsPriority", { priority });
+  const setPickedCategory = (category: string) =>
+    runBatch("category", SET_QUEUE_ITEMS_CATEGORY_MUTATION, "setQueueItemsCategory", { category });
 
-  const resumePicked = () =>
-    runOnPicked("resumed", { operationName: "ResumeSelectedJobs", aliasPrefix: "resumeJob", fieldName: "resumeJob" });
-
-  const editPicked = (kind: BulkReport, category: string | null, priority: string | null) =>
-    runOnPicked(kind, {
-      operationName: "UpdateSelectedJobs",
-      aliasPrefix: "updateJob",
-      fieldName: "updateJobs",
-      sharedVariables: {
-        category: { type: "String", value: category },
-        priority: { type: "String", value: priority },
-      },
-      buildFieldArguments: (idVariable) =>
-        `ids: [${idVariable}], category: $category, priority: $priority`,
-    });
-
-  // Rows leave the list the moment the cancel is sent, and any the daemon
-  // refuses come back once it answers.
+  // Ticked rows leave the list the moment the cancel is sent, and any the
+  // daemon refuses come back once it answers.
   const cancelPicked = async () => {
-    const ids = [...picked];
-    setBulkBusy(true);
-    setRemovedIds((current) => new Set([...current, ...ids]));
-    setSelectedId((current) => (current !== null && ids.includes(current) ? null : current));
-    const result = await executeAliasedIdMutation<boolean>({
-      client,
-      ids,
-      operationName: "CancelSelectedJobs",
-      aliasPrefix: "cancelJob",
-      fieldName: "cancelJob",
+    let hidden: number[] = [];
+    const refused = await runBatch("cancelled", CANCEL_QUEUE_ITEMS_MUTATION, "cancelQueueItems", {}, (target) => {
+      if ("ids" in target) {
+        hidden = target.ids;
+        setRemovedIds((current) => new Set([...current, ...target.ids]));
+        setSelectedId((current) => (current !== null && target.ids.includes(current) ? null : current));
+      }
     });
-    const cancelled = ids.filter((_id, index) => result.data?.[`cancelJob${index}`] === true);
-    const failed = ids.filter((id) => !cancelled.includes(id));
-    if (failed.length > 0) {
-      setRemovedIds((current) => new Set([...current].filter((id) => !failed.includes(id))));
+    const back = refused === null ? new Set(hidden) : refused;
+    if (back.size > 0) {
+      setRemovedIds((current) => new Set([...current].filter((id) => !back.has(id))));
     }
-    setBulkBusy(false);
     setConfirmCancel(false);
-    setPicked(new Set());
-    setReport(bulkReport("cancelled", ids.length, failed.length));
-    refreshQueue();
   };
 
   const priorityOptions = [
@@ -368,6 +534,11 @@ export function DownloadsPage() {
   // One set of actions, shown in the tab row where it fits and in its own bar where it does not.
   const bulkActions = (
     <>
+      {canSelectAllMatching ? (
+        <BulkButton disabled={bulkBusy} onClick={() => setAllMatching(true)}>
+          {t("next.downloads.selectAllMatching", { count: page.totalCount })}
+        </BulkButton>
+      ) : null}
       <BulkButton icon="pause" disabled={bulkBusy} onClick={() => void pausePicked()}>
         {t("action.pause")}
       </BulkButton>
@@ -379,7 +550,7 @@ export function DownloadsPage() {
         label={t("next.downloads.setPriority")}
         disabled={bulkBusy}
         options={priorityOptions}
-        onSelect={(value) => void editPicked("priority", null, value)}
+        onSelect={(value) => void setPickedPriority(value)}
       >
         {t("table.priority")}
       </BulkMenu>
@@ -388,7 +559,7 @@ export function DownloadsPage() {
         label={t("next.downloads.setCategory")}
         disabled={bulkBusy}
         options={categoryOptions}
-        onSelect={(value) => void editPicked("category", value, null)}
+        onSelect={(value) => void setPickedCategory(value)}
       >
         {t("table.category")}
       </BulkMenu>
@@ -398,17 +569,7 @@ export function DownloadsPage() {
     </>
   );
 
-  const remainingBytes = useMemo(
-    () =>
-      jobs.reduce((total, job) => {
-        const token = statusToken(job.status);
-        if (token !== "downloading" && token !== "queued") {
-          return total;
-        }
-        return total + Math.max(job.totalBytes - job.downloadedBytes, 0);
-      }, 0),
-    [jobs],
-  );
+  const remainingBytes = page.remainingBytes;
 
   const volumes = systemInfo?.systemInfo?.configuredStorage ?? [];
 
@@ -484,17 +645,10 @@ export function DownloadsPage() {
             placeholder={t("next.downloads.search")}
             mono={false}
             value={query}
-            onChange={setQuery}
+            onChange={(next) => reset(() => setQuery(next))}
             className="w-[132px] sm:w-[224px]"
           />
-          <SecondaryButton
-            icon={isPaused ? "resume" : "pause"}
-            onClick={() => {
-              void (isPaused ? resumeAll({}) : pauseAll({}));
-            }}
-          >
-            {isPaused ? t("next.downloads.resumeAll") : t("next.downloads.pauseAll")}
-          </SecondaryButton>
+          <PauseAllControl paused={isPaused} resumeAt={resumeAt} />
           <SpeedLimitControl />
           <PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>
         </>
@@ -508,8 +662,8 @@ export function DownloadsPage() {
           <CategoryListBlock
             items={categories}
             selected={facets}
-            onToggle={(key) => setFacets((current) => toggleFacet(current, key))}
-            onClear={() => setFacets(NO_FACETS)}
+            onToggle={(key) => reset(() => setFacets((current) => toggleFacet(current, key)))}
+            onClear={() => reset(() => setFacets(NO_FACETS))}
           />
         </>
       }
@@ -527,7 +681,7 @@ export function DownloadsPage() {
               note={
                 remainingBytes > 0
                   ? t("next.downloads.leftToFetch", { size: formatSize(remainingBytes) })
-                  : queue.isLoading
+                  : page.isLoading
                     ? t("next.downloads.fetchingQueue")
                     : t("next.downloads.queueClear")
               }
@@ -546,10 +700,10 @@ export function DownloadsPage() {
               { id: "paused", label: t("status.paused"), count: tabCounts.paused },
             ]}
             active={tab}
-            onSelect={setTab}
+            onSelect={(next) => reset(() => setTab(next))}
             center={
-              picked.size === 0 ? undefined : (
-                <BulkCluster count={picked.size} onClear={() => setPicked(new Set())}>
+              pickedCount === 0 ? undefined : (
+                <BulkCluster count={pickedCount} onClear={clearPicked}>
                   {bulkActions}
                 </BulkCluster>
               )
@@ -581,7 +735,7 @@ export function DownloadsPage() {
                       key={option.value}
                       selected={option.value === sort}
                       onSelect={() => {
-                        setSort(option.value);
+                        reset(() => setSort(option.value));
                         setSortOpen(false);
                       }}
                     >
@@ -594,18 +748,29 @@ export function DownloadsPage() {
           />
 
           {/* From xl the actions sit in the tab row instead; below it there is no room. */}
-          {picked.size === 0 ? null : (
-            <BulkBar count={picked.size} onClear={() => setPicked(new Set())} className="xl:hidden">
+          {pickedCount === 0 ? null : (
+            <BulkBar count={pickedCount} onClear={clearPicked} className="xl:hidden">
               {bulkActions}
             </BulkBar>
           )}
         </>
       }
+      afterContent={
+        <Pagination
+          pageIndex={clampedPage}
+          pageCount={pageCount}
+          onPage={(next) => setPageIndex(Math.max(0, Math.min(pageCount - 1, next)))}
+          pageSize={pageSize}
+          pageSizes={PAGE_SIZES}
+          onPageSize={(next) => reset(() => setPageSize(next))}
+          total={page.totalCount}
+        />
+      }
       statusNote={report ?? undefined}
       statusRight={
-        queue.totalCount > queue.jobs.length
-          ? t("next.downloads.showingPage", { shown: queue.jobs.length, total: queue.totalCount })
-          : t("next.downloads.shown", { shown: inCategory.length, total: jobs.length })
+        pageCount > 1
+          ? t("next.downloads.showingPage", { shown: jobs.length, total: page.totalCount })
+          : t("next.downloads.shown", { shown: jobs.length, total: queue.summary.totalItems })
       }
       // The list and the inspector are side by side only where both fit; below
       // that the inspector becomes a panel under the list rather than squeezing
@@ -641,17 +806,21 @@ export function DownloadsPage() {
           setUploadOpen(true);
         }}
       >
-        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-          {queue.isLoading ? (
+        <div
+          aria-busy={showingStale}
+          className={`flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list${showingStale ? " opacity-60" : ""}`}
+        >
+          {page.isLoading ? (
             <EmptyState loading title={t("next.common.loading")} body={t("next.downloads.loadingBody")} />
-          ) : jobs.length === 0 ? (
+          ) : queue.summary.totalItems === 0 && jobs.length === 0 ? (
             <EmptyState
               centered
+              testId={testIds.queueEmpty}
               title={t("next.downloads.emptyTitle")}
               body={t("next.downloads.emptyBody")}
               action={<PrimaryButton icon="add" onClick={() => setUploadOpen(true)}>{t("next.addNzb.title")}</PrimaryButton>}
             />
-          ) : visibleGroups.length === 0 ? (
+          ) : jobs.length === 0 ? (
             <EmptyState
               title={t("next.downloads.noMatchTitle")}
               body={t("next.downloads.noMatchBody")}
@@ -662,6 +831,7 @@ export function DownloadsPage() {
                 <QueueGroup
                   key={group}
                   group={group}
+                  count={groupCounts[group]}
                   rows={grouped.get(group)!}
                   sort={sort}
                   etaById={sort === "eta" ? etaById : null}
@@ -700,7 +870,7 @@ export function DownloadsPage() {
       <ConfirmDialog
         open={confirmCancel}
         title={t("next.downloads.cancelTitle")}
-        note={t("bulk.selected", { count: picked.size })}
+        note={t("bulk.selected", { count: pickedCount })}
         busy={bulkBusy}
         destructive
         body={t("confirm.cancelSelectedMessage")}
@@ -708,6 +878,20 @@ export function DownloadsPage() {
         dismissLabel={t("next.downloads.keepDownloading")}
         onConfirm={() => void cancelPicked()}
         onDismiss={() => setConfirmCancel(false)}
+      />
+
+      <ConfirmDialog
+        open={reconfirm !== null}
+        title={t("next.downloads.selectionChanged")}
+        busy={bulkBusy}
+        body={t("bulk.selected", { count: reconfirm?.matched ?? 0 })}
+        confirmLabel={t("action.apply")}
+        onConfirm={() => {
+          const run = reconfirm?.run;
+          setReconfirm(null);
+          run?.();
+        }}
+        onDismiss={() => setReconfirm(null)}
       />
 
       <ConfirmDialog
@@ -744,6 +928,8 @@ function sameGroupProps(left: QueueGroupProps, right: QueueGroupProps): boolean 
 
 interface QueueGroupProps {
   group: DownloadGroup;
+  /** The section's jobs across every page. */
+  count: number;
   /** In queue order; sorted here. */
   rows: readonly JobData[];
   sort: SortId;
@@ -768,6 +954,7 @@ interface QueueGroupProps {
  */
 const QueueGroup = memo(function QueueGroup({
   group,
+  count,
   rows,
   sort,
   etaById,
@@ -795,7 +982,7 @@ const QueueGroup = memo(function QueueGroup({
           />
         }
         label={t(DOWNLOAD_GROUP_LABEL[group])}
-        count={rows.length}
+        count={count}
         note={DOWNLOAD_GROUP_NOTE[group] === null ? undefined : t(DOWNLOAD_GROUP_NOTE[group])}
       />
       {sorted.map((job) => (

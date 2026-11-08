@@ -107,7 +107,7 @@ impl Database {
         ];
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE servers SET pipelining_depth = {} WHERE id = {}",
                 &args,
             )

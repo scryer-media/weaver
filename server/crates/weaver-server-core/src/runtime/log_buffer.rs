@@ -66,11 +66,13 @@ mod tests {
     }
 }
 
-// Thread-safe ring buffer that captures log lines for live viewing.
+// Thread-safe ring buffer that captures log records for live viewing.
 //
 // Implements `io::Write` so it can be used as a tracing subscriber layer writer.
 // Each complete line (terminated by `\n`) is stored in the ring buffer and
-// broadcast to any active subscribers.
+// broadcast to any active subscribers. The service writes one JSON record
+// per line; `text_line` turns one back into the familiar text line for a
+// reader that wants text, so the buffer keeps only the one copy.
 #[derive(Clone)]
 pub struct LogRingBuffer {
     inner: Arc<Mutex<RingBufferInner>>,
@@ -149,5 +151,191 @@ impl Write for LogRingBuffer {
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+// A JSON log record as the familiar text line:
+// `{timestamp} {LEVEL} {spans}{target}: {message} {key=value ...}`.
+//
+// A string value is written bare unless it is empty or holds a space, a
+// quote, an `=` or a control character, in which case it is quoted. One that
+// is already a quoted string, as a `?` field's Debug text of a string is, is
+// written as it stands. A line that is not a record is returned as it is.
+pub fn text_line(record: &str) -> String {
+    let Ok(record) = serde_json::from_str::<TextRecord>(record) else {
+        return record.to_owned();
+    };
+    let mut line = format!("{} {:>5} ", record.timestamp, record.level);
+    for span in &record.spans {
+        line.push_str(&span.name);
+        let fields: Vec<String> = span
+            .fields
+            .0
+            .iter()
+            .map(|(key, value)| format!("{key}={}", text_value(value)))
+            .collect();
+        if !fields.is_empty() {
+            line.push('{');
+            line.push_str(&fields.join(" "));
+            line.push('}');
+        }
+        line.push(':');
+    }
+    if !record.spans.is_empty() {
+        line.push(' ');
+    }
+    line.push_str(&record.target);
+    line.push(':');
+    for (key, value) in &record.fields.0 {
+        line.push(' ');
+        if key == "message" {
+            line.push_str(value.as_str().unwrap_or(&value.to_string()));
+        } else {
+            line.push_str(key);
+            line.push('=');
+            line.push_str(&text_value(value));
+        }
+    }
+    line
+}
+
+fn text_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) if is_quoted(text) => text.clone(),
+        serde_json::Value::String(text) => {
+            let quote = text.is_empty()
+                || text
+                    .chars()
+                    .any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '=');
+            if quote {
+                format!("{text:?}")
+            } else {
+                text.clone()
+            }
+        }
+        other => other.to_string(),
+    }
+}
+
+// Whether the text is one string already quoted, as Debug writes one: a `"`
+// at each end and every quote between them escaped.
+fn is_quoted(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
+        return false;
+    }
+    let mut at = 1;
+    while at < bytes.len() - 1 {
+        match bytes[at] {
+            b'\\' => at += 2,
+            b'"' => return false,
+            _ => at += 1,
+        }
+    }
+    at == bytes.len() - 1
+}
+
+#[derive(serde::Deserialize)]
+struct TextSpan {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    fields: InOrder,
+}
+
+#[derive(serde::Deserialize)]
+struct TextRecord {
+    timestamp: String,
+    level: String,
+    target: String,
+    #[serde(default)]
+    fields: InOrder,
+    #[serde(default)]
+    spans: Vec<TextSpan>,
+}
+
+// A JSON object's entries in the order they were written.
+#[derive(Default)]
+struct InOrder(Vec<(String, serde_json::Value)>);
+
+impl<'de> serde::Deserialize<'de> for InOrder {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Entries;
+
+        impl<'de> serde::de::Visitor<'de> for Entries {
+            type Value = InOrder;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("an object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<InOrder, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(InOrder(entries))
+            }
+        }
+
+        deserializer.deserialize_map(Entries)
+    }
+}
+
+#[cfg(test)]
+mod text_line_tests {
+    use super::*;
+
+    #[test]
+    fn a_record_reads_as_the_text_line_it_stands_for() {
+        let record = r#"{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs","fields":{"message":"job added","job_id":7,"name":"My Show","path":"/data/a","ok":true}}"#;
+        assert_eq!(
+            text_line(record),
+            r#"2026-11-03T08:10:00.123456-07:00  INFO weaver::jobs: job added job_id=7 name="My Show" path=/data/a ok=true"#
+        );
+    }
+
+    #[test]
+    fn spans_come_before_the_target_as_text_writes_them() {
+        let record = r#"{"timestamp":"2026-11-03T08:10:00.123456Z","level":"ERROR","target":"weaver::http","fields":{"message":"failed"},"spans":[{"name":"request","fields":{"id":3}},{"name":"bare"}]}"#;
+        assert_eq!(
+            text_line(record),
+            "2026-11-03T08:10:00.123456Z ERROR request{id=3}:bare: weaver::http: failed"
+        );
+    }
+
+    #[test]
+    fn a_debug_string_is_quoted_once() {
+        let record = r#"{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs","fields":{"message":"dbg","name":"\"plain\""}}"#;
+        assert_eq!(
+            text_line(record),
+            r#"2026-11-03T08:10:00.123456-07:00  INFO weaver::jobs: dbg name="plain""#
+        );
+    }
+
+    #[test]
+    fn a_string_quoted_at_each_end_but_not_as_one_token_is_quoted() {
+        let record = r#"{"timestamp":"2026-11-03T08:10:00.123456-07:00","level":"INFO","target":"weaver::jobs","fields":{"message":"two","name":"\"a\" b \"c\"","tail":"\"a\\\""}}"#;
+        assert_eq!(
+            text_line(record),
+            r#"2026-11-03T08:10:00.123456-07:00  INFO weaver::jobs: two name="\"a\" b \"c\"" tail="\"a\\\"""#
+        );
+    }
+
+    #[test]
+    fn a_line_that_is_not_a_record_is_left_alone() {
+        assert_eq!(text_line("plain words"), "plain words");
+        assert_eq!(text_line("{\"half\":"), "{\"half\":");
+    }
+
+    #[test]
+    fn the_buffer_keeps_one_record_per_line() {
+        let mut buffer = LogRingBuffer::new(2);
+        buffer.write_all(b"{\"a\":1}\n{\"b\":").unwrap();
+        buffer.write_all(b"2}\n{\"c\":3}\n").unwrap();
+        assert_eq!(buffer.snapshot(10), ["{\"b\":2}", "{\"c\":3}"]);
     }
 }

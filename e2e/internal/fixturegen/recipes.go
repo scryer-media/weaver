@@ -73,10 +73,11 @@ const (
 	twoSetsDamageLength       = 2 * twoSetsPrimarySliceSize
 )
 
-// ignorableSidecarNotesText is the sidecar payload of the ignorable-deficit
-// set. WriteText pads it to a fixed length, so what matters is that it is a
-// deterministic run of bytes; the title is invented.
-const ignorableSidecarNotesText = "Golden Meridian - season two, episode three. Release notes beside the payload; every name here is invented.\n"
+// Distinct blocks prevent PAR2 from repairing a deficit by copying an
+// identical surviving block instead of consuming recovery data.
+func writeIgnorableSidecar(path string) error {
+	return WritePRNG(path, "ignorable-deficit/sidecar", ignorableSidecarBytes)
+}
 
 // The payload paths recipes name as provenance: ledger paths that carry
 // exactly the bytes the artifact cache feeds to the oracles.
@@ -132,7 +133,19 @@ var ScenarioOnly = map[string]string{
 	"par2-rar-placement-stripped-recovery":     "the same staging, with the recovery volumes stripped after posting",
 	"rar5-multivolume-missing-tail":            "stages the first two volumes of rar5-multivolume and omits the third",
 	"single-mkv-sparse-nzb":                    "stages single-mkv's payload under a sparse NZB numbering",
+	"extensionless-payload-named-by-content":   "stages single-mkv's payload under a name with no extension",
+	"par3-obfuscated-plain-name":               "stages par3-obfuscated-names under a bare hex name, so the payload is a plain file until its PAR3 set moves it",
 	"stat-health-probe":                        "stages two direct MKVs; the same articles are deleted from each by the harness",
+	"adv-rar-named-mkv":                        "stages rar5-single's archive under a .mkv name",
+	"adv-7z-named-rar":                         "stages single-7z's archive under a .rar name",
+	"adv-exe-carrying-rar":                     "stages rar5-single's archive under a .exe name",
+	"adv-zip-named-par2":                       "stages zip-unencrypted's archive under a .par2 name",
+	"adv-password-rar5":                        "stages rar5-encrypted's archive; the lane submits it with no password and with a wrong one",
+	"adv-password-7z":                          "stages 7z-encrypted's archive; the lane submits it with no password and with a wrong one",
+	"adv-password-zip":                         "stages zip-encrypted's archive; the lane submits it with no password and with a wrong one",
+	"yenc-lie-field-size-lost":                 "stages yenc-lie-field-size's payload under the same size lie and deletes one middle article",
+	"yenc-lie-size-large":                      "stages yenc-lie-field-size's payload with every header stating half as much again",
+	"yenc-lie-end-below-begin":                 "stages yenc-lie-field-size's payload with one part's end= below its begin=",
 }
 
 // Recipes is the corpus, one entry per scenario directory that owns bytes.
@@ -1189,13 +1202,13 @@ func Recipes() []Recipe {
 
 	add(Recipe{
 		Slug: "par2-ignorable-deficit", Family: "PAR2",
-		Notes: "A 5 MiB payload and a 32 KiB text sidecar under one recovery set of 4 KiB blocks, with five of the sidecar's eight blocks zeroed against three recovery blocks. " +
+		Notes: "A 5 MiB payload and a 32 KiB sidecar of distinct deterministic blocks under one recovery set of 4 KiB blocks, with five of the sidecar's eight blocks zeroed against three recovery blocks. " +
 			"Every payload block verifies, so the only damage in the set is a short metadata file the recovery data cannot rebuild: the whole question the fixture asks is what a verdict does with that alone.",
 		Inputs: []string{previewPayloadPath},
 		Build: sequence(
 			publish("clip-preview", "test-media.mkv"),
 			func(ctx context.Context, env *Env) error {
-				return WriteText(env.OutputPath("info.nfo"), ignorableSidecarNotesText, ignorableSidecarBytes)
+				return writeIgnorableSidecar(env.OutputPath("info.nfo"))
 			},
 			par2(PAR2Spec{Base: "release.par2", SliceSize: ignorableSliceSize, RecoveryBlocks: 3, RecoveryFiles: 1,
 				Sources: []string{"test-media.mkv", "info.nfo"}}),
@@ -1341,7 +1354,7 @@ func Recipes() []Recipe {
 	add(Recipe{
 		Slug: "par2-multi-set-archives-insufficient", Family: "PAR2",
 		Notes: "The 64 KiB/96 KiB mixed-grid counterpart: the primary archive has enough recovery data for its two damaged slices, " +
-			"while the secondary archive has only one recovery block and must make the aggregate job fail.",
+			"while the secondary archive has only one recovery block, so the job ends Partial with the primary's member delivered whole.",
 		Inputs: []string{samplePayloadPath, previewPayloadPath},
 		Build:  multiPARSetArchives(1),
 	})
@@ -1576,12 +1589,65 @@ func Recipes() []Recipe {
 		},
 	})
 
+	// ---------------------------------------------------- lying yEnc headers
+	//
+	// The bytes here are ordinary; the lies are told at seed time, when the
+	// harness files the posted articles again with their `=ybegin` or
+	// `=ypart` line rewritten (see internal/weaver/yenc_header_lies.go). The
+	// scenarios that only restage these payloads under a different lie are
+	// listed in ScenarioOnly.
+	add(Recipe{
+		Slug: "yenc-lie-field-size", Family: "yEnc header lies", ByteReproducible: true,
+		Notes: "The field post: 28 articles of 768,000 bytes, 21,504,000 in all, every header stating size=1536000 while the 28th part begins at 20,736,001. " +
+			"Every reference decoder writes each part where its own begin= puts it, so a whole post is byte-equal whatever the size says.",
+		Build: func(ctx context.Context, env *Env) error {
+			return WritePRNG(env.OutputPath(yencLieFieldMedia), "lantern-reach", yencLieFieldBytes)
+		},
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			return map[string]string{yencLieFieldMedia: env.OutputPath(yencLieFieldMedia)}, nil
+		},
+	})
+
+	add(Recipe{
+		Slug: "yenc-lie-overlap-par2", Family: "yEnc header lies",
+		Notes: "Six articles of 768,000 bytes with a recovery set over them; at seed time the third part's begin= and end= move down by half an article, over the part before it. " +
+			"Every decoder writes the body where the header says, so the file is wrong where it lands and only the recovery set puts it back.",
+		Build: func(ctx context.Context, env *Env) error {
+			if err := WritePRNG(env.OutputPath(yencLieOverlapMedia), "copper-mesa", yencLieOverlapBytes); err != nil {
+				return err
+			}
+			return env.PAR2(ctx, PAR2Spec{
+				Base: yencLieOverlapMedia + ".par2", SliceSize: yencLieArticleBytes, RecoveryBlocks: 3, RecoveryFiles: 1,
+				Sources: []string{yencLieOverlapMedia},
+			})
+		},
+		ExpectedOutputs: func(ctx context.Context, env *Env) (map[string]string, error) {
+			return map[string]string{yencLieOverlapMedia: env.OutputPath(yencLieOverlapMedia)}, nil
+		},
+	})
+
 	// ------------------------------------------------------- direct store
 	recipes = append(recipes, DirectStoreRecipes()...)
+	recipes = append(recipes, ZipStoreEncryptedRecipes()...)
 	recipes = append(recipes, PAR3Recipes()...)
 	recipes = append(recipes, SpeedTestRecipes()...)
+	recipes = append(recipes, AdversarialRecipes()...)
+	recipes = append(recipes, GraphGapRecipes()...)
+	recipes = append(recipes, GraphBoundaryRecipes()...)
 	return recipes
 }
+
+// The lying-header payloads. An article is the field post's 768,000 bytes,
+// which the scenarios post with segment_size; the field payload is its 28
+// articles exactly, and the overlap payload six, enough for a part with a
+// neighbour on each side.
+const (
+	yencLieFieldMedia   = "lantern.reach.s01e03.mkv"
+	yencLieOverlapMedia = "copper.mesa.s01e02.mkv"
+	yencLieArticleBytes = 768000
+	yencLieFieldBytes   = 28 * yencLieArticleBytes
+	yencLieOverlapBytes = 6 * yencLieArticleBytes
+)
 
 // The uu fixtures' member names. They are invented titles, and they are also
 // the names the `begin` lines carry, which makes them the names a decoder

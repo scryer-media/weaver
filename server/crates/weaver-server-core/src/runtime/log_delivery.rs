@@ -26,7 +26,11 @@ fn registry() -> &'static Registry {
 
 /// Counters retain completed sinks so restarts cannot decrease process totals.
 pub fn counter_snapshot() -> std::collections::BTreeMap<&'static str, (u64, u64)> {
-    let mut totals = std::collections::BTreeMap::from([("file", (0, 0)), ("stderr", (0, 0))]);
+    let mut totals = std::collections::BTreeMap::from([
+        ("file", (0, 0)),
+        ("stderr", (0, 0)),
+        ("stdout", (0, 0)),
+    ]);
     for (sink, counters) in registry().lock().unwrap().iter() {
         let total = totals.entry(sink).or_default();
         total.0 += counters.dropped.load(Ordering::Relaxed);

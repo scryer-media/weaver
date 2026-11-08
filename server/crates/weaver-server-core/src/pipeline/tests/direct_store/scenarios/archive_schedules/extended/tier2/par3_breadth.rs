@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// PAR3 across its surface: a sidecar set, a set inserted inside a 7z after
-// its end header, and both at once; Cauchy and FFT codes; recovery with
-// margin, exact and one block short; three block sizes; one member and two;
-// one archive set in the job and two; the index present, absent and damaged.
-use super::super::super::super::sevenz_store::embedded_par3::with_embedded_par3_named;
+// PAR3 across its surface: a sidecar set posted beside the archive; Cauchy
+// and FFT codes; recovery with margin, exact and one block short; three
+// block sizes; one member and two; one archive set in the job and two; the
+// index present, absent and damaged.
 use super::super::super::super::sevenz_store::{Entry, build_7z_shaped, split_volumes};
 use super::fixtures::{Container, MEMBER, SEVENZ_MEMBER, payload};
 use super::post::{Damage, Post, Posted, Role, Wire};
@@ -15,18 +14,6 @@ use super::*;
 const ARTICLE: usize = 768;
 const VOLUMES: usize = 4;
 const ARTICLES_PER_VOLUME: usize = 32;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(super) enum Placement {
-    // A PAR3 set posted beside the archive.
-    Sidecar,
-    // A PAR3 recovery tail inside the 7z, after its end header.
-    Embedded,
-    // Both: the sidecar protects the container, tail and all.
-    Both,
-}
-
-const PLACEMENTS: [Placement; 3] = [Placement::Sidecar, Placement::Embedded, Placement::Both];
 
 const BLOCKS: [usize; 3] = [512, 1024, 4096];
 
@@ -57,7 +44,6 @@ const CONTAINERS: [Container; 2] = [Container::Rar5, Container::SevenZip];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct Par3Cell {
-    pub placement: Placement,
     pub code: Code,
     pub margin: Margin,
     pub block: usize,
@@ -67,39 +53,24 @@ pub(super) struct Par3Cell {
     pub container: Container,
 }
 
-// Whether the cell can be posted: a tail is inserted into a 7z only, and a
-// post with no sidecar has no index to lose.
-fn possible(cell: Par3Cell) -> bool {
-    if cell.placement != Placement::Sidecar && cell.container != Container::SevenZip {
-        return false;
-    }
-    !(cell.placement == Placement::Embedded && cell.index != Index::Present)
-}
-
 pub(super) fn cells() -> Vec<Par3Cell> {
     let mut cells = Vec::new();
-    for placement in PLACEMENTS {
-        for code in [Code::Cauchy, Code::Fft] {
-            for margin in MARGINS {
-                for block in BLOCKS {
-                    for entries in [Entries::One, Entries::Two] {
-                        for sets in [Sets::One, Sets::Two] {
-                            for index in INDICES {
-                                for container in CONTAINERS {
-                                    let cell = Par3Cell {
-                                        placement,
-                                        code,
-                                        margin,
-                                        block,
-                                        entries,
-                                        sets,
-                                        index,
-                                        container,
-                                    };
-                                    if possible(cell) {
-                                        cells.push(cell);
-                                    }
-                                }
+    for code in [Code::Cauchy, Code::Fft] {
+        for margin in MARGINS {
+            for block in BLOCKS {
+                for entries in [Entries::One, Entries::Two] {
+                    for sets in [Sets::One, Sets::Two] {
+                        for index in INDICES {
+                            for container in CONTAINERS {
+                                cells.push(Par3Cell {
+                                    code,
+                                    margin,
+                                    block,
+                                    entries,
+                                    sets,
+                                    index,
+                                    container,
+                                });
                             }
                         }
                     }
@@ -110,25 +81,20 @@ pub(super) fn cells() -> Vec<Par3Cell> {
     cells
 }
 
-// Schedules each (cell, profile) unit samples from the matrix's smoke
-// schedules.
+// Schedules each cell samples from the matrix's smoke schedules.
 pub(super) const PER_UNIT: usize = 231;
 
-// 720 possible cells under three profiles, 231 schedules each.
-pub(super) const TOTAL: usize = 498_960;
+// 432 cells, 231 schedules each.
+pub(super) const TOTAL: usize = 99_792;
 
 pub(super) fn family() -> Family<Par3Cell> {
     let cells = cells();
-    assert_eq!(cells.len(), 720);
+    assert_eq!(cells.len(), 432);
     Family {
         units: cells
             .into_iter()
             .enumerate()
-            .flat_map(|(index, cell)| {
-                PROFILES
-                    .into_iter()
-                    .map(move |profile| (cell, profile, Pool::Smoke, PER_UNIT, index))
-            })
+            .map(|(index, cell)| (cell, Pool::Smoke, PER_UNIT, index))
             .collect(),
     }
 }
@@ -174,9 +140,8 @@ impl Par3Cell {
         }
     }
 
-    // The posted volumes of one archive set, with the tail inserted where
-    // the placement says.
-    fn volumes(self, set: &ArchiveSet, tail_blocks: usize) -> Vec<(String, Vec<u8>)> {
+    // The posted volumes of one archive set.
+    fn volumes(self, set: &ArchiveSet) -> Vec<(String, Vec<u8>)> {
         let mut volumes = match self.container {
             Container::SevenZip => {
                 let entries: Vec<Entry> = set
@@ -184,26 +149,8 @@ impl Par3Cell {
                     .iter()
                     .map(|(name, bytes)| Entry::file(leak(name), bytes.clone()))
                     .collect();
-                let mut archive =
+                let archive =
                     build_7z_shaped(&entries, sevenz_turbo::EncoderMethod::COPY, None, false);
-                if self.placement != Placement::Sidecar {
-                    use par3_rs::creation::{CreationCodec, CreationOptions};
-                    // The authenticated filename must follow the archive set,
-                    // not the fixture helper's single-set default name.
-                    let recovery_count = tail_blocks.max(1) as u64;
-                    // PAR-inside authoring requires Cauchy. The code axis
-                    // selects the sidecar codec when this post has a sidecar.
-                    archive = with_embedded_par3_named(
-                        &archive,
-                        &format!("{}.7z", set.prefix),
-                        CreationOptions {
-                            block_size: self.block as u64,
-                            codec: CreationCodec::Cauchy,
-                            recovery_count,
-                            ..CreationOptions::default()
-                        },
-                    );
-                }
                 split_volumes(&archive, VOLUMES)
             }
             _ => {
@@ -238,8 +185,7 @@ impl Par3Cell {
     }
 
     // The post with its sidecar sets authored to the margin over the data as
-    // posted (tail included), and the tail sized to the margin over the
-    // container's own bytes.
+    // posted.
     fn build(self, interruption: Interruption) -> (Post, Option<Geometry>, Option<Verdict>) {
         let sets = self.archive_sets();
         let geometry = Geometry {
@@ -247,45 +193,9 @@ impl Par3Cell {
             packed: false,
         };
         let lost = move |post: &Post| run::lost_articles(post, interruption);
-        // The tail first: it changes the data bytes the sidecar protects.
-        let mut tail_blocks = vec![0usize; sets.len()];
-        let mut post = self.data(&sets, &tail_blocks);
-        if self.placement != Placement::Sidecar {
-            let mut killed = vec![0usize; sets.len()];
-            for _ in 0..8 {
-                let lost_now = lost(&post);
-                let mut settled = true;
-                for (set, files) in self.data_files(&post).into_iter().enumerate() {
-                    let needed = tail_needed(&post, &files, &lost_now, self.block);
-                    let blocks = recovery::blocks_for(self.margin, needed, killed[set], 2);
-                    let (least, most) = tail_surviving(&post, &files, &lost_now, false);
-                    let after = if self.margin == Margin::OneShort {
-                        tail_blocks[set].saturating_sub(most)
-                    } else {
-                        tail_blocks[set].saturating_sub(least)
-                    };
-                    if blocks != tail_blocks[set] || after != killed[set] {
-                        settled = false;
-                    }
-                    tail_blocks[set] = blocks;
-                    killed[set] = after;
-                }
-                post = self.data(&sets, &tail_blocks);
-                if settled {
-                    break;
-                }
-            }
-        }
-        if self.placement == Placement::Embedded {
-            let lost_now = lost(&post);
-            let mut verdict = Verdict::Completes;
-            for files in self.data_files(&post) {
-                verdict = combine(verdict, tail_verdict(&post, &files, &lost_now, self.block));
-            }
-            return (post, None, Some(verdict));
-        }
         // Sidecars, one per archive set, each authored over its own volumes.
-        let data = post.clone();
+        let data = self.data(&sets);
+        let mut post = data.clone();
         let per_set = self.data_files(&data);
         let mut killed = vec![0usize; sets.len()];
         let mut blocks = vec![0usize; sets.len()];
@@ -354,14 +264,6 @@ impl Par3Cell {
             if self.index != Index::Present && upper > 0 && sidecar != Verdict::Fails {
                 sidecar = Verdict::Either;
             }
-            if self.placement == Placement::Both {
-                let tail = tail_verdict(&post, files, &lost_now, self.block);
-                sidecar = match (sidecar, tail) {
-                    (Verdict::Completes, _) | (_, Verdict::Completes) => Verdict::Completes,
-                    (Verdict::Fails, Verdict::Fails) => Verdict::Fails,
-                    _ => Verdict::Either,
-                };
-            }
             verdict = combine(verdict, sidecar);
         }
         (post, Some(geometry), Some(verdict))
@@ -380,11 +282,11 @@ impl Par3Cell {
             .collect()
     }
 
-    fn data(self, sets: &[ArchiveSet], tail_blocks: &[usize]) -> Post {
+    fn data(self, sets: &[ArchiveSet]) -> Post {
         let mut files = Vec::new();
         let mut expected = Vec::new();
-        for (index, set) in sets.iter().enumerate() {
-            for (name, bytes) in self.volumes(set, tail_blocks[index]) {
+        for set in sets {
+            for (name, bytes) in self.volumes(set) {
                 files.push(Posted::new(name, bytes, ARTICLE, Role::Data));
             }
             expected.extend(set.members.iter().cloned());
@@ -471,146 +373,6 @@ fn recovery_surviving(
     (least, most)
 }
 
-// The container bytes of a set with a tail, as one span across its volumes,
-// and the posted offset of each file in that span.
-fn container_span(post: &Post, files: &[usize]) -> (usize, Vec<usize>) {
-    let mut offsets = Vec::new();
-    let mut at = 0;
-    for &file in files {
-        offsets.push(at);
-        at += post.files[file].bytes.len();
-    }
-    let whole: Vec<u8> = files
-        .iter()
-        .flat_map(|&file| post.files[file].bytes.clone())
-        .collect();
-    // PAR-inside protects the 7z container, not its following description
-    // packets. The start header declares the exact end of that container.
-    let next = u64::from_le_bytes(whole[12..20].try_into().unwrap());
-    let size = u64::from_le_bytes(whole[20..28].try_into().unwrap());
-    let end = usize::try_from(32 + next + size).unwrap();
-    assert!(end <= whole.len());
-    (end, offsets)
-}
-
-// Container blocks a tail may and must mend: the wrong ranges that fall
-// before the tail, in the container's own block grid.
-fn tail_needed(
-    post: &Post,
-    files: &[usize],
-    lost: &BTreeMap<usize, BTreeSet<u32>>,
-    block: usize,
-) -> (usize, usize) {
-    let none = BTreeSet::new();
-    let (tail, offsets) = container_span(post, files);
-    let mut may_all = Vec::new();
-    let mut must_all = Vec::new();
-    for (at, &file) in files.iter().enumerate() {
-        let (may, must) = post.files[file].wrong_ranges(lost.get(&file).unwrap_or(&none));
-        let shift = |range: Range<usize>| {
-            (range.start + offsets[at]).min(tail)..(range.end + offsets[at]).min(tail)
-        };
-        may_all.extend(may.into_iter().map(shift));
-        must_all.extend(must.into_iter().map(shift));
-    }
-    (
-        blocks_touched(&may_all, block),
-        blocks_touched(&must_all, block),
-    )
-}
-
-// Recovery packets of a tail that survive what the post loses.
-fn tail_surviving(
-    post: &Post,
-    files: &[usize],
-    lost: &BTreeMap<usize, BTreeSet<u32>>,
-    require_metadata: bool,
-) -> (usize, usize) {
-    let none = BTreeSet::new();
-    let (tail, offsets) = container_span(post, files);
-    let whole: Vec<u8> = files
-        .iter()
-        .flat_map(|&file| post.files[file].bytes.clone())
-        .collect();
-    let packets = recovery_packets(&whole);
-    // Recovery symbols are unusable without their authenticated layout and
-    // matrix. Count duplicate copies by packet hash, so any intact copy of
-    // each required description is sufficient.
-    let mut metadata = BTreeMap::<[u8; 16], Vec<Range<usize>>>::new();
-    let mut at = tail;
-    // Authoring sizes parity from packet loss alone. Metadata loss changes
-    // the verdict, not the authored layout or the article chosen for loss.
-    while require_metadata && at + 48 <= whole.len() {
-        assert!(whole[at..].starts_with(b"PAR3\0PKT"));
-        let length = u64::from_le_bytes(whole[at + 24..at + 32].try_into().unwrap()) as usize;
-        assert!(length >= 48 && at + length <= whole.len());
-        if matches!(
-            &whole[at + 40..at + 48],
-            b"PAR STA\0" | b"PAR CAU\0" | b"PAR FIL\0" | b"PAR ROO\0" | b"PAR EXT\0"
-        ) {
-            metadata
-                .entry(whole[at + 8..at + 24].try_into().unwrap())
-                .or_default()
-                .push(at..at + length);
-        }
-        at += length;
-    }
-    assert!(!require_metadata || !metadata.is_empty());
-    let mut may_all = Vec::new();
-    let mut must_all = Vec::new();
-    for (at, &file) in files.iter().enumerate() {
-        let (may, must) = post.files[file].wrong_ranges(lost.get(&file).unwrap_or(&none));
-        may_all.extend(
-            may.into_iter()
-                .map(|range| range.start + offsets[at]..range.end + offsets[at]),
-        );
-        must_all.extend(
-            must.into_iter()
-                .map(|range| range.start + offsets[at]..range.end + offsets[at]),
-        );
-    }
-    let hit = |ranges: &[Range<usize>], packet: &Range<usize>| {
-        ranges
-            .iter()
-            .any(|range| range.start < packet.end && packet.start < range.end)
-    };
-    let usable = |damage: &[Range<usize>]| {
-        if metadata
-            .values()
-            .any(|copies| copies.iter().all(|copy| hit(damage, copy)))
-        {
-            0
-        } else {
-            packets.iter().filter(|packet| !hit(damage, packet)).count()
-        }
-    };
-    (usable(&may_all), usable(&must_all))
-}
-
-// What a 7z with a tail must end in under the loss: the tail mends the
-// container when enough of it survives; a lost start header leaves no map,
-// so the set demotes and the conventional path repairs from the tail, which
-// is still a completion.
-fn tail_verdict(
-    post: &Post,
-    files: &[usize],
-    lost: &BTreeMap<usize, BTreeSet<u32>>,
-    block: usize,
-) -> Verdict {
-    let (upper, lower) = tail_needed(post, files, lost, block);
-    if upper == 0 {
-        return Verdict::Completes;
-    }
-    let (least, most) = tail_surviving(post, files, lost, true);
-    if upper <= least {
-        Verdict::Completes
-    } else if lower > most {
-        Verdict::Fails
-    } else {
-        Verdict::Either
-    }
-}
-
 impl Cell for Par3Cell {
     fn post(self, interruption: Interruption) -> Built {
         let (post, geometry, ruling) = self.build(interruption);
@@ -627,14 +389,13 @@ impl Cell for Par3Cell {
 }
 
 macro_rules! par3_smokes {
-    ($($name:ident $placement:ident $code:ident $margin:ident $block:literal $entries:ident $sets:ident $index:ident $container:ident;)+) => {
+    ($($name:ident $code:ident $margin:ident $block:literal $entries:ident $sets:ident $index:ident $container:ident;)+) => {
         mod combined_par3_breadth_smoke {
             use super::*;
             $(
                 #[tokio::test]
                 async fn $name() {
                     smoke(Par3Cell {
-                        placement: Placement::$placement,
                         code: Code::$code,
                         margin: Margin::$margin,
                         block: $block,
@@ -651,67 +412,11 @@ macro_rules! par3_smokes {
 }
 
 par3_smokes! {
-    sidecar_cauchy_rar5 Sidecar Cauchy With 1024 One One Present Rar5;
-    sidecar_fft_sevenz_two_entries Sidecar Fft Exact 512 Two One Present SevenZip;
-    sidecar_two_sets_index_absent Sidecar Cauchy With 4096 One Two Absent Rar5;
-    sidecar_fft_two_sets_present Sidecar Fft With 4096 One Two Present Rar5;
-    sidecar_index_damaged_short Sidecar Fft OneShort 1024 One One Damaged SevenZip;
-    embedded_cauchy Embedded Cauchy With 1024 One One Present SevenZip;
-    embedded_fft_two_sets Embedded Fft Exact 512 Two Two Present SevenZip;
-    both_cauchy_index_damaged Both Cauchy With 4096 One One Damaged SevenZip;
-    both_fft_two_entries Both Fft OneShort 1024 Two One Present SevenZip;
-}
-
-#[tokio::test]
-async fn embedded_replacement_retires_its_split_sidecar() {
-    for sets in [Sets::One, Sets::Two] {
-        let cell = Par3Cell {
-            placement: Placement::Both,
-            code: Code::Fft,
-            margin: Margin::With,
-            block: 4096,
-            entries: Entries::One,
-            sets,
-            index: Index::Present,
-            container: Container::SevenZip,
-        };
-        let interruption = Interruption::Starved { mask: 11 };
-        assert_eq!(cell.build(interruption).2, Some(Verdict::Completes));
-        for profile in PROFILES {
-            run_cell(
-                cell,
-                profile,
-                vec![(441207, (vec![(0, 0), (0, 1), (1, 0), (1, 1)], interruption))],
-            )
-            .await;
-        }
-    }
-}
-
-#[tokio::test]
-async fn embedded_recovery_requires_its_metadata() {
-    let cell = Par3Cell {
-        placement: Placement::Both,
-        code: Code::Fft,
-        margin: Margin::With,
-        block: 4096,
-        entries: Entries::One,
-        sets: Sets::One,
-        index: Index::Present,
-        container: Container::SevenZip,
-    };
-    for (mask, verdict) in [(1, Verdict::Completes), (8, Verdict::Fails)] {
-        let interruption = Interruption::Starved { mask };
-        assert_eq!(cell.build(interruption).2, Some(verdict));
-        for profile in PROFILES {
-            run_cell(
-                cell,
-                profile,
-                vec![(441205, (vec![(0, 0), (0, 1), (1, 0), (1, 1)], interruption))],
-            )
-            .await;
-        }
-    }
+    sidecar_cauchy_rar5 Cauchy With 1024 One One Present Rar5;
+    sidecar_fft_sevenz_two_entries Fft Exact 512 Two One Present SevenZip;
+    sidecar_two_sets_index_absent Cauchy With 4096 One Two Absent Rar5;
+    sidecar_fft_two_sets_present Fft With 4096 One Two Present Rar5;
+    sidecar_index_damaged_short Fft OneShort 1024 One One Damaged SevenZip;
 }
 
 mod combined_par3_breadth_loss_smoke {
@@ -720,7 +425,6 @@ mod combined_par3_breadth_loss_smoke {
     #[tokio::test]
     async fn sidecar_fft_rar5() {
         loss_smoke(Par3Cell {
-            placement: Placement::Sidecar,
             code: Code::Fft,
             margin: Margin::With,
             block: 1024,
@@ -731,39 +435,9 @@ mod combined_par3_breadth_loss_smoke {
         })
         .await;
     }
-
-    #[tokio::test]
-    async fn embedded_cauchy_two_sets() {
-        loss_smoke(Par3Cell {
-            placement: Placement::Embedded,
-            code: Code::Cauchy,
-            margin: Margin::With,
-            block: 512,
-            entries: Entries::Two,
-            sets: Sets::Two,
-            index: Index::Present,
-            container: Container::SevenZip,
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn embedded_cauchy_sevenz() {
-        loss_smoke(Par3Cell {
-            placement: Placement::Embedded,
-            code: Code::Cauchy,
-            margin: Margin::With,
-            block: 1024,
-            entries: Entries::One,
-            sets: Sets::One,
-            index: Index::Present,
-            container: Container::SevenZip,
-        })
-        .await;
-    }
 }
 
-// The campaign: 500 shards of about a thousand cases.
+// The campaign: 500 shards of about two hundred cases.
 mod combined_par3_breadth {
     use super::*;
 

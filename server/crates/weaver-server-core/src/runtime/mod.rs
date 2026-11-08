@@ -14,6 +14,7 @@ pub mod log_buffer;
 pub mod log_delivery;
 pub mod log_file;
 pub mod log_filter;
+pub mod panic_trap;
 pub(crate) mod perf_probe;
 pub mod postprocess_pool;
 pub mod process_metrics;
@@ -25,8 +26,9 @@ pub mod system_profile;
 pub mod thread_release;
 pub mod tuning;
 
-pub use hardware_profile::{ChaseWidening, HardwareProfile, MemoryShare, ProfileTuning};
+pub use hardware_profile::{HardwareProfile, MemoryShare, ProfileTuning};
 pub use reload::{load_global_pause_from_db, rebuild_nntp_from_config, reload_runtime_from_db};
 pub use system_probe::{
-    detect as detect_system_profile, detect_startup_profile, measure_random_read_iops,
+    DiskMeasurement, StartupDiskGate, StartupDiskGateOpener, detect as detect_system_profile,
+    detect_startup_profile, measure_disk_profile, startup_disk_measurement,
 };

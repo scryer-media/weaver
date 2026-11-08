@@ -3,6 +3,7 @@
 
 import {
   createContext,
+  useCallback,
   useContext,
   useLayoutEffect,
   useMemo,
@@ -20,6 +21,7 @@ import { EmptyState } from "../components/chrome";
 import { SecondaryButton, Select, TextField } from "../components/controls";
 import { LogRow } from "../components/LogRow";
 import { formatCount } from "../data/format";
+import { runtimeIds } from "../testids";
 import { LOG_LEVEL_COLORS, WV } from "../data/palette";
 import { countLabel } from "../i18n/labels";
 import { sameElements, shallowEqual, useSettled } from "../data/settled";
@@ -27,6 +29,7 @@ import {
   LOG_LEVELS,
   useServiceLogs,
   type LogLevelFilter,
+  type LogLine,
   type ServiceLogs,
 } from "../data/use-service-logs";
 import { NextShell } from "../shell/NextShell";
@@ -42,13 +45,13 @@ const ROW_ESTIMATE_PX = 31;
 
 const FILTERS: LogLevelFilter[] = ["all", ...LOG_LEVELS];
 
-type LogFilterPreset = "default" | "download" | "directStore" | "everything" | "custom";
+type LogFilterPreset = "default" | "download" | "graphEngine" | "everything" | "custom";
 
 /** Directives per preset. Blank asks the server for its startup filter. */
 const PRESET_DIRECTIVES: Record<Exclude<LogFilterPreset, "custom">, string> = {
   default: "",
   download: "info,weaver_server_core::pipeline::download=debug,weaver_nntp=debug",
-  directStore: "info,weaver_server_core::pipeline::direct_store=debug",
+  graphEngine: "info,weaver_server_core::pipeline::graph=debug,weaver_graph=debug",
   everything: "debug",
 };
 
@@ -107,7 +110,7 @@ function LogFilterBar() {
   const options: { value: LogFilterPreset; label: string }[] = [
     { value: "default", label: t("next.logs.filter.preset.default") },
     { value: "download", label: t("next.logs.filter.preset.download") },
-    { value: "directStore", label: t("next.logs.filter.preset.directStore") },
+    { value: "graphEngine", label: t("next.logs.filter.preset.graphEngine") },
     { value: "everything", label: t("next.logs.filter.preset.everything") },
     { value: "custom", label: t("next.logs.filter.preset.custom") },
   ];
@@ -124,6 +127,7 @@ function LogFilterBar() {
         {t("next.logs.filter.label")}
       </span>
       <Select
+        testId={runtimeIds.logsLevel}
         label={t("next.logs.filter.label")}
         value={presetFor(current)}
         options={options}
@@ -131,6 +135,7 @@ function LogFilterBar() {
         className="w-[190px]"
       />
       <TextField
+        testId={runtimeIds.logsDirectives}
         label={t("next.logs.filter.directives")}
         placeholder={current.defaultDirectives}
         value={draft}
@@ -262,7 +267,11 @@ function TailPauseButton() {
   const t = useTranslate();
   const { paused, setPaused } = useLogsPart(LogTailContext);
   return (
-    <SecondaryButton icon={paused ? "resume" : "pause"} onClick={() => setPaused(!paused)}>
+    <SecondaryButton
+      testId={paused ? runtimeIds.logsResumeTail : runtimeIds.logsPauseTail}
+      icon={paused ? "resume" : "pause"}
+      onClick={() => setPaused(!paused)}
+    >
       {paused ? t("next.logs.resumeTail") : t("next.logs.pauseTail")}
     </SecondaryButton>
   );
@@ -307,7 +316,10 @@ function LevelBar({
           );
         })}
       </div>
-      <span className="ml-auto hidden flex-none pl-3 font-wv-mono text-[11px] text-wv-faint sm:inline">
+      <span
+        data-testid={runtimeIds.logsTail(paused ? "paused" : connected ? "following" : "disconnected")}
+        className="ml-auto hidden flex-none pl-3 font-wv-mono text-[11px] text-wv-faint sm:inline"
+      >
         {paused
           ? t("next.logs.pausedNote")
           : connected
@@ -336,6 +348,29 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
   const { lines, loading } = useLogsPart(LogLinesContext);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const followingRef = useRef(true);
+  // The open line, by its record: a line keeps its record when the buffer
+  // numbers it again. While one is open the tail stops following, so the
+  // record stays put; closing it follows again if the tail was following.
+  const [selected, setSelected] = useState<string | null>(null);
+  const selectedRef = useRef<string | null>(null);
+  const resumeRef = useRef(true);
+  const select = useCallback((source: string | null) => {
+    if (source !== null && selectedRef.current === null) {
+      resumeRef.current = followingRef.current;
+    }
+    if (source === null && selectedRef.current !== null) {
+      followingRef.current = resumeRef.current;
+    }
+    if (source !== null) {
+      followingRef.current = false;
+    }
+    selectedRef.current = source;
+    setSelected(source);
+  }, []);
+  const onToggle = useCallback(
+    (line: LogLine) => select(selectedRef.current === line.source ? null : line.source),
+    [select],
+  );
   const virtualizer = useVirtualizer({
     count: lines.length,
     getScrollElement: () => scrollerRef.current,
@@ -346,8 +381,19 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
   });
   const totalSize = virtualizer.getTotalSize();
   useLayoutEffect(() => {
-    followingRef.current = true;
+    if (selectedRef.current === null) {
+      followingRef.current = true;
+    } else {
+      resumeRef.current = true;
+    }
   }, [level, query]);
+  // A line that left the view, out of the buffer or filtered away, closes.
+  useLayoutEffect(() => {
+    const open = selectedRef.current;
+    if (open !== null && !lines.some((line) => line.source === open)) {
+      select(null);
+    }
+  }, [lines, select]);
   // Pinned again whenever the height changes as well as when lines arrive:
   // the rows at the tail are measured after they render, and a wrapped one is
   // taller than its estimate.
@@ -360,8 +406,13 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
   const onScroll = () => {
     const scroller = scrollerRef.current;
     if (scroller) {
-      followingRef.current =
+      const atTail =
         scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight <= TAIL_SLACK_PX;
+      if (selectedRef.current === null) {
+        followingRef.current = atTail;
+      } else {
+        resumeRef.current = atTail;
+      }
     }
   };
 
@@ -388,7 +439,11 @@ function LogList({ level, query }: { level: LogLevelFilter; query: string }) {
               className="absolute top-0 left-0 w-full"
               style={{ transform: `translateY(${item.start}px)` }}
             >
-              <LogRow line={lines[item.index]!} />
+              <LogRow
+                line={lines[item.index]!}
+                selected={lines[item.index]!.source === selected}
+                onToggle={onToggle}
+              />
             </div>
           ))}
         </div>

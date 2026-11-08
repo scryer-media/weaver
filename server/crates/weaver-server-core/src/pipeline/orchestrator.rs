@@ -4,19 +4,22 @@
 use super::*;
 
 mod commands;
+mod control;
 mod hardware_profile;
 mod history;
+mod report;
 mod runtime;
 mod scripts;
 mod state;
 
-pub(crate) use history::{FinishedJobs, HistoryDeleteDone};
-pub(super) use runtime::timestamp_secs;
-pub(crate) use runtime::{
-    DirectWriteBatches, SegmentWriteBatchError, close_cached_write_handles_under,
-    is_terminal_status, register_direct_placement, release_cached_write_handle,
-    remove_file_after_cached_write_handle, submit_segments_to_disk, sync_direct_destinations,
-    write_direct_batches, write_segment_to_disk,
-};
+pub(super) use commands::{CancelJobsDone, CancelledJobCleanup};
 #[cfg(test)]
-pub(crate) use runtime::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
+pub(super) use control::RESTORE_BATCH;
+pub(crate) use runtime::is_terminal_status;
+pub(super) use runtime::timestamp_secs;
+#[cfg(test)]
+pub(super) use runtime::{DECODES_HEARD_RESTORING, PERIODIC_TICKS, actor_db};
+#[cfg(test)]
+pub(super) use runtime::{compute_decode_backlog_budget_bytes, compute_write_backlog_budget_bytes};
+#[cfg(test)]
+pub(super) use scripts::ADDED_SCRIPT_RAISES;

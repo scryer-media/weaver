@@ -20,10 +20,7 @@ use crate::persistence::sql_services::DatabaseServices;
 
 pub use crate::auth::{ApiKeyRow, AuthCredentials};
 pub use crate::history::{HistoryFilter, IntegrationEventRow, JobEvent, JobHistoryRow};
-pub use crate::jobs::{
-    ActiveFileIdentity, ActiveFileProgress, ActiveJob, ActivePar2File, ExtractionChunk,
-    RecoveredJob,
-};
+pub use crate::jobs::{ActiveFileIdentity, ActiveJob, RecoveredJob};
 pub use crate::operations::{
     MetricsHistoryChunkRow, MetricsHistoryQueryData, MetricsHistoryQueryResult,
     RawMetricsHistoryPoint, RollupMetricsHistoryPoint, StableStateExport,
@@ -83,6 +80,10 @@ impl DatabaseRuntimeWorker {
         T: Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
+        #[cfg(test)]
+        actor_thread::note(caller);
         match self {
             Self::Sqlite { writer, .. } => writer.block_on(caller, future),
             Self::Postgres(worker) => worker.block_on(future),
@@ -99,6 +100,10 @@ impl DatabaseRuntimeWorker {
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
+        #[cfg(test)]
+        actor_thread::note(caller);
         match self {
             Self::Sqlite { writer, .. } => writer.block_on_local(caller, build),
             Self::Postgres(_) => Err(StateError::Database(
@@ -117,6 +122,10 @@ impl DatabaseRuntimeWorker {
         T: Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + Send + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
+        #[cfg(test)]
+        actor_thread::note(caller);
         match self {
             Self::Sqlite { reads, .. } => reads.block_on(caller, future),
             Self::Postgres(worker) => worker.block_on(future),
@@ -133,6 +142,8 @@ impl DatabaseRuntimeWorker {
         Build: FnOnce() -> Fut + Send + 'static,
         Fut: Future<Output = Result<T, StateError>> + 'static,
     {
+        #[cfg(test)]
+        blocking_call_probe::note(caller);
         match self {
             Self::Sqlite { writer, .. } => writer.block_on_local(caller, build),
             Self::Postgres(worker) => worker.block_on_local(build),
@@ -773,24 +784,38 @@ enum DbWriteCommand {
         // history row is queryable through the read paths.
         committed: Option<oneshot::Sender<()>>,
     },
+    // Several jobs' archives as one ordered write. Each archive keeps its own
+    // transaction; `committed` fires once every one has run, naming the jobs
+    // whose archive failed and why.
+    ArchiveJobs {
+        jobs: Vec<(crate::jobs::ids::JobId, crate::history::JobHistoryRow)>,
+        failure_kind: Option<crate::history::HistoryFailureKind>,
+        committed: oneshot::Sender<BTreeMap<crate::jobs::ids::JobId, String>>,
+    },
     InsertJobEvents {
         events: Vec<crate::history::JobEvent>,
     },
     // A generic ordered write. Same-key state transitions land in enqueue
-    // order: on SQLite every command is awaited before the next, and on
-    // Postgres writes on one lane keep their order and a write with no lane
-    // is a barrier.
+    // order: writes on one lane keep their order and a write with no lane
+    // is a barrier. SQLite additionally serializes SQL execution.
     // `op` runs on a
     // `Database` clone the writer task holds, letting it call methods that
     // live on `Database` (e.g. `set_active_job_runtime` / `update_active_job`)
     // without duplicating them onto `DatabaseWriterExecutor`.
     Write {
         label: &'static str,
-        // The lane this write extends. On Postgres writes on one lane keep
+        // The lane this write extends. Writes on one lane keep
         // their order while other lanes' writes run alongside; `None` makes
         // the write a barrier against every other queued write.
         lane: Option<WriteLane>,
         op: WriteOp,
+        // Answers with the write's outcome once it has run. A write that
+        // never runs drops it, which its receiver reads as a failure.
+        committed: Option<oneshot::Sender<Result<(), String>>>,
+    },
+    GraphCheckpoint {
+        job_id: crate::jobs::ids::JobId,
+        prepare: Box<dyn FnOnce() -> super::checkpoint_write::CheckpointWrite + Send>,
     },
     Flush {
         reply: oneshot::Sender<()>,
@@ -826,10 +851,14 @@ impl DbWriteCommand {
                 WriteLane::Job(job_id.0),
             )),
             Self::InsertJobEvents { .. } => Some((&[], WriteLane::Events)),
+            Self::GraphCheckpoint { job_id, .. } => Some((&[], WriteLane::Job(job_id.0))),
             Self::Write {
                 lane: Some(lane), ..
             } => Some((&[], *lane)),
-            Self::Write { lane: None, .. } | Self::Flush { .. } => None,
+            // Spans many jobs' lanes, so it is a barrier: every earlier write
+            // for any of its jobs (a support facts save among them), every
+            // event batch and every attribution checkpoint lands first.
+            Self::ArchiveJobs { .. } | Self::Write { lane: None, .. } | Self::Flush { .. } => None,
         }
     }
 }
@@ -855,7 +884,15 @@ async fn execute_write_command(
     command: DbWriteCommand,
     writer: &DatabaseWriterExecutor,
     writer_db: &Database,
+    permits: &Arc<Semaphore>,
 ) {
+    // Checkpoints acquire a slot per SQL attempt, releasing it while paused.
+    // Every other command executes once under one slot.
+    let _permit = if matches!(&command, DbWriteCommand::GraphCheckpoint { .. }) {
+        None
+    } else {
+        Some(permits.clone().acquire_owned().await)
+    };
     match command {
         DbWriteCommand::ArchiveJob {
             job_id,
@@ -865,7 +902,7 @@ async fn execute_write_command(
             committed,
         } => {
             let writer = writer.clone();
-            tokio::task::spawn_blocking(move || {
+            let archived = tokio::task::spawn_blocking(move || {
                 // Capture the cache generation *before* the archive
                 // read so a concurrent history-delete that bumps the
                 // generation makes the conditional insert a no-op,
@@ -885,13 +922,65 @@ async fn execute_write_command(
                             error = %error,
                             "failed to archive job on database writer path"
                         );
+                        return false;
                     }
                 }
+                true
             })
-            .await
-            .ok();
-            if let Some(committed) = committed {
-                let _ = committed.send(());
+            .await;
+            if matches!(archived, Ok(true)) {
+                // An archived job no longer needs its cancelled checkpoint.
+                // Keep the failure until this transaction actually succeeds.
+                writer_db.checkpoint_failures.send_modify(|failures| {
+                    failures.remove(&job_id);
+                });
+                if let Some(committed) = committed {
+                    let _ = committed.send(());
+                }
+            }
+        }
+        DbWriteCommand::ArchiveJobs {
+            jobs,
+            failure_kind,
+            committed,
+        } => {
+            let writer = writer.clone();
+            let archived_jobs: Vec<_> = jobs.iter().map(|(job_id, _)| *job_id).collect();
+            let failed = tokio::task::spawn_blocking(move || {
+                let mut failed = BTreeMap::new();
+                for (job_id, history) in jobs {
+                    // Taken before each archive read, as for one archive.
+                    let observed_generation = writer.job_history_cache_generation();
+                    match writer.archive_job_with_terminal_cause(
+                        job_id,
+                        &history,
+                        None,
+                        failure_kind,
+                    ) {
+                        Ok(Some(row)) => writer.cache_job_history_at(row, observed_generation),
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(
+                                job_id = job_id.0,
+                                error = %error,
+                                "failed to archive job on database writer path"
+                            );
+                            failed.insert(job_id, error.to_string());
+                        }
+                    }
+                }
+                failed
+            })
+            .await;
+            if let Ok(failed) = failed {
+                writer_db.checkpoint_failures.send_modify(|failures| {
+                    for job_id in archived_jobs {
+                        if !failed.contains_key(&job_id) {
+                            failures.remove(&job_id);
+                        }
+                    }
+                });
+                let _ = committed.send(failed);
             }
         }
         DbWriteCommand::InsertJobEvents { events } => {
@@ -908,15 +997,54 @@ async fn execute_write_command(
             .await
             .ok();
         }
-        DbWriteCommand::Write { label, op, .. } => {
+        DbWriteCommand::Write {
+            label,
+            op,
+            committed,
+            ..
+        } => {
             let writer_db = writer_db.clone();
             tokio::task::spawn_blocking(move || {
-                if let Err(error) = op(&writer_db) {
+                let outcome = op(&writer_db).map_err(|error| error.to_string());
+                if let Err(error) = &outcome {
                     tracing::warn!(label, error = %error, "failed to run ordered database write");
+                }
+                if let Some(committed) = committed {
+                    let _ = committed.send(outcome);
                 }
             })
             .await
             .ok();
+        }
+        DbWriteCommand::GraphCheckpoint { job_id, prepare } => {
+            let mut write = prepare();
+            let blocked = write.blocked;
+            let failures = Arc::clone(&writer_db.checkpoint_failures);
+            write.blocked = Box::new(move |revision, error| {
+                failures.send_modify(|failures| {
+                    failures.insert(job_id, error.to_owned());
+                });
+                blocked(revision, error);
+            });
+            let result = write
+                .run(
+                    job_id,
+                    writer_db,
+                    writer_db.checkpoint_shutdown.subscribe(),
+                    permits,
+                )
+                .await;
+            writer_db
+                .checkpoint_failures
+                .send_modify(|failures| match result {
+                    Ok(true) => {
+                        failures.remove(&job_id);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        failures.insert(job_id, error);
+                    }
+                });
         }
         DbWriteCommand::Flush { reply } => {
             let _ = reply.send(());
@@ -924,17 +1052,13 @@ async fn execute_write_command(
     }
 }
 
-// The SQLite writer: one command at a time, each awaited before the next.
-// SQLite has a single writer connection, so there is nothing to overlap.
+// SQLite shares ordered lanes, but only one SQL command executes at a time.
 async fn run_serial_writes(
-    mut rx: mpsc::Receiver<QueuedWrite>,
+    rx: mpsc::Receiver<QueuedWrite>,
     writer: DatabaseWriterExecutor,
     writer_db: Database,
 ) {
-    while let Some(QueuedWrite { queued_at, command }) = rx.recv().await {
-        let _executed = writer_command_scope(&command, queued_at);
-        execute_write_command(command, &writer, &writer_db).await;
-    }
+    run_postgres_write_lanes(rx, writer, writer_db, 1, SQLITE_WRITE_QUEUE_CAPACITY).await;
 }
 
 // Ordered writes a Postgres writer runs at once: half the pool, so queued
@@ -948,9 +1072,9 @@ fn postgres_write_lane_concurrency() -> usize {
 // fills and senders see it full, as on the serial writer.
 const POSTGRES_WRITES_TAKEN_PER_LANE_SLOT: usize = 4;
 
-// The Postgres writer. Postgres has no single-writer limit, so ordered writes
-// for different jobs run at once, up to `concurrency`, while each lane keeps
-// submission order:
+// The ordered lane writer, shared by both datastores. SQL execution is
+// limited by `concurrency`, while each lane keeps submission order even
+// when its checkpoint is paused between attempts:
 //
 // - a job's writes apply one after another, in the order they were queued;
 // - an archive also waits for every event batch and every server attribution
@@ -973,8 +1097,8 @@ async fn run_postgres_write_lanes(
     // The completion signal of the last command taken on each lane.
     let mut tails: HashMap<WriteLane, watch::Receiver<bool>> = HashMap::new();
     loop {
-        // Every taken command's predecessors were taken before it, and none
-        // holds a permit while it waits, so the oldest one always finishes.
+        // Bound ownership of taken commands as well as the incoming queue.
+        // A paused checkpoint retains its lane until resumed or cancelled.
         while in_flight.len() >= max_taken {
             in_flight.join_next().await;
         }
@@ -984,10 +1108,27 @@ async fn run_postgres_write_lanes(
         while in_flight.try_join_next().is_some() {}
         prune_finished_lane_tails(&mut tails);
         let Some((also_after, lane)) = command.lanes() else {
-            while in_flight.join_next().await.is_some() {}
+            let mut command = command;
+            let abandoned = if let DbWriteCommand::Flush { reply } = &mut command {
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = reply.closed() => break true,
+                        joined = in_flight.join_next() => {
+                            if joined.is_none() { break false; }
+                        }
+                    }
+                }
+            } else {
+                while in_flight.join_next().await.is_some() {}
+                false
+            };
+            if abandoned {
+                continue;
+            }
             tails.clear();
             let _executed = writer_command_scope(&command, queued_at);
-            execute_write_command(command, &writer, &writer_db).await;
+            execute_write_command(command, &writer, &writer_db, &permits).await;
             continue;
         };
         let waits: Vec<watch::Receiver<bool>> = std::iter::once(&lane)
@@ -1007,9 +1148,8 @@ async fn run_postgres_write_lanes(
             }
             // Taken only once the predecessors are done, so a write waiting
             // on its lane never holds a permit a predecessor needs.
-            let _permit = permits.acquire_owned().await;
             let _executed = writer_command_scope(&command, queued_at);
-            execute_write_command(command, &writer, &writer_db).await;
+            execute_write_command(command, &writer, &writer_db, &permits).await;
             let _ = done_tx.send(true);
         });
     }
@@ -1031,8 +1171,10 @@ impl DbWriteCommand {
     fn label(&self) -> &'static str {
         match self {
             Self::ArchiveJob { .. } => "archive_job",
+            Self::ArchiveJobs { .. } => "archive_jobs",
             Self::InsertJobEvents { .. } => "insert_job_events",
             Self::Write { label, .. } => label,
+            Self::GraphCheckpoint { .. } => "save_graph_checkpoint",
             Self::Flush { .. } => "flush",
         }
     }
@@ -1087,29 +1229,30 @@ impl JobHistoryCache {
             .retain(|cached_id| *cached_id != job_id);
         self.generation = self.generation.wrapping_add(1);
     }
-
-    fn clear(&mut self) {
-        self.rows.clear();
-        self.insertion_order.clear();
-        self.generation = self.generation.wrapping_add(1);
-    }
 }
 
 // SQL-backed persistent store for config, servers, and job history.
 #[derive(Clone)]
 pub struct Database {
+    #[cfg(test)]
+    pub(crate) graph_checkpoint_writes: Arc<AtomicUsize>,
     pub(crate) rss_schedule_cache: Arc<crate::rss::ScheduleCache>,
     pub(crate) script_runtime: Arc<crate::post_processing::events::ScriptRuntime>,
     target: DatabaseTarget,
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
     writer_tx: mpsc::Sender<QueuedWrite>,
+    checkpoint_shutdown: watch::Sender<bool>,
+    checkpoint_failures: Arc<watch::Sender<BTreeMap<crate::jobs::ids::JobId, String>>>,
     // Count of in-flight background re-sends into the bounded writer queue
     // (archive jobs and generic ordered writes) spawned when `try_send` hit a
     // full queue. `flush_write_queue` waits for this to reach zero before its
     // own `Flush` so a re-send in progress is not skipped at shutdown.
     pending_write_retries: Arc<AtomicUsize>,
     pending_write_notify: Arc<Notify>,
+    // The writes waiting, in the order they were queued, for room in the
+    // full writer queue: some while the re-send empties them into it.
+    write_overflow: Arc<Mutex<Option<VecDeque<QueuedWrite>>>>,
     pub(crate) history_delete_wake: Arc<Notify>,
     job_history_cache: Arc<Mutex<JobHistoryCache>>,
     encryption_key: Option<crate::persistence::encryption::EncryptionKey>,
@@ -1139,13 +1282,18 @@ impl Database {
         let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {
             rss_schedule_cache: Arc::new(crate::rss::ScheduleCache::default()),
+            #[cfg(test)]
+            graph_checkpoint_writes: Arc::default(),
             script_runtime: Arc::new(crate::post_processing::events::ScriptRuntime::default()),
             target,
             sql_services,
             sql_worker,
             writer_tx,
+            checkpoint_shutdown: watch::channel(false).0,
+            checkpoint_failures: Arc::new(watch::channel(BTreeMap::new()).0),
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
+            write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: None,
@@ -1167,11 +1315,16 @@ impl Database {
         let (writer_tx, writer_rx) = mpsc::channel(SQLITE_WRITE_QUEUE_CAPACITY);
         let db = Self {
             target,
+            #[cfg(test)]
+            graph_checkpoint_writes: Arc::default(),
             sql_services,
             sql_worker,
             writer_tx,
+            checkpoint_shutdown: watch::channel(false).0,
+            checkpoint_failures: Arc::new(watch::channel(BTreeMap::new()).0),
             pending_write_retries: Arc::new(AtomicUsize::new(0)),
             pending_write_notify: Arc::new(Notify::new()),
+            write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
             encryption_key: Some(crate::persistence::encryption::EncryptionKey::generate()),
@@ -1206,6 +1359,10 @@ impl Database {
         &self.target
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "writer gate: a TRUNCATE checkpoint for backup, outside the gate by ruling, idle at the time"
+    )]
     pub(crate) fn checkpoint_sqlite(&self) -> Result<(), StateError> {
         let StoreDatastore::Sqlite { pool, .. } = self.datastore() else {
             return Ok(());
@@ -1220,17 +1377,24 @@ impl Database {
         })
     }
 
+    // Closes every connection this database opened, the WAL checkpoint
+    // task's last, even while another owner, such as the background writer,
+    // still holds a handle to the services: a file is then free to be
+    // replaced, which Windows refuses while any handle is open.
     pub(crate) fn close(self) -> Result<(), StateError> {
         let datastore = self.datastore();
+        let services = self.sql_services.clone();
         let worker = self.sql_worker.clone();
         drop(self);
-        worker.block_on(std::panic::Location::caller(), async move {
+        let closed = worker.block_on(std::panic::Location::caller(), async move {
             match datastore {
                 StoreDatastore::Sqlite { pool, .. } => pool.close().await,
                 StoreDatastore::Postgres { pool } => pool.close().await,
             }
             Ok(())
-        })
+        });
+        services.stop_checkpointer();
+        closed
     }
 
     pub(crate) fn get_cached_job_history(&self, job_id: u64) -> Option<JobHistoryRow> {
@@ -1262,17 +1426,17 @@ impl Database {
     }
 
     pub(crate) fn invalidate_job_history_cache(&self, job_id: u64) {
-        self.job_history_cache
-            .lock()
-            .expect("job history cache poisoned")
-            .remove(job_id);
+        self.invalidate_job_history_cache_for(&[job_id]);
     }
 
-    pub(crate) fn clear_job_history_cache(&self) {
-        self.job_history_cache
+    pub(crate) fn invalidate_job_history_cache_for(&self, job_ids: &[u64]) {
+        let mut cache = self
+            .job_history_cache
             .lock()
-            .expect("job history cache poisoned")
-            .clear();
+            .expect("job history cache poisoned");
+        for job_id in job_ids {
+            cache.remove(*job_id);
+        }
     }
 
     #[track_caller]
@@ -1384,11 +1548,16 @@ impl Database {
         let (detached_tx, _detached_rx) = mpsc::channel(1);
         Database {
             target: self.target.clone(),
+            #[cfg(test)]
+            graph_checkpoint_writes: self.graph_checkpoint_writes.clone(),
             sql_services: self.sql_services.clone(),
             sql_worker: self.sql_worker.clone(),
             writer_tx: detached_tx,
+            checkpoint_shutdown: self.checkpoint_shutdown.clone(),
+            checkpoint_failures: self.checkpoint_failures.clone(),
             pending_write_retries: self.pending_write_retries.clone(),
             pending_write_notify: self.pending_write_notify.clone(),
+            write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: self.history_delete_wake.clone(),
             job_history_cache: self.job_history_cache.clone(),
             encryption_key: self.encryption_key.clone(),
@@ -1472,6 +1641,26 @@ impl Database {
         Ok(committed_rx)
     }
 
+    // Queue several jobs' history archives as one ordered write, and hand
+    // back a signal that fires once every archive has run, naming the jobs
+    // whose archive failed. A dropped signal means the writer closed first.
+    pub(crate) fn try_queue_archive_jobs(
+        &self,
+        jobs: Vec<(crate::jobs::ids::JobId, crate::history::JobHistoryRow)>,
+        failure_kind: Option<crate::history::HistoryFailureKind>,
+    ) -> Result<oneshot::Receiver<BTreeMap<crate::jobs::ids::JobId, String>>, StateError> {
+        let (committed_tx, committed_rx) = oneshot::channel();
+        self.try_send_with_retry(
+            DbWriteCommand::ArchiveJobs {
+                jobs,
+                failure_kind,
+                committed: committed_tx,
+            },
+            "archive",
+        )?;
+        Ok(committed_rx)
+    }
+
     // Queue a generic ordered write. It runs after every write queued before
     // it and before every write queued after it, so two writes to the same
     // row land in enqueue order — closing the same-key reorder hazard that
@@ -1489,25 +1678,89 @@ impl Database {
             label,
             lane: None,
             op: Box::new(op),
+            committed: None,
         };
         self.try_send_with_retry(command, label)
     }
 
     // [`Self::try_queue_write`] for a write that belongs to one job. It keeps
-    // its order against that job's other queued writes and its archive, and on
-    // Postgres runs alongside other jobs' writes instead of behind them.
+    // its order against that job's other queued writes and its archive.
+    // Other jobs can advance while this job's checkpoint awaits resume.
     pub fn try_queue_job_write(
         &self,
         job_id: crate::jobs::ids::JobId,
         label: &'static str,
         op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
     ) -> Result<(), StateError> {
+        self.queue_job_write(job_id, label, op, None)
+    }
+
+    // [`Self::try_queue_job_write`] whose receiver answers with the write's
+    // outcome once it has run. A write that fails, or never runs because the
+    // lane closed, answers with an error or not at all.
+    pub(crate) fn try_queue_job_write_committed(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        label: &'static str,
+        op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+    ) -> Result<oneshot::Receiver<Result<(), String>>, StateError> {
+        let (committed, rx) = oneshot::channel();
+        self.queue_job_write(job_id, label, op, Some(committed))?;
+        Ok(rx)
+    }
+
+    fn queue_job_write(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        label: &'static str,
+        op: impl FnOnce(&Database) -> Result<(), StateError> + Send + 'static,
+        committed: Option<oneshot::Sender<Result<(), String>>>,
+    ) -> Result<(), StateError> {
         let command = DbWriteCommand::Write {
             label,
             lane: Some(WriteLane::Job(job_id.0)),
             op: Box::new(op),
+            committed,
         };
         self.try_send_with_retry(command, label)
+    }
+
+    // A marker at the end of the job's lane: it answers once every write
+    // queued for the job before it has run, each to its commit, as writes
+    // on one lane run in order. Queue the markers of several jobs before
+    // awaiting any, and their lanes are passed once.
+    pub(crate) fn queue_job_writes_marker(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+    ) -> Result<oneshot::Receiver<()>, StateError> {
+        let (reached, rx) = oneshot::channel();
+        self.try_queue_job_write(job_id, "job_writes_committed", move |_| {
+            let _ = reached.send(());
+            Ok(())
+        })?;
+        #[cfg(test)]
+        JOB_WRITE_WAITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(rx)
+    }
+
+    pub(crate) fn try_queue_graph_checkpoint(
+        &self,
+        job_id: crate::jobs::ids::JobId,
+        prepare: impl FnOnce() -> super::checkpoint_write::CheckpointWrite + Send + 'static,
+    ) -> Result<(), StateError> {
+        self.try_send_with_retry(
+            DbWriteCommand::GraphCheckpoint {
+                job_id,
+                prepare: Box::new(prepare),
+            },
+            "save_graph_checkpoint",
+        )
+    }
+
+    // Stop retry waits at shutdown without claiming any unwritten delta
+    // committed. A database call already running is still awaited.
+    pub(crate) fn stop_checkpoint_retries(&self) {
+        self.checkpoint_shutdown.send_replace(true);
     }
 
     // Queue a server attribution or support facts checkpoint. Checkpoints keep their order
@@ -1523,51 +1776,74 @@ impl Database {
             label: LABEL,
             lane: Some(WriteLane::ServerAttribution),
             op: Box::new(op),
+            committed: None,
         };
         self.try_send_with_retry(command, LABEL)
     }
 
-    // Shared enqueue path for ordered writer commands. Tries a non-blocking
-    // send; on a full queue spawns a background re-send tracked by
-    // `pending_write_retries`/`pending_write_notify` (so a flush cannot race
-    // past an in-flight re-send), falling back to a blocking send off-runtime.
+    // Shared enqueue path for ordered writer commands. A write goes straight
+    // into the queue only when no write waits ahead of it. Once the queue is
+    // full, writes wait in an overflow line that one sender empties into it
+    // in order, and a write queued while that line is being emptied joins
+    // its tail, even when the queue has room again: no write overtakes one
+    // queued before it. On the runtime the sender is a background task; off
+    // it, the caller's own thread, which waits for room with the line's lock
+    // released, so a runtime worker queueing meanwhile joins the line and
+    // never waits. Either sender is tracked by
+    // `pending_write_retries`/`pending_write_notify`, so a flush cannot race
+    // past it.
     fn try_send_with_retry(
         &self,
         command: DbWriteCommand,
         context: &'static str,
     ) -> Result<(), StateError> {
         let command = self.enqueue_write(command);
-        match self.writer_tx.try_send(command) {
-            Ok(()) => Ok(()),
-            Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => {
-                let tx = self.writer_tx.clone();
-                let pending_write_retries = self.pending_write_retries.clone();
-                let pending_write_notify = self.pending_write_notify.clone();
-                if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                    pending_write_retries.fetch_add(1, Ordering::AcqRel);
-                    handle.spawn(async move {
-                        let send_result = tx.send(command).await;
-                        pending_write_retries.fetch_sub(1, Ordering::AcqRel);
-                        pending_write_notify.notify_waiters();
-                        if let Err(error) = send_result {
-                            tracing::warn!(
-                                context,
-                                error = %error,
-                                "database writer queue closed while retrying enqueue"
-                            );
-                        }
-                    });
-                    Ok(())
-                } else {
-                    tx.blocking_send(command).map_err(|_| {
-                        StateError::Database("database writer queue closed".to_string())
-                    })
+        let mut overflow = self
+            .write_overflow
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(waiting) = overflow.as_mut() {
+            waiting.push_back(command);
+            return Ok(());
+        }
+        let command = match self.writer_tx.try_send(command) {
+            Ok(()) => return Ok(()),
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                return Err(writer_queue_closed());
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(command)) => command,
+        };
+        *overflow = Some(VecDeque::from([command]));
+        drop(overflow);
+        self.pending_write_retries.fetch_add(1, Ordering::AcqRel);
+        let tx = self.writer_tx.clone();
+        let overflow = Arc::clone(&self.write_overflow);
+        let pending_write_retries = self.pending_write_retries.clone();
+        let pending_write_notify = self.pending_write_notify.clone();
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            let mut sent = Ok(());
+            while let Some(next) = next_in_line(&overflow) {
+                if tx.blocking_send(next).is_err() {
+                    close_line(&overflow, context);
+                    sent = Err(writer_queue_closed());
+                    break;
                 }
             }
-            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Err(StateError::Database(
-                "database writer queue closed".to_string(),
-            )),
-        }
+            pending_write_retries.fetch_sub(1, Ordering::AcqRel);
+            pending_write_notify.notify_waiters();
+            return sent;
+        };
+        handle.spawn(async move {
+            while let Some(next) = next_in_line(&overflow) {
+                if tx.send(next).await.is_err() {
+                    close_line(&overflow, context);
+                    break;
+                }
+            }
+            pending_write_retries.fetch_sub(1, Ordering::AcqRel);
+            pending_write_notify.notify_waiters();
+        });
+        Ok(())
     }
 
     // Stamp a command with its enqueue instant and sample how full the ordered
@@ -1585,48 +1861,72 @@ impl Database {
         }
     }
 
+    // Queued through the same line as every other write, so it never
+    // overtakes a write waiting for room in the full queue. It does not wait
+    // for room itself.
     pub async fn queue_archive_job(
         &self,
         job_id: crate::jobs::ids::JobId,
         history: crate::history::JobHistoryRow,
     ) -> Result<(), StateError> {
-        let command = self.enqueue_write(DbWriteCommand::ArchiveJob {
-            job_id,
-            history: Box::new(history),
-            typed_terminal_cause: None,
-            failure_kind: None,
-            committed: None,
-        });
-        self.writer_tx
-            .send(command)
-            .await
-            .map_err(|_| StateError::Database("database writer queue closed".to_string()))
+        self.try_queue_archive_job(job_id, history)
     }
 
+    // Queued through the same line as every other write, as
+    // [`Self::queue_archive_job`] is.
     pub async fn queue_job_events(
         &self,
         events: Vec<crate::history::JobEvent>,
     ) -> Result<(), StateError> {
-        let command = self.enqueue_write(DbWriteCommand::InsertJobEvents { events });
-        self.writer_tx
-            .send(command)
-            .await
-            .map_err(|_| StateError::Database("database writer queue closed".to_string()))
+        self.try_send_with_retry(DbWriteCommand::InsertJobEvents { events }, "job_events")
     }
 
     pub async fn flush_write_queue(&self) -> Result<(), StateError> {
-        // Drain any in-flight background re-sends (archive jobs and generic
-        // writes) into the queue first, so the `Flush` we enqueue below sits
-        // behind every write that had already been accepted for the queue.
-        self.wait_for_pending_write_retries().await;
-        let (reply, rx) = oneshot::channel();
-        let command = self.enqueue_write(DbWriteCommand::Flush { reply });
-        self.writer_tx
-            .send(command)
-            .await
-            .map_err(|_| StateError::Database("database writer queue closed".to_string()))?;
-        rx.await
-            .map_err(|_| StateError::Database("database writer flush failed".to_string()))
+        // Subscribe before queuing the barrier. A checkpoint that needs
+        // explicit resume retains its ordered slot, but a flush must report
+        // that unresolved failure instead of waiting behind it forever.
+        let mut failures = self.checkpoint_failures.subscribe();
+        let flush = async {
+            // Drain any in-flight background re-sends (archive jobs and generic
+            // writes) into the queue first, so the `Flush` we enqueue below sits
+            // behind every write that had already been accepted for the queue.
+            self.wait_for_pending_write_retries().await;
+            let (reply, rx) = oneshot::channel();
+            let command = self.enqueue_write(DbWriteCommand::Flush { reply });
+            self.writer_tx
+                .send(command)
+                .await
+                .map_err(|_| StateError::Database("database writer queue closed".to_string()))?;
+            rx.await
+                .map_err(|_| StateError::Database("database writer flush failed".to_string()))?;
+            Ok::<_, StateError>(())
+        };
+        tokio::pin!(flush);
+        let mut flushed = false;
+        loop {
+            {
+                let unresolved = failures.borrow_and_update();
+                if !unresolved.is_empty() {
+                    return Err(StateError::Database(format!(
+                        "unresolved graph checkpoint writes: {}",
+                        unresolved
+                            .iter()
+                            .map(|(job, error)| format!("job {}: {error}", job.0))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    )));
+                }
+            }
+            if flushed {
+                return Ok(());
+            }
+            tokio::select! {
+                result = &mut flush => { result?; flushed = true; }
+                changed = failures.changed() => {
+                    changed.map_err(|_| StateError::Database("checkpoint failure reporting closed".into()))?;
+                }
+            }
+        }
     }
 
     async fn wait_for_pending_write_retries(&self) {
@@ -1835,7 +2135,7 @@ impl Database {
                     maybe_encrypt(Some(&key), &val).map_err(StateError::Database)?
                 {
                     SqlRuntime::execute(
-                        datastore.read_exec(),
+                        datastore.write_exec(),
                         "UPDATE servers SET password = {} WHERE id = {}",
                         &[SqlArg::Text(encrypted), SqlArg::I64(*id)],
                     )
@@ -1868,7 +2168,7 @@ impl Database {
                     maybe_encrypt(Some(&key), &val).map_err(StateError::Database)?
                 {
                     SqlRuntime::execute(
-                        datastore.read_exec(),
+                        datastore.write_exec(),
                         "UPDATE rss_feeds SET password = {} WHERE id = {}",
                         &[SqlArg::Text(encrypted), SqlArg::I64(*id)],
                     )
@@ -1901,7 +2201,7 @@ impl Database {
                     let encrypted = crate::persistence::encryption::encrypt_value(&key, &password)
                         .map_err(StateError::Database)?;
                     SqlRuntime::execute(
-                        datastore.read_exec(),
+                        datastore.write_exec(),
                         update,
                         &[
                             SqlArg::Text(encrypted),
@@ -1918,5 +2218,120 @@ impl Database {
     }
 }
 
+fn writer_queue_closed() -> StateError {
+    StateError::Database("database writer queue closed".to_string())
+}
+
+// The overflow line's next write, taken under its lock and sent with the
+// lock released. The line stays open while its head is sent, so a write
+// queued meanwhile waits behind it; it closes in the same turn it is found
+// empty, so a write queued after that goes straight to the queue.
+fn next_in_line(overflow: &Mutex<Option<VecDeque<QueuedWrite>>>) -> Option<QueuedWrite> {
+    let mut line = overflow
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let next = line.as_mut().and_then(VecDeque::pop_front);
+    if next.is_none() {
+        *line = None;
+    }
+    next
+}
+
+// No writer is left to take what still waits in the overflow line.
+fn close_line(overflow: &Mutex<Option<VecDeque<QueuedWrite>>>, context: &'static str) {
+    tracing::warn!(
+        context,
+        "database writer queue closed while retrying enqueue"
+    );
+    *overflow
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+}
+
+// The database calls made from the pipeline actor's own thread, counted
+// by call site for the tests: a call there stalls every turn behind it.
+#[cfg(test)]
+pub(crate) mod actor_thread {
+    use std::cell::Cell;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    thread_local! {
+        static ON_ACTOR: Cell<bool> = const { Cell::new(false) };
+    }
+
+    static CALLS: Mutex<BTreeMap<String, u64>> = Mutex::new(BTreeMap::new());
+
+    pub(crate) fn note(caller: &'static std::panic::Location<'static>) {
+        if ON_ACTOR.with(Cell::get) {
+            *CALLS
+                .lock()
+                .expect("actor thread counter poisoned")
+                .entry(super::caller_label(caller))
+                .or_default() += 1;
+        }
+    }
+
+    pub(crate) fn total() -> u64 {
+        CALLS
+            .lock()
+            .expect("actor thread counter poisoned")
+            .values()
+            .sum()
+    }
+
+    // Marks the thread polling the wrapped future as the actor's.
+    pub(crate) struct OnActor<F>(pub(crate) std::pin::Pin<Box<F>>);
+
+    impl<F: std::future::Future> std::future::Future for OnActor<F> {
+        type Output = F::Output;
+
+        fn poll(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<F::Output> {
+            ON_ACTOR.with(|on| on.set(true));
+            let polled = self.0.as_mut().poll(cx);
+            ON_ACTOR.with(|on| on.set(false));
+            polled
+        }
+    }
+}
+
+// Each wait for a job's queued writes, counted for the tests.
+#[cfg(test)]
+pub(crate) static JOB_WRITE_WAITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 #[cfg(test)]
 mod tests;
+
+// Every blocking database call made on the thread that armed it, by the
+// caller's location: a test proves an actor turn reads nothing by arming the
+// probe on the actor's thread, running the turn, and taking the list.
+#[cfg(test)]
+pub(crate) mod blocking_call_probe {
+    use std::cell::RefCell;
+    use std::panic::Location;
+
+    thread_local! {
+        static CALLS: RefCell<Option<Vec<&'static Location<'static>>>> =
+            const { RefCell::new(None) };
+    }
+
+    pub(crate) fn arm() {
+        CALLS.with(|calls| *calls.borrow_mut() = Some(Vec::new()));
+    }
+
+    pub(crate) fn take() -> Vec<&'static Location<'static>> {
+        CALLS.with(|calls| calls.borrow_mut().take().unwrap_or_default())
+    }
+
+    pub(super) fn note(caller: &'static Location<'static>) {
+        CALLS.with(|calls| {
+            if let Some(calls) = calls.borrow_mut().as_mut() {
+                calls.push(caller);
+            }
+        });
+    }
+}

@@ -260,3 +260,18 @@ test("rejects enum value additions as dangerous", () => {
     changes.dangerous.some((change) => change.description.includes("REPAIRING")),
   );
 });
+
+test("permits dangerous changes only with an explicit override", () => {
+  const changes = changesFor(BASE_SCHEMA.replace("COMPLETED", "COMPLETED\n    REPAIRING"));
+  assert.equal(hasSchemaCompatibilityFailure(changes), true);
+  assert.equal(hasSchemaCompatibilityFailure(changes, { allowDangerous: true }), false);
+});
+
+test("the dangerous override still rejects breaking changes", () => {
+  const changes = changesFor(BASE_SCHEMA
+    .replace("COMPLETED", "COMPLETED\n    REPAIRING")
+    .replace("name: String!", "name: Int!"));
+  assert.ok(changes.breaking.length > 0);
+  assert.ok(changes.dangerous.length > 0);
+  assert.equal(hasSchemaCompatibilityFailure(changes, { allowDangerous: true }), true);
+});

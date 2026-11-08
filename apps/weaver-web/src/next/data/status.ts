@@ -3,7 +3,7 @@
 
 import { useCallback } from "react";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
-import { isActiveStatus, statusI18nKey, statusToken } from "@/lib/status-tokens";
+import { statusI18nKey } from "@/lib/status-tokens";
 import type { JobData } from "@/lib/job-types";
 import { latestPhase } from "./phase-bars";
 
@@ -14,7 +14,9 @@ import { latestPhase } from "./phase-bars";
  * weaver's pipeline states the same way.
  */
 
-export type DownloadGroup = "active" | "paused" | "queued" | "attention";
+import type { DownloadGroup } from "./queue-page";
+
+export { downloadGroup, type DownloadGroup } from "./queue-page";
 
 export const DOWNLOAD_GROUP_ORDER: readonly DownloadGroup[] = [
   "active",
@@ -38,14 +40,6 @@ export const DOWNLOAD_GROUP_NOTE: Record<DownloadGroup, string | null> = {
   queued: "next.group.note.queued",
   attention: "next.group.note.attention",
 };
-
-export function downloadGroup(status: string): DownloadGroup {
-  const token = statusToken(status);
-  if (token === "paused") return "paused";
-  if (token === "failed") return "attention";
-  if (isActiveStatus(status)) return "active";
-  return "queued";
-}
 
 export function useStatusLabel(): (status: string) => string {
   const t = useTranslate();
@@ -79,23 +73,4 @@ export function statusDetail(
   return null;
 }
 
-/**
- * The colour an event kind takes in a job's log.
- *
- * Event kinds are open-ended — the engine adds them as the pipeline grows — so
- * this reads the name rather than enumerating it. Three tones only: something
- * went wrong, something finished well, something the engine decided (a retry,
- * a skipped recovery set). Everything else stays quiet.
- */
-export function eventTone(kind: string): "bad" | "good" | "note" | "plain" {
-  if (/FAIL|ERROR|MISSING|CANCEL|INTERRUPT|CORRUPT|DAMAGE/.test(kind)) {
-    return "bad";
-  }
-  if (/COMPLETE|SUCCEED|PASSED|REPAIRED/.test(kind)) {
-    return "good";
-  }
-  if (/RETRY|SKIP|REPAIR|PAUSE|RESUME|WAIT|PROPAGAT/.test(kind)) {
-    return "note";
-  }
-  return "plain";
-}
+export { eventTone } from "./event-tone";

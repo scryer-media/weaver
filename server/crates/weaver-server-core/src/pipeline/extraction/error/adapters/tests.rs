@@ -44,21 +44,6 @@ fn zstd_0_13_checksum_mismatch_is_recoverable() {
 }
 
 #[test]
-fn zstd_0_13_frame_past_the_window_is_recognised() {
-    let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
-    encoder.window_log(24).unwrap();
-    let data: Vec<u8> = (0u32..1 << 20)
-        .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
-        .collect();
-    encoder.write_all(&data).unwrap();
-    let frame = encoder.finish().unwrap();
-    let mut decoder = zstd::stream::read::Decoder::new(Cursor::new(frame)).unwrap();
-    decoder.window_log_max(10).unwrap();
-    let error = read_all(decoder);
-    assert!(zstd_0_13_frame_exceeds_window(&error.to_string()));
-}
-
-#[test]
 fn flate2_1_1_gzip_trailer_mismatch_is_recoverable() {
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     encoder.write_all(&[9u8; 4096]).unwrap();

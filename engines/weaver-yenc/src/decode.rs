@@ -207,6 +207,14 @@ fn finalize_decode(
     checkpoint_plan: CheckpointPlan,
     checkpoint_collapse_reason: Option<crate::segment::CheckpointCollapseReason>,
 ) -> Result<DecodeResult, YencError> {
+    let mut metadata = metadata;
+    let mut segments = segments;
+    // An exchanged `=ypart` pair puts the article at its smaller field. Its
+    // checksums were taken from the larger, so they become one checksum of
+    // the whole article where it now lies.
+    if metadata.settle_exchanged_range(bytes_written as u64) {
+        segments = whole_buffer_segments(&metadata, bytes_written, part_crc);
+    }
     let (expected_part_crc, expected_file_crc, yend_size, yend_defects, has_trailer) = match yend {
         Some(yend) => (yend.pcrc32, yend.crc32, yend.size, yend.defects, true),
         None => (None, None, None, YencHeaderDefects::default(), false),
@@ -2966,6 +2974,70 @@ mod tests {
         let (result, data) = nntp(&[ONE_PART, b"kl\r\n.\r\n=yend size=2\r\n"].concat()).unwrap();
         assert!(result.has_trailer);
         assert_eq!(data, b"AB");
+    }
+
+    // A first part whose `=ypart begin=` and `end=` were exchanged lies at
+    // the smaller field, on every entry point, with one checksum of the
+    // whole article there; an end below begin that is not an exchange is
+    // still placed by its begin.
+    #[test]
+    fn exchanged_ypart_range_places_the_part_at_the_smaller() {
+        let original = b"exchanged range body";
+        let len = original.len() as u64;
+        let crc = {
+            let mut crc = Crc32::new();
+            crc.update(original);
+            crc.finalize()
+        };
+        let article = |begin: u64, end: u64| {
+            let mut article = format!(
+                "=ybegin part=1 total=2 line=128 size={} name=a\r\n=ypart begin={begin} end={end}\r\n",
+                2 * len
+            )
+            .into_bytes();
+            article.extend_from_slice(&encode_raw(original));
+            article.extend_from_slice(
+                format!("\r\n=yend size={len} part=1 pcrc32={crc:08x}\r\n").as_bytes(),
+            );
+            article
+        };
+        let streamed = |article: &[u8]| {
+            let mut decoder = StreamingArticleDecoder::new();
+            let mut output = Vec::new();
+            decoder.feed_chunk(article, &mut output).unwrap();
+            decoder.finish(output).unwrap().result
+        };
+
+        let exchanged = article(len, 1);
+        let (whole, data) = nntp(&exchanged).unwrap();
+        assert_eq!(data, original);
+        for result in [whole, streamed(&exchanged)] {
+            assert_eq!(
+                (result.metadata.begin, result.metadata.end),
+                (Some(1), Some(len))
+            );
+            assert_eq!(result.metadata.article_file_offset(), 0);
+            assert!(!result.defects.ypart_size_mismatch);
+            assert_eq!(result.crc_status, CrcVerification::Verified);
+            assert_eq!(
+                result
+                    .segments
+                    .iter()
+                    .map(|segment| (segment.file_offset, segment.len, segment.crc32))
+                    .collect::<Vec<_>>(),
+                vec![(0, len, crc)]
+            );
+        }
+
+        // An end one below begin is no exchange: begin still places it.
+        let below = article(len + 1, len);
+        for result in [nntp(&below).unwrap().0, streamed(&below)] {
+            assert_eq!(
+                (result.metadata.begin, result.metadata.end),
+                (Some(len + 1), None)
+            );
+            assert_eq!(result.metadata.article_file_offset(), len);
+        }
     }
 
     #[test]

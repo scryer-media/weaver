@@ -1,0 +1,25 @@
+{
+  "slug": "zip-store-encrypted-nested-no-seek",
+  "title": "zip-store-encrypted-nested-no-seek.2026.TEST",
+  "description": "The identical encrypted inner ZIP inside a deflated outer ZIP: unavailable seek must select ZipEngine for the inner archive.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "password": "e2e-test-password",
+  "segment_size": 768000,
+  "expectedOutputBLAKE3": {
+    "feature.mkv": "8d3de71a518f9bfb6a290d350c2cf1b3cab0a56ad2249d60216ab0ee1b95c2a3"
+  },
+  "exactOutputFiles": true,
+  "runtimeAssertions": {
+    "archiveModes": [
+      {
+        "archive": "outer.zip",
+        "requireKind": "zip_engine"
+      },
+      {
+        "archive": "inner.zip",
+        "requireKind": "zip_engine"
+      }
+    ]
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "slug": "adv-zip-directory-disagrees",
+  "title": "E2E.Adversarial.Zip.Directory.Disagrees.2026-TESTGRP",
+  "description": "A member whose central directory record names a different file and declares twice the size its local header and data carry. The job settles with a named verdict.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "settles"
+  }
+}

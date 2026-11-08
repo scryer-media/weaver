@@ -49,9 +49,22 @@ impl From<CoreDirectoryBrowseListing> for DirectoryBrowseResult {
 }
 
 #[derive(Debug, Clone, SimpleObject)]
+#[graphql(complex)]
 pub struct ServiceLogsPayload {
-    pub lines: Vec<String>,
+    /// One JSON record per line, oldest first.
+    pub records: Vec<String>,
     pub count: i32,
+}
+
+#[ComplexObject]
+impl ServiceLogsPayload {
+    /// The same lines as text, rendered from the records when asked for.
+    async fn lines(&self) -> Vec<String> {
+        self.records
+            .iter()
+            .map(|record| weaver_server_core::runtime::log_buffer::text_line(record))
+            .collect()
+    }
 }
 
 /// The live log filter. Changes last until the process exits.
@@ -107,6 +120,11 @@ pub struct DownloadBlock {
     pub window_ends_at_epoch_ms: Option<f64>,
     pub timezone_name: String,
     pub scheduled_speed_limit: u64,
+    /// Speed limit the downloads run under now: the schedule's while one
+    /// holds, even one set to unlimited, else the configured one. 0 is none.
+    pub speed_limit_in_force: u64,
+    /// Whether a schedule window sets the limit in force, even to unlimited.
+    pub speed_limit_by_schedule: bool,
     /// Why a schedule rule is holding new downloads, while one is.
     pub schedule_hold_reason: Option<String>,
 }
@@ -124,12 +142,15 @@ impl From<&DownloadBlockState> for DownloadBlock {
             window_ends_at_epoch_ms: value.window_ends_at_epoch_ms,
             timezone_name: value.timezone_name.clone(),
             scheduled_speed_limit: value.scheduled_speed_limit,
+            speed_limit_in_force: value.speed_limit_in_force,
+            speed_limit_by_schedule: value.speed_limit_by_schedule,
             schedule_hold_reason: value.schedule_hold_reason.clone(),
         }
     }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct Metrics {
     pub bytes_downloaded: u64,
     pub bytes_decoded: u64,
@@ -144,20 +165,6 @@ pub struct Metrics {
     pub write_buffered_bytes: u64,
     pub write_buffered_segments: u32,
     pub direct_write_evictions: u64,
-    /// Lifetime count of archive sets direct-store admitted. Together with
-    /// the two below this is the external answer to "did direct routing carry
-    /// this work, or quietly fall back?" — output bytes are identical either
-    /// way.
-    pub direct_sets_admitted: u64,
-    /// Lifetime count of sets that left direct routing (demoted); per-reason
-    /// detail is in the server logs.
-    pub direct_sets_demoted: u64,
-    /// Lifetime count of sets that completed without ever writing a source
-    /// volume to disk — direct-store's success case.
-    pub direct_sets_finalized_direct: u64,
-    /// Lifetime count of sets repaired in place without leaving direct
-    /// routing.
-    pub direct_sets_repaired_while_direct: u64,
     pub decode_pressure_soft_limit_bytes: u64,
     pub decode_pressure_hard_limit_bytes: u64,
     pub write_pressure_soft_limit_bytes: u64,
@@ -214,6 +221,42 @@ pub struct Metrics {
     pub decode_rate_mbps: f64,
 }
 
+// The direct-store set counters, kept in the schema at 0 for the clients that
+// still read them: the graph engine routes no set directly.
+// TODO(0.17.0): remove
+#[ComplexObject]
+impl Metrics {
+    /// Lifetime count of archive sets direct-store admitted. Together with
+    /// the two below this is the external answer to "did direct routing carry
+    /// this work, or quietly fall back?" — output bytes are identical either
+    /// way.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_admitted(&self) -> u64 {
+        0
+    }
+
+    /// Lifetime count of sets that left direct routing (demoted); per-reason
+    /// detail is in the server logs.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_demoted(&self) -> u64 {
+        0
+    }
+
+    /// Lifetime count of sets that completed without ever writing a source
+    /// volume to disk — direct-store's success case.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_finalized_direct(&self) -> u64 {
+        0
+    }
+
+    /// Lifetime count of sets repaired in place without leaving direct
+    /// routing.
+    #[graphql(deprecation = "always 0 since the graph engine; removed in 0.17.0")]
+    async fn direct_sets_repaired_while_direct(&self) -> u64 {
+        0
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Enum)]
 pub enum DownloadPressureStateGql {
     #[default]
@@ -268,10 +311,6 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             write_buffered_bytes: m.write_buffered_bytes,
             write_buffered_segments: m.write_buffered_segments as u32,
             direct_write_evictions: m.direct_write_evictions,
-            direct_sets_admitted: m.direct_sets_admitted,
-            direct_sets_demoted: m.direct_sets_demoted,
-            direct_sets_finalized_direct: m.direct_sets_finalized_direct,
-            direct_sets_repaired_while_direct: m.direct_sets_repaired_while_direct,
             decode_pressure_soft_limit_bytes: m.decode_pressure_soft_limit_bytes,
             decode_pressure_hard_limit_bytes: m.decode_pressure_hard_limit_bytes,
             write_pressure_soft_limit_bytes: m.write_pressure_soft_limit_bytes,
@@ -761,6 +800,17 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 file_id: None,
                 message: error.clone(),
             },
+            PipelineEvent::ArchiveDemoted {
+                job_id,
+                member,
+                container,
+                reason,
+            } => Self {
+                kind: EventKind::ArchiveDemoted,
+                job_id: Some(job_id.0),
+                file_id: None,
+                message: archive_demoted_message(member, container, reason),
+            },
             PipelineEvent::MoveToCompleteStarted { job_id } => Self {
                 kind: EventKind::MoveToCompleteStarted,
                 job_id: Some(job_id.0),
@@ -814,6 +864,38 @@ impl From<&weaver_server_core::events::model::PipelineEvent> for PipelineEventGq
                 message: format!("{event:?}"),
             },
         }
+    }
+}
+
+// An archive demotion as the job's event log says it: the member, why the
+// archive was given up on in plain words, and the reason's label with the
+// archive's kind for anyone matching on them.
+pub(crate) fn archive_demoted_message(member: &str, container: &str, reason: &str) -> String {
+    let why = match reason {
+        "compressed" => "its bytes are compressed",
+        "tail_unreachable" => "its index could not be reached",
+        "encrypted_header" => "its header is encrypted and no password opened it",
+        "encrypted" => "it is encrypted",
+        "unbounded_entry" => "its size is not declared",
+        "not_a_file" => "it is not a file",
+        "unrepairable" => "its damage could not be repaired",
+        "first_bytes_lost" => "its first bytes were lost",
+        "holds_breached" => "its held bytes went over budget",
+        "unsupported" => "the archive layout is not supported",
+        "unmapped" => "the archive never placed it",
+        "too_deep" => "the archive is nested too deep",
+        "invalid_archive" => "the archive failed validation",
+        _ => "of an unnamed reason",
+    };
+    let name = if member.is_empty() {
+        "a member"
+    } else {
+        member
+    };
+    if container.is_empty() {
+        format!("{name}: archive given up because {why} ({reason})")
+    } else {
+        format!("{name}: {container} archive given up because {why} ({reason})")
     }
 }
 
@@ -1448,5 +1530,38 @@ mod tests {
         assert_eq!(event.kind, EventKind::PhaseProgressUpdated);
         assert_eq!(event.job_id, Some(42));
         assert_eq!(event.file_id, None);
+    }
+}
+
+#[cfg(test)]
+mod archive_demoted_tests {
+    use super::archive_demoted_message;
+
+    // Every reason the graph can give an archive up for has words of its own.
+    #[test]
+    fn every_demotion_reason_is_said_in_words() {
+        for reason in [
+            "compressed",
+            "tail_unreachable",
+            "encrypted_header",
+            "encrypted",
+            "unbounded_entry",
+            "not_a_file",
+            "unrepairable",
+            "first_bytes_lost",
+            "holds_breached",
+            "unsupported",
+            "unmapped",
+            "too_deep",
+            "invalid_archive",
+        ] {
+            let message = archive_demoted_message("pack.bin", "rar_store", reason);
+            assert!(!message.contains("unnamed"), "{message}");
+            assert!(message.ends_with(&format!("({reason})")), "{message}");
+        }
+        assert_eq!(
+            archive_demoted_message("notes.bin", "", "holds_breached"),
+            "notes.bin: archive given up because its held bytes went over budget (holds_breached)"
+        );
     }
 }

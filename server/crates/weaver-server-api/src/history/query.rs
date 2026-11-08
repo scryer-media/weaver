@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use super::*;
 use crate::history::types::{history_delete_row_state_from_core, history_table_item_from_row};
 use crate::jobs::types::load_duplicate_summaries_chunked;
+use weaver_server_core::HistoryRows;
 
 enum HistoryQueryPlan {
     Empty,
@@ -50,7 +51,10 @@ impl HistoryQuery {
             // page that contains a live job's row comes back short by that many
             // rows rather than pulling the next row forward. The cursor stays a
             // plain row offset, which is what the next page is decoded against.
-            let rows = exclude_live_rows(db.list_job_history(&history_filter)?, &live_jobs);
+            let rows = exclude_live_rows(
+                db.list_job_history(&history_filter, HistoryRows::Shown)?,
+                &live_jobs,
+            );
             let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
             let duplicate_summaries = load_duplicate_summaries_chunked(
                 &db,
@@ -142,7 +146,7 @@ impl HistoryQuery {
         // The count answers for the same rows the list returns, so the rows the
         // list excludes as still-live are taken off it too.
         let count = tokio::task::spawn_blocking(move || {
-            let counted = db.count_job_history(&history_filter)?;
+            let counted = db.count_job_history(&history_filter, HistoryRows::Shown)?;
             let live = count_live_rows_matching(&db, &history_filter, &live_jobs)?;
             Ok::<_, weaver_server_core::StateError>(counted.saturating_sub(live))
         })
@@ -399,7 +403,10 @@ async fn load_history_page(
         let page = if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
             build_history_page_sql(&db, plan, &live_in_history)?
         } else {
-            let rows = db.list_job_history(&weaver_server_core::HistoryFilter::default())?;
+            let rows = db.list_job_history(
+                &weaver_server_core::HistoryFilter::default(),
+                HistoryRows::Shown,
+            )?;
             build_history_page(exclude_live_rows(rows, &live_in_history), input)
         };
         attach_history_page_badges(&db, page)
@@ -540,9 +547,18 @@ fn build_history_page_sql(
     // Counts are always computed over the entire (unfiltered-by-status) set, just
     // like the Rust path computes them before applying the status filter.
     let counts = HistoryPageCounts {
-        all: db.count_job_history(&excluding_live(weaver_server_core::HistoryFilter::default()))?,
-        success: db.count_job_history(&excluding_live(success_history_filter()))?,
-        failure: db.count_job_history(&excluding_live(failure_history_filter()))?,
+        all: db.count_job_history(
+            &excluding_live(weaver_server_core::HistoryFilter::default()),
+            HistoryRows::Shown,
+        )?,
+        success: db.count_job_history(
+            &excluding_live(success_history_filter()),
+            HistoryRows::Shown,
+        )?,
+        failure: db.count_job_history(
+            &excluding_live(failure_history_filter()),
+            HistoryRows::Shown,
+        )?,
     };
 
     // The status filter selects which rows are paginated and counted for
@@ -557,20 +573,21 @@ fn build_history_page_sql(
     // plan only exists when no category filter is set, so there is nothing to
     // leave out of them here.
     let mut category_counts: Vec<HistoryCategoryCount> = db
-        .count_job_history_by_category(&excluding_live(
-            weaver_server_core::HistoryFilter::default(),
-        ))?
+        .count_job_history_by_category(
+            &excluding_live(weaver_server_core::HistoryFilter::default()),
+            HistoryRows::Shown,
+        )?
         .into_iter()
         .map(|(category, count)| HistoryCategoryCount { category, count })
         .collect();
     category_counts.sort_by(|left, right| left.category.cmp(&right.category));
 
-    let total_count = db.count_job_history(&items_filter)?;
+    let total_count = db.count_job_history(&items_filter, HistoryRows::Shown)?;
 
     items_filter.limit = Some(plan.page_size as u32);
     items_filter.offset =
         Some(u32::try_from(plan.page_index.saturating_mul(plan.page_size)).unwrap_or(u32::MAX));
-    let rows = db.list_job_history(&items_filter)?;
+    let rows = db.list_job_history(&items_filter, HistoryRows::Shown)?;
     let items = rows
         .into_iter()
         .map(|row| history_table_item_from_row(&row, None))
@@ -584,8 +601,8 @@ fn build_history_page_sql(
     })
 }
 
-// Ids of the jobs the scheduler still owns, i.e. whose status is neither of
-// the two terminal ones.
+// Ids of every row the queue still owns, including hidden cancellations and
+// terminal rows whose archive acknowledgement has not retired them yet.
 //
 // A job can have a history row while the scheduler still holds it: the row is
 // written before the job leaves the scheduler, and a re-queued job keeps its
@@ -594,18 +611,7 @@ fn build_history_page_sql(
 // is still live. Every history read surface applies this same predicate so the
 // single-item read, the lists, and the queue cannot disagree.
 pub(crate) fn live_job_ids(handle: &SchedulerHandle) -> HashSet<u64> {
-    handle
-        .list_jobs()
-        .into_iter()
-        .filter(|info| {
-            !matches!(
-                info.status,
-                weaver_server_core::JobStatus::Complete
-                    | weaver_server_core::JobStatus::Failed { .. }
-            )
-        })
-        .map(|info| info.job_id.0)
-        .collect()
+    handle.queued_job_ids().into_iter().map(|id| id.0).collect()
 }
 
 // Drop the history rows whose job is still live (see [`live_job_ids`]).
@@ -638,8 +644,9 @@ fn live_jobs_in_history(
         item_ids: Some(live_jobs.iter().copied().collect()),
         ..Default::default()
     };
+    // An exclusion list: an id that is hidden anyway changes nothing.
     Ok(db
-        .list_job_history(&filter)?
+        .list_job_history(&filter, HistoryRows::All)?
         .into_iter()
         .map(|row| row.job_id)
         .collect())
@@ -673,7 +680,8 @@ fn count_live_rows_matching(
         offset: None,
         ..filter.clone()
     };
-    db.count_job_history(&filter)
+    // Taken off a count of shown rows, so it counts shown rows too.
+    db.count_job_history(&filter, HistoryRows::Shown)
 }
 
 fn load_history_delete_states(
@@ -708,8 +716,11 @@ fn history_query_plan(
         for state in states {
             match state {
                 QueueItemState::Completed => statuses.push("complete".to_string()),
+                // Clients see a partial delivery as failed, so asking for
+                // failed rows asks for partial ones too.
                 QueueItemState::Failed => {
                     statuses.push("failed".to_string());
+                    statuses.push("partial".to_string());
                     statuses.push("cancelled".to_string());
                 }
                 QueueItemState::Paused => statuses.push("paused".to_string()),
@@ -1009,6 +1020,10 @@ fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
         total_files: 0,
         completed_files: 0,
         remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
+        file_parked_bytes: Vec::new(),
+        remaining_bytes: 0,
+        wanted_bytes: 0,
         password: None,
         category: row.category.clone(),
         metadata,
@@ -1088,7 +1103,10 @@ mod tests {
 
     fn rust_page(db: &Database, input: HistoryPageInput, live: &HashSet<u64>) -> HistoryPage {
         let rows = db
-            .list_job_history(&weaver_server_core::HistoryFilter::default())
+            .list_job_history(
+                &weaver_server_core::HistoryFilter::default(),
+                HistoryRows::Shown,
+            )
             .unwrap();
         build_history_page(exclude_live_rows(rows, live), input)
     }
@@ -1345,10 +1363,8 @@ mod tests {
     // here drives the pipeline; the reads under test go straight to the
     // published list.
     fn scheduler_with_jobs(jobs: Vec<JobInfo>) -> SchedulerHandle {
-        let (command_tx, _command_rx) = tokio::sync::mpsc::channel(1);
         let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1);
         SchedulerHandle::new(
-            command_tx,
             event_tx,
             weaver_server_core::jobs::handle::SharedPipelineState::new(
                 weaver_server_core::operations::metrics::PipelineMetrics::new(),
@@ -1392,7 +1408,10 @@ mod tests {
 
         // The list surfaces share the exclusion, so they agree with the page.
         let rows = db
-            .list_job_history(&weaver_server_core::HistoryFilter::default())
+            .list_job_history(
+                &weaver_server_core::HistoryFilter::default(),
+                HistoryRows::Shown,
+            )
             .unwrap();
         let list_ids: Vec<u64> = exclude_live_rows(rows, &live)
             .iter()
@@ -1404,7 +1423,7 @@ mod tests {
         let all = weaver_server_core::HistoryFilter::default();
         assert_eq!(count_live_rows_matching(&db, &all, &live).unwrap(), 1);
         assert_eq!(
-            db.count_job_history(&all).unwrap()
+            db.count_job_history(&all, HistoryRows::Shown).unwrap()
                 - count_live_rows_matching(&db, &all, &live).unwrap(),
             6
         );
@@ -1417,11 +1436,20 @@ mod tests {
             0
         );
 
-        // Once the scheduler reports it terminal, the same row is history again.
+        // A terminal report still belongs to the queue until retirement.
         let handle = scheduler_with_jobs(vec![resident_job(
             &row,
             weaver_server_core::JobStatus::Complete,
         )]);
+        let live = live_job_ids(&handle);
+        assert!(live.contains(&3));
+        let page = load_history_page(db.clone(), live, page_input(0, 25, None))
+            .await
+            .unwrap();
+        assert!(!page.items.iter().any(|item| item.id == 3));
+
+        // Only removal from the queue makes its durable row history.
+        let handle = scheduler_with_jobs(vec![]);
         let live = live_job_ids(&handle);
         assert!(live.is_empty());
         let page = load_history_page(db, live, page_input(0, 25, None))
@@ -1431,6 +1459,30 @@ mod tests {
         assert!(ids.contains(&3));
         assert_eq!(page.total_count, 7);
         assert_eq!(page.counts.success, 3);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_row_is_not_history_until_retirement() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        let row = history_row(3, "cancelled", 1_200);
+        let handle = scheduler_with_jobs(vec![resident_job(
+            &row,
+            weaver_server_core::JobStatus::Queued,
+        )]);
+        handle
+            .cancel_job(weaver_server_core::JobId(3))
+            .await
+            .unwrap();
+        // Still listed: the job leaves the queue only once its history row commits.
+        assert!(handle.list_jobs().iter().any(|job| job.job_id.0 == 3));
+        let live = live_job_ids(&handle);
+        assert!(live.contains(&3));
+        let page = load_history_page(db, live, page_input(0, 25, None))
+            .await
+            .unwrap();
+        assert!(!page.items.iter().any(|item| item.id == 3));
+        assert_eq!(page.total_count, 6);
     }
 
     #[tokio::test]

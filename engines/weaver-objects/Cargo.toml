@@ -1,0 +1,38 @@
+[package]
+name = "weaver-objects"
+description = "Weaver's format objects: one per format, behind the graph's format-blind interfaces"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+
+[features]
+# The recovery record encoders, for other crates' tests. Never enabled in
+# a product build.
+test-support = []
+
+[dependencies]
+aws-lc-rs = { workspace = true }
+brotli = { workspace = true }
+bytes = { workspace = true }
+bzip2 = { workspace = true }
+crc-turbo = { workspace = true }
+flate2 = { workspace = true }
+lzma-turbo = { workspace = true }
+par2-rs = { workspace = true }
+par3-rs = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true }
+sevenz-turbo = { workspace = true }
+thiserror = { workspace = true }
+unrar-rs = { workspace = true }
+weaver-graph = { path = "../weaver-graph" }
+zeroize = { workspace = true }
+zip = { workspace = true }
+zstd = { workspace = true }
+
+[dev-dependencies]
+weaver-graph = { path = "../weaver-graph", features = ["test-support"] }
+lzma-turbo = { workspace = true, features = ["enc"] }
+sevenz-turbo = { workspace = true, features = ["compress"] }
+tempfile = { workspace = true }

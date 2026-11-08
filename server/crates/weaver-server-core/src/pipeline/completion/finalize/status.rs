@@ -3,6 +3,73 @@
 
 use super::*;
 
+// Runtime row writes queued, for tests that pin how many a path makes. Each
+// test runs in its own process, so a count is the test's own.
+#[cfg(test)]
+pub(crate) static RUNTIME_WRITES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+// A job's runtime columns in its active row, as the pipeline writes them.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ActiveRuntimeValues {
+    pub(crate) status: &'static str,
+    pub(crate) download_state: Option<&'static str>,
+    pub(crate) post_state: Option<&'static str>,
+    pub(crate) run_state: Option<&'static str>,
+    pub(crate) error: Option<String>,
+    pub(crate) queued_repair_at_epoch_ms: Option<f64>,
+    pub(crate) queued_extract_at_epoch_ms: Option<f64>,
+    pub(crate) paused_resume_status: Option<&'static str>,
+    pub(crate) paused_resume_download_state: Option<&'static str>,
+    pub(crate) paused_resume_post_state: Option<&'static str>,
+}
+
+// A job's runtime columns as its active row holds them, read by a restart.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct StoredRuntimeValues {
+    status: String,
+    download_state: Option<String>,
+    post_state: Option<String>,
+    run_state: Option<String>,
+    error: Option<String>,
+    queued_repair_at_epoch_ms: Option<f64>,
+    queued_extract_at_epoch_ms: Option<f64>,
+    paused_resume_status: Option<String>,
+    paused_resume_download_state: Option<String>,
+    paused_resume_post_state: Option<String>,
+}
+
+impl StoredRuntimeValues {
+    pub(crate) fn of(row: &crate::jobs::record::RecoveredJob) -> Self {
+        Self {
+            status: row.status.clone(),
+            download_state: row.download_state.clone(),
+            post_state: row.post_state.clone(),
+            run_state: row.run_state.clone(),
+            error: row.error.clone(),
+            queued_repair_at_epoch_ms: row.queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms: row.queued_extract_at_epoch_ms,
+            paused_resume_status: row.paused_resume_status.clone(),
+            paused_resume_download_state: row.paused_resume_download_state.clone(),
+            paused_resume_post_state: row.paused_resume_post_state.clone(),
+        }
+    }
+
+    // Whether the row already holds every one of `values`.
+    pub(crate) fn holds(&self, values: &ActiveRuntimeValues) -> bool {
+        self.status == values.status
+            && self.download_state.as_deref() == values.download_state
+            && self.post_state.as_deref() == values.post_state
+            && self.run_state.as_deref() == values.run_state
+            && self.error == values.error
+            && self.queued_repair_at_epoch_ms == values.queued_repair_at_epoch_ms
+            && self.queued_extract_at_epoch_ms == values.queued_extract_at_epoch_ms
+            && self.paused_resume_status.as_deref() == values.paused_resume_status
+            && self.paused_resume_download_state.as_deref() == values.paused_resume_download_state
+            && self.paused_resume_post_state.as_deref() == values.paused_resume_post_state
+    }
+}
+
 impl Pipeline {
     #[cfg(test)]
     pub(crate) fn status_enter_failpoint_for_transition(
@@ -40,136 +107,116 @@ impl Pipeline {
         crate::e2e_failpoint::STATUS_ENTER_VERIFYING
     }
 
-    pub(crate) fn trip_par2_verification_started_failpoint() {
-        let name = Self::par2_verification_started_failpoint_name();
-        crate::e2e_failpoint::maybe_delay(name);
-        crate::e2e_failpoint::maybe_trip(name);
-    }
-
     pub(crate) fn persist_active_runtime(&self, job_id: JobId) {
-        self.persist_active_runtime_at(job_id, None);
+        let _ = self.persist_active_runtime_at(job_id, None);
     }
 
     // [`Self::persist_active_runtime`] that also records `output_dir` as the
-    // job's output location in the same ordered write.
+    // job's output location in the same ordered write. A moving job's row
+    // names the destination it moves into, so a restart finds the delivery
+    // there. The receiver answers once the write has committed.
     pub(crate) fn persist_active_runtime_at(
         &self,
         job_id: JobId,
         output_dir: Option<std::path::PathBuf>,
-    ) {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
-        };
-        let output_dir = output_dir.map(|dir| dir.to_string_lossy().into_owned());
-        let status = Self::persist_active_status_for(&state.status).to_string();
-        let error = match &state.status {
-            JobStatus::Failed { error } => Some(error.clone()),
-            _ => state.failure_error.clone(),
-        };
-        let queued_repair_at_epoch_ms = state.queued_repair_at_epoch_ms;
-        let queued_extract_at_epoch_ms = state.queued_extract_at_epoch_ms;
-        let paused_resume_status = state
-            .paused_resume_status
-            .as_ref()
-            .map(Self::persist_active_status_for)
-            .map(str::to_string);
-        let download_state = state.download_state.as_str().to_string();
-        let post_state = state.post_state.as_str().to_string();
-        let run_state = state.run_state.as_str().to_string();
-        let paused_resume_download_state = state
-            .paused_resume_download_state
-            .as_ref()
-            .map(|download_state| download_state.as_str())
-            .map(str::to_string)
-            .or_else(|| {
-                state
-                    .paused_resume_status
-                    .as_ref()
-                    .map(crate::jobs::model::runtime_lanes_from_status_snapshot)
-                    .map(|(download_state, _, _)| download_state.as_str().to_string())
-            });
-        let paused_resume_post_state = state
-            .paused_resume_post_state
-            .as_ref()
-            .map(|post_state| post_state.as_str())
-            .map(str::to_string)
-            .or_else(|| {
-                state
-                    .paused_resume_status
-                    .as_ref()
-                    .map(crate::jobs::model::runtime_lanes_from_status_snapshot)
-                    .map(|(_, post_state, _)| post_state.as_str().to_string())
-            });
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+        let values = self.active_runtime_values(job_id)?;
+        #[cfg(test)]
+        RUNTIME_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let output_dir = output_dir
+            .or_else(|| match values.status {
+                "moving" => self.reserved_complete_destinations.get(&job_id).cloned(),
+                _ => None,
+            })
+            .map(|dir| dir.to_string_lossy().into_owned());
+        // The moving row keeps what the delivery ruled, in the same
+        // statement: a restart from here on has no graph to ask.
+        let post_processing_outcome = (values.status == "moving")
+            .then(|| {
+                self.fresh_post_processing_facts(
+                    job_id,
+                    crate::post_processing::model::PipelineOutcome::Succeeded,
+                )
+            })
+            .and_then(|facts| serde_json::to_string(&facts).ok());
+        let ActiveRuntimeValues {
+            status,
+            download_state,
+            post_state,
+            run_state,
+            error,
+            queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms,
+            paused_resume_status,
+            paused_resume_download_state,
+            paused_resume_post_state,
+        } = values;
 
         // Route through the ordered writer queue rather than a detached
         // fire-and-forget task: two rapid runtime transitions for the same job
         // (last-write-wins columns: run_state / paused_resume_* / status) must
         // land in enqueue order, or a restored job could resume stale state.
-        if let Err(error) =
-            self.db
-                .try_queue_job_write(job_id, "set_active_job_runtime", move |db| {
-                    db.set_active_job_runtime_at(
-                        job_id,
-                        output_dir.as_deref(),
-                        &status,
-                        Some(&download_state),
-                        Some(&post_state),
-                        Some(&run_state),
-                        error.as_deref(),
-                        queued_repair_at_epoch_ms,
-                        queued_extract_at_epoch_ms,
-                        paused_resume_status.as_deref(),
-                        paused_resume_download_state.as_deref(),
-                        paused_resume_post_state.as_deref(),
-                    )
-                })
-        {
-            tracing::error!(
-                error = %error,
-                "failed to queue active job runtime write"
-            );
+        match self
+            .db
+            .try_queue_job_write_committed(job_id, "set_active_job_runtime", move |db| {
+                db.set_active_job_runtime_at(
+                    job_id,
+                    output_dir.as_deref(),
+                    post_processing_outcome.as_deref(),
+                    status,
+                    download_state,
+                    post_state,
+                    run_state,
+                    error.as_deref(),
+                    queued_repair_at_epoch_ms,
+                    queued_extract_at_epoch_ms,
+                    paused_resume_status,
+                    paused_resume_download_state,
+                    paused_resume_post_state,
+                )
+            }) {
+            Ok(committed) => Some(committed),
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "failed to queue active job runtime write"
+                );
+                None
+            }
         }
     }
 
-    pub(crate) fn active_repair_jobs(&self) -> usize {
-        self.jobs
-            .values()
-            .filter(|state| matches!(state.status, JobStatus::Repairing))
-            .count()
-    }
-
-    pub(crate) fn active_extract_jobs(&self) -> usize {
-        self.jobs
-            .values()
-            .filter(|state| matches!(state.status, JobStatus::Extracting))
-            .count()
-    }
-
-    pub(crate) fn job_has_active_extraction_tasks(&self, job_id: JobId) -> bool {
-        self.has_active_rar_workers(job_id)
-            || self
-                .inflight_extractions
-                .get(&job_id)
-                .is_some_and(|sets| !sets.is_empty())
-    }
-
-    fn next_queued_repair_job(&self) -> Option<JobId> {
-        self.jobs
-            .iter()
-            .filter(|(_, state)| matches!(state.status, JobStatus::QueuedRepair))
-            .filter(|(job_id, _)| self.repair_phase_has_capacity(**job_id))
-            .min_by(|(job_id_a, state_a), (job_id_b, state_b)| {
-                state_a
-                    .queued_repair_at_epoch_ms
-                    .unwrap_or(state_a.created_at_epoch_ms)
-                    .total_cmp(
-                        &state_b
-                            .queued_repair_at_epoch_ms
-                            .unwrap_or(state_b.created_at_epoch_ms),
-                    )
-                    .then_with(|| job_id_a.0.cmp(&job_id_b.0))
-            })
-            .map(|(job_id, _)| *job_id)
+    // What [`Self::persist_active_runtime`] writes for the job.
+    pub(crate) fn active_runtime_values(&self, job_id: JobId) -> Option<ActiveRuntimeValues> {
+        let state = self.jobs.get(&job_id)?;
+        let resume_lanes = state
+            .paused_resume_status
+            .as_ref()
+            .map(crate::jobs::model::runtime_lanes_from_status_snapshot);
+        Some(ActiveRuntimeValues {
+            status: Self::persist_active_status_for(&state.status),
+            download_state: Some(state.download_state.as_str()),
+            post_state: Some(state.post_state.as_str()),
+            run_state: Some(state.run_state.as_str()),
+            error: match &state.status {
+                JobStatus::Failed { error } => Some(error.clone()),
+                _ => state.failure_error.clone(),
+            },
+            queued_repair_at_epoch_ms: state.queued_repair_at_epoch_ms,
+            queued_extract_at_epoch_ms: state.queued_extract_at_epoch_ms,
+            paused_resume_status: state
+                .paused_resume_status
+                .as_ref()
+                .map(Self::persist_active_status_for),
+            paused_resume_download_state: state
+                .paused_resume_download_state
+                .map(|download_state| download_state.as_str())
+                .or_else(|| resume_lanes.map(|(download_state, _, _)| download_state.as_str())),
+            paused_resume_post_state: state
+                .paused_resume_post_state
+                .map(|post_state| post_state.as_str())
+                .or_else(|| resume_lanes.map(|(_, post_state, _)| post_state.as_str())),
+        })
     }
 
     pub(crate) fn schedule_job_completion_check(&mut self, job_id: JobId) {
@@ -182,6 +229,7 @@ impl Pipeline {
                 | JobStatus::Checking
                 | JobStatus::Moving
                 | JobStatus::Complete
+                | JobStatus::Partial
                 | JobStatus::Failed { .. }
         ) {
             return;
@@ -189,46 +237,6 @@ impl Pipeline {
         if !self.pending_completion_checks.contains(&job_id) {
             self.pending_completion_checks.push_back(job_id);
         }
-    }
-
-    pub(crate) fn schedule_job_completion_check_if_download_pipeline_drained(
-        &mut self,
-        job_id: JobId,
-        reason: &'static str,
-    ) {
-        // An in-flight probe both keeps the job in `Checking` (an early return
-        // below) and counts as pending pipeline work, so it would swallow this
-        // drain notification entirely. It has nothing left to say once the
-        // segments have settled.
-        self.retire_health_probe_if_download_pipeline_drained(job_id);
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
-        };
-        if matches!(
-            state.status,
-            JobStatus::Paused
-                | JobStatus::Checking
-                | JobStatus::Moving
-                | JobStatus::Complete
-                | JobStatus::Failed { .. }
-        ) {
-            return;
-        }
-        if self.job_has_pending_download_pipeline_work(job_id)
-            || self.direct_post_repair_in_flight.contains_key(&job_id)
-            || self.direct_tolerated_in_flight.contains_key(&job_id)
-            || self.par2_analysis_in_flight.contains_key(&job_id)
-            || self.direct_demotion_in_flight.contains_key(&job_id)
-            || self.pending_completion_checks.contains(&job_id)
-        {
-            return;
-        }
-
-        debug!(
-            job_id = job_id.0,
-            reason, "scheduling completion check after download pipeline drained"
-        );
-        self.pending_completion_checks.push_back(job_id);
     }
 
     pub(crate) fn remove_pending_completion_check(&mut self, job_id: JobId) {
@@ -251,6 +259,7 @@ impl Pipeline {
             JobStatus::QueuedPostProcessing => "queued_post_processing",
             JobStatus::PostProcessing => "post_processing",
             JobStatus::Complete => "complete",
+            JobStatus::Partial => "partial",
             JobStatus::Failed { .. } => "failed",
             JobStatus::Paused => "paused",
         }
@@ -264,7 +273,10 @@ impl Pipeline {
         new_post_state: crate::jobs::model::PostState,
         new_run_state: crate::jobs::model::RunState,
         persist_status: Option<&'static str>,
-    ) {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
+        // A moving row is the one durable mark that the delivery has begun:
+        // a restart must resume the move into the recorded destination, never
+        // fetch the job again.
         fn should_persist_runtime_to_db(
             old_run_state: crate::jobs::model::RunState,
             new_status: &JobStatus,
@@ -272,7 +284,11 @@ impl Pipeline {
         ) -> bool {
             matches!(
                 new_status,
-                JobStatus::Complete | JobStatus::Failed { .. } | JobStatus::Paused
+                JobStatus::Complete
+                    | JobStatus::Partial
+                    | JobStatus::Failed { .. }
+                    | JobStatus::Paused
+                    | JobStatus::Moving
             ) || matches!(
                 (old_run_state, new_run_state),
                 (
@@ -283,9 +299,7 @@ impl Pipeline {
         }
 
         let failpoint_name = {
-            let Some(state) = self.jobs.get(&job_id) else {
-                return;
-            };
+            let state = self.jobs.get(&job_id)?;
             if state.run_state != new_run_state
                 && matches!(new_run_state, crate::jobs::model::RunState::Paused)
             {
@@ -310,18 +324,8 @@ impl Pipeline {
                 }
             }
         };
-        let (
-            transitioned,
-            persisted_snapshot_changed,
-            persist_runtime_to_db,
-            released_repair,
-            released_extract,
-            entered_repair,
-            entered_extract,
-        ) = {
-            let Some(state) = self.jobs.get_mut(&job_id) else {
-                return;
-            };
+        let (transitioned, persisted_snapshot_changed, persist_runtime_to_db, moved, old_run_state) = {
+            let state = self.jobs.get_mut(&job_id)?;
             let old_status = state.status.clone();
             let old_download_state = state.download_state;
             let old_post_state = state.post_state;
@@ -336,18 +340,6 @@ impl Pipeline {
                 || old_download_state != new_download_state
                 || old_post_state != new_post_state
                 || old_run_state != new_run_state;
-            let released_repair =
-                matches!(old_post_state, crate::jobs::model::PostState::Repairing)
-                    && !matches!(new_post_state, crate::jobs::model::PostState::Repairing);
-            let released_extract =
-                matches!(old_post_state, crate::jobs::model::PostState::Extracting)
-                    && !matches!(new_post_state, crate::jobs::model::PostState::Extracting);
-            let entered_repair =
-                !matches!(old_post_state, crate::jobs::model::PostState::Repairing)
-                    && matches!(new_post_state, crate::jobs::model::PostState::Repairing);
-            let entered_extract =
-                !matches!(old_post_state, crate::jobs::model::PostState::Extracting)
-                    && matches!(new_post_state, crate::jobs::model::PostState::Extracting);
             let now = crate::jobs::model::epoch_ms_now();
             if let JobStatus::Failed { error } = &new_status {
                 state.failure_error = Some(error.clone());
@@ -402,25 +394,18 @@ impl Pipeline {
                 transitioned,
                 persisted_snapshot_changed,
                 persist_runtime_to_db,
-                released_repair,
-                released_extract,
-                entered_repair,
-                entered_extract,
+                (old_post_state, new_post_state),
+                old_run_state,
             )
         };
 
-        if released_repair {
-            self.metrics.repair_active.fetch_sub(1, Ordering::Relaxed);
+        let paused = matches!(new_run_state, crate::jobs::model::RunState::Paused);
+        if paused != matches!(old_run_state, crate::jobs::model::RunState::Paused) {
+            self.hold_extraction_clock(job_id);
         }
-        if released_extract {
-            self.metrics.extract_active.fetch_sub(1, Ordering::Relaxed);
-        }
-        if entered_repair {
-            self.metrics.repair_active.fetch_add(1, Ordering::Relaxed);
-        }
-        if entered_extract {
-            self.metrics.extract_active.fetch_add(1, Ordering::Relaxed);
-        }
+
+        self.metrics.post_state_moved(moved.0, moved.1);
+        let mut committed = None;
         if let Some(persist_status) = persist_status {
             let changed_label = if persisted_snapshot_changed {
                 "changed"
@@ -434,7 +419,7 @@ impl Pipeline {
                 std::time::Duration::from_nanos(1),
             );
             if persist_runtime_to_db {
-                self.persist_active_runtime(job_id);
+                committed = self.persist_active_runtime_at(job_id, None);
             } else {
                 crate::runtime::perf_probe::record_owned(
                     format!("pipeline.persist_active_runtime.skipped.transient.{persist_status}"),
@@ -446,117 +431,7 @@ impl Pipeline {
             crate::e2e_failpoint::maybe_delay(name);
             crate::e2e_failpoint::maybe_trip(name);
         }
-        if released_repair {
-            self.promote_queued_repairs();
-        }
-        if released_extract {
-            self.promote_queued_extractions();
-        }
-    }
-
-    pub(crate) async fn reconcile_extracted_outputs_for_completion(
-        &mut self,
-        job_id: JobId,
-    ) -> bool {
-        let Some(existing_members) = self.extracted_members.get(&job_id).cloned() else {
-            return false;
-        };
-        if existing_members.is_empty() {
-            return false;
-        }
-
-        let missing_members: Vec<String> = existing_members
-            .iter()
-            .filter(|member| {
-                self.resolve_job_input_path(job_id, member)
-                    .is_none_or(|path| !path.exists())
-            })
-            .cloned()
-            .collect();
-        if missing_members.is_empty() {
-            return false;
-        }
-
-        warn!(
-            job_id = job_id.0,
-            missing_members = ?missing_members,
-            "reconciling stale extracted output records"
-        );
-
-        let missing_set: std::collections::HashSet<String> =
-            missing_members.iter().cloned().collect();
-        if let Some(extracted_members) = self.extracted_members.get_mut(&job_id) {
-            extracted_members.retain(|member| !missing_set.contains(member));
-            if extracted_members.is_empty() {
-                self.extracted_members.remove(&job_id);
-            }
-        }
-        if let Some(pending_concat) = self.pending_concat.get_mut(&job_id) {
-            pending_concat.retain(|member| !missing_set.contains(member));
-            if pending_concat.is_empty() {
-                self.pending_concat.remove(&job_id);
-            }
-        }
-        self.extracted_archives.remove(&job_id);
-        // The extracted output this job was judged against is gone, so the
-        // verdict that a set had no volumes left to read goes with it.
-        self.missing_volume_archive_sets.remove(&job_id);
-        self.clear_persisted_extracted_members(job_id).await;
-        let set_names = self.rar_set_names_for_job(job_id);
-        let members_to_clear: Vec<String> = missing_members.clone();
-        if !members_to_clear.is_empty() {
-            self.db_blocking(move |db| {
-                for member in &members_to_clear {
-                    if let Err(error) = db.clear_member_chunks_for_all_sets(job_id, member) {
-                        warn!(
-                            job_id = job_id.0,
-                            member = %member,
-                            error = %error,
-                            "failed to clear stale extracted member chunks after reconciliation"
-                        );
-                    }
-                }
-            })
-            .await;
-        }
-
-        let members_to_persist: Vec<(String, std::path::PathBuf)> = self
-            .extracted_members
-            .get(&job_id)
-            .map(|remaining_members| {
-                remaining_members
-                    .iter()
-                    .filter_map(|member| {
-                        self.resolve_job_input_path(job_id, member)
-                            .map(|path| (member.clone(), path))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        if !members_to_persist.is_empty()
-            && let Err(error) = self
-                .db_blocking(move |db| db.add_extracted_members(job_id, &members_to_persist))
-                .await
-        {
-            warn!(
-                job_id = job_id.0,
-                error = %error,
-                "failed to rebuild persisted extracted members after reconciliation"
-            );
-        }
-
-        for set_name in set_names {
-            if let Err(error) = self.recompute_rar_set_state(job_id, &set_name).await {
-                warn!(
-                    job_id = job_id.0,
-                    set_name = %set_name,
-                    error,
-                    "failed to recompute RAR set after extracted output reconciliation"
-                );
-            }
-        }
-
-        true
+        committed
     }
 
     pub(crate) async fn reconcile_job_progress(&mut self, job_id: JobId) {
@@ -564,7 +439,16 @@ impl Pipeline {
     }
 
     pub(crate) fn transition_completed_runtime(&mut self, job_id: JobId) {
-        self.transition_postprocessing_status(job_id, JobStatus::Complete, Some("complete"));
+        // The job rules on what it delivered: its graph while it has one,
+        // else what the graph ruled before a restart.
+        let status = self.graph_terminal_status(job_id).unwrap_or_else(|| {
+            match self.delivered_verdict(job_id) {
+                Some(verdict) if verdict.partial => JobStatus::Partial,
+                _ => JobStatus::Complete,
+            }
+        });
+        let persisted = status.persisted_status();
+        self.transition_postprocessing_status(job_id, status, Some(persisted));
     }
 
     pub(crate) fn pause_job_runtime(&mut self, job_id: JobId) -> Result<(), crate::SchedulerError> {
@@ -586,16 +470,6 @@ impl Pipeline {
                 "the download is complete and waiting for queue scripts".into(),
             ));
         }
-        // A pause stops new dispatch but never resumes on a schedule, so a
-        // parked chase would hold a blocking thread for as long as the operator
-        // leaves the job paused. Retryable: nothing about the archive was
-        // wrong, so a part completing after resume can arm it again.
-        self.direct_unpack_abort_job(
-            job_id,
-            "job paused",
-            crate::pipeline::direct_unpack::wiring::AbortLatch::Retryable,
-            crate::pipeline::direct_unpack::wiring::DemotionReason::DownloadEnded,
-        );
         let pauseable_download_lane = matches!(
             previous_download_state,
             crate::jobs::model::DownloadState::Queued
@@ -628,6 +502,7 @@ impl Pipeline {
         self.transition_postprocessing_status(job_id, JobStatus::Paused, Some("paused"));
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
+        self.park_job_articles(job_id);
         Ok(())
     }
 
@@ -673,11 +548,22 @@ impl Pipeline {
 
         if matches!(
             resume_status,
-            JobStatus::Complete | JobStatus::Failed { .. } | JobStatus::Moving | JobStatus::Paused
+            JobStatus::Complete
+                | JobStatus::Partial
+                | JobStatus::Failed { .. }
+                | JobStatus::Moving
+                | JobStatus::Paused
         ) {
             return Ok(());
         }
         let persist_status = Self::persist_active_status_for(&resume_status);
+        if let Some(graph) = self
+            .graph_jobs
+            .get(&job_id)
+            .or_else(|| self.retiring_graph_jobs.get(&job_id))
+        {
+            graph.pending().control().resume();
+        }
         self.transition_runtime_snapshot(
             job_id,
             resume_status.clone(),
@@ -686,6 +572,7 @@ impl Pipeline {
             crate::jobs::model::RunState::Active,
             Some(persist_status),
         );
+        self.resume_graph_work(job_id);
         if matches!(
             resume_download_state,
             crate::jobs::model::DownloadState::Downloading
@@ -700,7 +587,7 @@ impl Pipeline {
         job_id: JobId,
         new_status: JobStatus,
         persist_status: Option<&'static str>,
-    ) {
+    ) -> Option<tokio::sync::oneshot::Receiver<Result<(), String>>> {
         let (new_download_state, new_post_state, new_run_state) =
             crate::jobs::model::runtime_lanes_from_status_snapshot(&new_status);
         self.transition_runtime_snapshot(
@@ -710,305 +597,37 @@ impl Pipeline {
             new_post_state,
             new_run_state,
             persist_status,
-        );
+        )
+    }
+}
+
+impl Pipeline {
+    // A graph job kept while its extraction is stopped spends none of its
+    // extraction deadline: while the job is paused, or every download is,
+    // by hand, by schedule or for a speed test.
+    pub(crate) fn hold_extraction_clock(&mut self, job_id: JobId) {
+        let paused = self.shared_state.is_paused()
+            || self.jobs.get(&job_id).is_some_and(|state| {
+                matches!(state.run_state, crate::jobs::model::RunState::Paused)
+            });
+        if let Some(graph) = match self.graph_jobs.get_mut(&job_id) {
+            Some(graph) => Some(graph),
+            None => self.retiring_graph_jobs.get_mut(&job_id),
+        } {
+            graph.hold_clock(paused);
+        }
     }
 
-    pub(crate) async fn maybe_start_repair(&mut self, job_id: JobId) -> bool {
-        if let Some(runtime) = self.par3_runtime.as_mut() {
-            runtime.set_repair_phase(job_id, false);
-        }
-        self.start_repair_phase(job_id)
-    }
-
-    pub(crate) async fn maybe_start_par3_repair(&mut self, job_id: JobId) -> bool {
-        if let Some(runtime) = self.par3_runtime.as_mut() {
-            runtime.set_repair_phase(job_id, true);
-        }
-        self.start_repair_phase(job_id)
-    }
-
-    fn repair_phase_has_capacity(&self, job_id: JobId) -> bool {
-        let par3_owned = |id| {
-            self.par3_runtime
-                .as_ref()
-                .is_some_and(|runtime| runtime.owns_repair_phase(id))
-        };
-        let limit = if par3_owned(job_id)
-            && self
-                .jobs
-                .iter()
-                .filter(|(_, state)| matches!(state.status, JobStatus::Repairing))
-                .all(|(&id, _)| par3_owned(id))
-        {
-            2
-        } else {
-            MAX_CONCURRENT_REPAIRS
-        };
-        self.active_repair_jobs() < limit
-    }
-
-    fn start_repair_phase(&mut self, job_id: JobId) -> bool {
-        if self.shared_state.is_post_processing_paused() {
-            self.deferred_post_processing.insert(job_id);
-            return false;
-        }
-        let Some(status) = self.jobs.get(&job_id).map(|state| state.status.clone()) else {
-            return false;
-        };
-        if matches!(
-            status,
-            JobStatus::Paused
-                | JobStatus::Checking
-                | JobStatus::Moving
-                | JobStatus::Complete
-                | JobStatus::Failed { .. }
-        ) {
-            return false;
-        }
-        // An extraction phase only owns the job while it has work in flight.
-        // A job whose sets extract independently stays `Extracting` (or
-        // queued for it) after one set's members are out while another set
-        // still waits on its repair; that idle phase must yield to the repair,
-        // or nothing ever moves the job out of it. While a worker or batch is
-        // live the repair waits: the extraction's settlement re-runs the
-        // completion check, which repairs on the same verdict.
-        if matches!(status, JobStatus::QueuedExtract | JobStatus::Extracting)
-            && self.job_has_active_extraction_tasks(job_id)
-        {
-            return false;
-        }
-        if matches!(status, JobStatus::Repairing) {
-            return true;
-        }
-        if !self.repair_phase_has_capacity(job_id) {
-            self.transition_postprocessing_status(
-                job_id,
-                JobStatus::QueuedRepair,
-                Some("queued_repair"),
-            );
-            return false;
-        }
-
-        self.phase_end_extracting_if_idle(job_id);
-        self.transition_postprocessing_status(job_id, JobStatus::Repairing, Some("repairing"));
-        let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
-        true
-    }
-
-    pub(crate) async fn maybe_start_extraction(&mut self, job_id: JobId) -> bool {
-        if self.shared_state.is_post_processing_paused() {
-            self.deferred_post_processing.insert(job_id);
-            return false;
-        }
-        let Some(status) = self.jobs.get(&job_id).map(|state| state.status.clone()) else {
-            return false;
-        };
-        if matches!(
-            status,
-            JobStatus::Paused
-                | JobStatus::Checking
-                | JobStatus::Moving
-                | JobStatus::Complete
-                | JobStatus::Failed { .. }
-                | JobStatus::Verifying
-                | JobStatus::QueuedRepair
-                | JobStatus::Repairing
-        ) {
-            return false;
-        }
-        if matches!(status, JobStatus::Extracting) {
-            return true;
-        }
-        if self.active_extract_jobs() >= self.tuner.max_concurrent_extractions() {
-            self.transition_postprocessing_status(
-                job_id,
-                JobStatus::QueuedExtract,
-                Some("queued_extract"),
-            );
-            return false;
-        }
-
-        self.transition_postprocessing_status(job_id, JobStatus::Extracting, Some("extracting"));
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::ExtractionReady { job_id });
-        info!(job_id = job_id.0, "extraction ready");
-        true
-    }
-
-    pub(crate) fn promote_queued_repairs(&mut self) {
-        if self.shared_state.is_post_processing_paused() {
-            return;
-        }
-        let Some(job_id) = self.next_queued_repair_job() else {
-            return;
-        };
-        self.transition_postprocessing_status(job_id, JobStatus::Repairing, Some("repairing"));
-        let _ = self.event_tx.send(PipelineEvent::RepairStarted { job_id });
-        self.schedule_job_completion_check(job_id);
-    }
-
-    pub(crate) fn promote_queued_extractions(&mut self) {
-        if self.shared_state.is_post_processing_paused() {
-            return;
-        }
-        let available = self
-            .tuner
-            .max_concurrent_extractions()
-            .saturating_sub(self.active_extract_jobs());
-        if available == 0 {
-            return;
-        }
-        let mut candidates: Vec<(JobId, f64)> = self
-            .jobs
-            .iter()
-            .filter_map(|(job_id, state)| {
-                matches!(state.status, JobStatus::QueuedExtract).then_some((
-                    *job_id,
-                    state
-                        .queued_extract_at_epoch_ms
-                        .unwrap_or(state.created_at_epoch_ms),
-                ))
-            })
+    // Every download paused or resumed: each graph job's clock follows.
+    pub(crate) fn hold_extraction_clocks(&mut self) {
+        let jobs: Vec<JobId> = self
+            .graph_jobs
+            .keys()
+            .chain(self.retiring_graph_jobs.keys())
+            .copied()
             .collect();
-        candidates.sort_by(|(job_id_a, queued_at_a), (job_id_b, queued_at_b)| {
-            queued_at_a
-                .total_cmp(queued_at_b)
-                .then_with(|| job_id_a.0.cmp(&job_id_b.0))
-        });
-        for (job_id, _) in candidates.into_iter().take(available) {
-            self.transition_postprocessing_status(
-                job_id,
-                JobStatus::Extracting,
-                Some("extracting"),
-            );
-            let _ = self
-                .event_tx
-                .send(PipelineEvent::ExtractionReady { job_id });
-            self.schedule_job_completion_check(job_id);
+        for job_id in jobs {
+            self.hold_extraction_clock(job_id);
         }
-    }
-
-    pub(super) async fn cleanup_recovery_files(&self, job_id: JobId) {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
-        };
-        let cleanup_dir = state.working_dir.clone();
-        let recovery_files: Vec<String> = state
-            .assembly
-            .files()
-            .filter(|f| {
-                matches!(
-                    f.role(),
-                    weaver_model::files::FileRole::Par2 { .. }
-                        | weaver_model::files::FileRole::Par3 { .. }
-                )
-            })
-            .map(|f| self.current_filename_for_file(job_id, f))
-            .collect();
-        if recovery_files.is_empty() {
-            return;
-        }
-
-        let mut removed = 0u32;
-        for filename in &recovery_files {
-            let path = cleanup_dir.join(filename);
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => removed += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "failed to delete recovery file");
-                }
-            }
-        }
-        if removed > 0 {
-            debug!(
-                job_id = job_id.0,
-                removed,
-                total = recovery_files.len(),
-                "deleted recovery files"
-            );
-        }
-    }
-
-    // Remove the volume images of container sets whose members were installed
-    // straight from the wire.
-    //
-    // Such a set never writes its volumes, so there is normally nothing here.
-    // A repair that rebuilt a volume is the exception: it lands the rebuilt
-    // image at the volume's own name so the set can route it, and once the set
-    // is finalized the image is spent. A job with only installed sets never
-    // reaches the extraction cleanup that removes archive parts, so without
-    // this the rebuilt volume would be released next to the members it
-    // carried.
-    pub(super) async fn cleanup_installed_direct_set_volumes(&self, job_id: JobId) {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
-        };
-        let cleanup_dir = state.working_dir.clone();
-        let mut volume_files: std::collections::HashSet<String> = state
-            .assembly
-            .files()
-            .filter(|f| {
-                matches!(
-                    self.classified_role_for_file(job_id, f),
-                    weaver_model::files::FileRole::SevenZipArchive
-                        | weaver_model::files::FileRole::SevenZipSplit { .. }
-                ) && self.direct_set_already_installed(job_id, f)
-            })
-            .map(|f| self.current_filename_for_file(job_id, f))
-            .collect();
-        // Whatever an earlier incarnation of the job wrote at a finalized
-        // set's volume names is left over too, under any format and under
-        // names no role classifies.
-        volume_files.extend(self.finalized_direct_volume_filenames(job_id));
-
-        let mut removed = 0u32;
-        for filename in &volume_files {
-            let path = cleanup_dir.join(filename);
-            match tokio::fs::remove_file(&path).await {
-                Ok(()) => removed += 1,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => {
-                    warn!(file = %path.display(), error = %e, "failed to delete installed set volume");
-                }
-            }
-        }
-        if removed > 0 {
-            info!(
-                job_id = job_id.0,
-                removed,
-                total = volume_files.len(),
-                "deleted installed set volumes"
-            );
-        }
-    }
-
-    pub(crate) fn clear_par2_runtime_state(&mut self, job_id: JobId) {
-        self.block_crcs.forget_job(job_id);
-        self.direct_store.clear_pending_materializations(job_id);
-        self.par2_runtime.remove(&job_id);
-        if let Some(coordinator) = self.par3_runtime.as_mut() {
-            coordinator.forget(job_id);
-        }
-        self.par2_cancellations.remove(&job_id);
-        self.direct_post_repair_in_flight.remove(&job_id);
-        self.direct_post_repair_results.remove(&job_id);
-        self.direct_post_repair_carry.remove(&job_id);
-        // The retained session this ticket is carrying belongs to a runtime
-        // that is being discarded, so its verdict describes a set that will not
-        // exist when it lands.
-        self.forget_par2_analysis_work(job_id);
-        self.shared_state.clear_job_cancellations(job_id);
-        self.par2_verified.remove(&job_id);
-        self.par2_joined_split_sets.remove(&job_id);
-        self.recovery_unposted_outputs.remove(&job_id);
-        self.par2_pre_repair_dir_entries.remove(&job_id);
-        // A reprocessed job runs its verification again, so it must be able to
-        // record a fresh outcome.
-        self.sfv_checked.remove(&job_id);
-        self.jobs_with_verification_outcome.remove(&job_id);
-        self.unavailable_promoted_recovery_segments
-            .retain(|segment_id| segment_id.file_id.job_id != job_id);
     }
 }

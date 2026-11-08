@@ -16,9 +16,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use weaver_server_api::{
     Attribute, AttributeInput, CLIENT_REQUEST_ID_ATTRIBUTE_KEY, PRIORITY_ATTRIBUTE_KEY, QueueItem,
-    QueueItemState, QueuePhase, SubmissionOptions, SubmitNzbError, fetch_nzb_from_url,
-    history_item_from_row, normalize_priority_value, queue_item_from_job, submit_metadata,
-    submit_nzb_bytes_with_options,
+    QueueItemState, QueuePhase, QueuePhaseProgress, QueueStateFacts, SubmissionOptions,
+    SubmitNzbError, fetch_nzb_from_url, history_item_from_row, normalize_priority_value,
+    queue_item_from_job, queue_item_state, queue_item_state_for_download_accounting,
+    queue_table_item_from_job, submit_metadata, submit_nzb_bytes_with_options,
 };
 use weaver_server_core::auth::{ApiKeyCache, CallerScope, LoginAuthCache};
 use weaver_server_core::history::{HistoryFailureKind, NzbgetMarkStatus};
@@ -26,7 +27,7 @@ use weaver_server_core::post_processing::hooks::UrlStatus;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::SharedConfig;
 use weaver_server_core::{
-    Database, FieldUpdate, HistoryFilter, JobId, JobStatus, JobUpdate, SchedulerError,
+    Database, FieldUpdate, HistoryFilter, HistoryRows, JobId, JobStatus, JobUpdate, SchedulerError,
     SchedulerHandle,
 };
 
@@ -34,6 +35,9 @@ use weaver_server_core::{
 pub(super) struct NzbgetFacadeContext {
     db: Database,
     handle: SchedulerHandle,
+    // The queue the handle drives, read in place so a poll borrows rows
+    // instead of copying the queue.
+    queue: weaver_server_core::SharedPipelineState,
     config: SharedConfig,
     auth_cache: LoginAuthCache,
     api_key_cache: ApiKeyCache,
@@ -65,6 +69,7 @@ impl NzbgetFacadeContext {
     pub(super) fn new(
         db: Database,
         handle: SchedulerHandle,
+        queue: weaver_server_core::SharedPipelineState,
         config: SharedConfig,
         auth_cache: LoginAuthCache,
         api_key_cache: ApiKeyCache,
@@ -78,6 +83,7 @@ impl NzbgetFacadeContext {
         Self {
             db,
             handle,
+            queue,
             config,
             auth_cache,
             api_key_cache,
@@ -224,6 +230,9 @@ async fn run_jsonrpc(
         return rpc_error_response(StatusCode::FORBIDDEN, id, RpcError::access_denied());
     }
 
+    if method == "listgroups" {
+        return listgroups_response(ctx, id).await;
+    }
     match dispatch_method(ctx, &method, params).await {
         Ok(result) => rpc_success_response(id, result),
         Err(error) => rpc_error_response(StatusCode::OK, id, error),
@@ -1501,43 +1510,35 @@ async fn append_url(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<
 }
 
 async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    // Iterate `JobInfo` directly instead of mapping every job through
-    // `queue_item_from_job` (which deep-clones name/metadata/phase_progress)
-    // just to sum bytes and count states. Use the download-accounting
-    // projection, not the user-facing queue state: the pipeline force-projects
-    // `download_state = Downloading` for a post-processing job with pending
-    // download work, so classifying off `status` alone would flip `ServerStandBy`
-    // and the post/par counts for those jobs.
-    let jobs = ctx.handle.list_jobs();
-    let states: Vec<(QueueItemState, u64, u64)> = jobs
-        .iter()
-        .map(|job| {
-            (
-                weaver_server_api::queue_item_state_from_job_info_for_download_accounting(job),
-                job.total_bytes,
-                job.downloaded_bytes,
-            )
-        })
-        .collect();
-    let remaining = states
-        .iter()
-        .filter(|(state, _, _)| {
-            !matches!(state, QueueItemState::Completed | QueueItemState::Failed)
-        })
-        .map(|(_, total, downloaded)| total.saturating_sub(*downloaded))
-        .sum::<u64>();
+    // Sum and count over the queue rows in place, copying no job. Use the
+    // download-accounting projection, not the user-facing queue state: the
+    // pipeline force-projects `download_state = Downloading` for a
+    // post-processing job with pending download work, so classifying off
+    // `status` alone would flip `ServerStandBy` and the post/par counts for
+    // those jobs. History rows are terminal and count toward none of these.
+    let (remaining, post_job_count, any_active) = ctx.queue.read_queue(|inner| {
+        let mut remaining = 0u64;
+        let mut post_job_count = 0usize;
+        let mut any_active = false;
+        for row in &inner.jobs {
+            let view = row.view(&inner.globals);
+            let state = queue_item_state_for_download_accounting(QueueStateFacts::of_view(&view));
+            let job = view.job();
+            // What is still to come, the recovery held back until a loss
+            // asks for it left out, as NZBGet leaves out its paused files.
+            if !matches!(state, QueueItemState::Completed | QueueItemState::Failed) {
+                remaining += job.remaining_bytes.min(job.wanted_bytes);
+            }
+            if matches!(view.status(), JobStatus::QueuedPostProcessing)
+                || queue_item_state_in_post_processing(state)
+            {
+                post_job_count += 1;
+            }
+            any_active |= state == QueueItemState::Downloading;
+        }
+        (remaining, post_job_count, any_active)
+    });
     let forced = 0u64;
-    let post_job_count = jobs
-        .iter()
-        .zip(&states)
-        .filter(|(job, (state, _, _))| {
-            matches!(job.status, JobStatus::QueuedPostProcessing)
-                || queue_item_state_in_post_processing(*state)
-        })
-        .count();
-    let any_active = states
-        .iter()
-        .any(|(state, _, _)| *state == QueueItemState::Downloading);
     let metrics = ctx.handle.get_metrics();
     let download_rate = metrics.current_download_speed;
     let arr_download_rate = download_rate.min(i32::MAX as u64);
@@ -1637,9 +1638,8 @@ async fn status(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
     }))
 }
 
-// `status()` iterates `SchedulerHandle::list_jobs()` directly (avoiding a
-// per-job `QueueItem` deep-clone) and classifies each job with
-// `queue_item_state_from_job_info`, so it needs the check on a bare state.
+// `status()` and `listgroups` classify rows in place, so they need the check
+// on a bare state.
 fn queue_item_state_in_post_processing(state: QueueItemState) -> bool {
     matches!(
         state,
@@ -1652,39 +1652,127 @@ fn queue_item_state_in_post_processing(state: QueueItemState) -> bool {
     )
 }
 
-async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let jobs = ctx.handle.list_jobs();
-    let items = jobs
-        .iter()
-        .map(|job| (queue_item_from_job(job), job))
-        .filter(|(item, _)| {
-            !matches!(
+// How many groups `listgroups` reads under the queue lock at a time.
+const GROUP_CHUNK: usize = 256;
+
+// The database reads `listgroups` has made in this process, for the tests
+// that hold it to one read however many groups it lists.
+#[cfg(test)]
+pub(super) static LISTGROUPS_DB_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// The groups `listgroups` answers with: the ids of every queue row still
+// downloading or post-processing, in queue order, read without copying a
+// row, and when each post-processing one began.
+struct GroupListing {
+    ids: Vec<JobId>,
+    post_started: HashMap<u64, i64>,
+}
+
+async fn group_listing(ctx: &NzbgetFacadeContext) -> GroupListing {
+    let (ids, post_ids) = ctx.queue.read_queue(|inner| {
+        let mut ids = Vec::with_capacity(inner.jobs.len());
+        let mut post_ids = Vec::new();
+        for row in &inner.jobs {
+            let view = row.view(&inner.globals);
+            let state = queue_item_state(QueueStateFacts::of_view(&view));
+            if matches!(state, QueueItemState::Completed | QueueItemState::Failed) {
+                continue;
+            }
+            if queue_item_state_in_post_processing(state) {
+                post_ids.push(row.id.0);
+            }
+            ids.push(row.id);
+        }
+        (ids, post_ids)
+    });
+    GroupListing {
+        ids,
+        post_started: post_started_at(ctx, post_ids).await,
+    }
+}
+
+// The groups for `ids`. The rows are copied under the lock and the groups
+// built after it is released; a job that left the queue or finished since
+// the listing is skipped.
+fn group_chunk(
+    ctx: &NzbgetFacadeContext,
+    ids: &[JobId],
+    post_started: &HashMap<u64, i64>,
+) -> Vec<Value> {
+    let jobs = ctx.queue.read_queue(|inner| {
+        ids.iter()
+            .filter_map(|id| inner.row(*id))
+            .map(|row| row.view(&inner.globals).list_info())
+            .collect::<Vec<_>>()
+    });
+    jobs.iter()
+        .filter_map(|job| {
+            let item = queue_table_item_from_job(job);
+            (!matches!(
                 item.state,
                 QueueItemState::Completed | QueueItemState::Failed
-            )
+            ))
+            .then(|| {
+                nzbget_group(
+                    &item,
+                    &reported_category(job.category.as_deref(), &job.metadata),
+                    nzbget_priority(&job.metadata),
+                    post_started.get(&item.id).copied(),
+                )
+            })
         })
-        .collect::<Vec<_>>();
-    let post_started = post_started_at(
-        ctx,
-        items
-            .iter()
-            .filter(|(item, _)| queue_item_state_in_post_processing(item.state))
-            .map(|(item, _)| item.id)
+        .collect()
+}
+
+async fn listgroups(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
+    let listing = group_listing(ctx).await;
+    Ok(Value::Array(
+        listing
+            .ids
+            .chunks(GROUP_CHUNK)
+            .flat_map(|ids| group_chunk(ctx, ids, &listing.post_started))
             .collect(),
+    ))
+}
+
+// `listgroups` over JSON-RPC: NZBGet has no paging for it, so the answer is
+// every group, written a chunk at a time as the client reads it. No chunk
+// holds the queue lock while it is serialised or sent.
+async fn listgroups_response(ctx: &NzbgetFacadeContext, id: Value) -> Response {
+    use tokio::io::AsyncWriteExt as _;
+
+    let listing = group_listing(ctx).await;
+    let (mut writer, reader) = tokio::io::duplex(64 * 1024);
+    let ctx = ctx.clone();
+    tokio::spawn(async move {
+        let mut buf = Vec::with_capacity(GROUP_CHUNK * 1024);
+        buf.extend_from_slice(br#"{"version":"1.1","id":"#);
+        let _ = serde_json::to_writer(&mut buf, &id);
+        buf.extend_from_slice(br#","result":["#);
+        let mut first = true;
+        for ids in listing.ids.chunks(GROUP_CHUNK) {
+            for group in group_chunk(&ctx, ids, &listing.post_started) {
+                if !first {
+                    buf.push(b',');
+                }
+                first = false;
+                let _ = serde_json::to_writer(&mut buf, &group);
+            }
+            // The client went away; nothing is left to send it.
+            if writer.write_all(&buf).await.is_err() {
+                return;
+            }
+            buf.clear();
+        }
+        buf.extend_from_slice(b"]}");
+        let _ = writer.write_all(&buf).await;
+    });
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        axum::body::Body::from_stream(tokio_util::io::ReaderStream::new(reader)),
     )
-    .await;
-    let groups = items
-        .iter()
-        .map(|(item, job)| {
-            nzbget_group(
-                item,
-                &reported_category(job.category.as_deref(), &job.metadata),
-                nzbget_priority(&job.metadata),
-                post_started.get(&item.id).copied(),
-            )
-        })
-        .collect::<Vec<_>>();
-    Ok(Value::Array(groups))
+        .into_response()
 }
 
 // Events that mark a job's post-processing under way.
@@ -1702,6 +1790,8 @@ async fn post_started_at(ctx: &NzbgetFacadeContext, ids: Vec<u64>) -> HashMap<u6
     if ids.is_empty() {
         return HashMap::new();
     }
+    #[cfg(test)]
+    LISTGROUPS_DB_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db = ctx.db.clone();
     let bounds =
         tokio::task::spawn_blocking(move || db.get_job_event_stage_bounds(&ids, POST_START_KINDS))
@@ -1736,13 +1826,22 @@ fn nzbget_group(
     priority: i64,
     post_started_at: Option<i64>,
 ) -> Value {
+    // NZBGet counts its paused files in the remaining size and again in the
+    // paused size, so a client reads what is still to come as the one less
+    // the other. The recovery held back until a loss asks for it is
+    // Weaver's paused files; a paused job pauses all of it. Every figure is
+    // in the post's declared bytes, so the file size is what was done plus
+    // what remains.
     let total = item.total_bytes;
-    let downloaded = item.downloaded_bytes;
-    let remaining = total.saturating_sub(downloaded);
+    let wanted = item.wanted_bytes.min(total);
+    let still = item.remaining_bytes.min(wanted);
+    let held_back = total - wanted;
+    let remaining = still + held_back;
+    let downloaded = wanted - still;
     let paused = if item.state == QueueItemState::Paused {
         remaining
     } else {
-        0
+        held_back
     };
     let (file_lo, file_hi) = size_parts(total);
     let (remaining_lo, remaining_hi) = size_parts(remaining);
@@ -1789,7 +1888,7 @@ fn nzbget_group(
         "FileCount": item.file_count,
         "RemainingFileCount": item.remaining_file_count,
         "RemainingParCount": item.remaining_par_count,
-        "Health": item.health,
+        "Health": nzbget_health_of(item.total_bytes, item.optional_recovery_bytes, item.failed_bytes),
         "CriticalHealth": critical_health,
         "DupeKey": attribute_value(&item.attributes, "nzbget.dupe_key").unwrap_or_default(),
         "DupeScore": attribute_value(&item.attributes, "nzbget.dupe_score")
@@ -1861,10 +1960,10 @@ fn post_progress_info(item: &QueueItem, post_started_at: Option<i64>) -> PostPro
     let stage_progress = progress
         .map(|entry| (entry.progress_percent.clamp(0.0, 100.0) * 10.0) as u64)
         .unwrap_or(0);
+    let now = unix_now_secs() as f64 * 1000.0;
+    let sampled_at = |entry: &QueuePhaseProgress| stage_measured_to(entry, now);
     let stage_time_sec = progress
-        .map(|entry| {
-            ((entry.updated_at_epoch_ms - entry.started_at_epoch_ms) / 1000.0).max(0.0) as u64
-        })
+        .map(|entry| ((sampled_at(entry) - entry.started_at_epoch_ms) / 1000.0).max(0.0) as u64)
         .unwrap_or(0);
     let text = match progress {
         Some(entry) if entry.progress_percent > 0.0 => {
@@ -1874,10 +1973,7 @@ fn post_progress_info(item: &QueueItem, post_started_at: Option<i64>) -> PostPro
     };
     // Measured to the same moment as the stage time, so the total never
     // reads less than the stage it contains.
-    let observed_at = progress.map_or_else(
-        || unix_now_secs() as f64 * 1000.0,
-        |entry| entry.updated_at_epoch_ms,
-    );
+    let observed_at = progress.map_or(now, sampled_at);
     let total_time_sec = post_started_at
         .map(|start| ((observed_at - start as f64) / 1000.0).max(0.0) as u64)
         .unwrap_or(0)
@@ -1891,17 +1987,50 @@ fn post_progress_info(item: &QueueItem, post_started_at: Option<i64>) -> PostPro
 }
 
 // NZBGet's CriticalHealth: the health floor below which the download cannot
-// be repaired. Approximated from the recovery volume share of the job.
+// be repaired, as NZBGet reports it: the recovery must cover the loss and
+// still leave itself enough blocks, so the floor is (size - 2 x recovery) /
+// (size - recovery). A job with no recovery reports 1000; one with any
+// recovery never does.
 fn critical_health(item: &QueueItem) -> u64 {
     critical_health_of(item.total_bytes, item.optional_recovery_bytes)
+}
+
+// The moment a stage is measured to: its last sample. One with no byte
+// total, such as a repair, is never sampled, so it is measured to `now`.
+fn stage_measured_to(entry: &QueuePhaseProgress, now: f64) -> f64 {
+    if entry.total_bytes > 0.0 {
+        entry.updated_at_epoch_ms
+    } else {
+        now
+    }
+}
+
+// NZBGet's Health: the share of the non-recovery bytes that arrived, as
+// NZBGet's CalcHealth weighs it. A job that lost anything never reads 1000.
+// `failed_bytes` is already the non-recovery loss.
+fn nzbget_health_of(total_bytes: u64, optional_recovery_bytes: u64, failed_bytes: u64) -> u32 {
+    if failed_bytes == 0 || total_bytes <= optional_recovery_bytes {
+        return 1000;
+    }
+    let size = total_bytes - optional_recovery_bytes;
+    let health = size.saturating_sub(failed_bytes) * 1000 / size;
+    health.min(999) as u32
 }
 
 fn critical_health_of(total_bytes: u64, optional_recovery_bytes: u64) -> u64 {
     if total_bytes == 0 {
         return 1000;
     }
-    let payload = total_bytes.saturating_sub(optional_recovery_bytes);
-    (payload * 1000) / total_bytes
+    if optional_recovery_bytes.saturating_mul(2) > total_bytes {
+        return 0;
+    }
+    let critical = (total_bytes - optional_recovery_bytes * 2) * 1000
+        / (total_bytes - optional_recovery_bytes);
+    if optional_recovery_bytes > 0 {
+        critical.min(999)
+    } else {
+        critical
+    }
 }
 
 // The category string an NZBGet client submitted, kept beside the canonical
@@ -1966,17 +2095,35 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     // history(Hidden): rows a client removed with HistoryDelete are listed
     // only when the first parameter is true.
     let include_hidden = optional_bool_param(&positional_params(params)?, 0)?.unwrap_or(false);
-    let terminal_items = ctx
-        .handle
-        .list_jobs()
+    // The queue's finished rows, copied, and the in-memory history, shared,
+    // under one queue lock: history is replaced under that lock, so a job
+    // moving from the queue into history is listed exactly once.
+    let (finished_rows, history_rows) = ctx.queue.read_queue(|inner| {
+        let finished = inner
+            .jobs
+            .iter()
+            .filter_map(|row| {
+                let view = row.view(&inner.globals);
+                matches!(
+                    queue_item_state(QueueStateFacts::of_view(&view)),
+                    QueueItemState::Completed | QueueItemState::Failed
+                )
+                .then(|| view.list_info())
+            })
+            .collect::<Vec<_>>();
+        (finished, ctx.queue.history_rows())
+    });
+    let terminal_items = finished_rows
         .iter()
+        .chain(history_rows.iter())
         .map(|job| {
             (
-                queue_item_from_job(job),
+                queue_table_item_from_job(job),
                 reported_category(job.category.as_deref(), &job.metadata),
+                implied_failure_kind(job),
             )
         })
-        .filter(|(item, _)| {
+        .filter(|(item, _, _)| {
             matches!(
                 item.state,
                 QueueItemState::Completed | QueueItemState::Failed
@@ -1985,16 +2132,20 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
         .collect::<Vec<_>>();
     let terminal_ids = terminal_items
         .iter()
-        .map(|(item, _)| item.id)
+        .map(|(item, _, _)| item.id)
         .collect::<Vec<_>>();
     let db = ctx.db.clone();
     let (rows, facade_states) = tokio::task::spawn_blocking(move || {
-        let rows = db.list_nzbget_history(
+        let rows = db.list_job_history(
             &HistoryFilter {
                 limit: Some(1000),
                 ..HistoryFilter::default()
             },
-            include_hidden,
+            if include_hidden {
+                HistoryRows::All
+            } else {
+                HistoryRows::Shown
+            },
         )?;
         let ids = rows
             .iter()
@@ -2027,7 +2178,7 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
     let ids: Vec<u64> = terminal_items
         .iter()
-        .map(|(item, _)| item.id)
+        .map(|(item, _, _)| item.id)
         .chain(rows.iter().map(|row| row.job_id))
         .collect();
     let db = ctx.db.clone();
@@ -2041,9 +2192,16 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     let mut seen_terminal_ids = HashSet::with_capacity(terminal_items.len());
     let mut items = terminal_items
         .iter()
-        .filter(|(item, _)| !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id))
-        .map(|(item, category)| {
-            nzbget_history_queue_item(item, category, history_timings(stage_bounds.get(&item.id)))
+        .filter(|(item, _, _)| {
+            !persisted_ids.contains(&item.id) && seen_terminal_ids.insert(item.id)
+        })
+        .map(|(item, category, kept)| {
+            nzbget_history_queue_item(
+                item,
+                category,
+                *kept,
+                history_timings(stage_bounds.get(&item.id)),
+            )
         })
         .collect::<Vec<_>>();
 
@@ -2312,6 +2470,14 @@ fn failure_kind_for(
     failed.then(|| kept.unwrap_or_else(|| HistoryFailureKind::derive(None, None, error, health, 0)))
 }
 
+// The kind a terminal job's own status names before its history row holds
+// one: a partial delivery's is the unpack it fell short in.
+fn implied_failure_kind(job: &weaver_server_core::JobInfo) -> Option<HistoryFailureKind> {
+    job.status.shortfall_stage().map(|stage| {
+        HistoryFailureKind::derive(Some(stage), None, job.error.as_deref(), job.health, 0)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn nzbget_history_entry(
     id: u64,
@@ -2403,7 +2569,11 @@ fn nzbget_history_item(
             },
         ),
         timings,
-        item.health,
+        nzbget_health_of(
+            item.total_bytes,
+            item.optional_recovery_bytes,
+            item.failed_bytes,
+        ),
         critical_health_of(item.total_bytes, item.optional_recovery_bytes),
         &item.error.clone().unwrap_or_default(),
         item.client_request_id.as_deref(),
@@ -2411,7 +2581,12 @@ fn nzbget_history_item(
     )
 }
 
-fn nzbget_history_queue_item(item: &QueueItem, category: &str, timings: HistoryTimings) -> Value {
+fn nzbget_history_queue_item(
+    item: &QueueItem,
+    category: &str,
+    kept: Option<HistoryFailureKind>,
+    timings: HistoryTimings,
+) -> Value {
     let failed = item.state == QueueItemState::Failed;
     nzbget_history_entry(
         item.id,
@@ -2426,10 +2601,14 @@ fn nzbget_history_queue_item(item: &QueueItem, category: &str, timings: HistoryT
         item.created_at.timestamp(),
         history_statuses(
             false,
-            failure_kind_for(failed, None, item.error.as_deref(), item.health),
+            failure_kind_for(failed, kept, item.error.as_deref(), item.health),
         ),
         timings,
-        item.health,
+        nzbget_health_of(
+            item.total_bytes,
+            item.optional_recovery_bytes,
+            item.failed_bytes,
+        ),
         critical_health_of(item.total_bytes, item.optional_recovery_bytes),
         &item.error.clone().unwrap_or_default(),
         item.client_request_id.as_deref(),
@@ -2698,6 +2877,10 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         _ => {}
     }
 
+    // NZBGet applies an edit to every id it finds and answers true when it
+    // found at least one; a missing id holds back none of the others.
+    let mut applied = 0usize;
+    let mut missing = Vec::new();
     for job_id in request.ids {
         let result = match command.as_str() {
             "grouppause" => ctx.handle.pause_job(job_id).await,
@@ -2772,8 +2955,8 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             other => return Err(RpcError::invalid_action(other)),
         };
         match result {
-            Ok(()) => {}
-            Err(SchedulerError::JobNotFound(_)) => return Ok(json!(false)),
+            Ok(()) => applied += 1,
+            Err(SchedulerError::JobNotFound(_)) => missing.push(job_id.0),
             Err(error) => {
                 return Err(RpcError::invalid_parameter(format!(
                     "{} failed: {error}",
@@ -2782,8 +2965,16 @@ async fn editqueue(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
             }
         }
     }
+    if !missing.is_empty() {
+        tracing::debug!(
+            command = %request.command,
+            applied,
+            ?missing,
+            "editqueue named ids the queue does not hold"
+        );
+    }
 
-    Ok(json!(true))
+    Ok(json!(applied > 0))
 }
 
 // HistoryDelete hides the row from the client's default history listing but
@@ -2806,8 +2997,7 @@ async fn group_final_delete(
     ctx: &NzbgetFacadeContext,
     job_id: JobId,
 ) -> Result<(), SchedulerError> {
-    ctx.handle.cancel_job(job_id).await?;
-    ctx.handle.delete_history(job_id, false).await.map(|_| ())
+    ctx.handle.cancel_job_and_delete_history(job_id).await
 }
 
 // GroupMoveTop / GroupMoveBottom / GroupMoveOffset. The move delta arrives in
@@ -2858,12 +3048,21 @@ async fn set_job_category(
         weaver_server_core::ingest::resolve_submission_category(&ctx.config, Some(requested))
             .await
             .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?;
-    let mut metadata = ctx.handle.get_job(job_id)?.metadata;
+    let mut metadata = Vec::new();
     let submitted = category.as_ref().map(|_| requested);
     record_submitted_category(&mut metadata, submitted, category.as_deref());
     let update = JobUpdate {
         category: category.map_or(FieldUpdate::Clear, FieldUpdate::Set),
-        metadata: FieldUpdate::Set(metadata),
+        metadata_edits: [SUBMITTED_CATEGORY_KEY, SUBMITTED_CATEGORY_FOR_KEY]
+            .into_iter()
+            .map(|key| {
+                let value = metadata
+                    .iter()
+                    .find(|(existing, _)| existing == key)
+                    .map(|(_, value)| value.clone());
+                (key.to_string(), value)
+            })
+            .collect(),
         ..JobUpdate::default()
     };
     ctx.handle.update_job(job_id, update).await
@@ -2893,15 +3092,17 @@ async fn set_job_priority(
     // Weaver dispatches by a three-level label; the number the client set is
     // kept beside it and reported back. Force dispatches as HIGH.
     let priority = parse_nzbget_priority(param);
-    let mut metadata = ctx.handle.get_job(job_id)?.metadata;
-    metadata.retain(|(key, _)| !key.eq_ignore_ascii_case(PRIORITY_ATTRIBUTE_KEY));
-    metadata.push((
-        PRIORITY_ATTRIBUTE_KEY.to_string(),
-        priority_label(priority).to_string(),
-    ));
-    record_submitted_priority(&mut metadata, priority);
     let update = JobUpdate {
-        metadata: FieldUpdate::Set(metadata),
+        metadata_edits: vec![
+            (
+                PRIORITY_ATTRIBUTE_KEY.to_string(),
+                Some(priority_label(priority).to_string()),
+            ),
+            (
+                SUBMITTED_PRIORITY_KEY.to_string(),
+                Some(priority.to_string()),
+            ),
+        ],
         ..JobUpdate::default()
     };
     ctx.handle.update_job(job_id, update).await
@@ -2953,13 +3154,8 @@ async fn upsert_job_metadata(
     key: &str,
     value: Option<String>,
 ) -> Result<(), SchedulerError> {
-    let mut metadata = ctx.handle.get_job(job_id)?.metadata;
-    metadata.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
-    if let Some(value) = value {
-        metadata.push((key.to_string(), value));
-    }
     let update = JobUpdate {
-        metadata: FieldUpdate::Set(metadata),
+        metadata_edits: vec![(key.to_string(), value)],
         ..JobUpdate::default()
     };
     ctx.handle.update_job(job_id, update).await
@@ -3020,19 +3216,25 @@ async fn set_history_category(
     job_id: JobId,
     requested: &str,
 ) -> Result<(), SchedulerError> {
-    let Some(row) = history_row(ctx, job_id).await? else {
-        return Err(SchedulerError::JobNotFound(job_id));
-    };
     let category =
         weaver_server_core::ingest::resolve_submission_category(&ctx.config, Some(requested))
             .await
             .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?;
-    let mut metadata = weaver_server_core::history::parse_history_metadata(row.metadata.as_deref());
+    let mut metadata = Vec::new();
     let submitted = category.as_ref().map(|_| requested);
     record_submitted_category(&mut metadata, submitted, category.as_deref());
     let update = JobUpdate {
         category: category.map_or(FieldUpdate::Clear, FieldUpdate::Set),
-        metadata: FieldUpdate::Set(metadata),
+        metadata_edits: [SUBMITTED_CATEGORY_KEY, SUBMITTED_CATEGORY_FOR_KEY]
+            .into_iter()
+            .map(|key| {
+                let value = metadata
+                    .iter()
+                    .find(|(existing, _)| existing == key)
+                    .map(|(_, value)| value.clone());
+                (key.to_string(), value)
+            })
+            .collect(),
         ..JobUpdate::default()
     };
     update_history(ctx, job_id, update).await
@@ -3044,22 +3246,17 @@ async fn set_history_parameter(
     name: &str,
     value: &str,
 ) -> Result<(), SchedulerError> {
-    let Some(row) = history_row(ctx, job_id).await? else {
+    if !history_row_exists(ctx, job_id).await? {
         return Err(SchedulerError::JobNotFound(job_id));
-    };
+    }
     let name = name.trim();
     if name.is_empty() {
         return Ok(());
     }
     let key = parameter_metadata_key(name)?;
-    let mut metadata = weaver_server_core::history::parse_history_metadata(row.metadata.as_deref());
-    metadata.retain(|(existing, _)| !existing.eq_ignore_ascii_case(key));
     let value = parameter_metadata_value(name, value);
-    if !value.is_empty() {
-        metadata.push((key.to_string(), value));
-    }
     let update = JobUpdate {
-        metadata: FieldUpdate::Set(metadata),
+        metadata_edits: vec![(key.to_string(), (!value.is_empty()).then_some(value))],
         ..JobUpdate::default()
     };
     update_history(ctx, job_id, update).await
@@ -3071,15 +3268,7 @@ async fn delete_as_duplicate(
     ctx: &NzbgetFacadeContext,
     job_id: JobId,
 ) -> Result<(), SchedulerError> {
-    ctx.handle.cancel_job(job_id).await?;
-    let db = ctx.db.clone();
-    // The cancel archives the row before it answers.
-    tokio::task::spawn_blocking(move || {
-        db.set_history_failure_kind(job_id.0, Some(HistoryFailureKind::Duplicate))
-    })
-    .await
-    .map_err(|error| SchedulerError::InvalidInput(error.to_string()))?
-    .map_err(SchedulerError::from)?;
+    ctx.handle.cancel_duplicate_job(job_id).await?;
     ctx.history_cache.lock().await.remove(&job_id.0);
     Ok(())
 }
@@ -3087,12 +3276,17 @@ async fn delete_as_duplicate(
 // The live queue in listing order, with each job's reported category and
 // priority.
 fn queue_order(ctx: &NzbgetFacadeContext) -> Vec<(QueueItem, String, i64)> {
-    ctx.handle
-        .list_jobs()
-        .iter()
+    let jobs = ctx.queue.read_queue(|inner| {
+        inner
+            .jobs
+            .iter()
+            .map(|row| row.view(&inner.globals).list_info())
+            .collect::<Vec<_>>()
+    });
+    jobs.iter()
         .map(|job| {
             (
-                queue_item_from_job(job),
+                queue_table_item_from_job(job),
                 reported_category(job.category.as_deref(), &job.metadata),
                 nzbget_priority(&job.metadata),
             )
@@ -3243,10 +3437,7 @@ async fn sort_groups(
                 .to_lowercase()
                 .cmp(&nzbget_release_name(&right.original_title, &right.name).to_lowercase()),
             "size" => left.total_bytes.cmp(&right.total_bytes),
-            "left" => left
-                .total_bytes
-                .saturating_sub(left.downloaded_bytes)
-                .cmp(&right.total_bytes.saturating_sub(right.downloaded_bytes)),
+            "left" => left.remaining_bytes.cmp(&right.remaining_bytes),
             "priority" => right_priority.cmp(left_priority),
             "category" => left_category
                 .to_lowercase()
@@ -3325,10 +3516,16 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         return Ok(Value::Array(Vec::new()));
     };
     let targets: Vec<_> = ctx
-        .handle
-        .list_jobs()
+        .queue
+        .read_queue(|inner| inner.row(job_id).map(|row| row.info(&inner.globals)))
+        .or_else(|| {
+            ctx.queue
+                .history_rows()
+                .iter()
+                .find(|job| job.job_id == job_id)
+                .cloned()
+        })
         .into_iter()
-        .filter(|job| job.job_id == job_id)
         .collect();
     if targets.is_empty() {
         return Err(RpcError::invalid_parameter("nzb id not found in queue"));
@@ -3338,15 +3535,13 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
     for info in targets {
         let job_id = info.job_id;
         let db = ctx.db.clone();
-        let loaded = tokio::task::spawn_blocking(move || {
-            let nzb = db.load_active_job_persisted_nzb(job_id)?;
-            let runtime = db.load_active_file_runtime(job_id)?;
-            Ok::<_, weaver_server_core::StateError>((nzb, runtime))
-        })
-        .await
-        .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?
-        .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?;
-        let (persisted, (progress, complete)) = loaded;
+        let persisted =
+            tokio::task::spawn_blocking(move || db.load_active_job_persisted_nzb(job_id))
+                .await
+                .map_err(|error| RpcError::invalid_parameter(format!("listfiles failed: {error}")))?
+                .map_err(|error| {
+                    RpcError::invalid_parameter(format!("listfiles failed: {error}"))
+                })?;
         let Some((_, Some(nzb_zstd))) = persisted else {
             continue;
         };
@@ -3363,17 +3558,29 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
         let paused = item.state == QueueItemState::Paused;
         let output_dir = item.output_dir.clone().unwrap_or_default();
         for (index, file) in nzb.files.iter().enumerate() {
-            let index_u32 = index as u32;
             let total: u64 = file
                 .segments
                 .iter()
                 .map(|segment| segment.bytes as u64)
                 .sum();
-            let remaining = if job_done || complete.contains(&index_u32) {
+            // The job's snapshot says what of each file is still to come; a
+            // file it says nothing of has all of it to come.
+            let remaining = if job_done {
                 0
             } else {
-                total.saturating_sub(progress.get(&index_u32).copied().unwrap_or(0))
+                info.file_remaining_bytes
+                    .get(index)
+                    .copied()
+                    .unwrap_or(total)
+                    .min(total)
             };
+            // Recovery held back until a loss asks for it lists as NZBGet
+            // lists its paused par files: paused, still to come.
+            let held_back = !job_done
+                && info
+                    .file_parked_bytes
+                    .get(index)
+                    .is_some_and(|parked| *parked > 0);
             let (file_lo, file_hi) = size_parts(total);
             let (remaining_lo, remaining_hi) = size_parts(remaining);
             let filename = file
@@ -3395,7 +3602,7 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
                 "RemainingSizeHi": remaining_hi,
                 "PostTime": file.date,
                 "FilenameConfirmed": true,
-                "Paused": paused,
+                "Paused": paused || held_back,
                 "ActiveDownloads": 0,
                 "Progress": (total.saturating_sub(remaining))
                     .saturating_mul(1000)
@@ -3410,17 +3617,24 @@ async fn listfiles(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<V
 }
 
 async fn postqueue(ctx: &NzbgetFacadeContext) -> Result<Value, RpcError> {
-    let items = ctx
-        .handle
-        .list_jobs()
+    // Only the queue's rows can be post-processing; history rows are done.
+    let jobs = ctx.queue.read_queue(|inner| {
+        inner
+            .jobs
+            .iter()
+            .filter_map(|row| {
+                let view = row.view(&inner.globals);
+                (matches!(view.status(), JobStatus::QueuedPostProcessing)
+                    || queue_item_state_in_post_processing(queue_item_state(
+                        QueueStateFacts::of_view(&view),
+                    )))
+                .then(|| view.list_info())
+            })
+            .collect::<Vec<_>>()
+    });
+    let items = jobs
         .iter()
-        .filter(|job| {
-            matches!(job.status, JobStatus::QueuedPostProcessing)
-                || queue_item_state_in_post_processing(
-                    weaver_server_api::queue_item_state_from_job_info(job),
-                )
-        })
-        .map(queue_item_from_job)
+        .map(queue_table_item_from_job)
         .collect::<Vec<_>>();
     let post_started = post_started_at(ctx, items.iter().map(|item| item.id).collect()).await;
     let entries = items
@@ -3684,12 +3898,15 @@ async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result
     let id_from = optional_i64_param(&params, 0)?.unwrap_or(0).max(0) as u64;
     let limit = optional_i64_param(&params, 1)?.unwrap_or(0).max(0) as usize;
 
-    let jobs = ctx.handle.list_jobs();
-    let names: std::collections::HashMap<u64, String> = jobs
-        .iter()
-        .map(|job| (job.job_id.0, job.name.clone()))
-        .collect();
-    let ids: Vec<u64> = jobs.iter().map(|job| job.job_id.0).collect();
+    let history = ctx.queue.history_rows();
+    let ids: Vec<u64> = ctx.queue.read_queue(|inner| {
+        inner
+            .jobs
+            .iter()
+            .map(|row| row.id.0)
+            .chain(history.iter().map(|job| job.job_id.0))
+            .collect()
+    });
     let db = ctx.db.clone();
     // `limit == 0` means "no cap" everywhere else in this RPC surface, but an
     // unbounded fetch across every queued job in one query is not a
@@ -3701,6 +3918,27 @@ async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("log unavailable: {error}")))?
     .map_err(|error| RpcError::invalid_parameter(format!("log unavailable: {error}")))?;
+    // Names only for the jobs the returned events name.
+    let wanted = events
+        .iter()
+        .map(|event| event.job_id)
+        .collect::<HashSet<_>>();
+    let mut names: HashMap<u64, String> = ctx.queue.read_queue(|inner| {
+        wanted
+            .iter()
+            .filter_map(|id| {
+                let row = inner.row(JobId(*id))?;
+                Some((*id, row.view(&inner.globals).job().name.clone()))
+            })
+            .collect()
+    });
+    for job in history.iter() {
+        if wanted.contains(&job.job_id.0) {
+            names
+                .entry(job.job_id.0)
+                .or_insert_with(|| job.name.clone());
+        }
+    }
 
     Ok(Value::Array(job_events_to_log_entries(
         events,
@@ -4273,5 +4511,34 @@ mod active_download_state_tests {
         assert!(!nzbget_has_active_download(
             QueueItemState::FinalizingDownload
         ));
+    }
+}
+
+#[cfg(test)]
+mod health_and_stage_tests {
+    use super::*;
+
+    #[test]
+    fn health_is_weighed_over_the_bytes_that_are_not_recovery() {
+        assert_eq!(nzbget_health_of(1000, 100, 0), 1000);
+        assert_eq!(nzbget_health_of(1000, 100, 90), 900);
+        assert_eq!(nzbget_health_of(1_000_000, 0, 1), 999);
+        assert_eq!(nzbget_health_of(100, 100, 5), 1000);
+    }
+
+    #[test]
+    fn a_stage_with_no_byte_total_is_measured_to_now() {
+        let entry = |total_bytes: f64| QueuePhaseProgress {
+            phase: QueuePhase::Repairing,
+            completed_bytes: 0.0,
+            total_bytes,
+            progress_percent: 0.0,
+            rate_bps: None,
+            estimated_remaining_ms: None,
+            started_at_epoch_ms: 1_000.0,
+            updated_at_epoch_ms: 1_000.0,
+        };
+        assert_eq!(stage_measured_to(&entry(0.0), 9_000.0), 9_000.0);
+        assert_eq!(stage_measured_to(&entry(10.0), 9_000.0), 1_000.0);
     }
 }

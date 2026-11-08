@@ -186,7 +186,7 @@ impl Database {
             let generated = generate_jwt_secret();
             let stored = encode_stored_jwt_signing_secret(&generated, encryption_key.as_ref())?;
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO settings (key, value) VALUES ({}, {})
                  ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 &[
@@ -236,7 +236,7 @@ impl Database {
             .as_secs() as i64;
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO auth_credentials (id, username, password_hash, created_at, updated_at)
                  VALUES (1, {}, {}, {}, {})
                  ON CONFLICT(id) DO UPDATE SET username = excluded.username, password_hash = excluded.password_hash, updated_at = excluded.updated_at",
@@ -383,7 +383,7 @@ impl Database {
         let token_hash = token_hash.to_string();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE browser_sessions SET revoked_at = {} WHERE token_hash = {} AND revoked_at IS NULL",
                 &[SqlArg::I64(now), SqlArg::Text(token_hash)],
             )
@@ -404,7 +404,7 @@ impl Database {
         let token_hash = token_hash.to_string();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE browser_sessions SET expires_at = {} WHERE token_hash = {}",
                 &[SqlArg::I64(expires_at), SqlArg::Text(token_hash)],
             )
@@ -417,7 +417,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE browser_sessions SET revoked_at = {} WHERE revoked_at IS NULL",
                 &[SqlArg::I64(now)],
             )
@@ -438,7 +438,7 @@ impl Database {
         let token_hash = token_hash.to_string();
         self.run_sql_blocking(async move {
             let updated = SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO browser_session_verifications (token_hash, verified_at)
                  SELECT token_hash, {} FROM browser_sessions
                  WHERE token_hash = {} AND revoked_at IS NULL AND expires_at > {}

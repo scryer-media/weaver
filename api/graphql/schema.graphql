@@ -304,6 +304,19 @@ type BandwidthTestRequest {
 	customUrl: String
 }
 
+"""
+One job's result from a batched cancel.
+"""
+type CancelJobResult {
+	id: Int!
+	cancelled: Boolean!
+	"""
+	`NOT_FOUND`, `CONFLICT` or `INTERNAL` when the job was not cancelled.
+	"""
+	errorCode: String
+	message: String
+}
+
 type Category {
 	id: Int!
 	name: String!
@@ -453,6 +466,15 @@ type DownloadBlock {
 	windowEndsAtEpochMs: Float
 	timezoneName: String!
 	scheduledSpeedLimit: Int!
+	"""
+	Speed limit the downloads run under now: the schedule's while one
+	holds, even one set to unlimited, else the configured one. 0 is none.
+	"""
+	speedLimitInForce: Int!
+	"""
+	Whether a schedule window sets the limit in force, even to unlimited.
+	"""
+	speedLimitBySchedule: Boolean!
 	"""
 	Why a schedule rule is holding new downloads, while one is.
 	"""
@@ -664,6 +686,7 @@ enum EventKind {
 	EXTRACTION_PROGRESS
 	EXTRACTION_COMPLETE
 	EXTRACTION_FAILED
+	ARCHIVE_DEMOTED
 	MOVE_TO_COMPLETE_STARTED
 	MOVE_TO_COMPLETE_FINISHED
 	SEGMENT_RETRY_SCHEDULED
@@ -746,6 +769,7 @@ type GeneralSettings {
 	maxDownloadSpeed: Int!
 	maxRetries: Int!
 	propagationDelaySecs: Int!
+	maxConcurrentNzbs: Int!
 	enableSrrdbLookup: Boolean!
 	watchFolder: WatchFolderSettings!
 	duplicatePolicy: DuplicatePolicySettings!
@@ -758,6 +782,7 @@ input GeneralSettingsInput {
 	maxDownloadSpeed: Int
 	maxRetries: Int
 	propagationDelaySecs: Int
+	maxConcurrentNzbs: Int
 	enableSrrdbLookup: Boolean
 	watchFolder: WatchFolderSettingsInput
 	duplicatePolicy: DuplicatePolicySettingsInput
@@ -767,6 +792,11 @@ type GlobalQueueState {
 	isPaused: Boolean!
 	speedLimitBytesPerSec: Int!
 	downloadBlock: DownloadBlock!
+	"""
+	When a timed pause resumes downloads on its own, in epoch milliseconds.
+	Null when no resume is scheduled.
+	"""
+	resumeAtEpochMs: Int
 }
 
 """
@@ -1394,28 +1424,6 @@ type Metrics {
 	writeBufferedBytes: Int!
 	writeBufferedSegments: Int!
 	directWriteEvictions: Int!
-	"""
-	Lifetime count of archive sets direct-store admitted. Together with
-	the two below this is the external answer to "did direct routing carry
-	this work, or quietly fall back?" — output bytes are identical either
-	way.
-	"""
-	directSetsAdmitted: Int!
-	"""
-	Lifetime count of sets that left direct routing (demoted); per-reason
-	detail is in the server logs.
-	"""
-	directSetsDemoted: Int!
-	"""
-	Lifetime count of sets that completed without ever writing a source
-	volume to disk — direct-store's success case.
-	"""
-	directSetsFinalizedDirect: Int!
-	"""
-	Lifetime count of sets repaired in place without leaving direct
-	routing.
-	"""
-	directSetsRepairedWhileDirect: Int!
 	decodePressureSoftLimitBytes: Int!
 	decodePressureHardLimitBytes: Int!
 	writePressureSoftLimitBytes: Int!
@@ -1470,6 +1478,28 @@ type Metrics {
 	recoveryQueueDepth: Int!
 	articlesPerSec: Float!
 	decodeRateMbps: Float!
+	"""
+	Lifetime count of archive sets direct-store admitted. Together with
+	the two below this is the external answer to "did direct routing carry
+	this work, or quietly fall back?" — output bytes are identical either
+	way.
+	"""
+	directSetsAdmitted: Int! @deprecated(reason: "always 0 since the graph engine; removed in 0.17.0")
+	"""
+	Lifetime count of sets that left direct routing (demoted); per-reason
+	detail is in the server logs.
+	"""
+	directSetsDemoted: Int! @deprecated(reason: "always 0 since the graph engine; removed in 0.17.0")
+	"""
+	Lifetime count of sets that completed without ever writing a source
+	volume to disk — direct-store's success case.
+	"""
+	directSetsFinalizedDirect: Int! @deprecated(reason: "always 0 since the graph engine; removed in 0.17.0")
+	"""
+	Lifetime count of sets repaired in place without leaving direct
+	routing.
+	"""
+	directSetsRepairedWhileDirect: Int! @deprecated(reason: "always 0 since the graph engine; removed in 0.17.0")
 }
 
 enum MetricsHistoryRangeGql {
@@ -1656,6 +1686,12 @@ type MutationRoot {
 	"""
 	cancelJob(id: Int!): Boolean!
 	"""
+	Cancel and remove several jobs in one pipeline command. Each id gets
+	its own result; a job that cannot be cancelled never holds back the
+	rest.
+	"""
+	cancelJobs(ids: [Int!]!): [CancelJobResult!]!
+	"""
 	Reprocess a completed or failed job (re-run post-download stages without re-downloading).
 	"""
 	reprocessJob(id: Int!, password: String): Boolean!
@@ -1698,6 +1734,28 @@ type MutationRoot {
 	"""
 	updateJobs(ids: [Int!]!, category: String, priority: String): Boolean!
 	"""
+	Pause every job the target names, as one queue change. A job that is
+	missing or refuses is listed in `refused` and holds back nothing.
+	"""
+	pauseQueueItems(target: QueueBatchTarget!): QueueBatchResult!
+	"""
+	Resume every job the target names, as one queue change.
+	"""
+	resumeQueueItems(target: QueueBatchTarget!): QueueBatchResult!
+	"""
+	Cancel and remove every job the target names, as one queue change.
+	"""
+	cancelQueueItems(target: QueueBatchTarget!): QueueBatchResult!
+	"""
+	Move every job the target names into `category`; the empty string
+	clears it.
+	"""
+	setQueueItemsCategory(target: QueueBatchTarget!, category: String!): QueueBatchResult!
+	"""
+	Give every job the target names `priority`.
+	"""
+	setQueueItemsPriority(target: QueueBatchTarget!, priority: QueuePriority!): QueueBatchResult!
+	"""
 	Set or clear a queued job's archive/unpack password. Passing null or
 	an empty string removes the password (even one that came from the NZB
 	itself); the override is durable across restarts. The password never
@@ -1712,9 +1770,10 @@ type MutationRoot {
 	"""
 	reorderQueueItem(id: Int!, kind: QueueMoveKind!, offset: Int): Boolean!
 	"""
-	Pause all download dispatch globally.
+	Pause all download dispatch globally. With `resumeAfterSecs`, downloads
+	resume on their own after that many seconds (1 to 30 days).
 	"""
-	pauseAll: Boolean!
+	pauseAll(resumeAfterSecs: Int): Boolean!
 	"""
 	Resume all download dispatch globally.
 	"""
@@ -2067,6 +2126,7 @@ type NetworkPoolMemberFlow {
 	blocked: String
 	handshakeMs: Float
 	connectMs: Float
+	rank: Int
 	bytesPerSecond: Float
 	samples: Int!
 	failures: Int!
@@ -2635,7 +2695,7 @@ type QueryRoot {
 	"""
 	pathStorage(path: String!): ConfiguredStorage!
 	"""
-	Return recent log lines from the in-memory ring buffer.
+	Return recent log records from the in-memory ring buffer.
 	"""
 	serviceLogs(limit: Int! = 250): ServiceLogsPayload!
 	"""
@@ -2669,6 +2729,49 @@ type QueueAttention {
 	message: String!
 }
 
+"""
+One job a batch did not change, and why: `NOT_FOUND` for an id the queue
+does not hold, `CONFLICT` for a job that refuses the change now,
+`INTERNAL` otherwise.
+"""
+type QueueBatchRefusal {
+	id: Int!
+	code: String!
+	message: String!
+}
+
+"""
+What a batch did: how many jobs it named, how many took the change, and
+each one that did not.
+"""
+type QueueBatchResult {
+	matched: Int!
+	applied: Int!
+	refused: [QueueBatchRefusal!]!
+}
+
+"""
+The jobs a batch acts on: `ids` (at most 1,000 distinct) or a `selection`
+that names every queued job it matches. Give exactly one. A selection
+carries `expectedMatched`, the count the caller saw; when the queue now
+matches a different count the whole batch is refused with `CONFLICT`,
+whose `matched` extension carries the current count to confirm again.
+"""
+input QueueBatchTarget {
+	ids: [Int!]
+	selection: QueueSelectionInput
+	expectedMatched: Int
+}
+
+"""
+Jobs matching the search and priorities, counted by category before the
+category and state filters apply. The empty string is no category.
+"""
+type QueueCategoryCount {
+	category: String!
+	count: Int!
+}
+
 type QueueCommandResult {
 	success: Boolean!
 	message: String
@@ -2682,6 +2785,15 @@ enum QueueDownloadState {
 	CHECKING
 	COMPLETE
 	FAILED
+}
+
+"""
+Bytes still to fetch for one page row and every waiting or downloading
+job ahead of it in queue order, whatever the page's sort.
+"""
+type QueueEtaBytes {
+	id: Int!
+	bytesThrough: Int!
 }
 
 type QueueEvent {
@@ -2703,6 +2815,11 @@ enum QueueEventKind {
 	ITEM_ATTENTION
 	ITEM_COMPLETED
 	ITEM_REMOVED
+	"""
+	The global state changed, or many items changed at once: their
+	per-item progress and state changes are not sent one by one, so
+	re-read the queue. Arrivals, completions and failures are still sent.
+	"""
 	GLOBAL_STATE_CHANGED
 }
 
@@ -2733,6 +2850,18 @@ type QueueItem {
 	downloadedBytes: Int!
 	optionalRecoveryBytes: Int!
 	optionalRecoveryDownloadedBytes: Int!
+	"""
+	Declared bytes still to come: every article neither in hand nor lost,
+	less the recovery held back until a loss asks for it. Reaches 0 when
+	the download has brought everything it wants.
+	"""
+	remainingBytes: Int!
+	"""
+	Declared bytes the download is out to bring: the post less the
+	recovery still held back. `progressPercent` is this less
+	`remainingBytes`, over this.
+	"""
+	wantedBytes: Int!
 	phaseProgress: [QueuePhaseProgress!]!
 	failedBytes: Int!
 	health: Int!
@@ -2799,6 +2928,21 @@ type QueuePage {
 	totalCount: Int!
 	summary: QueueSummary!
 	categories: [String!]!
+	categoryCounts: [QueueCategoryCount!]!
+	stateCounts: [QueueStateCount!]!
+	"""
+	Bytes still to fetch across queued and downloading jobs.
+	"""
+	remainingBytes: Int!
+	"""
+	Size and fetched bytes of the jobs a time-left estimate counts.
+	"""
+	etaTotalBytes: Int!
+	etaDownloadedBytes: Int!
+	"""
+	One entry per page row a time-left estimate counts.
+	"""
+	etaThrough: [QueueEtaBytes!]!
 	latestCursor: String!
 }
 
@@ -2808,6 +2952,9 @@ input QueuePageInput {
 	search: String
 	states: [QueueItemState!]
 	priorities: [QueuePriority!]
+	"""
+	The empty string names jobs with no category.
+	"""
 	categories: [String!]
 	"""
 	Omit both fields to retain the scheduler's hot-download order.
@@ -2857,6 +3004,25 @@ enum QueuePriority {
 	HIGH
 }
 
+"""
+Which queued jobs a batch acts on: every job matching all the given
+fields. A selection with no filter names the whole queue only when it says
+so with `all: true`; otherwise it is refused.
+"""
+input QueueSelectionInput {
+	search: String
+	states: [QueueItemState!]
+	priorities: [QueuePriority!]
+	"""
+	The empty string names jobs with no category.
+	"""
+	categories: [String!]
+	"""
+	The whole queue, stated outright. Required when no filter is given.
+	"""
+	all: Boolean
+}
+
 type QueueSnapshot {
 	items: [QueueItem!]!
 	summary: QueueSummary!
@@ -2878,6 +3044,15 @@ enum QueueSortField {
 	CATEGORY
 	PROGRESS
 	SIZE
+}
+
+"""
+Jobs matching the search, priorities and categories, counted by state
+before the state filter applies.
+"""
+type QueueStateCount {
+	state: QueueItemState!
+	count: Int!
 }
 
 type QueueSummary {
@@ -4099,8 +4274,15 @@ type ServerRestartCapability {
 }
 
 type ServiceLogsPayload {
-	lines: [String!]!
+	"""
+	One JSON record per line, oldest first.
+	"""
+	records: [String!]!
 	count: Int!
+	"""
+	The same lines as text, rendered from the records when asked for.
+	"""
+	lines: [String!]!
 }
 
 type SpeedTestFailure {
@@ -4291,16 +4473,22 @@ type SubscriptionRoot {
 	"""
 	Subscribe to real-time job state snapshots.
 
-	Pushes a full snapshot whenever a pipeline event fires, throttled to
-	at most once per 100ms so rapid-fire segment events don't flood the
-	client. Also ticks every 2s so speed gauges stay fresh; a tick that
-	finds the jobs, metrics, pause and block state unchanged sends nothing.
+	Pushes a full snapshot when the job list or the global pause changes,
+	at most once per second however fast the queue moves. Also ticks every
+	2s so speed gauges stay fresh; a tick that finds the jobs, metrics,
+	pause and block state unchanged sends nothing.
 	"""
 	jobUpdates: JobsSnapshot!
 	"""
 	Subscribe to the public queue snapshot facade.
 	"""
 	queueSnapshots(filter: QueueFilterInput): QueueSnapshot!
+	"""
+	Subscribe to one queue page: the page `input` names, sent at once and
+	again when the queue, the global pause or the speeds move, at most
+	twice a second. Only that page's rows travel, never the whole queue.
+	"""
+	queuePageUpdates(input: QueuePageInput!): QueuePage!
 	"""
 	Subscribe to live public queue events.
 
@@ -4309,9 +4497,13 @@ type SubscriptionRoot {
 	"""
 	queueEvents(after: String, filter: QueueFilterInput): QueueEvent!
 	"""
-	Subscribe to live log lines from the service.
+	Subscribe to live log lines from the service, as text.
 	"""
 	serviceLogLines: String!
+	"""
+	Subscribe to live log records from the service, one JSON object each.
+	"""
+	serviceLogRecords: String!
 	"""
 	Subscribe to release-check state changes, including the initial snapshot.
 	"""

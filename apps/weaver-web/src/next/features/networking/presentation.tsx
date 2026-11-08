@@ -150,6 +150,7 @@ export function StatusMark({
   detail,
   wrap = false,
   className,
+  testId,
 }: {
   state: string;
   /** The word, when the caller already has it. */
@@ -160,9 +161,10 @@ export function StatusMark({
   /** Let a long detail run onto more lines instead of cutting it off. */
   wrap?: boolean;
   className?: string;
+  testId?: string;
 }) {
   return (
-    <span className={cn("inline-flex min-w-0 gap-2", wrap ? "items-start" : "items-center", className)}>
+    <span data-testid={testId} className={cn("inline-flex min-w-0 gap-2", wrap ? "items-start" : "items-center", className)}>
       <Square color={TONE_COLOR[tone ?? stateTone(state)]} className={wrap ? "mt-[6px]" : undefined} />
       <span className="flex-none font-wv-mono text-[12px] leading-[1.5] text-wv-fg">{label}</span>
       {detail === undefined ? null : (

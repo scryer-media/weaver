@@ -5,6 +5,7 @@ import { memo, useContext, useEffect, useState } from "react";
 import { useQuery } from "urql";
 import { authHeaders } from "@/graphql/client";
 import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
+import { copyText } from "@/lib/clipboard";
 import { useTranslate } from "@/lib/context/translate-context";
 import { readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 import type { MetricsSnapshot } from "@/lib/metrics";
@@ -430,10 +431,9 @@ const CopyReportButton = memo(function CopyReportButton({
       disabled={!info}
       onClick={() => {
         if (!info) return;
-        void navigator.clipboard
-          ?.writeText(reportText(info, cache.bytes, cache.limit))
-          .then(() => onCopied())
-          .catch(() => onFailed());
+        void copyText(reportText(info, cache.bytes, cache.limit)).then((taken) =>
+          taken ? onCopied() : onFailed(),
+        );
       }}
     >
       {copied ? t("next.system.copied") : t("next.system.copyReport")}

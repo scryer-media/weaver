@@ -568,21 +568,26 @@ pub(crate) async fn delete_script_state_tx(
         &[],
     )
     .await?;
-    tx.execute(
-        "DELETE FROM script_outputs WHERE job_id = {}",
-        &[SqlArg::I64(job_id)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM script_event_queue WHERE job_id = {}",
-        &[SqlArg::I64(job_id)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM script_job_state WHERE job_id = {}",
-        &[SqlArg::I64(job_id)],
-    )
-    .await?;
+    delete_script_state_rows_tx(tx, &[job_id]).await
+}
+
+// The rows half of `delete_script_state_tx`, for a caller that already holds
+// the `script_output_state` lock and deletes many jobs under it.
+pub(crate) async fn delete_script_state_rows_tx(
+    tx: &mut SqlTx<'_>,
+    job_ids: &[i64],
+) -> Result<(), StateError> {
+    for chunk in job_ids.chunks(crate::persistence::sql_runtime::max_rows_for_tx(tx, 1)) {
+        let placeholders = vec!["{}"; chunk.len()].join(", ");
+        let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+        for table in ["script_outputs", "script_event_queue", "script_job_state"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE job_id IN ({placeholders})"),
+                &args,
+            )
+            .await?;
+        }
+    }
     Ok(())
 }
 

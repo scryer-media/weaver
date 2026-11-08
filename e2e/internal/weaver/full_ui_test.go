@@ -418,10 +418,14 @@ func TestFullPhaseContextsIncludeContainerAndManagedRestarts(t *testing.T) {
 		{name: "Functional Postgres", command: "test-all", datastore: "postgres"},
 		{name: "NNTP Chaos", command: "chaos-test", datastore: "sqlite"},
 		{name: "TCP Chaos", command: "tcp-chaos", datastore: "sqlite"},
+		{name: "TLS NNTP", command: "tls-test", datastore: "sqlite"},
+		{name: "Adaptive Dispatch", command: "adaptive-dispatch", datastore: "sqlite"},
+		{name: "Adversarial Archives", command: "adversarial", datastore: "sqlite"},
 		{name: "Container Restart", command: "container-restart", datastore: "sqlite", skipSeed: true},
 		{name: "Restart SQLite", command: "restart-all", datastore: "sqlite"},
 		{name: "Restart Postgres", command: "restart-all", datastore: "postgres"},
 		{name: "Product Behavior Gate", command: "release-gate", datastore: "sqlite", skipSeed: true},
+		{name: "Filesystem Gate", command: "filesystem", datastore: "sqlite", skipSeed: true},
 	}
 	if len(got) != len(want) {
 		t.Fatalf("expected %d phases, got %d: %#v", len(want), len(got), got)
@@ -791,7 +795,7 @@ func TestFullDashboardRendersOneBarPerReleaseGateFlow(t *testing.T) {
 	barColumn := -1
 	bars := 0
 	for _, line := range strings.Split(frame, "\n") {
-		// Skip the cursor-home/clear escape, which also contains a bare "[".
+		// Skip the title and blank lines, which carry no bar.
 		if !strings.Contains(line, "]") {
 			continue
 		}
@@ -831,6 +835,9 @@ func TestFullPhasesHaveIsolatedPortsAndProfiles(t *testing.T) {
 		"functional-postgres": "functional",
 		"nntp-chaos":          "chaos",
 		"tcp-chaos":           "tcp-chaos",
+		"tls-nntp":            "functional",
+		"adaptive-dispatch":   "tcp-chaos",
+		"adversarial":         "adversarial",
 		"restart-sqlite":      "restart",
 		"restart-postgres":    "restart",
 	} {
@@ -971,16 +978,170 @@ func TestFullPhaseJobsBoundsTheRequestedWidth(t *testing.T) {
 	}
 }
 
-func TestFullRunNarrowsTheReleaseGateUnlessTheOperatorSetsAWidth(t *testing.T) {
+func TestFullPhaseJobsCountsTheGateSlot(t *testing.T) {
+	phaseCount := len(fullPhaseDefinitions)
+	tests := []struct {
+		value       string
+		wantSuites  int
+		wantGeneral int
+	}{
+		{value: "", wantSuites: defaultFullPhaseJobs, wantGeneral: defaultFullPhaseJobs - 1},
+		{value: "1", wantSuites: 1, wantGeneral: 1},
+		{value: "2", wantSuites: 2, wantGeneral: 1},
+		{value: "3", wantSuites: 3, wantGeneral: 2},
+		{value: "8", wantSuites: 8, wantGeneral: 7},
+	}
+	for _, tt := range tests {
+		t.Run("E2E_FULL_PHASE_JOBS="+tt.value, func(t *testing.T) {
+			t.Setenv("E2E_FULL_PHASE_JOBS", tt.value)
+			if got := fullPhaseJobs(phaseCount); got != tt.wantSuites {
+				t.Fatalf("fullPhaseJobs(%d) = %d, want %d", phaseCount, got, tt.wantSuites)
+			}
+			if got := fullGeneralPhaseJobs(phaseCount); got != tt.wantGeneral {
+				t.Fatalf("fullGeneralPhaseJobs(%d) = %d, want %d", phaseCount, got, tt.wantGeneral)
+			}
+			slots := newFullPhaseSlots(phaseCount)
+			if got := cap(slots.general); got != tt.wantGeneral {
+				t.Fatalf("general slots = %d, want %d", got, tt.wantGeneral)
+			}
+			if got := cap(slots.gate); got != 1 {
+				t.Fatalf("gate slots = %d, want 1", got)
+			}
+		})
+	}
+}
+
+func TestFullPhaseSlotsRunTheGateBesideThreeSuites(t *testing.T) {
+	t.Setenv("E2E_FULL_PHASE_JOBS", "")
+	slots := newFullPhaseSlots(len(fullPhaseDefinitions))
+
+	gate := &fullPhaseContext{Name: "Product Behavior Gate", Command: "release-gate"}
+	first := &fullPhaseContext{Name: "Functional SQLite", Command: "test-all"}
+	second := &fullPhaseContext{Name: "NNTP Chaos", Command: "chaos-test"}
+	third := &fullPhaseContext{Name: "TCP Chaos", Command: "tcp-chaos"}
+	fourth := &fullPhaseContext{Name: "TLS NNTP", Command: "tls-test"}
+
+	tryTake := func(phase *fullPhaseContext) bool {
+		select {
+		case slots.slotFor(phase) <- struct{}{}:
+			return true
+		default:
+			return false
+		}
+	}
+
+	if !tryTake(first) || !tryTake(second) || !tryTake(third) {
+		t.Fatal("three suites must start together under the default width")
+	}
+	if tryTake(fourth) {
+		t.Fatal("a fourth suite started while three held the general slots")
+	}
+	if !tryTake(gate) {
+		t.Fatal("the gate waited behind the suites instead of taking its own slot")
+	}
+	if got := len(slots.general); got != 3 {
+		t.Fatalf("general slots held = %d after the gate started, want 3", got)
+	}
+	if tryTake(gate) {
+		t.Fatal("the gate's slot admitted a second gate")
+	}
+
+	// The first suite finishes and frees its slot; the fourth takes it.
+	<-slots.slotFor(first)
+	if !tryTake(fourth) {
+		t.Fatal("the fourth suite did not start after a general slot came free")
+	}
+}
+
+func TestFullRunSetsTenReleaseFlowsUnlessTheOperatorSetsAWidth(t *testing.T) {
 	phase := &fullPhaseContext{Name: "Release Gate", Command: "release-gate", RunDir: t.TempDir()}
 
 	t.Setenv("E2E_WEAVER_RELEASE_GATE_JOBS", "")
-	if got, want := phase.env()["E2E_WEAVER_RELEASE_GATE_JOBS"], strconv.Itoa(fullRunReleaseGateJobs); got != want {
+	if got, want := phase.env()["E2E_WEAVER_RELEASE_GATE_JOBS"], "10"; got != want {
 		t.Fatalf("release-gate jobs = %q, want %q", got, want)
 	}
 
 	t.Setenv("E2E_WEAVER_RELEASE_GATE_JOBS", "12")
 	if got, ok := phase.env()["E2E_WEAVER_RELEASE_GATE_JOBS"]; ok {
 		t.Fatalf("release-gate jobs = %q, want the operator's width left in place", got)
+	}
+}
+
+// recordingWriter keeps each Write call separately so a test can count them.
+type recordingWriter struct {
+	writes []string
+}
+
+func (w *recordingWriter) Write(p []byte) (int, error) {
+	w.writes = append(w.writes, string(p))
+	return len(p), nil
+}
+
+func TestFramePainterRewritesOnlyChangedRowsInOneWrite(t *testing.T) {
+	out := &recordingWriter{}
+	painter := framePainter{out: out}
+
+	painter.paint("title   elapsed 9s\n\nSeeding [##  ] 1/2\nPhase A [    ] 0/1\n")
+	if len(out.writes) != 1 {
+		t.Fatalf("first frame took %d writes, want 1", len(out.writes))
+	}
+	want := "\x1b[H\x1b[J" +
+		"\x1b[1;1Htitle   elapsed 9s\x1b[K" +
+		"\x1b[2;1H\x1b[K" +
+		"\x1b[3;1HSeeding [##  ] 1/2\x1b[K" +
+		"\x1b[4;1HPhase A [    ] 0/1\x1b[K" +
+		"\x1b[5;1H"
+	if out.writes[0] != want {
+		t.Fatalf("first frame bytes:\n got %q\nwant %q", out.writes[0], want)
+	}
+
+	// An unchanged frame writes nothing at all.
+	painter.paint("title   elapsed 9s\n\nSeeding [##  ] 1/2\nPhase A [    ] 0/1\n")
+	if len(out.writes) != 1 {
+		t.Fatalf("unchanged frame wrote %q", out.writes[1:])
+	}
+
+	// A tick that moves only the clock rewrites only the title row, with no
+	// screen clear before it.
+	painter.paint("title   elapsed 10s\n\nSeeding [##  ] 1/2\nPhase A [    ] 0/1\n")
+	if len(out.writes) != 2 {
+		t.Fatalf("clock tick took %d writes, want 1", len(out.writes)-1)
+	}
+	if got, want := out.writes[1], "\x1b[1;1Htitle   elapsed 10s\x1b[K\x1b[5;1H"; got != want {
+		t.Fatalf("clock tick bytes:\n got %q\nwant %q", got, want)
+	}
+
+	// A frame that grows by a row paints the changed row and the new one.
+	painter.paint("title   elapsed 10s\n\nSeeding [####] 2/2\nPhase A [    ] 0/1\n  flow [    ] 0/1\n")
+	if got, want := out.writes[2], "\x1b[3;1HSeeding [####] 2/2\x1b[K\x1b[5;1H  flow [    ] 0/1\x1b[K\x1b[6;1H"; got != want {
+		t.Fatalf("growing frame bytes:\n got %q\nwant %q", got, want)
+	}
+
+	// A frame that shrinks blanks the rows it no longer uses.
+	painter.paint("title   elapsed 10s\n\nSeeding [####] 2/2\n")
+	if got, want := out.writes[3], "\x1b[4;1H\x1b[K\x1b[5;1H\x1b[K\x1b[4;1H"; got != want {
+		t.Fatalf("shrinking frame bytes:\n got %q\nwant %q", got, want)
+	}
+
+	if len(out.writes) != 4 {
+		t.Fatalf("got %d writes for 4 changed frames", len(out.writes))
+	}
+	for i, write := range out.writes[1:] {
+		if strings.Contains(write, "\x1b[J") || strings.Contains(write, "\x1b[2J") {
+			t.Fatalf("write %d after the first clears the screen: %q", i+1, write)
+		}
+	}
+}
+
+func TestFullDashboardFrameCarriesNoScreenClear(t *testing.T) {
+	dashboard := &fullDashboard{
+		start:  time.Now(),
+		seed:   dashboardBar{Label: "Seeding", Total: 1, Status: "running"},
+		phases: map[string]*dashboardBar{"Phase A": {Label: "Phase A", Status: "waiting"}},
+		order:  []string{"Phase A"},
+	}
+	frame := dashboard.buildFrameLocked()
+	if strings.Contains(frame, "\x1b[J") || strings.Contains(frame, "\x1b[H") {
+		t.Fatalf("frame text carries a clear or cursor-home: %q", frame)
 	}
 }

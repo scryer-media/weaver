@@ -1,0 +1,19 @@
+{
+  "slug": "yenc-lie-size-large",
+  "title": "Lantern.Reach.S01E03.Large.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "The field payload in 28 articles whose every =ybegin header states size=32256000, half as much again as the file. A larger size bounds nothing a decoder writes, so the file must come out byte-equal at its real length.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 768000,
+  "fixtureAssets": [
+    "yenc-lie-field-size/lantern.reach.s01e03.mkv"
+  ],
+  "yencHeaderLies": [
+    {
+      "size": 32256000
+    }
+  ],
+  "expectedOutputBLAKE3": {
+    "lantern.reach.s01e03.mkv": "49647069b2641d8f67d3fea64dc0ca4f1ee04d4edd4154a935565293a20bf46e"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "slug": "yenc-lie-field-size-lost",
+  "title": "Lantern.Reach.S01E03.Lost.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "The field post with the same size=1536000 in every header, and its 14th article deleted after posting with no recovery set. The one file is not whole, so nothing usable is delivered: the job fails, never partial and never complete on a 1.5 MB file.",
+  "category": "2000",
+  "expected_outcome": "health_failure",
+  "segment_size": 768000,
+  "fixtureAssets": [
+    "yenc-lie-field-size/lantern.reach.s01e03.mkv"
+  ],
+  "yencHeaderLies": [
+    {
+      "size": 1536000
+    }
+  ],
+  "deleteSegmentNumbers": [
+    14
+  ]
+}

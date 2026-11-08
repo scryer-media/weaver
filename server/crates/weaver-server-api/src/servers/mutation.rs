@@ -291,7 +291,7 @@ impl ServersMutation {
             .into_iter()
             .map(|snapshot| (snapshot.server_id, snapshot))
             .collect::<std::collections::HashMap<_, _>>();
-        let tls_diagnostics = load_tls_diagnostics_by_server(db).await?;
+        let tls_diagnostics = load_tls_diagnostics_by_server(db).await;
         Ok(remaining
             .iter()
             .map(|server| {
@@ -742,10 +742,10 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: weaver_server_core::jobs::DuplicatePolicy::default(),
             direct_store: None,
-            direct_unpack: None,
             delivery_naming: None,
             metrics: Default::default(),
             config_path: None,

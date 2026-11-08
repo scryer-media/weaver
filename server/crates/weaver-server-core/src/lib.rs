@@ -3,6 +3,7 @@
 
 // Tests dial their own loopback fixtures.
 #![cfg_attr(test, allow(clippy::disallowed_methods))]
+#![deny(clippy::await_holding_lock)]
 
 pub mod application_upgrade;
 pub mod auth;
@@ -40,21 +41,21 @@ pub use auth::{ApiKeyRow, AuthCredentials};
 pub use bandwidth::rate_limiter::TokenBucket;
 pub use error::Error;
 pub use history::{
-    CLIENT_REQUEST_ID_ATTRIBUTE_KEY, HistoryFilter, HistoryMetadataEquals, IntegrationEventRow,
-    JobEvent, JobHistoryRow, is_public_history_attribute_key, parse_history_metadata,
-    public_history_attributes, split_history_metadata,
+    CLIENT_REQUEST_ID_ATTRIBUTE_KEY, HistoryFilter, HistoryMetadataEquals, HistoryRows,
+    IntegrationEventRow, JobEvent, JobHistoryRow, is_public_history_attribute_key,
+    parse_history_metadata, public_history_attributes, split_history_metadata,
 };
 pub use jobs::{
-    ActiveFileProgress, ActiveJob, ActivePar2File, CallerScopedIdempotency, DownloadBlockKind,
-    DownloadBlockState, DownloadState, DuplicateAction, DuplicateAdmission,
-    DuplicateAdmissionRequest, DuplicateBackfillEntry, DuplicateBackfillSource,
-    DuplicateBackfillState, DuplicateDecision, DuplicateJobLifecycle, DuplicateJobSummary,
-    DuplicateMode, DuplicatePolicy, EgressQuotaBlock, ExtractionChunk, FieldUpdate, FileSpec,
-    FingerprintEvidence, FingerprintKind, HardwareProfileInForce, HistoryDeleteOutcome,
-    JobFingerprint, JobId, JobInfo, JobPhase, JobPhaseProgress, JobSpec, JobState, JobStatus,
-    JobUpdate, MessageId, NntpRuntimeActivation, NzbFileId, PhaseCounters, PostState,
-    QueueMoveTarget, RecoveredJob, RestoreJobRequest, RunState, SchedulerCommand, SchedulerError,
-    SchedulerHandle, SegmentId, SegmentSpec, SemanticCandidateSnapshot, SemanticCandidateSource,
+    ActiveJob, CallerScopedIdempotency, CancelJobsOutcome, DownloadBlockKind, DownloadBlockState,
+    DownloadState, DuplicateAction, DuplicateAdmission, DuplicateAdmissionRequest,
+    DuplicateBackfillEntry, DuplicateBackfillSource, DuplicateBackfillState, DuplicateDecision,
+    DuplicateJobLifecycle, DuplicateJobSummary, DuplicateMode, DuplicatePolicy, EgressQuotaBlock,
+    FieldUpdate, FileSpec, FingerprintEvidence, FingerprintKind, HISTORY_DELETE_BATCH_SIZE,
+    HardwareProfileInForce, HistoryDeleteBatchOutcome, HistoryDeleteOutcome, JobFingerprint, JobId,
+    JobInfo, JobPhase, JobPhaseProgress, JobSpec, JobState, JobStatus, JobUpdate, MessageId,
+    MessageIds, NntpRuntimeActivation, NzbFileId, PhaseCounters, PostState, QueueMoveTarget,
+    RecoveredJob, RestartRead, RestoreJobRequest, RunState, SchedulerError, SchedulerHandle,
+    SegmentId, SegmentSpec, SemanticCandidateSnapshot, SemanticCandidateSource,
     SemanticCandidateState, SemanticDuplicate, SemanticDuplicateLifecycleEvent,
     SemanticPromotionClaim, SemanticPromotionState, SemanticTerminalCause, ServerId,
     ServerTransportHealth, SharedPipelineState, SubmissionOrigin, classify_semantic_terminal_cause,
@@ -86,7 +87,7 @@ pub use operations::{
     MetricsHistoryQueryData, MetricsHistoryQueryResult, MetricsHistoryTier, RawMetricsHistoryPoint,
     RollupMetricsHistoryPoint, StableStateExport,
 };
-pub use persistence::{Database, Refusal, StateError};
+pub use persistence::{Database, LoadError, Refusal, StateError};
 pub use pipeline::Pipeline;
 pub use pipeline::download::{DownloadQueue, DownloadWork};
 pub use rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};

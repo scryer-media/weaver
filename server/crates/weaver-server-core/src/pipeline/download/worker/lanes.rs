@@ -116,11 +116,6 @@ impl Pipeline {
         terminal_state: SegmentTerminalState,
     ) -> bool {
         let job_id = seg_id.file_id.job_id;
-        // A segment can become a PAR2 metadata probe after an earlier ordinary
-        // attempt already exhausted it. The ledger stays idempotent below,
-        // but discovery must still learn that its newly queued probe cannot
-        // produce metadata or it will wait forever in `work_is_queued`.
-        self.mark_promoted_recovery_segment_unavailable(seg_id);
         if self.segment_already_delivered(seg_id) {
             // Delivery is a terminal state too, and it is held in the assembly
             // bitmap. A late failure result for an ordinal that already landed
@@ -138,24 +133,21 @@ impl Pipeline {
                 slot.insert(terminal_state);
             }
         }
-        // A container set whose map this article closed cannot read it now.
-        self.note_direct_article_terminal(seg_id);
+        let jobs = &self.jobs;
+        self.given_up
+            .entry(job_id)
+            .or_insert_with(|| {
+                jobs.get(&job_id)
+                    .map_or_else(crate::pipeline::post_health::GivenUp::default, |state| {
+                        crate::pipeline::post_health::GivenUp::new(&state.spec)
+                    })
+            })
+            .give_up(seg_id, Some(terminal_state), declared_bytes);
         self.note_gap_support_fact(seg_id, terminal_state);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);
-            // The failing-file set follows the same rule as the bytes: a lost
-            // recovery volume is not damage to the release.
-            let file_index = seg_id.file_id.file_index;
-            if state
-                .spec
-                .files
-                .get(file_index as usize)
-                .is_some_and(|file| file.role.counts_toward_health())
-            {
-                state.health_failing_files.insert(file_index);
-            }
         }
-        self.skip_failed_uu_segment(seg_id);
+        let uu_released = self.skip_failed_uu_segment(seg_id);
         // This ordinal will not be asked for again, which is the last thing
         // assembly was waiting to know about any damaged bytes it kept: once
         // no cleaner copy can displace them, they end where the part behind
@@ -166,18 +158,14 @@ impl Pipeline {
         // placed after this one have lost their anchor for good. The run is
         // taken out of the park before any of it is booked, so each booking
         // below finds nothing further to release.
-        if self.settled_segment_anchors_successor(seg_id) {
+        if uu_released {
             self.pending_unanchored_release.push(seg_id);
         } else {
-            for dependent in self.take_unanchored_dependents(seg_id) {
-                self.give_up_unanchored(dependent);
-            }
+            self.settle_unanchored_behind(seg_id);
         }
-        // The first-article sample is read before the health arithmetic: when
-        // it can answer, it answers about the whole post rather than about a
-        // byte count, and it needs no probe of its own to do it.
-        self.note_first_article_settled(seg_id);
-        self.check_health(job_id);
+        // The job's root marks the article's range damaged, and its objects
+        // rule on the loss.
+        self.graph_article_lost(seg_id);
         true
     }
 
@@ -185,8 +173,22 @@ impl Pipeline {
     fn segment_already_delivered(&self, seg_id: SegmentId) -> bool {
         self.jobs
             .get(&seg_id.file_id.job_id)
-            .and_then(|state| state.assembly.file(seg_id.file_id))
+            .and_then(|state| state.articles.assembly()?.file(seg_id.file_id))
             .is_some_and(|file| file.has_segment(seg_id.segment_number))
+    }
+
+    // An ordinal no further copy of is coming either still tells the
+    // articles held behind it where they start, and they are released through
+    // the ordinary commit path once the caller can run it, or it does not and
+    // they are given up.
+    pub(in crate::pipeline) fn settle_unanchored_behind(&mut self, seg_id: SegmentId) {
+        if self.settled_segment_anchors_successor(seg_id) {
+            self.pending_unanchored_release.push(seg_id);
+        } else {
+            for dependent in self.take_unanchored_dependents(seg_id) {
+                self.give_up_unanchored(dependent);
+            }
+        }
     }
 
     // Whether an ordinal that has just reached a terminal state still tells
@@ -204,26 +206,8 @@ impl Pipeline {
         }
         self.jobs
             .get(&seg_id.file_id.job_id)
-            .and_then(|state| state.assembly.file(seg_id.file_id))
+            .and_then(|state| state.articles.assembly()?.file(seg_id.file_id))
             .is_some_and(|file| file.anchor_end_after(seg_id.segment_number, true).is_some())
-    }
-
-    // A verified late replacement settles a previously damaged ordinal once.
-    pub(in crate::pipeline) fn clear_replaced_damage_failure(&mut self, segment_id: SegmentId) {
-        let Some(terminal_state) = self.segment_terminal_states.remove(&segment_id) else {
-            return;
-        };
-        self.forget_gap_support_fact(segment_id, terminal_state);
-        let bytes = self.health_counted_segment_bytes(segment_id);
-        let file_has_failures = self.file_terminal_failed_bytes(segment_id.file_id) > 0;
-        if let Some(state) = self.jobs.get_mut(&segment_id.file_id.job_id) {
-            state.failed_bytes = state.failed_bytes.saturating_sub(bytes);
-            if !file_has_failures {
-                state
-                    .health_failing_files
-                    .remove(&segment_id.file_id.file_index);
-            }
-        }
     }
 
     // The job's failed bytes as the terminal states alone define them.
@@ -233,11 +217,9 @@ impl Pipeline {
     // is what settlement re-derives against rather than trusting the running
     // figure it is about to persist forever.
     pub(in crate::pipeline) fn derived_failed_bytes(&self, job_id: JobId) -> u64 {
-        self.segment_terminal_states
-            .keys()
-            .filter(|seg_id| seg_id.file_id.job_id == job_id)
-            .map(|seg_id| self.health_counted_segment_bytes(*seg_id))
-            .sum()
+        self.given_up
+            .get(&job_id)
+            .map_or(0, crate::pipeline::post_health::GivenUp::bytes)
     }
 
     // The failed bytes to write into the terminal record, pinned to what the
@@ -273,16 +255,6 @@ impl Pipeline {
         failed_bytes
     }
 
-    // The declared bytes of this file's segments that reached a terminal
-    // state without arriving.
-    pub(in crate::pipeline) fn file_terminal_failed_bytes(&self, file_id: NzbFileId) -> u64 {
-        self.segment_terminal_states
-            .keys()
-            .filter(|seg_id| seg_id.file_id == file_id)
-            .map(|seg_id| self.health_counted_segment_bytes(*seg_id))
-            .sum()
-    }
-
     // Unwedge a uuencode file whose cursor is waiting on a part that will
     // never arrive.
     //
@@ -297,17 +269,23 @@ impl Pipeline {
     // PAR2 is the authority on whether it can be recovered. Without PAR2 the
     // file is simply wrong, which is still better than a job that never
     // finishes — and the damage flag is what tells the truth about it.
-    pub(in crate::pipeline) fn skip_failed_uu_segment(&mut self, seg_id: SegmentId) {
-        let Some(uu) = self.uu_files.get_mut(&seg_id.file_id) else {
-            return;
+    //
+    // Returns whether a part parked ahead now sits at the cursor: booking
+    // cannot write it, so the caller has it released at the next seam that
+    // can.
+    pub(in crate::pipeline) fn skip_failed_uu_segment(&mut self, seg_id: SegmentId) -> bool {
+        let Some(uu) = self.uu_files.get(&seg_id.file_id) else {
+            return false;
         };
         if seg_id.segment_number != uu.next_index {
             // Only the ordinal the cursor is actually waiting on can wedge it.
-            // A later failure is handled when the cursor reaches it.
-            return;
+            // A later failure is passed when the cursor reaches it.
+            return false;
         }
-        uu.damaged = true;
-        uu.next_index = uu.next_index.saturating_add(1);
+        self.pass_given_up_uu(seg_id.file_id);
+        self.uu_files
+            .get(&seg_id.file_id)
+            .is_some_and(|uu| uu.parked.contains_key(&uu.next_index))
     }
 
     // Drop the job's terminal states, and the ledger derived from them.
@@ -320,67 +298,15 @@ impl Pipeline {
         self.clear_gap_support_facts(job_id);
         self.segment_terminal_states
             .retain(|segment_id, _| segment_id.file_id.job_id != job_id);
+        self.given_up.remove(&job_id);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = 0;
-            state.probe_projected_failed_bytes = 0;
-            state.health_failing_files.clear();
-            state.early_recovery_requested_blocks = 0;
         }
         self.files_counted_missing
             .retain(|file_id| file_id.job_id != job_id);
     }
 
-    // Count the files this job could not assemble from articles.
-    //
-    // Called once the download pipeline has drained with data files still
-    // incomplete: that is the moment the remaining segments are known to be
-    // unavailable across every configured server rather than merely late.
-    // A file is counted **once**, with the number of segments still missing
-    // at that moment — not once per failed segment — and the per-job guard
-    // set keeps the many re-entries of the completion check from counting it
-    // again. PAR2 may still rebuild the file afterwards; that is a repair,
-    // and `weaver_repairs_total` is where it is accounted for. What this
-    // counter answers is how much of the payload Usenet itself could not
-    // supply.
-    //
-    // Per-file, per-job: a `HashMap` lookup and a `HashSet` insert here are
-    // the same class of work `check_job_completion` around it already does,
-    // and nothing on a per-segment path reaches this.
-    pub(in crate::pipeline) fn note_incomplete_files_after_download_drain(
-        &mut self,
-        job_id: JobId,
-    ) {
-        let Some(state) = self.jobs.get(&job_id) else {
-            return;
-        };
-        let incomplete: Vec<(NzbFileId, u64)> = state
-            .assembly
-            .files()
-            .filter(|file| !file.is_complete())
-            // Recovery volumes are optional by design: an absent PAR2 block is
-            // not a file the job failed to assemble, it is recovery capacity
-            // that was never needed or never fetched.
-            .filter(|file| {
-                !matches!(
-                    file.role(),
-                    weaver_model::files::FileRole::Par2 {
-                        is_index: false,
-                        ..
-                    }
-                )
-            })
-            .map(|file| (file.file_id(), u64::from(file.missing_count())))
-            .collect();
-        for (file_id, missing_segments) in incomplete {
-            if self.files_counted_missing.insert(file_id) {
-                self.metrics
-                    .job_lifecycle
-                    .note_file_missing(missing_segments);
-            }
-        }
-    }
-
-    fn health_counted_segment_bytes(&self, segment_id: SegmentId) -> u64 {
+    pub(in crate::pipeline) fn health_counted_segment_bytes(&self, segment_id: SegmentId) -> u64 {
         self.jobs
             .get(&segment_id.file_id.job_id)
             .and_then(|state| {
@@ -412,7 +338,7 @@ impl Pipeline {
         }
     }
 
-    pub(in crate::pipeline::download::worker) fn activation_items(
+    pub(in crate::pipeline) fn activation_items(
         lease: &DownloadBatchLease,
     ) -> Vec<(SegmentId, NzbFileId, u64)> {
         lease
@@ -433,11 +359,30 @@ impl Pipeline {
         lease: DownloadBatchLease,
     ) {
         for work in lease.works {
-            if let Some(state) = self.jobs.get_mut(&lease.job_id) {
-                state.download_queue.push(work);
-            }
+            self.enqueue_download_work(work);
         }
         self.update_queue_metrics();
+    }
+
+    // Whether a batch that ended unclean is evidence about its server.
+    //
+    // A batch weaver itself cut short — shutdown, a job cancel, a pause —
+    // ended because the lanes were being stopped, and its torn connections say
+    // nothing about the depth the server sustains. Only a batch that failed
+    // while the job was still meant to be downloading lowers depth, pins the
+    // server, or is reported as a failed fetch.
+    pub(in crate::pipeline) fn unclean_batch_is_server_fault(&self, job_id: JobId) -> bool {
+        self.shared_state.queue.read(|inner| {
+            let globals = &inner.globals;
+            let stopping = globals.shutting_down
+                || globals.paused
+                || globals.scheduled_pause
+                || globals.speed_test_paused;
+            let job_stopped = inner.job(job_id).is_none_or(|row| {
+                row.intents.cancelled.is_some() || row.intents.paused == Some(true)
+            });
+            !stopping && !job_stopped
+        })
     }
 
     pub(in crate::pipeline::download::worker) fn record_download_lane_observation(
@@ -453,6 +398,11 @@ impl Pipeline {
 
         let now = Instant::now();
         let pressure_clear = observation.pressure_clear;
+        // Asked only of an unclean batch, which is rare: the answer reads the
+        // control plane.
+        let unclean_server_fault = observation.batch_complete
+            && !observation.batch_clean
+            && self.unclean_batch_is_server_fault(result.job_id);
         // Every configured server is seeded when the pool is activated, so
         // this is only the fallback for a server that answered before the
         // seeding ran or that the pool grew underneath it. Seeding needs the
@@ -501,6 +451,7 @@ impl Pipeline {
                 observation.policy_elapsed,
                 pressure_clear,
                 observation.cold,
+                observation.fed,
             );
         }
 
@@ -509,7 +460,7 @@ impl Pipeline {
                 self.metrics
                     .download_pipeline_trial_success_total
                     .fetch_add(1, Ordering::Relaxed);
-            } else {
+            } else if unclean_server_fault {
                 change = explorer.note_unclean_batch(now).or(change);
                 self.metrics
                     .download_pipeline_trial_failure_total
@@ -759,8 +710,15 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline) fn reset_owned_download_lanes(&mut self) {
-        for lease in self.owned_download_lane_pool.reset() {
+        let stopped = self.owned_download_lane_pool.reset();
+        for lease in stopped.leases {
             self.restore_stopped_owned_lane_lease(lease);
+        }
+        // A probe batch no worker started was never asked: it waits for a
+        // seat again, on the lanes the reset leaves.
+        if !stopped.probes.is_empty() {
+            self.post_probes.waiting.extend(stopped.probes);
+            self.download_dispatch_wake = true;
         }
     }
 
@@ -770,7 +728,7 @@ impl Pipeline {
     // an answer about the articles, so nothing here is reported as a download
     // failure: the works return to the queue and the lane parks on the error
     // reason so the dispatcher stops counting it as live.
-    pub(in crate::pipeline::download::worker) fn restore_stopped_owned_lane_lease(
+    pub(in crate::pipeline) fn restore_stopped_owned_lane_lease(
         &mut self,
         lease: DownloadBatchLease,
     ) {
@@ -795,8 +753,21 @@ impl Pipeline {
         event: OwnedDownloadLaneEvent,
         pending: &mut VecDeque<DownloadResult>,
     ) {
+        self.ingest_owned_download_lane_event(event, pending);
+        #[cfg(test)]
+        self.audit_lane_holdings();
+    }
+
+    fn ingest_owned_download_lane_event(
+        &mut self,
+        event: OwnedDownloadLaneEvent,
+        pending: &mut VecDeque<DownloadResult>,
+    ) {
         let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.owned_lane.event");
         match event {
+            OwnedDownloadLaneEvent::LeaseObsolete { lease } => {
+                self.restore_stopped_owned_lane_lease(lease);
+            }
             OwnedDownloadLaneEvent::AcquireFailed { lease, error } => {
                 if !self.download_lane_is_live(lease.lane_id) {
                     return;
@@ -826,8 +797,9 @@ impl Pipeline {
                         1,
                     );
                     for work in works {
-                        self.accept_lane_work(lane_id, work.segment_id);
-                        self.restore_owned_lane_unrequested_work(lane_id, work);
+                        if self.accept_lane_work(lane_id, work.segment_id) {
+                            self.restore_owned_lane_unrequested_work(lane_id, work);
+                        }
                     }
                     self.handle_download_lane_parked(DownloadLaneParked {
                         lane_id,
@@ -855,6 +827,9 @@ impl Pipeline {
                     1,
                 );
                 let failure = DownloadFailure::from_lane_acquire_failure(error.nntp_error());
+                // A refusal one server gave is that server's answer for the
+                // articles, so the result names it the way a fetch would.
+                let source_server_idx = error.server().map(|server| server.0);
                 let policy_blocked = failure.kind == DownloadFailureKind::ServerQuota;
                 let DownloadBatchLease {
                     lane_id,
@@ -892,12 +867,13 @@ impl Pipeline {
                             payload_bytes: 0,
                             policy_elapsed: Duration::ZERO,
                             pressure_clear: false,
+                            fed: false,
                             batch_complete: true,
                             batch_clean: policy_outcome,
                             unresolved_count: u64::from(!policy_outcome),
                             connection_discarded: false,
                         }),
-                        source_server_idx: None,
+                        source_server_idx,
                         origin: DownloadResultOrigin::from_work(
                             work.is_recovery,
                             work.completion_critical,
@@ -1012,6 +988,7 @@ impl Pipeline {
             "provider_capacity" => "download.owned_lane.acquire_failed.provider_capacity",
             "local_capacity" => "download.owned_lane.acquire_failed.local_capacity",
             "server_recovering" => "download.owned_lane.acquire_failed.server_recovering",
+            "credentials_refused" => "download.owned_lane.acquire_failed.credentials_refused",
             "no_eligible_server" => "download.owned_lane.acquire_failed.no_eligible_server",
             "selection_contended" => "download.owned_lane.acquire_failed.selection_contended",
             _ => "download.owned_lane.acquire_failed.other",
@@ -1071,12 +1048,15 @@ impl Pipeline {
             excluded_servers = ?lease.dial_exclude_servers,
             "owned blocking download lane could not be acquired"
         );
-        crate::runtime::job_debug_ring::dump(
-            lease.job_id.0,
+        self.dump_job_debug_ring(
+            lease.job_id,
             "owned blocking download lane could not be acquired",
         );
     }
 
+    // Put an article a lane has given back, unrequested, into its queue. The
+    // lane's record has already let go of it (see
+    // [`Self::accept_lane_work`]), which is what lowered the in-flight gauges.
     pub(in crate::pipeline::download::worker) fn restore_owned_lane_unrequested_work(
         &mut self,
         lane_id: u64,
@@ -1085,10 +1065,6 @@ impl Pipeline {
         self.finish_checkpoint_progress_article(lane_id, work.segment_id);
         self.reconcile_rate_limit_for_download(work.segment_id, None);
         let job_id = work.segment_id.file_id.job_id;
-        self.active_downloads = self.active_downloads.saturating_sub(1);
-        if work.is_recovery {
-            self.active_recovery = self.active_recovery.saturating_sub(1);
-        }
         if self
             .jobs
             .get(&job_id)
@@ -1096,32 +1072,8 @@ impl Pipeline {
         {
             self.note_download_activity(job_id);
         }
-        if let Some(in_flight) = self.active_downloads_by_job.get_mut(&job_id) {
-            *in_flight = in_flight.saturating_sub(1);
-            if *in_flight == 0 {
-                self.active_downloads_by_job.remove(&job_id);
-            }
-        }
-        if let Some(in_flight) = self
-            .active_downloads_by_file
-            .get_mut(&work.segment_id.file_id)
-        {
-            *in_flight = in_flight.saturating_sub(1);
-            if *in_flight == 0 {
-                self.active_downloads_by_file
-                    .remove(&work.segment_id.file_id);
-            }
-        }
 
-        if let Some(state) = self.jobs.get_mut(&job_id)
-            && !is_terminal_status(&state.status)
-        {
-            if work.is_recovery && !work.completion_critical {
-                state.recovery_queue.push(work);
-            } else {
-                state.download_queue.push(work);
-            }
-        }
+        self.enqueue_download_work(work);
         self.update_queue_metrics();
         self.publish_active_stage_metrics();
     }
@@ -1189,5 +1141,7 @@ impl Pipeline {
             }
         }
         self.publish_active_stage_metrics();
+        #[cfg(test)]
+        self.audit_lane_holdings();
     }
 }

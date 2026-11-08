@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+// Tests write their own fixtures on raw connections.
+#![expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: tests write their own fixtures on raw connections"
+)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use tempfile::TempDir;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast};
 use weaver_model::files::FileRole;
 use weaver_nntp::client::{NntpClient, NntpClientConfig};
 use weaver_server_core::ingest::{
@@ -23,8 +29,8 @@ use weaver_server_core::settings::{Config, SharedConfig};
 use weaver_server_core::watch_folder::WatchFolderConfig;
 use weaver_server_core::{
     Database, DuplicateAdmission, DuplicateAdmissionRequest, DuplicateMode, DuplicatePolicy,
-    FileSpec, FingerprintEvidence, JobId, JobSpec, Pipeline, PipelineMetrics, SchedulerCommand,
-    SchedulerError, SchedulerHandle, SegmentSpec, SemanticCandidateSource, SemanticCandidateState,
+    FileSpec, FingerprintEvidence, JobId, JobSpec, Pipeline, PipelineMetrics, SchedulerError,
+    SchedulerHandle, SegmentSpec, SemanticCandidateSource, SemanticCandidateState,
     SemanticDuplicate, SemanticPromotionState, SharedPipelineState, SubmissionOrigin,
     semantic_duplicate_lifecycle_metrics_snapshot,
 };
@@ -56,19 +62,18 @@ impl Harness {
             retry: None,
             max_download_speed: None,
             propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             watch_folder: WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
-            direct_unpack: None,
             delivery_naming: None,
             metrics: Default::default(),
             config_path: None,
         }));
-        let (cmd_tx, cmd_rx) = mpsc::channel::<SchedulerCommand>(64);
         let (event_tx, _) = broadcast::channel(1024);
         let state = SharedPipelineState::new(PipelineMetrics::new(), vec![]);
-        let handle = SchedulerHandle::new(cmd_tx, event_tx.clone(), state.clone());
+        let handle = SchedulerHandle::new(event_tx.clone(), state.clone());
         let nntp = NntpClient::new(NntpClientConfig {
             servers: vec![],
             max_idle_age: Duration::from_secs(1),
@@ -101,7 +106,6 @@ impl Harness {
             large_count: 2,
         });
         let mut pipeline = Pipeline::new(
-            cmd_rx,
             event_tx,
             nntp,
             buffers,
@@ -116,6 +120,7 @@ impl Harness {
             state,
             db.clone(),
             config,
+            weaver_server_core::runtime::StartupDiskGate::opened(),
         )
         .await
         .unwrap();
@@ -187,7 +192,7 @@ fn score_spec(name: &str, message_id: &str) -> JobSpec {
                 ordinal: 0,
                 article_number: 1,
                 bytes: 10,
-                message_id: message_id.to_string(),
+                message_ids: weaver_server_core::MessageIds::new(vec![message_id.to_string()]),
             }],
         }],
     }

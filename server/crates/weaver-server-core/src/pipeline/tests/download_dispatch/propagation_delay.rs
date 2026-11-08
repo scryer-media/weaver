@@ -20,11 +20,16 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .unwrap();
     let segment_id = work.segment_id;
+    pipeline.hold_test_lane_works(vec![work.clone()], false);
     let lease = DownloadBatchLease {
+        body_activity: Arc::default(),
         lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
@@ -37,15 +42,10 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         pressure_clear: true,
         works: vec![work],
     };
-    pipeline.active_downloads = 1;
     pipeline.active_download_connections = 1;
-    pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .active_download_connections_by_job
         .insert(job_id, 1);
-    pipeline
-        .active_downloads_by_file
-        .insert(segment_id.file_id, 1);
     pipeline.note_download_lane_started(DownloadLaneMode::Sequential);
 
     let resets_before = pipeline.owned_download_lane_pool.reset_calls();
@@ -78,6 +78,9 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .unwrap();
@@ -104,11 +107,16 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         .jobs
         .get_mut(&job_id)
         .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
         .download_queue
         .pop()
         .unwrap();
     let segment_id = work.segment_id;
+    pipeline.hold_test_lane_works(vec![work.clone()], false);
     let lease = DownloadBatchLease {
+        body_activity: Arc::default(),
         lane_id: 0,
         job_id,
         runtime_generation: pipeline.pool_generation,
@@ -121,15 +129,10 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         pressure_clear: true,
         works: vec![work],
     };
-    pipeline.active_downloads = 1;
     pipeline.active_download_connections = 1;
-    pipeline.active_downloads_by_job.insert(job_id, 1);
     pipeline
         .active_download_connections_by_job
         .insert(job_id, 1);
-    pipeline
-        .active_downloads_by_file
-        .insert(segment_id.file_id, 1);
     pipeline.note_download_lane_started(DownloadLaneMode::Sequential);
 
     let resets_before = pipeline.owned_download_lane_pool.reset_calls();
@@ -165,6 +168,9 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
     let restored = pipeline
         .jobs
         .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
         .unwrap()
         .download_queue
         .pop()
@@ -228,13 +234,24 @@ async fn dispatch_downloads_shares_a_small_hot_job_across_both_lanes_before_the_
     // job beside a hot job it could still be fetching. The next job waits
     // for the first lane that finds the hot job drained.
     assert_eq!(
-        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&hot_job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         0
     );
     assert_eq!(
         pipeline
             .jobs
             .get(&secondary_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -310,13 +327,24 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
             .contains_key(&secondary_job_id)
     );
     assert_eq!(
-        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&hot_job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         2
     );
     assert_eq!(
         pipeline
             .jobs
             .get(&secondary_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -345,7 +373,15 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
     assert_eq!(pipeline.active_downloads, 1);
     assert_eq!(pipeline.active_download_connections, 1);
     assert_eq!(
-        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&hot_job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         2
     );
 
@@ -356,7 +392,15 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
     assert_eq!(pipeline.active_download_connections, 2);
     assert_eq!(pipeline.active_downloads_by_job.get(&hot_job_id), Some(&2));
     assert_eq!(
-        pipeline.jobs.get(&hot_job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&hot_job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         1
     );
 }
@@ -419,6 +463,9 @@ async fn dispatch_downloads_suppresses_the_spill_under_soft_byte_pressure() {
             .jobs
             .get(&secondary_job_id)
             .unwrap()
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .len(),
         1
@@ -480,10 +527,19 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
 
     {
         let state = pipeline.jobs.get_mut(&leading_job_id).unwrap();
-        let _ = state.download_queue.pop().expect(
-            "leading low-priority job should have one completed segment removed from queue",
-        );
+        let _ = state
+            .articles
+            .active_mut()
+            .unwrap()
+            .download_queue
+            .pop()
+            .expect(
+                "leading low-priority job should have one completed segment removed from queue",
+            );
         state
+            .articles
+            .active_mut()
+            .unwrap()
             .assembly
             .file_mut(NzbFileId {
                 job_id: leading_job_id,
@@ -505,6 +561,9 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .jobs
             .get(&leading_job_id)
             .unwrap()
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .len(),
         65 - want
@@ -514,16 +573,16 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .jobs
             .get(&promoted_job_id)
             .unwrap()
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .len(),
         1
     );
     settle_lane_dials(&mut pipeline).await;
 
-    pipeline.active_downloads = 0;
-    pipeline.active_download_connections = 0;
-    pipeline.active_downloads_by_job.clear();
-    pipeline.active_download_connections_by_job.clear();
+    pipeline.finish_test_lanes();
     pipeline.active_download_passes.clear();
     pipeline
         .jobs
@@ -540,6 +599,9 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
             .jobs
             .get(&leading_job_id)
             .unwrap()
+            .articles
+            .active()
+            .unwrap()
             .download_queue
             .len(),
         65 - want
@@ -548,6 +610,9 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
         pipeline
             .jobs
             .get(&promoted_job_id)
+            .unwrap()
+            .articles
+            .active()
             .unwrap()
             .download_queue
             .len(),
@@ -586,7 +651,7 @@ async fn list_jobs_projects_downloading_while_extracting_with_active_download_wo
             state.download_state,
             crate::jobs::model::DownloadState::Complete
         );
-        assert_eq!(state.download_queue.len(), 1);
+        assert_eq!(state.articles.active().unwrap().download_queue.len(), 1);
     }
 
     let info = pipeline
@@ -615,7 +680,7 @@ async fn list_jobs_projects_downloading_while_extracting_with_active_download_wo
 }
 
 #[tokio::test]
-async fn list_jobs_queues_inactive_downloads_and_rewarms_their_phase_rate() {
+async fn lane_less_download_stays_downloading_and_resumes_on_the_gauge_window() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
         &temp_dir,
@@ -635,54 +700,126 @@ async fn list_jobs_queues_inactive_downloads_and_rewarms_their_phase_rate() {
     )
     .await;
 
+    pipeline.report_job(job_id);
     pipeline.phase_begin(job_id, JobPhase::Downloading, Some(512));
-    assert!(!pipeline.job_has_current_download_activity(job_id));
-
+    let counters = pipeline.shared_state.queue.read(|inner| {
+        inner
+            .jobs
+            .iter()
+            .find(|row| row.id == job_id)
+            .unwrap()
+            .counters
+            .clone()
+    });
+    let now = std::time::Instant::now();
     pipeline.active_downloads_by_job.insert(job_id, 1);
-    pipeline.sample_phase_progress();
-    {
-        let runtime = pipeline
-            .phase_progress
-            .get_mut(&(job_id, JobPhase::Downloading))
-            .expect("download phase should exist");
-        runtime.first_sample_at = Some(std::time::Instant::now() - Duration::from_secs(10));
-        runtime.rate.update(std::time::Instant::now(), 64);
-        assert!(runtime.rate.has_samples());
-    }
+    pipeline.report_job(job_id);
+    pipeline
+        .shared_state
+        .queue
+        .sample_counters(&pipeline.metrics, &pipeline.event_tx, now);
+    counters.downloaded.store(64, Ordering::Relaxed);
+    pipeline.shared_state.queue.counters.bandwidth.record(64);
+    pipeline.shared_state.queue.sample_counters(
+        &pipeline.metrics,
+        &pipeline.event_tx,
+        now + Duration::from_secs(1),
+    );
+    assert!(
+        pipeline
+            .shared_state
+            .get_job(job_id)
+            .unwrap()
+            .phase_progress[0]
+            .rate_bps
+            .is_some()
+    );
 
     pipeline.active_downloads_by_job.remove(&job_id);
-    pipeline.sample_phase_progress();
-    let inactive_info = pipeline
-        .list_jobs()
-        .into_iter()
-        .find(|info| info.job_id == job_id)
-        .expect("job should be listed");
-    assert_eq!(
-        inactive_info.download_state,
-        crate::jobs::model::DownloadState::Queued
+    pipeline.report_job(job_id);
+    pipeline.shared_state.queue.sample_counters(
+        &pipeline.metrics,
+        &pipeline.event_tx,
+        now + Duration::from_secs(2),
     );
-    assert!(inactive_info.phase_progress.is_empty());
-    let runtime = pipeline
-        .phase_progress
-        .get(&(job_id, JobPhase::Downloading))
-        .expect("download phase should remain registered");
-    assert!(!runtime.rate.has_samples());
-    assert!(runtime.first_sample_at.is_none());
+    let inactive = pipeline.shared_state.get_job(job_id).unwrap();
+    // Started, so its status stays Downloading; no lane holds it, so its
+    // download lane reads as waiting for one.
+    assert_eq!(inactive.status, JobStatus::Downloading);
+    assert_eq!(inactive.download_state, crate::DownloadState::Queued);
+    assert!(inactive.phase_progress.is_empty());
 
     pipeline.active_downloads_by_job.insert(job_id, 1);
-    pipeline.sample_phase_progress();
-    let active_info = pipeline
+    pipeline.report_job(job_id);
+    pipeline.shared_state.queue.sample_counters(
+        &pipeline.metrics,
+        &pipeline.event_tx,
+        now + Duration::from_secs(3),
+    );
+    let active = pipeline.shared_state.get_job(job_id).unwrap();
+    assert_eq!(active.download_state, crate::DownloadState::Downloading);
+    assert_eq!(active.phase_progress.len(), 1);
+    assert_eq!(active.phase_progress[0].phase, JobPhase::Downloading);
+    // The rate kept its window while no lane held the job, so it resumes on
+    // the gauge's figure rather than warming up a window of its own.
+    assert_eq!(
+        active.phase_progress[0].rate_bps,
+        Some(
+            pipeline
+                .shared_state
+                .metrics_snapshot()
+                .current_download_speed
+        )
+    );
+}
+
+#[tokio::test]
+async fn a_started_download_with_only_queued_work_lists_as_downloading() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    let job_id = JobId(20010);
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Wedged Download", &[("queued.bin".to_string(), 512)]),
+    )
+    .await;
+    {
+        let state = pipeline.jobs.get(&job_id).unwrap();
+        assert_eq!(state.status, JobStatus::Downloading);
+        assert_eq!(state.articles.active().unwrap().download_queue.len(), 1);
+    }
+    assert!(
+        !pipeline
+            .active_download_connections_by_job
+            .contains_key(&job_id)
+    );
+    assert!(!pipeline.active_downloads_by_job.contains_key(&job_id));
+    assert!(!pipeline.active_decodes_by_job.contains_key(&job_id));
+    assert!(!pipeline.job_has_current_download_activity(job_id));
+
+    let info = pipeline
         .list_jobs()
         .into_iter()
         .find(|info| info.job_id == job_id)
         .expect("job should be listed");
+
+    // Started, so its status stays Downloading; no lane holds it, so its
+    // download lane reads as waiting for one.
+    assert_eq!(info.status, JobStatus::Downloading);
     assert_eq!(
-        active_info.download_state,
-        crate::jobs::model::DownloadState::Downloading
+        info.download_state,
+        crate::jobs::model::DownloadState::Queued
     );
-    assert_eq!(active_info.phase_progress.len(), 1);
-    assert_eq!(active_info.phase_progress[0].phase, JobPhase::Downloading);
-    assert!(active_info.phase_progress[0].rate_bps.is_none());
 }
 
 #[tokio::test]
@@ -702,31 +839,48 @@ async fn download_phase_rate_matches_the_global_speed_gauge() {
     insert_active_job(
         &mut pipeline,
         job_id,
-        standalone_job_spec("Wire Rate", &[("payload.bin".to_string(), 1_024)]),
+        standalone_job_spec(
+            "Wire Rate",
+            &[
+                ("payload-0.bin".to_string(), 512),
+                ("payload-1.bin".to_string(), 512),
+            ],
+        ),
     )
     .await;
-    pipeline.phase_begin(job_id, JobPhase::Downloading, Some(1_024));
     pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.report_job(job_id);
+    pipeline.phase_begin(job_id, JobPhase::Downloading, Some(1_024));
+    let counters = pipeline.shared_state.queue.read(|inner| {
+        inner
+            .jobs
+            .iter()
+            .find(|row| row.id == job_id)
+            .unwrap()
+            .counters
+            .clone()
+    });
+    let now = std::time::Instant::now();
+    pipeline
+        .shared_state
+        .queue
+        .sample_counters(&pipeline.metrics, &pipeline.event_tx, now);
 
-    // One tick: both estimators take their first sample together. The gauge
-    // already sampled once when the pipeline was built, which would start its
-    // window early and skew the comparison, so it is emptied first.
-    pipeline.metrics.reset_speed_tracker();
-    pipeline.sample_phase_progress();
-    pipeline.shared_state.refresh_metrics_snapshot();
-
-    // Decoded bytes move the bar but never the rate: the row's rate must
-    // integrate the same wire bytes the nav counter does.
+    // Accepted payload advances progress without inventing wire traffic.
     pipeline.jobs.get_mut(&job_id).unwrap().downloaded_bytes = 512;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    pipeline.sample_phase_progress();
-    pipeline.shared_state.refresh_metrics_snapshot();
-    let info = pipeline
-        .list_jobs()
-        .into_iter()
-        .find(|info| info.job_id == job_id)
-        .expect("job should be listed");
-    assert_eq!(info.phase_progress.len(), 1);
+    pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .arrived_before(|volume, _| volume != weaver_graph::VolumeIndex(0));
+    pipeline.report_job(job_id);
+    counters.decoded.store(512, Ordering::Relaxed);
+    pipeline.shared_state.queue.sample_counters(
+        &pipeline.metrics,
+        &pipeline.event_tx,
+        now + Duration::from_secs(1),
+    );
+    let info = pipeline.shared_state.get_job(job_id).unwrap();
     assert_eq!(info.phase_progress[0].completed_bytes, 512);
     assert!(info.phase_progress[0].rate_bps.is_none());
     assert_eq!(
@@ -737,39 +891,175 @@ async fn download_phase_rate_matches_the_global_speed_gauge() {
         0
     );
 
-    // The same wire bytes land on both counters; the next tick must publish
-    // the same number on the row and the gauge.
+    // Both rate windows sample the exact same clock and wire-byte delta.
+    counters.downloaded.store(30_000, Ordering::Relaxed);
     pipeline
-        .jobs
-        .get_mut(&job_id)
-        .unwrap()
-        .downloaded_wire_bytes = 30_000;
-    pipeline
-        .metrics
-        .bytes_downloaded
-        .fetch_add(30_000, Ordering::Relaxed);
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    pipeline.sample_phase_progress();
-    pipeline.shared_state.refresh_metrics_snapshot();
-    let info = pipeline
-        .list_jobs()
-        .into_iter()
-        .find(|info| info.job_id == job_id)
-        .expect("job should be listed");
+        .shared_state
+        .queue
+        .counters
+        .bandwidth
+        .record(30_000);
+    pipeline.shared_state.queue.sample_counters(
+        &pipeline.metrics,
+        &pipeline.event_tx,
+        now + Duration::from_secs(2),
+    );
+    let info = pipeline.shared_state.get_job(job_id).unwrap();
     let row = info.phase_progress[0]
         .rate_bps
-        .expect("wire bytes should produce a rate");
+        .expect("wire traffic produces a rate");
     let gauge = pipeline
         .shared_state
         .metrics_snapshot()
         .current_download_speed;
-    assert!(gauge > 0, "gauge should be live");
-    let tolerance = (gauge as f64 * 0.02).max(2.0);
-    assert!(
-        (row as f64 - gauge as f64).abs() <= tolerance,
-        "row rate {row} should match gauge {gauge} within {tolerance}"
-    );
+    assert!(gauge > 0);
+    assert_eq!(row, gauge);
     assert_eq!(info.phase_progress[0].completed_bytes, 512);
+
+    // Replacement articles add decoder and wire throughput, but replace
+    // payload that the report already counted.
+    counters.decoded.store(1_536, Ordering::Relaxed);
+    counters.downloaded.store(60_000, Ordering::Relaxed);
+    pipeline
+        .shared_state
+        .queue
+        .counters
+        .bandwidth
+        .record(30_000);
+    pipeline.shared_state.queue.sample_counters(
+        &pipeline.metrics,
+        &pipeline.event_tx,
+        now + Duration::from_secs(3),
+    );
+    let info = pipeline.shared_state.get_job(job_id).unwrap();
+    assert_eq!(info.phase_progress[0].completed_bytes, 512);
+    assert_eq!(info.phase_progress[0].progress_percent, 50.0);
+    assert!(info.phase_progress[0].rate_bps.is_some());
+    assert!(info.phase_progress[0].estimated_remaining_ms.is_some());
+}
+
+// A job whose lane lease starts downloading: the queue's counters linked to
+// the transfer total exactly as a handout links them.
+fn start_rate_sum_download(
+    pipeline: &mut Pipeline,
+    job_id: JobId,
+) -> Arc<crate::pipeline::queue::JobCounters> {
+    pipeline.active_downloads_by_job.insert(job_id, 1);
+    pipeline.report_job(job_id);
+    pipeline.phase_begin(job_id, JobPhase::Downloading, Some(1 << 40));
+    let counters = pipeline.shared_state.queue.job_counters(job_id).unwrap();
+    counters
+        .totals
+        .get_or_init(|| pipeline.shared_state.queue.counters.clone());
+    counters
+}
+
+fn land_rate_sum_article(counters: &crate::pipeline::queue::JobCounters, wire: usize) {
+    crate::pipeline::download::owned_lane::credit_transfer(
+        counters,
+        &Ok(DownloadPayload::Raw(vec![0; wire].into())),
+    );
+}
+
+// Every downloading row's rate and the gauge on one tick.
+fn rate_sum_tick(pipeline: &Pipeline, at: std::time::Instant) -> (Vec<(JobId, u64)>, u64) {
+    pipeline
+        .shared_state
+        .queue
+        .sample_counters(&pipeline.metrics, &pipeline.event_tx, at);
+    (
+        pipeline.shared_state.job_download_rates(),
+        pipeline
+            .shared_state
+            .metrics_snapshot()
+            .current_download_speed,
+    )
+}
+
+fn assert_rates_sum_to_gauge(rates: &[(JobId, u64)], gauge: u64, tick: u32) {
+    let sum: u64 = rates.iter().map(|(_, rate)| rate).sum();
+    assert!(gauge > 0, "tick {tick}: the gauge reads traffic");
+    // Each row and the gauge truncate to whole bytes per second on their own.
+    assert!(
+        sum.abs_diff(gauge) <= rates.len() as u64,
+        "tick {tick}: rows {rates:?} sum to {sum}, gauge reads {gauge}"
+    );
+}
+
+#[tokio::test]
+async fn downloading_rows_rates_sum_to_the_global_speed_gauge() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
+        &temp_dir,
+        BufferPoolConfig {
+            small_count: 2,
+            medium_count: 1,
+            large_count: 1,
+        },
+        2,
+    )
+    .await;
+    let first = JobId(20040);
+    let second = JobId(20041);
+    insert_active_job(
+        &mut pipeline,
+        first,
+        standalone_job_spec("Rate Sum First", &[("first.bin".to_string(), 1 << 30)]),
+    )
+    .await;
+    let first_counters = start_rate_sum_download(&mut pipeline, first);
+    let start = std::time::Instant::now();
+    let at = |tick: u32| start + Duration::from_millis(250) * tick;
+
+    // The first job alone, at a rate that moves from tick to tick.
+    for tick in 0..12 {
+        land_rate_sum_article(&first_counters, 300_000 + 100_000 * (tick as usize % 4));
+        let (rates, gauge) = rate_sum_tick(&pipeline, at(tick));
+        if tick > 0 {
+            assert_eq!(rates.len(), 1, "tick {tick}");
+            assert_rates_sum_to_gauge(&rates, gauge, tick);
+        }
+    }
+
+    // A second job is added and starts mid-window: its rate is measured on
+    // the gauge's window, not on one of its own that begins now.
+    insert_active_job(
+        &mut pipeline,
+        second,
+        standalone_job_spec("Rate Sum Second", &[("second.bin".to_string(), 1 << 30)]),
+    )
+    .await;
+    let (_, _) = rate_sum_tick(&pipeline, at(12));
+    let second_counters = start_rate_sum_download(&mut pipeline, second);
+    for tick in 13..40 {
+        land_rate_sum_article(&first_counters, 250_000);
+        land_rate_sum_article(&second_counters, 600_000 + 200_000 * (tick as usize % 3));
+        let (rates, gauge) = rate_sum_tick(&pipeline, at(tick));
+        assert_eq!(rates.len(), 2, "tick {tick}");
+        assert_rates_sum_to_gauge(&rates, gauge, tick);
+    }
+
+    // Between lanes the second job shows no rate; once a lane holds it again
+    // its rate resumes on the same window, with no warm-up of its own.
+    pipeline.active_downloads_by_job.remove(&second);
+    pipeline.report_job(second);
+    for tick in 40..44 {
+        land_rate_sum_article(&first_counters, 250_000);
+        let (rates, _) = rate_sum_tick(&pipeline, at(tick));
+        assert_eq!(
+            rates.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            vec![first]
+        );
+    }
+    pipeline.active_downloads_by_job.insert(second, 1);
+    pipeline.report_job(second);
+    for tick in 44..60 {
+        land_rate_sum_article(&first_counters, 250_000);
+        land_rate_sum_article(&second_counters, 500_000);
+        let (rates, gauge) = rate_sum_tick(&pipeline, at(tick));
+        assert_eq!(rates.len(), 2, "tick {tick}");
+        assert_rates_sum_to_gauge(&rates, gauge, tick);
+    }
 }
 
 #[tokio::test]
@@ -836,6 +1126,128 @@ async fn egress_quota_block_outranks_server_quota_and_yields_to_a_pause() {
     );
 }
 
+// The pipeline refreshes the quota presentation on every article it takes.
+// With no egress block standing, clearing it again takes no lock; a real
+// change still takes it and lays the block as before.
+#[tokio::test]
+async fn refreshing_the_quota_presentation_without_an_egress_block_takes_no_lock() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let locks = || pipeline.shared_state.egress_quota_block_lock_count();
+
+    let before = locks();
+    for _ in 0..3 {
+        pipeline.refresh_server_quota_block_presentation();
+    }
+    assert_eq!(locks(), before, "no egress lock per article");
+    assert_eq!(pipeline.shared_state.egress_quota_block(), None);
+
+    let block = crate::jobs::handle::EgressQuotaBlock {
+        egress_id: 5,
+        egress_name: "Egress A".to_string(),
+        used_bytes: 1_000,
+        limit_bytes: 1_000,
+        remaining_bytes: 0,
+        window_starts_at_epoch_ms: None,
+        window_ends_at_epoch_ms: None,
+        timezone_name: "UTC".to_string(),
+    };
+    pipeline
+        .shared_state
+        .set_egress_quota_block(Some(block.clone()));
+    assert_eq!(locks(), before + 1);
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::EgressQuota
+    );
+    pipeline.refresh_server_quota_block_presentation();
+    assert_eq!(
+        locks(),
+        before + 2,
+        "a standing block is cleared under the lock"
+    );
+    assert_eq!(pipeline.shared_state.egress_quota_block(), None);
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::None
+    );
+    pipeline.refresh_server_quota_block_presentation();
+    assert_eq!(locks(), before + 2);
+}
+
+// Dispatch never sends work to a server that is out of quota, so queued work
+// behind an exhausted pool never parks. The block still has to say why it
+// cannot move, as soon as the queue holds it.
+#[tokio::test]
+async fn queued_work_behind_quota_blocked_fills_shows_the_server_quota_block() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let control = weaver_nntp::transfer::ServerTransferRegistry::new().configure(
+        weaver_nntp::transfer::StableServerId(31),
+        weaver_nntp::transfer::ServerTransferConfig {
+            rate_bytes_per_sec: 0,
+            quota: Some(weaver_nntp::transfer::QuotaRuntimeConfig {
+                limit_bytes: 128,
+                generation: 1,
+                retry_at: None,
+            }),
+        },
+    );
+    let _spent = control.try_reserve(128).unwrap();
+    pipeline.nntp = std::sync::Arc::new(NntpClient::new(NntpClientConfig {
+        servers: vec![weaver_nntp::pool::ServerPoolConfig {
+            server: weaver_nntp::ServerConfig {
+                host: "spent-quota.example.com".to_string(),
+                ..Default::default()
+            },
+            stable_id: weaver_nntp::transfer::StableServerId(31),
+            transfer_control: Some(std::sync::Arc::clone(&control)),
+            max_connections: 1,
+            group: 0,
+            backfill: false,
+            retention_days: 0,
+        }],
+        max_idle_age: Duration::from_secs(1),
+        max_retries_per_server: 0,
+        soft_timeout: Duration::from_secs(1),
+    }));
+    assert!(pipeline.nntp.all_normal_fill_servers_quota_blocked());
+
+    let job_id = JobId(20995);
+    let spec = standalone_job_spec("Spent Quota", &[("queued.bin".to_string(), 512u32)]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    pipeline.update_queue_metrics();
+
+    assert!(pipeline.server_quota_parked.is_empty());
+    assert!(
+        !pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .is_empty()
+    );
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::ServerQuota
+    );
+
+    // With nothing left queued, an exhausted pool holds nothing back.
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = DownloadQueue::new();
+    pipeline.update_queue_metrics();
+    assert_eq!(
+        pipeline.shared_state.download_block().kind,
+        crate::jobs::handle::DownloadBlockKind::None
+    );
+}
+
 #[tokio::test]
 async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -874,10 +1286,23 @@ async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 1);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 0);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        0
+    );
+    // The queue change re-derives the block from the pool, whose server has
+    // quota, so the stale presentation gives way to the schedule beneath it.
     assert_eq!(
         pipeline.shared_state.download_block().kind,
-        crate::jobs::handle::DownloadBlockKind::ServerQuota
+        crate::jobs::handle::DownloadBlockKind::Scheduled
     );
 }
 
@@ -903,13 +1328,13 @@ async fn download_block_refresh_preserves_scheduled_speed_limit() {
         131_072
     );
 
-    pipeline.record_download_bandwidth_usage(1_024).unwrap();
+    pipeline.shared_state.queue.counters.bandwidth.record(1_024);
     assert_eq!(
         pipeline.shared_state.download_block().scheduled_speed_limit,
         131_072
     );
 
-    pipeline.flush_download_bandwidth_usage().unwrap();
+    pipeline.shared_state.queue.sample_bandwidth(true).unwrap();
     assert_eq!(
         pipeline.shared_state.download_block().scheduled_speed_limit,
         131_072
@@ -930,38 +1355,41 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
 
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::SetSpeedLimit {
-            bytes_per_sec: 512 * 1024,
-            replaces_schedule: true,
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .set_speed_limit(512 * 1024)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
+    assert_eq!(
+        pipeline.shared_state.download_block().speed_limit_in_force,
+        512 * 1024
+    );
+    assert!(
+        !pipeline
+            .shared_state
+            .download_block()
+            .speed_limit_by_schedule
+    );
 
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ApplyScheduleAction {
-            action: global_speed(128 * 1024),
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .apply_schedule_action(global_speed(128 * 1024))
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
 
     for action in [
         crate::bandwidth::ScheduleAction::Pause,
         crate::bandwidth::ScheduleAction::Resume,
     ] {
-        let (reply, received) = oneshot::channel();
-        pipeline
-            .handle_command(SchedulerCommand::ApplyScheduleAction {
-                action: action.clone(),
-                reply,
-            })
-            .await;
-        received.await.unwrap();
+        pipeline.report_all_for_test();
+        SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+            .apply_schedule_action(action.clone())
+            .await
+            .unwrap();
+        pipeline.apply_queue_intents().await;
         assert_eq!(
             pipeline.global_paused,
             action == crate::bandwidth::ScheduleAction::Pause
@@ -972,191 +1400,95 @@ async fn a_scheduled_speed_limit_holds_over_pauses_and_reloaded_limits() {
             pipeline.shared_state.download_block().scheduled_speed_limit,
             128 * 1024
         );
+        assert_eq!(
+            pipeline.shared_state.download_block().speed_limit_in_force,
+            128 * 1024
+        );
+        assert!(
+            pipeline
+                .shared_state
+                .download_block()
+                .speed_limit_by_schedule
+        );
     }
 
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::SetSpeedLimit {
-            bytes_per_sec: 768 * 1024,
-            replaces_schedule: false,
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .restore_speed_limit(768 * 1024)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     // A reload records the saved limit but leaves the scheduled one in force.
     assert_eq!(pipeline.configured_rate_limit, 768 * 1024);
     assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
 
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ApplyScheduleAction {
-            action: crate::bandwidth::ScheduleAction::Pause,
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .apply_schedule_action(crate::bandwidth::ScheduleAction::Pause)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     // Unlimited still means unlimited, even when the configured limit is nonzero.
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ApplyScheduleAction {
-            action: global_speed(0),
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .apply_schedule_action(global_speed(0))
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert_eq!(pipeline.scheduled_rate_limit, Some(0));
     assert_eq!(pipeline.rate_limiter.rate(), 0);
     assert!(pipeline.global_paused);
+    // The published limit in force says so too, not the configured one.
+    assert_eq!(
+        pipeline.shared_state.download_block().speed_limit_in_force,
+        0
+    );
+    // An unlimited window is still the schedule's limit.
+    assert!(
+        pipeline
+            .shared_state
+            .download_block()
+            .speed_limit_by_schedule
+    );
 }
 
 #[tokio::test]
 async fn speed_test_hold_preserves_later_schedule_pause() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::SetSpeedTestPause {
-            paused: true,
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .set_speed_test_pause(true)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(pipeline.shared_state.is_paused());
     assert!(
         !pipeline.global_paused,
         "the transient hold does not become a persisted pause"
     );
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ApplyScheduleAction {
-            action: crate::bandwidth::ScheduleAction::Pause,
-            reply,
-        })
-        .await;
-    received.await.unwrap();
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::SetSpeedTestPause {
-            paused: false,
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .apply_schedule_action(crate::bandwidth::ScheduleAction::Pause)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .set_speed_test_pause(false)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(pipeline.global_paused);
     assert!(pipeline.scheduled_pause);
     assert!(pipeline.shared_state.is_paused());
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::ApplyScheduleAction {
-            action: crate::bandwidth::ScheduleAction::Resume,
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .apply_schedule_action(crate::bandwidth::ScheduleAction::Resume)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert!(!pipeline.shared_state.is_paused());
-}
-
-#[tokio::test]
-async fn streamed_decoded_download_bypasses_decode_backlog() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(20017);
-    let filename = "streamed.bin";
-    let payload = b"already decoded bytes".to_vec();
-    let spec = segmented_job_spec(
-        "Streamed Decode Success",
-        filename,
-        &[payload.len() as u32, 1],
-    );
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    let segment_id = SegmentId {
-        file_id: NzbFileId {
-            job_id,
-            file_index: 0,
-        },
-        segment_number: 0,
-    };
-    let raw_size = 256;
-    pipeline.active_downloads += 1;
-    pipeline
-        .handle_download_done(DownloadResult {
-            lane_id: 0,
-            job_id: segment_id.file_id.job_id,
-            runtime_generation: 0,
-            segment_id,
-            data: Ok(DownloadPayload::Decoded(DecodeResult {
-                encoding: SegmentEncoding::Yenc,
-                segment_id,
-                raw_size,
-                yenc_layout: YencLayoutAssertions {
-                    file_size: payload.len() as u64 + 1,
-                    part: Some(1),
-                    total: Some(2),
-                    begin: Some(1),
-                    end: Some(payload.len() as u64),
-                },
-                crc_valid: true,
-                part_crc_verified: false,
-                part_crc: par2_rs::checksum::crc32(&payload),
-                truncation_suspected: false,
-                expected_file_crc: None,
-                data: DecodedChunk::from(payload.clone()),
-                yenc_name: filename.to_string(),
-                checkpoint_plan: weaver_yenc::CheckpointPlan::None,
-                segments: Vec::new(),
-            })),
-            attempts: Vec::new(),
-            lane_observation: None,
-            source_server_idx: Some(0),
-            origin: DownloadResultOrigin::NormalPrimary,
-            retry_count: 0,
-            exclude_servers: vec![2],
-            release_connection_slot: true,
-        })
-        .await;
-
-    assert_eq!(pipeline.pending_decode.len(), 0);
-    assert_eq!(pipeline.metrics.decode_pending.load(Ordering::Relaxed), 0);
-    assert_eq!(
-        pipeline
-            .metrics
-            .decode_pending_bytes
-            .load(Ordering::Relaxed),
-        0
-    );
-    assert_eq!(
-        pipeline.metrics.bytes_downloaded.load(Ordering::Relaxed),
-        raw_size
-    );
-    assert_eq!(
-        pipeline.metrics.bytes_decoded.load(Ordering::Relaxed),
-        payload.len() as u64
-    );
-    assert_eq!(pipeline.metrics.segments_decoded.load(Ordering::Relaxed), 1);
-    assert!(pipeline.decode_done_rx.try_recv().is_err());
-    assert_eq!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .map(|state| state.downloaded_bytes),
-        Some(payload.len() as u64)
-    );
-    // Wire bytes are credited to the job in lockstep with the global counter.
-    assert_eq!(
-        pipeline
-            .jobs
-            .get(&job_id)
-            .map(|state| state.downloaded_wire_bytes),
-        Some(raw_size)
-    );
-    let provenance = pipeline
-        .unverified_segments
-        .get(&segment_id.file_id)
-        .and_then(|segments| segments.get(&segment_id.segment_number))
-        .expect("streamed success must retain unverified segment provenance");
-    assert_eq!(provenance.source_server_idx, Some(0));
-    assert_eq!(provenance.exclude_servers, vec![2]);
 }
 
 #[tokio::test]
@@ -1189,7 +1521,19 @@ async fn add_job_with_options_initially_paused_publishes_queued_lane_from_real_p
     );
     assert_eq!(info.run_state, crate::jobs::model::RunState::Paused);
 
+    let mut revisions = harness.handle.subscribe_job_changes();
     harness.handle.resume_job(job_id).await.unwrap();
+    loop {
+        revisions.mark_unchanged();
+        if harness
+            .handle
+            .get_job(job_id)
+            .is_ok_and(|job| job.run_state == crate::jobs::model::RunState::Active)
+        {
+            break;
+        }
+        revisions.changed().await.unwrap();
+    }
     let info = harness.handle.get_job(job_id).unwrap();
     assert_eq!(info.status, JobStatus::Queued);
     assert_eq!(
@@ -1222,6 +1566,9 @@ async fn redownload_job_rebuilds_failed_history_as_queued_download() {
         .unwrap();
     let mut row =
         history_row_with_output_dir(job_id, "Failed History Job", "failed", working_dir.clone());
+    crate::jobs::working_dir::stamp_working_dir(&intermediate_dir, &working_dir, job_id)
+        .await
+        .unwrap();
     row.category = Some("tv".to_string());
     row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
     insert_history_row_with_nzb_zstd(&pipeline.db, &row, &sample_nzb_zstd());
@@ -1230,15 +1577,16 @@ async fn redownload_job_rebuilds_failed_history_as_queued_download() {
 
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert_eq!(state.status, JobStatus::Queued);
-    assert!(!state.download_queue.is_empty());
+    assert_eq!(state.articles.queued_download_len(), 1);
     assert_eq!(state.downloaded_bytes, 0);
     assert_eq!(state.spec.category.as_deref(), Some("tv"));
     assert!(!working_dir.exists());
     assert!(!staging_dir.exists());
     assert!(
         pipeline
-            .finished_jobs
-            .iter()
+            .finished_jobs()
+            .await
+            .into_iter()
             .all(|job| job.job_id != job_id)
     );
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
@@ -1275,6 +1623,7 @@ async fn redownload_job_rebuilds_complete_history_as_queued_download() {
         "complete",
         working_dir.clone(),
     );
+    crate::jobs::working_dir::mark_weaver_owned_output_dir(&working_dir).unwrap();
     row.category = Some("tv".to_string());
     row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
     insert_history_row_with_nzb_zstd(&pipeline.db, &row, &sample_nzb_zstd());
@@ -1283,15 +1632,16 @@ async fn redownload_job_rebuilds_complete_history_as_queued_download() {
 
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert_eq!(state.status, JobStatus::Queued);
-    assert!(!state.download_queue.is_empty());
+    assert_eq!(state.articles.queued_download_len(), 1);
     assert_eq!(state.downloaded_bytes, 0);
     assert_eq!(state.spec.category.as_deref(), Some("tv"));
     assert!(!working_dir.exists());
     assert!(!staging_dir.exists());
     assert!(
         pipeline
-            .finished_jobs
-            .iter()
+            .finished_jobs()
+            .await
+            .into_iter()
             .all(|job| job.job_id != job_id)
     );
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
@@ -1309,6 +1659,9 @@ async fn redownload_job_uses_history_blob_when_history_path_is_stale() {
 
     let mut row =
         history_row_with_output_dir(job_id, "Stale History Job", "failed", working_dir.clone());
+    crate::jobs::working_dir::stamp_working_dir(&intermediate_dir, &working_dir, job_id)
+        .await
+        .unwrap();
     row.category = Some("tv".to_string());
     row.nzb_path = Some(stale_nzb_path.display().to_string());
     row.metadata = Some(serde_json::to_string(&vec![("source", "history")]).unwrap());
@@ -1318,377 +1671,11 @@ async fn redownload_job_uses_history_blob_when_history_path_is_stale() {
 
     let state = pipeline.jobs.get(&job_id).unwrap();
     assert_eq!(state.status, JobStatus::Queued);
-    assert!(!state.download_queue.is_empty());
+    assert_eq!(state.articles.queued_download_len(), 1);
     assert_eq!(state.downloaded_bytes, 0);
     assert_eq!(state.spec.category.as_deref(), Some("tv"));
     assert!(!stale_nzb_path.exists());
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
-}
-
-#[tokio::test]
-async fn no_par2_single_file_retry_marks_zip_volume_complete_after_redownload() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(30028);
-    let spec = JobSpec {
-        name: "No PAR2 ZIP Retry Refresh".to_string(),
-        password: None,
-        total_bytes: 128,
-        category: None,
-        metadata: vec![],
-        files: vec![FileSpec {
-            filename: "archive.zip".to_string(),
-            role: FileRole::from_filename("archive.zip"),
-            groups: vec!["alt.binaries.test".to_string()],
-            posted_at_epoch: None,
-            segments: vec![segment_spec! {
-                number: 0,
-                bytes: 128,
-                message_id: "zip-refresh-0@example.com".to_string(),
-            }],
-        }],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state
-            .assembly
-            .file_mut(NzbFileId {
-                job_id,
-                file_index: 0,
-            })
-            .unwrap()
-            .commit_segment(0, 128)
-            .unwrap();
-        state.assembly.set_archive_topology(
-            "archive.zip".to_string(),
-            crate::jobs::assembly::ArchiveTopology {
-                archive_type: crate::jobs::assembly::ArchiveType::Zip,
-                volume_map: HashMap::from([("archive.zip".to_string(), 0)]),
-                complete_volumes: [0u32].into_iter().collect(),
-                expected_volume_count: Some(1),
-                members: vec![crate::jobs::assembly::ArchiveMember {
-                    name: "sample.mkv".to_string(),
-                    first_volume: 0,
-                    last_volume: 0,
-                    unpacked_size: 0,
-                }],
-                unresolved_spans: Vec::new(),
-            },
-        );
-    }
-    pipeline
-        .failed_extractions
-        .insert(job_id, HashSet::from(["archive.zip".to_string()]));
-
-    pipeline.check_job_completion(job_id).await;
-
-    {
-        let state = pipeline.jobs.get(&job_id).unwrap();
-        assert!(state.assembly.archive_topology_for("archive.zip").is_none());
-    }
-
-    let file_id = NzbFileId {
-        job_id,
-        file_index: 0,
-    };
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state
-            .assembly
-            .file_mut(file_id)
-            .unwrap()
-            .commit_segment(0, 128)
-            .unwrap();
-    }
-
-    pipeline.try_update_7z_topology(job_id, file_id);
-
-    let state = pipeline.jobs.get(&job_id).unwrap();
-    let topo = state.assembly.archive_topology_for("archive.zip").unwrap();
-    assert!(topo.complete_volumes.contains(&0));
-    assert!(matches!(
-        state.assembly.set_extraction_readiness("archive.zip"),
-        crate::jobs::assembly::ExtractionReadiness::Ready
-    ));
-}
-
-#[tokio::test]
-async fn no_par2_single_file_retry_marks_7z_volume_complete_after_redownload() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(30029);
-    let spec = JobSpec {
-        name: "No PAR2 7z Retry Refresh".to_string(),
-        password: None,
-        total_bytes: 128,
-        category: None,
-        metadata: vec![],
-        files: vec![FileSpec {
-            filename: "archive.7z".to_string(),
-            role: FileRole::from_filename("archive.7z"),
-            groups: vec!["alt.binaries.test".to_string()],
-            posted_at_epoch: None,
-            segments: vec![segment_spec! {
-                number: 0,
-                bytes: 128,
-                message_id: "7z-refresh-0@example.com".to_string(),
-            }],
-        }],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state
-            .assembly
-            .file_mut(NzbFileId {
-                job_id,
-                file_index: 0,
-            })
-            .unwrap()
-            .commit_segment(0, 128)
-            .unwrap();
-        state.assembly.set_archive_topology(
-            "archive.7z".to_string(),
-            crate::jobs::assembly::ArchiveTopology {
-                archive_type: crate::jobs::assembly::ArchiveType::SevenZip,
-                volume_map: HashMap::from([("archive.7z".to_string(), 0)]),
-                complete_volumes: [0u32].into_iter().collect(),
-                expected_volume_count: Some(1),
-                members: vec![crate::jobs::assembly::ArchiveMember {
-                    name: "sample.mkv".to_string(),
-                    first_volume: 0,
-                    last_volume: 0,
-                    unpacked_size: 0,
-                }],
-                unresolved_spans: Vec::new(),
-            },
-        );
-    }
-    pipeline
-        .failed_extractions
-        .insert(job_id, HashSet::from(["archive.7z".to_string()]));
-
-    pipeline.check_job_completion(job_id).await;
-
-    {
-        let state = pipeline.jobs.get(&job_id).unwrap();
-        assert!(state.assembly.archive_topology_for("archive.7z").is_none());
-    }
-
-    let file_id = NzbFileId {
-        job_id,
-        file_index: 0,
-    };
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state
-            .assembly
-            .file_mut(file_id)
-            .unwrap()
-            .commit_segment(0, 128)
-            .unwrap();
-    }
-
-    pipeline.try_update_7z_topology(job_id, file_id);
-
-    let state = pipeline.jobs.get(&job_id).unwrap();
-    let topo = state.assembly.archive_topology_for("archive.7z").unwrap();
-    assert!(topo.complete_volumes.contains(&0));
-    assert!(matches!(
-        state.assembly.set_extraction_readiness("archive.7z"),
-        crate::jobs::assembly::ExtractionReadiness::Ready
-    ));
-}
-
-#[tokio::test]
-async fn incomplete_download_promotes_parked_par2_metadata_before_failing() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(30079);
-    let payload_filename = "payload.mkv";
-    let index_filename = "repair.par2";
-    let spec = JobSpec {
-        name: "Promote Parked PAR2 Metadata".to_string(),
-        password: None,
-        total_bytes: 164,
-        category: None,
-        metadata: vec![],
-        files: vec![
-            FileSpec {
-                filename: payload_filename.to_string(),
-                role: FileRole::from_filename(payload_filename),
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: 100,
-                    message_id: "parked-par2-payload@example.com".to_string(),
-                }],
-            },
-            FileSpec {
-                filename: index_filename.to_string(),
-                role: FileRole::from_filename(index_filename),
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: 64,
-                    message_id: "parked-par2-index@example.com".to_string(),
-                }],
-            },
-        ],
-    };
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        let queued = state.download_queue.drain_all();
-        state.download_queue = DownloadQueue::new();
-        for work in queued {
-            if work.segment_id.file_id.file_index == 1 {
-                state.recovery_queue.push(work);
-            }
-        }
-        state.failed_bytes = 100;
-    }
-
-    pipeline.check_job_completion(job_id).await;
-
-    assert!(!matches!(
-        job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Failed { .. })
-    ));
-    let state = pipeline.jobs.get(&job_id).unwrap();
-    assert!(
-        state
-            .download_queue
-            .count_matching(|work| work.segment_id.file_id.file_index == 1)
-            > 0
-    );
-    assert_eq!(
-        pipeline
-            .par2_runtime(job_id)
-            .and_then(|runtime| runtime.files.get(&1))
-            .map(|file| file.promoted),
-        Some(true)
-    );
-}
-
-#[tokio::test]
-async fn direct_payload_par2_repair_completes_after_download_exhaustion() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(30080);
-    let payload_filename = "payload.mkv";
-    let index_filename = "repair.par2";
-    let recovery_filename = "repair.vol00+01.par2";
-    let original_payload: Vec<u8> = (0..128u32).map(|value| (value % 251) as u8).collect();
-    let mut damaged_payload = original_payload.clone();
-    for byte in &mut damaged_payload[64..128] {
-        *byte = 0;
-    }
-    let par2_bytes = build_test_par2_index(payload_filename, &original_payload, 64);
-    let recovery_bytes = vec![0xAA; 64];
-    let spec = JobSpec {
-        name: "Direct Payload PAR2 Repair".to_string(),
-        password: None,
-        total_bytes: (original_payload.len() + par2_bytes.len() + recovery_bytes.len()) as u64,
-        category: None,
-        metadata: vec![],
-        files: vec![
-            FileSpec {
-                filename: payload_filename.to_string(),
-                role: FileRole::from_filename(payload_filename),
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![
-                    segment_spec! {
-                        number: 0,
-                        bytes: 64,
-                        message_id: "payload-0@example.com".to_string(),
-                    },
-                    segment_spec! {
-                        number: 1,
-                        bytes: 64,
-                        message_id: "payload-1@example.com".to_string(),
-                    },
-                ],
-            },
-            FileSpec {
-                filename: index_filename.to_string(),
-                role: FileRole::from_filename(index_filename),
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: par2_bytes.len() as u32,
-                    message_id: "payload-index@example.com".to_string(),
-                }],
-            },
-            FileSpec {
-                filename: recovery_filename.to_string(),
-                role: FileRole::from_filename(recovery_filename),
-                groups: vec!["alt.binaries.test".to_string()],
-                posted_at_epoch: None,
-                segments: vec![segment_spec! {
-                    number: 0,
-                    bytes: recovery_bytes.len() as u32,
-                    message_id: "payload-recovery@example.com".to_string(),
-                }],
-            },
-        ],
-    };
-    let working_dir = insert_active_job(&mut pipeline, job_id, spec).await;
-
-    tokio::fs::write(working_dir.join(payload_filename), &damaged_payload)
-        .await
-        .unwrap();
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
-        state
-            .assembly
-            .file_mut(NzbFileId {
-                job_id,
-                file_index: 0,
-            })
-            .unwrap()
-            .commit_segment(0, 64)
-            .unwrap();
-    }
-    write_and_complete_file(&mut pipeline, job_id, 1, index_filename, &par2_bytes).await;
-    write_and_complete_file(&mut pipeline, job_id, 2, recovery_filename, &recovery_bytes).await;
-    install_test_par2_runtime(
-        &mut pipeline,
-        job_id,
-        build_repairable_par2_set(payload_filename, &original_payload, 64, 1),
-        &[
-            (1, index_filename, 0, false),
-            (2, recovery_filename, 1, true),
-        ],
-    );
-
-    pipeline.check_job_completion(job_id).await;
-    pump_pipeline_runtime_queues(&mut pipeline).await;
-
-    assert_eq!(
-        job_status_for_assert(&pipeline, job_id),
-        Some(JobStatus::Complete)
-    );
-    let output_dir = pipeline
-        .complete_dir
-        .join(crate::jobs::working_dir::sanitize_dirname(
-            "Direct Payload PAR2 Repair",
-        ));
-    let completed_payload = tokio::fs::read(output_dir.join(payload_filename))
-        .await
-        .unwrap();
-    assert_eq!(completed_payload, original_payload);
 }
 
 #[test]
@@ -1732,192 +1719,6 @@ fn runtime_transition_failpoint_mapping_uses_lane_transitions() {
 }
 
 #[tokio::test]
-async fn no_par2_retry_clears_detected_archive_identity_before_redownload() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(30078);
-    let filename = "51273aad56a8b904e96928935278a627";
-    let fixture_bytes = rar5_fixture_bytes("rar5_store.rar");
-    let spec = rar_job_spec(
-        "Obfuscated RAR Retry Clears Detection",
-        &[(filename.to_string(), fixture_bytes.clone())],
-    );
-    insert_active_job(&mut pipeline, job_id, spec).await;
-    pause_job_for_rar_fixture_setup(&mut pipeline, job_id);
-    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
-
-    write_and_complete_rar_volume(&mut pipeline, job_id, 0, filename, &fixture_bytes).await;
-
-    let file_id = NzbFileId {
-        job_id,
-        file_index: 0,
-    };
-    {
-        let state = pipeline.jobs.get(&job_id).unwrap();
-        let file = state.assembly.file(file_id).unwrap();
-        assert!(matches!(file.role(), FileRole::Unknown));
-        assert!(matches!(
-            pipeline.classified_role_for_file(job_id, file),
-            weaver_model::files::FileRole::RarVolume { .. }
-        ));
-        assert_eq!(
-            pipeline
-                .detected_archive_identity(job_id, file.file_id())
-                .map(|detected| detected.set_name.as_str()),
-            Some(filename)
-        );
-    }
-    assert_eq!(
-        pipeline
-            .db
-            .load_detected_archive_identities(job_id)
-            .unwrap()
-            .len(),
-        1
-    );
-
-    pipeline
-        .failed_extractions
-        .insert(job_id, HashSet::from([filename.to_string()]));
-
-    resume_job_downloading_for_test(&mut pipeline, job_id);
-    pipeline.check_job_completion(job_id).await;
-
-    {
-        let state = pipeline.jobs.get(&job_id).unwrap();
-        let file = state.assembly.file(file_id).unwrap();
-        assert!(matches!(state.status, JobStatus::Downloading));
-        assert_eq!(state.download_queue.len(), 1);
-        assert!(!file.is_complete());
-        assert!(matches!(
-            pipeline.classified_role_for_file(job_id, file),
-            FileRole::Unknown
-        ));
-        assert!(
-            pipeline
-                .detected_archive_identity(job_id, file.file_id())
-                .is_none()
-        );
-        assert!(state.assembly.archive_topology_for(filename).is_none());
-    }
-    assert!(
-        pipeline
-            .db
-            .load_detected_archive_identities(job_id)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        pipeline
-            .db
-            .load_all_archive_headers(job_id)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(
-        pipeline
-            .db
-            .load_all_rar_volume_facts(job_id)
-            .unwrap()
-            .is_empty()
-    );
-    assert!(!pipeline.failed_extractions.contains_key(&job_id));
-    assert!(pipeline.normalization_retried.contains(&job_id));
-
-    write_and_complete_file(&mut pipeline, job_id, 0, filename, &fixture_bytes).await;
-
-    {
-        let state = pipeline.jobs.get(&job_id).unwrap();
-        let file = state.assembly.file(file_id).unwrap();
-        assert!(matches!(
-            pipeline.classified_role_for_file(job_id, file),
-            weaver_model::files::FileRole::RarVolume { .. }
-        ));
-        assert_eq!(
-            pipeline
-                .detected_archive_identity(job_id, file.file_id())
-                .map(|detected| detected.set_name.as_str()),
-            Some(filename)
-        );
-    }
-    assert_eq!(
-        pipeline
-            .db
-            .load_detected_archive_identities(job_id)
-            .unwrap()
-            .len(),
-        1
-    );
-}
-
-// A probe that is still in flight when the last segment settles must not hold
-// the completion checkpoint.
-//
-// The probe estimates a release's health from a sample while bytes are still
-// arriving. Once the download pass ends, the job's own terminal states are the
-// answer, and waiting on the probe only postpones the checkpoint — and PAR2
-// recovery promotion with it — for the probe's whole soft timeout.
-#[tokio::test]
-async fn drained_download_pass_retires_the_probe_instead_of_waiting_for_it() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let job_id = JobId(30024);
-    let spec = standalone_job_spec(
-        "Probe Completion Resume",
-        &[
-            ("probe-a.bin".to_string(), 100),
-            ("probe-b.bin".to_string(), 100),
-            ("probe-c.bin".to_string(), 100),
-        ],
-    );
-    insert_active_job(&mut pipeline, job_id, spec).await;
-
-    pipeline.activate_health_probes(job_id);
-    pipeline.active_download_passes.insert(job_id);
-    {
-        let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.download_queue = DownloadQueue::new();
-        state.recovery_queue = DownloadQueue::new();
-    }
-
-    pipeline.maybe_finish_download_pass(job_id);
-
-    {
-        let state = pipeline.jobs.get(&job_id).unwrap();
-        assert!(!state.health_probing, "the probe should have been retired");
-        assert!(matches!(state.status, JobStatus::Downloading));
-    }
-    assert!(
-        pipeline.pending_completion_checks.contains(&job_id),
-        "the checkpoint must not wait for the probe once the pass has drained"
-    );
-
-    // The abandoned round lands late; it must change nothing.
-    pipeline.pending_completion_checks.clear();
-    pipeline.handle_probe_update(ProbeUpdate {
-        job_id,
-        probe_round: 0,
-        total: 1,
-        missed: 1,
-        unverified: 0,
-        done: true,
-        inconclusive: false,
-    });
-
-    let state = pipeline.jobs.get(&job_id).unwrap();
-    assert!(!state.health_probing);
-    assert!(matches!(state.status, JobStatus::Downloading));
-    assert_eq!(
-        state.probe_projected_failed_bytes, 0,
-        "a retired round must not project damage onto a settled ledger"
-    );
-    assert!(
-        pipeline.pending_completion_checks.is_empty(),
-        "a retired round must not re-drive the checkpoint"
-    );
-}
-
-#[tokio::test]
 async fn reconcile_job_progress_does_not_rewrite_status_from_lanes() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
@@ -1933,7 +1734,6 @@ async fn reconcile_job_progress_does_not_rewrite_status_from_lanes() {
 
     {
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
-        state.health_probing = false;
         state.download_state = crate::jobs::model::DownloadState::Checking;
         state.refresh_legacy_status();
     }
@@ -1946,105 +1746,6 @@ async fn reconcile_job_progress_does_not_rewrite_status_from_lanes() {
         crate::jobs::model::DownloadState::Checking
     ));
     assert!(matches!(state.status, JobStatus::Checking));
-}
-
-#[tokio::test]
-async fn restore_job_reemits_open_download_finalization_and_drains_it() {
-    let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let mut events = pipeline.event_tx.subscribe();
-    let job_id = JobId(30094);
-    let spec = standalone_job_spec(
-        "Restore Finalizing Download",
-        &[("payload.bin".to_string(), 100)],
-    );
-    let working_dir = temp_dir.path().join("restore-finalizing-download");
-    tokio::fs::create_dir_all(&working_dir).await.unwrap();
-
-    pipeline
-        .db
-        .insert_job_events(&[
-            crate::JobEvent {
-                job_id: job_id.0,
-                timestamp: 1,
-                kind: "JobCreated".to_string(),
-                message: "created".to_string(),
-                file_id: None,
-            },
-            crate::JobEvent {
-                job_id: job_id.0,
-                timestamp: 2,
-                kind: "DownloadFinished".to_string(),
-                message: "download finished".to_string(),
-                file_id: Some(
-                    crate::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER.to_string(),
-                ),
-            },
-        ])
-        .unwrap();
-
-    pipeline
-        .restore_job(RestoreJobRequest {
-            job_id,
-            job_hash: [0; 32],
-            spec,
-            file_progress: HashMap::new(),
-            complete_files: HashSet::from([NzbFileId {
-                job_id,
-                file_index: 0,
-            }]),
-            detected_archives: HashMap::new(),
-            file_identities: HashMap::new(),
-            extracted_members: HashSet::new(),
-            status: JobStatus::Downloading,
-            download_state: Some(crate::jobs::model::DownloadState::Complete),
-            post_state: Some(crate::jobs::model::PostState::Idle),
-            run_state: Some(crate::jobs::model::RunState::Active),
-            queued_repair_at_epoch_ms: None,
-            queued_extract_at_epoch_ms: None,
-            paused_resume_status: None,
-            paused_resume_download_state: None,
-            paused_resume_post_state: None,
-            working_dir,
-        })
-        .await
-        .unwrap();
-
-    assert!(pipeline.jobs_finalizing_download.contains(&job_id));
-
-    pump_pipeline_runtime_queues(&mut pipeline).await;
-
-    let drained_events = drain_job_events(&mut events, job_id);
-    assert!(
-        drained_events.iter().any(|event| {
-            matches!(
-                event,
-                PipelineEvent::DownloadFinished {
-                    finalization_pending: true,
-                    ..
-                }
-            )
-        }),
-        "events: {drained_events:?}"
-    );
-    let finish_idx = drained_events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                PipelineEvent::DownloadFinished {
-                    finalization_pending: true,
-                    ..
-                }
-            )
-        })
-        .expect("restored download finished event");
-    let drained_idx = drained_events
-        .iter()
-        .position(|event| matches!(event, PipelineEvent::DownloadPipelineDrained { .. }))
-        .expect("download pipeline drained event");
-    assert!(finish_idx < drained_idx, "events: {drained_events:?}");
-    assert!(!pipeline.jobs_finalizing_download.contains(&job_id));
 }
 
 #[tokio::test]
@@ -2061,11 +1762,8 @@ async fn restore_paused_postprocessing_target_normalizes_to_downloading() {
             job_id,
             job_hash: [0; 32],
             spec,
-            file_progress: HashMap::new(),
-            complete_files: HashSet::new(),
             detected_archives: HashMap::new(),
             file_identities: HashMap::new(),
-            extracted_members: HashSet::new(),
             status: JobStatus::Paused,
             download_state: None,
             post_state: None,
@@ -2076,6 +1774,7 @@ async fn restore_paused_postprocessing_target_normalizes_to_downloading() {
             paused_resume_download_state: None,
             paused_resume_post_state: None,
             working_dir,
+            restart: None,
         })
         .await
         .unwrap();
@@ -2131,7 +1830,18 @@ async fn active_rate_limit_does_not_prelease_multiple_bodies() {
     pipeline.dispatch_downloads();
 
     assert_eq!(pipeline.active_downloads, 1);
-    assert_eq!(pipeline.jobs.get(&job_id).unwrap().download_queue.len(), 3);
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        3
+    );
 }
 
 #[tokio::test]
@@ -2237,6 +1947,7 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
     pipeline.download_lane_owners.insert(
         lane_id,
         DownloadLaneOwner {
+            body_activity: Vec::new(),
             job_id,
             mode: DownloadLaneMode::Sequential,
             completion_critical: false,
@@ -2245,6 +1956,7 @@ async fn auto_pause_stalled_download_releases_blocking_runtime() {
             outstanding: HashMap::from([(
                 segment_id,
                 DownloadWork {
+                    counters: None,
                     segment_id,
                     message_id: crate::jobs::ids::MessageId::new("stalled-article"),
                     groups: Arc::from(vec![]),
@@ -2306,6 +2018,76 @@ async fn auto_pause_ignores_stale_jobs_without_inflight_downloads() {
         Some(JobStatus::Downloading)
     );
     assert!(pipeline.active_download_passes.contains(&job_id));
+}
+
+#[tokio::test]
+async fn body_activity_keeps_only_its_current_job_alive_without_article_results() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let live = JobId(31234);
+    let silent = JobId(31235);
+    let stale = JobId(31236);
+    let bytes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let old_bytes = Arc::new(std::sync::atomic::AtomicU64::new(1));
+    for job in [live, silent, stale] {
+        pipeline.jobs.insert(
+            job,
+            minimal_job_state(job, "paced", temp_dir.path().join(job.0.to_string())),
+        );
+        pipeline.active_downloads_by_job.insert(job, 1);
+    }
+    pipeline.download_lane_owners.insert(
+        Pipeline::next_download_lane_id(),
+        DownloadLaneOwner {
+            body_activity: vec![
+                (live, pipeline.pool_generation, Arc::downgrade(&bytes)),
+                (
+                    stale,
+                    pipeline.pool_generation.wrapping_add(1),
+                    Arc::downgrade(&old_bytes),
+                ),
+            ],
+            job_id: live,
+            mode: DownloadLaneMode::Sequential,
+            completion_critical: false,
+            server_idx: Some(0),
+            connection: false,
+            outstanding: HashMap::new(),
+        },
+    );
+    for _ in 0..4 {
+        for job in [live, silent, stale] {
+            pipeline.job_last_download_activity.insert(
+                job,
+                std::time::Instant::now()
+                    - STALLED_DOWNLOAD_IDLE_THRESHOLD
+                    - Duration::from_secs(1),
+            );
+        }
+        bytes.fetch_add(128, std::sync::atomic::Ordering::Relaxed);
+        pipeline.auto_pause_stalled_downloads();
+        assert_eq!(pipeline.jobs[&live].status, JobStatus::Downloading);
+        assert_eq!(pipeline.jobs[&silent].status, JobStatus::Paused);
+        assert_eq!(pipeline.jobs[&stale].status, JobStatus::Paused);
+    }
+    pipeline.job_last_download_activity.insert(
+        live,
+        std::time::Instant::now() - STALLED_DOWNLOAD_IDLE_THRESHOLD - Duration::from_secs(1),
+    );
+    pipeline.auto_pause_stalled_downloads();
+    assert_eq!(pipeline.jobs[&live].status, JobStatus::Paused);
+
+    // Resuming the same ID need not replace the pool. A retired lease can
+    // still return bytes, but only leases admitted after retirement count.
+    pipeline.resume_job_runtime(live).unwrap();
+    pipeline.active_downloads_by_job.insert(live, 1);
+    pipeline.job_last_download_activity.insert(
+        live,
+        std::time::Instant::now() - STALLED_DOWNLOAD_IDLE_THRESHOLD - Duration::from_secs(1),
+    );
+    bytes.fetch_add(128, std::sync::atomic::Ordering::Relaxed);
+    pipeline.auto_pause_stalled_downloads();
+    assert_eq!(pipeline.jobs[&live].status, JobStatus::Paused);
 }
 
 #[tokio::test]
@@ -2489,7 +2271,7 @@ async fn changing_propagation_delay_updates_the_hold_and_zero_dispatches_immedia
     )
     .await;
     pipeline.dispatch_downloads();
-    pipeline.publish_snapshot();
+    pipeline.report_all_for_test();
     let held = pipeline.shared_state.get_job(job_id).unwrap();
     assert_eq!(held.download_state, crate::DownloadState::Queued);
     assert_eq!(
@@ -2498,14 +2280,12 @@ async fn changing_propagation_delay_updates_the_hold_and_zero_dispatches_immedia
     );
     let initial_deadline = held.download_retry_at_epoch_ms.unwrap();
     let initial_hold = pipeline.propagation_ready_at[&job_id];
-    let (reply, done) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::SetPropagationDelay {
-            seconds: 600,
-            reply,
-        })
-        .await;
-    done.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .set_propagation_delay(600)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert_eq!(
         pipeline.propagation_ready_at[&job_id], initial_hold,
         "saving unchanged settings must preserve the timer"
@@ -2521,7 +2301,7 @@ async fn changing_propagation_delay_updates_the_hold_and_zero_dispatches_immedia
         count
     };
     assert_eq!(drain_wait_updates(&mut events), 1);
-    pipeline.publish_snapshot();
+    pipeline.report_all_for_test();
     assert_eq!(drain_wait_updates(&mut events), 0);
     assert_eq!(
         pipeline
@@ -2532,14 +2312,13 @@ async fn changing_propagation_delay_updates_the_hold_and_zero_dispatches_immedia
         Some(initial_deadline)
     );
 
-    let (reply, done) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::SetPropagationDelay {
-            seconds: 1200,
-            reply,
-        })
-        .await;
-    done.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .set_propagation_delay(1200)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
+    pipeline.dispatch_downloads();
     let held = pipeline.shared_state.get_job(job_id).unwrap();
     assert!(held.download_retry_at_epoch_ms.unwrap() > initial_deadline + 500_000.0);
     assert_eq!(pipeline.active_downloads, 0);
@@ -2561,11 +2340,13 @@ async fn changing_propagation_delay_updates_the_hold_and_zero_dispatches_immedia
             .any(|job| job.job_id == job_id && job.download_wait_reason.is_some())
     );
 
-    let (reply, done) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::SetPropagationDelay { seconds: 0, reply })
-        .await;
-    done.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .set_propagation_delay(0)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
+    pipeline.dispatch_downloads();
     assert_eq!(pipeline.active_downloads, 1);
     assert!(pipeline.propagation_ready_at.is_empty());
     assert!(pipeline.next_propagation_delay().is_none());
@@ -2627,7 +2408,15 @@ async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
     // half of what the gate promises.
     set_job_status_for_test(&mut pipeline, job_id, JobStatus::Queued);
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         1,
         "one file, one segment, waiting to be issued"
     );
@@ -2639,7 +2428,15 @@ async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
         "a deferred job must not put an article on the wire"
     );
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         1,
         "and its segment must still be queued, not leased"
     );
@@ -2658,7 +2455,15 @@ async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
         "once the post has propagated the same pass dispatches it"
     );
     assert_eq!(
-        pipeline.jobs.get(&job_id).unwrap().download_queue.len(),
+        pipeline
+            .jobs
+            .get(&job_id)
+            .unwrap()
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
         0,
         "and the segment leaves the queue"
     );
@@ -2872,29 +2677,21 @@ async fn deferral_survives_pause_resume_and_leaves_nothing_behind_on_delete() {
 async fn an_operator_speed_limit_replaces_the_scheduled_one_until_the_next_rule_fires() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
-    let apply = |action| {
-        let (reply, received) = oneshot::channel();
-        (
-            SchedulerCommand::ApplyScheduleAction { action, reply },
-            received,
-        )
-    };
-
-    let (command, received) = apply(global_speed(128 * 1024));
-    pipeline.handle_command(command).await;
-    received.await.unwrap();
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle
+        .apply_schedule_action(global_speed(128 * 1024))
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert_eq!(pipeline.rate_limiter.rate(), 128 * 1024);
 
     // The operator sets a limit: it is in force at once.
-    let (reply, received) = oneshot::channel();
-    pipeline
-        .handle_command(SchedulerCommand::SetSpeedLimit {
-            bytes_per_sec: 640 * 1024,
-            replaces_schedule: true,
-            reply,
-        })
-        .await;
-    received.await.unwrap();
+    pipeline.report_all_for_test();
+    SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone())
+        .set_speed_limit(640 * 1024)
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert_eq!(pipeline.scheduled_rate_limit, None);
     assert_eq!(pipeline.configured_rate_limit, 640 * 1024);
     assert_eq!(pipeline.rate_limiter.rate(), 640 * 1024);
@@ -2904,9 +2701,11 @@ async fn an_operator_speed_limit_replaces_the_scheduled_one_until_the_next_rule_
     );
 
     // The next scheduled speed rule takes over again.
-    let (command, received) = apply(global_speed(256 * 1024));
-    pipeline.handle_command(command).await;
-    received.await.unwrap();
+    handle
+        .apply_schedule_action(global_speed(256 * 1024))
+        .await
+        .unwrap();
+    pipeline.apply_queue_intents().await;
     assert_eq!(pipeline.scheduled_rate_limit, Some(256 * 1024));
     assert_eq!(pipeline.rate_limiter.rate(), 256 * 1024);
     assert_eq!(pipeline.configured_rate_limit, 640 * 1024);

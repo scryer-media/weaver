@@ -21,6 +21,8 @@ import {
   RESUME_JOB_MUTATION,
 } from "@/graphql/queries";
 import { authHeaders } from "@/graphql/client";
+import { copyText } from "@/lib/clipboard";
+import { criticalHealthMilli, HEALTH_TONE_CLASS, healthTone } from "@/lib/health-tone";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { openUrlAsDownload, readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
@@ -61,7 +63,7 @@ import { buildTimelineView, downloadingMs, type JobTimelineData } from "../data/
 import { useNextData } from "../data/next-data";
 import { useSharedStructure } from "../data/share";
 import { countLabel } from "../i18n/labels";
-import { NextShell, RailBlock } from "../shell/NextShell";
+import { NextShell } from "../shell/NextShell";
 import { SupportReportActions } from "../features/SupportReportActions";
 
 /**
@@ -320,6 +322,12 @@ function JobDetailContent() {
   const terminal = done || failed;
   const color = statusColor(progress.status);
   const percent = job.progress * 100;
+  // While queued, the payload is what the download is out to bring, so a
+  // clean post fills it whatever recovery stayed held back.
+  const payload =
+    job.wantedBytes && job.wantedBytes > 0
+      ? { done: job.wantedBytes - Math.min(job.remainingBytes ?? 0, job.wantedBytes), total: job.wantedBytes }
+      : { done: job.downloadedBytes, total: job.totalBytes };
   const phase = ratePhase(job.phaseProgress);
   const stageIds = new Set(timeline?.stages.map((stage) => stage.id) ?? []);
   const verified = stageIds.has("VERIFYING");
@@ -406,8 +414,9 @@ function JobDetailContent() {
           `${formatClockSeconds(event.timestamp)}  ${event.kind.padEnd(32)}  ${event.message}`,
       )
       .join("\n");
-    void navigator.clipboard?.writeText(text);
-    setReport(countLabel(t, "next.job.copiedEvents", events.length));
+    void copyText(text).then((taken) =>
+      setReport(taken ? countLabel(t, "next.job.copiedEvents", events.length) : t("next.system.copyFailed")),
+    );
   };
 
   return (
@@ -531,22 +540,6 @@ function JobDetailContent() {
           </div>
         </header>
       }
-      railFooter={
-        <RailBlock eyebrow={t("next.job.savedBandwidth")}>
-          <div className="text-[20px] font-semibold tracking-[-0.02em] text-wv-accent">
-            {job.optionalRecoveryBytes > 0 ? formatSize(savedBytes) : EM_DASH}
-          </div>
-          <div className="font-wv-mono text-[10.5px] leading-[1.5] text-wv-faint">
-            {job.optionalRecoveryBytes === 0
-              ? t("next.job.saved.noSet")
-              : job.optionalRecoveryDownloadedBytes === 0
-                ? t("next.job.saved.untouched")
-                : savedBytes === 0
-                  ? t("next.job.saved.wholeSet")
-                  : t("next.job.saved.partSet")}
-          </div>
-        </RailBlock>
-      }
       statusNote={
         report ?? (
           <span className="flex min-w-0 items-center gap-[7px]">
@@ -595,9 +588,9 @@ function JobDetailContent() {
             valueClassName={
               !verified && !done && !failed
                 ? "text-wv-muted"
-                : job.health >= 1000
-                  ? "text-wv-accent"
-                  : "text-wv-error"
+                : HEALTH_TONE_CLASS[
+                    healthTone(job.health, criticalHealthMilli(job.totalBytes, job.optionalRecoveryBytes))
+                  ]
             }
             note={
               verified || done || failed
@@ -713,8 +706,11 @@ function JobDetailContent() {
                   type="button"
                   title={t("next.job.copyPathTitle")}
                   onClick={() => {
-                    void navigator.clipboard?.writeText(file.path);
-                    setReport(t("next.job.copiedPath", { name: file.name }));
+                    void copyText(file.path).then((taken) =>
+                      setReport(
+                        taken ? t("next.job.copiedPath", { name: file.name }) : t("next.system.copyFailed"),
+                      ),
+                    );
                   }}
                   className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg"
                 >
@@ -895,8 +891,8 @@ function JobDetailContent() {
           <DetailBlock id="recovery" title={t("next.job.bytes")} tone="panel" bodyClassName="gap-[11px]">
             <ShareRow
               label={t("next.job.payload")}
-              note={t("next.job.sizeOf", { done: formatSize(job.downloadedBytes), total: formatSize(job.totalBytes) })}
-              percent={job.totalBytes > 0 ? (job.downloadedBytes / job.totalBytes) * 100 : 0}
+              note={t("next.job.sizeOf", { done: formatSize(payload.done), total: formatSize(payload.total) })}
+              percent={payload.total > 0 ? (payload.done / payload.total) * 100 : 0}
               color={color}
             />
             <ShareRow

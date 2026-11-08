@@ -238,6 +238,105 @@ async fn a_recovery_gate_refusal_is_not_capacity_saturation() {
         .expect("a recovered server takes warm dials again");
 }
 
+// A server quarantined because it refused the credentials is a verdict for
+// the work, not a wait: the acquire answers with the refusal, names the
+// server, and does not hand the work back. The same acquire on a server
+// quarantined by transport failures still waits on the recovery gate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_credentials_quarantine_refuses_where_a_transport_quarantine_waits() {
+    use crate::client::BlockingBodyLaneAcquireError;
+
+    let client = || {
+        NntpClient::new(NntpClientConfig {
+            servers: vec![ServerPoolConfig {
+                server: ServerConfig {
+                    host: "127.0.0.1".into(),
+                    port: 1,
+                    tls: false,
+                    ..Default::default()
+                },
+                stable_id: StableServerId(12),
+                max_connections: 4,
+                ..Default::default()
+            }],
+            max_idle_age: Duration::from_secs(300),
+            max_retries_per_server: 0,
+            soft_timeout: Duration::from_secs(1),
+        })
+    };
+
+    let refused = client();
+    refused.pool().health.lock().await.record_failure(0, true);
+    assert!(refused.pool().refuses_credentials(0));
+    assert!(matches!(
+        refused
+            .pool()
+            .try_acquire_blocking_permit_for_work(ServerId(0), true),
+        Err(NntpError::AuthenticationRejected)
+    ));
+    let Err(error) = refused.try_acquire_blocking_body_lane(&[], &[]) else {
+        panic!("a server refusing credentials opened a lane");
+    };
+    assert!(
+        matches!(
+            error,
+            BlockingBodyLaneAcquireError::CredentialsRefused {
+                server: ServerId(0),
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.kind(), "credentials_refused");
+    assert_eq!(error.server(), Some(ServerId(0)));
+    assert!(!error.should_requeue_owned_work());
+    assert!(
+        error
+            .nntp_error()
+            .is_some_and(NntpError::is_credentials_refusal)
+    );
+    // Excluded for the article, the server is no answer at all.
+    assert!(matches!(
+        refused.try_acquire_blocking_body_lane(&[], &[0]),
+        Err(BlockingBodyLaneAcquireError::NoEligibleServer)
+    ));
+    // Once the disable runs out the one probe is due, and the refusal is a
+    // wait like any other until the probe answers.
+    refused.pool().recovery_gates[0].expire_now();
+    assert!(!refused.pool().refuses_credentials(0));
+    let probe = refused
+        .pool()
+        .try_acquire_blocking_permit_for_work(ServerId(0), true)
+        .expect("the lapsed refusal admits its probe");
+    assert!(matches!(
+        refused
+            .pool()
+            .try_acquire_blocking_permit_for_work(ServerId(0), true),
+        Err(NntpError::ServerRecovering)
+    ));
+    drop(probe);
+
+    let outage = client();
+    for _ in 0..10 {
+        outage.pool().health.lock().await.record_failure(0, false);
+    }
+    assert!(outage.pool().requires_recovery(0));
+    assert!(!outage.pool().refuses_credentials(0));
+    assert!(matches!(
+        outage
+            .pool()
+            .try_acquire_blocking_permit_for_work(ServerId(0), true),
+        Err(NntpError::ServerRecovering)
+    ));
+    let Err(error) = outage.try_acquire_blocking_body_lane(&[], &[]) else {
+        panic!("an outage-quarantined server opened a lane");
+    };
+    assert!(
+        error.server().is_none() && error.kind() != "credentials_refused",
+        "{error:?}"
+    );
+}
+
 // The label the refusal travels under is the whole point of the variant.
 #[test]
 fn a_recovery_refusal_reports_its_own_kind() {
@@ -254,4 +353,102 @@ fn a_recovery_refusal_reports_its_own_kind() {
         "the probe clears on its own, so the work waits on the owned lanes"
     );
     assert!(recovering.nntp_error().is_none());
+}
+
+// The probe proves the server is up the moment it answers the demanded BODY
+// with its 2xx status line. The quarantine lifts while the body is still
+// streaming, however long the rest of the transfer then takes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn recovery_probe_clears_the_quarantine_on_its_answer_before_the_body_ends() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (finish, mut finish_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        let (reader, mut writer) = socket.into_split();
+        writer.write_all(b"200 ready\r\n").await.unwrap();
+        let mut lines = BufReader::new(reader).lines();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if line == "CAPABILITIES" {
+                writer
+                    .write_all(b"101 capabilities\r\nVERSION 2\r\nPIPELINING\r\n.\r\n")
+                    .await
+                    .unwrap();
+            } else {
+                assert!(line.starts_with("BODY "));
+                writer
+                    .write_all(b"222 1 <probe@test>\r\n=ybegin line=128 size=2 name=x\r\nk\r\n")
+                    .await
+                    .unwrap();
+                writer.flush().await.unwrap();
+                finish_rx.recv().await.unwrap();
+                writer
+                    .write_all(b"k\r\n=yend size=2\r\n.\r\n")
+                    .await
+                    .unwrap();
+            }
+        }
+    });
+    let client = NntpClient::new(NntpClientConfig {
+        servers: vec![ServerPoolConfig {
+            server: ServerConfig {
+                host: address.ip().to_string(),
+                port: address.port(),
+                tls: false,
+                ..Default::default()
+            },
+            stable_id: StableServerId(8),
+            max_connections: 2,
+            ..Default::default()
+        }],
+        max_idle_age: Duration::from_secs(300),
+        max_retries_per_server: 0,
+        // No runner waits this long: the body's hold ends only when the
+        // test releases it. `Duration::MAX` itself overflows the lane's
+        // acquire deadline.
+        soft_timeout: Duration::from_secs(365 * 24 * 60 * 60),
+    });
+    let pool = client.pool();
+    for _ in 0..10 {
+        pool.health.lock().await.record_failure(0, false);
+    }
+    assert!(pool.requires_recovery(0));
+    pool.recovery_gates[0].expire_now();
+    let mut changes = pool.recovery_gates[0].subscribe();
+    let mut lane = client.acquire_body_lane(ServerId(0), &[]).await.unwrap();
+    assert!(pool.requires_recovery(0), "handshake is insufficient");
+    let fetch = tokio::spawn(async move {
+        let mut decoded = None;
+        lane.fetch_decoded_pipeline(&["<probe@test>"], 1, |_, trace, _| {
+            decoded = Some(trace.result.is_ok());
+            async {}
+        })
+        .await;
+        (lane, decoded)
+    });
+
+    while pool.requires_recovery(0) {
+        changes.changed().await.unwrap();
+    }
+    assert!(
+        !fetch.is_finished(),
+        "the quarantine lifted on the answer, before the body ended"
+    );
+    assert!(
+        pool.try_acquire_blocking_permit_for_work(ServerId(0), false)
+            .is_ok(),
+        "a lifted quarantine admits ordinary work again"
+    );
+
+    finish.send(()).await.unwrap();
+    let (lane, decoded) = fetch.await.unwrap();
+    assert_eq!(decoded, Some(true));
+    assert!(!pool.requires_recovery(0));
+    assert_eq!(
+        *pool.health.lock().await.server(0).state(),
+        crate::health::ServerState::Healthy
+    );
+    drop(lane);
+    pool.drain_all_idle().await;
+    server.await.unwrap();
 }

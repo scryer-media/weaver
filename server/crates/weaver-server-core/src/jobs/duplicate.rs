@@ -174,7 +174,10 @@ impl JobFingerprint {
                     framed_hasher("weaver.job-fingerprint/strict-article-layout/file/v1");
                 write_count(&mut hasher, file.segments.len());
                 for segment in &file.segments {
-                    write_string(&mut hasher, &segment.message_id);
+                    // A part listed once hashes as it always has.
+                    for id in segment.message_ids.all() {
+                        write_string(&mut hasher, id);
+                    }
                     // The parser validates and normalizes this u32 declared
                     // byte count. Encode it as a fixed-width u64 to keep the
                     // layout forward-compatible without platform dependence.
@@ -201,7 +204,9 @@ impl JobFingerprint {
                 let mut hasher = framed_hasher("weaver.job-fingerprint/article-layout/file/v1");
                 write_count(&mut hasher, file.segments.len());
                 for segment in &file.segments {
-                    write_string(&mut hasher, &segment.message_id);
+                    for id in segment.message_ids.all() {
+                        write_string(&mut hasher, id);
+                    }
                 }
                 *hasher.finalize().as_bytes()
             })
@@ -223,7 +228,8 @@ impl JobFingerprint {
             .flat_map(|file| {
                 file.segments
                     .iter()
-                    .map(|segment| segment.message_id.as_str())
+                    .flat_map(|segment| segment.message_ids.all())
+                    .map(String::as_str)
             })
             .collect::<BTreeSet<_>>();
         let mut hasher = framed_hasher(FingerprintKind::ArticleSet.domain());
@@ -769,7 +775,7 @@ mod tests {
                             ordinal: ordinal as u32,
                             article_number: ordinal as u32 + 1,
                             bytes,
-                            message_id: message_id.to_string(),
+                            message_ids: message_id.into(),
                         })
                         .collect(),
                 })
@@ -812,6 +818,26 @@ mod tests {
             vec![("one@Id", 1), ("one@Id", 1)],
         ]);
         assert_eq!(fingerprints(&first)[2], fingerprints(&reordered)[2]);
+    }
+
+    // A part the NZB listed under two ids: the same NZB imported twice is
+    // the same job, and every id is part of what it is compared by.
+    #[test]
+    fn a_part_listed_twice_compares_by_every_id() {
+        let posted_twice = || {
+            let mut spec = spec(vec![vec![("one@Id", 1), ("two@Id", 2)]]);
+            spec.files[0].segments[0].message_ids =
+                crate::jobs::MessageIds::new(vec!["one@Id".to_string(), "again@Id".to_string()]);
+            spec
+        };
+        assert_eq!(fingerprints(&posted_twice()), fingerprints(&posted_twice()));
+
+        let posted_once = spec(vec![vec![("one@Id", 1), ("two@Id", 2)]]);
+        let (twice, once) = (fingerprints(&posted_twice()), fingerprints(&posted_once));
+        assert_ne!(twice[0], once[0]);
+        assert_ne!(twice[1], once[1]);
+        assert_ne!(twice[2], once[2]);
+        assert_eq!(twice[3], once[3]);
     }
 
     #[test]

@@ -272,7 +272,7 @@ const screen = query.has("routes")
 const live = {
   isPaused: false,
   speed: query.has("gauge") ? 12 * 1024 * 1024 : 0,
-  queue: { jobs: query.has("downloading") ? [{ id: 7, status: "DOWNLOADING" }] : [] } as unknown as NextData["queue"],
+  queue: { stateCounts: query.has("downloading") ? [{ state: "DOWNLOADING", count: 1 }] : [] } as NextData["queue"],
 } as NextData;
 const shell = { search: "", actionsRef: { current: null }, setFlags: () => {}, controlsHost: document.getElementById("controls") };
 createRoot(document.getElementById("root")!).render(<StrictMode><Provider value={client}><TranslateContext.Provider value={{ t, uiLanguage: "eng", selectedLanguage: { code: "eng", label: "English" }, setLanguagePreference: () => {} }}><MemoryRouter initialEntries={[query.has("routes") ? "/settings/networking/routes" : "/settings/networking/speed?consumer=server:1"]}><SettingsShellProvider {...shell}><NextDataContext.Provider value={live}><main className="mx-auto flex max-w-[1400px] flex-col p-8">{screen}</main></NextDataContext.Provider></SettingsShellProvider></MemoryRouter></TranslateContext.Provider></Provider></StrictMode>);

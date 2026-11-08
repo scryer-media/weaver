@@ -599,3 +599,58 @@ func deleteArticleIDsAt(host, port string, messageIDs []string) error {
 	_, _ = conn.Write([]byte("QUIT\r\n"))
 	return nil
 }
+
+// missingArticleIDsAt asks the server at host:port for each message id with
+// STAT, on the harness's control channel, and returns the ids it answers
+// absent (430). Any other answer is an error: only 223 and 430 decide.
+func missingArticleIDsAt(host, port string, messageIDs []string) ([]string, error) {
+	if len(messageIDs) == 0 {
+		return nil, nil
+	}
+
+	addr := net.JoinHostPort(host, port)
+	conn, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("dial %s: %w", addr, err)
+	}
+	defer conn.Close()
+
+	r := bufio.NewReader(conn)
+	conn.SetReadDeadline(time.Now().Add(15 * time.Second))
+	greeting, err := r.ReadString('\n')
+	if err != nil {
+		return nil, fmt.Errorf("read greeting: %w", err)
+	}
+	if !strings.HasPrefix(greeting, "200") {
+		return nil, fmt.Errorf("unexpected greeting: %s", strings.TrimSpace(greeting))
+	}
+	if err := authenticateNNTPConnection(conn, r, addr); err != nil {
+		return nil, err
+	}
+
+	var missing []string
+	for _, messageID := range messageIDs {
+		cmd := fmt.Sprintf("STAT <%s>\r\n", messageID)
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		if _, err := conn.Write([]byte(cmd)); err != nil {
+			return nil, fmt.Errorf("write STAT for <%s>: %w", messageID, err)
+		}
+
+		conn.SetReadDeadline(time.Now().Add(20 * time.Second))
+		resp, err := r.ReadString('\n')
+		if err != nil {
+			return nil, fmt.Errorf("read STAT response for <%s>: %w", messageID, err)
+		}
+		resp = strings.TrimSpace(resp)
+		switch {
+		case strings.HasPrefix(resp, "223"):
+		case strings.HasPrefix(resp, "430"):
+			missing = append(missing, messageID)
+		default:
+			return nil, fmt.Errorf("STAT for <%s> on %s: %s", messageID, addr, resp)
+		}
+	}
+
+	_, _ = conn.Write([]byte("QUIT\r\n"))
+	return missing, nil
+}

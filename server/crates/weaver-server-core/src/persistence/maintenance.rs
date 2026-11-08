@@ -270,7 +270,7 @@ async fn run_sqlite_maintenance_pass(
                     freelist_count_before = before.freelist_count,
                     "starting sqlite full vacuum during idle maintenance"
                 );
-                match SqlRuntime::execute(datastore.read_exec(), "VACUUM", &[]).await {
+                match SqlRuntime::execute(datastore.write_exec(), "VACUUM", &[]).await {
                     Ok(_) => {
                         write_last_full_vacuum_success_epoch_secs(datastore, now_epoch_secs)
                             .await?;
@@ -310,7 +310,7 @@ async fn run_sqlite_maintenance_pass(
                 let batch = options.incremental_batch_pages.max(1).min(page_budget);
                 let previous_freelist = current.freelist_count;
                 SqlRuntime::execute(
-                    datastore.read_exec(),
+                    datastore.write_exec(),
                     &format!("PRAGMA incremental_vacuum({batch})"),
                     &[],
                 )
@@ -390,7 +390,7 @@ async fn run_postgres_maintenance_pass(
         // `table` is a compile-time constant from POSTGRES_ANALYZE_TABLES, so
         // interpolating it into the statement carries no injection risk, and
         // ANALYZE takes no bound parameters.
-        match SqlRuntime::execute(datastore.read_exec(), &format!("ANALYZE {table}"), &[]).await {
+        match SqlRuntime::execute(datastore.write_exec(), &format!("ANALYZE {table}"), &[]).await {
             Ok(_) => report.analyzed_tables.push(table),
             Err(error) => {
                 tracing::warn!(table, error = %error, "failed to ANALYZE postgres table during maintenance");
@@ -539,7 +539,7 @@ fn full_vacuum_is_due(
 }
 
 async fn ensure_internal_metadata_table(datastore: &StoreDatastore) -> Result<(), StateError> {
-    SqlRuntime::execute(datastore.read_exec(), INTERNAL_METADATA_TABLE_SQL, &[]).await?;
+    SqlRuntime::execute(datastore.write_exec(), INTERNAL_METADATA_TABLE_SQL, &[]).await?;
     Ok(())
 }
 
@@ -565,7 +565,7 @@ async fn write_last_full_vacuum_success_epoch_secs(
 ) -> Result<(), StateError> {
     ensure_internal_metadata_table(datastore).await?;
     SqlRuntime::execute(
-        datastore.read_exec(),
+        datastore.write_exec(),
         "INSERT INTO weaver_internal_metadata (key, value)
          VALUES ({}, {})
          ON CONFLICT(key) DO UPDATE SET value = excluded.value",

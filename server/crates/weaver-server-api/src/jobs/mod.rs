@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+pub mod batch;
+pub(crate) mod paging;
 pub(crate) mod release_display;
 pub(crate) mod replay;
 pub mod scheduled_resume;

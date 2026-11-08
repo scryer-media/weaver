@@ -17,30 +17,14 @@ pub(crate) struct JobsSubscription;
 impl JobsSubscription {
     /// Subscribe to real-time job state snapshots.
     ///
-    /// Pushes a full snapshot whenever a pipeline event fires, throttled to
-    /// at most once per 100ms so rapid-fire segment events don't flood the
-    /// client. Also ticks every 2s so speed gauges stay fresh; a tick that
-    /// finds the jobs, metrics, pause and block state unchanged sends nothing.
+    /// Pushes a full snapshot when the job list or the global pause changes,
+    /// at most once per second however fast the queue moves. Also ticks every
+    /// 2s so speed gauges stay fresh; a tick that finds the jobs, metrics,
+    /// pause and block state unchanged sends nothing.
     #[graphql(guard = "AdminGuard")]
     async fn job_updates(&self, ctx: &Context<'_>) -> Result<impl Stream<Item = JobsSnapshot>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
-        // Per-article events trigger a snapshot too (throttled below); they
-        // arrive on their own channel.
-        let event_stream = tokio_stream::wrappers::BroadcastStream::new(handle.subscribe_events())
-            .merge(tokio_stream::wrappers::BroadcastStream::new(
-                handle.subscribe_segment_events(),
-            ))
-            .filter_map(|r| r.ok().map(|_| SnapshotTrigger::ItemsChanged));
-
-        // Tick every 2s as a heartbeat so speed/metrics stay fresh even when
-        // no events are firing (e.g. all jobs paused while gauges decay).
-        let heartbeat =
-            tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(SNAPSHOT_HEARTBEAT))
-                .map(|_| SnapshotTrigger::Heartbeat);
-
-        // Merge event triggers with heartbeat, then throttle to 100ms.
-        let merged = event_stream.merge(heartbeat);
-        let throttled = throttle(merged, SNAPSHOT_THROTTLE);
+        let throttled = Box::pin(snapshot_triggers(&handle, FULL_SNAPSHOT_PERIOD));
 
         let mut last_state: Option<SnapshotState> = None;
         let stream = throttled.filter_map(move |trigger| {
@@ -78,18 +62,11 @@ impl JobsSubscription {
             .clone();
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         let db = ctx.data::<Database>()?.clone();
+        let state_handle = ctx
+            .data::<weaver_server_core::SharedPipelineState>()?
+            .clone();
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
-        let event_stream = tokio_stream::wrappers::BroadcastStream::new(handle.subscribe_events())
-            .merge(tokio_stream::wrappers::BroadcastStream::new(
-                handle.subscribe_segment_events(),
-            ))
-            .filter_map(|r| r.ok().map(|_| SnapshotTrigger::ItemsChanged));
-        let heartbeat =
-            tokio_stream::wrappers::IntervalStream::new(tokio::time::interval(SNAPSHOT_HEARTBEAT))
-                .map(|_| SnapshotTrigger::Heartbeat);
-        let initial = tokio_stream::once(SnapshotTrigger::ItemsChanged);
-        let merged = initial.merge(event_stream).merge(heartbeat);
-        let throttled = throttle(merged, SNAPSHOT_THROTTLE);
+        let throttled = Box::pin(snapshot_triggers(&handle, FULL_SNAPSHOT_PERIOD));
 
         let memo = Arc::new(std::sync::Mutex::new(QueueSnapshotMemo::default()));
         let stream = throttled
@@ -100,6 +77,7 @@ impl JobsSubscription {
                 let db = db.clone();
                 let prepared_filter = prepared_filter.clone();
                 let memo = memo.clone();
+                let state_handle = state_handle.clone();
                 async move {
                     let state = SnapshotState::capture(&handle);
                     let max_download_speed = config.read().await.max_download_speed.unwrap_or(0);
@@ -113,21 +91,14 @@ impl JobsSubscription {
                         }
                         memo.last = Some((state.clone(), max_download_speed));
                     }
-                    let mut items: Vec<QueueItem> = handle
-                        .list_jobs()
-                        .into_iter()
-                        .filter(|info| {
-                            !matches!(
-                                info.status,
-                                weaver_server_core::JobStatus::Complete
-                                    | weaver_server_core::JobStatus::Failed { .. }
-                            )
-                        })
-                        .map(|info| queue_item_from_job(&info))
-                        .filter(|item| {
-                            matches_queue_filter_prepared(item, prepared_filter.as_ref())
-                        })
-                        .collect();
+                    let mut items: Vec<QueueItem> =
+                        crate::jobs::paging::read_listing(&state_handle)
+                            .iter()
+                            .map(queue_item_from_job)
+                            .filter(|item| {
+                                matches_queue_filter_prepared(item, prepared_filter.as_ref())
+                            })
+                            .collect();
                     let cached = {
                         let memo = memo.lock().expect("queue snapshot memo poisoned");
                         memo.summaries
@@ -156,8 +127,10 @@ impl JobsSubscription {
                             item.duplicate_summary = Some(summary.clone());
                         }
                     }
-                    let metrics = &state.metrics;
                     let latest_cursor = replay.latest_cursor().await;
+                    // Read the gauges after the awaits above, so the snapshot
+                    // carries the speeds published as it goes out.
+                    let metrics = &handle.get_metrics();
                     Some(Ok(QueueSnapshot {
                         summary: queue_summary(&items, metrics),
                         metrics: metrics_from_snapshot(metrics),
@@ -175,6 +148,45 @@ impl JobsSubscription {
             .filter_map(|snapshot| snapshot);
 
         Ok(stream)
+    }
+    /// Subscribe to one queue page: the page `input` names, sent at once and
+    /// again when the queue, the global pause or the speeds move, at most
+    /// twice a second. Only that page's rows travel, never the whole queue.
+    #[graphql(guard = "ReadGuard")]
+    async fn queue_page_updates(
+        &self,
+        ctx: &Context<'_>,
+        input: QueuePageInput,
+    ) -> Result<impl Stream<Item = Result<QueuePage>>> {
+        let handle = ctx.data::<SchedulerHandle>()?.clone();
+        let state = ctx
+            .data::<weaver_server_core::SharedPipelineState>()?
+            .clone();
+        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
+        let db = ctx.data::<Database>()?.clone();
+        let wants = crate::jobs::query::page_wants(ctx);
+        let mut triggers = Box::pin(snapshot_triggers(&handle, PAGE_UPDATE_PERIOD));
+        Ok(async_stream::stream! {
+            // What a page shows beyond its rows' revision: the live speed in
+            // its summary, and the global pause its row states read. A wake
+            // that moves none of it sends nothing.
+            let mut last: Option<(u64, u64, bool)> = None;
+            let mut duplicates = crate::jobs::query::DuplicateSummaryCache::default();
+            while triggers.next().await.is_some() {
+                let captured = (
+                    handle.job_revision(),
+                    handle.get_metrics().current_download_speed,
+                    handle.is_globally_paused(),
+                );
+                if last == Some(captured) {
+                    continue;
+                }
+                last = Some(captured);
+                yield crate::jobs::query::build_queue_page(
+                    &handle, &state, &replay, db.clone(), &input, wants, &mut duplicates,
+                ).await;
+            }
+        })
     }
     /// Subscribe to live public queue events.
     ///
@@ -331,24 +343,54 @@ enum SnapshotTrigger {
 }
 
 const SNAPSHOT_HEARTBEAT: Duration = Duration::from_secs(2);
-const SNAPSHOT_THROTTLE: Duration = Duration::from_millis(100);
+/// The fastest a whole-queue snapshot is rebuilt for one subscriber.
+const FULL_SNAPSHOT_PERIOD: Duration = Duration::from_secs(1);
+/// The fastest one subscriber's page is rebuilt.
+const PAGE_UPDATE_PERIOD: Duration = Duration::from_millis(500);
 
-fn throttle<S, T>(stream: S, period: Duration) -> impl Stream<Item = T>
-where
-    S: Stream<Item = T> + Unpin,
-{
+/// What wakes a snapshot subscriber: the published job list moving, the
+/// global pause flipping, or the heartbeat. Everything that moves within one
+/// `period` folds into one trigger, so a subscriber builds at most one answer
+/// per period however fast the queue publishes. The first trigger fires at
+/// once.
+fn snapshot_triggers(
+    handle: &SchedulerHandle,
+    period: Duration,
+) -> impl Stream<Item = SnapshotTrigger> + Send + use<> {
+    use tokio::sync::broadcast::error::RecvError;
+    use weaver_server_core::events::model::PipelineEvent;
+
+    let mut changes = handle.subscribe_job_changes();
+    let mut events = handle.subscribe_events();
     async_stream::stream! {
-        tokio::pin!(stream);
-        let mut last = tokio::time::Instant::now() - period;
-
-        while let Some(item) = stream.next().await {
-            let now = tokio::time::Instant::now();
-            let elapsed = now.duration_since(last);
-            if elapsed < period {
-                tokio::time::sleep(period - elapsed).await;
-            }
-            last = tokio::time::Instant::now();
-            yield item;
+        changes.borrow_and_update();
+        yield SnapshotTrigger::ItemsChanged;
+        let mut last_sent = tokio::time::Instant::now();
+        let mut heartbeat = tokio::time::interval_at(
+            last_sent + SNAPSHOT_HEARTBEAT,
+            SNAPSHOT_HEARTBEAT,
+        );
+        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            let trigger = tokio::select! {
+                changed = changes.changed() => match changed {
+                    Ok(()) => SnapshotTrigger::ItemsChanged,
+                    Err(_) => break,
+                },
+                event = events.recv() => match event {
+                    Ok(PipelineEvent::GlobalPaused | PipelineEvent::GlobalResumed)
+                    | Err(RecvError::Lagged(_)) => SnapshotTrigger::ItemsChanged,
+                    Ok(_) => continue,
+                    Err(RecvError::Closed) => break,
+                },
+                _ = heartbeat.tick() => SnapshotTrigger::Heartbeat,
+            };
+            // Hold until a period has passed since the last answer; every
+            // publish in between is read by the one answer that follows.
+            tokio::time::sleep_until(last_sent + period).await;
+            changes.borrow_and_update();
+            last_sent = tokio::time::Instant::now();
+            yield trigger;
         }
     }
 }

@@ -37,6 +37,9 @@ export interface DownloadBlockState {
   windowEndsAtEpochMs?: number | null;
   timezoneName: string;
   scheduledSpeedLimit: number;
+  speedLimitInForce: number;
+  /** Whether a schedule window sets the limit in force, even to unlimited. */
+  speedLimitBySchedule: boolean;
   /** Why a schedule rule is holding new downloads, while one is. */
   scheduleHoldReason?: string | null;
 }
@@ -67,6 +70,8 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
   windowEndsAtEpochMs: null,
   timezoneName: "",
   scheduledSpeedLimit: 0,
+  speedLimitInForce: 0,
+  speedLimitBySchedule: false,
 };
 const DEFAULT_CONNECTION: LiveConnectionState = {
   status: "connecting",

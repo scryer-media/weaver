@@ -10,54 +10,6 @@ use crate::jobs::working_dir::{WORKING_DIR_MARKER, mark_weaver_owned_output_dir}
 use crate::post_processing::model::PostProcessingSettings;
 use crate::runtime::{file_cache, fs as runtime_fs};
 
-fn record_member_crc32_value(
-    by_path: &mut HashMap<String, u32>,
-    ambiguous_paths: &mut HashSet<String>,
-    member_name: &str,
-    crc32: u32,
-) {
-    let Ok(relative_path) =
-        crate::pipeline::direct_store::plan::DirectSetPlan::destination_relative_name(member_name)
-    else {
-        return;
-    };
-    let key = relative_path.to_ascii_lowercase();
-    if ambiguous_paths.contains(&key) {
-        return;
-    }
-    match by_path.get(&key).copied() {
-        None => {
-            by_path.insert(key, crc32);
-        }
-        Some(existing) if existing == crc32 => {}
-        Some(_) => {
-            by_path.remove(&key);
-            ambiguous_paths.insert(key);
-        }
-    }
-}
-
-// Folds one volume's member headers into the checksum map. A member spanning
-// volumes states its checksum on the header that ends it, so earlier volumes
-// simply contribute nothing. Conflicting checksums for the same normalized
-// delivery path make that path unusable instead of picking an iteration-order
-// winner.
-fn record_member_crc32(
-    by_path: &mut HashMap<String, u32>,
-    ambiguous_paths: &mut HashSet<String>,
-    facts: &unrar_rs::RarVolumeFacts,
-) {
-    for member in &facts.members {
-        if member.is_directory {
-            continue;
-        }
-        let Some(crc32) = member.data_crc32 else {
-            continue;
-        };
-        record_member_crc32_value(by_path, ambiguous_paths, &member.name, crc32);
-    }
-}
-
 #[derive(Debug)]
 struct UnacceptableExtensionMatch {
     // Relative to the delivery, `/`-separated: the path the file would have
@@ -69,6 +21,36 @@ struct UnacceptableExtensionMatch {
 struct DeliverySourceValidation {
     total_bytes: u64,
     root_entry_bytes: HashMap<PathBuf, u64>,
+}
+
+// Each delivered file's CRC32 as its object's headers state it, by its path
+// in lowercase. A path two members name with different checksums names
+// none, since either could be the file there.
+pub(in crate::pipeline) fn member_crc32_by_path(
+    files: &[crate::pipeline::graph::status::Delivered],
+) -> HashMap<String, u32> {
+    let mut by_path = HashMap::new();
+    let mut ambiguous = HashSet::new();
+    for file in files {
+        let Some(crc32) = file.crc32 else {
+            continue;
+        };
+        let key = file.name.to_ascii_lowercase();
+        if ambiguous.contains(&key) {
+            continue;
+        }
+        match by_path.get(&key).copied() {
+            None => {
+                by_path.insert(key, crc32);
+            }
+            Some(existing) if existing == crc32 => {}
+            Some(_) => {
+                by_path.remove(&key);
+                ambiguous.insert(key);
+            }
+        }
+    }
+    by_path
 }
 
 enum DeliveryPolicySource {
@@ -84,6 +66,7 @@ fn validate_delivery_sources(
     working_dir: &Path,
     staging_dir: Option<&Path>,
     settings: &PostProcessingSettings,
+    left_behind: &HashSet<PathBuf>,
 ) -> Result<DeliverySourceValidation, String> {
     let mut validation = DeliverySourceValidation::default();
     let mut source_exists = false;
@@ -92,6 +75,7 @@ fn validate_delivery_sources(
             staging_dir,
             "staging",
             &[".weaver-chunks"],
+            &HashSet::new(),
             settings,
             &mut validation,
         )?;
@@ -99,7 +83,13 @@ fn validate_delivery_sources(
     source_exists |= scan_delivery_root(
         working_dir,
         "working",
-        &[".weaver-chunks", ".weaver-staging", WORKING_DIR_MARKER],
+        &[
+            ".weaver-chunks",
+            weaver_graph::names::CACHE_DIR,
+            ".weaver-staging",
+            WORKING_DIR_MARKER,
+        ],
+        left_behind,
         settings,
         &mut validation,
     )?;
@@ -112,6 +102,7 @@ fn scan_delivery_root(
     root: &Path,
     source_name: &str,
     ignored_entries: &[&str],
+    ignored_paths: &HashSet<PathBuf>,
     settings: &PostProcessingSettings,
     validation: &mut DeliverySourceValidation,
 ) -> Result<bool, String> {
@@ -149,6 +140,9 @@ fn scan_delivery_root(
             continue;
         }
         let entry_path = entry.path();
+        if ignored_paths.contains(&entry_path) {
+            continue;
+        }
         let entry_name = entry.file_name();
         let mut entry_bytes = 0u64;
         let mut stack = vec![(entry_path.clone(), PathBuf::from(&entry_name))];
@@ -267,19 +261,11 @@ fn move_path_with_copy_fallback(
     }
 
     let parent_fingerprint = runtime_fs::prepare_destination_parent(dst)?;
-    match file_cache::copy_large_file_with_progress(src, dst, |copied| {
+    file_cache::copy_large_file_with_progress(src, dst, |copied| {
         phase_counters
             .completed_bytes
             .fetch_add(copied, Ordering::Relaxed);
-    }) {
-        Ok(_) => {}
-        Err(error) => {
-            if error.kind() != std::io::ErrorKind::AlreadyExists {
-                cleanup_copy_destination_if_parent_matches(dst, &parent_fingerprint);
-            }
-            return Err(error);
-        }
-    }
+    })?;
     if !runtime_fs::destination_parent_matches(dst, &parent_fingerprint)? {
         return Err(std::io::Error::other(format!(
             "destination parent changed during copy: {}",
@@ -288,15 +274,6 @@ fn move_path_with_copy_fallback(
     }
     std::fs::remove_file(src)?;
     Ok(())
-}
-
-fn cleanup_copy_destination_if_parent_matches(
-    dst: &std::path::Path,
-    parent_fingerprint: &runtime_fs::DirectoryFingerprint,
-) {
-    if runtime_fs::destination_parent_matches(dst, parent_fingerprint).unwrap_or(false) {
-        let _ = std::fs::remove_file(dst);
-    }
 }
 
 fn rename_path_for_publication(
@@ -368,6 +345,57 @@ where
     }
 }
 
+// Moves one entry of the delivered set into the destination. On a resumed
+// move the working directory is authoritative: an entry still present there
+// had not finished moving, so whatever already stands at its destination is
+// an interrupted copy and gives way to it. A destination entry whose source
+// is gone moved whole before the restart, and nothing here reaches it.
+fn move_delivered_entry(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    source_bytes: u64,
+    phase_counters: Arc<PhaseCounters>,
+    resumed: bool,
+) -> Result<(), (std::io::Error, std::io::Error)> {
+    let interrupted = resumed
+        && std::fs::symlink_metadata(dst).is_ok()
+        && !runtime_fs::paths_equivalent_for_placement(src, dst);
+    if !interrupted {
+        return move_path_with_safe_rename_or_copy_fallback(src, dst, source_bytes, phase_counters);
+    }
+    let not_cleared = |error: std::io::Error| {
+        (
+            error,
+            std::io::Error::other("the interrupted copy at the destination was not cleared"),
+        )
+    };
+    let src_metadata = std::fs::symlink_metadata(src).map_err(not_cleared)?;
+    let dst_metadata = std::fs::symlink_metadata(dst).map_err(not_cleared)?;
+    let real_dir =
+        |metadata: &std::fs::Metadata| metadata.is_dir() && !metadata_is_link_or_reparse(metadata);
+    if real_dir(&src_metadata) && real_dir(&dst_metadata) {
+        // A directory copied part way: what already left it stands in the
+        // destination, and each entry still in it follows the same rule.
+        for entry in std::fs::read_dir(src).map_err(not_cleared)? {
+            let entry = entry.map_err(not_cleared)?;
+            move_delivered_entry(
+                &entry.path(),
+                &dst.join(entry.file_name()),
+                0,
+                Arc::clone(&phase_counters),
+                true,
+            )?;
+        }
+        return std::fs::remove_dir(src).map_err(not_cleared);
+    }
+    if real_dir(&dst_metadata) {
+        std::fs::remove_dir_all(dst).map_err(not_cleared)?;
+    } else {
+        std::fs::remove_file(dst).map_err(not_cleared)?;
+    }
+    move_path_with_safe_rename_or_copy_fallback(src, dst, source_bytes, phase_counters)
+}
+
 async fn validate_script_move_destination(
     db: crate::Database,
     context: crate::post_processing::runner::JobExecutionContext,
@@ -383,7 +411,7 @@ async fn validate_script_move_destination(
         )));
     }
     let path = expected.to_path_buf();
-    let validated = tokio::task::spawn_blocking(move || {
+    let validated = crate::runtime::panic_trap::spawn_blocking(move || {
         crate::post_processing::effects::validate_directory(&db, &context, &path)
     })
     .await
@@ -401,6 +429,72 @@ async fn validate_script_move_destination(
     Ok(())
 }
 
+// Waits for the moving row to commit. A write that failed, or a writer
+// lane that closed before running it, fails the move before any file has
+// left the working directory, and the still-empty claim is given back.
+async fn moving_row_committed(
+    durable: tokio::sync::oneshot::Receiver<Result<(), String>>,
+    dest: &std::path::Path,
+) -> Result<(), MoveToCompleteFailure> {
+    let outcome = durable
+        .await
+        .unwrap_or_else(|_| Err("the database writer closed before it ran".into()));
+    if let Err(error) = outcome {
+        let _ = tokio::fs::remove_dir(dest).await;
+        return Err(MoveToCompleteFailure::Operational(format!(
+            "could not record the move before starting it: {error}"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) type MoveHook = Box<dyn FnOnce(JobId) + Send>;
+
+// Runs once the moving row has committed and before any file moves.
+#[cfg(test)]
+pub(crate) static BEFORE_FIRST_MOVE: std::sync::Mutex<Option<MoveHook>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) type SpentHook = Box<dyn FnOnce(&[PathBuf]) + Send>;
+
+// Runs with the consumed inputs once their handles are released and before
+// they are removed.
+#[cfg(test)]
+pub(crate) static BEFORE_SPENT_REMOVAL: std::sync::Mutex<Option<SpentHook>> =
+    std::sync::Mutex::new(None);
+
+// Where a final move delivers: a directory it claimed empty, or the one
+// the moving row of a job interrupted by a restart names, which already
+// holds what moved before the restart.
+enum MoveInto {
+    Claimed(PathBuf),
+    Resumed(PathBuf),
+}
+
+// What a final move's task is given.
+struct FinalMove {
+    job_id: JobId,
+    working_dir: PathBuf,
+    staging_dir: Option<PathBuf>,
+    dest: PathBuf,
+    // Answers once the moving row has committed. A resumed move has none:
+    // its row was already moving when it was read.
+    durable: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    script_validation: Option<(
+        crate::Database,
+        crate::post_processing::runner::JobExecutionContext,
+    )>,
+    hold: Option<&'static str>,
+    phase_counters: Arc<PhaseCounters>,
+    naming: Option<DeliveryNamingPlan>,
+    policy_source: DeliveryPolicySource,
+    // Consumed inputs whose removal failed: they stay where they are.
+    left_behind: HashSet<PathBuf>,
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_move_to_complete(
     job_id: JobId,
     working_dir: PathBuf,
@@ -409,16 +503,18 @@ async fn run_move_to_complete(
     phase_counters: Arc<PhaseCounters>,
     naming: Option<DeliveryNamingPlan>,
     policy_source: DeliveryPolicySource,
+    left_behind: HashSet<PathBuf>,
 ) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
     let claimed_dest = dest.clone();
     let result = run_move_to_claimed_destination(
         job_id,
         working_dir,
         staging_dir,
-        dest,
+        MoveInto::Claimed(dest),
         phase_counters,
         naming,
         policy_source,
+        left_behind,
     )
     .await;
     if result.is_err() {
@@ -430,27 +526,26 @@ async fn run_move_to_complete(
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_move_to_claimed_destination(
     job_id: JobId,
     working_dir: PathBuf,
     staging_dir: Option<PathBuf>,
-    dest: PathBuf,
+    dest: MoveInto,
     phase_counters: Arc<PhaseCounters>,
     naming: Option<DeliveryNamingPlan>,
     policy_source: DeliveryPolicySource,
+    // Consumed inputs that could not be removed: they stay in the working
+    // directory and are neither scanned nor moved.
+    left_behind: HashSet<PathBuf>,
 ) -> Result<MoveToCompleteResult, MoveToCompleteFailure> {
-    // Every cached disk write handle under either of the job's roots must be
-    // closed before its files are renamed or moved. The staging root is not
-    // only extraction output any more: direct-store writes member payload
-    // straight into it, through the same owner pool.
-    crate::pipeline::close_cached_write_handles_under(&working_dir).await;
-    if let Some(staging) = staging_dir.as_deref() {
-        crate::pipeline::close_cached_write_handles_under(staging).await;
-    }
-
+    let (dest, resumed) = match dest {
+        MoveInto::Claimed(dest) => (dest, false),
+        MoveInto::Resumed(dest) => (dest, true),
+    };
     let policy = match policy_source {
         DeliveryPolicySource::Persisted(database) => {
-            tokio::task::spawn_blocking(move || database.post_processing_settings())
+            crate::runtime::panic_trap::spawn_blocking(move || database.post_processing_settings())
                 .await
                 .map_err(|error| {
                     MoveToCompleteFailure::Operational(format!(
@@ -471,8 +566,9 @@ async fn run_move_to_claimed_destination(
         let working_dir = working_dir.clone();
         let staging_dir = staging_dir.clone();
         let policy = Arc::clone(&policy);
-        tokio::task::spawn_blocking(move || {
-            validate_delivery_sources(&working_dir, staging_dir.as_deref(), &policy)
+        let left_behind = left_behind.clone();
+        crate::runtime::panic_trap::spawn_blocking(move || {
+            validate_delivery_sources(&working_dir, staging_dir.as_deref(), &policy, &left_behind)
         })
         .await
         .map_err(|error| {
@@ -504,16 +600,17 @@ async fn run_move_to_claimed_destination(
             dest.display()
         ))
     })?;
-    if existing_entries
-        .next_entry()
-        .await
-        .map_err(|error| {
-            MoveToCompleteFailure::Operational(format!(
-                "could not inspect claimed complete directory {}: {error}",
-                dest.display()
-            ))
-        })?
-        .is_some()
+    if !resumed
+        && existing_entries
+            .next_entry()
+            .await
+            .map_err(|error| {
+                MoveToCompleteFailure::Operational(format!(
+                    "could not inspect claimed complete directory {}: {error}",
+                    dest.display()
+                ))
+            })?
+            .is_some()
     {
         return Err(MoveToCompleteFailure::Security(format!(
             "claimed complete directory was populated before publication: {}",
@@ -549,13 +646,8 @@ async fn run_move_to_claimed_destination(
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
-            match tokio::task::spawn_blocking(move || {
-                move_path_with_safe_rename_or_copy_fallback(
-                    &src_fb,
-                    &dst_fb,
-                    source_bytes,
-                    counters,
-                )
+            match crate::runtime::panic_trap::spawn_blocking(move || {
+                move_delivered_entry(&src_fb, &dst_fb, source_bytes, counters, resumed)
             })
             .await
             {
@@ -585,27 +677,26 @@ async fn run_move_to_claimed_destination(
         while let Ok(Some(entry)) = entries.next_entry().await {
             let file_name = entry.file_name();
             if file_name == ".weaver-chunks"
+                || file_name == weaver_graph::names::CACHE_DIR
                 || file_name == ".weaver-staging"
                 || file_name == WORKING_DIR_MARKER
             {
                 continue;
             }
             let src = entry.path();
+            if left_behind.contains(&src) {
+                continue;
+            }
             let dst = dest.join(&file_name);
-            if dst.exists() && !runtime_fs::paths_equivalent_for_placement(&src, &dst) {
+            if !resumed && dst.exists() && !runtime_fs::paths_equivalent_for_placement(&src, &dst) {
                 continue;
             }
             let source_bytes = validation.root_entry_bytes.get(&src).copied().unwrap_or(0);
             let src_fb = src.clone();
             let dst_fb = dst.clone();
             let counters = Arc::clone(&phase_counters);
-            match tokio::task::spawn_blocking(move || {
-                move_path_with_safe_rename_or_copy_fallback(
-                    &src_fb,
-                    &dst_fb,
-                    source_bytes,
-                    counters,
-                )
+            match crate::runtime::panic_trap::spawn_blocking(move || {
+                move_delivered_entry(&src_fb, &dst_fb, source_bytes, counters, resumed)
             })
             .await
             {
@@ -655,8 +746,35 @@ async fn run_move_to_claimed_destination(
         None => Vec::new(),
     };
 
+    // The delivered tree is the user's Weaver runs as, with the modes its
+    // umask gives, whatever the archives it came out of said.
+    let delivered = dest.clone();
+    match crate::runtime::panic_trap::spawn_blocking(move || {
+        runtime_fs::normalize_extracted_tree(&delivered)
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return Err(MoveToCompleteFailure::Operational(format!(
+                "could not set ownership and modes of {}: {error}",
+                dest.display()
+            )));
+        }
+        Err(error) => {
+            return Err(MoveToCompleteFailure::Operational(format!(
+                "ownership and mode worker failed for {}: {error}",
+                dest.display()
+            )));
+        }
+    }
+
     let output_dir = dest.clone();
-    match tokio::task::spawn_blocking(move || mark_weaver_owned_output_dir(&output_dir)).await {
+    match crate::runtime::panic_trap::spawn_blocking(move || {
+        mark_weaver_owned_output_dir(&output_dir)
+    })
+    .await
+    {
         Ok(Ok(())) => {}
         Ok(Err(error)) => warn!(
             job_id = job_id.0,
@@ -682,6 +800,23 @@ async fn run_move_to_claimed_destination(
             error = %error,
             "failed to remove staging directory after move"
         );
+    }
+
+    // The chunk workspace is the job's scratch, and the cache beside it the
+    // run's: everything they backed has been published, so they go with the
+    // working directory they live in.
+    for scratch in [".weaver-chunks", weaver_graph::names::CACHE_DIR] {
+        let chunks = working_dir.join(scratch);
+        if let Err(error) = tokio::fs::remove_dir_all(&chunks).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                job_id = job_id.0,
+                path = %chunks.display(),
+                error = %error,
+                "failed to remove chunk workspace during final move"
+            );
+        }
     }
 
     let marker_path = working_dir.join(WORKING_DIR_MARKER);
@@ -949,65 +1084,16 @@ impl Pipeline {
         // never opted in never pays for gathering it.
         let srrdb = srrdb_from_config.then(|| SrrdbInputs {
             base_url: deobfuscate::SRRDB_API_BASE.to_string(),
-            crc32_by_member_path: HashMap::new(),
+            crc32_by_member_path: member_crc32_by_path(
+                &self.graph_delivery(job_id).unwrap_or_default().files,
+            ),
             proxies: self.shared_state.proxy_runtime(),
         });
-        let srrdb = match srrdb {
-            Some(mut inputs) => {
-                inputs.crc32_by_member_path = self.member_crc32_by_path(job_id).await;
-                Some(inputs)
-            }
-            None => None,
-        };
 
         Some(DeliveryNamingPlan {
             job_display_name: job_name.to_string(),
             srrdb,
         })
-    }
-
-    // The CRC32 each archive header stated for its member, keyed by its
-    // normalized, lowercased delivery-relative path.
-    //
-    // Read from two places because the two delivery routes keep the same facts
-    // in different homes: extraction keeps a set's parsed headers in memory
-    // until the job leaves the pipeline, while direct-store only ever writes
-    // them to the durable facts table. Reading both makes the map route-blind.
-    // A member the headers never stated a checksum for is simply absent, and
-    // the lookup falls back to the job name for it.
-    async fn member_crc32_by_path(&self, job_id: JobId) -> HashMap<String, u32> {
-        let mut by_path = HashMap::new();
-        let mut ambiguous_paths = HashSet::new();
-        for ((set_job_id, _), state) in &self.rar_sets {
-            if *set_job_id != job_id {
-                continue;
-            }
-            for facts in state.facts.values() {
-                record_member_crc32(&mut by_path, &mut ambiguous_paths, facts);
-            }
-        }
-
-        let persisted = self
-            .db_blocking(move |db| db.load_all_rar_volume_facts(job_id))
-            .await;
-        match persisted {
-            Ok(sets) => {
-                for (_, volumes) in sets {
-                    for (_, blob) in volumes {
-                        if let Ok(facts) = rmp_serde::from_slice::<unrar_rs::RarVolumeFacts>(&blob)
-                        {
-                            record_member_crc32(&mut by_path, &mut ambiguous_paths, &facts);
-                        }
-                    }
-                }
-            }
-            Err(error) => debug!(
-                job_id = job_id.0,
-                error = %error,
-                "could not read persisted volume facts for the release-index lookup"
-            ),
-        }
-        by_path
     }
 
     // Move extracted/completed files from the intermediate working directory
@@ -1020,6 +1106,17 @@ impl Pipeline {
     //
     // Uses rename() for same-filesystem moves, falls back to copy+delete for cross-FS.
     pub(crate) async fn start_move_to_complete(&mut self, job_id: JobId) -> Result<(), String> {
+        self.start_move_to_complete_held(job_id, None).await
+    }
+
+    // [`Self::start_move_to_complete`], the move first holding at the named
+    // e2e delay hook. The hold is on the move's own task, so the job stands
+    // at `Moving` and nothing else waits on it.
+    pub(crate) async fn start_move_to_complete_held(
+        &mut self,
+        job_id: JobId,
+        hold: Option<&'static str>,
+    ) -> Result<(), String> {
         if self.inflight_moves.contains(&job_id) {
             return Ok(());
         }
@@ -1037,12 +1134,72 @@ impl Pipeline {
         // file, and refuses the delivery outright when a file was never
         // delivered and nothing accounts for it.
         self.reconcile_terminal_delivery(job_id)?;
+        // Serialize the final-move gate with pause and cancellation acceptance.
+        // An intent recorded before this boundary must hold the move.
+        self.report_job(job_id);
+        let (move_allowed, paused) = self.shared_state.queue.write(|inner| {
+            let Some(row) = inner.job_mut(job_id) else {
+                return crate::pipeline::queue::Change::unchanged((false, false));
+            };
+            if row.intents.cancelled.is_some() {
+                return crate::pipeline::queue::Change::unchanged((false, false));
+            }
+            if row.intents.paused == Some(true) {
+                return crate::pipeline::queue::Change::unchanged((false, true));
+            }
+            row.report.moving = true;
+            crate::pipeline::queue::Change::changed((true, false))
+        });
+        if !move_allowed {
+            if paused {
+                self.deferred_moves.insert(job_id);
+            }
+            return Ok(());
+        }
+        // Updates accepted while the preceding stage awaited I/O belong to
+        // this delivery. Read them after claiming the move boundary and before
+        // copying its category, name and naming metadata.
+        self.apply_pending_job_update(job_id);
 
-        // Terminal transition: the job is leaving the verification question
-        // behind. With no recovery set there was never a verdict to be had, so
-        // attribute it rather than leaving the job out of
-        // `weaver_verifications_total` entirely. No-op when a pass ruled.
-        self.note_job_unverifiable_if_no_par2_set(job_id);
+        // The storage adapter relinquishes every handle before completion
+        // removes consumed inputs or publishes outputs. Unlinking an open
+        // file creates a visible .nfs entry on NFS and can fail on Windows.
+        // Paused jobs never reach this ownership boundary.
+        let spent = self
+            .graph_jobs
+            .get_mut(&job_id)
+            .map(|graph| graph.release_delivery_files())
+            .transpose()
+            .map_err(str::to_owned)?
+            .unwrap_or_default();
+        #[cfg(test)]
+        {
+            let hook = BEFORE_SPENT_REMOVAL.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(&spent);
+            }
+        }
+        // A consumed input another process still holds open, or a share that
+        // refuses the unlink, is not part of the delivery and costs it
+        // nothing: it stays where it is, and the move leaves it there. No
+        // retry: the handles Weaver held are already closed, and an outside
+        // holder keeps its own for as long as it likes.
+        let mut left_behind = HashSet::new();
+        for path in spent {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    warn!(
+                        job_id = job_id.0,
+                        path = %path.display(),
+                        error = %error,
+                        "could not remove a consumed input before delivery; it stays in the working directory"
+                    );
+                    left_behind.insert(path);
+                }
+            }
+        }
 
         let (working_dir, staging_dir, job_name, folder_name, category) = {
             let Some(state) = self.jobs.get(&job_id) else {
@@ -1101,41 +1258,276 @@ impl Pipeline {
         self.phase_end(job_id, JobPhase::Extracting);
         self.phase_end(job_id, JobPhase::Repairing);
         let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
-        self.transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"));
+        self.reserved_complete_destinations
+            .insert(job_id, dest.clone());
+        // The moving row keeps what the move leaves, relative to the working
+        // directory, so a restart that finds the job elsewhere leaves the
+        // same inputs.
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            let mut kept: Vec<PathBuf> = left_behind
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&working_dir)
+                        .map_or_else(|_| path.clone(), Path::to_path_buf)
+                })
+                .collect();
+            kept.sort();
+            state.delivery_left_behind = kept;
+        }
+        // The moving row, naming `dest`, must be durable before the first file
+        // leaves the working directory: a restart then finds the delivery and
+        // never fetches the job again. SABnzbd keeps a finished download in
+        // its saved postprocessor queue (sabnzbd/postproc.py:144) and marks it
+        // moving before the first file moves (sabnzbd/postproc.py:517);
+        // NZBGet writes the post stage into its queue file
+        // (daemon/queue/DiskState.cpp:552).
+        let durable = self
+            .transition_postprocessing_status(job_id, JobStatus::Moving, Some("moving"))
+            .unwrap_or_else(|| {
+                let (failed, durable) = tokio::sync::oneshot::channel();
+                let _ = failed.send(Err("the write could not be queued".into()));
+                durable
+            });
+        self.inflight_moves.insert(job_id);
+
+        self.emit_job_event(PipelineEvent::MoveToCompleteStarted { job_id });
+        self.report_job(job_id);
+
+        let naming = self.delivery_naming_plan(job_id, &job_name).await;
+        self.spawn_final_move(FinalMove {
+            job_id,
+            working_dir,
+            staging_dir,
+            dest,
+            durable: Some(durable),
+            script_validation,
+            hold,
+            phase_counters,
+            naming,
+            policy_source: DeliveryPolicySource::Persisted(self.db.clone()),
+            left_behind,
+        });
+        Ok(())
+    }
+
+    // A job restored from a moving row goes on with its move: what is still
+    // in its working directory moves into the destination the row names. A
+    // working directory that is gone with the destination in place means
+    // the move finished, and the job goes on to its terminal pass.
+    pub(crate) async fn resume_restored_move(&mut self, job_id: JobId) {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return;
+        };
+        let recorded = state.working_dir.clone();
+        let staging_dir = state.staging_dir.clone();
+        let job_name = state.spec.name.clone();
+        let folder_name =
+            crate::ingest::completed_folder_name(&state.spec.name, &state.spec.metadata);
+        let category = state.spec.category.clone();
+        let root = self.intermediate_dir.clone();
+        let named = recorded.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            let source = crate::jobs::working_dir::find_job_working_dir(&root, job_id)?;
+            let own = source.as_ref() == Some(&named)
+                || crate::jobs::working_dir::is_job_working_dir(&root, &named, job_id)?;
+            Ok::<_, std::io::Error>((source, own))
+        })
+        .await
+        .map_err(std::io::Error::other)
+        .and_then(|found| found);
+        let (source, names_working_dir) = match found {
+            Ok(found) => found,
+            Err(error) => {
+                self.fail_job(
+                    job_id,
+                    format!("could not find what is left to move after a restart: {error}"),
+                );
+                return;
+            }
+        };
+        // A row that names the job's own working directory, not a
+        // destination, was written before the destination was recorded; the
+        // move claims one. A destination is told from it by the job's
+        // ownership marker, never by where it sits: a complete directory may
+        // lie inside the intermediate one, and its destination is resumed
+        // into, not claimed again beside itself.
+        let dest = if names_working_dir {
+            match self
+                .claim_complete_destination(job_id, &folder_name, category.as_deref())
+                .await
+            {
+                Ok(dest) => dest,
+                Err(error) => {
+                    self.fail_job(job_id, error);
+                    return;
+                }
+            }
+        } else {
+            recorded
+        };
+        let delivered = tokio::fs::symlink_metadata(&dest)
+            .await
+            .is_ok_and(|metadata| metadata.is_dir());
+        let Some(working_dir) = source else {
+            if delivered {
+                if let Some(state) = self.jobs.get_mut(&job_id) {
+                    state.working_dir = dest;
+                    state.staging_dir = None;
+                }
+                info!(
+                    job_id = job_id.0,
+                    "final move had finished before the restart"
+                );
+                self.start_terminal_post_processing(job_id);
+            } else {
+                self.fail_job(
+                    job_id,
+                    format!(
+                        "neither the working directory nor the destination {} survived the restart",
+                        dest.display()
+                    ),
+                );
+            }
+            return;
+        };
+        if !delivered {
+            self.fail_job(
+                job_id,
+                format!(
+                    "the destination {} of an interrupted move is gone",
+                    dest.display()
+                ),
+            );
+            return;
+        }
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            state.working_dir = working_dir.clone();
+        }
+        self.shared_state.queue.write(|inner| {
+            let Some(row) = inner.job_mut(job_id) else {
+                return crate::pipeline::queue::Change::unchanged(());
+            };
+            row.report.moving = true;
+            crate::pipeline::queue::Change::changed(())
+        });
+        let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
         self.inflight_moves.insert(job_id);
-
-        let _ = self
-            .event_tx
-            .send(PipelineEvent::MoveToCompleteStarted { job_id });
-        self.publish_snapshot();
-
+        self.emit_job_event(PipelineEvent::MoveToCompleteStarted { job_id });
+        self.report_job(job_id);
+        info!(
+            job_id = job_id.0,
+            dest = %dest.display(),
+            "resuming final move after a restart"
+        );
         let naming = self.delivery_naming_plan(job_id, &job_name).await;
-        let policy_source = DeliveryPolicySource::Persisted(self.db.clone());
+        // The consumed inputs the move was told to leave before the restart
+        // stay where they are.
+        let left_behind = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .delivery_left_behind
+                    .iter()
+                    .map(|path| working_dir.join(path))
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.spawn_final_move(FinalMove {
+            job_id,
+            working_dir,
+            staging_dir,
+            dest,
+            durable: None,
+            script_validation: None,
+            hold: None,
+            phase_counters,
+            naming,
+            policy_source: DeliveryPolicySource::Persisted(self.db.clone()),
+            left_behind,
+        });
+    }
 
+    fn spawn_final_move(&self, final_move: FinalMove) {
+        let FinalMove {
+            job_id,
+            working_dir,
+            staging_dir,
+            dest,
+            durable,
+            script_validation,
+            hold,
+            phase_counters,
+            naming,
+            policy_source,
+            left_behind,
+        } = final_move;
         let move_done_tx = self.move_done_tx.clone();
         debug!(
             job_id = job_id.0,
             dest = %dest.display(),
+            resumed = durable.is_none(),
             "starting final move"
         );
-        tokio::spawn(async move {
+        // The move is the job's work, and so is every blocking thread it
+        // hands work to.
+        tokio::spawn(crate::runtime::panic_trap::in_job(job_id, async move {
+            if let Some(hook) = hold {
+                // The hook sleeps its thread, so it is given one of its own.
+                let _ = crate::runtime::panic_trap::spawn_blocking(move || {
+                    crate::e2e_failpoint::maybe_delay(hook);
+                })
+                .await;
+            }
             let move_started = Instant::now();
             let result = async {
+                let into = match durable {
+                    Some(durable) => {
+                        moving_row_committed(durable, &dest).await?;
+                        MoveInto::Claimed(dest.clone())
+                    }
+                    None => MoveInto::Resumed(dest.clone()),
+                };
+                #[cfg(test)]
+                {
+                    let hook = BEFORE_FIRST_MOVE.lock().unwrap().take();
+                    if let Some(hook) = hook {
+                        let _ = tokio::task::spawn_blocking(move || hook(job_id)).await;
+                    }
+                }
                 if let Some((db, context)) = script_validation {
                     validate_script_move_destination(db, context, &dest).await?;
                 }
-                run_move_to_complete(
-                    job_id,
-                    working_dir,
-                    staging_dir,
-                    dest.clone(),
-                    phase_counters,
-                    naming,
-                    policy_source,
-                )
-                .await
+                match into {
+                    MoveInto::Claimed(dest) => {
+                        run_move_to_complete(
+                            job_id,
+                            working_dir,
+                            staging_dir,
+                            dest,
+                            phase_counters,
+                            naming,
+                            policy_source,
+                            left_behind,
+                        )
+                        .await
+                    }
+                    resumed => {
+                        run_move_to_claimed_destination(
+                            job_id,
+                            working_dir,
+                            staging_dir,
+                            resumed,
+                            phase_counters,
+                            naming,
+                            policy_source,
+                            left_behind,
+                        )
+                        .await
+                    }
+                }
             }
             .await;
             match &result {
@@ -1161,8 +1553,7 @@ impl Pipeline {
                     result,
                 })
                 .await;
-        });
-        Ok(())
+        }));
     }
 
     pub(crate) async fn handle_move_to_complete_done(&mut self, done: MoveToCompleteDone) {
@@ -1194,9 +1585,7 @@ impl Pipeline {
                 state.working_dir = dest.clone();
                 state.staging_dir = None;
 
-                let _ = self
-                    .event_tx
-                    .send(PipelineEvent::MoveToCompleteFinished { job_id });
+                self.emit_job_event(PipelineEvent::MoveToCompleteFinished { job_id });
                 debug!(
                     job_id = job_id.0,
                     moved = outcome.moved_entries,
@@ -1237,6 +1626,10 @@ impl Pipeline {
 
     // Resolve and run the job's script list, telling the scripts `facts`
     // about how the download ended.
+    //
+    // The script settings are read off the actor and the answer comes back
+    // as an event: the job is held by its terminal pass from here, so the
+    // queue window, slot admission and a rename all leave it alone meanwhile.
     fn start_terminal_post_processing_with_facts(
         &mut self,
         job_id: JobId,
@@ -1246,19 +1639,69 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return;
         };
+        if !self.inflight_terminal_post_processing.insert(job_id) {
+            return;
+        }
         let category = state.spec.category.clone();
-        let admission = match self
-            .terminal_post_processing_executor
-            .admit_job_scripts(category.as_deref())
-        {
+        let executor = self.terminal_post_processing_executor.clone();
+        let db = self.db.clone();
+        let done_tx = self.terminal_post_processing_done_tx.clone();
+        tokio::spawn(async move {
+            let read = tokio::task::spawn_blocking(move || {
+                let admission = executor.admit_job_scripts(category.as_deref());
+                let queue_events_may_hold = match &admission {
+                    Ok(Some(admission)) => {
+                        !admission.has_enabled_entries() && queue_events_may_hold_job(&db, job_id)
+                    }
+                    _ => false,
+                };
+                (admission, queue_events_may_hold)
+            })
+            .await;
+            let (admission, queue_events_may_hold) = read.unwrap_or_else(|error| {
+                (
+                    Err(crate::StateError::Database(format!(
+                        "the script settings read did not finish: {error}"
+                    ))),
+                    false,
+                )
+            });
+            let _ = done_tx
+                .send(TerminalPostProcessingEvent::ScriptsAdmitted(
+                    TerminalScriptsAdmitted {
+                        job_id,
+                        facts,
+                        primary_failure,
+                        admission,
+                        queue_events_may_hold,
+                    },
+                ))
+                .await;
+        });
+    }
+
+    // Run the scripts the settings admitted, or finish the job when none
+    // can be involved.
+    pub(in crate::pipeline) fn handle_terminal_scripts_admitted(
+        &mut self,
+        admitted: TerminalScriptsAdmitted,
+    ) {
+        let TerminalScriptsAdmitted {
+            job_id,
+            facts,
+            primary_failure,
+            admission,
+            queue_events_may_hold,
+        } = admitted;
+        self.inflight_terminal_post_processing.remove(&job_id);
+        // A cancellation archived the job while its settings were read.
+        if !self.jobs.contains_key(&job_id) {
+            return;
+        }
+        let admission = match admission {
             Ok(Some(admission)) => admission,
             Ok(None) => {
-                match primary_failure {
-                    Some(failure) => {
-                        self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
-                    }
-                    None => self.complete_job_after_terminal_post_processing(job_id),
-                }
+                self.finish_without_terminal_scripts(job_id, primary_failure);
                 return;
             }
             Err(error) => {
@@ -1267,12 +1710,7 @@ impl Pipeline {
                     error = %error,
                     "could not admit post-processing scripts; skipping scripts"
                 );
-                match primary_failure {
-                    Some(failure) => {
-                        self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
-                    }
-                    None => self.complete_job_after_terminal_post_processing(job_id),
-                }
+                self.finish_without_terminal_scripts(job_id, primary_failure);
                 return;
             }
         };
@@ -1280,18 +1718,11 @@ impl Pipeline {
         // events of its own queued or running; the terminal pass waits for
         // those before the job leaves the queue, so it is skipped only when
         // no queue script can be involved.
-        if !admission.has_enabled_entries() && !self.queue_events_may_hold_job(job_id) {
-            match primary_failure {
-                Some(failure) => {
-                    self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
-                }
-                None => self.complete_job_after_terminal_post_processing(job_id),
-            }
+        if !admission.has_enabled_entries() && !queue_events_may_hold {
+            self.finish_without_terminal_scripts(job_id, primary_failure);
             return;
         }
-        if !self.inflight_terminal_post_processing.insert(job_id) {
-            return;
-        }
+        self.inflight_terminal_post_processing.insert(job_id);
         // Low-frequency: at most one terminal post-processing pass per job.
         self.note_stage_started(
             job_id,
@@ -1300,15 +1731,13 @@ impl Pipeline {
         self.launch_terminal_post_processing_run(job_id, admission, facts, primary_failure, None);
     }
 
-    // Whether a queue script could have an event of this job queued or
-    // running. The hint is worked out afresh when a settings or instance save
-    // dropped it, so an unknown hint never sends a job without queue scripts
-    // through the terminal pass.
-    fn queue_events_may_hold_job(&self, job_id: JobId) -> bool {
-        if let Err(error) = crate::post_processing::events::refresh_admission_hint(&self.db) {
-            warn!(job_id = job_id.0, %error, "could not read the queue script settings");
+    fn finish_without_terminal_scripts(&mut self, job_id: JobId, primary_failure: Option<String>) {
+        match primary_failure {
+            Some(failure) => {
+                self.finalize_failed_job_after_terminal_post_processing(job_id, failure);
+            }
+            None => self.complete_job_after_terminal_post_processing(job_id),
         }
-        self.db.queue_barrier_possible(job_id.0)
     }
 
     // What the scripts of a pass beginning now are told about how the job's
@@ -1323,6 +1752,7 @@ impl Pipeline {
             crate::post_processing::model::PipelineOutcome::Failed { stage, .. } => Some(*stage),
             crate::post_processing::model::PipelineOutcome::Succeeded => None,
         };
+        let verdict = self.delivered_verdict(job_id);
         let par_status = if matches!(
             pipeline_failure_stage,
             Some(
@@ -1331,7 +1761,10 @@ impl Pipeline {
             )
         ) {
             1
-        } else if self.par2_verified.contains(&job_id) {
+        } else if verdict
+            .as_ref()
+            .is_some_and(|verdict| verdict.recovery_verified)
+        {
             2
         } else {
             0
@@ -1341,20 +1774,34 @@ impl Pipeline {
             Some(crate::post_processing::model::PipelineFailureStage::Extract)
         ) {
             1
-        } else if self
-            .extracted_archives
-            .get(&job_id)
-            .is_some_and(|archives| !archives.is_empty())
-        {
+        } else if verdict.as_ref().is_some_and(|verdict| verdict.unpacked) {
             2
         } else {
             0
         };
+        let delivered = verdict.filter(|_| pipeline_failure_stage.is_none());
+        let left_behind = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.delivery_left_behind.clone())
+            .unwrap_or_default();
         crate::post_processing::model::PostProcessingFacts {
             outcome,
             par_status,
             unpack_status,
+            delivered,
+            left_behind,
         }
+    }
+
+    // What the job's delivery came to: its graph's ruling while it has one,
+    // else the ruling its row kept when its final move began.
+    pub(in crate::pipeline) fn delivered_verdict(
+        &self,
+        job_id: JobId,
+    ) -> Option<crate::post_processing::model::DeliveredVerdict> {
+        self.graph_delivered_verdict(job_id)
+            .or_else(|| self.jobs.get(&job_id)?.delivered.clone())
     }
 
     // The context a job's scripts are handed, told `facts` about how its
@@ -1482,7 +1929,7 @@ impl Pipeline {
         // directory the move already emptied. A failed job is recorded too:
         // the outcome written above tells its restored scripts it failed.
         self.persist_active_runtime_at(job_id, delivered_dir);
-        self.publish_snapshot();
+        self.report_job(job_id);
         let (cancellation_tx, cancellation_rx) = tokio::sync::watch::channel(false);
         self.terminal_post_processing_cancellations
             .insert(job_id, cancellation_tx);
@@ -1737,7 +2184,7 @@ impl Pipeline {
             JobStatus::PostProcessing,
             Some("running post-processing scripts"),
         );
-        self.publish_snapshot();
+        self.report_job(job_id);
     }
 
     pub(crate) fn handle_terminal_post_processing_done(
@@ -1830,47 +2277,34 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
     ) {
-        self.clear_health_deferral(job_id);
         self.transition_completed_runtime(job_id);
         if self.active_download_passes.remove(&job_id) {
             self.phase_end(job_id, JobPhase::Downloading);
-            let _ = self.event_tx.send(PipelineEvent::DownloadFinished {
+            self.emit_job_event(PipelineEvent::DownloadFinished {
                 job_id,
                 finalization_pending: false,
             });
         }
         self.jobs_finalizing_download.remove(&job_id);
-        self.clear_par2_runtime_state(job_id);
-        self.clear_job_rar_runtime(job_id);
         self.job_order.retain(|id| *id != job_id);
         info!(
             job_id = job_id.0,
             "job completed after terminal post-processing"
         );
         self.record_job_history(job_id, Some(PipelineEvent::JobCompleted { job_id }));
-        self.publish_snapshot();
+        self.report_job(job_id);
     }
+}
 
-    pub(in crate::pipeline) fn resolve_job_input_path(
-        &self,
-        job_id: JobId,
-        relative_path: &str,
-    ) -> Option<PathBuf> {
-        let state = self.jobs.get(&job_id)?;
-        let working_path = state.working_dir.join(relative_path);
-        if working_path.exists() {
-            return Some(working_path);
-        }
-
-        if let Some(staging_dir) = state.staging_dir.as_ref() {
-            let staging_path = staging_dir.join(relative_path);
-            if staging_path.exists() {
-                return Some(staging_path);
-            }
-        }
-
-        Some(working_path)
+// Whether a queue script could have an event of this job queued or running.
+// The hint is worked out afresh when a settings or instance save dropped it,
+// so an unknown hint never sends a job without queue scripts through the
+// terminal pass.
+fn queue_events_may_hold_job(db: &crate::Database, job_id: JobId) -> bool {
+    if let Err(error) = crate::post_processing::events::refresh_admission_hint(db) {
+        warn!(job_id = job_id.0, %error, "could not read the queue script settings");
     }
+    db.queue_barrier_possible(job_id.0)
 }
 
 #[cfg(test)]

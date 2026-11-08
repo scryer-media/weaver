@@ -69,6 +69,69 @@ func TestPodmanHostPortBindCollisionRecognition(t *testing.T) {
 	}
 }
 
+func TestContainerEngineAPITransportFailureRecognition(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		message string
+		want    bool
+	}{
+		{
+			name:    "podman machine socket EOF from the 0.16.11 gate run",
+			message: "docker compose up: exit status 1\n\nLast command output:\nerror during connect: Put \"http://%2Fvar%2Ffolders%2F8x%2Ftq_8ldy17r734s057p4l4xkm0000gn%2FT%2Fpodman%2Fpodman-machine-default-api.sock/v1.44/containers/a2d91c017595e807dc1b4afed970f76253668e444fa56a10e96bb6a6aee9c570/archive?noOverwriteDirNonDir=true&path=%2F\": EOF",
+			want:    true,
+		},
+		{
+			name:    "docker daemon unreachable",
+			message: "error during connect: Get \"http://%2Fvar%2Frun%2Fdocker.sock/v1.44/containers/json\": dial unix /var/run/docker.sock: connect: no such file or directory",
+			want:    true,
+		},
+		{
+			name:    "engine socket reset",
+			message: "Post \"http://d/v4.0.0/libpod/containers/create\": read unix @->/run/podman/podman.sock: read: connection reset by peer",
+			want:    true,
+		},
+		{
+			name:    "engine socket broken pipe",
+			message: "write unix @->/var/run/docker.sock: write: broken pipe",
+			want:    true,
+		},
+		{
+			name:    "engine socket unexpected EOF",
+			message: "Put \"http://d/v1.44/containers/x/archive\": read unix /tmp/podman.sock: unexpected EOF",
+			want:    true,
+		},
+		{
+			name:    "EOF not on the engine socket",
+			message: "docker compose up: exit status 1\n\nLast command output:\nnntp-health: read tcp 127.0.0.1:55482: EOF",
+			want:    false,
+		},
+		{
+			name:    "unhealthy dependency",
+			message: "docker compose up: exit status 1\n\nLast command output:\ndependency failed to start: container weaver is unhealthy",
+			want:    false,
+		},
+		{
+			name:    "invalid compose file",
+			message: "docker compose up: invalid compose file",
+			want:    false,
+		},
+		{
+			name:    "host port collision",
+			message: "failed to bind host port 0.0.0.0:55482/tcp: address already in use",
+			want:    false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isContainerEngineAPITransportMessage(tc.message); got != tc.want {
+				t.Fatalf("isContainerEngineAPITransportMessage(%q) = %v, want %v", tc.message, got, tc.want)
+			}
+		})
+	}
+	if isContainerEngineAPITransportFailure(nil) {
+		t.Fatal("a nil error is not a transport failure")
+	}
+}
+
 func TestReallocateRuntimePortsForDockerRetryPreservesExplicitNNTPAliases(t *testing.T) {
 	statePath := filepath.Join(t.TempDir(), "runtime-ports.json")
 	previous, err := allocateRuntimePortState()

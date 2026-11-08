@@ -2,22 +2,22 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use serde::{Deserialize, Serialize};
-use std::any::Any;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::broadcast;
 
 use crate::events::model::PipelineEvent;
 use crate::jobs::assembly::DetectedArchiveIdentity;
-use crate::jobs::ids::{JobId, NzbFileId};
+use crate::jobs::ids::JobId;
 use crate::jobs::record::ActiveFileIdentity;
 
 use crate::jobs::error::SchedulerError;
 use crate::jobs::model::{JobSpec, JobStatus, JobUpdate};
 use crate::operations::metrics::{MetricsSnapshot, PipelineMetrics};
+use crate::pipeline::queue::{Change, Queue};
 
 pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
 pub const PROPAGATION_WAIT_REASON: &str = "propagation_delay";
@@ -39,25 +39,6 @@ struct JobCancellationState {
 }
 
 impl JobCancellationRegistry {
-    fn register(&self, job_id: JobId, callback: JobCancellationCallback) {
-        let cancel_now = {
-            let mut state = self
-                .state
-                .lock()
-                .expect("job cancellation registry poisoned");
-            let cancel_now = state.requested.contains(&job_id);
-            state
-                .callbacks
-                .entry(job_id)
-                .or_default()
-                .push(Arc::clone(&callback));
-            cancel_now
-        };
-        if cancel_now {
-            callback();
-        }
-    }
-
     fn cancel(&self, job_id: JobId) -> bool {
         let callbacks = {
             let mut state = self
@@ -74,14 +55,6 @@ impl JobCancellationRegistry {
         cancelled
     }
 
-    fn requested(&self, job_id: JobId) -> bool {
-        self.state
-            .lock()
-            .expect("job cancellation registry poisoned")
-            .requested
-            .contains(&job_id)
-    }
-
     fn clear(&self, job_id: JobId) {
         let mut state = self
             .state
@@ -92,41 +65,27 @@ impl JobCancellationRegistry {
     }
 }
 
-// Shared read-only view of pipeline state for the control plane.
-//
-// Written by the pipeline loop after each event, read by API handlers
-// without going through the command channel.
-#[cfg(test)]
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PipelineTurnObservation {
-    pub metrics_refreshes: u64,
-    pub job_revision: u64,
-    pub period: Duration,
-}
-
 #[derive(Clone)]
 pub struct SharedPipelineState {
-    #[cfg(test)]
-    pub(crate) turn_observation: tokio::sync::watch::Sender<Option<PipelineTurnObservation>>,
-    jobs: Arc<RwLock<PublishedJobs>>,
-    job_revision: tokio::sync::watch::Sender<u64>,
-    paused: Arc<AtomicBool>,
-    speed_test_paused: Arc<AtomicBool>,
-    schedule_replay_paused: Arc<AtomicBool>,
-    // Why the schedule evaluator is holding download admission, while it is.
-    schedule_hold_reason: Arc<RwLock<Option<String>>>,
-    post_processing_paused: Arc<AtomicBool>,
+    pub(crate) queue: Arc<Queue>,
     metrics: Arc<PipelineMetrics>,
-    metrics_snapshot: Arc<RwLock<MetricsSnapshot>>,
     download_block: Arc<RwLock<DownloadBlockState>>,
     server_quota_blocked: Arc<AtomicBool>,
+    // Set once shutdown is asked for, with the queue's own signal, for work
+    // off the actor that must not take the queue's lock to read it.
+    shutdown_started: Arc<AtomicBool>,
     // The egress whose download quota holds work back, while one does.
     egress_quota_block: Arc<RwLock<Option<EgressQuotaBlock>>>,
+    // Whether `egress_quota_block` holds one, written with it under its
+    // write lock: clearing a block that is not there, which the pipeline
+    // asks on every article, takes no lock.
+    egress_quota_blocked: Arc<AtomicBool>,
+    #[cfg(test)]
+    egress_quota_block_locks: Arc<AtomicU64>,
     proxy_runtime: Arc<RwLock<Option<Arc<crate::proxies::ProxyRuntime>>>>,
     server_transfer_policy:
         Arc<RwLock<Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>>>,
     nntp_pool: Arc<RwLock<Option<Arc<weaver_nntp::pool::NntpPool>>>>,
-    nntp_runtime_activation: Arc<RwLock<Option<NntpRuntimeActivation>>>,
     // Per-server BODY transport state from the download lanes, indexed by
     // pool server index. Published on the tuning tick, not per response.
     download_transport: Arc<RwLock<Vec<ServerTransportHealth>>>,
@@ -140,14 +99,6 @@ pub struct SharedPipelineState {
     // profile put in force now reaches the next extraction. `u64::MAX` means no profile cap, and
     // the extraction ceiling alone bounds the decoder.
     sevenz_decode_memory_bytes: Arc<AtomicU64>,
-    // How a direct-unpack chase widens its 7z decoder, as the hardware
-    // profile in force decides it. Read when a chase starts, so a profile put
-    // in force now reaches the next chase.
-    chase_widening: Arc<RwLock<crate::runtime::hardware_profile::ChaseWidening>>,
-    // The hardware profile whose limits are in force, and the scheduled one
-    // overriding the operator's choice, if any. `None` until a pipeline has
-    // resolved one.
-    hardware_profile: Arc<RwLock<Option<HardwareProfileInForce>>>,
     job_cancellations: JobCancellationRegistry,
     // The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
     // kept off the job-level broadcast: a download emits several of these
@@ -157,25 +108,6 @@ pub struct SharedPipelineState {
     segment_events: broadcast::Sender<PipelineEvent>,
     // The speed test service, held weakly: the service holds this handle.
     speed_test: Arc<std::sync::Mutex<std::sync::Weak<crate::speed_test::ServiceInner>>>,
-    // Metrics snapshot refreshes, counted so tests can observe the cadence of
-    // the orchestrator's periodic tick.
-    #[cfg(test)]
-    metrics_refreshes: Arc<AtomicU64>,
-}
-
-// The published job list: live jobs rebuilt on each publish, followed by the
-// finished jobs, which are shared with the orchestrator and only rebuilt when
-// history itself changes.
-#[derive(Default)]
-struct PublishedJobs {
-    live: Vec<JobInfo>,
-    history: Arc<[JobInfo]>,
-}
-
-impl PublishedJobs {
-    fn iter(&self) -> impl Iterator<Item = &JobInfo> {
-        self.live.iter().chain(self.history.iter())
-    }
 }
 
 // Bounded like the job-level broadcast; a lagging listener drops articles,
@@ -184,43 +116,32 @@ const SEGMENT_EVENT_CAPACITY: usize = 1024;
 
 impl SharedPipelineState {
     pub fn new(metrics: Arc<PipelineMetrics>, initial_jobs: Vec<JobInfo>) -> Self {
-        let metrics_snapshot = metrics.snapshot();
-        let (job_revision, _) = tokio::sync::watch::channel(0);
+        let metrics_snapshot = metrics.raw_snapshot();
+        let queue = Arc::new(Queue::new(initial_jobs));
+        queue.write(|inner| {
+            inner.metrics = Some(metrics_snapshot);
+            Change::unchanged(())
+        });
         let (segment_events, _) = broadcast::channel(SEGMENT_EVENT_CAPACITY);
         Self {
-            jobs: Arc::new(RwLock::new(PublishedJobs {
-                live: initial_jobs,
-                history: Arc::from(Vec::new()),
-            })),
-            job_revision,
-            paused: Arc::new(AtomicBool::new(false)),
-            speed_test_paused: Arc::new(AtomicBool::new(false)),
-            schedule_replay_paused: Arc::new(AtomicBool::new(false)),
-            schedule_hold_reason: Arc::new(RwLock::new(None)),
-            post_processing_paused: Arc::new(AtomicBool::new(false)),
+            queue,
             metrics,
-            metrics_snapshot: Arc::new(RwLock::new(metrics_snapshot)),
             download_block: Arc::new(RwLock::new(DownloadBlockState::default())),
             server_quota_blocked: Arc::new(AtomicBool::new(false)),
+            shutdown_started: Arc::new(AtomicBool::new(false)),
             egress_quota_block: Arc::new(RwLock::new(None)),
+            egress_quota_blocked: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            egress_quota_block_locks: Arc::new(AtomicU64::new(0)),
             proxy_runtime: Arc::new(RwLock::new(None)),
             server_transfer_policy: Arc::new(RwLock::new(None)),
             nntp_pool: Arc::new(RwLock::new(None)),
-            nntp_runtime_activation: Arc::new(RwLock::new(None)),
             download_transport: Arc::new(RwLock::new(Vec::new())),
             server_probe_latency: Arc::new(RwLock::new(HashMap::new())),
             sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
-            chase_widening: Arc::new(RwLock::new(
-                crate::runtime::hardware_profile::ChaseWidening::default(),
-            )),
-            hardware_profile: Arc::new(RwLock::new(None)),
             job_cancellations: JobCancellationRegistry::default(),
             segment_events,
             speed_test: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
-            #[cfg(test)]
-            metrics_refreshes: Arc::new(AtomicU64::new(0)),
-            #[cfg(test)]
-            turn_observation: tokio::sync::watch::channel(None).0,
         }
     }
 
@@ -240,20 +161,58 @@ impl SharedPipelineState {
     // --- Reader methods (called by API handlers) ---
 
     pub fn list_jobs(&self) -> Vec<JobInfo> {
-        self.jobs.read().unwrap().iter().cloned().collect()
+        self.queue.read(|inner| {
+            inner
+                .visible_jobs()
+                .chain(self.queue.history().iter().cloned())
+                .collect()
+        })
+    }
+
+    // The queue's own rows, whatever their status: a job retiring into
+    // history stays here until its archive commits, and history hides it
+    // until then.
+    pub fn queue_jobs(&self) -> Vec<JobInfo> {
+        self.queue.read(|inner| inner.visible_jobs().collect())
     }
 
     // How many published jobs are in each status, counted under the read
     // lock without copying a job.
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
-        crate::operations::metrics_store::JobStatusCounts::from_statuses(
-            self.jobs.read().unwrap().iter().map(|job| &job.status),
-        )
+        self.queue.read(|inner| {
+            inner
+                .history_summary
+                .with_statuses(inner.jobs.iter().map(|row| &row.report.job.status))
+        })
+    }
+
+    // The jobs that get their own `weaver_job_*` series under `mode`,
+    // copied under the read lock; nothing else in the queue is copied.
+    // `Active` is the jobs the pipeline is working on: those holding an NZB
+    // slot and those past their download, until they finish. A job waiting
+    // its turn moves no value a series would show, and at ten thousand
+    // queued jobs its series were most of the scrape.
+    pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
+        use crate::settings::PerJobSeries;
+        self.queue.read(|inner| match mode {
+            PerJobSeries::Off => Vec::new(),
+            PerJobSeries::All => inner
+                .visible_jobs()
+                .chain(self.queue.history().iter().cloned())
+                .collect(),
+            PerJobSeries::Active => inner
+                .jobs
+                .iter()
+                .filter(|row| row.report.nzb_admitted || row.report.job.status.past_download())
+                .map(|row| row.info(&inner.globals))
+                .filter(|job| !job.status.finished())
+                .collect(),
+        })
     }
 
     // The revision of the published job list; it moves on every publish.
     pub fn job_revision(&self) -> u64 {
-        *self.job_revision.borrow()
+        self.queue.revision()
     }
 
     // Live download rate of every transferring job, read off the published
@@ -264,67 +223,95 @@ impl SharedPipelineState {
     // `(job id, rate)` pairs, so a metrics subscriber sampling it every
     // 250 ms costs less than the job-list clone the queue readers make.
     pub fn job_download_rates(&self) -> Vec<(JobId, u64)> {
-        let jobs = self.jobs.read().unwrap();
-        let mut rates = job_download_rates(&jobs.live);
-        rates.extend(job_download_rates(&jobs.history));
-        rates
+        self.queue.read(|inner| {
+            inner
+                .jobs
+                .iter()
+                .filter(|row| row.intents.cancelled.is_none())
+                .filter_map(|row| {
+                    let phases = if row.phases.is_empty() {
+                        &row.report.job.phase_progress
+                    } else {
+                        &row.sampled_phases
+                    };
+                    phases
+                        .iter()
+                        .find(|phase| {
+                            phase.phase == crate::jobs::phase_progress::JobPhase::Downloading
+                        })
+                        .and_then(|phase| phase.rate_bps)
+                        .map(|rate| (row.id, rate))
+                })
+                .collect()
+        })
     }
 
     pub fn get_job(&self, job_id: JobId) -> Option<JobInfo> {
-        self.jobs
-            .read()
-            .unwrap()
-            .iter()
-            .find(|j| j.job_id == job_id)
-            .cloned()
+        self.queue.read(|inner| {
+            inner
+                .job(job_id)
+                .map(|row| row.info(&inner.globals))
+                .or_else(|| {
+                    self.queue
+                        .history()
+                        .iter()
+                        .find(|job| job.job_id == job_id)
+                        .cloned()
+                })
+        })
+    }
+
+    // Includes hidden cancellations and terminal rows awaiting durable retirement.
+    pub fn queued_job_ids(&self) -> HashSet<JobId> {
+        self.queue
+            .read(|inner| inner.jobs.iter().map(|row| row.id).collect())
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused.load(Ordering::Relaxed) || self.speed_test_paused()
+        self.queue
+            .read(|inner| inner.globals.paused || inner.globals.speed_test_paused)
     }
 
     pub(crate) fn speed_test_paused(&self) -> bool {
-        self.speed_test_paused.load(Ordering::Acquire)
+        self.queue.read(|inner| inner.globals.speed_test_paused)
     }
 
     pub fn set_speed_test_paused(&self, paused: bool) {
-        self.speed_test_paused.store(paused, Ordering::Release);
+        self.queue.write_intent(|inner| {
+            inner.globals.speed_test_paused = paused;
+            Change::changed(())
+        });
     }
 
     pub(crate) fn schedule_replay_paused(&self) -> bool {
-        self.schedule_replay_paused.load(Ordering::Acquire)
+        self.queue
+            .read(|inner| inner.globals.schedule_replay_paused)
     }
 
     pub fn is_post_processing_paused(&self) -> bool {
-        self.post_processing_paused.load(Ordering::Relaxed)
+        self.queue
+            .read(|inner| inner.globals.post_processing_paused)
     }
 
     pub fn set_post_processing_paused(&self, paused: bool) {
-        self.post_processing_paused.store(paused, Ordering::Relaxed);
+        self.queue.write_intent(|inner| {
+            inner.globals.post_processing_paused = paused;
+            Change::changed(())
+        });
     }
 
     pub fn metrics_snapshot(&self) -> MetricsSnapshot {
-        self.metrics_snapshot.read().unwrap().clone()
+        self.queue
+            .read(|inner| inner.metrics.clone())
+            .unwrap_or_else(|| self.metrics.raw_snapshot())
     }
 
     pub fn raw_metrics_snapshot(&self) -> MetricsSnapshot {
         self.metrics.raw_snapshot()
     }
 
-    pub(crate) fn register_job_cancellation(
-        &self,
-        job_id: JobId,
-        callback: JobCancellationCallback,
-    ) {
-        self.job_cancellations.register(job_id, callback);
-    }
-
     pub(crate) fn cancel_active_job_work(&self, job_id: JobId) -> bool {
         self.job_cancellations.cancel(job_id)
-    }
-
-    pub(crate) fn is_job_cancellation_requested(&self, job_id: JobId) -> bool {
-        self.job_cancellations.requested(job_id)
     }
 
     pub(crate) fn clear_job_cancellations(&self, job_id: JobId) {
@@ -337,54 +324,74 @@ impl SharedPipelineState {
 
     pub fn download_block(&self) -> DownloadBlockState {
         let mut state = self.download_block.read().unwrap().clone();
-        state.schedule_hold_reason = self.schedule_hold_reason.read().unwrap().clone();
+        state.schedule_hold_reason = self
+            .queue
+            .read(|inner| inner.globals.schedule_hold_reason.clone());
         if state.schedule_hold_reason.is_some() && state.kind == DownloadBlockKind::None {
             state.kind = DownloadBlockKind::Scheduled;
         }
         state
     }
 
-    // --- Writer methods (called by pipeline loop only) ---
-
+    #[cfg(any(test, feature = "test-support"))]
     pub fn publish_jobs(&self, jobs: Vec<JobInfo>) {
-        self.publish_live_jobs(jobs, Arc::from(Vec::new()));
+        self.queue.write(|inner| {
+            inner.jobs = jobs
+                .into_iter()
+                .map(crate::pipeline::queue::JobRow::new)
+                .collect();
+            inner.reindex_jobs();
+            self.queue.replace_history(inner, Arc::from(Vec::new()));
+            crate::pipeline::queue::Change::changed(())
+        });
     }
 
-    // Publish the live jobs together with the finished ones. The finished
-    // list is shared, not copied: the orchestrator rebuilds it only when
-    // history changes.
-    pub fn publish_live_jobs(&self, live: Vec<JobInfo>, history: Arc<[JobInfo]>) {
-        *self.jobs.write().unwrap() = PublishedJobs { live, history };
-        self.job_revision
-            .send_modify(|revision| *revision = revision.wrapping_add(1));
+    pub fn load_history(&self, history: Vec<JobInfo>) {
+        self.queue.write(|inner| {
+            self.queue.replace_history(inner, history.into());
+            Change::changed(())
+        });
     }
 
     pub fn subscribe_job_changes(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.job_revision.subscribe()
+        self.queue.subscribe()
     }
 
     // Advance the rate windows and publish the metrics snapshot. Returns
     // whether any published rate is still above zero, so the caller keeps
     // sampling quickly until the gauges have settled.
-    pub fn refresh_metrics_snapshot(&self) -> bool {
-        let snapshot = self.metrics.snapshot();
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refresh_metrics_snapshot(&self, now: std::time::Instant) -> bool {
+        // The gauge integrates the transfer total, the counter the queue tick
+        // hands it, so a test tick and a live tick feed one series.
+        let snapshot = self
+            .metrics
+            .sample_totals(now, self.queue.counters.bandwidth.total(), 0, 0);
         let rates_moving = snapshot.current_download_speed > 0
             || snapshot.articles_per_sec > 0.0
             || snapshot.decode_rate_mbps > 0.0;
-        *self.metrics_snapshot.write().unwrap() = snapshot;
-        #[cfg(test)]
-        self.metrics_refreshes.fetch_add(1, Ordering::Relaxed);
+        self.queue.write(|inner| {
+            inner.metrics = Some(snapshot);
+            Change::unchanged(())
+        });
         rates_moving
     }
 
-    // How many times the metrics snapshot has been refreshed.
-    #[cfg(test)]
-    pub(crate) fn metrics_refresh_count(&self) -> u64 {
-        self.metrics_refreshes.load(Ordering::Relaxed)
+    // Book wire bytes the way a lane and its completion do: the transfer total
+    // the download gauge integrates, and the lifetime downloaded counter.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn record_wire_bytes(&self, bytes: u64) {
+        self.queue.counters.bandwidth.record(bytes);
+        self.metrics
+            .bytes_downloaded
+            .fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn set_paused(&self, paused: bool) {
-        self.paused.store(paused, Ordering::Relaxed);
+        self.queue.write_intent(|inner| {
+            inner.globals.paused = paused;
+            Change::changed(())
+        });
     }
 
     pub fn set_download_block(&self, mut state: DownloadBlockState) {
@@ -444,15 +451,32 @@ impl SharedPipelineState {
     // Record which egress quota, if any, holds work back, and re-lay the
     // published block state over it.
     pub fn set_egress_quota_block(&self, block: Option<EgressQuotaBlock>) {
+        if block.is_none() && !self.egress_quota_blocked.load(Ordering::Acquire) {
+            return;
+        }
+        #[cfg(test)]
+        self.egress_quota_block_locks
+            .fetch_add(1, Ordering::Relaxed);
+        if *self.egress_quota_block.read().unwrap() == block {
+            return;
+        }
         let mut state = self.download_block.write().unwrap();
         {
             let mut current = self.egress_quota_block.write().unwrap();
             if *current == block {
                 return;
             }
+            self.egress_quota_blocked
+                .store(block.is_some(), Ordering::Release);
             *current = block;
         }
         self.apply_quota_blocks(&mut state);
+    }
+
+    // How many times setting the egress block took its lock.
+    #[cfg(test)]
+    pub(crate) fn egress_quota_block_lock_count(&self) -> u64 {
+        self.egress_quota_block_locks.load(Ordering::Relaxed)
     }
 
     // Memory one conventional 7z extraction may hold. `u64::MAX` when no
@@ -468,34 +492,39 @@ impl SharedPipelineState {
             .store(bytes.max(1), Ordering::Relaxed);
     }
 
-    // How a direct-unpack chase widens its 7z decoder. The balanced
-    // profile's widening until a profile is put in force.
-    pub fn chase_widening(&self) -> crate::runtime::hardware_profile::ChaseWidening {
-        *self.chase_widening.read().unwrap()
-    }
-
-    // Apply the chosen profile's chase widening. Chases already running keep
-    // the widening they started with.
-    pub fn set_chase_widening(&self, widening: crate::runtime::hardware_profile::ChaseWidening) {
-        *self.chase_widening.write().unwrap() = widening;
-    }
-
     // The hardware profile in force, or `None` before a pipeline has
     // resolved one.
     pub fn hardware_profile_in_force(&self) -> Option<HardwareProfileInForce> {
-        *self.hardware_profile.read().unwrap()
+        self.queue
+            .read(|inner| inner.globals.hardware_profile_in_force)
     }
 
     // Publish the hardware profile the pipeline has put in force.
     pub fn set_hardware_profile_in_force(&self, in_force: HardwareProfileInForce) {
-        *self.hardware_profile.write().unwrap() = Some(in_force);
+        self.queue.write(|inner| {
+            if inner.globals.hardware_profile_in_force == Some(in_force) {
+                return Change::unchanged(());
+            }
+            inner.globals.hardware_profile_in_force = Some(in_force);
+            Change::changed(())
+        });
+    }
+
+    // The shutdown signal as an atomic, for work off the actor.
+    pub(crate) fn shutdown_started(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.shutdown_started)
     }
 
     pub fn server_quota_blocked(&self) -> bool {
         self.server_quota_blocked.load(Ordering::Relaxed)
     }
 
+    // The block is laid again only when the value changed: the pipeline
+    // derives it on every queue change.
     pub fn set_server_quota_blocked(&self, blocked: bool) {
+        if self.server_quota_blocked.load(Ordering::Relaxed) == blocked {
+            return;
+        }
         let mut state = self.download_block.write().unwrap();
         self.server_quota_blocked.store(blocked, Ordering::Relaxed);
         self.apply_quota_blocks(&mut state);
@@ -527,11 +556,14 @@ impl SharedPipelineState {
     }
 
     pub fn set_nntp_runtime_activation(&self, activation: NntpRuntimeActivation) {
-        *self.nntp_runtime_activation.write().unwrap() = Some(activation);
+        self.queue.write(|inner| {
+            inner.globals.nntp_active = Some(activation);
+            Change::changed(())
+        });
     }
 
     pub fn nntp_runtime_activation(&self) -> Option<NntpRuntimeActivation> {
-        *self.nntp_runtime_activation.read().unwrap()
+        self.queue.read(|inner| inner.globals.nntp_active)
     }
 
     pub fn set_download_transport_health(&self, health: Vec<ServerTransportHealth>) {
@@ -698,6 +730,13 @@ pub struct DownloadBlockState {
     // Speed limit imposed by the active schedule (0 = no scheduled limit).
     #[serde(default)]
     pub scheduled_speed_limit: u64,
+    // Speed limit the downloads run under now: the schedule's while one
+    // holds, even one set to unlimited, else the configured one (0 = none).
+    #[serde(default)]
+    pub speed_limit_in_force: u64,
+    // Whether a schedule window sets the limit in force, even to unlimited.
+    #[serde(default)]
+    pub speed_limit_by_schedule: bool,
     // Why a schedule rule is holding new downloads, while one is.
     #[serde(default)]
     pub schedule_hold_reason: Option<String>,
@@ -730,6 +769,8 @@ impl Default for DownloadBlockState {
             window_ends_at_epoch_ms: None,
             timezone_name: chrono::Local::now().offset().to_string(),
             scheduled_speed_limit: 0,
+            speed_limit_in_force: 0,
+            speed_limit_by_schedule: false,
             schedule_hold_reason: None,
         }
     }
@@ -741,11 +782,8 @@ pub struct RestoreJobRequest {
     pub job_id: JobId,
     pub job_hash: [u8; 32],
     pub spec: JobSpec,
-    pub complete_files: HashSet<NzbFileId>,
-    pub file_progress: HashMap<u32, u64>,
     pub detected_archives: HashMap<u32, DetectedArchiveIdentity>,
     pub file_identities: HashMap<u32, ActiveFileIdentity>,
-    pub extracted_members: HashSet<String>,
     pub status: JobStatus,
     pub download_state: Option<crate::jobs::model::DownloadState>,
     pub post_state: Option<crate::jobs::model::PostState>,
@@ -756,6 +794,23 @@ pub struct RestoreJobRequest {
     pub paused_resume_download_state: Option<crate::jobs::model::DownloadState>,
     pub paused_resume_post_state: Option<crate::jobs::model::PostState>,
     pub working_dir: PathBuf,
+    // What a restart read of the job's row, when the request comes from one.
+    pub restart: Option<RestartRead>,
+}
+
+// What a restart read of a job's active row besides its request: the runtime
+// columns as stored, so the install writes back only what it changes, and
+// the summaries of the article lists it let go, so a job waiting its turn
+// installs without reading them back.
+#[derive(Clone, Debug)]
+pub struct RestartRead {
+    pub(crate) runtime: crate::pipeline::StoredRuntimeValues,
+    pub(crate) summaries: crate::jobs::model::FileSummaries,
+    // When the job was added, as its row stores it.
+    pub(crate) created_at_epoch_ms: f64,
+    // The job is entering the queue window again, not arriving: it raises
+    // no creation event.
+    pub(crate) reentry: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -779,6 +834,7 @@ pub struct AddJobOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CancellationOrigin {
     User,
+    UserDuplicate,
     // A user cancel that leaves the job's files on disk.
     UserKeepingFiles,
     SemanticBad,
@@ -787,9 +843,16 @@ pub enum CancellationOrigin {
 
 impl CancellationOrigin {
     pub fn is_user(self) -> bool {
-        matches!(self, Self::User | Self::UserKeepingFiles)
+        matches!(
+            self,
+            Self::User | Self::UserDuplicate | Self::UserKeepingFiles
+        )
     }
 }
+
+// Per-id acceptance: `Ok` means the cancellation intent was recorded and
+// hidden from the live queue; teardown and durable archival follow later.
+pub type CancelJobsOutcome = BTreeMap<JobId, Result<(), SchedulerError>>;
 
 // Which hardware profile's limits the pipeline is running under, and why.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -819,177 +882,30 @@ pub struct HistoryDeleteOutcome {
     pub left_in_place: Vec<std::path::PathBuf>,
 }
 
-pub enum SchedulerCommand {
-    // Submit a new job.
-    AddJob {
-        job_id: JobId,
-        spec: JobSpec,
-        nzb_path: PathBuf,
-        nzb_zstd: Vec<u8>,
-        options: AddJobOptions,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Restore a job from the journal (crash recovery).
-    RestoreJob {
-        request: Box<RestoreJobRequest>,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Pause a job.
-    PauseJob {
-        job_id: JobId,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Resume a paused job.
-    ResumeJob {
-        job_id: JobId,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Cancel and remove a job.
-    CancelJob {
-        job_id: JobId,
-        origin: CancellationOrigin,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Update a job's category and/or metadata.
-    UpdateJob {
-        job_id: JobId,
-        update: JobUpdate,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Rename, recategorise or re-parameterise a finished job's history row.
-    UpdateHistory {
-        job_id: JobId,
-        update: JobUpdate,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Move a job within the manual queue order.
-    ReorderJob {
-        job_id: JobId,
-        target: QueueMoveTarget,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Batch-move multiple jobs within the manual queue order in a single
-    // round trip. Applied all-or-nothing: if any job id is unknown, no move
-    // is applied. Persists the resulting order and publishes a snapshot
-    // once for the whole batch rather than once per move.
-    ReorderJobs {
-        moves: Vec<(JobId, QueueMoveTarget)>,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Pause all jobs globally (pipeline-wide).
-    PauseAll {
-        reply: oneshot::Sender<()>,
-    },
-    // An in-memory hold independent of operator and schedule pauses.
-    SetSpeedTestPause {
-        paused: bool,
-        reply: oneshot::Sender<()>,
-    },
-    // Resume all jobs globally.
-    ResumeAll {
-        reply: oneshot::Sender<()>,
-    },
-    // Pause admission of queued extension post-processing attempts.
-    PausePostProcessing {
-        reply: oneshot::Sender<()>,
-    },
-    // Resume admission of queued extension post-processing attempts.
-    ResumePostProcessing {
-        reply: oneshot::Sender<()>,
-    },
-    // Cancel the queued or active extension attempt for a job.
-    CancelPostProcessing {
-        job_id: JobId,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Set global speed limit (bytes/sec). 0 means unlimited. With
-    // `replaces_schedule`, an operator's edit: it is in force at once, over
-    // a scheduled limit, until the next scheduled speed rule fires. Without,
-    // it is recorded and waits while a scheduled limit is in force.
-    SetSpeedLimit {
-        bytes_per_sec: u64,
-        replaces_schedule: bool,
-        reply: oneshot::Sender<()>,
-    },
-    // Change the minimum post age and recalculate pending propagation holds.
-    SetPropagationDelay {
-        seconds: u32,
-        reply: oneshot::Sender<()>,
-    },
-    // Apply a scheduled action (pause, resume, or speed limit).
-    // Sent by the schedule evaluator background task.
-    ApplyScheduleAction {
-        action: crate::bandwidth::ScheduleAction,
-        reply: oneshot::Sender<()>,
-    },
-    // Make this the operator's hardware profile: the one in force whenever
-    // no schedule rule puts another in force.
-    SetHardwareProfile {
-        profile: crate::runtime::HardwareProfile,
-        reply: oneshot::Sender<()>,
-    },
-    // Put a hardware profile in force from the schedule, or hand control
-    // back to the operator's choice with `None`.
-    SetScheduledHardwareProfile {
-        profile: Option<crate::runtime::HardwareProfile>,
-        reply: oneshot::Sender<()>,
-    },
-    // Replace the NNTP client at runtime (hot-reload after server config change).
-    // The client is boxed as `dyn Any` to avoid coupling weaver-scheduler to weaver-nntp.
-    RebuildNntp {
-        client: Box<dyn Any + Send>,
-        total_connections: usize,
-        reply: oneshot::Sender<Result<NntpRuntimeActivation, SchedulerError>>,
-    },
-    // Apply the asynchronous random-read disk measurement to the tuner.
-    UpdateRandomReadIops {
-        random_read_iops: f64,
-        reply: oneshot::Sender<()>,
-    },
-    // Update runtime storage directories after a restore.
-    UpdateRuntimePaths {
-        data_dir: PathBuf,
-        intermediate_dir: PathBuf,
-        complete_dir: PathBuf,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Reprocess a completed or failed job (re-run post-download stages without re-downloading).
-    ReprocessJob {
-        job_id: JobId,
-        password: Option<String>,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Re-download a completed or failed job from its persisted NZB under the same job ID.
-    RedownloadJob {
-        job_id: JobId,
-        password: Option<String>,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Delete a completed/failed/cancelled job from history.
-    DeleteHistory {
-        job_id: JobId,
-        delete_files: bool,
-        reply: oneshot::Sender<Result<HistoryDeleteOutcome, SchedulerError>>,
-    },
-    // Delete all completed/failed/cancelled jobs from history.
-    DeleteAllHistory {
-        delete_files: bool,
-        reply: oneshot::Sender<Result<(), SchedulerError>>,
-    },
-    // Copy a read-only diagnostics snapshot out of the pipeline actor.
-    //
-    // Answered from the same command loop as everything else, so the snapshot
-    // is coherent with the turn it lands in rather than being stitched
-    // together from fields read while the actor was running.
-    PipelineDiagnostics {
-        reply: oneshot::Sender<Box<crate::pipeline::diagnostics::PipelineDiagnostics>>,
-    },
-    // Shutdown the scheduler gracefully.
-    Shutdown,
+// How many history ids one delete command carries. A batch is one
+// transaction, one statement per table, and one reply the caller waits for,
+// while the queue scripts of each job in it are stopped one after another
+// before its directory goes. So a batch is also what one database error or
+// one slow script fails whole: small enough to keep that to a few dozen
+// rows, large enough that the transaction, lock and sweep a batch pays once
+// are still shared across many.
+pub const HISTORY_DELETE_BATCH_SIZE: usize = 50;
+
+// What one batched history delete did, id by id. A refused id never holds
+// back the rest of the batch.
+#[derive(Debug, Default)]
+pub struct HistoryDeleteBatchOutcome {
+    // Every id whose record is gone, with what its cleanup did: what it left
+    // on disk, or why it did not finish. A cleanup that failed still leaves
+    // the record deleted, so the id is here either way and is announced as
+    // removed; the error is reported beside that, never instead of it.
+    pub deleted: BTreeMap<JobId, Result<HistoryDeleteOutcome, SchedulerError>>,
+    // Ids whose record was not deleted, and why.
+    pub refused: BTreeMap<JobId, SchedulerError>,
 }
 
 // One `(job, bytes per second)` pair per job whose download phase currently
-// reports a rate. The rate is the value `sample_phase_progress` published for
+// reports a rate. The rate is the value the independent ticker published for
 // that job on the metrics tick, so it is the same estimator and the same
 // instant as the global speed gauge.
 pub fn job_download_rates(jobs: &[JobInfo]) -> Vec<(JobId, u64)> {
@@ -1046,6 +962,27 @@ pub struct JobInfo {
     // Files fully downloaded and committed.
     #[serde(default)]
     pub completed_files: u32,
+    // Each NZB file's bytes not yet downloaded, in the NZB's file order, as
+    // the post declares their sizes. Empty when no download runs for the job.
+    #[serde(default)]
+    pub file_remaining_bytes: Vec<u64>,
+    // Of each NZB file's bytes not yet downloaded, those of recovery held
+    // back until a loss asks for it, in the same order. Empty when no
+    // download runs for the job.
+    #[serde(default)]
+    pub file_parked_bytes: Vec<u64>,
+    // The post's encoded bytes still to come: every article neither in hand
+    // nor lost for good, less the recovery parked until something asks for
+    // it. A clean post ends its download at zero; recovery fetched after a
+    // loss counts from the moment it is asked for.
+    #[serde(default)]
+    pub remaining_bytes: u64,
+    // The post's encoded bytes the download is out to bring: every article
+    // but the recovery still parked. What is done of it is this less
+    // `remaining_bytes`, so the two measure the same declared bytes and the
+    // download ends at exactly 100%.
+    #[serde(default)]
+    pub wanted_bytes: u64,
     // PAR2 recovery volumes not yet fetched (fetched on demand).
     #[serde(default)]
     pub remaining_par_files: u32,
@@ -1077,24 +1014,17 @@ pub struct JobInfo {
 // Cloneable, can be shared across tasks.
 #[derive(Clone)]
 pub struct SchedulerHandle {
-    cmd_tx: mpsc::Sender<SchedulerCommand>,
     event_tx: broadcast::Sender<PipelineEvent>,
     state: SharedPipelineState,
 }
 
 impl SchedulerHandle {
-    // Create a new handle from a command sender, event broadcast sender,
-    // and shared pipeline state.
-    pub fn new(
-        cmd_tx: mpsc::Sender<SchedulerCommand>,
-        event_tx: broadcast::Sender<PipelineEvent>,
-        state: SharedPipelineState,
-    ) -> Self {
-        Self {
-            cmd_tx,
-            event_tx,
-            state,
-        }
+    // Attach the control-plane handle and its independent metrics ticker.
+    pub fn new(event_tx: broadcast::Sender<PipelineEvent>, state: SharedPipelineState) -> Self {
+        state
+            .queue
+            .start_ticker(state.metrics.clone(), event_tx.clone());
+        Self { event_tx, state }
     }
 
     // Submit a new download job.
@@ -1118,58 +1048,75 @@ impl SchedulerHandle {
         nzb_zstd: Vec<u8>,
         options: AddJobOptions,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::AddJob {
+        self.state
+            .queue
+            .clone()
+            .add(
                 job_id,
                 spec,
                 nzb_path,
                 nzb_zstd,
                 options,
-                reply: tx,
-            })
+                self.event_tx.clone(),
+            )
             .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
     // Restore a job from crash-recovery journal.
     pub async fn restore_job(&self, request: RestoreJobRequest) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::RestoreJob {
-                request: Box::new(request),
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.state.queue.restore(request)
     }
 
     // Pause a job.
     pub async fn pause_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::PauseJob { job_id, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.state.queue.set_job_paused(job_id, true)
     }
 
     // Resume a paused job.
     pub async fn resume_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::ResumeJob { job_id, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.state.queue.set_job_paused(job_id, false)
+    }
+
+    // Pause or resume every job named as one queue change: one revision for
+    // the batch, each job answered on its own.
+    pub async fn set_jobs_paused(
+        &self,
+        job_ids: impl IntoIterator<Item = JobId>,
+        paused: bool,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        self.state.queue.set_jobs_paused(job_ids, paused)
+    }
+
+    // Apply every job update named as one queue change: one revision for the
+    // batch, each job answered on its own.
+    pub async fn update_jobs(
+        &self,
+        updates: impl IntoIterator<Item = (JobId, JobUpdate)>,
+    ) -> BTreeMap<JobId, Result<(), SchedulerError>> {
+        self.state.queue.update_jobs(updates)
     }
 
     // Cancel a job.
     pub async fn cancel_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
         self.cancel_job_with_origin(job_id, CancellationOrigin::User)
             .await
+    }
+
+    pub async fn cancel_duplicate_job(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.cancel_job_with_origin(job_id, CancellationOrigin::UserDuplicate)
+            .await
+    }
+
+    pub async fn cancel_job_and_delete_history(&self, job_id: JobId) -> Result<(), SchedulerError> {
+        self.state
+            .queue
+            .cancel_jobs_with_history_policy(
+                BTreeSet::from([job_id]),
+                CancellationOrigin::User,
+                true,
+            )
+            .remove(&job_id)
+            .unwrap_or(Err(SchedulerError::JobNotFound(job_id)))
     }
 
     // Cancel a job and keep whatever it has written so far.
@@ -1193,33 +1140,25 @@ impl SchedulerHandle {
         job_id: JobId,
         origin: CancellationOrigin,
     ) -> Result<(), SchedulerError> {
-        if origin.is_user() {
-            self.state.cancel_active_job_work(job_id);
-        }
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::CancelJob {
-                job_id,
-                origin,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.cancel_jobs(BTreeSet::from([job_id]), origin)
+            .await?
+            .remove(&job_id)
+            .unwrap_or(Err(SchedulerError::JobNotFound(job_id)))
+    }
+
+    // Record cancellation and hide accepted rows immediately. Teardown and
+    // durable history follow at the pipeline's next boundary.
+    pub async fn cancel_jobs(
+        &self,
+        job_ids: BTreeSet<JobId>,
+        origin: CancellationOrigin,
+    ) -> Result<CancelJobsOutcome, SchedulerError> {
+        Ok(self.state.queue.cancel_jobs(job_ids, origin))
     }
 
     // Update a job's category and/or metadata.
     pub async fn update_job(&self, job_id: JobId, update: JobUpdate) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::UpdateJob {
-                job_id,
-                update,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.state.queue.update_job(job_id, update)
     }
 
     // Update a finished job's history row. The password field is ignored.
@@ -1228,16 +1167,11 @@ impl SchedulerHandle {
         job_id: JobId,
         update: JobUpdate,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::UpdateHistory {
-                job_id,
-                update,
-                reply: tx,
-            })
+        self.state
+            .queue
+            .clone()
+            .update_history(job_id, update)
             .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
     // Move a job within the manual queue order. Durable and reflected in
@@ -1248,16 +1182,7 @@ impl SchedulerHandle {
         job_id: JobId,
         target: QueueMoveTarget,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::ReorderJob {
-                job_id,
-                target,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.state.queue.reorder_jobs(vec![(job_id, target)])
     }
 
     // Move multiple jobs within the manual queue order in a single round
@@ -1269,12 +1194,7 @@ impl SchedulerHandle {
         &self,
         moves: Vec<(JobId, QueueMoveTarget)>,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::ReorderJobs { moves, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.state.queue.reorder_jobs(moves)
     }
 
     // Reprocess a completed or failed job (re-run post-download stages without re-downloading).
@@ -1287,16 +1207,11 @@ impl SchedulerHandle {
         job_id: JobId,
         password: Option<String>,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::ReprocessJob {
-                job_id,
-                password,
-                reply: tx,
-            })
+        self.state
+            .queue
+            .clone()
+            .restart(job_id, password, true, self.event_tx.clone())
             .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
     // Re-download a completed or failed job from its persisted NZB under the same job ID.
@@ -1309,47 +1224,48 @@ impl SchedulerHandle {
         job_id: JobId,
         password: Option<String>,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::RedownloadJob {
-                job_id,
-                password,
-                reply: tx,
-            })
+        self.state
+            .queue
+            .clone()
+            .restart(job_id, password, false, self.event_tx.clone())
             .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
     // Delete a completed/failed/cancelled job from history.
+    //
+    // An `Err` does not say the record survived: a cleanup that failed after
+    // the record was deleted is returned as its error too. A caller that must
+    // know whether the record is gone reads `delete_history_batch`.
     pub async fn delete_history(
         &self,
         job_id: JobId,
         delete_files: bool,
     ) -> Result<HistoryDeleteOutcome, SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::DeleteHistory {
-                job_id,
-                delete_files,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        let mut outcome = self
+            .delete_history_batch(BTreeSet::from([job_id]), delete_files)
+            .await?;
+        if let Some(error) = outcome.refused.remove(&job_id) {
+            return Err(error);
+        }
+        outcome
+            .deleted
+            .remove(&job_id)
+            .unwrap_or(Ok(Default::default()))
     }
 
-    // Delete all completed/failed/cancelled jobs from history.
-    pub async fn delete_all_history(&self, delete_files: bool) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::DeleteAllHistory {
-                delete_files,
-                reply: tx,
-            })
+    // Delete a batch of completed/failed/cancelled jobs from history in one
+    // pipeline command. Callers holding more than `HISTORY_DELETE_BATCH_SIZE`
+    // ids send them in batches of that size.
+    pub async fn delete_history_batch(
+        &self,
+        job_ids: BTreeSet<JobId>,
+        delete_files: bool,
+    ) -> Result<HistoryDeleteBatchOutcome, SchedulerError> {
+        self.state
+            .queue
+            .clone()
+            .delete_history(job_ids, delete_files)
             .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
     }
 
     // Get info about a specific job (reads from shared state, no channel round-trip).
@@ -1364,10 +1280,26 @@ impl SchedulerHandle {
         self.state.list_jobs()
     }
 
+    // The queue's jobs, a job retiring into history included.
+    pub fn queue_jobs(&self) -> Vec<JobInfo> {
+        self.state.queue_jobs()
+    }
+
+    // History excludes every row still owned by the queue, even after it is hidden.
+    pub fn queued_job_ids(&self) -> HashSet<JobId> {
+        self.state.queued_job_ids()
+    }
+
     // How many jobs are in each status (reads from shared state, copies no
     // job).
     pub fn job_status_counts(&self) -> crate::operations::metrics_store::JobStatusCounts {
         self.state.job_status_counts()
+    }
+
+    // The jobs that get their own `weaver_job_*` series under `mode`. See
+    // [`SharedPipelineState::metrics_jobs`].
+    pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
+        self.state.metrics_jobs(mode)
     }
 
     // The revision of the published job list; it moves on every publish.
@@ -1413,12 +1345,9 @@ impl SchedulerHandle {
 
     // Whether the pipeline task is gone.
     //
-    // Reads the command channel's liveness without sending anything through
-    // it, so a readiness probe can tell "the scheduler died" from "the
-    // scheduler is busy" — a probe that queued a command behind the pipeline
-    // loop would fail exactly when the box is most loaded.
+    // The runtime guard closes the queue when the pipeline task exits.
     pub fn is_closed(&self) -> bool {
-        self.cmd_tx.is_closed()
+        self.state.queue.closed.load(Ordering::Acquire)
     }
 
     // Count one job accepted into the pipeline, labelled by where it came
@@ -1488,28 +1417,43 @@ impl SchedulerHandle {
         self.state.note_server_probe_latency(server_id, latency);
     }
 
-    // Read-only pipeline internals for the diagnostics package.
+    // Read-only pipeline internals for the diagnostics package. The pipeline
+    // builds the snapshot at the top of its next turn after the request is
+    // recorded; only this endpoint pays for it.
     pub async fn pipeline_diagnostics(
         &self,
     ) -> Result<crate::pipeline::diagnostics::PipelineDiagnostics, SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::PipelineDiagnostics { reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await
-            .map(|diagnostics| *diagnostics)
-            .map_err(|_| SchedulerError::ChannelClosed)
+        let queue = &self.state.queue;
+        let mut changes = queue.subscribe();
+        let wanted = queue.write_intent(|inner| {
+            inner.diagnostics_requested += 1;
+            Change::unchanged(inner.diagnostics_requested)
+        });
+        loop {
+            let answer = queue.read(|inner| {
+                inner
+                    .diagnostics
+                    .as_ref()
+                    .filter(|(answered, _)| *answered >= wanted)
+                    .map(|(_, diagnostics)| diagnostics.clone())
+            });
+            if let Some(diagnostics) = answer {
+                return Ok(diagnostics);
+            }
+            if queue.closed.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(SchedulerError::ChannelClosed);
+            }
+            changes
+                .changed()
+                .await
+                .map_err(|_| SchedulerError::ChannelClosed)?;
+        }
     }
 
     // Change only the speed test's transient download hold.
     pub(crate) async fn set_speed_test_pause(&self, paused: bool) -> Result<(), SchedulerError> {
-        let (reply, received) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::SetSpeedTestPause { paused, reply })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        received.await.map_err(|_| SchedulerError::ChannelClosed)
+        self.state.set_speed_test_paused(paused);
+        Ok(())
     }
 
     pub(crate) fn clear_speed_test_pause(&self) {
@@ -1518,53 +1462,50 @@ impl SchedulerHandle {
 
     // Pause all download dispatch globally.
     pub async fn pause_all(&self) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::PauseAll { reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        self.state.queue.write_intent(|inner| {
+            inner.globals.paused = true;
+            inner.globals.scheduled_pause = false;
+            Change::changed(())
+        });
         Ok(())
     }
 
     // Resume all download dispatch globally.
     pub async fn resume_all(&self) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::ResumeAll { reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        self.state.queue.write_intent(|inner| {
+            inner.globals.paused = false;
+            inner.globals.scheduled_pause = false;
+            Change::changed(())
+        });
         Ok(())
     }
 
     pub async fn pause_post_processing(&self) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::PausePostProcessing { reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        self.state.set_post_processing_paused(true);
         Ok(())
     }
 
     pub async fn resume_post_processing(&self) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::ResumePostProcessing { reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        self.state.set_post_processing_paused(false);
         Ok(())
     }
 
     pub async fn cancel_post_processing(&self, job_id: JobId) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::CancelPostProcessing { job_id, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        self.state.queue.write_intent(|inner| {
+            let Some(row) = inner
+                .jobs
+                .iter_mut()
+                .find(|row| row.id == job_id && row.report.post_processing_cancellable)
+            else {
+                return Change::unchanged(Err(SchedulerError::Conflict(format!(
+                    "job {} has no queued or active post-processing attempt",
+                    job_id.0
+                ))));
+            };
+            row.intents.cancel_post_processing = true;
+            row.intents.seq += 1;
+            Change::changed(Ok(()))
+        })
     }
 
     // Check whether the pipeline is globally paused (reads from shared state).
@@ -1576,10 +1517,11 @@ impl SchedulerHandle {
     // reason is published with the download block so the hold is visible.
     pub(crate) fn set_schedule_admission_hold(&self, reason: Option<String>) {
         let held = reason.is_some();
-        *self.state.schedule_hold_reason.write().unwrap() = reason;
-        self.state
-            .schedule_replay_paused
-            .store(held, Ordering::Release);
+        self.state.queue.write_intent(|inner| {
+            inner.globals.schedule_hold_reason = reason;
+            inner.globals.schedule_replay_paused = held;
+            Change::changed(())
+        });
     }
 
     pub fn is_post_processing_paused(&self) -> bool {
@@ -1604,26 +1546,32 @@ impl SchedulerHandle {
         bytes_per_sec: u64,
         replaces_schedule: bool,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::SetSpeedLimit {
-                bytes_per_sec,
-                replaces_schedule,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        self.state.queue.write_intent(|inner| {
+            inner.globals.speed_limit = bytes_per_sec;
+            if replaces_schedule {
+                inner.globals.scheduled_speed_limit = None;
+            }
+            Change::changed(())
+        });
+        Ok(())
+    }
+
+    pub async fn set_max_concurrent_nzbs(
+        &self,
+        limit: std::num::NonZeroU32,
+    ) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.max_concurrent_nzbs = Some(limit);
+            crate::pipeline::queue::Change::changed(())
+        });
         Ok(())
     }
 
     pub async fn set_propagation_delay(&self, seconds: u32) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::SetPropagationDelay { seconds, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        self.state.queue.write_intent(|inner| {
+            inner.globals.propagation_delay = Duration::from_secs(u64::from(seconds));
+            Change::changed(())
+        });
         Ok(())
     }
 
@@ -1632,28 +1580,69 @@ impl SchedulerHandle {
         &self,
         action: crate::bandwidth::ScheduleAction,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::ApplyScheduleAction { action, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        use crate::bandwidth::ScheduleAction;
+        match &action {
+            ScheduleAction::Pause | ScheduleAction::PauseAll | ScheduleAction::Resume => {
+                self.state.queue.write_intent(|inner| {
+                    inner.globals.paused = !matches!(action, ScheduleAction::Resume);
+                    inner.globals.scheduled_pause = inner.globals.paused;
+                    Change::changed(())
+                });
+                return Ok(());
+            }
+            ScheduleAction::PausePostProcessing => return self.pause_post_processing().await,
+            ScheduleAction::ResumePostProcessing => return self.resume_post_processing().await,
+            ScheduleAction::HardwareProfile { profile } => {
+                return self.set_scheduled_hardware_profile(Some(*profile)).await;
+            }
+            ScheduleAction::SpeedLimit { limits } => {
+                if let Some(limit) = limits
+                    .iter()
+                    .rev()
+                    .find(|limit| limit.target == crate::bandwidth::SpeedTarget::Global)
+                {
+                    self.state.queue.write_intent(|inner| {
+                        inner.globals.scheduled_speed_limit = Some(limit.bytes_per_sec);
+                        Change::changed(())
+                    });
+                }
+                return Ok(());
+            }
+            ScheduleAction::SetQuotaMetering { enabled, target } => match target {
+                crate::bandwidth::QuotaTarget::AllEgresses => {
+                    if let Some(policy) = self.state.server_transfer_policy() {
+                        policy.set_egress_quota_metering(*enabled);
+                    }
+                    self.state.queue.write_intent(|_| {
+                        self.state
+                            .queue
+                            .counters
+                            .bandwidth
+                            .set_metering_enabled(*enabled);
+                        Change::changed(())
+                    });
+                }
+                crate::bandwidth::QuotaTarget::Egress(id) => {
+                    if let Some(policy) = self.state.server_transfer_policy() {
+                        policy.set_one_egress_quota_metering(*id, *enabled);
+                    }
+                }
+            },
+            _ => tracing::warn!(?action, "service schedule action reached download pipeline"),
+        }
         Ok(())
     }
 
-    // Make `profile` the operator's hardware profile. Its limits are in
-    // force when this returns unless a schedule rule has another in force;
+    // Record the operator's hardware profile for the next dispatch boundary;
     // work already running keeps the limits it started with.
     pub async fn set_hardware_profile(
         &self,
         profile: crate::runtime::HardwareProfile,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::SetHardwareProfile { profile, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        self.state.queue.write_intent(|inner| {
+            inner.globals.hardware_profile = Some(profile);
+            Change::changed(())
+        });
         Ok(())
     }
 
@@ -1663,12 +1652,10 @@ impl SchedulerHandle {
         &self,
         profile: Option<crate::runtime::HardwareProfile>,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::SetScheduledHardwareProfile { profile, reply: tx })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        self.state.queue.write_intent(|inner| {
+            inner.globals.scheduled_hardware_profile = profile;
+            Change::changed(())
+        });
         Ok(())
     }
 
@@ -1735,32 +1722,56 @@ impl SchedulerHandle {
         client: T,
         total_connections: usize,
     ) -> Result<NntpRuntimeActivation, SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::RebuildNntp {
-                client: Box::new(client),
-                total_connections,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
+        let client: Box<dyn std::any::Any + Send> = Box::new(client);
+        let client = client
+            .downcast::<weaver_nntp::client::NntpClient>()
+            .map_err(|_| {
+                SchedulerError::Internal(
+                    "invalid NNTP runtime client supplied for activation".into(),
+                )
+            })?;
+        // A rebuild the pipeline has not taken yet is superseded; its client
+        // leaves the lock with the write and is dropped after it.
+        let (activation, _superseded) = self.state.queue.write_intent(|inner| {
+            inner.globals.nntp_generation += 1;
+            let generation = inner.globals.nntp_generation;
+            let superseded = inner.nntp.replace((generation, *client, total_connections));
+            Change::changed((
+                NntpRuntimeActivation {
+                    generation,
+                    configured_connections: total_connections,
+                },
+                superseded,
+            ))
+        });
+        Ok(activation)
     }
 
     // Update disk tuning after the background startup measurement completes.
+    // A zero write throughput means it was not measured and is not applied.
+    pub async fn update_disk_measurement(
+        &self,
+        measurement: crate::runtime::DiskMeasurement,
+    ) -> Result<(), SchedulerError> {
+        self.state.queue.write_intent(|inner| {
+            inner.globals.random_read_iops = Some(measurement.random_read_iops);
+            if measurement.sequential_write_mbps > 0.0 {
+                inner.globals.sequential_write_mbps = Some(measurement.sequential_write_mbps);
+            }
+            Change::changed(())
+        });
+        Ok(())
+    }
+
+    // Update read IOPS alone.
     pub async fn update_random_read_iops(
         &self,
         random_read_iops: f64,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::UpdateRandomReadIops {
-                random_read_iops,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?;
+        self.state.queue.write_intent(|inner| {
+            inner.globals.random_read_iops = Some(random_read_iops);
+            Change::changed(())
+        });
         Ok(())
     }
 
@@ -1771,22 +1782,18 @@ impl SchedulerHandle {
         intermediate_dir: PathBuf,
         complete_dir: PathBuf,
     ) -> Result<(), SchedulerError> {
-        let (tx, rx) = oneshot::channel();
-        self.cmd_tx
-            .send(SchedulerCommand::UpdateRuntimePaths {
-                data_dir,
-                intermediate_dir,
-                complete_dir,
-                reply: tx,
-            })
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
-        rx.await.map_err(|_| SchedulerError::ChannelClosed)?
-    }
-
-    // Replace the shared job snapshot without a pipeline command round-trip.
-    pub fn replace_jobs_snapshot(&self, jobs: Vec<JobInfo>) {
-        self.state.publish_jobs(jobs);
+        tokio::fs::create_dir_all(&data_dir).await?;
+        tokio::fs::create_dir_all(&intermediate_dir).await?;
+        tokio::fs::create_dir_all(&complete_dir).await?;
+        self.state.queue.write_intent(|inner| {
+            inner.globals.runtime_paths = Some(crate::pipeline::queue::RuntimePaths {
+                data: data_dir,
+                intermediate: intermediate_dir,
+                complete: complete_dir,
+            });
+            Change::changed(())
+        });
+        Ok(())
     }
 
     // Subscribe to job-level pipeline events.
@@ -1802,10 +1809,14 @@ impl SchedulerHandle {
 
     // Signal shutdown.
     pub async fn shutdown(&self) -> Result<(), SchedulerError> {
-        self.cmd_tx
-            .send(SchedulerCommand::Shutdown)
-            .await
-            .map_err(|_| SchedulerError::ChannelClosed)?;
+        self.state.queue.write_intent(|inner| {
+            inner.globals.shutting_down = true;
+            Change::changed(())
+        });
+        self.state.shutdown_started.store(true, Ordering::Release);
+        // An e2e hook held until shutdown is released by the same signal
+        // the pipeline reads.
+        crate::e2e_failpoint::release_shutdown_holds();
         Ok(())
     }
 }

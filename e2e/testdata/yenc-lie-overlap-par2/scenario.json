@@ -1,0 +1,22 @@
+{
+  "slug": "yenc-lie-overlap-par2",
+  "title": "Copper.Mesa.S01E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "Six articles of 768,000 bytes with a recovery set over them, the third of which states an =ypart range moved down by half an article, over the part before it. Every decoder writes the body where its header says, so the file is wrong where it lands; the recovery set covers it, and the file must come out byte-equal.",
+  "category": "2000",
+  "expected_outcome": "repair_then_success",
+  "segment_size": 768000,
+  "yencHeaderLies": [
+    {
+      "subjectContains": [
+        "copper.mesa.s01e02.mkv\""
+      ],
+      "segments": [
+        3
+      ],
+      "shift": -384000
+    }
+  ],
+  "expectedOutputBLAKE3": {
+    "copper.mesa.s01e02.mkv": "2cd91c2ac8b6c6974e74d44f4fc90d104e337e37c00aac330c6c908c618f1818"
+  }
+}

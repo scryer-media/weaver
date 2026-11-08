@@ -6,6 +6,7 @@ import test from "node:test";
 import {
   downloadPercent,
   installableUpgrade,
+  upgradeFailureKey,
   upgradesInApp,
   type ApplicationUpgradeRun,
   type ApplicationUpgradeStatus,
@@ -43,6 +44,29 @@ function status(overrides: Partial<ApplicationUpgradeStatus> = {}): ApplicationU
     ...overrides,
   };
 }
+
+test("GitHub server failures explain that the update can be tried again later", () => {
+  for (const host of ["github.com", "release-assets.githubusercontent.com"]) {
+    for (const code of [500, 502, 503, 504]) {
+      const error = `failed to fetch v2 upgrade manifest: HTTP status server error (${code} Gateway Timeout) (https://${host}/releases/manifest.json)`;
+      assert.equal(upgradeFailureKey(error), "applicationUpgrade.githubUnavailable");
+    }
+  }
+});
+
+test("other upgrade failures keep their specific explanation", () => {
+  for (const error of [
+    null,
+    "signature verification failed",
+    "not enough disk space",
+    "failed to fetch v2 upgrade manifest: HTTP status client error (404 Not Found) (https://github.com/releases/manifest.json)",
+    "failed to fetch v2 upgrade manifest: HTTP status client error (429 Too Many Requests) (https://github.com/releases/manifest.json)",
+    "HTTP status server error (504 Gateway Timeout) (https://example.invalid/manifest.json)",
+    "HTTP status server error (504 Gateway Timeout) (https://github.com.example.invalid/manifest.json)",
+  ]) {
+    assert.equal(upgradeFailureKey(error), "applicationUpgrade.failed");
+  }
+});
 
 test("offers the release the server advertised", () => {
   assert.deepEqual(installableUpgrade(status()), {

@@ -87,6 +87,15 @@ pub(crate) struct UsenetFacts {
     pub tls_cipher_suite: Option<String>,
 }
 
+// The closed sample bins of a run: one sample per leg per bin, each with
+// its rate over the bin's exact width.
+#[derive(Default)]
+struct Bins {
+    closed_at: Duration,
+    samples: Vec<Sample>,
+    rates: Vec<f64>,
+}
+
 // The live counters of one run. The resolvers read a partial result off
 // them while the run measures.
 pub(crate) struct Progress {
@@ -94,8 +103,7 @@ pub(crate) struct Progress {
     finished: OnceLock<Instant>,
     legs: Vec<LegCounters>,
     connections: Mutex<Vec<Arc<ConnectionRecord>>>,
-    samples: Mutex<(Duration, Vec<Sample>)>,
-    gauge_peak: AtomicU64,
+    bins: Mutex<Bins>,
     pub usenet: UsenetCounters,
     usenet_facts: OnceLock<UsenetFacts>,
     // When a bandwidth run's warm-up ended and the bytes moved by then.
@@ -112,8 +120,7 @@ impl Progress {
             finished: OnceLock::new(),
             legs: (0..legs).map(|_| LegCounters::default()).collect(),
             connections: Mutex::new(Vec::new()),
-            samples: Mutex::new((Duration::ZERO, Vec::new())),
-            gauge_peak: AtomicU64::new(0),
+            bins: Mutex::new(Bins::default()),
             usenet: UsenetCounters::default(),
             usenet_facts: OnceLock::new(),
             warm_up: OnceLock::new(),
@@ -165,11 +172,6 @@ impl Progress {
         }
     }
 
-    pub(crate) fn note_gauge(&self, bytes_per_second: u64) {
-        self.gauge_peak
-            .fetch_max(bytes_per_second, Ordering::Relaxed);
-    }
-
     pub(crate) fn mark_warm_up(&self, at: Duration, bytes: u64) {
         let _ = self.warm_up.set((at, bytes));
     }
@@ -189,13 +191,18 @@ impl Progress {
         if !self.measuring() {
             return;
         }
-        let at = self.elapsed();
-        let mut samples = self.samples.lock().expect("speed test samples");
-        if at <= samples.0 && !samples.1.is_empty() {
+        self.sample_at(self.elapsed());
+    }
+
+    // Close the bin that ends `at` into the run. A bin with no width is
+    // left open, so its bytes land in the next.
+    fn sample_at(&self, at: Duration) {
+        let mut bins = self.bins.lock().expect("speed test samples");
+        if at <= bins.closed_at {
             return;
         }
-        let width = at.saturating_sub(samples.0).as_secs_f64();
-        samples.0 = at;
+        let width = at.saturating_sub(bins.closed_at).as_secs_f64();
+        bins.closed_at = at;
         for record in self
             .connections
             .lock()
@@ -204,24 +211,23 @@ impl Progress {
         {
             let total = record.bytes.load(Ordering::Relaxed);
             let moved = total.saturating_sub(record.sampled.swap(total, Ordering::Relaxed));
-            let rate = if width > 0.0 {
-                (moved as f64 / width) as u64
-            } else {
-                0
-            };
-            record.rate.store(rate, Ordering::Relaxed);
+            record
+                .rate
+                .store((moved as f64 / width) as u64, Ordering::Relaxed);
         }
         for (leg, counters) in self.legs.iter().enumerate() {
             let total = counters.bytes.load(Ordering::Relaxed);
             let previous = counters.sampled.swap(total, Ordering::Relaxed);
             let decoded = counters.decoded.load(Ordering::Relaxed);
             let decoded_previous = counters.decoded_sampled.swap(decoded, Ordering::Relaxed);
-            samples.1.push(Sample {
+            let bytes = total.saturating_sub(previous);
+            bins.samples.push(Sample {
                 at_ms: at.as_millis() as u64,
                 leg,
-                bytes: total.saturating_sub(previous),
+                bytes,
                 decoded_bytes: decoded.saturating_sub(decoded_previous),
             });
+            bins.rates.push(bytes as f64 / width);
         }
     }
 
@@ -334,7 +340,10 @@ impl Progress {
                 0.0
             }
         };
-        let samples = self.samples.lock().expect("speed test samples").1.clone();
+        let (samples, bin_rates) = {
+            let bins = self.bins.lock().expect("speed test samples");
+            (bins.samples.clone(), bins.rates.clone())
+        };
         let connections: Vec<ConnectionResult> = self
             .connections
             .lock()
@@ -342,18 +351,6 @@ impl Progress {
             .iter()
             .map(|record| record.result())
             .collect();
-        // Bin rates, using each bin's own width.
-        let mut bin_rates: Vec<(u64, usize, f64)> = Vec::new();
-        let mut previous_at = vec![0u64; self.legs.len()];
-        for sample in &samples {
-            let width = sample.at_ms.saturating_sub(previous_at[sample.leg]).max(1);
-            previous_at[sample.leg] = sample.at_ms;
-            bin_rates.push((
-                sample.at_ms,
-                sample.leg,
-                sample.bytes as f64 * 1000.0 / width as f64,
-            ));
-        }
         let legs: Vec<LegResult> = self
             .legs
             .iter()
@@ -380,10 +377,11 @@ impl Progress {
                     position,
                     bytes,
                     average_bps: rate(bytes),
-                    peak_bps: bin_rates
+                    peak_bps: samples
                         .iter()
-                        .filter(|(_, leg, _)| *leg == position)
-                        .map(|(_, _, rate)| *rate)
+                        .zip(&bin_rates)
+                        .filter(|(sample, _)| sample.leg == position)
+                        .map(|(_, rate)| *rate)
                         .fold(0.0, f64::max),
                     connections: mine
                         .iter()
@@ -394,23 +392,14 @@ impl Progress {
             })
             .collect();
         let bytes = self.bytes();
-        // The run's peak: for Usenet the highest reading of the header gauge,
-        // which this run's bytes drive. Bins stand in when the gauge never
-        // ticked during the run.
-        let mut bin_totals: Vec<(u64, f64)> = Vec::new();
-        for (at, _, rate) in &bin_rates {
-            match bin_totals.iter_mut().find(|(t, _)| t == at) {
-                Some((_, total)) => *total += rate,
-                None => bin_totals.push((*at, *rate)),
-            }
-        }
-        let bins_peak = bin_totals.iter().map(|(_, rate)| *rate).fold(0.0, f64::max);
-        let gauge_peak = self.gauge_peak.load(Ordering::Relaxed) as f64;
-        let peak = if usenet && gauge_peak > 0.0 {
-            gauge_peak
-        } else {
-            bins_peak
-        };
+        // The run's peak: its fastest bin, every leg's bytes together. The
+        // bins tile the run from its start to the last one closed, the
+        // final partial one included, so a finished run peaks at no less
+        // than its average.
+        let peak = bin_rates
+            .chunks(self.legs.len().max(1))
+            .map(|bin| bin.iter().sum::<f64>())
+            .fold(0.0, f64::max);
         let usenet = usenet.then(|| {
             let facts = self.usenet_facts.get().cloned().unwrap_or_default();
             UsenetResult {

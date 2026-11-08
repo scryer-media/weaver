@@ -25,10 +25,11 @@ import { RecordEditor, type EditorSection } from "../../../components/RecordEdit
 import { speedPage } from "../../../features/networking/data";
 import { SecondaryButton, Toggle } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
+import { settingsIds, testIds } from "../../../testids";
 import { WorkingOverlay } from "../../../components/WorkingOverlay";
 import { WV } from "../../../data/palette";
 import { formatHostnames, formatLatency } from "../../../data/format";
-import { SettingsBlocks, useSettingsPanelActive, type SettingsBlock } from "../framework";
+import { SettingsBlocks, usePanelStatus, useSettingsPanelActive, type SettingsBlock } from "../framework";
 import { quotaDraft, quotaFields, quotaInput, trimNumber, type QuotaDraft } from "../quota";
 
 /**
@@ -165,7 +166,7 @@ function transportLabel(t: Translate, server: Server): string {
 
 function roleLabel(t: Translate, server: Server): string {
   if (server.backfill) {
-    return t("next.providers.blockAccount");
+    return t("next.providers.backfillServer");
   }
   return server.priority === 0
     ? t("next.providers.primary")
@@ -221,7 +222,7 @@ function serverInput(form: ServerForm) {
 
 export function ProvidersPanel() {
   const t = useTranslate();
-  const [{ data, fetching }, reexecute] = useQuery<{ servers: Server[] }>({ query: SERVERS_QUERY });
+  const [{ data, fetching, error: listError }, reexecute] = useQuery<{ servers: Server[] }>({ query: SERVERS_QUERY });
   const [, addServer] = useMutation(ADD_SERVER_MUTATION);
   const [, updateServer] = useMutation(UPDATE_SERVER_MUTATION);
   const [, removeServer] = useMutation(REMOVE_SERVER_MUTATION);
@@ -249,6 +250,12 @@ export function ProvidersPanel() {
     variables: { id: typeof editingId === "number" ? editingId : 0 },
     pause: typeof editingId !== "number",
   });
+
+  // A list that could not be read says why: in place of the table when there
+  // are no rows to show, on the status line beside rows the answer still held.
+  const listFailure = listError ? refusalMessage(t, listError) : null;
+  const failureBesideRows = (data?.servers?.length ?? 0) > 0 ? listFailure : null;
+  usePanelStatus(failureBesideRows, failureBesideRows !== null);
 
   const servers = useMemo(
     () =>
@@ -463,6 +470,15 @@ export function ProvidersPanel() {
         "",
       ],
       empty: t("next.providers.empty"),
+      failure: listFailure === null
+        ? undefined
+        : {
+            message: listFailure,
+            retry: {
+              label: t("next.networking.retry"),
+              onClick: () => void reexecute({ requestPolicy: "network-only" }),
+            },
+          },
       add: { label: t("next.providers.add"), onClick: addProvider },
       onRowClick: (id) => editProvider(Number(id)),
       rows: servers.map((server) => ({
@@ -474,10 +490,10 @@ export function ProvidersPanel() {
             <span className="min-w-0 truncate font-wv-mono text-[12.5px]">{server.host}</span>
             <span className="flex-none font-wv-mono text-[11px] text-wv-faint">:{server.port}</span>
           </span>,
-          <Cell key="connections" mono>
+          <Cell key="connections" mono testId={settingsIds.providerConnections}>
             {server.connections}
           </Cell>,
-          <Cell key="transport" mono className="text-wv-secondary">
+          <Cell key="transport" mono className="text-wv-secondary" testId={settingsIds.providerTransport(server.tls ? "tls" : "plain")}>
             {transportLabel(t, server)}
           </Cell>,
           <Cell key="role">{roleLabel(t, server)}</Cell>,
@@ -487,6 +503,7 @@ export function ProvidersPanel() {
               checked={server.active}
               onChange={(next) => void setActive(server, next)}
               label={t("next.providers.enabledAria", { host: server.host })}
+              testId={settingsIds.providerEnabled}
             />
           </span>,
           <span key="actions" className="ml-auto flex gap-2" onClick={(event) => event.stopPropagation()}>
@@ -515,7 +532,6 @@ export function ProvidersPanel() {
             {
               id: "host",
               label: t("next.providers.host"),
-              help: t("next.providers.hostHelp"),
               control: {
                 kind: "text",
                 value: values.host,
@@ -536,8 +552,7 @@ export function ProvidersPanel() {
             },
             {
               id: "tls",
-              label: "TLS",
-              help: t("next.providers.tlsHelp"),
+              label: "SSL/TLS",
               control: {
                 kind: "toggle",
                 value: values.tls,
@@ -586,7 +601,6 @@ export function ProvidersPanel() {
             {
               id: "active",
               label: t("next.providers.enabled"),
-              help: t("next.providers.enabledHelp"),
               control: {
                 kind: "toggle",
                 value: values.active && !values.killSwitch,
@@ -608,8 +622,8 @@ export function ProvidersPanel() {
             },
             {
               id: "backfill",
-              label: t("next.providers.blockAccount"),
-              help: t("next.providers.blockAccountHelp"),
+              label: t("next.providers.backfillServer"),
+              help: t("next.providers.backfillServerHelp"),
               control: {
                 kind: "toggle",
                 value: values.backfill,
@@ -619,7 +633,6 @@ export function ProvidersPanel() {
             {
               id: "retentionDays",
               label: t("next.providers.retention"),
-              help: t("next.providers.retentionHelp"),
               control: {
                 kind: "number",
                 value: values.retentionDays,
@@ -637,7 +650,6 @@ export function ProvidersPanel() {
             {
               id: "speedUnlimited",
               label: t("next.providers.unlimitedSpeed"),
-              help: t("next.providers.unlimitedSpeedHelp"),
               control: {
                 kind: "toggle",
                 value: values.speedUnlimited,
@@ -661,7 +673,6 @@ export function ProvidersPanel() {
                 ]),
             ...quotaFields(t, values.quota, (quota) => patch({ quota }), {
               label: t("next.providers.quota"),
-              help: t("next.providers.quotaHelp"),
               usedBytes: values.quotaUsedBytes,
             }),
           ],
@@ -696,10 +707,11 @@ export function ProvidersPanel() {
 
       <RecordEditor
         open={editingId !== null}
+        testId={testIds.dialog("provider")}
         title={editingId === "new" ? t("next.providers.add") : (editing?.host ?? t("next.providers.provider"))}
         note={
           editingId === "new"
-            ? t("next.providers.newNote")
+            ? undefined
             : t("next.providers.priorityNote", { priority: values?.priority ?? 0 })
         }
         width={620}
@@ -747,35 +759,35 @@ export function ProvidersPanel() {
         ) : null}
         {testResult ? (
           <div className="flex flex-none flex-col gap-1.5 border-t border-wv-hairline px-4 sm:px-6 py-4">
-            {adoptable ? (
-              // A certificate on offer is the whole story: say whose certificate
-              // it is instead of repeating the server's failure above it.
-              <div className="flex items-start gap-[9px] text-[13px] leading-[1.45]">
-                <Square color={WV.warn} className="mt-[6px] flex-none" />
-                <span className="text-wv-warn">
-                  {adoptable.names.length
-                    ? t("next.providers.certIssuedFor", {
-                        names: formatHostnames(adoptable.names),
-                        host: values?.host.trim() ?? "",
-                      })
-                    : t("next.providers.certMismatch")}
+            <div
+              role="status"
+              className={`flex items-center gap-3 px-[12px] py-[11px] text-wv-on-accent ${
+                adoptable ? "bg-wv-warn" : testResult.success ? "bg-wv-accent" : "bg-wv-error"
+              }`}
+            >
+              <Icon name={adoptable ? "trust" : "test"} size={22} className="flex-none self-start" />
+              <span className="flex min-w-0 flex-col gap-[5px]">
+                <span className="text-[13.5px] leading-[1.35] font-semibold tracking-[-0.005em]">
+                  {adoptable
+                    ? // A certificate on offer is the whole story: say whose certificate
+                      // it is instead of repeating the server's failure above it.
+                      adoptable.names.length
+                      ? t("next.providers.certIssuedFor", {
+                          names: formatHostnames(adoptable.names),
+                          host: values?.host.trim() ?? "",
+                        })
+                      : t("next.providers.certMismatch")
+                    : testResult.message}
                 </span>
-              </div>
-            ) : (
-              <div className="flex items-center gap-[9px] text-[13px]">
-                <Square color={testResult.success ? WV.green : WV.error} />
-                <span className={testResult.success ? "text-wv-fg" : "text-wv-error-text"}>
-                  {testResult.message}
-                </span>
-              </div>
-            )}
-            {testResult.latencyMs === null ? null : (
-              <div className="font-wv-mono text-[11.5px] text-wv-muted">
-                {formatLatency(testResult.latencyMs)}
-                {testResult.supportsPipelining ? ` · ${t("next.providers.pipelining")}` : ""}
-                {testResult.tlsCipherSuite ? ` · ${shortCipher(testResult.tlsCipherSuite)}` : ""}
-              </div>
-            )}
+                {testResult.latencyMs === null ? null : (
+                  <span className="font-wv-mono text-[11px] leading-none">
+                    {formatLatency(testResult.latencyMs)}
+                    {testResult.supportsPipelining ? ` · ${t("next.providers.pipelining")}` : ""}
+                    {testResult.tlsCipherSuite ? ` · ${shortCipher(testResult.tlsCipherSuite)}` : ""}
+                  </span>
+                )}
+              </span>
+            </div>
             {adoptable ? (
               <div className="flex flex-col gap-2 pt-1.5">
                 <span className="font-wv-mono text-[11px] break-all text-wv-muted">
@@ -843,6 +855,7 @@ export function ProvidersPanel() {
 
       <ConfirmDialog
         open={confirmRemove !== null}
+        testId={testIds.dialog("provider-remove")}
         title={t("next.providers.remove")}
         note={confirmRemove?.host}
         busy={busy}

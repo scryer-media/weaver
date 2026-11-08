@@ -38,7 +38,14 @@ async fn unavailable_provider_recovery_does_not_leave_602_retries_parked_forever
         segmented_job_spec("Provider recovery", "payload.bin", &[128; 602]),
     )
     .await;
-    pipeline.jobs.get_mut(&job_id).unwrap().download_queue = DownloadQueue::new();
+    pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue = DownloadQueue::new();
     assert!(matches!(
         pipeline.nntp.body_server_availability(&[], &[], 0).await,
         weaver_nntp::pool::BodyServerAvailability::Blocked
@@ -97,7 +104,15 @@ async fn unavailable_provider_recovery_does_not_leave_602_retries_parked_forever
         assert_eq!(retry.work.retry_count, 0);
         pipeline.receive_retry_work(retry);
     }
-    assert_eq!(pipeline.jobs[&job_id].download_queue.len(), 602);
+    assert_eq!(
+        pipeline.jobs[&job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len(),
+        602
+    );
     assert!(!pipeline.pending_retries_by_job.contains_key(&job_id));
     assert!(!pipeline.download_wait_by_job.contains_key(&job_id));
     assert_eq!(pipeline.jobs[&job_id].failed_bytes, 0);

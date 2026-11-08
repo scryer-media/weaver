@@ -3,19 +3,13 @@
 
 use super::*;
 
-use crate::operations::metrics::RateSeries;
-
-const PHASE_RATE_WARMUP: Duration = Duration::from_millis(250);
-const PHASE_PUBLISH_INTERVAL: Duration = Duration::from_secs(1);
-
 #[derive(Debug)]
 pub(crate) struct JobPhaseRuntime {
     pub(super) counters: Arc<PhaseCounters>,
     pub(super) started_at_epoch_ms: f64,
-    // The same estimator the global speed gauge uses, advanced on the same
-    // 100 ms tick, so a row's rate is comparable to the nav counter.
-    pub(super) rate: RateSeries,
-    pub(super) first_sample_at: Option<Instant>,
+    // Whether the open phase holds the pipeline live, so the periodic
+    // drivers keep sampling its bytes.
+    pub(super) holds_live: bool,
 }
 
 // The metric stage label for a user-visible job phase. Verification and
@@ -31,21 +25,29 @@ const fn stage_kind_for_phase(phase: JobPhase) -> crate::operations::instrumenta
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PhasePublishSignature(Vec<(JobPhase, u8, bool)>);
-
-#[derive(Debug)]
-pub(crate) struct PhasePublishState {
-    signature: PhasePublishSignature,
-    sent_at: Instant,
-}
-
 impl Pipeline {
     pub(crate) fn phase_begin(
         &mut self,
         job_id: JobId,
         phase: JobPhase,
         initial_total: Option<u64>,
+    ) -> Arc<PhaseCounters> {
+        self.open_phase(job_id, phase, initial_total, phase != JobPhase::Downloading)
+    }
+
+    // A phase with no bytes to sample, such as the graph's repair or
+    // extraction: its row and stage clock open, but nothing in it moves for
+    // the drivers to sample, so it does not hold the pipeline live.
+    pub(crate) fn phase_begin_unsampled(&mut self, job_id: JobId, phase: JobPhase) {
+        self.open_phase(job_id, phase, None, false);
+    }
+
+    fn open_phase(
+        &mut self,
+        job_id: JobId,
+        phase: JobPhase,
+        initial_total: Option<u64>,
+        holds_live: bool,
     ) -> Arc<PhaseCounters> {
         let key = (job_id, phase);
         if let Some(runtime) = self.phase_progress.get(&key) {
@@ -59,14 +61,21 @@ impl Pipeline {
         let runtime = JobPhaseRuntime {
             counters: Arc::clone(&counters),
             started_at_epoch_ms: crate::jobs::epoch_ms_now(),
-            rate: RateSeries::new(),
-            first_sample_at: None,
+            holds_live,
         };
+        self.shared_state.queue.begin_phase(
+            job_id,
+            phase,
+            Arc::clone(&counters),
+            runtime.started_at_epoch_ms,
+        );
         self.phase_progress.insert(key, runtime);
-        if phase != JobPhase::Downloading {
+        if holds_live {
             self.post_download_phases += 1;
+            // A worker moves bytes while this turn awaits its other work.
+            // Its independent sampler must wake before the turn ends.
+            self.shared_state.queue.set_driving(true);
         }
-        self.phase_publish_state.remove(&job_id);
         // Stage timing rides the phase lifecycle, which is per job per phase —
         // a handful of events over a job's whole life, never a per-segment
         // path. One `Instant::now()` here is the cheapest honest measurement
@@ -76,16 +85,11 @@ impl Pipeline {
     }
 
     pub(crate) fn phase_end(&mut self, job_id: JobId, phase: JobPhase) {
+        self.shared_state.queue.end_phase(job_id, phase);
         self.note_stage_finished(job_id, stage_kind_for_phase(phase));
-        let removed = self.phase_progress.remove(&(job_id, phase)).is_some();
-        if removed && phase != JobPhase::Downloading {
+        let removed = self.phase_progress.remove(&(job_id, phase));
+        if removed.is_some_and(|runtime| runtime.holds_live) {
             self.post_download_phases = self.post_download_phases.saturating_sub(1);
-        }
-        if removed && let Some(phases) = self.phase_progress_snapshots.get_mut(&job_id) {
-            phases.retain(|progress| progress.phase != phase);
-            if phases.is_empty() {
-                self.phase_progress_snapshots.remove(&job_id);
-            }
         }
     }
 
@@ -126,35 +130,6 @@ impl Pipeline {
         self.job_stage_started_at.retain(|(id, _), _| *id != job_id);
     }
 
-    pub(crate) fn phase_subtract_completed_bytes(
-        &mut self,
-        job_id: JobId,
-        phase: JobPhase,
-        bytes: u64,
-    ) {
-        if bytes == 0 {
-            return;
-        }
-        let Some(runtime) = self.phase_progress.get(&(job_id, phase)) else {
-            return;
-        };
-        let _ = runtime.counters.completed_bytes.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(bytes)),
-        );
-    }
-
-    pub(crate) fn phase_end_extracting_if_idle(&mut self, job_id: JobId) {
-        let has_inflight_extractions = self
-            .inflight_extractions
-            .get(&job_id)
-            .is_some_and(|sets| !sets.is_empty());
-        if !has_inflight_extractions && !self.has_active_rar_workers(job_id) {
-            self.phase_end(job_id, JobPhase::Extracting);
-        }
-    }
-
     // Credit one landed article's wire bytes to its job's download rate, and
     // to the server that served it.
     //
@@ -169,6 +144,17 @@ impl Pipeline {
     // whose server cannot be named is credited to the job's bytes and left
     // out of the ledger: an uncounted article is recoverable from the totals,
     // a misattributed one is not.
+    // Write the job's debug ring out beside a stall report, once per stall
+    // episode. The job's downloaded wire bytes are its progress: a report at
+    // the same count as the last replay belongs to the same episode.
+    pub(crate) fn dump_job_debug_ring(&self, job_id: JobId, reason: &'static str) {
+        let progress = self
+            .jobs
+            .get(&job_id)
+            .map_or(0, |state| state.downloaded_wire_bytes);
+        crate::runtime::job_debug_ring::dump(job_id.0, progress, reason);
+    }
+
     pub(crate) fn note_job_wire_bytes(
         &mut self,
         segment_id: SegmentId,
@@ -193,9 +179,12 @@ impl Pipeline {
 
     pub(crate) fn clear_job_phase_progress_runtime(&mut self, job_id: JobId) {
         let mut removed_post_download = 0;
-        self.phase_progress.retain(|(jid, phase), _| {
+        self.phase_progress.retain(|(jid, phase), runtime| {
             let keep = *jid != job_id;
-            if !keep && *phase != JobPhase::Downloading {
+            if !keep {
+                self.shared_state.queue.end_phase(job_id, *phase);
+            }
+            if !keep && runtime.holds_live {
                 removed_post_download += 1;
             }
             keep
@@ -203,166 +192,5 @@ impl Pipeline {
         self.post_download_phases = self
             .post_download_phases
             .saturating_sub(removed_post_download);
-        self.phase_progress_snapshots.remove(&job_id);
-        self.phase_publish_state.remove(&job_id);
     }
-
-    pub(crate) fn sample_phase_progress(&mut self) {
-        let now = Instant::now();
-        let updated_at_epoch_ms = crate::jobs::epoch_ms_now();
-        let keys: Vec<_> = self.phase_progress.keys().copied().collect();
-        let mut by_job: HashMap<JobId, Vec<JobPhaseProgress>> = HashMap::new();
-
-        for (job_id, phase) in keys {
-            let download_active =
-                phase != JobPhase::Downloading || self.job_has_current_download_activity(job_id);
-            // The download phase deliberately reports two different byte
-            // counts. Progress is decoded bytes against the declared total, so
-            // the bar cannot overshoot 100%. The rate is wire bytes, the same
-            // counter the global speed gauge integrates: yEnc runs ~3% larger
-            // than its payload (uuencode ~38%), and a decoded-byte rate also
-            // trails the network by however deep the decode queue is, so a row
-            // built from it never agreed with the nav counter.
-            let derived_download = if phase == JobPhase::Downloading {
-                self.jobs.get(&job_id).map(|state| {
-                    (
-                        Self::effective_downloaded_bytes(state),
-                        state.spec.total_bytes,
-                        state.downloaded_wire_bytes,
-                    )
-                })
-            } else {
-                None
-            };
-
-            let Some(runtime) = self.phase_progress.get_mut(&(job_id, phase)) else {
-                continue;
-            };
-            let (completed_bytes, total_bytes, rate_bytes) =
-                derived_download.unwrap_or_else(|| {
-                    let completed = runtime.counters.completed_bytes.load(Ordering::Relaxed);
-                    (
-                        completed,
-                        runtime.counters.total_bytes.load(Ordering::Relaxed),
-                        completed,
-                    )
-                });
-            if phase == JobPhase::Downloading && !download_active {
-                runtime.rate = RateSeries::new();
-                runtime.first_sample_at = None;
-                continue;
-            }
-            if total_bytes == 0 {
-                runtime.rate.update(now, rate_bytes);
-                continue;
-            }
-
-            if runtime.first_sample_at.is_none() {
-                runtime.first_sample_at = Some(now);
-            }
-            let rate = runtime.rate.update(now, rate_bytes);
-
-            let rate_warm = runtime
-                .first_sample_at
-                .is_some_and(|first| now.duration_since(first) >= PHASE_RATE_WARMUP);
-            // Same rounding as the global gauge: below 1 B/s reads as idle.
-            let rate_bps = (rate_warm && rate.is_finite() && rate >= 1.0).then_some(rate as u64);
-            let effective_total = total_bytes.max(completed_bytes);
-            let progress_percent = if effective_total == 0 {
-                0.0
-            } else {
-                ((completed_bytes as f64 / effective_total as f64) * 100.0).clamp(0.0, 100.0) as f32
-            };
-            let estimated_remaining_ms = rate_bps.and_then(|rate| {
-                if rate == 0 || completed_bytes >= total_bytes {
-                    None
-                } else {
-                    Some(
-                        (total_bytes - completed_bytes)
-                            .saturating_mul(1000)
-                            .checked_div(rate)
-                            .unwrap_or(u64::MAX),
-                    )
-                }
-            });
-
-            by_job.entry(job_id).or_default().push(JobPhaseProgress {
-                phase,
-                completed_bytes,
-                total_bytes,
-                progress_percent,
-                rate_bps,
-                estimated_remaining_ms,
-                started_at_epoch_ms: runtime.started_at_epoch_ms,
-                updated_at_epoch_ms,
-            });
-        }
-
-        for phases in by_job.values_mut() {
-            phases.sort_by_key(|progress| progress.phase);
-        }
-
-        // Nothing to show before or after means the published rows already
-        // carry no phase progress; republishing them would change nothing.
-        let shows_progress = !by_job.is_empty() || !self.phase_progress_snapshots.is_empty();
-        self.phase_progress_snapshots = by_job;
-        if shows_progress {
-            self.publish_snapshot();
-        }
-        self.emit_phase_progress_update_events(now);
-    }
-
-    fn emit_phase_progress_update_events(&mut self, now: Instant) {
-        let mut job_ids: HashSet<JobId> = self.phase_progress_snapshots.keys().copied().collect();
-        job_ids.extend(self.phase_publish_state.keys().copied());
-
-        for job_id in job_ids {
-            let signature = phase_publish_signature(
-                self.phase_progress_snapshots
-                    .get(&job_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or(&[]),
-            );
-            if signature.0.is_empty() {
-                if self.phase_publish_state.remove(&job_id).is_some() {
-                    let _ = self
-                        .event_tx
-                        .send(PipelineEvent::PhaseProgressUpdated { job_id });
-                }
-                continue;
-            }
-
-            let should_send = self.phase_publish_state.get(&job_id).is_none_or(|state| {
-                state.signature != signature
-                    || now.duration_since(state.sent_at) >= PHASE_PUBLISH_INTERVAL
-            });
-            if should_send {
-                self.phase_publish_state.insert(
-                    job_id,
-                    PhasePublishState {
-                        signature,
-                        sent_at: now,
-                    },
-                );
-                let _ = self
-                    .event_tx
-                    .send(PipelineEvent::PhaseProgressUpdated { job_id });
-            }
-        }
-    }
-}
-
-fn phase_publish_signature(progress: &[JobPhaseProgress]) -> PhasePublishSignature {
-    PhasePublishSignature(
-        progress
-            .iter()
-            .map(|item| {
-                (
-                    item.phase,
-                    item.progress_percent.floor().clamp(0.0, 100.0) as u8,
-                    item.rate_bps.is_some(),
-                )
-            })
-            .collect(),
-    )
 }

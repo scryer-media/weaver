@@ -1,235 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::cmp::Ordering;
-use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use super::*;
+use crate::jobs::paging::{PageRead, PageWants, read_row};
 use crate::jobs::types::{
     DuplicateIdentitySnapshotInfo, DuplicateSummaryInfo, PreparedQueueFilter,
-    load_duplicate_summaries_chunked, matches_queue_filter_prepared, queue_display_titles_from_job,
-    queue_item_state_from_job_info, queue_table_item_from_job,
+    load_duplicate_summaries_chunked, matches_queue_filter_prepared, queue_table_item_from_job,
 };
 use crate::observability::with_timed_config_read;
 
 #[derive(Default)]
 pub(crate) struct JobsQuery;
-
-const MAX_QUEUE_PAGE_SIZE: usize = 500;
-
-fn queue_page_display_name(original_title: &str, name: &str, display_title: &str) -> String {
-    let release_name = if original_title.trim().is_empty() {
-        name.trim()
-    } else {
-        original_title.trim()
-    };
-    if release_name.is_empty() {
-        return display_title.to_string();
-    }
-
-    release_name
-        .replace('.', " ")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn queue_page_job_display_name(info: &weaver_server_core::JobInfo) -> String {
-    let (original_title, display_title) = queue_display_titles_from_job(info);
-    queue_page_display_name(&original_title, &info.name, &display_title)
-}
-
-fn queue_display_state(state: QueueItemState) -> &'static str {
-    match state {
-        QueueItemState::AwaitingQueueScripts => "AWAITING_QUEUE_SCRIPTS",
-        QueueItemState::Queued => "QUEUED",
-        QueueItemState::Downloading => "DOWNLOADING",
-        QueueItemState::FetchingRepairData => "FETCHING_REPAIR_DATA",
-        QueueItemState::FinalizingDownload => "FINALIZING_DOWNLOAD",
-        QueueItemState::Checking | QueueItemState::Verifying => "VERIFYING",
-        QueueItemState::Repairing => "REPAIRING",
-        QueueItemState::Extracting => "EXTRACTING",
-        QueueItemState::Finalizing => "MOVING",
-        QueueItemState::PostProcessing => "POST_PROCESSING",
-        QueueItemState::Completed => "COMPLETE",
-        QueueItemState::Failed => "FAILED",
-        QueueItemState::Paused => "PAUSED",
-    }
-}
-
-fn queue_page_job_matches(info: &weaver_server_core::JobInfo, input: &QueuePageInput) -> bool {
-    let state = queue_item_state_from_job_info(info);
-    if let Some(states) = input.states.as_ref()
-        && !states.is_empty()
-        && !states.contains(&state)
-    {
-        return false;
-    }
-
-    if let Some(priorities) = input.priorities.as_ref()
-        && !priorities.is_empty()
-        && !priorities.contains(&QueuePriority::from_metadata(&info.metadata))
-    {
-        return false;
-    }
-
-    if input.categories.as_ref().is_some_and(|categories| {
-        !categories.is_empty()
-            && !info
-                .category
-                .as_ref()
-                .is_some_and(|category| categories.contains(category))
-    }) {
-        return false;
-    }
-
-    let Some(search) = input
-        .search
-        .as_deref()
-        .map(str::trim)
-        .filter(|search| !search.is_empty())
-    else {
-        return true;
-    };
-    let (original_title, display_title) = queue_display_titles_from_job(info);
-    let search = search.to_lowercase();
-    [
-        queue_page_display_name(&original_title, &info.name, &display_title),
-        info.name.clone(),
-        display_title,
-    ]
-    .into_iter()
-    .any(|value| value.to_lowercase().contains(&search))
-}
-
-fn queue_page_job_progress(info: &weaver_server_core::JobInfo) -> f64 {
-    let progress = info.progress.clamp(0.0, 1.0);
-    if info.total_bytes == 0 {
-        return progress;
-    }
-    let processed_bytes = info
-        .downloaded_bytes
-        .saturating_add(info.failed_bytes)
-        .min(info.total_bytes);
-    progress.max(processed_bytes as f64 / info.total_bytes as f64)
-}
-
-fn queue_page_job_live_rate(info: &weaver_server_core::JobInfo) -> u64 {
-    info.phase_progress
-        .iter()
-        .filter_map(|phase| phase.rate_bps)
-        .max()
-        .unwrap_or_default()
-}
-
-fn queue_page_download_rank(state: QueueItemState) -> u8 {
-    match state {
-        QueueItemState::Downloading | QueueItemState::FetchingRepairData => 1,
-        _ => 0,
-    }
-}
-
-fn queue_page_download_order(
-    left: &weaver_server_core::JobInfo,
-    right: &weaver_server_core::JobInfo,
-) -> Ordering {
-    queue_page_download_rank(queue_item_state_from_job_info(right)).cmp(&queue_page_download_rank(
-        queue_item_state_from_job_info(left),
-    ))
-}
-
-fn queue_page_default_order(
-    left: &weaver_server_core::JobInfo,
-    right: &weaver_server_core::JobInfo,
-) -> Ordering {
-    queue_page_download_order(left, right)
-        .then_with(|| queue_page_job_live_rate(right).cmp(&queue_page_job_live_rate(left)))
-}
-
-fn queue_page_job_order(
-    left: &weaver_server_core::JobInfo,
-    right: &weaver_server_core::JobInfo,
-    input: &QueuePageInput,
-) -> Ordering {
-    let Some(sort_field) = input.sort_field else {
-        return Ordering::Equal;
-    };
-    let order = match sort_field {
-        QueueSortField::Name => {
-            queue_page_job_display_name(left).cmp(&queue_page_job_display_name(right))
-        }
-        QueueSortField::State => queue_display_state(queue_item_state_from_job_info(left))
-            .cmp(queue_display_state(queue_item_state_from_job_info(right))),
-        QueueSortField::Priority => QueuePriority::from_metadata(&left.metadata)
-            .rank()
-            .cmp(&QueuePriority::from_metadata(&right.metadata).rank()),
-        QueueSortField::Category => left
-            .category
-            .as_deref()
-            .unwrap_or("\u{2014}")
-            .cmp(right.category.as_deref().unwrap_or("\u{2014}")),
-        QueueSortField::Progress => {
-            queue_page_job_progress(left).total_cmp(&queue_page_job_progress(right))
-        }
-        QueueSortField::Size => left.total_bytes.cmp(&right.total_bytes),
-    };
-    let order = match input.sort_direction.unwrap_or(QueueSortDirection::Desc) {
-        QueueSortDirection::Asc => order,
-        QueueSortDirection::Desc => order.reverse(),
-    };
-    queue_page_download_order(left, right)
-        .then(order)
-        .then_with(|| left.job_id.0.cmp(&right.job_id.0))
-}
-
-fn queue_page_summary(
-    jobs: &[weaver_server_core::JobInfo],
-    metrics: &weaver_server_core::operations::metrics::MetricsSnapshot,
-) -> QueueSummary {
-    let mut summary = QueueSummary {
-        total_items: jobs.len() as u32,
-        queued_items: 0,
-        active_items: 0,
-        paused_items: 0,
-        failed_items: 0,
-        total_bytes: jobs.iter().map(|job| job.total_bytes).sum(),
-        downloaded_bytes: jobs.iter().map(|job| job.downloaded_bytes).sum(),
-        current_download_speed: metrics.current_download_speed,
-        verifying_items: 0,
-        repairing_items: 0,
-        extracting_items: 0,
-    };
-
-    for job in jobs {
-        match queue_item_state_from_job_info(job) {
-            QueueItemState::AwaitingQueueScripts => summary.active_items += 1,
-            QueueItemState::Queued => summary.queued_items += 1,
-            QueueItemState::Paused => summary.paused_items += 1,
-            QueueItemState::Failed => summary.failed_items += 1,
-            QueueItemState::Verifying | QueueItemState::Checking => {
-                summary.active_items += 1;
-                summary.verifying_items += 1;
-            }
-            QueueItemState::Repairing => {
-                summary.active_items += 1;
-                summary.repairing_items += 1;
-            }
-            QueueItemState::Extracting => {
-                summary.active_items += 1;
-                summary.extracting_items += 1;
-            }
-            QueueItemState::Downloading
-            | QueueItemState::FetchingRepairData
-            | QueueItemState::FinalizingDownload
-            | QueueItemState::Finalizing
-            | QueueItemState::PostProcessing => summary.active_items += 1,
-            QueueItemState::Completed => {}
-        }
-    }
-
-    summary
-}
 
 #[Object]
 impl JobsQuery {
@@ -263,94 +46,42 @@ impl JobsQuery {
         first: Option<u32>,
         after: Option<String>,
     ) -> Result<Vec<QueueItem>> {
-        let handle = ctx.data::<SchedulerHandle>()?;
         let offset = decode_offset_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
         let limit = first.unwrap_or(u32::MAX) as usize;
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
-        let mut items: Vec<QueueItem> = handle
-            .list_jobs()
-            .into_iter()
-            .filter(|info| {
-                !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-            })
-            .map(|info| queue_item_from_job(&info))
-            .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
-            .skip(offset)
-            .take(limit)
-            .collect();
+        let mut items: Vec<QueueItem> = crate::jobs::paging::read_listing(
+            ctx.data::<weaver_server_core::SharedPipelineState>()?,
+        )
+        .iter()
+        .map(queue_item_from_job)
+        .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
+        .skip(offset)
+        .take(limit)
+        .collect();
         attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
         Ok(items)
     }
     /// Server-paginated queue rows for the interactive queue table.
     #[graphql(guard = "ReadGuard")]
     async fn queue_page(&self, ctx: &Context<'_>, input: QueuePageInput) -> Result<QueuePage> {
-        let handle = ctx.data::<SchedulerHandle>()?.clone();
-        let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
-        // Capture before reading the scheduler so events produced while this page
-        // is assembled remain eligible for replay by queueEvents(after: ...).
-        let latest_cursor = replay.latest_cursor().await;
-        let mut all_jobs: Vec<weaver_server_core::JobInfo> = handle
-            .list_jobs()
-            .into_iter()
-            .filter(|info| {
-                !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-            })
-            .collect();
-        let categories = all_jobs
-            .iter()
-            .filter_map(|job| job.category.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        let metrics = handle.get_metrics();
-        let summary = queue_page_summary(&all_jobs, &metrics);
-        let page_size = (input.page_size as usize).clamp(1, MAX_QUEUE_PAGE_SIZE);
-        let offset = (input.page_index as usize).saturating_mul(page_size);
-        all_jobs.retain(|job| queue_page_job_matches(job, &input));
-        if input.sort_field.is_some() {
-            all_jobs.sort_by(|left, right| queue_page_job_order(left, right, &input));
-        } else {
-            all_jobs.sort_by(queue_page_default_order);
-        }
-        let total_count = u32::try_from(all_jobs.len()).unwrap_or(u32::MAX);
-        let mut items = all_jobs
-            .into_iter()
-            .skip(offset)
-            .take(page_size)
-            .map(|job| queue_table_item_from_job(&job))
-            .collect::<Vec<_>>();
-        attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
-
-        Ok(QueuePage {
-            items,
-            total_count,
-            summary,
-            categories,
-            latest_cursor,
-        })
+        build_queue_page(
+            ctx.data::<SchedulerHandle>()?,
+            ctx.data::<weaver_server_core::SharedPipelineState>()?,
+            ctx.data::<crate::jobs::replay::QueueEventReplay>()?,
+            ctx.data::<Database>()?.clone(),
+            &input,
+            page_wants(ctx),
+            &mut DuplicateSummaryCache::default(),
+        )
+        .await
     }
     /// Public queue facade for one active item.
     #[graphql(guard = "ReadGuard")]
     async fn queue_item(&self, ctx: &Context<'_>, id: u64) -> Result<Option<QueueItem>> {
-        let handle = ctx.data::<SchedulerHandle>()?;
-        let Some(info) = handle.list_jobs().into_iter().find(|info| {
-            info.job_id.0 == id
-                && !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-        }) else {
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
+        let Some(info) = read_row(state, weaver_server_core::jobs::ids::JobId(id)) else {
             return Ok(None);
         };
         let mut item = queue_item_from_job(&info);
@@ -365,19 +96,8 @@ impl JobsQuery {
     #[graphql(guard = "ReadGuard")]
     async fn queue_summary(&self, ctx: &Context<'_>) -> Result<QueueSummary> {
         let handle = ctx.data::<SchedulerHandle>()?;
-        let items: Vec<QueueItem> = handle
-            .list_jobs()
-            .into_iter()
-            .filter(|info| {
-                !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-            })
-            .map(|info| queue_item_from_job(&info))
-            .collect();
-        Ok(queue_summary(&items, &handle.get_metrics()))
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
+        Ok(crate::jobs::paging::summary(state, &handle.get_metrics()))
     }
     /// Atomic queue bootstrap snapshot for initial page load and reconnect polling.
     #[graphql(guard = "ReadGuard")]
@@ -391,19 +111,13 @@ impl JobsQuery {
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
-        let mut items: Vec<QueueItem> = handle
-            .list_jobs()
-            .into_iter()
-            .filter(|info| {
-                !matches!(
-                    info.status,
-                    weaver_server_core::JobStatus::Complete
-                        | weaver_server_core::JobStatus::Failed { .. }
-                )
-            })
-            .map(|info| queue_item_from_job(&info))
-            .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
-            .collect();
+        let mut items: Vec<QueueItem> = crate::jobs::paging::read_listing(
+            ctx.data::<weaver_server_core::SharedPipelineState>()?,
+        )
+        .iter()
+        .map(queue_item_from_job)
+        .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
+        .collect();
         attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
         let metrics = handle.get_metrics();
         let latest_cursor = replay.latest_cursor().await;
@@ -461,37 +175,41 @@ impl JobsQuery {
         limit: Option<u32>,
         offset: Option<u32>,
     ) -> Result<Vec<Job>> {
-        let handle = ctx.data::<SchedulerHandle>()?;
-        let infos = handle.list_jobs();
-        let filtered = infos.iter().filter(|info| {
-            if let Some(ref statuses) = status {
-                let gql_status = JobStatusGql::from(&info.status);
-                if !statuses.contains(&gql_status) {
-                    return false;
-                }
-            }
-            if let Some(ref cat) = category
-                && info.category.as_ref() != Some(cat)
-            {
-                return false;
-            }
-            if let Some(ref key) = has_metadata_key
-                && !info.metadata.iter().any(|(k, _)| k == key)
-            {
-                return false;
-            }
-            true
-        });
-        let jobs = if let Some(lim) = limit {
-            filtered
-                .skip(offset.unwrap_or(0) as usize)
-                .take(lim as usize)
-                .map(Job::from)
-                .collect()
-        } else {
-            filtered.map(Job::from).collect()
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
+        let filter = JobFilter {
+            status,
+            category,
+            has_metadata_key,
         };
-        Ok(jobs)
+        let offset = offset.unwrap_or(0) as usize;
+        let limit = limit.map_or(usize::MAX, |limit| limit as usize);
+        let history = state.history_rows();
+        // Only the jobs on the page are copied; the rest are matched in place.
+        let (mut infos, queued_matches) = state.read_queue(|inner| {
+            let mut infos = Vec::new();
+            let mut matched = 0usize;
+            for row in &inner.jobs {
+                let view = row.view(&inner.globals);
+                if !filter.matches(view.status(), view.job()) {
+                    continue;
+                }
+                if matched >= offset && infos.len() < limit {
+                    infos.push(row.info(&inner.globals));
+                }
+                matched += 1;
+            }
+            (infos, matched)
+        });
+        let room = limit - infos.len();
+        infos.extend(
+            history
+                .iter()
+                .filter(|info| filter.matches(&info.status, info))
+                .skip(offset.saturating_sub(queued_matches))
+                .take(room)
+                .cloned(),
+        );
+        Ok(infos.iter().map(Job::from).collect())
     }
     /// Count jobs matching the given filters (same filters as `jobs`).
     async fn job_count(
@@ -501,29 +219,25 @@ impl JobsQuery {
         category: Option<String>,
         has_metadata_key: Option<String>,
     ) -> Result<u32> {
-        let handle = ctx.data::<SchedulerHandle>()?;
-        let infos = handle.list_jobs();
-        let count = infos
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
+        let filter = JobFilter {
+            status,
+            category,
+            has_metadata_key,
+        };
+        let history = state.history_rows();
+        let count = state.read_queue(|inner| {
+            inner
+                .jobs
+                .iter()
+                .filter(|row| {
+                    let view = row.view(&inner.globals);
+                    filter.matches(view.status(), view.job())
+                })
+                .count()
+        }) + history
             .iter()
-            .filter(|info| {
-                if let Some(ref statuses) = status {
-                    let gql_status = JobStatusGql::from(&info.status);
-                    if !statuses.contains(&gql_status) {
-                        return false;
-                    }
-                }
-                if let Some(ref cat) = category
-                    && info.category.as_ref() != Some(cat)
-                {
-                    return false;
-                }
-                if let Some(ref key) = has_metadata_key
-                    && !info.metadata.iter().any(|(k, _)| k == key)
-                {
-                    return false;
-                }
-                true
-            })
+            .filter(|info| filter.matches(&info.status, info))
             .count();
         Ok(count as u32)
     }
@@ -628,6 +342,117 @@ fn list_output_files(dir: &std::path::Path) -> Result<JobOutputResult> {
     })
 }
 
+/// What a page request selects beyond the counts: a selection that names no
+/// row field (the screen-wide totals) is planned without any row.
+pub(crate) fn page_wants(ctx: &Context<'_>) -> PageWants {
+    let fields = ctx.look_ahead();
+    PageWants {
+        rows: fields.field("items").exists() || fields.field("etaThrough").exists(),
+    }
+}
+
+/// The duplicate summaries a page answer last read, kept while the queue
+/// revision they were read at stands. A job's summary changes only with the
+/// queue (an add, a removal or a retirement moves the revision), so a push
+/// at the same revision reads nothing, and a page with no rows never reads.
+#[derive(Default)]
+pub(crate) struct DuplicateSummaryCache {
+    revision: Option<u64>,
+    by_id: std::collections::HashMap<u64, Option<DuplicateSummaryInfo>>,
+    reads: u32,
+}
+
+impl DuplicateSummaryCache {
+    pub(crate) async fn attach(
+        &mut self,
+        db: Database,
+        revision: u64,
+        items: &mut [QueueItem],
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
+        }
+        if self.revision != Some(revision) {
+            self.by_id.clear();
+            self.revision = Some(revision);
+        }
+        let missing = items
+            .iter()
+            .filter(|item| !self.by_id.contains_key(&item.id))
+            .map(|item| weaver_server_core::jobs::ids::JobId(item.id))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            self.reads += 1;
+            let wanted = missing.clone();
+            let summaries =
+                tokio::task::spawn_blocking(move || load_duplicate_summaries_chunked(&db, wanted))
+                    .await
+                    .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+                    .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+            for id in missing {
+                self.by_id.insert(
+                    id.0,
+                    summaries.get(&id).map(DuplicateSummaryInfo::from_summary),
+                );
+            }
+        }
+        for item in items {
+            item.duplicate_summary = self.by_id.get(&item.id).cloned().flatten();
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reads(&self) -> u32 {
+        self.reads
+    }
+}
+
+/// One queue page: the rows `input` asks for, and the counts and totals
+/// over every row it matches.
+pub(crate) async fn build_queue_page(
+    handle: &SchedulerHandle,
+    state: &weaver_server_core::SharedPipelineState,
+    replay: &crate::jobs::replay::QueueEventReplay,
+    db: Database,
+    input: &QueuePageInput,
+    wants: PageWants,
+    duplicates: &mut DuplicateSummaryCache,
+) -> Result<QueuePage> {
+    // Capture before reading the scheduler so events produced while this page
+    // is assembled remain eligible for replay by queueEvents(after: ...).
+    let latest_cursor = replay.latest_cursor().await;
+    let PageRead {
+        walk,
+        plan,
+        rows,
+        revision,
+    } = PageRead::read(state, input, wants);
+    let metrics = handle.get_metrics();
+    let summary = walk.summary(&metrics);
+    let categories = walk.categories();
+    drop(walk);
+    let mut items = rows
+        .iter()
+        .map(queue_table_item_from_job)
+        .collect::<Vec<_>>();
+    duplicates.attach(db, revision, &mut items).await?;
+
+    Ok(QueuePage {
+        items,
+        total_count: plan.total_count,
+        summary,
+        categories,
+        category_counts: plan.category_counts,
+        state_counts: plan.state_counts,
+        remaining_bytes: plan.remaining_bytes,
+        eta_total_bytes: plan.eta_total_bytes,
+        eta_downloaded_bytes: plan.eta_downloaded_bytes,
+        eta_through: plan.eta_through,
+        latest_cursor,
+    })
+}
+
 async fn attach_duplicate_summaries(db: Database, items: &mut [QueueItem]) -> Result<()> {
     let job_ids = items
         .iter()
@@ -671,19 +496,35 @@ fn collect_files_recursive(dir: &std::path::Path, out: &mut Vec<JobOutputFile>) 
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// The filters `jobs` and `jobCount` share.
+struct JobFilter {
+    status: Option<Vec<JobStatusGql>>,
+    category: Option<String>,
+    has_metadata_key: Option<String>,
+}
 
-    #[test]
-    fn downloading_states_rank_above_queued() {
-        assert!(
-            queue_page_download_rank(QueueItemState::Downloading)
-                > queue_page_download_rank(QueueItemState::Queued)
-        );
-        assert!(
-            queue_page_download_rank(QueueItemState::FetchingRepairData)
-                > queue_page_download_rank(QueueItemState::Queued)
-        );
+impl JobFilter {
+    // `status` is the job's status as published; `job` carries the rest.
+    fn matches(
+        &self,
+        status: &weaver_server_core::JobStatus,
+        job: &weaver_server_core::JobInfo,
+    ) -> bool {
+        if let Some(statuses) = &self.status
+            && !statuses.contains(&JobStatusGql::from(status))
+        {
+            return false;
+        }
+        if let Some(category) = &self.category
+            && job.category.as_ref() != Some(category)
+        {
+            return false;
+        }
+        if let Some(key) = &self.has_metadata_key
+            && !job.metadata.iter().any(|(k, _)| k == key)
+        {
+            return false;
+        }
+        true
     }
 }

@@ -66,8 +66,10 @@ export const Chart = memo(function Chart({
   xLabels,
   formatValue,
   loading = false,
+  testId,
 }: {
   title: string;
+  testId?: string;
   note?: ReactNode;
   series: readonly ChartSeries[];
   /** Three labels, oldest to newest. */
@@ -87,7 +89,7 @@ export const Chart = memo(function Chart({
   const yLabels = [ceiling, (ceiling * 2) / 3, ceiling / 3, 0];
 
   return (
-    <section className="flex flex-none flex-col">
+    <section data-testid={testId} className="flex flex-none flex-col">
       <SectionHeader label={title} note={note} sticky={false} />
       <div className="flex flex-wrap items-start gap-x-6 gap-y-5 px-4 sm:px-6 py-5">
         <div className="flex min-w-[280px] flex-[1_1_360px] gap-3">

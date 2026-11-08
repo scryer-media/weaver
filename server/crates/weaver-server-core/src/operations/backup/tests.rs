@@ -72,11 +72,11 @@ fn sample_config() -> Config {
         }),
         max_download_speed: Some(42),
         propagation_delay_secs: None,
+        max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
-        direct_unpack: None,
         delivery_naming: None,
         metrics: Default::default(),
         config_path: None,
@@ -251,7 +251,9 @@ async fn export_and_import_stable_state_roundtrip() {
     assert_eq!(restored_usage.updated_at, usage_updated_at);
     assert_eq!(restored.categories.len(), 1);
     assert_eq!(dest.list_api_keys().unwrap().len(), 1);
-    let history = dest.list_job_history(&HistoryFilter::default()).unwrap();
+    let history = dest
+        .list_job_history(&HistoryFilter::default(), crate::HistoryRows::All)
+        .unwrap();
     assert_eq!(history.len(), 1);
     assert_eq!(history[0].optional_recovery_bytes, 45);
     assert_eq!(history[0].optional_recovery_downloaded_bytes, 12);

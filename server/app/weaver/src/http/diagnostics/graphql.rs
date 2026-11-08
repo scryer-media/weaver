@@ -20,7 +20,7 @@
 // root field is executed as its own request so one large surface cannot push
 // another past the schema's complexity limit.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use async_graphql::parser::types::{BaseType, TypeKind, TypeSystemDefinition};
@@ -110,6 +110,16 @@ impl SchemaShape {
             objects,
             query_type,
         })
+    }
+
+    // Every field name the schema's object types declare: the keys a
+    // GraphQL response is written with.
+    pub(super) fn field_names(&self) -> HashSet<String> {
+        self.objects
+            .values()
+            .flatten()
+            .map(|field| field.name.clone())
+            .collect()
     }
 
     // One field of the root query type, by name.

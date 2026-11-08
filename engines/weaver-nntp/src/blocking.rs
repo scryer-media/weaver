@@ -15,6 +15,7 @@ use std::os::fd::AsRawFd;
 #[cfg(not(windows))]
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
@@ -214,8 +215,15 @@ pub struct BlockingNntpConnection {
     current_group: Option<String>,
     credentials: Option<(String, String)>,
     poisoned: bool,
+    // The server answered a pipelined BODY with 480: the session expired,
+    // but the socket is still framed. Nothing new may be written until every
+    // reply queued behind that 480 has been read and the session has been
+    // re-authenticated in place. See
+    // [`Self::reauthenticate_expired_session`].
+    reauth_pending: bool,
     transfer_control: Option<Arc<ServerTransferControl>>,
     body_accounting: VecDeque<BodyTransferAccounting>,
+    body_activity: Option<Arc<AtomicU64>>,
     // The egress's accounting for each outstanding BODY, in step with
     // `body_accounting`. Empty when the connection has no egress control.
     egress_accounting: VecDeque<BodyTransferAccounting>,
@@ -229,9 +237,18 @@ pub struct BlockingNntpConnection {
     // offered, because the server has never been shown to need one. See
     // [`crate::server_caps`].
     group_probe_armed: bool,
+    // The recovery ticket of the lane this connection serves, told when a
+    // BODY is answered. See [`crate::recovery::ConnectionHealth::answered`].
+    health: Option<Arc<crate::recovery::ConnectionHealth>>,
 }
 
 impl BlockingBodyLane {
+    // The caller owns attribution and generation. Replace before each
+    // response so a reused connection never credits the previous lease.
+    pub fn set_body_activity(&mut self, activity: Arc<AtomicU64>) {
+        self.conn.body_activity = Some(activity);
+    }
+
     // Apply the batch's immutable geometry before every decoded response, so
     // a lane reused by another job cannot carry previous checkpoint state.
     pub fn set_checkpoint_plan(&mut self, checkpoint_plan: CheckpointPlan) {
@@ -260,6 +277,7 @@ impl BlockingBodyLane {
         let mut conn =
             BlockingNntpConnection::connect_for_group(config, groups.first().map(String::as_str))?;
         conn.set_transfer_control(transfer_control);
+        conn.health = Some(Arc::clone(&permit.health_lease.0));
         permit.socket_slot.set_path(conn.route_path.as_ref());
         permit
             .socket_slot
@@ -438,7 +456,7 @@ impl BlockingBodyLane {
             .lock()
             .expect("lane idle clock poisoned")
             .map_or(Duration::ZERO, |since| since.elapsed());
-        if idle >= Duration::from_mins(5) {
+        if idle >= self._permit.max_idle_age {
             return true;
         }
         if self.conn.transport.tcp().is_none() {
@@ -641,6 +659,11 @@ impl BlockingBodyLane {
                     policy_elapsed.saturating_sub(response_line_wait),
                 );
             }
+            // The whole batch is read: a session that expired part-way
+            // through logs in again before the lane is handed back.
+            if idx + 1 == requested && !closed_early {
+                self.reauthenticate_drained_session();
+            }
             if self.conn.poisoned
                 || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
             {
@@ -723,6 +746,14 @@ impl BlockingBodyLane {
         self.ring.closed
     }
 
+    // The session expired mid-batch and the replies queued behind its 480
+    // are still being read. Keep reading the ring; issue nothing until the
+    // lane has re-authenticated, which it does by itself once the ring is
+    // empty.
+    pub fn holds_new_requests(&self) -> bool {
+        self.conn.reauth_pending
+    }
+
     // Write one more BODY onto the ring at `depth`.
     //
     // The command is buffered, not flushed; [`Self::ring_read_next`] pushes it
@@ -742,6 +773,17 @@ impl BlockingBodyLane {
                 Err(DecodedBodyError::Nntp(NntpError::ConnectionClosed)),
             );
             return RingIssueOutcome::Failed(Box::new(trace));
+        }
+        // A caller that ignored [`Self::holds_new_requests`]. Nothing goes out
+        // behind a 480 until the session has been re-authenticated, and the
+        // lane is still healthy, so this article simply was not answered.
+        if self.conn.reauth_pending {
+            let trace = self.trace_item(
+                message_id,
+                Duration::ZERO,
+                Err(DecodedBodyError::Nntp(NntpError::SessionExpired)),
+            );
+            return RingIssueOutcome::Rejected(Box::new(trace));
         }
         let depth = depth.max(1);
         self.ring.current_depth = depth;
@@ -836,6 +878,12 @@ impl BlockingBodyLane {
                 policy_elapsed.saturating_sub(response_line_wait),
             );
         }
+        // The last reply owed behind a 480 has been read: log in again on
+        // this socket. A refusal poisons the connection, so the window below
+        // closes as unhealthy and the caller discards the lane.
+        if self.ring.outstanding.is_empty() && !self.ring.closed {
+            self.reauthenticate_drained_session();
+        }
         if self.conn.poisoned
             || matches!(result, Err(DecodedBodyError::Nntp(ref e)) if is_connection_error(e))
         {
@@ -876,6 +924,26 @@ impl BlockingBodyLane {
         self.ring.window_depth = 0;
         self.ring.window_responses = 0;
         dropped
+    }
+
+    // Re-authenticate a session that expired mid-batch, once nothing is
+    // outstanding on it. A no-op unless a 480 is pending.
+    fn reauthenticate_drained_session(&mut self) {
+        if !self.conn.reauth_pending() || self.conn.poisoned {
+            return;
+        }
+        let budget = ActiveTransferBudget::new(self.soft_timeout);
+        match self.conn.reauthenticate_expired_session(Some(&budget)) {
+            Ok(()) => debug!(
+                server = self.server_id.0,
+                "re-authenticated an expired session in place"
+            ),
+            Err(error) => debug!(
+                server = self.server_id.0,
+                error = %error,
+                "could not re-authenticate an expired session; dropping the connection"
+            ),
+        }
     }
 
     fn close_ring_window(&mut self, healthy: bool) -> BodyLaneTraceMeta {
@@ -1232,12 +1300,15 @@ impl BlockingNntpConnection {
             current_group: None,
             credentials: None,
             poisoned: false,
+            reauth_pending: false,
             transfer_control: None,
             body_accounting: VecDeque::new(),
+            body_activity: None,
             egress_accounting: VecDeque::new(),
             checkpoint_plan: CheckpointPlan::None,
             last_response_line_wait: Duration::ZERO,
             group_probe_armed: false,
+            health: None,
         };
 
         // The route's setup evidence is whether the server answered over this
@@ -1260,8 +1331,12 @@ impl BlockingNntpConnection {
         debug!(code = greeting.code.raw(), msg = %greeting.message, "received blocking NNTP greeting");
         match greeting.code.raw() {
             200 | 201 => {}
-            400 => return Err(NntpError::ServiceUnavailable),
-            502 => return Err(NntpError::from_status(greeting.code, &greeting.message)),
+            400 | 502 => {
+                return Err(NntpError::from_login_status(
+                    greeting.code,
+                    &greeting.message,
+                ));
+            }
             _ => return Err(NntpError::unexpected(greeting.code, &greeting.message)),
         }
 
@@ -1419,15 +1494,21 @@ impl BlockingNntpConnection {
         match user_resp.code.raw() {
             281 => return Ok(()),
             381 => {}
-            _ => return Err(NntpError::from_status(user_resp.code, &user_resp.message)),
+            _ => {
+                return Err(NntpError::from_login_status(
+                    user_resp.code,
+                    &user_resp.message,
+                ));
+            }
         }
 
         let pass_resp = self.send_command(&Command::AuthInfoPass(password.to_string()))?;
         match pass_resp.code.raw() {
             281 => Ok(()),
-            481 => Err(NntpError::AuthenticationFailed),
-            482 => Err(NntpError::AuthenticationRejected),
-            _ => Err(NntpError::from_status(pass_resp.code, &pass_resp.message)),
+            _ => Err(NntpError::from_login_status(
+                pass_resp.code,
+                &pass_resp.message,
+            )),
         }
     }
 
@@ -1444,7 +1525,12 @@ impl BlockingNntpConnection {
         match user_resp.code.raw() {
             281 => return Ok(()),
             381 => {}
-            _ => return Err(NntpError::from_status(user_resp.code, &user_resp.message)),
+            _ => {
+                return Err(NntpError::from_login_status(
+                    user_resp.code,
+                    &user_resp.message,
+                ));
+            }
         }
 
         let pass_resp = self.send_command_with_active_budget(
@@ -1453,9 +1539,52 @@ impl BlockingNntpConnection {
         )?;
         match pass_resp.code.raw() {
             281 => Ok(()),
-            481 => Err(NntpError::AuthenticationFailed),
-            482 => Err(NntpError::AuthenticationRejected),
-            _ => Err(NntpError::from_status(pass_resp.code, &pass_resp.message)),
+            _ => Err(NntpError::from_login_status(
+                pass_resp.code,
+                &pass_resp.message,
+            )),
+        }
+    }
+
+    // Whether a mid-batch 480 is waiting for this session to be
+    // re-authenticated. Nothing new may be written meanwhile.
+    pub fn reauth_pending(&self) -> bool {
+        self.reauth_pending
+    }
+
+    // Re-authenticate, on this socket, a session the server expired part-way
+    // through a batch. Call it only once every reply queued behind the 480
+    // has been read: an AUTHINFO written earlier would be answered by one of
+    // them.
+    //
+    // The login replies are classified as at dial time. Any refusal, or a
+    // socket that goes away, poisons the connection: the next dial then logs
+    // in from the start, and that is where a credential that has really gone
+    // bad is booked.
+    pub(crate) fn reauthenticate_expired_session(
+        &mut self,
+        budget: Option<&ActiveTransferBudget>,
+    ) -> Result<()> {
+        if !self.reauth_pending || self.poisoned {
+            return Ok(());
+        }
+        let Some((user, pass)) = self.credentials.clone() else {
+            // Never set without credentials; kept total for safety.
+            self.fail_body_pipeline();
+            return Err(NntpError::SessionExpired);
+        };
+        match self.authenticate_with_active_budget(&user, &pass, budget) {
+            Ok(()) => {
+                self.reauth_pending = false;
+                // As on the sequential re-auth: a new session need not keep
+                // the old one's group.
+                self.current_group = None;
+                Ok(())
+            }
+            Err(error) => {
+                self.fail_body_pipeline();
+                Err(error)
+            }
         }
     }
 
@@ -1590,6 +1719,9 @@ impl BlockingNntpConnection {
     }
 
     fn charge_active_body(&mut self, bytes: usize) -> Duration {
+        if let Some(activity) = &self.body_activity {
+            activity.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         // Both levels are charged before either is waited on, so the read
         // waits for the later deadline: the lower of the two rates.
         let egress_charge = match (self.egress_accounting.front_mut(), &self.egress_control) {
@@ -1627,33 +1759,6 @@ impl BlockingNntpConnection {
             permit.add_throttle_wait(server_wait);
         }
         egress_wait.saturating_add(server_wait)
-    }
-
-    fn charge_active_body_without_wait(&mut self, bytes: usize) {
-        if let Some(outcome) = &self.route_outcome {
-            outcome.read(bytes);
-        }
-        match (self.egress_accounting.front_mut(), &self.egress_control) {
-            (Some(BodyTransferAccounting::Tracked(permit)), _) => {
-                permit.record_without_wait(bytes);
-            }
-            (Some(BodyTransferAccounting::Unlimited), Some(control)) => {
-                control.record_unlimited_body_bytes(bytes);
-            }
-            (None, Some(control)) => control.pace_read_without_wait(bytes),
-            (_, None) => {}
-        }
-        match self.body_accounting.front_mut() {
-            Some(BodyTransferAccounting::Unlimited) => {
-                if let Some(control) = &self.transfer_control {
-                    control.record_unlimited_body_bytes(bytes);
-                }
-            }
-            Some(BodyTransferAccounting::Tracked(permit)) => {
-                permit.record_without_wait(bytes);
-            }
-            None => {}
-        }
     }
 
     fn finish_active_body(&mut self) {
@@ -2156,14 +2261,24 @@ impl BlockingNntpConnection {
         if initial.code.raw() == 480 {
             // Mid-batch, a 480 says the session expired, not that the
             // credentials are wrong: they were accepted when this connection
-            // was set up. Re-authenticating here is not open to us — the rest
-            // of the batch's replies are still queued on the socket, and an
-            // AUTHINFO would be answered by one of them — so the connection is
-            // dropped and the next dial authenticates from the start, which is
-            // also where a credential that has genuinely gone bad is booked.
-            // Reporting this as an auth failure instead disabled the whole
-            // server for the auth backoff and unlocked backfill behind it.
-            self.fail_body_pipeline();
+            // was set up. Reporting it as an auth failure disabled the whole
+            // server for the auth backoff.
+            //
+            // A 480 is one line, so the reply stream is still in step. The
+            // rest of the batch's replies are queued behind it and an AUTHINFO
+            // written now would be answered by one of them, so the session is
+            // only marked: the caller reads those replies first, then
+            // re-authenticates on this socket (RFC 4643 §2.3; SABnzbd and
+            // NZBGet do the same).
+            if self.credentials.is_some() {
+                self.abort_active_body();
+                self.reauth_pending = true;
+            } else {
+                // An anonymous session has nothing to re-authenticate with:
+                // the connection is dropped and the next dial meets the
+                // server's demand for credentials where it is booked today.
+                self.fail_body_pipeline();
+            }
             return Err(NntpError::SessionExpired.into());
         }
         self.last_response_line_wait = response_started.elapsed();
@@ -2197,6 +2312,9 @@ impl BlockingNntpConnection {
                 return Err(error);
             }
         };
+        if let Some(health) = &self.health {
+            health.answered();
+        }
         let profile_cpu = profile_cpu_timings_enabled();
         decoder.set_profile_cpu(profile_cpu);
         decoder.set_checkpoint_plan(self.checkpoint_plan.clone());
@@ -2213,25 +2331,13 @@ impl BlockingNntpConnection {
             let payload_delta = decoder
                 .body_payload_bytes_consumed()
                 .saturating_sub(payload_before);
-            if let Some(budget) = budget.as_deref()
-                && budget.remaining().is_zero()
-            {
-                self.charge_active_body_without_wait(payload_delta as usize);
-                let error = active_transfer_timeout(budget);
-                self.fail_body_pipeline();
-                return Err(error.into());
-            }
+            // Every turn follows bytes arriving (the status line or a read),
+            // and a deliberate local rate-limit wait is not the server's
+            // silence, so the inactivity budget restarts after both.
             let waited = self.charge_active_body(payload_delta as usize);
             throttle_wait = throttle_wait.saturating_add(waited);
             if let Some(budget) = budget.as_deref_mut() {
-                budget.exclude_wait(waited);
-            }
-            if let Some(budget) = budget.as_deref()
-                && budget.remaining().is_zero()
-            {
-                let error = active_transfer_timeout(budget);
-                self.fail_body_pipeline();
-                return Err(error.into());
+                budget.progress_at(Instant::now());
             }
             match decoded {
                 Err(error) => {
@@ -3163,6 +3269,7 @@ fn clone_nntp_error(error: &NntpError) -> NntpError {
         NntpError::PoolShutdown => NntpError::PoolShutdown,
         NntpError::SoftTimeout(seconds) => NntpError::SoftTimeout(*seconds),
         NntpError::AcquireTimeout(seconds) => NntpError::AcquireTimeout(*seconds),
+        NntpError::WorkObsolete => NntpError::WorkObsolete,
         NntpError::QuotaBlocked(rejection) => NntpError::QuotaBlocked(rejection.clone()),
         NntpError::BodyNotRequestedDueToQuota {
             preceding_rejection,
@@ -3198,6 +3305,10 @@ fn decoded_result_keeps_connection(
 ) -> bool {
     match result {
         Ok(_) => true,
+        // A 480 at the status line is one line too. When it cost the socket
+        // (no credentials, or the re-auth after the drain failed) the lane
+        // closes its window as unhealthy on its own.
+        Err(DecodedBodyError::Nntp(NntpError::SessionExpired)) => true,
         Err(DecodedBodyError::Nntp(error)) => error.is_article_not_found(),
         Err(DecodedBodyError::Decode { .. }) => false,
     }

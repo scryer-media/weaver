@@ -7,6 +7,17 @@ pub struct HistoryMetadataEquals {
     pub value: String,
 }
 
+// Which history rows a read sees. A row a client removed with NZBGet's
+// non-final `HistoryDelete` stays in the table, as NZBGet keeps it as a hidden
+// duplicate, but leaves every listing a user reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HistoryRows {
+    // The rows a user's history listing shows.
+    Shown,
+    // Every row, hidden ones included.
+    All,
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct HistoryFilter {
     pub statuses: Option<Vec<String>>,

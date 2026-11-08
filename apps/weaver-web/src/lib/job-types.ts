@@ -77,6 +77,10 @@ export interface JobData {
   downloadedBytes: number;
   optionalRecoveryBytes: number;
   optionalRecoveryDownloadedBytes: number;
+  /** Declared bytes still to come, recovery held back until a loss asks left out; queue rows only. */
+  remainingBytes?: number;
+  /** Declared bytes the download is out to bring; queue rows only. */
+  wantedBytes?: number;
   phaseProgress: JobPhaseProgressData[];
   failedBytes: number;
   health: number;

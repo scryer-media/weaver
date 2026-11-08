@@ -541,7 +541,7 @@ function ProviderStep({ onContinue }: { onContinue: () => void }) {
         {editing ? (
           <div className="flex flex-col gap-4">
             <div className="grid grid-cols-[minmax(0,1fr)_110px] gap-3">
-              <FormField label={t("next.providers.host")} help={t("next.providers.hostHelp")}>
+              <FormField label={t("next.providers.host")}>
                 <TextField
                   label={t("next.providers.host")}
                   value={form.host}

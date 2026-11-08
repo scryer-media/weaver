@@ -20,6 +20,8 @@ const FACADE_QUEUE_ITEM_FIELDS = `
     downloadedBytes
     optionalRecoveryBytes
     optionalRecoveryDownloadedBytes
+    remainingBytes
+    wantedBytes
     phaseProgress {
       phase
       completedBytes
@@ -55,6 +57,8 @@ const QUEUE_TABLE_ITEM_FIELDS = `
     downloadedBytes
     optionalRecoveryBytes
     optionalRecoveryDownloadedBytes
+    remainingBytes
+    wantedBytes
     phaseProgress {
       phase
       completedBytes
@@ -449,6 +453,7 @@ const GENERAL_SETTINGS_FIELDS = `
     maxDownloadSpeed
     maxRetries
     propagationDelaySecs
+    maxConcurrentNzbs
     enableSrrdbLookup
     duplicatePolicy {
       strictActiveOrSuccess
@@ -481,6 +486,8 @@ const DOWNLOAD_BLOCK_FIELDS = `
     windowEndsAtEpochMs
     timezoneName
     scheduledSpeedLimit
+    speedLimitInForce
+    speedLimitBySchedule
     scheduleHoldReason
   }
 `;
@@ -658,24 +665,126 @@ export const JOBS_PAGE_QUERY = gql`
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
 
+const QUEUE_PAGE_FIELDS = `
+  fragment QueuePageFields on QueuePage {
+    items {
+      ...QueueTableItemFields
+    }
+    totalCount
+    categoryCounts {
+      category
+      count
+    }
+    stateCounts {
+      state
+      count
+    }
+    remainingBytes
+    etaTotalBytes
+    etaDownloadedBytes
+    etaThrough {
+      id
+      bytesThrough
+    }
+    latestCursor
+  }
+`;
+
 export const QUEUE_PAGE_QUERY = gql`
   query QueuePage($input: QueuePageInput!) {
     queuePage(input: $input) {
-      items {
-        ...QueueTableItemFields
-      }
-      totalCount
-      summary {
-        totalItems
-        queuedItems
-        activeItems
-        pausedItems
-      }
-      categories
-      latestCursor
+      ...QueuePageFields
     }
   }
+  ${QUEUE_PAGE_FIELDS}
   ${QUEUE_TABLE_ITEM_FIELDS}
+`;
+
+/** One page of the queue, pushed again whenever the queue moves. */
+export const QUEUE_PAGE_UPDATES_SUBSCRIPTION = gql`
+  subscription QueuePageUpdates($input: QueuePageInput!) {
+    queuePageUpdates(input: $input) {
+      ...QueuePageFields
+    }
+  }
+  ${QUEUE_PAGE_FIELDS}
+  ${QUEUE_TABLE_ITEM_FIELDS}
+`;
+
+const QUEUE_TOTALS_FIELDS = `
+  fragment QueueTotalsFields on QueuePage {
+    totalCount
+    summary {
+      totalItems
+      queuedItems
+      activeItems
+      pausedItems
+    }
+    stateCounts {
+      state
+      count
+    }
+    categories
+  }
+`;
+
+/** The queue's totals, which every screen shows; no rows. */
+export const QUEUE_TOTALS_QUERY = gql`
+  query QueueTotals {
+    queuePage(input: { pageIndex: 0, pageSize: 1 }) {
+      ...QueueTotalsFields
+    }
+  }
+  ${QUEUE_TOTALS_FIELDS}
+`;
+
+export const QUEUE_TOTALS_SUBSCRIPTION = gql`
+  subscription QueueTotalsUpdates {
+    queuePageUpdates(input: { pageIndex: 0, pageSize: 1 }) {
+      ...QueueTotalsFields
+    }
+  }
+  ${QUEUE_TOTALS_FIELDS}
+`;
+
+const QUEUE_BATCH_RESULT_FIELDS = `
+  matched
+  applied
+  refused {
+    id
+    code
+    message
+  }
+`;
+
+export const PAUSE_QUEUE_ITEMS_MUTATION = gql`
+  mutation PauseQueueItems($target: QueueBatchTarget!) {
+    pauseQueueItems(target: $target) {${QUEUE_BATCH_RESULT_FIELDS}}
+  }
+`;
+
+export const RESUME_QUEUE_ITEMS_MUTATION = gql`
+  mutation ResumeQueueItems($target: QueueBatchTarget!) {
+    resumeQueueItems(target: $target) {${QUEUE_BATCH_RESULT_FIELDS}}
+  }
+`;
+
+export const CANCEL_QUEUE_ITEMS_MUTATION = gql`
+  mutation CancelQueueItems($target: QueueBatchTarget!) {
+    cancelQueueItems(target: $target) {${QUEUE_BATCH_RESULT_FIELDS}}
+  }
+`;
+
+export const SET_QUEUE_ITEMS_CATEGORY_MUTATION = gql`
+  mutation SetQueueItemsCategory($target: QueueBatchTarget!, $category: String!) {
+    setQueueItemsCategory(target: $target, category: $category) {${QUEUE_BATCH_RESULT_FIELDS}}
+  }
+`;
+
+export const SET_QUEUE_ITEMS_PRIORITY_MUTATION = gql`
+  mutation SetQueueItemsPriority($target: QueueBatchTarget!, $priority: QueuePriority!) {
+    setQueueItemsPriority(target: $target, priority: $priority) {${QUEUE_BATCH_RESULT_FIELDS}}
+  }
 `;
 
 export const JOB_QUERY = gql`
@@ -835,6 +944,7 @@ export const LIVE_METRICS_QUERY = gql`
     globalState: globalQueueState {
       isPaused
       speedLimitBytesPerSec
+      resumeAtEpochMs
       downloadBlock {
         ...DownloadBlockFields
       }
@@ -1026,8 +1136,8 @@ export const ACCEPT_HISTORY_DELETE_MUTATION = gql`
 `;
 
 export const PAUSE_ALL_MUTATION = gql`
-  mutation PauseAll {
-    pauseAll
+  mutation PauseAll($resumeAfterSecs: Int) {
+    pauseAll(resumeAfterSecs: $resumeAfterSecs)
   }
 `;
 
@@ -1093,6 +1203,7 @@ export const LIVE_METRICS_SUBSCRIPTION = gql`
       globalState {
         isPaused
         speedLimitBytesPerSec
+        resumeAtEpochMs
         downloadBlock {
           ...DownloadBlockFields
         }
@@ -1148,7 +1259,7 @@ export const HISTORY_FACADE_EVENTS_SUBSCRIPTION = gql`
 export const SERVICE_LOGS_QUERY = gql`
   query ServiceLogs($limit: Int) {
     serviceLogs(limit: $limit) {
-      lines
+      records
       count
     }
   }

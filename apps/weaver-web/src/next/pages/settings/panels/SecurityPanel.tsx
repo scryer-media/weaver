@@ -23,6 +23,7 @@ import { authHeaders } from "@/graphql/client";
 import { useTranslate } from "@/lib/context/translate-context";
 import { noteLoginEnabled } from "@/lib/login-required";
 import { takeApiKeyLink } from "@/lib/api-key-link";
+import { copyText } from "@/lib/clipboard";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { Dialog } from "../../../components/Dialog";
@@ -30,6 +31,7 @@ import { Icon } from "../../../components/icons";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { DangerButton, PrimaryButton, SecondaryButton, TextField } from "../../../components/controls";
 import { Cell } from "../../../components/rows";
+import { settingsIds, testIds } from "../../../testids";
 import { WV } from "../../../data/palette";
 import { formatDate } from "../../../data/format";
 import {
@@ -445,7 +447,7 @@ function SecurityPanelBody({
   const [keyForm, setKeyForm] = useState({ name: "", scope: "CONTROL" });
   const [keyError, setKeyError] = useState<string | null>(null);
   const [createdKey, setCreatedKey] = useState<{ name: string; rawKey: string } | null>(null);
-  const [copied, setCopied] = useState(false);
+  const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
   const [removeKey, setRemoveKey] = useState<ApiKey | null>(null);
   const keyFieldRef = useRef<HTMLInputElement | null>(null);
 
@@ -460,11 +462,21 @@ function SecurityPanelBody({
     return () => window.cancelAnimationFrame(frame);
   }, [createdKey]);
 
-  const copyCreatedKey = () => {
+  // The key is selected either way: a copy the browser refuses leaves the
+  // user's own copy keystroke as the next thing to do.
+  const copyCreatedKey = async () => {
     if (!createdKey) return;
+    const taken = await copyText(createdKey.rawKey);
+    setCopied(taken ? "copied" : "failed");
+    keyFieldRef.current?.focus();
     keyFieldRef.current?.select();
-    void navigator.clipboard?.writeText(createdKey.rawKey).then(() => setCopied(true));
   };
+  const copyLabel =
+    copied === "copied"
+      ? t("next.security.copied")
+      : copied === "failed"
+        ? t("next.security.copyFailed")
+        : t("next.security.copyKey");
 
   const submitEnable = async (): Promise<"done" | "password"> => {
     if (enableForm.password !== enableForm.confirm) {
@@ -534,7 +546,7 @@ function SecurityPanelBody({
     }
     setKeyOpen(false);
     setCreatedKey({ name: trimmed, rawKey: result.data.createApiKey.rawKey });
-    setCopied(false);
+    setCopied("idle");
     setKeyForm({ name: "", scope: "CONTROL" });
     void refetchKeys({ requestPolicy: "network-only" });
     return "done";
@@ -789,11 +801,12 @@ function SecurityPanelBody({
           kind: "custom",
           control: (
             <>
-              <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)}>
+              <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)} testId={settingsIds.passwordChange}>
                 {t("next.security.changePassword")}
               </SecondaryButton>
               <DangerButton
                 icon="signOut"
+                testId={settingsIds.signOutEverywhere}
                 onClick={() => {
                   setSignOutAllError(null);
                   setSignOutAllOpen(true);
@@ -808,23 +821,21 @@ function SecurityPanelBody({
     : {
         id: "loginEnabled",
         label: t("next.security.requireLogin"),
-        help: login?.enabled
-          ? t("next.security.requireLoginOnHelp")
-          : t("next.security.requireLoginOffHelp"),
+        help: login?.enabled ? undefined : t("next.security.requireLoginOffHelp"),
         keywords: "password admin authentication",
         control: {
           kind: "custom",
           control: login?.enabled ? (
             <>
-              <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)}>
+              <SecondaryButton icon="password" onClick={() => setPasswordOpen(true)} testId={settingsIds.passwordChange}>
                 {t("next.security.changePassword")}
               </SecondaryButton>
-              <SecondaryButton icon="unlock" onClick={() => setDisableOpen(true)}>
+              <SecondaryButton icon="unlock" onClick={() => setDisableOpen(true)} testId={settingsIds.loginOff}>
                 {t("next.security.turnOff")}
               </SecondaryButton>
             </>
           ) : (
-            <PrimaryButton icon="lock" onClick={() => setEnableOpen(true)}>
+            <PrimaryButton icon="lock" onClick={() => setEnableOpen(true)} testId={settingsIds.loginSetup}>
               {t("next.security.setUpLogin")}
             </PrimaryButton>
           ),
@@ -867,7 +878,7 @@ function SecurityPanelBody({
         searchText: `${key.name} ${key.scope} ${scopeLabel(key.scope)}`,
         cells: [
           <Cell key="name">{key.name}</Cell>,
-          <Cell key="scope" mono className="text-wv-secondary">
+          <Cell key="scope" mono className="text-wv-secondary" testId={settingsIds.keyScope(key.scope)}>
             {scopeLabel(key.scope)}
           </Cell>,
           <Cell key="created" mono className="text-wv-muted">
@@ -876,7 +887,7 @@ function SecurityPanelBody({
           <Cell key="used" mono className="text-wv-muted">
             {key.lastUsedAt ? formatDate(key.lastUsedAt) : t("next.security.never")}
           </Cell>,
-          <SecondaryButton icon="remove" key="revoke" className="h-7 px-2" onClick={() => setRemoveKey(key)}>
+          <SecondaryButton icon="remove" key="revoke" className="h-7 px-2" onClick={() => setRemoveKey(key)} testId={settingsIds.keyRevoke}>
             {t("next.security.revoke")}
           </SecondaryButton>,
         ],
@@ -915,6 +926,7 @@ function SecurityPanelBody({
 
       <RecordEditor
         open={enableOpen}
+        testId={testIds.dialog("login-setup")}
         title={t("next.security.setUpLogin")}
         note={t("next.security.appliesImmediately")}
         error={enableError}
@@ -969,6 +981,7 @@ function SecurityPanelBody({
 
       <RecordEditor
         open={passwordOpen}
+        testId={testIds.dialog("password-change")}
         title={t("next.security.changePassword")}
         error={passwordError}
         busy={busy}
@@ -1022,6 +1035,7 @@ function SecurityPanelBody({
 
       <RecordEditor
         open={keyOpen}
+        testId={testIds.dialog("key-new")}
         title={t("next.security.newKey")}
         note={t("next.security.newKeyNote")}
         error={keyError}
@@ -1037,7 +1051,6 @@ function SecurityPanelBody({
               {
                 id: "name",
                 label: t("next.security.name"),
-                help: t("next.security.keyNameHelp"),
                 control: {
                   kind: "text",
                   mono: false,
@@ -1063,16 +1076,17 @@ function SecurityPanelBody({
 
       <Dialog
         open={createdKey !== null}
+        testId={testIds.dialog("key-created")}
         title={t("next.security.keyCreated")}
         note={createdKey?.name}
         width={560}
         onDismiss={() => setCreatedKey(null)}
         footer={
           <>
-            <SecondaryButton icon={copied ? "copied" : "copy"} onClick={copyCreatedKey}>
-              {copied ? t("next.security.copied") : t("next.security.copyKey")}
+            <SecondaryButton icon={copied === "copied" ? "copied" : "copy"} onClick={() => void copyCreatedKey()}>
+              {copyLabel}
             </SecondaryButton>
-            <PrimaryButton onClick={() => setCreatedKey(null)}>{t("next.security.done")}</PrimaryButton>
+            <PrimaryButton onClick={() => setCreatedKey(null)} testId={settingsIds.keyCreatedDone}>{t("next.security.done")}</PrimaryButton>
           </>
         }
       >
@@ -1083,6 +1097,7 @@ function SecurityPanelBody({
           <div className="relative w-full">
             <TextField
               ref={keyFieldRef}
+              testId={settingsIds.keyCreatedValue}
               label={t("next.security.apiKey")}
               value={createdKey?.rawKey ?? ""}
               onChange={() => undefined}
@@ -1092,12 +1107,12 @@ function SecurityPanelBody({
             />
             <button
               type="button"
-              title={copied ? t("next.security.copied") : t("next.security.copyKey")}
-              aria-label={copied ? t("next.security.copied") : t("next.security.copyKey")}
-              onClick={copyCreatedKey}
+              title={copyLabel}
+              aria-label={copyLabel}
+              onClick={() => void copyCreatedKey()}
               className="absolute inset-y-0 right-0 flex w-10 cursor-pointer items-center justify-center text-wv-dim hover:text-wv-fg"
             >
-              <Icon name={copied ? "copied" : "copy"} size={15} />
+              <Icon name={copied === "copied" ? "copied" : "copy"} size={15} />
             </button>
           </div>
         </div>
@@ -1105,6 +1120,7 @@ function SecurityPanelBody({
 
       <ConfirmDialog
         open={disableOpen}
+        testId={testIds.dialog("login-off")}
         title={t("next.security.turnOffTitle")}
         busy={busy}
         confirmLabel={t("next.security.turnOffLogin")}
@@ -1115,6 +1131,7 @@ function SecurityPanelBody({
 
       <ConfirmDialog
         open={signOutAllOpen}
+        testId={testIds.dialog("sign-out-everywhere")}
         title={t("next.security.signOutEverywhereTitle")}
         busy={busy}
         destructive
@@ -1148,6 +1165,7 @@ function SecurityPanelBody({
 
       <ConfirmDialog
         open={removeKey !== null}
+        testId={testIds.dialog("key-revoke")}
         title={t("next.security.revokeTitle")}
         note={removeKey?.name}
         busy={busy}

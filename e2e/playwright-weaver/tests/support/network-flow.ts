@@ -46,7 +46,7 @@ export type LegFlow = {
 };
 export type PoolMemberFlow = {
   id: number; state: string; open: number; opening: number; warmed: boolean; blocked: string | null;
-  handshakeMs: number | null; connectMs: number | null; bytesPerSecond: number | null; liveBytesPerSecond: number; samples: number; failures: number;
+  handshakeMs: number | null; connectMs: number | null; rank: number | null; bytesPerSecond: number | null; liveBytesPerSecond: number; samples: number; failures: number;
 };
 export type PoolFlow = { poolId: number; egressId: number; pinnedMember: number | null; members: PoolMemberFlow[] };
 export type NetworkFlow = {
@@ -68,7 +68,7 @@ export const FLOW_SELECTION = `
   consumers { key id name kind cap route { ${ROUTE} } }
   legs { consumer position egressId weight target open opening state reason ${PATH}
     pinnedAddress sourceAddress bytesPerSecond selectedRung selectedProxyId rungStates }
-  pools { poolId egressId pinnedMember members { id state open opening warmed blocked handshakeMs connectMs bytesPerSecond liveBytesPerSecond samples failures } }
+  pools { poolId egressId pinnedMember members { id state open opening warmed blocked handshakeMs connectMs rank bytesPerSecond liveBytesPerSecond samples failures } }
   egresses { ${EGRESS} } proxies { ${PROFILE} } proxyPools { ${POOL} } sampledAt`;
 
 export const serverKey = (id: number) => `server:${id}`;

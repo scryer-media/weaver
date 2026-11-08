@@ -1,0 +1,21 @@
+{
+  "slug": "split-xz-missing-article",
+  "title": "E2E.Test.split.xz.missing.article.2026-TESTGRP",
+  "description": "The second 16 KiB article of the anchored middle XZ piece is absent; retained joined bytes have exactly that zero-filled gap.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "expectedRetainedOutputBLAKE3": {
+    "灯火.bin.xz": "705e782a808ed3cfacb324eaf80e3bec8b2354ab2bab00f7222bfe56300ebb05"
+  },
+  "forbiddenOutputPaths": [
+    ".weaver-chunks",
+    "灯火.bin"
+  ],
+  "segment_size": 16384,
+  "deleteSegmentSubjectContains": [
+    "灯火.bin.xz.002"
+  ],
+  "deleteSegmentNumbers": [
+    2
+  ]
+}

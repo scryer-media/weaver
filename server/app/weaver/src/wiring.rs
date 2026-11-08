@@ -25,6 +25,7 @@ pub(crate) fn build_runtime_context(profile: SystemProfile) -> RuntimeContext {
         cores = profile.cpu.physical_cores,
         storage = ?profile.disk.storage_class,
         iops = format!("{:.0}", profile.disk.random_read_iops),
+        write_mbps = format!("{:.0}", profile.disk.sequential_write_mbps),
         "system profile"
     );
 
@@ -354,6 +355,42 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    // A demotion is a row of the job's event history: its kind, the member,
+    // the reason in words and as its label, and when it happened.
+    #[tokio::test]
+    async fn an_archive_demotion_is_kept_in_the_job_event_history() {
+        let db = Database::open_in_memory().unwrap();
+        let (tx, rx) = broadcast::channel(8);
+        let task = tokio::spawn(persist_events(
+            rx,
+            db.clone(),
+            Arc::new(tokio::sync::Notify::new()),
+        ));
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        tx.send(PipelineEvent::ArchiveDemoted {
+            job_id: JobId(7),
+            member: "lantern.tar".to_string(),
+            container: "tar".to_string(),
+            reason: "unrepairable".to_string(),
+        })
+        .unwrap();
+        drop(tx);
+        task.await.unwrap();
+
+        let events = db.get_job_events(7).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, "ArchiveDemoted");
+        assert_eq!(
+            events[0].message,
+            "lantern.tar: tar archive given up because its damage could not be repaired (unrepairable)"
+        );
+        assert!(events[0].timestamp >= before);
+        assert!(events[0].file_id.is_none());
     }
 
     #[tokio::test]

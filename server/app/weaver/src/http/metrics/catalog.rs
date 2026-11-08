@@ -108,6 +108,8 @@ metric_families! {
         "Segments parked while NNTP infrastructure is unavailable.");
     GENERATION_RECOVERY_REQUEUES = ("weaver_nntp_generation_recovery_requeues_total", Counter, [],
         "Segments requeued after stale NNTP generation failures.");
+    DOWNLOAD_DISPATCH_STALL_RECOVERIES = ("weaver_pipeline_download_dispatch_stall_recoveries_total", Counter, ["action"],
+        "Download dispatch stalls recovered, by escalation (kick, release).");
 
     // ---- failures --------------------------------------------------------
     DOWNLOAD_FAILURES = ("weaver_pipeline_download_failures_total", Counter, ["kind"],
@@ -214,8 +216,6 @@ metric_families! {
         "Duration of the hard pressure stall in progress; zero when not stalled.");
     DIRECT_WRITE_EVICTIONS = ("weaver_pipeline_direct_write_evictions_total", Counter, [],
         "Direct write evictions.");
-    DIRECT_STORE_SETS = ("weaver_direct_store_sets_total", Counter, ["event"],
-        "RAR direct-store set lifecycle events.");
     DEOBFUSCATED_MEMBERS = ("weaver_deobfuscated_members_renamed_total", Counter, [],
         "Delivered files renamed out of an obfuscated in-archive member name.");
 
@@ -248,9 +248,9 @@ metric_families! {
     JOB_PROGRESS_RATIO = ("weaver_job_progress_ratio", Gauge, ["job_id"],
         "Fractional job progress from 0 to 1.");
     JOB_TOTAL_BYTES = ("weaver_job_total_bytes", Gauge, ["job_id"],
-        "Expected total bytes for the job.");
+        "Expected total bytes for the job: while it downloads, the post's declared bytes less the recovery held back until a loss asks for it.");
     JOB_DOWNLOADED_BYTES = ("weaver_job_downloaded_bytes", Gauge, ["job_id"],
-        "Downloaded bytes for the job.");
+        "Downloaded bytes for the job: while it downloads, the declared bytes of the total no longer still to come.");
     JOB_OPTIONAL_RECOVERY_BYTES = ("weaver_job_optional_recovery_bytes", Gauge, ["job_id"],
         "Optional recovery bytes available for the job.");
     JOB_OPTIONAL_RECOVERY_DOWNLOADED_BYTES = ("weaver_job_optional_recovery_downloaded_bytes",
@@ -549,6 +549,8 @@ metric_families! {
         "Decoded bytes attributed to each category. Category is empty when the job has none.");
 
     // ---- pipeline stage histograms ----------------------------------------------------
+    TURN_DURATION = ("weaver_pipeline_turn_duration_seconds", Histogram, [],
+        "Pipeline turn duration, including awaited work and excluding the idle event wait.");
     DISK_WRITE_DURATION = ("weaver_pipeline_disk_write_duration_seconds", Histogram, [],
         "Time spent in individual disk write calls.");
     DECODE_TASK_DURATION = ("weaver_pipeline_decode_task_duration_seconds", Histogram, [],

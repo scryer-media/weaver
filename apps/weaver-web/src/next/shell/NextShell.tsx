@@ -9,6 +9,7 @@ import { useLoginEnabled } from "@/lib/login-required";
 import { authHeaders } from "@/graphql/client";
 import { signOut } from "@/lib/logout";
 import { cn } from "@/lib/utils";
+import { testIds } from "@/next/testids";
 import { upgradesInApp } from "@/next/features/updates/application-upgrade";
 import { useApplicationUpgradeStatus } from "@/next/features/updates/use-application-upgrade";
 import { useNextData, useNextDataSelector } from "../data/next-data";
@@ -168,6 +169,7 @@ export function NextShell({
         <button
           type="button"
           onClick={() => setNavOpen(true)}
+          data-testid={testIds.shellOpenNavigation}
           aria-label={t("next.shell.openNavigation")}
           aria-expanded={navOpen}
           className="absolute top-0 left-0 z-20 flex h-14 w-12 cursor-pointer items-center justify-center text-wv-muted hover:text-wv-fg lg:hidden"
@@ -215,10 +217,13 @@ export function NextShell({
 
         {afterContent}
 
-        <footer className="flex h-[34px] flex-none items-center gap-3 border-t border-wv-line-strong bg-wv-chrome px-4 font-wv-mono text-[11px] text-wv-muted sm:gap-4 sm:px-6">
-          <span className="flex flex-none items-center gap-[7px] whitespace-nowrap">
+        <footer data-testid={testIds.shellFooter} className="flex h-[34px] flex-none items-center gap-3 border-t border-wv-line-strong bg-wv-chrome px-4 font-wv-mono text-[11px] text-wv-muted sm:gap-4 sm:px-6">
+          <span data-testid={testIds.shellConnection} className="flex flex-none items-center gap-[7px] whitespace-nowrap">
             <span
               aria-hidden="true"
+              data-testid={testIds.shellConnectionState(
+                connection.isDisconnected ? (connection.isPolling ? "polling" : "reconnecting") : "connected",
+              )}
               className={cn(
                 "size-1.5 flex-none",
                 connection.isDisconnected ? "bg-wv-warn" : "bg-wv-accent",
@@ -243,7 +248,7 @@ export function NextShell({
             </>
           )}
           {statusRight === undefined ? null : (
-            <span className="ml-auto truncate whitespace-nowrap text-right">{statusRight}</span>
+            <span data-testid={testIds.shellStatus} className="ml-auto truncate whitespace-nowrap text-right">{statusRight}</span>
           )}
         </footer>
       </div>
@@ -299,10 +304,11 @@ const RailHead = memo(function RailHead({
         )}
       </div>
 
-      <nav className="flex flex-col gap-0.5 px-[10px] py-[14px]">
+      <nav data-testid={testIds.shellNav} className="flex flex-col gap-0.5 px-[10px] py-[14px]">
         {nav.map((entry) => (
           <NavLink
             key={entry.to}
+            data-testid={testIds.navLink(entry.icon)}
             to={entry.to}
             end={entry.to === "/"}
             className={({ isActive }) =>
@@ -362,6 +368,7 @@ function SignOutControl() {
           type="button"
           title={label}
           aria-label={label}
+          data-testid={testIds.shellSignOut}
           disabled={busy}
           onClick={() => {
             setBusy(true);
@@ -461,10 +468,11 @@ const UpdateBlock = memo(function UpdateBlock({
  */
 const ThroughputBlock = memo(function ThroughputBlock() {
   const t = useTranslate();
-  const { speed, peakSpeed } = useNextData("speed", "peakSpeed");
+  const { speed, peakSpeed, isPaused } = useNextData("speed", "peakSpeed", "isPaused");
   const { inForce, bySchedule } = useSpeedLimitInForce();
   const { openDialog, dialog } = useSpeedLimitDialog();
-  const now = splitSpeed(speed);
+  // Held, nothing moves: 0 at once, not once the daemon's rate window drains.
+  const now = splitSpeed(isPaused ? 0 : speed);
   const peak = splitSpeed(peakSpeed);
   const limit = splitSpeed(inForce);
   const title = bySchedule ? t("next.speedLimit.bySchedule") : t("next.speedLimit.buttonTitle");

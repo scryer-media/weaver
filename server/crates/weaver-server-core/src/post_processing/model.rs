@@ -1211,6 +1211,28 @@ pub struct PostProcessingFacts {
     pub outcome: PipelineOutcome,
     pub par_status: i32,
     pub unpack_status: i32,
+    // What a delivered job's graph ruled, kept from the moment its final
+    // move begins: a restart after that has no graph to ask again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivered: Option<DeliveredVerdict>,
+    // The consumed inputs the final move was told to leave in the working
+    // directory because their removal failed, relative to it, kept from the
+    // moment the move begins: a resumed move leaves them too.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub left_behind: Vec<std::path::PathBuf>,
+}
+
+// How a job that delivered ended, as its graph ruled: whole or in part, the
+// stage and words that left it short, and what its recovery and unpack came
+// to.
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeliveredVerdict {
+    pub partial: bool,
+    pub shortfall_stage: PipelineFailureStage,
+    pub shortfall_message: Option<String>,
+    pub recovery_verified: bool,
+    pub unpacked: bool,
 }
 
 impl PostProcessingFacts {

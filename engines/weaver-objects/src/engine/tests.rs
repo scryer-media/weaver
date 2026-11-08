@@ -1,0 +1,54 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+// Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+use weaver_graph::{Object, Seek, VolumeIndex};
+
+use crate::rar_engine::RarEngine;
+use crate::testing::replay::{Step, contains, restores_alike};
+use crate::zip_engine::ZipEngine;
+
+const PASSWORD: &str = "a-test-passphrase";
+
+// Two volumes bound, the run past the first, a password offered: restored,
+// the engine claims and bids alike, and its facts hold no password. `last`
+// is the index the set's last name binds at, which a set whose last volume
+// carries no number does not know from the name.
+fn restored(engine: Box<dyn Object>, names: [&str; 3], last: u32) {
+    let steps = [
+        Step::Bound(0, names[0]),
+        Step::Bound(last, names[2]),
+        Step::Password(PASSWORD),
+    ];
+    let (facts, mut live, mut again) = restores_alike(engine, &steps, 3, &[]);
+    assert!(!contains(&facts.bytes, PASSWORD.as_bytes()));
+    let claim = |object: &mut Box<dyn Object>| object.claim(names[1], &[], None);
+    assert_eq!(claim(&mut live), claim(&mut again));
+    assert_eq!(claim(&mut live), vec![VolumeIndex(1)]);
+    let bids = |object: &mut Box<dyn Object>| {
+        let mut out: Vec<Seek> = Vec::new();
+        object.wants(&mut out);
+        if let Some(engine) = object.engine() {
+            engine.bid(VolumeIndex(1), &mut out);
+        }
+        out
+    };
+    assert_eq!(bids(&mut live), bids(&mut again));
+    assert!(
+        !bids(&mut live).is_empty(),
+        "the run past the first is bid past"
+    );
+}
+
+#[test]
+fn every_engine_of_volumes_restored_from_its_facts_claims_and_bids_alike() {
+    restored(
+        Box::new(RarEngine::new()),
+        ["alpha.part1.rar", "alpha.part2.rar", "alpha.part3.rar"],
+        2,
+    );
+    restored(
+        Box::new(ZipEngine::new()),
+        ["alpha.z01", "alpha.z02", "alpha.zip"],
+        u32::MAX,
+    );
+}

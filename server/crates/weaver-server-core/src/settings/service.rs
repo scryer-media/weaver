@@ -7,8 +7,8 @@ use crate::persistence::Database;
 use crate::runtime::hardware_profile::HardwareProfile;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
-    BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides,
-    DirectUnpackOverrides, MetricsConfig, PerJobSeries, RetryOverrides,
+    BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides, MetricsConfig,
+    PerJobSeries, RetryOverrides,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -19,7 +19,11 @@ pub const HARDWARE_PROFILE_SETTING: &str = "hardware_profile";
 // Keys earlier releases stored that nothing reads any more. Loading the
 // config removes them, so an old database or a restored backup does not
 // carry a setting the product no longer has.
-pub(crate) const RETIRED_SETTING_KEYS: &[&str] = &["ip_replacement_trial_extra_connections"];
+pub(crate) const RETIRED_SETTING_KEYS: &[&str] = &[
+    "ip_replacement_trial_extra_connections",
+    "direct_store.enabled",
+    "direct_unpack.enabled",
+];
 
 impl Database {
     // Load a full `Config` from the settings and servers tables.
@@ -118,12 +122,9 @@ impl Database {
         };
 
         // Absent keys mean "defaults", and a partially configured table is
-        // normal: an operator who only ever flips `enabled` should not have to
-        // restate the scratch ceiling.
+        // normal: an operator who only ever sets one limit should not have to
+        // restate the others.
         let direct_store = {
-            let enabled = settings
-                .get("direct_store.enabled")
-                .and_then(|v| v.parse().ok());
             let bytes_setting = |key: &str| settings.get(key).and_then(|v| v.parse::<u64>().ok());
             let holds_scratch_ceiling_bytes =
                 bytes_setting("direct_store.holds_scratch_ceiling_bytes");
@@ -131,14 +132,12 @@ impl Database {
                 bytes_setting("direct_store.holds_resident_limit_bytes");
             let holds_scratch_total_bytes = bytes_setting("direct_store.holds_scratch_total_bytes");
             let holds_disk_reserve_bytes = bytes_setting("direct_store.holds_disk_reserve_bytes");
-            if enabled.is_some()
-                || holds_scratch_ceiling_bytes.is_some()
+            if holds_scratch_ceiling_bytes.is_some()
                 || holds_resident_limit_bytes.is_some()
                 || holds_scratch_total_bytes.is_some()
                 || holds_disk_reserve_bytes.is_some()
             {
                 Some(DirectStoreOverrides {
-                    enabled,
                     holds_scratch_ceiling_bytes,
                     holds_resident_limit_bytes,
                     holds_scratch_total_bytes,
@@ -147,15 +146,6 @@ impl Database {
             } else {
                 None
             }
-        };
-
-        let direct_unpack = {
-            let enabled = settings
-                .get("direct_unpack.enabled")
-                .and_then(|v| v.parse().ok());
-            enabled.map(|enabled| DirectUnpackOverrides {
-                enabled: Some(enabled),
-            })
         };
 
         let delivery_naming = {
@@ -230,10 +220,12 @@ impl Database {
             max_download_speed,
             cleanup_after_extract,
             propagation_delay_secs,
+            max_concurrent_nzbs: settings
+                .get("max_concurrent_nzbs")
+                .and_then(|value| value.parse().ok()),
             watch_folder,
             duplicate_policy,
             direct_store,
-            direct_unpack,
             delivery_naming,
             hardware_profile,
             metrics,
@@ -255,6 +247,9 @@ impl Database {
         }
         if let Some(delay) = config.propagation_delay_secs {
             self.set_setting("propagation_delay_secs", &delay.to_string())?;
+        }
+        if let Some(limit) = config.max_concurrent_nzbs {
+            self.set_setting("max_concurrent_nzbs", &limit.to_string())?;
         }
         if let Some(cleanup) = config.cleanup_after_extract {
             self.set_setting("cleanup_after_extract", &cleanup.to_string())?;
@@ -323,9 +318,6 @@ impl Database {
         }
 
         if let Some(ref direct_store) = config.direct_store {
-            if let Some(enabled) = direct_store.enabled {
-                self.set_setting("direct_store.enabled", &enabled.to_string())?;
-            }
             for (key, bytes) in [
                 (
                     "direct_store.holds_scratch_ceiling_bytes",
@@ -348,12 +340,6 @@ impl Database {
                     self.set_setting(key, &bytes.to_string())?;
                 }
             }
-        }
-
-        if let Some(ref direct_unpack) = config.direct_unpack
-            && let Some(enabled) = direct_unpack.enabled
-        {
-            self.set_setting("direct_unpack.enabled", &enabled.to_string())?;
         }
 
         if let Some(ref delivery_naming) = config.delivery_naming {

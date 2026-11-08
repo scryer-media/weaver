@@ -8,6 +8,7 @@ import { SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import type { MetricsHistoryRange } from "@/lib/metrics";
 import { Bar, Eyebrow, MetricCell, SectionHeader, Square } from "../components/chrome";
+import { runtimeIds } from "../testids";
 import { Segmented } from "../components/controls";
 import { Chart, type ChartSeries } from "../components/Chart";
 import { columnStyle } from "../components/columns";
@@ -183,6 +184,7 @@ const MonitoringScreen = memo(function MonitoringScreen({
           formatValue={formatPerSecond}
         />
         <Chart
+          testId={runtimeIds.monitoringDepths}
           title={t("next.monitoring.depths")}
           note={t("next.monitoring.depthsNote")}
           series={depths}
@@ -316,6 +318,7 @@ const MonitoringStrip = memo(function MonitoringStrip({
       })}
     >
       <MetricCell
+        testId={runtimeIds.monitoringPipeline}
         eyebrow={t("next.monitoring.pipeline")}
         value={pipelineBusy ? t("next.monitoring.active") : t("next.monitoring.idle")}
         valueClassName={pipelineBusy ? "text-wv-accent" : "text-wv-idle"}
@@ -332,6 +335,7 @@ const MonitoringStrip = memo(function MonitoringStrip({
         }
       />
       <MetricCell
+        testId={runtimeIds.monitoringConnections}
         eyebrow={t("next.monitoring.connections")}
         value={formatCount(connectionsActive)}
         unit={`/ ${connectionsMax}`}
@@ -368,7 +372,7 @@ const ProvidersSection = memo(function ProvidersSection() {
   const { active: connectionsActive } = connectionTotals(providers);
 
   return (
-    <section className="flex flex-none flex-col">
+    <section data-testid={runtimeIds.monitoringProviders} className="flex flex-none flex-col">
       <SectionHeader
         label={t("next.rail.providers")}
         note={t("next.monitoring.providersNote")}

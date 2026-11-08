@@ -59,6 +59,15 @@ export function installableUpgrade(
   return { version, tag };
 }
 
+/** Temporary release-host failures have a retry message; other failures keep their details. */
+export function upgradeFailureKey(error: string | null):
+  "applicationUpgrade.githubUnavailable" | "applicationUpgrade.failed" {
+  const unavailable = error !== null
+    && /HTTP status server error \(5\d{2}\b/.test(error)
+    && /https:\/\/(?:github\.com|api\.github\.com|(?:release-assets|github-releases)\.githubusercontent\.com)[/)]/.test(error);
+  return unavailable ? "applicationUpgrade.githubUnavailable" : "applicationUpgrade.failed";
+}
+
 /** How far the download has got, or `undefined` while no size is known yet. */
 export function downloadPercent(run: ApplicationUpgradeRun): number | undefined {
   if (run.totalBytes <= 0) {

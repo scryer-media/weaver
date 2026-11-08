@@ -42,6 +42,8 @@ pub(super) use render::{
     OBSERVED_LIMITERS, job_status_label, render_post_processing, render_prometheus_metrics,
     render_prometheus_metrics_input,
 };
+#[cfg(test)]
+pub(super) use weaver_server_core::operations::metrics_store::JobStatusCounts;
 
 // Reasons the extraction guardrails refuse an archive entry, in the order
 // `SchedulerHandle::get_extraction_rejections` returns their counters.
@@ -205,7 +207,12 @@ impl PrometheusMetricsExporter {
         http_metrics: &super::HttpMetricsHandle,
     ) -> String {
         let snapshot = self.handle.get_metrics();
-        let jobs = self.handle.list_jobs();
+        let per_job_series = self.config.read().await.metrics.per_job_series;
+        // The queue counts every job by status in place, history from its
+        // running summary, and copies only the jobs that get a series of
+        // their own under the configured mode.
+        let job_counts = self.handle.job_status_counts();
+        let jobs = self.handle.metrics_jobs(per_job_series);
         let download_block = self.handle.get_download_block();
         let nntp_pool = self
             .handle
@@ -219,7 +226,6 @@ impl PrometheusMetricsExporter {
         let server_health = collect_server_health(&nntp_pool).await;
         let server_transfers = self.transfer_policy.transfer_registry().snapshots();
         let egress_transfers = self.transfer_policy.egress_transfer_registry().snapshots();
-        let per_job_series = self.config.read().await.metrics.per_job_series;
 
         let extraction_rejections: Vec<(&'static str, u64)> = EXTRACTION_REJECTION_REASONS
             .into_iter()
@@ -275,6 +281,7 @@ impl PrometheusMetricsExporter {
 
         let mut input = PrometheusRenderInput::new(&snapshot, &download_block);
         input.jobs = &jobs;
+        input.job_counts = &job_counts;
         input.pipeline_paused = self.handle.is_globally_paused();
         input.server_health = &server_health;
         input.runtime_generation = runtime_generation;
@@ -612,7 +619,9 @@ pub(super) fn job_is_exported(status: &weaver_server_core::JobStatus, mode: PerJ
         // series would never change again but would be scraped forever.
         PerJobSeries::Active => !matches!(
             status,
-            weaver_server_core::JobStatus::Complete | weaver_server_core::JobStatus::Failed { .. }
+            weaver_server_core::JobStatus::Complete
+                | weaver_server_core::JobStatus::Partial
+                | weaver_server_core::JobStatus::Failed { .. }
         ),
     }
 }

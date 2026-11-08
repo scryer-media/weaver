@@ -1,0 +1,12 @@
+{
+  "slug": "adv-zip-many-members",
+  "title": "E2E.Adversarial.Zip.Many.Members.2026-TESTGRP",
+  "description": "Thirty thousand tiny stored members inside the default entry cap and the managed server's memory budget. Every member is delivered.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 30000
+  }
+}

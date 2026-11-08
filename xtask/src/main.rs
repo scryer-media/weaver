@@ -26,7 +26,6 @@ use std::thread;
 use std::time::{Duration as StdDuration, Instant};
 use toml_edit::{DocumentMut, value};
 
-mod container_engine;
 mod monitor;
 mod par2_kit;
 mod perf;
@@ -120,6 +119,11 @@ struct ReleaseArgs {
     patch: bool,
     #[arg(long)]
     dry_run: bool,
+    #[arg(
+        long,
+        help = "Explicitly permit dangerous GraphQL changes; breaking changes still fail patch releases"
+    )]
+    allow_graphql_dangerous: bool,
     version: Option<String>,
 }
 
@@ -132,16 +136,10 @@ struct CiArgs {
 #[derive(Subcommand)]
 enum CiCommand {
     Audit,
-    Clippy(ClippyArgs),
+    Clippy,
     Winget(WingetArgs),
     /// Write a release's signed upgrade manifest for one schema generation.
     UpgradeManifest(upgrade_manifest::UpgradeManifestArgs),
-}
-
-#[derive(Args)]
-struct ClippyArgs {
-    #[arg(long)]
-    linux_only: bool,
 }
 
 #[derive(Args)]
@@ -441,7 +439,7 @@ fn main() -> Result<()> {
         Commands::Release(args) => run_release(&ctx, args),
         Commands::Ci(args) => match args.command {
             CiCommand::Audit => run_cargo_audit_validation(&ctx, "ci-audit"),
-            CiCommand::Clippy(args) => run_clippy_ci(&ctx, args),
+            CiCommand::Clippy => run_clippy_ci(&ctx),
             CiCommand::Winget(args) => run_ci_winget(&ctx, args),
             CiCommand::UpgradeManifest(args) => upgrade_manifest::run_upgrade_manifest(args),
         },
@@ -1411,11 +1409,19 @@ fn commit_release_notes_if_changed(
     Ok(true)
 }
 
-fn release_args_signature(explicit: Option<&Version>, bump: VersionBump) -> String {
-    explicit.map_or_else(
+fn release_args_signature(
+    explicit: Option<&Version>,
+    bump: VersionBump,
+    allow_graphql_dangerous: bool,
+) -> String {
+    let mut signature = explicit.map_or_else(
         || format!("bump:{}", version_bump_label(bump)),
         |version| format!("version:{version}"),
-    )
+    );
+    if allow_graphql_dangerous {
+        signature.push_str(":allow-graphql-dangerous");
+    }
+    signature
 }
 
 fn version_bump_label(bump: VersionBump) -> &'static str {
@@ -1582,173 +1588,36 @@ fn write_workspace_version(path: &Path, version: &Version) -> Result<()> {
     Ok(())
 }
 
-// The toolchain `rust-toolchain.toml` pins.
-//
-// The Linux clippy image is derived from it rather than named on its own,
-// because rustup inside that container reads the same file from the mounted
-// checkout: an image built on another compiler does not run clippy on an older
-// toolchain, it downloads this one on every run. A hard-coded tag only drifts
-// silently until someone notices the container is not the toolchain.
-fn pinned_rust_channel(ctx: &TaskContext) -> Result<String> {
-    let path = ctx.repo_root.join("rust-toolchain.toml");
-    let document = fs::read_to_string(&path)
-        .with_context(|| format!("failed to read {}", path.display()))?
-        .parse::<DocumentMut>()
-        .with_context(|| format!("failed to parse {}", path.display()))?;
-    document["toolchain"]["channel"]
-        .as_str()
-        .map(str::to_string)
-        .ok_or_else(|| anyhow!("{} has no toolchain.channel", path.display()))
-}
+const WINDOWS_CLIPPY_TARGET: &str = "x86_64-pc-windows-msvc";
+const CI_CLIPPY_ARGS: &[&str] = &[
+    "--workspace",
+    "--locked",
+    "--lib",
+    "--bins",
+    "--tests",
+    "--examples",
+    "--benches",
+];
 
-// C compiler flags a musl clippy build needs for its vendored C code.
-//
-// aarch64 gcc defaults to `-moutline-atomics`, whose helpers link against a
-// glibc-only symbol, so every atomics probe in a C configure script (jemalloc's
-// among them) fails under musl and the build concludes it has no atomics.
-fn musl_c_flags_env(target: &str) -> Vec<(String, String)> {
-    if !target.starts_with("aarch64-") {
-        return Vec::new();
+fn run_clippy_ci(ctx: &TaskContext) -> Result<()> {
+    println!("Running cargo clippy for host target");
+    let mut command = ctx.command_in("cargo", &ctx.repo_root);
+    command.arg("clippy").args(CI_CLIPPY_ARGS);
+    command.args(["--", "-D", "warnings"]);
+    run_checked(&mut command)?;
+
+    if !command_available("cargo-xwin")? {
+        warn("cargo-xwin not installed — installing");
+        let mut install = ctx.command_in("cargo", &ctx.repo_root);
+        install.args(["install", "--locked", "cargo-xwin"]);
+        run_checked(&mut install)?;
     }
-    let key = target.replace('-', "_");
-    ["CFLAGS", "CXXFLAGS"]
-        .into_iter()
-        .map(|name| (format!("{name}_{key}"), "-mno-outline-atomics".to_string()))
-        .collect()
-}
-
-fn linux_clippy_defaults(host_target: &str) -> (&'static str, &'static str) {
-    if host_target.starts_with("aarch64-") {
-        ("aarch64-unknown-linux-musl", "linux/arm64")
-    } else {
-        ("x86_64-unknown-linux-musl", "linux/amd64")
-    }
-}
-
-fn cargo_target_env_key(target: &str, suffix: &str) -> String {
-    format!(
-        "CARGO_TARGET_{}_{}",
-        target.replace('-', "_").to_ascii_uppercase(),
-        suffix
-    )
-}
-
-fn run_clippy_ci(ctx: &TaskContext, args: ClippyArgs) -> Result<()> {
-    let mut rustc = ctx.command("rustc");
-    rustc.arg("-vV");
-    let host_target = run_capture(&mut rustc)?
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .ok_or_else(|| anyhow!("failed to determine host target"))?
-        .trim()
-        .to_string();
-    let (default_linux_target, default_linux_platform) = linux_clippy_defaults(&host_target);
-    let linux_target =
-        std::env::var("WEAVER_LINUX_CLIPPY_TARGET").unwrap_or_else(|_| default_linux_target.into());
-    let linux_image = match std::env::var("WEAVER_LINUX_CLIPPY_IMAGE") {
-        Ok(image) => image,
-        Err(_) => format!("rust:{}-bookworm", pinned_rust_channel(ctx)?),
-    };
-    let linux_platform = std::env::var("WEAVER_LINUX_CLIPPY_PLATFORM")
-        .unwrap_or_else(|_| default_linux_platform.into());
-    let linux_rustflags = ci_rustflags_for_target(&linux_target, ReleaseLane::Portable)?;
-    let linux_rustflags_env = format!(
-        "{}={linux_rustflags}",
-        cargo_target_env_key(&linux_target, "RUSTFLAGS")
-    );
-    let linux_linker_env = format!("{}=musl-gcc", cargo_target_env_key(&linux_target, "LINKER"));
-    let linux_c_flags = musl_c_flags_env(&linux_target);
-    let linux_clippy_script = format!(
-        "set -euo pipefail; export PATH=\"/usr/local/cargo/bin:$PATH\"; apt-get update >/dev/null; apt-get install -y --no-install-recommends musl-tools >/dev/null; /usr/local/cargo/bin/rustup component add clippy; /usr/local/cargo/bin/rustup target add {linux_target}; cargo clippy --workspace --lib --bins --tests --examples --benches --target {linux_target} -- -D warnings"
-    );
-
-    if !args.linux_only {
-        println!("Running cargo clippy for host target: {host_target}");
-        let mut command = ctx.command_in("cargo", &ctx.repo_root);
-        command.args([
-            "clippy",
-            "--workspace",
-            "--lib",
-            "--bins",
-            "--tests",
-            "--examples",
-            "--benches",
-            "--",
-            "-D",
-            "warnings",
-        ]);
-        run_checked(&mut command)?;
-    }
-
-    if args.linux_only || host_target != linux_target {
-        let engine = container_engine::running_engine(&container_engine::HostProbe);
-        if let Ok(engine) = engine {
-            let linux_image = engine.image_reference(&linux_image);
-            println!(
-                "Running cargo clippy in Linux container on {}: {linux_image}",
-                engine.name()
-            );
-            let mut command = ctx.command(engine.binary());
-            command.args(["run", "--rm"]);
-            command.args(engine.bind_mount_run_args());
-            command.args([
-                "--platform",
-                &linux_platform,
-                "-v",
-                &format!("{}:/work", ctx.repo_root.display()),
-                "-w",
-                "/work",
-                "-e",
-                "CARGO_HOME=/tmp/cargo",
-                "-e",
-                "CARGO_TARGET_DIR=/tmp/target",
-                "-e",
-                "CARGO_TERM_COLOR=always",
-                "-e",
-                &linux_rustflags_env,
-                "-e",
-                &linux_linker_env,
-            ]);
-            for (key, value) in &linux_c_flags {
-                command.args(["-e", &format!("{key}={value}")]);
-            }
-            command.args([&linux_image, "bash", "-lc", &linux_clippy_script]);
-            run_checked(&mut command)?;
-        } else if command_available("musl-gcc")? {
-            let mut target_add = ctx.command("rustup");
-            target_add.args(["target", "add", &linux_target]);
-            run_checked(&mut target_add)?;
-
-            let mut command = ctx.command_in("cargo", &ctx.repo_root);
-            command.env(
-                cargo_target_env_key(&linux_target, "RUSTFLAGS"),
-                &linux_rustflags,
-            );
-            command.env(cargo_target_env_key(&linux_target, "LINKER"), "musl-gcc");
-            command.envs(linux_c_flags.iter().map(|(key, value)| (key, value)));
-            command.args([
-                "clippy",
-                "--workspace",
-                "--lib",
-                "--bins",
-                "--tests",
-                "--examples",
-                "--benches",
-                "--target",
-                &linux_target,
-                "--",
-                "-D",
-                "warnings",
-            ]);
-            run_checked(&mut command)?;
-        } else if let Err(error) = engine {
-            bail!(
-                "cannot run Linux CI clippy locally: {error:#}; start Docker or Podman, or install musl-gcc"
-            );
-        }
-    }
-
-    Ok(())
+    println!("Running cargo clippy for {WINDOWS_CLIPPY_TARGET}");
+    let mut command = ctx.command_in("cargo", &ctx.repo_root);
+    command.args(["xwin", "clippy", "--target", WINDOWS_CLIPPY_TARGET]);
+    command.args(CI_CLIPPY_ARGS);
+    command.args(["--", "-D", "warnings"]);
+    run_checked(&mut command)
 }
 
 fn run_ci_winget(ctx: &TaskContext, args: WingetArgs) -> Result<()> {
@@ -2019,7 +1888,8 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
         .transpose()?
         .unwrap_or_else(|| Version::new(0, 0, 0));
     let (bump, explicit) = parse_bump(&args)?;
-    let release_args = release_args_signature(explicit.as_ref(), bump);
+    let release_args =
+        release_args_signature(explicit.as_ref(), bump, args.allow_graphql_dangerous);
     let next_version = explicit.unwrap_or_else(|| next_version(&current_version, bump));
     let tag_name = format!("weaver-v{next_version}");
 
@@ -2028,6 +1898,9 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
         latest_tag.as_deref().unwrap_or("none")
     );
     println!("   Next tag   : {tag_name}");
+    if args.allow_graphql_dangerous {
+        warn("Dangerous GraphQL changes explicitly permitted by --allow-graphql-dangerous");
+    }
     if args.dry_run {
         println!(
             "   {YELLOW}(dry run — no tags or pushes; only uncommitted release notes are committed){RESET}"
@@ -2173,6 +2046,7 @@ fn run_release(ctx: &TaskContext, args: ReleaseArgs) -> Result<()> {
                 "[graphql] ",
                 latest_tag.as_deref(),
                 &next_version,
+                args.allow_graphql_dangerous,
             )?;
 
             Ok::<(Vec<String>, String), anyhow::Error>((
@@ -2318,11 +2192,11 @@ fn run_weaver_release_container_contract_validation(
     ctx: &TaskContext,
     prefix: &'static str,
 ) -> Result<()> {
-    prefixed_step(prefix, "Checking Docker release publish contract");
+    prefixed_step(prefix, "Checking release publish configuration");
     let mut command = ctx.command_in("sh", &ctx.repo_root);
-    command.arg("docker/validate-release-build-config.sh");
+    command.args(["docker/validate-release-build-config.sh", "--config-only"]);
     run_checked(&mut command)?;
-    prefixed_ok(prefix, "Docker release publish contract passed");
+    prefixed_ok(prefix, "Release publish configuration passed");
     Ok(())
 }
 
@@ -2345,13 +2219,14 @@ fn run_weaver_release_hygiene_validation(ctx: &TaskContext, prefix: &'static str
 
 // Export the current GraphQL SDL, diff it against the schema shipped by the
 // previous release, and refresh the committed `api/graphql/schema.graphql`
-// artifact. Breaking and dangerous changes fail a patch release outright and
-// are only warned about when the release raises the minor or major version.
+// artifact. Patch releases reject breaking changes; dangerous changes require
+// an explicit override. A minor or major version increase permits both.
 fn run_weaver_graphql_api_compat_validation(
     ctx: &TaskContext,
     prefix: &'static str,
     latest_tag: Option<&str>,
     next_version: &Version,
+    allow_graphql_dangerous: bool,
 ) -> Result<()> {
     prefixed_step(prefix, "Exporting current GraphQL schema");
     let export_dir = ctx.path(GRAPHQL_SCHEMA_EXPORT_DIR);
@@ -2392,6 +2267,9 @@ fn run_weaver_graphql_api_compat_validation(
             check.arg("scripts/check-graphql-schema-compat.mjs");
             check.arg(&previous_schema_path);
             check.arg(&current_schema_path);
+            if allow_graphql_dangerous {
+                check.arg("--allow-dangerous");
+            }
             match run_streaming(&mut check, prefix) {
                 Ok(()) => prefixed_ok(prefix, "GraphQL API compatibility passed"),
                 Err(error) if schema_breaks_allowed_for_bump(latest_tag, next_version) => {
@@ -2662,9 +2540,12 @@ fn run_weaver_nextest_validation(ctx: &TaskContext, prefix: &'static str) -> Res
 }
 
 fn run_weaver_ci_clippy_validation(ctx: &TaskContext, prefix: &'static str) -> Result<()> {
-    prefixed_step(prefix, "Running cargo xtask ci clippy --linux-only");
+    prefixed_step(
+        prefix,
+        "Running host and Windows clippy for the whole workspace",
+    );
     let mut clippy = ctx.command_in("cargo", &ctx.repo_root);
-    clippy.args(["xtask", "ci", "clippy", "--linux-only"]);
+    clippy.args(["xtask", "ci", "clippy"]);
     run_streaming(&mut clippy, prefix)?;
     prefixed_ok(prefix, "Clippy passed");
     Ok(())

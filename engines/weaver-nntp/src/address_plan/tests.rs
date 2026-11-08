@@ -14,8 +14,14 @@ fn addr(last: u8) -> SocketAddr {
     SocketAddr::from(([192, 0, 2, last], 563))
 }
 
+fn addr6(last: u16) -> SocketAddr {
+    SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, last], 563))
+}
+
 enum Answer {
     Refuse,
+    // Every dial finds the address's network unreachable.
+    Unreachable,
     // Connect once the test sends on the paired sender.
     ConnectWhenReleased(Receiver<()>),
     // Fail once with this error kind; the next dial connects.
@@ -79,6 +85,13 @@ impl AddressDialer for ScriptedDialer {
             Some(Answer::Refuse) => {
                 self.answers.lock().unwrap().insert(addr, Answer::Refuse);
                 return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+            }
+            Some(Answer::Unreachable) => {
+                self.answers
+                    .lock()
+                    .unwrap()
+                    .insert(addr, Answer::Unreachable);
+                return Err(io::Error::from(io::ErrorKind::NetworkUnreachable));
             }
             Some(Answer::ConnectWhenReleased(gate)) => Some(gate),
             Some(Answer::Fail(kind)) => return Err(io::Error::from(kind)),
@@ -1145,4 +1158,98 @@ fn unresolved_server_is_destination_evidence_even_without_cached_candidates() {
         assert!(!error.is_path_evidence());
     }
     assert!(dialer.take_dialled().is_empty());
+}
+
+#[test]
+fn a_family_whose_network_is_unreachable_is_left_out_of_later_races_and_dials() {
+    let (v6_first, v6_second) = (addr6(1), addr6(2));
+    let (winner, held) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[v6_first, v6_second, winner, held]);
+    dialer.answer(v6_first, Answer::Unreachable);
+    dialer.answer(v6_second, Answer::Unreachable);
+    let plan = plan();
+    pin(&plan, &dialer, winner, &[held]);
+    settle_all(&dialer);
+    dialer.take_dialled();
+
+    // A race on age dials only the family that can be reached.
+    plan.age_pin_by(ADDRESS_REPLAN_INTERVAL);
+    let hold = dialer.gate(held);
+    let (_, raced) = plan.connect(&dialer).unwrap();
+    drop(hold);
+    settle_all(&dialer);
+    assert_eq!(raced, winner);
+    let mut dialled = dialer.take_dialled();
+    dialled.sort();
+    assert_eq!(dialled, vec![winner, held]);
+
+    // A pin that refuses falls over to the reachable family only.
+    dialer.answer(winner, Answer::Refuse);
+    let (_, connected) = plan.connect(&dialer).unwrap();
+    assert_eq!(connected, held);
+    assert_eq!(dialer.take_dialled(), vec![winner, held]);
+
+    // The unreachable addresses stay known to the plan.
+    let known: Vec<SocketAddr> = plan
+        .snapshot()
+        .addresses
+        .iter()
+        .map(|address| address.address)
+        .collect();
+    assert!(known.contains(&v6_first) && known.contains(&v6_second));
+}
+
+#[test]
+fn an_unreachable_family_is_still_dialled_when_the_leg_has_nothing_else() {
+    let (first, second) = (addr6(1), addr6(2));
+    let dialer = ScriptedDialer::new(&[first, second]);
+    dialer.answer(first, Answer::Unreachable);
+    dialer.answer(second, Answer::Unreachable);
+    let plan = plan();
+    let error = plan.connect(&dialer).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NetworkUnreachable);
+    settle_all(&dialer);
+    dialer.take_dialled();
+
+    // Nothing else is left, so the marked family is dialled, and a connect
+    // on it clears the mark.
+    dialer.answer(second, Answer::ConnectWhenReleased(channel().1));
+    let (_, connected) = plan.connect(&dialer).unwrap();
+    assert_eq!(connected, second);
+    assert_eq!(dialer.take_dialled(), vec![first, second]);
+}
+
+#[test]
+fn a_kept_pin_that_keeps_refusing_races_once_per_holdoff_not_on_every_connect() {
+    let (pinned, other) = (addr(1), addr(2));
+    let dialer = ScriptedDialer::new(&[pinned, other]);
+    let plan = plan();
+    pin(&plan, &dialer, pinned, &[other]);
+    dialer.answer(pinned, Answer::Refuse);
+    dialer.answer(other, Answer::Refuse);
+
+    // Two refusals make the pin suspect, and the race that follows finds
+    // nothing answering and keeps the pin.
+    for _ in 0..SUSPECT_AFTER_FAILURES {
+        plan.connect(&dialer).unwrap_err();
+    }
+    plan.connect(&dialer).unwrap_err();
+    settle_all(&dialer);
+    assert_eq!(plan.snapshot().races_failed, 1);
+    assert_eq!(plan.snapshot().pinned, Some(pinned));
+    dialer.take_dialled();
+
+    // Within the holdoff every connect dials the pin and then the other
+    // address, and no further race runs however often the pin refuses.
+    for _ in 0..5 {
+        plan.connect(&dialer).unwrap_err();
+        assert_eq!(dialer.take_dialled(), vec![pinned, other]);
+    }
+    assert_eq!(plan.snapshot().races_failed, 1);
+
+    // Once the holdoff has passed, the suspicion races again.
+    plan.age_failed_race_by(FAILED_RACE_HOLDOFF);
+    plan.connect(&dialer).unwrap_err();
+    settle_all(&dialer);
+    assert_eq!(plan.snapshot().races_failed, 2);
 }

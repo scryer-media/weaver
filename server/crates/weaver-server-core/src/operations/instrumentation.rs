@@ -114,6 +114,41 @@ impl AtomicHistogram {
     }
 }
 
+/// Measures one pipeline turn, excluding the idle select wait. Awaited work
+/// inside a handler remains part of the observation, including slow I/O.
+pub(crate) struct TurnTimer<'a> {
+    histogram: &'a AtomicHistogram,
+    started: Option<std::time::Instant>,
+    elapsed: Duration,
+}
+
+impl<'a> TurnTimer<'a> {
+    pub(crate) fn new(histogram: &'a AtomicHistogram) -> Self {
+        Self {
+            histogram,
+            started: Some(std::time::Instant::now()),
+            elapsed: Duration::ZERO,
+        }
+    }
+
+    pub(crate) fn pause(&mut self) {
+        if let Some(started) = self.started.take() {
+            self.elapsed += started.elapsed();
+        }
+    }
+
+    pub(crate) fn resume(&mut self) {
+        self.started.get_or_insert_with(std::time::Instant::now);
+    }
+}
+
+impl Drop for TurnTimer<'_> {
+    fn drop(&mut self) {
+        self.pause();
+        self.histogram.observe(self.elapsed);
+    }
+}
+
 // Point-in-time copy of an [`AtomicHistogram`].
 //
 // `counts` holds **per-bucket** (not cumulative) counts and is always
@@ -669,11 +704,6 @@ impl JobLifecycleMetrics {
         self.stage_duration[stage.index()].observe(elapsed);
     }
 
-    // Low-frequency: one per PAR2 verification pass.
-    pub fn note_verification(&self, outcome: VerificationOutcomeKind) {
-        self.verifications[outcome.index()].fetch_add(1, Ordering::Relaxed);
-    }
-
     // Low-frequency: one per PAR2 repair attempt.
     pub fn note_repair(&self, outcome: StageOutcomeKind, slices_repaired: u64) {
         self.repairs[outcome.index()].fetch_add(1, Ordering::Relaxed);
@@ -681,11 +711,6 @@ impl JobLifecycleMetrics {
             self.repair_slices_repaired_total
                 .fetch_add(slices_repaired, Ordering::Relaxed);
         }
-    }
-
-    // Low-frequency: one per archive extraction.
-    pub fn note_extraction(&self, outcome: StageOutcomeKind) {
-        self.extractions[outcome.index()].fetch_add(1, Ordering::Relaxed);
     }
 
     // Low-frequency: one per file that could not be assembled.
@@ -838,6 +863,7 @@ impl JobLifecycleMetrics {
 // struct starts a clock.
 #[derive(Debug)]
 pub struct PipelineHistograms {
+    pub turn_duration: AtomicHistogram,
     pub disk_write_duration: AtomicHistogram,
     pub decode_task_duration: AtomicHistogram,
     pub extract_member_duration: AtomicHistogram,
@@ -858,17 +884,12 @@ impl PipelineHistograms {
     pub const fn new() -> Self {
         Self {
             disk_write_duration: AtomicHistogram::new(DISK_WRITE_DURATION_BOUNDS),
+            turn_duration: AtomicHistogram::new(&[0.0001, 0.001, 0.01, 0.1, 1.0, 10.0, 60.0]),
             decode_task_duration: AtomicHistogram::new(DECODE_TASK_DURATION_BOUNDS),
             extract_member_duration: AtomicHistogram::new(EXTRACT_MEMBER_DURATION_BOUNDS),
             decode_task_observed: AtomicU64::new(0),
             extract_member_observed: AtomicU64::new(0),
         }
-    }
-
-    // Hot-path safe: called from the decode worker's disk-write path with the
-    // `Duration` that path already measured for `disk_write_latency_us`.
-    pub fn observe_disk_write(&self, elapsed: Duration) {
-        self.disk_write_duration.observe(elapsed);
     }
 
     // Hot-path safe when the caller already holds a wall-clock measurement.
@@ -877,14 +898,9 @@ impl PipelineHistograms {
         self.decode_task_duration.observe(elapsed);
     }
 
-    // Low-frequency: one per extracted archive member.
-    pub fn observe_extract_member(&self, elapsed: Duration) {
-        self.extract_member_observed.store(1, Ordering::Relaxed);
-        self.extract_member_duration.observe(elapsed);
-    }
-
     pub fn snapshot(&self) -> PipelineHistogramsSnapshot {
         PipelineHistogramsSnapshot {
+            turn_duration: self.turn_duration.snapshot(),
             disk_write_duration: self.disk_write_duration.snapshot(),
             decode_task_duration: (self.decode_task_observed.load(Ordering::Relaxed) != 0)
                 .then(|| self.decode_task_duration.snapshot()),
@@ -901,6 +917,7 @@ impl PipelineHistograms {
 // rather than reporting a fabricated empty series.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct PipelineHistogramsSnapshot {
+    pub turn_duration: HistogramSnapshot,
     pub disk_write_duration: HistogramSnapshot,
     pub decode_task_duration: Option<HistogramSnapshot>,
     pub extract_member_duration: Option<HistogramSnapshot>,

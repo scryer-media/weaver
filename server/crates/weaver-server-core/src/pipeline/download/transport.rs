@@ -261,6 +261,10 @@ pub(crate) struct ServerPipelineExplorer {
     window_rung_responses: u64,
     window_rung_bytes: u64,
     window_rung_elapsed: Duration,
+    // A response in the window arrived with its lane holding less than a
+    // full rung of articles: the lane waited on its next lease, and the
+    // window timed that wait as well as the server.
+    window_starved: bool,
     // Ring of recent decoded body sizes; the depth formula takes its median.
     body_bytes: [u64; BODY_SIZE_SAMPLES],
     body_bytes_len: usize,
@@ -296,6 +300,7 @@ impl Default for ServerPipelineExplorer {
             window_rung_responses: 0,
             window_rung_bytes: 0,
             window_rung_elapsed: Duration::ZERO,
+            window_starved: false,
             body_bytes: [0; BODY_SIZE_SAMPLES],
             body_bytes_len: 0,
             body_bytes_next: 0,
@@ -506,7 +511,9 @@ impl ServerPipelineExplorer {
     }
 
     // Fold one clean response into the current window and, once the window is
-    // full, decide whether the rung stays, reverts, or advances.
+    // full, decide whether the rung stays, reverts, or advances. `fed` says
+    // the response's lane held a full rung of articles when it was read.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn note_response(
         &mut self,
         now: Instant,
@@ -515,6 +522,7 @@ impl ServerPipelineExplorer {
         policy_elapsed: Duration,
         pressure_clear: bool,
         cold: bool,
+        fed: bool,
     ) -> Option<RungChange> {
         // A pinned server is out of the exploration entirely: nothing it does
         // afterwards may walk its depth back up.
@@ -550,6 +558,7 @@ impl ServerPipelineExplorer {
             return None;
         }
         self.window_responses = self.window_responses.saturating_add(1);
+        self.window_starved |= !fed;
         self.window_model_bytes = self.window_model_bytes.saturating_add(payload_bytes);
         // `transfer` is the lane's status-line-to-terminator time, refreshed
         // just before this call; a lane that has not measured one yet has
@@ -587,14 +596,21 @@ impl ServerPipelineExplorer {
         // next one, by which time the shallower leases have drained.
         let rung_was_measured =
             self.window_rung_responses.saturating_mul(2) >= self.window_target_responses();
+        // A rung is judged only on a window its lanes were fed for
+        // throughout. A lane left without its next lease stops at the bottom
+        // of its pipe, and the window then times the wait for work as if the
+        // server had been slow: a verdict on that window reverts a rung for
+        // the dispatcher's lateness.
+        let rung_was_fed = !self.window_starved;
         self.fold_window_latency();
         self.reset_window();
         self.warmup_windows_left = self.warmup_windows_left.saturating_sub(1);
 
-        if !rung_was_measured {
+        if !rung_was_measured || !rung_was_fed {
             // Most of this window came from leases still draining at a
-            // shallower depth. The link model above is worth having either
-            // way; the rung comparison has too little in it to compare.
+            // shallower depth, or a lane ran out of work inside it. The link
+            // model above is worth having either way; the rung comparison has
+            // nothing in it that describes the rung.
             return None;
         }
 
@@ -733,6 +749,7 @@ impl ServerPipelineExplorer {
         self.window_rung_responses = 0;
         self.window_rung_bytes = 0;
         self.window_rung_elapsed = Duration::ZERO;
+        self.window_starved = false;
     }
 }
 
@@ -890,6 +907,7 @@ mod tests {
                     elapsed_per_response,
                     true,
                     false,
+                    true,
                 )
                 .or(change);
         }
@@ -906,7 +924,15 @@ mod tests {
         let depth = explorer.current_depth();
         for _ in 0..explorer.window_target_responses() {
             assert_eq!(
-                explorer.note_response(now, depth, 100_000, Duration::from_millis(400), true, true),
+                explorer.note_response(
+                    now,
+                    depth,
+                    100_000,
+                    Duration::from_millis(400),
+                    true,
+                    true,
+                    true
+                ),
                 None
             );
         }
@@ -944,7 +970,15 @@ mod tests {
         for _ in 0..LATENCY_FOLD_SAMPLES - 1 {
             explorer.note_latency_sample(Duration::from_millis(100), false);
             assert_eq!(
-                explorer.note_response(now, 1, 100_000, Duration::from_millis(100), true, false),
+                explorer.note_response(
+                    now,
+                    1,
+                    100_000,
+                    Duration::from_millis(100),
+                    true,
+                    false,
+                    true
+                ),
                 None
             );
         }
@@ -1086,6 +1120,41 @@ mod tests {
         assert_eq!(explorer.current_depth(), 8);
     }
 
+    // A trial window in which one response found its lane short of a full
+    // rung is no verdict: the slow window timed the lane waiting on its next
+    // lease. The trial stays open, and the next window, fed throughout,
+    // judges it, and still reverts a rung that did not pay.
+    #[test]
+    fn a_window_a_lane_ran_short_in_judges_no_rung() {
+        let mut explorer = explorer(300, 50);
+        let now = Instant::now();
+        run_window(&mut explorer, now, 100_000, Duration::from_millis(100));
+        assert_eq!(explorer.current_depth(), 8);
+
+        let responses = explorer.window_target_responses();
+        let mut change = None;
+        for response in 0..responses {
+            let fed = response != responses / 2;
+            change = explorer
+                .note_response(
+                    now,
+                    8,
+                    101_000,
+                    Duration::from_millis(100),
+                    true,
+                    false,
+                    fed,
+                )
+                .or(change);
+        }
+        assert_eq!(change, None);
+        assert_eq!(explorer.current_depth(), 8);
+        assert_eq!(explorer.window_responses, 0);
+
+        let change = run_window(&mut explorer, now, 101_000, Duration::from_millis(100));
+        assert_eq!(change, Some(RungChange::Reverted { from: 8, to: 2 }));
+    }
+
     #[test]
     fn a_step_up_that_does_not_pay_reverts_and_holds() {
         let mut explorer = explorer(300, 50);
@@ -1159,7 +1228,15 @@ mod tests {
         let now = Instant::now();
         for _ in 0..RUNG_WINDOW_RESPONSES * 2 {
             assert_eq!(
-                explorer.note_response(now, 2, 100_000, Duration::from_millis(100), false, false),
+                explorer.note_response(
+                    now,
+                    2,
+                    100_000,
+                    Duration::from_millis(100),
+                    false,
+                    false,
+                    true
+                ),
                 None
             );
         }
@@ -1179,7 +1256,15 @@ mod tests {
         let short_of_a_window = explorer.window_target_responses() - 1;
         for _ in 0..short_of_a_window {
             assert_eq!(
-                explorer.note_response(now, 8, 400_000, Duration::from_millis(100), true, false),
+                explorer.note_response(
+                    now,
+                    8,
+                    400_000,
+                    Duration::from_millis(100),
+                    true,
+                    false,
+                    true
+                ),
                 None
             );
         }
@@ -1279,7 +1364,15 @@ mod tests {
         // is already running eight.
         for _ in 0..deep.window_target_responses() {
             assert_eq!(
-                deep.note_response(now, 2, 750_000, Duration::from_millis(125), true, false),
+                deep.note_response(
+                    now,
+                    2,
+                    750_000,
+                    Duration::from_millis(125),
+                    true,
+                    false,
+                    true
+                ),
                 None,
                 "a shallower lease may fill the window but may not judge the rung"
             );
@@ -1296,7 +1389,15 @@ mod tests {
         let mut shallow = explorer(300, 50);
         for _ in 0..RUNG_WINDOW_RESPONSES * 2 {
             assert_eq!(
-                shallow.note_response(now, 8, 100_000, Duration::from_millis(100), true, false),
+                shallow.note_response(
+                    now,
+                    8,
+                    100_000,
+                    Duration::from_millis(100),
+                    true,
+                    false,
+                    true
+                ),
                 None
             );
         }
@@ -1372,7 +1473,15 @@ mod tests {
         let now = Instant::now();
         for _ in 0..RUNG_WINDOW_RESPONSES * 2 {
             assert_eq!(
-                explorer.note_response(now, 8, 100_000, Duration::from_millis(100), true, false),
+                explorer.note_response(
+                    now,
+                    8,
+                    100_000,
+                    Duration::from_millis(100),
+                    true,
+                    false,
+                    true
+                ),
                 None
             );
         }

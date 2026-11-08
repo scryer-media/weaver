@@ -94,7 +94,12 @@ interface ProviderHoldoff {
 
 interface LiveMetricsSnapshot {
   metrics: { currentDownloadSpeed: number };
-  globalState: { isPaused: boolean; speedLimitBytesPerSec: number; downloadBlock: DownloadBlockState };
+  globalState: {
+    isPaused: boolean;
+    speedLimitBytesPerSec: number;
+    resumeAtEpochMs?: number | null;
+    downloadBlock: DownloadBlockState;
+  };
   providerHoldoffs?: ProviderHoldoff[];
   providerConnections?: ProviderConnections[];
   /** Per-job download rates on the same tick as the speed; only the push carries them. */
@@ -116,6 +121,8 @@ export interface NextData {
   /** Highest speed seen since the tab opened; the rail and stat strip both note it. */
   peakSpeed: number;
   isPaused: boolean;
+  /** When a timed pause resumes on its own, in epoch milliseconds; null when none is set. */
+  resumeAt: number | null;
   /** The configured download ceiling in bytes per second; 0 is unlimited. */
   speedLimit: number;
   downloadBlock: DownloadBlockState;
@@ -156,6 +163,8 @@ const DEFAULT_DOWNLOAD_BLOCK: DownloadBlockState = {
   windowEndsAtEpochMs: null,
   timezoneName: "",
   scheduledSpeedLimit: 0,
+  speedLimitInForce: 0,
+  speedLimitBySchedule: false,
 };
 
 const EMPTY_CATEGORIES: ConfiguredCategory[] = [];
@@ -363,6 +372,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   const globalState = snapshot?.globalState;
   const downloadBlock = useSettled(globalState?.downloadBlock ?? DEFAULT_DOWNLOAD_BLOCK, shallowEqual);
   const isPaused = globalState?.isPaused ?? false;
+  const resumeAt = globalState?.resumeAtEpochMs ?? null;
   const speedLimit = globalState?.speedLimitBytesPerSec ?? 0;
   const categories = categoryData?.categories ?? EMPTY_CATEGORIES;
   const refreshCategories = useCallback(
@@ -409,6 +419,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       speed,
       peakSpeed,
       isPaused,
+      resumeAt,
       speedLimit,
       downloadBlock,
       queue,
@@ -433,6 +444,7 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
       providersLoaded,
       queue,
       refreshCategories,
+      resumeAt,
       refreshHistoryCount,
       speed,
       speedLimit,

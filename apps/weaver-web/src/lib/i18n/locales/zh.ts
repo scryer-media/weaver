@@ -17,6 +17,7 @@ const zh: LocaleDictionary = {
   "applicationUpgrade.install": "安装 v{{version}}",
   "applicationUpgrade.notEligible": "Weaver 无法在应用内更新此安装（{{reason}}）。",
   "applicationUpgrade.failed": "更新到 v{{version}} 失败：{{error}}",
+  "applicationUpgrade.githubUnavailable": "GitHub 暂时不可用。请稍后重试更新。",
   "applicationUpgrade.completed": "已更新到 v{{version}}。",
   "applicationUpgrade.phase.checking": "正在检查版本…",
   "applicationUpgrade.phase.downloading": "正在下载 v{{version}}…",

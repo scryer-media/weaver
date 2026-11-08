@@ -122,10 +122,18 @@ func (session *nntpCommandSession) send(cmd string) (string, error) {
 	return line, nil
 }
 
-func (session *nntpCommandSession) close() {
-	_ = session.conn.SetWriteDeadline(time.Now().Add(time.Second))
-	_, _ = session.conn.Write([]byte("QUIT\r\n"))
-	_ = session.conn.Close()
+func (session *nntpCommandSession) close() error {
+	defer session.conn.Close()
+	if _, err := session.send("QUIT"); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil
+		}
+		return err
+	}
+	// EOF follows the fixture's session and admission-counter release. A
+	// local socket close alone does not prove the provider freed the seat.
+	_, err := io.Copy(io.Discard, session.reader)
+	return err
 }
 
 func sendNntpCommandToOnceWithAuth(host, port, cmd string, authenticate bool) (string, error) {
@@ -133,8 +141,12 @@ func sendNntpCommandToOnceWithAuth(host, port, cmd string, authenticate bool) (s
 	if err != nil {
 		return "", err
 	}
-	defer session.close()
-	return session.send(cmd)
+	response, err := session.send(cmd)
+	closed := session.close()
+	if err != nil {
+		return "", err
+	}
+	return response, closed
 }
 
 func resetNntpServer(host, port, label string) error {
@@ -296,39 +308,54 @@ func parseContainerEncryptionKeyState(fingerprintOutput, modeOutput string) (con
 }
 
 func dockerComposeUp(services ...string) error {
+	if err := ensureNNTPHealthBinary(); err != nil {
+		return err
+	}
 	if requiresWeaverService(services) {
 		if err := ensureLocalWeaverImage(); err != nil {
 			return err
 		}
 	}
-	const maxPortBindRetries = 2
+	// Two retries cover the transient causes below: a host port another
+	// process took between allocation and bind, or one API call the engine
+	// dropped under load. A third failure in a row is not transient.
+	const maxComposeUpRetries = 2
 	for attempt := 0; ; attempt++ {
 		log.Printf("starting docker services: %s", strings.Join(services, ", "))
 		args := append(dockerComposeArgs("up", "-d", "--quiet-pull"), services...)
 		cmd := containerengine.Command(args...)
 		cmd.Dir = e2eDir()
 		err := runExternalCommand(cmd, "docker compose up")
-		if err == nil || !isDockerHostPortBindCollision(err) || attempt == maxPortBindRetries {
+		if err == nil || attempt == maxComposeUpRetries {
+			return err
+		}
+		portCollision := isDockerHostPortBindCollision(err)
+		if !portCollision && !isContainerEngineAPITransportFailure(err) {
 			return err
 		}
 		// The failed attempt may have created some services already. A retry
-		// with new ports must recreate them, and the engine refuses to recreate
-		// a container another one shares a network namespace with (capture
-		// runs in weaver's), so remove what this attempt started first.
+		// must recreate them, and the engine refuses to recreate a container
+		// another one shares a network namespace with (capture runs in
+		// weaver's), so remove what this attempt started first.
 		rm := containerengine.Command(dockerComposeRetryCleanupArgs(services...)...)
 		rm.Dir = e2eDir()
 		if rmErr := runExternalCommand(rm, "docker compose rm"); rmErr != nil {
 			return fmt.Errorf("%w; remove services before retry: %v", err, rmErr)
 		}
+		if !portCollision {
+			// The ports were not the problem; keep them.
+			log.Printf("container engine API dropped a compose call; retrying compose with the same runtime ports (attempt %d/%d)", attempt+1, maxComposeUpRetries)
+			continue
+		}
 		if retryErr := reallocateRuntimePortsForDockerRetry(); retryErr != nil {
 			return fmt.Errorf("%w; reallocate runtime ports for retry: %v", err, retryErr)
 		}
-		log.Printf("docker host-port collision; retrying compose with fresh runtime ports (attempt %d/%d)", attempt+1, maxPortBindRetries)
+		log.Printf("docker host-port collision; retrying compose with fresh runtime ports (attempt %d/%d)", attempt+1, maxComposeUpRetries)
 	}
 }
 
 // dockerComposeRetryCleanupArgs stops and removes the given services'
-// containers, and only those, so a port-collision retry starts them afresh.
+// containers, and only those, so a compose up retry starts them afresh.
 func dockerComposeRetryCleanupArgs(services ...string) []string {
 	return append(dockerComposeArgs("rm", "--force", "--stop"), services...)
 }
@@ -342,7 +369,8 @@ func requiresWeaverService(services []string) bool {
 	return false
 }
 
-func dockerComposeRestart(services ...string) error {
+func dockerComposeRestart(services ...string) (err error) {
+	defer endWeaverReleaseStage("restart", weaverReleaseStageLifecycle, time.Now(), &err)
 	log.Printf("restarting docker services: %s", strings.Join(services, ", "))
 	cmd := containerengine.Command(dockerComposeRestartArgs(services...)...)
 	cmd.Dir = e2eDir()

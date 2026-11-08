@@ -19,9 +19,12 @@ use tracing::{debug, info};
 // short enough that the death window it brackets is useful.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(60);
 
-// Every beat is written at DEBUG; every this-many-th one, and the first, at
-// INFO, so the default log keeps a coarse pulse without a line a minute.
-const HEARTBEAT_INFO_EVERY: u64 = 10;
+// How often a beat is written at INFO regardless of memory.
+const HEARTBEAT_INFO_PERIOD: Duration = Duration::from_secs(60 * 60);
+
+// Every beat is written at DEBUG; the first, and one an hour, at INFO, so the
+// default log keeps a coarse pulse without a line every few minutes.
+const HEARTBEAT_INFO_EVERY: u64 = HEARTBEAT_INFO_PERIOD.as_secs() / HEARTBEAT_INTERVAL.as_secs();
 
 // A beat whose resident set moved by more than this fraction since the last
 // INFO beat is written at INFO too: memory climbing is exactly what the
@@ -179,12 +182,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_first_and_every_tenth_beat_are_info() {
-        let info_beats: Vec<u64> = (1..=30)
+    fn the_first_beat_and_one_an_hour_are_info() {
+        let info_beats: Vec<u64> = (1..=180)
             .filter(|beat| beat_is_info(*beat, Some(100), Some(100)))
             .collect();
 
-        assert_eq!(info_beats, vec![1, 10, 20, 30]);
+        assert_eq!(HEARTBEAT_INFO_EVERY, 60);
+        assert_eq!(info_beats, vec![1, 60, 120, 180]);
+    }
+
+    #[test]
+    fn a_steady_beat_between_the_hours_is_debug() {
+        for beat in [2, 10, 20, 30, 59, 61, 119] {
+            assert!(!beat_is_info(beat, Some(100), Some(100)), "beat {beat}");
+        }
     }
 
     #[test]

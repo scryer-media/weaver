@@ -19,6 +19,7 @@ import {
   scriptResults, scriptSettings, setScriptLists, submitNzb, useScripts, waitJobLessResults, waitQueueRows, waitResults,
   withControlKey,
 } from "./support/script-settings";
+import { jobIds, testIds } from "./support/testids";
 
 /**
  * Queue, scheduler and feed scripts. Every fixture
@@ -121,7 +122,12 @@ async function resumeAll(request: APIRequestContext): Promise<void> {
 }
 
 async function cancelJob(request: APIRequestContext, id: number): Promise<void> {
-  await graphql(request, "mutation($id: Int!) { cancelJob(id: $id) }", { id });
+  const result = await graphql<{ cancelJob: boolean }>(
+    request, "mutation($id: Int!) { cancelJob(id: $id) }", { id },
+  );
+  if (!result.cancelJob) {
+    throw new Error(`failed to cancel event-script job ${id}`);
+  }
 }
 
 async function markGood(request: APIRequestContext, id: number): Promise<void> {
@@ -328,6 +334,7 @@ test("Q06 NZB_DELETED follows a user cancel; deleteHistory raises none", async (
     const [deleted] = await waitRecords(script, 1, forJob(first));
     expect(deleted!.env).toMatchObject({ NZBNA_EVENT: "NZB_DELETED", NZBNA_NZBID: String(first), NZBNA_DELETESTATUS: "MANUAL" });
 
+    await waitTerminal(request, first);
     await graphql(request, "mutation($id: Int!) { deleteHistory(id: $id, deleteFiles: true) { id } }", { id: first });
     // Queue events drain one at a time in admission order, so once a later
     // sentinel's event has run, any event deleteHistory raised has run too.
@@ -865,19 +872,24 @@ test("UI01 the settings and job pages show script jobs by trigger, and run statu
   const restore = await useScripts(request, { global: [queue, scheduler, scan, feed].map(script => ({ script })) });
   try {
     await page.goto("/settings/scripts/configuration");
-    await expect(page.getByRole("textbox", { name: "Scripts directory", exact: true })).toHaveValue(WEAVER_SCRIPTS_DIR);
-    await expect(page.getByRole("region", { name: "Event scripts and output retention", exact: true })).toBeVisible();
+    await expect(page.getByTestId(jobIds.scriptDirectory).getByRole("textbox")).toHaveValue(WEAVER_SCRIPTS_DIR);
+    await expect(page.getByTestId(testIds.section("event-scripts"))).toBeVisible();
     await page.goto("/settings/scripts/list");
-    // Jobs are grouped by what starts them; a job's row carries its name.
-    const jobs = page.getByRole("region", { name: "Jobs", exact: true });
-    const row = (group: string, name: string) =>
-      jobs.getByRole("region", { name: group, exact: true }).getByRole("button").filter({ has: page.getByText(name, { exact: true }) });
-    for (const [group, name] of [
-      ["Post-processing", queue], ["Queue · NZB_ADDED", queue], ["Queue · NZB_DOWNLOADED", queue],
-      ["Schedule", scheduler], ["Scan", scan], ["Feed", feed],
+    // Jobs are grouped by what starts them; a job's row carries its script.
+    const listed = await scriptInstances(request);
+    const groupOf = (instance: { trigger: string; queueEvent: string | null }) =>
+      instance.trigger === "QUEUE" ? `QUEUE:${instance.queueEvent ?? ""}` : instance.trigger;
+    const jobs = page.getByTestId(testIds.section("instances"));
+    for (const [group, script] of [
+      ["POST_PROCESSING", queue], ["QUEUE:NZB_ADDED", queue], ["QUEUE:NZB_DOWNLOADED", queue],
+      ["SCHEDULER", scheduler], ["SCAN", scan], ["FEED", feed],
     ] as const) {
-      await expect(row(group, name), `${name} under ${group}`).toBeVisible();
-      await expect(jobs.getByRole("region", { name: group, exact: true }).getByRole("switch", { name: `${name} enabled`, exact: true })).toBeChecked();
+      const instance = listed.find(entry => entry.script === script && groupOf(entry) === group);
+      expect(instance, `${script} is a ${group} job`).toBeDefined();
+      const row = jobs.getByTestId(testIds.rowGroup("instances", group)).getByTestId(testIds.row("instances", `i:${instance!.id}`));
+      await expect(row, `${script} under ${group}`).toBeVisible();
+      await expect(row).toContainText(script);
+      await expect(row.getByRole("switch")).toBeChecked();
     }
 
     await pauseAll(request);
@@ -888,14 +900,16 @@ test("UI01 the settings and job pages show script jobs by trigger, and run statu
     const results = (await waitResults(request, jobId, all => all.filter(result => result.script === queue).length >= 3, "three runs of the queue script"))
       .filter(result => result.script === queue);
     await page.goto(`/jobs/${jobId}`);
-    // One group per event, named with its run count, each showing how its runs ended.
+    // One group per event, holding every run of it, each showing how its run ended.
     const allResults = await scriptResults(request, jobId);
     for (const event of new Set(results.map(result => result.event))) {
       const ofEvent = allResults.filter(result => result.event === event);
-      const group = page.getByRole("group", { name: `${event} (${ofEvent.length})`, exact: true });
+      const group = page.getByTestId(jobIds.scriptEventGroup(event));
       await expect(group).toBeVisible();
+      await expect(group.getByTestId(jobIds.scriptRun)).toHaveCount(ofEvent.length);
       for (const status of new Set(ofEvent.map(result => result.status))) {
-        await expect(group.getByText(status, { exact: true })).toHaveCount(ofEvent.filter(result => result.status === status).length);
+        const count = ofEvent.filter(result => result.status === status).length;
+        await expect(group.getByTestId(jobIds.scriptRunStatus(status))).toHaveText(Array<string>(count).fill(status));
       }
     }
   } finally {

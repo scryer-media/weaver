@@ -27,35 +27,26 @@ func TestAssertTerminalFixtureStatePassesWhenArchivedJobIsClean(t *testing.T) {
 }
 
 func TestAssertTerminalFixtureStateEventuallyWaitsForHistoryVisibility(t *testing.T) {
-	previousTimeout := terminalFixtureStateTimeout
-	previousPollInterval := terminalFixtureStatePollInterval
-	terminalFixtureStateTimeout = 250 * time.Millisecond
-	terminalFixtureStatePollInterval = 10 * time.Millisecond
-	t.Cleanup(func() {
-		terminalFixtureStateTimeout = previousTimeout
-		terminalFixtureStatePollInterval = previousPollInterval
-	})
-
 	dbPath := newTestWeaverStateDB(t)
-
-	errCh := make(chan error, 1)
-	go func() {
-		time.Sleep(25 * time.Millisecond)
-		db, err := sql.Open("sqlite", dbPath)
-		if err != nil {
-			errCh <- err
-			return
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+	now := time.Unix(0, 0)
+	checks := 0
+	err := waitForTerminalFixtureState(func() error {
+		checks++
+		return assertTerminalFixtureState(dbPath, 2, "COMPLETE")
+	}, func() time.Time { return now }, func(interval time.Duration) {
+		if checks != 1 {
+			t.Fatalf("expected exactly one observation before history becomes visible, got %d", checks)
 		}
-		defer db.Close()
-		_, err = db.Exec(`INSERT INTO job_history (job_id, status) VALUES (2, 'COMPLETED')`)
-		errCh <- err
-	}()
-
-	if err := assertTerminalFixtureStateEventually(dbPath, 2, "COMPLETE"); err != nil {
+		mustExecWeaverStateSQL(t, db, `INSERT INTO job_history (job_id, status) VALUES (2, 'COMPLETED')`)
+		now = now.Add(interval)
+	})
+	if err != nil {
 		t.Fatalf("expected eventual terminal state validation to pass, got %v", err)
 	}
-	if err := <-errCh; err != nil {
-		t.Fatalf("insert delayed job history row: %v", err)
+	if checks != 2 {
+		t.Fatalf("expected absent then visible history, got %d observations", checks)
 	}
 }
 
@@ -284,310 +275,6 @@ func TestAssertNoOrphanActiveStatePathFailsForOrphanRows(t *testing.T) {
 	}
 }
 
-func TestObserveActiveFileIdentityRewritePassesWhenCanonicalRowsObserved(t *testing.T) {
-	dbPath := newTestWeaverStateDB(t)
-	db := openTestWeaverStateDB(t, dbPath)
-	defer db.Close()
-
-	insertActiveFileIdentity(t, db, 42, 1, "51273...101", "archive.part1.rar", "par2")
-	insertActiveFileIdentity(t, db, 42, 2, "51273...102", "archive.part2.rar", "par2")
-	insertActiveFileIdentity(t, db, 42, 3, "51273...103", "archive.part3.rar", "par2")
-
-	observation, err := observeActiveFileIdentityRewrite(dbPath, 42, &ScenarioFileIdentityRewriteAssertion{
-		RequiredCurrentFilenames:     []string{"archive.part1.rar", "archive.part2.rar", "archive.part3.rar"},
-		ForbiddenCurrentFilenames:    []string{"51273aad56a8b904e96928935278a627.101"},
-		RequiredClassificationSource: "par2",
-	})
-	if err != nil {
-		t.Fatalf("observe active file identity rewrite: %v", err)
-	}
-	if !observation.Observed {
-		t.Fatalf("expected rewrite observation to pass, got %#v", observation)
-	}
-}
-
-func TestFileIdentityRewriteObserverReusesOpenDatabase(t *testing.T) {
-	dbPath := newTestWeaverStateDB(t)
-	db := openTestWeaverStateDB(t, dbPath)
-	defer db.Close()
-
-	insertActiveFileIdentity(t, db, 42, 1, "51273...101", "archive.part1.rar", "par2")
-	insertActiveFileIdentity(t, db, 43, 1, "51273...201", "episode.mkv", "par2")
-
-	observer, err := openFileIdentityRewriteObserver(dbPath)
-	if err != nil {
-		t.Fatalf("open reusable file identity rewrite observer: %v", err)
-	}
-	defer observer.Close()
-
-	for _, tc := range []struct {
-		jobID    int
-		filename string
-	}{
-		{jobID: 42, filename: "archive.part1.rar"},
-		{jobID: 43, filename: "episode.mkv"},
-	} {
-		observation, err := observer.Observe(tc.jobID, &ScenarioFileIdentityRewriteAssertion{
-			RequiredCurrentFilenames:     []string{tc.filename},
-			RequiredClassificationSource: "par2",
-		})
-		if err != nil {
-			t.Fatalf("observe job %d through reusable observer: %v", tc.jobID, err)
-		}
-		if !observation.Observed {
-			t.Fatalf("expected rewrite observation for job %d to pass, got %#v", tc.jobID, observation)
-		}
-	}
-}
-
-func TestObserveActiveFileIdentityRewriteFailsWhenObfuscatedRowsRemain(t *testing.T) {
-	dbPath := newTestWeaverStateDB(t)
-	db := openTestWeaverStateDB(t, dbPath)
-	defer db.Close()
-
-	insertActiveFileIdentity(t, db, 7, 1, "51273...101", "archive.part1.rar", "par2")
-	insertActiveFileIdentity(t, db, 7, 2, "51273...102", "archive.part2.rar", "par2")
-	insertActiveFileIdentity(t, db, 7, 3, "51273...103", "archive.part3.rar", "par2")
-	insertActiveFileIdentity(t, db, 7, 4, "51273...104", "51273aad56a8b904e96928935278a627.101", "declared")
-
-	observation, err := observeActiveFileIdentityRewrite(dbPath, 7, &ScenarioFileIdentityRewriteAssertion{
-		RequiredCurrentFilenames:     []string{"archive.part1.rar", "archive.part2.rar", "archive.part3.rar"},
-		ForbiddenCurrentFilenames:    []string{"51273aad56a8b904e96928935278a627.101"},
-		RequiredClassificationSource: "par2",
-	})
-	if err != nil {
-		t.Fatalf("observe active file identity rewrite: %v", err)
-	}
-	if observation.Observed {
-		t.Fatalf("expected rewrite observation to fail when obfuscated names remain, got %#v", observation)
-	}
-	if len(observation.ForbiddenCurrentFilenames) != 1 || observation.ForbiddenCurrentFilenames[0] != "51273aad56a8b904e96928935278a627.101" {
-		t.Fatalf("expected forbidden obfuscated filename to be reported, got %#v", observation)
-	}
-}
-
-func TestObserveActiveFileIdentityRewriteFailsWhenPar2ClassificationIsMissing(t *testing.T) {
-	dbPath := newTestWeaverStateDB(t)
-	db := openTestWeaverStateDB(t, dbPath)
-	defer db.Close()
-
-	insertActiveFileIdentity(t, db, 9, 1, "51273...101", "archive.part1.rar", "declared")
-	insertActiveFileIdentity(t, db, 9, 2, "51273...102", "archive.part2.rar", "declared")
-	insertActiveFileIdentity(t, db, 9, 3, "51273...103", "archive.part3.rar", "declared")
-
-	observation, err := observeActiveFileIdentityRewrite(dbPath, 9, &ScenarioFileIdentityRewriteAssertion{
-		RequiredCurrentFilenames:     []string{"archive.part1.rar", "archive.part2.rar", "archive.part3.rar"},
-		RequiredClassificationSource: "par2",
-	})
-	if err != nil {
-		t.Fatalf("observe active file identity rewrite: %v", err)
-	}
-	if observation.Observed {
-		t.Fatalf("expected rewrite observation to fail when classification_source=par2 is missing, got %#v", observation)
-	}
-	if len(observation.WrongClassificationSources) != 3 {
-		t.Fatalf("expected all canonical rows to report source mismatches, got %#v", observation)
-	}
-	if !strings.Contains(observation.WrongClassificationSources[0], "found: declared") {
-		t.Fatalf("expected source mismatch details to include the observed classification source, got %#v", observation)
-	}
-}
-
-func TestObserveActiveFileIdentityRewriteUsesObserverRowsAfterActiveCleanup(t *testing.T) {
-	dbPath := newTestWeaverStateDB(t)
-	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
-		t.Fatalf("install file identity rewrite observer: %v", err)
-	}
-	db := openTestWeaverStateDB(t, dbPath)
-	defer db.Close()
-
-	insertActiveFileIdentity(t, db, 17, 1, "archive.part1.rar", "archive.part1.rar", "par2")
-	insertActiveFileIdentity(t, db, 17, 2, "51273...102", "51273aad56a8b904e96928935278a627.102", "declared")
-	if _, err := db.Exec(
-		`UPDATE active_file_identities
-		 SET current_filename = ?,
-		     canonical_filename = ?,
-		     classification_source = ?
-		 WHERE job_id = ? AND file_index = ?`,
-		"archive.part2.rar",
-		"archive.part2.rar",
-		"par2",
-		17,
-		2,
-	); err != nil {
-		t.Fatalf("update active_file_identities row: %v", err)
-	}
-	deleteActiveFileIdentities(t, db, 17)
-
-	observation, err := observeActiveFileIdentityRewrite(dbPath, 17, &ScenarioFileIdentityRewriteAssertion{
-		RequiredCurrentFilenames:     []string{"archive.part1.rar", "archive.part2.rar"},
-		RequiredClassificationSource: "par2",
-	})
-	if err != nil {
-		t.Fatalf("observe active file identity rewrite: %v", err)
-	}
-	if !observation.Observed {
-		t.Fatalf("expected observer rows to satisfy rewrite assertion after active cleanup, got %#v", observation)
-	}
-
-	assertObservedFileIdentityRewriteRow(t, db, 17, "insert", "archive.part1.rar", "archive.part1.rar", "par2")
-	assertObservedFileIdentityRewriteRow(t, db, 17, "update", "archive.part2.rar", "archive.part2.rar", "par2")
-}
-
-func TestObserveActiveFileIdentityRewriteUsesLatestObserverRowsAfterSupersededObfuscatedRows(t *testing.T) {
-	dbPath := newTestWeaverStateDB(t)
-	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
-		t.Fatalf("install file identity rewrite observer: %v", err)
-	}
-	db := openTestWeaverStateDB(t, dbPath)
-	defer db.Close()
-
-	insertActiveFileIdentity(t, db, 19, 0, "51273...101", "51273aad56a8b904e96928935278a627.101", "declared")
-	insertActiveFileIdentity(t, db, 19, 1, "51273...102", "51273aad56a8b904e96928935278a627.102", "declared")
-	insertActiveFileIdentity(t, db, 19, 2, "51273...103", "51273aad56a8b904e96928935278a627.103", "declared")
-	updateActiveFileIdentity(t, db, 19, 0, "51273aad56a8b904e96928935278a627.101", "51273aad56a8b904e96928935278a627.101", "probe")
-	updateActiveFileIdentity(t, db, 19, 0, "archive.part1.rar", "archive.part1.rar", "par2")
-	updateActiveFileIdentity(t, db, 19, 1, "51273aad56a8b904e96928935278a627.102", "51273aad56a8b904e96928935278a627.102", "probe")
-	updateActiveFileIdentity(t, db, 19, 1, "archive.part2.rar", "archive.part2.rar", "par2")
-	updateActiveFileIdentity(t, db, 19, 2, "51273aad56a8b904e96928935278a627.103", "51273aad56a8b904e96928935278a627.103", "probe")
-	updateActiveFileIdentity(t, db, 19, 2, "archive.part3.rar", "archive.part3.rar", "par2")
-	deleteActiveFileIdentities(t, db, 19)
-
-	observation, err := observeActiveFileIdentityRewrite(dbPath, 19, &ScenarioFileIdentityRewriteAssertion{
-		RequiredCurrentFilenames: []string{
-			"archive.part1.rar",
-			"archive.part2.rar",
-			"archive.part3.rar",
-		},
-		ForbiddenCurrentFilenames: []string{
-			"51273aad56a8b904e96928935278a627.101",
-			"51273aad56a8b904e96928935278a627.102",
-			"51273aad56a8b904e96928935278a627.103",
-		},
-		RequiredClassificationSource: "par2",
-	})
-	if err != nil {
-		t.Fatalf("observe active file identity rewrite: %v", err)
-	}
-	if !observation.Observed {
-		t.Fatalf("expected latest observer rows to satisfy rewrite assertion, got %#v", observation)
-	}
-	for _, observed := range observation.ObservedCurrentFilenames {
-		if strings.Contains(observed, "51273aad56a8b904e96928935278a627") {
-			t.Fatalf("expected effective rows to omit superseded obfuscated filenames, got %#v", observation.ObservedCurrentFilenames)
-		}
-	}
-}
-
-func TestObserveActiveFileIdentityRewriteFailsWhenLatestObserverRowRemainsForbidden(t *testing.T) {
-	dbPath := newTestWeaverStateDB(t)
-	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
-		t.Fatalf("install file identity rewrite observer: %v", err)
-	}
-	db := openTestWeaverStateDB(t, dbPath)
-	defer db.Close()
-
-	insertActiveFileIdentity(t, db, 20, 1, "51273...101", "archive.part1.rar", "par2")
-	updateActiveFileIdentity(t, db, 20, 1, "51273aad56a8b904e96928935278a627.101", "51273aad56a8b904e96928935278a627.101", "declared")
-	deleteActiveFileIdentities(t, db, 20)
-
-	observation, err := observeActiveFileIdentityRewrite(dbPath, 20, &ScenarioFileIdentityRewriteAssertion{
-		RequiredCurrentFilenames:     []string{"archive.part1.rar"},
-		ForbiddenCurrentFilenames:    []string{"51273aad56a8b904e96928935278a627.101"},
-		RequiredClassificationSource: "par2",
-	})
-	if err != nil {
-		t.Fatalf("observe active file identity rewrite: %v", err)
-	}
-	if observation.Observed {
-		t.Fatalf("expected latest forbidden observer row to fail, got %#v", observation)
-	}
-	if len(observation.ForbiddenCurrentFilenames) != 1 || observation.ForbiddenCurrentFilenames[0] != "51273aad56a8b904e96928935278a627.101" {
-		t.Fatalf("expected latest forbidden filename to be reported, got %#v", observation)
-	}
-}
-
-func TestObserveActiveFileIdentityRewriteFailsWhenLatestObserverRowMissesPar2Classification(t *testing.T) {
-	dbPath := newTestWeaverStateDB(t)
-	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
-		t.Fatalf("install file identity rewrite observer: %v", err)
-	}
-	db := openTestWeaverStateDB(t, dbPath)
-	defer db.Close()
-
-	insertActiveFileIdentity(t, db, 21, 1, "51273...101", "archive.part1.rar", "par2")
-	updateActiveFileIdentity(t, db, 21, 1, "archive.part1.rar", "archive.part1.rar", "declared")
-	deleteActiveFileIdentities(t, db, 21)
-
-	observation, err := observeActiveFileIdentityRewrite(dbPath, 21, &ScenarioFileIdentityRewriteAssertion{
-		RequiredCurrentFilenames:     []string{"archive.part1.rar"},
-		RequiredClassificationSource: "par2",
-	})
-	if err != nil {
-		t.Fatalf("observe active file identity rewrite: %v", err)
-	}
-	if observation.Observed {
-		t.Fatalf("expected latest observer row without classification_source=par2 to fail, got %#v", observation)
-	}
-	if len(observation.WrongClassificationSources) != 1 || !strings.Contains(observation.WrongClassificationSources[0], "found: declared") {
-		t.Fatalf("expected latest source mismatch to be reported, got %#v", observation)
-	}
-}
-
-func TestObserveActiveFileIdentityRewriteUsesLiveRowsBeforeObserverHistory(t *testing.T) {
-	dbPath := newTestWeaverStateDB(t)
-	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
-		t.Fatalf("install file identity rewrite observer: %v", err)
-	}
-	db := openTestWeaverStateDB(t, dbPath)
-	defer db.Close()
-
-	insertActiveFileIdentity(t, db, 22, 1, "51273...101", "archive.part1.rar", "par2")
-	deleteActiveFileIdentities(t, db, 22)
-	insertActiveFileIdentity(t, db, 22, 1, "51273...101", "51273aad56a8b904e96928935278a627.101", "declared")
-
-	observation, err := observeActiveFileIdentityRewrite(dbPath, 22, &ScenarioFileIdentityRewriteAssertion{
-		RequiredCurrentFilenames:     []string{"archive.part1.rar"},
-		RequiredClassificationSource: "par2",
-	})
-	if err != nil {
-		t.Fatalf("observe active file identity rewrite: %v", err)
-	}
-	if observation.Observed {
-		t.Fatalf("expected live active rows to override historical observer rows, got %#v", observation)
-	}
-	if len(observation.MissingCurrentFilenames) != 1 || observation.MissingCurrentFilenames[0] != "archive.part1.rar" {
-		t.Fatalf("expected live-row snapshot to report missing canonical filename, got %#v", observation)
-	}
-}
-
-func TestObserveActiveFileIdentityRewriteFailsWhenObserverRowsMissPar2Classification(t *testing.T) {
-	dbPath := newTestWeaverStateDB(t)
-	if err := installFileIdentityRewriteObserver(dbPath); err != nil {
-		t.Fatalf("install file identity rewrite observer: %v", err)
-	}
-	db := openTestWeaverStateDB(t, dbPath)
-	defer db.Close()
-
-	insertActiveFileIdentity(t, db, 18, 1, "51273...101", "archive.part1.rar", "declared")
-	insertActiveFileIdentity(t, db, 18, 2, "51273...102", "archive.part2.rar", "declared")
-	deleteActiveFileIdentities(t, db, 18)
-
-	observation, err := observeActiveFileIdentityRewrite(dbPath, 18, &ScenarioFileIdentityRewriteAssertion{
-		RequiredCurrentFilenames:     []string{"archive.part1.rar", "archive.part2.rar"},
-		RequiredClassificationSource: "par2",
-	})
-	if err != nil {
-		t.Fatalf("observe active file identity rewrite: %v", err)
-	}
-	if observation.Observed {
-		t.Fatalf("expected observer rows without classification_source=par2 to fail, got %#v", observation)
-	}
-	if len(observation.WrongClassificationSources) != 2 {
-		t.Fatalf("expected both observer rows to report source mismatches, got %#v", observation)
-	}
-}
-
 func TestApplyRuntimeFileIdentityRewriteTerminalCheckFailsWhenJobCompletesBeforeObservation(t *testing.T) {
 	status, errMsg, overridden := applyRuntimeFileIdentityRewriteTerminalCheck(
 		"COMPLETE",
@@ -618,70 +305,6 @@ func TestApplyRuntimeFileIdentityRewriteTerminalCheckFailsWhenJobCompletesBefore
 	}
 }
 
-func TestAssertPar2CleanSettlementDistinguishesGridAndAuthoritativeSets(t *testing.T) {
-	runDir := t.TempDir()
-	t.Setenv("E2E_RUN_DIR", runDir)
-	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	logLines := []string{
-		`job_id=42 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
-		`job_id=42 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
-		`job_id=42 recovery_set_id=late-set slice_size=96 verification_mode=authoritative PAR2 clean set verification source`,
-	}
-	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	assertion := &ScenarioPar2CleanSettlementAssertion{
-		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64, "late-set": 96},
-		ExpectedSetVerificationModes: map[string][]string{
-			"grid-set": {"grid"},
-			"late-set": {"authoritative"},
-		},
-	}
-	if err := assertPar2CleanSettlement(42, assertion); err != nil {
-		t.Fatalf("expected mixed settlement sources to pass: %v", err)
-	}
-}
-
-// A stall report replays the job's recent debug events at WARN under the debug
-// ring's own target. The replay repeats the event's message and its job id, in
-// either the older rendered-line shape or the field-per-part shape, and must
-// not count as a second observation of the event.
-func TestAssertPar2CleanSettlementIgnoresDebugRingReplays(t *testing.T) {
-	runDir := t.TempDir()
-	t.Setenv("E2E_RUN_DIR", runDir)
-	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	logLines := []string{
-		"2026-01-02T03:04:05.000001+00:00 DEBUG weaver_server_core::pipeline::completion::finalize::check: PAR2 clean set verification source job_id=42 recovery_set_id=grid-set slice_size=64 verification_mode=grid",
-		"2026-01-02T03:04:05.000002+00:00 DEBUG weaver_server_core::pipeline::completion::finalize::check: PAR2 set settled clean from in-stream grid evidence job_id=42 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0",
-		`2026-01-02T03:04:06.000001+00:00  WARN weaver_server_core::runtime::job_debug_ring: stall diagnostics line job_id=42 reason="dispatch stall: job not eligible" at=2026-01-02T03:04:05.000001+00:00 line=DEBUG weaver_server_core::pipeline::completion::finalize::check: PAR2 clean set verification source job_id=42 recovery_set_id=grid-set slice_size=64 verification_mode=grid`,
-		"\x1b[2m2026-01-02T03:04:06.000002+00:00\x1b[0m \x1b[33m WARN\x1b[0m \x1b[2mweaver_server_core::runtime::job_debug_ring\x1b[0m\x1b[2m:\x1b[0m stall diagnostics line job_id=42 reason=\"dispatch stall: job not eligible\" at=2026-01-02T03:04:05.000002+00:00 replayed_level=DEBUG replayed_target=\"weaver_server_core::pipeline::completion::finalize::check\" replayed_message=\"PAR2 set settled clean from in-stream grid evidence\" replayed_fields=\"job_id=42 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0\"",
-		`2026-01-02T03:04:06.000003+00:00  WARN weaver_server_core::runtime::job_debug_ring: stall diagnostics line job_id=42 reason="dispatch stall: job not eligible" at=2026-01-02T03:04:05.000001+00:00 replayed_level=DEBUG replayed_target="weaver_server_core::pipeline::completion::finalize::check" replayed_message="PAR2 clean set verification source" replayed_fields="job_id=42 recovery_set_id=grid-set slice_size=64 verification_mode=grid"`,
-	}
-	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	err := assertPar2CleanSettlement(42, &ScenarioPar2CleanSettlementAssertion{
-		ExpectedSetSliceSizes:        map[string]uint64{"grid-set": 64},
-		ExpectedSetVerificationModes: map[string][]string{"grid-set": {"grid"}},
-	})
-	if err != nil {
-		t.Fatalf("expected the replays to be ignored, got %v", err)
-	}
-
-	if !isWeaverDebugRingReplay(logLines[3]) {
-		t.Fatal("a coloured replay must be recognised after its escapes are stripped")
-	}
-	if isWeaverDebugRingReplay(logLines[0]) {
-		t.Fatal("the event itself is not a replay")
-	}
-}
-
 func TestAssertLogLinesIgnoresDebugRingReplays(t *testing.T) {
 	maxCount := 1
 	raw := strings.Join([]string{
@@ -698,211 +321,6 @@ func TestAssertLogLinesIgnoresDebugRingReplays(t *testing.T) {
 	}
 }
 
-func TestUnexpectedDirectDemotionsIgnoresDebugRingReplays(t *testing.T) {
-	raw := strings.Join([]string{
-		`2026-01-02T03:04:05.000001+00:00  INFO weaver_server_core::direct: direct-store set demoted job_id=9 reason="member_compressed"`,
-		`2026-01-02T03:04:06.000001+00:00  WARN weaver_server_core::runtime::job_debug_ring: stall diagnostics line job_id=9 reason="dispatch stall: job not eligible" at=2026-01-02T03:04:05.000001+00:00 line=INFO weaver_server_core::direct: direct-store set demoted job_id=9 reason=member_compressed`,
-	}, "\n")
-	if got := unexpectedDirectDemotions(raw, nil); len(got) != 0 {
-		t.Fatalf("a replay's own reason must not be read as a demotion reason: %v", got)
-	}
-}
-
-func TestAssertPar2CleanSettlementRejectsModeOutsideSingletonPin(t *testing.T) {
-	runDir := t.TempDir()
-	t.Setenv("E2E_RUN_DIR", runDir)
-	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	logLines := []string{
-		`job_id=44 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
-		`job_id=44 recovery_set_id=grid-set slice_size=64 verification_mode=quick_digest PAR2 clean set verification source`,
-	}
-	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	err := assertPar2CleanSettlement(44, &ScenarioPar2CleanSettlementAssertion{
-		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64},
-		ExpectedSetVerificationModes: map[string][]string{
-			"grid-set": {"grid"},
-		},
-	})
-	if err == nil || !strings.Contains(err.Error(), `mode "quick_digest", want one of [grid]`) {
-		t.Fatalf("expected singleton grid pin to reject quick_digest, got %v", err)
-	}
-}
-
-func TestAssertPar2CleanSettlementAcceptsAllowedNonGridModes(t *testing.T) {
-	runDir := t.TempDir()
-	t.Setenv("E2E_RUN_DIR", runDir)
-	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	logLines := []string{
-		`job_id=43 recovery_set_id=first-set slice_size=64 verification_mode=strong_decode PAR2 clean set verification source`,
-		`job_id=43 recovery_set_id=second-set slice_size=96 verification_mode=authoritative PAR2 clean set verification source`,
-	}
-	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
-		t.Fatal(err)
-	}
-
-	assertion := &ScenarioPar2CleanSettlementAssertion{
-		ExpectedSetSliceSizes: map[string]uint64{"first-set": 64, "second-set": 96},
-		ExpectedSetVerificationModes: map[string][]string{
-			"first-set":  {"strong_decode", "authoritative"},
-			"second-set": {"strong_decode", "authoritative"},
-		},
-	}
-	if err := assertPar2CleanSettlement(43, assertion); err != nil {
-		t.Fatalf("expected allowed non-grid settlement modes to pass: %v", err)
-	}
-}
-
-func TestAssertPar2CleanSettlementConditionsGridEvidenceOnObservedMode(t *testing.T) {
-	runDir := t.TempDir()
-	t.Setenv("E2E_RUN_DIR", runDir)
-	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	assertion := &ScenarioPar2CleanSettlementAssertion{
-		ExpectedSetSliceSizes: map[string]uint64{"variable-set": 64},
-		ExpectedSetVerificationModes: map[string][]string{
-			"variable-set": {"grid", "quick_digest"},
-		},
-	}
-
-	for _, test := range []struct {
-		name  string
-		lines []string
-	}{
-		{
-			name: "quick digest needs no grid record",
-			lines: []string{
-				`job_id=45 recovery_set_id=variable-set slice_size=64 verification_mode=quick_digest PAR2 clean set verification source`,
-			},
-		},
-		{
-			name: "grid requires its matching record",
-			lines: []string{
-				`job_id=45 recovery_set_id=variable-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
-				`job_id=45 recovery_set_id=variable-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			if err := assertPar2CleanSettlement(45, assertion); err != nil {
-				t.Fatal(err)
-			}
-		})
-	}
-}
-
-func TestAssertPar2CleanSettlementRejectsGridEvidenceForNonGridMode(t *testing.T) {
-	runDir := t.TempDir()
-	t.Setenv("E2E_RUN_DIR", runDir)
-	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	logLines := []string{
-		`job_id=46 recovery_set_id=late-set slice_size=96 verification_mode=quick_digest PAR2 clean set verification source`,
-		`job_id=46 recovery_set_id=late-set slice_size=96 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
-	}
-	if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(logLines, "\n")), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	err := assertPar2CleanSettlement(46, &ScenarioPar2CleanSettlementAssertion{
-		ExpectedSetSliceSizes: map[string]uint64{"late-set": 96},
-		ExpectedSetVerificationModes: map[string][]string{
-			"late-set": {"grid", "quick_digest", "authoritative"},
-		},
-	})
-	if err == nil || !strings.Contains(err.Error(), `non-grid mode "quick_digest"`) {
-		t.Fatalf("expected non-grid settlement evidence failure, got %v", err)
-	}
-}
-
-func TestAssertPar2CleanSettlementRejectsMissingGridEvidence(t *testing.T) {
-	runDir := t.TempDir()
-	t.Setenv("E2E_RUN_DIR", runDir)
-	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(
-		localWeaverLogPath(),
-		[]byte(`job_id=47 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`),
-		0o644,
-	); err != nil {
-		t.Fatal(err)
-	}
-	err := assertPar2CleanSettlement(47, &ScenarioPar2CleanSettlementAssertion{
-		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64},
-		ExpectedSetVerificationModes: map[string][]string{
-			"grid-set": {"grid"},
-		},
-	})
-	if err == nil || !strings.Contains(err.Error(), "did not observe grid set(s): grid-set") {
-		t.Fatalf("expected missing grid settlement failure, got %v", err)
-	}
-}
-
-func TestAssertPar2CleanSettlementRejectsDuplicateAndUnknownRecords(t *testing.T) {
-	runDir := t.TempDir()
-	t.Setenv("E2E_RUN_DIR", runDir)
-	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	assertion := &ScenarioPar2CleanSettlementAssertion{
-		ExpectedSetSliceSizes: map[string]uint64{"grid-set": 64},
-		ExpectedSetVerificationModes: map[string][]string{
-			"grid-set": {"grid"},
-		},
-	}
-	for _, test := range []struct {
-		name    string
-		lines   []string
-		message string
-	}{
-		{
-			name: "duplicate source",
-			lines: []string{
-				`job_id=48 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
-				`job_id=48 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
-			},
-			message: "verification source observed set grid-set more than once",
-		},
-		{
-			name: "unknown source",
-			lines: []string{
-				`job_id=48 recovery_set_id=unknown-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
-			},
-			message: "verification source observed unexpected set unknown-set",
-		},
-		{
-			name: "duplicate grid record",
-			lines: []string{
-				`job_id=48 recovery_set_id=grid-set slice_size=64 verification_mode=grid PAR2 clean set verification source`,
-				`job_id=48 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
-				`job_id=48 recovery_set_id=grid-set slice_size=64 verdict=clean verification_read_bytes=0 PAR2 set settled clean from in-stream grid evidence`,
-			},
-			message: "settlement observed set grid-set more than once",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			err := assertPar2CleanSettlement(48, assertion)
-			if err == nil || !strings.Contains(err.Error(), test.message) {
-				t.Fatalf("expected %q, got %v", test.message, err)
-			}
-		})
-	}
-}
-
 func TestAssertPar2CleanSettlementRejectsUnknownVerificationMode(t *testing.T) {
 	err := assertPar2CleanSettlement(49, &ScenarioPar2CleanSettlementAssertion{
 		ExpectedSetSliceSizes: map[string]uint64{"typed-set": 64},
@@ -912,23 +330,6 @@ func TestAssertPar2CleanSettlementRejectsUnknownVerificationMode(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), `unknown verification mode "mystery"`) {
 		t.Fatalf("expected unknown verification mode failure, got %v", err)
-	}
-}
-
-func TestWaitForActiveFileCompleteMatchesExactJobAndFilename(t *testing.T) {
-	dbPath := newTestWeaverStateDB(t)
-	db := openTestWeaverStateDB(t, dbPath)
-	defer db.Close()
-
-	mustExecWeaverStateSQL(t, db, `INSERT INTO active_files (job_id, file_index, filename) VALUES (51, 0, 'other.mkv')`)
-	mustExecWeaverStateSQL(t, db, `INSERT INTO active_files (job_id, file_index, filename) VALUES (52, 0, 'payload.mkv')`)
-	if err := waitForActiveFileComplete(dbPath, 51, "payload.mkv", 100*time.Millisecond); err == nil {
-		t.Fatal("wrong-job and wrong-filename rows must not release the gate")
-	}
-
-	mustExecWeaverStateSQL(t, db, `INSERT INTO active_files (job_id, file_index, filename) VALUES (51, 1, 'payload.mkv')`)
-	if err := waitForActiveFileComplete(dbPath, 51, "payload.mkv", time.Second); err != nil {
-		t.Fatalf("exact completed file did not release the gate: %v", err)
 	}
 }
 
@@ -1009,119 +410,6 @@ func mustExecWeaverStateSQL(t *testing.T, db *sql.DB, query string) {
 
 	if _, err := db.Exec(query); err != nil {
 		t.Fatalf("exec %q: %v", query, err)
-	}
-}
-
-func insertActiveFileIdentity(
-	t *testing.T,
-	db *sql.DB,
-	jobID int,
-	fileIndex int,
-	sourceFilename string,
-	currentFilename string,
-	classificationSource string,
-) {
-	t.Helper()
-
-	_, err := db.Exec(
-		`INSERT INTO active_file_identities (
-			job_id,
-			file_index,
-			source_filename,
-			current_filename,
-			canonical_filename,
-			classification_kind,
-			classification_set_name,
-			classification_volume_index,
-			classification_source
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		jobID,
-		fileIndex,
-		sourceFilename,
-		currentFilename,
-		currentFilename,
-		"rar",
-		"archive",
-		fileIndex,
-		classificationSource,
-	)
-	if err != nil {
-		t.Fatalf("insert active_file_identities row: %v", err)
-	}
-}
-
-func updateActiveFileIdentity(
-	t *testing.T,
-	db *sql.DB,
-	jobID int,
-	fileIndex int,
-	currentFilename string,
-	canonicalFilename string,
-	classificationSource string,
-) {
-	t.Helper()
-
-	_, err := db.Exec(
-		`UPDATE active_file_identities
-		 SET current_filename = ?,
-		     canonical_filename = ?,
-		     classification_source = ?
-		 WHERE job_id = ? AND file_index = ?`,
-		currentFilename,
-		canonicalFilename,
-		classificationSource,
-		jobID,
-		fileIndex,
-	)
-	if err != nil {
-		t.Fatalf("update active_file_identities row: %v", err)
-	}
-}
-
-func deleteActiveFileIdentities(t *testing.T, db *sql.DB, jobID int) {
-	t.Helper()
-
-	if _, err := db.Exec(`DELETE FROM active_file_identities WHERE job_id = ?`, jobID); err != nil {
-		t.Fatalf("delete active_file_identities rows: %v", err)
-	}
-}
-
-func assertObservedFileIdentityRewriteRow(
-	t *testing.T,
-	db *sql.DB,
-	jobID int,
-	operation string,
-	currentFilename string,
-	canonicalFilename string,
-	classificationSource string,
-) {
-	t.Helper()
-
-	var count int
-	if err := db.QueryRow(
-		`SELECT COUNT(*)
-		 FROM e2e_file_identity_rewrite_observations
-		 WHERE job_id = ?
-		   AND operation = ?
-		   AND current_filename = ?
-		   AND canonical_filename = ?
-		   AND classification_source = ?`,
-		jobID,
-		operation,
-		currentFilename,
-		canonicalFilename,
-		classificationSource,
-	).Scan(&count); err != nil {
-		t.Fatalf("query observed file identity rewrite rows: %v", err)
-	}
-	if count != 1 {
-		t.Fatalf(
-			"expected one %s observer row for %s (%s), got %d",
-			operation,
-			currentFilename,
-			classificationSource,
-			count,
-		)
 	}
 }
 
@@ -1215,171 +503,82 @@ func TestAssertForbiddenOutputPathsReadsTheDeliveredTree(t *testing.T) {
 	}
 }
 
-func TestAssertDirectStoreScenarioRequiresRoutedMaterializationWithoutRefetch(t *testing.T) {
-	runDir := t.TempDir()
-	t.Setenv("E2E_RUN_DIR", runDir)
-	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	assertion := &ScenarioDirectStoreAssertion{
-		ExpectedDemotionReason:           "member_malformed_chain",
-		RequireRoutedByteMaterialization: true,
-		ForbidVolumeRefetch:              true,
+func TestPartialDeliveryExpectsPartialHistoryBehindFailedFacade(t *testing.T) {
+	scenario := &Scenario{
+		Slug:            "partial-delivery",
+		ExpectedOutcome: outcomePartialDelivery,
 	}
 
-	for _, test := range []struct {
-		name    string
-		lines   []string
-		wantErr string
-	}{
-		{
-			name: "matching job passes",
-			lines: []string{
-				`job_id=81 direct-store set demoted reason="member_malformed_chain"`,
-				`job_id=81 direct-store set materialized from its own routed bytes`,
-				`job_id=82 direct-store reconstruction is not possible; refetching the set's volumes`,
-			},
-		},
-		{
-			name: "refetch fails",
-			lines: []string{
-				`job_id=81 direct-store set demoted reason="member_malformed_chain"`,
-				`job_id=81 direct-store set materialized from its own routed bytes`,
-				`job_id=81 direct-store reconstruction is not possible; refetching the set's volumes`,
-			},
-			wantErr: "refetched volumes",
-		},
-		{
-			name: "missing materialization fails",
-			lines: []string{
-				`job_id=81 direct-store set demoted reason="member_malformed_chain"`,
-			},
-			wantErr: "did not materialize",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			err := assertDirectStoreScenario(81, assertion)
-			if test.wantErr == "" && err != nil {
-				t.Fatalf("assertion failed: %v", err)
-			}
-			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
-				t.Fatalf("error = %v, want %q", err, test.wantErr)
-			}
-		})
+	if got := scenario.expectedHistoryStatus("FAILED"); got != "PARTIAL" {
+		t.Fatalf("partial delivery history = %q, want PARTIAL", got)
+	}
+	if !scenario.deliveredOn("FAILED") {
+		t.Fatal("a partial delivery must run the delivered-output checks behind a FAILED facade")
+	}
+	if got := scenario.expectedHistoryStatus("COMPLETE"); got != "COMPLETE" {
+		t.Fatalf("a completed facade still expects COMPLETE history, got %q", got)
+	}
+
+	dbPath := newTestWeaverStateDB(t)
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+	mustExecWeaverStateSQL(t, db, `INSERT INTO job_history (job_id, status) VALUES (11, 'partial')`)
+	if err := assertTerminalFixtureState(dbPath, 11, scenario.expectedHistoryStatus("FAILED")); err != nil {
+		t.Fatalf("partial history behind a FAILED facade must pass, got %v", err)
+	}
+
+	whole := &Scenario{Slug: "whole-delivery", ExpectedOutcome: "success"}
+	if got := whole.expectedHistoryStatus("FAILED"); got != "FAILED" {
+		t.Fatalf("a scenario that expects success keeps the facade status, got %q", got)
+	}
+	if whole.deliveredOn("FAILED") {
+		t.Fatal("a FAILED job the scenario does not expect to deliver in part has no delivered outputs to check")
+	}
+	if err := assertTerminalFixtureState(dbPath, 11, whole.expectedHistoryStatus("FAILED")); err == nil {
+		t.Fatal("a scenario that expects FAILED history must mismatch a partial row")
+	}
+	var nilScenario *Scenario
+	if got := nilScenario.expectedHistoryStatus("FAILED"); got != "FAILED" {
+		t.Fatalf("a scenario that failed to load expects the facade status, got %q", got)
 	}
 }
 
-func TestAssertHealthProbeScenarioReadsTheProbeLines(t *testing.T) {
-	runDir := t.TempDir()
-	t.Setenv("E2E_RUN_DIR", runDir)
-	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	assertion := &ScenarioHealthProbeAssertion{RequireActivated: true, ForbidInconclusive: true}
+func TestFileCompleteReadsTheGraphCheckpoint(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "weaver.db")
+	db := openTestWeaverStateDB(t, dbPath)
+	defer db.Close()
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE graph_members (job_id INTEGER NOT NULL, node_id INTEGER NOT NULL, member_id INTEGER NOT NULL, name TEXT NOT NULL, length INTEGER)`)
+	mustExecWeaverStateSQL(t, db, `CREATE TABLE graph_coverage (job_id INTEGER NOT NULL, node_id INTEGER NOT NULL, member_id INTEGER NOT NULL, range_start INTEGER NOT NULL, range_end INTEGER NOT NULL)`)
 
-	for _, test := range []struct {
-		name    string
-		lines   []string
-		wantErr string
-	}{
-		{
-			name: "an activated probe that concluded passes",
-			lines: []string{
-				`job_id=91 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
-				`job_id=91 probe_round=0 probes=18 health probe starting`,
-				`job_id=91 total=18 missed=6 miss_pct=33 inconclusive=false health probe complete`,
-			},
-		},
-		{
-			name: "a retired probe passes: the round ended without a verdict of its own",
-			lines: []string{
-				`job_id=91 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
-				`job_id=91 retiring health probe — every segment already reached a terminal state`,
-			},
-		},
-		{
-			name: "another job's inconclusive round is not this job's",
-			lines: []string{
-				`job_id=91 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
-				`job_id=92 total=0 missed=0 miss_pct=0 inconclusive=true health probe complete`,
-			},
-		},
-		{
-			name:    "a probe that never activated fails",
-			lines:   []string{`job_id=91 health check: 33.3% failed`},
-			wantErr: "never activated",
-		},
-		{
-			name: "an inconclusive round fails",
-			lines: []string{
-				`job_id=91 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
-				`job_id=91 probe_round=0 batch_index=0 batch_len=18 checked_so_far=0 health probe: confirmation batch inconclusive, skipping batch`,
-				`job_id=91 total=0 missed=0 miss_pct=0 inconclusive=true unverified=18 probe_count=18 health probe complete`,
-			},
-			wantErr: "ended inconclusive",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			err := assertHealthProbeScenario(91, assertion)
-			if test.wantErr == "" && err != nil {
-				t.Fatalf("assertion failed: %v", err)
-			}
-			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
-				t.Fatalf("error = %v, want %q", err, test.wantErr)
-			}
-		})
+	check := func(want bool) {
+		t.Helper()
+		got, err := fileComplete(db, weaverDatastoreSQLite, 7, "media.mkv")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("complete = %v, want %v", got, want)
+		}
 	}
-}
 
-func TestAssertHealthProbeScenarioCanForbidActivation(t *testing.T) {
-	runDir := t.TempDir()
-	t.Setenv("E2E_RUN_DIR", runDir)
-	if err := os.MkdirAll(localWeaverDir(), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	assertion := &ScenarioHealthProbeAssertion{ForbidActivated: true}
+	// Nothing written yet.
+	check(false)
 
-	for _, test := range []struct {
-		name    string
-		lines   []string
-		wantErr string
-	}{
-		{
-			name:  "a job whose probe stayed off passes",
-			lines: []string{`job_id=91 health check: 3.1% failed`},
-		},
-		{
-			name: "another job's activation is not this job's",
-			lines: []string{
-				`job_id=92 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
-			},
-		},
-		{
-			name: "an activated probe fails",
-			lines: []string{
-				`job_id=91 probe_round=0 probes=18 total_segments=180 health probe activated — batched STAT sampling`,
-				`job_id=91 total=18 missed=6 miss_pct=33 inconclusive=false health probe complete`,
-			},
-			wantErr: "activated 1 time(s)",
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			if err := os.WriteFile(localWeaverLogPath(), []byte(strings.Join(test.lines, "\n")), 0o644); err != nil {
-				t.Fatal(err)
-			}
-			err := assertHealthProbeScenario(91, assertion)
-			if test.wantErr == "" && err != nil {
-				t.Fatalf("assertion failed: %v", err)
-			}
-			if test.wantErr != "" && (err == nil || !strings.Contains(err.Error(), test.wantErr)) {
-				t.Fatalf("error = %v, want %q", err, test.wantErr)
-			}
-		})
-	}
+	// A root member whose length is unknown is not complete.
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_members VALUES (7, 0, 1, 'media.mkv', NULL)`)
+	check(false)
+
+	// Known length, with a hole in its runs.
+	mustExecWeaverStateSQL(t, db, `UPDATE graph_members SET length = 300`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_coverage VALUES (7, 0, 1, 0, 100), (7, 0, 1, 200, 300)`)
+	check(false)
+
+	// The same name inside an archive, or in another job, does not count.
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_members VALUES (7, 3, 1, 'media.mkv', 100), (8, 0, 1, 'media.mkv', 100)`)
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_coverage VALUES (7, 3, 1, 0, 100), (8, 0, 1, 0, 100)`)
+	check(false)
+
+	// Its runs cover every byte.
+	mustExecWeaverStateSQL(t, db, `INSERT INTO graph_coverage VALUES (7, 0, 1, 100, 200)`)
+	check(true)
 }

@@ -129,14 +129,18 @@ func cmdSubmit(slug string) {
 				errMsg = "unknown"
 			}
 			log.Printf("job %d FAILED: %s", jobID, errMsg)
-			if scenario.ExpectedOutcome == "health_failure" {
-				expected := scenario.ExpectedErrorContains
+			if scenario.expectedOutcome() == "health_failure" {
+				expected := scenario.expectedErrorContains()
 				if expected != "" &&
 					!strings.Contains(strings.ToLower(errMsg), strings.ToLower(expected)) {
 					log.Printf("expected the failure to mention %q, got %q", expected, errMsg)
 					os.Exit(1)
 				}
 				log.Printf("(failure was expected for this scenario)")
+				return
+			}
+			if scenario.expectedOutcome() == outcomePartialDelivery {
+				log.Printf("(partial delivery was expected for this scenario)")
 				return
 			}
 			os.Exit(1)

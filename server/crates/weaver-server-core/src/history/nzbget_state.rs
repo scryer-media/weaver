@@ -11,7 +11,7 @@ use crate::StateError;
 use crate::history::HistoryFailureKind;
 use crate::jobs::{FieldUpdate, JobUpdate};
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NzbgetHistoryState {
@@ -82,40 +82,37 @@ impl Database {
     ) -> Result<bool, StateError> {
         let job_id = i64::try_from(job_id)
             .map_err(|_| StateError::Database("job id is too large".into()))?;
-        let mut update = update.clone();
-        if let Some(name) = &update.name {
-            let mut metadata = match &update.metadata {
-                FieldUpdate::Set(metadata) => metadata.clone(),
-                FieldUpdate::Clear => Vec::new(),
-                FieldUpdate::Unchanged => self
-                    .get_job_history(job_id as u64)?
-                    .map(|row| crate::history::parse_history_metadata(row.metadata.as_deref()))
-                    .unwrap_or_default(),
-            };
-            crate::ingest::set_renamed_title(&mut metadata, name);
-            update.metadata = FieldUpdate::Set(metadata);
-        }
-        let metadata = match &update.metadata {
-            FieldUpdate::Unchanged => None,
-            FieldUpdate::Clear => Some(None),
-            FieldUpdate::Set(metadata) => Some(crate::jobs::persistence::metadata_json(metadata)?),
-        };
+        let update = update.clone();
         let datastore = self.datastore();
         let found = self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "update_job_history_fields", |tx| {
                 let update = update.clone();
-                let metadata = metadata.clone();
                 Box::pin(async move {
-                    let found = tx
-                        .fetch_optional(
-                            "SELECT job_id FROM job_history WHERE job_id = {}",
-                            &[SqlArg::I64(job_id)],
-                        )
-                        .await?
-                        .is_some();
-                    if !found {
+                    let lookup = match tx {
+                        SqlTx::Postgres(_) => {
+                            "SELECT metadata FROM job_history WHERE job_id = {} FOR UPDATE"
+                        }
+                        SqlTx::Sqlite(_) => "SELECT metadata FROM job_history WHERE job_id = {}",
+                    };
+                    let row = tx.fetch_optional(lookup, &[SqlArg::I64(job_id)]).await?;
+                    let Some(row) = row else {
                         return Ok(false);
-                    }
+                    };
+                    let metadata = if !update.metadata.is_unchanged()
+                        || !update.metadata_edits.is_empty()
+                        || update.name.is_some()
+                    {
+                        let mut metadata = crate::history::parse_history_metadata(
+                            row.opt_text("metadata")?.as_deref(),
+                        );
+                        update.apply_to_metadata(&mut metadata);
+                        if let Some(name) = &update.name {
+                            crate::ingest::set_renamed_title(&mut metadata, name);
+                        }
+                        Some(crate::jobs::persistence::metadata_json(&metadata)?)
+                    } else {
+                        None
+                    };
                     if let Some(name) = update.name {
                         tx.execute(
                             "UPDATE job_history SET name = {} WHERE job_id = {}",
@@ -246,5 +243,145 @@ impl Database {
             }
             Ok(states)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn database_with_history() -> Database {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_history(&crate::JobHistoryRow {
+            job_id: 41,
+            job_hash: None,
+            name: "history fixture".into(),
+            status: "complete".into(),
+            error_message: None,
+            total_bytes: 100,
+            downloaded_bytes: 100,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1000,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1,
+            completed_at: 2,
+            metadata: Some(
+                serde_json::to_string(&[
+                    ("priority", "NORMAL"),
+                    ("obsolete", "remove me"),
+                    ("untouched", "original"),
+                ])
+                .unwrap(),
+            ),
+            server_attribution: None,
+        })
+        .unwrap();
+        db
+    }
+
+    #[test]
+    fn history_metadata_edits_and_rename_preserve_intervening_updates() {
+        let db = database_with_history();
+        // Warm the row cache before either edit; both updates invalidate it.
+        db.get_job_history(41).unwrap().unwrap();
+        let update = JobUpdate {
+            metadata_edits: vec![
+                ("PRIORITY".into(), Some("HIGH".into())),
+                ("OBSOLETE".into(), None),
+            ],
+            name: Some("renamed history".into()),
+            ..Default::default()
+        };
+        db.update_job_history_fields(
+            41,
+            &JobUpdate {
+                metadata_edits: vec![("later".into(), Some("other client".into()))],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        db.update_job_history_fields(41, &update).unwrap();
+
+        let row = db.get_job_history(41).unwrap().unwrap();
+        assert_eq!(row.name, "renamed history");
+        let metadata = crate::history::parse_history_metadata(row.metadata.as_deref());
+        assert!(metadata.contains(&("untouched".into(), "original".into())));
+        assert!(metadata.contains(&("later".into(), "other client".into())));
+        assert!(metadata.contains(&("PRIORITY".into(), "HIGH".into())));
+        assert_eq!(
+            metadata
+                .iter()
+                .filter(|(key, _)| key.eq_ignore_ascii_case("priority"))
+                .count(),
+            1
+        );
+        assert!(
+            !metadata
+                .iter()
+                .any(|(key, _)| key.eq_ignore_ascii_case("obsolete"))
+        );
+        assert_eq!(
+            crate::ingest::renamed_title(&metadata),
+            Some("renamed history")
+        );
+    }
+
+    #[test]
+    fn history_rename_only_and_metadata_replacement_keep_their_semantics() {
+        let db = database_with_history();
+        db.update_job_history_fields(
+            41,
+            &JobUpdate {
+                name: Some("rename only".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let row = db.get_job_history(41).unwrap().unwrap();
+        let metadata = crate::history::parse_history_metadata(row.metadata.as_deref());
+        assert!(metadata.contains(&("untouched".into(), "original".into())));
+        assert_eq!(crate::ingest::renamed_title(&metadata), Some("rename only"));
+
+        db.update_job_history_fields(
+            41,
+            &JobUpdate {
+                metadata: FieldUpdate::Set(vec![("replacement".into(), "initial".into())]),
+                metadata_edits: vec![("REPLACEMENT".into(), Some("final".into()))],
+                name: Some("replacement title".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let row = db.get_job_history(41).unwrap().unwrap();
+        let metadata = crate::history::parse_history_metadata(row.metadata.as_deref());
+        assert_eq!(metadata.len(), 2);
+        assert!(metadata.contains(&("REPLACEMENT".into(), "final".into())));
+        assert_eq!(
+            crate::ingest::renamed_title(&metadata),
+            Some("replacement title")
+        );
+
+        db.update_job_history_fields(
+            41,
+            &JobUpdate {
+                metadata: FieldUpdate::Clear,
+                metadata_edits: vec![("after-clear".into(), Some("value".into()))],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let row = db.get_job_history(41).unwrap().unwrap();
+        assert_eq!(
+            crate::history::parse_history_metadata(row.metadata.as_deref()),
+            vec![("after-clear".into(), "value".into())]
+        );
+        assert!(
+            !db.update_job_history_fields(42, &JobUpdate::default())
+                .unwrap()
+        );
     }
 }

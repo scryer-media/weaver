@@ -9,6 +9,7 @@ import {
   UPDATE_SECRET_MUTATION,
 } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { testIds } from "@/next/testids";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
 import { RecordEditor } from "../../../components/RecordEditor";
 import { NEW_SECRET, secretChange, type Secret, type SecretForm } from "../../../data/secrets";
@@ -130,9 +131,9 @@ export function SecretEditor({
   return (
     <>
       <RecordEditor
+        testId={testIds.dialog("secret")}
         open
         title={editing ? editing.name : t("next.secrets.add")}
-        note={editing ? t("next.secrets.editNote") : t("next.secrets.newNote")}
         error={error}
         busy={busy}
         onSave={() => checked(save)}
@@ -179,6 +180,7 @@ export function SecretEditor({
         ]}
       />
       <ConfirmDialog
+        testId={testIds.dialog("secret-delete")}
         open={confirmDelete}
         title={t("next.secrets.delete")}
         note={editing?.name}

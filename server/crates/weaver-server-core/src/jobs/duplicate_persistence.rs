@@ -15,7 +15,7 @@ use crate::jobs::duplicate::{
 };
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_tx};
 use crate::settings::persistence::reserve_next_job_id_tx;
 
 const RESERVATION_TTL_SECONDS: i64 = 5 * 60;
@@ -254,7 +254,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE duplicate_job_snapshots
                  SET lifecycle = {}, updated_at = {}
                  WHERE job_id = {}",
@@ -364,7 +364,9 @@ impl Database {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
                 "SELECT c.job_id, c.group_id, g.normalized_key, c.score, c.candidate_state,
-                        c.source_nzb_zstd, c.terminal_cause, c.promotion_state
+                        CASE WHEN length(c.source_nzb_zstd) > 0 THEN 1 ELSE 0 END
+                            AS source_stored,
+                        c.terminal_cause, c.promotion_state
                  FROM semantic_duplicate_candidates AS c
                  INNER JOIN semantic_duplicate_groups AS g ON g.group_id = c.group_id
                  WHERE c.job_id = {}",
@@ -385,10 +387,7 @@ impl Database {
                     normalized_key: row.text("normalized_key")?,
                     score: row.i64("score")?,
                     state,
-                    source_stored: row
-                        .bytes("source_nzb_zstd")
-                        .map(|bytes| !bytes.is_empty())
-                        .unwrap_or(false),
+                    source_stored: row.i64("source_stored")? != 0,
                     terminal_cause: row
                         .opt_text("terminal_cause")?
                         .as_deref()
@@ -406,8 +405,12 @@ impl Database {
         })
     }
 
-    // Loads at most 256 requested duplicate summaries with one bounded query
-    // on both SQLite and PostgreSQL. Missing identities are omitted.
+    // Loads at most 256 requested duplicate summaries on both SQLite and
+    // PostgreSQL with two bounded queries: one row per job for the snapshot
+    // and its semantic candidate, then the jobs' fingerprints. The candidate's
+    // stored source is read only by length, so the compressed NZB that sits in
+    // the same row is never read, and the candidate row is read once per job
+    // rather than once per fingerprint. Missing identities are omitted.
     pub fn duplicate_summaries(
         &self,
         job_ids: &[JobId],
@@ -429,26 +432,31 @@ impl Database {
             .iter()
             .map(|job_id| SqlArg::I64(job_id.0 as i64))
             .collect::<Vec<_>>();
-        let query = format!(
+        let summary_query = format!(
             "SELECT s.job_id, s.lifecycle, s.normalized_name, s.admission_action,
                     s.admission_reason, s.created_at,
                     s.updated_at, s.reservation_expires_at,
-                    f.fingerprint_kind, f.fingerprint_version, f.fingerprint_digest,
                     c.group_id AS semantic_group_id, g.normalized_key AS semantic_normalized_key,
                     c.score AS semantic_score, c.candidate_state AS semantic_candidate_state,
-                    c.source_nzb_zstd AS semantic_source_nzb_zstd,
+                    CASE WHEN length(c.source_nzb_zstd) > 0 THEN 1 ELSE 0 END
+                        AS semantic_source_stored,
                     c.terminal_cause AS semantic_terminal_cause,
                     c.promotion_state AS semantic_promotion_state
              FROM duplicate_job_snapshots AS s
-             LEFT JOIN job_fingerprints AS f ON f.job_id = s.job_id
              LEFT JOIN semantic_duplicate_candidates AS c ON c.job_id = s.job_id
              LEFT JOIN semantic_duplicate_groups AS g ON g.group_id = c.group_id
              WHERE s.job_id IN ({placeholders})
-             ORDER BY s.job_id ASC, f.fingerprint_kind ASC, f.fingerprint_version ASC"
+             ORDER BY s.job_id ASC"
+        );
+        let fingerprint_query = format!(
+            "SELECT job_id, fingerprint_kind, fingerprint_version, fingerprint_digest
+             FROM job_fingerprints
+             WHERE job_id IN ({placeholders})
+             ORDER BY job_id ASC, fingerprint_kind ASC, fingerprint_version ASC"
         );
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &query, &args).await?;
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &summary_query, &args).await?;
             let mut summaries = BTreeMap::new();
             for row in rows {
                 let job_id = JobId(row.i64("job_id")? as u64);
@@ -468,32 +476,41 @@ impl Database {
                     }
                     None => None,
                 };
-                let entry = summaries
-                    .entry(job_id)
-                    .or_insert_with(|| DuplicateJobSummary {
+                let semantic = match row.opt_text("semantic_candidate_state")? {
+                    Some(_) => Some(semantic_snapshot_from_summary_row(&row)?),
+                    None => None,
+                };
+                summaries.insert(
+                    job_id,
+                    DuplicateJobSummary {
                         snapshot,
                         admission_action,
                         admission_reason,
                         fingerprints: Vec::new(),
-                        semantic: None,
-                    });
-                if let Some(kind) = row.opt_text("fingerprint_kind")? {
-                    let kind = FingerprintKind::from_persisted(&kind).ok_or_else(|| {
-                        StateError::Database("invalid duplicate fingerprint kind".to_string())
-                    })?;
-                    let digest = row.bytes("fingerprint_digest")?;
-                    let digest = digest.try_into().map_err(|_| {
-                        StateError::Database("invalid duplicate fingerprint digest".to_string())
-                    })?;
-                    entry.fingerprints.push(JobFingerprint {
-                        kind,
-                        version: row.i64("fingerprint_version")? as u16,
-                        digest,
-                    });
-                }
-                if entry.semantic.is_none() && row.opt_text("semantic_candidate_state")?.is_some() {
-                    entry.semantic = Some(semantic_snapshot_from_summary_row(&row)?);
-                }
+                        semantic,
+                    },
+                );
+            }
+            let rows =
+                SqlRuntime::fetch_all(datastore.read_exec(), &fingerprint_query, &args).await?;
+            for row in rows {
+                let job_id = JobId(row.i64("job_id")? as u64);
+                let Some(entry) = summaries.get_mut(&job_id) else {
+                    continue;
+                };
+                let kind = row.text("fingerprint_kind")?;
+                let kind = FingerprintKind::from_persisted(&kind).ok_or_else(|| {
+                    StateError::Database("invalid duplicate fingerprint kind".to_string())
+                })?;
+                let digest = row.bytes("fingerprint_digest")?;
+                let digest = digest.try_into().map_err(|_| {
+                    StateError::Database("invalid duplicate fingerprint digest".to_string())
+                })?;
+                entry.fingerprints.push(JobFingerprint {
+                    kind,
+                    version: row.i64("fingerprint_version")? as u16,
+                    digest,
+                });
             }
             for summary in summaries.values_mut() {
                 summary.fingerprints.sort();
@@ -572,7 +589,7 @@ impl Database {
         let now = epoch_seconds();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE semantic_duplicate_candidates
                  SET candidate_state = {}, terminal_cause = {}, promotion_state = {},
                      promotion_claimed_at = NULL, updated_at = {}
@@ -599,7 +616,7 @@ impl Database {
         let now = epoch_seconds();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "UPDATE semantic_duplicate_candidates
                  SET candidate_state = {}, terminal_cause = NULL, promotion_state = {},
                      promotion_claimed_at = NULL, updated_at = {}
@@ -1033,7 +1050,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
-                datastore.read_exec(),
+                datastore.write_exec(),
                 "INSERT INTO duplicate_backfill_state
                     (backfill_key, cursor_job_id, completed_at, updated_at)
                  VALUES ({}, {}, {}, {})
@@ -1337,7 +1354,8 @@ pub(crate) async fn transition_duplicate_snapshot_for_history_tx(
 ) -> Result<(), StateError> {
     let lifecycle = match history_status {
         "complete" | "succeeded" => DuplicateJobLifecycle::Succeeded,
-        "failed" => DuplicateJobLifecycle::Failed,
+        // A partial delivery reads as failed outside the engine.
+        "failed" | "partial" => DuplicateJobLifecycle::Failed,
         "cancelled" => DuplicateJobLifecycle::Cancelled,
         _ => return Ok(()),
     };
@@ -2057,39 +2075,46 @@ async fn cleanup_stale_admissions_tx(tx: &mut SqlTx<'_>, now: i64) -> Result<usi
             ],
         )
         .await?;
-    let count = rows.len();
-    for row in rows {
-        forget_duplicate_identity_tx(tx, JobId(row.i64("job_id")? as u64)).await?;
-    }
-    Ok(count)
+    let job_ids = rows
+        .iter()
+        .map(|row| row.i64("job_id").map(|id| JobId(id as u64)))
+        .collect::<Result<Vec<_>, _>>()?;
+    forget_duplicate_identities_tx(tx, &job_ids).await?;
+    Ok(job_ids.len())
 }
 
 async fn forget_duplicate_identity_tx(tx: &mut SqlTx<'_>, job_id: JobId) -> Result<(), StateError> {
-    tx.execute(
-        "DELETE FROM semantic_duplicate_candidates WHERE job_id = {}",
-        &[SqlArg::I64(job_id.0 as i64)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM duplicate_admission_claims WHERE job_id = {}",
-        &[SqlArg::I64(job_id.0 as i64)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM job_fingerprints WHERE job_id = {}",
-        &[SqlArg::I64(job_id.0 as i64)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM submission_idempotency WHERE job_id = {}",
-        &[SqlArg::I64(job_id.0 as i64)],
-    )
-    .await?;
-    tx.execute(
-        "DELETE FROM duplicate_job_snapshots WHERE job_id = {}",
-        &[SqlArg::I64(job_id.0 as i64)],
-    )
-    .await?;
+    forget_duplicate_identities_tx(tx, &[job_id]).await
+}
+
+// Removes every id's durable duplicate identity with one `IN (...)` delete
+// per table and chunk, then sweeps the semantic groups left without a
+// candidate once for the whole set.
+async fn forget_duplicate_identities_tx(
+    tx: &mut SqlTx<'_>,
+    job_ids: &[JobId],
+) -> Result<(), StateError> {
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+    let ids = job_ids.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+    for chunk in ids.chunks(max_rows_for_tx(tx, 1)) {
+        let placeholders = vec!["{}"; chunk.len()].join(", ");
+        let args = chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
+        for table in [
+            "semantic_duplicate_candidates",
+            "duplicate_admission_claims",
+            "job_fingerprints",
+            "submission_idempotency",
+            "duplicate_job_snapshots",
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE job_id IN ({placeholders})"),
+                &args,
+            )
+            .await?;
+        }
+    }
     tx.execute(
         "DELETE FROM semantic_duplicate_groups
          WHERE NOT EXISTS (
@@ -2104,18 +2129,31 @@ async fn forget_duplicate_identity_tx(tx: &mut SqlTx<'_>, job_id: JobId) -> Resu
 
 // Records a permanent user-requested deletion before removing the durable
 // identity, so duplicate backfill cannot recreate it from stale source data.
-pub(crate) async fn forget_duplicate_identity_for_history_delete_tx(
+pub(crate) async fn forget_duplicate_identities_for_history_delete_tx(
     tx: &mut SqlTx<'_>,
-    job_id: JobId,
+    job_ids: &[JobId],
 ) -> Result<(), StateError> {
-    tx.execute(
-        "INSERT INTO forgotten_duplicate_identities (job_id, forgotten_at)
-         VALUES ({}, {})
-         ON CONFLICT(job_id) DO UPDATE SET forgotten_at = excluded.forgotten_at",
-        &[SqlArg::I64(job_id.0 as i64), SqlArg::I64(epoch_seconds())],
-    )
-    .await?;
-    forget_duplicate_identity_tx(tx, job_id).await
+    if job_ids.is_empty() {
+        return Ok(());
+    }
+    let forgotten_at = epoch_seconds();
+    for chunk in job_ids.chunks(max_rows_for_tx(tx, 2)) {
+        let values = vec!["({}, {})"; chunk.len()].join(", ");
+        let args = chunk
+            .iter()
+            .flat_map(|id| [SqlArg::I64(id.0 as i64), SqlArg::I64(forgotten_at)])
+            .collect::<Vec<_>>();
+        tx.execute(
+            &format!(
+                "INSERT INTO forgotten_duplicate_identities (job_id, forgotten_at)
+                 VALUES {values}
+                 ON CONFLICT(job_id) DO UPDATE SET forgotten_at = excluded.forgotten_at"
+            ),
+            &args,
+        )
+        .await?;
+    }
+    forget_duplicate_identities_tx(tx, job_ids).await
 }
 
 fn snapshot_from_row(
@@ -2161,10 +2199,7 @@ fn semantic_snapshot_from_summary_row(
         normalized_key: row.text("semantic_normalized_key")?,
         score: row.i64("semantic_score")?,
         state,
-        source_stored: row
-            .bytes("semantic_source_nzb_zstd")
-            .map(|bytes| !bytes.is_empty())
-            .unwrap_or(false),
+        source_stored: row.i64("semantic_source_stored")? != 0,
         terminal_cause: row
             .opt_text("semantic_terminal_cause")?
             .as_deref()

@@ -79,6 +79,29 @@ impl<T> InfrastructureRetryQueue<T> {
         ready
     }
 
+    // Wake only the selected jobs without changing any other retry deadline.
+    pub(super) fn wake_where(&mut self, mut predicate: impl FnMut(&T) -> bool) -> Vec<T> {
+        let mut ready = Vec::new();
+        for batch in self
+            .timed
+            .values_mut()
+            .chain(std::iter::once(&mut self.indefinite))
+        {
+            let mut kept = VecDeque::new();
+            for work in batch.drain(..) {
+                if predicate(&work) {
+                    ready.push(work);
+                } else {
+                    kept.push_back(work);
+                }
+            }
+            *batch = kept;
+        }
+        self.timed.retain(|_, batch| !batch.is_empty());
+        self.len -= ready.len();
+        ready
+    }
+
     pub(super) fn cancel_where(&mut self, mut predicate: impl FnMut(&T) -> bool) -> usize {
         let previous_len = self.len;
         for batch in self.timed.values_mut() {
@@ -117,6 +140,24 @@ mod tests {
 
         assert_eq!(queue.cancel_where(|(job, _)| *job == 1), 2);
         assert_eq!(queue.wake_all(), vec![(2, 2)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn selective_wake_preserves_other_jobs_deadlines() {
+        let mut queue = InfrastructureRetryQueue::default();
+        queue.schedule(Some(Duration::from_secs(10)), (1, 1));
+        queue.schedule(Some(Duration::from_secs(20)), (2, 2));
+        queue.schedule(None, (2, 3));
+        let deadline = queue
+            .iter_with_deadlines()
+            .find_map(|(at, work)| (work.0 == 2).then_some(at).flatten())
+            .unwrap();
+        assert_eq!(queue.wake_where(|work| work.0 == 1), vec![(1, 1)]);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.next_deadline(), Some(deadline));
+        assert!(queue.take_due(deadline - Duration::from_secs(1)).is_empty());
+        assert_eq!(queue.take_due(deadline), vec![(2, 2)]);
+        assert_eq!(queue.wake_all(), vec![(2, 3)]);
     }
 
     #[test]

@@ -1,0 +1,20 @@
+{
+  "slug": "zip-deflate-lost-article",
+  "title": "E2E.Test.ZIP.Deflate.Lost.Article.2026.1080p-TESTGRP",
+  "description": "A two-member deflated zip with no PAR2, posted as 256 KiB articles, with one article inside the second member's data withheld. The zip opens from its records alone, so the lost bytes fail the second entry only: the first member, closed before them, is delivered whole and the job ends Partial.",
+  "category": "2000",
+  "expected_outcome": "partial_delivery",
+  "segment_size": 262144,
+  "deleteSegmentSubjectContains": [
+    "archive.zip"
+  ],
+  "deleteSegmentNumbers": [
+    17
+  ],
+  "expectedOutputBLAKE3": {
+    "Ember.Part1.mkv": "10c6efd3343c1e7a162b53ff0d807550d50c0fa4fc5eb001ac7be573bb5c2f74"
+  },
+  "forbiddenOutputPaths": [
+    "Quill.Part2.mkv"
+  ]
+}

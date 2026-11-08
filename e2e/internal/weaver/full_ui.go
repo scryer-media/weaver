@@ -71,23 +71,25 @@ type fullSuiteOptions struct {
 }
 
 var fullPhaseDefinitions = []fullPhaseDefinition{
-	// Direct-store routing is on for the functional corpus rather than in a
-	// phase of its own. It began as a duplicate phase re-running all 92 fixtures
-	// with the gate flipped, which cost a second full run to learn very little:
-	// most of the corpus is archives direct-store is *right* to refuse, so the
-	// phase mostly measured refusals. The corpus now carries `direct-store-*`
-	// fixtures built to route direct, the gate is on for every functional run,
-	// and `assertDirectStoreEngagement` asserts from weaver's own counters that
-	// those sets really did route — the only external evidence available, since
-	// direct output is byte-identical to the conventional path.
-	{name: "Functional SQLite", command: "test-all", slug: "functional-sqlite", seedProfile: "functional", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_DIRECT_UNPACK": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
-	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_RAR_DIRECT_STORE": "1", "WEAVER_DIRECT_UNPACK": "1", "WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
+	// The functional corpus carries `direct-store-*` fixtures built to be read
+	// in place, and `assertDirectStoreEngagement` asserts from the graph's lines
+	// that those sets really were: stored output is byte-identical either way.
+	{name: "Functional SQLite", command: "test-all", slug: "functional-sqlite", seedProfile: "functional", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
+	{name: "Functional Postgres", command: "test-all", slug: "functional-postgres", seedProfile: "functional", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_E2E_DELAY": "direct_store.post_repair_verify=20000"}},
 	{name: "NNTP Chaos", command: "chaos-test", slug: "nntp-chaos", seedProfile: "chaos", datastore: weaverDatastoreSQLite},
 	{name: "TCP Chaos", command: "tcp-chaos", slug: "tcp-chaos", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite},
+	// The TLS suite submits five canonical fixtures over the NNTP container's
+	// TLS listener, so it seeds the functional corpus they come from.
+	{name: "TLS NNTP", command: "tls-test", slug: "tls-nntp", seedProfile: "functional", datastore: weaverDatastoreSQLite},
+	// Adaptive dispatch drives one large-segment fixture through injected
+	// latency; the TCP chaos profile is the smallest corpus that carries it.
+	{name: "Adaptive Dispatch", command: "adaptive-dispatch", slug: "adaptive-dispatch", seedProfile: "tcp-chaos", datastore: weaverDatastoreSQLite},
+	{name: "Adversarial Archives", command: "adversarial", slug: "adversarial", seedProfile: "adversarial", datastore: weaverDatastoreSQLite},
 	{name: "Container Restart", command: "container-restart", slug: "container-restart", skipSeed: true, datastore: weaverDatastoreSQLite},
-	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite, extraEnv: map[string]string{"WEAVER_DIRECT_UNPACK": "1"}},
-	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres, extraEnv: map[string]string{"WEAVER_DIRECT_UNPACK": "1"}},
+	{name: "Restart SQLite", command: "restart-all", slug: "restart-sqlite", seedProfile: "restart", datastore: weaverDatastoreSQLite},
+	{name: "Restart Postgres", command: "restart-all", slug: "restart-postgres", seedProfile: "restart", datastore: weaverDatastorePostgres},
 	{name: "Product Behavior Gate", command: "release-gate", slug: "product-behavior", skipSeed: true, datastore: weaverDatastoreSQLite},
+	{name: "Filesystem Gate", command: "filesystem", slug: "filesystem", skipSeed: true, datastore: weaverDatastoreSQLite},
 }
 
 // functionalFullPhase selects the fast iteration loop: the SQLite functional
@@ -227,6 +229,7 @@ type fullRunManifest struct {
 
 type fullRunPhaseEntry struct {
 	Name             string `json:"name"`
+	Command          string `json:"command,omitempty"`
 	Datastore        string `json:"datastore"`
 	Project          string `json:"project"`
 	RootDir          string `json:"root_dir"`
@@ -255,7 +258,7 @@ type fullDashboard struct {
 	flowOrder   map[string][]string
 	seedByPhase map[string]int
 	dirty       bool
-	lastFrame   string
+	painter     framePainter
 	stopCh      chan struct{}
 	doneCh      chan struct{}
 	mu          sync.Mutex
@@ -289,6 +292,7 @@ const (
 func newFullDashboard(title string, phaseNames []string, seedTotal int) *fullDashboard {
 	d := &fullDashboard{
 		interactive: isInteractiveTerminal(),
+		painter:     framePainter{out: os.Stdout},
 		title:       title,
 		start:       time.Now(),
 		seed: dashboardBar{
@@ -393,6 +397,17 @@ func (d *fullDashboard) setPhaseRunning(name string, detail string) {
 	defer d.mu.Unlock()
 	if phase, ok := d.phases[name]; ok {
 		phase.Status = "running"
+		phase.Detail = detail
+	}
+	d.scheduleRenderLocked()
+}
+
+// setPhaseDetail says what a phase is waiting on before it runs, leaving
+// its status as it is.
+func (d *fullDashboard) setPhaseDetail(name string, detail string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if phase, ok := d.phases[name]; ok {
 		phase.Detail = detail
 	}
 	d.scheduleRenderLocked()
@@ -525,14 +540,44 @@ func (d *fullDashboard) renderLocked() {
 }
 
 func (d *fullDashboard) renderFrameLocked() {
-	frame := d.buildFrameLocked()
-	if frame == d.lastFrame {
-		d.dirty = false
+	d.painter.paint(d.buildFrameLocked())
+	d.dirty = false
+}
+
+// framePainter puts dashboard frames on the terminal without flicker. The
+// first frame clears the screen once; after that only the rows that changed
+// are rewritten in place, each erased to its end so a shorter line leaves no
+// tail, and rows a shorter frame no longer uses are blanked. Every paint is a
+// single write, and an unchanged frame writes nothing. The cursor is parked on
+// the row below the frame, where a trailing newline would have left it.
+type framePainter struct {
+	out     io.Writer
+	last    []string
+	painted bool
+}
+
+func (p *framePainter) paint(frame string) {
+	lines := strings.Split(strings.TrimSuffix(frame, "\n"), "\n")
+	var b strings.Builder
+	if !p.painted {
+		b.WriteString("\x1b[H\x1b[J")
+	}
+	for row, line := range lines {
+		if p.painted && row < len(p.last) && p.last[row] == line {
+			continue
+		}
+		fmt.Fprintf(&b, "\x1b[%d;1H%s\x1b[K", row+1, line)
+	}
+	for row := len(lines); row < len(p.last); row++ {
+		fmt.Fprintf(&b, "\x1b[%d;1H\x1b[K", row+1)
+	}
+	p.painted = true
+	p.last = lines
+	if b.Len() == 0 {
 		return
 	}
-	fmt.Fprint(os.Stdout, frame)
-	d.lastFrame = frame
-	d.dirty = false
+	fmt.Fprintf(&b, "\x1b[%d;1H", len(lines)+1)
+	_, _ = io.WriteString(p.out, b.String())
 }
 
 func (d *fullDashboard) scheduleRenderLocked() {
@@ -544,7 +589,6 @@ func (d *fullDashboard) scheduleRenderLocked() {
 
 func (d *fullDashboard) buildFrameLocked() string {
 	var b strings.Builder
-	b.WriteString("\x1b[H\x1b[J")
 	layout := d.dashboardLayoutLocked()
 	elapsed := time.Since(d.start).Truncate(time.Second)
 	title := d.title
@@ -1125,14 +1169,19 @@ func newFullPreseedBootstrap(tempRoot, profile string, source *fullPhaseContext,
 }
 
 const (
+	// defaultFullPhaseJobs is how many suites of a full run execute at once,
+	// the Product Behavior Gate included: the gate holds a slot of its own and
+	// the other phases share the rest, so the default runs the gate beside
+	// three other suites.
 	defaultFullPhaseJobs = 4
-	// A full run's release gate shares the engine with the other phases, so
-	// it runs narrower than a standalone gate unless the operator sets a width.
-	fullRunReleaseGateJobs = 4
+	// Playwright flows have their own concurrency within the gate's suite
+	// slot, unless the operator explicitly sets a width.
+	fullRunReleaseGateJobs = 10
 )
 
-// fullPhaseJobs is how many phases of a full run execute at once, set with
-// E2E_FULL_PHASE_JOBS.
+// fullPhaseJobs is how many suites of a full run execute at once, set with
+// E2E_FULL_PHASE_JOBS. The count includes the Product Behavior Gate's own
+// slot, so the phases other than the gate share one slot fewer than this.
 func fullPhaseJobs(phaseCount int) int {
 	requested := envInt("E2E_FULL_PHASE_JOBS", defaultFullPhaseJobs)
 	if requested > phaseCount {
@@ -1142,6 +1191,41 @@ func fullPhaseJobs(phaseCount int) int {
 		requested = 1
 	}
 	return requested
+}
+
+// fullPhaseSlots paces a full run's phases. The Product Behavior Gate runs its
+// own concurrent release flows, so it holds a dedicated slot and never waits
+// behind the other suites; every other phase takes one of the general slots,
+// which number one fewer than fullPhaseJobs and never fewer than one.
+type fullPhaseSlots struct {
+	general chan struct{}
+	gate    chan struct{}
+}
+
+func newFullPhaseSlots(phaseCount int) fullPhaseSlots {
+	return fullPhaseSlots{
+		general: make(chan struct{}, fullGeneralPhaseJobs(phaseCount)),
+		gate:    make(chan struct{}, 1),
+	}
+}
+
+// fullGeneralPhaseJobs is how many phases other than the Product Behavior
+// Gate execute at once: the suite count less the gate's own slot, never below
+// one.
+func fullGeneralPhaseJobs(phaseCount int) int {
+	general := fullPhaseJobs(phaseCount) - 1
+	if general < 1 {
+		general = 1
+	}
+	return general
+}
+
+// slotFor is the slot channel a phase waits on before it starts.
+func (s fullPhaseSlots) slotFor(phase *fullPhaseContext) chan struct{} {
+	if phase.Command == "release-gate" {
+		return s.gate
+	}
+	return s.general
 }
 
 func runFullPipeline(
@@ -1157,16 +1241,17 @@ func runFullPipeline(
 	// Every phase brings up its own stack and drives it hard, so phases share
 	// a fixed number of slots instead of all starting together. A phase holds
 	// its slot from seeding through its own cleanup.
-	slots := make(chan struct{}, fullPhaseJobs(len(phases)))
+	slots := newFullPhaseSlots(len(phases))
 
 	var wg sync.WaitGroup
 	for _, phase := range phases {
 		wg.Add(1)
 		go func(phase *fullPhaseContext) {
 			defer wg.Done()
+			slot := slots.slotFor(phase)
 			select {
-			case slots <- struct{}{}:
-				defer func() { <-slots }()
+			case slot <- struct{}{}:
+				defer func() { <-slot }()
 			case <-ctx.Done():
 				canceledErr := fmt.Errorf("canceled before the phase started: %w", ctx.Err())
 				phaseResults <- recordPhaseSetupFailure(phase, phase.Command, time.Now(), canceledErr)
@@ -1193,16 +1278,19 @@ func runFullPipeline(
 			}
 
 			setupStarted := time.Now()
-			weaverBin, err := ensureE2EWeaverBinary()
-			if err != nil {
-				setupErr := fmt.Errorf("prepare e2e weaver binary: %w", err)
-				phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
-				dashboard.markPhaseResult(phase.Name, "fail")
-				return
+			if phase.Command != "filesystem" {
+				weaverBin, err := ensureE2EWeaverBinary()
+				if err != nil {
+					setupErr := fmt.Errorf("prepare e2e weaver binary: %w", err)
+					phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
+					dashboard.markPhaseResult(phase.Name, "fail")
+					return
+				}
+				phase.WeaverBin = weaverBin
 			}
-			phase.WeaverBin = weaverBin
 			if fullPhaseNeedsLocalWeaverImage(phase) && awaitWeaverImage != nil {
 				setupStarted = time.Now()
+				dashboard.setPhaseDetail(phase.Name, "waiting for Weaver image")
 				if err := awaitWeaverImage(); err != nil {
 					setupErr := fmt.Errorf("prepare local Weaver image: %w", err)
 					phaseResults <- recordPhaseSetupFailure(phase, phase.Command, setupStarted, setupErr)
@@ -1555,6 +1643,15 @@ func cleanupFullPhaseContext(phase *fullPhaseContext) error {
 	if phase.Cleaned {
 		return nil
 	}
+	if phase.Command == "filesystem" {
+		// The fixture owns its containers directly, without a Compose stack.
+		// Retry its exact recorded cleanup if the child was interrupted.
+		if err := cleanupFilesystemGateAt(phase.RunDir); err != nil {
+			return err
+		}
+		phase.Cleaned = true
+		return nil
+	}
 	var errs []error
 	if err := capturePhaseDiagnostics(phase); err != nil {
 		errs = append(errs, fmt.Errorf("capture diagnostics: %w", err))
@@ -1869,6 +1966,7 @@ func writeFullRunManifest(path, tempRoot string, phases []*fullPhaseContext) err
 	for _, phase := range phases {
 		manifest.Phases = append(manifest.Phases, fullRunPhaseEntry{
 			Name:             phase.Name,
+			Command:          phase.Command,
 			Datastore:        normalizedWeaverDatastoreForPhase(phase.Datastore),
 			Project:          phase.Project,
 			RootDir:          phase.RootDir,
@@ -1930,6 +2028,11 @@ func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*ful
 		retained := index < 3
 		teardown := !manifest.StacksReleased && !(retained && manifest.KeepStacks)
 		if retained && !teardown {
+			if manifest.StacksReleased && !manifest.KeepStacks {
+				if err := dropFullRunDownloads(manifest); err != nil {
+					errs = append(errs, err)
+				}
+			}
 			continue
 		}
 		phases := manifest.Phases
@@ -1940,6 +2043,7 @@ func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*ful
 		for _, entry := range phases {
 			phase := &fullPhaseContext{
 				Name:             entry.Name,
+				Command:          entry.Command,
 				Project:          entry.Project,
 				RootDir:          entry.RootDir,
 				RunDir:           entry.RunDir,
@@ -1956,8 +2060,30 @@ func pruneFullRunBundles(tempDir string, alive func(int) bool, cleanup func(*ful
 			if err := markFullRunStacksReleased(filepath.Join(candidate.path, "full-run.json")); err != nil {
 				errs = append(errs, err)
 			}
+			if err := dropFullRunDownloads(manifest); err != nil {
+				errs = append(errs, err)
+			}
 		default:
 			if err := os.RemoveAll(candidate.path); err != nil {
+				errs = append(errs, err)
+			}
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// dropFullRunDownloads removes what Weaver downloaded in each phase of a
+// retained bundle whose stacks are gone: its complete and intermediate
+// directories, nearly all of a bundle's size. The logs, database, compose
+// evidence and Playwright artifacts stay.
+func dropFullRunDownloads(manifest fullRunManifest) error {
+	var errs []error
+	for _, entry := range manifest.Phases {
+		if strings.TrimSpace(entry.RunDir) == "" {
+			continue
+		}
+		for _, dir := range []string{"complete", "intermediate"} {
+			if err := os.RemoveAll(filepath.Join(entry.RunDir, "weaver", dir)); err != nil {
 				errs = append(errs, err)
 			}
 		}

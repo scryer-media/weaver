@@ -50,6 +50,9 @@ pub struct SubmittedJobSummary {
     pub category: Option<String>,
     pub metadata: Vec<(String, String)>,
     pub total_bytes: u64,
+    // The declared bytes a run starts out to bring, the recovery volumes
+    // left out.
+    pub wanted_bytes: u64,
     pub file_count: u32,
     pub remaining_par_count: u32,
 }
@@ -62,6 +65,7 @@ impl SubmittedJobSummary {
             category: spec.category.clone(),
             metadata: spec.metadata.clone(),
             total_bytes: spec.total_bytes,
+            wanted_bytes: spec.wanted_bytes(),
             file_count: spec.files.len() as u32,
             remaining_par_count: spec.par2_volume_count() as u32,
         }
@@ -864,7 +868,7 @@ pub async fn submit_nzb_bytes_with_options(
 
 // An NZB weaver fetched itself: its bytes, the file name the response named,
 // and every `X-DNZB-Password` value the response carried, raw and in the order
-// received.
+// received, less any value that only flags the archive as protected.
 pub struct FetchedNzb {
     pub bytes: Vec<u8>,
     pub filename: Option<String>,
@@ -1621,6 +1625,67 @@ mod tests {
             ]
         );
         assert!(!format!("{fetched:?}").contains("first-key"));
+    }
+
+    // An indexer's protection flag in the header is not a password: it takes
+    // no header slot, and a response carrying only flags fills none.
+    #[tokio::test]
+    async fn fetch_nzb_drops_protection_flags_from_dnzb_password_headers() {
+        async fn fetch_with(password_headers: &'static str) -> FetchedNzb {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let xml = minimal_nzb("Header.Flags");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                read_http_request(&mut stream).await;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\n\
+                     Content-Type: application/x-nzb\r\n\
+                     {password_headers}\
+                     Content-Length: {}\r\n\
+                     Connection: close\r\n\
+                     \r\n\
+                     {}",
+                    xml.len(),
+                    xml
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+            });
+            let url = format!("http://{addr}/download.nzb");
+            let fetched = fetch_nzb_from_url(&crate::proxies::direct_runtime(), &url)
+                .await
+                .unwrap();
+            server.await.unwrap();
+            fetched
+        }
+
+        let fetched = fetch_with(
+            "X-DNZB-Password: -1\r\n\
+             X-DNZB-Password: protected\r\n\
+             X-DNZB-Password: real-key\r\n",
+        )
+        .await;
+        assert_eq!(fetched.header_passwords, ["real-key"]);
+        let candidates = crate::ingest::header_archive_password_candidates(
+            fetched.header_passwords.iter().map(String::as_str),
+        );
+        let candidates =
+            crate::pipeline::assemble_archive_password_candidates(None, &candidates, &[]);
+        assert_eq!(labelled(&candidates), [("dnzb_header", "real-key")]);
+
+        let fetched = fetch_with(
+            "X-DNZB-Password: -1\r\n\
+             X-DNZB-Password: TRUE\r\n",
+        )
+        .await;
+        assert!(fetched.header_passwords.is_empty());
+        let candidates = crate::ingest::header_archive_password_candidates(
+            fetched.header_passwords.iter().map(String::as_str),
+        );
+        assert!(
+            crate::pipeline::assemble_archive_password_candidates(None, &candidates, &[])
+                .is_empty()
+        );
     }
 
     #[tokio::test]
