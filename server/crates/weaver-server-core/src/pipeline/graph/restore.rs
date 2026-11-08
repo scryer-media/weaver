@@ -187,6 +187,9 @@ impl RestoreSeat {
     // and fetches every article, and its first checkpoint replaces the old
     // rows whole. Blocks: called off the pipeline thread. A job whose work
     // crashed the daemon never reaches here: its install is given no seat.
+    // A job that starts afresh finds its directories as its last run left
+    // them, which may have stopped before its first checkpoint committed:
+    // no row names anything there as the job's, so all of it goes first.
     pub(crate) fn restore(
         self,
         job_id: JobId,
@@ -196,8 +199,11 @@ impl RestoreSeat {
         RESTORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A restore replays the job's own facts: a panic in it is the job's.
         let _job = crate::runtime::panic_trap::JobScope::enter(job_id);
+        let roots: Vec<PathBuf> = std::iter::once(self.working_dir.clone())
+            .chain(self.output.as_ref().map(|(dir, _)| dir.clone()))
+            .collect();
         let loaded = self.db.load_graph_checkpoint(job_id);
-        loaded
+        let restored = loaded
             .map_err(GraphRestoreError::from)
             .and_then(|rows| rows.ok_or(GraphRestoreError::NoCheckpoint(job_id.0)))
             .and_then(|rows| self.rebuild(job_id, files, rows))
@@ -211,7 +217,13 @@ impl RestoreSeat {
                     "graph job checkpoint is not one this build restores; the job starts afresh"
                 );
                 GraphRestoreError::NoCheckpoint(job_id.0)
-            })
+            });
+        if matches!(restored, Err(GraphRestoreError::NoCheckpoint(_))) {
+            for root in &roots {
+                sweep_all(root);
+            }
+        }
+        restored
     }
 
     fn rebuild(
@@ -334,6 +346,14 @@ pub(super) fn sweep_unnamed(
     }
     sweep_within(working_dir, Path::new(""), &named, &within);
     Ok(())
+}
+
+// A job with no checkpoint to come back to has nothing in its directory:
+// every file a step wrote goes, as `sweep_unnamed` takes what no
+// checkpoint names. The directory's own marker and the run's cache stay.
+fn sweep_all(dir: &Path) {
+    let within = HashSet::from([key(INTERNAL_DIR)]);
+    sweep_within(dir, Path::new(""), &HashSet::new(), &within);
 }
 
 fn sweep_within(dir: &Path, at: &Path, named: &HashSet<String>, within: &HashSet<String>) {

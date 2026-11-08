@@ -1770,6 +1770,51 @@ async fn starts_afresh(change: &'static str) {
     job.starts_afresh().await;
 }
 
+// A job stopped before its first checkpoint committed, as one can while the
+// change waits for its bytes or its age: its run wrote files no row names,
+// among them one a step made that the fresh job never makes again, as a
+// split's join is. Restored with no checkpoint, none of it is the job's: it
+// goes before the job starts afresh, and the job delivers only its own file.
+#[tokio::test]
+async fn a_job_stopped_before_its_first_checkpoint_starts_afresh_with_nothing_its_run_left() {
+    let job = reopened().await;
+    let datastore = job.pipeline.db.datastore();
+    crate::persistence::sql_runtime::SqlRuntime::run_in_transaction(
+        &datastore,
+        "test_drop_checkpoint",
+        |tx| {
+            Box::pin(async move {
+                for table in crate::jobs::graph_checkpoint::TABLES {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE job_id = {{}}"),
+                        &[crate::persistence::sql_runtime::SqlArg::I64(JOB.0 as i64)],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        job.pipeline
+            .db
+            .load_graph_checkpoint(JOB)
+            .unwrap()
+            .is_none()
+    );
+    job.starts_afresh_with_nothing_its_run_left().await;
+}
+
+// The same for a checkpoint this build does not restore.
+#[tokio::test]
+async fn a_checkpoint_this_build_does_not_restore_starts_afresh_with_nothing_its_run_left() {
+    let job = reopened().await;
+    change_checkpoint(&job.pipeline, UNKNOWN_REASON).await;
+    job.starts_afresh_with_nothing_its_run_left().await;
+}
+
 // A job served four of its twelve articles and stopped, and its pipeline
 // opened again: what a restart test changes before it restores the job.
 struct Reopened {
@@ -1816,6 +1861,38 @@ impl Reopened {
     // again, and the job finishes.
     async fn starts_afresh(mut self) {
         self.restore().await;
+        self.restored_afresh().await;
+    }
+
+    // Files the stopped run left that no row names: one a step made, one
+    // in a folder of its own and a chunk. The directory's marker and the
+    // run's cache are the directory's and stay.
+    async fn starts_afresh_with_nothing_its_run_left(mut self) {
+        let made = self.working_dir.join("ember");
+        let folder = self.working_dir.join("inner");
+        let chunk = self
+            .working_dir
+            .join(weaver_graph::names::INTERNAL_DIR)
+            .join("graph-waiting-0-0");
+        let cached = self
+            .working_dir
+            .join(weaver_graph::names::CACHE_DIR)
+            .join("kept");
+        let marker = self
+            .working_dir
+            .join(crate::jobs::working_dir::WORKING_DIR_MARKER);
+        assert!(marker.is_file(), "the job's directory has its marker");
+        for path in [&made, &folder.join("left.bin"), &chunk, &cached] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"left by the stopped run").unwrap();
+        }
+        self.restore().await;
+        assert!(!made.exists() && !folder.exists() && !chunk.exists());
+        assert!(cached.is_file() && marker.is_file());
+        self.restored_afresh().await;
+    }
+
+    async fn restored_afresh(self) {
         assert!(!self.pipeline.blocked_restores.contains_key(&JOB));
         let info = self
             .pipeline
