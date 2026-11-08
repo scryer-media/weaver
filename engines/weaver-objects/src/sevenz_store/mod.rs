@@ -22,7 +22,7 @@ mod record;
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -223,6 +223,17 @@ pub struct SevenZipStore {
     stale: bool,
     // The object gave its container up; it says nothing more.
     gone: bool,
+    // Candidates whose folder keys the cache has no answer for: derived
+    // away from the loop while the store is lent out, and the folders open
+    // once it is back. Neither is kept: a restart offers the password
+    // again, and the keys are derived again.
+    #[serde(skip)]
+    derive_due: BTreeSet<usize>,
+    // What the pool derived, by candidate and folder, until the store is
+    // gone: the process's cache is shared and may drop an entry before the
+    // folders take it.
+    #[serde(skip)]
+    derived: BTreeMap<(usize, usize), open::FolderKey>,
 }
 
 impl Durable for SevenZipStore {
@@ -313,6 +324,8 @@ impl SevenZipStore {
             recovery_said: false,
             stale: true,
             gone: false,
+            derive_due: BTreeSet::new(),
+            derived: BTreeMap::new(),
         }
     }
 
@@ -932,5 +945,16 @@ impl Object for SevenZipStore {
     }
     fn facts(&self) -> Facts {
         Facts::of(Kind::SevenZipStore, self)
+    }
+
+    // A folder key the cache has no answer for: the derivation is the
+    // slowest thing the store does, done away from the loop.
+    fn work_due(&self) -> bool {
+        !self.gone && !self.derive_due.is_empty()
+    }
+
+    fn work(&mut self, out: &mut Vec<Emit>) {
+        self.derive_due();
+        self.settle(out);
     }
 }

@@ -345,7 +345,7 @@ impl Pipeline {
             if self.pending_graph_terminals.contains_key(&job_id)
                 || matches!(
                     &said.heard,
-                    Heard::Repaired(_) | Heard::Replayed(_) | Heard::Verified(_)
+                    Heard::Repaired(_) | Heard::Replayed(_) | Heard::Verified(_) | Heard::Worked(_)
                 )
             {
                 if let Err(error) = graph.drain_failed_run(said) {
@@ -408,7 +408,11 @@ impl Pipeline {
         };
         let ended = matches!(
             said.heard,
-            Heard::Ended | Heard::Repaired(_) | Heard::Replayed(_) | Heard::Verified(_)
+            Heard::Ended
+                | Heard::Repaired(_)
+                | Heard::Replayed(_)
+                | Heard::Verified(_)
+                | Heard::Worked(_)
         );
         let moving = graph.moves_waiting();
         let result = graph.run_said(said, &mut self.graph_status.repairs, limit);

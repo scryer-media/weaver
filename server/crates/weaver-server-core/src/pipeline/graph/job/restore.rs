@@ -122,6 +122,7 @@ impl GraphJob {
             builder: Box::new(runs.hardware()),
             writer,
             loans: Loans::new(runs.scope(), runs.mail(), runs.hardware()),
+            works: super::works::Works::new(runs.scope(), runs.mail(), runs.hardware()),
             runs,
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.root.reported,

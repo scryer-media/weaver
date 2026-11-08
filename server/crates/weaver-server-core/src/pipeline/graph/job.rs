@@ -13,6 +13,7 @@ mod passwords;
 mod repair;
 pub(crate) mod restore;
 mod runs;
+mod works;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -26,6 +27,8 @@ use weaver_graph::{
 
 use self::loans::Loans;
 use self::passwords::Passwords;
+pub(crate) use self::works::Worked;
+use self::works::Works;
 use super::checkpoint::Pending;
 use super::engine::{Runs, Said};
 use super::leaf::LeafError;
@@ -107,6 +110,7 @@ pub(crate) struct GraphJob {
     writer: NamespaceWriter,
     runs: Runs,
     loans: Loans,
+    works: Works,
     passwords: Passwords,
     // The phase last reported, so only a change is reported.
     reported: Option<RootPhase>,
@@ -213,6 +217,7 @@ impl GraphJob {
             builder,
             writer,
             loans: Loans::new(runs.scope(), runs.mail(), runs.hardware()),
+            works: Works::new(runs.scope(), runs.mail(), runs.hardware()),
             runs,
             passwords: Passwords::default(),
             reported: None,
@@ -263,16 +268,30 @@ impl GraphJob {
         self.loans.out()
     }
 
+    // Whether an object of the job is out for its work. No checkpoint is
+    // taken meanwhile: its facts as it left hold the work undone, which a
+    // restart could not always do without the tree.
+    pub(crate) fn working(&self) -> bool {
+        self.works.out()
+    }
+
+    // A checkpoint found an object out for its work and took nothing: the
+    // work stays on the loop until one is recorded.
+    pub(crate) fn owe_checkpoint(&mut self) {
+        self.works.owe_checkpoint();
+    }
+
     // Whether something of the job is out on a thread and will speak
     // through the run mail: a run, or a repair.
     pub(in crate::pipeline) fn awaits_mail(&self) -> bool {
-        self.runs.in_flight() || self.loans.out() || self.mail_owed.is_some()
+        self.runs.in_flight() || self.loans.out() || self.works.out() || self.mail_owed.is_some()
     }
 
     // The checkpoint `stamp` records every name the job's files want and
     // every name they left so far.
     pub(crate) fn recorded(&mut self, stamp: u64) {
         self.writer.recorded(stamp);
+        self.works.checkpointed();
     }
 
     // Whether a member's file still waits to move, or a name a file left
@@ -345,7 +364,10 @@ impl GraphJob {
     // Completion waits for every worker's acknowledgment and for replays
     // or checks queued behind admission, not just actual recovery work.
     pub(crate) fn work_pending(&self) -> bool {
-        self.loans.out() || self.writer.rechecks_waiting() || self.verifications_due()
+        self.loans.out()
+            || self.works.out()
+            || self.writer.rechecks_waiting()
+            || self.verifications_due()
     }
 
     // A checksum obligation something can still meet: one an ended
@@ -905,6 +927,21 @@ impl GraphJob {
         if effects.is_empty() {
             return Ok(());
         }
+        let mut out = Vec::new();
+        self.writer.apply_all(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            effects,
+            &mut out,
+        )?;
+        self.heard(out)
+    }
+
+    // What an object back from its work said, through the writer even when
+    // it said nothing: what it can place changed, as under an offer, and the
+    // writer is where held bytes go down.
+    fn settle_worked(&mut self, effects: Vec<Effect>) -> Result<(), GraphError> {
         let mut out = Vec::new();
         self.writer.apply_all(
             &mut self.tree,

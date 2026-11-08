@@ -37,7 +37,37 @@ impl GraphJob {
         if let Some(ticket) = self.loans.give_back() {
             slots.release(ticket);
         }
-        walked
+        walked?;
+        self.lend_work()
+    }
+
+    // Lend out every object that holds work too slow for the loop. Once
+    // the pipeline is shutting down, or while a checkpoint that found a
+    // loan out is owed, nothing goes out: the work is done here, so the
+    // checkpoint finds none of it out.
+    fn lend_work(&mut self) -> Result<(), GraphError> {
+        let admit = self.works.admit();
+        for node in self.tree.working() {
+            let Some(mut object) = self.tree.lend_work(node) else {
+                continue;
+            };
+            if admit {
+                self.works.lend(node, object);
+                continue;
+            }
+            let mut said = Vec::new();
+            object.work(&mut said);
+            let mut effects = Vec::new();
+            self.tree.take_back_worked(
+                node,
+                object,
+                said,
+                &mut self.writer.placing(&mut *self.builder),
+                &mut effects,
+            );
+            self.settle_worked(effects)?;
+        }
+        Ok(())
     }
 
     // A retiring job releases an idle slot. An outstanding repair keeps
@@ -54,6 +84,11 @@ impl GraphJob {
     // changes, applied, takes back the rulings it touches (an uncovered
     // input), and the set rules again through the same walk.
     fn walk(&mut self, mut slots: Option<(&mut RepairSlots, usize)>) -> Result<(), GraphError> {
+        // An object out for its work is not there to read a set's inputs
+        // back through: the walk waits for it, and its return walks again.
+        if self.works.out() {
+            return Ok(());
+        }
         let mut walked = None;
         while let Some(node) = self.tree.next_recovery_home(walked) {
             walked = Some(node);
@@ -210,7 +245,12 @@ impl GraphJob {
     // namespace's sets have ruled on something other than waiting, none
     // with a volume of its own still arriving.
     fn quiet(&self) -> bool {
-        if self.runs.live() || self.loans.out() || self.writer.rechecks_waiting() {
+        if self.runs.live()
+            || self.loans.out()
+            || self.works.out()
+            || !self.tree.working().is_empty()
+            || self.writer.rechecks_waiting()
+        {
             return false;
         }
         let coming = self.coming();

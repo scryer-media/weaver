@@ -70,6 +70,9 @@ pub(crate) enum Heard {
     Repaired(Box<Returned>),
     Replayed(Box<super::namespace::Replayed>),
     Verified(Box<super::namespace::Verified>),
+    // An object lent off the loop for the work it held came back with what
+    // it said: addressed to its node, under the loan's number.
+    Worked(Box<super::job::Worked>),
     // The job's checkpoints committed through this stamp, or a write of
     // them failed (`None`), while a member's file waited on them to move.
     // Addressed to the root, under no run's generation.

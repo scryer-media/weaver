@@ -129,6 +129,73 @@ fn zipcrypto_sparse_pieces_wait_for_the_prefix_and_reproduce_the_ciphertext() {
 }
 
 #[test]
+fn held_zipcrypto_ciphertext_waits_for_its_loan_and_survives_a_restart() {
+    let plain = payload(91, 230_011);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + super::super::crypto::HEADER;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    owner.lend_late = true;
+    offer(&mut owner, PASSWORD);
+    // Nothing of the delivery is deciphered on the loop: it waits for the
+    // loan. Anything else that reaches the object would run it first.
+    owner.arrive(0, ByteRange::new(0, start + 100_000));
+    assert!(owner.object.work_due());
+    assert!(owner.members.get(&0).is_none_or(|got| got.bytes.is_empty()));
+    // A restart before the loan finds the ciphertext in the facts and no
+    // keys: it waits until the password is offered again, whose keys are
+    // proved while the member has said nothing.
+    owner.restore();
+    assert!(!owner.object.work_due());
+    let mut out = Vec::new();
+    owner.object.offer_password(PASSWORD, &mut out);
+    owner.apply(out);
+    assert!(owner.object.work_due());
+    owner.work();
+    owner.deliver(0, ByteRange::new(start + 100_000, archive.len() as u64));
+    owner.work();
+    owner.close(0);
+    assert!(
+        owner.member("alpha.bin").bytes == plain,
+        "len={} cov={:?} replays={} said={:?}",
+        owner.member("alpha.bin").bytes.len(),
+        owner.member("alpha.bin").coverage,
+        owner.replays,
+        owner.said
+    );
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert!(!owner.object.work_due());
+}
+
+#[test]
+fn a_part_that_cannot_wait_runs_what_its_member_holds_first() {
+    let plain = payload(92, 210_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + super::super::crypto::HEADER;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.lend_late = true;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, start + 4096));
+    owner.deliver(0, ByteRange::new(start + 4096, 80_000));
+    assert!(owner.object.work_due());
+    owner.deliver(0, ByteRange::new(120_000, 160_000));
+    owner.deliver(0, ByteRange::new(80_000, 120_000));
+    owner.work();
+    owner.deliver(0, ByteRange::new(160_000, archive.len() as u64));
+    owner.work();
+    owner.close(0);
+    assert!(
+        owner.member("alpha.bin").bytes == plain,
+        "len={} said={:?}",
+        owner.member("alpha.bin").bytes.len(),
+        owner.said
+    );
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+#[test]
 fn zipcrypto_rejects_a_wrong_password_and_opens_with_the_next() {
     let plain = payload(83, 170_011);
     let archive = encrypted(&plain);
@@ -296,6 +363,10 @@ fn a_zipcrypto_local_header_starts_without_a_terminal_article_extent() {
         &mut |_, _| false,
         &mut out,
     );
+    // The front waits for its keys away from the loop, as the owner lends
+    // the object out for it.
+    assert!(object.work_due());
+    object.work(&mut out);
     assert!(out.iter().any(
         |emit| matches!(emit, Emit::Bytes { offset: 0, bytes, .. } if bytes[..] == plain[..4096])
     ));
@@ -1497,4 +1568,211 @@ fn zipcrypto_repairs_before_their_replay_are_replayed_once() {
         .entry(MemberId(0))
         .unwrap();
     assert!(cipher.cipher.as_ref().unwrap().pending.is_empty());
+}
+
+// Deliver `range` of the only volume in frames, as articles arrive in order.
+fn arrive(owner: &mut Owner, range: ByteRange, frame: u64) {
+    let mut start = range.start;
+    while start < range.end {
+        let end = (start + frame).min(range.end);
+        owner.deliver(0, ByteRange::new(start, end));
+        start = end;
+    }
+}
+
+fn no_handoff(owner: &Owner) {
+    assert!(
+        !owner.said.iter().any(|emit| matches!(
+            emit,
+            Emit::NeedsEngine(_) | Emit::Refuse(_) | Emit::Retract(_)
+        )),
+        "{:?}",
+        owner.said
+    );
+}
+
+#[test]
+fn a_known_size_zipcrypto_entry_deciphers_from_the_front_while_its_tail_is_bid_for() {
+    let plain = payload(120, 200_003);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + super::super::crypto::HEADER;
+    let total = archive.len() as u64;
+    let mut owner = Owner::alone(Zip::new(), archive.clone());
+    // The tail is bid for, and nothing above has brought it forward yet.
+    owner.pull = Pull::Moved(0);
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, start + 4096));
+    assert!(owner.member("alpha.bin").bytes == plain[..4096]);
+    assert!(!owner.member("alpha.bin").closed);
+    assert!(
+        owner.seeks.iter().any(|seek| seek.range.end == total),
+        "{:?}",
+        owner.seeks
+    );
+    arrive(&mut owner, ByteRange::new(start + 4096, total), 4096);
+    owner.close(0);
+    // Every byte is deciphered and said once, on the loan or on the loop.
+    assert_eq!(owner.emitted, plain.len() as u64);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    no_handoff(&owner);
+}
+
+#[test]
+fn a_known_size_zipcrypto_walk_whose_tail_came_first_is_checked_against_it() {
+    let plain = payload(123, 200_003);
+    let archive = encrypted(&plain);
+    let total = archive.len() as u64;
+    let mut owner = Owner::alone(Zip::new(), archive.clone());
+    offer(&mut owner, PASSWORD);
+    // The tail is brought forward as soon as it is bid for.
+    arrive(&mut owner, ByteRange::new(0, total), 4096);
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    no_handoff(&owner);
+}
+
+// A bounded ZipCrypto entry, then a stored one whose local header says its
+// sizes only after its data, which the directory says up front.
+fn encrypted_then_unbounded(plain: &[u8], other: &[u8]) -> Vec<u8> {
+    let single = encrypted(plain);
+    let end = records::find_end(&single).unwrap();
+    let central = single[end.offset as usize..end.at as usize].to_vec();
+    let mut archive = single[..end.offset as usize].to_vec();
+    let at = archive.len() as u32;
+    let name = b"beta.bin";
+    let (crc, len) = (crate::grid::crc32(other), other.len() as u32);
+    let u16s = |archive: &mut Vec<u8>, values: &[u16]| {
+        values
+            .iter()
+            .for_each(|value| archive.extend(value.to_le_bytes()))
+    };
+    archive.extend(0x0403_4b50u32.to_le_bytes());
+    u16s(&mut archive, &[20, 1 << 3, 0, 0, 0x21]);
+    archive.extend([0u8; 12]);
+    u16s(&mut archive, &[name.len() as u16, 0]);
+    archive.extend(name);
+    archive.extend(other);
+    archive.extend(0x0807_4b50u32.to_le_bytes());
+    for value in [crc, len, len] {
+        archive.extend(value.to_le_bytes());
+    }
+    let directory = archive.len() as u32;
+    archive.extend(&central);
+    archive.extend(0x0201_4b50u32.to_le_bytes());
+    u16s(&mut archive, &[20, 20, 1 << 3, 0, 0, 0x21]);
+    for value in [crc, len, len] {
+        archive.extend(value.to_le_bytes());
+    }
+    u16s(&mut archive, &[name.len() as u16, 0, 0, 0, 0]);
+    archive.extend(0u32.to_le_bytes());
+    archive.extend(at.to_le_bytes());
+    archive.extend(name);
+    let size = archive.len() as u32 - directory;
+    archive.extend(0x0605_4b50u32.to_le_bytes());
+    u16s(&mut archive, &[0, 0, 2, 2]);
+    archive.extend(size.to_le_bytes());
+    archive.extend(directory.to_le_bytes());
+    u16s(&mut archive, &[0]);
+    // The independent library reader checks the fixture.
+    let mut reader = ::zip::ZipArchive::new(Cursor::new(&archive)).unwrap();
+    let mut decoded = Vec::new();
+    std::io::Read::read_to_end(
+        &mut reader.by_index_decrypt(0, PASSWORD.as_bytes()).unwrap(),
+        &mut decoded,
+    )
+    .unwrap();
+    assert!(decoded == plain);
+    decoded.clear();
+    std::io::Read::read_to_end(&mut reader.by_index(1).unwrap(), &mut decoded).unwrap();
+    assert!(decoded == other);
+    drop(reader);
+    archive
+}
+
+#[test]
+fn a_walk_that_meets_an_entry_sized_after_its_data_reads_it_from_the_directory() {
+    let (plain, other) = (payload(121, 100_003), payload(122, 50_001));
+    let archive = encrypted_then_unbounded(&plain, &other);
+    let start = records::local_len(&archive).unwrap() + super::super::crypto::HEADER;
+    let total = archive.len() as u64;
+    let mut owner = Owner::alone(Zip::new(), archive.clone());
+    owner.pull = Pull::Moved(0);
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, start + 4096));
+    assert!(owner.member("alpha.bin").bytes == plain[..4096]);
+    // The tail, bid for, comes whole ahead of the second entry, as its
+    // article does.
+    let tail = total.saturating_sub(records::TAIL).max(start + 4096);
+    owner.deliver(0, ByteRange::new(tail, total));
+    arrive(&mut owner, ByteRange::new(start + 4096, tail), 4096);
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("beta.bin").bytes == other);
+    assert!(owner.member("alpha.bin").closed && owner.member("beta.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    no_handoff(&owner);
+}
+
+#[test]
+fn a_walk_without_a_tail_still_gives_an_entry_sized_after_its_data_to_an_engine() {
+    let (plain, other) = (payload(124, 100_003), payload(125, 50_001));
+    let archive = encrypted_then_unbounded(&plain, &other);
+    let total = archive.len() as u64;
+    let mut owner = Owner::alone(Zip::new(), archive);
+    owner.pull = Pull::Unseekable;
+    offer(&mut owner, PASSWORD);
+    let beta = owner.volumes[0]
+        .1
+        .windows(4)
+        .rposition(|window| window == 0x0403_4b50u32.to_le_bytes())
+        .unwrap() as u64;
+    // The walk reads the second header, then the rest is lost.
+    let header = beta + 30 + 8;
+    arrive(&mut owner, ByteRange::new(0, header), 4096);
+    let mut out = Vec::new();
+    owner.object.volume_lost(
+        VolumeIndex(crate::zip_engine::naming::LAST),
+        ByteRange::new(header, total),
+        &mut out,
+    );
+    owner.apply(out);
+    assert!(
+        owner
+            .said
+            .iter()
+            .any(|emit| *emit == Emit::NeedsEngine(Why::UnboundedEntry)),
+        "{:?}",
+        owner.said
+    );
+}
+
+// The password comes only once every byte of the member came: what the
+// object kept of its ciphertext waits for the loan, which deciphers it
+// whole with nothing read.
+#[test]
+fn ciphertext_kept_before_the_password_is_deciphered_by_the_loan() {
+    for frame in [64, 4096] {
+        let plain = payload(93, 5_003);
+        let archive = encrypted(&plain);
+        let mut owner = Owner::single(Zip::new(), archive.clone());
+        owner.whole(frame);
+        let refetched = owner.refetched.clone();
+        assert_eq!(owner.said, vec![Emit::NeedsPassword]);
+        assert!(!owner.object.work_due());
+        let mut out = Vec::new();
+        owner.object.offer_password(PASSWORD, &mut out);
+        assert!(owner.object.work_due());
+        owner.apply(out);
+        owner.settle();
+        assert!(owner.member("alpha.bin").bytes == plain, "frame {frame}");
+        assert!(owner.member("alpha.bin").closed);
+        assert!(owner.posted(0) == Some(archive));
+        assert!(!owner.object.work_due());
+        // The loan asks for nothing: the ciphertext was kept.
+        assert_eq!(owner.refetched, refetched, "frame {frame}");
+    }
 }

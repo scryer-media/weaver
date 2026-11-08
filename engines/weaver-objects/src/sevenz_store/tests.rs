@@ -576,6 +576,34 @@ fn the_key_cache_derives_each_tuple_once_across_objects() {
     assert_eq!(keys.derivations(), derived);
 }
 
+// A folder key is derived away from the loop: the offer that names the
+// password derives nothing and says nothing of the files, the store holds
+// the derivation as work, and the folders open once it comes back.
+#[test]
+fn a_folder_key_is_derived_on_the_loan_not_in_the_offer() {
+    let keys = Arc::new(Keys::new(16));
+    let mut owner = Owner::single(
+        SevenZipStore::with_keys(keys.clone()),
+        archive(aes(), false),
+    );
+    owner.frames(0, 4096);
+    assert!(!owner.object.work_due());
+    let mut out = Vec::new();
+    owner.object.offer_password(PASSWORD, &mut out);
+    assert_eq!(keys.derivations(), 0);
+    assert!(owner.object.work_due());
+    assert!(
+        !out.iter().any(|emit| matches!(emit, Emit::Bytes { .. })),
+        "{out:?}"
+    );
+    owner.settle();
+    owner.close(0);
+    no_trouble(&owner);
+    streamed(&owner);
+    assert!(keys.derivations() > 0);
+    assert!(!owner.object.work_due());
+}
+
 // A stretch of cipher posted wrong, its articles said damaged or not
 // noticed at all, then its repair: every member comes out whole and marked
 // nowhere damaged, and the container reads back as posted, whether the

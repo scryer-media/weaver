@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A recovery object lent out of its node, so its owner can run its repair
-// away from the tree. The node keeps what the object is and what its facts
-// were when it left; everything that reaches the object meanwhile waits in
-// arrival order, and a member of its namespace that the object might claim
-// queues behind it. Taken back, the object hears what waited as if it had
-// been there, and the queued members are asked again who owns them.
+// An object lent out of its node, so its owner can run its work away from
+// the tree: a recovery object's repair, or the slow work any object says it
+// holds. The node keeps what the object is and, for a repair, what its facts
+// were when it left; everything that reaches the object meanwhile waits in arrival
+// order, and a member of its namespace that the object might claim queues
+// behind it. Taken back, the object hears what waited as if it had been
+// there, and the queued members are asked again who owns them.
 
 use super::{Builder, Effect, NodeId, Tree};
-use crate::deliver::{Delivery, Provenance};
+use crate::deliver::{Delivery, Emit, Provenance};
 use crate::evidence::Evidenced;
 use crate::facts::Facts;
 use crate::member::MemberId;
@@ -20,13 +21,19 @@ use crate::volume::{ByteRange, VolumeIndex};
 
 pub(super) struct Lent {
     kind: Kind,
-    facts: Facts,
+    // What a repair's object was as it left. An object out for its work
+    // leaves none: no checkpoint is taken while it is out, and it always
+    // comes back, so nothing reads them, and taking them on every loan
+    // would encode what it holds each time.
+    facts: Option<Facts>,
     // The members of its namespace it covered when it left.
     covers: Vec<MemberId>,
     waiting: Vec<Waiting>,
     // Members that could not be asked whether they are its volumes, in the
     // order they asked.
     queued: Vec<(NodeId, MemberId)>,
+    // Lent for the work it held, not for a repair.
+    work: bool,
 }
 
 // Bytes for one of an object's volumes, owned, so a delivery can wait.
@@ -111,10 +118,51 @@ impl Tree {
         let object = found.object.take()?;
         found.lent = Some(Lent {
             kind: object.kind(),
-            facts: object.facts(),
+            facts: Some(object.facts()),
             covers,
             waiting: Vec::new(),
             queued: Vec::new(),
+            work: false,
+        });
+        Some(object)
+    }
+
+    // The nodes whose object holds work to be lent out for, in node order.
+    pub fn working(&self) -> Vec<NodeId> {
+        self.nodes
+            .iter()
+            .filter(|(_, found)| !found.retired && found.lent.is_none())
+            .filter(|(_, found)| {
+                found
+                    .object
+                    .as_ref()
+                    .is_some_and(|object| object.work_due())
+            })
+            .map(|(node, _)| *node)
+            .collect()
+    }
+
+    // Lend the object at `node` out to do the work it holds. `None` when it
+    // holds none, is retired, or is out already.
+    pub fn lend_work(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
+        let found = self.nodes.get_mut(&node)?;
+        if found.retired
+            || found.lent.is_some()
+            || !found
+                .object
+                .as_ref()
+                .is_some_and(|object| object.work_due())
+        {
+            return None;
+        }
+        let object = found.object.take()?;
+        found.lent = Some(Lent {
+            kind: object.kind(),
+            facts: None,
+            covers: Vec::new(),
+            waiting: Vec::new(),
+            queued: Vec::new(),
+            work: true,
         });
         Some(object)
     }
@@ -123,6 +171,14 @@ impl Tree {
         self.nodes
             .get(&node)
             .is_some_and(|found| found.lent.is_some())
+    }
+
+    // Whether the object at `node` is out for a repair.
+    pub(super) fn lent_for_repair(&self, node: NodeId) -> bool {
+        self.nodes
+            .get(&node)
+            .and_then(|found| found.lent.as_ref())
+            .is_some_and(|lent| !lent.work)
     }
 
     // Whether the object lent from `node` covered the member when it left.
@@ -137,10 +193,11 @@ impl Tree {
         Some(self.nodes.get(&node)?.lent.as_ref()?.kind)
     }
 
-    // The facts of the object at `node` as they were when it was lent: what
-    // it is checkpointed as while it is out, and what rebuilds it as it was.
+    // The facts of the object at `node` as they were when it was lent for a
+    // repair: what it is checkpointed as while it is out, and what rebuilds
+    // it as it was. An object out for its work has none.
     pub fn lent_facts(&self, node: NodeId) -> Option<&Facts> {
-        Some(&self.nodes.get(&node)?.lent.as_ref()?.facts)
+        self.nodes.get(&node)?.lent.as_ref()?.facts.as_ref()
     }
 
     // A lent object comes back, the one lent or one rebuilt from its facts.
@@ -151,7 +208,20 @@ impl Tree {
     pub fn take_back(
         &mut self,
         node: NodeId,
+        object: Box<dyn Object>,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        self.take_back_worked(node, object, Vec::new(), builder, effects);
+    }
+
+    // A lent object comes back with what its work said, which is applied
+    // first, as if it said it in its node, before what waited is heard.
+    pub fn take_back_worked(
+        &mut self,
+        node: NodeId,
         mut object: Box<dyn Object>,
+        mut said: Vec<Emit>,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
@@ -166,6 +236,9 @@ impl Tree {
             object.handed(&binding.handed);
         }
         found.object = Some(object);
+        if !said.is_empty() {
+            self.apply(node, &mut said, builder, effects);
+        }
         for waiting in waiting {
             self.hear(node, waiting, builder, effects);
         }

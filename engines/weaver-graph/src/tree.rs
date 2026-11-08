@@ -598,9 +598,9 @@ impl Tree {
     }
 
     // Whether the object at `node` is a recovery object: only a recovery
-    // object is lent.
+    // object is lent for a repair.
     pub fn recovers(&self, node: NodeId) -> bool {
-        self.recovery(node).is_some() || self.lent(node)
+        self.recovery(node).is_some() || self.lent_for_repair(node)
     }
 
     // Whether the job spends the member of `node`'s namespace rather than

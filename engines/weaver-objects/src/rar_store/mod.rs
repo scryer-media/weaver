@@ -333,6 +333,13 @@ pub struct RarStore {
     // changed, a volume touched, a condemned file's cipher taken or let go.
     // Data that only passes through moves nothing.
     placed: u64,
+    // The keys a file needs of a candidate that the cache holds no answer
+    // for, as (candidate, entry): derived away from the loop while the
+    // store is lent out, and the files open once it is back.
+    derive_due: BTreeSet<(usize, usize)>,
+    // What the pool derived for them, until the files take it: the
+    // process's cache is shared and may drop an entry before then.
+    derived: BTreeMap<(usize, usize), lock::Derived>,
 }
 
 // Every store's placement numbers, so no two stores, a store restored in
@@ -379,6 +386,8 @@ impl RarStore {
             stale: false,
             gone: false,
             placed: next_placed(),
+            derive_due: BTreeSet::new(),
+            derived: BTreeMap::new(),
         }
     }
 
@@ -702,6 +711,17 @@ impl Object for RarStore {
 
     fn facts(&self) -> weaver_graph::Facts {
         facts::of(self)
+    }
+
+    // A file key the cache has no answer for: the derivation is the
+    // slowest thing the store does, done away from the loop.
+    fn work_due(&self) -> bool {
+        !self.gone && !self.derive_due.is_empty()
+    }
+
+    fn work(&mut self, out: &mut Vec<Emit>) {
+        self.derive_due();
+        self.settle(None, out);
     }
 
     fn deliver(

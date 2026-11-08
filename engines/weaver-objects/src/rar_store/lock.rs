@@ -26,35 +26,56 @@ use crate::kept::Kept;
 use crate::keys::{self, Keys, Tuple};
 
 // A file's key, IV and hash key.
-struct FileKey {
+pub(super) struct FileKey {
     key: Zeroizing<Vec<u8>>,
     iv: [u8; 16],
     hash_key: Option<Zeroizing<[u8; 32]>>,
 }
 
-enum Derived {
+pub(super) enum Derived {
     Key(FileKey),
     Wrong,
     // A KDF count the crate refuses: nothing can decipher the member.
     Unkeyable,
 }
 
-// The derivation for one candidate, once per tuple in the process: the key
-// cache holds the key, or the finding that the check refutes the password.
-// A RAR5 entry is the key then the hash key; a RAR4 one the key then the IV.
-fn derive(keys: &Keys, password: &str, keying: &MemberKeying) -> Derived {
-    let kdf = keys.kdf();
+// The cache's tuple for a candidate's key to a file.
+fn with_tuple<R>(password: &str, keying: &MemberKeying, then: impl FnOnce(&Tuple<'_>) -> R) -> R {
     let (format, salt, count): (_, &[u8], _) = match keying {
         MemberKeying::Rar5(facts) => ("rar5", &facts.salt, [facts.kdf_count_lg2]),
         MemberKeying::Rar4 { salt } => ("rar4", salt.as_ref().map_or(&[], |salt| salt), [0]),
     };
-    let tuple = Tuple {
+    then(&Tuple {
         format,
         password,
         salt,
         params: &count,
+    })
+}
+
+// Whether the cache holds the answer for a candidate's key to a file: the
+// key, or that the check refutes the password. Without one the derivation
+// is too slow for the loop.
+fn known(keys: &Keys, password: &str, keying: &MemberKeying) -> bool {
+    with_tuple(password, keying, |tuple| keys.get(tuple).is_some())
+}
+
+// The derivation for one candidate, once per tuple in the process: the key
+// cache holds the key, or the finding that the check refutes the password.
+// A RAR5 entry is the key then the hash key; a RAR4 one the key then the IV.
+fn derive(keys: &Keys, password: &str, keying: &MemberKeying) -> Derived {
+    with_tuple(password, keying, |tuple| {
+        derive_tuple(keys, password, keying, tuple)
+    })
+}
+
+fn derive_tuple(keys: &Keys, password: &str, keying: &MemberKeying, tuple: &Tuple<'_>) -> Derived {
+    let kdf = keys.kdf();
+    let count = match keying {
+        MemberKeying::Rar5(facts) => [facts.kdf_count_lg2],
+        MemberKeying::Rar4 { .. } => [0],
     };
-    let derived = keys.derive(&tuple, || match keying {
+    let derived = keys.derive(tuple, || match keying {
         MemberKeying::Rar5(facts) => {
             let check = facts.psw_check.as_ref();
             match check_member_password(kdf, password, &facts.salt, count[0], check) {
@@ -75,7 +96,7 @@ fn derive(keys: &Keys, password: &str, keying: &MemberKeying) -> Derived {
         Ok(keys::Derived::Key(material)) => Derived::Key(file_key(&material, keying)),
         Ok(keys::Derived::Wrong) => Derived::Wrong,
         Err(Derived::Wrong) => {
-            keys.mark_wrong(&tuple);
+            keys.mark_wrong(tuple);
             Derived::Wrong
         }
         Err(other) => other,
@@ -239,9 +260,28 @@ impl RarStore {
         order
     }
 
+    // Derive every key a file is waiting on, away from the loop, into the
+    // cache: the files open from it once the store is back.
+    pub(super) fn derive_due(&mut self) {
+        for (candidate, index) in std::mem::take(&mut self.derive_due) {
+            let (Some(found), Some(store)) = (
+                self.candidates.get(candidate),
+                self.entries
+                    .get(index)
+                    .and_then(|entry| entry.store.as_ref()),
+            ) else {
+                continue;
+            };
+            let derived = derive(&self.keys, &found.secret, &store.keying());
+            self.derived.insert((candidate, index), derived);
+        }
+        self.stale = true;
+    }
+
     pub(super) fn open_files(&mut self, out: &mut Vec<Emit>) {
         let order = self.order();
         let mut asks = false;
+        let mut due = Vec::new();
         for index in 0..self.entries.len() {
             let entry = &self.entries[index];
             let (Lock::Locked | Lock::Sealed(_), Some(store), Some(length)) =
@@ -254,11 +294,26 @@ impl RarStore {
             };
             let keying = store.keying();
             let mut opened = None;
+            let mut waits = false;
             for candidate in &order {
                 if self.candidates[*candidate].files_wrong {
                     continue;
                 }
-                match derive(&self.keys, &self.candidates[*candidate].secret, &keying) {
+                let secret = &self.candidates[*candidate].secret;
+                // A key the cache has no answer for is derived on the pool:
+                // the file waits for it, and no later candidate is tried.
+                let derived = match self.derived.remove(&(*candidate, index)) {
+                    Some(derived) => derived,
+                    None if known(&self.keys, secret, &keying) => {
+                        derive(&self.keys, secret, &keying)
+                    }
+                    None => {
+                        due.push((*candidate, index));
+                        waits = true;
+                        break;
+                    }
+                };
+                match derived {
                     Derived::Key(key) => {
                         // A RAR4 file key has no check of its own: unless
                         // the candidate proved itself on the headers, it is
@@ -273,6 +328,9 @@ impl RarStore {
                         return self.give_up(Emit::NeedsEngine(Why::Encrypted), out);
                     }
                 }
+            }
+            if waits {
+                continue;
             }
             let Some((key, trial)) = opened else {
                 asks = true;
@@ -294,6 +352,7 @@ impl RarStore {
             entry.trial = trial;
             self.stale = true;
         }
+        self.derive_due.extend(due);
         if asks {
             self.ask(out);
         }

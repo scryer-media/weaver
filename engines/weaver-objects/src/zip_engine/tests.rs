@@ -509,7 +509,8 @@ fn a_run_asks_for_a_password_before_its_volumes_close() {
             file.compressed_size() as usize,
         )
     };
-    let gate = Gate::with_holes(vec![archive], vec![last_at + 1..last_at + last_len - 1]);
+    let hole = last_at + 1..last_at + last_len - 1;
+    let gate = Gate::with_holes(vec![archive], std::iter::once(hole).collect());
     let (runner, heard) = running(named(&["locked.zip"]).start(), &gate);
     runner.join().unwrap();
     assert_eq!(gate.len(VolumeIndex(0)), None, "the volume is still open");

@@ -453,6 +453,18 @@ pub trait Object: Send + Sync {
     // header and, if it opens, carries on.
     fn offer_password(&mut self, _secret: &str, _out: &mut Vec<Emit>) {}
 
+    // Whether I hold work too slow for the loop that delivers to me: a
+    // keystream to run over held ciphertext, a key to derive from a
+    // password. My owner lends me out to do it and takes me back with what
+    // I said, as it lends a recovery object for its repair.
+    fn work_due(&self) -> bool {
+        false
+    }
+
+    // Do the work I hold, away from the tree: no placement can be read.
+    // What I say is applied as I come back.
+    fn work(&mut self, _out: &mut Vec<Emit>) {}
+
     // Bytes of my envelope, for the inverse map's remainder.
     fn envelope(&self, envelope: u32, range: ByteRange) -> Option<bytes::Bytes>;
 
