@@ -791,6 +791,132 @@ async fn fallback_keeps_real_error_before_a_skipped_rung() {
     ));
 }
 
+// A rung with a naming of its own: it resolves every name to `answer`,
+// counting the lookups, and keeps the targets it is asked to dial. It fails
+// each dial as its path when `fails`, and reaches a stream otherwise.
+struct OwnNaming {
+    answer: Vec<IpAddr>,
+    fails: bool,
+    lookups: std::sync::atomic::AtomicUsize,
+    dialled: Mutex<Vec<Target>>,
+}
+impl OwnNaming {
+    fn new(answer: &[&str], fails: bool) -> Arc<Self> {
+        Arc::new(Self {
+            answer: answer.iter().map(|ip| ip.parse().unwrap()).collect(),
+            fails,
+            lookups: Default::default(),
+            dialled: Default::default(),
+        })
+    }
+    fn lookups(&self) -> usize {
+        self.lookups.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn dialled(&self) -> Vec<Vec<IpAddr>> {
+        self.dialled
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|target| target.addresses.clone())
+            .collect()
+    }
+}
+#[async_trait::async_trait]
+impl Dialer for OwnNaming {
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        self.dialled.lock().unwrap().push(target.clone());
+        if self.fails {
+            return Err(DialError::Egress(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "fixture refusal",
+            )));
+        }
+        let (near, _far) = tokio::io::duplex(64);
+        Ok(Dialed {
+            stream: DialedStream::Tunnel(Box::new(near)),
+            outcome: Default::default(),
+            path: DialPath::default(),
+            peer: None,
+            source: None,
+            setup: None,
+        })
+    }
+    async fn resolve(&self, _host: &str) -> Result<Resolution, DialError> {
+        self.lookups
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(if self.answer.is_empty() {
+            Resolution::Unresolved
+        } else {
+            Resolution::Addresses(self.answer.clone())
+        })
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "own naming".into()
+    }
+}
+
+// The addresses `ladder` resolves `host` to, pinned on a dial of it.
+async fn checked(ladder: &Fallback, host: &str) -> Target {
+    let Resolution::Addresses(addresses) = ladder.resolve(host).await.unwrap() else {
+        panic!("the answering rung resolves names");
+    };
+    Target {
+        addresses,
+        ..named(host, 443)
+    }
+}
+
+// A name checked under the first rung's naming is not dialled with that
+// answer by the rung below it when the first fails: the rung below asks its
+// own naming and dials only the checked addresses its answer also holds.
+#[tokio::test]
+async fn a_fallback_rung_dials_a_checked_name_under_its_own_naming() {
+    let first = OwnNaming::new(&["192.0.2.1", "192.0.2.2"], true);
+    let second = OwnNaming::new(&["192.0.2.2", "192.0.2.3"], false);
+    let ladder = Fallback::new(vec![first.clone(), second.clone()]);
+    let target = checked(&ladder, "feed.invalid").await;
+    assert_eq!(first.lookups(), 1);
+    ladder.dial(&target).await.unwrap();
+    assert_eq!(first.lookups(), 1, "the answering rung dials what it gave");
+    assert_eq!(second.lookups(), 1, "the rung below asks its own naming");
+    assert_eq!(
+        second.dialled(),
+        [vec!["192.0.2.2".parse::<IpAddr>().unwrap()]]
+    );
+}
+
+// A rung below whose naming gives none of the checked addresses does not
+// carry the dial, and the first rung's failure is the one reported.
+#[tokio::test]
+async fn a_fallback_rung_whose_naming_disagrees_is_skipped() {
+    let first = OwnNaming::new(&["192.0.2.1"], true);
+    let second = OwnNaming::new(&["192.0.2.3"], false);
+    let ladder = Fallback::new(vec![first.clone(), second.clone()]);
+    let target = checked(&ladder, "feed.invalid").await;
+    assert!(matches!(
+        ladder.dial(&target).await,
+        Err(DialError::Egress(_))
+    ));
+    assert_eq!(second.lookups(), 1);
+    assert!(second.dialled().is_empty());
+}
+
+// A rung below whose proxy resolves names is handed the name, not the first
+// rung's answer.
+#[tokio::test]
+async fn a_fallback_rung_whose_proxy_resolves_is_handed_the_name() {
+    let first = OwnNaming::new(&["192.0.2.1"], true);
+    let second = OwnNaming::new(&[], false);
+    let ladder = Fallback::new(vec![first.clone(), second.clone()]);
+    let target = checked(&ladder, "feed.invalid").await;
+    ladder.dial(&target).await.unwrap();
+    assert_eq!(second.lookups(), 1);
+    assert_eq!(second.dialled(), [Vec::<IpAddr>::new()]);
+}
+
 #[test]
 fn unresolved_destination_and_bound_route_failures_have_distinct_evidence() {
     let unresolved = DialError::destination(io::Error::new(

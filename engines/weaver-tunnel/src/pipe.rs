@@ -1492,6 +1492,50 @@ impl Fallback {
         }
     }
 }
+impl Fallback {
+    // The rung whose naming answers a caller resolving through the ladder:
+    // the first one a dial that is not a probe would try.
+    fn answering(&self) -> Option<usize> {
+        (0..self.rungs.len()).find(|index| self.allows_rung(*index, false))
+    }
+}
+
+// `target` as `rung` dials it. Addresses pinned for a name were resolved by
+// the answering rung's naming; any other rung asks its own naming and keeps
+// only the pinned addresses it also gives, or is handed the name when its
+// proxy resolves names. A rung whose naming gives none of them is skipped.
+async fn as_named_by<'a>(
+    rung: &dyn Dialer,
+    target: &'a Target,
+    answered: bool,
+) -> Result<std::borrow::Cow<'a, Target>, DialError> {
+    if answered || target.addresses.is_empty() || target.host.parse::<IpAddr>().is_ok() {
+        return Ok(std::borrow::Cow::Borrowed(target));
+    }
+    let addresses = match rung.resolve(&target.host).await? {
+        Resolution::Unresolved => Vec::new(),
+        Resolution::Addresses(own) => {
+            let kept: Vec<_> = target
+                .addresses
+                .iter()
+                .copied()
+                .filter(|ip| own.contains(ip))
+                .collect();
+            if kept.is_empty() {
+                return Err(DialError::Skipped(format!(
+                    "{}: this rung resolves it to none of the addresses checked",
+                    target.host
+                )));
+            }
+            kept
+        }
+    };
+    Ok(std::borrow::Cow::Owned(Target {
+        addresses,
+        ..target.clone()
+    }))
+}
+
 // Whether a dial for `purpose` probes its path, and so tries rungs still
 // cooling.
 fn probes(purpose: &Purpose) -> bool {
@@ -1517,11 +1561,16 @@ impl Dialer for Fallback {
     async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
         let mut last = DialError::Skipped("all rungs are unavailable".into());
         let mut capacity_changes = Vec::new();
+        let answering = self.answering();
         for (index, rung) in self.rungs.iter().enumerate() {
             if !self.allows_rung(index, probes(&target.purpose)) {
                 continue;
             }
-            match rung.dial(target).await {
+            let dialed = match as_named_by(rung.as_ref(), target, answering == Some(index)).await {
+                Ok(target) => rung.dial(&target).await,
+                Err(error) => Err(error),
+            };
+            match dialed {
                 Ok(mut dialed) => {
                     self.states.lock().expect("rung state")[index].clear();
                     dialed.path.rung = Some(index);
@@ -1547,7 +1596,7 @@ impl Dialer for Fallback {
     }
     // What the first rung a dial would try resolves `host` to.
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
-        match (0..self.rungs.len()).find(|index| self.allows_rung(*index, false)) {
+        match self.answering() {
             Some(index) => self.rungs[index].resolve(host).await,
             None => Ok(Resolution::Unresolved),
         }
