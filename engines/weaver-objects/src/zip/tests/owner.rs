@@ -52,6 +52,11 @@ pub(super) struct Owner {
     pub refetched: Vec<(VolumeIndex, ByteRange)>,
     // Runs read back and delivered again.
     pub replays: usize,
+    // The object is not lent out for what it holds until `work` is called.
+    pub lend_late: bool,
+    working: bool,
+    // Member bytes said, every time they were said.
+    pub emitted: u64,
 }
 
 // What is held of `range` of `volume`, read the way the owner reads a held
@@ -124,6 +129,9 @@ impl Owner {
             fetched: BTreeMap::new(),
             refetched: Vec::new(),
             replays: 0,
+            lend_late: false,
+            emitted: 0,
+            working: false,
         };
         let name = owner.volumes[0].0.clone();
         owner.object.bound(owner.index[0], &name, &[], None);
@@ -187,6 +195,14 @@ impl Owner {
         self.fetch(self.index[volume], range);
         self.push(self.index[volume], range, provenance, bytes);
         self.settle();
+    }
+
+    // A range arrives and nothing else reaches the object after it: no
+    // seek is answered, nothing held is handed back.
+    pub fn arrive(&mut self, volume: usize, range: ByteRange) {
+        self.bind(volume);
+        self.fetch(self.index[volume], range);
+        self.push(self.index[volume], range, Provenance::Fresh, None);
     }
 
     // Bytes from outside.
@@ -347,6 +363,14 @@ impl Owner {
         self.held.len()
     }
 
+    // The object is lent out for what it holds, works away from every
+    // placement, and is taken back with what it said.
+    pub fn work(&mut self) {
+        let mut out = Vec::new();
+        self.object.work(&mut out);
+        self.apply(out);
+    }
+
     pub(super) fn apply(&mut self, out: Vec<Emit>) {
         let mut again = Vec::new();
         for emit in out {
@@ -380,6 +404,7 @@ impl Owner {
                     bytes,
                     provenance,
                 } => {
+                    self.emitted += bytes.len() as u64;
                     let got = self.members.get_mut(&member.0).expect("announced first");
                     let end = offset as usize + bytes.len();
                     if got.bytes.len() < end {
@@ -407,6 +432,14 @@ impl Owner {
         }
         if !again.is_empty() {
             self.again(&again);
+        }
+        // The owner lends the object out for what it holds, and takes it
+        // back with what it said, after each thing it heard and before
+        // anything else reaches it; what the loan said is not lent for.
+        if !self.lend_late && !self.working && self.object.work_due() {
+            self.working = true;
+            self.work();
+            self.working = false;
         }
     }
 

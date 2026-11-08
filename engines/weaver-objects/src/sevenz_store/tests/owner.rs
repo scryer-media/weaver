@@ -188,6 +188,15 @@ impl Owner {
     pub fn settle(&mut self) {
         loop {
             let mut changed = false;
+            // Work the store holds is done away from the loop once what was
+            // delivered is placed, as the tree lends it after a step, and
+            // what it says is applied as it comes back.
+            if self.object.work_due() {
+                let mut out = Vec::new();
+                self.object.work(&mut out);
+                self.apply(out);
+                changed = true;
+            }
             // The object restates its wants every round; only a change in
             // them is news.
             let mut seeks = Vec::new();

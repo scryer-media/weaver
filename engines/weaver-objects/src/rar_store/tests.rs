@@ -1185,6 +1185,36 @@ fn encrypted_files_without_the_password_are_refused_at_quiet() {
     assert!(owner.said.contains(&Emit::Refuse(Why::Encrypted)));
 }
 
+// A file key is derived away from the loop: the offer that names the
+// password derives nothing and says nothing of the files, the store holds
+// the derivation as work, and the files open once it comes back.
+#[test]
+fn a_file_key_is_derived_on_the_loan_not_in_the_offer() {
+    for version in [Version::Rar5, Version::Rar4] {
+        let keys = Arc::new(Keys::new(CAPACITY));
+        let volumes = write(&items(), &encrypted(version, false));
+        let mut owner = Owner::named(RarStore::with_keys(Arc::clone(&keys)), volumes);
+        owner.frames(0, 4096);
+        assert!(!owner.object.work_due(), "{version:?}");
+        let mut out = Vec::new();
+        owner.object.offer_password(PASSWORD, &mut out);
+        assert_eq!(keys.derivations(), 0, "{version:?}");
+        assert!(owner.object.work_due(), "{version:?}");
+        assert!(
+            !out.iter().any(|emit| matches!(emit, Emit::Bytes { .. })),
+            "{version:?} {out:?}"
+        );
+        owner.settle();
+        owner.close(0);
+        owner.said.retain(|emit| *emit != Emit::NeedsPassword);
+        no_trouble(&owner);
+        streamed(&owner);
+        posted_whole(&owner);
+        assert!(keys.derivations() > 0, "{version:?}");
+        assert!(!owner.object.work_due(), "{version:?}");
+    }
+}
+
 // One key cache per process: a second store offered the same password over
 // the same salts derives nothing, neither a file key nor a header check.
 #[test]

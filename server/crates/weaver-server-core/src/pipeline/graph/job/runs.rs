@@ -38,6 +38,9 @@ impl GraphJob {
             Heard::Verified(_) => {
                 self.loans.returned(said.node, said.generation);
             }
+            Heard::Worked(_) => {
+                self.works.returned(said.node, said.generation);
+            }
             Heard::Written { stamp, control } => {
                 if self.pending.control().same(&control) {
                     self.acknowledge_checkpoint(stamp.unwrap_or(said.generation));
@@ -94,6 +97,23 @@ impl GraphJob {
                     &mut out,
                 )?;
                 self.heard(out)?;
+                self.step_runs(Vec::new(), limit)?;
+                return self.lend(slots, limit);
+            }
+            Heard::Worked(worked) => {
+                if !self.works.returned(node, said.generation) {
+                    return Ok(());
+                }
+                let super::Worked { object, said } = *worked;
+                let mut effects = Vec::new();
+                self.tree.take_back_worked(
+                    node,
+                    object,
+                    said,
+                    &mut self.writer.placing(&mut *self.builder),
+                    &mut effects,
+                );
+                self.settle_worked(effects)?;
                 self.step_runs(Vec::new(), limit)?;
                 return self.lend(slots, limit);
             }

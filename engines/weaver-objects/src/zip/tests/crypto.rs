@@ -129,6 +129,73 @@ fn zipcrypto_sparse_pieces_wait_for_the_prefix_and_reproduce_the_ciphertext() {
 }
 
 #[test]
+fn held_zipcrypto_ciphertext_waits_for_its_loan_and_survives_a_restart() {
+    let plain = payload(91, 230_011);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + super::super::crypto::HEADER;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.pull = Pull::Unseekable;
+    owner.lend_late = true;
+    offer(&mut owner, PASSWORD);
+    // Nothing of the delivery is deciphered on the loop: it waits for the
+    // loan. Anything else that reaches the object would run it first.
+    owner.arrive(0, ByteRange::new(0, start + 100_000));
+    assert!(owner.object.work_due());
+    assert!(owner.members.get(&0).is_none_or(|got| got.bytes.is_empty()));
+    // A restart before the loan finds the ciphertext in the facts and no
+    // keys: it waits until the password is offered again, whose keys are
+    // proved while the member has said nothing.
+    owner.restore();
+    assert!(!owner.object.work_due());
+    let mut out = Vec::new();
+    owner.object.offer_password(PASSWORD, &mut out);
+    owner.apply(out);
+    assert!(owner.object.work_due());
+    owner.work();
+    owner.deliver(0, ByteRange::new(start + 100_000, archive.len() as u64));
+    owner.work();
+    owner.close(0);
+    assert!(
+        owner.member("alpha.bin").bytes == plain,
+        "len={} cov={:?} replays={} said={:?}",
+        owner.member("alpha.bin").bytes.len(),
+        owner.member("alpha.bin").coverage,
+        owner.replays,
+        owner.said
+    );
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert!(!owner.object.work_due());
+}
+
+#[test]
+fn a_part_that_cannot_wait_runs_what_its_member_holds_first() {
+    let plain = payload(92, 210_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + super::super::crypto::HEADER;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.lend_late = true;
+    offer(&mut owner, PASSWORD);
+    owner.deliver(0, ByteRange::new(0, start + 4096));
+    owner.deliver(0, ByteRange::new(start + 4096, 80_000));
+    assert!(owner.object.work_due());
+    owner.deliver(0, ByteRange::new(120_000, 160_000));
+    owner.deliver(0, ByteRange::new(80_000, 120_000));
+    owner.work();
+    owner.deliver(0, ByteRange::new(160_000, archive.len() as u64));
+    owner.work();
+    owner.close(0);
+    assert!(
+        owner.member("alpha.bin").bytes == plain,
+        "len={} said={:?}",
+        owner.member("alpha.bin").bytes.len(),
+        owner.said
+    );
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+}
+
+#[test]
 fn zipcrypto_rejects_a_wrong_password_and_opens_with_the_next() {
     let plain = payload(83, 170_011);
     let archive = encrypted(&plain);
@@ -296,6 +363,10 @@ fn a_zipcrypto_local_header_starts_without_a_terminal_article_extent() {
         &mut |_, _| false,
         &mut out,
     );
+    // The front waits for its keys away from the loop, as the owner lends
+    // the object out for it.
+    assert!(object.work_due());
+    object.work(&mut out);
     assert!(out.iter().any(
         |emit| matches!(emit, Emit::Bytes { offset: 0, bytes, .. } if bytes[..] == plain[..4096])
     ));
@@ -1540,6 +1611,8 @@ fn a_known_size_zipcrypto_entry_deciphers_from_the_front_while_its_tail_is_bid_f
     );
     arrive(&mut owner, ByteRange::new(start + 4096, total), 4096);
     owner.close(0);
+    // Every byte is deciphered and said once, on the loan or on the loop.
+    assert_eq!(owner.emitted, plain.len() as u64);
     assert!(owner.member("alpha.bin").bytes == plain);
     assert!(owner.member("alpha.bin").closed);
     assert!(owner.posted(0) == Some(archive));
@@ -1675,4 +1748,31 @@ fn a_walk_without_a_tail_still_gives_an_entry_sized_after_its_data_to_an_engine(
         "{:?}",
         owner.said
     );
+}
+
+// The password comes only once every byte of the member came: what the
+// object kept of its ciphertext waits for the loan, which deciphers it
+// whole with nothing read.
+#[test]
+fn ciphertext_kept_before_the_password_is_deciphered_by_the_loan() {
+    for frame in [64, 4096] {
+        let plain = payload(93, 5_003);
+        let archive = encrypted(&plain);
+        let mut owner = Owner::single(Zip::new(), archive.clone());
+        owner.whole(frame);
+        let refetched = owner.refetched.clone();
+        assert_eq!(owner.said, vec![Emit::NeedsPassword]);
+        assert!(!owner.object.work_due());
+        let mut out = Vec::new();
+        owner.object.offer_password(PASSWORD, &mut out);
+        assert!(owner.object.work_due());
+        owner.apply(out);
+        owner.settle();
+        assert!(owner.member("alpha.bin").bytes == plain, "frame {frame}");
+        assert!(owner.member("alpha.bin").closed);
+        assert!(owner.posted(0) == Some(archive));
+        assert!(!owner.object.work_due());
+        // The loan asks for nothing: the ciphertext was kept.
+        assert_eq!(owner.refetched, refetched, "frame {frame}");
+    }
 }

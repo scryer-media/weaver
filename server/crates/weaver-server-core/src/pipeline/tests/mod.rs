@@ -2056,6 +2056,17 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
         pipeline.check_job_completion(queued_job).await;
         pipeline.pump_decode_queue();
     }
+    // An object lent out for its work comes back before the next article,
+    // as the runtime's loop takes its mail while a lane fetches.
+    while pipeline.graph_jobs.values().any(|job| job.working()) {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("an object out for its work comes back");
+        pipeline.graph_run_said(said);
+        pipeline.pump_decode_queue();
+    }
     settle_inflight_moves(pipeline).await;
     settle_failed_releases(pipeline).await;
 }

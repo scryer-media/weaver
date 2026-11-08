@@ -140,6 +140,12 @@ impl Owner {
 
     fn release(&mut self, object: &mut dyn Object, out: &mut Vec<Emit>) {
         loop {
+            // Work the object holds is done once what was delivered is
+            // placed, as the tree lends it after a step.
+            if object.work_due() {
+                object.work(out);
+                continue;
+            }
             let placed = self.held.iter().position(|(volume, start, bytes)| {
                 let mut placements = Vec::new();
                 object.locate(

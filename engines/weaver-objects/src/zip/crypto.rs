@@ -682,6 +682,30 @@ impl super::Zip {
         }
     }
 
+    // Whether some member's keys are proved and stand where ciphertext the
+    // object kept starts: it can be deciphered with nothing read.
+    pub(super) fn kept_due(&self) -> bool {
+        self.map.as_ref().is_some_and(|map| {
+            map.entries.iter().any(|entry| {
+                let (Some(member), Some(data), Some(cipher)) =
+                    (entry.member, entry.data, &entry.cipher)
+                else {
+                    return false;
+                };
+                cipher.open.as_ref().is_some_and(|open| {
+                    let at = open.reaches();
+                    open.checked
+                        && !cipher.retry
+                        && at < entry.length
+                        && !self.kept.from(data + at).is_empty()
+                        && !self.members[member.0 as usize]
+                            .coverage
+                            .covered(ByteRange::at(at, 1))
+                })
+            })
+        })
+    }
+
     pub(super) fn emit_kept_encrypted(
         &mut self,
         read: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,

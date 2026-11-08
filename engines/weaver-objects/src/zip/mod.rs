@@ -20,6 +20,7 @@ mod carried;
 mod crypto;
 mod directory;
 mod geometry;
+mod held;
 mod map;
 mod place;
 mod record;
@@ -98,6 +99,9 @@ pub struct Zip {
     stale: bool,
     // The object gave its container up; it says nothing more.
     gone: bool,
+    // Ciphertext waiting for its keys to run over it away from the loop.
+    #[serde(default)]
+    held: Vec<held::Held>,
 }
 
 impl Durable for Zip {
@@ -442,6 +446,9 @@ impl Object for Zip {
         if self.gone {
             return;
         }
+        if self.holds_any() {
+            self.run_held(Some(&mut *read), out);
+        }
         self.install(out);
         self.decide_last(&delivery, read, out);
         if self.gone {
@@ -480,6 +487,7 @@ impl Object for Zip {
 
     fn volume_closed(&mut self, _volume: VolumeIndex, out: &mut Vec<Emit>) {
         if !self.gone {
+            self.run_held_first(out);
             self.install(out);
         }
         self.stale = true;
@@ -490,6 +498,7 @@ impl Object for Zip {
         if self.gone {
             return;
         }
+        self.run_held_first(out);
         self.install(out);
         let Some(range) = self.global(volume, range) else {
             return;
@@ -518,6 +527,7 @@ impl Object for Zip {
         if self.gone {
             return;
         }
+        self.run_held_first(out);
         self.install(out);
         if let Some(why) = crate::quiet::damaged(standing)
             .or_else(|| {
@@ -570,6 +580,7 @@ impl Object for Zip {
         if self.gone {
             return;
         }
+        self.run_held_first(out);
         self.install(out);
         if matches!(pull, Pull::Moved(_) | Pull::Unlocated) {
             return;
@@ -669,6 +680,7 @@ impl Object for Zip {
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
         if !self.gone {
+            self.run_held_first(out);
             self.install(out);
         }
         let Some(disk) = self.disk(volume) else {
@@ -682,6 +694,7 @@ impl Object for Zip {
     }
 
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
+        self.run_held_first(out);
         self.asked = false;
         if !self
             .candidates
@@ -729,6 +742,17 @@ impl Object for Zip {
 
     fn facts(&self) -> Facts {
         Facts::of(Kind::Zip, self)
+    }
+
+    // A member's keys running over held ciphertext: the slowest thing the
+    // object does, done away from the loop.
+    fn work_due(&self) -> bool {
+        !self.gone && (self.held_ready() || self.kept_due())
+    }
+
+    fn work(&mut self, out: &mut Vec<Emit>) {
+        self.run_held(None, out);
+        self.emit_kept_encrypted(&mut |_, _| false, out);
     }
 }
 

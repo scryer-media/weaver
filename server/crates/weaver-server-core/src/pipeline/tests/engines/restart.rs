@@ -1456,6 +1456,38 @@ async fn a_stored_zip_of_one_member_restarted_after_every_article_delivers_it() 
     .await;
 }
 
+// A ZipCrypto member's ciphertext is deciphered on the pool while its zip is
+// lent out; a restart while it is out, or before, delivers it all the same.
+fn zipcrypto() -> ::zip::write::SimpleFileOptions {
+    use ::zip::unstable::write::FileOptionsExt;
+    zip::stored()
+        .with_deprecated_encryption(SECRET.as_bytes())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_zipcrypto_zip_of_one_member_restarted_after_every_article_delivers_it() {
+    let mut writer = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer.start_file("ember.bin", zipcrypto()).unwrap();
+    std::io::Write::write_all(&mut writer, &payload(9 * ARTICLE + 5, 88)).unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+    restart_row(Scenario::new(vec![Post::plain("lantern.zip", bytes)]).password(SECRET)).await;
+}
+
+#[tokio::test]
+async fn a_zipcrypto_zip_under_par2_restarted_after_every_article_is_repaired_with_no_refetch() {
+    let posts = with_par2(
+        vec![Post::plain("lantern.zip", zip::archive(zipcrypto()))],
+        2,
+    );
+    restart_row(Scenario::new(posts).damaged(0, 2).password(SECRET)).await;
+}
+
+#[tokio::test]
+async fn a_zipcrypto_zip_spanned_restarted_after_every_article_delivers_its_members() {
+    restart_row(Scenario::new(zip::spanned(&zip::archive(zipcrypto()), 3)).password(SECRET)).await;
+}
+
 // The engine's inflate run replays the member's stream from its start over
 // the partial on disk, so a restart inside the run re-reads and never fetches.
 #[tokio::test]

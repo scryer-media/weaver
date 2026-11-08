@@ -39,7 +39,16 @@ impl Zip {
         for (member, part, start) in parts {
             let slice =
                 bytes.slice((part.start - range.start) as usize..(part.end - range.start) as usize);
-            self.decrypt_record(member, part.start - start, slice, provenance, read, out);
+            let offset = part.start - start;
+            if self.hold(member, offset, &slice, provenance) {
+                continue;
+            }
+            // A part that cannot wait behind what the member holds is heard
+            // after it, as it came.
+            if self.holding(member) {
+                self.run_held(Some(&mut *read), out);
+            }
+            self.decrypt_record(member, offset, slice, provenance, read, out);
         }
         self.emit_kept_encrypted(read, out);
     }

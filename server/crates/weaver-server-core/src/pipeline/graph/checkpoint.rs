@@ -951,6 +951,13 @@ impl Pipeline {
             if pending.control().cancelled() {
                 return;
             }
+            // The steps stay unread until the object out for its work is
+            // back. Nothing more goes out until a checkpoint is recorded, so
+            // the step that takes it back takes them.
+            if graph.working() {
+                graph.owe_checkpoint();
+                return;
+            }
             pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
             graph.recorded(pending.stamp());
             let mut moved = false;
