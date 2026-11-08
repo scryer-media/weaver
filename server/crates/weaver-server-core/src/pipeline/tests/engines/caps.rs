@@ -142,13 +142,16 @@ async fn a_stored_member_split_over_volumes_bound_one_by_one_stays_under_the_rat
     // The member's file takes its whole length at its first write, while
     // only the first of the eight volumes is bound. The ratio is taken over
     // every volume posted, not only the ones bound so far: twice one volume
-    // is under the member, twice the eight is over it.
-    let body = payload(64 * ARTICLE, 81);
+    // is under the member, twice the eight is over it. Each article holds a
+    // whole front, as a 750 KB article of a 100 MiB volume does, so the
+    // first volume is founded, and its member written, on its first article.
+    let front = weaver_graph::member::FIRST_BYTES;
+    let body = payload(8 * 2 * front, 81);
     let posts = single_member_store_set("beacon.bin", &body, 8)
         .into_iter()
         .map(|(name, bytes)| Post::plain(&name, bytes))
         .collect();
-    let scenario = Scenario::new(posts).limits(limits(|limits| {
+    let scenario = Scenario::new(posts).framed(front).limits(limits(|limits| {
         limits.max_ratio = 2;
         limits.ratio_floor_bytes = 1024;
     }));
