@@ -10,4 +10,4 @@ mod opened_file;
 mod sparse;
 
 pub use fs::{FilesystemStorage, FilesystemStorageFactory};
-pub use opened_file::OurFileExt;
+pub use opened_file::{OurFileExt, pread_exact_vectored};

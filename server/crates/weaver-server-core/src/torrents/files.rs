@@ -338,6 +338,16 @@ impl Files {
         read_exact_at(&handle, offset, out)
     }
 
+    // `outs` filled one after the other from the file's bytes at `offset`,
+    // in one positional read where the platform has one.
+    pub(crate) fn readv(&self, file: usize, offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
+        let name = self.name(file)?;
+        let at = self.at();
+        let path = at.dir.join(name);
+        let handle = self.pool.open(at.reads[file], || File::open(&path))?;
+        weaver_torrent::storage::filesystem::pread_exact_vectored(&handle, offset, outs)
+    }
+
     // The file made `length` long when it is shorter, so a file whose
     // pieces are all had is there whole, an empty one among them. A longer
     // one stays as it is.

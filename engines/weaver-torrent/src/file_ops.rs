@@ -517,6 +517,71 @@ impl<'a> FileOps<'a> {
         Ok(())
     }
 
+    /// Each of `chunks` read into its buffer of `bufs`, sized to the block.
+    /// A run of blocks one after another in one file on disk is read in one
+    /// go (libtorrent `disk_io_thread::do_read` reads a cache line of blocks
+    /// with one readv); a block in padding, or across a file boundary, is
+    /// read on its own. On an error, the first block not read and why: the
+    /// blocks before it are read whole.
+    pub fn read_chunks(
+        &self,
+        who_sent: PeerHandle,
+        chunks: &[ChunkInfo],
+        bufs: &mut [&mut [u8]],
+    ) -> Result<(), (usize, anyhow::Error)> {
+        let lengths = self.torrent.lengths();
+        let mut i = 0;
+        while i < chunks.len() {
+            let start = lengths.chunk_absolute_offset(&chunks[i]);
+            let mut file_start = 0u64;
+            let mut file = None;
+            for (file_idx, file_info) in self.file_infos.iter().enumerate() {
+                if start - file_start < file_info.len {
+                    file = (!file_info.attrs.padding)
+                        .then_some((file_idx, file_start + file_info.len));
+                    break;
+                }
+                file_start += file_info.len;
+            }
+            let mut end = start;
+            let mut j = i;
+            if let Some((_, file_end)) = file {
+                while j < chunks.len()
+                    && bufs[j].len() == chunks[j].size as usize
+                    && lengths.chunk_absolute_offset(&chunks[j]) == end
+                    && end + u64::from(chunks[j].size) <= file_end
+                {
+                    end += u64::from(chunks[j].size);
+                    j += 1;
+                }
+            }
+            match file {
+                Some((file_idx, _)) if j - i > 1 => {
+                    trace!(
+                        handle = %who_sent,
+                        file_idx,
+                        blocks = j - i,
+                        "reading a run of blocks from {}",
+                        start - file_start
+                    );
+                    self.files
+                        .preadv_exact(file_idx, start - file_start, &mut bufs[i..j])
+                        .with_context(|| {
+                            format!("error reading {} bytes, file_id: {file_idx}", end - start)
+                        })
+                        .map_err(|e| (i, e))?;
+                    i = j;
+                }
+                _ => {
+                    self.read_chunk(who_sent, &chunks[i], bufs[i])
+                        .map_err(|e| (i, e))?;
+                    i += 1;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn write_chunk(
         &self,
         who_sent: PeerHandle,
@@ -770,6 +835,148 @@ mod tests {
         fn on_piece_hashed(&self, piece: ValidPieceIndex, bytes: bytes::Bytes) {
             self.hashed.lock().unwrap().push((piece.get(), bytes));
         }
+    }
+
+    /// A storage over `Files` that keeps each run of buffers it was asked to
+    /// read in one go: the file, the offset and how many.
+    struct Runs {
+        files: Files,
+        runs: std::sync::Mutex<Vec<(usize, u64, usize)>>,
+    }
+
+    impl TorrentStorage for Runs {
+        fn init(
+            &mut self,
+            shared: &ManagedTorrentShared,
+            metadata: &TorrentMetadata,
+        ) -> anyhow::Result<()> {
+            self.files.init(shared, metadata)
+        }
+
+        fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+            self.files.pread_exact(file_id, offset, buf)
+        }
+
+        fn preadv_exact(
+            &self,
+            file_id: usize,
+            mut offset: u64,
+            bufs: &mut [&mut [u8]],
+        ) -> anyhow::Result<()> {
+            self.runs
+                .lock()
+                .unwrap()
+                .push((file_id, offset, bufs.len()));
+            for buf in bufs.iter_mut() {
+                self.files.pread_exact(file_id, offset, buf)?;
+                offset += buf.len() as u64;
+            }
+            Ok(())
+        }
+
+        fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+            self.files.pwrite_all(file_id, offset, buf)
+        }
+
+        fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+            self.files.remove_file(file_id, filename)
+        }
+
+        fn remove_directory_if_empty(&self, path: &Path) -> anyhow::Result<()> {
+            self.files.remove_directory_if_empty(path)
+        }
+
+        fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+            self.files.ensure_file_length(file_id, length)
+        }
+
+        fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+            self.files.take()
+        }
+    }
+
+    fn peer() -> PeerHandle {
+        "127.0.0.1:6881".parse().unwrap()
+    }
+
+    // Every block of the torrent, in order.
+    fn every_block(metadata: &TorrentMetadata) -> Vec<ChunkInfo> {
+        let lengths = metadata.lengths();
+        lengths
+            .iter_piece_infos()
+            .flat_map(|piece| lengths.iter_chunk_infos(piece.piece_index))
+            .collect()
+    }
+
+    /// The blocks one after another in one file are read in one go, a block
+    /// across a file boundary or in padding on its own, and each block
+    /// reads as it does alone.
+    #[test]
+    fn a_run_of_blocks_in_one_file_is_read_in_one_go() {
+        let t = two_files();
+        let metadata = metadata(&t.torrent_bytes());
+        let payload = t.v1_payload();
+        let storage = Runs {
+            files: Files::new(&metadata, &payload),
+            runs: Default::default(),
+        };
+        let ops = FileOps::new(&metadata, &storage, false);
+        let chunks = every_block(&metadata);
+        let alone: Vec<Vec<u8>> = chunks
+            .iter()
+            .map(|chunk| {
+                let mut buf = vec![0; chunk.size as usize];
+                ops.read_chunk(peer(), chunk, &mut buf).unwrap();
+                buf
+            })
+            .collect();
+        let mut read: Vec<Vec<u8>> = chunks
+            .iter()
+            .map(|chunk| vec![0xee; chunk.size as usize])
+            .collect();
+        let mut bufs: Vec<&mut [u8]> = read.iter_mut().map(Vec::as_mut_slice).collect();
+        ops.read_chunks(peer(), &chunks, &mut bufs).unwrap();
+        assert_eq!(read, alone);
+        // Piece 0's blocks hold a, then padding, and the last piece's b's
+        // tail, then padding: the rest are b's, from its start.
+        let b = metadata
+            .file_infos
+            .iter()
+            .position(|fi| !fi.attrs.padding && fi.offset_in_torrent > 0)
+            .unwrap();
+        assert_eq!(*storage.runs.lock().unwrap(), [(b, 0, chunks.len() - 4)]);
+    }
+
+    /// A run that fails names its first block: the blocks before the run
+    /// are read whole.
+    #[test]
+    fn a_run_that_fails_names_its_first_block() {
+        let t = two_files();
+        let metadata = metadata(&t.torrent_bytes());
+        let payload = t.v1_payload();
+        let mut files = Files::new(&metadata, &payload);
+        let b = metadata
+            .file_infos
+            .iter()
+            .position(|fi| !fi.attrs.padding && fi.offset_in_torrent > 0)
+            .unwrap();
+        files.3.push((b, 40_000..40_001));
+        let storage = Runs {
+            files,
+            runs: Default::default(),
+        };
+        let ops = FileOps::new(&metadata, &storage, false);
+        let chunks = every_block(&metadata);
+        let mut read: Vec<Vec<u8>> = chunks
+            .iter()
+            .map(|chunk| vec![0xee; chunk.size as usize])
+            .collect();
+        let mut bufs: Vec<&mut [u8]> = read.iter_mut().map(Vec::as_mut_slice).collect();
+        let (first, _) = ops.read_chunks(peer(), &chunks, &mut bufs).unwrap_err();
+        assert_eq!(first, 2);
+        let mut block = vec![0; chunks[0].size as usize];
+        ops.read_chunk(peer(), &chunks[0], &mut block).unwrap();
+        assert_eq!(read[0], block);
     }
 
     /// A check hands the storage each piece it wants as it hashed it, read

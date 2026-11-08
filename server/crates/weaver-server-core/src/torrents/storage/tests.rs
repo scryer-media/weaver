@@ -179,6 +179,35 @@ fn a_piece_in_flight_is_read_back_from_memory() {
     shim.storage.pread_exact(0, 1000, &mut []).unwrap();
 }
 
+// A run of a file's bytes read in one go comes from disk, and a piece of it
+// still in flight from memory: either way each buffer holds its bytes.
+#[test]
+fn a_run_read_in_one_go_takes_a_held_piece_from_memory() {
+    let (shim, torrent) = three_files();
+    for piece in 0..4 {
+        if piece == 2 {
+            shim.write(piece, &torrent);
+        } else {
+            shim.complete(piece, &torrent);
+        }
+    }
+    // File b is torrent bytes 1000..3500: pieces 0 to 3.
+    let run = |at: u64, lens: &[usize]| {
+        let mut read: Vec<Vec<u8>> = lens.iter().map(|len| vec![0xee; *len]).collect();
+        let mut bufs: Vec<&mut [u8]> = read.iter_mut().map(Vec::as_mut_slice).collect();
+        shim.storage.preadv_exact(1, at, &mut bufs).unwrap();
+        read.concat()
+    };
+    // Pieces 0 and 1, on disk.
+    assert_eq!(run(0, &[24, 1000, 24]), torrent[1000..2048]);
+    // Pieces 1 to 3, piece 2 in memory.
+    assert_eq!(run(24, &[1024, 1024, 428]), torrent[1024..3500]);
+    // Past the end of the file is no read.
+    let mut over = [0; 600];
+    let mut bufs: Vec<&mut [u8]> = vec![&mut over];
+    assert!(shim.storage.preadv_exact(1, 2000, &mut bufs).is_err());
+}
+
 // libtorrent `disk_io_thread::async_write`: a verified piece is written to
 // the torrent's listed files under its directory, and is had.
 #[test]

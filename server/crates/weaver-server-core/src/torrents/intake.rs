@@ -148,6 +148,10 @@ impl Pieces for Intake {
         self.inner.read(file, offset, out)
     }
 
+    fn readv(&self, file: usize, offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
+        self.inner.readv(file, offset, outs)
+    }
+
     fn grow(&self, file: usize, length: u64) -> io::Result<()> {
         self.inner.grow(file, length)
     }

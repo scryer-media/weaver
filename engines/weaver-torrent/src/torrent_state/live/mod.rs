@@ -2494,6 +2494,14 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state.file_ops().read_chunk(self.addr, chunk, buf)
     }
 
+    fn read_chunks(
+        &self,
+        chunks: &[ChunkInfo],
+        bufs: &mut [&mut [u8]],
+    ) -> std::result::Result<(), (usize, anyhow::Error)> {
+        self.state.file_ops().read_chunks(self.addr, chunks, bufs)
+    }
+
     fn on_extended_handshake(&self, hs: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
         if let Some(client_name) = hs.v.as_ref().and_then(format_peer_client_name) {
             self.state

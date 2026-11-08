@@ -122,6 +122,76 @@ impl OurFileExt for File {
     }
 }
 
+/// `bufs` filled whole, one after the other, from the file's bytes at
+/// `offset`, in as few positional reads as the platform allows: one preadv
+/// for them all where it has one (libtorrent `disk_io_thread::do_read` reads
+/// a cache line of blocks with one readv). A file too short says so.
+pub fn pread_exact_vectored(
+    file: &File,
+    offset: u64,
+    bufs: &mut [&mut [u8]],
+) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::IoSliceMut;
+        let total: u64 = bufs.iter().map(|buf| buf.len() as u64).sum();
+        // off_t is 32 bits on some 32-bit targets: past it, read the buffers
+        // one after the other, as pwrite_all_vectored() writes them.
+        if nix::libc::off_t::try_from(offset.saturating_add(total)).is_ok() {
+            let mut slices: Vec<IoSliceMut<'_>> =
+                bufs.iter_mut().map(|buf| IoSliceMut::new(buf)).collect();
+            let mut left: &mut [IoSliceMut<'_>] = &mut slices;
+            let mut at = offset;
+            while !left.is_empty() {
+                let off = nix::libc::off_t::try_from(at).map_err(std::io::Error::other)?;
+                match nix::sys::uio::preadv(file, left, off) {
+                    Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                    Ok(read) => {
+                        at += read as u64;
+                        IoSliceMut::advance_slices(&mut left, read);
+                    }
+                    Err(nix::errno::Errno::EINTR) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            return Ok(());
+        }
+    }
+    let mut at = offset;
+    for buf in bufs.iter_mut() {
+        read_exact_at(file, at, buf)?;
+        at += buf.len() as u64;
+    }
+    Ok(())
+}
+
+// `buf` filled whole from the file's bytes at `offset`.
+fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut read = 0usize;
+        while read < buf.len() {
+            let progress = file.seek_read(&mut buf[read..], offset + read as u64)?;
+            if progress == 0 {
+                return Err(std::io::ErrorKind::UnexpectedEof.into());
+            }
+            read += progress;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (file, offset, buf);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
 /// What pwrite_all_vectored() falls back to when the offset does not fit the platform's
 /// pwritev: the same bytes, in two plain positional writes.
 #[cfg(unix)]
@@ -309,5 +379,30 @@ mod tests {
             (1u64 << 31) + 12345,
             super::pwrite_all_unvectored,
         );
+    }
+
+    // Each buffer is filled in turn from the bytes at the offset, an empty
+    // one among them, and a read past the end of the file says so.
+    #[test]
+    fn pread_exact_vectored_fills_each_buffer_in_turn() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("f");
+        let bytes: Vec<u8> = (0..50_000u32)
+            .map(|i| (i * 7 + i / 251).to_le_bytes()[0])
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+
+        let (mut a, mut b, mut c, mut d) = (vec![0; 3], vec![0; 16384], vec![], vec![0; 9000]);
+        let mut bufs: Vec<&mut [u8]> = vec![&mut a, &mut b, &mut c, &mut d];
+        super::pread_exact_vectored(&file, 77, &mut bufs).unwrap();
+        assert_eq!(a, bytes[77..80]);
+        assert_eq!(b, bytes[80..16464]);
+        assert_eq!(d, bytes[16464..25464]);
+
+        let (mut e, mut f) = (vec![0; 100], vec![0; 100]);
+        let mut past: Vec<&mut [u8]> = vec![&mut e, &mut f];
+        let err = super::pread_exact_vectored(&file, 49_850, &mut past).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

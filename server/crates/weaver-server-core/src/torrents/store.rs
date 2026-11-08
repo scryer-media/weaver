@@ -390,6 +390,10 @@ impl Pieces for TorrentStore {
         self.files.read(file, offset, out)
     }
 
+    fn readv(&self, file: usize, offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
+        self.files.readv(file, offset, outs)
+    }
+
     // Only a file it has whole is made its full length, an empty one among
     // them: the others grow as their pieces are written, sparse, as
     // libtorrent leaves them, and a file already there that the torrent has

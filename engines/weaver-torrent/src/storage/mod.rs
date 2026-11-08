@@ -169,6 +169,21 @@ pub trait TorrentStorage: Send + Sync {
     /// read buf.len() bytes into buf at offset.
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()>;
 
+    /// `bufs` filled whole, one after the other, from the file's bytes at
+    /// `offset`: a storage that can read them in one go does.
+    fn preadv_exact(
+        &self,
+        file_id: usize,
+        mut offset: u64,
+        bufs: &mut [&mut [u8]],
+    ) -> anyhow::Result<()> {
+        for buf in bufs.iter_mut() {
+            self.pread_exact(file_id, offset, buf)?;
+            offset += buf.len() as u64;
+        }
+        Ok(())
+    }
+
     /// Given a file_id (which you can get more info from in init_storage() through torrent info)
     /// write buf.len() bytes into the file at offset.
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()>;
@@ -283,6 +298,15 @@ pub trait TorrentStorage: Send + Sync {
 impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         (**self).pread_exact(file_id, offset, buf)
+    }
+
+    fn preadv_exact(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: &mut [&mut [u8]],
+    ) -> anyhow::Result<()> {
+        (**self).preadv_exact(file_id, offset, bufs)
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {

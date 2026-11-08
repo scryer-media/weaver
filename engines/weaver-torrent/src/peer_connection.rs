@@ -119,6 +119,19 @@ pub trait PeerConnectionHandler {
         Ok(true)
     }
     fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()>;
+    /// Each of `chunks` read into its buffer of `bufs`. On an error, the
+    /// first block not read and why: the blocks before it are read whole.
+    /// A handler with no faster way reads them one at a time.
+    fn read_chunks(
+        &self,
+        chunks: &[ChunkInfo],
+        bufs: &mut [&mut [u8]],
+    ) -> std::result::Result<(), (usize, anyhow::Error)> {
+        for (i, (chunk, buf)) in chunks.iter().zip(bufs.iter_mut()).enumerate() {
+            self.read_chunk(chunk, buf).map_err(|e| (i, e))?;
+        }
+        Ok(())
+    }
     fn update_my_extended_handshake(
         &self,
         _handshake: &mut ExtendedHandshake<ByteBuf>,
@@ -377,6 +390,38 @@ impl Framed {
             chunk: None,
             read: false,
         }
+    }
+}
+
+/// The block frames one write of the writer carries at most, when that many
+/// are waiting: 512 KiB of payload, about libtorrent's default send buffer
+/// watermark, 500 KiB, which libtorrent fills and writes whole in one writev
+/// (`peer_connection::setup_send`). The writer's own buffer holds two; a
+/// longer run is framed in a buffer lent for the write.
+const BATCH_BLOCKS: usize = 32;
+const BATCH_LEN: usize = BATCH_BLOCKS * PIECE_MESSAGE_DEFAULT_LEN;
+// The batch buffers kept for the next writer once returned; any more are
+// let go.
+const BATCH_BUFS_KEPT: usize = 16;
+
+/// The batch buffers between writes: a writer holds one only from framing
+/// its blocks to their write, so a connection at rest holds none.
+static BATCH_BUFS: std::sync::Mutex<Vec<Box<[u8]>>> = std::sync::Mutex::new(Vec::new());
+
+fn lend_batch_buf() -> Box<[u8]> {
+    BATCH_BUFS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pop()
+        .unwrap_or_else(|| vec![0u8; BATCH_LEN].into_boxed_slice())
+}
+
+fn return_batch_buf(buf: Box<[u8]>) {
+    let mut kept = BATCH_BUFS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if kept.len() < BATCH_BUFS_KEPT {
+        kept.push(buf);
     }
 }
 
@@ -716,6 +761,17 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         .unwrap_or_default()
                 };
 
+                // A run of blocks longer than the writer's buffer holds is
+                // framed in a batch buffer, so it goes in one write.
+                let mut lent = (matches!(first, WriterRequest::ReadChunkRequest(_))
+                    && outgoing_chan.len() >= 2
+                    && BATCH_LEN > write_buf.len())
+                .then(lend_batch_buf);
+                let buf: &mut [u8] = match &mut lent {
+                    Some(lent) => lent,
+                    None => &mut write_buf,
+                };
+
                 let mut filled = 0;
                 let mut ending = None;
                 let mut next = Some(first);
@@ -728,11 +784,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         WriterRequest::Disconnect(_) => 0,
                         _ => longest_frame,
                     };
-                    if filled > 0 && write_buf.len() - filled < needs {
+                    if filled > 0 && buf.len() - filled < needs {
                         carried = Some(req);
                         break;
                     }
-                    let out = &mut write_buf[filled..];
+                    let out = &mut buf[filled..];
                     let framed = match req {
                         WriterRequest::Message(msg) => {
                             Some(Framed::message(msg.serialize(out, ext_msg_ids)?))
@@ -818,29 +874,36 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 }
 
                 // The batch's blocks are read together, on one blocking
-                // thread. A read that fails ends the connection once the
+                // thread, a run of them next to one another on disk in one
+                // read. A read that fails ends the connection once the
                 // frames before its block are out.
                 let mut failed = None;
                 if batch.iter().any(|framed| framed.read) {
+                    // Each block read: where its frame is in the batch and
+                    // the buffer, the block, and its payload's room.
+                    let mut places = Vec::new();
+                    let mut chunks = Vec::new();
+                    let mut payloads: Vec<&mut [u8]> = Vec::new();
+                    let mut rest = &mut buf[..filled];
+                    let mut at = 0;
+                    for (i, framed) in batch.iter().enumerate() {
+                        let (frame, after) = std::mem::take(&mut rest).split_at_mut(framed.len);
+                        rest = after;
+                        if let (true, Some(chunk)) = (framed.read, framed.chunk) {
+                            places.push((i, at));
+                            chunks.push(chunk);
+                            payloads.push(&mut frame[PIECE_MESSAGE_PREAMBLE_LEN..]);
+                        }
+                        at += framed.len;
+                    }
                     let read = self
                         .spawner
                         .block_in_place_with_semaphore(|| {
-                            let mut at = 0;
-                            for (i, framed) in batch.iter().enumerate() {
-                                if let (true, Some(chunk)) = (framed.read, framed.chunk) {
-                                    let payload = at + PIECE_MESSAGE_PREAMBLE_LEN..at + framed.len;
-                                    if let Err(e) =
-                                        self.handler.read_chunk(&chunk, &mut write_buf[payload])
-                                    {
-                                        return Some((i, at, e));
-                                    }
-                                }
-                                at += framed.len;
-                            }
-                            None
+                            self.handler.read_chunks(&chunks, &mut payloads)
                         })
                         .await;
-                    if let Some((i, at, e)) = read {
+                    if let Err((k, e)) = read {
+                        let (i, at) = places[k];
                         batch.truncate(i);
                         filled = at;
                         failed = Some(Error::ReadChunk(e));
@@ -851,11 +914,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     send(
                         &mut up,
                         &mut write,
-                        &mut write_buf[..filled],
+                        &mut buf[..filled],
                         "writing",
                         rwtimeout,
                     )
                     .await?;
+                }
+                if let Some(lent) = lent {
+                    return_batch_buf(lent);
                 }
 
                 for framed in batch.drain(..) {
@@ -1841,6 +1907,12 @@ mod tests {
     /// the handler was told, the bytes on the wire, those bytes as plain
     /// text, and what the meter counted as sent.
     async fn serve_two_blocks(rc4: bool) -> (Vec<Told>, Vec<u8>, Vec<u8>, u64) {
+        serve_blocks(rc4, 2).await
+    }
+
+    /// Serves `blocks` blocks, one a piece, queued at once, and a have behind
+    /// them, as [`serve_two_blocks`] does.
+    async fn serve_blocks(rc4: bool, blocks: u32) -> (Vec<Told>, Vec<u8>, Vec<u8>, u64) {
         use tokio::io::AsyncReadExt;
         let recorder = Recorder::default();
         let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
@@ -1875,7 +1947,9 @@ mod tests {
             encryption: crate::mse::Encryption::None,
             meter: meter.clone(),
         };
-        let lengths = crate::core::lengths::Lengths::new(2 * BLOCK as u64, BLOCK).unwrap();
+        let lengths =
+            crate::core::lengths::Lengths::new(u64::from(blocks) * u64::from(BLOCK), BLOCK)
+                .unwrap();
         let block = |piece| {
             lengths
                 .chunk_info_from_received_data(
@@ -1886,8 +1960,10 @@ mod tests {
                 .unwrap()
         };
         let (tx, rx) = mpsc::unbounded_channel();
-        tx.send(WriterRequest::ReadChunkRequest(block(0))).unwrap();
-        tx.send(WriterRequest::ReadChunkRequest(block(1))).unwrap();
+        for piece in 0..blocks {
+            tx.send(WriterRequest::ReadChunkRequest(block(piece)))
+                .unwrap();
+        }
         tx.send(WriterRequest::Message(Message::Have(3))).unwrap();
         let peer = async {
             let mut cipher = rc4.then(|| crate::mse::Rc4::new_discard_1024(b"key"));
@@ -1913,6 +1989,37 @@ mod tests {
         assert!(matches!(result, Err(Error::TorrentIsNotLive)), "{result:?}");
         let told = recorder.told.lock().clone();
         (told, wire, plain, meter.sent())
+    }
+
+    // A run of blocks queued together goes out in writes of at most
+    // BATCH_BLOCKS blocks, each paid for whole, and the have behind them
+    // rides with the last.
+    #[tokio::test(start_paused = true)]
+    async fn a_long_run_of_blocks_goes_out_a_batch_a_write() {
+        let batch = u32::try_from(super::BATCH_BLOCKS).unwrap();
+        let blocks = batch + 8;
+        let (told, wire, _, sent) = serve_blocks(false, blocks).await;
+        assert_eq!(sent, wire.len() as u64);
+        let frame = 13 + u64::from(BLOCK);
+        let grants: Vec<u64> = told
+            .iter()
+            .filter_map(|t| match t {
+                Told::Granted(n) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            grants[grants.len() - 2..],
+            [u64::from(batch) * frame, 8 * frame + 9]
+        );
+        let done: Vec<u32> = told
+            .iter()
+            .filter_map(|t| match t {
+                Told::Done(piece) => Some(*piece),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(done, (0..blocks).collect::<Vec<_>>());
     }
 
     // Under RC4 the writer task encrypts each write in place before it goes
@@ -1949,9 +2056,9 @@ mod tests {
             });
             assert_eq!(granted - returned, sent);
             assert_eq!(protocol, sent - 2 * u64::from(BLOCK));
-            // Both blocks queued together are paid for and written together;
-            // then each block's protocol bytes, its payload, and done, in
-            // order.
+            // Both blocks and the have queued behind them are paid for and
+            // written together; then each block's protocol bytes, its
+            // payload, and done, in order, and the have's.
             let tail: Vec<_> = told
                 .iter()
                 .filter(|t| matches!(t, Told::Uploaded(_) | Told::Done(_)))
@@ -1968,15 +2075,16 @@ mod tests {
             );
             let done0 = told.iter().position(|t| *t == Told::Done(0)).unwrap();
             assert_eq!(
-                told[done0 - 3..done0 + 4],
+                told[done0 - 3..done0 + 5],
                 [
-                    Told::Granted(2 * (13 + u64::from(BLOCK))),
+                    Told::Granted(2 * (13 + u64::from(BLOCK)) + 9),
                     Told::Protocol(13),
                     Told::Uploaded(BLOCK),
                     Told::Done(0),
                     Told::Protocol(13),
                     Told::Uploaded(BLOCK),
                     Told::Done(1),
+                    Told::Protocol(9),
                 ]
             );
         }

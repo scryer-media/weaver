@@ -54,6 +54,15 @@ pub(crate) trait Pieces: Send + Sync {
     fn hashed(&self, _piece: u32, _held: &Bytes) {}
     // The file's bytes from `offset` as it holds them on disk.
     fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> std::io::Result<()>;
+    // `outs` filled one after the other from the file's bytes at `offset`
+    // as it holds them on disk.
+    fn readv(&self, file: usize, mut offset: u64, outs: &mut [&mut [u8]]) -> std::io::Result<()> {
+        for out in outs.iter_mut() {
+            self.read(file, offset, out)?;
+            offset += out.len() as u64;
+        }
+        Ok(())
+    }
     // The file made at least `length` long.
     fn grow(&self, file: usize, length: u64) -> std::io::Result<()>;
 }
@@ -233,6 +242,40 @@ impl TorrentStorage for PieceStorage {
             .pieces
             .read(file_id, offset, buf)
             .with_context(|| format!("{} bytes at {offset} of file {file_id}", buf.len()))
+    }
+
+    // A run of a file's bytes on disk is read in one go; one with any of
+    // its pieces held in memory, or of padding, a buffer at a time.
+    fn preadv_exact(
+        &self,
+        file_id: usize,
+        offset: u64,
+        bufs: &mut [&mut [u8]],
+    ) -> anyhow::Result<()> {
+        let len: usize = bufs.iter().map(|buf| buf.len()).sum();
+        let layout = &self.inner.layout;
+        let on_disk = len > 0
+            && bufs.len() > 1
+            && layout.file(file_id).is_some_and(|file| !file.padding)
+            && {
+                let (start, _) = self.place(file_id, offset, len)?;
+                let first = start / layout.piece_length();
+                let last = (start + len as u64 - 1) / layout.piece_length();
+                let flight = self.flight();
+                !(first..=last).any(|piece| flight.contains_key(&(piece as u32)))
+            };
+        if !on_disk {
+            let mut at = offset;
+            for buf in bufs.iter_mut() {
+                self.pread_exact(file_id, at, buf)?;
+                at += buf.len() as u64;
+            }
+            return Ok(());
+        }
+        self.inner
+            .pieces
+            .readv(file_id, offset, bufs)
+            .with_context(|| format!("{len} bytes at {offset} of file {file_id}"))
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
