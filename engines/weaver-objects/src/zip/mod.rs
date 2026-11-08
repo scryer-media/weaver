@@ -6,7 +6,9 @@
 // of its own. It bids for the directory at the container's tail and reads
 // the entries from it; a stored entry's data is its member's bytes once the
 // entry's local header says where they start. When nothing above can bring
-// the tail forward, it walks the local headers from the front instead.
+// the tail forward, it walks the local headers from the front instead, as
+// it does from the start for an archive opening with a bounded ZipCrypto
+// entry, whose keys run from its first byte.
 // Stored ZipCrypto entries decipher directly into their members. Compressed
 // entries, other ciphers and unknown extents go to an engine, before any
 // member is said whenever the directory can say so.
@@ -225,15 +227,18 @@ impl Zip {
         self.resolve_last(delivery, read, out);
     }
 
-    // A bounded ZipCrypto entry can start before a parent knows EOF.
-    // Other fronts keep waiting for their directory, which can supply
-    // extents absent from local headers without a premature refusal.
+    // A bounded ZipCrypto entry starts from the front, as the download
+    // arrives, whether or not its length is known yet: its keys run from
+    // its first byte, so nothing else lets it decipher alongside. The
+    // directory, bid for at the tail, holds the walk to account once both
+    // are in. Other fronts keep waiting for their directory, which can
+    // supply extents absent from local headers without a premature refusal.
     fn walk_encrypted_front(
         &mut self,
         delivery: &Delivery<'_>,
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
     ) {
-        if self.walking || self.map.is_some() || self.total().is_some() {
+        if self.walking || self.map.is_some() {
             return;
         }
         let Some(fixed) = read_through(ByteRange::at(0, records::LOCAL_LEN), delivery, read) else {
@@ -353,21 +358,17 @@ impl Zip {
             return;
         }
         self.find_recovery(out);
+        // A map not yet held against its directory reads it: a walk's
+        // gathers it as it comes and is checked once the walk reaches it;
+        // one the walk left reads its entries from it.
         if self.walking {
             self.walk(out);
-            if !self.gone
-                && (self.rereading()
-                    || self
-                        .map
-                        .as_ref()
-                        .is_some_and(|map| map.end.is_some() && !map.checked))
-            {
-                self.read_directory(out);
-            }
-        } else if self.map.is_none() || self.rereading() {
+        }
+        let unchecked = self.map.as_ref().is_none_or(|map| !map.checked);
+        if !self.gone && (unchecked || self.rereading()) {
             self.read_directory(out);
         }
-        if !self.walking && self.map.is_some() && !self.gone {
+        if !self.walking && self.map.as_ref().is_some_and(|map| map.checked) && !self.gone {
             self.read_locals(out);
         }
         if let (Some(end), Some(total)) = (self.map.as_ref().and_then(|map| map.end), self.total())
@@ -416,9 +417,10 @@ impl Zip {
         self.basis.clear();
     }
 
-    // Whether the range is one the directory read needs, before the map.
+    // Whether the range is one the directory read needs, before a map held
+    // against it.
     fn is_directory(&self, range: ByteRange) -> bool {
-        self.map.is_none()
+        self.map.as_ref().is_none_or(|map| !map.checked)
             && self
                 .directory
                 .iter()
@@ -493,7 +495,16 @@ impl Object for Zip {
             return;
         };
         if self.is_directory(range) {
-            return self.start_walking(out);
+            match (&self.map, self.walking) {
+                (None, _) => return self.start_walking(out),
+                // A walk that left for the directory has no way on without
+                // it.
+                (Some(_), false) => {
+                    return self.give_up(Emit::NeedsEngine(Why::UnboundedEntry), out);
+                }
+                // A walk still on reads the rest from the front.
+                (Some(_), true) => {}
+            }
         }
         // A header that will never arrive leaves its entry's bytes nowhere.
         if self.lost_header(range) {

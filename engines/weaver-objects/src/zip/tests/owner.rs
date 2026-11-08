@@ -89,7 +89,6 @@ fn read_held(
 
 impl Owner {
     pub fn new(object: Zip, volumes: Vec<(String, Vec<u8>)>) -> Self {
-        let count = volumes.len();
         let index = volumes
             .iter()
             .enumerate()
@@ -99,6 +98,17 @@ impl Owner {
                 _ => VolumeIndex(position as u32),
             })
             .collect();
+        Self::with_index(object, volumes, index)
+    }
+
+    // One `.zip` alone, bound at the symbolic last as the tree binds it.
+    pub fn alone(object: Zip, bytes: Vec<u8>) -> Self {
+        let volumes = vec![("alpha.zip".to_owned(), bytes)];
+        Self::with_index(object, volumes, vec![VolumeIndex(LAST)])
+    }
+
+    fn with_index(object: Zip, volumes: Vec<(String, Vec<u8>)>, index: Vec<VolumeIndex>) -> Self {
+        let count = volumes.len();
         let mut owner = Self {
             object,
             volumes,
@@ -116,7 +126,7 @@ impl Owner {
             replays: 0,
         };
         let name = owner.volumes[0].0.clone();
-        owner.object.bound(VolumeIndex(0), &name, &[], None);
+        owner.object.bound(owner.index[0], &name, &[], None);
         owner.bound[0] = true;
         owner.size(0);
         for volume in 1..count {
