@@ -83,6 +83,18 @@ fn fill(offset: u64, into: &mut [u8]) {
 
 // Files whose lengths are whole pieces, so the hybrid's v1 listing needs no
 // padding and a v1 offset is the offset in the files laid end to end.
+// Which hashes the torrent carries: WEAVER_BENCH_V1 makes it v1 only,
+// WEAVER_BENCH_V2 v2 only, and without either it is hybrid.
+fn kind() -> &'static str {
+    if std::env::var_os("WEAVER_BENCH_V1").is_some() {
+        "v1"
+    } else if std::env::var_os("WEAVER_BENCH_V2").is_some() {
+        "v2"
+    } else {
+        "hybrid"
+    }
+}
+
 fn build(shape: Shape) -> (bytes::Bytes, [u8; 20]) {
     assert!(shape.file_length.is_multiple_of(shape.piece_length));
     assert!(shape.file_length >= 2 * shape.piece_length);
@@ -121,6 +133,35 @@ fn build(shape: Shape) -> (bytes::Bytes, [u8; 20]) {
         out.extend_from_slice(bytes);
         out
     };
+    let pieces_field = bstr(
+        &hashes
+            .iter()
+            .flat_map(|(sha1, _)| *sha1)
+            .collect::<Vec<_>>(),
+    );
+    let mut files = b"5:filesl".to_vec();
+    for file in 0..shape.files {
+        files.extend_from_slice(format!("d6:lengthi{}e4:pathl", shape.file_length).as_bytes());
+        files.extend(bstr(format!("f{file}.bin").as_bytes()));
+        files.extend_from_slice(b"ee");
+    }
+    files.extend_from_slice(b"e");
+    // A v1 torrent has SHA-1 pieces and no file tree or piece layers.
+    if kind() == "v1" {
+        let mut info = b"d".to_vec();
+        info.extend_from_slice(&files);
+        info.extend_from_slice(b"4:name5:bench12:piece length");
+        info.extend_from_slice(format!("i{}e6:pieces", shape.piece_length).as_bytes());
+        info.extend(pieces_field);
+        info.extend_from_slice(b"e");
+        let mut sha1 = Sha1::new();
+        sha1.update(&info);
+        let info_hash = sha1.finish();
+        let mut torrent = b"d4:info".to_vec();
+        torrent.extend_from_slice(&info);
+        torrent.extend_from_slice(b"e");
+        return (torrent.into(), info_hash);
+    }
     let mut layers = Vec::new();
     let mut info = b"d9:file treed".to_vec();
     for file in 0..shape.files as usize {
@@ -136,24 +177,27 @@ fn build(shape: Shape) -> (bytes::Bytes, [u8; 20]) {
         info.extend_from_slice(b"ee");
         layers.push((root, layer));
     }
-    info.extend_from_slice(b"e5:filesl");
-    for file in 0..shape.files {
-        info.extend_from_slice(format!("d6:lengthi{}e4:pathl", shape.file_length).as_bytes());
-        info.extend(bstr(format!("f{file}.bin").as_bytes()));
-        info.extend_from_slice(b"ee");
-    }
-    info.extend_from_slice(b"e12:meta versioni2e4:name5:bench12:piece length");
-    info.extend_from_slice(format!("i{}e6:pieces", shape.piece_length).as_bytes());
-    info.extend(bstr(
-        &hashes
-            .iter()
-            .flat_map(|(sha1, _)| *sha1)
-            .collect::<Vec<_>>(),
-    ));
     info.extend_from_slice(b"e");
-    let mut sha1 = Sha1::new();
-    sha1.update(&info);
-    let info_hash = sha1.finish();
+    // A v2 torrent has no v1 file list or pieces, and peers name it by its
+    // SHA-256 info hash cut to 20 bytes.
+    let v2 = kind() == "v2";
+    if !v2 {
+        info.extend_from_slice(&files);
+    }
+    info.extend_from_slice(b"12:meta versioni2e4:name5:bench12:piece length");
+    info.extend_from_slice(format!("i{}e", shape.piece_length).as_bytes());
+    if !v2 {
+        info.extend_from_slice(b"6:pieces");
+        info.extend(pieces_field);
+    }
+    info.extend_from_slice(b"e");
+    let info_hash: [u8; 20] = if v2 {
+        merkle::hash_block(&info).0[..20].try_into().unwrap()
+    } else {
+        let mut sha1 = Sha1::new();
+        sha1.update(&info);
+        sha1.finish()
+    };
 
     let mut torrent = b"d4:info".to_vec();
     torrent.extend_from_slice(&info);
@@ -382,10 +426,11 @@ async fn torrent_loopback_throughput() {
     let built = Instant::now();
     let (torrent, info_hash) = build(shape);
     println!(
-        "BENCH torrent: {} files of {} MiB, {} KiB pieces, hybrid, built in {:.1} s",
+        "BENCH torrent: {} files of {} MiB, {} KiB pieces, {}, built in {:.1} s",
         shape.files,
         shape.file_length >> 20,
         shape.piece_length >> 10,
+        kind(),
         built.elapsed().as_secs_f64()
     );
     let metainfo = torrent_from_bytes(&torrent).unwrap();
@@ -474,6 +519,14 @@ async fn torrent_loopback_counterpart() {
         return;
     };
     let shape = Shape::from_env();
+    // The torrent alone, written where WEAVER_BENCH_TORRENT_OUT says, so
+    // another client can be benched against the same scripted peers.
+    if role == "torrent" {
+        let (torrent, info_hash) = build(shape);
+        std::fs::write(std::env::var("WEAVER_BENCH_TORRENT_OUT").unwrap(), &torrent).unwrap();
+        println!("BENCH INFOHASH {}", hex(&info_hash));
+        return;
+    }
     let info_hash = unhex(&std::env::var("WEAVER_BENCH_INFO_HASH").unwrap());
     let peers = env_u64("WEAVER_BENCH_PEERS", 8);
     match role.as_str() {
@@ -486,11 +539,14 @@ async fn torrent_loopback_counterpart() {
                 listeners.push(listener);
             }
             println!("BENCH PORTS {}", ports.join(","));
-            for listener in listeners {
+            // Each seeder has its own peer id: a client may drop a second
+            // connection that reuses one.
+            for (at, listener) in listeners.into_iter().enumerate() {
+                let tag = 128 + at as u8;
                 tokio::spawn(async move {
                     loop {
                         let (stream, _) = listener.accept().await.unwrap();
-                        tokio::spawn(seed(stream, info_hash, shape));
+                        tokio::spawn(seed(stream, info_hash, shape, tag));
                     }
                 });
             }
@@ -575,12 +631,12 @@ fn bitfield(pieces: u32) -> Vec<u8> {
 }
 
 // A seeder that has every piece, unchokes at once and answers every request.
-async fn seed(stream: TcpStream, info_hash: [u8; 20], shape: Shape) {
+async fn seed(stream: TcpStream, info_hash: [u8; 20], shape: Shape, tag: u8) {
     stream.set_nodelay(true).unwrap();
     let (read, mut write) = stream.into_split();
     let mut read = BufReader::with_capacity(64 * 1024, read);
     read_handshake(&mut read, &info_hash).await;
-    let mut out = handshake(&info_hash, 255);
+    let mut out = handshake(&info_hash, tag);
     frame(&mut out, 5, &[&bitfield(shape.pieces())]);
     frame(&mut out, 1, &[]);
     write.write_all(&out).await.unwrap();
