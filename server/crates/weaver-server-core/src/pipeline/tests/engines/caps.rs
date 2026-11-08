@@ -138,6 +138,34 @@ async fn a_member_declaring_past_its_byte_cap_fails_naming_member_bytes() {
 }
 
 #[tokio::test]
+async fn a_stored_member_split_over_volumes_bound_one_by_one_stays_under_the_ratio() {
+    // The member's file takes its whole length at its first write, while
+    // only the first of the eight volumes is bound. The ratio is taken over
+    // every volume posted, not only the ones bound so far: twice one volume
+    // is under the member, twice the eight is over it.
+    let body = payload(64 * ARTICLE, 81);
+    let posts = single_member_store_set("beacon.bin", &body, 8)
+        .into_iter()
+        .map(|(name, bytes)| Post::plain(&name, bytes))
+        .collect();
+    let scenario = Scenario::new(posts).limits(limits(|limits| {
+        limits.max_ratio = 2;
+        limits.ratio_floor_bytes = 1024;
+    }));
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    let delivered = graph
+        .files
+        .iter()
+        .find(|(path, _)| path.rsplit('/').next() == Some("beacon.bin"));
+    assert!(
+        delivered.is_some_and(|(_, delivered)| *delivered == body),
+        "{:?}",
+        graph.files.keys()
+    );
+}
+
+#[tokio::test]
 async fn an_archive_past_the_entry_cap_fails_naming_entries() {
     let members: Vec<(String, Vec<u8>)> = (0..5)
         .map(|index| (format!("ember{index}.bin"), payload(ARTICLE + index, 73)))

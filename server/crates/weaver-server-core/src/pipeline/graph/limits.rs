@@ -534,18 +534,14 @@ impl Caps {
         }
     }
 
-    // The bytes posted for the root members an object other than a
-    // recovery object owns, or gave up: the archives the output came from.
+    // The bytes posted for every root member but recovery data. A member
+    // no object holds yet counts: an archive's member takes its whole
+    // length at its first write, before its later volumes are bound.
     fn declared(&self, tree: &Tree) -> u64 {
         self.declared
             .iter()
             .zip(0u32..)
-            .filter(|(_, index)| {
-                let member = MemberId(*index);
-                tree.child_of(NodeId::ROOT, member)
-                    .or_else(|| tree.retired(NodeId::ROOT, member))
-                    .is_some_and(|(object, _)| !tree.recovers(object))
-            })
+            .filter(|(_, index)| !recovery_post(tree, MemberId(*index)))
             .map(|(bytes, _)| *bytes)
             .fold(0u64, u64::saturating_add)
     }
@@ -557,6 +553,21 @@ impl Caps {
                 ExtractionFailure::new(reason, detail)
             })
             .clone()
+    }
+}
+
+// Whether a post is recovery data: a recovery object holds it or gave it
+// up, or, held by none, its posted name says so.
+fn recovery_post(tree: &Tree, member: MemberId) -> bool {
+    match tree
+        .child_of(NodeId::ROOT, member)
+        .or_else(|| tree.retired(NodeId::ROOT, member))
+    {
+        Some((object, _)) => tree.recovers(object),
+        None => tree
+            .namespace(NodeId::ROOT)
+            .and_then(|namespace| namespace.get(member))
+            .is_some_and(|record| weaver_graph::names_recovery(&record.name)),
     }
 }
 
