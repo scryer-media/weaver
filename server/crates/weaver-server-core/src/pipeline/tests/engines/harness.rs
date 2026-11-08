@@ -858,6 +858,9 @@ pub(in crate::pipeline::tests) struct GraphView {
     // Across each restart: the bytes still to come and wanted the report
     // showed as the pipeline went down, and as the new one restored the job.
     pub(in crate::pipeline::tests) restored_remaining: Vec<((u64, u64), (u64, u64))>,
+    // The restarts after which the restored job had a run out and articles
+    // queued to fetch at once: it downloads while its runs decode again.
+    pub(in crate::pipeline::tests) fetching_while_running: usize,
     // At each look, for every root member a set covers: its name, whether
     // its sets proved it (every one covering it ruled clean or repaired and
     // none is out), and whether the root still keeps its checksums.

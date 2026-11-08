@@ -894,6 +894,24 @@ impl Tree {
         }
     }
 
+    // A restore tells every object it was rebuilt, once, before any close
+    // or loss is told again: each asks for what its facts do not hold.
+    pub fn restored(&mut self, builder: &mut dyn Builder, effects: &mut Vec<Effect>) {
+        for node in self.live() {
+            let mut emits = std::mem::take(&mut self.emits);
+            emits.clear();
+            if let Some(object) = self
+                .nodes
+                .get_mut(&node)
+                .and_then(|found| found.object.as_mut())
+            {
+                object.restored(&mut emits);
+            }
+            self.apply(node, &mut emits, builder, effects);
+            self.emits = emits;
+        }
+    }
+
     fn windows_on(&self, node: NodeId, member: MemberId) -> Vec<NodeId> {
         self.nodes
             .get(&node)
@@ -2192,6 +2210,88 @@ impl Tree {
         if came {
             self.front_changed(node, member, false, builder, effects);
         }
+    }
+
+    // The fronts a restart can bring again, parents first: each member
+    // whose front came and is not in hand, with the runs its record says
+    // arrived inside its first FIRST_BYTES. No record keeps a front, so the
+    // owner reads these from where the bytes went.
+    pub fn fronts_away(&self) -> Vec<(NodeId, MemberId, Vec<ByteRange>)> {
+        let window = ByteRange::new(0, FIRST_BYTES as u64);
+        let mut out = Vec::new();
+        for node in self.live() {
+            let Some(namespace) = self.namespace(node) else {
+                continue;
+            };
+            for record in namespace.members() {
+                if namespace.front_away(record.id) != Some(false) {
+                    continue;
+                }
+                let runs: Vec<ByteRange> = record
+                    .coverage
+                    .overlapping(window)
+                    .filter(|run| run.provenance.arrived())
+                    .filter_map(|run| run.range.intersect(window))
+                    .filter(|run| !run.is_empty())
+                    .collect();
+                if !runs.is_empty() {
+                    out.push((node, record.id, runs));
+                }
+            }
+        }
+        out
+    }
+
+    // A member's front, read again after a restart a run at a time: it is
+    // kept and judged as a front that came is, and nothing goes below it or
+    // to its file, where its bytes already are.
+    pub fn front_again(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        pieces: &[(u64, Vec<u8>)],
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let named = self.child_of(node, member).filter(|(child, _)| {
+            self.namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .and_then(|record| crate::sniff::recovery_by_name(&record.name))
+                .is_some_and(|kind| self.kind(*child) == Some(kind))
+        });
+        let Some(namespace) = self.nodes.namespace_mut(node) else {
+            return;
+        };
+        for (offset, bytes) in pieces {
+            let piece = ByteRange::at(*offset, bytes.len() as u64);
+            let runs: Vec<(ByteRange, Provenance)> = namespace
+                .get(member)
+                .map(|record| {
+                    record
+                        .coverage
+                        .overlapping(piece)
+                        .filter_map(|run| Some((run.range.intersect(piece)?, run.provenance)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            for (range, provenance) in runs {
+                let from = (range.start - offset) as usize;
+                let to = (range.end - offset) as usize;
+                namespace.keep_first_bytes(member, range.start, &bytes[from..to], provenance);
+            }
+        }
+        if namespace.first_bytes(member).is_empty() {
+            return;
+        }
+        let length = namespace.get(member).and_then(|record| record.length);
+        let signs = signed(namespace.first_bytes(member), length);
+        if let Some((child, volume)) = named
+            && matches!(signs, Sniff::Object(kind) if self.kind(child) != Some(kind))
+        {
+            self.release_named(node, child, (volume, member), builder, effects);
+        }
+        self.identify_again(node, member, builder, effects);
+        self.front_changed(node, member, false, builder, effects);
     }
 
     // The member's front changed: it came, or was lost. A member not yet
@@ -4194,7 +4294,41 @@ impl Tree {
         for (volume, posted) in again {
             self.replay_again(serial, node, volume, posted, builder, effects);
         }
+        self.again_closed(node, ranges, builder, effects);
         self.again_done();
+    }
+
+    // The volumes an `again_read` said again hear their close again where
+    // their members are still closed: the replay uncovered them below the
+    // member only, so the object forgot a close the member still holds. The
+    // owner calls it once the last piece went, before `again_done`.
+    pub fn again_closed(
+        &mut self,
+        node: NodeId,
+        ranges: &[(VolumeIndex, ByteRange)],
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some((parent, volumes)) = self.volumes(node) else {
+            return;
+        };
+        let members: BTreeSet<MemberId> = self
+            .forgets(node, ranges, false)
+            .iter()
+            .filter_map(|(volume, _)| volumes.get(volume).copied())
+            .collect();
+        let window = self.window(node).is_some();
+        for member in members {
+            let closed = self
+                .namespace(parent)
+                .and_then(|namespace| namespace.get(member))
+                .is_some_and(|record| record.closed);
+            match (closed, window) {
+                (false, _) => {}
+                (true, true) => self.close_window(node, builder, effects),
+                (true, false) => self.closed_at(parent, member, builder, effects),
+            }
+        }
     }
 
     // What `again` delivers, read back a piece of at most `AGAIN_PIECE`

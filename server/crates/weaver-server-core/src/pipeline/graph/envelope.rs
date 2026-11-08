@@ -215,6 +215,15 @@ impl Envelopes {
         }
     }
 
+    // Whether every byte of `range` of an envelope was kept, from the
+    // record alone.
+    pub(crate) fn keeps(&self, node: NodeId, envelope: u32, range: ByteRange) -> bool {
+        match self.shelves.get(&node) {
+            Some(shelf) => shelf.keeps(envelope, range),
+            None => range.is_empty(),
+        }
+    }
+
     // Every node with a shelf, in node order.
     pub(crate) fn nodes(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.shelves.keys().copied()
@@ -449,6 +458,15 @@ impl Shelf {
         };
         let len = usize::try_from(range.len()).expect("an envelope range fits the address space");
         kept.coverage.covered(range) && kept.leaf.read(range.start, len, into).is_ok()
+    }
+
+    // Whether every byte of `range` of an envelope was kept, read from the
+    // record alone: a restore cut the record to its file's length.
+    pub(crate) fn keeps(&self, envelope: u32, range: ByteRange) -> bool {
+        self.lock()
+            .kept
+            .get(&envelope)
+            .map_or(range.is_empty(), |kept| kept.coverage.covered(range))
     }
 
     // Whether any byte of any volume is in.

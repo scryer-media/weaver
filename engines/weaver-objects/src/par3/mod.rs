@@ -574,6 +574,27 @@ impl Object for Par3 {
     // `volume_lost` at its exact range, and the rest of it still comes.
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
+    // The kept fronts are not in the facts, nor what waited while the
+    // object was out for a repair: each volume's front is asked for again,
+    // and all of it past the front that it never heard.
+    fn restored(&mut self, out: &mut Vec<Emit>) {
+        let past = ByteRange::new(FRONT_CAP as u64, u64::MAX);
+        for (index, volume) in self.volumes.iter().enumerate() {
+            let mut asked = Coverage::new();
+            asked.write(ByteRange::new(0, u64::MAX), weaver_graph::Provenance::Fresh);
+            for run in volume.arrived.runs() {
+                if let Some(heard) = run.range.intersect(past) {
+                    asked.erase(heard);
+                }
+            }
+            let volume = VolumeIndex(index as u32);
+            out.extend(asked.runs().map(|run| Emit::Again {
+                volume,
+                range: run.range,
+            }));
+        }
+    }
+
     // What arrived there is to come again, and the blocks it carried; a
     // volume closed over them is open until they do.
     fn unposted(&mut self, volume: VolumeIndex, range: ByteRange) {

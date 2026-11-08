@@ -11,9 +11,11 @@
 use std::collections::BTreeMap;
 
 use weaver_graph::holds::{Reserve, ScratchHold};
-use weaver_graph::{Algorithm, ByteRange, Digest, MemberId, NodeId, Tree};
+use weaver_graph::{
+    ByteRange, Coverage, Digest, MemberId, NodeId, Provenance, Segment, Tree, VolumeIndex,
+};
 
-use super::{NamespaceWriter, WriteError, scratch_name};
+use super::{NamespaceWriter, Segments, WriteError, scratch_name};
 use crate::pipeline::graph::checkpoint::{FileState, HoldRecord};
 use crate::pipeline::graph::envelope::durable::KeptRecord;
 use crate::pipeline::graph::leaf::Leaf;
@@ -170,14 +172,17 @@ impl NamespaceWriter {
     // with a stated CRC takes back its fold, so its check at close reads
     // nothing: one closed whole and undamaged passed that check as it
     // closed, unless verification was still pending. Pending checks keep
-    // no assumed fold and resume through the worker. One still open reads
-    // what it holds back here, off the pipeline thread, as a restore reads.
+    // no assumed fold and resume through the worker. One still open folds
+    // what the source's checksums vouch for of what it holds, and nothing
+    // is read: what they do not vouch for leaves the fold short, and its
+    // check at close reads the file through the worker, as a pending one.
     pub(crate) fn restore_file(
         &mut self,
         tree: &Tree,
         node: NodeId,
         member: MemberId,
         state: &FileState,
+        segments: &dyn Segments,
     ) -> Result<(), WriteError> {
         let Some(record) = tree.namespace(node).and_then(|found| found.get(member)) else {
             return Ok(());
@@ -202,13 +207,9 @@ impl NamespaceWriter {
                     {
                         leaf.fold_passed(length, Digest::crc32(stated));
                     }
-                    (false, _) => leaf.fold_back(
-                        Algorithm::Crc32,
-                        record
-                            .coverage
-                            .runs()
-                            .map(|run| (run.range.start, run.range.end)),
-                    ),
+                    (false, _) => {
+                        leaf.fold_vouched(vouched(segments, node, member, &record.coverage))
+                    }
                 }
             }
             self.files_mut(node).leaves.insert(member, leaf);
@@ -224,6 +225,17 @@ impl NamespaceWriter {
     // budget as the tree holds them.
     pub(crate) fn restore_members(&mut self, tree: &Tree) {
         self.caps.restore_members(tree);
+    }
+
+    // A member whose front a restore read again keeps it in memory: the
+    // job's limits judge it as they judge a member that grew.
+    pub(crate) fn admit_front(
+        &mut self,
+        tree: &Tree,
+        node: NodeId,
+        member: MemberId,
+    ) -> Result<(), WriteError> {
+        Ok(self.caps.admit_member(tree, node, member)?)
     }
 
     // The member reads the job's repairs made.
@@ -250,4 +262,36 @@ impl NamespaceWriter {
         access.held = false;
         access.read_at(NodeId::ROOT, member, range, into)
     }
+}
+
+// The runs of a member's file the source's checksums vouch for, each with
+// its CRC: as far as they lie end to end, every one passed, wholly inside
+// bytes that came fresh and stand as they came.
+fn vouched(
+    segments: &dyn Segments,
+    node: NodeId,
+    member: MemberId,
+    coverage: &Coverage,
+) -> Vec<(ByteRange, Digest)> {
+    let mut out = Vec::new();
+    let mut found = Vec::new();
+    for run in coverage
+        .runs()
+        .filter(|run| run.provenance == Provenance::Fresh)
+    {
+        found.clear();
+        segments.segments_for(node, VolumeIndex(member.0), run.range, &mut found);
+        found.retain(|segment: &Segment| {
+            segment.verified
+                && segment.range.start >= run.range.start
+                && segment.range.end <= run.range.end
+        });
+        found.sort_by_key(|segment| segment.range.start);
+        out.extend(
+            found
+                .iter()
+                .map(|segment| (segment.range, Digest::crc32(segment.crc32))),
+        );
+    }
+    out
 }

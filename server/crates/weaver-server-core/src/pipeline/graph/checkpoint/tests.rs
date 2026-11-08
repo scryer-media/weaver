@@ -1709,3 +1709,128 @@ async fn a_forced_write_leaves_a_crash_nothing_to_fetch_again() {
     let (restored, _mail) = restored(&read, &files, dir.path());
     assert_eq!(restored.job.on_disk(), job.on_disk());
 }
+
+// A plain file's article, 8 KiB of bytes its file and ordinal say.
+const PIECE: u32 = 8 * 1024;
+// The front a namespace keeps of each member, which no record keeps.
+const FRONT: u64 = 16 * 1024;
+
+fn piece(volume: u32, ordinal: u32) -> Vec<u8> {
+    (0..PIECE)
+        .map(|at| (at as u8).wrapping_mul(31) ^ (volume as u8 * 16 + ordinal as u8))
+        .collect()
+}
+
+// Three plain files of six articles, the first four of each in: each is
+// on disk well past its front.
+fn plain_files() -> (GraphJob, tempfile::TempDir, Vec<RootFile>) {
+    let files: Vec<RootFile> = (0..3)
+        .map(|index| file(&format!("part{index}.mkv"), &[PIECE; 6]))
+        .collect();
+    let (mut job, dir, _) = job_with(&files, Vec::new());
+    for volume in 0..3 {
+        for ordinal in 0..4 {
+            plain(&mut job, volume, ordinal);
+        }
+    }
+    (job, dir, files)
+}
+
+fn plain(job: &mut GraphJob, volume: u32, ordinal: u32) {
+    job.intake(
+        decoded(
+            volume,
+            ordinal,
+            u64::from(ordinal * PIECE),
+            &piece(volume, ordinal),
+            Some(u64::from(6 * PIECE)),
+        ),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+}
+
+// The job's checkpoint as the database would hold it now.
+fn checkpointed(job: &GraphJob) -> Snapshot {
+    let pending = Pending::default();
+    assert!(pending.put(job, Vec::new()));
+    snapshot(&held(&pending.take().0.unwrap())).unwrap()
+}
+
+// What `step` read from and wrote to the job's files, and hashed.
+fn touched<T>(step: impl FnOnce() -> T) -> (T, u64, u64, u64) {
+    use crate::pipeline::graph::leaf::counting;
+    let (read, written) = counting::so_far();
+    let hashed = weaver_graph::evidence::counting::hashed();
+    let out = step();
+    let (read_after, written_after) = counting::so_far();
+    (
+        out,
+        read_after - read,
+        written_after - written,
+        weaver_graph::evidence::counting::hashed() - hashed,
+    )
+}
+
+// A restart trusts its checkpoint: a restore of plain files reads none of
+// their bytes to check them, hashes none and writes none. The one thing it
+// reads is each member's front, which no record keeps, as far as it came;
+// nothing is fetched again, and the job holds what it held.
+#[test]
+fn a_restore_of_plain_files_reads_only_their_fronts_and_writes_nothing() {
+    let (job, dir, files) = plain_files();
+    let read = checkpointed(&job);
+    let ((restored, _mail), bytes_read, written, hashed) =
+        touched(|| restored(&read, &files, dir.path()));
+    assert_eq!(written, 0, "a restore writes nothing");
+    assert_eq!(hashed, 0, "a restore hashes nothing");
+    // A test build's restore ends by asking its crash oracle what is on
+    // disk, which reads every arrived article back: that read is the
+    // test's, not the restore's.
+    let (_, oracle, _, _) = touched(|| restored.job.on_disk());
+    assert_eq!(oracle, 3 * 4 * u64::from(PIECE));
+    assert_eq!(
+        bytes_read - oracle,
+        3 * FRONT,
+        "a restore reads the fronts alone"
+    );
+    assert!(restored.refetched.is_empty());
+    assert_eq!(restored.job.on_disk(), job.on_disk());
+    let coverage = |job: &GraphJob| job.tree().record(NodeId::ROOT).unwrap().coverage;
+    assert_eq!(coverage(&restored.job), coverage(&job));
+}
+
+// A file cut shorter than its record says, as a disk that lost its tail
+// leaves it: the restore reads no byte of it to find that, only its length,
+// and the articles past the cut are fetched again. The articles that come
+// again land, and the file holds every byte as it came.
+#[test]
+fn a_file_cut_short_before_a_restore_fetches_again_what_it_lost() {
+    let (job, dir, files) = plain_files();
+    let read = checkpointed(&job);
+    let path = dir.path().join("part1.mkv");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(u64::from(2 * PIECE) + 100)
+        .unwrap();
+    let ((restored, _mail), _, written, hashed) = touched(|| restored(&read, &files, dir.path()));
+    assert_eq!(written, 0, "a restore writes nothing");
+    assert_eq!(hashed, 0, "a restore hashes nothing");
+    assert_eq!(
+        restored.refetched,
+        vec![(VolumeIndex(1), 2), (VolumeIndex(1), 3)],
+        "the articles past the cut, and no other, are fetched again"
+    );
+    let mut job = restored.job;
+    for ordinal in 2..6 {
+        plain(&mut job, 1, ordinal);
+    }
+    let whole: Vec<u8> = (0..6).flat_map(|ordinal| piece(1, ordinal)).collect();
+    assert!(
+        std::fs::read(&path).unwrap() == whole,
+        "the file holds every byte"
+    );
+}

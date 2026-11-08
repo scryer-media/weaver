@@ -12,9 +12,9 @@
 // again from the namespace, which keeps every member's first bytes, and
 // only a content match renames. Recovery payloads stay in the volumes and
 // are read back when a repair spends them; a packet streamed when the
-// checkpoint was taken, and the bytes held past the walk's front, come back
-// with the server's replay of the volumes, so nothing of a hash in flight is
-// recorded.
+// checkpoint was taken, and the bytes held past the walk's front, lie past
+// that front, which the restored object asks for again, so nothing of a
+// hash in flight is recorded.
 
 use std::collections::{BTreeMap, BTreeSet};
 

@@ -1372,10 +1372,10 @@ fn a_new_repair_leaf_cannot_outlive_its_uncommitted_name_during_a_move() {
         CapacityReader::unknown(),
     );
     job.writer
-        .restore_file(&job.tree, NodeId::ROOT, donor, &donor_file)
+        .restore_file(&job.tree, NodeId::ROOT, donor, &donor_file, &Unsourced)
         .unwrap();
     job.writer
-        .restore_file(&job.tree, NodeId::ROOT, repair, &repair_file)
+        .restore_file(&job.tree, NodeId::ROOT, repair, &repair_file, &Unsourced)
         .unwrap();
     for (node, member, name) in job.writer.waiting() {
         job.tree.leaving(node, member, &name);
@@ -1700,10 +1700,10 @@ fn a_restore_finds_a_file_opened_while_a_move_waited_at_its_name() {
         CapacityReader::unknown(),
     );
     job.writer
-        .restore_file(&job.tree, NodeId::ROOT, first, &first_file)
+        .restore_file(&job.tree, NodeId::ROOT, first, &first_file, &Unsourced)
         .unwrap();
     job.writer
-        .restore_file(&job.tree, NodeId::ROOT, second, &second_file)
+        .restore_file(&job.tree, NodeId::ROOT, second, &second_file, &Unsourced)
         .unwrap();
     for (member, name, bytes) in [
         (first, "3f9a.bin", b"alpha"),
@@ -1860,7 +1860,7 @@ fn an_envelope_on_disk_reads_through_the_root_only_after_its_ownership_is_restor
         CapacityReader::unknown(),
     );
     job.writer
-        .restore_file(&job.tree, child, MemberId(0), &file)
+        .restore_file(&job.tree, child, MemberId(0), &file, &Unsourced)
         .unwrap();
 
     let mut posted = Vec::new();
@@ -1892,7 +1892,7 @@ fn a_deleted_output_does_not_hide_the_surviving_committed_envelope() {
     std::fs::remove_file(job.dir.path().join("inner.bin")).unwrap();
     job.writer.restore_kept(&kept[0]).unwrap();
     job.writer
-        .restore_file(&job.tree, child, MemberId(0), &file)
+        .restore_file(&job.tree, child, MemberId(0), &file, &Unsourced)
         .unwrap();
 
     let mut posted = Vec::new();
@@ -1948,7 +1948,7 @@ fn give_back_retains_the_unreplayed_leaf_without_adopting_sparse_holes() {
         if restored {
             let state = job.writer.file_state(NodeId::ROOT, member);
             job.writer
-                .restore_file(&job.tree, NodeId::ROOT, member, &state)
+                .restore_file(&job.tree, NodeId::ROOT, member, &state, &Unsourced)
                 .unwrap();
             assert_eq!(
                 job.writer.files[&NodeId::ROOT].leaves[&member]

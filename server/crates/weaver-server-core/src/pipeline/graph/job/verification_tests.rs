@@ -32,7 +32,7 @@ fn pending() -> (GraphJob, tempfile::TempDir, RunMail, Vec<RootFile>) {
     let state = job.writer.file_state(NodeId::ROOT, MemberId(0));
     job.writer.restore_verifications(&[(0, 0)]);
     job.writer
-        .restore_file(&job.tree, NodeId::ROOT, MemberId(0), &state)
+        .restore_file(&job.tree, NodeId::ROOT, MemberId(0), &state, &job.root)
         .unwrap();
     let mail = RunMail::default();
     job.loans = Loans::new(1, mail.sender(), job.runs.hardware());

@@ -20,7 +20,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
-use weaver_graph::{Algorithm, Digest, Evidenced};
+use weaver_graph::{Algorithm, ByteRange, Digest, Evidenced};
 
 use crate::pipeline::graph::sparse::{PlatformMarker, create_sparse};
 
@@ -76,8 +76,6 @@ pub(crate) struct Leaf {
     changed: BTreeMap<(u64, u64), u64>,
 }
 
-// How much of a file is read back at a time when its CRC is not in the fold.
-const READ_BACK: u64 = 1 << 20;
 static NEXT_LEAF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 // A contiguous run of written bytes, and their digest when every write in
@@ -422,9 +420,10 @@ impl Leaf {
 
     // A restored member's fold, which a restore starts empty. A member
     // whose bytes passed its stated CRC folds to that CRC; any other folds
-    // what of `ranges` its file holds, read back from it. A range the file
-    // does not hold is left out of the fold: a file lost, or cut short,
-    // since its bytes passed holds no bytes that passed, and folds nothing.
+    // the runs something else vouches for, each with its digest, joined
+    // where they abut, and nothing is read. A file lost, or cut short,
+    // since its bytes passed holds no bytes that passed past its length, and
+    // folds nothing there.
     pub(crate) fn fold_passed(&mut self, length: u64, digest: Digest) {
         self.written.clear();
         if length > 0 && self.len().is_ok_and(|held| held >= length) {
@@ -438,23 +437,23 @@ impl Leaf {
         }
     }
 
-    pub(crate) fn fold_back(
-        &mut self,
-        algorithm: Algorithm,
-        ranges: impl IntoIterator<Item = (u64, u64)>,
-    ) {
-        for (start, end) in ranges {
-            let mut at = start;
-            while at < end {
-                let take = (end - at).min(READ_BACK);
-                let mut chunk = Vec::new();
-                if self.read(at, index(take), &mut chunk).is_err() {
-                    break;
-                }
-                let chunk = Evidenced::from(chunk);
-                self.wrote((at, at + take), Some((algorithm, &chunk)), &[], &[]);
-                at += take;
+    pub(crate) fn fold_vouched(&mut self, runs: impl IntoIterator<Item = (ByteRange, Digest)>) {
+        let held = self.len().unwrap_or(0);
+        for (range, digest) in runs {
+            if range.is_empty()
+                || range.end > held
+                || !self.overlapped((range.start, range.end)).is_empty()
+            {
+                continue;
             }
+            self.written.insert(
+                range.start,
+                Written {
+                    end: range.end,
+                    digest: Some(digest),
+                },
+            );
+            self.join(range.start, range.end);
         }
     }
 
@@ -678,6 +677,8 @@ fn create_parent(path: &Path) -> Result<(), LeafError> {
 }
 
 fn write_all_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(test)]
+    counting::wrote(bytes.len());
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
@@ -701,6 +702,8 @@ fn write_all_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
 }
 
 pub(crate) fn read_exact_at(file: &File, offset: u64, out: &mut [u8]) -> io::Result<()> {
+    #[cfg(test)]
+    counting::read(out.len());
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
@@ -734,6 +737,31 @@ fn joined_digest(first: Option<Digest>, second: Option<Digest>, len_second: u64)
     }
     let value = algorithm.join(first.value, second.value, len_second)?;
     Some(Digest { algorithm, value })
+}
+
+// The bytes this thread read from and wrote to the job's files, so a test
+// can hold a step to what it touches on disk.
+#[cfg(test)]
+pub(crate) mod counting {
+    use std::cell::Cell;
+
+    thread_local! {
+        static READ: Cell<u64> = const { Cell::new(0) };
+        static WRITTEN: Cell<u64> = const { Cell::new(0) };
+    }
+
+    pub(super) fn read(len: usize) {
+        READ.with(|read| read.set(read.get() + len as u64));
+    }
+
+    pub(super) fn wrote(len: usize) {
+        WRITTEN.with(|written| written.set(written.get() + len as u64));
+    }
+
+    // Bytes read and bytes written so far.
+    pub(crate) fn so_far() -> (u64, u64) {
+        (READ.with(Cell::get), WRITTEN.with(Cell::get))
+    }
 }
 
 #[cfg(test)]
@@ -849,13 +877,42 @@ mod tests {
         leaf.close(7000).unwrap();
         assert_eq!(leaf.folded(7000, crc), Some(file_crc(&leaf, 7000)));
 
+        // A restore folds what is vouched for, run by run, reading nothing.
+        let digest = |from: u64, to: u64| {
+            let mut bytes = Vec::new();
+            leaf.read(from, (to - from) as usize, &mut bytes).unwrap();
+            crc.hash(&bytes)
+        };
+        let vouched = [
+            (ByteRange::new(0, 3000), digest(0, 3000)),
+            (ByteRange::new(3000, 7000), digest(3000, 7000)),
+        ];
         let mut restored = Leaf::at(dir.path(), "lantern.bin");
         assert_eq!(restored.folded(7000, crc), None);
-        restored.fold_back(crc, [(0, 3000), (3000, 7000)]);
+        let hashed = weaver_graph::evidence::counting::hashed();
+        let (read, written) = counting::so_far();
+        restored.fold_vouched(vouched);
+        assert_eq!(weaver_graph::evidence::counting::hashed(), hashed);
+        assert_eq!(counting::so_far(), (read, written));
         assert_eq!(restored.folded(7000, crc), Some(file_crc(&leaf, 7000)));
-        // A range the file does not hold stays out of the fold.
+        // A run nothing vouches for leaves the fold short.
         let mut short = Leaf::at(dir.path(), "lantern.bin");
-        short.fold_back(crc, [(0, 9000)]);
+        short.fold_vouched([vouched[1]]);
         assert_eq!(short.folded(7000, crc), None);
+        // A file cut short since: a run past its length folds nothing, and
+        // a write over it later reads nothing that is not there.
+        let first = file_crc(&leaf, 3000);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(leaf.path())
+            .unwrap()
+            .set_len(5000)
+            .unwrap();
+        let mut cut = Leaf::at(dir.path(), "lantern.bin");
+        cut.fold_vouched(vouched);
+        assert_eq!(cut.folded(3000, crc), Some(first));
+        assert_eq!(cut.folded(7000, crc), None);
+        folding(&mut cut, 3000, bytes(4000, 3));
+        assert_eq!(cut.folded(7000, crc), Some(file_crc(&cut, 7000)));
     }
 }

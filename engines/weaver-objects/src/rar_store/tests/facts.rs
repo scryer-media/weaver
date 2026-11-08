@@ -7,7 +7,7 @@ use weaver_graph::{Facts, Kind, RestoreError};
 use super::super::facts::{KeyTuple, StoreFacts};
 use super::writer::{Options, Version, write};
 use super::{PASSWORD, encrypted, items, split, split_encrypted, store};
-use crate::testing::replay::{Step, contains, frames, replay, restores_alike};
+use crate::testing::replay::{Step, contains, frames, restores_alike};
 
 fn named(volumes: Vec<Vec<u8>>) -> Vec<(String, Vec<u8>)> {
     let count = volumes.len();
@@ -47,8 +47,8 @@ fn into_volume(steps: &[Step<'_>], index: u32) -> Option<usize> {
 }
 
 // A cut after the first header, mid-member, and on each side of a volume
-// boundary, with the password offered again and the placed bytes replayed
-// as a restart does.
+// boundary, with the password offered again as a restart does, and nothing
+// replayed: the facts carry what the store judges its checksums with.
 fn every_cut(volumes: &[(String, Vec<u8>)], frame: usize, password: bool) -> Vec<Facts> {
     let steps = steps(volumes, frame, password);
     let first = into_volume(&steps, 0).expect("the set has a first volume");
@@ -62,7 +62,6 @@ fn every_cut(volumes: &[(String, Vec<u8>)], frame: usize, password: bool) -> Vec
             if password {
                 again.push(Step::Password(PASSWORD));
             }
-            again.extend(replay(&steps[..cut]));
             restores_alike(Box::new(store()), &steps, cut, &again).0
         })
         .collect()
@@ -147,7 +146,10 @@ fn facts_of_the_previous_version_are_refused() {
     let mut object = store();
     object.bound(VolumeIndex(0), &volumes[0].0, &volumes[0].1, None);
     let mut facts = object.facts();
-    assert_eq!(facts.version, 4);
+    assert_eq!(facts.version, 5);
+    assert!(crate::restore(&facts, weaver_graph::Budget::default()).is_ok());
+    // Version 4 kept no CRC runs; it reads as one with none.
+    facts.version = 4;
     assert!(crate::restore(&facts, weaver_graph::Budget::default()).is_ok());
     facts.version = 2;
     assert!(matches!(

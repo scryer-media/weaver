@@ -78,12 +78,14 @@ pub(in crate::pipeline::tests) async fn run_restarting(
 
 // How the pipeline goes down: as a crash drops it, shut down, or as a crash
 // that also loses the file written for the member of this output name, so
-// the restore cannot read back any article holding its bytes.
+// the restore finds no article holding its bytes on disk, or that cuts
+// that file to the length given, as a disk that lost its tail leaves it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline::tests) enum Down<'a> {
     Crash,
     Shutdown,
     Losing(&'a str),
+    Cutting(&'a str, u64),
 }
 
 // As `run_restarting`, going down as `down` says and only after the articles
@@ -154,6 +156,13 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
                         std::fs::remove_file(working_dir.join(name))
                             .expect("the member's file is on disk to lose");
                     }
+                    if let Down::Cutting(name, length) = down {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(working_dir.join(name))
+                            .and_then(|file| file.set_len(length))
+                            .expect("the member's file is on disk to cut");
+                    }
                     inspect(rows);
                 };
                 let figures = |pipeline: &Pipeline| {
@@ -165,6 +174,19 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
                 pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut going_down).await;
                 if let (Some(before), Some(after)) = (before, figures(&pipeline)) {
                     graph.restored_remaining.push((before, after));
+                }
+                let running = pipeline
+                    .graph_jobs
+                    .get(&JOB)
+                    .is_some_and(|job| job.awaits_mail());
+                let queued = pipeline.jobs.get(&JOB).is_some_and(|state| {
+                    state
+                        .articles
+                        .active()
+                        .is_some_and(|active| !active.download_queue.is_empty())
+                });
+                if running && queued {
+                    graph.fetching_while_running += 1;
                 }
                 in_memory.extend(owed.iter().copied());
                 restarts += 1;
@@ -462,6 +484,48 @@ async fn a_uuencoded_file_under_par2_with_a_lost_article_restarted_after_every_a
         8,
     );
     restart_row(Scenario::new(posts).uuencoded().lost(0, 2)).await;
+}
+
+// A plain file cut shorter than its checkpoint says while the pipeline is
+// down: the restore finds that from the file's length alone, the articles
+// past the cut and no other come again, and every file is delivered whole.
+#[tokio::test]
+async fn a_plain_file_cut_short_at_a_restart_fetches_again_only_what_it_lost() {
+    let posts = vec![
+        Post::plain("ember.bin", payload(9 * ARTICLE + 21, 71)),
+        Post::plain("quill.bin", payload(7 * ARTICLE + 5, 72)),
+    ];
+    let order: Vec<(u32, u32)> = (0..10).map(|ordinal| (0, ordinal)).collect();
+    let scenario = Scenario::new(posts).first(&order);
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let cut = 4 * ARTICLE as u64 + 10;
+    let down = order.len();
+    let restarted = run_restarting_at(
+        &scenario,
+        &mut |_| {},
+        Down::Cutting("ember.bin", cut),
+        &|nth| nth == down,
+    )
+    .await;
+    assert_eq!(restarted.restarts, 1);
+    assert_eq!(restarted.status, whole.status, "status");
+    assert_eq!(
+        restarted.files.keys().collect::<Vec<_>>(),
+        whole.files.keys().collect::<Vec<_>>()
+    );
+    for (name, bytes) in &whole.files {
+        assert!(restarted.files[name] == *bytes, "{name}: delivered bytes");
+    }
+    let lost: BTreeSet<(u32, u32)> = (4..10)
+        .map(|ordinal| (0, ordinal))
+        .filter(|article| !restarted.in_memory.contains(article))
+        .collect();
+    assert!(lost.contains(&(0, 4)), "the cut article was on disk");
+    assert_eq!(
+        restarted.from_disk, lost,
+        "the articles past the cut, and no other, come again"
+    );
 }
 
 // Every event `pipeline` sent since `sent` subscribed, kept in order.
@@ -1251,6 +1315,23 @@ async fn stream_row(name: &str, compress: fn(&[u8]) -> Vec<u8>) {
 #[tokio::test]
 async fn a_gzip_stream_restarted_after_every_article_replays_from_its_start() {
     stream_row("ember.bin.gz", gzip).await;
+}
+
+// A stream restored mid-download decodes again from its start on its run's
+// thread, not in the restore: the restored job hands out the articles still
+// to come while that run is out.
+#[tokio::test]
+async fn a_gzip_stream_restored_mid_download_fetches_while_it_decodes_again() {
+    let body = gzip(&payload(30 * ARTICLE + 7, 80));
+    let scenario = Scenario::new(vec![Post::plain("ember.bin.gz", body)]);
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert!(
+        restarted.graph.fetching_while_running > 0,
+        "a restored job fetches while its run decodes again"
+    );
+    assert_restarted(&restarted, &whole);
 }
 
 #[tokio::test]
