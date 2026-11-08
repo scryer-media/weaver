@@ -245,7 +245,7 @@ impl StreamConnector {
     ) -> Result<(
         ConnectionKind,
         BoxAsyncReadVectored,
-        BoxAsyncWrite,
+        mse::Outbound,
         Meter,
         Encryption,
     )> {
@@ -273,7 +273,7 @@ impl StreamConnector {
                     w.write_all(handshake).map_err(Error::WriteHandshake),
                 )
                 .await?;
-                return Ok((kind, r, w, meter, Encryption::None));
+                return Ok((kind, r, w.into(), meter, Encryption::None));
             }
         };
 
@@ -291,7 +291,7 @@ impl StreamConnector {
                 w.write_all(handshake).map_err(Error::WriteHandshake),
             )
             .await?;
-            return Ok((kind, r, w, meter, Encryption::None));
+            return Ok((kind, r, w.into(), meter, Encryption::None));
         }
 
         stats.attempts(1);

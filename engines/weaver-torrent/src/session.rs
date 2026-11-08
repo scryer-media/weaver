@@ -1172,7 +1172,7 @@ pub(crate) struct CheckedIncomingConnection {
     pub kind: ConnectionKind,
     pub addr: SocketAddr,
     pub reader: BoxAsyncReadVectored,
-    pub writer: BoxAsyncWrite,
+    pub writer: crate::mse::Outbound,
     pub read_buf: ReadBuf,
     pub handshake: Handshake,
     /// How the peer's handshake went (libtorrent
@@ -1894,13 +1894,13 @@ impl Session {
 
         // Every byte from here on crossed the peer's socket for the torrent
         // it greets, and is charged to it once the connection is its own.
-        let (meter, mut reader, mut writer) = Meter::wrap(reader, writer);
+        let (meter, mut reader, writer) = Meter::wrap(reader, writer);
 
         // A connection on the SSL listener is TLS from its first byte, under
         // the torrent its SNI names: that torrent's CA checks the peer's
         // chain and our identity under it answers. No encryption handshake
         // runs inside it.
-        let (encryption, named) = if tls {
+        let (encryption, writer, named) = if tls {
             let (r, w, named) = tokio::time::timeout(handshake_timeout, async {
                 let incoming = crate::ssl::Incoming::start(reader, writer)
                     .await
@@ -1926,8 +1926,7 @@ impl Session {
             .await
             .context("TLS handshake timed out")??;
             reader = r;
-            writer = w;
-            (crate::mse::Encryption::None, Some(named))
+            (crate::mse::Encryption::None, w.into(), Some(named))
         } else {
             // With encryption enabled, an encrypted connection is unwrapped here
             // and a plaintext one passed through (or refused); with it disabled
@@ -1951,16 +1950,16 @@ impl Session {
                     t.info_hashes().ids20().map(move |hash| (hash, policy))
                 })
                 .collect();
-            let encryption = crate::mse::upgrade_incoming(
+            let (encryption, writer) = crate::mse::upgrade_incoming(
                 session_policy,
                 &mut reader,
-                &mut writer,
+                writer,
                 handshake_timeout,
                 &policies,
             )
             .await
             .context("error in the encryption handshake")?;
-            (encryption, None)
+            (encryption, writer, None)
         };
 
         let mut read_buf = ReadBuf::new();
@@ -5468,7 +5467,7 @@ mod tests {
             kind: crate::stream_connect::ConnectionKind::Tcp,
             addr: addr.parse().unwrap(),
             reader,
-            writer,
+            writer: writer.into(),
             read_buf: crate::read_buf::ReadBuf::new(),
             handshake: crate::peer_protocol::Handshake::new(info_hash, super::Id20::new([7; 20])),
             encryption: crate::mse::Encryption::None,

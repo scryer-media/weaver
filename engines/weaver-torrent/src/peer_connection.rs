@@ -41,7 +41,7 @@ use crate::{
     spawn_utils::BlockingSpawner,
     ssl::SslTorrent,
     stream_connect::{Guard, StreamConnector, Transports},
-    type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite},
+    type_aliases::BoxAsyncReadVectored,
 };
 
 pub trait PeerConnectionHandler {
@@ -277,7 +277,7 @@ struct ManagePeerArgs {
     read_buf: ReadBuf,
     write_buf: Box<[u8]>,
     read: BoxAsyncReadVectored,
-    write: BoxAsyncWrite,
+    write: crate::mse::Outbound,
     meter: Meter,
     outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
 }
@@ -364,12 +364,11 @@ impl<H: PeerConnectionHandler> ReadQuota for Quota<'_, H> {
 /// socket is written, not while the quota is waited for.
 async fn send<H: PeerConnectionHandler>(
     quota: &mut Quota<'_, H>,
-    write: &mut BoxAsyncWrite,
-    buf: &[u8],
+    write: &mut crate::mse::Outbound,
+    buf: &mut [u8],
     what: &'static str,
     timeout: Duration,
 ) -> Result<()> {
-    use tokio::io::AsyncWriteExt;
     quota.reserve(buf.len() as u64).await;
     with_timeout(what, timeout, write.write_all(buf).map_err(Error::Write)).await
 }
@@ -432,8 +431,6 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         outgoing_chan: tokio::sync::mpsc::UnboundedReceiver<WriterRequest>,
         mut incoming: CheckedIncomingConnection,
     ) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
-
         // A peer speaks v2 when it greets with the truncated v2 hash or
         // offers v2, which a torrent without v2 refuses (libtorrent
         // `bt_peer_connection::on_receive_handshake`).
@@ -460,7 +457,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.options.handshake_timeout(),
             incoming
                 .writer
-                .write_all(&write_buf[..hlen])
+                .write_all(&mut write_buf[..hlen])
                 .map_err(Error::WriteHandshake),
         )
         .await?;
@@ -637,7 +634,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             send(
                 &mut up,
                 &mut write,
-                &write_buf[..esz],
+                &mut write_buf[..esz],
                 "writing extended handshake",
                 rwtimeout,
             )
@@ -656,7 +653,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 send(
                     &mut up,
                     &mut write,
-                    &write_buf[..len],
+                    &mut write_buf[..len],
                     "writing bitfield",
                     rwtimeout,
                 )
@@ -771,7 +768,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     }
                 };
 
-                send(&mut up, &mut write, &write_buf[..len], "writing", rwtimeout).await?;
+                send(
+                    &mut up,
+                    &mut write,
+                    &mut write_buf[..len],
+                    "writing",
+                    rwtimeout,
+                )
+                .await?;
 
                 let payload = uploaded_add.map_or(0, |chunk| chunk.size);
                 self.handler
@@ -1085,7 +1089,7 @@ mod tests {
             kind: ConnectionKind::Tcp,
             addr: "127.0.0.1:6881".parse().unwrap(),
             reader,
-            writer,
+            writer: writer.into(),
             read_buf: ReadBuf::new(),
             handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
             encryption: crate::mse::Encryption::None,
@@ -1186,7 +1190,7 @@ mod tests {
             kind: ConnectionKind::Tcp,
             addr: "127.0.0.1:6881".parse().unwrap(),
             reader,
-            writer,
+            writer: writer.into(),
             read_buf: ReadBuf::new(),
             handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
             encryption: crate::mse::Encryption::None,
@@ -1293,7 +1297,7 @@ mod tests {
             kind: ConnectionKind::Tcp,
             addr: "127.0.0.1:6881".parse().unwrap(),
             reader,
-            writer,
+            writer: writer.into(),
             read_buf: ReadBuf::new(),
             handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
             encryption: crate::mse::Encryption::None,
@@ -1431,7 +1435,7 @@ mod tests {
             kind: ConnectionKind::Tcp,
             addr: "127.0.0.1:6881".parse().unwrap(),
             reader,
-            writer,
+            writer: writer.into(),
             read_buf: ReadBuf::new(),
             handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
             encryption: crate::mse::Encryption::None,
@@ -1634,5 +1638,256 @@ mod tests {
                 ..Default::default()
             }
         );
+    }
+    /// One thing the writer task told the handler, in the order told.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Told {
+        Granted(u64),
+        Returned(u64),
+        Protocol(u64),
+        Uploaded(u32),
+        Done(u32),
+    }
+
+    /// Serves every block, filled from its piece index, and logs what the
+    /// writer task tells it about the upload channel.
+    #[derive(Default)]
+    struct Recorder {
+        told: parking_lot::Mutex<Vec<Told>>,
+    }
+
+    impl PeerConnectionHandler for &Recorder {
+        fn should_send_bitfield(&self) -> bool {
+            false
+        }
+        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_received_message(&self, _: Message<'_>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_uploaded_bytes(&self, bytes: u32) {
+            self.told.lock().push(Told::Uploaded(bytes));
+        }
+        fn claim_upload(&self, _: &ChunkInfo) -> bool {
+            true
+        }
+        fn upload_done(&self, chunk: &ChunkInfo) {
+            self.told.lock().push(Told::Done(chunk.piece_index.get()));
+        }
+        fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
+            for (k, b) in buf.iter_mut().enumerate() {
+                *b = u8::try_from((k + chunk.piece_index.get() as usize) % 239).unwrap();
+            }
+            Ok(())
+        }
+        async fn request_bandwidth(&self, channel: Channel, bytes: u64) -> u64 {
+            if channel == Channel::Upload {
+                self.told.lock().push(Told::Granted(bytes));
+            }
+            bytes
+        }
+        fn return_bandwidth(&self, channel: Channel, bytes: u64) {
+            if channel == Channel::Upload {
+                self.told.lock().push(Told::Returned(bytes));
+            }
+        }
+        fn on_protocol_bytes(&self, channel: Channel, bytes: u64) {
+            if channel == Channel::Upload {
+                self.told.lock().push(Told::Protocol(bytes));
+            }
+        }
+    }
+
+    /// Takes at most 5000 bytes a write, and is pending on every other poll.
+    struct Halting {
+        inner: BoxAsyncWrite,
+        polls: usize,
+    }
+
+    impl tokio::io::AsyncWrite for Halting {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            this.polls += 1;
+            if this.polls.is_multiple_of(2) {
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            let n = buf.len().min(5000);
+            std::pin::Pin::new(&mut this.inner).poll_write(cx, &buf[..n])
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    /// Serves two blocks and a have to a peer over a socket that writes in
+    /// short pieces with Pendings between them, under RC4 or not. Returns what
+    /// the handler was told, the bytes on the wire, those bytes as plain
+    /// text, and what the meter counted as sent.
+    async fn serve_two_blocks(rc4: bool) -> (Vec<Told>, Vec<u8>, Vec<u8>, u64) {
+        use tokio::io::AsyncReadExt;
+        let recorder = Recorder::default();
+        let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        let connection = PeerConnection::new(
+            connection.addr,
+            connection.info_hashes,
+            connection.peer_id,
+            &recorder,
+            Some(connection.options),
+            BlockingSpawner::new(1),
+            connection.connector,
+        );
+        let (ours, mut theirs) = tokio::io::duplex(1 << 18);
+        let (reader, writer) = halves(ours);
+        let writer: BoxAsyncWrite = Box::new(Halting {
+            inner: writer,
+            polls: 0,
+        });
+        let (meter, reader, writer) = Meter::wrap(reader, writer);
+        let writer = if rc4 {
+            crate::mse::Outbound::rc4(writer, crate::mse::Rc4::new_discard_1024(b"key"))
+        } else {
+            writer.into()
+        };
+        let incoming = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            reader,
+            writer,
+            read_buf: ReadBuf::new(),
+            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encryption: crate::mse::Encryption::None,
+            meter: meter.clone(),
+        };
+        let lengths = crate::core::lengths::Lengths::new(2 * BLOCK as u64, BLOCK).unwrap();
+        let block = |piece| {
+            lengths
+                .chunk_info_from_received_data(
+                    lengths.validate_piece_index(piece).unwrap(),
+                    0,
+                    BLOCK,
+                )
+                .unwrap()
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(WriterRequest::ReadChunkRequest(block(0))).unwrap();
+        tx.send(WriterRequest::ReadChunkRequest(block(1))).unwrap();
+        tx.send(WriterRequest::Message(Message::Have(3))).unwrap();
+        let peer = async {
+            let mut cipher = rc4.then(|| crate::mse::Rc4::new_discard_1024(b"key"));
+            let mut wire = Vec::new();
+            let mut plain = Vec::new();
+            let mut chunk = [0u8; 4096];
+            // Until the have closes the stream: its five bytes end it.
+            while !plain.ends_with(&[0, 0, 0, 5, 4, 0, 0, 0, 3]) {
+                let n = theirs.read(&mut chunk).await.unwrap();
+                assert_ne!(n, 0, "the stream ended before the have");
+                wire.extend_from_slice(&chunk[..n]);
+                let mut got = chunk[..n].to_vec();
+                if let Some(cipher) = &mut cipher {
+                    cipher.apply(&mut got);
+                }
+                plain.extend_from_slice(&got);
+            }
+            drop(tx);
+            (wire, plain)
+        };
+        let (result, (wire, plain)) =
+            tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
+        assert!(matches!(result, Err(Error::TorrentIsNotLive)), "{result:?}");
+        let told = recorder.told.lock().clone();
+        (told, wire, plain, meter.sent())
+    }
+
+    // Under RC4 the writer task encrypts each message in place before its
+    // first write; short writes and Pendings below the cipher change nothing
+    // the handler is told, nor its order, and the receiver decrypts the same
+    // bytes a plain peer gets as they are.
+    #[tokio::test(start_paused = true)]
+    async fn an_rc4_upload_is_accounted_as_a_plain_one_and_decrypts_byte_exact() {
+        let (told_plain, wire_plain, plain_plain, sent_plain) = serve_two_blocks(false).await;
+        let (told_rc4, wire_rc4, plain_rc4, sent_rc4) = serve_two_blocks(true).await;
+
+        // A plain peer gets the bytes as the writer task built them.
+        assert_eq!(wire_plain, plain_plain);
+        assert_eq!(plain_rc4, plain_plain);
+        assert_ne!(wire_rc4, plain_rc4);
+        assert_eq!(told_rc4, told_plain);
+        for (told, wire, sent) in [
+            (&told_plain, &wire_plain, sent_plain),
+            (&told_rc4, &wire_rc4, sent_rc4),
+        ] {
+            assert_eq!(sent, wire.len() as u64);
+            let sum = |pick: fn(&Told) -> Option<u64>| told.iter().filter_map(pick).sum::<u64>();
+            let granted = sum(|t| match t {
+                Told::Granted(n) => Some(*n),
+                _ => None,
+            });
+            let returned = sum(|t| match t {
+                Told::Returned(n) => Some(*n),
+                _ => None,
+            });
+            let protocol = sum(|t| match t {
+                Told::Protocol(n) => Some(*n),
+                _ => None,
+            });
+            assert_eq!(granted - returned, sent);
+            assert_eq!(protocol, sent - 2 * u64::from(BLOCK));
+            // Each block: paid for, written, its protocol bytes, its payload,
+            // then done, in that order.
+            let tail: Vec<_> = told
+                .iter()
+                .filter(|t| matches!(t, Told::Uploaded(_) | Told::Done(_)))
+                .cloned()
+                .collect();
+            assert_eq!(
+                tail,
+                [
+                    Told::Uploaded(BLOCK),
+                    Told::Done(0),
+                    Told::Uploaded(BLOCK),
+                    Told::Done(1)
+                ]
+            );
+            let done0 = told.iter().position(|t| *t == Told::Done(0)).unwrap();
+            assert_eq!(told[done0 - 1], Told::Uploaded(BLOCK));
+            assert_eq!(told[done0 - 2], Told::Protocol(13));
+            assert_eq!(told[done0 - 3], Told::Granted(13 + u64::from(BLOCK)));
+        }
+        // The two blocks' payloads, as the receiver sees them.
+        for piece in 0..2u32 {
+            let begin = plain_rc4
+                .windows(9)
+                .position(|w| w[..5] == [0, 0, 0x40, 9, 7] && w[5..] == piece.to_be_bytes())
+                .unwrap()
+                + 13;
+            let payload = &plain_rc4[begin..begin + BLOCK as usize];
+            assert!(
+                payload
+                    .iter()
+                    .enumerate()
+                    .all(|(k, b)| usize::from(*b) == (k + piece as usize) % 239)
+            );
+        }
     }
 }

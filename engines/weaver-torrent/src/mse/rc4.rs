@@ -13,6 +13,9 @@ pub(crate) struct Rc4 {
     s: [u8; 256],
     i: u8,
     j: u8,
+    /// Keystream bytes produced, shared with every clone.
+    #[cfg(test)]
+    ran: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Rc4 {
@@ -30,7 +33,13 @@ impl Rc4 {
             j = j.wrapping_add(s[i]).wrapping_add(key[i % key.len()]);
             s.swap(i, j as usize);
         }
-        Self { s, i: 0, j: 0 }
+        Self {
+            s,
+            i: 0,
+            j: 0,
+            #[cfg(test)]
+            ran: Default::default(),
+        }
     }
 
     /// The handshake's variant: the first 1024 bytes of keystream are thrown away.
@@ -50,6 +59,8 @@ impl Rc4 {
 
     /// XOR the keystream into `buf`.
     pub fn apply(&mut self, buf: &mut [u8]) {
+        #[cfg(test)]
+        self.count(buf.len());
         for b in buf.iter_mut() {
             *b ^= self.next_byte();
         }
@@ -57,9 +68,25 @@ impl Rc4 {
 
     /// Advance the keystream by `n` bytes.
     pub fn skip(&mut self, n: usize) {
+        #[cfg(test)]
+        self.count(n);
         for _ in 0..n {
             self.next_byte();
         }
+    }
+}
+
+#[cfg(test)]
+impl Rc4 {
+    fn count(&self, n: usize) {
+        self.ran
+            .fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Keystream bytes this cipher and its clones have produced, the
+    /// handshake's discard included.
+    pub fn keystream_bytes(&self) -> u64 {
+        self.ran.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

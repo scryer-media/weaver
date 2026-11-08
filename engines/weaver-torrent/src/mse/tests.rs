@@ -124,7 +124,7 @@ async fn exchange(mut a: Established, mut b: Established, info_hash: Id20) {
     assert_eq!(h.info_hash, info_hash);
     assert_eq!(h.peer_id, Id20::new([1; 20]));
     b.writer
-        .write_all(&bt_handshake(info_hash, 2))
+        .write_all(&mut bt_handshake(info_hash, 2))
         .await
         .unwrap();
     let h = read_bt_handshake(&mut a.reader).await;
@@ -134,9 +134,10 @@ async fn exchange(mut a: Established, mut b: Established, info_hash: Id20) {
     let data: Vec<u8> = (0..200_000u32)
         .map(|i| u8::try_from(i % 241).unwrap())
         .collect();
+    let (mut out_a, mut out_b) = (data.clone(), data.clone());
     let (sent_a, sent_b, got_a, got_b) = tokio::join!(
-        a.writer.write_all(&data),
-        b.writer.write_all(&data),
+        a.writer.write_all(&mut out_a),
+        b.writer.write_all(&mut out_b),
         async {
             let mut got = vec![0u8; data.len()];
             a.reader.read_exact(&mut got).await.unwrap();
@@ -234,16 +235,11 @@ async fn plaintext_against(
     (BoxAsyncReadVectored, BoxAsyncWrite),
 ) {
     let ih = Id20::new([7; 20]);
-    let ((ar, mut aw), (mut reader, mut writer)) = pipe();
+    let ((ar, mut aw), (mut reader, writer)) = pipe();
     aw.write_all(&bt_handshake(ih, 1)).await.unwrap();
-    let res = upgrade_incoming(
-        policy,
-        &mut reader,
-        &mut writer,
-        Duration::MAX,
-        &[(ih, policy)],
-    )
-    .await;
+    let res = upgrade_incoming(policy, &mut reader, writer, Duration::MAX, &[(ih, policy)])
+        .await
+        .map(|(encryption, _)| encryption);
     (res, reader, (ar, aw))
 }
 
@@ -276,13 +272,13 @@ async fn test_prefer_and_require_responders_accept_encrypted() {
         let ((ar, aw), (br, bw)) = pipe();
         let ia = bt_handshake(ih, 1);
         let mut reader = br;
-        let mut writer = bw;
         let policies = [(ih, policy)];
         let (a, b) = tokio::join!(
             initiate(ar, aw, &ih, outgoing_offer(EncryptionPolicy::Require), &ia),
-            upgrade_incoming(policy, &mut reader, &mut writer, Duration::MAX, &policies),
+            upgrade_incoming(policy, &mut reader, bw, Duration::MAX, &policies),
         );
-        assert_eq!(b.unwrap(), Encryption::Rc4);
+        let (encryption, writer) = b.unwrap();
+        assert_eq!(encryption, Encryption::Rc4);
         let b = Established {
             reader,
             writer,

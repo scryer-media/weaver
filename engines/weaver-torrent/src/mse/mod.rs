@@ -42,8 +42,9 @@ use crate::{
     vectored_traits::AsyncReadVectoredIntoCompat,
 };
 
-use rc4::Rc4;
-use stream::{DecryptingReader, EncryptingWriter};
+pub(crate) use rc4::Rc4;
+use stream::DecryptingReader;
+pub(crate) use stream::Outbound;
 
 /// Whether peer connections use message stream encryption.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -283,7 +284,7 @@ fn be_u32(b: &[u8]) -> u32 {
 /// The connection after a successful handshake.
 pub(crate) struct Established {
     pub reader: BoxAsyncReadVectored,
-    pub writer: BoxAsyncWrite,
+    pub writer: Outbound,
     /// What the handshake encrypted: none of it for a plaintext BitTorrent
     /// handshake that never went through the key exchange.
     pub encryption: Encryption,
@@ -305,14 +306,14 @@ fn establish(
         prefix.append(&mut rest);
         Established {
             reader: Box::new(DecryptingReader::new(prefix, reader, Some(dec))),
-            writer: Box::new(EncryptingWriter::new(writer, enc)),
+            writer: Outbound::rc4(writer, enc),
             encryption: Encryption::Rc4,
         }
     } else {
         prefix.append(&mut rest);
         Established {
             reader: DecryptingReader::new(prefix, reader, None).into_boxed(),
-            writer,
+            writer: writer.into(),
             encryption: Encryption::HeaderOnly,
         }
     }
@@ -431,7 +432,7 @@ pub(crate) async fn respond(
         let prefix = std::mem::take(&mut wire.buf);
         return Ok(Established {
             reader: DecryptingReader::new(prefix, reader, None).into_boxed(),
-            writer,
+            writer: writer.into(),
             encryption: Encryption::None,
         });
     }
@@ -512,32 +513,31 @@ pub(crate) async fn respond(
     Ok(establish(reader, writer, ia, rest, selected, dec, enc))
 }
 
-/// Upgrade an accepted connection in place under the session's `policy`
+/// Upgrade an accepted connection under the session's `policy`
 /// and `policies`, each torrent's hash with its own: an encrypted handshake
 /// selects a method its torrent's policy allows, and a plaintext one passes
 /// while any of them takes plaintext, to be judged by its torrent once its
-/// BitTorrent handshake names it. When every one is `Disabled` this does
-/// nothing: no byte is read and no wrapper is added.
+/// BitTorrent handshake names it. The reader is replaced in place and the
+/// writer comes back with the cipher it writes under. When every one is
+/// `Disabled` no byte is read and the writer comes back as it was.
 pub(crate) async fn upgrade_incoming(
     policy: EncryptionPolicy,
     reader: &mut BoxAsyncReadVectored,
-    writer: &mut BoxAsyncWrite,
+    writer: BoxAsyncWrite,
     timeout: Duration,
     policies: &[(Id20, EncryptionPolicy)],
-) -> Result<Encryption, MseError> {
+) -> Result<(Encryption, Outbound), MseError> {
     let every = || std::iter::once(policy).chain(policies.iter().map(|(_, p)| *p));
     if every().all(|p| p == EncryptionPolicy::Disabled) {
-        return Ok(Encryption::None);
+        return Ok((Encryption::None, writer.into()));
     }
     let r = std::mem::replace(reader, Box::new(tokio::io::empty().into_vectored_compat()));
-    let w = std::mem::replace(writer, Box::new(tokio::io::sink()));
     let allow_plaintext = every().any(|p| p != EncryptionPolicy::Require);
-    let established = tokio::time::timeout(timeout, respond(r, w, allow_plaintext, policies))
+    let established = tokio::time::timeout(timeout, respond(r, writer, allow_plaintext, policies))
         .await
         .map_err(|_| MseError::Timeout)??;
     *reader = established.reader;
-    *writer = established.writer;
-    Ok(established.encryption)
+    Ok((established.encryption, established.writer))
 }
 
 /// The crypto_provide bitmask an outgoing connection offers under `policy`.

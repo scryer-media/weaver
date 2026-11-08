@@ -9,7 +9,7 @@
 //!
 //! Everything past the handshake sees plain bytes: the reader first hands out
 //! what the handshake already read (decrypted), then decrypts in place as it
-//! reads; the writer encrypts on the way out.
+//! reads; the writer encrypts each outgoing buffer in place, once.
 
 use std::{
     io::IoSliceMut,
@@ -17,7 +17,7 @@ use std::{
     task::{Context, Poll, ready},
 };
 
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, ReadBuf};
 
 use super::rc4::Rc4;
 use crate::{
@@ -112,59 +112,48 @@ impl AsyncReadVectored for DecryptingReader {
     }
 }
 
-/// The most bytes encrypted per write call. The keystream for bytes the inner
-/// stream does not take is recomputed on the next call, so this bounds that work.
-const MAX_WRITE_CHUNK: usize = 64 * 1024;
-
-/// Encrypts everything written.
-///
-/// The cipher only advances by what the inner stream accepted: each call
-/// encrypts with a copy of the state, and keeps that copy only as far as the
-/// bytes the inner stream took. A caller that retries with different bytes
-/// after `Pending` or a short write still gets a correct stream.
-pub(crate) struct EncryptingWriter {
+/// The writing half of a connection, and the RC4 cipher its bytes go under
+/// when the encryption handshake settled on RC4.
+pub(crate) struct Outbound {
     inner: BoxAsyncWrite,
-    cipher: Rc4,
-    scratch: Vec<u8>,
+    cipher: Option<Rc4>,
 }
 
-impl EncryptingWriter {
-    pub fn new(inner: BoxAsyncWrite, cipher: Rc4) -> Self {
+impl From<BoxAsyncWrite> for Outbound {
+    fn from(inner: BoxAsyncWrite) -> Self {
         Self {
             inner,
-            cipher,
-            scratch: Vec::new(),
+            cipher: None,
         }
     }
 }
 
-impl AsyncWrite for EncryptingWriter {
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let len = buf.len().min(MAX_WRITE_CHUNK);
-        this.scratch.clear();
-        this.scratch.extend_from_slice(&buf[..len]);
-        let mut next = this.cipher.clone();
-        next.apply(&mut this.scratch);
-        let n = ready!(Pin::new(&mut this.inner).poll_write(cx, &this.scratch))?;
-        if n == len {
-            this.cipher = next;
-        } else {
-            this.cipher.skip(n);
+impl Outbound {
+    pub fn rc4(inner: BoxAsyncWrite, cipher: Rc4) -> Self {
+        Self {
+            inner,
+            cipher: Some(cipher),
         }
-        Poll::Ready(Ok(n))
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    /// Writes `buf` whole, encrypting it in place first when the connection
+    /// is under RC4. `buf` holds the bytes as they went out afterwards.
+    pub async fn write_all(&mut self, buf: &mut [u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        // The cipher has run over exactly the bytes handed to the inner
+        // writer, in order: each byte once, here, before its first write. A
+        // write cut short or pending leaves bytes already encrypted, which are
+        // written as they are; a call dropped midway ends the connection.
+        if let Some(cipher) = &mut self.cipher {
+            cipher.apply(buf);
+        }
+        self.inner.write_all(buf).await
     }
 
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    #[cfg(test)]
+    pub async fn shutdown(&mut self) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.inner.shutdown().await
     }
 }
 
@@ -173,7 +162,7 @@ mod tests {
     use std::sync::Arc;
 
     use parking_lot::Mutex;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     use super::*;
     use crate::vectored_traits::{AsyncReadVectoredExt, AsyncReadVectoredIntoCompat};
@@ -218,7 +207,7 @@ mod tests {
         Rc4::new_discard_1024(b"k").apply(&mut expected);
 
         let out = Arc::new(Mutex::new(Vec::new()));
-        let mut w = EncryptingWriter::new(
+        let mut w = Outbound::rc4(
             Box::new(Stingy {
                 out: out.clone(),
                 max: 7,
@@ -228,7 +217,7 @@ mod tests {
         );
         // Several writes of odd sizes, each split into short writes and Pendings.
         for chunk in plain.chunks(333) {
-            w.write_all(chunk).await.unwrap();
+            w.write_all(&mut chunk.to_vec()).await.unwrap();
         }
         assert_eq!(*out.lock(), expected);
     }
@@ -239,14 +228,14 @@ mod tests {
             .map(|i| u8::try_from(i % 253).unwrap())
             .collect();
         let (tx, rx) = tokio::io::duplex(4096);
-        let mut w = EncryptingWriter::new(Box::new(tx), Rc4::new_discard_1024(b"k"));
+        let mut w = Outbound::rc4(Box::new(tx), Rc4::new_discard_1024(b"k"));
         let mut r = DecryptingReader::new(
             Vec::new(),
             Box::new(rx.into_vectored_compat()),
             Some(Rc4::new_discard_1024(b"k")),
         );
         let writer = async {
-            w.write_all(&plain).await.unwrap();
+            w.write_all(&mut plain.clone()).await.unwrap();
             w.shutdown().await.unwrap();
         };
         let reader = async {
@@ -289,5 +278,224 @@ mod tests {
             }
         }
         assert_eq!(got, b"prefix:hello world");
+    }
+
+    #[tokio::test]
+    async fn test_a_piece_frame_written_in_pieces_decrypts_and_runs_the_keystream_once() {
+        let mut frame = vec![0u8; 13 + 16_384];
+        frame[..4].copy_from_slice(&(16_384u32 + 9).to_be_bytes());
+        frame[4] = 7;
+        for (k, b) in frame[13..].iter_mut().enumerate() {
+            *b = u8::try_from(k % 241).unwrap();
+        }
+        let plain = frame.clone();
+        let cipher = Rc4::new_discard_1024(b"k");
+        let probe = cipher.clone();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut w = Outbound::rc4(
+            Box::new(Stingy {
+                out: out.clone(),
+                max: 5_000,
+                calls: 0,
+            }),
+            cipher,
+        );
+        w.write_all(&mut frame).await.unwrap();
+        // Short writes and Pendings in the middle; every byte went through the
+        // keystream once, and the buffer holds what went out.
+        assert_eq!(probe.keystream_bytes() - 1024, plain.len() as u64);
+        assert_eq!(*out.lock(), frame);
+        let mut got = out.lock().clone();
+        Rc4::new_discard_1024(b"k").apply(&mut got);
+        assert_eq!(got, plain);
+    }
+
+    /// The send-side measurement; it reads process CPU time, which needs Unix.
+    #[cfg(unix)]
+    mod send_side {
+        use super::*;
+
+        const ARM: &str = "B";
+
+        fn sender(inner: BoxAsyncWrite, cipher: Rc4) -> Outbound {
+            Outbound::rc4(inner, cipher)
+        }
+
+        async fn send(w: &mut Outbound, buf: &mut [u8]) {
+            w.write_all(buf).await.unwrap();
+        }
+
+        /// Counts what the socket below the cipher did: polls left pending, and
+        /// writes that took less than they were offered.
+        struct Counting {
+            inner: tokio::net::tcp::OwnedWriteHalf,
+            pending: Arc<std::sync::atomic::AtomicU64>,
+            short: Arc<std::sync::atomic::AtomicU64>,
+        }
+
+        impl AsyncWrite for Counting {
+            fn poll_write(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+                buf: &[u8],
+            ) -> Poll<std::io::Result<usize>> {
+                use std::sync::atomic::Ordering::Relaxed;
+                let this = self.get_mut();
+                match Pin::new(&mut this.inner).poll_write(cx, buf) {
+                    Poll::Pending => {
+                        this.pending.fetch_add(1, Relaxed);
+                        Poll::Pending
+                    }
+                    Poll::Ready(Ok(n)) => {
+                        if n < buf.len() {
+                            this.short.fetch_add(1, Relaxed);
+                        }
+                        Poll::Ready(Ok(n))
+                    }
+                    other => other,
+                }
+            }
+            fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+            }
+            fn poll_shutdown(
+                self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+            }
+        }
+
+        /// A piece message for block `i`: 13-byte header, then 16 KiB of payload.
+        fn piece_frame(i: u32, frame: &mut [u8]) {
+            let (head, payload) = frame.split_at_mut(13);
+            head[..4].copy_from_slice(&(16_384u32 + 9).to_be_bytes());
+            head[4] = 7;
+            head[5..9].copy_from_slice(&(i / 64).to_be_bytes());
+            head[9..13].copy_from_slice(&((i % 64) * 16_384).to_be_bytes());
+            for (k, b) in payload.iter_mut().enumerate() {
+                *b = u8::try_from((k ^ i as usize) & 0xff).unwrap();
+            }
+        }
+
+        fn cpu() -> (f64, f64) {
+            use nix::sys::resource::{UsageWho, getrusage};
+            let u = getrusage(UsageWho::RUSAGE_SELF).unwrap();
+            let ms = |t: nix::sys::time::TimeVal| {
+                t.tv_sec() as f64 * 1000.0 + t.tv_usec() as f64 / 1000.0
+            };
+            (ms(u.user_time()), ms(u.system_time()))
+        }
+
+        /// Sends `frames` piece messages over loopback TCP under RC4. With
+        /// `verify`, the receiver keeps every byte, decrypts them and compares;
+        /// otherwise it only drains. `sndbuf` sets the sender's socket buffer,
+        /// small enough to cut writes short. Returns (user ms, sys ms, pending polls,
+        /// short writes, keystream bytes past the discard, bytes on the wire).
+        async fn send_over_loopback(
+            frames: u32,
+            verify: bool,
+            sndbuf: Option<usize>,
+        ) -> (f64, f64, u64, u64, u64, u64) {
+            use crate::network::SocketFactory;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let drain = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    let (mut s, _) = crate::test_support::sockets()
+                        .connect_tcp(addr)
+                        .await
+                        .unwrap();
+                    let mut buf = vec![0u8; 65_536];
+                    let mut kept = Vec::new();
+                    let mut total = 0u64;
+                    loop {
+                        let n = s.read(&mut buf).await.unwrap();
+                        if n == 0 {
+                            break;
+                        }
+                        total += n as u64;
+                        if verify {
+                            kept.extend_from_slice(&buf[..n]);
+                        }
+                    }
+                    (total, kept)
+                })
+            });
+            let (stream, _) = listener.accept().await.unwrap();
+            if let Some(size) = sndbuf {
+                socket2::SockRef::from(&stream)
+                    .set_send_buffer_size(size)
+                    .unwrap();
+            }
+            let (_read, write) = stream.into_split();
+            let pending = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let short = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let cipher = Rc4::new_discard_1024(b"send-side key");
+            let probe = cipher.clone();
+            let mut w = sender(
+                Box::new(Counting {
+                    inner: write,
+                    pending: pending.clone(),
+                    short: short.clone(),
+                }),
+                cipher,
+            );
+            let mut frame = vec![0u8; 13 + 16_384];
+            let before = cpu();
+            for i in 0..frames {
+                piece_frame(i, &mut frame);
+                send(&mut w, &mut frame).await;
+            }
+            let after = cpu();
+            w.shutdown().await.unwrap();
+            drop(w);
+            let (total, mut kept) = drain.join().unwrap();
+            if verify {
+                Rc4::new_discard_1024(b"send-side key").apply(&mut kept);
+                let mut expected = Vec::with_capacity(kept.len());
+                for i in 0..frames {
+                    piece_frame(i, &mut frame);
+                    expected.extend_from_slice(&frame);
+                }
+                assert!(kept == expected, "receiver decrypted different bytes");
+            }
+            use std::sync::atomic::Ordering::Relaxed;
+            (
+                after.0 - before.0,
+                after.1 - before.1,
+                pending.load(Relaxed),
+                short.load(Relaxed),
+                probe.keystream_bytes() - 1024,
+                total,
+            )
+        }
+
+        /// Send-side cost of RC4 peers over loopback, for comparing writer shapes.
+        #[tokio::test]
+        #[ignore = "measurement, run by hand"]
+        async fn rc4_send_side_ab() {
+            for (label, sndbuf) in [("default", None), ("sndbuf8k", Some(8_192usize))] {
+                // The receiver decrypts every byte and compares.
+                send_over_loopback(512, true, sndbuf).await;
+                let (user, sys, pending, short, ks, wire) =
+                    send_over_loopback(16_384, false, sndbuf).await;
+                let mib = wire as f64 / 1_048_576.0;
+                println!(
+                    "ab arm={ARM} socket={label} mib={mib:.1} user_ms_per_mib={:.4} \
+                     sys_ms_per_mib={:.4} pending_per_mib={:.2} short_per_mib={:.2} \
+                     keystream_per_wire={:.4}",
+                    user / mib,
+                    sys / mib,
+                    pending as f64 / mib,
+                    short as f64 / mib,
+                    ks as f64 / wire as f64,
+                );
+            }
+        }
     }
 }
