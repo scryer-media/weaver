@@ -25,7 +25,6 @@ disallowed-methods = [
     { path = "std::net::ToSocketAddrs::to_socket_addrs", reason = "resolve through the route's path, so the name never reaches the host resolver" },
     { path = "url::Url::socket_addrs", reason = "resolve through the route's path, so the name never reaches the host resolver" },
     # The routing layer's own direct primitives.
-    { path = "weaver_tunnel::resolution::connect_host", reason = "dial through the proxy runtime, so the connection takes its route" },
     { path = "weaver_tunnel::resolution::host_lookup", reason = "resolve through the route's path, so the name never reaches the host resolver" },
     { path = "weaver_tunnel::resolution::host_lookup_blocking", reason = "resolve through the route's path, so the name never reaches the host resolver" },
     { path = "weaver_tunnel::egress::SocketEgress::connect", reason = "dial through the proxy runtime, so the connection takes its route" },

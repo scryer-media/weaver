@@ -368,7 +368,8 @@ const HTTP3_RESPONSE: &str = "invalid or interrupted CONNECT response";
 // a tunnel.
 const NAME_PHRASES: [&str; 13] = [
     "failed to lookup address information",
-    crate::resolution::NO_ADDRESS,
+    // std, when a name it resolved itself has no address.
+    "could not resolve to any address",
     pipe::NO_ADDRESS_RESOLVED,
     pipe::RESOLVE_TIMED_OUT,
     crate::dns::UNRESOLVED,

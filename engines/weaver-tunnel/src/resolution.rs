@@ -12,12 +12,12 @@ use std::{
     collections::HashMap,
     future::Future,
     io,
-    net::{IpAddr, SocketAddr},
+    net::IpAddr,
     sync::{Arc, LazyLock, Mutex},
     time::Duration,
 };
 
-use tokio::{net::TcpStream, sync::watch, time::Instant};
+use tokio::{sync::watch, time::Instant};
 
 use crate::{
     TunnelError,
@@ -364,19 +364,6 @@ impl<E: Replicate> ResolutionCache<E> {
             _ => None,
         }
     }
-
-    // Whether an answer is held for `name`, current or not.
-    #[cfg(test)]
-    fn held(&self, name: &str) -> bool {
-        matches!(
-            self.slots
-                .lock()
-                .expect("resolution cache")
-                .names
-                .get(&key(name)),
-            Some(Slot::Held { .. })
-        )
-    }
 }
 
 fn key(name: &str) -> String {
@@ -458,17 +445,16 @@ static HOST: LazyLock<ResolutionCache<io::Error>> = LazyLock::new(ResolutionCach
 // The one place a name reaches the host resolver: a leg whose naming is Host.
 #[cfg_attr(dylint_lib = "host_name_lookup", allow(host_name_lookup))]
 pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
-    if host.parse::<IpAddr>().is_err() {
-        record::asking(host, record::Asker::host);
-    }
-    HOST.resolve(Resolver::Host, host, || async {
-        let found = tokio::net::lookup_host((host, 0)).await;
-        metrics::record_resolution(Resolver::Host, found.is_ok());
-        Ok(untimed(found?.map(|peer| peer.ip())))
-    })
-    .await
-    .inspect(|addresses| record::found(host, addresses))
-    .inspect_err(|error| record::failed_saying(host, error))
+    asking_host(host);
+    noted_by_host(
+        host,
+        HOST.resolve(Resolver::Host, host, || async {
+            let found = tokio::net::lookup_host((host, 0)).await;
+            metrics::record_resolution(Resolver::Host, found.is_ok());
+            Ok(untimed(found?.map(|peer| peer.ip())))
+        })
+        .await,
+    )
 }
 
 // `host_lookup` for a thread that may block.
@@ -479,40 +465,36 @@ pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
 // The one place a name reaches the host resolver: a leg whose naming is Host.
 #[cfg_attr(dylint_lib = "host_name_lookup", allow(host_name_lookup))]
 pub fn host_lookup_blocking(host: &str) -> io::Result<Vec<IpAddr>> {
-    HOST.resolve_blocking(Resolver::Host, host, || {
-        let found = std::net::ToSocketAddrs::to_socket_addrs(&(host, 0));
-        metrics::record_resolution(Resolver::Host, found.is_ok());
-        Ok(untimed(found?.map(|peer| peer.ip())))
-    })
+    asking_host(host);
+    noted_by_host(
+        host,
+        HOST.resolve_blocking(Resolver::Host, host, || {
+            let found = std::net::ToSocketAddrs::to_socket_addrs(&(host, 0));
+            metrics::record_resolution(Resolver::Host, found.is_ok());
+            Ok(untimed(found?.map(|peer| peer.ip())))
+        }),
+    )
+}
+
+// Notes in the test recording, if any, that the host's own DNS is asked for
+// `host`. An address is asked of no one.
+fn asking_host(host: &str) {
+    if host.parse::<IpAddr>().is_err() {
+        record::asking(host, record::Asker::host);
+    }
+}
+
+// Notes what the host's own DNS answered for `host`.
+fn noted_by_host(host: &str, found: io::Result<Vec<IpAddr>>) -> io::Result<Vec<IpAddr>> {
+    found
+        .inspect(|addresses| record::found(host, addresses))
+        .inspect_err(|error| record::failed_saying(host, error))
 }
 
 // Drops what the host's own DNS gave for `host`.
 pub fn forget_host(host: &str) {
     HOST.forget(host);
 }
-
-// Connects to the first of `host`'s addresses that answers, as
-// `TcpStream::connect` does, resolving with the host's own DNS. When none
-// answers, the name is asked afresh next time.
-#[expect(
-    clippy::disallowed_methods,
-    reason = "a leg that dials directly with the host resolver"
-)]
-pub async fn connect_host(host: &str, port: u16) -> io::Result<TcpStream> {
-    let mut last = None;
-    for ip in host_lookup(host).await? {
-        match TcpStream::connect(SocketAddr::new(ip, port)).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) => last = Some(error),
-        }
-    }
-    forget_host(host);
-    Err(last.unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, NO_ADDRESS)))
-}
-
-// What `connect_host` says of a name with no address, as std says it; `fault`
-// reads it back.
-pub(crate) const NO_ADDRESS: &str = "could not resolve to any address";
 
 fn untimed(found: impl Iterator<Item = IpAddr>) -> Lookup {
     let mut addresses = Vec::new();

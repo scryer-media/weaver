@@ -1154,7 +1154,7 @@ where
     // handed that address, so the leg dials exactly it; with none, the
     // name, which the leg's exit resolves. The gateway a port mapper asks
     // is on the local network: its client, the leg's otherwise, never goes
-    // through a proxy.
+    // through a proxy. A client with no target looks no name up itself.
     fn builder(
         &self,
         target: Option<HttpTarget<'_>>,
@@ -1167,7 +1167,7 @@ where
                 tracing::debug!(%error, "the leg's builder failed; the gateway's client is built plain");
                 plain_builder(&self.kind)
             });
-            return shape.apply(builder.no_proxy());
+            return shape.apply(builder.no_proxy().dns_resolver(Arc::new(NoLookups)));
         }
         let builder = (self.base)().map_err(anyhow::Error::msg)?;
         let (host, port, addrs) = target.map_or(("", 0, &[][..]), |target| {
@@ -1179,9 +1179,25 @@ where
             None => crate::proxies::pinned(builder, host, port, addrs),
         };
         shape.apply(match target {
-            None => builder,
+            None => builder.dns_resolver(Arc::new(NoLookups)),
             Some(_) => builder.redirect(reqwest::redirect::Policy::none()),
         })
+    }
+}
+
+// The resolver of a leg's client with no target: it answers no name, so a
+// name such a client meets is refused, never asked of the host's own DNS.
+// Through the leg's bridge the name is handed to the leg, and this is never
+// asked.
+struct NoLookups;
+
+impl reqwest::dns::Resolve for NoLookups {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let said = format!(
+            "{}: a client with no target looks no name up",
+            name.as_str()
+        );
+        Box::pin(async move { Err(said.into()) })
     }
 }
 
@@ -2267,6 +2283,43 @@ mod tests {
                 .contains(&format!("host: seed.test:{port}\r\n")),
             "{head}"
         );
+    }
+
+    // A leg's client with no target, the gateway's among them, looks no
+    // name up: a URL naming a host fails before any lookup, of reqwest's own
+    // resolver or the host's DNS, with the refusal and not a failed connect.
+    #[tokio::test]
+    async fn a_client_with_no_target_looks_no_name_up() {
+        let port = 9;
+        let clients = LegClients::new(
+            || Ok(reqwest::Client::builder().no_proxy()),
+            None,
+            LegKind::System,
+            system_dialer(),
+        );
+        let host_lookups = || {
+            weaver_tunnel::metrics::snapshot()
+                .resolutions
+                .iter()
+                .filter(|(by, ..)| *by == weaver_tunnel::metrics::Resolver::Host)
+                .map(|(_, ok, failed)| ok + failed)
+                .sum::<u64>()
+        };
+        for shape in [ClientShape::FETCH, ClientShape::GATEWAY] {
+            let before = host_lookups();
+            let client = clients.client(None, &shape).unwrap();
+            let error = client
+                .get(format!("http://localhost:{port}/"))
+                .send()
+                .await
+                .unwrap_err();
+            let said = format!("{:?}", anyhow::Error::from(error));
+            assert!(
+                said.contains("a client with no target looks no name up"),
+                "{said}"
+            );
+            assert_eq!(host_lookups(), before);
+        }
     }
 
     // A leg whose WireGuard session has its TCP peer share full says it has

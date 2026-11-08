@@ -3,7 +3,7 @@
 
 // One loopback front per proxy configuration, started lazily.
 //
-// ## Why `ensure_*` is synchronous and never blocks
+// ## Why `ensure_tunnel_with` is synchronous and never blocks
 //
 // The egress seam it serves (`transport_proxy::proxy_egress_url`) is a
 // synchronous function called from three very different places: an async
@@ -14,7 +14,7 @@
 //
 // So starting a tunnel does no async work: it binds a `std::net::TcpListener`
 // on `127.0.0.1:0` — which is immediate — reads the port off it, and hands the
-// accept loop to a tokio runtime this registry owns. The SSH session is
+// accept loop to a tokio runtime this registry owns. The provider's session is
 // established later, by the first connection the front accepts, inside that
 // runtime. Callers get a port back in microseconds and never touch a future.
 //
@@ -31,10 +31,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::error::TunnelError;
-use crate::provider::{TunnelObserver, TunnelProvider, TunnelSpec};
+use crate::provider::{TunnelObserver, TunnelProvider};
 use crate::socks5::Socks5Front;
-use crate::ssh::SshTunnelProvider;
-use crate::wireguard::{WireGuardSpec, WireGuardTunnelProvider};
 
 struct TunnelEntry {
     revision: String,
@@ -73,53 +71,9 @@ impl TunnelRegistry {
         }
     }
 
-    // Ensure an SSH tunnel for `spec` is running and return the loopback
-    // address of its SOCKS5 front.
-    pub fn ensure_ssh_tunnel(
-        &self,
-        spec: TunnelSpec,
-        observer: Arc<dyn TunnelObserver>,
-    ) -> Result<SocketAddr, TunnelError> {
-        let id = spec.proxy_config_id.clone();
-        let revision = spec.revision.clone();
-        let timeout = spec.request_timeout;
-        let for_observer = Arc::clone(&observer);
-        self.ensure_tunnel_with(&id, &revision, timeout, observer, move || {
-            Ok(Arc::new(SshTunnelProvider::new(spec, for_observer)) as Arc<dyn TunnelProvider>)
-        })
-    }
-
-    // Ensure a WireGuard tunnel for `spec` is running and return the loopback
-    // address of its SOCKS5 front.
-    //
-    // The factory below is synchronous, as it must be, and building a
-    // [`WireGuardTunnelProvider`] does no I/O: the device, its handshake and
-    // the smoltcp stack all come up inside the first dial. That is the same
-    // choice the SSH family makes and for the same reason — this call is
-    // reached from a blocking plugin worker with no runtime — and it has the
-    // property that matters here: a failed bring-up leaves the provider
-    // empty, so it is reported to the observer by the dial that hit it and
-    // retried by the next one, rather than poisoning the entry until a
-    // restart.
-    pub fn ensure_wireguard_tunnel(
-        &self,
-        spec: WireGuardSpec,
-        observer: Arc<dyn TunnelObserver>,
-    ) -> Result<SocketAddr, TunnelError> {
-        let id = spec.proxy_config_id.clone();
-        let revision = spec.revision.clone();
-        let timeout = spec.request_timeout;
-        let for_observer = Arc::clone(&observer);
-        self.ensure_tunnel_with(&id, &revision, timeout, observer, move || {
-            Ok(Arc::new(WireGuardTunnelProvider::new(spec, for_observer))
-                as Arc<dyn TunnelProvider>)
-        })
-    }
-
-    // The technology-independent half: everything except which provider gets
-    // built. Both `ensure_*` entry points call this with a different factory
-    // and inherit the front, the keying, the lifecycle and every consumer
-    // unchanged.
+    // Ensure a tunnel front for `proxy_config_id` at `revision` is running,
+    // building its provider with `make_provider` only when it must start, and
+    // return the front's loopback address.
     pub fn ensure_tunnel_with<F>(
         &self,
         proxy_config_id: &str,

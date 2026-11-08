@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // TCP proxy adapters. Only the proxy endpoint is resolved on the host.
-use crate::{TunnelError, TunnelProvider, TunnelStream, fault::authority};
+use crate::{TunnelError, fault::authority};
 use base64::Engine;
 use std::{
     fmt,
@@ -448,34 +448,6 @@ impl TransportProxy {
                 }
             }
         }
-    }
-}
-
-#[async_trait::async_trait]
-impl TunnelProvider for TransportProxy {
-    fn kind(&self) -> Option<crate::metrics::TunnelKind> {
-        Some(self.kind.tunnel_kind())
-    }
-    async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "a proxy hop dials its proxy server"
-        )]
-        let mut stream = crate::resolution::connect_host(&self.host, self.port)
-            .await
-            // The system's own words name what went wrong, and `fault`
-            // reads them.
-            .map_err(|error| {
-                TunnelError::Engine(format!("proxy endpoint is unreachable: {error}"))
-            })?;
-        stream
-            .set_nodelay(true)
-            .map_err(|_| failure(Said::SocketSetup))?;
-        self.negotiate(&mut stream, host, port).await?;
-        Ok(Box::new(stream))
-    }
-    fn describe(&self) -> String {
-        format!("{:?} {}:{}", self.kind, self.host, self.port)
     }
 }
 

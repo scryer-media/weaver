@@ -36,7 +36,6 @@ const BANNED: &[&str] = &[
     "tokio::net::lookup_host",
     "std::net::ToSocketAddrs::to_socket_addrs",
     "url::Url::socket_addrs",
-    "weaver_tunnel::resolution::connect_host",
     "weaver_tunnel::resolution::host_lookup",
     "weaver_tunnel::resolution::host_lookup_blocking",
     "weaver_tunnel::egress::SocketEgress::connect",
@@ -71,9 +70,8 @@ const LIFTED: &[(&str, usize)] = &[
     ("engines/weaver-tunnel/src/egress/multicast.rs", 1),
     ("engines/weaver-tunnel/src/lib.rs", 2),
     ("engines/weaver-tunnel/src/pipe.rs", 5),
-    ("engines/weaver-tunnel/src/resolution.rs", 3),
+    ("engines/weaver-tunnel/src/resolution.rs", 2),
     ("engines/weaver-tunnel/src/test_support/http_client.rs", 2),
-    ("engines/weaver-tunnel/src/transport.rs", 1),
     ("server/app/weaver/src/commands/nzb.rs", 1),
     ("server/app/weaver/src/main.rs", 1),
     ("server/app/weaver/src/tray/shared.rs", 1),
@@ -104,6 +102,64 @@ const DYLINT_LIBRARY: &str = "lints/host_name_lookup";
 // Every file that lifts the host name lookup lint, and how many times: only
 // the host resolver every Host-resolved leg shares.
 const DYLINT_LIFTED: &[(&str, usize)] = &[("engines/weaver-tunnel/src/resolution.rs", 2)];
+
+// How a PostgreSQL connection is opened: sqlx resolves the database host
+// with the host's own DNS. Built here so this file never counts as one.
+const DATABASE_CONNECTS: [&str; 3] = [
+    concat!("PgPool", "Options::new()"),
+    concat!("PgConnection", "::connect"),
+    concat!("PgPool", "::connect"),
+];
+
+// Every file that opens a PostgreSQL connection, and how many times. The
+// database host is outside every route by nature, so its name goes to the
+// host's own DNS; a new connect anywhere is one more such name.
+const KNOWN_HOST_DNS: &[(&str, usize)] = &[
+    (
+        "server/crates/weaver-server-core/src/operations/backup.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-core/src/operations/backup/logical.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-core/src/operations/backup/upgrade.rs",
+        2,
+    ),
+    (
+        "server/crates/weaver-server-core/src/operations/usage_history/tests.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-core/src/persistence/connection/tests.rs",
+        3,
+    ),
+    (
+        "server/crates/weaver-server-core/src/persistence/postgres_migrations.rs",
+        2,
+    ),
+    (
+        "server/crates/weaver-server-core/src/persistence/setup.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-core/src/persistence/sql_services.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-core/tests/browser_session_contract.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-core/tests/initial_setup_contract.rs",
+        1,
+    ),
+    (
+        "server/crates/weaver-server-core/tests/network_access_transaction_contract.rs",
+        1,
+    ),
+];
 
 // The crates that open connections of their own, and every crate allowed to
 // depend on one. A new dependent can reach the network without a route.
@@ -235,6 +291,34 @@ fn every_lift_of_the_host_name_lookup_lint_is_pinned() {
         found, pinned,
         "the host name lookup lint is lifted somewhere new: resolve through the leg's naming \
          and dial the address instead, or pin the lift here once its reason is reviewed"
+    );
+}
+
+#[test]
+fn every_database_connect_is_pinned() {
+    let root = workspace();
+    let mut found = BTreeMap::new();
+    for dir in ["engines", "server", "shared", "xtask"] {
+        count_in(
+            &root,
+            &root.join(dir),
+            &|text| {
+                DATABASE_CONNECTS
+                    .iter()
+                    .map(|connect| text.matches(connect).count())
+                    .sum()
+            },
+            &mut found,
+        );
+    }
+    let pinned: BTreeMap<String, usize> = KNOWN_HOST_DNS
+        .iter()
+        .map(|(path, count)| ((*path).to_owned(), *count))
+        .collect();
+    assert_eq!(
+        found, pinned,
+        "a PostgreSQL connection opens somewhere new or moved: its host resolves with the \
+         host's own DNS, so pin it here once that is reviewed"
     );
 }
 

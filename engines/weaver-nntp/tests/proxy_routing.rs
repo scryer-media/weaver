@@ -20,6 +20,33 @@ use weaver_tunnel::{
     transport::{TransportKind, TransportProxy},
 };
 
+// An HTTP CONNECT or SOCKS5 proxy fixture on loopback, reached at its
+// address and asked for each destination.
+struct LoopbackProxy {
+    proxy: TransportProxy,
+    at: SocketAddr,
+}
+#[async_trait::async_trait]
+impl TunnelProvider for LoopbackProxy {
+    fn kind(&self) -> Option<weaver_tunnel::metrics::TunnelKind> {
+        Some(self.proxy.kind.tunnel_kind())
+    }
+    async fn dial(
+        &self,
+        host: &str,
+        port: u16,
+    ) -> Result<Box<dyn TunnelStream>, weaver_tunnel::TunnelError> {
+        let mut stream = tokio::net::TcpStream::connect(self.at)
+            .await
+            .map_err(|error| weaver_tunnel::TunnelError::Engine(error.to_string()))?;
+        self.proxy.negotiate(&mut stream, host, port).await?;
+        Ok(Box::new(stream))
+    }
+    fn describe(&self) -> String {
+        format!("loopback proxy {}", self.at)
+    }
+}
+
 struct BridgeDialer(Arc<weaver_tunnel::bridge::Bridge>);
 #[async_trait::async_trait]
 impl weaver_tunnel::pipe::Dialer for BridgeDialer {
@@ -182,12 +209,15 @@ async fn profile(kind: u8, destination: SocketAddr) -> (Fixture, Arc<dyn TunnelP
             let proxy =
                 ProxyServerDouble::start(kind, Some(("user".into(), "password".into())), mapping)
                     .await;
-            let provider = TransportProxy {
-                kind,
-                host: proxy.addr.ip().to_string(),
-                port: proxy.addr.port(),
-                username: Some("user".into()),
-                password: Some("password".into()),
+            let provider = LoopbackProxy {
+                proxy: TransportProxy {
+                    kind,
+                    host: proxy.addr.ip().to_string(),
+                    port: proxy.addr.port(),
+                    username: Some("user".into()),
+                    password: Some("password".into()),
+                },
+                at: proxy.addr,
             };
             (Fixture::Standard(proxy), Arc::new(provider))
         }

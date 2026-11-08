@@ -923,6 +923,7 @@ async fn import_sqlite(
         fill_older_unwanted_extensions(&mut SqlConn::Sqlite(&mut conn), source_schema_version)
             .await?;
         name_older_proxy_resolvers(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await?;
+        refuse_unsaveable_proxies(&mut SqlConn::Sqlite(&mut conn)).await?;
         move_older_bandwidth_limits(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await
     }
     .await;
@@ -1023,6 +1024,7 @@ async fn import_postgres(
     .await?;
     fill_older_unwanted_extensions(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     name_older_proxy_resolvers(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
+    refuse_unsaveable_proxies(&mut SqlConn::Postgres(&mut tx)).await?;
     move_older_bandwidth_limits(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     tx.commit().await.map_err(db_err)
 }
@@ -1088,6 +1090,24 @@ async fn name_older_proxy_resolvers(
 ) -> Result<(), StateError> {
     if source_schema_version < proxy_resolver_v64::SCHEMA_VERSION {
         proxy_resolver_v64::name_proxy_resolvers(conn).await?;
+    }
+    Ok(())
+}
+
+// A restored proxy is one a save would take. A restore checks no row the
+// way a save does, so a bundle holding a proxy no save would take, such as
+// a WireGuard proxy left to resolve names with no DNS server, is refused
+// whole, with what a save of that proxy says.
+async fn refuse_unsaveable_proxies(conn: &mut SqlConn<'_>) -> Result<(), StateError> {
+    let rows = conn
+        .fetch_all("SELECT config FROM proxy_profiles ORDER BY id", &[])
+        .await?;
+    for row in rows {
+        let profile: crate::proxies::ProxyProfile = serde_json::from_str(&row.text("config")?)
+            .map_err(|error| {
+                StateError::Database(format!("a restored proxy cannot be read: {error}"))
+            })?;
+        profile.validate()?;
     }
     Ok(())
 }
@@ -1999,6 +2019,63 @@ mod logical_reader_tests {
             .import_logical_backup(&tables, &archive.tables, archive.schema_version - 1)
             .unwrap();
         assert_eq!(target.list_egress_interfaces().unwrap().len(), 1);
+    }
+
+    // A bundle holding a WireGuard proxy left to resolve names with no DNS
+    // server, which no save takes, is refused whole with what a save says.
+    #[test]
+    fn a_bundle_with_a_proxy_no_save_would_take_is_refused() {
+        use crate::proxies::{ProxyKind, ProxyProfile, ProxySecrets, Resolver};
+        use base64::Engine;
+        let key = |seed: u8| base64::engine::general_purpose::STANDARD.encode([seed; 32]);
+        let source = Database::open_in_memory().unwrap();
+        source
+            .save_proxy_profile(&ProxyProfile {
+                id: 0,
+                name: "tunnel".into(),
+                kind: ProxyKind::WireGuard,
+                enabled: true,
+                host: "192.0.2.10".into(),
+                port: 51820,
+                resolver: Resolver::Proxy,
+                dns_servers: vec!["10.63.0.1".parse().unwrap()],
+                tunnel_addresses: vec!["10.63.0.2/32".into()],
+                peer_public_key: Some(key(2)),
+                mtu: 1420,
+                keepalive_seconds: None,
+                timeout_seconds: 30,
+                host_key_fingerprint: None,
+                revision: 0,
+                natpmp: false,
+                forwarded_port: None,
+                secrets: ProxySecrets {
+                    private_key: Some(key(1)),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let mut archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+        let metadata = rewrite_table_objects(archive.staging.path(), "proxy_profiles", |row| {
+            let mut config: JsonValue =
+                serde_json::from_str(row["config"].as_str().unwrap()).unwrap();
+            config["dns_servers"] = JsonValue::Array(Vec::new());
+            row.insert("config".into(), JsonValue::from(config.to_string()));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(metadata.rows, 1);
+        archive.tables.insert("proxy_profiles".into(), metadata);
+
+        let target = Database::open_in_memory().unwrap();
+        let error = target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+            .unwrap_err();
+        assert_eq!(
+            error.refusal().map(|refusal| refusal.code),
+            Some(crate::proxies::NetworkRefusal::ProxyWireGuardNeedsDnsServers.code())
+        );
+        assert!(target.list_proxy_profiles().unwrap().is_empty());
     }
 
     #[test]

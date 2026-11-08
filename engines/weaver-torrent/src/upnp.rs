@@ -338,13 +338,14 @@ pub type Discovered = Result<UpnpDiscoverResponse, String>;
 
 /// A host a real gateway never uses for its URLs (libtorrent
 /// `invalid_upnp_host`): refusing it keeps a forged SSDP reply from pointing
-/// the mapper somewhere else.
+/// the mapper somewhere else. A gateway names itself by address, so a name
+/// is refused too: looking it up would let any device on the network have
+/// Weaver ask DNS for a name it picks.
 fn invalid_upnp_host(url: &Url) -> bool {
     let ip = match url.host() {
         Some(url::Host::Ipv4(ip)) => IpAddr::V4(ip),
         Some(url::Host::Ipv6(ip)) => IpAddr::V6(ip),
-        Some(url::Host::Domain(_)) => return false,
-        None => return true,
+        Some(url::Host::Domain(_)) | None => return true,
     };
     let link_local = match ip {
         IpAddr::V4(ip) => ip.is_link_local(),
@@ -1449,6 +1450,8 @@ pub(crate) mod tests {
             "http://239.255.255.250:5000/rootDesc.xml",
             "http://0.0.0.0:5000/rootDesc.xml",
             "https://192.168.1.1:5000/rootDesc.xml",
+            "http://gateway.lan:5000/rootDesc.xml",
+            "http://router:5000/rootDesc.xml",
         ] {
             assert!(
                 parse_upnp_discover_response(reply(bad).as_bytes(), from).is_err(),
