@@ -639,7 +639,7 @@ mod tests {
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use weaver_torrent::network::{Resolved, Resolver};
-    use weaver_torrent::{ClientShape, HttpTarget};
+    use weaver_torrent::{ClientShape, HttpClients, HttpTarget};
     use weaver_tunnel::pipe::DialedStream;
     use weaver_tunnel::resolution::record::{Recording, ResolvedBy};
 
@@ -939,6 +939,165 @@ mod tests {
         assert_eq!(target.host, "tracker.test");
         assert!(target.addresses.is_empty(), "{:?}", target.addresses);
         assert_eq!(host_lookups(), before);
+    }
+
+    // A runtime whose default torrent scope rides a ladder through a SOCKS5
+    // proxy named by `resolver`, asking no DNS servers of its own. The proxy
+    // is never dialled: only names are looked up on the leg.
+    fn ladder_runtime(resolver: crate::proxies::Resolver) -> (Arc<NetworkRuntime>, Configuration) {
+        let runtime = NetworkRuntime::new(
+            crate::Database::open_in_memory().unwrap(),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        let consumer = Consumer::Torrent(TorrentScope::Default);
+        let mut config = runtime.configuration.read().unwrap().clone();
+        config.profiles.insert(
+            1,
+            ProxyProfile {
+                id: 1,
+                name: "socks".into(),
+                kind: ProxyKind::Socks5,
+                enabled: true,
+                host: "127.0.0.1".into(),
+                port: 1,
+                resolver,
+                dns_servers: vec![],
+                tunnel_addresses: vec![],
+                peer_public_key: None,
+                mtu: 1420,
+                keepalive_seconds: None,
+                timeout_seconds: 1,
+                host_key_fingerprint: None,
+                natpmp: false,
+                forwarded_port: None,
+                revision: 1,
+                secrets: Default::default(),
+            },
+        );
+        config.consumers.insert(consumer.key());
+        config.policies.insert(
+            consumer.key(),
+            RoutingPolicy {
+                legs: vec![RouteLeg {
+                    egress_id: SYSTEM_EGRESS_ID,
+                    weight: 100,
+                    path: LegPath::Ladder {
+                        rungs: vec![Rung::Proxy { id: 1 }],
+                        direct_fallback: false,
+                    },
+                }],
+                ..Default::default()
+            },
+        );
+        runtime.apply_configuration(config.clone()).unwrap();
+        (runtime, config)
+    }
+
+    // What an announce to `host` on a leg does before it sends: the name
+    // looked up on the leg, recorded, and the client held to what it gave.
+    async fn reach_on(
+        names: &LegNames,
+        clients: &dyn HttpClients,
+        host: &str,
+        port: u16,
+    ) -> (
+        Option<weaver_tunnel::resolution::record::HostResolution>,
+        Vec<IpAddr>,
+    ) {
+        let recording = Arc::new(Recording::default());
+        let addrs: Vec<IpAddr> = match recording.scope(names.resolve(host, port)).await.unwrap() {
+            Resolved::Addresses(found) => found.iter().map(SocketAddr::ip).collect(),
+            Resolved::AtExit => Vec::new(),
+        };
+        clients
+            .client(
+                Some(HttpTarget {
+                    host,
+                    port,
+                    addrs: &addrs,
+                }),
+                &ClientShape::of(weaver_torrent::ClientUse::Tracker { title_case: false }),
+            )
+            .unwrap();
+        (recording.finish(host, port, None), addrs)
+    }
+
+    // Two announces to one tracker host on one leg whose naming is Weaver's:
+    // the first looks the name up, the second is answered by what the leg's
+    // naming holds, and both ride the one client built for that host.
+    #[tokio::test]
+    async fn two_announces_to_one_host_on_a_leg_resolve_once_and_share_a_client() {
+        let (runtime, _) = ladder_runtime(crate::proxies::Resolver::Weaver);
+        let leg = runtime
+            .torrent_leg(TorrentScope::Default, 0, 8, Duration::from_secs(30))
+            .unwrap();
+        let names = LegNames(leg.dialer());
+        let clients = crate::torrents::net::LegClients::new(
+            || Ok(reqwest::Client::builder().no_proxy()),
+            Some(leg.bridge().unwrap()),
+            LegKind::Ladder,
+            leg.dialer(),
+        );
+        let (first, first_addrs) = reach_on(&names, &clients, "localhost", 6969).await;
+        let (second, second_addrs) = reach_on(&names, &clients, "localhost", 6969).await;
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_eq!(first.by, ResolvedBy::Host);
+        assert!(!first.cached, "the first announce looks the name up");
+        assert!(second.cached, "the second is answered from the held answer");
+        assert!(!first_addrs.is_empty());
+        assert_eq!(first_addrs, second_addrs);
+        assert_eq!(clients.built(), 1);
+        runtime.shutdown().await;
+    }
+
+    // A proxy's resolver edited from Weaver to Proxy revokes the leg the
+    // session opened on: the session's names and clients go with it, and
+    // the leg the route gives now hands the name to the proxy, reusing
+    // neither the answer the old naming held nor its clients. The host's
+    // resolver is not asked on the proxied leg.
+    #[tokio::test]
+    async fn a_resolver_edit_from_weaver_to_proxy_reuses_no_answer_or_client() {
+        let (runtime, mut config) = ladder_runtime(crate::proxies::Resolver::Weaver);
+        let timeout = Duration::from_secs(30);
+        let old = runtime
+            .torrent_leg(TorrentScope::Default, 0, 8, timeout)
+            .unwrap();
+        let old_clients = crate::torrents::net::LegClients::new(
+            || Ok(reqwest::Client::builder().no_proxy()),
+            Some(old.bridge().unwrap()),
+            LegKind::Ladder,
+            old.dialer(),
+        );
+        let (held, _) = reach_on(&LegNames(old.dialer()), &old_clients, "localhost", 6969).await;
+        assert_eq!(held.unwrap().by, ResolvedBy::Host);
+
+        let profile = config.profiles.get_mut(&1).unwrap();
+        profile.resolver = crate::proxies::Resolver::Proxy;
+        profile.revision += 1;
+        runtime.apply_configuration(config).unwrap();
+        assert!(old.stage.is_revoked());
+
+        let new = runtime
+            .torrent_leg(TorrentScope::Default, 0, 8, timeout)
+            .unwrap();
+        assert!(!Arc::ptr_eq(&old.stage, &new.stage));
+        let new_clients = crate::torrents::net::LegClients::new(
+            || Ok(reqwest::Client::builder().no_proxy()),
+            Some(new.bridge().unwrap()),
+            LegKind::Ladder,
+            new.dialer(),
+        );
+        let before = host_lookups();
+        let (handed, addrs) =
+            reach_on(&LegNames(new.dialer()), &new_clients, "localhost", 6969).await;
+        let handed = handed.unwrap();
+        assert_eq!(handed.by, ResolvedBy::Proxy);
+        assert!(!handed.cached);
+        assert!(addrs.is_empty(), "{addrs:?}");
+        assert_eq!(new_clients.built(), 1);
+        assert_eq!(host_lookups(), before);
+        runtime.shutdown().await;
     }
 
     // A dialer that resolves with the host's resolver, as a Host-named leg

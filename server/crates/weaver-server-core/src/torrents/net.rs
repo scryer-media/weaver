@@ -840,7 +840,10 @@ impl DatagramSend for CarriedSender {
 
 /// The names a session resolves on its leg: who resolves each is the leg's
 /// naming, as for every other dial on the leg. A name the leg hands to its
-/// proxy resolves at the exit, and no lookup is made here.
+/// proxy resolves at the exit, and no lookup is made here. The naming that
+/// answers holds its answer for as long as the answer's TTL allows, so a
+/// name asked again, as each announce asks its tracker's, is looked up once
+/// while that holds; the answers go with the leg's naming when it changes.
 pub struct LegNames(pub Arc<dyn Dialer>);
 
 impl Resolver for LegNames {
