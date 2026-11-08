@@ -296,20 +296,45 @@ impl GraphJob {
     }
 
     // Each article the root has in hand, and whether its bytes read back
-    // from disk.
+    // from disk, in the root's order. Every checkpoint asks this of every
+    // article, so articles that lie end to end are read back
+    // as one run, and only a run that does not read back is halved until
+    // each article in it is answered alone.
     #[cfg(test)]
     fn arrived(&self, mut each: impl FnMut((u32, u32), bool)) {
         let mut bytes = Vec::new();
         for index in 0..self.root.map.volume_count() {
             let volume = VolumeIndex(index as u32);
-            for (ordinal, range) in self.root.map.arrived_ranges(volume) {
-                bytes.clear();
-                let on_disk =
-                    self.writer
-                        .read_posted(&self.tree, MemberId(volume.0), range, &mut bytes);
-                each((volume.0, ordinal), on_disk);
+            let articles = self.root.map.arrived_ranges(volume);
+            for run in articles.chunk_by(|(_, a), (_, b)| a.end == b.start) {
+                self.reads_back(volume, run, &mut bytes, &mut each);
             }
         }
+    }
+
+    // Whether each article of `run`, which lie end to end, reads back.
+    #[cfg(test)]
+    fn reads_back(
+        &self,
+        volume: VolumeIndex,
+        run: &[(u32, ByteRange)],
+        bytes: &mut Vec<u8>,
+        each: &mut impl FnMut((u32, u32), bool),
+    ) {
+        let whole = ByteRange::new(run[0].1.start, run[run.len() - 1].1.end);
+        bytes.clear();
+        let read = self
+            .writer
+            .read_posted(&self.tree, MemberId(volume.0), whole, bytes);
+        if read || run.len() == 1 {
+            for (ordinal, _) in run {
+                each((volume.0, *ordinal), read);
+            }
+            return;
+        }
+        let (front, back) = run.split_at(run.len() / 2);
+        self.reads_back(volume, front, bytes, each);
+        self.reads_back(volume, back, bytes, each);
     }
 
     fn deliver_again(&mut self, read: ReadBack) -> Result<(), GraphError> {
