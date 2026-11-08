@@ -555,3 +555,130 @@ async fn a_cooling_leg_is_published_as_probing_when_its_cooldown_lapses() {
     assert_eq!(timer_snapshots(&route), before + 1);
     assert_eq!(updates.borrow()[0].target, 1);
 }
+
+// A leg that answers every name with `answer` and records the addresses it
+// is asked to dial.
+struct OwnNaming {
+    answer: Vec<std::net::IpAddr>,
+    lookups: std::sync::atomic::AtomicUsize,
+    dialled: std::sync::Mutex<Vec<Vec<std::net::IpAddr>>>,
+}
+impl OwnNaming {
+    fn new(answer: &[[u8; 4]]) -> Arc<Self> {
+        Arc::new(Self {
+            answer: answer.iter().copied().map(std::net::IpAddr::from).collect(),
+            lookups: Default::default(),
+            dialled: Default::default(),
+        })
+    }
+    fn lookups(&self) -> usize {
+        self.lookups.load(Ordering::SeqCst)
+    }
+}
+#[async_trait::async_trait]
+impl Dialer for OwnNaming {
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        self.dialled.lock().unwrap().push(target.addresses.clone());
+        let (stream, _) = tokio::io::duplex(64);
+        Ok(Dialed {
+            stream: DialedStream::Tunnel(Box::new(stream)),
+            outcome: Arc::new(ConnectionOutcome::default()),
+            path: DialPath::default(),
+            peer: None,
+            source: None,
+            setup: None,
+        })
+    }
+    async fn resolve(&self, _host: &str) -> Result<Resolution, DialError> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        Ok(Resolution::Addresses(self.answer.clone()))
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(1)
+    }
+    fn describe(&self) -> String {
+        "own naming".into()
+    }
+}
+
+// Two legs of a route whose namings answer `first` and `second`, and a
+// target for a name resolved through the route, pinned to its answer.
+async fn named_legs(
+    first: &[[u8; 4]],
+    second: &[[u8; 4]],
+) -> (Arc<Weighted>, [Arc<OwnNaming>; 2], Target) {
+    let legs = [OwnNaming::new(first), OwnNaming::new(second)];
+    let route = Route {
+        legs: (0..2)
+            .map(|egress_id| RouteLeg {
+                egress_id,
+                weight: 50,
+                path: LegPath::Direct,
+            })
+            .collect(),
+        failover: Failover::Redistribute,
+    };
+    let weighted = Weighted::new(
+        route,
+        legs.iter().map(|l| l.clone() as Arc<dyn Dialer>).collect(),
+        2,
+        &tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let Resolution::Addresses(addresses) = weighted.resolve("news.invalid").await.unwrap() else {
+        panic!("the first leg resolves names");
+    };
+    let target = Target {
+        addresses,
+        ..target()
+    };
+    (weighted, legs, target)
+}
+
+// A name resolved under the first leg's naming is dialled by the second leg
+// only at the checked addresses its own naming also gives.
+#[tokio::test]
+async fn a_leg_dials_a_checked_name_under_its_own_naming() {
+    let (weighted, [first, second], target) = named_legs(
+        &[[192, 0, 2, 1], [192, 0, 2, 2]],
+        &[[192, 0, 2, 2], [192, 0, 2, 3]],
+    )
+    .await;
+    let opened = [
+        weighted.dial(&target).await.unwrap(),
+        weighted.dial(&target).await.unwrap(),
+    ];
+    assert_eq!(
+        opened
+            .iter()
+            .map(|d| d.path.leg.unwrap())
+            .collect::<Vec<_>>(),
+        [0, 1]
+    );
+    assert_eq!(first.lookups(), 1, "the answering leg dials what it gave");
+    assert_eq!(
+        *first.dialled.lock().unwrap(),
+        std::slice::from_ref(&target.addresses)
+    );
+    assert_eq!(second.lookups(), 1, "the other leg asks its own naming");
+    assert_eq!(
+        *second.dialled.lock().unwrap(),
+        [vec![std::net::IpAddr::from([192, 0, 2, 2])]]
+    );
+}
+
+// A leg whose naming gives none of the checked addresses carries nothing for
+// the name and books no failure against itself.
+#[tokio::test]
+async fn a_leg_whose_naming_disagrees_carries_nothing_and_stays_up() {
+    let (weighted, [_, second], target) = named_legs(&[[192, 0, 2, 1]], &[[192, 0, 2, 3]]).await;
+    let _first = weighted.dial(&target).await.unwrap();
+    let health = weighted.allocations()[1].health.clone();
+    assert!(matches!(
+        weighted.dial(&target).await,
+        Err(DialError::Skipped(_))
+    ));
+    assert!(second.dialled.lock().unwrap().is_empty());
+    assert_eq!(weighted.allocations()[1].health, health);
+    assert_eq!(weighted.allocations()[1].opening, 0);
+}

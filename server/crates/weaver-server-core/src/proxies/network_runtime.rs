@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 use weaver_nntp::route_dialer::{AddressPlanned, RouteDialer};
+use weaver_tunnel::endpoint_names::EndpointNames;
 use weaver_tunnel::{
     Http3TunnelProvider, SshTunnelProvider, TunnelProvider, WireGuardTunnelProvider,
     egress::SocketEgress,
@@ -805,7 +806,9 @@ impl NetworkRuntime {
                             .map_err(|e| e.to_string())?;
                         let provider = WireGuardTunnelProvider::new(spec, observer);
                         let provider = match prefix.last() {
-                            None => provider.with_udp_factory(bottom.clone()),
+                            None => provider
+                                .with_udp_factory(bottom.clone())
+                                .with_endpoint_resolver(Arc::new(EndpointNames(bottom.clone()))),
                             // A WireGuard tunnel rides only on another
                             // WireGuard tunnel: nothing else carries UDP.
                             Some(beneath) => {
@@ -836,7 +839,8 @@ impl NetworkRuntime {
                                 profile.http3_spec().map_err(|e| e.to_string())?,
                             )
                             .map_err(|e| e.to_string())?
-                            .with_udp_factory(bottom.clone()),
+                            .with_udp_factory(bottom.clone())
+                            .with_endpoint_resolver(Arc::new(EndpointNames(bottom.clone()))),
                         )
                     }
                     _ => unreachable!(),

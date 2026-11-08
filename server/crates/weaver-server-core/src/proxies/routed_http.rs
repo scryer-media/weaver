@@ -111,6 +111,27 @@ pub(crate) fn start_bridge(path: Arc<dyn FetchPath>) -> Result<Arc<Bridge>, Stri
     bridge_onto(path, budget)
 }
 
+// A bridge onto `path`, with the path itself: a client pins on the path
+// what it checked for a name, then hands the bridge the name, so whichever
+// leg of the path dials is held to the checked addresses.
+#[derive(Clone)]
+pub struct PathBridge {
+    pub bridge: Arc<Bridge>,
+    pub path: Arc<dyn FetchPath>,
+}
+
+impl PathBridge {
+    pub(crate) fn onto(path: Arc<dyn FetchPath>) -> Result<Self, String> {
+        Ok(Self {
+            bridge: start_bridge(path.clone())?,
+            path,
+        })
+    }
+    pub async fn revoke(&self) {
+        self.bridge.revoke().await;
+    }
+}
+
 fn bridge_onto(provider: Arc<dyn TunnelProvider>, budget: Duration) -> Result<Arc<Bridge>, String> {
     let mut secret = [0u8; 32];
     getrandom::fill(&mut secret).map_err(|_| "could not generate bridge credentials")?;
@@ -253,28 +274,6 @@ pub(crate) fn through_bridge(
     bridge: &Bridge,
 ) -> Result<reqwest::ClientBuilder, String> {
     bridged(builder, bridge, "socks5h")
-}
-
-// Sends every request of `builder` through `bridge`, handing the bridge
-// `host` at the first of the checked `addresses`, so the path dials an
-// address that was checked and resolves nothing. With no addresses the
-// bridge is handed the name, as `through_bridge` does.
-pub(crate) fn through_bridge_at(
-    builder: reqwest::ClientBuilder,
-    bridge: &Bridge,
-    host: &str,
-    port: u16,
-    addresses: &[IpAddr],
-) -> Result<reqwest::ClientBuilder, String> {
-    if addresses.is_empty() || host.parse::<IpAddr>().is_ok() {
-        return through_bridge(builder, bridge);
-    }
-    Ok(pinned(
-        bridged(builder, bridge, "socks5")?,
-        host,
-        port,
-        addresses,
-    ))
 }
 
 fn bridged(

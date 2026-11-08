@@ -395,6 +395,15 @@ pub struct Weighted {
 }
 
 impl Weighted {
+    // The leg whose naming answers a caller resolving through the route:
+    // the first one allocated any share.
+    fn answering(&self) -> Result<usize, DialError> {
+        self.allocations()
+            .iter()
+            .find(|a| a.target > 0)
+            .map(|a| a.position)
+            .ok_or_else(|| DialError::AtCapacity(vec![self.shared.changed.clone()]))
+    }
     pub fn new(
         route: Route,
         legs: Vec<Arc<dyn Dialer>>,
@@ -841,6 +850,14 @@ impl Dialer for Weighted {
             *leg = position;
             *probing = opening.probe;
         }
+        // A name pinned to what the answering leg resolved is dialled by any
+        // other leg only at the addresses its own naming also gives. A leg
+        // that gives none of them carries nothing and books no failure.
+        let answered = target.addresses.is_empty()
+            || target.host.parse::<std::net::IpAddr>().is_ok()
+            || self.answering().ok() == Some(position);
+        let target =
+            weaver_tunnel::pipe::as_named_by(opening.dialer.as_ref(), &target, answered).await?;
         // Enforce the leg's own budget here so a leg that swallows connects
         // books the timeout against itself; the caller's route budget is
         // only a backstop and fires later.
@@ -863,12 +880,7 @@ impl Dialer for Weighted {
         }
     }
     async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
-        let allocations = self.allocations();
-        let position = allocations
-            .iter()
-            .find(|a| a.target > 0)
-            .map(|a| a.position)
-            .ok_or_else(|| DialError::AtCapacity(vec![self.shared.changed.clone()]))?;
+        let position = self.answering()?;
         let stage = self
             .legs
             .read()

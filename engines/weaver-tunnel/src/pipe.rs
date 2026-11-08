@@ -1500,11 +1500,12 @@ impl Fallback {
     }
 }
 
-// `target` as `rung` dials it. Addresses pinned for a name were resolved by
-// the answering rung's naming; any other rung asks its own naming and keeps
-// only the pinned addresses it also gives, or is handed the name when its
-// proxy resolves names. A rung whose naming gives none of them is skipped.
-async fn as_named_by<'a>(
+// `target` as `rung`, a ladder rung or a route leg, dials it. Addresses
+// pinned for a name were resolved by the answering stage's naming; any other
+// asks its own naming and keeps only the pinned addresses it also gives, or
+// is handed the name when its proxy resolves names. A stage whose naming
+// gives none of them is skipped.
+pub async fn as_named_by<'a>(
     rung: &dyn Dialer,
     target: &'a Target,
     answered: bool,

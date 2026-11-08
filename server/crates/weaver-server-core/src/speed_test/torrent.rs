@@ -26,13 +26,12 @@ use weaver_torrent::{
     AddTorrent, AddTorrentOptions, Checkpoint, IpFilter, ManagedTorrent, PiecePriority, Session,
     SessionOptions, TrackerAnnounce,
 };
-use weaver_tunnel::bridge::Bridge;
 use weaver_tunnel::pipe::Dialer;
 
 use super::progress::StreamProvider;
 use super::torrent_net::{PieceStore, ProbeSockets, Watched};
 use crate::proxies::{
-    AttemptError, FetchOptions, FetchPath, ResolvedBy, fetch_on, read_body, start_bridge,
+    AttemptError, FetchOptions, FetchPath, PathBridge, ResolvedBy, fetch_on, read_body,
 };
 use crate::settings::TorrentConfig;
 use crate::torrents::identity::IDENTITY;
@@ -172,7 +171,7 @@ pub(crate) struct P2pLeg {
 pub(crate) struct P2pPath {
     stage: Arc<dyn Dialer>,
     leg: OpenLeg,
-    bridge: Option<Arc<Bridge>>,
+    bridge: Option<PathBridge>,
     down: Option<crate::torrents::sessions::RouteFailure>,
     names: Option<ResolvedBy>,
     torrent: TorrentConfig,
@@ -183,9 +182,10 @@ pub(crate) struct P2pPath {
 impl P2pPath {
     pub(crate) async fn open(leg: P2pLeg) -> Result<Self, String> {
         let bridge = match leg.kind {
-            LegKind::Ladder => Some(start_bridge(
-                StreamProvider::new(Arc::clone(&leg.stage), None) as Arc<dyn FetchPath>,
-            )?),
+            LegKind::Ladder => Some(PathBridge::onto(StreamProvider::new(
+                Arc::clone(&leg.stage),
+                None,
+            ) as Arc<dyn FetchPath>)?),
             _ => None,
         };
         match OpenLeg::on(leg.kind, Arc::clone(&leg.stage), bridge.clone(), None) {

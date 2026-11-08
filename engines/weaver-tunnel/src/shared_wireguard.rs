@@ -24,6 +24,13 @@ impl WireGuardTunnelProvider {
     ) -> Self {
         Self(self.0.with_datagram_transport(transport))
     }
+    // Resolve an endpoint written as a name with `resolver`.
+    pub fn with_endpoint_resolver(
+        self,
+        resolver: Arc<dyn crate::endpoint::EndpointResolver>,
+    ) -> Self {
+        Self(self.0.with_endpoint_resolver(resolver))
+    }
     pub fn new(spec: WireGuardSpec, observer: Arc<dyn TunnelObserver>) -> Self {
         Self(
             proxy_tunnels::WireGuardTunnelProvider::new(spec, Arc::new(Observer(observer, None)))

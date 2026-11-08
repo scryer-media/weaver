@@ -414,7 +414,8 @@ async fn the_probe_opens_with_a_routes_options_on_every_kind_of_leg() {
         .unwrap();
         let bridge = match kind {
             LegKind::Ladder => Some(
-                start_bridge(StreamProvider::new(loopback(), None) as Arc<dyn FetchPath>).unwrap(),
+                PathBridge::onto(StreamProvider::new(loopback(), None) as Arc<dyn FetchPath>)
+                    .unwrap(),
             ),
             _ => None,
         };

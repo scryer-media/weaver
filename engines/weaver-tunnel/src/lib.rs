@@ -16,6 +16,7 @@ pub mod bridge;
 pub mod direct;
 pub mod dns;
 pub mod egress;
+pub mod endpoint_names;
 pub mod fault;
 pub mod metrics;
 pub mod pipe;
@@ -26,8 +27,6 @@ mod error;
 #[path = "shared_http3.rs"]
 mod http3;
 mod provider;
-#[cfg(any(test, feature = "test-support"))]
-mod registry;
 mod shared;
 pub mod socks5;
 #[path = "shared_ssh.rs"]
@@ -58,8 +57,6 @@ pub use provider::{
     ED25519_ONLY_PRIVATE_KEY_MESSAGE, NoopTunnelObserver, TunnelObserver, TunnelProvider,
     TunnelSpec, TunnelStream,
 };
-#[cfg(any(test, feature = "test-support"))]
-pub use registry::TunnelRegistry;
 pub use ssh::{SshTunnelProvider, validate_private_key};
 pub use wireguard::{
     DEFAULT_WIREGUARD_KEEPALIVE, DEFAULT_WIREGUARD_MTU, IpCidr, MAX_WIREGUARD_MTU,

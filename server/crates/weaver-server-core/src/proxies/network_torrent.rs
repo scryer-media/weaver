@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::PoisonError;
 
 use super::*;
@@ -25,7 +27,7 @@ pub struct TorrentLeg {
     counted: std::sync::Weak<Revocable>,
     route: Arc<super::weighted::Weighted>,
     handle: tokio::runtime::Handle,
-    bridge: Mutex<Option<Arc<Bridge>>>,
+    bridge: Mutex<Option<PathBridge>>,
 }
 impl TorrentLeg {
     /// The leg's dialer, whose connections the route counts as its own.
@@ -37,7 +39,7 @@ impl TorrentLeg {
         })
     }
     // The bridge onto the leg's stage, started the first time it is asked for.
-    pub fn bridge(&self) -> Result<Arc<Bridge>, String> {
+    pub fn bridge(&self) -> Result<PathBridge, String> {
         // A panic while starting the bridge left it unstarted: start it.
         let mut bridge = self.bridge.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(bridge) = bridge.as_ref() {
@@ -45,13 +47,17 @@ impl TorrentLeg {
         }
         let mut secret = [0u8; 32];
         getrandom::fill(&mut secret).map_err(|_| "could not generate bridge credentials")?;
-        let started = Bridge::start(
-            &self.handle,
-            Arc::new(TorrentProvider(self.dialer())),
-            self.stage.budget(),
-            ("weaver".into(), hex::encode(secret)),
-        )
-        .map_err(|e| e.to_string())?;
+        let path = Arc::new(TorrentProvider::new(self.dialer()));
+        let started = PathBridge {
+            bridge: Bridge::start(
+                &self.handle,
+                path.clone(),
+                self.stage.budget(),
+                ("weaver".into(), hex::encode(secret)),
+            )
+            .map_err(|e| e.to_string())?,
+            path,
+        };
         *bridge = Some(started.clone());
         Ok(started)
     }
@@ -293,7 +299,48 @@ impl InboundListener for CarriedListener {
         Ok(accepted)
     }
 }
-struct TorrentProvider(Arc<dyn Dialer>);
+// The leg under a torrent bridge, and the addresses a client checked for
+// each name it hands the bridge.
+struct TorrentProvider {
+    leg: Arc<dyn Dialer>,
+    pinned: Mutex<HashMap<String, Vec<IpAddr>>>,
+}
+impl TorrentProvider {
+    fn new(leg: Arc<dyn Dialer>) -> Self {
+        Self {
+            leg,
+            pinned: Mutex::default(),
+        }
+    }
+    // What a dial of `host` is held to: the address it is, or what a client
+    // checked for the name; none when the leg's exit resolves it.
+    fn addresses(&self, host: &str) -> Vec<IpAddr> {
+        if let Ok(address) = host.trim_matches(['[', ']']).parse() {
+            return vec![address];
+        }
+        self.pinned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(host)
+            .cloned()
+            .unwrap_or_default()
+    }
+}
+#[async_trait::async_trait]
+impl FetchPath for TorrentProvider {
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.leg.resolve(host).await
+    }
+    fn pin(&self, host: &str, addresses: Vec<IpAddr>) {
+        self.pinned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(host.to_owned(), addresses);
+    }
+    fn budget(&self) -> Duration {
+        self.leg.budget()
+    }
+}
 #[async_trait::async_trait]
 impl TunnelProvider for TorrentProvider {
     async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
@@ -305,15 +352,16 @@ impl TunnelProvider for TorrentProvider {
         port: u16,
         outcome: Arc<ConnectionOutcome>,
     ) -> Result<Box<dyn TunnelStream>, TunnelError> {
-        // A client hands the bridge the address it checked, which the leg
-        // dials as it is; a name it hands on, the leg resolves by its naming.
+        // A client hands the bridge a name with the addresses it checked
+        // pinned, which every rung of the leg keeps to; a name with none
+        // pinned, the leg's exit resolves.
         let dialed = self
-            .0
+            .leg
             .dial(&Target {
                 host: host.into(),
                 port,
                 purpose: Purpose::TorrentHttp,
-                addresses: host.trim_matches(['[', ']']).parse().into_iter().collect(),
+                addresses: self.addresses(host),
             })
             .await
             .map_err(|e| match e {
@@ -687,13 +735,17 @@ mod tests {
             asked: Mutex::default(),
             dialed: Mutex::default(),
         });
-        let bridge = Bridge::start(
-            &tokio::runtime::Handle::current(),
-            Arc::new(TorrentProvider(leg.clone())),
-            leg.budget(),
-            ("weaver".into(), "bridge".into()),
-        )
-        .unwrap();
+        let path = Arc::new(TorrentProvider::new(leg.clone()));
+        let bridge = PathBridge {
+            bridge: Bridge::start(
+                &tokio::runtime::Handle::current(),
+                path.clone(),
+                leg.budget(),
+                ("weaver".into(), "bridge".into()),
+            )
+            .unwrap(),
+            path,
+        };
         let port = exit.port();
         let addrs: Vec<IpAddr> = match LegNames(leg.clone())
             .resolve("tracker.test", port)
@@ -732,10 +784,131 @@ mod tests {
         (asked, dialed)
     }
 
+    // A ladder rung that answers every name with `answer`, and either
+    // refuses every dial or reaches the loopback tracker at `exit`.
+    struct OwnNaming {
+        answer: Vec<IpAddr>,
+        exit: Option<SocketAddr>,
+        asked: Mutex<Vec<String>>,
+        dialed: Mutex<Vec<Target>>,
+    }
+
+    impl OwnNaming {
+        fn new(answer: &[[u8; 4]], exit: Option<SocketAddr>) -> Arc<Self> {
+            Arc::new(Self {
+                answer: answer.iter().copied().map(IpAddr::from).collect(),
+                exit,
+                asked: Mutex::default(),
+                dialed: Mutex::default(),
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Dialer for OwnNaming {
+        async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+            self.dialed.lock().unwrap().push(target.clone());
+            let Some(exit) = self.exit else {
+                return Err(DialError::Egress(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "fixture refusal",
+                )));
+            };
+            let stream = tokio::net::TcpStream::connect(exit)
+                .await
+                .map_err(|e| DialError::Skipped(e.to_string()))?;
+            Ok(Dialed {
+                stream: DialedStream::Socket(stream),
+                outcome: Arc::default(),
+                path: Default::default(),
+                peer: None,
+                source: None,
+                setup: None,
+            })
+        }
+        async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+            self.asked.lock().unwrap().push(host.into());
+            Ok(Resolution::Addresses(self.answer.clone()))
+        }
+        fn budget(&self) -> Duration {
+            Duration::from_secs(60)
+        }
+        fn describe(&self) -> String {
+            "own naming".into()
+        }
+    }
+
+    // A tracker announced to by name through the bridge of a two-rung
+    // ladder whose first rung refuses: the name reaches the ladder with the
+    // first rung's checked answer pinned, and the second rung asks its own
+    // naming and dials only the address both answers hold.
+    #[tokio::test]
+    async fn a_lower_rung_under_the_bridge_dials_only_what_its_own_naming_shares() {
+        let (exit, served) = tracker().await;
+        let first = OwnNaming::new(&[[127, 0, 0, 1], [127, 0, 0, 2]], None);
+        let second = OwnNaming::new(&[[127, 0, 0, 2], [127, 0, 0, 3]], Some(exit));
+        let ladder: Arc<dyn Dialer> = Arc::new(weaver_tunnel::pipe::Fallback::new(vec![
+            first.clone(),
+            second.clone(),
+        ]));
+        let path = Arc::new(TorrentProvider::new(ladder.clone()));
+        let bridge = PathBridge {
+            bridge: Bridge::start(
+                &tokio::runtime::Handle::current(),
+                path.clone(),
+                ladder.budget(),
+                ("weaver".into(), "bridge".into()),
+            )
+            .unwrap(),
+            path,
+        };
+        let port = exit.port();
+        let Resolved::Addresses(found) = LegNames(ladder.clone())
+            .resolve("tracker.test", port)
+            .await
+            .unwrap()
+        else {
+            panic!("the first rung resolves names");
+        };
+        let addrs: Vec<IpAddr> = found.iter().map(SocketAddr::ip).collect();
+        let client = tracker_client(&LegKind::Ladder, ladder, Some(bridge.clone()))
+            .unwrap()
+            .client(
+                Some(HttpTarget {
+                    host: "tracker.test",
+                    port,
+                    addrs: &addrs,
+                }),
+                &ClientShape::FETCH,
+            )
+            .unwrap();
+        let response = client
+            .get(format!("http://tracker.test:{port}/announce"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        served.await.unwrap();
+        bridge.revoke().await;
+
+        let [refused] = &first.dialed.lock().unwrap()[..] else {
+            panic!("the first rung dials once");
+        };
+        assert_eq!(refused.host, "tracker.test");
+        assert_eq!(refused.addresses, addrs);
+        assert_eq!(*first.asked.lock().unwrap(), ["tracker.test"]);
+        assert_eq!(*second.asked.lock().unwrap(), ["tracker.test"]);
+        let [carried] = &second.dialed.lock().unwrap()[..] else {
+            panic!("the second rung dials once");
+        };
+        assert_eq!(carried.host, "tracker.test");
+        assert_eq!(carried.addresses, [IpAddr::from([127, 0, 0, 2])]);
+    }
+
     // Host, Servers and Proxy-servers naming each answer the leg's lookup
-    // with addresses: the session checks those, and the bridge is handed
-    // the checked address, which the leg dials as it is. The host's
-    // resolver is never asked.
+    // with addresses: the session checks those and pins them, and the
+    // bridge is handed the name, which the leg dials at the checked address.
+    // The host's resolver is never asked.
     #[tokio::test]
     async fn a_name_the_leg_resolves_is_dialled_at_the_checked_address() {
         let before = host_lookups();
@@ -747,7 +920,7 @@ mod tests {
                 panic!("{naming}: dialled {dialed:?}");
             };
             assert_eq!(target.addresses, [checked], "{naming}");
-            assert_eq!(target.host, checked.to_string(), "{naming}");
+            assert_eq!(target.host, "tracker.test", "{naming}");
             assert!(matches!(target.purpose, Purpose::TorrentHttp), "{naming}");
         }
         assert_eq!(host_lookups(), before);

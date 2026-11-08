@@ -26,13 +26,13 @@ use weaver_torrent::upnp::{PortMapReceiver, PortMapped, PortmapProtocol, Portmap
 use weaver_torrent::{
     ClientShape, ClientUse, Egress, HttpClients, HttpTarget, Session, SocketFactory, StreamListener,
 };
-use weaver_tunnel::bridge::{Bridge, ConnectionOutcome};
+use weaver_tunnel::bridge::ConnectionOutcome;
 use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
 use weaver_tunnel::pipe::{
     DialedStream, Dialer, InboundListener as Listening, Purpose, Resolution, Target,
 };
 
-use crate::proxies::{EgressBinding, LegPath, ResolvedBy};
+use crate::proxies::{EgressBinding, LegPath, PathBridge, ResolvedBy};
 
 /// How a leg reaches peers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -999,7 +999,7 @@ impl DatagramSocket for NoDatagrams {
 pub fn tracker_client(
     kind: &LegKind,
     dialer: Arc<dyn Dialer>,
-    bridge: Option<Arc<Bridge>>,
+    bridge: Option<PathBridge>,
 ) -> Result<Arc<dyn HttpClients>, String> {
     let bridge = match (kind, bridge) {
         (LegKind::Ladder, None) => return Err("a ladder leg needs its bridge".into()),
@@ -1060,7 +1060,7 @@ pub(crate) fn system_dialer() -> Arc<dyn Dialer> {
 /// own.
 pub(crate) struct LegClients<F> {
     base: F,
-    bridge: Option<Arc<Bridge>>,
+    bridge: Option<PathBridge>,
     kind: LegKind,
     dialer: Arc<dyn Dialer>,
     kept: Mutex<Kept>,
@@ -1129,7 +1129,7 @@ where
 {
     pub(crate) fn new(
         base: F,
-        bridge: Option<Arc<Bridge>>,
+        bridge: Option<PathBridge>,
         kind: LegKind,
         dialer: Arc<dyn Dialer>,
     ) -> Self {
@@ -1150,9 +1150,10 @@ where
     }
 
     // A client for a target dials the host at an address it was checked
-    // at, and follows no redirect. Through the leg's bridge, the bridge is
-    // handed that address, so the leg dials exactly it; with none, the
-    // name, which the leg's exit resolves. The gateway a port mapper asks
+    // at, and follows no redirect. Through the leg's bridge, the checked
+    // addresses are pinned on the leg's path and the bridge is handed the
+    // name, so whichever rung dials keeps to them; with none checked, the
+    // name goes on to the leg's exit, which resolves it. The gateway a port mapper asks
     // is on the local network: its client, the leg's otherwise, never goes
     // through a proxy. A client with no target looks no name up itself.
     fn builder(
@@ -1174,8 +1175,13 @@ where
             (target.host, target.port, target.addrs)
         });
         let builder = match &self.bridge {
-            Some(bridge) => crate::proxies::through_bridge_at(builder, bridge, host, port, addrs)
-                .map_err(anyhow::Error::msg)?,
+            Some(bridge) => {
+                if !addrs.is_empty() && host.parse::<IpAddr>().is_err() {
+                    bridge.path.pin(host, addrs.to_vec());
+                }
+                crate::proxies::through_bridge(builder, &bridge.bridge)
+                    .map_err(anyhow::Error::msg)?
+            }
             None => crate::proxies::pinned(builder, host, port, addrs),
         };
         shape.apply(match target {

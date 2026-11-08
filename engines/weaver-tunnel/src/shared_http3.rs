@@ -18,6 +18,13 @@ impl Http3TunnelProvider {
     ) -> Self {
         Self(self.0.with_udp_factory(factory))
     }
+    // Resolve a proxy written as a name with `resolver`.
+    pub fn with_endpoint_resolver(
+        self,
+        resolver: std::sync::Arc<dyn crate::endpoint::EndpointResolver>,
+    ) -> Self {
+        Self(self.0.with_endpoint_resolver(resolver))
+    }
     pub fn new(spec: Http3TunnelSpec) -> Result<Self, TunnelError> {
         proxy_tunnels::Http3TunnelProvider::new(spec).map(Self)
     }

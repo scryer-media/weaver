@@ -24,7 +24,6 @@ use weaver_torrent::{
     ListenerMode, ListenerOptions, PeerConnectionOptions, Session, SessionLimits, SessionOptions,
     SharedLimits, SocketFactory,
 };
-use weaver_tunnel::bridge::Bridge;
 use weaver_tunnel::pipe::Dialer;
 
 use crate::StateError;
@@ -344,7 +343,7 @@ impl OpenLeg {
     pub fn on(
         kind: LegKind,
         dialer: Arc<dyn Dialer>,
-        bridge: Option<Arc<Bridge>>,
+        bridge: Option<crate::proxies::PathBridge>,
         leg: Option<Arc<TorrentLeg>>,
     ) -> Result<Self, String> {
         let factory: Arc<dyn SocketFactory> = if kind.own_sockets() {
