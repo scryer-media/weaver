@@ -6464,7 +6464,6 @@ dependencies = [
  "async-trait",
  "atoi 3.1.1",
  "aws-lc-rs",
- "aws-lc-sys",
  "backon",
  "base64 0.23.1",
  "bitvec",

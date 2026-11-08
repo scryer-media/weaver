@@ -50,6 +50,14 @@ const PAIR_PAD: [u8; 64] = {
     b
 };
 
+// aws-lc's SHA-256 block function, linked in through aws-lc-rs. aws-lc-sys
+// exports it under its version's symbol prefix, which the build script
+// reads from Cargo.lock, so no second aws-lc-sys can be pulled in for it.
+unsafe extern "C" {
+    #[link_name = env!("WEAVER_AWS_LC_SHA256_TRANSFORM_BLOCKS")]
+    fn sha256_transform_blocks(state: *mut u32, data: *const u8, num_blocks: usize);
+}
+
 /// The parent of two nodes.
 ///
 /// A pair is always 64 bytes, so its padding block is always the same.
@@ -66,7 +74,7 @@ pub fn hash_pair(left: &Id32, right: &Id32) -> Id32 {
     let mut state = SHA256_IV;
     // SAFETY: `state` is the eight words the function reads and updates,
     // and `blocks` is two whole 64-byte blocks, the count passed.
-    unsafe { aws_lc_sys::SHA256_TransformBlocks(state.as_mut_ptr(), blocks.as_ptr(), 2) };
+    unsafe { sha256_transform_blocks(state.as_mut_ptr(), blocks.as_ptr(), 2) };
     let mut out = [0u8; 32];
     for (bytes, word) in out.chunks_exact_mut(4).zip(state) {
         bytes.copy_from_slice(&word.to_be_bytes());
