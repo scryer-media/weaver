@@ -258,6 +258,11 @@ impl TorrentStorage for PieceStorage {
         Ok(())
     }
 
+    // A block is only ever copied into the piece held for it.
+    fn writes_to_memory(&self) -> bool {
+        true
+    }
+
     fn pwrite_all_vectored(
         &self,
         file_id: usize,

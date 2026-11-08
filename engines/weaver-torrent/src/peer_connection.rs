@@ -18,7 +18,8 @@ use crate::core::{
     peer_id::try_decode_peer_id,
 };
 use crate::peer_protocol::{
-    Handshake, Hashes, Message, PartialBlock,
+    Handshake, Hashes, Message, PIECE_MESSAGE_DEFAULT_LEN, PIECE_MESSAGE_PREAMBLE_LEN,
+    PartialBlock,
     extended::{
         ExtendedMessage, PeerExtendedMessageIds, handshake::ExtendedHandshake,
         ut_metadata::UtMetadata, ut_pex::UtPex,
@@ -360,6 +361,25 @@ impl<H: PeerConnectionHandler> ReadQuota for Quota<'_, H> {
     }
 }
 
+/// A frame in the writer's buffer, in the order the buffer holds them: its
+/// length, the block it carries if it is one, and whether that block is
+/// still to be read into it.
+struct Framed {
+    len: usize,
+    chunk: Option<ChunkInfo>,
+    read: bool,
+}
+
+impl Framed {
+    fn message(len: usize) -> Self {
+        Self {
+            len,
+            chunk: None,
+            read: false,
+        }
+    }
+}
+
 /// Writes `buf` once its bytes are paid for. The timeout runs only while the
 /// socket is written, not while the quota is waited for.
 async fn send<H: PeerConnectionHandler>(
@@ -573,7 +593,10 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
 
     /// A buffer for the longest frame of the torrent.
     fn frame_buf(&self) -> Box<[u8]> {
-        vec![0u8; max_frame_len(self.handler.num_pieces())].into_boxed_slice()
+        // The longest frame, and room for a block's frame behind it, so a
+        // write carries more than one frame.
+        vec![0u8; max_frame_len(self.handler.num_pieces()) + PIECE_MESSAGE_DEFAULT_LEN]
+            .into_boxed_slice()
     }
 
     /// Our handshake: the hash of the protocol the peer speaks, offering
@@ -662,20 +685,29 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 trace!("sent bitfield");
             }
 
+            // The frames queued behind the first go out in the same write, as
+            // many as the buffer holds: a block while the room left holds its
+            // frame, any other message while it holds the longest frame. One
+            // that does not fit is the first of the next write.
+            let longest_frame = write_buf.len() - PIECE_MESSAGE_DEFAULT_LEN;
+            let mut carried: Option<WriterRequest> = None;
+            let mut batch: Vec<Framed> = Vec::new();
             loop {
-                let req = match timeout(keep_alive_interval, outgoing_chan.recv()).await {
-                    Ok(Some(msg)) => msg,
-                    Ok(None) => {
-                        return Err(Error::TorrentIsNotLive);
-                    }
-                    Err(_) => WriterRequest::Message(Message::KeepAlive),
+                let first = match carried.take() {
+                    Some(req) => req,
+                    None => match timeout(keep_alive_interval, outgoing_chan.recv()).await {
+                        Ok(Some(msg)) => msg,
+                        Ok(None) => {
+                            return Err(Error::TorrentIsNotLive);
+                        }
+                        Err(_) => WriterRequest::Message(Message::KeepAlive),
+                    },
                 };
 
-                tokio::task::yield_now().await;
+                // The rest of the connection runs once this task has run its
+                // share, not after every message.
+                tokio::task::coop::consume_budget().await;
 
-                let mut uploaded_add = None;
-
-                trace!("about to send: {:?}", &req);
                 let ext_msg_ids = &|| {
                     extended_handshake_ref
                         .read()
@@ -684,105 +716,160 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         .unwrap_or_default()
                 };
 
-                let len = match req {
-                    WriterRequest::Message(msg) => msg.serialize(&mut write_buf, ext_msg_ids)?,
-                    WriterRequest::UtMetadata(utm) => {
-                        Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
-                            .serialize(&mut write_buf, ext_msg_ids)?
+                let mut filled = 0;
+                let mut ending = None;
+                let mut next = Some(first);
+                while let Some(req) = next.take() {
+                    trace!("about to send: {:?}", &req);
+                    let needs = match &req {
+                        WriterRequest::ReadChunkRequest(chunk) => {
+                            PIECE_MESSAGE_PREAMBLE_LEN + chunk.size as usize
+                        }
+                        WriterRequest::Disconnect(_) => 0,
+                        _ => longest_frame,
+                    };
+                    if filled > 0 && write_buf.len() - filled < needs {
+                        carried = Some(req);
+                        break;
                     }
-                    WriterRequest::UtPex(ut_pex) => {
-                        Message::Extended(ExtendedMessage::UtPex(ut_pex.as_borrowed()))
-                            .serialize(&mut write_buf, ext_msg_ids)?
-                    }
-                    WriterRequest::Hashes(hashes) => Message::Hashes(hashes.as_borrowed())
-                        .serialize(&mut write_buf, ext_msg_ids)?,
-                    WriterRequest::ReadChunkRequest(chunk) => {
-                        if !self.handler.claim_upload(&chunk) {
-                            trace!(?chunk, "upload taken off the queue before it was sent");
-                            continue;
+                    let out = &mut write_buf[filled..];
+                    let framed = match req {
+                        WriterRequest::Message(msg) => {
+                            Some(Framed::message(msg.serialize(out, ext_msg_ids)?))
                         }
-                        if !self
-                            .handler
-                            .serves(&chunk)
-                            .await
-                            .map_err(Error::ReadChunk)?
-                        {
-                            trace!(?chunk, "upload not served");
-                            self.handler.upload_done(&chunk);
-                            continue;
-                        }
-
-                        #[allow(unused_mut)]
-                        let mut skip_reading_for_e2e_tests = false;
-
-                        #[cfg(test)]
-                        {
-                            use tracing::warn;
-                            // This is poor-mans fault injection for running e2e tests.
-                            use crate::tests::test_util::TestPeerMetadata;
-                            let tpm = TestPeerMetadata::from_peer_id(self.peer_id);
-                            use rand::RngExt;
-                            if rand::rng().random_bool(tpm.disconnect_probability()) {
-                                return Err(Error::TestDisconnect);
-                            }
-
-                            #[allow(clippy::cast_possible_truncation)]
-                            let sleep_ms = (rand::rng().random::<f64>()
-                                * (tpm.max_random_sleep_ms as f64))
-                                as u64;
-                            if sleep_ms > 0 {
-                                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
-                            }
-
-                            if rand::rng().random_bool(tpm.bad_data_probability()) {
-                                warn!(
-                                    "will NOT actually read the data to simulate a malicious peer that sends garbage"
-                                );
-                                write_buf.fill(0);
-                                skip_reading_for_e2e_tests = true;
-                            }
-                        }
-
-                        // this whole section is an optimization
-                        let preamble_len = serialize_piece_preamble(&chunk, &mut write_buf);
-                        let full_len = preamble_len + chunk.size as usize;
-                        if !skip_reading_for_e2e_tests {
-                            self.spawner
-                                .block_in_place_with_semaphore(|| {
-                                    self.handler
-                                        .read_chunk(&chunk, &mut write_buf[preamble_len..full_len])
-                                })
+                        WriterRequest::UtMetadata(utm) => Some(Framed::message(
+                            Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
+                                .serialize(out, ext_msg_ids)?,
+                        )),
+                        WriterRequest::UtPex(ut_pex) => Some(Framed::message(
+                            Message::Extended(ExtendedMessage::UtPex(ut_pex.as_borrowed()))
+                                .serialize(out, ext_msg_ids)?,
+                        )),
+                        WriterRequest::Hashes(hashes) => Some(Framed::message(
+                            Message::Hashes(hashes.as_borrowed()).serialize(out, ext_msg_ids)?,
+                        )),
+                        WriterRequest::ReadChunkRequest(chunk) => {
+                            if !self.handler.claim_upload(&chunk) {
+                                trace!(?chunk, "upload taken off the queue before it was sent");
+                                None
+                            } else if !self
+                                .handler
+                                .serves(&chunk)
                                 .await
-                                .map_err(Error::ReadChunk)?;
+                                .map_err(Error::ReadChunk)?
+                            {
+                                trace!(?chunk, "upload not served");
+                                self.handler.upload_done(&chunk);
+                                None
+                            } else {
+                                #[allow(unused_mut)]
+                                let mut read = true;
+
+                                #[cfg(test)]
+                                {
+                                    use tracing::warn;
+                                    // This is poor-mans fault injection for running e2e tests.
+                                    use crate::tests::test_util::TestPeerMetadata;
+                                    let tpm = TestPeerMetadata::from_peer_id(self.peer_id);
+                                    use rand::RngExt;
+                                    if rand::rng().random_bool(tpm.disconnect_probability()) {
+                                        return Err(Error::TestDisconnect);
+                                    }
+
+                                    #[allow(clippy::cast_possible_truncation)]
+                                    let sleep_ms = (rand::rng().random::<f64>()
+                                        * (tpm.max_random_sleep_ms as f64))
+                                        as u64;
+                                    if sleep_ms > 0 {
+                                        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+                                    }
+
+                                    if rand::rng().random_bool(tpm.bad_data_probability()) {
+                                        warn!(
+                                            "will NOT actually read the data to simulate a malicious peer that sends garbage"
+                                        );
+                                        out[..needs].fill(0);
+                                        read = false;
+                                    }
+                                }
+
+                                serialize_piece_preamble(&chunk, out);
+                                Some(Framed {
+                                    len: needs,
+                                    chunk: Some(chunk),
+                                    read,
+                                })
+                            }
                         }
-
-                        uploaded_add = Some(chunk);
-                        full_len
-                    }
-                    WriterRequest::Disconnect(res) => {
-                        trace!("disconnect requested, closing writer");
-                        match res {
-                            Ok(()) => return Err(Error::Disconnect),
-                            Err(e) => return Err(Error::DisconnectWithSource(e)),
+                        WriterRequest::Disconnect(res) => {
+                            trace!("disconnect requested, closing writer");
+                            ending = Some(match res {
+                                Ok(()) => Error::Disconnect,
+                                Err(e) => Error::DisconnectWithSource(e),
+                            });
+                            break;
                         }
+                    };
+                    if let Some(framed) = framed {
+                        filled += framed.len;
+                        batch.push(framed);
                     }
-                };
+                    next = outgoing_chan.try_recv().ok();
+                }
 
-                send(
-                    &mut up,
-                    &mut write,
-                    &mut write_buf[..len],
-                    "writing",
-                    rwtimeout,
-                )
-                .await?;
+                // The batch's blocks are read together, on one blocking
+                // thread. A read that fails ends the connection once the
+                // frames before its block are out.
+                let mut failed = None;
+                if batch.iter().any(|framed| framed.read) {
+                    let read = self
+                        .spawner
+                        .block_in_place_with_semaphore(|| {
+                            let mut at = 0;
+                            for (i, framed) in batch.iter().enumerate() {
+                                if let (true, Some(chunk)) = (framed.read, framed.chunk) {
+                                    let payload = at + PIECE_MESSAGE_PREAMBLE_LEN..at + framed.len;
+                                    if let Err(e) =
+                                        self.handler.read_chunk(&chunk, &mut write_buf[payload])
+                                    {
+                                        return Some((i, at, e));
+                                    }
+                                }
+                                at += framed.len;
+                            }
+                            None
+                        })
+                        .await;
+                    if let Some((i, at, e)) = read {
+                        batch.truncate(i);
+                        filled = at;
+                        failed = Some(Error::ReadChunk(e));
+                    }
+                }
 
-                let payload = uploaded_add.map_or(0, |chunk| chunk.size);
-                self.handler
-                    .on_protocol_bytes(Channel::Upload, (len - payload as usize) as u64);
-                if let Some(chunk) = uploaded_add {
-                    self.handler.on_uploaded_bytes(chunk.size);
-                    self.handler.upload_done(&chunk);
+                if filled > 0 {
+                    send(
+                        &mut up,
+                        &mut write,
+                        &mut write_buf[..filled],
+                        "writing",
+                        rwtimeout,
+                    )
+                    .await?;
+                }
+
+                for framed in batch.drain(..) {
+                    let payload = framed.chunk.map_or(0, |chunk| chunk.size as usize);
+                    self.handler
+                        .on_protocol_bytes(Channel::Upload, (framed.len - payload) as u64);
+                    if let Some(chunk) = framed.chunk {
+                        self.handler.on_uploaded_bytes(chunk.size);
+                        self.handler.upload_done(&chunk);
+                    }
+                }
+
+                if let Some(e) = failed.or(ending) {
+                    return Err(e);
                 }
             }
 
@@ -819,7 +906,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     )));
                 }
 
-                tokio::task::yield_now().await;
+                // The writer and the requester run once this task has run its
+                // share, not after every message.
+                tokio::task::coop::consume_budget().await;
 
                 if let Message::Extended(ExtendedMessage::Handshake(h)) = &message {
                     *extended_handshake_ref.write() = Some(h.peer_extended_messages());
@@ -1654,6 +1743,8 @@ mod tests {
     #[derive(Default)]
     struct Recorder {
         told: parking_lot::Mutex<Vec<Told>>,
+        /// The piece whose block fails to read, if any.
+        fails: Option<u32>,
     }
 
     impl PeerConnectionHandler for &Recorder {
@@ -1682,6 +1773,11 @@ mod tests {
             self.told.lock().push(Told::Done(chunk.piece_index.get()));
         }
         fn read_chunk(&self, chunk: &ChunkInfo, buf: &mut [u8]) -> anyhow::Result<()> {
+            anyhow::ensure!(
+                self.fails != Some(chunk.piece_index.get()),
+                "piece {} cannot be read",
+                chunk.piece_index.get()
+            );
             for (k, b) in buf.iter_mut().enumerate() {
                 *b = u8::try_from((k + chunk.piece_index.get() as usize) % 239).unwrap();
             }
@@ -1819,8 +1915,8 @@ mod tests {
         (told, wire, plain, meter.sent())
     }
 
-    // Under RC4 the writer task encrypts each message in place before its
-    // first write; short writes and Pendings below the cipher change nothing
+    // Under RC4 the writer task encrypts each write in place before it goes
+    // out; short writes and Pendings below the cipher change nothing
     // the handler is told, nor its order, and the receiver decrypts the same
     // bytes a plain peer gets as they are.
     #[tokio::test(start_paused = true)]
@@ -1853,8 +1949,9 @@ mod tests {
             });
             assert_eq!(granted - returned, sent);
             assert_eq!(protocol, sent - 2 * u64::from(BLOCK));
-            // Each block: paid for, written, its protocol bytes, its payload,
-            // then done, in that order.
+            // Both blocks queued together are paid for and written together;
+            // then each block's protocol bytes, its payload, and done, in
+            // order.
             let tail: Vec<_> = told
                 .iter()
                 .filter(|t| matches!(t, Told::Uploaded(_) | Told::Done(_)))
@@ -1870,9 +1967,18 @@ mod tests {
                 ]
             );
             let done0 = told.iter().position(|t| *t == Told::Done(0)).unwrap();
-            assert_eq!(told[done0 - 1], Told::Uploaded(BLOCK));
-            assert_eq!(told[done0 - 2], Told::Protocol(13));
-            assert_eq!(told[done0 - 3], Told::Granted(13 + u64::from(BLOCK)));
+            assert_eq!(
+                told[done0 - 3..done0 + 4],
+                [
+                    Told::Granted(2 * (13 + u64::from(BLOCK))),
+                    Told::Protocol(13),
+                    Told::Uploaded(BLOCK),
+                    Told::Done(0),
+                    Told::Protocol(13),
+                    Told::Uploaded(BLOCK),
+                    Told::Done(1),
+                ]
+            );
         }
         // The two blocks' payloads, as the receiver sees them.
         for piece in 0..2u32 {
@@ -1889,5 +1995,205 @@ mod tests {
                     .all(|(k, b)| usize::from(*b) == (k + piece as usize) % 239)
             );
         }
+    }
+
+    /// Logs the length of every write handed to it.
+    struct Logging {
+        inner: BoxAsyncWrite,
+        writes: Arc<parking_lot::Mutex<Vec<usize>>>,
+    }
+
+    impl tokio::io::AsyncWrite for Logging {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            let polled = std::pin::Pin::new(&mut this.inner).poll_write(cx, buf);
+            if polled.is_ready() {
+                this.writes.lock().push(buf.len());
+            }
+            polled
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::pin::Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+        }
+    }
+
+    fn have_frame(piece: u32) -> Vec<u8> {
+        let mut frame = vec![0, 0, 0, 5, 4];
+        frame.extend_from_slice(&piece.to_be_bytes());
+        frame
+    }
+
+    /// The frame of `piece`'s block as `Recorder` reads it.
+    fn block_frame(piece: u32) -> Vec<u8> {
+        let mut frame = (9 + BLOCK).to_be_bytes().to_vec();
+        frame.push(7);
+        frame.extend_from_slice(&piece.to_be_bytes());
+        frame.extend_from_slice(&0u32.to_be_bytes());
+        frame
+            .extend((0..BLOCK as usize).map(|k| u8::try_from((k + piece as usize) % 239).unwrap()));
+        frame
+    }
+
+    /// Serves `queued`, every request on the queue before the writer task
+    /// starts, until the bytes on the wire end with `until` or the
+    /// connection ends. Returns how it ended, the bytes on the wire, and the
+    /// length of each write, the handshakes' first.
+    async fn serve_queued(
+        recorder: &Recorder,
+        queued: Vec<WriterRequest>,
+        until: &[u8],
+    ) -> (crate::Result<()>, Vec<u8>, Vec<usize>) {
+        use tokio::io::AsyncReadExt;
+        let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        let connection = PeerConnection::new(
+            connection.addr,
+            connection.info_hashes,
+            connection.peer_id,
+            recorder,
+            Some(connection.options),
+            BlockingSpawner::new(1),
+            connection.connector,
+        );
+        let (ours, mut theirs) = tokio::io::duplex(1 << 18);
+        let (reader, writer) = halves(ours);
+        let writes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer: BoxAsyncWrite = Box::new(Logging {
+            inner: writer,
+            writes: writes.clone(),
+        });
+        let (meter, reader, writer) = Meter::wrap(reader, writer);
+        let incoming = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            reader,
+            writer: writer.into(),
+            read_buf: ReadBuf::new(),
+            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encryption: crate::mse::Encryption::None,
+            meter,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        for request in queued {
+            tx.send(request).unwrap();
+        }
+        let peer = async {
+            let mut wire = Vec::new();
+            let mut chunk = [0u8; 4096];
+            while !wire.ends_with(until) {
+                let n = theirs.read(&mut chunk).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                wire.extend_from_slice(&chunk[..n]);
+            }
+            drop(tx);
+            wire
+        };
+        let (result, wire) = tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
+        let writes = writes.lock().clone();
+        (result, wire, writes)
+    }
+
+    fn blocks_of(pieces: u32) -> impl Fn(u32) -> ChunkInfo {
+        let lengths =
+            crate::core::lengths::Lengths::new(u64::from(pieces) * u64::from(BLOCK), BLOCK)
+                .unwrap();
+        move |piece| {
+            lengths
+                .chunk_info_from_received_data(
+                    lengths.validate_piece_index(piece).unwrap(),
+                    0,
+                    BLOCK,
+                )
+                .unwrap()
+        }
+    }
+
+    // What is queued together goes out in one write, in order, as much as the
+    // buffer holds: here three haves and two blocks. The have queued after
+    // them does not fit behind the blocks, and is the next write.
+    #[tokio::test(start_paused = true)]
+    async fn messages_queued_together_go_out_in_one_write() {
+        let recorder = Recorder::default();
+        let block = blocks_of(5);
+        let queued = vec![
+            WriterRequest::Message(Message::Have(1)),
+            WriterRequest::Message(Message::Have(2)),
+            WriterRequest::Message(Message::Have(3)),
+            WriterRequest::ReadChunkRequest(block(0)),
+            WriterRequest::ReadChunkRequest(block(1)),
+            WriterRequest::Message(Message::Have(4)),
+        ];
+        let (result, wire, writes) = serve_queued(&recorder, queued, &have_frame(4)).await;
+        assert!(matches!(result, Err(Error::TorrentIsNotLive)), "{result:?}");
+
+        let batch = [
+            have_frame(1),
+            have_frame(2),
+            have_frame(3),
+            block_frame(0),
+            block_frame(1),
+        ]
+        .concat();
+        assert!(
+            writes.ends_with(&[batch.len(), have_frame(4).len()]),
+            "{writes:?}"
+        );
+        assert!(wire.ends_with(&[batch, have_frame(4)].concat()));
+        let told = recorder.told.lock().clone();
+        let tail: Vec<_> = told
+            .iter()
+            .filter(|t| matches!(t, Told::Uploaded(_) | Told::Done(_)))
+            .cloned()
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                Told::Uploaded(BLOCK),
+                Told::Done(0),
+                Told::Uploaded(BLOCK),
+                Told::Done(1)
+            ]
+        );
+    }
+
+    // A block that fails to read ends the connection once the frames queued
+    // before it are out; neither it nor what was queued after it is sent or
+    // done.
+    #[tokio::test(start_paused = true)]
+    async fn a_block_that_fails_to_read_ends_the_connection_after_the_frames_before_it() {
+        let recorder = Recorder {
+            fails: Some(1),
+            ..Recorder::default()
+        };
+        let block = blocks_of(5);
+        let queued = vec![
+            WriterRequest::Message(Message::Have(1)),
+            WriterRequest::ReadChunkRequest(block(0)),
+            WriterRequest::ReadChunkRequest(block(1)),
+            WriterRequest::Message(Message::Have(2)),
+        ];
+        let (result, wire, writes) = serve_queued(&recorder, queued, &have_frame(2)).await;
+        assert!(matches!(result, Err(Error::ReadChunk(_))), "{result:?}");
+
+        let sent = [have_frame(1), block_frame(0)].concat();
+        assert_eq!(writes.last(), Some(&sent.len()), "{writes:?}");
+        assert!(wire.ends_with(&sent));
+        let told = recorder.told.lock().clone();
+        assert!(told.contains(&Told::Done(0)));
+        assert!(!told.contains(&Told::Done(1)));
     }
 }

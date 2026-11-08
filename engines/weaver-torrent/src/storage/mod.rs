@@ -222,6 +222,13 @@ pub trait TorrentStorage: Send + Sync {
         false
     }
 
+    /// Whether every write lands in memory the storage holds and touches no
+    /// file, so a block is written by copying it, which needs no blocking
+    /// thread. Default implementation says no.
+    fn writes_to_memory(&self) -> bool {
+        false
+    }
+
     /// Callback called every time a piece failed its hash check, before it is queued again:
     /// a downloaded piece, or one a check of the files did not find, which the storage then
     /// holds no longer. Default implementation does nothing, but can be override in trait
@@ -321,6 +328,10 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn hash_held_piece(&self, piece_id: ValidPieceIndex, update: &mut dyn FnMut(&[u8])) -> bool {
         (**self).hash_held_piece(piece_id, update)
+    }
+
+    fn writes_to_memory(&self) -> bool {
+        (**self).writes_to_memory()
     }
 
     fn on_piece_hash_failed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {

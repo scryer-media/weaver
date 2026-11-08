@@ -3818,15 +3818,14 @@ impl PeerHandler {
             .fetched_bytes
             .fetch_add(piece.len() as u64, Ordering::Relaxed);
 
-        fn write_to_disk(
+        // Writes the block, and when it was the piece's last, hands back the
+        // piece's download time and senders for its check.
+        fn land_block(
             state: &TorrentStateLive,
             addr: PeerHandle,
-            counters: &AtomicPeerCounters,
             piece: &Piece<ByteBuf<'_>>,
             chunk_info: &ChunkInfo,
-        ) -> anyhow::Result<()> {
-            let index = piece.index;
-
+        ) -> anyhow::Result<Option<(Option<Duration>, crate::piece_tracker::Senders)>> {
             // A block we lack is written, whoever owns its piece now. While
             // it is, no one steals the piece, so that by the time we are done
             // writing AND if it was the last block, we can actually checksum
@@ -3850,7 +3849,7 @@ impl PeerHandler {
                         debug!(
                             "{chunk_info:?} is had, arrived from another first, or has no room, ignoring"
                         );
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             };
@@ -3879,14 +3878,14 @@ impl PeerHandler {
                     .get_pieces_mut()?
                     .write_failed(chunk_info);
                 if state.handle_disk_error(&e) {
-                    return Ok(());
+                    return Ok(None);
                 }
                 error!(
                     id = state.shared.id,
                     info_hash = ?state.shared.info_hash,
                     "FATAL: error writing chunk to disk: {e:#}"
                 );
-                return state.on_fatal_error(e);
+                return state.on_fatal_error(e).map(|()| None);
             }
 
             let piece_index = chunk_info.piece_index;
@@ -3905,7 +3904,7 @@ impl PeerHandler {
                     Some(ChunkMarkingResult::PreviouslyCompleted) => {
                         // TODO: we might need to send cancellations here.
                         debug!("piece={} was done by someone else, ignoring", piece.index);
-                        return Ok(());
+                        return Ok(None);
                     }
                     Some(ChunkMarkingResult::NotCompleted) => None,
                     None => {
@@ -3921,11 +3920,22 @@ impl PeerHandler {
             // It shouldn't impact perf anyway, but dropping just in case.
             drop(ppl_guard);
 
-            // The time is known when the piece was in flight: one whose last
-            // block came after it was given back has none.
-            let Some((full_piece_download_time, senders)) = full_piece_download else {
-                return Ok(());
-            };
+            Ok(full_piece_download)
+        }
+
+        // Checks a piece whose last block landed, and hands it to the
+        // storage if it passed. The time is known when the piece was in
+        // flight: one whose last block came after it was given back has none.
+        fn check_landed_piece(
+            state: &TorrentStateLive,
+            addr: PeerHandle,
+            counters: &AtomicPeerCounters,
+            chunk_info: &ChunkInfo,
+            full_piece_download_time: Option<Duration>,
+            senders: crate::piece_tracker::Senders,
+        ) -> anyhow::Result<()> {
+            let index = chunk_info.piece_index.get();
+            let piece_index = chunk_info.piece_index;
             let read_block = |who: PeerHandle, chunk: &ChunkInfo, buf: &mut [u8]| {
                 state.file_ops().read_chunk(who, chunk, buf)
             };
@@ -4077,14 +4087,26 @@ impl PeerHandler {
             Ok(())
         }
 
-        self.state
-            .shared
-            .spawner
-            .block_in_place_with_semaphore(|| {
-                write_to_disk(&self.state, self.addr, &self.counters, &piece, &chunk_info)
-            })
-            .await
-            .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
+        let state = &*self.state;
+        let spawner = &state.shared.spawner;
+        let land = || land_block(state, self.addr, &piece, &chunk_info);
+        // A block the storage copies into memory is copied here, on this
+        // thread: only a write that reaches a file, and the check of a
+        // piece, which hashes it and writes it out, take a blocking thread.
+        let landed = if state.files.writes_to_memory() {
+            land()
+        } else {
+            spawner.block_in_place_with_semaphore(land).await
+        }
+        .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
+        if let Some((time, senders)) = landed {
+            spawner
+                .block_in_place_with_semaphore(|| {
+                    check_landed_piece(state, self.addr, &self.counters, &chunk_info, time, senders)
+                })
+                .await
+                .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
+        }
 
         Ok(())
     }

@@ -6710,6 +6710,10 @@ impl TorrentStorage for HeldStorage {
         self.inner.pwrite_all(file_id, offset, buf)
     }
 
+    fn writes_to_memory(&self) -> bool {
+        true
+    }
+
     fn remove_file(&self, file_id: usize, filename: &std::path::Path) -> anyhow::Result<()> {
         self.inner.remove_file(file_id, filename)
     }
@@ -6804,6 +6808,39 @@ async fn a_block_owed_for_a_piece_that_failed_its_hash_is_written_into_room_gran
     }
     assert!(h.have(0));
     assert!(!storage.held.lock().contains(&0));
+}
+
+// A block the storage copies into memory lands with every blocking permit
+// taken, on the task that read it. The piece's last block waits for a
+// permit: its check hashes the piece and hands it to the storage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_block_copied_into_memory_takes_no_blocking_permit_and_the_piece_check_does() {
+    let storage = HeldStorageFactory::default();
+    let h = Harness::build_on(
+        "memory_block_inline",
+        0x00,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
+    h.take(&owner, 0);
+    let semaphore = h.live.shared.spawner.semaphore();
+    let permits = u32::try_from(semaphore.available_permits()).unwrap();
+    let taken = semaphore.acquire_many_owned(permits).await.unwrap();
+
+    let last = CHUNKS_PER_PIECE - 1;
+    for chunk in 0..last {
+        h.send(&owner, (0, chunk), false).await.unwrap();
+    }
+    assert_eq!(h.missing_chunks(0), vec![last]);
+
+    let mut check = std::pin::pin!(h.send(&owner, (0, last), false));
+    assert!(futures::poll!(check.as_mut()).is_pending());
+    assert!(!h.have(0));
+    drop(taken);
+    check.await.unwrap();
+    assert!(h.have(0));
 }
 
 // Idle torrents cost the session's rate tick nothing: with `n` torrents

@@ -34,7 +34,7 @@ use self::extended::ExtendedMessage;
 const INTEGER_LEN: usize = 4;
 const MSGID_LEN: usize = 1;
 const PREAMBLE_LEN: usize = INTEGER_LEN + MSGID_LEN;
-const PIECE_MESSAGE_PREAMBLE_LEN: usize = PREAMBLE_LEN + INTEGER_LEN * 2;
+pub(crate) const PIECE_MESSAGE_PREAMBLE_LEN: usize = PREAMBLE_LEN + INTEGER_LEN * 2;
 pub const PIECE_MESSAGE_DEFAULT_LEN: usize = PIECE_MESSAGE_PREAMBLE_LEN + CHUNK_SIZE as usize;
 
 const MAX_MSG_LEN_LEN_JUST_IN_CASE_EXTRA: usize = 64;
