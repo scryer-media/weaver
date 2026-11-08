@@ -273,7 +273,14 @@ impl SqliteDatabaseRuntimeWorker {
         std::thread::Builder::new()
             .name("weaver-sqlite-db-runtime".to_string())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                // sqlx hands a dropped connection back to the pool from a
+                // spawned task. A current-thread runtime only runs that task
+                // inside the next job's `block_on`, so an idle writer kept its
+                // last connection checked out and a one-connection pool timed
+                // out on the next read. One worker thread runs it at once.
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("weaver-sqlite-db-runtime-worker")
                     .enable_all()
                     .build()
                     .map_err(|error| error.to_string());
