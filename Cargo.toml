@@ -285,3 +285,6 @@ lto = "thin"
 # repository: the e2e harness's Weaver image build refuses such a manifest, and
 # any build without that exact checkout cannot compile the workspace. When a
 # rarpar change is needed, publish it and bump the requirement here instead.
+
+[patch.crates-io]
+sevenz-turbo = { path = "../../../sevenz-turbo/.worktrees/parallel-large-folders" }
