@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
-    ByteRange, Change, Durable, Facts, Give, Part, Sealed, Shelf, Take, VolumeIndex, decode_parts,
+    Change, Durable, Facts, Give, Part, Sealed, Shelf, Take, VolumeIndex, decode_parts,
     encode_since,
 };
 
@@ -106,10 +106,6 @@ impl ArticleRoot {
         root.map
             .vouch(|volume, range| checksums.verified(volume, range));
         Ok(root)
-    }
-
-    pub(crate) fn matches(&self, volume: VolumeIndex, range: ByteRange, bytes: &[u8]) -> bool {
-        self.checksums.matches(volume, range, bytes)
     }
 }
 

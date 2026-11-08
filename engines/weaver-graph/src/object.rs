@@ -377,6 +377,13 @@ pub trait Object: Send + Sync {
     // The answer to a seek I made.
     fn pulled(&mut self, seek: Seek, pull: crate::seek::Pull, out: &mut Vec<Emit>);
 
+    // I was rebuilt from my facts, which a restore reads nothing to check.
+    // What of my volumes they do not hold, and what reached me while I was
+    // lent out for a repair, I ask for again through `Emit::Again`: the
+    // owner says again what of it arrived. Told once, after a restore,
+    // before any close or loss is told again.
+    fn restored(&mut self, _out: &mut Vec<Emit>) {}
+
     // The inverse map: where did this range of my volume go? One piece per
     // contiguous run, in volume order, together covering the whole range.
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>);

@@ -20,21 +20,10 @@ pub(crate) enum Step<'a> {
     Bytes(u32, u64, &'a [u8]),
     Closed(u32),
     Password(&'a str),
-    // Bytes the object placed before the checkpoint, delivered again as a
-    // restart replays its partials: what it holds now the owner already
-    // holds, so nothing here is held again.
+    // Bytes delivered before the checkpoint, said again as the tree says
+    // what a restored object asks for again: what it holds now the owner
+    // already holds, so nothing here is held again.
     Replay(u32, u64, &'a [u8]),
-}
-
-// The replay of every delivery among `steps`, as a restart makes it.
-pub(crate) fn replay<'a>(steps: &[Step<'a>]) -> Vec<Step<'a>> {
-    steps
-        .iter()
-        .filter_map(|step| match *step {
-            Step::Bytes(volume, offset, bytes) => Some(Step::Replay(volume, offset, bytes)),
-            _ => None,
-        })
-        .collect()
 }
 
 // One volume in frames, in order.
@@ -54,6 +43,8 @@ struct Owner {
     members: BTreeMap<MemberId, u64>,
     // What each member was written, read back as a namespace reads it.
     written: BTreeMap<MemberId, (Vec<u8>, Coverage)>,
+    // What each volume was delivered, which a restored object hears again.
+    posted: BTreeMap<VolumeIndex, (Vec<u8>, Coverage)>,
 }
 
 impl Owner {
@@ -126,6 +117,10 @@ impl Owner {
             out,
         );
         let range = ByteRange::at(offset, bytes.len() as u64);
+        let (posted, coverage) = self.posted.entry(volume).or_default();
+        posted.resize(posted.len().max(range.end as usize), 0);
+        posted[range.start as usize..range.end as usize].copy_from_slice(bytes);
+        coverage.write(range, Provenance::Fresh);
         self.placed.push((volume, range));
         let mut placements = Vec::new();
         object.locate(volume, range, &mut placements);
@@ -135,6 +130,26 @@ impl Owner {
                 let held = bytes[from..from + range.len() as usize].to_vec();
                 self.held.push((volume, range.start, held));
             }
+        }
+    }
+
+    // What of a range the object asks for again was delivered is said again,
+    // each run forgotten first, as the tree says it.
+    fn again(&mut self, object: &mut dyn Object, volume: VolumeIndex, range: ByteRange) {
+        let Some((bytes, coverage)) = self.posted.get(&volume).cloned() else {
+            return;
+        };
+        for run in coverage.runs() {
+            let Some(piece) = run.range.intersect(range).filter(|piece| !piece.is_empty()) else {
+                continue;
+            };
+            object.unposted(volume, piece);
+            let said = &bytes[piece.start as usize..piece.end as usize];
+            self.step(
+                object,
+                &Step::Replay(volume.0, piece.start, said),
+                &mut Vec::new(),
+            );
         }
     }
 
@@ -202,7 +217,8 @@ fn read(
 }
 
 // Run `steps` to `cut` on the live object, restore a copy from its facts
-// and give it `again` (a password offered anew), then check that the two
+// and give it `again` (a password offered anew), tell it it was restored and
+// say again what it asks for of what was delivered, then check that the two
 // place alike, and take the rest of the steps with the same emits, ending
 // with the same facts.
 pub(crate) fn restores_alike(
@@ -227,6 +243,13 @@ pub(crate) fn restores_alike(
     let mut theirs = owner.clone();
     for step in again {
         theirs.step(restored.as_mut(), step, &mut Vec::new());
+    }
+    let mut asked = Vec::new();
+    restored.restored(&mut asked);
+    for emit in asked {
+        if let Emit::Again { volume, range } = emit {
+            theirs.again(restored.as_mut(), volume, range);
+        }
     }
     owner.alike(live.as_ref(), restored.as_ref());
     for step in &steps[cut..] {

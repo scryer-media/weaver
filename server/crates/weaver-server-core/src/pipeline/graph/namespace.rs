@@ -486,21 +486,6 @@ impl NamespaceWriter {
         self.release_held(tree, builder, segments, out)
     }
 
-    // Bytes a restore reads back from where they went before the restart.
-    // They are not new to the job: every set that took them then ruled on
-    // them or reads them back, so none hears them again.
-    pub(crate) fn deliver_again(
-        &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        segments: &dyn Segments,
-        arrival: Arrival,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), WriteError> {
-        self.arrive(tree, builder, segments, Write::Again, arrival, out)?;
-        self.release_held(tree, builder, segments, out)
-    }
-
     // Bytes for a member, by the one write path, inside a call that
     // releases the holds once it is done.
     fn arrive(
@@ -1274,15 +1259,26 @@ impl NamespaceWriter {
                 );
                 let replayed = match staged.failed() {
                     Some(error) => Err(WriteError::from(error)),
-                    None => self.again_staged(
-                        tree,
-                        builder,
-                        segments,
-                        (serial, *node),
-                        &staged,
-                        sources,
-                        out,
-                    ),
+                    None => self
+                        .again_staged(
+                            tree,
+                            builder,
+                            segments,
+                            (serial, *node),
+                            &staged,
+                            sources,
+                            out,
+                        )
+                        .and_then(|()| {
+                            let mut effects = Vec::new();
+                            tree.again_closed(
+                                *node,
+                                ranges,
+                                &mut self.placing(builder),
+                                &mut effects,
+                            );
+                            self.apply_each(tree, builder, segments, effects, Write::Again, out)
+                        }),
                 };
                 tree.again_done();
                 let removed = staged.discard();
@@ -2423,6 +2419,103 @@ impl Access<'_> {
             into.truncate(start);
         }
         read
+    }
+
+    // Whether the range of the member is where the records say, judged
+    // from them and the files' lengths alone: the read the range would make,
+    // with zeros standing in for every byte a file would give. `scratch` is
+    // the buffer the zeros go in.
+    pub(crate) fn reaches(
+        &self,
+        node: NodeId,
+        member: MemberId,
+        range: ByteRange,
+        scratch: &mut Vec<u8>,
+    ) -> bool {
+        scratch.clear();
+        read_member(&Probe(self), node, member, range, scratch)
+    }
+}
+
+// The access as a restore judges it: a file gives zeros for every byte its
+// record says it holds and its length reaches, and nothing is read.
+struct Probe<'a, 'b>(&'b Access<'a>);
+
+impl Probe<'_, '_> {
+    fn zeros(into: &mut Vec<u8>, len: u64) -> bool {
+        into.resize(into.len() + index(len), 0);
+        true
+    }
+}
+
+impl Source for Probe<'_, '_> {
+    fn bound(&self, node: NodeId, member: MemberId) -> Option<(NodeId, VolumeIndex)> {
+        self.0.bound(node, member)
+    }
+
+    fn recovers(&self, child: NodeId) -> bool {
+        self.0.recovers(child)
+    }
+
+    fn in_member(&self, child: NodeId, range: ByteRange) -> Option<ByteRange> {
+        self.0.in_member(child, range)
+    }
+
+    fn posted(
+        &self,
+        child: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        self.0.posted(child, volume, range, read, into)
+    }
+
+    fn envelope(&self, child: NodeId, envelope: u32, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        self.0.writer.envelopes.keeps(child, envelope, range) && Self::zeros(into, range.len())
+    }
+
+    fn leaf(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+        let written = self
+            .0
+            .tree
+            .namespace(node)
+            .and_then(|namespace| namespace.get(member))
+            .is_some_and(|record| record.coverage.covered(range));
+        let Some(leaf) = self
+            .0
+            .writer
+            .files
+            .get(&node)
+            .and_then(|files| files.leaves.get(&member))
+        else {
+            return range.is_empty();
+        };
+        written
+            && leaf.len().is_ok_and(|length| length >= range.end)
+            && Self::zeros(into, range.len())
+    }
+
+    fn held(&self, node: NodeId, member: MemberId, range: ByteRange) -> Vec<(ByteRange, Location)> {
+        self.0.held(node, member, range)
+    }
+
+    fn scratch(
+        &self,
+        node: NodeId,
+        _: MemberId,
+        offset: u64,
+        len: u64,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        self.0
+            .writer
+            .files
+            .get(&node)
+            .and_then(|files| files.scratch.as_ref())
+            .is_some_and(|scratch| scratch.len().is_ok_and(|length| length >= offset + len))
+            && Self::zeros(into, len)
     }
 }
 

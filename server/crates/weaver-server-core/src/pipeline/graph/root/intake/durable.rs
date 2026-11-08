@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The decoder's checksums out as facts and back, and the check a restore
-// makes of bytes it reads back against them.
+// The decoder's checksums out as facts and back: what a restore vouches
+// for a member's bytes with, reading none of them.
 
 use std::ops::Bound;
 
@@ -80,26 +80,4 @@ impl Checksums {
             .peekable();
         inside.peek().is_some() && inside.all(|segment| segment.verified)
     }
-
-    // Whether bytes read back for `range` match every checksum the decoder
-    // took wholly inside it. A range with none is taken as read.
-    pub(crate) fn matches(&self, volume: VolumeIndex, range: ByteRange, bytes: &[u8]) -> bool {
-        let Some(kept) = self.volumes.get(&volume) else {
-            return true;
-        };
-        kept.range(range.start..range.end)
-            .map(|(_, segment)| segment)
-            .filter(|segment| segment.range.end <= range.end)
-            .all(|segment| {
-                let from = (segment.range.start - range.start) as usize;
-                let to = (segment.range.end - range.start) as usize;
-                bytes
-                    .get(from..to)
-                    .is_some_and(|piece| crc32(piece) == segment.crc32)
-            })
-    }
-}
-
-fn crc32(bytes: &[u8]) -> u32 {
-    crc_turbo::checksum(crc_turbo::CrcAlgorithm::Crc32IsoHdlc, bytes) as u32
 }

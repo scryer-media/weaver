@@ -9,8 +9,8 @@
 // each set a repair settled, with the members it was bound to then.
 //
 // The kept fronts are not recorded: they are a cache of the volumes' first
-// bytes, which the server's replay of the volumes delivers again, and the
-// sets are read from them anew. A content match is kept as the described
+// bytes, which the restored object asks for again, and the sets are read
+// from them anew. A content match is kept as the described
 // path it named, so a restore binds it again without reading the member
 // back. Recovery blocks stay in the volumes and are read back when a repair
 // spends them.
@@ -120,7 +120,7 @@ pub(super) fn par3(facts: &Facts) -> Result<Par3, RestoreError> {
     par3.last = kept.last;
     par3.settled = kept.settled;
     // The blocks they touch are counted again at the next bind, once the
-    // replayed fronts describe the sets.
+    // fronts asked for again describe the sets.
     par3.shown.refusals = kept.refusals;
     Ok(par3)
 }
