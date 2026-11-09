@@ -24,7 +24,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, debug, debug_span, trace, warn};
 use url::Url;
 
-use crate::core::net::{ClientShape, HttpClients};
+use crate::core::net::{ClientShape, DatagramSocket, HttpClients};
 use crate::route_interface::RouteInterface;
 
 /// What a mapping forwards (libtorrent `portmap_protocol`).
@@ -240,6 +240,33 @@ pub fn get_local_ip_relative_to(
     bail!("couldn't find a local ip address")
 }
 
+/// The address a gateway at `gateway` forwards a mapped port to: `from`,
+/// the address the search went out from, when it is on the gateway's
+/// network, else the first address on that network. libtorrent names the
+/// address its SOAP connection leaves from (`upnp::create_port_mapping`);
+/// a session held to one address of an interface that holds several must
+/// get its ports forwarded to that one.
+fn internal_client(
+    from: Option<Ipv4Addr>,
+    gateway: SocketAddr,
+    interfaces: &[NetworkInterface],
+) -> anyhow::Result<IpAddr> {
+    if let Some(from) = from {
+        let held: Vec<NetworkInterface> = interfaces
+            .iter()
+            .cloned()
+            .map(|mut interface| {
+                interface.addr.retain(|addr| addr.ip() == IpAddr::V4(from));
+                interface
+            })
+            .collect();
+        if let Ok(ip) = get_local_ip_relative_to(gateway, &held) {
+            return Ok(ip);
+        }
+    }
+    get_local_ip_relative_to(gateway, interfaces)
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 pub struct RootDesc {
     /// The base the device's relative URLs resolve against, when it names one.
@@ -393,32 +420,27 @@ pub fn parse_upnp_discover_response(
     })
 }
 
-/// The SSDP socket: bound to `from` and sending its multicast out of the
-/// interface holding it, whatever interface the host routes multicast to.
-fn ssdp_socket(from: Ipv4Addr) -> anyhow::Result<tokio::net::UdpSocket> {
+/// A host SSDP socket: bound to `from` and sending its multicast out of
+/// the interface holding it, whatever interface the host routes multicast
+/// to.
+pub(crate) fn host_ssdp_socket(from: Ipv4Addr) -> std::io::Result<tokio::net::UdpSocket> {
     use socket2::{Domain, Protocol, Socket, Type};
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))
-        .context("error creating the SSDP socket")?;
-    socket
-        .set_multicast_if_v4(&from)
-        .with_context(|| format!("error searching from {from}"))?;
-    socket
-        .bind(&SocketAddr::from((from, 0)).into())
-        .with_context(|| format!("error binding the SSDP socket to {from}"))?;
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_multicast_if_v4(&from)?;
+    socket.bind(&SocketAddr::from((from, 0)).into())?;
     socket.set_nonblocking(true)?;
-    Ok(tokio::net::UdpSocket::from_std(socket.into())?)
+    tokio::net::UdpSocket::from_std(socket.into())
 }
 
-/// Search for devices of `kind` from the interface holding `from` for
-/// `timeout`, sending each that answers to `tx`; returns how many answered.
+/// Search for devices of `kind` over `socket`, bound on the interface to
+/// search, for `timeout`, sending each that answers to `tx`; returns how
+/// many answered.
 pub async fn discover_once(
     tx: &UnboundedSender<Discovered>,
     kind: &str,
     timeout: Duration,
-    from: Ipv4Addr,
+    socket: &dyn DatagramSocket,
 ) -> anyhow::Result<usize> {
-    let socket = ssdp_socket(from)?;
-
     let message = make_ssdp_search_request(kind);
     socket
         .send_to(message.as_bytes(), SSDP_MULTICAST_IP)
@@ -547,6 +569,8 @@ pub struct UpnpPortForwarder {
     /// why there is none to search from.
     search_from: Result<Ipv4Addr, String>,
     client: Client,
+    /// The session's clients, which give the socket each search goes out on.
+    clients: std::sync::Arc<dyn HttpClients>,
 }
 
 /// Where to search for a gateway on the route's interface: a
@@ -568,7 +592,7 @@ impl UpnpPortForwarder {
         mappings: Vec<PortMapRequest>,
         opts: Option<UpnpPortForwarderOptions>,
         interface: Result<RouteInterface, String>,
-        clients: &dyn HttpClients,
+        clients: std::sync::Arc<dyn HttpClients>,
     ) -> anyhow::Result<Self> {
         if mappings.is_empty() {
             bail!("empty ports")
@@ -582,6 +606,7 @@ impl UpnpPortForwarder {
             opts: opts.unwrap_or_default(),
             search_from: interface.and_then(|i| search_from(&i)),
             client,
+            clients,
         })
     }
 
@@ -593,9 +618,7 @@ impl UpnpPortForwarder {
             discover_interval.tick().await;
             let none = match &self.search_from {
                 Ok(from) => {
-                    match discover_once(&tx, SSDP_SEARCH_ROOT_ST, self.opts.discover_timeout, *from)
-                        .await
-                    {
+                    match self.search(&tx, *from).await {
                         Ok(0) => "no UPnP device answered the search".to_owned(),
                         Ok(_) => continue,
                         Err(e) => {
@@ -610,6 +633,26 @@ impl UpnpPortForwarder {
                 return;
             }
         }
+    }
+
+    /// One search from `from`, over the socket the session's clients give.
+    async fn search(
+        &self,
+        tx: &UnboundedSender<Discovered>,
+        from: Ipv4Addr,
+    ) -> anyhow::Result<usize> {
+        let socket = self
+            .clients
+            .ssdp_socket(from)
+            .await
+            .with_context(|| format!("error binding the SSDP socket to {from}"))?;
+        discover_once(
+            tx,
+            SSDP_SEARCH_ROOT_ST,
+            self.opts.discover_timeout,
+            socket.as_ref(),
+        )
+        .await
     }
 
     fn report(
@@ -700,7 +743,8 @@ impl UpnpPortForwarder {
             );
         }
         let nics = NetworkInterface::show().context("error listing network interfaces")?;
-        let local_ip = get_local_ip_relative_to(found.received_from, &nics).with_context(|| {
+        let from = self.search_from.as_ref().ok().copied();
+        let local_ip = internal_client(from, found.received_from, &nics).with_context(|| {
             format!(
                 "can't determine local IP relative to {}",
                 found.received_from
@@ -988,7 +1032,11 @@ impl UpnpPortForwarder {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::{net::SocketAddr, sync::Arc, time::Duration};
+    use std::{
+        net::{IpAddr, SocketAddr},
+        sync::Arc,
+        time::Duration,
+    };
 
     use quick_xml::de::from_str;
     use tokio::{
@@ -1269,7 +1317,7 @@ pub(crate) mod tests {
             mappings,
             Some(UpnpPortForwarderOptions::default()),
             Ok(loopback()),
-            &Loopback::default(),
+            Arc::new(Loopback::default()),
         )
         .unwrap();
         let (found, found_rx) = unbounded_channel();
@@ -1486,7 +1534,7 @@ pub(crate) mod tests {
                 ..Default::default()
             }),
             Ok(loopback()),
-            &Loopback::default(),
+            Arc::new(Loopback::default()),
         )
         .unwrap();
         let (found, found_rx) = unbounded_channel();
@@ -1817,7 +1865,7 @@ pub(crate) mod tests {
             point_to_point: true,
         };
         let forwarder =
-            UpnpPortForwarder::new(tcp_and_udp(6881), None, Ok(tunnel), &Loopback::default())
+            UpnpPortForwarder::new(tcp_and_udp(6881), None, Ok(tunnel), Arc::new(Loopback::default()))
                 .unwrap();
         let cancel = CancellationToken::new();
         let (events_tx, mut events) = unbounded_channel();
@@ -1834,6 +1882,103 @@ pub(crate) mod tests {
         cancel.cancel();
         task.await.unwrap().unwrap();
         assert_eq!(events.recv().await, None);
+    }
+
+    /// Clients that note each address a search asks a socket for, and
+    /// give none: their route binds no socket of its own.
+    #[derive(Default)]
+    struct NoSearchSocket {
+        asked: std::sync::Mutex<Vec<std::net::Ipv4Addr>>,
+        clients: Loopback,
+    }
+
+    impl crate::core::net::HttpClients for NoSearchSocket {
+        fn client(
+            &self,
+            target: Option<crate::core::net::HttpTarget<'_>>,
+            shape: &crate::core::net::ClientShape,
+        ) -> anyhow::Result<reqwest::Client> {
+            self.clients.client(target, shape)
+        }
+
+        fn ssdp_socket<'a>(
+            &'a self,
+            from: std::net::Ipv4Addr,
+        ) -> crate::network::BoxFuture<
+            'a,
+            std::io::Result<Arc<dyn crate::core::net::DatagramSocket>>,
+        > {
+            self.asked.lock().unwrap().push(from);
+            Box::pin(async {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "the leg binds no socket of its own",
+                ))
+            })
+        }
+    }
+
+    // The search goes out on the socket the session's clients give for the
+    // route interface's address; with none, it does not go out at all, and
+    // each mapping fails for why.
+    #[tokio::test(start_paused = true)]
+    async fn the_search_goes_out_on_the_socket_the_clients_give() {
+        let _hold = hold_clock();
+        let clients = Arc::new(NoSearchSocket::default());
+        let interface = RouteInterface {
+            name: "en7".into(),
+            ip: std::net::Ipv4Addr::new(192, 0, 2, 4),
+            point_to_point: false,
+        };
+        let forwarder =
+            UpnpPortForwarder::new(tcp_and_udp(6881), None, Ok(interface), clients.clone())
+                .unwrap();
+        let cancel = CancellationToken::new();
+        let (events_tx, mut events) = unbounded_channel();
+        let task = tokio::spawn(forwarder.run(cancel.clone(), events_tx));
+        for protocol in [PortmapProtocol::Tcp, PortmapProtocol::Udp] {
+            assert_eq!(
+                events.recv().await.unwrap(),
+                unmapped(
+                    protocol,
+                    "error binding the SSDP socket to 192.0.2.4: the leg binds no socket of its own"
+                )
+            );
+        }
+        assert_eq!(
+            *clients.asked.lock().unwrap(),
+            [std::net::Ipv4Addr::new(192, 0, 2, 4)]
+        );
+        cancel.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    // The gateway forwards to the address the search went out from when it
+    // is on the gateway's network, not to the first address there.
+    #[test]
+    fn the_gateway_forwards_to_the_address_the_search_went_out_from() {
+        use network_interface::{Addr, NetworkInterface, V4IfAddr};
+        let address = |ip: [u8; 4]| {
+            Addr::V4(V4IfAddr {
+                ip: ip.into(),
+                broadcast: None,
+                netmask: Some([255, 255, 255, 0].into()),
+            })
+        };
+        let interfaces = [NetworkInterface {
+            name: "en0".into(),
+            addr: vec![address([192, 168, 1, 20]), address([192, 168, 1, 21])],
+            mac_addr: None,
+            index: 4,
+            internal: false,
+        }];
+        let gateway: SocketAddr = "192.168.1.1:1900".parse().unwrap();
+        let client = |from| super::internal_client(from, gateway, &interfaces).unwrap();
+        assert_eq!(client(Some([192, 168, 1, 21].into())), IpAddr::from([192, 168, 1, 21]));
+        assert_eq!(client(Some([192, 168, 1, 20].into())), IpAddr::from([192, 168, 1, 20]));
+        // An address off the gateway's network names none of its own.
+        assert_eq!(client(Some([10, 0, 0, 5].into())), IpAddr::from([192, 168, 1, 20]));
+        assert_eq!(client(None), IpAddr::from([192, 168, 1, 20]));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1854,7 +1999,7 @@ pub(crate) mod tests {
             tcp_and_udp(6881),
             None,
             Ok(loopback()),
-            &Loopback::default(),
+            Arc::new(Loopback::default()),
         )
         .unwrap();
         let found = UpnpDiscoverResponse {
@@ -1894,7 +2039,7 @@ pub(crate) mod tests {
             tcp_and_udp(6881),
             None,
             Ok(loopback()),
-            &Loopback::default(),
+            Arc::new(Loopback::default()),
         )
         .unwrap();
         let open = |location| {

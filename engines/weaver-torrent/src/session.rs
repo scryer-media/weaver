@@ -2146,16 +2146,34 @@ impl Session {
     /// address the gateway gave as the router's vote (`on_port_mapping`),
     /// and pass each report on to `forward`. Both mappers work on the
     /// interface the session's traffic leaves through: the bound device, or
-    /// the one the host routes public traffic to.
+    /// the one holding the address the session's clients send public
+    /// traffic from. Neither runs on an interface that reaches only the
+    /// local network.
     fn start_port_mapping(
         &self,
         requests: Vec<PortMapRequest>,
         bind_device_name: Option<&str>,
         forward: Option<PortMapEvents>,
     ) {
+        // A session held to an address only the local network reaches maps
+        // nothing (libtorrent `start_natpmp` and `start_upnp` skip a
+        // `local_network` socket and a local IPv6 one).
+        let listen_ip = self.listen_addr.map(|addr| addr.ip());
+        if let Some(ip) = listen_ip
+            && crate::route_interface::local_network_address(ip)
+        {
+            info!(%ip, "no port mapping on an address only the local network reaches");
+            return;
+        }
         let interface =
             crate::route_interface::route_interface(bind_device_name, self.http_clients.as_ref())
                 .map_err(|e| format!("{e:#}"));
+        if let Ok(interface) = &interface
+            && interface.local_network_only()
+        {
+            info!(?interface, "no port mapping on an interface that reaches only the local network");
+            return;
+        }
         info!(
             ?requests,
             ?interface,
@@ -2166,17 +2184,23 @@ impl Session {
             description: self.identity.user_agent.clone(),
             ..Default::default()
         };
-        match UpnpPortForwarder::new(
-            requests.clone(),
-            Some(upnp_opts),
-            interface.clone(),
-            self.http_clients.as_ref(),
-        ) {
-            Ok(upnp) => self.spawn_port_mapper(
-                "upnp_forward",
-                upnp.run(self.cancellation_token.clone(), events_tx.clone()),
-            ),
-            Err(e) => warn!("error starting UPnP port mapping: {e:#}"),
+        // SSDP runs over IPv4 alone: a session held to an IPv6 address
+        // searches for no UPnP gateway (libtorrent `start_upnp`).
+        if listen_ip.is_some_and(|ip| ip.is_ipv6() && !ip.is_unspecified()) {
+            info!("no UPnP on a session held to an IPv6 address");
+        } else {
+            match UpnpPortForwarder::new(
+                requests.clone(),
+                Some(upnp_opts),
+                interface.clone(),
+                self.http_clients.clone(),
+            ) {
+                Ok(upnp) => self.spawn_port_mapper(
+                    "upnp_forward",
+                    upnp.run(self.cancellation_token.clone(), events_tx.clone()),
+                ),
+                Err(e) => warn!("error starting UPnP port mapping: {e:#}"),
+            }
         }
         let route = interface.and_then(|i| GatewayRoute::of(&i).map_err(|e| format!("{e:#}")));
         self.map_over(route, requests, events_tx);
@@ -4063,6 +4087,39 @@ mod tests {
         assert_ne!(listening, Some(50000));
         assert_eq!(port, "50000");
         Ok(())
+    }
+
+    // A session held to an address only the local network reaches starts
+    // no mapper: every holder of its report channel lets go of it with no
+    // report sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_session_on_a_local_only_address_maps_nothing() {
+        let dir = TempDir::new().unwrap();
+        let (events, mut reports) = tokio::sync::mpsc::unbounded_channel();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                port_map_events: Some(events),
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    announce_port: Some(6881),
+                    enable_upnp_port_forwarding: true,
+                    ssl_listen_port: Some(0),
+                    ..Default::default()
+                }),
+                ..crate::test_support::session_options()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(reports.recv().await, None);
+        assert_eq!(session.announce_port_of(false), Some(6881));
+        session.stop().await;
     }
 
     // An SSL torrent announces the port a mapper got for the SSL listener,

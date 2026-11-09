@@ -24,6 +24,27 @@ pub struct RouteInterface {
     pub point_to_point: bool,
 }
 
+impl RouteInterface {
+    /// The interface reaches only the local network: its address is a
+    /// loopback or link-local one. No gateway on it forwards a port from
+    /// the internet, so no mapper runs on it (libtorrent marks such a
+    /// listen socket `local_network` and starts neither mapper on it).
+    pub fn local_network_only(&self) -> bool {
+        local_network_address(IpAddr::V4(self.ip))
+    }
+}
+
+/// An address only the local network reaches: loopback or link-local, and
+/// for IPv6 a unique local one too (libtorrent marks a listen socket on a
+/// loopback or link-local address `local_network`, and maps no local IPv6
+/// address).
+pub fn local_network_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_link_local(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unicast_link_local() || ip.is_unique_local(),
+    }
+}
+
 /// A documentation address no host answers at. The routing table sends it
 /// the way it sends any public address: where traffic toward it leaves
 /// from names the interface.
@@ -195,6 +216,24 @@ mod tests {
             name: name.into(),
             ip: ip.into(),
             point_to_point,
+        }
+    }
+
+    #[test]
+    fn a_loopback_or_link_local_interface_reaches_only_the_local_network() {
+        assert!(interface("lo0", [127, 0, 0, 1], false).local_network_only());
+        assert!(interface("en0", [169, 254, 3, 9], false).local_network_only());
+        assert!(!interface("en0", [192, 168, 1, 20], false).local_network_only());
+        assert!(!interface("en0", [203, 0, 113, 9], false).local_network_only());
+        for (ip, local) in [
+            ("::1", true),
+            ("fe80::1", true),
+            ("fd12:3456::1", true),
+            ("2001:db8::1", false),
+            ("0.0.0.0", false),
+            ("::", false),
+        ] {
+            assert_eq!(super::local_network_address(ip.parse().unwrap()), local, "{ip}");
         }
     }
 
