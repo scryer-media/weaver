@@ -233,7 +233,11 @@ mod tests {
             ("0.0.0.0", false),
             ("::", false),
         ] {
-            assert_eq!(super::local_network_address(ip.parse().unwrap()), local, "{ip}");
+            assert_eq!(
+                super::local_network_address(ip.parse().unwrap()),
+                local,
+                "{ip}"
+            );
         }
     }
 

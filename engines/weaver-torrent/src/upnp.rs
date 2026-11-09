@@ -617,16 +617,14 @@ impl UpnpPortForwarder {
         loop {
             discover_interval.tick().await;
             let none = match &self.search_from {
-                Ok(from) => {
-                    match self.search(&tx, *from).await {
-                        Ok(0) => "no UPnP device answered the search".to_owned(),
-                        Ok(_) => continue,
-                        Err(e) => {
-                            debug!("failed to run SSDP/UPNP discovery: {e:#}");
-                            format!("{e:#}")
-                        }
+                Ok(from) => match self.search(&tx, *from).await {
+                    Ok(0) => "no UPnP device answered the search".to_owned(),
+                    Ok(_) => continue,
+                    Err(e) => {
+                        debug!("failed to run SSDP/UPNP discovery: {e:#}");
+                        format!("{e:#}")
                     }
-                }
+                },
                 Err(none) => none.clone(),
             };
             if tx.send(Err(none)).is_err() {
@@ -1864,9 +1862,13 @@ pub(crate) mod tests {
             ip: std::net::Ipv4Addr::new(10, 44, 0, 2),
             point_to_point: true,
         };
-        let forwarder =
-            UpnpPortForwarder::new(tcp_and_udp(6881), None, Ok(tunnel), Arc::new(Loopback::default()))
-                .unwrap();
+        let forwarder = UpnpPortForwarder::new(
+            tcp_and_udp(6881),
+            None,
+            Ok(tunnel),
+            Arc::new(Loopback::default()),
+        )
+        .unwrap();
         let cancel = CancellationToken::new();
         let (events_tx, mut events) = unbounded_channel();
         let task = tokio::spawn(forwarder.run(cancel.clone(), events_tx));
@@ -1904,10 +1906,8 @@ pub(crate) mod tests {
         fn ssdp_socket<'a>(
             &'a self,
             from: std::net::Ipv4Addr,
-        ) -> crate::network::BoxFuture<
-            'a,
-            std::io::Result<Arc<dyn crate::core::net::DatagramSocket>>,
-        > {
+        ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::core::net::DatagramSocket>>>
+        {
             self.asked.lock().unwrap().push(from);
             Box::pin(async {
                 Err(std::io::Error::new(
@@ -1974,10 +1974,19 @@ pub(crate) mod tests {
         }];
         let gateway: SocketAddr = "192.168.1.1:1900".parse().unwrap();
         let client = |from| super::internal_client(from, gateway, &interfaces).unwrap();
-        assert_eq!(client(Some([192, 168, 1, 21].into())), IpAddr::from([192, 168, 1, 21]));
-        assert_eq!(client(Some([192, 168, 1, 20].into())), IpAddr::from([192, 168, 1, 20]));
+        assert_eq!(
+            client(Some([192, 168, 1, 21].into())),
+            IpAddr::from([192, 168, 1, 21])
+        );
+        assert_eq!(
+            client(Some([192, 168, 1, 20].into())),
+            IpAddr::from([192, 168, 1, 20])
+        );
         // An address off the gateway's network names none of its own.
-        assert_eq!(client(Some([10, 0, 0, 5].into())), IpAddr::from([192, 168, 1, 20]));
+        assert_eq!(
+            client(Some([10, 0, 0, 5].into())),
+            IpAddr::from([192, 168, 1, 20])
+        );
         assert_eq!(client(None), IpAddr::from([192, 168, 1, 20]));
     }
 

@@ -122,10 +122,13 @@ impl NatPmpGateway {
     pub async fn granted(&self, opcode: u8, internal: u16) -> Granted {
         loop {
             let notified = self.mapped.notify.notified();
-            if let Some(granted) =
-                self.mapped.granted.lock().unwrap().iter().find(|granted| {
-                    granted.opcode == opcode && granted.internal == internal
-                })
+            if let Some(granted) = self
+                .mapped
+                .granted
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|granted| granted.opcode == opcode && granted.internal == internal)
             {
                 return *granted;
             }

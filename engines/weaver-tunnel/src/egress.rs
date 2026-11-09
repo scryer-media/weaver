@@ -322,18 +322,26 @@ mod connect_tests {
         let pinned = SocketEgress::SourceAddress(loopback.into())
             .bind_udp_at(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
             .unwrap();
-        assert_eq!(socket2::SockRef::from(&pinned).multicast_if_v4().unwrap(), loopback);
+        assert_eq!(
+            socket2::SockRef::from(&pinned).multicast_if_v4().unwrap(),
+            loopback
+        );
         let at = SocketEgress::System
             .bind_udp_at(SocketAddr::from((loopback, 0)))
             .unwrap();
-        assert_eq!(socket2::SockRef::from(&at).multicast_if_v4().unwrap(), loopback);
+        assert_eq!(
+            socket2::SockRef::from(&at).multicast_if_v4().unwrap(),
+            loopback
+        );
         let anywhere = SocketEgress::System
             .bind_udp_at(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
             .unwrap();
-        assert!(socket2::SockRef::from(&anywhere)
-            .multicast_if_v4()
-            .unwrap()
-            .is_unspecified());
+        assert!(
+            socket2::SockRef::from(&anywhere)
+                .multicast_if_v4()
+                .unwrap()
+                .is_unspecified()
+        );
     }
 
     // A socket bound at the unspecified IPv6 address takes IPv4 as well.

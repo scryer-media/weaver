@@ -36,10 +36,10 @@ use tracing::trace;
 
 use crate::{
     dht::Dht,
-    session::FetchPhase,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
+    session::FetchPhase,
     spawn_utils::BlockingSpawner,
     stream_connect::{ConnectionKind, StreamConnector},
     torrent_state::live::peers::PeerStates,

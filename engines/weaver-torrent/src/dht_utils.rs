@@ -14,10 +14,10 @@ use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use tokio::time::Instant;
 use tracing::{Instrument, debug, debug_span};
 
-use crate::core::hash_id::{Id20, InfoHashes};
+use crate::core::hash_id::Id20;
 use crate::{
     peer_connection::PeerConnectionOptions,
-    peer_info_reader::{self, FetchDht, MetadataFetch},
+    peer_info_reader::{self, MetadataFetch},
     spawn_utils::BlockingSpawner,
     stream_connect::StreamConnector,
     torrent_state::live::peers::{NextCandidate, PeerList, PeerStates},
@@ -48,21 +48,20 @@ pub struct MetadataPeers<A> {
     pub stream: A,
 }
 
-pub async fn read_metainfo_from_peer_receiver<
+/// Ask `peers` for the metadata `fetch` gathers; the peers asked fill its
+/// one buffer between them.
+pub(crate) async fn read_metainfo_from_peer_receiver<
     A: Stream<Item = (SocketAddr, PeerSourceFlag)> + Unpin,
 >(
     peer_id: Id20,
-    info_hashes: InfoHashes,
+    fetch: Arc<MetadataFetch>,
     peers: MetadataPeers<A>,
     unable: &tokio::sync::watch::Sender<HashSet<SocketAddr>>,
     peer_connection_options: Option<PeerConnectionOptions>,
     connector: Arc<StreamConnector>,
     client_name_and_version: String,
-    dht: Option<FetchDht>,
 ) -> ReadMetainfoResult<A> {
     let semaphore = tokio::sync::Semaphore::new(128);
-    // The peers asked fill one buffer between them.
-    let fetch = MetadataFetch::new(info_hashes, dht);
 
     let read_info_guarded = |addr, peers: &Arc<PeerStates>| {
         let semaphore = &semaphore;
@@ -186,6 +185,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use crate::core::hash_id::InfoHashes;
     use crate::core::peer_id::generate_peer_id;
     use crate::dht::{DhtBuilder, Id20};
 
@@ -379,10 +379,13 @@ mod tests {
         let peer_id = generate_peer_id(b"-xx1234-");
         match read_metainfo_from_peer_receiver(
             peer_id,
-            InfoHashes {
-                v1: Some(info_hash),
-                v2: None,
-            },
+            MetadataFetch::new(
+                InfoHashes {
+                    v1: Some(info_hash),
+                    v2: None,
+                },
+                None,
+            ),
             MetadataPeers {
                 list: PeerList::default(),
                 stream: peer_rx,
@@ -397,7 +400,6 @@ mod tests {
                 .unwrap(),
             ),
             crate::client_name_and_version().to_owned(),
-            None,
         )
         .await
         {

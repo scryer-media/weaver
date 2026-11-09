@@ -68,9 +68,9 @@ use crate::{
     limits::{Limits, LimitsConfig},
     listen::{Accept, ListenerOptions},
     merge_streams::merge_streams,
-    peer_info_reader::FetchDht,
     network::SocketFactory,
     peer_connection::PeerConnectionOptions,
+    peer_info_reader::{self, FetchDht},
     piece_priority::{
         FilePriority, PiecePriority, file_priorities, file_to_piece_priorities,
         validate_piece_priorities, wanted_files,
@@ -269,13 +269,14 @@ fn port_map_requests(
         .into_iter()
         .flatten()
     }
-    let plain = protocols(listen.tcp_socket.is_some(), listen.utp_socket.is_some()).map(
-        |protocol| PortMapRequest {
-            protocol,
-            local_port: listen.addr.port(),
-            external_port: announce_port,
-        },
-    );
+    let plain =
+        protocols(listen.tcp_socket.is_some(), listen.utp_socket.is_some()).map(|protocol| {
+            PortMapRequest {
+                protocol,
+                local_port: listen.addr.port(),
+                external_port: announce_port,
+            }
+        });
     let ssl = listen.ssl.iter().flat_map(|ssl| {
         let port = ssl.addr.port();
         protocols(ssl.tcp_socket.is_some(), ssl.utp_socket.is_some()).map(move |protocol| {
@@ -2171,7 +2172,10 @@ impl Session {
         if let Ok(interface) = &interface
             && interface.local_network_only()
         {
-            info!(?interface, "no port mapping on an interface that reaches only the local network");
+            info!(
+                ?interface,
+                "no port mapping on an interface that reaches only the local network"
+            );
             return;
         }
         info!(
@@ -2917,7 +2921,7 @@ impl Session {
                 };
                 let resolved_magnet = self
                     .resolve_magnet(
-                        info_hashes,
+                        peer_info_reader::MetadataFetch::new(info_hashes, fetch_dht),
                         &identity,
                         MetadataPeers {
                             list: peer_list,
@@ -2926,7 +2930,6 @@ impl Session {
                         &unable_tx,
                         &tracker_tiers,
                         opts.peer_opts,
-                        fetch_dht,
                     )
                     .await?;
 
@@ -3689,23 +3692,21 @@ impl Session {
 
     async fn resolve_magnet(
         self: &Arc<Self>,
-        info_hashes: InfoHashes,
+        fetch: Arc<peer_info_reader::MetadataFetch>,
         identity: &Identity,
         peers: MetadataPeers<PeerStream>,
         unable: &tokio::sync::watch::Sender<HashSet<SocketAddr>>,
         tracker_tiers: &[Vec<Tracker>],
         peer_opts: Option<PeerConnectionOptions>,
-        dht: Option<FetchDht>,
     ) -> anyhow::Result<ResolveMagnetResult> {
         match read_metainfo_from_peer_receiver(
             identity.peer_id,
-            info_hashes,
+            fetch,
             peers,
             unable,
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
             identity.version.clone(),
-            dht,
         )
         .await
         {
@@ -4185,7 +4186,10 @@ mod tests {
             .wait_for(|port| *port == Some(50001))
             .await
             .unwrap();
-        announced.wait_for(|port| *port == Some(50000)).await.unwrap();
+        announced
+            .wait_for(|port| *port == Some(50000))
+            .await
+            .unwrap();
         assert_eq!(session.announce_port_of(true), Some(50001));
         assert_eq!(session.announce_port_of(false), Some(50000));
         session.stop().await;
@@ -4293,43 +4297,43 @@ mod tests {
             (ListenerMode::UtpOnly, vec![Udp]),
             (ListenerMode::TcpAndUtp, vec![Tcp, Udp]),
         ] {
-          for ssl in [false, true] {
-            let token = tokio_util::sync::CancellationToken::new();
-            let slots = crate::connection_slots::ConnectionSlots::new(
-                super::DEFAULT_CONNECTIONS_LIMIT,
-                crate::connection_slots::DEFAULT_CONNECTIONS_SLACK,
-                crate::connection_slots::DEFAULT_CONNECTION_SPEED,
-            );
-            let listen = ListenerOptions {
-                mode,
-                listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
-                ssl_listen_port: ssl.then_some(0),
-                ..Default::default()
+            for ssl in [false, true] {
+                let token = tokio_util::sync::CancellationToken::new();
+                let slots = crate::connection_slots::ConnectionSlots::new(
+                    super::DEFAULT_CONNECTIONS_LIMIT,
+                    crate::connection_slots::DEFAULT_CONNECTIONS_SLACK,
+                    crate::connection_slots::DEFAULT_CONNECTION_SPEED,
+                );
+                let listen = ListenerOptions {
+                    mode,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ssl_listen_port: ssl.then_some(0),
+                    ..Default::default()
+                }
+                .start(
+                    None,
+                    token.clone(),
+                    &crate::test_support::socket_factory(),
+                    &slots,
+                )
+                .await
+                .unwrap();
+                // The plain listener asks for the announced port; the SSL one,
+                // when there is one, for its own port.
+                let plain = listen.addr.port();
+                let mut wanted: Vec<_> = expected.iter().map(|&p| (p, plain, 40001)).collect();
+                if let Some(ssl) = &listen.ssl {
+                    let port = ssl.addr.port();
+                    assert_ne!(port, plain);
+                    wanted.extend(expected.iter().map(|&p| (p, port, port)));
+                }
+                let requests: Vec<_> = port_map_requests(&listen, 40001)
+                    .into_iter()
+                    .map(|r| (r.protocol, r.local_port, r.external_port))
+                    .collect();
+                assert_eq!(requests, wanted, "{mode:?} ssl {ssl}");
+                token.cancel();
             }
-            .start(
-                None,
-                token.clone(),
-                &crate::test_support::socket_factory(),
-                &slots,
-            )
-            .await
-            .unwrap();
-            // The plain listener asks for the announced port; the SSL one,
-            // when there is one, for its own port.
-            let plain = listen.addr.port();
-            let mut wanted: Vec<_> = expected.iter().map(|&p| (p, plain, 40001)).collect();
-            if let Some(ssl) = &listen.ssl {
-                let port = ssl.addr.port();
-                assert_ne!(port, plain);
-                wanted.extend(expected.iter().map(|&p| (p, port, port)));
-            }
-            let requests: Vec<_> = port_map_requests(&listen, 40001)
-                .into_iter()
-                .map(|r| (r.protocol, r.local_port, r.external_port))
-                .collect();
-            assert_eq!(requests, wanted, "{mode:?} ssl {ssl}");
-            token.cancel();
-          }
         }
     }
 

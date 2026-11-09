@@ -44,10 +44,10 @@ use crate::{
         },
     },
     read_buf::ReadBuf,
+    session::FetchPhase,
     sha1w::{ISha1, Sha1},
     spawn_utils::BlockingSpawner,
     stream_connect::{StreamConnector, StreamConnectorArgs},
-    session::FetchPhase,
     torrent_state::live::{
         peers::{PeerList, PeerStates},
         tests::{HeldUdp, dict_bytes},
@@ -559,7 +559,7 @@ async fn two_peers_send_the_metadata_between_them() {
 
     let found = read_metainfo_from_peer_receiver(
         Id20::new([1; 20]),
-        hashes,
+        MetadataFetch::new(hashes, None),
         MetadataPeers {
             list: PeerList::resumed([addr(1), addr(2)], []),
             stream: futures::stream::pending(),
@@ -568,7 +568,6 @@ async fn two_peers_send_the_metadata_between_them() {
         None,
         connector,
         "test".to_owned(),
-        None,
     )
     .await;
 
@@ -621,7 +620,7 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
     let unable = tokio::sync::watch::Sender::new(Default::default());
     let fetch = read_metainfo_from_peer_receiver(
         Id20::new([1; 20]),
-        hashes,
+        MetadataFetch::new(hashes, None),
         MetadataPeers {
             list: PeerList::resumed([addr(1)], []),
             stream: futures::stream::pending(),
@@ -630,7 +629,6 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
         None,
         connector.clone(),
         "test".to_owned(),
-        None,
     );
 
     let (found, _peer) = tokio::join!(fetch, peer);
@@ -931,25 +929,31 @@ async fn a_metadata_fetch_offers_the_dht_only_once_it_looks_for_peers_there() {
     let dht = held_dht(&udp).await;
     let mut node_side = udp.take(dht.listen_addr());
     let (phase_tx, phase) = tokio::sync::watch::channel(FetchPhase::Trackers);
-    let fetch = MetadataFetch::new(
-        metadata(10).1,
-        Some(FetchDht::new(dht.clone(), phase)),
-    );
+    let fetch = MetadataFetch::new(metadata(10).1, Some(FetchDht::new(dht.clone(), phase)));
     let (reader, _sent) = handler(&fetch);
 
     assert_eq!(reader.dht_port(), None);
-    reader.on_received_message(Message::Port(6890)).await.unwrap();
+    reader
+        .on_received_message(Message::Port(6890))
+        .await
+        .unwrap();
     assert_eq!(*reader.dht_node_named.lock(), None);
 
     phase_tx.send(FetchPhase::Discovery).unwrap();
     assert_eq!(reader.dht_port(), Some(dht.listen_addr().port()));
-    reader.on_received_message(Message::Port(6890)).await.unwrap();
+    reader
+        .on_received_message(Message::Port(6890))
+        .await
+        .unwrap();
     assert_eq!(*reader.dht_node_named.lock(), Some(6890));
     let (_, to) = node_side.sent.recv().await.unwrap();
     assert_eq!(to, addr(6890));
 
     let (no_dht, _sent) = handler(&MetadataFetch::new(metadata(10).1, None));
     assert_eq!(no_dht.dht_port(), None);
-    no_dht.on_received_message(Message::Port(6890)).await.unwrap();
+    no_dht
+        .on_received_message(Message::Port(6890))
+        .await
+        .unwrap();
     assert_eq!(*no_dht.dht_node_named.lock(), None);
 }
