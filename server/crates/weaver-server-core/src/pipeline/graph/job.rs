@@ -146,6 +146,9 @@ pub(crate) enum Note {
     Repaired(u64),
     // An archive was given up on as an archive for this member.
     GivenBack(super::namespace::GivenBack),
+    // An article the root held is no longer where it was put and is
+    // fetched again.
+    Unread(VolumeIndex, u32),
 }
 
 // A root member as the post lists it.
@@ -220,13 +223,15 @@ impl GraphJob {
                 warn!(member = member.0, error = %error, "graph member announcement failed");
             }
         }
+        // The deadline counts the time the runs and the loans decode.
+        let runs = runs.timed(writer.decode_clock());
         Self {
             tree,
             root,
             builder,
             writer,
             loans: Loans::new(runs.scope(), runs.mail(), runs.hardware()),
-            works: Works::new(runs.scope(), runs.mail(), runs.hardware()),
+            works: Works::new(runs.scope(), runs.mail(), runs.hardware()).timed(runs.clock()),
             runs,
             passwords: Passwords::default(),
             reported: None,
@@ -291,6 +296,12 @@ impl GraphJob {
         self.works.hold_loans();
     }
 
+    // How many objects went out for their work.
+    #[cfg(test)]
+    pub(crate) fn loans_lent(&self) -> u64 {
+        self.works.lent()
+    }
+
     #[cfg(test)]
     pub(crate) fn held_loans(&mut self) -> Vec<(NodeId, u64, Box<dyn weaver_graph::Object>)> {
         self.works.take_held()
@@ -306,7 +317,10 @@ impl GraphJob {
         limit: usize,
     ) -> Result<(), GraphError> {
         let mut said = Vec::new();
-        object.work(&mut said);
+        {
+            let _decoding = self.works.decoding();
+            object.work(&mut said);
+        }
         let said = super::engine::Said {
             scope: self.works.scope(),
             node,
@@ -458,6 +472,12 @@ impl GraphJob {
     #[cfg(test)]
     pub(crate) fn clock_held(&self) -> bool {
         self.writer.clock_held()
+    }
+
+    // Read the job's content policy if it is still unread, and judge the
+    // names that waited for it.
+    pub(crate) fn learn_policy(&mut self) -> Result<(), String> {
+        self.writer.learn_policy()
     }
 
     pub(crate) fn pending(&self) -> &Pending {
@@ -725,8 +745,9 @@ impl GraphJob {
         &mut self,
         volume: VolumeIndex,
         ordinal: u32,
+        limit: usize,
     ) -> Result<(), GraphError> {
-        self.unarrive(volume, ordinal)
+        self.unarrive(volume, ordinal, limit)
     }
 
     // The root waits on an arrived article again, and what its bytes
@@ -736,7 +757,12 @@ impl GraphJob {
     // it fed, is read back first, under those keys, and said again once it
     // is uncovered: it waits there for the keys the article's next copy
     // makes.
-    fn unarrive(&mut self, volume: VolumeIndex, ordinal: u32) -> Result<(), GraphError> {
+    fn unarrive(
+        &mut self,
+        volume: VolumeIndex,
+        ordinal: u32,
+        limit: usize,
+    ) -> Result<(), GraphError> {
         let range = self.root.map.arrived_range(volume, ordinal);
         let tail = match (range, self.tree.child_of(NodeId::ROOT, MemberId(volume.0))) {
             (Some(range), Some((child, bound))) => Some(self.writer.read_tail(
@@ -763,7 +789,55 @@ impl GraphJob {
             self.heard(out)?;
         }
         // Saying the tail again may make work due.
-        self.lend_work()
+        self.lend_work(limit)
+    }
+
+    // A piece of a recovery object's volume its rewalk could not read back
+    // from where it was put: what of the root's articles lies under it is
+    // fetched again, as a restore fetches an article not on disk, and its
+    // member waits on it again. The object hears the bytes as they come.
+    pub(super) fn unread(
+        &mut self,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: weaver_graph::ByteRange,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        let mut asks = Vec::new();
+        let mut recorder = Recorder {
+            asks: &mut asks,
+            bidder: node,
+            in_order: false,
+        };
+        self.tree.lift(
+            node,
+            Seek::recovery(volume, range, weaver_graph::Weight::FIRST),
+            &mut recorder,
+        );
+        let mut under = std::collections::BTreeSet::new();
+        for ask in asks {
+            let at = ask.seek.range;
+            under.extend(
+                self.root
+                    .map
+                    .arrived_ranges(ask.seek.volume)
+                    .into_iter()
+                    .filter(|(_, placed)| placed.start < at.end && at.start < placed.end)
+                    .map(|(ordinal, _)| (ask.seek.volume, ordinal)),
+            );
+        }
+        for (volume, ordinal) in under {
+            self.unarrive(volume, ordinal, limit)?;
+            if let Some(found) = self
+                .tree
+                .namespace_mut(NodeId::ROOT)
+                .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
+            {
+                found.closed = false;
+            }
+            self.notes.push(Note::Unread(volume, ordinal));
+        }
+        Ok(())
     }
 
     // The volume's articles the root holds intact, at the ranges they were
@@ -980,7 +1054,7 @@ impl GraphJob {
             self.lend(slots, limit)?;
         } else {
             // What the answers let an object hold may be due.
-            self.lend_work()?;
+            self.lend_work(limit)?;
         }
         Ok(self.root.map.take_moves())
     }

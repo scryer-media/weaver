@@ -16,6 +16,7 @@ use std::fmt;
 use tokio::sync::mpsc;
 use weaver_graph::{Emit, NodeId, Object};
 
+use super::super::decoding::{DecodeClock, Decoding};
 use super::super::engine::{Heard, Said};
 use super::super::hardware::Hardware;
 use super::super::namespace::{RewalkLoan, Rewalked};
@@ -35,10 +36,15 @@ pub(crate) struct Works {
     // recorded, the work is done on the loop, so the next step takes it.
     owed: bool,
     hardware: Hardware,
+    // Where a loan keeps the time its work spends executing.
+    clock: DecodeClock,
     // A test keeps every loan in hand, to send the job what it would hear
     // while the object is out, and hands each back when it chooses.
     #[cfg(test)]
     held: Option<Vec<HeldLoan>>,
+    // How many objects went out for their work.
+    #[cfg(test)]
+    lent: u64,
 }
 
 // A loan a test keeps in hand: its node, its number, and the object.
@@ -75,9 +81,23 @@ impl Works {
             rewalks: BTreeMap::new(),
             owed: false,
             hardware,
+            clock: DecodeClock::default(),
             #[cfg(test)]
             held: None,
+            #[cfg(test)]
+            lent: 0,
         }
+    }
+
+    // The loans, keeping the time their work executes on `clock`.
+    pub(crate) fn timed(mut self, clock: DecodeClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    // Work done where it stands, not lent, executes as a loan's does.
+    pub(crate) fn decoding(&self) -> Decoding {
+        self.clock.decoding()
     }
 
     #[cfg(test)]
@@ -89,6 +109,11 @@ impl Works {
     #[cfg(test)]
     pub(crate) fn take_held(&mut self) -> Vec<HeldLoan> {
         self.held.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lent(&self) -> u64 {
+        self.lent
     }
 
     #[cfg(test)]
@@ -199,16 +224,25 @@ impl Works {
         let (scope, serial) = (self.scope, self.serial);
         self.out.insert(node, serial);
         #[cfg(test)]
+        {
+            self.lent += 1;
+        }
+        #[cfg(test)]
         if let Some(held) = &mut self.held {
             held.push((node, serial, object));
             return;
         }
         let mail = self.mail.clone();
         let grant = self.hardware.grant();
+        let clock = self.clock.clone();
         tokio::task::spawn_blocking(move || {
             let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
             let mut said = Vec::new();
-            grant.install(|| object.work(&mut said));
+            // Executing once a thread of the pool takes it, until it is done.
+            grant.install(|| {
+                let _decoding = clock.decoding();
+                object.work(&mut said);
+            });
             // A closed channel means the pipeline is gone, and no one is
             // left to tell.
             let _ = mail.blocking_send(Said {

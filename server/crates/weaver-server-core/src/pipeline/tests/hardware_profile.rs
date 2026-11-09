@@ -90,6 +90,7 @@ fn assert_limits_of(pipeline: &Pipeline, profile: HardwareProfile) {
         lent(&grant.run),
         (
             Some(tuning.sevenz_decode_memory_bytes),
+            Some(tuning.decode_window_bytes),
             tuning.extract_threads,
             true
         )
@@ -238,9 +239,15 @@ async fn a_scheduled_profile_the_machine_cannot_honour_is_skipped() {
     assert_limits_of(&pipeline, HardwareProfile::Efficient);
 }
 
-// A run's grant as its memory, its threads, and whether the pool is lent.
-fn lent(budget: &Budget) -> (Option<u64>, usize, bool) {
-    (budget.memory_bytes, budget.threads, budget.pool.is_some())
+// A run's grant as its memory, its window, its threads, and whether the
+// pool is lent.
+fn lent(budget: &Budget) -> (Option<u64>, Option<u64>, usize, bool) {
+    (
+        budget.memory_bytes,
+        budget.window_bytes,
+        budget.threads,
+        budget.pool.is_some(),
+    )
 }
 
 fn pool_size(grant: &Grant) -> usize {
@@ -326,6 +333,7 @@ async fn a_profile_change_reaches_the_next_run_and_not_the_running_one() {
         lent(&first_budget),
         (
             Some(balanced.sevenz_decode_memory_bytes),
+            Some(balanced.decode_window_bytes),
             balanced.extract_threads,
             true
         )
@@ -334,6 +342,7 @@ async fn a_profile_change_reaches_the_next_run_and_not_the_running_one() {
         lent(&second_budget),
         (
             Some(efficient.sevenz_decode_memory_bytes),
+            Some(efficient.decode_window_bytes),
             efficient.extract_threads,
             true
         )
@@ -358,6 +367,7 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
         balanced.repair,
         Budget {
             memory_bytes: Some(1024 * 1024 * 1024),
+            window_bytes: None,
             threads: 6,
             pool: None,
         }
@@ -373,6 +383,7 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
         grant.repair,
         Budget {
             memory_bytes: Some(256 * 1024 * 1024),
+            window_bytes: None,
             threads: 4,
             pool: None,
         }

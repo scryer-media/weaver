@@ -128,6 +128,7 @@ fn each_profile_decides_its_own_limits() {
 
     let efficient = HardwareProfile::Efficient.tuning(&large);
     assert_eq!(efficient.sevenz_decode_memory_bytes, 512 * MIB);
+    assert_eq!(efficient.decode_window_bytes, 256 * MIB);
     assert_eq!(efficient.extraction_memory_bytes, 8 * GIB);
     assert_eq!(efficient.decode_threads, 2);
     assert_eq!(efficient.extract_threads, 4);
@@ -135,6 +136,7 @@ fn each_profile_decides_its_own_limits() {
 
     let balanced = HardwareProfile::Balanced.tuning(&large);
     assert_eq!(balanced.sevenz_decode_memory_bytes, GIB);
+    assert_eq!(balanced.decode_window_bytes, GIB);
     assert_eq!(balanced.extraction_memory_bytes, 16 * GIB);
     assert_eq!(balanced.decode_threads, 4);
     assert_eq!(balanced.extract_threads, 8);
@@ -142,6 +144,7 @@ fn each_profile_decides_its_own_limits() {
 
     let performance = HardwareProfile::Performance.tuning(&large);
     assert_eq!(performance.sevenz_decode_memory_bytes, 4 * GIB);
+    assert_eq!(performance.decode_window_bytes, 4 * GIB);
     assert_eq!(performance.extraction_memory_bytes, 16 * GIB);
     assert_eq!(performance.decode_threads, 16);
     assert_eq!(performance.extract_threads, 8);

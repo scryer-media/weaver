@@ -101,6 +101,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    scenario.built(&pipeline);
 
     let mut requests = BTreeMap::new();
     let mut order = Vec::new();
@@ -385,6 +386,7 @@ async fn restart_heard(
         })
         .await
         .unwrap();
+    scenario.built(&pipeline);
     assert!(
         !pipeline.blocked_restores.contains_key(&JOB),
         "a checkpointed graph job restores"
@@ -422,11 +424,13 @@ pub(in crate::pipeline::tests) fn assert_restarted(restarted: &Restarted, whole:
     );
 }
 
-pub(in crate::pipeline::tests) async fn restart_row(scenario: Scenario) {
+// The run with no restart is given back, for a row to ask more of it.
+pub(in crate::pipeline::tests) async fn restart_row(scenario: Scenario) -> Outcome {
     let whole = run(&scenario).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     let restarted = run_restarting(&scenario, &mut |_| {}).await;
     assert_restarted(&restarted, &whole);
+    whole
 }
 
 fn with_par2(mut posts: Vec<Post>, blocks: u32) -> Vec<Post> {

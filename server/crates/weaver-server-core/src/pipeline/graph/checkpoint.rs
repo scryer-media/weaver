@@ -906,6 +906,22 @@ impl Pipeline {
         {
             return;
         }
+        self.hold_graph_job_on_host_error(
+            job_id,
+            format!(
+                "Checkpoint could not be persisted: {error}. Resolve the storage error and resume to retry; files are retained."
+            ),
+        );
+    }
+
+    // The host failed the job a step it cannot go on without: the job
+    // pauses, keeping its files, with the reason the operator resolves
+    // before resuming it. A host error never fails a job.
+    pub(in crate::pipeline) fn hold_graph_job_on_host_error(
+        &mut self,
+        job_id: JobId,
+        reason: String,
+    ) {
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -921,9 +937,7 @@ impl Pipeline {
             );
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.failure_error = Some(format!(
-                "Checkpoint could not be persisted: {error}. Resolve the storage error and resume to retry; files are retained."
-            ));
+            state.failure_error = Some(reason);
         }
         self.report_job(job_id);
     }

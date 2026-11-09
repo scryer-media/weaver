@@ -98,6 +98,10 @@ pub type Sink<'a> = dyn FnMut(Emit) -> bool + 'a;
 #[derive(Clone, Default)]
 pub struct Budget {
     pub memory_bytes: Option<u64>,
+    // The largest window one decoder may hold in memory: an LZ dictionary,
+    // an xz or zstd window. A member that asks for more is refused. None
+    // leaves each decoder its own limit. Never more than `memory_bytes`.
+    pub window_bytes: Option<u64>,
     pub threads: usize,
     // The owner's threads, which work that spreads borrows instead of
     // starting its own, so the threads of every job together stay within
@@ -147,17 +151,19 @@ impl std::fmt::Debug for Budget {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Budget")
             .field("memory_bytes", &self.memory_bytes)
+            .field("window_bytes", &self.window_bytes)
             .field("threads", &self.threads)
             .field("pool", &self.pool.is_some())
             .finish()
     }
 }
 
-// Two grants are alike when they grant the same memory and threads on the
-// same pool.
+// Two grants are alike when they grant the same memory, window and threads
+// on the same pool.
 impl PartialEq for Budget {
     fn eq(&self, other: &Self) -> bool {
         self.memory_bytes == other.memory_bytes
+            && self.window_bytes == other.window_bytes
             && self.threads == other.threads
             && match (&self.pool, &other.pool) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -187,6 +193,15 @@ impl Budget {
     // allowance, when the owner granted none.
     pub fn memory_or(&self, own: u64) -> u64 {
         self.memory_bytes.unwrap_or(own)
+    }
+
+    // The window one decoder may hold: the grant, or `own`, the decoder's
+    // own limit, when the owner granted none; never more than the memory
+    // granted.
+    pub fn window_or(&self, own: u64) -> u64 {
+        self.window_bytes
+            .unwrap_or(own)
+            .min(self.memory_or(u64::MAX))
     }
 }
 

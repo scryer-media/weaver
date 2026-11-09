@@ -168,6 +168,60 @@ fn held_zipcrypto_ciphertext_waits_for_its_loan_and_survives_a_restart() {
     assert!(!owner.object.work_due());
 }
 
+// Eight articles of a stored entry, each arriving while the object is out
+// for none of them: every part waits behind the one before it, and the keys
+// run over them all on the pool.
+#[test]
+fn articles_in_order_wait_for_the_loan_and_are_deciphered_away_from_the_loop() {
+    let plain = payload(93, 240_017);
+    let archive = encrypted(&plain);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.lend_late = true;
+    offer(&mut owner, PASSWORD);
+    let length = archive.len() as u64;
+    let article = length.div_ceil(8);
+    for index in 0..8 {
+        let start = index * article;
+        owner.deliver(0, ByteRange::new(start, (start + article).min(length)));
+    }
+    let on_the_loop = owner.emitted;
+    assert!(owner.object.work_due());
+    owner.work();
+    let in_work = owner.emitted - on_the_loop;
+    owner.close(0);
+    assert!(owner.member("alpha.bin").bytes == plain);
+    assert!(owner.member("alpha.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert_eq!(
+        (on_the_loop, in_work),
+        (0, plain.len() as u64),
+        "said={:?}",
+        owner.said
+    );
+}
+
+// Facts holding ciphertext for a member the map does not give, or past its
+// entry's end, are facts no object could have written.
+#[test]
+fn held_ciphertext_outside_the_map_is_impossible() {
+    use weaver_graph::Durable;
+    let plain = payload(94, 120_007);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + super::super::crypto::HEADER;
+    let mut owner = Owner::single(Zip::new(), archive);
+    owner.lend_late = true;
+    offer(&mut owner, PASSWORD);
+    owner.arrive(0, ByteRange::new(0, start + 50_000));
+    assert!(owner.object.work_due());
+    assert_eq!(owner.object.impossible(), None);
+    owner.object.held[0].member = 7;
+    assert!(owner.object.impossible().is_some());
+    owner.object.held[0].member = 0;
+    assert_eq!(owner.object.impossible(), None);
+    owner.object.held[0].offset = plain.len() as u64;
+    assert!(owner.object.impossible().is_some());
+}
+
 #[test]
 fn a_part_that_cannot_wait_runs_what_its_member_holds_first() {
     let plain = payload(92, 210_007);

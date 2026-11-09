@@ -575,6 +575,12 @@ pub(in crate::pipeline::tests) struct Scenario {
     // The hold budgets every graph job of the pipeline shares, when not the
     // host's.
     pub(in crate::pipeline::tests) holds: Option<weaver_graph::holds::HoldBudgets>,
+    // How many of the pipelines the scenario prepares, the first that
+    // admits the job and then each that restores it, find the stored
+    // settings unreadable when they build the job; each reads them again
+    // once the job is built. `usize::MAX` never reads them.
+    policy_unread: usize,
+    prepared: std::sync::atomic::AtomicUsize,
     // The STAT server of every pipeline the scenario prepared, held as long
     // as the scenario is.
     stat_servers: std::sync::Mutex<Vec<Listener>>,
@@ -603,8 +609,40 @@ impl Scenario {
             limits: None,
             unacceptable: None,
             holds: None,
+            policy_unread: 0,
+            prepared: std::sync::atomic::AtomicUsize::new(0),
             stat_servers: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    // The first `pipelines` to build the job cannot read the stored
+    // settings: the document does not parse until the job is built.
+    pub(in crate::pipeline::tests) fn policy_unread(mut self, pipelines: usize) -> Self {
+        self.policy_unread = pipelines;
+        self
+    }
+
+    // The pipeline built the job: the settings read again, unless the
+    // scenario never lets them.
+    pub(in crate::pipeline::tests) fn built(&self, pipeline: &Pipeline) {
+        if self.policy_unread != usize::MAX {
+            self.store_policy(pipeline);
+        }
+    }
+
+    // The scenario's settings, stored as a save leaves them.
+    fn store_policy(&self, pipeline: &Pipeline) {
+        let settings = crate::post_processing::model::PostProcessingSettings {
+            unacceptable_extensions: self.unacceptable.clone().unwrap_or_default(),
+            ..Default::default()
+        };
+        pipeline
+            .db
+            .set_setting(
+                crate::post_processing::settings::SETTINGS_KEY,
+                &serde_json::to_string(&settings).unwrap(),
+            )
+            .unwrap();
     }
 
     // The job runs under these extraction limits.
@@ -646,6 +684,12 @@ impl Scenario {
                 .save_archive_password_settings(Some(self.global_passwords.clone()), None)
                 .unwrap();
         }
+        let prepared = self
+            .prepared
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.policy_unread > 0 {
+            self.store_policy(pipeline);
+        }
         if let Some(extensions) = &self.unacceptable {
             pipeline
                 .db
@@ -661,6 +705,12 @@ impl Scenario {
         if let Some(budgets) = self.holds {
             pipeline.graph_holds =
                 std::sync::Arc::new(weaver_graph::holds::HoldsAccountant::new(budgets));
+        }
+        if prepared < self.policy_unread {
+            pipeline
+                .db
+                .set_setting(crate::post_processing::settings::SETTINGS_KEY, "{unreadable")
+                .unwrap();
         }
     }
 
@@ -849,6 +899,9 @@ pub(in crate::pipeline::tests) struct GraphView {
     pub(in crate::pipeline::tests) rulings: Vec<(String, Option<RepairOutcome>)>,
     // The kind of every object the tree held at any look, by its name.
     pub(in crate::pipeline::tests) kinds: BTreeSet<String>,
+    // How many objects the job had sent out for their work, at the last
+    // look.
+    pub(in crate::pipeline::tests) loans: u64,
     // How many password candidates each node was offered, at the last look.
     pub(in crate::pipeline::tests) offered: BTreeMap<weaver_graph::NodeId, usize>,
     // The files the job hands over at every depth, by output name.
@@ -1040,6 +1093,7 @@ async fn try_run_then(
     after: impl AsyncFnOnce(&mut Pipeline, &Path),
 ) -> Result<Outcome, Stall> {
     let (_temp_dir, mut pipeline, complete_dir) = admit(scenario).await;
+    scenario.built(&pipeline);
     // Events the run sends are heard from admission on; nothing sent before
     // the job was admitted belongs to it.
     let (heard, kept) = hear(pipeline.event_tx.subscribe());
@@ -1609,6 +1663,7 @@ pub(in crate::pipeline::tests) fn observe(
         }
         view.report = Some(report);
     }
+    view.loans = view.loans.max(job.loans_lent());
     let tree = job.tree();
     if let Some(namespace) = tree.namespace(weaver_graph::NodeId::ROOT) {
         let sets = tree.recovery_nodes(weaver_graph::NodeId::ROOT);

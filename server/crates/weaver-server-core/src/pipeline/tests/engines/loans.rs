@@ -167,7 +167,22 @@ fn scenario(kind: Kind, shape: Shape, order: Order) -> Scenario {
     ordered(scenario, order)
 }
 
-fn assert_delivered(outcome: &Outcome) {
+// Where the member's work was done: an AES zip entry is refused by the store
+// and its key is derived and its bytes deciphered by an engine run, which
+// lends nothing; every other kind lends its work out.
+fn assert_worked(kind: Kind, outcome: &Outcome) {
+    let graph = outcome.graph();
+    match kind {
+        Kind::ZipAes => {
+            assert!(graph.kinds.contains("zip_engine"), "{:?}", graph.kinds);
+            assert_eq!(graph.loans, 0, "a loan went out");
+        }
+        _ => assert!(graph.loans > 0, "a loan went out"),
+    }
+}
+
+fn assert_delivered(kind: Kind, outcome: &Outcome) {
+    assert_worked(kind, outcome);
     assert!(
         outcome.completed(),
         "{:?} {:?}",
@@ -187,7 +202,7 @@ fn assert_delivered(outcome: &Outcome) {
 }
 
 async fn delivers(kind: Kind, shape: Shape, order: Order) {
-    assert_delivered(&run(&scenario(kind, shape, order)).await);
+    assert_delivered(kind, &run(&scenario(kind, shape, order)).await);
 }
 
 // One article of the first post damaged beside a PAR2 set over every post:
@@ -209,13 +224,60 @@ async fn repaired(kind: Kind, shape: Shape, order: Order) {
         .framed(FRAME)
         .password(SECRET)
         .damaged(0, middle);
-    assert_delivered(&run(&ordered(scenario, order)).await);
+    assert_delivered(kind, &run(&ordered(scenario, order)).await);
+}
+
+// One article of the first post damaged and nothing to rebuild it: it is
+// sent back while the work is out or due, its server has no other copy, and
+// the one member is short. No usable file came whole, so the job fails.
+async fn lost(kind: Kind, shape: Shape, order: Order) {
+    let middle = posts(kind, shape, &body())[0].articles(FRAME).count() as u32 / 2;
+    let outcome = run(&scenario(kind, shape, order).damaged(0, middle)).await;
+    assert_worked(kind, &outcome);
+    assert!(
+        matches!(outcome.status, Some(crate::JobStatus::Failed { .. })),
+        "{:?} {:?}",
+        outcome.status,
+        outcome.files.keys().collect::<Vec<_>>()
+    );
 }
 
 // Restarted after every article served: a loan out or due when the
 // pipeline goes down is found again on restore.
 async fn restarted(kind: Kind, shape: Shape) {
-    restart_row(scenario(kind, shape, Order::Forwards)).await;
+    let whole = restart_row(scenario(kind, shape, Order::Forwards)).await;
+    assert_worked(kind, &whole);
+}
+
+// A ZipCrypto member's keys never run on the loop, which runs on the test's
+// thread: every byte of its ciphertext is deciphered once, on a loan.
+async fn deciphered_on_loans(kind: Kind, order: Order) {
+    use weaver_objects::zip::counting;
+    let outcome = run(&scenario(kind, Shape::Flat, order)).await;
+    assert_delivered(kind, &outcome);
+    assert!(counting::delivered_here() > 0, "the loop delivered here");
+    assert_eq!(counting::deciphered_here(), 0, "deciphered on the loop");
+    assert_eq!(counting::deciphered_everywhere(), BODY as u64);
+}
+
+#[tokio::test]
+async fn zipcrypto_sized_tail_first_deciphers_on_loans() {
+    deciphered_on_loans(Kind::ZipCryptoSized, Order::TailFirst).await
+}
+
+#[tokio::test]
+async fn zipcrypto_sized_backwards_deciphers_on_loans() {
+    deciphered_on_loans(Kind::ZipCryptoSized, Order::Backwards).await
+}
+
+#[tokio::test]
+async fn zipcrypto_descriptor_in_order_deciphers_on_loans() {
+    deciphered_on_loans(Kind::ZipCryptoDescriptor, Order::Forwards).await
+}
+
+#[tokio::test]
+async fn zipcrypto_descriptor_leased_deciphers_on_loans() {
+    deciphered_on_loans(Kind::ZipCryptoDescriptor, Order::Leased).await
 }
 
 macro_rules! delivery_rows {
@@ -237,6 +299,10 @@ macro_rules! delivery_rows {
                 async fn repaired_backwards() { repaired(Kind::$kind, Shape::Flat, Order::Backwards).await }
                 #[tokio::test]
                 async fn restarted_after_every_article() { restarted(Kind::$kind, Shape::Flat).await }
+                #[tokio::test]
+                async fn lost_in_order() { lost(Kind::$kind, Shape::Flat, Order::Forwards).await }
+                #[tokio::test]
+                async fn lost_backwards() { lost(Kind::$kind, Shape::Flat, Order::Backwards).await }
             }
             mod $nested {
                 use super::*;
@@ -254,6 +320,8 @@ macro_rules! delivery_rows {
                 async fn repaired_backwards() { repaired(Kind::$kind, Shape::Nested, Order::Backwards).await }
                 #[tokio::test]
                 async fn restarted_after_every_article() { restarted(Kind::$kind, Shape::Nested).await }
+                #[tokio::test]
+                async fn lost_in_order() { lost(Kind::$kind, Shape::Nested, Order::Forwards).await }
             }
         )*
     };

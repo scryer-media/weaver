@@ -5,6 +5,7 @@
 // root, the tree and the namespace writer to its files.
 
 pub(crate) mod checkpoint;
+pub(crate) mod decoding;
 pub(crate) mod engine;
 pub(crate) mod envelope;
 pub(crate) mod hardware;

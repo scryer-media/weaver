@@ -740,13 +740,17 @@ impl Object for SevenZipStore {
         // signature names the end header, the end header names its packs.
         loop {
             let generation = self.kept.generation();
-            if self
-                .kept
-                .absorb(range, bytes, delivery.provenance)
-                .is_some()
-            {
+            if let Some(at) = self.kept.absorb(range, bytes, delivery.provenance) {
                 self.stale = true;
                 self.rebuild_if_changed(range);
+                // A candidate the proof ruled wrong was wrong for the bytes
+                // it read: bytes of the proof that came again are tried
+                // under every candidate again.
+                if proof.is_some_and(|proof| proof.intersect(ByteRange::new(at, range.end)).is_some()) {
+                    for candidate in &mut self.candidates {
+                        candidate.folder_wrong = false;
+                    }
+                }
             }
             self.settle(out);
             if self.gone {

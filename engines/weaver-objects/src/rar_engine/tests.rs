@@ -1091,6 +1091,7 @@ fn on_budget(volumes: Vec<Vec<u8>>, memory_bytes: Option<u64>, threads: usize) -
         &mut sink,
         weaver_graph::Budget {
             memory_bytes,
+            window_bytes: None,
             threads,
             pool: Some(Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>),
         },
@@ -1128,6 +1129,87 @@ fn a_compressed_member_larger_than_the_run_memory_budget_is_refused() {
             .iter()
             .any(|said| matches!(said, Said::Bytes(_, _)))
     );
+}
+
+const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
+
+// A run as each hardware profile grants it: its memory and the window one
+// decoder may hold, Efficient, Balanced and Performance in turn.
+fn profiles() -> [weaver_graph::Budget; 3] {
+    [(512 * MIB, 256 * MIB), (GIB, GIB), (4 * GIB, 4 * GIB)].map(|(memory, window)| {
+        weaver_graph::Budget {
+            memory_bytes: Some(memory),
+            window_bytes: Some(window),
+            threads: 1,
+            ..Default::default()
+        }
+    })
+}
+
+// The dictionary limit is the window the profile grants. A RAR3 PPMd arena
+// keeps the format's 256 MiB ceiling on every profile. A run granted no
+// window keeps the decoder's own 256 MiB, narrowed by the memory granted.
+#[test]
+fn each_profiles_window_is_the_rar_dictionary_limit() {
+    let [efficient, balanced, performance] = profiles().map(|budget| run::limits(&budget));
+    assert_eq!(efficient.max_dict_size, 256 * MIB);
+    assert_eq!(balanced.max_dict_size, GIB);
+    assert_eq!(performance.max_dict_size, 4 * GIB);
+    for limits in [&efficient, &balanced, &performance] {
+        assert_eq!(limits.max_ppmd_arena_size, 256 * MIB);
+    }
+    let own = run::limits(&weaver_graph::Budget::default());
+    assert_eq!(own.max_dict_size, 256 * MIB);
+    let narrow = run::limits(&weaver_graph::Budget {
+        memory_bytes: Some(64 * MIB),
+        window_bytes: Some(GIB),
+        ..Default::default()
+    });
+    assert_eq!(narrow.max_dict_size, 64 * MIB);
+    assert_eq!(narrow.max_ppmd_arena_size, 64 * MIB);
+}
+
+// A compressed member whose header names a 1 GiB dictionary: RAR5 method 1,
+// dictionary 128 KiB << 13. Its data is never decoded.
+fn one_gib_dictionary() -> Vec<u8> {
+    [
+        rar5::start(None),
+        rar5::file_as("wide.bin", 0, &[0; 64], MIB, None, (1 << 7) | (13 << 10)),
+        rar5::end(false),
+    ]
+    .concat()
+}
+
+// The header's dictionary fits the Balanced and Performance limits and not
+// the Efficient one, and an Efficient run refuses the member before it
+// holds any window.
+#[test]
+fn a_one_gib_rar_dictionary_is_refused_only_under_efficient() {
+    let archive = unrar_rs::RarArchive::open_prefix(
+        io::Cursor::new(one_gib_dictionary()),
+        None,
+        NonZeroUsize::MIN,
+    )
+    .unwrap();
+    let dictionary = archive.member_info(0).unwrap().compression.dict_size;
+    assert_eq!(dictionary, GIB);
+    let fits = profiles().map(|budget| dictionary <= run::limits(&budget).max_dict_size);
+    assert_eq!(fits, [false, true, true]);
+
+    let [efficient, ..] = profiles();
+    let mut emits = Vec::new();
+    RarEngine::new().start().run(
+        Gate::whole(vec![one_gib_dictionary()]) as Arc<dyn Volumes>,
+        &mut |emit| {
+            emits.push(emit);
+            true
+        },
+        efficient,
+    );
+    let said = said(&emits);
+    assert!(said.contains(&Said::Refuse(Why::Unsupported)), "{said:?}");
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(_, _))));
 }
 
 #[test]
@@ -1263,6 +1345,7 @@ fn a_volume_whose_bytes_are_not_all_in_decodes_one_by_one() {
         &mut sink,
         weaver_graph::Budget {
             memory_bytes: None,
+            window_bytes: None,
             threads: 4,
             pool: Some(Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>),
         },
@@ -1537,6 +1620,7 @@ fn arriving_on(
                 &mut sink,
                 weaver_graph::Budget {
                     memory_bytes: None,
+                    window_bytes: None,
                     threads,
                     pool: Some(pool),
                 },
@@ -1699,6 +1783,7 @@ fn a_run_stopped_while_files_decode_beside_it_joins_them_and_the_next_says_all()
                 &mut sink,
                 weaver_graph::Budget {
                     memory_bytes: None,
+                    window_bytes: None,
                     threads: 4,
                     pool: Some(Arc::clone(&held) as Arc<dyn weaver_graph::Pool>),
                 },
@@ -1786,6 +1871,7 @@ fn arrived(
         &mut sink,
         weaver_graph::Budget {
             memory_bytes: None,
+            window_bytes: None,
             threads,
             pool: Some(lent as Arc<dyn weaver_graph::Pool>),
         },

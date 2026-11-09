@@ -219,10 +219,12 @@ impl Pipeline {
     // by its neighbours, is sent back to the root for another copy.
     pub(in crate::pipeline) fn graph_article_sent_back(&mut self, segment_id: SegmentId) {
         let job_id = segment_id.file_id.job_id;
+        let limit = self.graph_job_slot_limit(job_id);
         if let Some(graph) = self.graph_jobs.get_mut(&job_id)
             && let Err(error) = graph.send_back(
                 VolumeIndex(segment_id.file_id.file_index),
                 segment_id.segment_number,
+                limit,
             )
         {
             self.after_graph_result(job_id, Err(error));
@@ -522,10 +524,13 @@ impl Pipeline {
         if limit == 0 {
             return;
         }
+        // What the lend did on the loop and could not write fails the job,
+        // as a step's error does.
         if let Some(graph) = self.graph_jobs.get_mut(&job_id)
             && let Err(error) = graph.lend(&mut self.graph_status.repairs, limit)
         {
-            warn!(job_id = job_id.0, error = %error, "graph repair lending failed");
+            self.after_graph_result(job_id, Err(error));
+            return;
         }
         self.wake_repair_waiters();
     }

@@ -1540,8 +1540,9 @@ impl Pipeline {
 
     // Queue a segment again exactly as first dispatched: full retry budget,
     // no excluded server. Used where an article has to come back for an
-    // ordering reason rather than because anything was wrong with it.
-    fn push_requeued_segment(&mut self, segment_id: SegmentId) -> bool {
+    // ordering reason, or because its bytes are no longer where they were
+    // put, rather than because anything was wrong with what was served.
+    pub(in crate::pipeline) fn push_requeued_segment(&mut self, segment_id: SegmentId) -> bool {
         let job_id = segment_id.file_id.job_id;
         let Some(work) = self.download_retry_work(segment_id, 0, Vec::new()) else {
             return false;

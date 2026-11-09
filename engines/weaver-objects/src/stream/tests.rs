@@ -485,7 +485,8 @@ fn each_stream_reserves_the_window_its_first_bytes_declare() {
     // 1 MiB is dictionary property 16, 4 MiB property 20.
     assert_eq!(reserve::<Xz>(&xz_at(&plain, 1 << 20)), lzma2(16));
     assert_eq!(reserve::<Xz>(&xz_at(&plain, 4 << 20)), lzma2(20));
-    // A zstd frame reserves the decoder's own limit, whatever it declares.
+    // A zstd frame no wider than the decoder's own limit reserves that
+    // limit, so a wider frame after it still fits.
     assert_eq!(reserve::<Zstd>(&zstd_at(&plain, 20)), 1 << 27);
     assert_eq!(reserve::<Zstd>(&zstd_at(&plain, 23)), 1 << 27);
     assert_eq!(reserve::<Brotli>(&brotli_at(&plain, 18)), 1 << 18);
@@ -522,6 +523,107 @@ fn a_zstd_frame_wider_than_the_decoders_limit_is_refused() {
         decoded("a", b"z".to_vec())
     );
     refused(&whole(&mut stream, zstd_window(28)));
+}
+
+const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
+
+// A run as each hardware profile grants it: its memory and the window one
+// decoder may hold, Efficient, Balanced and Performance in turn.
+fn profiles() -> [weaver_graph::Budget; 3] {
+    [(512 * MIB, 256 * MIB), (GIB, GIB), (4 * GIB, 4 * GIB)].map(|(memory, window)| {
+        weaver_graph::Budget {
+            memory_bytes: Some(memory),
+            window_bytes: Some(window),
+            threads: 1,
+            ..Default::default()
+        }
+    })
+}
+
+// An xz stream whose first block names dictionary property `property`.
+// Only the header says so: the block was written with a 1 MiB dictionary.
+fn xz_declaring(property: u8) -> Vec<u8> {
+    let mut bytes = xz_at(&first_payload(), 1 << 20);
+    let end = 12 + (usize::from(bytes[12]) + 1) * 4;
+    let at = 12 + bytes[12..end]
+        .windows(3)
+        .position(|filter| filter == [0x21, 0x01, 16])
+        .unwrap()
+        + 2;
+    bytes[at] = property;
+    let check = crate::grid::crc32(&bytes[12..end - 4]);
+    bytes[end - 4..end].copy_from_slice(&check.to_le_bytes());
+    bytes
+}
+
+// The xz decoder holds its limit against a block's dictionary. A 1 GiB
+// dictionary, property 36, fits the window Balanced and Performance hand
+// the decoder and not Efficient's 256 MiB. A stream whose front says
+// nothing reserves the decoder's own 128 MiB, never the whole grant.
+#[test]
+fn each_profiles_window_reaches_the_xz_decoder() {
+    let declared = xz_declaring(36);
+    let [efficient, balanced, performance] = profiles();
+    assert_eq!(Xz::window(&declared, &efficient), 256 * MIB);
+    assert_eq!(Xz::window(&declared, &balanced), GIB);
+    assert_eq!(Xz::window(&declared, &performance), {
+        lzma_turbo::Lzma2Reader::<io::Empty>::memory_required(36).unwrap()
+    });
+    let fits = profiles().map(|budget| Xz::window(&declared, &budget) >= GIB);
+    assert_eq!(fits, [false, true, true]);
+    for budget in profiles() {
+        assert_eq!(Xz::window(&[], &budget), 128 * MIB);
+    }
+}
+
+// A zstd frame header naming a window of 1 << log, with no content size, so
+// nothing but the window says how much its decoder must hold.
+fn zstd_header(log: u8) -> Vec<u8> {
+    vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, (log - 10) << 3]
+}
+
+// The window a zstd decoder is held to is the profile's, up to libzstd's
+// own 2 GiB: a 1 GiB window fits Balanced and Performance and not
+// Efficient. A frame at or below the decoder's own 128 MiB reserves that.
+#[test]
+fn each_profiles_window_reaches_the_zstd_decoder() {
+    let window = |log, budget: &weaver_graph::Budget| Zstd::window(&zstd_header(log), budget);
+    let [efficient, balanced, performance] = profiles();
+    assert_eq!(window(30, &efficient), 256 * MIB);
+    assert_eq!(window(30, &balanced), GIB);
+    assert_eq!(window(30, &performance), GIB);
+    let fits = profiles().map(|budget| window(30, &budget) >= GIB);
+    assert_eq!(fits, [false, true, true]);
+    assert_eq!(window(31, &performance), 2 * GIB);
+    for budget in profiles() {
+        assert_eq!(Zstd::window(&[], &budget), 128 * MIB);
+    }
+    assert_eq!(window(20, &performance), 128 * MIB);
+    assert_eq!(window(28, &balanced), 256 * MIB);
+}
+
+// The grant's window is the one libzstd holds the decoder to: a frame that
+// fits it decodes, one a step wider is refused before its window is held.
+// Under Efficient a 512 MiB window is refused.
+#[test]
+fn a_zstd_frame_wider_than_the_granted_window_is_refused() {
+    let granted = weaver_graph::Budget {
+        memory_bytes: Some(GIB),
+        window_bytes: Some(MIB),
+        threads: 1,
+        ..Default::default()
+    };
+    let mut narrow = stream::<Zstd>("a.zst").within(granted);
+    assert_eq!(
+        whole(&mut narrow, zstd_window(20)),
+        decoded("a", b"z".to_vec())
+    );
+    refused(&whole(&mut narrow, zstd_window(21)));
+
+    let [efficient, ..] = profiles();
+    let mut held = stream::<Zstd>("a.zst").within(efficient);
+    refused(&whole(&mut held, zstd_window(29)));
 }
 
 #[test]
@@ -740,8 +842,8 @@ fn a_closed_multiblock_xz_decodes_its_blocks_side_by_side_within_the_budget() {
 
 // A run granted less than the 128 MiB an xz decoder may hold sizes its
 // window to the grant, whether the first bytes declare more or say nothing
-// yet; one granted more still holds to the 128 MiB. A dictionary the grant
-// cannot hold is refused rather than decoded past it.
+// yet; one granted more and no window still holds to the 128 MiB. A
+// dictionary the grant cannot hold is refused rather than decoded past it.
 #[test]
 fn an_xz_window_is_no_larger_than_the_memory_granted() {
     let window = |bytes: &[u8], granted: u64| Xz::window(bytes, &budget(granted, 1));

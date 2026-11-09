@@ -23,8 +23,8 @@ type Read<'a> = &'a mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Held {
-    member: u32,
-    offset: u64,
+    pub(super) member: u32,
+    pub(super) offset: u64,
     bytes: Vec<u8>,
     provenance: Provenance,
 }
@@ -32,8 +32,10 @@ pub(super) struct Held {
 impl Zip {
     // Hold the part of `member` at `offset` when its keys can run over it
     // with nothing read: they are open and proved, no replay waits, nothing
-    // of it was said, no kept bytes stand at it, and it starts where the
-    // keys, or the member's last held part, reach.
+    // of it was said, and it starts where the keys, or the member's last
+    // held part, reach. Kept bytes where the keys reach are said from what
+    // was kept, ahead of anything held; kept bytes past it, under a part
+    // held behind another, are said once what is held is.
     pub(super) fn hold(
         &mut self,
         member: MemberId,
@@ -66,7 +68,7 @@ impl Zip {
                 .overlapping(ByteRange::at(offset, len))
                 .next()
                 .is_some()
-            || !self.kept.from(data + offset).is_empty()
+            || !self.kept.from(data + open.reaches()).is_empty()
         {
             return false;
         }
@@ -77,6 +79,21 @@ impl Zip {
             provenance,
         });
         true
+    }
+
+    // Whether each part held is of a member the map gives, inside its
+    // entry.
+    pub(super) fn held_sound(&self) -> bool {
+        self.held.iter().all(|held| {
+            self.map
+                .as_ref()
+                .and_then(|map| map.entry(MemberId(held.member)))
+                .is_some_and(|entry| {
+                    held.offset
+                        .checked_add(held.bytes.len() as u64)
+                        .is_some_and(|end| end <= entry.length)
+                })
+        })
     }
 
     pub(super) fn holding(&self, member: MemberId) -> bool {

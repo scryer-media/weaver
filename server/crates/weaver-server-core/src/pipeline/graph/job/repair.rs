@@ -33,16 +33,19 @@ impl GraphJob {
     // the step started: a namespace one of them is about to read may still
     // announce members, and no set over it is due yet. Work goes first, as
     // the walk waits for it, and again after, for what the walk's rulings
-    // made due.
+    // made due. Under no slot, as for a job paused, held or retiring,
+    // nothing goes out and no work is done: the job lends once it runs.
     pub(crate) fn lend(&mut self, slots: &mut RepairSlots, limit: usize) -> Result<(), GraphError> {
-        self.lend_rewalks()?;
-        self.lend_work()?;
+        if limit > 0 {
+            self.lend_rewalks()?;
+        }
+        self.lend_work(limit)?;
         let walked = self.walk(Some((&mut *slots, limit)));
         if let Some(ticket) = self.loans.give_back() {
             slots.release(ticket);
         }
         walked?;
-        self.lend_work()
+        self.lend_work(limit)
     }
 
     // Lend out every object that holds work too slow for the loop. Once
@@ -55,10 +58,11 @@ impl GraphJob {
     // slot, so the gate lends it too before it rules. While a repair, a
     // replay or a check is out, no object goes out for its work: what that
     // loan comes to is read back through the objects its set covers, so
-    // they stay home until it returns, and its return lends them.
-    pub(crate) fn lend_work(&mut self) -> Result<(), GraphError> {
+    // they stay home until it returns, and its return lends them. Under no
+    // slot nothing is lent or done.
+    pub(crate) fn lend_work(&mut self, limit: usize) -> Result<(), GraphError> {
         let admit = self.works.admit();
-        if admit && self.loans.out() {
+        if limit == 0 || (admit && self.loans.out()) {
             return Ok(());
         }
         loop {
@@ -72,7 +76,10 @@ impl GraphJob {
                     continue;
                 }
                 let mut said = Vec::new();
-                object.work(&mut said);
+                {
+                    let _decoding = self.works.decoding();
+                    object.work(&mut said);
+                }
                 moved |= !said.is_empty();
                 let mut effects = Vec::new();
                 self.tree.take_back_worked(
