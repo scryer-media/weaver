@@ -207,6 +207,7 @@ fn full() -> Snapshot {
                     range: ByteRange::new(0, 64),
                     scratch_offset: 128,
                 },
+                on_file: false,
             },
             HoldRecord {
                 node: NodeId(1),
@@ -215,14 +216,16 @@ fn full() -> Snapshot {
                     range: ByteRange::new(20, 300),
                     scratch_offset: 0,
                 },
+                on_file: false,
             },
             HoldRecord {
                 node: NodeId(1),
                 held: ScratchHold {
                     volume: VolumeIndex(0),
                     range: ByteRange::new(400, 410),
-                    scratch_offset: 280,
+                    scratch_offset: 400,
                 },
+                on_file: true,
             },
         ],
         passwords: BTreeMap::from([(NodeId(1), 2)]),
@@ -415,11 +418,11 @@ fn rows(taken: &Snapshot) -> GraphCheckpoint {
         out.coverage.extend(rows.coverage);
         out.crypt.extend(rows.crypt);
         out.parts.extend(rows.parts);
-        let holds: Vec<ScratchHold> = taken
+        let holds: Vec<(ScratchHold, bool)> = taken
             .holds
             .iter()
             .filter(|record| record.node == node.node)
-            .map(|record| record.held)
+            .map(|record| (record.held, record.on_file))
             .collect();
         out.holds.extend(hold_rows(node.node, &holds));
     }
@@ -490,7 +493,10 @@ fn hold_rows_come_back_as_the_holds_a_restore_adopts() {
     let taken = full();
     let rows = rows(&taken);
     assert_eq!(rows.holds.len(), 3);
-    assert_eq!(rows.holds[2].scratch_offset, 280);
+    assert_eq!(rows.holds[1].scratch_offset, 0);
+    // A hold in its member's spill file lies at its own offset.
+    assert!(rows.holds[2].on_file);
+    assert_eq!(rows.holds[2].scratch_offset, 400);
     assert_eq!(snapshot(&rows).map(|back| back.holds), Ok(taken.holds));
     // A change to one hold rewrites that row alone.
     let mut moved = rows.clone();
@@ -526,6 +532,7 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
         format!("{INTERNAL_DIR}/graph-envelope-1-1-1"),
         format!("{INTERNAL_DIR}/graph-holds-0.scratch"),
         format!("{INTERNAL_DIR}/graph-holds-1.scratch"),
+        format!("{INTERNAL_DIR}/graph-spill-1-0.spill"),
         format!("{INTERNAL_DIR}/graph-waiting-0-1"),
         format!("{INTERNAL_DIR}/held-0-1.uu"),
         crate::jobs::working_dir::WORKING_DIR_MARKER.to_owned(),
@@ -534,6 +541,7 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
     let unnamed = [
         format!("{INTERNAL_DIR}/graph-envelope-1-2"),
         format!("{INTERNAL_DIR}/graph-holds-2.scratch"),
+        format!("{INTERNAL_DIR}/graph-spill-1-1.spill"),
         format!("{INTERNAL_DIR}/graph-recovery-0-3.repaired"),
         format!("{INTERNAL_DIR}/graph-recovery-0-3/set.par2"),
         format!("{INTERNAL_DIR}/graph-waiting-0-2"),

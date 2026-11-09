@@ -968,3 +968,20 @@ checksum_algo = "blake3"
 kind = "sql"
 file = "migrations/0079_graph_member_refuted/schema.sql"
 scope = "all"
+
+[[migration]]
+version = 80
+description = "a graph checkpoint keeps which holds lie in their member's spill file"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0080_graph_holds_on_file/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0080_graph_holds_on_file/postgres.sql"
+engine = "postgres"
+scope = "all"

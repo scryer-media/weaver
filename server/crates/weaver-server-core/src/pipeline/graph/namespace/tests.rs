@@ -28,6 +28,8 @@ thread_local! {
     pub(super) static RELEASE_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // How many held ranges a pass asked their object to place.
     pub(crate) static RELEASE_LOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // The most bytes one read took back from a spill file.
+    pub(super) static SPILL_READ_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_DELIVERIES: std::cell::RefCell<Option<Vec<(ByteRange, Provenance)>>> = const { std::cell::RefCell::new(None) };
     // Each delivery the pretend 7z store heard, with the CRC32 its bytes
     // came proven by, when every byte of them was.
@@ -633,6 +635,13 @@ impl Job {
         }
     }
 
+    // Where the member's bytes past the holds budgets lie.
+    fn spill(&self, member: MemberId) -> std::path::PathBuf {
+        self.dir
+            .path()
+            .join(super::spill_name(NodeId::ROOT, member))
+    }
+
     fn file(&self, name: &str) -> Vec<u8> {
         std::fs::read(self.dir.path().join(name)).expect("leaf file")
     }
@@ -752,10 +761,11 @@ fn routed_deliveries_reuse_the_writer_s_effect_room() {
     assert_eq!(job.file("notes.bin"), b"Raws, world");
 }
 
-// Members nothing held, each refused for breaching the holds, are one
-// archive given up on in their namespace: one event.
+// Members whose holds run past every budget are given up by none of them:
+// each stays undecided, its bytes held in its spill file, and nothing is
+// refused or given back.
 #[test]
-fn members_nothing_held_breaching_the_holds_are_one_event() {
+fn members_past_the_holds_are_held_and_given_up_by_none() {
     let mut job = Job::new(HoldBudgets {
         resident_limit: 4,
         scratch_total: 0,
@@ -767,47 +777,56 @@ fn members_nothing_held_breaching_the_holds_are_one_event() {
     for member in [first, second] {
         job.send(member, 0, b"Ra", Provenance::Fresh);
         job.send(member, 10, b"tail..", Provenance::Fresh);
-        assert_eq!(
-            job.writer.refused(NodeId::ROOT, member),
-            Some(Why::HoldsBreached)
-        );
+        assert_eq!(job.writer.refused(NodeId::ROOT, member), None);
+        assert!(job.tree.is_undecided(NodeId::ROOT, member));
+        assert!(job.spill(member).is_file());
     }
-    assert_eq!(
-        job.writer.take_given_back(),
-        [super::GivenBack {
-            member: "pack.r00".to_string(),
-            container: String::new(),
-            why: Why::HoldsBreached,
-        }]
+    assert!(job.writer.take_given_back().is_empty());
+    assert!(
+        !job.out
+            .iter()
+            .any(|effect| matches!(effect, Effect::Refused { .. }))
     );
 }
 
+// An undecided member whose bytes spill before its first article comes
+// gets every byte back, at its offset, once it is decided: the file is
+// byte-identical, the spill file is let go, and no budget counted it.
 #[test]
-fn a_breach_refuses_the_member_to_a_leaf_which_receives_every_byte() {
+fn an_undecided_member_spilled_before_its_first_article_is_byte_identical() {
     let mut job = Job::new(HoldBudgets {
-        resident_limit: 4,
+        resident_limit: 0,
         scratch_total: 0,
         scratch_ceiling: 0,
         disk_reserve: 0,
     });
     let member = job.member("notes.bin", None);
-    job.send(member, 0, b"Ra", Provenance::Fresh);
     job.send(member, 10, b"tail..", Provenance::Fresh);
-    assert_eq!(
-        job.writer.refused(NodeId::ROOT, member),
-        Some(Why::HoldsBreached)
-    );
-    assert!(job.out.contains(&Effect::Refused {
-        node: NodeId::ROOT,
-        member,
-        why: Why::HoldsBreached,
-    }));
+    assert!(job.spill(member).is_file());
     assert_eq!(job.accountant.usage().resident, 0);
-
-    // Decided now: the rest goes straight to the file.
+    assert_eq!(job.accountant.usage().scratch, 0);
     job.send(member, 2, b"r! mid.", Provenance::Fresh);
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    assert_eq!(job.writer.refused(NodeId::ROOT, member), None);
     job.close(member);
     assert_eq!(job.file("notes.bin"), b"Rar! mid.\0tail..");
+    assert_eq!(job.writer.refused(NodeId::ROOT, member), None);
+    // Nothing is held. The spill file keeps its bytes until a checkpoint
+    // taken since commits, which names none of them, and is emptied then;
+    // it stays the member's until its namespace goes.
+    assert_eq!(job.writer.files[&NodeId::ROOT].holds.total_held(), 0);
+    assert_eq!(std::fs::metadata(job.spill(member)).expect("spill").len(), 16);
+    commit_checkpoint(&mut job);
+    assert_eq!(std::fs::metadata(job.spill(member)).expect("spill").len(), 0);
+}
+
+// A checkpoint is taken of the job as it stands, and commits.
+fn commit_checkpoint(job: &mut Job) {
+    let stamp = job.writer.committed + 1;
+    job.writer.recorded(stamp);
+    job.writer
+        .commit_moves(&mut job.tree, stamp)
+        .expect("commit");
 }
 
 #[test]
@@ -862,9 +881,10 @@ fn holds_paged_out_at_a_stop_read_back_in_a_writer_rebuilt_from_their_records() 
         .writer
         .hold_records(NodeId::ROOT)
         .into_iter()
-        .map(|held| HoldRecord {
+        .map(|(held, on_file)| HoldRecord {
             node: NodeId::ROOT,
             held,
+            on_file,
         })
         .collect();
     assert_eq!(records.len(), 2);
@@ -920,6 +940,7 @@ fn a_hold_record_past_its_scratch_file_is_not_adopted() {
             range: ByteRange::new(6, 11),
             scratch_offset: 0,
         },
+        on_file: false,
     }];
     job.writer
         .restore_holds(&job.tree, &records)
@@ -932,6 +953,752 @@ fn a_hold_record_past_its_scratch_file_is_not_adopted() {
         ByteRange::new(6, 11),
         &mut bytes
     ));
+}
+
+// Each budget a hold can run past. Memory past its limit pages to scratch;
+// scratch past any of its budgets spills to the member's file.
+const PAST: [(&str, HoldBudgets); 4] = [
+    (
+        "resident_limit",
+        HoldBudgets {
+            resident_limit: 0,
+            ..PLENTY
+        },
+    ),
+    (
+        "scratch_total",
+        HoldBudgets {
+            resident_limit: 0,
+            scratch_total: 0,
+            ..PLENTY
+        },
+    ),
+    (
+        "scratch_ceiling",
+        HoldBudgets {
+            resident_limit: 0,
+            scratch_ceiling: 0,
+            ..PLENTY
+        },
+    ),
+    (
+        "disk_reserve",
+        HoldBudgets {
+            resident_limit: 0,
+            disk_reserve: u64::MAX,
+            ..PLENTY
+        },
+    ),
+];
+
+// Nothing of the namespace is held, on scratch or on file, and no budget
+// counts anything.
+fn nothing_held(job: &Job, budget: &str) {
+    let files = &job.writer.files[&NodeId::ROOT];
+    assert_eq!(files.holds.total_held(), 0, "{budget}");
+    // Each spill file holds nothing the ledger holds, and is empty or is
+    // emptied at the next commit.
+    for (member, spill) in &files.spills {
+        assert!(files.spills_empty.contains(member), "{budget}");
+        assert!(
+            spill.len().expect("spill length") == 0
+                || job.writer.spills_emptying.contains_key(&(NodeId::ROOT, *member)),
+            "{budget}"
+        );
+    }
+    assert_eq!(job.accountant.usage().resident, 0, "{budget}");
+    assert_eq!(job.accountant.usage().scratch, 0, "{budget}");
+}
+
+// A member not yet decided, past each budget: it stays undecided, and once
+// its front decides it every byte reaches its file.
+#[test]
+fn an_undecided_member_past_each_budget_is_written_whole() {
+    for (budget, budgets) in PAST {
+        let mut job = Job::new(budgets);
+        let member = job.member("notes.bin", None);
+        job.send(member, 10, b"tail..", Provenance::Fresh);
+        job.send(member, 2, b"r! mid.", Provenance::Fresh);
+        assert!(job.tree.is_undecided(NodeId::ROOT, member), "{budget}");
+        assert_eq!(
+            job.spill(member).is_file(),
+            budget != "resident_limit",
+            "{budget}"
+        );
+        assert_eq!(job.accountant.usage().resident, 0, "{budget}");
+
+        job.send(member, 0, b"Ra", Provenance::Fresh);
+        job.close(member);
+        assert_eq!(job.writer.refused(NodeId::ROOT, member), None, "{budget}");
+        assert_eq!(job.file("notes.bin"), b"Rar! mid.\0tail..", "{budget}");
+        nothing_held(&job, budget);
+    }
+}
+
+// A member bound to a store that has not yet placed its bytes, past each
+// budget: it stays bound, and once the store's map places them the member
+// below gets every byte.
+#[test]
+fn a_bound_member_past_each_budget_reaches_the_member_below_whole() {
+    for (budget, budgets) in PAST {
+        let mut job = Job::new(budgets);
+        let member = job.member("a.7z", Some(map_at().end));
+        let mut front = seven_z().to_vec();
+        front.extend_from_slice(b"hello");
+        job.send(member, 0, &front, Provenance::Fresh);
+        assert!(!job.tree.is_undecided(NodeId::ROOT, member), "{budget}");
+        assert!(job.tree.child_of(NodeId::ROOT, member).is_some(), "{budget}");
+        assert_eq!(
+            job.writer.held_bytes(NodeId::ROOT),
+            body().len(),
+            "{budget}"
+        );
+        assert_eq!(
+            job.spill(member).is_file(),
+            budget != "resident_limit",
+            "{budget}"
+        );
+
+        job.send(member, map_at().start, MAP, Provenance::Fresh);
+        assert_eq!(job.writer.refused(NodeId::ROOT, member), None, "{budget}");
+        assert_eq!(job.file("inner.bin"), b"hello", "{budget}");
+        nothing_held(&job, budget);
+    }
+}
+
+// Two jobs share the budgets. The first fills them, and the second's holds
+// go to its member's file; neither job loses a byte, and what the first
+// holds stays where it is.
+#[test]
+fn a_job_whose_holds_find_the_budgets_full_spills_and_the_first_keeps_its_own() {
+    let budgets = HoldBudgets {
+        resident_limit: 0,
+        scratch_total: 6,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    };
+    let mut first = Job::new(budgets);
+    let mut second = Job::new(budgets);
+    second.accountant = Arc::clone(&first.accountant);
+    second.writer = NamespaceWriter::new(
+        2,
+        second.dir.path().to_path_buf(),
+        Arc::clone(&first.accountant),
+        CapacityReader::unknown(),
+    );
+
+    let early = first.member("notes.bin", None);
+    first.send(early, 10, b"tail..", Provenance::Fresh);
+    assert!(!first.spill(early).is_file());
+    assert_eq!(first.accountant.usage().scratch, 6);
+
+    let late = second.member("notes.bin", None);
+    second.send(late, 10, b"other.", Provenance::Fresh);
+    assert!(second.spill(late).is_file());
+    assert_eq!(first.accountant.usage().scratch, 6);
+
+    second.send(late, 0, b"Rar! two.\0", Provenance::Fresh);
+    second.close(late);
+    assert_eq!(second.file("notes.bin"), b"Rar! two.\0other.");
+    assert_eq!(second.writer.refused(NodeId::ROOT, late), None);
+
+    // The first job's hold never moved.
+    assert!(!first.spill(early).is_file());
+    assert_eq!(first.accountant.usage().scratch, 6);
+    first.send(early, 0, b"Rar! one.\0", Provenance::Fresh);
+    first.close(early);
+    assert_eq!(first.file("notes.bin"), b"Rar! one.\0tail..");
+    assert_eq!(first.writer.refused(NodeId::ROOT, early), None);
+    nothing_held(&first, "first");
+    nothing_held(&second, "second");
+}
+
+// Holds paged to scratch and holds on file at a stop come back in a process
+// whose ceiling is now lower than what the scratch file holds: what scratch
+// cannot take goes to the member's file, and the member is written whole
+// with nothing fetched again.
+#[test]
+fn holds_restored_under_a_lower_ceiling_come_back_on_file() {
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 0,
+        scratch_ceiling: 6,
+        ..PLENTY
+    });
+    let member = job.member("notes.bin", None);
+    job.send(member, 10, b"tail..", Provenance::Fresh);
+    job.send(member, 2, b"r! mid.", Provenance::Fresh);
+    assert_eq!(job.accountant.usage().scratch, 6);
+    assert!(job.spill(member).is_file());
+
+    job.writer.page_out_holds().expect("page out");
+    let records: Vec<HoldRecord> = job
+        .writer
+        .hold_records(NodeId::ROOT)
+        .into_iter()
+        .map(|(held, on_file)| HoldRecord {
+            node: NodeId::ROOT,
+            held,
+            on_file,
+        })
+        .collect();
+    assert_eq!(
+        records.iter().map(|record| record.on_file).collect::<Vec<_>>(),
+        vec![false, true],
+        "{records:?}"
+    );
+
+    // The process goes away; its scratch and spill files stay. The next
+    // has no scratch room at all.
+    let lower = Arc::new(HoldsAccountant::new(HoldBudgets {
+        resident_limit: 0,
+        scratch_ceiling: 0,
+        ..PLENTY
+    }));
+    job.accountant = Arc::clone(&lower);
+    drop(std::mem::replace(
+        &mut job.writer,
+        NamespaceWriter::new(
+            1,
+            job.dir.path().to_path_buf(),
+            lower,
+            CapacityReader::unknown(),
+        ),
+    ));
+    job.writer
+        .restore_holds(&job.tree, &records)
+        .expect("restore holds");
+    assert_eq!(job.accountant.usage().scratch, 0);
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 13);
+    assert!(job.writer.files[&NodeId::ROOT].spills.contains_key(&member));
+    for (range, held) in [(ByteRange::new(10, 16), &b"tail.."[..]), (ByteRange::new(2, 9), b"r! mid.")] {
+        let mut bytes = Vec::new();
+        assert!(job.writer.access(&job.tree).read_at(NodeId::ROOT, member, range, &mut bytes));
+        assert_eq!(bytes, held);
+    }
+
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    job.close(member);
+    assert_eq!(job.file("notes.bin"), b"Rar! mid.\0tail..");
+    nothing_held(&job, "restored");
+}
+
+// What the writer's holds at `node` say to a checkpoint, as its rows.
+fn hold_rows(job: &Job, node: NodeId) -> Vec<HoldRecord> {
+    job.writer
+        .hold_records(node)
+        .into_iter()
+        .map(|(held, on_file)| HoldRecord {
+            node,
+            held,
+            on_file,
+        })
+        .collect()
+}
+
+// The process goes away, its files stay, and a new writer under
+// `accountant` is restored from `records`.
+fn restarted(job: &mut Job, accountant: Arc<HoldsAccountant>, records: &[HoldRecord]) {
+    job.accountant = Arc::clone(&accountant);
+    drop(std::mem::replace(
+        &mut job.writer,
+        NamespaceWriter::new(
+            1,
+            job.dir.path().to_path_buf(),
+            accountant,
+            CapacityReader::unknown(),
+        ),
+    ));
+    job.writer
+        .restore_holds(&job.tree, records)
+        .expect("a restore never fails for a hold");
+}
+
+fn read_at(job: &Job, node: NodeId, member: MemberId, range: ByteRange) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    job.writer
+        .access(&job.tree)
+        .read_at(node, member, range, &mut bytes)
+        .then_some(bytes)
+}
+
+const NO_ROOM: HoldBudgets = HoldBudgets {
+    resident_limit: 0,
+    scratch_total: 0,
+    scratch_ceiling: 0,
+    disk_reserve: 0,
+};
+
+// A member of a store spills while undecided, is taken back, and comes
+// again before any checkpoint commits. Its spill file is one file all
+// along: the second spill waits for a commit, the commit after it leaves
+// the file standing, its bytes read back byte for byte, and a restore from
+// that checkpoint adopts them.
+#[test]
+fn a_member_that_spills_again_after_a_release_keeps_its_spill_file_through_a_commit() {
+    let mut job = Job::new(NO_ROOM);
+    let (_, child) = bound_store(&mut job);
+    let late = MemberId(5);
+    let spill = job.dir.path().join(super::spill_name(child, late));
+    let bytes = |offset: u64, text: &'static [u8]| Emit::Bytes {
+        member: late,
+        offset,
+        bytes: Bytes::from_static(text).into(),
+        provenance: Provenance::Fresh,
+    };
+    let announce = || Emit::Member {
+        member: late,
+        name: "late.bin".into(),
+        length: Some(16),
+    };
+    store_says(&mut job, child, vec![announce(), bytes(10, b"first.")]);
+    assert!(job.tree.is_undecided(child, late));
+    assert_eq!(std::fs::read(&spill).expect("spilled"), b"\0\0\0\0\0\0\0\0\0\0first.");
+
+    // Taken back: what it held is let go. Its spill file waits for a commit
+    // to be emptied, and none comes first.
+    store_says(&mut job, child, vec![Emit::Retract(late)]);
+    assert_eq!(job.writer.held_bytes(child), 0);
+    assert_eq!(std::fs::metadata(&spill).expect("not gone").len(), 16);
+
+    // Said again, its bytes stay in RAM past the budgets while the file
+    // holds what a committed checkpoint may name there; once a checkpoint
+    // commits, a stop spills them, and its checkpoint commits.
+    store_says(&mut job, child, vec![announce(), bytes(10, b"again.")]);
+    assert!(job.tree.is_undecided(child, late));
+    assert_eq!(job.accountant.usage().resident, 6);
+    assert_eq!(std::fs::read(&spill).expect("kept"), b"\0\0\0\0\0\0\0\0\0\0first.");
+    commit_checkpoint(&mut job);
+    job.writer.page_out_holds().expect("page out");
+    assert_eq!(job.accountant.usage().resident, 0);
+    let records = hold_rows(&job, child);
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.held.range, record.on_file))
+            .collect::<Vec<_>>(),
+        vec![(ByteRange::new(10, 16), true)]
+    );
+    commit_checkpoint(&mut job);
+    job.commit();
+    assert!(spill.is_file());
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
+        Some(&b"again."[..])
+    );
+
+    // A restore from that checkpoint reads the second spill back.
+    let accountant = Arc::new(HoldsAccountant::new(NO_ROOM));
+    restarted(&mut job, accountant, &records);
+    assert_eq!(job.writer.held_bytes(child), 6);
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
+        Some(&b"again."[..])
+    );
+    store_says(
+        &mut job,
+        child,
+        vec![bytes(0, b"0123456789"), Emit::MemberClosed(late)],
+    );
+    assert!(!job.tree.is_undecided(child, late));
+    // Its file has it whole, and nothing is held for it any more.
+    assert_eq!(job.writer.held_bytes(child), 0);
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(0, 16)).as_deref(),
+        Some(&b"0123456789again."[..])
+    );
+}
+
+// A spill file keeps the bytes a committed checkpoint names on file until a
+// later checkpoint commits. The member spills, a checkpoint naming that hold
+// commits, the member is taken back, and it spills again further on before
+// another commits. The process dies there: a restore from the committed
+// checkpoint reads the first spill's bytes where its row says, never zeros.
+#[test]
+fn a_released_spill_keeps_what_the_committed_checkpoint_names_until_the_next_commit() {
+    let mut job = Job::new(NO_ROOM);
+    let (_, child) = bound_store(&mut job);
+    let late = MemberId(5);
+    let spill = job.dir.path().join(super::spill_name(child, late));
+    let bytes = |offset: u64, text: &'static [u8]| Emit::Bytes {
+        member: late,
+        offset,
+        bytes: Bytes::from_static(text).into(),
+        provenance: Provenance::Fresh,
+    };
+    let announce = || Emit::Member {
+        member: late,
+        name: "late.bin".into(),
+        length: Some(32),
+    };
+    store_says(&mut job, child, vec![announce(), bytes(10, b"first.")]);
+    // A stop's checkpoint names the hold on file, and commits; the restart
+    // adopts it, and until the restored job's first checkpoint commits the
+    // database still names it.
+    job.writer.page_out_holds().expect("page out");
+    let committed = hold_rows(&job, child);
+    assert_eq!(
+        committed
+            .iter()
+            .map(|record| (record.held.range, record.on_file))
+            .collect::<Vec<_>>(),
+        vec![(ByteRange::new(10, 16), true)]
+    );
+    commit_checkpoint(&mut job);
+    restarted(&mut job, Arc::new(HoldsAccountant::new(NO_ROOM)), &committed);
+    assert_eq!(job.writer.held_bytes(child), 6);
+
+    store_says(&mut job, child, vec![Emit::Retract(late)]);
+    store_says(&mut job, child, vec![announce(), bytes(20, b"again.")]);
+    assert_eq!(
+        std::fs::read(&spill).expect("spilled"),
+        [&[0u8; 10][..], b"first.", &[0; 4], b"again."].concat()
+    );
+
+    // Killed before another checkpoint commits.
+    restarted(&mut job, Arc::new(HoldsAccountant::new(NO_ROOM)), &committed);
+    assert_eq!(job.writer.held_bytes(child), 6);
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
+        Some(&b"first."[..])
+    );
+}
+
+// A member started over brings different bytes to offsets its spill file
+// already holds. A checkpoint naming the first spill there commits, the
+// member is taken back and its new bytes come before another commits: they
+// wait in RAM, and the file keeps what the committed row names. The process
+// dies there: a restore from the committed checkpoint reads the first
+// spill's bytes, never the new ones. Once a checkpoint commits, the new
+// bytes spill where the old were.
+#[test]
+fn a_member_started_over_writes_nothing_a_committed_row_names_until_the_next_commit() {
+    let mut job = Job::new(NO_ROOM);
+    let (_, child) = bound_store(&mut job);
+    let late = MemberId(5);
+    let spill = job.dir.path().join(super::spill_name(child, late));
+    let bytes = |offset: u64, text: &'static [u8]| Emit::Bytes {
+        member: late,
+        offset,
+        bytes: Bytes::from_static(text).into(),
+        provenance: Provenance::Fresh,
+    };
+    let announce = || Emit::Member {
+        member: late,
+        name: "late.bin".into(),
+        length: Some(16),
+    };
+    store_says(&mut job, child, vec![announce(), bytes(10, b"first.")]);
+    job.writer.page_out_holds().expect("page out");
+    let committed = hold_rows(&job, child);
+    commit_checkpoint(&mut job);
+    restarted(&mut job, Arc::new(HoldsAccountant::new(NO_ROOM)), &committed);
+    assert_eq!(job.writer.held_bytes(child), 6);
+
+    store_says(&mut job, child, vec![Emit::Retract(late)]);
+    store_says(&mut job, child, vec![announce(), bytes(10, b"again.")]);
+    assert_eq!(job.writer.held_bytes(child), 6);
+    assert_eq!(job.accountant.usage().resident, 6);
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
+        Some(&b"again."[..])
+    );
+    assert_eq!(
+        std::fs::read(&spill).expect("kept"),
+        b"\0\0\0\0\0\0\0\0\0\0first."
+    );
+    // A stop before the commit keeps the new bytes off the file too.
+    job.writer.page_out_holds().expect("page out");
+    assert_eq!(
+        std::fs::read(&spill).expect("kept"),
+        b"\0\0\0\0\0\0\0\0\0\0first."
+    );
+
+    // Killed before another checkpoint commits.
+    restarted(&mut job, Arc::new(HoldsAccountant::new(NO_ROOM)), &committed);
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
+        Some(&b"first."[..])
+    );
+}
+
+// Bytes kept off a spill file for a member started over spill there once a
+// checkpoint commits: the commit empties the file, and the next stop
+// writes them where the old were.
+#[test]
+fn a_member_started_over_spills_again_once_a_checkpoint_commits() {
+    let mut job = Job::new(NO_ROOM);
+    let (_, child) = bound_store(&mut job);
+    let late = MemberId(5);
+    let spill = job.dir.path().join(super::spill_name(child, late));
+    let bytes = |offset: u64, text: &'static [u8]| Emit::Bytes {
+        member: late,
+        offset,
+        bytes: Bytes::from_static(text).into(),
+        provenance: Provenance::Fresh,
+    };
+    let announce = || Emit::Member {
+        member: late,
+        name: "late.bin".into(),
+        length: Some(16),
+    };
+    store_says(&mut job, child, vec![announce(), bytes(10, b"first.")]);
+    store_says(&mut job, child, vec![Emit::Retract(late)]);
+    store_says(&mut job, child, vec![announce(), bytes(10, b"again.")]);
+    assert_eq!(job.accountant.usage().resident, 6);
+
+    commit_checkpoint(&mut job);
+    assert_eq!(std::fs::metadata(&spill).expect("kept").len(), 0);
+    job.writer.page_out_holds().expect("page out");
+    assert_eq!(job.accountant.usage().resident, 0);
+    assert_eq!(
+        std::fs::read(&spill).expect("spilled"),
+        b"\0\0\0\0\0\0\0\0\0\0again."
+    );
+}
+
+// The scratch file keeps every byte a committed checkpoint's rows name
+// until a later checkpoint commits. A stop's checkpoint names one member's
+// bytes on scratch and commits; the restart adopts them, the member is
+// taken back and another member pages out before another commit. The
+// process dies there: a restore from the committed checkpoint reads the
+// first member's bytes where its row says, never the second's.
+#[test]
+fn scratch_a_committed_row_names_is_not_reused_before_the_next_commit() {
+    let budgets = HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    };
+    let mut job = Job::new(budgets);
+    let (_, child) = bound_store(&mut job);
+    let (late, other) = (MemberId(5), MemberId(6));
+    let scratch = job.dir.path().join(super::scratch_name(child));
+    let bytes = |member: MemberId, offset: u64, text: &'static [u8]| Emit::Bytes {
+        member,
+        offset,
+        bytes: Bytes::from_static(text).into(),
+        provenance: Provenance::Fresh,
+    };
+    let announce = |member: MemberId, name: &str| Emit::Member {
+        member,
+        name: name.into(),
+        length: Some(16),
+    };
+    store_says(
+        &mut job,
+        child,
+        vec![announce(late, "late.bin"), bytes(late, 10, b"first.")],
+    );
+    job.writer.page_out_holds().expect("page out");
+    let committed = hold_rows(&job, child);
+    assert_eq!(
+        committed
+            .iter()
+            .map(|record| (record.held.scratch_offset, record.on_file))
+            .collect::<Vec<_>>(),
+        vec![(0, false)]
+    );
+    commit_checkpoint(&mut job);
+    restarted(&mut job, Arc::new(HoldsAccountant::new(budgets)), &committed);
+    assert_eq!(job.accountant.usage().scratch, 6);
+
+    // Taken back, nothing lives on scratch; another member pages out.
+    store_says(
+        &mut job,
+        child,
+        vec![Emit::Retract(late), announce(late, "late.bin")],
+    );
+    assert_eq!(job.accountant.usage().scratch, 0);
+    store_says(
+        &mut job,
+        child,
+        vec![announce(other, "other.bin"), bytes(other, 10, b"other.")],
+    );
+    assert_eq!(job.accountant.usage().scratch, 6);
+    assert_eq!(&std::fs::read(&scratch).expect("scratch")[..6], b"first.");
+
+    // Killed before another checkpoint commits.
+    restarted(&mut job, Arc::new(HoldsAccountant::new(budgets)), &committed);
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
+        Some(&b"first."[..])
+    );
+}
+
+// Scratch offsets start over once a checkpoint that names none of the file
+// commits, and not before.
+#[test]
+fn scratch_offsets_start_over_only_once_a_checkpoint_naming_none_commits() {
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    });
+    let member = job.member("notes.bin", Some(11));
+    job.send(member, 6, b"world", Provenance::Fresh);
+    let extent = |job: &Job| job.writer.files[&NodeId::ROOT].holds.scratch_extent();
+    assert_eq!(extent(&job), 5);
+    job.send(member, 0, b"hello ", Provenance::Fresh);
+    assert_eq!(job.file("notes.bin"), b"hello world");
+    assert_eq!(job.accountant.usage().scratch, 0);
+    assert_eq!(extent(&job), 5);
+
+    let stamp = job.writer.committed + 1;
+    job.writer.recorded(stamp);
+    assert_eq!(extent(&job), 5);
+    assert!(job.writer.awaits_commit());
+    assert!(job.writer.awaited() >= stamp);
+    job.writer.commit_moves(&mut job.tree, stamp).expect("commit");
+    assert_eq!(extent(&job), 0);
+    assert!(job.writer.scratch_rewinding.is_empty());
+}
+
+// A restore whose scratch rows the budgets now refuse adopts none of them
+// on scratch, yet the file stays as left: the first page-out after it
+// lands past every byte the rows name, so a restore from that checkpoint
+// still reads them.
+#[test]
+fn a_scratch_file_no_hold_came_back_to_keeps_what_its_rows_name() {
+    let budgets = HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    };
+    let mut job = Job::new(budgets);
+    let (_, child) = bound_store(&mut job);
+    let (late, other) = (MemberId(5), MemberId(6));
+    let scratch = job.dir.path().join(super::scratch_name(child));
+    let bytes = |member: MemberId, offset: u64, text: &'static [u8]| Emit::Bytes {
+        member,
+        offset,
+        bytes: Bytes::from_static(text).into(),
+        provenance: Provenance::Fresh,
+    };
+    let announce = |member: MemberId, name: &str| Emit::Member {
+        member,
+        name: name.into(),
+        length: Some(16),
+    };
+    store_says(
+        &mut job,
+        child,
+        vec![announce(late, "late.bin"), bytes(late, 10, b"first.")],
+    );
+    job.writer.page_out_holds().expect("page out");
+    let committed = hold_rows(&job, child);
+    commit_checkpoint(&mut job);
+
+    // The next process's ceiling refuses the row on scratch: it moves to
+    // the member's spill file, and nothing comes back on scratch.
+    let lower = HoldBudgets {
+        resident_limit: 0,
+        scratch_ceiling: 4,
+        ..PLENTY
+    };
+    restarted(&mut job, Arc::new(HoldsAccountant::new(lower)), &committed);
+    assert_eq!(job.accountant.usage().scratch, 0);
+    assert!(job.writer.files[&child].spills.contains_key(&late));
+    store_says(
+        &mut job,
+        child,
+        vec![announce(other, "other.bin"), bytes(other, 10, b"oth")],
+    );
+    assert_eq!(job.accountant.usage().scratch, 3);
+    assert_eq!(
+        std::fs::read(&scratch).expect("scratch"),
+        b"first.oth"
+    );
+
+    restarted(&mut job, Arc::new(HoldsAccountant::new(budgets)), &committed);
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
+        Some(&b"first."[..])
+    );
+}
+
+// A member whose bytes spill past every budget, more of it than one read
+// back takes, is written to its file a read at a time: no read from its
+// spill file takes more than `READ_BACK` into memory, however much spilled.
+#[test]
+fn spilled_bytes_reach_their_file_a_bounded_read_at_a_time() {
+    let mut job = Job::new(NO_ROOM);
+    let tail = payload(3 * READ_BACK as usize + 5);
+    let length = 10 + tail.len() as u64;
+    let member = job.member("notes.bin", Some(length));
+    job.send(member, 10, &tail, Provenance::Fresh);
+    assert_eq!(
+        std::fs::metadata(job.spill(member)).expect("spilled").len(),
+        length
+    );
+
+    SPILL_READ_MOST.set(0);
+    job.send(member, 0, b"0123456789", Provenance::Fresh);
+    assert!(!job.tree.is_undecided(NodeId::ROOT, member));
+    assert_eq!(SPILL_READ_MOST.get(), READ_BACK);
+    let mut whole = b"0123456789".to_vec();
+    whole.extend_from_slice(&tail);
+    assert!(job.file("notes.bin") == whole, "byte-identical");
+    nothing_held(&job, "released");
+}
+
+fn payload(len: usize) -> Vec<u8> {
+    (0..len).map(|at| (at * 31 % 251) as u8).collect()
+}
+
+// A restart under a disk with no room past its reserve: a hold on scratch
+// the budgets now refuse cannot move to its member's spill file within the
+// reserve, so it is not adopted and its article comes again. A hold whose
+// move fails is not either. Neither fails the restore.
+#[test]
+fn a_restored_hold_that_cannot_be_kept_is_fetched_again_and_the_restore_stands() {
+    for case in ["no room past the reserve", "the move fails"] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit: 0,
+            ..PLENTY
+        });
+        let member = job.member("notes.bin", None);
+        job.send(member, 10, b"tail..", Provenance::Fresh);
+        job.writer.page_out_holds().expect("page out");
+        let records = hold_rows(&job, NodeId::ROOT);
+        assert_eq!(
+            records.iter().map(|record| record.on_file).collect::<Vec<_>>(),
+            vec![false],
+            "{case}"
+        );
+        let budgets = if case == "the move fails" {
+            // Something that is no file sits where its spill file would.
+            std::fs::create_dir_all(job.spill(member)).expect("a directory in the way");
+            NO_ROOM
+        } else {
+            HoldBudgets {
+                disk_reserve: u64::MAX,
+                ..NO_ROOM
+            }
+        };
+        restarted(&mut job, Arc::new(HoldsAccountant::new(budgets)), &records);
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0, "{case}");
+        assert_eq!(job.accountant.usage().scratch, 0, "{case}");
+        assert_eq!(read_at(&job, NodeId::ROOT, member, ByteRange::new(10, 16)), None, "{case}");
+    }
+}
+
+// A member an older build refused because its holds ran past their budgets
+// is taken back: the refusal was never a ruling on its bytes, so the store
+// that owned it is asked again and the member below comes out whole.
+#[test]
+fn a_member_refused_for_its_holds_is_reopened_and_delivered() {
+    let mut job = Job::new(PLENTY);
+    let (member, child) = bound_store(&mut job);
+    store_says(&mut job, child, vec![Emit::Refuse(Why::HoldsBreached)]);
+    assert_eq!(
+        job.writer.refused(NodeId::ROOT, member),
+        Some(Why::HoldsBreached)
+    );
+
+    let mut build = job.build();
+    job.writer
+        .lift_hold_refusals(&mut job.tree, &mut build, &Source, &mut job.out)
+        .expect("lift");
+    assert_eq!(job.writer.refused(NodeId::ROOT, member), None);
+    assert!(job.tree.child_of(NodeId::ROOT, member).is_some());
+    assert_eq!(job.file("inner.bin"), b"hello");
 }
 
 #[test]
@@ -2668,7 +3435,8 @@ fn a_store_bound_over_a_member_logs_object_bound() {
 }
 
 // A member given back is said once, with the object that gave it back and
-// why; one no object held names none.
+// why. Holds past a budget give nothing back: the spill is said once per
+// budget, with how far that budget stands.
 #[test]
 fn a_member_given_back_logs_object_refused() {
     let (lines, _guard) = Lines::capture();
@@ -2701,9 +3469,11 @@ fn a_member_given_back_logs_object_refused() {
     job.send(member, 0, b"Ra", Provenance::Fresh);
     job.send(member, 10, b"tail..", Provenance::Fresh);
     job.send(member, 2, b"r! mid.", Provenance::Fresh);
+    job.send(member, 20, b"later", Provenance::Fresh);
+    assert!(lines.of("object refused").is_empty());
     assert_eq!(
-        lines.of("object refused"),
-        ["object refused job_id=1 node=0 kind= member=notes.bin why=holds_breached"]
+        lines.of("holds spilled"),
+        ["holds spilled job_id=1 node=0 member=0 budget=scratch_ceiling held=0 limit=0"]
     );
 }
 
@@ -3196,16 +3966,9 @@ fn unrelated_candidate_and_shared_scratch_activity_do_not_invalidate_repair_loan
             .pop()
             .unwrap()
             .run(weaver_graph::Budget::default(), &Default::default());
-        assert!(
-            !job.writer
-                .keep_held(
-                    NodeId::ROOT,
-                    other,
-                    25000,
-                    Bytes::from_static(b"held").into()
-                )
-                .unwrap()
-        );
+        job.writer
+            .keep_held(NodeId::ROOT, other, 25000, Bytes::from_static(b"held").into())
+            .unwrap();
         job.send(other, 20000, b"new", Provenance::Fresh);
         assert_eq!(
             job.writer.files[&NodeId::ROOT].leaves[&member].revision(),
@@ -3231,16 +3994,9 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
             fix: (2, b"OK"),
         }));
         let member = job.member("payload.bin", Some(8));
-        assert!(
-            !job.writer
-                .keep_held(
-                    NodeId::ROOT,
-                    member,
-                    0,
-                    Bytes::from_static(b"original").into()
-                )
-                .unwrap()
-        );
+        job.writer
+            .keep_held(NodeId::ROOT, member, 0, Bytes::from_static(b"original").into())
+            .unwrap();
         job.tree
             .namespace_mut(NodeId::ROOT)
             .unwrap()
@@ -3263,11 +4019,9 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
             Some(b"original".as_slice())
         );
         assert!(!job.writer.moved_since(&job.tree, &returned));
-        assert!(
-            !job.writer
-                .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new").into())
-                .unwrap()
-        );
+        job.writer
+            .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new").into())
+            .unwrap();
         assert!(
             job.writer.moved_since(&job.tree, &returned),
             "borrowed RAM and scratch sources keep their own identities"
@@ -3289,16 +4043,9 @@ fn a_returned_ruling_stands_on_the_ranges_it_read_and_only_those() {
         }));
         let member = job.member("payload.bin", Some(16));
         let arrive = |job: &mut Job, offset: u64, bytes: &'static [u8]| {
-            assert!(
-                !job.writer
-                    .keep_held(
-                        NodeId::ROOT,
-                        member,
-                        offset,
-                        Bytes::from_static(bytes).into()
-                    )
-                    .unwrap()
-            );
+            job.writer
+            .keep_held(NodeId::ROOT, member, offset, Bytes::from_static(bytes).into())
+            .unwrap();
             job.tree
                 .namespace_mut(NodeId::ROOT)
                 .unwrap()

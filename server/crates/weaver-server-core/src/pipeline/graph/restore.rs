@@ -296,7 +296,7 @@ impl RestoreSeat {
 // before the job is rebuilt, so no file the job opens again meets bytes it
 // never recorded and no file it never recorded is delivered. The checkpoint
 // names each member's file at the one place the restore opens it, every
-// envelope, every holds scratch and every spooled part. The
+// envelope, every holds scratch and spill file and every spooled part. The
 // directory's own marker and the run's cache are the directory's, never the
 // job's, and stay. A file that cannot be removed stays; the job does not
 // read it.
@@ -323,10 +323,13 @@ pub(super) fn sweep_unnamed(
             .clone()
             .unwrap_or_else(|| super::envelope::envelope_name(kept.node, kept.envelope))
     });
-    let holds = snapshot
-        .holds
-        .iter()
-        .map(|hold| super::namespace::scratch_name(hold.node));
+    let holds = snapshot.holds.iter().map(|hold| {
+        if hold.on_file {
+            super::namespace::spill_name(hold.node, weaver_graph::MemberId(hold.held.volume.0))
+        } else {
+            super::namespace::scratch_name(hold.node)
+        }
+    });
     let spooled = held_parts.iter().map(|part| part.spool_path.clone());
     // Each name as the path it takes on disk, the key the name ledger and
     // the writer compare names by: a directory "Folder/" and a file
