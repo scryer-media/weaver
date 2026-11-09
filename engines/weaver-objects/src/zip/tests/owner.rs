@@ -268,6 +268,25 @@ impl Owner {
             &mut out,
         );
         self.apply(out);
+        // What arrives is the volume's bytes now, whatever was held of them
+        // before, as the namespace takes them: a repair rewrites what was
+        // held, and the held copy never goes down after it.
+        for (at, piece, provenance, held) in std::mem::take(&mut self.held) {
+            if at != volume || piece.intersect(range).is_none() {
+                self.held.push((at, piece, provenance, held));
+                continue;
+            }
+            for keep in [
+                ByteRange::new(piece.start, range.start.clamp(piece.start, piece.end)),
+                ByteRange::new(range.end.clamp(piece.start, piece.end), piece.end),
+            ] {
+                if !keep.is_empty() {
+                    let from = (keep.start - piece.start) as usize;
+                    let bytes = held[from..from + keep.len() as usize].to_vec();
+                    self.held.push((at, keep, provenance, bytes));
+                }
+            }
+        }
         let offset = range.start;
         let mut placements = Vec::new();
         self.object.locate(volume, range, &mut placements);
@@ -361,6 +380,11 @@ impl Owner {
 
     pub fn held(&self) -> usize {
         self.held.len()
+    }
+
+    // The bytes held, every piece counted.
+    pub fn held_bytes(&self) -> u64 {
+        self.held.iter().map(|(_, range, _, _)| range.len()).sum()
     }
 
     // The object is lent out for what it holds, works away from every

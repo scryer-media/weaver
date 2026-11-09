@@ -805,16 +805,16 @@ impl super::Zip {
         provenance: Provenance,
         read: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<weaver_graph::Emit>,
-    ) {
+    ) -> bool {
         use weaver_graph::{Emit, Evidenced, Placement};
         let Some(map) = &mut self.map else {
-            return;
+            return false;
         };
         let index = map.members[member.0 as usize];
         let entry = &mut map.entries[index];
         let Some(mut cipher) = entry.cipher.take() else {
             self.record(member, offset, bytes, provenance, out);
-            return;
+            return true;
         };
         let coverage = &self.members[member.0 as usize].coverage;
         let mut plain =
@@ -848,7 +848,7 @@ impl super::Zip {
             let mut expected = Vec::new();
             if said > 0 && !plain(proof, &mut expected) {
                 entry.cipher = Some(cipher);
-                return;
+                return false;
             }
             if said == 0 || open.proves(&expected, &cipher.proof[..said as usize]) {
                 Arc::make_mut(cipher.open.as_mut().unwrap()).checked = true;
@@ -865,17 +865,18 @@ impl super::Zip {
         let Some(open) = &cipher.open else {
             entry.cipher = Some(cipher);
             if disproved {
-                return self.disown(member, out);
+                self.disown(member, out);
+                return true;
             }
             if !self.asked {
                 self.asked = true;
                 out.push(Emit::NeedsPassword);
             }
-            return;
+            return false;
         };
         if cipher.retry {
             entry.cipher = Some(cipher);
-            return;
+            return false;
         }
         let mut input = std::borrow::Cow::Borrowed(&bytes[..]);
         let range = ByteRange::at(offset, input.len() as u64);
@@ -905,7 +906,7 @@ impl super::Zip {
         let source = provenance;
         let Some(decrypted) = open.trial(offset, &input, provenance, coverage, &mut plain) else {
             entry.cipher = Some(cipher);
-            return;
+            return false;
         };
         // Capture the old suffix before replacing its prefix. Every byte
         // after a changed ciphertext byte needs the new feedback state.
@@ -920,7 +921,7 @@ impl super::Zip {
                 let again = ByteRange::new(data + range.start, data + entry.length);
                 entry.cipher = Some(cipher);
                 if replay_from.is_some_and(|from| from <= range.start) {
-                    return;
+                    return true;
                 }
                 // The replay says everything from the change again; the
                 // prefix's checksum, from the keys' state at the change,
@@ -942,7 +943,7 @@ impl super::Zip {
                         .into_iter()
                         .map(|(volume, range)| Emit::Again { volume, range }),
                 );
-                return;
+                return true;
             }
         }
         if offset <= cipher.proof.len() as u64 && offset < 32 {
@@ -978,6 +979,7 @@ impl super::Zip {
             .collect();
         entry.cipher = Some(cipher);
         self.record(member, offset, Evidenced::from(bytes), provenance, out);
+        true
     }
 }
 

@@ -76,6 +76,7 @@ impl Zip {
                     },
                 ),
                 Piece::Member(member, range) => {
+                    let piece_end = range.end;
                     let entry = self.map.as_ref().and_then(|map| map.entry(member));
                     // Split where what the keys reach, or the member said,
                     // ends: only the part past it can be held.
@@ -110,6 +111,33 @@ impl Zip {
                         );
                         continue;
                     }
+                    // What the object holds for the keys is its own, said
+                    // to the member once they run: its owner holds none of
+                    // it.
+                    let queued = self
+                        .queued_end(member)
+                        .filter(|end| range.start < *end)
+                        .map(|end| end.min(range.end));
+                    let range = match queued {
+                        Some(end) => {
+                            push(
+                                out,
+                                Placement::Member {
+                                    member,
+                                    range: ByteRange::new(range.start, end),
+                                },
+                            );
+                            if end == range.end {
+                                continue;
+                            }
+                            ByteRange::new(end, range.end)
+                        }
+                        None => range,
+                    };
+                    // What would take the bytes held for the keys past
+                    // their cap is held by the owner, wherever it starts.
+                    let parked = self.parks_from(member, range);
+                    let range = ByteRange::new(range.start, parked.unwrap_or(range.end));
                     let locked =
                         entry
                             .and_then(|entry| entry.cipher.as_ref())
@@ -125,6 +153,10 @@ impl Zip {
                         self.held_or_kept(range.shift(start as i64), base, out);
                     } else {
                         push(out, Placement::Member { member, range });
+                    }
+                    if let (Some(at), Some(start)) = (parked, data) {
+                        let end = piece_end;
+                        self.held_or_kept(ByteRange::new(at, end).shift(start as i64), base, out);
                     }
                 }
                 Piece::Unplaced(range) => self.held_or_kept(range, base, out),
