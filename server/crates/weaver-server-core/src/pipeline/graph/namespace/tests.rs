@@ -2791,7 +2791,7 @@ async fn the_deadline_runs_from_the_first_produced_member_not_from_admission() {
     job.inner = 10;
     job.writer = job.writer.capped(Caps::new(
         Arc::new(limits),
-        Ok(Arc::new(policy)),
+        crate::pipeline::graph::limits::known_policy(policy),
         Vec::new(),
     ));
     let past = std::time::Duration::from_secs(DEADLINE + 1);
@@ -2854,7 +2854,7 @@ async fn the_deadline_does_not_run_while_the_job_is_paused() {
     job.inner = 10;
     job.writer = job.writer.capped(Caps::new(
         Arc::new(limits),
-        Ok(Arc::new(policy)),
+        crate::pipeline::graph::limits::known_policy(policy),
         Vec::new(),
     ));
 
@@ -2880,6 +2880,126 @@ async fn the_deadline_does_not_run_while_the_job_is_paused() {
         .deliver(&mut job.tree, &mut build, &Source, arrival, &mut job.out);
     assert!(written.is_ok());
     assert!(job.writer.refusal().is_none());
+}
+
+// Limits nothing here comes near, but for the disk reserve.
+fn reserve_limits(min_free_bytes: u64) -> crate::pipeline::extraction::ExtractionLimits {
+    crate::pipeline::extraction::ExtractionLimits {
+        max_job_bytes: u64::MAX,
+        max_member_bytes: u64::MAX,
+        max_entries: u64::MAX,
+        max_ratio: u64::MAX,
+        ratio_floor_bytes: u64::MAX,
+        max_seconds: u64::MAX,
+        min_free_bytes,
+        max_memory_bytes: u64::MAX,
+    }
+}
+
+// A read of the policy that fails is no breach: the names placed while it
+// fails wait, and are judged when a read succeeds, refused or not.
+#[test]
+fn names_placed_while_the_policy_is_unreadable_are_judged_once_it_reads() {
+    use crate::pipeline::extraction::ExtractionRejectionReason;
+    use crate::post_processing::model::PostProcessingSettings;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let readable = Arc::new(AtomicBool::new(false));
+    let read: crate::pipeline::graph::limits::PolicyRead = {
+        let readable = Arc::clone(&readable);
+        Arc::new(move || {
+            if readable.load(Ordering::SeqCst) {
+                Ok(Arc::new(PostProcessingSettings {
+                    unacceptable_extensions: vec!["exe".into()],
+                    ..PostProcessingSettings::default()
+                }))
+            } else {
+                Err("database is locked".into())
+            }
+        })
+    };
+    let mut job = Job::new(PLENTY);
+    job.writer = job.writer.capped(Caps::new(
+        Arc::new(reserve_limits(0)),
+        read,
+        Vec::new(),
+    ));
+    let allowed = job.member("notes.bin", Some(5));
+    job.member("beacon.exe", Some(5));
+    assert!(job.writer.refusal().is_none());
+    job.send(allowed, 0, b"notes", Provenance::Fresh);
+    assert_eq!(job.file("notes.bin"), b"notes");
+
+    let unread = job.writer.learn_policy();
+    assert_eq!(
+        unread,
+        Err("The Unacceptable extensions setting could not be read: database is locked".into())
+    );
+    assert!(job.writer.refusal().is_none());
+
+    readable.store(true, Ordering::SeqCst);
+    assert_eq!(job.writer.learn_policy(), Ok(()));
+    let refusal = job.writer.refusal().expect("the waiting name is refused");
+    assert_eq!(refusal.reason(), ExtractionRejectionReason::ContentPolicy);
+    assert_eq!(
+        refusal.job_failure_reason(),
+        "unwanted extension '.exe' in 'beacon.exe'"
+    );
+}
+
+// A write the disk reserve refuses says the disk is out of space: where,
+// what is free and what must stay free, in units a reader reads, under the
+// marker anything that parses it reads.
+#[test]
+fn a_disk_reserve_refusal_says_the_disk_is_out_of_space() {
+    use crate::operations::disk::{Capacity, CapacityReading};
+    use crate::pipeline::extraction::ExtractionRejectionReason;
+
+    const MIB: u64 = 1024 * 1024;
+    let mut job = Job::new(PLENTY);
+    job.inner = 10;
+    let output = job.dir.path().join("complete");
+    std::fs::create_dir_all(&output).unwrap();
+    let reading = Capacity::Known(CapacityReading {
+        available_bytes: 1536 * MIB,
+        total_bytes: 100 * 1024 * MIB,
+        sampled_at: std::time::Instant::now(),
+        stale: false,
+    });
+    job.writer = job
+        .writer
+        .capped(Caps::new(
+            Arc::new(reserve_limits(2048 * MIB)),
+            crate::pipeline::graph::limits::known_policy(Default::default()),
+            Vec::new(),
+        ))
+        .delivering_to(output.clone(), CapacityReader::from_fn(move || reading));
+
+    let store = job.member("show.rar", None);
+    let mut front = SIGNATURE.to_vec();
+    front.extend_from_slice(b"hello");
+    let arrival = Arrival {
+        node: NodeId::ROOT,
+        member: store,
+        offset: 0,
+        bytes: Bytes::from(front).into(),
+        provenance: Provenance::Fresh,
+    };
+    let mut build = job.build();
+    let refused = job
+        .writer
+        .deliver(&mut job.tree, &mut build, &Source, arrival, &mut job.out);
+    assert!(refused.is_err());
+    let refusal = job.writer.refusal().expect("the reserve refused the write");
+    assert_eq!(refusal.reason(), ExtractionRejectionReason::DiskReserve);
+    assert_eq!(
+        refusal.job_failure_reason(),
+        format!(
+            "WEAVER_EXTRACTION_REJECTED[disk_reserve]: out of disk space: the disk holding {} \
+             has 1.5 GiB free, writing 10 B more would leave 1.5 GiB, and 2.0 GiB must stay free",
+            output.display()
+        )
+    );
 }
 
 // The stated checksum is checked whatever shape the writes left the fold

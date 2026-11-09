@@ -308,6 +308,102 @@ async fn a_member_the_policy_allows_is_untouched() {
     }
 }
 
+// A failed read of the operator's policy is the host's, not the post's: a
+// job built while the settings cannot be read is not failed, and the names
+// it placed are judged once a read succeeds, before anything is delivered.
+#[tokio::test]
+async fn a_job_built_while_the_policy_is_unreadable_is_judged_once_it_reads() {
+    let refused = vec![
+        vec![Post::plain("beacon.exe", payload(ARTICLE, 75))],
+        vec![Post::plain(
+            "lantern.tar",
+            tar(&[("beacon.exe", payload(2 * ARTICLE + 3, 75))]),
+        )],
+    ];
+    for posts in refused {
+        let scenario = Scenario::new(posts).unacceptable(&["exe"]).policy_unread(1);
+        let graph = run(&scenario).await;
+        assert_eq!(
+            graph.failure.as_deref(),
+            Some("unwanted extension '.exe' in 'beacon.exe'"),
+            "{:?}",
+            graph.status
+        );
+        assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
+        assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+    }
+
+    let body = payload(2 * ARTICLE + 3, 76);
+    let scenario = Scenario::new(vec![Post::plain(
+        "lantern.tar",
+        tar(&[("beacon.bin", body.clone())]),
+    )])
+    .unacceptable(&["exe"])
+    .policy_unread(1);
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert!(
+        graph
+            .files
+            .iter()
+            .any(|(path, bytes)| path.ends_with("beacon.bin") && *bytes == body),
+        "{:?}",
+        graph.files.keys()
+    );
+}
+
+// A restored job is judged as one built fresh: names a run before placed
+// while the settings could not be read are judged by the restored job,
+// and a restore that cannot read them waits as admission does.
+#[tokio::test]
+async fn a_restored_job_judges_names_placed_while_the_policy_was_unreadable() {
+    for pipelines in [1, 2] {
+        let scenario = Scenario::new(vec![Post::plain("beacon.exe", payload(4 * ARTICLE, 75))])
+            .unacceptable(&["exe"])
+            .policy_unread(pipelines);
+        let restarted = run_restarting(&scenario, &mut |_| {}).await;
+        assert!(restarted.restarts > 0, "{pipelines}: the run restarted");
+        assert_eq!(
+            restarted.status,
+            Some(JobStatus::Failed {
+                error: "unwanted extension '.exe' in 'beacon.exe'".into()
+            }),
+            "{pipelines}"
+        );
+        assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
+    }
+}
+
+// Settings that never read hold the job before it delivers: it pauses with
+// its files, naming the setting, and is not failed.
+#[tokio::test]
+async fn a_job_whose_policy_never_reads_pauses_before_it_delivers() {
+    let scenario = Scenario::new(vec![Post::plain("beacon.bin", payload(ARTICLE, 75))])
+        .unacceptable(&["exe"])
+        .policy_unread(usize::MAX);
+    let (_temp_dir, mut pipeline, _) = super::harness::admit(&scenario).await;
+    while let Some(work) = pipeline
+        .jobs
+        .get_mut(&super::harness::JOB)
+        .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
+    {
+        let article = (
+            work.segment_id.file_id.file_index,
+            work.segment_id.segment_number,
+        );
+        super::harness::serve(&mut pipeline, &scenario, article).await;
+    }
+    pipeline.check_job_completion(super::harness::JOB).await;
+    let state = &pipeline.jobs[&super::harness::JOB];
+    assert_eq!(state.status, JobStatus::Paused);
+    let reason = state.failure_error.clone().unwrap_or_default();
+    assert!(
+        reason.starts_with("The Unacceptable extensions setting could not be read: "),
+        "{reason}"
+    );
+    crate::pipeline::tests::retire_pipeline_database(pipeline).await;
+}
+
 #[tokio::test]
 async fn a_job_restarted_mid_extraction_keeps_counting_its_bytes() {
     let body = payload(40 * ARTICLE, 78);

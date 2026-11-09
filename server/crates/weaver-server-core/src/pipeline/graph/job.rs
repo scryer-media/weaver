@@ -464,6 +464,12 @@ impl GraphJob {
         self.writer.clock_held()
     }
 
+    // Read the job's content policy if it is still unread, and judge the
+    // names that waited for it.
+    pub(crate) fn learn_policy(&mut self) -> Result<(), String> {
+        self.writer.learn_policy()
+    }
+
     pub(crate) fn pending(&self) -> &Pending {
         &self.pending
     }

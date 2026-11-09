@@ -7,6 +7,7 @@
 // the same limits here.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -213,10 +214,16 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //   disk reserve       the free space a write would leave, against the
 //                      reading the holds already take
 //   content policy     the operator's unacceptable extensions, on every
-//                      name a namespace places
+//                      name a namespace places; a name placed before the
+//                      setting could be read waits, and is judged when a
+//                      read of it succeeds, before the job delivers
 pub(crate) struct Caps {
     limits: Arc<ExtractionLimits>,
-    policy: Result<Arc<PostProcessingSettings>, String>,
+    read_policy: PolicyRead,
+    policy: Policy,
+    // Names placed and not judged yet: placed while the policy was unread,
+    // or brought back by a restore.
+    waiting: Vec<String>,
     // The bytes posted for each root member, by member id.
     declared: Vec<u64>,
     // When extraction began: the first time an object's namespace was
@@ -237,6 +244,28 @@ pub(crate) struct Caps {
     refusal: Option<ExtractionFailure>,
 }
 
+// A read of the operator's settings, answering with them or with why the
+// read failed. A failed read is the host's, never the post's: it is tried
+// again when the policy is next needed.
+pub(crate) type PolicyRead =
+    Arc<dyn Fn() -> Result<Arc<PostProcessingSettings>, String> + Send + Sync>;
+
+// What a failed read of the policy is said as: the setting, never the post.
+const POLICY_UNREAD: &str = "The Unacceptable extensions setting could not be read";
+
+// A read that always answers with these settings.
+pub(crate) fn known_policy(settings: PostProcessingSettings) -> PolicyRead {
+    let settings = Arc::new(settings);
+    Arc::new(move || Ok(Arc::clone(&settings)))
+}
+
+// The unacceptable extensions as the job knows them: read, or not yet,
+// with why the last read failed.
+enum Policy {
+    Known(Arc<PostProcessingSettings>),
+    Unknown(String),
+}
+
 // One namespace's charge: how many members it held, and what it kept
 // resident for each record it was charged for.
 #[derive(Default)]
@@ -246,14 +275,24 @@ struct Account {
 }
 
 impl Caps {
+    // The policy is read once here; a read that fails is tried again.
     pub(crate) fn new(
         limits: Arc<ExtractionLimits>,
-        policy: Result<Arc<PostProcessingSettings>, String>,
+        read_policy: PolicyRead,
         declared: Vec<u64>,
     ) -> Self {
+        let policy = match read_policy() {
+            Ok(settings) => Policy::Known(settings),
+            Err(error) => {
+                warn!(%error, "{POLICY_UNREAD}; names wait to be judged until a read succeeds");
+                Policy::Unknown(error)
+            }
+        };
         Self {
             limits,
+            read_policy,
             policy,
+            waiting: Vec::new(),
             declared,
             started: None,
             paused: None,
@@ -283,7 +322,7 @@ impl Caps {
             unacceptable_extensions: Vec::new(),
             ..PostProcessingSettings::default()
         };
-        Self::new(Arc::new(limits), Ok(Arc::new(policy)), Vec::new())
+        Self::new(Arc::new(limits), known_policy(policy), Vec::new())
     }
 
     // The breach the job stopped on, if it did.
@@ -344,21 +383,47 @@ impl Caps {
     }
 
     // A namespace places `name`. A directory carries no extension.
+    // While the policy is unread the name waits to be judged.
     pub(crate) fn admit_name(&mut self, name: &str) -> Result<(), ExtractionFailure> {
         self.check()?;
         if Leaf::is_directory(name) {
             return Ok(());
         }
-        let rejected = match &self.policy {
-            Ok(policy) => policy
-                .unacceptable_extension_match(name)
-                .map(|_| unwanted_extension_reason(name)),
-            Err(error) => Some(error.clone()),
+        let policy = match &mut self.policy {
+            Policy::Known(policy) => Arc::clone(policy),
+            Policy::Unknown(_) => {
+                self.waiting.push(name.to_owned());
+                return Ok(());
+            }
         };
-        match rejected {
-            Some(detail) => Err(self.breach(ExtractionRejectionReason::ContentPolicy, detail)),
+        match policy.unacceptable_extension_match(name) {
+            Some(_) => Err(self.breach(
+                ExtractionRejectionReason::ContentPolicy,
+                unwanted_extension_reason(name),
+            )),
             None => Ok(()),
         }
+    }
+
+    // Read the policy again if it is still unread, and judge every name
+    // that waited for it. The error, worded for the operator, while the
+    // read still fails; a name the policy refuses stands as the breach.
+    pub(crate) fn learn_policy(&mut self) -> Result<(), String> {
+        if let Policy::Unknown(error) = &mut self.policy {
+            match (self.read_policy)() {
+                Ok(settings) => self.policy = Policy::Known(settings),
+                Err(failed) => {
+                    *error = failed;
+                    return Err(format!("{POLICY_UNREAD}: {error}"));
+                }
+            }
+        }
+        for name in std::mem::take(&mut self.waiting) {
+            if self.admit_name(&name).is_err() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     // A namespace announced a member, or bytes of one reached it: the
@@ -436,13 +501,14 @@ impl Caps {
     }
 
     // Bytes up to `end` of a member of `node`, against the disk reading the
-    // holds take. Only what an object produced counts.
+    // holds take of the filesystem under `folder`. Only what an object
+    // produced counts.
     pub(crate) fn admit_write(
         &mut self,
         tree: &Tree,
         (node, member): (NodeId, MemberId),
         end: u64,
-        capacity: Capacity,
+        (folder, capacity): (&Path, Capacity),
     ) -> Result<(), ExtractionFailure> {
         self.check()?;
         self.extracting(tree, node)?;
@@ -475,9 +541,11 @@ impl Caps {
         if let Some(reading) = self.debits.apply(capacity).reading() {
             let remaining = reading.available_bytes.saturating_sub(grown);
             if remaining < self.limits.min_free_bytes && !reading.stale {
-                let detail = format!(
-                    "writing {grown} bytes would leave {remaining} bytes free, reserve is {}",
-                    self.limits.min_free_bytes
+                let detail = disk_full(
+                    folder,
+                    reading.available_bytes,
+                    grown,
+                    self.limits.min_free_bytes,
                 );
                 return Err(self.breach(ExtractionRejectionReason::DiskReserve, detail));
             }
@@ -521,14 +589,25 @@ impl Caps {
     }
 
     // The restored tree's members, each charged as the tree holds it: what
-    // a checkpoint brings back is counted from the tree, never stored.
+    // a checkpoint brings back is counted from the tree, never stored. No
+    // checkpoint says which names a run before judged, so each waits to be
+    // judged again before the job delivers: a refusal here would stop the
+    // restore itself, and the job would never be failed for it.
     pub(crate) fn restore_members(&mut self, tree: &Tree) {
         for node in tree.live() {
-            let records: Vec<MemberId> = tree
+            let records: Vec<(MemberId, String)> = tree
                 .namespace(node)
-                .map(|namespace| namespace.records().map(|record| record.id).collect())
+                .map(|namespace| {
+                    namespace
+                        .records()
+                        .map(|record| (record.id, record.output_name.clone()))
+                        .collect()
+                })
                 .unwrap_or_default();
-            for member in records {
+            for (member, name) in records {
+                if !Leaf::is_directory(&name) {
+                    self.waiting.push(name);
+                }
                 self.charge(tree, node, member);
             }
         }
@@ -554,6 +633,20 @@ impl Caps {
             })
             .clone()
     }
+}
+
+// A disk reserve breach as the operator reads it: the disk is out of space,
+// where, and by how much.
+fn disk_full(folder: &Path, free: u64, writing: u64, reserve: u64) -> String {
+    use crate::support::human_bytes;
+    format!(
+        "out of disk space: the disk holding {} has {} free, writing {} more would leave {}, and {} must stay free",
+        folder.display(),
+        human_bytes(free),
+        human_bytes(writing),
+        human_bytes(free.saturating_sub(writing)),
+        human_bytes(reserve),
+    )
 }
 
 // Whether a post is recovery data: a recovery object holds it or gave it
@@ -592,10 +685,12 @@ pub(in crate::pipeline::graph) fn caps_for(
     extraction_limits: &Arc<ExtractionLimits>,
     files: &[RootFile],
 ) -> Caps {
-    let policy = db
-        .post_processing_settings()
-        .map(Arc::new)
-        .map_err(|error| format!("could not load unacceptable extension policy: {error}"));
+    let db = db.clone();
+    let policy: PolicyRead = Arc::new(move || {
+        db.post_processing_settings()
+            .map(Arc::new)
+            .map_err(|error| error.to_string())
+    });
     let declared = files
         .iter()
         .map(|file| {
