@@ -497,3 +497,154 @@ async fn a_script_on_the_own_and_the_generic_event_runs_for_each() {
     assert!(rig.service.torrent(job_id).await.is_some());
     rig.service.stop().await;
 }
+
+// A torrent of three files, each `seed` apart so no two tests share an info
+// hash, added to a service with queue scripts whose settle runs only when the
+// test calls it; and the storage its session writes through, whose
+// `on_file_completed` is what the session says when a piece makes a file
+// whole.
+async fn three_files(rig: &Rig, seed: u8) -> (JobId, PieceStorage) {
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    rig.service.publish_to(queue());
+    rig.service.restore().await.unwrap();
+    let [a, b, c] = [[seed; 3000], [seed + 1; 3000], [seed + 2; 3000]];
+    let bytes = metainfo(
+        "set",
+        &[("set/a.bin", &a), ("set/b.bin", &b), ("set/c.bin", &c)],
+        1024,
+        false,
+    );
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let (layout, intake) = {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        (
+            torrent.layout.clone().unwrap(),
+            torrent.intake.clone().unwrap(),
+        )
+    };
+    let storage = PieceStorage::new(
+        layout,
+        intake as Arc<dyn Pieces>,
+        rig.service.resident(job_id),
+    );
+    (job_id, storage)
+}
+
+fn file_downloaded_interval(db: &Database, interval: i64) {
+    let mut settings = db.post_processing_settings().unwrap();
+    settings.event_scripts.file_downloaded_event_interval = interval;
+    db.save_post_processing_settings(&settings).unwrap();
+}
+
+// A file of a torrent made whole queues FILE_DOWNLOADED for the torrent's
+// job, with the variables its other events carry and no file named, as an
+// NZB job's FILE_DOWNLOADED names none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_file_made_whole_queues_file_downloaded() {
+    let rig = rig(set_clock());
+    let (job_id, storage) = three_files(&rig, 10).await;
+    storage.on_file_completed(0);
+    rig.service.settle().await;
+    rig.db.admitted_so_far().await;
+    let queued = rig.db.queued_script_events(QueueEvent::FileDownloaded);
+    assert_eq!(queued.len(), 1);
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_torrent_vars(&queued[0], &view);
+    assert_eq!(queued[0].env["NZBNA_EVENT"], "FILE_DOWNLOADED");
+    assert_no_nzb_events(&rig.db);
+    rig.service.stop().await;
+}
+
+// With FILE_DOWNLOADED's interval at -1 a file made whole queues nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_file_made_whole_queues_nothing_at_interval_minus_one() {
+    let rig = rig(set_clock());
+    let (_, storage) = three_files(&rig, 20).await;
+    file_downloaded_interval(&rig.db, -1);
+    storage.on_file_completed(0);
+    rig.service.settle().await;
+    rig.db.admitted_so_far().await;
+    assert!(
+        rig.db
+            .queued_script_events(QueueEvent::FileDownloaded)
+            .is_empty()
+    );
+    rig.service.stop().await;
+}
+
+// At interval 0 each file queues FILE_DOWNLOADED, but a job holds at most
+// one not yet started: files made whole while one waits add none. Once the
+// torrent's download is over, a file heard after raises nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn each_file_of_a_torrent_queues_file_downloaded_one_waiting_at_a_time() {
+    let rig = rig(set_clock());
+    let out = rig.dir.path().join("told");
+    let (job_id, storage) = three_files(&rig, 30).await;
+    let supervisor = rig.db.tag_reporting_queue_script_for_test(&out);
+    file_downloaded_interval(&rig.db, 0);
+
+    // Two files whole before the first event runs: one waits.
+    storage.on_file_completed(0);
+    storage.on_file_completed(1);
+    rig.service.settle().await;
+    rig.db.admitted_so_far().await;
+    assert_eq!(
+        rig.db
+            .queued_script_events(QueueEvent::FileDownloaded)
+            .len(),
+        1
+    );
+    while rig
+        .db
+        .run_next_queue_event_for_test(&supervisor)
+        .await
+        .is_some()
+    {}
+
+    // The one that waited ran: the next file queues another.
+    storage.on_file_completed(2);
+    rig.service.settle().await;
+    rig.db.admitted_so_far().await;
+    assert_eq!(
+        rig.db
+            .queued_script_events(QueueEvent::FileDownloaded)
+            .len(),
+        2
+    );
+
+    // Its download over, a file heard late raises nothing.
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&job_id)
+        .unwrap()
+        .record
+        .completed_at_ms = Some(EPOCH_MS);
+    while rig
+        .db
+        .run_next_queue_event_for_test(&supervisor)
+        .await
+        .is_some()
+    {}
+    let before = rig
+        .db
+        .queued_script_events(QueueEvent::FileDownloaded)
+        .len();
+    storage.on_file_completed(2);
+    rig.service.settle().await;
+    rig.db.admitted_so_far().await;
+    assert_eq!(
+        rig.db
+            .queued_script_events(QueueEvent::FileDownloaded)
+            .len(),
+        before
+    );
+    rig.service.stop().await;
+}

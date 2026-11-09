@@ -807,13 +807,14 @@ impl PieceTracker {
         self.chunks.set_piece_priorities(priorities)
     }
 
-    /// Update per-file have bytes when a piece completes. Returns remaining bytes for the file.
+    /// Update per-file have bytes when a piece completes. True when the
+    /// piece made the file whole.
     pub fn update_file_have_on_piece_completed(
         &mut self,
         piece_id: ValidPieceIndex,
         file_id: usize,
         file_info: &FileInfo,
-    ) -> u64 {
+    ) -> bool {
         self.chunks
             .update_file_have_on_piece_completed(piece_id, file_id, file_info)
     }

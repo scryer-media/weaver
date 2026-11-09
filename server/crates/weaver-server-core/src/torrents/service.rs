@@ -1969,6 +1969,8 @@ pub(super) struct Signal {
     dirty: Mutex<BTreeSet<JobId>>,
     unsaved: Mutex<BTreeMap<JobId, u32>>,
     refused: Mutex<BTreeMap<JobId, String>>,
+    // How many files pieces made whole since the last settle.
+    whole: Mutex<BTreeMap<JobId, usize>>,
     // A slot or a rank moved where no pass runs: the next settle runs one.
     pass_wanted: AtomicBool,
     wake: Notify,
@@ -2002,6 +2004,10 @@ impl Signal {
                 locked(&self.refused).entry(job_id).or_insert(error);
                 self.mark(job_id);
             }
+            IntakeHeard::FileWhole => {
+                *locked(&self.whole).entry(job_id).or_default() += 1;
+                self.mark(job_id);
+            }
         }
     }
 
@@ -2024,6 +2030,10 @@ impl Signal {
 
     fn take_refused(&self, job_id: JobId) -> Option<String> {
         locked(&self.refused).remove(&job_id)
+    }
+
+    fn take_whole(&self, job_id: JobId) -> usize {
+        locked(&self.whole).remove(&job_id).unwrap_or_default()
     }
 
     fn take_unsaved(&self) -> BTreeSet<JobId> {
@@ -2608,6 +2618,7 @@ impl TorrentService {
     async fn settle(&self) {
         let dirty = self.inner.signal.take();
         for &job_id in &dirty {
+            let made_whole = self.inner.signal.take_whole(job_id);
             let found = {
                 let live = self.inner.live.lock().await;
                 live.get(&job_id).and_then(|torrent| {
@@ -2626,6 +2637,7 @@ impl TorrentService {
             if complete {
                 continue;
             }
+            self.files_downloaded(job_id, made_whole).await;
             let wanted = |file: usize| levels.get(file).copied().unwrap_or_default().wanted();
             let whole = store.has_files(wanted);
             let Some(tee) = store.tee() else {
@@ -2978,6 +2990,30 @@ impl TorrentService {
         self.inner
             .written
             .send_modify(|written| written.checkpoints += 1);
+    }
+
+    // FILE_DOWNLOADED, once for each of `files` files a piece made whole,
+    // while the torrent downloads: one heard after its download ended is
+    // dropped, as an NZB job raises none once its download is over. The
+    // event names no file, as an NZB job's does not.
+    async fn files_downloaded(&self, job_id: JobId, files: usize) {
+        if files == 0 {
+            return;
+        }
+        let live = self.inner.live.lock().await;
+        let Some(torrent) = live.get(&job_id) else {
+            return;
+        };
+        if torrent.complete() {
+            return;
+        }
+        let Some(context) = self.script_event(torrent, QueueEvent::FileDownloaded, &[]) else {
+            return;
+        };
+        for _ in 1..files {
+            self.queue_script_event(Some(context.clone()));
+        }
+        self.queue_script_event(Some(context));
     }
 
     // The job is done: its completion is written on its own, so an intent
