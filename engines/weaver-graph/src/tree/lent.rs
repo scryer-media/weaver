@@ -9,7 +9,7 @@
 // behind it. Taken back, the object hears what waited as if it had been
 // there, and the queued members are asked again who owns them.
 
-use super::{Builder, Effect, NodeId, Tree};
+use super::{Builder, Down, Effect, NodeId, Tree};
 use crate::deliver::{Delivery, Emit, Provenance};
 use crate::evidence::Evidenced;
 use crate::facts::Facts;
@@ -63,6 +63,13 @@ pub(super) enum Waiting {
         length: Option<u64>,
     },
     Told(Told),
+    // A range of one of its volumes that went down the tree and reached it
+    // while it was out, to go on down from it.
+    Descended {
+        volume: VolumeIndex,
+        range: ByteRange,
+        down: Down,
+    },
 }
 
 pub(super) enum Told {
@@ -155,6 +162,12 @@ impl Tree {
         {
             return None;
         }
+        self.lend_out(node)
+    }
+
+    // Out of its node as if for its work, whatever it holds.
+    fn lend_out(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
+        let found = self.nodes.get_mut(&node)?;
         let object = found.object.take()?;
         found.lent = Some(Lent {
             kind: object.kind(),
@@ -165,6 +178,11 @@ impl Tree {
             work: true,
         });
         Some(object)
+    }
+
+    #[cfg(test)]
+    pub(super) fn lend_for_test(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
+        self.lend_out(node)
     }
 
     pub fn lent(&self, node: NodeId) -> bool {
@@ -348,6 +366,22 @@ impl Tree {
                 self.deliver_to_object(node, &arrived, length, builder, effects);
             }
             Waiting::Told(told) => self.tell(node, told, builder, effects),
+            Waiting::Descended {
+                volume,
+                range,
+                down,
+            } => match down {
+                Down::Lost { origin } => effects.push(Effect::Lost {
+                    origin,
+                    node,
+                    volume,
+                    range,
+                }),
+                Down::Refuted => self.descend(vec![(node, volume, range)], down, effects),
+                Down::Forget { keep_repairs } => {
+                    self.forget_input(node, volume, range, keep_repairs);
+                }
+            },
         }
     }
 

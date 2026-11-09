@@ -327,6 +327,15 @@ pub enum Effect {
         member: MemberId,
         range: ByteRange,
     },
+    // A loss told at `origin` reached the object at `node` while it was
+    // lent, and waited for it: it is back now, so the owner marks this range
+    // of its volume lost below it, as it marked the loss at `origin`.
+    Lost {
+        origin: NodeId,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+    },
     // The member's output name changed: a member higher in the tree took
     // its name, or it was renamed. The owner moves the file it wrote, if
     // any; these come in an order that never moves a file onto one still
@@ -389,6 +398,16 @@ pub enum Disclaim {
     // A name moved a member: the place was wrong, never the kind, so each
     // member's name and front say who owns it, as founding asks.
     Moved,
+}
+
+// What goes down the tree from a range of a node's volume, by the inverse
+// map of each object it passes: a loss told at `origin`, a checksum's
+// verdict, or a range forgotten to come again.
+#[derive(Clone, Copy, Debug)]
+enum Down {
+    Lost { origin: NodeId },
+    Refuted,
+    Forget { keep_repairs: bool },
 }
 
 pub struct Tree {
@@ -3974,14 +3993,22 @@ impl Tree {
                 continue;
             };
             let ask = Seek { range, ..ask };
+            if parent == NodeId::ROOT {
+                // The root's members are the source's volumes in
+                // announcement order, so the member is the volume.
+                let volume = VolumeIndex(member.0);
+                pulled = pulled.fold(root.seek(Seek { volume, ..ask }));
+                continue;
+            }
             let Some(parent_node) = self.nodes.get(&parent) else {
                 continue;
             };
             let Some(object) = parent_node.object.as_ref() else {
-                // The parent is the root, whose members are the source's
-                // volumes in announcement order, so the member is the volume.
-                let volume = VolumeIndex(member.0);
-                pulled = pulled.fold(root.seek(Seek { volume, ..ask }));
+                // A parent lent out cannot say where the bytes are; the ask
+                // is lifted again next round, when it may be back.
+                if parent_node.lent.is_some() {
+                    pulled = pulled.fold(ask.unlocated());
+                }
                 continue;
             };
             let mut extents = std::mem::take(&mut self.extents);
@@ -4025,7 +4052,20 @@ impl Tree {
         range: ByteRange,
         effects: &mut Vec<Effect>,
     ) {
-        self.descend(vec![(node, volume, range)], Provenance::Lost, effects);
+        self.damage_from(node, node, volume, range, effects);
+    }
+
+    // A loss told at `origin` that goes on below `node`: the owner's word
+    // for one that waited for a lent object (`Effect::Lost`).
+    pub fn damage_from(
+        &mut self,
+        origin: NodeId,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+        effects: &mut Vec<Effect>,
+    ) {
+        self.descend(vec![(node, volume, range)], Down::Lost { origin }, effects);
     }
 
     // The member's bytes, every one of them in, fail the checksum its
@@ -4058,7 +4098,7 @@ impl Tree {
             .map(|&(child, volume)| (child, volume, range))
             .into_iter()
             .collect();
-        self.descend(pending, Provenance::Refuted, effects);
+        self.descend(pending, Down::Refuted, effects);
     }
 
     // Capture the complete input dependencies of checksummed, damaged
@@ -4195,7 +4235,7 @@ impl Tree {
                 let mut pending = Vec::new();
                 let verdict = (range, Provenance::Refuted);
                 self.mark(parent, member, verdict, effects, &mut pending);
-                self.descend(pending, Provenance::Refuted, effects);
+                self.descend(pending, Down::Refuted, effects);
             }
             None => self.damage(node, volume, range, effects),
         }
@@ -4247,10 +4287,14 @@ impl Tree {
     fn descend(
         &mut self,
         pending: Vec<(NodeId, VolumeIndex, ByteRange)>,
-        provenance: Provenance,
+        down: Down,
         effects: &mut Vec<Effect>,
     ) {
-        self.walk_down(pending, false, |tree, node, member, range, pending| {
+        let provenance = match down {
+            Down::Lost { .. } => Provenance::Lost,
+            Down::Refuted | Down::Forget { .. } => Provenance::Refuted,
+        };
+        self.walk_down(pending, down, |tree, node, member, range, pending| {
             tree.mark(node, member, (range, provenance), effects, pending);
         });
     }
@@ -4298,7 +4342,7 @@ impl Tree {
     ) {
         self.walk_down(
             vec![(node, volume, range)],
-            true,
+            Down::Forget { keep_repairs },
             |tree, node, member, range, pending| {
                 if !keep_repairs {
                     tree.unsay(node, member, range, pending);
@@ -4741,10 +4785,16 @@ impl Tree {
     // says forgetting it forgets with it, a cipher's tail, goes down too:
     // where the bytes landed is read before the object forgets them, since
     // forgetting moves where a cipher would place them now.
+    //
+    // A node whose object is lent out cannot say where the bytes went, and
+    // it is not the root: what reaches it waits in its loan, in the order
+    // it came, and goes on down from it once it is back. A loss goes back
+    // to the owner then (`Effect::Lost`), since the owner hears every
+    // member a loss marks.
     fn walk_down(
         &mut self,
         mut pending: Vec<(NodeId, VolumeIndex, ByteRange)>,
-        forget: bool,
+        down: Down,
         mut each: impl FnMut(
             &mut Self,
             NodeId,
@@ -4753,13 +4803,27 @@ impl Tree {
             &mut Vec<(NodeId, VolumeIndex, ByteRange)>,
         ),
     ) {
+        let forget = matches!(down, Down::Forget { .. });
         while let Some((at, volume, range)) = pending.pop() {
-            let Some(found) = self.nodes.get(&at) else {
+            if at == NodeId::ROOT {
+                // The root has no object: the volume is the member.
+                each(self, at, MemberId(volume.0), range, &mut pending);
+                continue;
+            }
+            let Some(found) = self.nodes.get_mut(&at) else {
                 continue;
             };
+            if let Some(lent) = found.lent.as_mut() {
+                lent.wait(Waiting::Descended {
+                    volume,
+                    range,
+                    down,
+                });
+                continue;
+            }
+            // An object out of its node for a moment (`take_object`)
+            // answers nothing.
             let Some(object) = found.object.as_ref() else {
-                // The root: the volume is the member.
-                each(self, at, MemberId(volume.0), range, &mut pending);
                 continue;
             };
             let mut forgets = Vec::new();
@@ -5606,6 +5670,72 @@ mod tests {
             inner.coverage.damaged_ranges().collect::<Vec<_>>(),
             vec![ByteRange::new(3, 6)]
         );
+    }
+
+    #[test]
+    fn damage_reaching_a_lent_object_waits_and_goes_back_to_the_owner() {
+        let (mut tree, first, child, _) = bound_tree();
+        let length = tree
+            .namespace(child)
+            .unwrap()
+            .get(MemberId(0))
+            .unwrap()
+            .length;
+        let object = tree.lend_for_test(child).expect("lent");
+        let mut effects = Vec::new();
+        tree.damage(
+            NodeId::ROOT,
+            VolumeIndex(first.0),
+            ByteRange::new(10, 13),
+            &mut effects,
+        );
+        // Only the root's member is marked: the object that would place the
+        // bytes below is out.
+        assert_eq!(
+            effects,
+            vec![Effect::Damaged {
+                node: NodeId::ROOT,
+                member: first,
+                range: ByteRange::new(10, 13)
+            }]
+        );
+        let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
+        assert_eq!(inner.coverage.damaged_ranges().count(), 0);
+        assert_eq!(inner.length, length);
+        let mut back = Vec::new();
+        tree.take_back_worked(child, object, Vec::new(), &mut Build, &mut back);
+        assert_eq!(
+            back,
+            vec![Effect::Lost {
+                origin: NodeId::ROOT,
+                node: child,
+                volume: VolumeIndex(0),
+                range: ByteRange::new(10, 13)
+            }]
+        );
+        // The owner marks it from there, through the object's map.
+        let mut marked = Vec::new();
+        tree.damage_from(
+            NodeId::ROOT,
+            child,
+            VolumeIndex(0),
+            ByteRange::new(10, 13),
+            &mut marked,
+        );
+        assert_eq!(
+            marked,
+            vec![Effect::Damaged {
+                node: child,
+                member: MemberId(0),
+                range: ByteRange::new(3, 6)
+            }]
+        );
+        let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
+        assert_eq!(
+            inner.coverage.damaged_ranges().collect::<Vec<_>>(),
+            vec![ByteRange::new(3, 6)]
+        );
+        assert_eq!(inner.length, length);
     }
 
     #[test]

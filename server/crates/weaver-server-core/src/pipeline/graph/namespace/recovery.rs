@@ -332,10 +332,26 @@ impl NamespaceWriter {
         (node, ranges): (NodeId, Vec<(VolumeIndex, ByteRange)>),
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        self.lost_from(tree, builder, segments, node, (node, ranges), out)
+    }
+
+    // A loss told at `origin` that goes on below `node`, whose object it
+    // waited for while it was lent: marked from there as it would have been
+    // had the object been home, and refused as far as `origin` will never
+    // bring it.
+    pub(crate) fn lost_from(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        origin: NodeId,
+        (node, ranges): (NodeId, Vec<(VolumeIndex, ByteRange)>),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
         let mut effects = Vec::new();
         for (volume, range) in ranges {
             let from = effects.len();
-            tree.damage(node, volume, range, &mut effects);
+            tree.damage_from(origin, node, volume, range, &mut effects);
             let marked: Vec<(NodeId, MemberId, ByteRange)> = effects[from..]
                 .iter()
                 .filter_map(|effect| match effect {
@@ -349,7 +365,7 @@ impl NamespaceWriter {
                 .collect();
             for marked in marked {
                 self.set_volume_lost(tree, builder, marked, &mut effects);
-                self.refuse_range(tree, node, marked);
+                self.refuse_range(tree, origin, marked);
             }
         }
         if effects.is_empty() {
