@@ -225,10 +225,12 @@ struct Connection {
 
 // The plain BitTorrent stream a connection sends: the handshake, then
 // length-prefixed messages. Only the blocks of piece messages are served
-// bytes.
+// bytes. A stream that does not open with the plain handshake is encrypted,
+// and none of its bytes can be told for blocks.
 #[derive(Default)]
 struct Frames {
     handshake: u64,
+    encrypted: bool,
     header: [u8; 5],
     header_len: usize,
     // Body bytes left in the message being sent.
@@ -241,14 +243,20 @@ struct Frames {
 
 // A piece message's id.
 const PIECE: u8 = 7;
+// How a plain handshake opens: the protocol name's length, then the name.
+const PLAIN_OPENING: &[u8] = b"\x13BitTorrent protocol";
 
 impl Frames {
     // The block bytes among `bytes`, the next ones sent.
     fn feed(&mut self, mut bytes: &[u8]) -> u64 {
         let mut served = 0;
-        while !bytes.is_empty() {
+        while !bytes.is_empty() && !self.encrypted {
             if self.handshake < HANDSHAKE_LEN {
                 let take = (HANDSHAKE_LEN - self.handshake).min(bytes.len() as u64);
+                let at = self.handshake as usize;
+                let opening = PLAIN_OPENING.get(at..).unwrap_or_default();
+                let checked = opening.len().min(take as usize);
+                self.encrypted = bytes[..checked] != opening[..checked];
                 self.handshake += take;
                 bytes = &bytes[take as usize..];
             } else if self.left > 0 {
@@ -764,5 +772,39 @@ mod tests {
         dialed.unwrap();
         accepted.unwrap();
         assert_eq!(watched.inbound(), 1);
+    }
+
+    // A piece message after the plain handshake: length, id, index, offset,
+    // then the block.
+    fn piece_message(block: &[u8]) -> Vec<u8> {
+        let mut message = (9 + block.len() as u32).to_be_bytes().to_vec();
+        message.push(PIECE);
+        message.extend_from_slice(&[0; 8]);
+        message.extend_from_slice(block);
+        message
+    }
+
+    // A plain stream's block bytes are served bytes, whichever writes they
+    // go out in.
+    #[test]
+    fn a_plain_streams_block_is_counted() {
+        let mut stream = PLAIN_OPENING.to_vec();
+        stream.resize(HANDSHAKE_LEN as usize, 0);
+        stream.extend_from_slice(&[0, 0, 0, 1, 2]);
+        stream.extend_from_slice(&piece_message(&[0xab; 100]));
+        let mut frames = Frames::default();
+        let served: u64 = stream.chunks(7).map(|chunk| frames.feed(chunk)).sum();
+        assert_eq!(served, 100);
+    }
+
+    // An encrypted stream's bytes are never told for blocks, even where
+    // they read as a piece message.
+    #[test]
+    fn an_encrypted_stream_counts_nothing() {
+        let mut stream = vec![0x5a; HANDSHAKE_LEN as usize];
+        stream.extend_from_slice(&piece_message(&[0xab; 100]));
+        let mut frames = Frames::default();
+        assert_eq!(frames.feed(&stream), 0);
+        assert_eq!(frames.feed(&piece_message(&[0xab; 100])), 0);
     }
 }

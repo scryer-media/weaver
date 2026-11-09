@@ -32,6 +32,9 @@ pub use failure::SpeedTestFailure;
 pub use model::*;
 pub use overrides::{TestedLeg, TestedRoute};
 pub use providers::{PROVIDERS, ProviderInfo, ProviderServer};
+#[cfg(any(test, feature = "test-support"))]
+pub use runner::HandClock;
+pub use runner::RunClock;
 pub use service::{
     ServiceInner, SpeedTestError, SpeedTestMetricsSnapshot, SpeedTestService,
     speed_test_metrics_snapshot,

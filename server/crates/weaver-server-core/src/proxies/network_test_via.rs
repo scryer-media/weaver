@@ -16,7 +16,7 @@ use weaver_tunnel::{fault, pipe::Purpose, resolution::record::Recording};
 
 use crate::settings::TorrentConfig;
 use crate::speed_test::torrent::{P2pLeg, P2pPath, P2pPlan, probe as p2p_probe};
-use crate::speed_test::{P2pReport, TestTorrentSource};
+use crate::speed_test::{P2pReport, RunClock, TestTorrentSource};
 use crate::torrents::net::LegKind;
 use crate::torrents::sessions::{leg_kind, leg_unavailable, names_on};
 
@@ -72,6 +72,8 @@ pub struct P2pTest {
     pub torrent: TorrentConfig,
     pub ip_filter: Result<weaver_torrent::IpFilter, String>,
     pub allow_private_network: bool,
+    // What the test's waits are timed by.
+    pub clock: RunClock,
 }
 
 // A path's stages: the one beneath the proxy under test, and that proxy on
@@ -549,6 +551,7 @@ impl Probe {
                     torrent: test.torrent.clone(),
                     ip_filter: test.ip_filter.clone(),
                     allow_private_network: test.allow_private_network,
+                    clock: test.clock.clone(),
                 })
                 .await;
                 Some(match opened {

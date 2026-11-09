@@ -886,10 +886,9 @@ async fn test_via_torrent(
         .torrent
         .clone();
     let allow_private_network = runtime.allow_private_network();
-    let ip_filter = ctx
-        .data::<weaver_server_core::speed_test::SpeedTestService>()?
-        .ip_filter(&torrent)
-        .await;
+    let speed_test = ctx.data::<weaver_server_core::speed_test::SpeedTestService>()?;
+    let ip_filter = speed_test.ip_filter(&torrent).await;
+    let clock = speed_test.clock();
     let tests = {
         let _guard = runtime.mutations.lock().await;
         let test: std::pin::Pin<
@@ -908,6 +907,7 @@ async fn test_via_torrent(
                 torrent,
                 ip_filter,
                 allow_private_network,
+                clock,
             },
         ));
         test.await.map_err(refusal_error)?
