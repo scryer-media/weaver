@@ -167,13 +167,15 @@ impl GraphJob {
         self.writer.kept_records(node)
     }
 
-    // The holds the node's namespace has on scratch.
-    pub(crate) fn hold_records(&self, node: NodeId) -> Vec<ScratchHold> {
+    // The holds the node's namespace has on scratch and in spill files,
+    // each with whether it is in a spill file.
+    pub(crate) fn hold_records(&self, node: NodeId) -> Vec<(ScratchHold, bool)> {
         self.writer.hold_records(node)
     }
 
-    // A graceful stop: what the job holds in RAM goes to scratch, so the
-    // checkpoint after it spares a restart fetching it again.
+    // A graceful stop: what the job holds in RAM goes to scratch, or past
+    // the budgets to its member's spill file, so the checkpoint after it
+    // spares a restart fetching it again.
     pub(crate) fn page_out_holds(&mut self) -> Result<(), WriteError> {
         self.writer.page_out_holds()
     }

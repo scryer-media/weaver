@@ -140,6 +140,7 @@ impl GraphJob {
         job.tree
             .restored(&mut job.writer.placing(&mut *job.builder), &mut effects);
         job.settle(effects)?;
+        job.lift_hold_refusals()?;
         job.writer.queue_rechecks(rejected);
         job.mark_damage()?;
         let mut effects = Vec::new();
@@ -161,6 +162,15 @@ impl GraphJob {
             refetched,
             job,
         })
+    }
+
+    // Refusals an older build gave when holds ran past their budgets are
+    // taken back, and their sets read their volumes again from their files.
+    fn lift_hold_refusals(&mut self) -> Result<(), GraphError> {
+        let mut out = Vec::new();
+        self.writer
+            .lift_hold_refusals(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
+        self.heard(out)
     }
 
     // The node was offered this candidate last: it is offered again, so the

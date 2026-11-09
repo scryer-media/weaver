@@ -868,9 +868,10 @@ fn holds_paged_out_at_a_stop_read_back_in_a_writer_rebuilt_from_their_records() 
         .writer
         .hold_records(NodeId::ROOT)
         .into_iter()
-        .map(|held| HoldRecord {
+        .map(|(held, on_file)| HoldRecord {
             node: NodeId::ROOT,
             held,
+            on_file,
         })
         .collect();
     assert_eq!(records.len(), 2);
@@ -926,6 +927,7 @@ fn a_hold_record_past_its_scratch_file_is_not_adopted() {
             range: ByteRange::new(6, 11),
             scratch_offset: 0,
         },
+        on_file: false,
     }];
     job.writer
         .restore_holds(&job.tree, &records)
