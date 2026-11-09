@@ -40,6 +40,11 @@ impl Decoder for Zstd {
         1 << log
     }
 
+    // libzstd refuses a frame too wide without saying how wide.
+    fn declared(first: &[u8]) -> Option<u64> {
+        declared_log(first).map(|log| 1u64 << log.min(63))
+    }
+
     fn open(input: Front, window: u64) -> io::Result<Box<dyn Read + Send>> {
         let mut decoder = FrameDecoder::new(input)?;
         decoder.window_log_max(log_floor(window))?;
@@ -65,7 +70,9 @@ fn log_ceil(bytes: u64) -> u32 {
 // content.
 fn declared_log(first: &[u8]) -> Option<u32> {
     let word = |at: usize| -> Option<u32> {
-        Some(u32::from_le_bytes(first.get(at..at.checked_add(4)?)?.try_into().ok()?))
+        Some(u32::from_le_bytes(
+            first.get(at..at.checked_add(4)?)?.try_into().ok()?,
+        ))
     };
     let mut at = 0;
     while word(at)? & SKIPPABLE_MASK == SKIPPABLE_MAGIC {

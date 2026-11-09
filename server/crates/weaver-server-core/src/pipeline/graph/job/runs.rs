@@ -135,8 +135,13 @@ impl GraphJob {
                         }
                         match piece {
                             Ok(posted) => {
-                                self.tree
-                                    .rewalked(node, volume, posted, &mut placing, &mut effects);
+                                self.tree.rewalked(
+                                    node,
+                                    volume,
+                                    posted,
+                                    &mut placing,
+                                    &mut effects,
+                                );
                             }
                             Err(range) => {
                                 drop(placing);
@@ -311,11 +316,15 @@ impl GraphJob {
         match self.runs.reserve(node, window) {
             Reservation::Granted => {}
             Reservation::Starved(admitted) => return Ok(admitted),
-            Reservation::Refused => {
+            Reservation::Refused { needed, allowed } => {
                 let mut effects = Vec::new();
+                let why = Why::TooLarge {
+                    needed: Some(needed),
+                    allowed: Some(allowed),
+                };
                 self.tree.emitted(
                     node,
-                    vec![Emit::Refuse(Why::Unsupported)],
+                    vec![Emit::Refuse(why)],
                     &mut self.writer.placing(&mut *self.builder),
                     &mut effects,
                 );

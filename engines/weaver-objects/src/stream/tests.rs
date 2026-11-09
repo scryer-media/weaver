@@ -513,16 +513,55 @@ fn zstd_window(log: u8) -> Vec<u8> {
     frame
 }
 
+// A run over `bytes` whose front the stream was handed first, as its owner
+// hands it before a run starts.
+fn fronted<D: Decoder>(stream: &mut Stream<D>, bytes: Vec<u8>) -> Vec<Said> {
+    stream.deliver(
+        Delivery {
+            volume: VolumeIndex(0),
+            offset: 0,
+            bytes: &weaver_graph::Evidenced::from(bytes.clone()),
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut Vec::new(),
+    );
+    whole(stream, bytes)
+}
+
+// Refused as needing more decode memory than it was allowed.
+fn too_large(said: &[Said], needed: Option<u64>, allowed: Option<u64>) {
+    assert_eq!(
+        ending(said),
+        [
+            Said::Retract,
+            Said::Refuse(Why::TooLarge { needed, allowed })
+        ],
+        "{said:?}"
+    );
+}
+
 // The decoder keeps its default window limit: a frame that asks for more is
-// refused, however little it holds.
+// refused as too large, however little it holds, with the window its header
+// declares against the one it was held to.
 #[test]
 fn a_zstd_frame_wider_than_the_decoders_limit_is_refused() {
-    let mut stream = stream::<Zstd>("a.zst");
+    let mut frames = stream::<Zstd>("a.zst");
     assert_eq!(
-        whole(&mut stream, zstd_window(27)),
+        fronted(&mut frames, zstd_window(27)),
         decoded("a", b"z".to_vec())
     );
-    refused(&whole(&mut stream, zstd_window(28)));
+    too_large(
+        &fronted(&mut frames, zstd_window(28)),
+        Some(1 << 28),
+        Some(1 << 27),
+    );
+    // A run whose front never reached the stream knows only the window.
+    too_large(
+        &whole(&mut stream::<Zstd>("a.zst"), zstd_window(28)),
+        None,
+        Some(1 << 27),
+    );
 }
 
 const MIB: u64 = 1 << 20;
@@ -546,10 +585,11 @@ fn profiles() -> [weaver_graph::Budget; 3] {
 fn xz_declaring(property: u8) -> Vec<u8> {
     let mut bytes = xz_at(&first_payload(), 1 << 20);
     let end = 12 + (usize::from(bytes[12]) + 1) * 4;
-    let at = 12 + bytes[12..end]
-        .windows(3)
-        .position(|filter| filter == [0x21, 0x01, 16])
-        .unwrap()
+    let at = 12
+        + bytes[12..end]
+            .windows(3)
+            .position(|filter| filter == [0x21, 0x01, 16])
+            .unwrap()
         + 2;
     bytes[at] = property;
     let check = crate::grid::crc32(&bytes[12..end - 4]);
@@ -619,11 +659,19 @@ fn a_zstd_frame_wider_than_the_granted_window_is_refused() {
         whole(&mut narrow, zstd_window(20)),
         decoded("a", b"z".to_vec())
     );
-    refused(&whole(&mut narrow, zstd_window(21)));
+    too_large(
+        &fronted(&mut narrow, zstd_window(21)),
+        Some(2 * MIB),
+        Some(MIB),
+    );
 
     let [efficient, ..] = profiles();
     let mut held = stream::<Zstd>("a.zst").within(efficient);
-    refused(&whole(&mut held, zstd_window(29)));
+    too_large(
+        &fronted(&mut held, zstd_window(29)),
+        Some(512 * MIB),
+        Some(256 * MIB),
+    );
 }
 
 #[test]
@@ -832,10 +880,9 @@ fn a_closed_multiblock_xz_decodes_its_blocks_side_by_side_within_the_budget() {
         bytes.clone(),
         budget(1, 4),
     );
-    assert_eq!(
-        ending(&held),
-        [Said::Retract, Said::Refuse(Why::Unsupported)]
-    );
+    // The decoder states the sizes it refused: the stream's index, 28
+    // bytes, against the one byte granted.
+    too_large(&held, Some(28), Some(1));
     let sequential = closed_run(&mut stream::<Xz>("ember.bin.xz"), bytes, budget(1, 1));
     assert_eq!(sequential, decoded("ember.bin", plain));
 }

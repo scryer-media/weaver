@@ -204,8 +204,9 @@ pub(crate) enum Reservation {
     // It does not fit beside what is resident now: its slot went to the
     // nodes named, which may start now.
     Starved(Vec<NodeId>),
-    // It is larger than the resident limit itself, so it can never fit.
-    Refused,
+    // It is larger than the resident limit itself, so it can never fit:
+    // `needed` bytes against the `allowed` limit.
+    Refused { needed: u64, allowed: u64 },
 }
 
 // A run's last word, said when the run's thread lets it go, however the run
@@ -405,8 +406,12 @@ impl Runs {
             return Reservation::Granted;
         }
         let len = window.saturating_add(RUN_OVERHEAD);
-        if len > self.accountant.budgets().resident_limit {
-            return Reservation::Refused;
+        let allowed = self.accountant.budgets().resident_limit;
+        if len > allowed {
+            return Reservation::Refused {
+                needed: len,
+                allowed,
+            };
         }
         if self.accountant.reserve_resident(namespace, len) == Reserve::Granted {
             run.reserved = len;

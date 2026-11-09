@@ -266,6 +266,48 @@ fn an_lzma2_archive_extracts_its_members() {
     );
 }
 
+// A folder whose decoder needs more memory than the run was granted is
+// refused as too large, with the sizes the decoder states, before any of
+// its bytes are said.
+#[test]
+fn a_folder_larger_than_the_memory_granted_is_refused_too_large() {
+    let first = payload(7, 2_000).repeat(10);
+    let archive = lzma2(&[("first.bin", &first)]);
+    let mut emits = Vec::new();
+    let mut sink = |emit| {
+        emits.push(emit);
+        true
+    };
+    SevenZipEngine::new().start().run(
+        Gate::whole(vec![archive]),
+        &mut sink,
+        weaver_graph::Budget {
+            memory_bytes: Some(1 << 10),
+            threads: 1,
+            ..Default::default()
+        },
+    );
+    let said = said(&emits);
+    assert!(
+        !said.iter().any(|said| matches!(said, Said::Bytes(..))),
+        "{said:?}"
+    );
+    let refused: Vec<&Said> = said
+        .iter()
+        .filter(|said| matches!(said, Said::Refuse(_)))
+        .collect();
+    assert!(
+        matches!(
+            refused.as_slice(),
+            [Said::Refuse(Why::TooLarge {
+                needed: Some(needed),
+                allowed: Some(1024),
+            })] if *needed > 1024
+        ),
+        "{said:?}"
+    );
+}
+
 #[test]
 fn a_run_waits_for_the_tail_and_continues_when_it_lands() {
     let archive = store();

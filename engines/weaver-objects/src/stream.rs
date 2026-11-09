@@ -50,6 +50,13 @@ pub trait Decoder: Send + Sync + 'static {
     // `budget` grants.
     fn window(first: &[u8], budget: &Budget) -> u64;
 
+    // The memory the first bytes declare the decoder needs, unbounded by any
+    // grant, for a decoder whose refusal does not say it: `None` where the
+    // front does not say or the decoder says for itself.
+    fn declared(_first: &[u8]) -> Option<u64> {
+        None
+    }
+
     // The decoded bytes of the stream read from `input`, holding no more
     // than `window` resident.
     fn open(input: Front, _window: u64) -> io::Result<Box<dyn Read + Send>> {
@@ -252,6 +259,7 @@ impl<D: Decoder> Engine for Stream<D> {
         Box::new(run::Run::<D>::new(
             D::member(&self.name),
             D::window(&self.first, &self.budget),
+            D::declared(&self.first),
         ))
     }
 

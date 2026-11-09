@@ -1119,9 +1119,12 @@ fn a_compressed_member_larger_than_the_run_memory_budget_is_refused() {
     );
     let result = on_budget(vec![archive.to_vec()], Some(1), 1);
     assert!(
-        result.said.contains(&Said::Refuse(Why::Unsupported)),
-        "{} events",
-        result.said.len()
+        result.said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(256 << 10),
+            allowed: Some(1),
+        })),
+        "{:?}",
+        result.said
     );
     assert!(
         !result
@@ -1208,7 +1211,13 @@ fn a_one_gib_rar_dictionary_is_refused_only_under_efficient() {
         efficient,
     );
     let said = said(&emits);
-    assert!(said.contains(&Said::Refuse(Why::Unsupported)), "{said:?}");
+    assert!(
+        said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(GIB),
+            allowed: Some(256 * MIB),
+        })),
+        "{said:?}"
+    );
     assert!(!said.iter().any(|said| matches!(said, Said::Bytes(_, _))));
 }
 

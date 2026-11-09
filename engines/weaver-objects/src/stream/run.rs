@@ -26,14 +26,18 @@ pub(super) struct Run<D> {
     decoder: PhantomData<fn() -> D>,
     name: String,
     window: u64,
+    // What the stream's front declares its decoder needs, where the
+    // decoder's own refusal does not say.
+    declared: Option<u64>,
 }
 
 impl<D: Decoder> Run<D> {
-    pub(super) fn new(name: String, window: u64) -> Self {
+    pub(super) fn new(name: String, window: u64, declared: Option<u64>) -> Self {
         Self {
             decoder: PhantomData,
             name,
             window,
+            declared,
         }
     }
 }
@@ -77,7 +81,7 @@ impl<D: Decoder> Extraction for Run<D> {
         if failed.load(Ordering::Acquire) || !sink(Emit::Retract(MEMBER)) {
             return;
         }
-        sink(Emit::Refuse(why(&error)));
+        sink(Emit::Refuse(why(&error, self.window, self.declared)));
     }
 }
 
@@ -129,12 +133,31 @@ fn fill<R: Read + ?Sized>(reader: &mut R, buffer: &mut [u8]) -> (usize, Option<i
     (filled, None)
 }
 
-// A stream that asks for more than its reservation, or for something its
+// A stream that asks for more memory than its window, or for something its
 // decoder does not implement, is not damage; everything else a decoder
-// fails on is, and nothing here can repair the decoder's input.
-fn why(error: &io::Error) -> Why {
+// fails on is, and nothing here can repair the decoder's input. A decoder
+// that states the sizes it refused says them. zstd states none: it was held
+// to the run's window, and needs what its front declares when that is more.
+fn why(error: &io::Error, window: u64, declared: Option<u64>) -> Why {
+    if let Some(why) = crate::verdict::too_large(error) {
+        return why;
+    }
+    if zstd_0_13_frame_too_wide(&error.to_string()) {
+        return Why::TooLarge {
+            needed: declared.filter(|declared| *declared > window),
+            allowed: Some(window),
+        };
+    }
     match error.kind() {
-        io::ErrorKind::Unsupported | io::ErrorKind::OutOfMemory => Why::Unsupported,
+        io::ErrorKind::Unsupported => Why::Unsupported,
         _ => Why::Unrepairable,
     }
+}
+
+// zstd 0.13 (libzstd 1.5.7): a frame whose window is wider than the
+// decoder's limit is an `io::Error` carrying `ZSTD_getErrorName`'s text for
+// `frameParameter_windowTooLarge`. zstd exposes no typed error code through
+// its `Read` adapters.
+fn zstd_0_13_frame_too_wide(text: &str) -> bool {
+    text.contains("Frame requires too much memory for decoding")
 }

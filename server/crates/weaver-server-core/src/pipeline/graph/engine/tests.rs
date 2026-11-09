@@ -573,13 +573,24 @@ async fn a_run_spends_only_the_time_its_decoder_executes() {
     let mut runs = Runs::new(1, 1, mail.sender(), unbounded()).timed(clock.clone());
     let (first, second) = (NodeId(1), NodeId(2));
     assert_eq!(runs.ask(first, 1), vec![first]);
-    assert!(runs.ask(second, 1).is_empty(), "the second waits for a slot");
+    assert!(
+        runs.ask(second, 1).is_empty(),
+        "the second waits for a slot"
+    );
     tokio::time::advance(PAST).await;
-    assert_eq!(clock.spent(), Duration::ZERO, "admitted, queued, not started");
+    assert_eq!(
+        clock.spent(),
+        Duration::ZERO,
+        "admitted, queued, not started"
+    );
 
     let (decoding, decoded) = std::sync::mpsc::channel();
     let (finish, done) = std::sync::mpsc::channel();
-    runs.start(first, Box::new(Decodes { decoding, done }), envelopes.shelf(first));
+    runs.start(
+        first,
+        Box::new(Decodes { decoding, done }),
+        envelopes.shelf(first),
+    );
     idle_after(&clock, 1);
     tokio::time::advance(PAST).await;
     assert_eq!(clock.spent(), Duration::ZERO, "waiting for its first byte");
@@ -606,13 +617,21 @@ async fn a_run_starved_of_memory_spends_nothing() {
 
     const WINDOW: u64 = 1 << 20;
     let clock = DecodeClock::default();
-    let mut runs = Runs::new(1, 2, RunMail::default().sender(), bounded(WINDOW + RUN_OVERHEAD))
-        .timed(clock.clone());
+    let mut runs = Runs::new(
+        1,
+        2,
+        RunMail::default().sender(),
+        bounded(WINDOW + RUN_OVERHEAD),
+    )
+    .timed(clock.clone());
     let (first, second) = (NodeId(1), NodeId(2));
     assert_eq!(runs.ask(first, 2), vec![first]);
     assert_eq!(runs.reserve(first, WINDOW), Reservation::Granted);
     assert_eq!(runs.ask(second, 2), vec![second]);
-    assert_eq!(runs.reserve(second, WINDOW), Reservation::Starved(Vec::new()));
+    assert_eq!(
+        runs.reserve(second, WINDOW),
+        Reservation::Starved(Vec::new())
+    );
     tokio::time::advance(Duration::from_secs(100)).await;
     assert_eq!(clock.spent(), Duration::ZERO);
 }
@@ -751,7 +770,13 @@ fn a_window_larger_than_the_resident_limit_is_refused() {
     let mut runs = Runs::new(1, 1, RunMail::default().sender(), bounded(RUN_OVERHEAD));
     let node = NodeId(1);
     assert_eq!(runs.ask(node, 1), vec![node]);
-    assert_eq!(runs.reserve(node, 1), Reservation::Refused);
+    assert_eq!(
+        runs.reserve(node, 1),
+        Reservation::Refused {
+            needed: 1 + RUN_OVERHEAD,
+            allowed: RUN_OVERHEAD
+        }
+    );
     assert_eq!(runs.reserved(node), 0);
 }
 
@@ -1065,16 +1090,20 @@ async fn a_job_holds_its_engines_window_while_the_run_is_live() {
     assert_eq!(echoing.accountant.usage().resident, 0);
 }
 
-// An engine whose window can never fit is refused to the tree, and its
-// volume is a leaf that says why.
+// An engine whose window can never fit is refused to the tree as too large,
+// with what it needs against the resident limit, and its volume is a leaf
+// that says why.
 #[tokio::test]
-async fn an_engine_whose_window_can_never_fit_is_refused_unsupported() {
+async fn an_engine_whose_window_can_never_fit_is_refused_too_large() {
     let mut echoing = echoing_within(1, 1 << 30, bounded(64 << 20));
     echoing.deliver(0);
     assert!(echoing.job.tree().engines().is_empty());
     assert_eq!(
         echoing.job.writer().refused(NodeId::ROOT, MemberId(0)),
-        Some(Why::Unsupported)
+        Some(Why::TooLarge {
+            needed: Some((1 << 30) + RUN_OVERHEAD),
+            allowed: Some(64 << 20),
+        })
     );
     assert!(!echoing.job.runs().live());
     assert_eq!(echoing.accountant.usage().resident, 0);

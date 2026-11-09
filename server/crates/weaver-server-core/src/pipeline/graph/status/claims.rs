@@ -292,7 +292,7 @@ impl Delivery {
         } else {
             ""
         };
-        let mut reasons: Vec<(&str, Vec<&str>)> = Vec::new();
+        let mut reasons: Vec<(String, Vec<&str>)> = Vec::new();
         for (name, why) in &self.withheld {
             let reason = withheld_because(*why);
             match reasons.iter_mut().find(|(seen, _)| *seen == reason) {
@@ -467,13 +467,38 @@ impl<F: Fn(&str) -> bool, R: Fn(NodeId, MemberId) -> bool> Walk<'_, F, R> {
 // Why a member was withheld, as a job's error words it after its names. A
 // password the object needed is one reason, whether it shut the member's
 // bytes or the headers naming them.
-fn withheld_because(why: Why) -> &'static str {
-    match why {
+fn withheld_because(why: Why) -> String {
+    let said = match why {
         Why::Encrypted | Why::EncryptedHeader => "needs a password and none was given",
         Why::Compressed => "is compressed and no engine reads it",
         Why::Unmapped => "never placed every member it named",
         Why::InvalidArchive => "is an invalid archive rejected by validation",
+        Why::TooLarge { needed, allowed } => return too_large(needed, allowed),
         _ => "was refused",
+    };
+    said.to_owned()
+}
+
+// An archive whose decode needs more memory than a decode may hold, with
+// the sizes the decoder that refused it said: "needs 2.0 GiB of decode
+// memory, 1.0 GiB allowed".
+fn too_large(needed: Option<u64>, allowed: Option<u64>) -> String {
+    use crate::support::human_bytes;
+    match (needed, allowed) {
+        (Some(needed), Some(allowed)) => format!(
+            "needs {} of decode memory, {} allowed",
+            human_bytes(needed),
+            human_bytes(allowed)
+        ),
+        (Some(needed), None) => format!(
+            "needs {} of decode memory, more than could be had",
+            human_bytes(needed)
+        ),
+        (None, Some(allowed)) => format!(
+            "needs more decode memory than the {} allowed",
+            human_bytes(allowed)
+        ),
+        (None, None) => "needs more decode memory than could be had".to_owned(),
     }
 }
 
