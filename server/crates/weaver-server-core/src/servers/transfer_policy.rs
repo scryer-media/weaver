@@ -361,6 +361,17 @@ impl ServerTransferPolicyRegistry {
         self.servers.transfers.subscribe_capacity_changes()
     }
 
+    // Rings each time a server or an egress starts or stops turning work
+    // away for its download quota: the two registries share one signal.
+    pub fn subscribe_quota_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.egresses.transfers.subscribe_quota_changes()
+    }
+
+    // Every egress with a policy, by id.
+    pub fn egress_ids(&self) -> Vec<u32> {
+        self.egresses.policies().keys().copied().collect()
+    }
+
     fn notify_changed(&self) {
         self.policy_revision
             .send_modify(|revision| *revision = revision.wrapping_add(1));
@@ -1022,14 +1033,20 @@ pub(crate) fn rate_config(
     }
 }
 
-// Where a holder stands in each direction. Downloads stop at the budget;
-// a download quota has no soft cap.
+// Where a holder stands in each direction. Downloads stop at the budget,
+// or once the quota turns work away: a reservation is taken at its estimate,
+// so the bytes used can stay short of the budget while nothing more fits. A
+// download quota has no soft cap.
 fn quota_states(
     snapshot: &weaver_nntp::transfer::ServerTransferSnapshot,
     policy: &ServerPolicyState,
 ) -> EgressQuotaStates {
+    let download = match policy.quota.download_bytes {
+        Some(_) if snapshot.quota_blocked => QuotaState::Stopped,
+        budget => QuotaState::of(snapshot.quota_used_bytes, None, budget),
+    };
     EgressQuotaStates {
-        download: QuotaState::of(snapshot.quota_used_bytes, None, policy.quota.download_bytes),
+        download,
         upload: policy.upload_state(),
     }
 }

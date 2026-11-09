@@ -874,6 +874,58 @@ async fn torrent_rates_on_an_egress_follow_its_caps_and_upload_quota() {
     runtime.shutdown().await;
 }
 
+// A download quota that turns work away stops torrent downloads on its
+// egress and says so, though the bytes used stay short of the budget, as
+// reservations are taken at their estimate. A larger allowance lets them
+// move again. Each turn rings.
+#[tokio::test]
+async fn a_download_quota_that_turns_work_away_stops_torrent_downloads_on_its_egress() {
+    let db = Database::open_in_memory().unwrap();
+    let metered = db
+        .create_egress_interface(&metered_egress(1_000_000))
+        .unwrap();
+    let policy = Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(db.clone(), &[])
+            .unwrap(),
+    );
+    let runtime = NetworkRuntime::with_quota_policy(
+        db,
+        tokio::runtime::Handle::current(),
+        Some(policy.clone()),
+    )
+    .unwrap();
+    spend(&runtime, metered.id, 900_000);
+    assert_eq!(runtime.torrent_egress_rates(metered.id).download, None);
+
+    // Only the refusal rings from here: nothing else changes.
+    let mut changes = runtime.egress_limit_changes().unwrap();
+    assert!(
+        runtime
+            .egress_controls
+            .control(weaver_nntp::transfer::StableServerId(metered.id))
+            .try_reserve(200_000)
+            .is_err()
+    );
+    assert!(changes.changed().await);
+    assert_eq!(runtime.torrent_egress_rates(metered.id).download, Some(0));
+    assert_eq!(
+        policy.egress_quota_states(metered.id).unwrap().download,
+        crate::bandwidth::QuotaState::Stopped
+    );
+
+    let mut raised = metered.clone();
+    raised.quota.download_bytes = Some(10_000_000);
+    policy.reconfigure_egresses(&[raised]).unwrap();
+    while runtime.torrent_egress_rates(metered.id).download.is_some() {
+        assert!(changes.changed().await);
+    }
+    assert_eq!(
+        policy.egress_quota_states(metered.id).unwrap().download,
+        crate::bandwidth::QuotaState::Normal
+    );
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn egress_quota_usage_survives_a_network_recompile_and_a_rebuilt_runtime() {
     let db = Database::open_in_memory().unwrap();

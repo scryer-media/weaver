@@ -329,6 +329,7 @@ impl Routes for FakeRoutes {
         Some(EgressLimitChanges::new(
             self.egress_policy.subscribe(),
             self.egress_capacity.subscribe(),
+            self.egress_capacity.subscribe(),
         ))
     }
 
