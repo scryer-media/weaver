@@ -545,6 +545,7 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
         format!("{INTERNAL_DIR}/graph-recovery-0-3.repaired"),
         format!("{INTERNAL_DIR}/graph-recovery-0-3/set.par2"),
         format!("{INTERNAL_DIR}/graph-waiting-0-2"),
+        crate::pipeline::graph::window::window_name(NodeId(1), 0),
         "inner/stray.bin".to_owned(),
         "set.par2".to_owned(),
         "set.part1.rar".to_owned(),
@@ -584,6 +585,32 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
     left.sort();
     assert_eq!(left, named);
     assert!(!dir.path().join("stray").exists());
+}
+
+// A decode window's scratch file is never named by a checkpoint: a restore
+// removes every one its job left, and touches none in a folder that is not
+// the job's.
+#[test]
+fn a_restore_removes_leftover_decode_windows_only_in_its_own_folder() {
+    use crate::pipeline::graph::window::window_name;
+    let dir = tempfile::tempdir().unwrap();
+    let job = dir.path().join("job");
+    let other = dir.path().join("other");
+    let windows = [window_name(NodeId(0), 0), window_name(NodeId(2), 7)];
+    for root in [&job, &other] {
+        for name in &windows {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"window").unwrap();
+        }
+    }
+    let rows = rows(&full());
+    let restored = snapshot(&rows).unwrap();
+    crate::pipeline::graph::restore::sweep_unnamed(&job, &restored, &rows.held_parts).unwrap();
+    for name in &windows {
+        assert!(!job.join(name).exists(), "{name} survived the restore");
+        assert!(other.join(name).exists(), "{name} went from another folder");
+    }
 }
 
 // A directory member the checkpoint names stays, but what is in it is the
@@ -1226,6 +1253,7 @@ fn restored(
             nesting: u32::MAX,
             hardware: Default::default(),
             metrics: None,
+            data_dir: None,
         },
         0,
     )

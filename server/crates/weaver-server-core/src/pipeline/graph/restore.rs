@@ -115,6 +115,7 @@ pub(crate) struct RestoreSeat {
     metrics: Arc<PipelineMetrics>,
     extraction_limits: Arc<ExtractionLimits>,
     spec_password: Option<String>,
+    data_dir: Option<(PathBuf, CapacityReader)>,
 }
 
 impl Pipeline {
@@ -143,6 +144,7 @@ impl Pipeline {
             metrics: Arc::clone(&self.metrics),
             extraction_limits: Arc::clone(&self.extraction_limits),
             spec_password,
+            data_dir: Some(self.window_data_dir()),
         }
     }
 }
@@ -250,6 +252,7 @@ impl RestoreSeat {
             nesting: super::limits::NESTING,
             hardware: self.hardware,
             metrics: Some(self.metrics),
+            data_dir: self.data_dir,
         };
         let limit = storage.slots;
         let Restored {

@@ -69,13 +69,15 @@ impl GraphJob {
         tree.nest_at_most(storage.nesting);
         let root = ArticleRoot::restore(files, &snapshot.root)?;
         same_post(&tree, files)?;
+        let windows = storage.windows(scope);
         let runs = Runs::new(
             scope,
             storage.slots,
             storage.mail,
             Arc::clone(&storage.accountant),
         )
-        .on(storage.hardware);
+        .on(storage.hardware)
+        .lending(windows);
         let mut writer = NamespaceWriter::new(
             scope,
             storage.working_dir,

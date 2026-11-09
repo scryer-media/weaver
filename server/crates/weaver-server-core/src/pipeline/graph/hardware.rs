@@ -92,6 +92,7 @@ impl Grant {
                 window_bytes: Some(tuning.decode_window_bytes),
                 threads,
                 pool: Some(lent),
+                lender: None,
             },
             repair: Budget {
                 memory_bytes: Some(
@@ -102,6 +103,7 @@ impl Grant {
                 window_bytes: None,
                 threads: tuning.par3_cpu_cap.map_or(host, |cap| host.min(cap)).max(1),
                 pool: None,
+                lender: None,
             },
         }
     }

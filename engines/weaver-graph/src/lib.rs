@@ -44,6 +44,7 @@ pub mod slots;
 pub mod sniff;
 pub mod tree;
 pub mod volume;
+pub mod window;
 mod wire;
 
 pub use deliver::{Delivery, Emit, Handed, Posted, Provenance, RecoveryKind, Why};
@@ -72,3 +73,4 @@ pub use sniff::{
 };
 pub use tree::{AGAIN_PIECE, Builder, Disclaim, Effect, NodeId, Rewalk, Tree};
 pub use volume::{ByteRange, VolumeIndex};
+pub use window::{WindowLender, WindowMemory};
