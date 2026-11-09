@@ -111,6 +111,29 @@ impl Zip {
                         );
                         continue;
                     }
+                    // What the object holds for the keys is its own, said
+                    // to the member once they run: its owner holds none of
+                    // it.
+                    let queued = self
+                        .queued_end(member)
+                        .filter(|end| range.start < *end)
+                        .map(|end| end.min(range.end));
+                    let range = match queued {
+                        Some(end) => {
+                            push(
+                                out,
+                                Placement::Member {
+                                    member,
+                                    range: ByteRange::new(range.start, end),
+                                },
+                            );
+                            if end == range.end {
+                                continue;
+                            }
+                            ByteRange::new(end, range.end)
+                        }
+                        None => range,
+                    };
                     // What would take the bytes held for the keys past
                     // their cap is held by the owner, wherever it starts.
                     let parked = self.parks_from(member, range);

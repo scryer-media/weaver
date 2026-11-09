@@ -189,6 +189,13 @@ impl Zip {
         })
     }
 
+    // Where what `member` holds for its keys ends, while it holds any.
+    pub(super) fn queued_end(&self, member: MemberId) -> Option<u64> {
+        self.holding(member)
+            .then(|| self.held_end(member))
+            .flatten()
+    }
+
     pub(super) fn holding(&self, member: MemberId) -> bool {
         self.held.iter().any(|held| held.member == member.0)
     }
@@ -229,15 +236,17 @@ impl Zip {
     // the tree. Away from the tree a member's parts are deciphered only
     // where its keys are proved and reach them, as they did when they were
     // held; a member a restart or a forgotten range left otherwise needs a
-    // read, and what it holds waits for one.
+    // read, and what it holds waits for one. A part nothing read reaches
+    // yet stays, with every part of its member after it, for the keys to
+    // come back to it: nothing held is lost.
     pub(super) fn run_held(&mut self, mut read: Option<Read<'_>>, out: &mut Vec<Emit>) {
         let mut away = |_: &Placement, _: &mut Vec<u8>| false;
         let mut waiting = std::collections::BTreeSet::new();
         let mut kept = Vec::new();
         for held in std::mem::take(&mut self.held) {
             let member = MemberId(held.member);
-            if read.is_none()
-                && (waiting.contains(&held.member) || !self.ready(member, held.offset))
+            if waiting.contains(&held.member)
+                || (read.is_none() && !self.ready(member, held.offset))
             {
                 waiting.insert(held.member);
                 kept.push(held);
@@ -247,14 +256,22 @@ impl Zip {
                 Some(read) => &mut **read,
                 None => &mut away,
             };
-            self.decrypt_record(
-                member,
-                held.offset,
-                Evidenced::from(held.bytes),
-                held.provenance,
-                read,
-                out,
-            );
+            let Held {
+                offset,
+                bytes,
+                provenance,
+                ..
+            } = held;
+            let bytes = Evidenced::from(bytes);
+            if !self.decrypt_record(member, offset, bytes.clone(), provenance, read, out) {
+                waiting.insert(member.0);
+                kept.push(Held {
+                    member: member.0,
+                    offset,
+                    bytes: bytes.to_vec(),
+                    provenance,
+                });
+            }
         }
         self.held = kept;
     }

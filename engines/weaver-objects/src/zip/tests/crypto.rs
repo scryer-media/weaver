@@ -262,6 +262,22 @@ fn assert_whole(owner: &Owner, plain: &[u8], archive: &[u8]) {
     assert!(super::super::counting::queued_most_here() <= SMALL_CAP);
 }
 
+// Crossing the cap asks for nothing again: the member is deciphered once,
+// every byte of it, and closes from that one pass.
+fn assert_once(owner: &Owner, plain: &[u8], deciphered: u64) {
+    let again: Vec<_> = owner
+        .said
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Again { .. }))
+        .collect();
+    assert!(again.is_empty(), "{again:?}");
+    assert_eq!(owner.replays, 0);
+    assert_eq!(
+        super::super::counting::deciphered_here() - deciphered,
+        plain.len() as u64
+    );
+}
+
 // In order, with the keys never run: the object holds no more than the cap
 // for them, deciphers nothing as the articles come, and places the rest of
 // the ciphertext as its owner's to hold. Run, the keys reach what the owner
@@ -300,6 +316,7 @@ fn ciphertext_past_the_cap_waits_with_its_owner_and_comes_back_in_order() {
     assert!(owner.held_bytes() > 0);
     drain(&mut owner);
     assert_whole(&owner, &plain, &archive);
+    assert_once(&owner, &plain, deciphered);
 }
 
 // An article that comes before the one ahead of it, past the cap, waits
@@ -314,6 +331,7 @@ fn a_wrong_order_arrival_past_the_cap_deciphers_in_order() {
     assert_eq!(super::super::counting::deciphered_here(), deciphered);
     drain(&mut owner);
     assert_whole(&owner, &plain, &archive);
+    assert_once(&owner, &plain, deciphered);
 }
 
 // The second article arrived damaged and was held for the keys; the ones
@@ -340,6 +358,105 @@ fn a_repair_across_the_cap_boundary_deciphers_correctly() {
     owner.deliver_as(0, across, Provenance::Repaired, None);
     drain(&mut owner);
     assert_whole(&owner, &plain, &archive);
+    // Only the repair is heard again: crossing the cap asks for nothing.
+    let again: Vec<_> = owner
+        .said
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Again { range, .. } if range.start < second.start))
+        .collect();
+    assert!(again.is_empty(), "{again:?}");
+}
+
+// Two encrypted members, the first's keys sent back to before what it holds
+// for them while that fills the cap: what it holds cannot run until its
+// article comes again, and stays held, not let go. The second's parts wait
+// with the owner meanwhile, and every byte of both still comes, in order,
+// once the article does.
+#[test]
+fn a_member_held_up_behind_another_at_the_cap_still_comes() {
+    use super::super::counting;
+    counting::cap_here(SMALL_CAP);
+    let zeta = payload(99, 150_011);
+    let beta = payload(100, 200_003);
+    let options = stored()
+        .with_deprecated_encryption(PASSWORD.as_bytes())
+        .unwrap();
+    let archive = write(&[
+        Entry::File("zeta.bin", &zeta, options),
+        Entry::File("beta.bin", &beta, options),
+    ]);
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.lend_late = true;
+    offer(&mut owner, PASSWORD);
+    let length = archive.len() as u64;
+    let piece = 25_000;
+    let pieces: Vec<ByteRange> = (0..length.div_ceil(piece))
+        .map(|index| ByteRange::new(index * piece, ((index + 1) * piece).min(length)))
+        .collect();
+    // The directory first, so both entries are known as their data comes.
+    let (tail, front) = pieces.split_last().unwrap();
+    owner.deliver(0, *tail);
+    // The first member's front, its keys run over it, and then what fills
+    // the cap behind it.
+    owner.deliver(0, front[0]);
+    owner.work();
+    for range in &front[1..5] {
+        owner.deliver(0, *range);
+    }
+    assert_eq!(owner.object.queued(), SMALL_CAP);
+    // Its first article goes back for another copy: its keys go back
+    // before what it holds, which cannot run until the article comes again.
+    owner.send_back(VolumeIndex(0), front[0]);
+    assert!(!owner.object.work_due());
+    for range in &front[5..] {
+        owner.deliver(0, *range);
+    }
+    // Nothing of the second is said while the first's parts fill the cap:
+    // its ciphertext waits with the owner, and nothing held was let go.
+    assert!(owner.member("beta.bin").coverage.runs().next().is_none());
+    assert!(owner.held_bytes() > SMALL_CAP);
+    assert_eq!(owner.object.queued(), SMALL_CAP);
+    assert!(counting::queued_most_here() <= SMALL_CAP);
+    owner.deliver(0, front[0]);
+    drain(&mut owner);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. })),
+        "{:?}",
+        owner.said
+    );
+    assert!(owner.member("zeta.bin").bytes == zeta, "{:?}", owner.said);
+    assert!(owner.member("beta.bin").bytes == beta, "{:?}", owner.said);
+    assert!(owner.member("zeta.bin").closed && owner.member("beta.bin").closed);
+    assert!(owner.posted(0) == Some(archive));
+    assert!(counting::queued_most_here() <= SMALL_CAP);
+}
+
+// A restart with the cap reached and the rest parked with the owner: the
+// facts bring back what was held for the keys, with no keys, and once the
+// password is offered again every byte comes, in order, CRC intact.
+#[test]
+fn a_restore_with_the_cap_reached_and_bytes_parked_comes_whole() {
+    let (plain, archive, _, mut owner) = capped(101);
+    for index in 0..8 {
+        owner.deliver(0, article(&archive, index));
+    }
+    assert!(owner.object.queued() > 0);
+    assert!(owner.held_bytes() > 0);
+    owner.restore();
+    offer(&mut owner, PASSWORD);
+    drain(&mut owner);
+    assert_whole(&owner, &plain, &archive);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Again { .. })),
+        "{:?}",
+        owner.said
+    );
 }
 
 // Facts holding ciphertext for a member the map does not give, or past its

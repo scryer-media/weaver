@@ -301,10 +301,15 @@ fn ciphertext_past_the_cap_waits_in_the_ledger_until_a_slot_comes() {
     let writer = NamespaceWriter::new(
         1,
         directory.path().to_owned(),
-        Arc::clone(&accountant),
+        accountant,
         CapacityReader::unknown(),
     );
-    let runs = Runs::new(1, 0, RunMail::default().sender(), accountant);
+    let runs = Runs::new(
+        1,
+        0,
+        RunMail::default().sender(),
+        crate::pipeline::graph::engine::DecodePool::unbounded(),
+    );
     let mut job = GraphJob::new(
         &files,
         Box::new(Hardware::default()),
@@ -338,12 +343,17 @@ fn ciphertext_past_the_cap_waits_in_the_ledger_until_a_slot_comes() {
         "deciphered with no slot: {proved}"
     );
     assert_eq!(counting::queued_most_here(), CAP, "held for the keys");
+    // The ledger holds the rest, short of the article that proved the
+    // password and the tail the zip keeps for its directory, and none of
+    // what the zip holds for the keys.
     let held = job.writer.held_bytes(NodeId::ROOT);
+    let tail = 5 * ARTICLE as u64;
     assert!(
-        held >= plain.len() as u64 - ARTICLE as u64 - CAP - last.1.len() as u64,
+        held >= plain.len() as u64 - ARTICLE as u64 - CAP - tail,
         "the ledger holds {held} of {}",
         plain.len()
     );
+    assert!(held + CAP <= archive.len() as u64, "held twice: {held}");
     assert!(!job.tree.working().is_empty(), "the keys' work waits");
     intake(&mut job, last);
     assert!(counting::queued_most_here() <= CAP);
@@ -357,4 +367,10 @@ fn ciphertext_past_the_cap_waits_in_the_ledger_until_a_slot_comes() {
     assert_eq!(job.phase(), RootPhase::Done, "the member delivered");
     assert!(super::super::loan_tests::holds(directory.path(), &plain));
     assert!(counting::queued_most_here() <= CAP);
+    // Deciphered once, every byte: crossing the cap asks for nothing again.
+    assert_eq!(
+        counting::deciphered_here() - deciphered,
+        plain.len() as u64,
+        "deciphered again"
+    );
 }
