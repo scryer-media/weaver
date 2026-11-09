@@ -28,6 +28,8 @@ thread_local! {
     pub(super) static RELEASE_ASKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // How many held ranges a pass asked their object to place.
     pub(crate) static RELEASE_LOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    // The most bytes one read took back from a spill file.
+    pub(super) static SPILL_READ_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_DELIVERIES: std::cell::RefCell<Option<Vec<(ByteRange, Provenance)>>> = const { std::cell::RefCell::new(None) };
     // Each delivery the pretend 7z store heard, with the CRC32 its bytes
     // came proven by, when every byte of them was.
@@ -809,11 +811,11 @@ fn an_undecided_member_spilled_before_its_first_article_is_byte_identical() {
     job.close(member);
     assert_eq!(job.file("notes.bin"), b"Rar! mid.\0tail..");
     assert_eq!(job.writer.refused(NodeId::ROOT, member), None);
-    // Nothing is held, and the spill file goes as any discarded file does,
-    // once a checkpoint stops naming it.
+    // Nothing is held, and the spill file is emptied; it stays the member's
+    // until its namespace goes.
     let files = &job.writer.files[&NodeId::ROOT];
     assert_eq!(files.holds.total_held(), 0);
-    assert!(!files.spills.contains_key(&member));
+    assert_eq!(std::fs::metadata(job.spill(member)).expect("spill").len(), 0);
 }
 
 #[test]
@@ -983,7 +985,9 @@ const PAST: [(&str, HoldBudgets); 4] = [
 fn nothing_held(job: &Job, budget: &str) {
     let files = &job.writer.files[&NodeId::ROOT];
     assert_eq!(files.holds.total_held(), 0, "{budget}");
-    assert!(files.spills.is_empty(), "{budget}");
+    for spill in files.spills.values() {
+        assert_eq!(spill.len().expect("spill length"), 0, "{budget}");
+    }
     assert_eq!(job.accountant.usage().resident, 0, "{budget}");
     assert_eq!(job.accountant.usage().scratch, 0, "{budget}");
 }
@@ -1158,6 +1162,189 @@ fn holds_restored_under_a_lower_ceiling_come_back_on_file() {
     job.close(member);
     assert_eq!(job.file("notes.bin"), b"Rar! mid.\0tail..");
     nothing_held(&job, "restored");
+}
+
+// What the writer's holds at `node` say to a checkpoint, as its rows.
+fn hold_rows(job: &Job, node: NodeId) -> Vec<HoldRecord> {
+    job.writer
+        .hold_records(node)
+        .into_iter()
+        .map(|(held, on_file)| HoldRecord {
+            node,
+            held,
+            on_file,
+        })
+        .collect()
+}
+
+// The process goes away, its files stay, and a new writer under
+// `accountant` is restored from `records`.
+fn restarted(job: &mut Job, accountant: Arc<HoldsAccountant>, records: &[HoldRecord]) {
+    job.accountant = Arc::clone(&accountant);
+    drop(std::mem::replace(
+        &mut job.writer,
+        NamespaceWriter::new(
+            1,
+            job.dir.path().to_path_buf(),
+            accountant,
+            CapacityReader::unknown(),
+        ),
+    ));
+    job.writer
+        .restore_holds(&job.tree, records)
+        .expect("a restore never fails for a hold");
+}
+
+fn read_at(job: &Job, node: NodeId, member: MemberId, range: ByteRange) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    job.writer
+        .access(&job.tree)
+        .read_at(node, member, range, &mut bytes)
+        .then_some(bytes)
+}
+
+const NO_ROOM: HoldBudgets = HoldBudgets {
+    resident_limit: 0,
+    scratch_total: 0,
+    scratch_ceiling: 0,
+    disk_reserve: 0,
+};
+
+// A member of a store spills while undecided, is taken back, and spills
+// again before any checkpoint commits. Its spill file is one file all
+// along: the commit after the second spill leaves it standing, its bytes
+// read back byte for byte, and a restore from that checkpoint adopts them.
+#[test]
+fn a_member_that_spills_again_after_a_release_keeps_its_spill_file_through_a_commit() {
+    let mut job = Job::new(NO_ROOM);
+    let (_, child) = bound_store(&mut job);
+    let late = MemberId(5);
+    let spill = job.dir.path().join(super::spill_name(child, late));
+    let bytes = |offset: u64, text: &'static [u8]| Emit::Bytes {
+        member: late,
+        offset,
+        bytes: Bytes::from_static(text).into(),
+        provenance: Provenance::Fresh,
+    };
+    let announce = || Emit::Member {
+        member: late,
+        name: "late.bin".into(),
+        length: Some(16),
+    };
+    store_says(&mut job, child, vec![announce(), bytes(10, b"first.")]);
+    assert!(job.tree.is_undecided(child, late));
+    assert_eq!(std::fs::read(&spill).expect("spilled"), b"\0\0\0\0\0\0\0\0\0\0first.");
+
+    // Taken back: what it held is let go, and its spill file emptied.
+    store_says(&mut job, child, vec![Emit::Retract(late)]);
+    assert_eq!(job.writer.held_bytes(child), 0);
+    assert_eq!(std::fs::metadata(&spill).expect("emptied, not gone").len(), 0);
+
+    // Said again, it spills again, and a stop's checkpoint commits.
+    store_says(&mut job, child, vec![announce(), bytes(10, b"again.")]);
+    assert!(job.tree.is_undecided(child, late));
+    job.writer.page_out_holds().expect("page out");
+    let records = hold_rows(&job, child);
+    assert_eq!(
+        records
+            .iter()
+            .map(|record| (record.held.range, record.on_file))
+            .collect::<Vec<_>>(),
+        vec![(ByteRange::new(10, 16), true)]
+    );
+    job.commit();
+    assert!(spill.is_file());
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
+        Some(&b"again."[..])
+    );
+
+    // A restore from that checkpoint reads the second spill back.
+    let accountant = Arc::new(HoldsAccountant::new(NO_ROOM));
+    restarted(&mut job, accountant, &records);
+    assert_eq!(job.writer.held_bytes(child), 6);
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
+        Some(&b"again."[..])
+    );
+    store_says(
+        &mut job,
+        child,
+        vec![bytes(0, b"0123456789"), Emit::MemberClosed(late)],
+    );
+    assert!(!job.tree.is_undecided(child, late));
+    // Its file has it whole, and nothing is held for it any more.
+    assert_eq!(job.writer.held_bytes(child), 0);
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(0, 16)).as_deref(),
+        Some(&b"0123456789again."[..])
+    );
+}
+
+// A member whose bytes spill past every budget, more of it than one read
+// back takes, is written to its file a read at a time: no read from its
+// spill file takes more than `READ_BACK` into memory, however much spilled.
+#[test]
+fn spilled_bytes_reach_their_file_a_bounded_read_at_a_time() {
+    let mut job = Job::new(NO_ROOM);
+    let tail = payload(3 * READ_BACK as usize + 5);
+    let length = 10 + tail.len() as u64;
+    let member = job.member("notes.bin", Some(length));
+    job.send(member, 10, &tail, Provenance::Fresh);
+    assert_eq!(
+        std::fs::metadata(job.spill(member)).expect("spilled").len(),
+        length
+    );
+
+    SPILL_READ_MOST.set(0);
+    job.send(member, 0, b"0123456789", Provenance::Fresh);
+    assert!(!job.tree.is_undecided(NodeId::ROOT, member));
+    assert_eq!(SPILL_READ_MOST.get(), READ_BACK);
+    let mut whole = b"0123456789".to_vec();
+    whole.extend_from_slice(&tail);
+    assert!(job.file("notes.bin") == whole, "byte-identical");
+    nothing_held(&job, "released");
+}
+
+fn payload(len: usize) -> Vec<u8> {
+    (0..len).map(|at| (at * 31 % 251) as u8).collect()
+}
+
+// A restart under a disk with no room past its reserve: a hold on scratch
+// the budgets now refuse cannot move to its member's spill file within the
+// reserve, so it is not adopted and its article comes again. A hold whose
+// move fails is not either. Neither fails the restore.
+#[test]
+fn a_restored_hold_that_cannot_be_kept_is_fetched_again_and_the_restore_stands() {
+    for case in ["no room past the reserve", "the move fails"] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit: 0,
+            ..PLENTY
+        });
+        let member = job.member("notes.bin", None);
+        job.send(member, 10, b"tail..", Provenance::Fresh);
+        job.writer.page_out_holds().expect("page out");
+        let records = hold_rows(&job, NodeId::ROOT);
+        assert_eq!(
+            records.iter().map(|record| record.on_file).collect::<Vec<_>>(),
+            vec![false],
+            "{case}"
+        );
+        let budgets = if case == "the move fails" {
+            // Something that is no file sits where its spill file would.
+            std::fs::create_dir_all(job.spill(member)).expect("a directory in the way");
+            NO_ROOM
+        } else {
+            HoldBudgets {
+                disk_reserve: u64::MAX,
+                ..NO_ROOM
+            }
+        };
+        restarted(&mut job, Arc::new(HoldsAccountant::new(budgets)), &records);
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0, "{case}");
+        assert_eq!(job.accountant.usage().scratch, 0, "{case}");
+        assert_eq!(read_at(&job, NodeId::ROOT, member, ByteRange::new(10, 16)), None, "{case}");
+    }
 }
 
 // A member an older build refused because its holds ran past their budgets

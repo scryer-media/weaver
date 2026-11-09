@@ -99,9 +99,12 @@ impl NamespaceWriter {
 
     // A graceful stop: every namespace pages what it holds in RAM to
     // scratch, under the same budgets as any page-out, and what scratch
-    // cannot take goes to its member's spill file, so the checkpoint after
-    // it records every hold and a restart reads each back. Nothing is
-    // fetched again.
+    // cannot take goes to its member's spill file as far as the disk
+    // reserve leaves room, so the checkpoint after it records those holds
+    // and a restart reads each back. The stop keeps the reserve for the
+    // checkpoint and the database: what neither scratch nor the reserve
+    // takes stays in RAM, unrecorded, and is fetched again after the
+    // restart.
     pub(crate) fn page_out_holds(&mut self) -> Result<(), WriteError> {
         self.stopped = true;
         let nodes: Vec<NodeId> = self
@@ -119,8 +122,13 @@ impl NamespaceWriter {
                     .write(page_out.scratch_offset, &page_out.bytes, None)?;
             }
             for spill in &spills {
-                self.spill_file(node, super::held_member(spill.volume))?
-                    .write(spill.range.start, &spill.bytes, None)?;
+                free_disk = free_disk.saturating_sub(spill.range.len());
+                self.spill_write(
+                    node,
+                    super::held_member(spill.volume),
+                    spill.range.start,
+                    &spill.bytes,
+                )?;
             }
         }
         Ok(())
@@ -130,15 +138,20 @@ impl NamespaceWriter {
     // scratch file and its members' spill files are opened as they were
     // left, never emptied, and each hold goes back into its ledger. A hold
     // on scratch the budgets now refuse, under a lower ceiling say, moves to
-    // its member's spill file, as any hold past the budgets does. A hold of
-    // a namespace or member the tree no longer has, or one past the end of
-    // its file, is not adopted, so its article reads as missing and is
-    // fetched again. Bytes the rows do not describe are never read.
+    // its member's spill file when the disk reserve has room for the copy.
+    // A hold that cannot be kept, one the reserve has no room for, one
+    // whose move fails, one of a namespace or member the tree no longer
+    // has, or one past the end of its file, is not adopted, so its article
+    // reads as missing and is fetched again: a restore never fails for a
+    // hold. Bytes the rows do not describe are never read.
     pub(crate) fn restore_holds(
         &mut self,
         tree: &Tree,
         records: &[HoldRecord],
     ) -> Result<(), WriteError> {
+        // The space a move to a spill file may take: what is free now, as
+        // the copy adds to the scratch file it leaves on disk.
+        let mut spill_free = self.free_disk_bytes();
         let mut by_node: BTreeMap<NodeId, Vec<(ScratchHold, bool)>> = BTreeMap::new();
         for record in records {
             let member = MemberId(record.held.volume.0);
@@ -186,24 +199,62 @@ impl NamespaceWriter {
                     adopted = true;
                     continue;
                 }
-                let mut bytes = Vec::new();
-                scratch.read(held.scratch_offset, super::index(held.range.len()), &mut bytes)?;
-                // The member's spill file may hold other rows' bytes: it is
-                // opened as left, never emptied.
-                self.adopt_spill(node, member)?;
-                let files = self.files_mut(node);
-                files
-                    .spills
-                    .get_mut(&member)
-                    .expect("adopted above")
-                    .write(held.range.start, &bytes, None)?;
-                files.holds.restore_spilled(held.volume, held.range);
+                match self.move_to_spill(&scratch, node, held, spill_free) {
+                    Ok(true) => {
+                        spill_free = spill_free.saturating_sub(held.range.len());
+                        self.files_mut(node)
+                            .holds
+                            .restore_spilled(held.volume, held.range);
+                    }
+                    // Not adopted: its article reads as missing and is
+                    // fetched again.
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(
+                        job_id = self.scope,
+                        node = node.0,
+                        member = member.0,
+                        error = %error,
+                        "a restored hold could not move to its spill file; fetching it again"
+                    ),
+                }
             }
             if adopted {
                 self.files_mut(node).scratch = Some(scratch);
             }
         }
         Ok(())
+    }
+
+    // A restored hold on scratch moved to its member's spill file, a
+    // `READ_BACK` at a time, when the disk reserve leaves room for it beside
+    // `free_disk`. False when it has no room. The member's spill file may
+    // hold other rows' bytes: it is opened as left, never emptied, and a
+    // move cut short leaves bytes in it that no row names and nothing
+    // reads.
+    fn move_to_spill(
+        &mut self,
+        scratch: &Leaf,
+        node: NodeId,
+        held: ScratchHold,
+        free_disk: u64,
+    ) -> Result<bool, WriteError> {
+        let len = held.range.len();
+        let reserve = self.accountant.budgets().disk_reserve;
+        if reserve != 0 && reserve.checked_add(len).is_none_or(|needed| needed > free_disk) {
+            return Ok(false);
+        }
+        let member = super::held_member(held.volume);
+        self.adopt_spill(node, member)?;
+        let mut done = 0;
+        let mut bytes = Vec::new();
+        while done < len {
+            let take = (len - done).min(super::READ_BACK);
+            bytes.clear();
+            scratch.read(held.scratch_offset + done, super::index(take), &mut bytes)?;
+            self.spill_write(node, member, held.range.start + done, &bytes)?;
+            done += take;
+        }
+        Ok(true)
     }
 
     // The member's spill file as a checkpoint left it, opened where it lies

@@ -86,6 +86,9 @@ pub(in crate::pipeline::tests) enum Down<'a> {
     Shutdown,
     Losing(&'a str),
     Cutting(&'a str, u64),
+    // As a crash, once the object over the first root member that has one
+    // refused it for its holds, as an older build's did.
+    RefusingForHolds,
 }
 
 // As `run_restarting`, going down as `down` says and only after the articles
@@ -148,6 +151,14 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
             // A live run is no reason to wait: the checkpoint describes what
             // is on disk, never how far a run has read.
             if first && at(requests.len()) {
+                if down == Down::RefusingForHolds {
+                    pipeline
+                        .graph_jobs
+                        .get_mut(&JOB)
+                        .expect("the graph job")
+                        .refuse_for_holds()
+                        .expect("refused for its holds");
+                }
                 if down == Down::Shutdown {
                     shut_down(&mut pipeline).await;
                 }

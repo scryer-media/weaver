@@ -193,8 +193,10 @@ struct Taken {
     // The bytes held for it, in offset order.
     held: Vec<(ByteRange, Location)>,
     scratch: Option<File>,
-    // Its spill file, for the bytes held past the budgets.
+    // Its spill file, for the bytes held past the budgets, and the revision
+    // that file stood at when lent.
     spill: Option<File>,
+    spill_revision: Option<(u64, u64)>,
     bound: Option<(NodeId, VolumeIndex)>,
 }
 
@@ -559,9 +561,6 @@ impl NamespaceWriter {
                         .collect()
                 } else {
                     self.held_pieces(files, member)
-                        .into_iter()
-                        .map(|(range, bytes)| (range, Location::Ram(bytes)))
-                        .collect()
                 }
             })
             .unwrap_or_default();
@@ -590,9 +589,15 @@ impl NamespaceWriter {
                     .and_then(|files| files.scratch.as_ref())
                     .filter(|_| access.defer_holds)
                     .and_then(|leaf| File::open(leaf.path()).ok()),
+                spill_revision: files
+                    .and_then(|files| files.spills.get(&member))
+                    .map(Leaf::revision),
+                // Read in place by every loan, never copied: bytes on file
+                // change only as the member's holds on file change, which
+                // the return sees, a recovery's in the hold revisions of
+                // the ranges it read, a replay's in the file's revision.
                 spill: files
                     .and_then(|files| files.spills.get(&member))
-                    .filter(|_| access.defer_holds)
                     .and_then(|leaf| File::open(leaf.path()).ok()),
                 bound,
             },
@@ -610,16 +615,18 @@ impl NamespaceWriter {
         self.take_namespace(tree, child, access, seen);
     }
 
-    // What is held for the member, in memory: bytes paged to scratch are
-    // copied out, since the scratch span is reused once its hold leaves.
-    fn held_pieces(&self, files: &super::Files, member: MemberId) -> Vec<(ByteRange, Bytes)> {
+    // What is held for the member: bytes paged to scratch are copied out,
+    // since the scratch span is reused once its hold leaves, and the
+    // budgets bound them. Bytes on file stay there, read through the
+    // loan's own handle on the spill file as the repair asks for them:
+    // nothing bounds how much spilled, so none of it is copied here.
+    fn held_pieces(&self, files: &super::Files, member: MemberId) -> Vec<(ByteRange, Location)> {
         files
             .holds
             .peek(held_volume(member), ALL)
             .into_iter()
             .filter_map(|piece| {
-                let bytes = match piece.location {
-                    Location::Ram(bytes) => bytes,
+                let location = match piece.location {
                     Location::Scratch { offset, len } => {
                         let mut bytes = Vec::new();
                         files
@@ -627,19 +634,11 @@ impl NamespaceWriter {
                             .as_ref()?
                             .read(offset, index(len), &mut bytes)
                             .ok()?;
-                        Bytes::from(bytes)
+                        Location::Ram(Bytes::from(bytes))
                     }
-                    Location::Spilled => {
-                        let mut bytes = Vec::new();
-                        files
-                            .spills
-                            .get(&member)?
-                            .read(piece.range.start, index(piece.range.len()), &mut bytes)
-                            .ok()?;
-                        Bytes::from(bytes)
-                    }
+                    kept @ (Location::Ram(_) | Location::Spilled) => kept,
                 };
-                Some((piece.range, bytes))
+                Some((piece.range, location))
             })
             .collect()
     }

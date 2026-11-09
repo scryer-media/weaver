@@ -315,7 +315,6 @@ async fn outcome(scenario: &Scenario) -> (Outcome, Vec<String>) {
 // scratch or spill file left behind.
 #[tokio::test]
 async fn every_kind_in_every_order_ends_under_tight_holds_as_under_unlimited_ones() {
-    let mut spilled = Vec::new();
     for kind in KINDS {
         for order in [Order::InOrder, Order::Backwards, Order::FirstVolumeLast] {
             let cell = format!("{} {order:?}", kind.name);
@@ -347,27 +346,35 @@ async fn every_kind_in_every_order_ends_under_tight_holds_as_under_unlimited_one
                 .filter(|line| line.contains("why=holds_breached"))
                 .collect();
             assert!(held_out.is_empty(), "{cell}: {held_out:?}");
-            if !lines.of("holds spilled").is_empty() {
-                spilled.push(cell);
-            }
+            // Each cell spills exactly when its holds run past memory and
+            // scratch, as `SPILLS` says it does.
+            assert_eq!(
+                !lines.of("holds spilled").is_empty(),
+                SPILLS.contains(&cell.as_str()),
+                "{cell}: holds spilled"
+            );
         }
     }
-    // The stored set's volumes wait on its first one's headers: what waits
-    // when that volume comes last is more than the holds keep.
-    assert!(
-        spilled.contains(&"stored rar with par2 FirstVolumeLast".to_owned()),
-        "{spilled:?}"
-    );
-    // Every kind but the compressed one, whose run's reservation leaves the
-    // holds room for its small set, spills in some order.
-    for kind in KINDS.iter().filter(|kind| kind.run == 0) {
-        assert!(
-            spilled.iter().any(|cell| cell.starts_with(&format!("{} ", kind.name))),
-            "{}: {spilled:?}",
-            kind.name
-        );
-    }
 }
+
+// The cells whose holds run past memory and scratch. What arrives before
+// the headers that place it is held until they come: every kind but the
+// compressed rar, whose run's reservation leaves the holds room for its
+// small set, spills backwards, and all of those but the split spill with
+// their first volume last too. In order, nothing waits long enough to.
+const SPILLS: &[&str] = &[
+    "stored rar with par2 Backwards",
+    "stored rar with par2 FirstVolumeLast",
+    "7z Backwards",
+    "7z FirstVolumeLast",
+    "zip Backwards",
+    "zip FirstVolumeLast",
+    "zip in a stored rar Backwards",
+    "zip in a stored rar FirstVolumeLast",
+    "tar Backwards",
+    "tar FirstVolumeLast",
+    "split Backwards",
+];
 
 // A damaged stored set under tight holds repairs from its recovery set
 // reading the bytes the holds spilled, and delivers its member whole.
@@ -407,11 +414,73 @@ async fn a_damaged_set_whose_holds_spilled_repairs_from_them() {
 async fn a_set_whose_holds_spilled_restarts_and_completes_from_them() {
     let body = payload(8 * 3 * FRAME + 13, 77);
     let scenario = scrambled_store_set(&body, 8).holds(TIGHT);
-    let restarted = run_restarting_at(&scenario, &mut |_| {}, Down::Shutdown, &|nth| nth == 14).await;
+    let (lines, _guard) = Lines::capture();
+    // Whether holds had spilled by the shutdown, and how the checkpoint it
+    // wrote recorded the holds: (on scratch, on file).
+    let mut at_shutdown = None;
+    let restarted = run_restarting_at(
+        &scenario,
+        &mut |rows| {
+            let on_file = rows.holds.iter().filter(|row| row.on_file).count();
+            at_shutdown = Some((
+                !lines.of("holds spilled").is_empty(),
+                rows.holds.len() - on_file,
+                on_file,
+            ));
+        },
+        Down::Shutdown,
+        &|nth| nth == 14,
+    )
+    .await;
     assert_eq!(restarted.restarts, 1);
+    let (spilled, on_scratch, on_file) = at_shutdown.expect("the shutdown's checkpoint");
+    assert!(spilled, "holds spilled before the shutdown");
+    assert!(on_file > 0, "rows on file: {on_file}, on scratch: {on_scratch}");
     assert_eq!(restarted.status, Some(JobStatus::Complete));
     assert!(restarted.files[&format!("lantern beacon/{MEMBER}")] == body);
+    // Every hold the checkpoint recorded, on file as on scratch, was
+    // adopted: a row the restore dropped would have its article fetched
+    // again.
     assert!(restarted.from_disk.is_empty(), "{:?}", restarted.from_disk);
+}
+
+// A member an older build refused because its holds ran past their budgets
+// goes into the checkpoint so. The restore takes the refusal back: it was
+// never a ruling on the member's bytes, so the object over it reads them
+// again and the member inside comes out whole, as with no refusal.
+#[tokio::test]
+async fn a_member_refused_for_its_holds_in_a_checkpoint_is_delivered_after_its_restore() {
+    for kind in [&KINDS[0], &KINDS[3]] {
+        let scenario = Scenario::new((kind.posts)()).framed(kind.article);
+        let plain = run(&scenario).await;
+        assert!(plain.completed(), "{}: {:?}", kind.name, plain.failure);
+        let mut refused = Vec::new();
+        let restarted = run_restarting_at(
+            &scenario,
+            &mut |rows| {
+                refused.extend(rows.members.iter().filter_map(|row| row.refused.clone()));
+            },
+            Down::RefusingForHolds,
+            &|nth| nth == 8,
+        )
+        .await;
+        assert_eq!(restarted.restarts, 1, "{}", kind.name);
+        // Every volume the object owned was refused with it.
+        assert_eq!(
+            refused,
+            vec!["holds_breached".to_owned(); kind.volumes.len()],
+            "{}",
+            kind.name
+        );
+        assert_eq!(restarted.status, Some(JobStatus::Complete), "{}", kind.name);
+        assert_eq!(
+            restarted.files.keys().collect::<Vec<_>>(),
+            plain.files.keys().collect::<Vec<_>>(),
+            "{}",
+            kind.name
+        );
+        assert!(restarted.files == plain.files, "{}: delivered bytes", kind.name);
+    }
 }
 
 // The layout needs of each volume only its front, where its headers are,

@@ -127,9 +127,20 @@ struct Files {
     holds: HoldLedger,
     // Where held bytes go when RAM runs short; opened on the first page-out.
     scratch: Option<Leaf>,
-    // Where a member's held bytes go past the budgets, at their own offsets;
-    // opened on its first spill and gone once nothing of it is held there.
+    // Where a member's held bytes go past the budgets, at their own offsets.
+    //
+    // A member's spill file, once made, is this one leaf until its
+    // namespace goes, when it is discarded with the namespace's other files
+    // (or a restore sweeps it, unnamed). It never goes through `discard` on
+    // its own, so its path is never queued to leave while it can still be
+    // written: a member that spills, releases and spills again writes the
+    // same file. Once the ledger holds nothing of the member on file the
+    // file is emptied, never removed (`release_spill`); a repair out with a
+    // handle on it reads that range as changed, since the holds it read
+    // and the file's revision both moved.
     spills: BTreeMap<MemberId, Leaf>,
+    // The members whose spill file is empty, emptied since its last write.
+    spills_empty: BTreeSet<MemberId>,
     // Why a member is a leaf when something refused to own it. Changed only
     // through `refuse` and `unrefuse`, which mark the member.
     refused: BTreeMap<MemberId, Why>,
@@ -142,6 +153,7 @@ impl Files {
             holds: HoldLedger::new(namespace, accountant),
             scratch: None,
             spills: BTreeMap::new(),
+            spills_empty: BTreeSet::new(),
             refused: BTreeMap::new(),
         }
     }
@@ -1549,11 +1561,12 @@ impl NamespaceWriter {
                 .write(page_out.scratch_offset, &page_out.bytes, None)?;
         }
         if let Placed::Spilled(budget) = outcome.placed {
-            self.spill_file(node, member)?
-                .write(offset, &spilled, None)?;
+            self.spill_write(node, member, offset, &spilled)?;
             self.said_spill(node, member, budget, free_disk);
+            return Ok(());
         }
-        Ok(())
+        // The new bytes may have replaced the last the member held on file.
+        self.release_spill(node, member)
     }
 
     // A member's first spill past a budget is said once, with how far that
@@ -1578,7 +1591,8 @@ impl NamespaceWriter {
         );
     }
 
-    // The member's spill file, opened empty on its first spill.
+    // The member's spill file, made empty on its first spill and the same
+    // leaf from then on, as `Files::spills` says.
     fn spill_file(&mut self, node: NodeId, member: MemberId) -> Result<&mut Leaf, WriteError> {
         let dir = self.working_dir.clone();
         let files = self.files_mut(node);
@@ -1586,21 +1600,41 @@ impl NamespaceWriter {
             let mut spill = Leaf::at(&dir, &spill_name(node, member));
             spill.truncate()?;
             files.spills.insert(member, spill);
+            files.spills_empty.insert(member);
         }
         Ok(files.spills.get_mut(&member).expect("opened above"))
     }
 
-    // The member's spill file goes once nothing of it is held there.
+    // Bytes of the member written to its spill file at their own offset,
+    // which the ledger already holds there.
+    fn spill_write(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), WriteError> {
+        self.spill_file(node, member)?.write(offset, bytes, None)?;
+        self.files_mut(node).spills_empty.remove(&member);
+        Ok(())
+    }
+
+    // Once the ledger holds nothing of the member on file, its spill file is
+    // emptied and its handle let go; the file and its leaf stay, so no later
+    // spill of the member meets a path queued to leave.
     fn release_spill(&mut self, node: NodeId, member: MemberId) -> Result<(), WriteError> {
         let Some(files) = self.files.get_mut(&node) else {
             return Ok(());
         };
-        if files.holds.spills(held_volume(member)) {
+        if files.spills_empty.contains(&member) || files.holds.spills(held_volume(member)) {
             return Ok(());
         }
-        if let Some(spill) = files.spills.remove(&member) {
-            self.discard(spill)?;
-        }
+        let Some(spill) = files.spills.get_mut(&member) else {
+            return Ok(());
+        };
+        spill.truncate()?;
+        spill.release_handle();
+        files.spills_empty.insert(member);
         Ok(())
     }
 
@@ -1635,8 +1669,10 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
     ) -> Result<(), WriteError> {
-        for (offset, bytes) in self.take_held(node, member, ALL)? {
-            self.write_file(tree, node, member, offset, &bytes)?;
+        for span in self.held_spans(node, member, ALL) {
+            for (offset, bytes) in self.take_held(node, member, span)? {
+                self.write_file(tree, node, member, offset, &bytes)?;
+            }
         }
         Ok(())
     }
@@ -1662,13 +1698,8 @@ impl NamespaceWriter {
         said: Option<&Coverage>,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        let held = self
-            .files
-            .get(&node)
-            .map(|files| files.holds.held_in(held_volume(member), range))
-            .unwrap_or_default();
-        for hold in held {
-            for piece in self.take_held(node, member, hold)? {
+        for span in self.held_spans(node, member, range) {
+            for piece in self.take_held(node, member, span)? {
                 self.replay_piece(tree, builder, segments, (node, member), piece, said, out)?;
             }
         }
@@ -1824,8 +1855,51 @@ impl NamespaceWriter {
         Ok(released)
     }
 
+    // The spans the held parts of `range` of the member leave the ledger
+    // in, in offset order, for `take_held`: a hold in RAM or on scratch
+    // whole, as the budgets bound it, and one in the spill file, which no
+    // budget bounds, a `READ_BACK` at a time. However much a member spilled,
+    // no more than that of it is read back into memory at once, and what is
+    // not yet read stays held on file, so a refusal or a second release
+    // among the pieces still sees it there.
+    fn held_spans(&self, node: NodeId, member: MemberId, range: ByteRange) -> Vec<ByteRange> {
+        let Some(files) = self.files.get(&node) else {
+            return Vec::new();
+        };
+        let mut spans = Vec::new();
+        for piece in files.holds.peek(held_volume(member), range) {
+            if piece.location != Location::Spilled {
+                spans.push(piece.range);
+                continue;
+            }
+            let mut at = piece.range.start;
+            while at < piece.range.end {
+                let end = piece.range.end.min(at.saturating_add(READ_BACK));
+                spans.push(ByteRange::new(at, end));
+                at = end;
+            }
+        }
+        spans
+    }
+
+    // What is held of `range` of the member leaves the ledger unread: the
+    // member's bytes are in hand elsewhere, or it is gone.
+    fn drop_held(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        range: ByteRange,
+    ) -> Result<(), WriteError> {
+        let Some(files) = self.files.get_mut(&node) else {
+            return Ok(());
+        };
+        files.holds.take(held_volume(member), range);
+        self.release_spill(node, member)
+    }
+
     // What is held of `range` of the member, in offset order, read back
-    // from scratch where it was paged.
+    // from scratch where it was paged and from the spill file where it
+    // spilled. Callers that deliver what they take ask by `held_spans`.
     fn take_held(
         &mut self,
         node: NodeId,
@@ -1846,6 +1920,9 @@ impl NamespaceWriter {
                     Bytes::from(buffer)
                 }
                 Location::Spilled => {
+                    #[cfg(test)]
+                    tests::SPILL_READ_MOST
+                        .with(|most| most.set(most.get().max(piece.range.len())));
                     let mut buffer = Vec::new();
                     self.spill_file(node, member)?.read(
                         piece.range.start,
@@ -2029,7 +2106,7 @@ impl NamespaceWriter {
     }
 
     fn retract(&mut self, tree: &Tree, node: NodeId, member: MemberId) -> Result<(), WriteError> {
-        self.take_held(node, member, ALL)?;
+        self.drop_held(node, member, ALL)?;
         if let Some(leaf) = self
             .files
             .get_mut(&node)
@@ -2085,7 +2162,7 @@ impl NamespaceWriter {
                 })
                 .collect();
             for member in gone {
-                self.take_held(node, member, ALL)?;
+                self.drop_held(node, member, ALL)?;
                 let files = self.files_mut(node);
                 files.unrefuse(member);
                 if let Some(leaf) = files.leaves.remove(&member) {

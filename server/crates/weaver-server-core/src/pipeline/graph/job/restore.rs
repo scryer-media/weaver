@@ -177,6 +177,33 @@ impl GraphJob {
         self.heard(out)
     }
 
+    // What an older build left when a member's holds ran past their
+    // budgets: the object bound over the first root member that has one
+    // refuses it for its holds, as that build's object said.
+    #[cfg(test)]
+    pub(crate) fn refuse_for_holds(&mut self) -> Result<NodeId, GraphError> {
+        let node = self
+            .tree
+            .namespace(NodeId::ROOT)
+            .and_then(|root| {
+                root.records()
+                    .find_map(|record| self.tree.child_of(NodeId::ROOT, record.id))
+            })
+            .map(|(node, _)| node)
+            .expect("an object bound over a root member");
+        let mut out = Vec::new();
+        self.writer.said(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            node,
+            weaver_graph::Emit::Refuse(weaver_graph::Why::HoldsBreached),
+            &mut out,
+        )?;
+        self.heard(out)?;
+        Ok(node)
+    }
+
     // The node was offered this candidate last: it is offered again, so the
     // object derives its keys from it as it did before.
     fn offer_again(&mut self, node: NodeId, index: usize) -> Result<(), GraphError> {

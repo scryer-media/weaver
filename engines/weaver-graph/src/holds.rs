@@ -432,6 +432,9 @@ pub struct HoldLedger {
     resident: u64,
     scratch: u64,
     spilled: u64,
+    // Bytes held in each volume's spill file, so whether a member still
+    // holds anything there is one lookup, asked on every take.
+    spilled_in: BTreeMap<VolumeIndex, u64>,
 }
 
 impl HoldLedger {
@@ -446,6 +449,7 @@ impl HoldLedger {
             resident: 0,
             scratch: 0,
             spilled: 0,
+            spilled_in: BTreeMap::new(),
         }
     }
 
@@ -608,6 +612,7 @@ impl HoldLedger {
         self.resident = 0;
         self.scratch = 0;
         self.spilled = 0;
+        self.spilled_in.clear();
         self.scratch_end = 0;
     }
 
@@ -656,11 +661,7 @@ impl HoldLedger {
 
     // Whether anything of `volume` is held in its spill file.
     pub fn spills(&self, volume: VolumeIndex) -> bool {
-        self.volumes.get(&volume).is_some_and(|holds| {
-            holds
-                .values()
-                .any(|hold| hold.location == Location::Spilled)
-        })
+        self.spilled_in.contains_key(&volume)
     }
 
     // Every hold in a spill file, in volume and offset order: what a
@@ -712,8 +713,10 @@ impl HoldLedger {
 
     // Page every resident hold to scratch, oldest first, under the same
     // budgets as any page-out: a graceful stop keeps what scratch can take.
-    // The first breach stops it, and what is left spills, so nothing a stop
-    // leaves in RAM is fetched again.
+    // The first breach stops it, and what is left spills, oldest first, as
+    // far as the disk reserve leaves room: a stop never takes the disk below
+    // it, since the checkpoint written after it must still land. What is
+    // left after that stays resident, unrecorded, and is fetched again.
     pub fn page_out_all(&mut self, free_disk: u64) -> (Vec<PageOut>, Vec<Spill>) {
         let mut free_disk = free_disk;
         let mut page_outs = Vec::new();
@@ -721,8 +724,22 @@ impl HoldLedger {
             free_disk = free_disk.saturating_sub(page_out.range.len());
             page_outs.push(page_out);
         }
+        let reserve = self.accountant.budgets().disk_reserve;
         let mut spills = Vec::new();
         while let Some(&(_, volume, start)) = self.resident_by_age.first() {
+            let len = self
+                .volumes
+                .get(&volume)
+                .and_then(|holds| holds.get(&start))
+                .map_or(0, |hold| hold.range.len());
+            let room = reserve == 0
+                || reserve
+                    .checked_add(len)
+                    .is_some_and(|needed| needed <= free_disk);
+            if !room {
+                break;
+            }
+            free_disk = free_disk.saturating_sub(len);
             let Some(hold) = self.unplace(volume, start) else {
                 break;
             };
@@ -823,7 +840,10 @@ impl HoldLedger {
                     .insert((hold.age, volume, hold.range.start));
             }
             Location::Scratch { .. } => self.scratch += len,
-            Location::Spilled => self.spilled += len,
+            Location::Spilled => {
+                self.spilled += len;
+                *self.spilled_in.entry(volume).or_default() += len;
+            }
         }
         self.volumes
             .entry(volume)
@@ -847,7 +867,15 @@ impl HoldLedger {
                 self.resident_by_age.remove(&(hold.age, volume, start));
             }
             Location::Scratch { .. } => self.scratch -= len,
-            Location::Spilled => self.spilled -= len,
+            Location::Spilled => {
+                self.spilled -= len;
+                if let Some(held) = self.spilled_in.get_mut(&volume) {
+                    *held -= len;
+                    if *held == 0 {
+                        self.spilled_in.remove(&volume);
+                    }
+                }
+            }
         }
         Some(hold)
     }
@@ -1452,6 +1480,61 @@ mod tests {
         );
         let left = ledger.take(VolumeIndex(0), ByteRange::new(0, 4));
         assert_eq!(left[0].location, Location::Spilled);
+    }
+
+    // A stop spills what scratch cannot take only as far as the disk
+    // reserve leaves room: the first hold that would take the disk below it
+    // stops the spill, and it and what is younger stay resident, unrecorded.
+    #[test]
+    fn paging_out_all_spills_no_further_than_the_disk_reserve() {
+        let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: 100,
+            scratch_total: 1_000,
+            scratch_ceiling: 0,
+            disk_reserve: 10,
+        }));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(0), 0, bytes(1, 4), PLENTY);
+        ledger.hold(VolumeIndex(1), 0, bytes(2, 4), PLENTY);
+        ledger.hold(VolumeIndex(2), 0, bytes(3, 2), PLENTY);
+
+        // Room for the reserve and five bytes: the oldest hold spills, the
+        // next would cross the reserve, and the spill stops there.
+        let (page_outs, spills) = ledger.page_out_all(15);
+        assert!(page_outs.is_empty());
+        assert_eq!(
+            spills,
+            vec![Spill {
+                volume: VolumeIndex(0),
+                range: ByteRange::new(0, 4),
+                bytes: bytes(1, 4),
+            }]
+        );
+        assert_eq!(ledger.spilled_holds(), vec![(VolumeIndex(0), ByteRange::new(0, 4))]);
+        assert_eq!(ledger.resident_bytes(), 6);
+        assert_eq!(
+            accountant.namespace_usage(NS),
+            NamespaceUsage {
+                resident: 6,
+                scratch: 0
+            }
+        );
+
+        // Already below the reserve, nothing spills at all.
+        let mut below = HoldLedger::new(
+            HoldsNamespace {
+                scope: 2,
+                node: NodeId(0),
+            },
+            Arc::clone(&accountant),
+        );
+        below.hold(VolumeIndex(0), 0, bytes(4, 4), PLENTY);
+        let (page_outs, spills) = below.page_out_all(9);
+        assert!(page_outs.is_empty() && spills.is_empty());
+        assert_eq!(below.resident_bytes(), 4);
+        ledger.discard();
+        below.discard();
+        assert_idle(&accountant);
     }
 
     #[test]
