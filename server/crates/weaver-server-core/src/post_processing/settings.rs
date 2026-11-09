@@ -135,44 +135,10 @@ impl Database {
         result
     }
 
+    // The stored settings, or the defaults when none are stored or the stored
+    // value does not parse. A read that failed is still an error.
     pub fn post_processing_settings(&self) -> Result<PostProcessingSettings, StateError> {
-        self.get_setting(SETTINGS_KEY)?
-            .map(|raw| from_json(&raw))
-            .transpose()
-            .map(Option::unwrap_or_default)
-    }
-
-    // The settings as stored, telling a read that failed, which a later try
-    // may get past, from a stored value that does not parse, which no try
-    // will: `LoadError::Read` and `LoadError::Rows`.
-    pub(crate) fn post_processing_settings_loaded(
-        &self,
-    ) -> Result<PostProcessingSettings, crate::persistence::LoadError> {
-        use crate::persistence::LoadError;
-        self.get_setting(SETTINGS_KEY)
-            .map_err(LoadError::Read)?
-            .map(|raw| from_json(&raw).map_err(LoadError::Rows))
-            .transpose()
-            .map(Option::unwrap_or_default)
-    }
-
-    // The settings a job's content is judged by. A stored value that does
-    // not parse is logged, without what it holds, and the defaults stand in;
-    // the value is left as it is for the operator to save again. A read that
-    // failed is still an error.
-    pub(crate) fn content_policy_settings(&self) -> Result<PostProcessingSettings, StateError> {
-        use crate::persistence::LoadError;
-        match self.post_processing_settings_loaded() {
-            Ok(settings) => Ok(settings),
-            Err(LoadError::Read(error)) => Err(error),
-            Err(LoadError::Rows(_)) => {
-                tracing::error!(
-                    setting = SETTINGS_KEY,
-                    "the stored post-processing settings do not parse; the default unacceptable extensions apply"
-                );
-                Ok(PostProcessingSettings::default())
-            }
-        }
+        Ok(stored_settings(self.get_setting(SETTINGS_KEY)?.as_deref()))
     }
 
     // Read the settings and the scripts root from one database snapshot.
@@ -200,11 +166,7 @@ impl Database {
                 }
             }
             Ok((
-                settings
-                    .as_deref()
-                    .map(from_json)
-                    .transpose()?
-                    .unwrap_or_default(),
+                stored_settings(settings.as_deref()),
                 script_directory.map(PathBuf::from).ok_or_else(|| {
                     StateError::Database(
                         "post-processing scripts directory is not initialized".into(),
@@ -309,7 +271,7 @@ impl Database {
                                 )
                             })?
                             .text("value")?;
-                        let stored = from_json::<PostProcessingSettings>(&stored)?;
+                        let stored = stored_settings(Some(&stored));
                         let settings = merge(&stored).normalized().map_err(state_err)?;
                         let lowered = retention_lowered(&stored, &settings);
                         tx.execute(
@@ -620,6 +582,22 @@ fn job_id_i64(job_id: u64) -> Result<i64, StateError> {
     i64::try_from(job_id).map_err(|_| StateError::Database("job id is out of range".into()))
 }
 
+// Every read of the stored settings goes through here. A stored value that
+// does not parse is logged, by key and never by what it holds, and the
+// defaults stand in; the value is left as stored until the operator saves.
+fn stored_settings(raw: Option<&str>) -> PostProcessingSettings {
+    let Some(raw) = raw else {
+        return PostProcessingSettings::default();
+    };
+    from_json(raw).unwrap_or_else(|_| {
+        tracing::error!(
+            setting = SETTINGS_KEY,
+            "the stored post-processing settings do not parse; the defaults apply until they are saved again"
+        );
+        PostProcessingSettings::default()
+    })
+}
+
 fn to_json<T: Serialize>(value: &T) -> Result<String, StateError> {
     serde_json::to_string(value).map_err(state_err)
 }
@@ -714,21 +692,57 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_value_that_does_not_parse_judges_content_by_the_default() {
+    fn every_read_of_a_stored_value_that_does_not_parse_gets_the_defaults() {
         let db = Database::open_in_memory().unwrap();
+        db.initialize_post_processing_script_directory(
+            &std::env::temp_dir(),
+            Some(&std::env::temp_dir()),
+        )
+        .unwrap();
         db.set_setting(SETTINGS_KEY, "{unreadable").unwrap();
-        assert!(matches!(
-            db.post_processing_settings_loaded(),
-            Err(crate::persistence::LoadError::Rows(_))
-        ));
         assert_eq!(
-            db.content_policy_settings().unwrap(),
+            db.post_processing_settings().unwrap(),
             PostProcessingSettings::default()
         );
-        // The value is left as stored.
+        let (admitted, _) = db.post_processing_script_admission().unwrap();
+        assert_eq!(admitted, PostProcessingSettings::default());
+        // Reads leave the value as stored.
         assert_eq!(
             db.get_setting(SETTINGS_KEY).unwrap().as_deref(),
             Some("{unreadable")
         );
+    }
+
+    #[test]
+    fn a_save_replaces_a_stored_value_that_does_not_parse() {
+        let db = Database::open_in_memory().unwrap();
+        let settings = PostProcessingSettings {
+            concurrency: 3,
+            ..PostProcessingSettings::default()
+        };
+        db.set_setting(SETTINGS_KEY, "{unreadable").unwrap();
+        db.save_post_processing_settings(&settings).unwrap();
+        assert_eq!(db.post_processing_settings().unwrap().concurrency, 3);
+
+        // The merging saves start from the defaults in its place.
+        db.set_setting(SETTINGS_KEY, "{unreadable").unwrap();
+        let saved = db.save_unacceptable_extensions(vec!["exe".into()]).unwrap();
+        assert_eq!(
+            saved,
+            PostProcessingSettings {
+                unacceptable_extensions: vec!["exe".into()],
+                ..PostProcessingSettings::default()
+            }
+        );
+        db.set_setting(SETTINGS_KEY, "{unreadable").unwrap();
+        let saved = db
+            .save_post_processing_settings_preserving_extensions(settings.clone(), true)
+            .unwrap();
+        assert_eq!(saved.concurrency, 3);
+        assert_eq!(
+            saved.unacceptable_extensions,
+            PostProcessingSettings::default().unacceptable_extensions
+        );
+        assert_eq!(db.post_processing_settings().unwrap(), saved);
     }
 }

@@ -693,7 +693,7 @@ pub(in crate::pipeline::graph) fn caps_for(
     // A stored value that does not parse reads as the default policy; only
     // a failed read leaves the policy unknown.
     let policy: PolicyRead = Arc::new(move || {
-        db.content_policy_settings()
+        db.post_processing_settings()
             .map(Arc::new)
             .map_err(|error| error.to_string())
     });
