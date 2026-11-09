@@ -572,6 +572,9 @@ pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) limits: Option<ExtractionLimits>,
     // The operator's unacceptable extensions, when not the stored ones.
     pub(in crate::pipeline::tests) unacceptable: Option<Vec<String>>,
+    // The hold budgets every graph job of the pipeline shares, when not the
+    // host's.
+    pub(in crate::pipeline::tests) holds: Option<weaver_graph::holds::HoldBudgets>,
     // The STAT server of every pipeline the scenario prepared, held as long
     // as the scenario is.
     stat_servers: std::sync::Mutex<Vec<Listener>>,
@@ -599,6 +602,7 @@ impl Scenario {
             leased: false,
             limits: None,
             unacceptable: None,
+            holds: None,
             stat_servers: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -654,6 +658,19 @@ impl Scenario {
         if let Some(limits) = &self.limits {
             pipeline.extraction_limits = std::sync::Arc::new(limits.clone());
         }
+        if let Some(budgets) = self.holds {
+            pipeline.graph_holds =
+                std::sync::Arc::new(weaver_graph::holds::HoldsAccountant::new(budgets));
+        }
+    }
+
+    // The job's holds run under these budgets.
+    pub(in crate::pipeline::tests) fn holds(
+        mut self,
+        budgets: weaver_graph::holds::HoldBudgets,
+    ) -> Self {
+        self.holds = Some(budgets);
+        self
     }
 
     // Whatever the download queue hands out at once arrives in reverse.
