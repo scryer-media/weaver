@@ -1608,6 +1608,7 @@ export const nextDe: LocaleDictionary = {
   "next.refusal.ROUTE_CONSUMER_NOT_FOUND": "Diese Route existiert nicht mehr.",
   "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT": "Ein WireGuard-Proxy kann einen Egress nur über einen Pfad erreichen.",
   "next.refusal.WIREGUARD_INSTANCE_LIMIT": "Diese Routen brauchen {{required}} WireGuard-Instanzen; dieser Host erlaubt {{limit}}.",
+  "next.refusal.WIREGUARD_SOCKET_BUDGET": "Usenet-Server brauchen mehr Verbindungen über einen WireGuard-Proxy, als er halten kann.",
   "next.refusal.PROXY_NAME_LENGTH": "Ein Proxy-Name braucht 1 bis 128 Zeichen.",
   "next.refusal.PROXY_ENDPOINT_INVALID": "Gib einen gültigen Host und Port ein.",
   "next.refusal.PROXY_TIMEOUT_RANGE": "Das Zeitlimit muss zwischen 1 und 300 Sekunden liegen.",

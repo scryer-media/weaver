@@ -403,6 +403,19 @@ fn append_history_row_filter_predicates(
         sql.push_str(" AND h.category = {}");
         args.push(SqlArg::Text(category.clone()));
     }
+    // A tag is looked up through `idx_job_tags_tag`; no tag at all, through
+    // the table's key, which starts with the job id.
+    if let Some(tag) = &filter.tag {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            sql.push_str(" AND NOT EXISTS (SELECT 1 FROM job_tags jt WHERE jt.job_id = h.job_id)");
+        } else {
+            sql.push_str(
+                " AND EXISTS (SELECT 1 FROM job_tags jt WHERE jt.tag = {} AND jt.job_id = h.job_id)",
+            );
+            args.push(SqlArg::Text(tag.to_owned()));
+        }
+    }
 }
 
 fn append_in_i64_or_text_filter(

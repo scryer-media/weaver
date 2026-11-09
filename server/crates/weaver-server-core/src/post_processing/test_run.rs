@@ -415,8 +415,7 @@ fn prepare(
             )
         }
         Some(context) => {
-            let mut env = context.weaver_env();
-            env.extend(context.env);
+            let env = context.script_env();
             let inputs = env.clone().into_iter().collect();
             let spec = ExecutionSpec {
                 manifest: script.manifest,

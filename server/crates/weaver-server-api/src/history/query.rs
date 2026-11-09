@@ -403,23 +403,35 @@ async fn load_history_page(
         let page = if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
             build_history_page_sql(&db, plan, &live_in_history)?
         } else {
-            let mut rows = db.list_job_history(
-                &weaver_server_core::HistoryFilter::default(),
-                HistoryRows::Shown,
-            )?;
-            if let Some(tag) = input.tag.as_deref() {
-                let tags = db.tag_snapshot()?;
-                rows.retain(|row| {
-                    tags.passes(weaver_server_core::jobs::ids::JobId(row.job_id), tag)
-                });
-            }
-            build_history_page(exclude_live_rows(rows, &live_in_history), input)
+            build_history_page_rust(&db, &live_in_history, input)?
         };
         attach_history_page_badges(&db, page)
     })
     .await
     .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
     .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+}
+
+// The page built in Rust over every shown history row, for a request the
+// SQL plan does not take. A tag filter is applied here from the tags in
+// memory, before the counts.
+fn build_history_page_rust(
+    db: &Database,
+    live_in_history: &HashSet<u64>,
+    input: HistoryPageInput,
+) -> Result<HistoryPage, weaver_server_core::StateError> {
+    let mut rows = db.list_job_history(
+        &weaver_server_core::HistoryFilter::default(),
+        HistoryRows::Shown,
+    )?;
+    if let Some(tag) = input.tag.as_deref() {
+        let tags = db.tag_snapshot()?;
+        rows.retain(|row| tags.passes(weaver_server_core::jobs::ids::JobId(row.job_id), tag));
+    }
+    Ok(build_history_page(
+        exclude_live_rows(rows, live_in_history),
+        input,
+    ))
 }
 
 // Attach the per-row delete-operation and duplicate badges to a built page.
@@ -459,6 +471,9 @@ fn attach_history_page_badges(
 // default `completed_at DESC` ordering; see [`HistoryPageSqlPlan::for_input`].
 struct HistoryPageSqlPlan {
     status: HistoryStatusFilter,
+    // The tag filter, if any: like the rows left out for being live, it
+    // narrows the counts as well as the page.
+    tag: Option<String>,
     page_index: usize,
     page_size: usize,
 }
@@ -487,10 +502,6 @@ impl HistoryPageSqlPlan {
         if input.completed_since_epoch_sec.is_some() {
             return None;
         }
-        // And for a tag: the tags are read from memory, not joined in SQL.
-        if input.tag.is_some() {
-            return None;
-        }
         // Only the default `completed_at DESC` ordering matches the indexed SQL
         // order (idx_job_history_completed_job → completed_at DESC, job_id DESC).
         // Any other sort field/direction is not indexed and its Rust tie-breaks
@@ -505,6 +516,7 @@ impl HistoryPageSqlPlan {
 
         Some(Self {
             status: input.status.unwrap_or(HistoryStatusFilter::All),
+            tag: input.tag.clone(),
             page_index: input.page_index as usize,
             page_size: sanitize_page_size(input.page_size),
         })
@@ -549,8 +561,10 @@ fn build_history_page_sql(
     plan: HistoryPageSqlPlan,
     live_in_history: &HashSet<u64>,
 ) -> Result<HistoryPage, weaver_server_core::StateError> {
-    // Every count and the page itself leave out rows of jobs still live.
+    // Every count and the page itself leave out rows of jobs still live, and
+    // keep only the rows that pass the tag filter.
     let excluding_live = |mut filter: weaver_server_core::HistoryFilter| {
+        filter.tag = plan.tag.clone();
         if !live_in_history.is_empty() {
             let mut ids: Vec<u64> = live_in_history.iter().copied().collect();
             ids.sort_unstable();
@@ -1137,13 +1151,7 @@ mod tests {
     }
 
     fn rust_page(db: &Database, input: HistoryPageInput, live: &HashSet<u64>) -> HistoryPage {
-        let rows = db
-            .list_job_history(
-                &weaver_server_core::HistoryFilter::default(),
-                HistoryRows::Shown,
-            )
-            .unwrap();
-        build_history_page(exclude_live_rows(rows, live), input)
+        build_history_page_rust(db, live, input).unwrap()
     }
 
     fn assert_parity(db: &Database, input: HistoryPageInput) {
@@ -1318,6 +1326,71 @@ mod tests {
         let page = build_history_page_sql(&db, plan, &live).unwrap();
         assert_eq!(page.total_count, 5);
         assert!(page.items.iter().all(|item| !live.contains(&item.id)));
+    }
+
+    // A tag filter stays on the SQL path: the page, its total and every
+    // count are those of the jobs that carry the tag, and the empty tag keeps
+    // the jobs that carry none. Each matches the Rust path over the same rows.
+    #[test]
+    fn sql_path_filters_by_tag_and_matches_rust_path() {
+        use weaver_server_core::jobs::ids::JobId;
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        db.tag_new_job(JobId(1), ["tv"]).unwrap();
+        db.tag_new_job(JobId(3), ["tv", "hd"]).unwrap();
+        db.tag_new_job(JobId(4), ["hd"]).unwrap();
+        db.tag_new_job(JobId(6), ["tv"]).unwrap();
+        let tagged = |tag: &str, page_index, page_size, status| HistoryPageInput {
+            tag: Some(tag.to_string()),
+            ..page_input(page_index, page_size, status)
+        };
+        let live: HashSet<u64> = [3, 7].into_iter().collect();
+        for tag in ["tv", "", "hd", " tv ", "TV", "none"] {
+            for status in [
+                None,
+                Some(HistoryStatusFilter::Success),
+                Some(HistoryStatusFilter::Failure),
+            ] {
+                for (page_index, page_size) in [(0, 25), (0, 2), (1, 2), (3, 2)] {
+                    assert_parity(&db, tagged(tag, page_index, page_size, status));
+                    assert_parity_excluding(&db, tagged(tag, page_index, page_size, status), &live);
+                }
+            }
+        }
+
+        let page = |input: HistoryPageInput| {
+            build_history_page_sql(
+                &db,
+                HistoryPageSqlPlan::for_input(&input).unwrap(),
+                &HashSet::new(),
+            )
+            .unwrap()
+        };
+        let ids = |page: &HistoryPage| page.items.iter().map(|item| item.id).collect::<Vec<_>>();
+
+        let tv = page(tagged("tv", 0, 2, None));
+        assert_eq!(ids(&tv), [6, 3]);
+        assert_eq!(tv.total_count, 3);
+        assert_eq!(
+            (tv.counts.all, tv.counts.success, tv.counts.failure),
+            (3, 3, 0)
+        );
+        assert_eq!(ids(&page(tagged("tv", 1, 2, None))), [1]);
+
+        let untagged = page(tagged("", 0, 25, None));
+        assert_eq!(ids(&untagged), [7, 5, 2]);
+        assert_eq!(untagged.total_count, 3);
+        assert_eq!(
+            (
+                untagged.counts.all,
+                untagged.counts.success,
+                untagged.counts.failure
+            ),
+            (3, 0, 2)
+        );
+        let failed = page(tagged("", 0, 25, Some(HistoryStatusFilter::Failure)));
+        assert_eq!(ids(&failed), [7, 2]);
+        assert_eq!(failed.total_count, 2);
     }
 
     #[test]

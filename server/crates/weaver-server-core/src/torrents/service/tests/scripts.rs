@@ -261,3 +261,42 @@ async fn a_torrent_raises_nothing_without_queue_scripts() {
     rig.db.admitted_so_far().await;
     assert_eq!(rig.db.queue_script_count().unwrap(), 0);
 }
+
+// A torrent's queue script is told its job's tags as it starts, as an NZB
+// job's is: one put on before the event was queued and one put on after.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrents_queue_script_is_told_its_jobs_tags() {
+    let rig = rig(set_clock());
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    let out = rig.dir.path().join("told");
+    let supervisor = rig.db.tag_reporting_queue_script_for_test(&out);
+    rig.service.publish_to(queue());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            tags: vec!["linux".into()],
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    rig.db.admitted_so_far().await;
+    let mut added = rig.db.queued_script_events(QueueEvent::NzbAdded);
+    assert_eq!(added.len(), 1);
+    rig.db.add_job_tags(&[job_id], ["iso"]).unwrap();
+    let results = crate::post_processing::events::run_event(
+        &rig.db,
+        &mut added[0],
+        "torrent-tags",
+        None,
+        Some(supervisor),
+    )
+    .await
+    .unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(out.join(job_id.0.to_string())).unwrap(),
+        "iso,linux"
+    );
+    rig.service.stop().await;
+}

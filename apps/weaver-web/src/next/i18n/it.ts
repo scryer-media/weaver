@@ -1608,6 +1608,7 @@ export const nextIt: LocaleDictionary = {
   "next.refusal.ROUTE_CONSUMER_NOT_FOUND": "Questo percorso non esiste più.",
   "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT": "Un proxy WireGuard può raggiungere un'uscita per una sola via.",
   "next.refusal.WIREGUARD_INSTANCE_LIMIT": "Questi percorsi richiedono {{required}} istanze WireGuard; questo host ne consente {{limit}}.",
+  "next.refusal.WIREGUARD_SOCKET_BUDGET": "I server Usenet richiedono più connessioni tramite un proxy WireGuard di quante ne possa sostenere.",
   "next.refusal.PROXY_NAME_LENGTH": "Il nome di un proxy richiede da 1 a 128 caratteri.",
   "next.refusal.PROXY_ENDPOINT_INVALID": "Inserisci un host e una porta validi.",
   "next.refusal.PROXY_TIMEOUT_RANGE": "Il timeout deve essere compreso tra 1 e 300 secondi.",
