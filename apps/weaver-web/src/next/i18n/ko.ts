@@ -1608,6 +1608,7 @@ export const nextKo: LocaleDictionary = {
   "next.refusal.ROUTE_CONSUMER_NOT_FOUND": "이 경로는 더 이상 존재하지 않습니다.",
   "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT": "WireGuard 프록시는 한 가지 경로로만 송신에 도달할 수 있습니다.",
   "next.refusal.WIREGUARD_INSTANCE_LIMIT": "이 경로들에는 WireGuard 인스턴스가 {{required}}개 필요하지만 이 호스트는 {{limit}}개까지 허용합니다.",
+  "next.refusal.WIREGUARD_SOCKET_BUDGET": "Usenet 서버에 필요한 연결 수가 WireGuard 프록시가 유지할 수 있는 수를 넘습니다.",
   "next.refusal.PROXY_NAME_LENGTH": "프록시 이름은 1~128자여야 합니다.",
   "next.refusal.PROXY_ENDPOINT_INVALID": "올바른 호스트와 포트를 입력하세요.",
   "next.refusal.PROXY_TIMEOUT_RANGE": "시간 제한은 1~300초여야 합니다.",

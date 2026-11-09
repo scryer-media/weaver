@@ -1608,6 +1608,7 @@ export const nextJa: LocaleDictionary = {
   "next.refusal.ROUTE_CONSUMER_NOT_FOUND": "このルートはもう存在しません。",
   "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT": "WireGuard プロキシが送信に届く経路は1つだけにしてください。",
   "next.refusal.WIREGUARD_INSTANCE_LIMIT": "これらのルートには WireGuard インスタンスが {{required}} 個必要ですが、このホストで使えるのは {{limit}} 個です。",
+  "next.refusal.WIREGUARD_SOCKET_BUDGET": "Usenet サーバーが、WireGuard プロキシが保てる数を超える接続を必要としています。",
   "next.refusal.PROXY_NAME_LENGTH": "プロキシの名前は1～128文字にしてください。",
   "next.refusal.PROXY_ENDPOINT_INVALID": "有効なホストとポートを入力してください。",
   "next.refusal.PROXY_TIMEOUT_RANGE": "タイムアウトは 1～300 秒にしてください。",

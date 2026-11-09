@@ -1608,6 +1608,7 @@ export const nextZh: LocaleDictionary = {
   "next.refusal.ROUTE_CONSUMER_NOT_FOUND": "此路由已不存在。",
   "next.refusal.WIREGUARD_PROXY_PATH_CONFLICT": "一个 WireGuard 代理只能经由一条路径到达出口。",
   "next.refusal.WIREGUARD_INSTANCE_LIMIT": "这些路由需要 {{required}} 个 WireGuard 实例；此主机允许 {{limit}} 个。",
+  "next.refusal.WIREGUARD_SOCKET_BUDGET": "Usenet 服务器需要的连接数超过了 WireGuard 代理所能容纳的数量。",
   "next.refusal.PROXY_NAME_LENGTH": "代理名称需要 1 到 128 个字符。",
   "next.refusal.PROXY_ENDPOINT_INVALID": "请输入有效的主机和端口。",
   "next.refusal.PROXY_TIMEOUT_RANGE": "超时必须在 1 到 300 秒之间。",
