@@ -560,7 +560,7 @@ fn xz_declaring(property: u8) -> Vec<u8> {
 // The xz decoder holds its limit against a block's dictionary. A 1 GiB
 // dictionary, property 36, fits the window Balanced and Performance hand
 // the decoder and not Efficient's 256 MiB. A stream whose front says
-// nothing is held to the profile's whole window.
+// nothing reserves the decoder's own 128 MiB, never the whole grant.
 #[test]
 fn each_profiles_window_reaches_the_xz_decoder() {
     let declared = xz_declaring(36);
@@ -572,9 +572,9 @@ fn each_profiles_window_reaches_the_xz_decoder() {
     });
     let fits = profiles().map(|budget| Xz::window(&declared, &budget) >= GIB);
     assert_eq!(fits, [false, true, true]);
-    assert_eq!(Xz::window(&[], &efficient), 256 * MIB);
-    assert_eq!(Xz::window(&[], &balanced), GIB);
-    assert_eq!(Xz::window(&[], &performance), 4 * GIB);
+    for budget in profiles() {
+        assert_eq!(Xz::window(&[], &budget), 128 * MIB);
+    }
 }
 
 // A zstd frame header naming a window of 1 << log, with no content size, so
@@ -596,8 +596,9 @@ fn each_profiles_window_reaches_the_zstd_decoder() {
     let fits = profiles().map(|budget| window(30, &budget) >= GIB);
     assert_eq!(fits, [false, true, true]);
     assert_eq!(window(31, &performance), 2 * GIB);
-    assert_eq!(Zstd::window(&[], &performance), 2 * GIB);
-    assert_eq!(Zstd::window(&[], &efficient), 256 * MIB);
+    for budget in profiles() {
+        assert_eq!(Zstd::window(&[], &budget), 128 * MIB);
+    }
     assert_eq!(window(20, &performance), 128 * MIB);
     assert_eq!(window(28, &balanced), 256 * MIB);
 }

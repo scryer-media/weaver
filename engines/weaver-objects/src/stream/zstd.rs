@@ -32,11 +32,11 @@ impl Decoder for Zstd {
 
     // The window the first frame declares, at least the decoder's own
     // default and no wider than the run was granted. A stream whose front
-    // does not say reserves the whole grant.
+    // does not say reserves the decoder's own default, never the whole grant.
     fn window(first: &[u8], budget: &Budget) -> u64 {
         let most = log_floor(budget.window_or(1 << WINDOW_LOG));
         let least = most.min(WINDOW_LOG);
-        let log = declared_log(first).map_or(most, |log| log.clamp(least, most));
+        let log = declared_log(first).map_or(least, |log| log.clamp(least, most));
         1 << log
     }
 

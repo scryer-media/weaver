@@ -29,13 +29,13 @@ impl Decoder for Xz {
     const KIND: Kind = Kind::Xz;
 
     // What the first block's dictionary needs, no more than the window the
-    // run was granted: a stream whose front has not said reserves the whole
-    // grant.
+    // run was granted: a stream whose front has not said reserves the
+    // decoder's own limit, never the whole grant.
     fn window(first: &[u8], budget: &Budget) -> u64 {
         let most = budget.window_or(MEMORY_LIMIT);
         dictionary(first)
             .and_then(|property| Lzma2Reader::<io::Empty>::memory_required(property).ok())
-            .map_or(most, |window| window.min(most))
+            .map_or(most.min(MEMORY_LIMIT), |window| window.min(most))
     }
 
     // Held to the first block's window: a later block that asks for more
