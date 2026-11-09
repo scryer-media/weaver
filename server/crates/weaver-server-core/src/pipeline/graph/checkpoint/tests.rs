@@ -1245,6 +1245,7 @@ fn restored(
                 scratch_ceiling: u64::MAX,
                 disk_reserve: 0,
             })),
+            decode: crate::pipeline::graph::engine::DecodePool::unbounded(),
             free_disk: CapacityReader::unknown(),
             slots: 1,
             mail: mail.sender(),

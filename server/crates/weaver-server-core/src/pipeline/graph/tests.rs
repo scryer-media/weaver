@@ -602,11 +602,8 @@ async fn a_run_waiting_for_another_jobs_memory_starts_when_that_run_ends() {
     )
     .await;
     pipeline
-        .graph_holds
-        .set_budgets(weaver_graph::holds::HoldBudgets {
-            resident_limit: WINDOW + engine::RUN_OVERHEAD,
-            ..pipeline.graph_holds.budgets()
-        });
+        .graph_decode
+        .set_limit(WINDOW + engine::RUN_OVERHEAD);
     for job_id in [first, second] {
         pipeline
             .graph_jobs

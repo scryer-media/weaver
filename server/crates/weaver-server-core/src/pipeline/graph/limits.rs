@@ -183,21 +183,6 @@ impl HoldSettings {
     }
 }
 
-// The decode pool: the holds' resident limit, which every run's reservation
-// shares with the direct store's holds, raised where it must be so one run
-// decoding at the ceiling the hardware grants a run always fits beside
-// nothing else. A run that does not fit beside the others waits for room; only
-// one wider than the pool itself is refused.
-pub(crate) fn decode_pool(base: HoldBudgets, run: &weaver_graph::Budget) -> HoldBudgets {
-    let ceiling = run.memory_bytes.max(run.window_bytes).unwrap_or(0);
-    HoldBudgets {
-        resident_limit: base
-            .resident_limit
-            .max(ceiling.saturating_add(crate::pipeline::graph::engine::RUN_OVERHEAD)),
-        ..base
-    }
-}
-
 // How many namespaces may extract at once: the extraction concurrency the
 // tuner allows, which already bounds streaming member extractions.
 pub(crate) fn slots(tuner: &RuntimeTuner) -> usize {
@@ -722,57 +707,4 @@ pub(in crate::pipeline::graph) fn caps_for(
         })
         .collect();
     Caps::new(Arc::clone(extraction_limits), policy, declared)
-}
-
-#[cfg(test)]
-mod decode_pool_tests {
-    use super::*;
-    use crate::pipeline::graph::engine::RUN_OVERHEAD;
-
-    const MIB: u64 = 1 << 20;
-    const GIB: u64 = 1 << 30;
-
-    fn holds(resident_limit: u64) -> HoldBudgets {
-        HoldBudgets {
-            resident_limit,
-            scratch_total: 7,
-            scratch_ceiling: 5,
-            disk_reserve: 3,
-        }
-    }
-
-    fn run(memory: Option<u64>, window: Option<u64>) -> weaver_graph::Budget {
-        weaver_graph::Budget {
-            memory_bytes: memory,
-            window_bytes: window,
-            ..Default::default()
-        }
-    }
-
-    // The pool always fits one run at the ceiling the profile grants, the
-    // wider of its memory and its window, and the run's overhead. A limit
-    // already wider stands, and nothing but the resident limit moves.
-    #[test]
-    fn the_pool_fits_one_decode_at_the_profiles_ceiling() {
-        let efficient = run(Some(512 * MIB), Some(256 * MIB));
-        assert_eq!(
-            decode_pool(holds(256 * MIB), &efficient),
-            HoldBudgets {
-                resident_limit: 512 * MIB + RUN_OVERHEAD,
-                ..holds(256 * MIB)
-            }
-        );
-        let balanced = run(Some(GIB), Some(GIB));
-        assert_eq!(
-            decode_pool(holds(GIB), &balanced).resident_limit,
-            GIB + RUN_OVERHEAD
-        );
-        assert_eq!(decode_pool(holds(8 * GIB), &balanced), holds(8 * GIB));
-        // A run granted no ceiling still needs room for its overhead.
-        assert_eq!(
-            decode_pool(holds(MIB), &run(None, None)),
-            holds(RUN_OVERHEAD)
-        );
-        assert_eq!(decode_pool(holds(GIB), &run(None, None)), holds(GIB));
-    }
 }

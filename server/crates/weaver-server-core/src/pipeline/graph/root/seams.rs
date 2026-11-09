@@ -73,6 +73,7 @@ impl Pipeline {
                 )
             }),
             accountant: Arc::clone(&self.graph_holds),
+            decode: Arc::clone(&self.graph_decode),
             free_disk: self
                 .storage_capacity
                 .reader(crate::operations::StorageRoot::Intermediate),

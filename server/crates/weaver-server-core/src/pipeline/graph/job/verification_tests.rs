@@ -172,6 +172,7 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
                 scratch_ceiling: u64::MAX,
                 disk_reserve: 0,
             })),
+            decode: crate::pipeline::graph::engine::DecodePool::unbounded(),
             free_disk: CapacityReader::unknown(),
             slots: 1,
             mail: mail.sender(),
