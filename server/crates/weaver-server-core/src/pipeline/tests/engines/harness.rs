@@ -36,6 +36,8 @@ pub(in crate::pipeline) const ARTICLE: usize = 64;
 // Every run is its own pipeline, so one id serves every scenario.
 pub(in crate::pipeline::tests) const JOB: JobId = JobId(93_001);
 const JOB_NAME: &str = "lantern beacon";
+// A stored settings value that does not parse.
+pub(in crate::pipeline::tests) const CORRUPT_POLICY: &str = "{unreadable";
 
 pub(in crate::pipeline) struct Post {
     pub(in crate::pipeline) name: String,
@@ -572,12 +574,9 @@ pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) limits: Option<ExtractionLimits>,
     // The operator's unacceptable extensions, when not the stored ones.
     pub(in crate::pipeline::tests) unacceptable: Option<Vec<String>>,
-    // How many of the pipelines the scenario prepares, the first that
-    // admits the job and then each that restores it, find the stored
-    // settings unreadable when they build the job; each reads them again
-    // once the job is built. `usize::MAX` never reads them.
-    policy_unread: usize,
-    prepared: std::sync::atomic::AtomicUsize,
+    // Every pipeline the scenario prepares finds the stored settings
+    // present but not parsing.
+    policy_corrupt: bool,
     // The STAT server of every pipeline the scenario prepared, held as long
     // as the scenario is.
     stat_servers: std::sync::Mutex<Vec<Listener>>,
@@ -605,40 +604,35 @@ impl Scenario {
             leased: false,
             limits: None,
             unacceptable: None,
-            policy_unread: 0,
-            prepared: std::sync::atomic::AtomicUsize::new(0),
+            policy_corrupt: false,
             stat_servers: std::sync::Mutex::new(Vec::new()),
         }
     }
 
-    // The first `pipelines` to build the job cannot read the stored
-    // settings: the document does not parse until the job is built.
-    pub(in crate::pipeline::tests) fn policy_unread(mut self, pipelines: usize) -> Self {
-        self.policy_unread = pipelines;
+    // The stored settings are present but do not parse, on every pipeline
+    // that runs the job.
+    pub(in crate::pipeline::tests) fn policy_corrupt(mut self) -> Self {
+        self.policy_corrupt = true;
         self
     }
 
-    // The pipeline built the job: the settings read again, unless the
-    // scenario never lets them.
+    // A restarting run's pipeline has built or restored the job: the
+    // settings are saved again, as the operator would, so the next pipeline
+    // can start; a pipeline does not start on settings that do not parse.
     pub(in crate::pipeline::tests) fn built(&self, pipeline: &Pipeline) {
-        if self.policy_unread != usize::MAX {
-            self.store_policy(pipeline);
+        if self.policy_corrupt {
+            let settings = crate::post_processing::model::PostProcessingSettings {
+                unacceptable_extensions: self.unacceptable.clone().unwrap_or_default(),
+                ..Default::default()
+            };
+            pipeline
+                .db
+                .set_setting(
+                    crate::post_processing::settings::SETTINGS_KEY,
+                    &serde_json::to_string(&settings).unwrap(),
+                )
+                .unwrap();
         }
-    }
-
-    // The scenario's settings, stored as a save leaves them.
-    fn store_policy(&self, pipeline: &Pipeline) {
-        let settings = crate::post_processing::model::PostProcessingSettings {
-            unacceptable_extensions: self.unacceptable.clone().unwrap_or_default(),
-            ..Default::default()
-        };
-        pipeline
-            .db
-            .set_setting(
-                crate::post_processing::settings::SETTINGS_KEY,
-                &serde_json::to_string(&settings).unwrap(),
-            )
-            .unwrap();
     }
 
     // The job runs under these extraction limits.
@@ -680,12 +674,6 @@ impl Scenario {
                 .save_archive_password_settings(Some(self.global_passwords.clone()), None)
                 .unwrap();
         }
-        let prepared = self
-            .prepared
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.policy_unread > 0 {
-            self.store_policy(pipeline);
-        }
         if let Some(extensions) = &self.unacceptable {
             pipeline
                 .db
@@ -698,10 +686,13 @@ impl Scenario {
         if let Some(limits) = &self.limits {
             pipeline.extraction_limits = std::sync::Arc::new(limits.clone());
         }
-        if prepared < self.policy_unread {
+        if self.policy_corrupt {
             pipeline
                 .db
-                .set_setting(crate::post_processing::settings::SETTINGS_KEY, "{unreadable")
+                .set_setting(
+                    crate::post_processing::settings::SETTINGS_KEY,
+                    CORRUPT_POLICY,
+                )
                 .unwrap();
         }
     }
@@ -1073,7 +1064,6 @@ async fn try_run_then(
     after: impl AsyncFnOnce(&mut Pipeline, &Path),
 ) -> Result<Outcome, Stall> {
     let (_temp_dir, mut pipeline, complete_dir) = admit(scenario).await;
-    scenario.built(&pipeline);
     // Events the run sends are heard from admission on; nothing sent before
     // the job was admitted belongs to it.
     let (heard, kept) = hear(pipeline.event_tx.subscribe());

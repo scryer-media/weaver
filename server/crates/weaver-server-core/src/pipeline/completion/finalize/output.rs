@@ -660,7 +660,7 @@ async fn run_move_to_claimed_destination(
     };
     let policy = match policy_source {
         DeliveryPolicySource::Persisted(database) => {
-            crate::runtime::panic_trap::spawn_blocking(move || database.post_processing_settings())
+            crate::runtime::panic_trap::spawn_blocking(move || database.content_policy_settings())
                 .await
                 .map_err(|error| {
                     MoveToCompleteFailure::Operational(format!(

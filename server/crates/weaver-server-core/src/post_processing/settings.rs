@@ -142,6 +142,39 @@ impl Database {
             .map(Option::unwrap_or_default)
     }
 
+    // The settings as stored, telling a read that failed, which a later try
+    // may get past, from a stored value that does not parse, which no try
+    // will: `LoadError::Read` and `LoadError::Rows`.
+    pub(crate) fn post_processing_settings_loaded(
+        &self,
+    ) -> Result<PostProcessingSettings, crate::persistence::LoadError> {
+        use crate::persistence::LoadError;
+        self.get_setting(SETTINGS_KEY)
+            .map_err(LoadError::Read)?
+            .map(|raw| from_json(&raw).map_err(LoadError::Rows))
+            .transpose()
+            .map(Option::unwrap_or_default)
+    }
+
+    // The settings a job's content is judged by. A stored value that does
+    // not parse is logged, without what it holds, and the defaults stand in;
+    // the value is left as it is for the operator to save again. A read that
+    // failed is still an error.
+    pub(crate) fn content_policy_settings(&self) -> Result<PostProcessingSettings, StateError> {
+        use crate::persistence::LoadError;
+        match self.post_processing_settings_loaded() {
+            Ok(settings) => Ok(settings),
+            Err(LoadError::Read(error)) => Err(error),
+            Err(LoadError::Rows(_)) => {
+                tracing::error!(
+                    setting = SETTINGS_KEY,
+                    "the stored post-processing settings do not parse; the default unacceptable extensions apply"
+                );
+                Ok(PostProcessingSettings::default())
+            }
+        }
+    }
+
     // Read the settings and the scripts root from one database snapshot.
     pub(crate) fn post_processing_script_admission(
         &self,
@@ -677,6 +710,25 @@ mod tests {
                 .unwrap()
                 .unacceptable_extensions
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_stored_value_that_does_not_parse_judges_content_by_the_default() {
+        let db = Database::open_in_memory().unwrap();
+        db.set_setting(SETTINGS_KEY, "{unreadable").unwrap();
+        assert!(matches!(
+            db.post_processing_settings_loaded(),
+            Err(crate::persistence::LoadError::Rows(_))
+        ));
+        assert_eq!(
+            db.content_policy_settings().unwrap(),
+            PostProcessingSettings::default()
+        );
+        // The value is left as stored.
+        assert_eq!(
+            db.get_setting(SETTINGS_KEY).unwrap().as_deref(),
+            Some("{unreadable")
         );
     }
 }
