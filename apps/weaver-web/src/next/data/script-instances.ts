@@ -41,6 +41,13 @@ export const QUEUE_EVENTS = [
   "QUOTA_TRICKLE",
   "QUOTA_STOPPED",
   "ROUTE_DOWN",
+  "TORRENT_MARKED",
+  "TORRENT_ADDED",
+  "TORRENT_DOWNLOADED",
+  "TORRENT_DELETED",
+  "JOB_ADDED",
+  "JOB_DOWNLOADED",
+  "JOB_DELETED",
 ] as const;
 
 export type QueueEvent = (typeof QUEUE_EVENTS)[number];

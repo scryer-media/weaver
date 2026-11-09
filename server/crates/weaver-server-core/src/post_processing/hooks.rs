@@ -93,7 +93,8 @@ pub fn mark_history_good(db: &Database, job_id: JobId) -> Result<bool, StateErro
     mark_history(db, job_id, crate::history::NzbgetMarkStatus::Good)
 }
 
-// Record how a client marked a history row and raise NZB_MARKED. GOOD and BAD
+// Record how a client marked a history row and raise NZB_MARKED, or
+// TORRENT_MARKED for a torrent's row. GOOD and BAD
 // also settle the row's duplicate candidate, as the web UI's marks do.
 pub fn mark_history(
     db: &Database,
@@ -109,7 +110,11 @@ pub fn mark_history(
     let Some(history) = db.get_job_history(job_id.0)? else {
         return Ok(changed);
     };
-    let mut context = context(db, history.category, QueueEvent::NzbMarked)?;
+    let event = match history.protocol {
+        crate::jobs::Protocol::Nzb => QueueEvent::NzbMarked,
+        crate::jobs::Protocol::Torrent => QueueEvent::TorrentMarked,
+    };
+    let mut context = context(db, history.category, event)?;
     context.job_id = Some(job_id.0);
     context
         .env

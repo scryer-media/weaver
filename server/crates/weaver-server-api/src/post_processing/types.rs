@@ -897,6 +897,13 @@ pub enum QueueEventGql {
     QuotaTrickle,
     QuotaStopped,
     RouteDown,
+    TorrentMarked,
+    TorrentAdded,
+    TorrentDownloaded,
+    TorrentDeleted,
+    JobAdded,
+    JobDownloaded,
+    JobDeleted,
 }
 
 impl From<weaver_server_core::post_processing::model::QueueEvent> for QueueEventGql {
@@ -916,6 +923,13 @@ impl From<weaver_server_core::post_processing::model::QueueEvent> for QueueEvent
             QueueEvent::QuotaTrickle => Self::QuotaTrickle,
             QueueEvent::QuotaStopped => Self::QuotaStopped,
             QueueEvent::RouteDown => Self::RouteDown,
+            QueueEvent::TorrentMarked => Self::TorrentMarked,
+            QueueEvent::TorrentAdded => Self::TorrentAdded,
+            QueueEvent::TorrentDownloaded => Self::TorrentDownloaded,
+            QueueEvent::TorrentDeleted => Self::TorrentDeleted,
+            QueueEvent::JobAdded => Self::JobAdded,
+            QueueEvent::JobDownloaded => Self::JobDownloaded,
+            QueueEvent::JobDeleted => Self::JobDeleted,
         }
     }
 }
@@ -936,6 +950,13 @@ impl From<QueueEventGql> for weaver_server_core::post_processing::model::QueueEv
             QueueEventGql::QuotaTrickle => Self::QuotaTrickle,
             QueueEventGql::QuotaStopped => Self::QuotaStopped,
             QueueEventGql::RouteDown => Self::RouteDown,
+            QueueEventGql::TorrentMarked => Self::TorrentMarked,
+            QueueEventGql::TorrentAdded => Self::TorrentAdded,
+            QueueEventGql::TorrentDownloaded => Self::TorrentDownloaded,
+            QueueEventGql::TorrentDeleted => Self::TorrentDeleted,
+            QueueEventGql::JobAdded => Self::JobAdded,
+            QueueEventGql::JobDownloaded => Self::JobDownloaded,
+            QueueEventGql::JobDeleted => Self::JobDeleted,
         }
     }
 }

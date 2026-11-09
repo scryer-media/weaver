@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::model::{QueueEvent, ScriptEventLabel};
+use super::model::ScriptEventLabel;
 
 pub const MAX_PARAMETER_NAME_BYTES: usize = 256;
 
@@ -53,7 +53,7 @@ impl Directive {
             ),
             ScriptEventLabel::Queue(queue) => {
                 matches!(self, Self::Parameter { .. } | Self::MarkBad)
-                    || (*queue == QueueEvent::NzbDownloaded && matches!(self, Self::Directory(_)))
+                    || (queue.downloaded() && matches!(self, Self::Directory(_)))
             }
             ScriptEventLabel::Scan => !matches!(
                 self,
@@ -274,6 +274,7 @@ pub fn parse_line(event: &ScriptEventLabel, line: &str) -> (String, Option<Scrip
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::post_processing::model::QueueEvent;
 
     #[test]
     fn directives_follow_each_kinds_contract() {

@@ -581,13 +581,21 @@ fn simulated_job(
 fn simulated_queue_event(job: &JobExecutionContext, event: QueueEvent) -> EventContext {
     let mut context = EventContext::from_job(job, event);
     let reported: &[(&str, &str)] = match event {
-        QueueEvent::NzbDeleted => &[("NZBNA_DELETESTATUS", "MANUAL")],
+        QueueEvent::NzbDeleted | QueueEvent::JobDeleted => &[("NZBNA_DELETESTATUS", "MANUAL")],
         QueueEvent::NzbMarked => &[("NZBNA_MARKSTATUS", "BAD")],
         QueueEvent::UrlCompleted => &[("NZBNA_URL", TEST_URL), ("NZBNA_URLSTATUS", "SUCCESS")],
         QueueEvent::FileDownloaded
         | QueueEvent::NzbAdded
         | QueueEvent::NzbNamed
-        | QueueEvent::NzbDownloaded => &[],
+        | QueueEvent::NzbDownloaded
+        | QueueEvent::JobAdded
+        | QueueEvent::JobDownloaded => &[],
+        QueueEvent::TorrentMarked => &[("NZBNA_MARKSTATUS", "BAD")],
+        QueueEvent::TorrentAdded | QueueEvent::TorrentDownloaded => &[(vars::PROTOCOL, "torrent")],
+        QueueEvent::TorrentDeleted => &[
+            (vars::PROTOCOL, "torrent"),
+            ("NZBNA_DELETESTATUS", "MANUAL"),
+        ],
         QueueEvent::SeedingFinished => {
             &[(vars::PROTOCOL, "torrent"), (vars::SEEDING_ACTION, "stop")]
         }

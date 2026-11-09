@@ -59,11 +59,22 @@ pub enum QueueEvent {
     QuotaStopped,
     // A configured route went from up to down.
     RouteDown,
+    // A torrent's job at the points an NZB job raises NZB_MARKED, NZB_ADDED,
+    // NZB_DOWNLOADED and NZB_DELETED.
+    TorrentMarked,
+    TorrentAdded,
+    TorrentDownloaded,
+    TorrentDeleted,
+    // Raised beside the job's own ADDED, DOWNLOADED or DELETED event, for
+    // every kind of job.
+    JobAdded,
+    JobDownloaded,
+    JobDeleted,
 }
 
 impl QueueEvent {
     // NZB_NAMED is retained for truthful declarations, but Weaver does not raise it.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 20] = [
         Self::FileDownloaded,
         Self::UrlCompleted,
         Self::NzbMarked,
@@ -77,6 +88,13 @@ impl QueueEvent {
         Self::QuotaTrickle,
         Self::QuotaStopped,
         Self::RouteDown,
+        Self::TorrentMarked,
+        Self::TorrentAdded,
+        Self::TorrentDownloaded,
+        Self::TorrentDeleted,
+        Self::JobAdded,
+        Self::JobDownloaded,
+        Self::JobDeleted,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -94,7 +112,38 @@ impl QueueEvent {
             Self::QuotaTrickle => "QUOTA_TRICKLE",
             Self::QuotaStopped => "QUOTA_STOPPED",
             Self::RouteDown => "ROUTE_DOWN",
+            Self::TorrentMarked => "TORRENT_MARKED",
+            Self::TorrentAdded => "TORRENT_ADDED",
+            Self::TorrentDownloaded => "TORRENT_DOWNLOADED",
+            Self::TorrentDeleted => "TORRENT_DELETED",
+            Self::JobAdded => "JOB_ADDED",
+            Self::JobDownloaded => "JOB_DOWNLOADED",
+            Self::JobDeleted => "JOB_DELETED",
         }
+    }
+
+    // The event every kind of job raises beside this one, if any.
+    pub fn generic(self) -> Option<Self> {
+        match self {
+            Self::NzbAdded | Self::TorrentAdded => Some(Self::JobAdded),
+            Self::NzbDownloaded | Self::TorrentDownloaded => Some(Self::JobDownloaded),
+            Self::NzbDeleted | Self::TorrentDeleted => Some(Self::JobDeleted),
+            _ => None,
+        }
+    }
+
+    // A job's download is complete: NZB_DOWNLOADED, TORRENT_DOWNLOADED or
+    // JOB_DOWNLOADED.
+    pub fn downloaded(self) -> bool {
+        matches!(
+            self,
+            Self::NzbDownloaded | Self::TorrentDownloaded | Self::JobDownloaded
+        )
+    }
+
+    // A job was marked: NZB_MARKED or TORRENT_MARKED.
+    pub fn marked(self) -> bool {
+        matches!(self, Self::NzbMarked | Self::TorrentMarked)
     }
 
     // The event for an egress's quota coming to `state`.
