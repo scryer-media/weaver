@@ -528,7 +528,7 @@ async fn settle_lane_dials(pipeline: &mut Pipeline) {
     }
 }
 
-async fn new_direct_pipeline_with_buffers(
+pub(crate) async fn new_direct_pipeline_with_buffers(
     temp_dir: &TempDir,
     buffer_config: BufferPoolConfig,
     total_connections: usize,
@@ -781,6 +781,20 @@ pub(in crate::pipeline) async fn hear_graph_mail(pipeline: &mut Pipeline, job_id
         .get(&job_id)
         .or_else(|| pipeline.retiring_graph_jobs.get(&job_id))
         .is_some_and(|job| job.awaits_mail())
+    {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+}
+
+// Hear the run mail until every restored recovery object of the graph job
+// heard what of its volumes arrived again, as it does before the job
+// fetches anything.
+pub(in crate::pipeline) async fn hear_rewalks(pipeline: &mut Pipeline, job_id: JobId) {
+    while pipeline
+        .graph_jobs
+        .get(&job_id)
+        .is_some_and(|job| job.rewalks_owed())
     {
         let said = pipeline.graph_runs.recv().await.unwrap();
         pipeline.graph_run_said(said);

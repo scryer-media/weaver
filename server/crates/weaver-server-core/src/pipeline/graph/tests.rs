@@ -1619,9 +1619,101 @@ async fn a_restart_parks_the_volume_again_from_the_objects_wants() {
         .await
         .unwrap();
     assert!(pipeline.graph_jobs.contains_key(&job_id));
+    // The volume's recovery object reads what arrived of it again before
+    // the job fetches: its parks stand once it heard that.
+    crate::pipeline::tests::hear_rewalks(&mut pipeline, job_id).await;
     for ordinal in after_head(&posts, 2) {
         assert_parked(&pipeline, job_id, 2, ordinal);
     }
+    retire_pipeline_database(pipeline).await;
+}
+
+// The same restart, the recovery volume's file stamped long ago before it.
+// The restore reads nothing of the volume: the read goes out once the job
+// is installed, and the job fetches nothing until it is heard. The bytes on
+// the volume's file are neither staged nor written again.
+#[tokio::test]
+async fn a_restart_reads_a_recovery_volume_after_the_restore_and_writes_nothing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_033);
+    let posts = three_volumes(33);
+    let stamp = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    let (working_dir, path, bytes) = {
+        let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+        decode_all(&mut pipeline, job_id, &posts, 1).await;
+        decode_head(&mut pipeline, job_id, &posts, 2).await;
+        pipeline.flush_graph_checkpoint(job_id);
+        pipeline.db.flush_write_queue().await.unwrap();
+        retire_pipeline_database(pipeline).await;
+        let path = working_dir.join(&posts[2].name);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_modified(stamp))
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(!bytes.is_empty(), "the volume's head is on disk");
+        (working_dir, path, bytes)
+    };
+
+    // Connections to lease on, so the gate is what holds the fetch back.
+    let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_with_buffers(
+        &temp_dir,
+        crate::runtime::buffers::BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        4,
+    )
+    .await;
+    pipeline
+        .restore_job(crate::RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: spec("lantern joined", &posts, ARTICLE),
+            detected_archives: Default::default(),
+            file_identities: Default::default(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+            restart: None,
+        })
+        .await
+        .unwrap();
+    assert!(
+        pipeline.graph_jobs[&job_id].rewalks_owed(),
+        "the restore read the volume itself"
+    );
+    assert!(
+        pipeline.lease_for_server_for_test(0).is_none(),
+        "the job fetched before its recovery heard what arrived"
+    );
+    crate::pipeline::tests::hear_rewalks(&mut pipeline, job_id).await;
+    assert!(
+        pipeline.lease_for_server_for_test(0).is_some(),
+        "the job fetched nothing once its recovery heard what arrived"
+    );
+    for ordinal in after_head(&posts, 2) {
+        assert_parked(&pipeline, job_id, 2, ordinal);
+    }
+    let metadata = std::fs::metadata(&path).unwrap();
+    assert_eq!(
+        metadata.modified().unwrap(),
+        stamp,
+        "the volume's file was written"
+    );
+    assert!(
+        std::fs::read(&path).unwrap() == bytes,
+        "the volume's bytes changed"
+    );
     retire_pipeline_database(pipeline).await;
 }
 

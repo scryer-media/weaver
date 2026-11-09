@@ -33,6 +33,7 @@ impl GraphJob {
     // the step started: a namespace one of them is about to read may still
     // announce members, and no set over it is due yet.
     pub(crate) fn lend(&mut self, slots: &mut RepairSlots, limit: usize) -> Result<(), GraphError> {
+        self.lend_rewalks()?;
         let walked = self.walk(Some((&mut *slots, limit)));
         if let Some(ticket) = self.loans.give_back() {
             slots.release(ticket);
@@ -70,6 +71,28 @@ impl GraphJob {
         Ok(())
     }
 
+    // What each restored recovery object asked again goes out once the job
+    // is installed, never inside its restore, whether or not it may run:
+    // the job fetches nothing until each is heard. One reads at a time, so
+    // a job holds one thread and reads one file at once; the end of each
+    // lends the next.
+    pub(crate) fn lend_rewalks(&mut self) -> Result<(), GraphError> {
+        if !self.works.admit_rewalk() || self.works.rewalks_out() {
+            return Ok(());
+        }
+        for node in self.tree.rewalks() {
+            if let Some(loan) = self
+                .writer
+                .lend_rewalk(&mut self.tree, node)
+                .map_err(WriteError::from)?
+            {
+                self.works.lend_rewalk(loan);
+                break;
+            }
+        }
+        Ok(())
+    }
+
     // A retiring job releases an idle slot. An outstanding repair keeps
     // its loan and ticket until its matching completion acknowledgment.
     pub(crate) fn forget_slot(&mut self) -> Option<Ticket> {
@@ -86,7 +109,9 @@ impl GraphJob {
     fn walk(&mut self, mut slots: Option<(&mut RepairSlots, usize)>) -> Result<(), GraphError> {
         // An object out for its work is not there to read a set's inputs
         // back through: the walk waits for it, and its return walks again.
-        if self.works.out() {
+        // A recovery object yet to hear all that arrived of it again, asked,
+        // being read or cut short, knows too little to rule on.
+        if self.works.out() || self.tree.rewalks_owed() {
             return Ok(());
         }
         let mut walked = None;
@@ -241,13 +266,14 @@ impl GraphJob {
         Ok(changed)
     }
 
-    // The payload is in, no run is reading, no repair is out, and every
-    // namespace's sets have ruled on something other than waiting, none
+    // The payload is in, no run is reading, no repair is out, no recovery
+    // object owes a rewalk, and every namespace's sets have ruled on something other than waiting, none
     // with a volume of its own still arriving.
     fn quiet(&self) -> bool {
         if self.runs.live()
             || self.loans.out()
             || self.works.out()
+            || self.tree.rewalks_owed()
             || !self.tree.working().is_empty()
             || self.writer.rechecks_waiting()
         {

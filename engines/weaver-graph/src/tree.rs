@@ -31,12 +31,14 @@ mod nodes;
 mod pieces;
 mod quiet;
 mod records;
+mod rewalk;
 
 use lent::{Arrived, Told, Waiting};
 pub use nodes::Mark;
 use nodes::Nodes;
 #[cfg(test)]
 pub(crate) use records::tests as record_tests;
+pub use rewalk::Rewalk;
 
 // The most bytes `Tree::again_read` reads back at once: an object asking
 // for a whole member again never has the member in memory, nor its
@@ -418,6 +420,12 @@ pub struct Tree {
     agains: Vec<(u64, NodeId, VolumeIndex, ByteRange)>,
     again_serial: u64,
     again_depth: u32,
+    // What a restored object asked for again, by node, still to be read
+    // and walked away from the loop: see `rewalk`. Never recorded: a
+    // restart asks again.
+    rewalks: BTreeMap<NodeId, Vec<(VolumeIndex, ByteRange)>>,
+    // The nodes whose restart asks are being read: see `rewalk`.
+    rewalking: BTreeSet<NodeId>,
 }
 
 impl Default for Tree {
@@ -444,6 +452,8 @@ impl Tree {
             agains: Vec::new(),
             again_serial: 0,
             again_depth: 0,
+            rewalks: BTreeMap::new(),
+            rewalking: BTreeSet::new(),
         }
     }
 
@@ -578,6 +588,17 @@ impl Tree {
 
     fn object(&self, node: NodeId) -> Option<&dyn Object> {
         self.nodes.get(&node)?.object.as_deref()
+    }
+
+    // What the object at `node` keeps checksummed of its member's bytes,
+    // as `Object::vouched` says. None for the root, whose checksums are
+    // the source's.
+    pub fn vouched(&self, node: NodeId, member: MemberId) -> Vec<(ByteRange, u32)> {
+        let mut out = Vec::new();
+        if let Some(object) = self.object(node) {
+            object.vouched(member, &mut out);
+        }
+        out
     }
 
     // What the object at `node` is, lent out or not. `None` for the root.
@@ -841,6 +862,12 @@ impl Tree {
         let Some((child, volume)) = found.children.get(&member).copied() else {
             return;
         };
+        // An object still to hear what arrived of its volumes again would
+        // count a closed one as bringing nothing more: it hears the close
+        // once the last piece came (`rewalk_done`).
+        if self.rewalk_owed(child) {
+            return;
+        }
         let told = Told::Closed {
             volume,
             length,
@@ -895,7 +922,10 @@ impl Tree {
     }
 
     // A restore tells every object it was rebuilt, once, before any close
-    // or loss is told again: each asks for what its facts do not hold.
+    // or loss is told again: each asks for what its facts do not hold. A
+    // recovery object's volumes stay in their members' own files, so what
+    // it asks is read and walked away from the loop once the job runs
+    // (`take_rewalk`); anything else an object asks goes again here.
     pub fn restored(&mut self, builder: &mut dyn Builder, effects: &mut Vec<Effect>) {
         for node in self.live() {
             let mut emits = std::mem::take(&mut self.emits);
@@ -906,6 +936,19 @@ impl Tree {
                 .and_then(|found| found.object.as_mut())
             {
                 object.restored(&mut emits);
+                if object.recovery().is_some() {
+                    let mut asked = Vec::new();
+                    emits.retain(|emit| match *emit {
+                        Emit::Again { volume, range } => {
+                            asked.push((volume, range));
+                            false
+                        }
+                        _ => true,
+                    });
+                    if !asked.is_empty() {
+                        self.rewalks.entry(node).or_default().extend(asked);
+                    }
+                }
             }
             self.apply(node, &mut emits, builder, effects);
             self.emits = emits;
@@ -928,6 +971,11 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        // A window still to hear what arrived of it again hears its close
+        // once the last piece came (`rewalk_done`), as any volume does.
+        if self.rewalk_owed(window) {
+            return;
+        }
         let Some(length) = self.window(window).map(|range| range.len()) else {
             return;
         };
@@ -4309,7 +4357,7 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        let Some((parent, volumes)) = self.volumes(node) else {
+        let Some((_, volumes)) = self.volumes(node) else {
             return;
         };
         let members: BTreeSet<MemberId> = self
@@ -4317,6 +4365,21 @@ impl Tree {
             .iter()
             .filter_map(|(volume, _)| volumes.get(volume).copied())
             .collect();
+        self.closed_again(node, members, builder, effects);
+    }
+
+    // The volumes of `node` in these members hear their close again where
+    // the members are still closed.
+    fn closed_again(
+        &mut self,
+        node: NodeId,
+        members: BTreeSet<MemberId>,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Some((parent, _)) = self.volumes(node) else {
+            return;
+        };
         let window = self.window(node).is_some();
         for member in members {
             let closed = self
@@ -4436,34 +4499,7 @@ impl Tree {
         stage: &mut dyn FnMut(VolumeIndex, Posted),
         again: &mut Vec<(VolumeIndex, ByteRange)>,
     ) {
-        let Some((parent, member)) = self
-            .nodes
-            .get(&node)
-            .and_then(|found| found.binding.as_ref())
-            .and_then(|binding| Some((binding.parent, *binding.volumes.get(&volume)?)))
-        else {
-            return;
-        };
-        let Some(within) = self.in_member(node, range) else {
-            return;
-        };
-        let shift = within.start as i64 - range.start as i64;
-        let record = self
-            .namespace(parent)
-            .and_then(|namespace| namespace.get(member));
-        let runs: Vec<(ByteRange, Provenance)> = record
-            .map(|record| {
-                record
-                    .coverage
-                    .overlapping(within)
-                    .filter(|run| run.provenance.arrived())
-                    .filter_map(|run| {
-                        let piece = run.range.intersect(within)?;
-                        (!piece.is_empty()).then(|| (piece.shift(-shift), run.provenance))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
+        let pieces = self.again_pieces(node, volume, range);
         let Some(object) = self
             .nodes
             .get(&node)
@@ -4475,24 +4511,6 @@ impl Tree {
         let mut read = |placement: &Placement, into: &mut Vec<u8>| {
             reader.read(tree, node, volume, placement, into)
         };
-        // Bytes held as damage above may not all sit below: an object
-        // that placed them only after they came holds none of them.
-        // Only what sits below goes again, and a loss never does.
-        let pieces = runs.into_iter().flat_map(|(piece, provenance)| {
-            let sitting = if provenance.is_damaged() {
-                tree.sitting(node, object.as_ref(), volume, piece)
-            } else {
-                vec![piece]
-            };
-            sitting.into_iter().flat_map(move |piece| {
-                (piece.start..piece.end)
-                    .step_by(AGAIN_PIECE as usize)
-                    .map(move |at| {
-                        let end = piece.end.min(at.saturating_add(AGAIN_PIECE));
-                        (ByteRange::new(at, end), provenance)
-                    })
-            })
-        });
         for (piece, provenance) in pieces {
             let mut bytes = Vec::new();
             if object.posted(volume, piece, &mut read, &mut bytes) {
@@ -4507,6 +4525,70 @@ impl Tree {
                 );
             }
         }
+    }
+
+    // What of this range of the node's volume arrived above, in pieces of
+    // at most `AGAIN_PIECE` bytes, each with the provenance the parent's
+    // member keeps for it. Bytes held as damage above may not all sit
+    // below: an object that placed them only after they came holds none of
+    // them. Only what sits below goes again, and a loss never does.
+    fn again_pieces(
+        &self,
+        node: NodeId,
+        volume: VolumeIndex,
+        range: ByteRange,
+    ) -> Vec<(ByteRange, Provenance)> {
+        let Some((parent, member)) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.as_ref())
+            .and_then(|binding| Some((binding.parent, *binding.volumes.get(&volume)?)))
+        else {
+            return Vec::new();
+        };
+        let Some(within) = self.in_member(node, range) else {
+            return Vec::new();
+        };
+        let Some(object) = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.object.as_ref())
+        else {
+            return Vec::new();
+        };
+        let shift = within.start as i64 - range.start as i64;
+        let runs: Vec<(ByteRange, Provenance)> = self
+            .namespace(parent)
+            .and_then(|namespace| namespace.get(member))
+            .map(|record| {
+                record
+                    .coverage
+                    .overlapping(within)
+                    .filter(|run| run.provenance.arrived())
+                    .filter_map(|run| {
+                        let piece = run.range.intersect(within)?;
+                        (!piece.is_empty()).then(|| (piece.shift(-shift), run.provenance))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        runs.into_iter()
+            .flat_map(|(piece, provenance)| {
+                let sitting = if provenance.is_damaged() {
+                    self.sitting(node, object.as_ref(), volume, piece)
+                } else {
+                    vec![piece]
+                };
+                sitting.into_iter().flat_map(move |piece| {
+                    (piece.start..piece.end)
+                        .step_by(AGAIN_PIECE as usize)
+                        .map(move |at| {
+                            let end = piece.end.min(at.saturating_add(AGAIN_PIECE));
+                            (ByteRange::new(at, end), provenance)
+                        })
+                })
+            })
+            .collect()
     }
 
     // One piece `again_read` under `serial` read back, said again as
@@ -4791,7 +4873,14 @@ impl Tree {
     // their answers so the caller can feed `pulled` back.
     pub fn collect_wants(&self, out: &mut Vec<(NodeId, Seek)>) {
         let mut seeks = Vec::new();
-        for (id, node) in self.nodes.iter().filter(|(_, node)| !node.retired) {
+        // A restored recovery object still to hear what arrived of its
+        // volumes again knows too little to ask for anything: it asks once
+        // it has heard them, and the job fetches nothing meanwhile.
+        for (id, node) in self
+            .nodes
+            .iter()
+            .filter(|(id, node)| !node.retired && !self.rewalk_owed(**id))
+        {
             if let Some(object) = node.object.as_ref() {
                 seeks.clear();
                 object.wants(&mut seeks);

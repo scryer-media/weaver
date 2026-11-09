@@ -41,6 +41,11 @@ impl GraphJob {
             Heard::Worked(_) => {
                 self.works.returned(said.node, said.generation);
             }
+            Heard::Rewalked(_) => {
+                if self.works.rewalk_returned(said.node, said.generation) {
+                    self.tree.rewalk_dropped(said.node);
+                }
+            }
             Heard::Written { stamp, control } => {
                 if self.pending.control().same(&control) {
                     self.acknowledge_checkpoint(stamp.unwrap_or(said.generation));
@@ -113,6 +118,43 @@ impl GraphJob {
                     &mut self.writer.placing(&mut *self.builder),
                     &mut effects,
                 );
+                self.settle_worked(effects)?;
+                self.step_runs(Vec::new(), limit)?;
+                return self.lend(slots, limit);
+            }
+            Heard::Rewalked(rewalked) => {
+                // Its reader goes on before anything here can fail: a job
+                // failing on this piece drains the rest, and the reader stops.
+                self.works.rewalk_heard(node);
+                let mut effects = Vec::new();
+                let mut placing = self.writer.placing(&mut *self.builder);
+                match rewalked.piece {
+                    Some((volume, posted)) => {
+                        if !self.works.rewalking(node, said.generation) {
+                            return Ok(());
+                        }
+                        self.tree
+                            .rewalked(node, volume, posted, &mut placing, &mut effects);
+                    }
+                    None => {
+                        if !self.works.rewalk_returned(node, said.generation) {
+                            return Ok(());
+                        }
+                        // A reading cut short leaves the object owing: it
+                        // hears no close and rules on nothing it has not
+                        // heard all of, and the next restore asks again.
+                        // Cut short with no shutdown, the job's working
+                        // directory went, and the job fails as its next
+                        // write would.
+                        if rewalked.whole {
+                            self.tree.rewalk_done(node, &mut placing, &mut effects);
+                        } else if self.works.admit_rewalk() {
+                            return Err(WriteError::from(self.writer.gone()).into());
+                        }
+                    }
+                }
+                // A commit held while this read waits for the checkpoint
+                // taken after it, which commits once nothing reads.
                 self.settle_worked(effects)?;
                 self.step_runs(Vec::new(), limit)?;
                 return self.lend(slots, limit);

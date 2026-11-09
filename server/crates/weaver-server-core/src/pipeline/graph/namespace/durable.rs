@@ -208,7 +208,9 @@ impl NamespaceWriter {
                         leaf.fold_passed(length, Digest::crc32(stated));
                     }
                     (false, _) => {
-                        leaf.fold_vouched(vouched(segments, node, member, &record.coverage))
+                        let mut runs = vouched(segments, node, member, &record.coverage);
+                        runs.extend(produced(tree, node, member, &record.coverage));
+                        leaf.fold_vouched(runs)
                     }
                 }
             }
@@ -262,6 +264,21 @@ impl NamespaceWriter {
         access.held = false;
         access.read_at(NodeId::ROOT, member, range, into)
     }
+}
+
+// The runs of a member's file the object that produced it checksummed as
+// they came, each with its CRC: those wholly inside bytes the tree holds
+// covered and undamaged.
+fn produced(
+    tree: &Tree,
+    node: NodeId,
+    member: MemberId,
+    coverage: &Coverage,
+) -> impl Iterator<Item = (ByteRange, Digest)> {
+    tree.vouched(node, member)
+        .into_iter()
+        .filter(|(range, _)| coverage.covered(*range) && !coverage.damaged(*range))
+        .map(|(range, crc)| (range, Digest::crc32(crc)))
 }
 
 // The runs of a member's file the source's checksums vouch for, each with

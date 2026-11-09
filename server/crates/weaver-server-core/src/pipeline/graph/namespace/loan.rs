@@ -14,6 +14,7 @@
 // repair rebuilt waits on disk until then, never in memory.
 
 pub(super) mod replay;
+pub(super) mod rewalk;
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
