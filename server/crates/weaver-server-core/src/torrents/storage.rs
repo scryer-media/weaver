@@ -65,6 +65,8 @@ pub(crate) trait Pieces: Send + Sync {
     }
     // The file made at least `length` long.
     fn grow(&self, file: usize, length: u64) -> std::io::Result<()>;
+    // A piece the session counted made the file whole, told once for it.
+    fn file_whole(&self, _file: usize) {}
 }
 
 // A piece in flight, the length of its piece: its chunks as they arrive,
@@ -441,6 +443,10 @@ impl TorrentStorage for PieceStorage {
 
     fn on_piece_hashed(&self, piece: ValidPieceIndex, bytes: Bytes) {
         self.inner.pieces.hashed(piece.get(), &bytes);
+    }
+
+    fn on_file_completed(&self, file_id: usize) {
+        self.inner.pieces.file_whole(file_id);
     }
 }
 

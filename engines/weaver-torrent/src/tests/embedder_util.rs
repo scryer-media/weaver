@@ -111,6 +111,8 @@ pub struct StorageLog {
     // The piece each write landed in, in the order the writes came.
     written_pieces: Mutex<Vec<u32>>,
     completed_pieces: Mutex<Vec<u32>>,
+    // The files the session said were made whole, in the order it said so.
+    completed_files: Mutex<Vec<usize>>,
     // Per-file contents, created on the first create() from the torrent's file sizes.
     files: RwLock<Vec<Arc<RwLock<Vec<u8>>>>>,
 }
@@ -126,6 +128,10 @@ impl StorageLog {
 
     pub fn completed_pieces(&self) -> Vec<u32> {
         self.completed_pieces.lock().clone()
+    }
+
+    pub fn completed_files(&self) -> Vec<usize> {
+        self.completed_files.lock().clone()
     }
 
     pub fn file_contents(&self, file_id: usize) -> Vec<u8> {
@@ -262,5 +268,9 @@ impl TorrentStorage for MemoryStorage {
     fn on_piece_completed(&self, piece_index: ValidPieceIndex) -> anyhow::Result<()> {
         self.log.completed_pieces.lock().push(piece_index.get());
         Ok(())
+    }
+
+    fn on_file_completed(&self, file_id: usize) {
+        self.log.completed_files.lock().push(file_id);
     }
 }

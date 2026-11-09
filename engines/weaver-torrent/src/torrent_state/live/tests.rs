@@ -6921,3 +6921,112 @@ async fn an_upload_watch_is_rung_by_a_written_batch_and_reads_its_stamp() {
     drop(watch);
     assert_eq!(h.upload_watches.load(Ordering::SeqCst), 0);
 }
+
+impl Harness {
+    /// A live torrent of two files of one and a half pieces each, so piece
+    /// 1 holds the end of the first and the start of the second, `have` the
+    /// bitfield of the pieces had, on `storage`.
+    async fn two_files(name: &str, have: u8, storage: &MemoryStorageFactory) -> Self {
+        let size = (PIECE_LENGTH + PIECE_LENGTH / 2) as usize;
+        let dir =
+            crate::tests::test_util::create_default_random_dir_with_torrents(2, size, Some(name));
+        let torrent = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(PIECE_LENGTH),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        let torrent = TestTorrent {
+            dir,
+            torrent,
+            content: Vec::new(),
+        };
+        let out = TempDir::with_prefix(name).unwrap();
+        let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
+            .await
+            .unwrap();
+        let add = AddTorrentOptions {
+            storage_factory: Some(storage.clone_box()),
+            ..Default::default()
+        };
+        let have = BF::from_boxed_slice(vec![have].into());
+        let mut h = Self::adding(session, out, torrent, crate::Checkpoint::pieces(have), add).await;
+        // The torrent's bytes in its files' order.
+        let dir = h._torrent.as_ref().unwrap().dir.path().to_owned();
+        let files = &h.live.metadata.file_infos;
+        assert_eq!(files.len(), 2);
+        h.content = files
+            .iter()
+            .flat_map(|file| {
+                std::fs::read(dir.join(file.relative_filename.file_name().unwrap())).unwrap()
+            })
+            .collect();
+        assert_eq!(h.content.len(), 2 * size);
+        h
+    }
+
+    /// Every chunk of piece `index` sent by `peer`.
+    async fn complete(&self, peer: &PeerHandler, index: u32) {
+        // Pieces an earlier take acquired on the way are free again.
+        self.lock_write("test")
+            .get_pieces_mut()
+            .unwrap()
+            .release_pieces_owned_by(peer.addr);
+        self.take(peer, index);
+        for chunk in 0..CHUNKS_PER_PIECE {
+            self.send(peer, (index, chunk), false).await.unwrap();
+        }
+        assert!(self.have(index));
+    }
+}
+
+// The piece that makes a file whole tells the storage so, once; a piece
+// that makes no file whole tells it nothing (libtorrent
+// `file_progress::update` posts `file_completed_alert` as a file's
+// progress reaches its size).
+#[tokio::test]
+async fn the_piece_that_makes_a_file_whole_tells_the_storage_once() {
+    let storage = MemoryStorageFactory::default();
+    let h = Harness::two_files("file_whole_once", 0x00, &storage).await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+
+    h.complete(&peer, 0).await;
+    assert_eq!(storage.log.completed_files(), Vec::<usize>::new());
+    h.complete(&peer, 1).await;
+    assert_eq!(storage.log.completed_files(), vec![0]);
+    h.complete(&peer, 2).await;
+    assert_eq!(storage.log.completed_files(), vec![0, 1]);
+}
+
+// A piece that ends one file and starts the next makes both whole at once
+// when it is the last either lacked: both are told, in the files' order.
+#[tokio::test]
+async fn a_piece_that_makes_two_files_whole_tells_both() {
+    let storage = MemoryStorageFactory::default();
+    let h = Harness::two_files("two_files_whole", 0x00, &storage).await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+
+    h.complete(&peer, 0).await;
+    h.complete(&peer, 2).await;
+    assert_eq!(storage.log.completed_files(), Vec::<usize>::new());
+    h.complete(&peer, 1).await;
+    assert_eq!(storage.log.completed_files(), vec![0, 1]);
+}
+
+// A file whole when the torrent starts, from what it had, is never told:
+// only the file a piece of this run makes whole is.
+#[tokio::test]
+async fn a_file_whole_at_the_start_is_never_told() {
+    let storage = MemoryStorageFactory::default();
+    let h = Harness::two_files("file_whole_at_start", 0xc0, &storage).await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+
+    h.complete(&peer, 2).await;
+    assert_eq!(storage.log.completed_files(), vec![1]);
+}

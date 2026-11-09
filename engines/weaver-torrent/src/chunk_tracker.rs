@@ -1084,20 +1084,24 @@ impl ChunkTracker {
         &self.per_file_bytes
     }
 
-    // Returns remaining bytes
+    /// The piece's bytes in the file are counted had. True when they made
+    /// the file whole: it lacked bytes before and lacks none now. An empty
+    /// file is never made whole by a piece, so never true for it.
     pub fn update_file_have_on_piece_completed(
         &mut self,
         piece_id: ValidPieceIndex,
         file_id: usize,
         file_info: &FileInfo,
-    ) -> u64 {
+    ) -> bool {
         let diff_have = self.lengths.size_of_piece_in_file(
             piece_id.get(),
             file_info.offset_in_torrent,
             file_info.len,
         );
-        self.per_file_bytes[file_id] += diff_have;
-        file_info.len.saturating_sub(self.per_file_bytes[file_id])
+        let had = &mut self.per_file_bytes[file_id];
+        let lacked = *had < file_info.len;
+        *had += diff_have;
+        lacked && *had >= file_info.len
     }
 }
 

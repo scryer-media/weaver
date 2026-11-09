@@ -2027,13 +2027,31 @@ impl TorrentStateLive {
     }
 
     /// The piece, which the storage took, is had: it is counted into its
-    /// files (libtorrent `torrent::we_have`).
+    /// files, and each file it made whole is told to the storage once the
+    /// lock is let go (libtorrent `torrent::we_have` and
+    /// `file_completed_alert`).
     fn on_piece_completed(&self, id: ValidPieceIndex) -> anyhow::Result<()> {
+        let whole = self.count_piece_had(id)?;
+        for file in whole {
+            self.files.on_file_completed(file);
+        }
+        Ok(())
+    }
+
+    /// The piece counted into its files, under the write lock, and what
+    /// follows from it. Returns the files it made whole, padding left out;
+    /// empty, and unallocated, when it made none.
+    fn count_piece_had(&self, id: ValidPieceIndex) -> anyhow::Result<Vec<usize>> {
+        let mut whole = Vec::new();
         let mut g = self.lock_write("on_piece_completed");
         let locked = &mut **g;
         let pieces = locked.get_pieces_mut()?;
         for (idx, file_info) in files_in_piece(&self.metadata.file_infos, id.get()) {
-            let _remaining = pieces.update_file_have_on_piece_completed(id, idx, file_info);
+            if pieces.update_file_have_on_piece_completed(id, idx, file_info)
+                && !file_info.attrs.padding
+            {
+                whole.push(idx);
+            }
         }
 
         self.streams
@@ -2065,7 +2083,7 @@ impl TorrentStateLive {
                 self.update_upload_only();
             }
         }
-        Ok(())
+        Ok(whole)
     }
 
     /// The torrent may want pieces again: the peers let go for being of no

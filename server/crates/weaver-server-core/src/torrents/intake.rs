@@ -68,6 +68,8 @@ pub(crate) enum Heard {
     // The store could not take a piece, and why: the torrent's failure. A
     // write that found no room is not one.
     Refused(String),
+    // A piece the session counted made one of the torrent's files whole.
+    FileWhole,
 }
 
 pub(crate) type Hear = Box<dyn Fn(Heard) + Send + Sync>;
@@ -154,6 +156,10 @@ impl Pieces for Intake {
 
     fn grow(&self, file: usize, length: u64) -> io::Result<()> {
         self.inner.grow(file, length)
+    }
+
+    fn file_whole(&self, _file: usize) {
+        (self.hear)(Heard::FileWhole);
     }
 }
 

@@ -224,6 +224,13 @@ pub trait TorrentStorage: Send + Sync {
         Ok(())
     }
 
+    /// Callback called once when a completed piece made file `file_id` whole: the file lacked
+    /// bytes before the piece and lacks none now (libtorrent `file_completed_alert`). A file
+    /// already whole when the torrent starts, an empty file, and a padding file are never
+    /// told of. Called after [`Self::on_piece_completed`] for that piece, with no lock of the
+    /// torrent held. Default implementation does nothing.
+    fn on_file_completed(&self, _file_id: usize) {}
+
     /// Hands `update` the whole piece, in order, straight from where the
     /// storage holds it in memory, and returns true; false, having handed it
     /// nothing, when the storage holds no copy of the piece in memory, so
@@ -348,6 +355,10 @@ impl<U: TorrentStorage + ?Sized> TorrentStorage for Box<U> {
 
     fn on_piece_completed(&self, piece_id: ValidPieceIndex) -> anyhow::Result<()> {
         (**self).on_piece_completed(piece_id)
+    }
+
+    fn on_file_completed(&self, file_id: usize) {
+        (**self).on_file_completed(file_id)
     }
 
     fn hash_held_piece(&self, piece_id: ValidPieceIndex, update: &mut dyn FnMut(&[u8])) -> bool {
