@@ -66,6 +66,12 @@ export const nextKo: LocaleDictionary = {
   "next.provider.state.disabled": "비활성화됨",
   "next.categories.all": "모든 카테고리",
   "next.categories.uncategorised": "카테고리 없음",
+  "next.tags.title": "태그",
+  "next.tags.all": "모든 태그",
+  "next.tags.none": "태그 없음",
+  "next.tags.add": "추가",
+  "next.tags.remove": "{{tag}} 제거",
+  "next.tags.placeholder": "tv, hd",
 
   // Error page
   "next.errorPage.notFound": "페이지를 찾을 수 없습니다",

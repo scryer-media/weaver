@@ -76,6 +76,7 @@ import {
   AttentionBlock,
   CategoryListBlock,
   ProtocolFilterBlock,
+  TagFilterBlock,
   ProvidersBlock,
   type ProtocolFacet,
 } from "../shell/rail-blocks";
@@ -253,6 +254,7 @@ export function DownloadsPage() {
 
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
   const [protocol, setProtocol] = useState<ProtocolFacet>(null);
+  const [tag, setTag] = useState<string | null>(null);
   const [tab, setTab] = useState<TabId>("all");
   const [sort, setSort] = useState<SortId>("priority");
   const [query, setQuery] = useState("");
@@ -296,8 +298,8 @@ export function DownloadsPage() {
   }>({ query: SYSTEM_INFO_QUERY });
 
   const selection = useMemo(
-    () => queueSelection({ tab, facets, query, protocol }),
-    [facets, protocol, query, tab],
+    () => queueSelection({ tab, facets, query, protocol, tag }),
+    [facets, protocol, query, tab, tag],
   );
   const input = useMemo(
     () => queuePageInput(selection, sort, pageIndex, pageSize),
@@ -732,6 +734,7 @@ export function DownloadsPage() {
             onToggle={(key) => reset(() => setFacets((current) => toggleFacet(current, key)))}
             onClear={() => reset(() => setFacets(NO_FACETS))}
           />
+          <TagFilterBlock selected={tag} onSelect={(next) => reset(() => setTag(next))} />
         </>
       }
       railFooter={<ProvidersBlock />}

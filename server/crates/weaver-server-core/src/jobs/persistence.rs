@@ -729,6 +729,7 @@ impl Database {
             facts.password =
                 decrypt_archive_password(self.encryption_key(), row.opt_text("password")?)?;
         }
+        facts.tags = self.job_tags(crate::jobs::JobId(job_id))?;
         Ok(())
     }
 

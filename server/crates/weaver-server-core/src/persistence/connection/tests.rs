@@ -2700,6 +2700,21 @@ async fn postgres_reserve_next_job_id_is_unique_under_concurrency_when_configure
 }
 
 #[tokio::test]
+async fn postgres_tags_follow_the_rules_when_configured() {
+    let Some((admin_pool, schema, target_url)) = create_postgres_test_schema("postgres_tags").await
+    else {
+        return;
+    };
+
+    let db = Database::open_target(DatabaseTarget::PostgresUrl(target_url)).unwrap();
+    crate::tags::tests::exercise_tags(&db);
+
+    drop(db);
+    execute_schema_ddl(&admin_pool, format!("DROP SCHEMA {schema} CASCADE")).await;
+    admin_pool.close().await;
+}
+
+#[tokio::test]
 async fn postgres_post_processing_roundtrip_when_configured() {
     let Some((admin_pool, schema, target_url)) =
         create_postgres_test_schema("postgres_post_processing").await

@@ -65,6 +65,8 @@ export interface QueueSelection {
   protocol?: JobProtocol;
   states?: QueueItemState[];
   categories?: string[];
+  /** Jobs carrying this tag; the empty tag is jobs with none. */
+  tag?: string;
 }
 
 export function queueSelection({
@@ -72,11 +74,13 @@ export function queueSelection({
   facets,
   query,
   protocol = null,
+  tag = null,
 }: {
   tab: QueueTab;
   facets: ReadonlySet<string>;
   query: string;
   protocol?: JobProtocol | null;
+  tag?: string | null;
 }): QueueSelection {
   const search = query.trim();
   const selection: QueueSelection = {};
@@ -87,6 +91,7 @@ export function queueSelection({
   if (facets.size > 0) {
     selection.categories = [...facets].map((key) => (key === UNCATEGORISED ? "" : key));
   }
+  if (tag !== null) selection.tag = tag;
   return selection;
 }
 
@@ -220,7 +225,8 @@ export function batchTarget(
   const unfiltered =
     selection.search === undefined
     && selection.states === undefined
-    && selection.categories === undefined;
+    && selection.categories === undefined
+    && selection.tag === undefined;
   return {
     selection: unfiltered ? { ...selection, all: true } : selection,
     expectedMatched,

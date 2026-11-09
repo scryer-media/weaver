@@ -226,6 +226,11 @@ impl Database {
                 let job_ids = job_ids.clone();
                 Box::pin(async move {
                     let deleted = delete_job_history_bundles_tx(tx, &job_ids).await?;
+                    // A job deleted from history takes its tags with it. A
+                    // restart keeps them: it reuses the bundle delete above,
+                    // not this.
+                    let ids = deleted.iter().map(|id| id.0 as i64).collect::<Vec<_>>();
+                    crate::tags::delete_job_tags_tx(tx, &ids).await?;
                     if forget_duplicate_identities {
                         crate::jobs::duplicate_persistence::forget_duplicate_identities_for_history_delete_tx(
                             tx, &deleted,
@@ -244,6 +249,7 @@ impl Database {
             self.forget_script_effects_for(&ids);
             self.invalidate_job_history_cache_for(&ids);
             self.notify_script_events_changed();
+            self.tags.changed();
         }
         result
     }

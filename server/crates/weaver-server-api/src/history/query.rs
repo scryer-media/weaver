@@ -403,10 +403,16 @@ async fn load_history_page(
         let page = if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
             build_history_page_sql(&db, plan, &live_in_history)?
         } else {
-            let rows = db.list_job_history(
+            let mut rows = db.list_job_history(
                 &weaver_server_core::HistoryFilter::default(),
                 HistoryRows::Shown,
             )?;
+            if let Some(tag) = input.tag.as_deref() {
+                let tags = db.tag_snapshot()?;
+                rows.retain(|row| {
+                    tags.passes(weaver_server_core::jobs::ids::JobId(row.job_id), tag)
+                });
+            }
             build_history_page(exclude_live_rows(rows, &live_in_history), input)
         };
         attach_history_page_badges(&db, page)
@@ -479,6 +485,10 @@ impl HistoryPageSqlPlan {
         // The same holds for a finish-time floor: the dashboards' "finished
         // today" link sets one, the default view never does.
         if input.completed_since_epoch_sec.is_some() {
+            return None;
+        }
+        // And for a tag: the tags are read from memory, not joined in SQL.
+        if input.tag.is_some() {
             return None;
         }
         // Only the default `completed_at DESC` ordering matches the indexed SQL
@@ -1119,6 +1129,7 @@ mod tests {
             search: None,
             status,
             categories: None,
+            tag: None,
             sort_field: None,
             sort_direction: None,
             completed_since_epoch_sec: None,

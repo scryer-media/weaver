@@ -43,7 +43,8 @@ import { countLabel } from "../i18n/labels";
 import { useStatusLabel } from "../data/status";
 import { testIds } from "@/next/testids";
 import { NextShell, RailBlock } from "../shell/NextShell";
-import { CategoryListBlock } from "../shell/rail-blocks";
+import { CategoryListBlock, TagFilterBlock } from "../shell/rail-blocks";
+import { TagChips } from "../components/Tags";
 import {
   categoryFacets,
   countsByFacet,
@@ -82,6 +83,8 @@ const COLUMNS = {
 const PAGE_SIZES = [25, 50, 100] as const;
 /** Deep enough to cover a busy day, cheap enough to ask for on every visit. */
 const SAMPLE_SIZE = 200;
+// A tag change answers with JobTag rows; refetch the page when one lands.
+const TAG_CONTEXT = { additionalTypenames: ["JobTag"] };
 const NO_COUNTS = { all: 0, success: 0, failure: 0 };
 const NO_VOLUMES: StorageVolume[] = [];
 
@@ -119,6 +122,7 @@ interface HistoryRow {
   health: number;
   hasPassword: boolean;
   category: string | null;
+  tags?: string[];
   createdAt: string | number | null;
   completedAt: string | number | null;
   deleteOperation: { state: string; locked: boolean } | null;
@@ -194,6 +198,7 @@ export function HistoryPage() {
   const [pageSize, setPageSize] = useState<number>(50);
   const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
+  const [tag, setTag] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [retryAction, setRetryAction] = useState<"redownload" | "reprocess" | null>(null);
   const [report, setReport] = useState<string | null>(null);
@@ -226,13 +231,15 @@ export function HistoryPage() {
       sortField: sortOption.field,
       sortDirection: sortOption.direction,
       completedSinceEpochSec: since ?? undefined,
+      tag: tag ?? undefined,
     }),
-    [categories, pageIndex, pageSize, query, since, sortOption.direction, sortOption.field, tab],
+    [categories, pageIndex, pageSize, query, since, sortOption.direction, sortOption.field, tab, tag],
   );
 
   const [{ data, fetching }, reexecute] = useQuery<HistoryPageResponse>({
     query: NEXT_HISTORY_PAGE_QUERY,
     variables: { input },
+    context: TAG_CONTEXT,
   });
   // The strip's own numbers — today's jobs and what they averaged — need rows
   // the current page may not hold, so they come from a shallow newest-first
@@ -247,8 +254,10 @@ export function HistoryPage() {
         categories,
         sortField: "COMPLETED_AT",
         sortDirection: "DESC",
+        tag: tag ?? undefined,
       },
     },
+    context: TAG_CONTEXT,
   });
   const [{ data: systemInfo }] = useQuery<{
     systemInfo: { configuredStorage: StorageVolume[] };
@@ -507,12 +516,15 @@ export function HistoryPage() {
         </>
       }
       railMiddle={
-        <CategoryListBlock
-          items={facetItems}
-          selected={facets}
-          onToggle={(key) => reset(() => setFacets((current) => toggleFacet(current, key)))}
-          onClear={() => reset(() => setFacets(NO_FACETS))}
-        />
+        <>
+          <CategoryListBlock
+            items={facetItems}
+            selected={facets}
+            onToggle={(key) => reset(() => setFacets((current) => toggleFacet(current, key)))}
+            onClear={() => reset(() => setFacets(NO_FACETS))}
+          />
+          <TagFilterBlock selected={tag} onSelect={(next) => reset(() => setTag(next))} />
+        </>
       }
       railFooter={
         <RailBlock eyebrow={t("next.completed.archive")}>
@@ -731,6 +743,7 @@ export function HistoryPage() {
                           <Icon name="lock" size={11} className="ml-[6px] inline-block align-[-1px] text-wv-muted" />
                         ) : null}
                       </div>
+                      <TagChips tags={row.tags} className="flex-none flex-nowrap" />
                     </div>
                     <div className="flex min-w-0 items-center gap-[7px]">
                       <Square

@@ -255,6 +255,7 @@ impl From<weaver_server_core::Protocol> for ProtocolGql {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct QueueItem {
     pub id: u64,
     #[serde(default)]
@@ -312,6 +313,14 @@ pub struct QueueItem {
     /// NZB material and credentials, which remain unavailable to GraphQL.
     #[serde(default)]
     pub duplicate_summary: Option<DuplicateSummaryInfo>,
+}
+
+#[async_graphql::ComplexObject]
+impl QueueItem {
+    /// The job's tags, in tag order.
+    async fn tags(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<Vec<String>> {
+        crate::tags::tags_of(ctx, self.id).await
+    }
 }
 
 fn default_queue_download_state() -> QueueDownloadState {
@@ -429,6 +438,8 @@ pub struct QueuePageInput {
     pub priorities: Option<Vec<QueuePriority>>,
     /// The empty string names jobs with no category.
     pub categories: Option<Vec<String>>,
+    /// Jobs carrying this tag; the empty string names jobs with none.
+    pub tag: Option<String>,
     /// Omit both fields to retain the scheduler's hot-download order.
     pub sort_field: Option<QueueSortField>,
     pub sort_direction: Option<QueueSortDirection>,
@@ -446,6 +457,8 @@ pub struct QueueSelectionInput {
     pub priorities: Option<Vec<QueuePriority>>,
     /// The empty string names jobs with no category.
     pub categories: Option<Vec<String>>,
+    /// Jobs carrying this tag; the empty string names jobs with none.
+    pub tag: Option<String>,
     /// The whole queue, stated outright. Required when no filter is given.
     pub all: Option<bool>,
 }
@@ -973,6 +986,9 @@ pub struct SubmitNzbInput {
     pub dupe_key: Option<String>,
     pub dupe_score: Option<i64>,
     pub dupe_mode: Option<DuplicateModeGql>,
+    /// The tags the job is added with.
+    #[graphql(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, InputObject)]
@@ -1001,6 +1017,9 @@ pub struct SubmitInput {
     /// Whether a torrent's archives are extracted; absent inherits. An NZB
     /// ignores it.
     pub unpack: Option<bool>,
+    /// The tags the job is added with.
+    #[graphql(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -1029,6 +1048,9 @@ pub struct SubmitStagedNzbsInput {
     pub dupe_mode: Option<DuplicateModeGql>,
     #[graphql(default)]
     pub paused: bool,
+    /// The tags each job is added with.
+    #[graphql(default)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -1158,6 +1180,7 @@ pub struct ParsedRelease {
 }
 
 #[derive(Debug, Clone, SimpleObject)]
+#[graphql(complex)]
 pub struct Job {
     pub id: u64,
     pub name: String,
@@ -1178,6 +1201,14 @@ pub struct Job {
     pub metadata: Vec<MetadataEntry>,
     pub output_dir: Option<String>,
     pub created_at: Option<f64>,
+}
+
+#[async_graphql::ComplexObject]
+impl Job {
+    /// The job's tags, in tag order.
+    async fn tags(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<Vec<String>> {
+        crate::tags::tags_of(ctx, self.id).await
+    }
 }
 
 impl From<&weaver_server_core::JobInfo> for Job {

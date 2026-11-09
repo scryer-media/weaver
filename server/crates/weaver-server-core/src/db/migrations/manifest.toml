@@ -1403,3 +1403,20 @@ kind = "sql"
 file = "migrations/0104_torrent_pool_member/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 105
+description = "a job carries tags, and the tags made are kept"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0105_job_tags/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0105_job_tags/postgres.sql"
+engine = "postgres"
+scope = "all"

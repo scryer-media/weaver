@@ -86,6 +86,7 @@ impl TorrentsMutation {
                 upload_limit: None,
                 download_limit: None,
                 placement: Default::default(),
+                tags: input.tags,
             },
         )
         .await?;

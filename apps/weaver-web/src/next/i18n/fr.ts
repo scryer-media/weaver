@@ -66,6 +66,12 @@ export const nextFr: LocaleDictionary = {
   "next.provider.state.disabled": "désactivé",
   "next.categories.all": "Toutes les catégories",
   "next.categories.uncategorised": "Aucune catégorie",
+  "next.tags.title": "Étiquettes",
+  "next.tags.all": "Toutes les étiquettes",
+  "next.tags.none": "Sans étiquette",
+  "next.tags.add": "Ajouter",
+  "next.tags.remove": "Retirer {{tag}}",
+  "next.tags.placeholder": "tv, hd",
 
   // Error page
   "next.errorPage.notFound": "Page introuvable",

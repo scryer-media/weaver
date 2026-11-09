@@ -91,6 +91,8 @@ impl JobsMutation {
         let caller = caller_identity(ctx)?;
         let mut options = graphql_submission_options(&caller, None, None, None, None, None, None);
         options.add_paused = input.paused;
+        options.tags = input.tags.clone();
+        let tags = input.tags;
         let category = input.category;
         let (source, filename, source_url) = match (input.text, input.upload) {
             (Some(text), None) => {
@@ -111,9 +113,15 @@ impl JobsMutation {
                 }
                 match kind.torrent(bytes) {
                     Ok(source) => {
-                        let added =
-                            add_torrent(ctx, source, category.clone(), input.paused, input.unpack)
-                                .await;
+                        let added = add_torrent(
+                            ctx,
+                            source,
+                            category.clone(),
+                            input.paused,
+                            input.unpack,
+                            tags,
+                        )
+                        .await;
                         if let Some(url) = source_url {
                             let status = if added.is_ok() {
                                 UrlStatus::Success
@@ -141,8 +149,15 @@ impl JobsMutation {
                     (!upload.filename.trim().is_empty()).then_some(upload.filename.clone());
                 match torrent_upload(upload) {
                     Ok(source) => {
-                        return add_torrent(ctx, source, category, input.paused, input.unpack)
-                            .await;
+                        return add_torrent(
+                            ctx,
+                            source,
+                            category,
+                            input.paused,
+                            input.unpack,
+                            tags,
+                        )
+                        .await;
                     }
                     Err(upload) => (NzbSource::Upload(upload), filename, None),
                 }
@@ -263,6 +278,7 @@ impl JobsMutation {
         let dupe_score = input.dupe_score;
         let dupe_mode = input.dupe_mode;
         let paused = input.paused;
+        let tags = input.tags.clone();
         let (entries, missing) =
             manager.take_for_submit(&caller_identity, &input.staged_upload_ids);
         let mut found_by_id = entries
@@ -298,6 +314,7 @@ impl JobsMutation {
                 .map(|key| format!("{key}:staged:{staged_upload_id}"));
             let options = SubmissionOptions {
                 add_paused: paused,
+                tags: tags.clone(),
                 ..graphql_submission_options(
                     &caller_identity,
                     None,
@@ -1205,7 +1222,12 @@ async fn run_batch(
 ) -> Result<QueueBatchResult> {
     let handle = ctx.data::<SchedulerHandle>()?;
     let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
-    let ids = crate::jobs::batch::resolve_target(state, target)?;
+    let tag = target
+        .selection
+        .as_ref()
+        .and_then(|selection| selection.tag.as_deref());
+    let tags = crate::tags::tags_for(ctx.data::<Database>()?, tag).await?;
+    let ids = crate::jobs::batch::resolve_target(state, target, tags.as_deref())?;
     Ok(batch_result(
         crate::jobs::batch::apply(handle, ids, op).await,
     ))
@@ -1485,6 +1507,7 @@ async fn submit_from_facade_input(
         input.dupe_mode,
     );
     options.supplied_password_candidates = supplied_password_candidates;
+    options.tags = input.tags;
     let metadata = submit_metadata(input.attributes, input.client_request_id.clone())
         .map_err(|message| graphql_error("INVALID_INPUT", message))?;
     let source = match (nzb_bytes, upload) {
@@ -1612,6 +1635,7 @@ async fn add_torrent(
     category: Option<String>,
     paused: bool,
     unpack: Option<bool>,
+    tags: Vec<String>,
 ) -> Result<SubmissionResult> {
     let job_id = TorrentsMutation::add(
         ctx,
@@ -1626,6 +1650,7 @@ async fn add_torrent(
             upload_limit: None,
             download_limit: None,
             placement: Default::default(),
+            tags,
         },
     )
     .await?;

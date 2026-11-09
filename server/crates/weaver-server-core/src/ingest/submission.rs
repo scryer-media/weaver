@@ -120,6 +120,9 @@ pub struct SubmissionOptions {
     // (`integration_archive_password_candidates`), then those weaver read from
     // its own NZB fetch (`header_archive_password_candidates`), in that order.
     pub supplied_password_candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
+    // The tags the job is added with. A job a duplicate check parks, or a
+    // replay of one already added, takes none from this submit.
+    pub tags: Vec<String>,
 }
 
 impl Default for SubmissionOptions {
@@ -131,6 +134,7 @@ impl Default for SubmissionOptions {
             origin: SubmissionOrigin::Api,
             idempotency: None,
             supplied_password_candidates: Vec::new(),
+            tags: Vec::new(),
         }
     }
 }
@@ -225,6 +229,8 @@ async fn rollback_accepted_submission(
     let release_db = db.clone();
     let _ =
         tokio::task::spawn_blocking(move || release_db.release_duplicate_admission(job_id)).await;
+    let untag_db = db.clone();
+    let _ = tokio::task::spawn_blocking(move || untag_db.untag_job(job_id)).await;
 }
 
 async fn submit_prepared_nzb(
@@ -408,6 +414,24 @@ async fn submit_prepared_nzb(
             return Err(SubmitNzbError::DuplicateBlocked { decision });
         }
     };
+    if !options.tags.is_empty() {
+        let tag_db = db.clone();
+        let tags = options.tags.clone();
+        let tagged = tokio::task::spawn_blocking(move || {
+            tag_db.tag_new_job(job_id, tags.iter().map(String::as_str))
+        })
+        .await
+        .map_err(|error| {
+            SubmitNzbError::State(crate::StateError::Database(format!(
+                "tag worker panicked: {error}"
+            )))
+        })
+        .and_then(|tagged| tagged.map_err(SubmitNzbError::from));
+        if let Err(error) = tagged {
+            rollback_accepted_submission(db, job_id, superseded_job_id).await;
+            return Err(error);
+        }
+    }
     if let Some(superseded_job_id) = superseded_job_id {
         match handle.cancel_semantic_superseded(superseded_job_id).await {
             Ok(()) | Err(crate::SchedulerError::JobNotFound(_)) => {}

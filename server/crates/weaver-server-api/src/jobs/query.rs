@@ -166,12 +166,15 @@ impl JobsQuery {
     }
     /// List jobs, optionally filtered by status, category, or metadata key.
     /// Supports pagination via `limit` and `offset`.
+    // Each GraphQL argument is a resolver parameter.
+    #[allow(clippy::too_many_arguments)]
     async fn jobs(
         &self,
         ctx: &Context<'_>,
         status: Option<Vec<JobStatusGql>>,
         category: Option<String>,
         has_metadata_key: Option<String>,
+        tag: Option<String>,
         limit: Option<u32>,
         offset: Option<u32>,
     ) -> Result<Vec<Job>> {
@@ -180,6 +183,7 @@ impl JobsQuery {
             status,
             category,
             has_metadata_key,
+            tag: JobFilter::tag(ctx, tag).await?,
         };
         let offset = offset.unwrap_or(0) as usize;
         let limit = limit.map_or(usize::MAX, |limit| limit as usize);
@@ -218,12 +222,14 @@ impl JobsQuery {
         status: Option<Vec<JobStatusGql>>,
         category: Option<String>,
         has_metadata_key: Option<String>,
+        tag: Option<String>,
     ) -> Result<u32> {
         let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
         let filter = JobFilter {
             status,
             category,
             has_metadata_key,
+            tag: JobFilter::tag(ctx, tag).await?,
         };
         let history = state.history_rows();
         let count = state.read_queue(|inner| {
@@ -427,7 +433,14 @@ pub(crate) async fn build_queue_page(
         plan,
         rows,
         revision,
-    } = PageRead::read(state, input, wants);
+    } = PageRead::read(
+        state,
+        input,
+        wants,
+        crate::tags::tags_for(&db, input.tag.as_deref())
+            .await?
+            .as_deref(),
+    );
     let metrics = handle.get_metrics();
     let summary = walk.summary(&metrics);
     let categories = walk.categories();
@@ -502,9 +515,28 @@ struct JobFilter {
     status: Option<Vec<JobStatusGql>>,
     category: Option<String>,
     has_metadata_key: Option<String>,
+    // A tag the job carries, the empty one naming jobs with none, with the
+    // tags as read for the query.
+    tag: Option<(
+        String,
+        std::sync::Arc<weaver_server_core::tags::TagSnapshot>,
+    )>,
 }
 
 impl JobFilter {
+    async fn tag(
+        ctx: &Context<'_>,
+        tag: Option<String>,
+    ) -> Result<
+        Option<(
+            String,
+            std::sync::Arc<weaver_server_core::tags::TagSnapshot>,
+        )>,
+    > {
+        let tags = crate::tags::tags_for(ctx.data::<Database>()?, tag.as_deref()).await?;
+        Ok(tag.zip(tags))
+    }
+
     // `status` is the job's status as published; `job` carries the rest.
     fn matches(
         &self,
@@ -523,6 +555,11 @@ impl JobFilter {
         }
         if let Some(key) = &self.has_metadata_key
             && !job.metadata.iter().any(|(k, _)| k == key)
+        {
+            return false;
+        }
+        if let Some((tag, tags)) = &self.tag
+            && !tags.passes(job.job_id, tag)
         {
             return false;
         }

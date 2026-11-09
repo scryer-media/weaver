@@ -73,6 +73,12 @@ export const nextEn: LocaleDictionary = {
   "next.provider.state.disabled": "disabled",
   "next.categories.all": "All categories",
   "next.categories.uncategorised": "Uncategorised",
+  "next.tags.title": "Tags",
+  "next.tags.all": "All tags",
+  "next.tags.none": "No tag",
+  "next.tags.add": "Add",
+  "next.tags.remove": "Remove {{tag}}",
+  "next.tags.placeholder": "tv, hd",
 
   // Error page
   "next.errorPage.notFound": "Page not found",

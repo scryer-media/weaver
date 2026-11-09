@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use async_graphql::ErrorExtensions;
 use weaver_server_core::jobs::handle::CancellationOrigin;
+use weaver_server_core::tags::TagSnapshot;
 use weaver_server_core::{JobId, JobUpdate, SchedulerError, SchedulerHandle, SharedPipelineState};
 
 use super::paging::{QueueSelection, QueueWalk};
@@ -34,6 +35,7 @@ pub(crate) type BatchOutcome = BTreeMap<JobId, Result<(), SchedulerError>>;
 pub(crate) fn resolve_target(
     state: &SharedPipelineState,
     target: &QueueBatchTarget,
+    tags: Option<&TagSnapshot>,
 ) -> async_graphql::Result<Vec<JobId>> {
     match (&target.ids, &target.selection) {
         (Some(ids), None) => {
@@ -61,7 +63,7 @@ pub(crate) fn resolve_target(
             Ok(ids)
         }
         (None, Some(input)) => {
-            let selection = QueueSelection::of_input(input);
+            let selection = QueueSelection::of_input(input).tagged(tags);
             if selection.is_unfiltered() && input.all != Some(true) {
                 return Err(graphql_error(
                     "INVALID_INPUT",

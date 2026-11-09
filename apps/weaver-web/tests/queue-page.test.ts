@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { UNCATEGORISED } from "../src/next/data/categories.ts";
+import { UNTAGGED } from "../src/next/data/tags.ts";
 import {
   batchTarget,
   conflictCount,
@@ -32,6 +33,14 @@ test("the selection carries only the filters set, uncategorised as the empty str
     queueSelection({ tab: "paused", facets: new Set(["tv", UNCATEGORISED]), query: " show " }),
     { search: "show", states: ["PAUSED"], categories: ["tv", ""] },
   );
+});
+
+test("a tag filter rides in the selection, no tag as the empty string, and is not the whole queue", () => {
+  const tagged = queueSelection({ tab: "all", facets: new Set(), query: "", tag: "hd" });
+  assert.deepEqual(tagged, { tag: "hd" });
+  const untagged = queueSelection({ tab: "all", facets: new Set(), query: "", tag: UNTAGGED });
+  assert.deepEqual(untagged, { tag: "" });
+  assert.deepEqual(batchTarget(true, new Set(), untagged, 3), { selection: { tag: "" }, expectedMatched: 3 });
 });
 
 test("priority and time left keep queue order; other sorts ask the daemon", () => {

@@ -4,7 +4,7 @@
 import { Fragment, memo, type ReactNode } from "react";
 import { Link, NavLink, useLocation } from "react-router";
 import { useQuery } from "urql";
-import { SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
+import { JOB_TAGS_QUERY, SERVERS_QUERY, SYSTEM_INFO_QUERY } from "@/graphql/queries";
 import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import type { JobProtocol } from "@/lib/job-types";
 import { cn } from "@/lib/utils";
@@ -20,6 +20,8 @@ import {
 } from "../data/next-data";
 import { sameItems } from "../data/settled";
 import { categoryColor, UNCATEGORISED_COLOR, WV } from "../data/palette";
+import { UNTAGGED } from "../data/tags";
+import { jobIds } from "../testids";
 import { useNow } from "../data/clock";
 import { formatClock, formatDayClock, formatLatency, splitUptime } from "../data/format";
 import { providerActivityLabel, type ProviderActivity } from "../data/provider-activity";
@@ -400,6 +402,46 @@ export function ProtocolFilterBlock({
   );
 }
 
+/**
+ * The rail's tag filter: one tag, jobs with none, or every job. Shown once a
+ * tag is made.
+ */
+export function TagFilterBlock({
+  selected,
+  onSelect,
+}: {
+  selected: string | null;
+  onSelect: (tag: string | null) => void;
+}) {
+  const t = useTranslate();
+  const [{ data }] = useQuery<{ jobTags: { name: string; count: number }[] }>({
+    query: JOB_TAGS_QUERY,
+  });
+  const tags = data?.jobTags ?? [];
+  if (tags.length === 0 && selected === null) return null;
+  const items: { tag: string | null; label: string }[] = [
+    { tag: null, label: t("next.tags.all") },
+    ...tags.map(({ name }) => ({ tag: name, label: name })),
+    { tag: UNTAGGED, label: t("next.tags.none") },
+  ];
+  return (
+    <RailBlock eyebrow={t("next.tags.title")} position="middle" className="gap-[9px]">
+      {items.map((item) => (
+        <FacetButton
+          key={item.tag ?? "*"}
+          active={item.tag === selected}
+          color={UNCATEGORISED_COLOR}
+          count={undefined}
+          onClick={() => onSelect(item.tag)}
+          testId={item.tag === null ? undefined : jobIds.tagFilter(item.tag)}
+        >
+          {item.label}
+        </FacetButton>
+      ))}
+    </RailBlock>
+  );
+}
+
 /** One facet in a rail block: its swatch, its name, its count. */
 function FacetButton({
   active,
@@ -407,16 +449,19 @@ function FacetButton({
   count,
   onClick,
   children,
+  testId,
 }: {
   active: boolean;
   color: string;
   count: number | undefined;
   onClick: () => void;
   children: ReactNode;
+  testId?: string;
 }) {
   return (
     <button
       type="button"
+      data-testid={testId}
       onClick={onClick}
       aria-pressed={active}
       className={cn(

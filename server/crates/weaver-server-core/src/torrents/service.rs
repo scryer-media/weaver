@@ -664,6 +664,8 @@ pub struct AddRequest {
     pub download_limit: Option<u64>,
     // Where its files go.
     pub placement: Placement,
+    // The tags its job is added with.
+    pub tags: Vec<String>,
 }
 
 /// Where a torrent's files go, as a client adding it asks (qBittorrent
@@ -865,6 +867,8 @@ pub struct TorrentView {
     pub trackers: Vec<TorrentTracker>,
     /// The attributes its job was added with.
     pub metadata: Vec<(String, String)>,
+    /// Its job's tags, in tag order.
+    pub tags: Vec<String>,
 }
 
 /// What a support report reads of a torrent beyond its view.
@@ -3559,6 +3563,7 @@ impl TorrentService {
                         return Err(error);
                     }
                 };
+                self.tag_added(job_id, &request.tags);
                 let made = self.give_metainfo(&mut torrent, &parsed);
                 self.enqueue(torrent).await;
                 match made {
@@ -3617,6 +3622,7 @@ impl TorrentService {
                 );
                 record.pool_member = pin;
                 let mut torrent = self.insert(record, &trackers)?;
+                self.tag_added(job_id, &request.tags);
                 let identity = identity_of(torrent.rule(&rules), &torrent.identity);
                 let terms = PeerTerms::of(&self.settings(), torrent.rule(&rules));
                 torrent.route = Some(plan.key.clone());
@@ -3627,6 +3633,19 @@ impl TorrentService {
                 self.publish_job(job_id).await;
                 Ok(job_id)
             }
+        }
+    }
+
+    // A torrent just added takes the tags it was added with. It is in the
+    // store already, so a tag that cannot be written leaves it untagged
+    // rather than undoing the add.
+    fn tag_added(&self, job_id: JobId, tags: &[String]) {
+        if let Err(error) = self
+            .inner
+            .db
+            .tag_new_job(job_id, tags.iter().map(String::as_str))
+        {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not tag a torrent");
         }
     }
 
@@ -6182,6 +6201,20 @@ impl TorrentService {
             file_have: reading.file_have,
             trackers: Vec::new(),
             metadata: record.metadata.clone(),
+            tags: Vec::new(),
+        }
+    }
+
+    // Each view's tags, from the tags as last read. A view whose tags cannot
+    // be read shows none.
+    fn tag(&self, views: &mut [&mut TorrentView]) {
+        match self.inner.db.tag_snapshot() {
+            Ok(tags) => {
+                for view in views {
+                    view.tags = tags.of(view.job_id).to_vec();
+                }
+            }
+            Err(error) => tracing::warn!(error = %error, "could not read the tags"),
         }
     }
 
@@ -6202,6 +6235,7 @@ impl TorrentService {
             )
         };
         self.track(&mut view, pinned, &listed, &announces, &mut HashMap::new());
+        self.tag(&mut [&mut view]);
         Some(view)
     }
 
@@ -6260,6 +6294,7 @@ impl TorrentService {
             &announces,
             &mut HashMap::new(),
         );
+        self.tag(&mut [&mut support.view]);
         if let Some(handle) = handle {
             support.peer_kinds = PeerKinds::of(&handle.peers());
         }
@@ -6345,6 +6380,7 @@ impl TorrentService {
             }
             self.track(view, *pinned, listed, announces, &mut names);
         }
+        self.tag(&mut views.iter_mut().map(|(view, ..)| view).collect::<Vec<_>>());
         let mut views: Vec<(TorrentView, TorrentSeries)> = views
             .into_iter()
             .map(|(view, announces, unviewed, ..)| {

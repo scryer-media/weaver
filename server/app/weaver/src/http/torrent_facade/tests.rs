@@ -462,6 +462,7 @@ fn view(state: TorrentState) -> TorrentView {
         file_have: Vec::new(),
         trackers: Vec::new(),
         metadata: Vec::new(),
+        tags: Vec::new(),
     }
 }
 
@@ -2735,22 +2736,115 @@ async fn a_closed_torrent_limit_is_never_read_as_no_limit() {
     assert_eq!(properties["dl_limit"], -1);
 }
 
+// Tags as qBittorrent's `TorrentsController` keeps them: taken on `add`,
+// shown joined by ", ", filtered on by `tag` (the empty tag is untagged),
+// and changed by the tag actions. A tag put on no torrent is not made.
+#[tokio::test]
+async fn a_torrent_keeps_the_tags_a_client_gives_it() {
+    let rig = rig().await;
+    let tagged = rig
+        .add_file(
+            &metainfo("one.mkv", 3000, false),
+            &[("tags", "tv, hd,,a,b")],
+        )
+        .await;
+    assert_eq!(tagged.status, StatusCode::OK);
+    rig.add_file(&metainfo("two.mkv", 3000, false), &[]).await;
+    let rig = &rig;
+    let info = |query: &'static str| async move {
+        rig.get(&format!("/api/v2/torrents/info{query}"))
+            .await
+            .json()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                (
+                    row["name"].as_str().unwrap().to_owned(),
+                    row["tags"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        info("?tag=tv").await,
+        [("one.mkv".to_owned(), "a, b, hd, tv".to_owned())]
+    );
+    assert_eq!(info("?tag=").await, [("two.mkv".to_owned(), String::new())]);
+    assert!(info("?tag=nope").await.is_empty());
+    assert_eq!(
+        rig.get("/api/v2/torrents/tags").await.json(),
+        json!(["a", "b", "hd", "tv"])
+    );
+
+    let one = rig
+        .torrents()
+        .await
+        .into_iter()
+        .find(|row| row["name"] == "one.mkv")
+        .unwrap();
+    let hash = one["hash"].as_str().unwrap().to_owned();
+    let two = rig
+        .torrents()
+        .await
+        .into_iter()
+        .find(|row| row["name"] == "two.mkv")
+        .unwrap();
+    let other = two["hash"].as_str().unwrap().to_owned();
+    for (action, form) in [
+        ("createTags", "tags=kept,".to_owned()),
+        ("deleteTags", "tags=a,b".to_owned()),
+        ("addTags", format!("hashes={other}&tags=hd")),
+        ("removeTags", format!("hashes={hash}&tags=tv")),
+        (
+            "addTags",
+            "hashes=0000000000000000000000000000000000000000&tags=ghost".to_owned(),
+        ),
+    ] {
+        let reply = rig.post(&format!("/api/v2/torrents/{action}"), &form).await;
+        assert_eq!(reply.status, StatusCode::OK, "{action}");
+    }
+    assert_eq!(
+        rig.get("/api/v2/torrents/tags").await.json(),
+        json!(["hd", "kept", "tv"])
+    );
+    assert_eq!(
+        info("?tag=hd").await,
+        [
+            ("one.mkv".to_owned(), "hd".to_owned()),
+            ("two.mkv".to_owned(), "hd".to_owned())
+        ]
+    );
+
+    let set = rig
+        .post(
+            "/api/v2/torrents/setTags",
+            &format!("hashes={hash}&tags=new"),
+        )
+        .await;
+    assert!(set.status.is_success(), "{}", set.status);
+    let cleared = rig
+        .post("/api/v2/torrents/removeTags", &format!("hashes={other}"))
+        .await;
+    assert_eq!(cleared.status, StatusCode::OK);
+    assert_eq!(
+        info("").await,
+        [
+            ("one.mkv".to_owned(), "new".to_owned()),
+            ("two.mkv".to_owned(), String::new())
+        ]
+    );
+    let main = rig.get("/api/v2/sync/maindata").await.json();
+    assert_eq!(main["tags"], json!(["hd", "kept", "new", "tv"]));
+}
+
 #[tokio::test]
 async fn the_stub_endpoints_answer_and_a_url_must_be_a_magnet() {
     let rig = rig().await;
-    for action in ["addTags", "removeTags"] {
-        let reply = rig
-            .post(&format!("/api/v2/torrents/{action}"), "hashes=all&tags=x")
-            .await;
-        assert_eq!(reply.status, StatusCode::OK, "{action}");
-    }
-    for path in ["/api/v2/torrents/tags", "/api/v2/log/main"] {
-        assert_eq!(
-            rig.get(path).await.json(),
-            Value::Array(Vec::new()),
-            "{path}"
-        );
-    }
+    assert_eq!(
+        rig.get("/api/v2/log/main").await.json(),
+        Value::Array(Vec::new())
+    );
     let url = rig
         .post(
             "/api/v2/torrents/add",

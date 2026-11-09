@@ -22,5 +22,12 @@ export const jobIds = {
   scriptEventGroup: (event: string) => `script-event-${event}`,
   scriptRun: "script-run",
   scriptRunStatus: (status: string) => `script-run-status-${status}`,
+
+  // A job's tags: its chips, the editor that adds and takes them off, and
+  // the rail filter, keyed by the tag ("" is jobs with none).
+  jobTags: "job-tags",
+  tagEditor: "tag-editor",
+  tagInput: "tag-input",
+  tagFilter: (tag: string) => `tag-filter-${tag}`,
 } as const;
 // testids:end
