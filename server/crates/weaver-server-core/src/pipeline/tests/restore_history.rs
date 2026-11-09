@@ -1050,6 +1050,12 @@ async fn renaming_a_quiet_job_preserves_existing_payload() {
             job_id,
         )
         .unwrap();
+        // A quiet job holds no articles and so no graph: a graph keeps the
+        // folder it was built in.
+        pipeline.release_job_articles(job_id);
+        while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+            hear_graph_mail(&mut pipeline, job_id).await;
+        }
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.status = JobStatus::Queued;
         state.download_state = crate::jobs::model::DownloadState::Queued;
