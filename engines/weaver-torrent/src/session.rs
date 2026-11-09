@@ -68,6 +68,7 @@ use crate::{
     limits::{Limits, LimitsConfig},
     listen::{Accept, ListenerOptions},
     merge_streams::merge_streams,
+    peer_info_reader::FetchDht,
     network::SocketFactory,
     peer_connection::PeerConnectionOptions,
     piece_priority::{
@@ -2801,6 +2802,13 @@ impl Session {
                     &unable.borrow(),
                     discovery,
                 ));
+                // The nodes the fetch's peers name go to the DHT once the
+                // fetch looks for peers there.
+                let fetch_dht = self
+                    .dht
+                    .clone()
+                    .filter(|_| sources.dht)
+                    .map(|dht| FetchDht::new(dht, phase.clone()));
                 if let Some(tx) = opts.metadata_fetch.take() {
                     let _ = tx.send(MetadataFetch {
                         trackers: table.clone(),
@@ -2845,6 +2853,7 @@ impl Session {
                         &unable_tx,
                         &tracker_tiers,
                         opts.peer_opts,
+                        fetch_dht,
                     )
                     .await?;
 
@@ -3613,6 +3622,7 @@ impl Session {
         unable: &tokio::sync::watch::Sender<HashSet<SocketAddr>>,
         tracker_tiers: &[Vec<Tracker>],
         peer_opts: Option<PeerConnectionOptions>,
+        dht: Option<FetchDht>,
     ) -> anyhow::Result<ResolveMagnetResult> {
         match read_metainfo_from_peer_receiver(
             identity.peer_id,
@@ -3622,6 +3632,7 @@ impl Session {
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
             identity.version.clone(),
+            dht,
         )
         .await
         {

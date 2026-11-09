@@ -35,6 +35,8 @@ use tokio::time::Instant;
 use tracing::trace;
 
 use crate::{
+    dht::Dht,
+    session::FetchPhase,
     peer_connection::{
         PeerConnection, PeerConnectionHandler, PeerConnectionOptions, WriterRequest,
     },
@@ -73,6 +75,7 @@ pub(crate) async fn read_metainfo_from_peer(
         result_tx: Mutex::new(Some(result_tx)),
         requests: requests.clone(),
         client_name_and_version,
+        dht_node_named: Mutex::new(None),
     };
     let connection = PeerConnection::new(
         addr,
@@ -123,14 +126,42 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) struct MetadataFetch {
     info_hashes: InfoHashes,
     sets: Mutex<HashMap<u32, Weak<Mutex<PieceSet>>>>,
+    /// The DHT the fetch looks for peers on, when it may.
+    dht: Option<FetchDht>,
+}
+
+/// The session's DHT, for a magnet whose metadata fetch may use it, and
+/// where that fetch asks for peers now. Until the metadata says whether
+/// the torrent is private, the fetch asks its own trackers alone, as a
+/// private torrent would; it uses the DHT only once it has gone on to
+/// discovery.
+#[derive(Clone)]
+pub(crate) struct FetchDht {
+    dht: Dht,
+    phase: tokio::sync::watch::Receiver<FetchPhase>,
+}
+
+impl FetchDht {
+    pub(crate) fn new(dht: Dht, phase: tokio::sync::watch::Receiver<FetchPhase>) -> Self {
+        Self { dht, phase }
+    }
 }
 
 impl MetadataFetch {
-    pub(crate) fn new(info_hashes: InfoHashes) -> Arc<Self> {
+    pub(crate) fn new(info_hashes: InfoHashes, dht: Option<FetchDht>) -> Arc<Self> {
         Arc::new(Self {
             info_hashes,
             sets: Default::default(),
+            dht,
         })
+    }
+
+    /// The DHT the fetch's peers hear of right now: none until the fetch
+    /// uses it. A torrent's live connections draw the same line, where a
+    /// private torrent's peers hear of no DHT.
+    fn dht(&self) -> Option<&Dht> {
+        let fetch = self.dht.as_ref()?;
+        (*fetch.phase.borrow() == FetchPhase::Discovery).then_some(&fetch.dht)
     }
 
     /// The buffer of the metadata size a peer names, made when no peer
@@ -441,6 +472,26 @@ struct Handler {
     /// handshake on.
     requests: Arc<Requests>,
     client_name_and_version: String,
+    /// The DHT port the peer named last (BEP 5 PORT).
+    dht_node_named: Mutex<Option<u16>>,
+}
+
+impl Handler {
+    /// A peer named its DHT node: the DHT pings it and adds it on reply
+    /// (libtorrent `peer_connection::incoming_dht_port`), once for each
+    /// port the connection names, as on a live connection. Nothing goes
+    /// to the DHT while the fetch does not use it. No PORT of ours goes
+    /// back: libtorrent sends its own after the bitfield
+    /// (`bt_peer_connection::on_dht_port`, `write_dht_port`), and a
+    /// connection sends no bitfield before the metadata is in.
+    fn on_dht_port(&self, port: u16) {
+        let Some(dht) = self.fetch.dht() else {
+            return;
+        };
+        if self.dht_node_named.lock().replace(port) != Some(port) {
+            dht.add_node(SocketAddr::new(self.addr.ip(), port));
+        }
+    }
 }
 
 impl PeerConnectionHandler for Handler {
@@ -486,6 +537,10 @@ impl PeerConnectionHandler for Handler {
             // A Reject answers its request: the piece is not coming yet.
             Message::Extended(ExtendedMessage::UtMetadata(UtMetadata::Reject(piece))) => {
                 self.requests.rejected(piece);
+                return Ok(());
+            }
+            Message::Port(port) => {
+                self.on_dht_port(port);
                 return Ok(());
             }
             _ => return Ok(()),
@@ -576,6 +631,11 @@ impl PeerConnectionHandler for Handler {
 
     fn client_name_and_version(&self) -> &str {
         &self.client_name_and_version
+    }
+
+    /// The handshake offers the DHT while the fetch uses it.
+    fn dht_port(&self) -> Option<u16> {
+        self.fetch.dht().map(|dht| dht.listen_addr().port())
     }
 }
 

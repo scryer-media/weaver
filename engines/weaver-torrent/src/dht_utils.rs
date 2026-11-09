@@ -17,7 +17,7 @@ use tracing::{Instrument, debug, debug_span};
 use crate::core::hash_id::{Id20, InfoHashes};
 use crate::{
     peer_connection::PeerConnectionOptions,
-    peer_info_reader::{self, MetadataFetch},
+    peer_info_reader::{self, FetchDht, MetadataFetch},
     spawn_utils::BlockingSpawner,
     stream_connect::StreamConnector,
     torrent_state::live::peers::{NextCandidate, PeerList, PeerStates},
@@ -58,10 +58,11 @@ pub async fn read_metainfo_from_peer_receiver<
     peer_connection_options: Option<PeerConnectionOptions>,
     connector: Arc<StreamConnector>,
     client_name_and_version: String,
+    dht: Option<FetchDht>,
 ) -> ReadMetainfoResult<A> {
     let semaphore = tokio::sync::Semaphore::new(128);
     // The peers asked fill one buffer between them.
-    let fetch = MetadataFetch::new(info_hashes);
+    let fetch = MetadataFetch::new(info_hashes, dht);
 
     let read_info_guarded = |addr, peers: &Arc<PeerStates>| {
         let semaphore = &semaphore;
@@ -396,6 +397,7 @@ mod tests {
                 .unwrap(),
             ),
             crate::client_name_and_version().to_owned(),
+            None,
         )
         .await
         {

@@ -3826,7 +3826,7 @@ fn handshake(dht: bool) -> Handshake {
     Handshake::new(Id20::default(), Id20::new([9; 20])).offering_dht(dht)
 }
 
-type Datagram = (Vec<u8>, SocketAddr);
+pub(crate) type Datagram = (Vec<u8>, SocketAddr);
 
 /// A datagram socket the test holds the other end of: what the session
 /// sends through it comes out of the test's receiver, with the address it
@@ -3884,22 +3884,22 @@ impl crate::network::DatagramSocket for HeldDatagrams {
 }
 
 /// The test's ends of a [`HeldDatagrams`].
-struct HeldEnds {
+pub(crate) struct HeldEnds {
     addr: SocketAddr,
-    sent: tokio::sync::mpsc::UnboundedReceiver<Datagram>,
-    arriving: tokio::sync::mpsc::UnboundedSender<Datagram>,
+    pub(crate) sent: tokio::sync::mpsc::UnboundedReceiver<Datagram>,
+    pub(crate) arriving: tokio::sync::mpsc::UnboundedSender<Datagram>,
 }
 
 /// A socket factory whose every datagram socket is a [`HeldDatagrams`], at
 /// an address of its own on 127.0.0.1, and which makes no connection.
 #[derive(Default)]
-struct HeldUdp {
+pub(crate) struct HeldUdp {
     held: parking_lot::Mutex<Vec<HeldEnds>>,
 }
 
 impl HeldUdp {
     /// The test's ends of the socket bound at `addr`.
-    fn take(&self, addr: SocketAddr) -> HeldEnds {
+    pub(crate) fn take(&self, addr: SocketAddr) -> HeldEnds {
         let mut held = self.held.lock();
         let at = held.iter().position(|h| h.addr == addr).unwrap();
         held.swap_remove(at)
@@ -3955,7 +3955,7 @@ impl crate::network::SocketFactory for HeldUdp {
 }
 
 /// The value under `key` in the bencoded dict `v`, as bytes.
-fn dict_bytes<'a>(
+pub(crate) fn dict_bytes<'a>(
     v: &'a crate::bencode::BencodeValue<crate::bencode::ByteBufOwned>,
     key: &str,
 ) -> &'a [u8] {

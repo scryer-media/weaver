@@ -18,7 +18,7 @@ use tokio::{
 };
 
 use super::{
-    Handler, MAX_METADATA_SIZE, MetadataFetch, REJECTED_WAIT, REQUEST_TIMEOUT, Requests,
+    FetchDht, Handler, MAX_METADATA_SIZE, MetadataFetch, REJECTED_WAIT, REQUEST_TIMEOUT, Requests,
     TorrentAndInfoBytes, read_metainfo_from_peer,
 };
 use crate::{
@@ -27,6 +27,7 @@ use crate::{
         constants::CHUNK_SIZE,
         hash_id::{Id20, InfoHashes},
     },
+    dht::{DhtBuilder, DhtConfig},
     dht_utils::{MetadataPeers, ReadMetainfoResult, read_metainfo_from_peer_receiver},
     mse::EncryptionPolicy,
     network::{
@@ -46,7 +47,11 @@ use crate::{
     sha1w::{ISha1, Sha1},
     spawn_utils::BlockingSpawner,
     stream_connect::{StreamConnector, StreamConnectorArgs},
-    torrent_state::live::peers::{PeerList, PeerStates},
+    session::FetchPhase,
+    torrent_state::live::{
+        peers::{PeerList, PeerStates},
+        tests::{HeldUdp, dict_bytes},
+    },
 };
 
 /// The mock peers wait on us, never on the clock.
@@ -349,6 +354,15 @@ async fn fetch_from(
     hashes: InfoHashes,
     connector: Arc<StreamConnector>,
 ) -> anyhow::Result<TorrentAndInfoBytes> {
+    fetch_into(addr, MetadataFetch::new(hashes, None), connector).await
+}
+
+/// [`fetch_from`], filling `fetch`.
+async fn fetch_into(
+    addr: SocketAddr,
+    fetch: Arc<MetadataFetch>,
+    connector: Arc<StreamConnector>,
+) -> anyhow::Result<TorrentAndInfoBytes> {
     // A peer that keeps the connection up as long as libtorrent does
     // (`settings_pack::peer_timeout`), so the request limit can pass.
     let options = PeerConnectionOptions {
@@ -359,7 +373,7 @@ async fn fetch_from(
         addr,
         no_peers(),
         Id20::new([1; 20]),
-        MetadataFetch::new(hashes),
+        fetch,
         Some(options),
         BlockingSpawner::new(1),
         connector,
@@ -433,6 +447,7 @@ fn handler(fetch: &Arc<MetadataFetch>) -> (Handler, mpsc::UnboundedReceiver<Writ
         result_tx: Mutex::new(None),
         requests: Arc::new(Requests::new()),
         client_name_and_version: "test".to_owned(),
+        dht_node_named: Mutex::new(None),
     };
     (handler, writer_rx)
 }
@@ -460,7 +475,7 @@ fn set_of(handler: &Handler) -> Arc<Mutex<super::PieceSet>> {
 
 #[tokio::test]
 async fn peers_naming_one_metadata_size_fill_one_buffer() {
-    let fetch = MetadataFetch::new(metadata(10).1);
+    let fetch = MetadataFetch::new(metadata(10).1, None);
     let (a, _a_writes) = handler(&fetch);
     let (b, _b_writes) = handler(&fetch);
 
@@ -472,7 +487,7 @@ async fn peers_naming_one_metadata_size_fill_one_buffer() {
 
 #[tokio::test]
 async fn a_repeated_extended_handshake_asks_for_nothing_again() {
-    let fetch = MetadataFetch::new(metadata(10).1);
+    let fetch = MetadataFetch::new(metadata(10).1, None);
     let (peer, _writes) = handler(&fetch);
 
     peer.on_extended_handshake(&naming(40_000)).unwrap();
@@ -488,7 +503,7 @@ async fn a_repeated_extended_handshake_asks_for_nothing_again() {
 
 #[tokio::test]
 async fn metadata_sizes_past_the_cap_or_zero_are_refused() {
-    let fetch = MetadataFetch::new(metadata(10).1);
+    let fetch = MetadataFetch::new(metadata(10).1, None);
     for size in [0, MAX_METADATA_SIZE + 1, u32::MAX] {
         let (peer, _writes) = handler(&fetch);
         assert!(peer.on_extended_handshake(&naming(size)).is_err(), "{size}");
@@ -503,7 +518,7 @@ async fn metadata_sizes_past_the_cap_or_zero_are_refused() {
 
 #[tokio::test]
 async fn a_metadata_buffer_goes_with_its_last_peer() {
-    let fetch = MetadataFetch::new(metadata(10).1);
+    let fetch = MetadataFetch::new(metadata(10).1, None);
     let (a, _a_writes) = handler(&fetch);
     let (b, _b_writes) = handler(&fetch);
     a.on_extended_handshake(&naming(40_000)).unwrap();
@@ -553,6 +568,7 @@ async fn two_peers_send_the_metadata_between_them() {
         None,
         connector,
         "test".to_owned(),
+        None,
     )
     .await;
 
@@ -614,6 +630,7 @@ async fn a_plaintext_only_peer_sends_the_metadata_over_the_next_connection_at_on
         None,
         connector.clone(),
         "test".to_owned(),
+        None,
     );
 
     let (found, _peer) = tokio::join!(fetch, peer);
@@ -641,11 +658,12 @@ fn reader(info: &Bytes) -> (Handler, mpsc::UnboundedReceiver<WriterRequest>, Fou
     let handler = Handler {
         addr: addr(1),
         peers: no_peers(),
-        fetch: MetadataFetch::new(hashes_of(info)),
+        fetch: MetadataFetch::new(hashes_of(info), None),
         writer_tx,
         result_tx: Mutex::new(Some(result_tx)),
         requests,
         client_name_and_version: "test".to_owned(),
+        dht_node_named: Mutex::new(None),
     };
     handler
         .on_extended_handshake(&naming(info.len().try_into().unwrap()))
@@ -754,7 +772,7 @@ async fn metadata_that_fails_its_hash_check_penalises_every_peer_that_sent_a_pie
     // libtorrent ut_metadata_plugin::received_metadata: each piece's
     // source gets the penalty, and every piece is missing again.
     let info = info_bytes(1000);
-    let fetch = MetadataFetch::new(hashes_of(&info));
+    let fetch = MetadataFetch::new(hashes_of(&info), None);
     let (a, _a_writes) = handler(&fetch);
     let (b, _b_writes) = handler(&fetch);
     let size = info.len().try_into().unwrap();
@@ -783,7 +801,7 @@ async fn any_peer_is_asked_for_the_least_requested_missing_piece() {
     // (maybe_send_request), whoever was asked for it before.
     let info = info_bytes(2000);
     assert_eq!(info.len().div_ceil(CHUNK_SIZE as usize), 3);
-    let fetch = MetadataFetch::new(hashes_of(&info));
+    let fetch = MetadataFetch::new(hashes_of(&info), None);
     let size = info.len().try_into().unwrap();
     let (a, _a_writes) = handler(&fetch);
     let (b, _b_writes) = handler(&fetch);
@@ -838,4 +856,100 @@ async fn a_metadata_request_left_unanswered_ends_the_connection() {
         "{error:#}"
     );
     assert!(Instant::now() >= asked + REQUEST_TIMEOUT);
+}
+
+/// A DHT over a socket the test holds, with no bootstrap host, so the
+/// pings it sends are the only datagrams that leave it.
+async fn held_dht(udp: &Arc<HeldUdp>) -> crate::dht::Dht {
+    DhtBuilder::with_config(DhtConfig {
+        bootstrap_addrs: Some(Vec::new()),
+        sockets: Some(udp.clone()),
+        ..Default::default()
+    })
+    .await
+    .unwrap()
+}
+
+// libtorrent fetches metadata over ordinary connections, so a peer's PORT
+// adds its node there as anywhere (`bt_peer_connection::on_dht_port`,
+// `peer_connection::incoming_dht_port`, `node::add_node`): the DHT pings
+// the node and, on its reply, enters it in the routing table.
+#[tokio::test]
+async fn a_port_during_a_metadata_fetch_adds_the_peers_node_to_the_dht() {
+    let (metadata, hashes) = metadata(10);
+    let udp = Arc::new(HeldUdp::default());
+    let dht = held_dht(&udp).await;
+    let mut node_side = udp.take(dht.listen_addr());
+    let (_phase_tx, phase) = tokio::sync::watch::channel(FetchPhase::Discovery);
+    let fetch = MetadataFetch::new(hashes, Some(FetchDht::new(dht.clone(), phase)));
+    // The node the peer names, on the peer's address.
+    let node = SocketAddr::from((Ipv4Addr::LOCALHOST, 6890));
+
+    let (connector, mut dials) = connector().await;
+    let peer = async {
+        let (_, stream) = dials.recv().await.unwrap();
+        let mut peer = MockPeer::greet(stream, hashes).await;
+        peer.send(Message::Port(node.port())).await;
+        peer.send_extended_handshake(u32::try_from(metadata.len()).unwrap())
+            .await;
+        let piece = peer.next_request().await.unwrap();
+        peer.send_piece(&metadata, piece).await;
+        peer
+    };
+    let (fetched, _peer) = tokio::join!(fetch_into(addr(1), fetch, connector), peer);
+    assert_eq!(fetched.unwrap().1.as_ref(), metadata.as_ref());
+
+    let (ping, to) = node_side.sent.recv().await.unwrap();
+    assert_eq!(to, node);
+    let ping = crate::bencode::dyn_from_bytes::<crate::bencode::ByteBufOwned>(&ping).unwrap();
+    assert_eq!(dict_bytes(&ping, "q"), b"ping");
+    let tid = dict_bytes(&ping, "t");
+
+    let their_id = Id20::new([0x33; 20]);
+    let entered = dht.with_routing_tables(|v4, _| v4.entered());
+    let mut entry = std::pin::pin!(entered.notified());
+    entry.as_mut().enable();
+    let mut answer = b"d1:rd2:id20:".to_vec();
+    answer.extend_from_slice(&their_id.0);
+    answer.extend_from_slice(format!("e1:t{}:", tid.len()).as_bytes());
+    answer.extend_from_slice(tid);
+    answer.extend_from_slice(b"1:y1:re");
+    node_side.arriving.send((answer, node)).unwrap();
+    entry.await;
+    assert!(dht.with_routing_tables(|v4, _| {
+        v4.iter().any(|n| n.id() == their_id && n.addr() == node)
+    }));
+}
+
+// Until a magnet's metadata says whether it is private, its fetch asks its
+// own trackers alone, as a private torrent's would: its handshake offers no
+// DHT and a PORT adds no node. Once the fetch goes on to discovery, both
+// do. A fetch the DHT is not for never offers it.
+#[tokio::test]
+async fn a_metadata_fetch_offers_the_dht_only_once_it_looks_for_peers_there() {
+    let udp = Arc::new(HeldUdp::default());
+    let dht = held_dht(&udp).await;
+    let mut node_side = udp.take(dht.listen_addr());
+    let (phase_tx, phase) = tokio::sync::watch::channel(FetchPhase::Trackers);
+    let fetch = MetadataFetch::new(
+        metadata(10).1,
+        Some(FetchDht::new(dht.clone(), phase)),
+    );
+    let (reader, _sent) = handler(&fetch);
+
+    assert_eq!(reader.dht_port(), None);
+    reader.on_received_message(Message::Port(6890)).await.unwrap();
+    assert_eq!(*reader.dht_node_named.lock(), None);
+
+    phase_tx.send(FetchPhase::Discovery).unwrap();
+    assert_eq!(reader.dht_port(), Some(dht.listen_addr().port()));
+    reader.on_received_message(Message::Port(6890)).await.unwrap();
+    assert_eq!(*reader.dht_node_named.lock(), Some(6890));
+    let (_, to) = node_side.sent.recv().await.unwrap();
+    assert_eq!(to, addr(6890));
+
+    let (no_dht, _sent) = handler(&MetadataFetch::new(metadata(10).1, None));
+    assert_eq!(no_dht.dht_port(), None);
+    no_dht.on_received_message(Message::Port(6890)).await.unwrap();
+    assert_eq!(*no_dht.dht_node_named.lock(), None);
 }
