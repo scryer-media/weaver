@@ -720,6 +720,7 @@ pub(crate) struct DatabaseWriterExecutor {
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
     job_history_cache: Arc<Mutex<JobHistoryCache>>,
+    pub(crate) tags: Arc<crate::tags::TagCache>,
 }
 
 impl DatabaseWriterExecutor {
@@ -728,6 +729,7 @@ impl DatabaseWriterExecutor {
             sql_services: db.sql_services.clone(),
             sql_worker: db.sql_worker.clone(),
             job_history_cache: db.job_history_cache.clone(),
+            tags: db.tags.clone(),
         }
     }
 
@@ -1279,6 +1281,8 @@ pub struct Database {
     write_overflow: Arc<Mutex<Option<VecDeque<QueuedWrite>>>>,
     pub(crate) history_delete_wake: Arc<Notify>,
     job_history_cache: Arc<Mutex<JobHistoryCache>>,
+    // Every tag and each job's tags, as last read, and their revision.
+    pub(crate) tags: Arc<crate::tags::TagCache>,
     encryption_key: Option<crate::persistence::encryption::EncryptionKey>,
     _ephemeral_dir: Option<Arc<tempfile::TempDir>>,
 }
@@ -1325,6 +1329,7 @@ impl Database {
             write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
+            tags: Arc::default(),
             encryption_key: None,
             _ephemeral_dir: None,
         };
@@ -1361,6 +1366,7 @@ impl Database {
             write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: Arc::new(Notify::new()),
             job_history_cache: Arc::new(Mutex::new(JobHistoryCache::default())),
+            tags: Arc::default(),
             encryption_key: Some(crate::persistence::encryption::EncryptionKey::generate()),
             rss_schedule_cache: Arc::new(crate::rss::ScheduleCache::default()),
             script_runtime: Arc::new(crate::post_processing::events::ScriptRuntime::default()),
@@ -1592,6 +1598,7 @@ impl Database {
             write_overflow: Arc::new(Mutex::new(None)),
             history_delete_wake: self.history_delete_wake.clone(),
             job_history_cache: self.job_history_cache.clone(),
+            tags: self.tags.clone(),
             encryption_key: self.encryption_key.clone(),
             script_runtime: self.script_runtime.clone(),
             rss_schedule_cache: self.rss_schedule_cache.clone(),
