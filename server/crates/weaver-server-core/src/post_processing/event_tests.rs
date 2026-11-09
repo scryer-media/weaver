@@ -811,7 +811,8 @@ async fn a_queue_script_is_told_the_jobs_tags_as_it_starts() {
             QueueEvent::NzbAdded,
         )
     };
-    db.tag_new_job(crate::jobs::JobId(41), ["tv", "hd"]).unwrap();
+    db.tag_new_job(crate::jobs::JobId(41), ["tv", "hd"])
+        .unwrap();
     for (job_id, now) in [(41, 1), (42, 2)] {
         db.enqueue_script_event(&job(job_id), now).unwrap().unwrap();
     }
@@ -829,7 +830,12 @@ async fn a_queue_script_is_told_the_jobs_tags_as_it_starts() {
         .await
         .unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].status, ScriptStatus::Succeeded, "{:?}", results[0]);
+        assert_eq!(
+            results[0].status,
+            ScriptStatus::Succeeded,
+            "{:?}",
+            results[0]
+        );
     }
     let told = |name: &str| std::fs::read_to_string(out.join(name)).unwrap();
     assert_eq!(told("41"), "hd,late,tv");
@@ -841,6 +847,11 @@ async fn a_queue_script_is_told_the_jobs_tags_as_it_starts() {
     let results = run_event(&db, &mut quota, "quota", None, Some(supervisor))
         .await
         .unwrap();
-    assert_eq!(results[0].status, ScriptStatus::Succeeded, "{:?}", results[0]);
+    assert_eq!(
+        results[0].status,
+        ScriptStatus::Succeeded,
+        "{:?}",
+        results[0]
+    );
     assert_eq!(told("none"), "unset");
 }

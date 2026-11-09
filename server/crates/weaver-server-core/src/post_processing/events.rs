@@ -1529,10 +1529,7 @@ impl Database {
     // for a jobless event. Returns the supervisor a run must be given: this
     // test binary, run as the real one.
     #[cfg(test)]
-    pub(crate) fn tag_reporting_queue_script_for_test(
-        &self,
-        out: &std::path::Path,
-    ) -> PathBuf {
+    pub(crate) fn tag_reporting_queue_script_for_test(&self, out: &std::path::Path) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(out).unwrap();
         let scripts = self.post_processing_script_directory().unwrap();

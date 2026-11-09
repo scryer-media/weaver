@@ -1359,22 +1359,33 @@ mod tests {
         }
 
         let page = |input: HistoryPageInput| {
-            build_history_page_sql(&db, HistoryPageSqlPlan::for_input(&input).unwrap(), &HashSet::new())
-                .unwrap()
+            build_history_page_sql(
+                &db,
+                HistoryPageSqlPlan::for_input(&input).unwrap(),
+                &HashSet::new(),
+            )
+            .unwrap()
         };
         let ids = |page: &HistoryPage| page.items.iter().map(|item| item.id).collect::<Vec<_>>();
 
         let tv = page(tagged("tv", 0, 2, None));
         assert_eq!(ids(&tv), [6, 3]);
         assert_eq!(tv.total_count, 3);
-        assert_eq!((tv.counts.all, tv.counts.success, tv.counts.failure), (3, 3, 0));
+        assert_eq!(
+            (tv.counts.all, tv.counts.success, tv.counts.failure),
+            (3, 3, 0)
+        );
         assert_eq!(ids(&page(tagged("tv", 1, 2, None))), [1]);
 
         let untagged = page(tagged("", 0, 25, None));
         assert_eq!(ids(&untagged), [7, 5, 2]);
         assert_eq!(untagged.total_count, 3);
         assert_eq!(
-            (untagged.counts.all, untagged.counts.success, untagged.counts.failure),
+            (
+                untagged.counts.all,
+                untagged.counts.success,
+                untagged.counts.failure
+            ),
             (3, 0, 2)
         );
         let failed = page(tagged("", 0, 25, Some(HistoryStatusFilter::Failure)));
