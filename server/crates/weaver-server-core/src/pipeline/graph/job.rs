@@ -701,6 +701,12 @@ impl GraphJob {
         Ok(files)
     }
 
+    // A failed job gives its working directory back as a delivery does:
+    // every handle goes first, and the names stay for its record.
+    pub(crate) fn release_handles(&mut self) {
+        self.writer.release_handles();
+    }
+
     // Articles the queues do not hold were fetched by an earlier run.
     pub(crate) fn arrived_before(&mut self, queued: impl FnMut(VolumeIndex, u32) -> bool) {
         self.root.map.arrived_before(queued);

@@ -3,6 +3,16 @@
 
 use super::*;
 
+#[cfg(test)]
+pub(crate) type FailedReleaseHook =
+    Box<dyn FnOnce(&std::path::Path, Option<&super::graph::job::GraphJob>) + Send>;
+
+// Runs with a failed job's working directory, and its graph if it has one,
+// as the release of that directory starts.
+#[cfg(test)]
+pub(crate) static BEFORE_FAILED_RELEASE: std::sync::Mutex<Option<FailedReleaseHook>> =
+    std::sync::Mutex::new(None);
+
 pub(crate) struct PendingGraphFailure {
     pub(super) error: String,
     pub(super) extraction_rejected: bool,
@@ -288,6 +298,21 @@ impl Pipeline {
             self.record_failed_job(job_id, error);
             return;
         };
+        // Nothing of the job is out on a thread by now, and its decodes are
+        // refused, so the graph is the last holder of its files: it lets go
+        // of every one before any is removed. A file unlinked while open
+        // stays behind on an NFS or FUSE share, and the directory never
+        // empties.
+        if let Some(graph) = self.graph_jobs.get_mut(&job_id) {
+            graph.release_handles();
+        }
+        #[cfg(test)]
+        {
+            let hook = BEFORE_FAILED_RELEASE.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(&working_dir, self.graph_jobs.get(&job_id));
+            }
+        }
         let root = self.intermediate_dir.clone();
         let done = self.failed_release_tx.clone();
         self.releasing_failed_jobs.insert(job_id);

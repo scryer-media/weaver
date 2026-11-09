@@ -307,6 +307,48 @@ async fn completion_releases_consumed_storage_before_unlink_and_publication() {
     retire_pipeline_database(pipeline).await;
 }
 
+// A failed job's working directory is released as a delivery is: with no
+// handle of its graph open under it. A file unlinked while open stays behind
+// on an NFS or FUSE share as a hidden entry, and the directory never empties.
+#[tokio::test]
+async fn a_failed_release_starts_with_no_graph_handle_open() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_031);
+    let data = payload(4 * ARTICLE, 4);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
+    let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+    decode_all(&mut pipeline, job_id, &posts, 0).await;
+    decode_all(&mut pipeline, job_id, &posts, 1).await;
+    decode(&mut pipeline, job_id, &posts, 2, 0, true).await;
+    hear_repair(&mut pipeline, job_id).await;
+    let held = pipeline.graph_jobs[&job_id].writer().open_files();
+    assert!(!held.is_empty(), "exercise retained recovery handles");
+
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let heard = seen.clone();
+    *crate::pipeline::health::BEFORE_FAILED_RELEASE.lock().unwrap() =
+        Some(Box::new(move |dir: &std::path::Path, graph: Option<&job::GraphJob>| {
+            *heard.lock().unwrap() = Some((
+                dir.to_path_buf(),
+                graph.map(|graph| graph.writer().open_files()),
+            ));
+        }));
+    pipeline.fail_job(job_id, "the post failed it".to_string());
+    let (dir, open) = seen
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the failed job's working directory is released");
+    assert_eq!(dir, working_dir);
+    let open = open.expect("the graph stays for the job's record");
+    assert!(open.is_empty(), "open as the release starts: {open:?}");
+
+    let released = pipeline.failed_release_rx.recv().await.unwrap();
+    pipeline.handle_failed_job_released(released);
+    retire_pipeline_database(pipeline).await;
+}
+
 #[tokio::test]
 async fn a_lost_article_under_a_par2_set_is_repaired_through_the_tree() {
     let temp_dir = tempfile::tempdir().unwrap();
