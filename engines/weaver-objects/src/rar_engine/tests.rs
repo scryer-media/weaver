@@ -2079,3 +2079,43 @@ fn a_compressed_member_is_said_in_megabyte_pieces() {
         }
     }
 }
+
+// A volume whose one compressed member names a 1 GiB dictionary, RAR5
+// method 1, and unpacks to 64 KiB; `flags` are the archive's.
+fn wide_dictionary_small_member(flags: u64) -> Vec<u8> {
+    [
+        rar5::start_flagged(flags, 0),
+        rar5::file_as(
+            "small.bin",
+            0,
+            &[0; 64],
+            64 << 10,
+            None,
+            (1 << 7) | (13 << 10),
+        ),
+        rar5::end(true),
+    ]
+    .concat()
+}
+
+fn reserved(front: &[u8]) -> Option<u64> {
+    let mut engine = RarEngine::new();
+    engine.bound(VolumeIndex(0), "lantern.part1.rar", front, None);
+    engine.reserve()
+}
+
+// A run reserves what its decode will hold: the dictionary the header
+// declares or the member's whole unpacked size, the less. A solid archive
+// keeps one window across members no front sums, so it holds the whole
+// dictionary. A front that states no compressed member reserves nothing
+// past the format's own.
+#[test]
+fn a_small_member_of_a_wide_dictionary_reserves_its_own_size() {
+    assert_eq!(reserved(&wide_dictionary_small_member(0)), Some(64 << 10));
+    assert_eq!(
+        reserved(&wide_dictionary_small_member(rar5::SOLID)),
+        Some(GIB)
+    );
+    assert_eq!(reserved(&six_files(0)[0]), Some(0));
+    assert_eq!(reserved(&[]), Some(0));
+}

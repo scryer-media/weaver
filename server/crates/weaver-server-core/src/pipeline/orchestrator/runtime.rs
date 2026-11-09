@@ -248,8 +248,12 @@ impl Pipeline {
             crate::pipeline::graph::hardware::Shutdown::of(shared_state.shutdown_started()),
         );
 
+        let graph_hold_budgets = hold_settings.budgets();
         let graph_holds = Arc::new(weaver_graph::holds::HoldsAccountant::new(
-            hold_settings.budgets(),
+            crate::pipeline::graph::limits::decode_pool(
+                graph_hold_budgets,
+                &graph_hardware.grant().run,
+            ),
         ));
         let mut pipeline = Self {
             _control_runtime: crate::pipeline::queue::RuntimeGuard(shared_state.queue.clone()),
@@ -265,6 +269,7 @@ impl Pipeline {
             retiring_graph_jobs: HashMap::new(),
             graph_status: Default::default(),
             graph_holds,
+            graph_hold_budgets,
             graph_runs: Default::default(),
             post_probes: Default::default(),
             nzb_admitted,

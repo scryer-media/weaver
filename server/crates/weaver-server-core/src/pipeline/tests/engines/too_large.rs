@@ -165,16 +165,16 @@ async fn a_zstd_frame_wider_than_any_decode_window_fails_with_the_sizes() {
         wide_zstd(),
     )]))
     .await;
-    // The run's reservation, the widest window the profile grants and the
-    // run's overhead, is more than the resident limit holds, so the run is
-    // refused before its decoder opens.
+    // The run reserves no more than the widest window the profile grants,
+    // which the decode pool always fits, so the decoder opens and refuses
+    // the frame with the window its header names.
     failed(
         &outcome,
         "lantern.mkv.zst",
         Why::TooLarge {
-            needed: Some(GIB + crate::pipeline::graph::engine::RUN_OVERHEAD),
+            needed: Some(1 << 41),
             allowed: Some(GIB),
         },
-        "lantern.mkv.zst needs 1.0 GiB of decode memory, 1.0 GiB allowed",
+        "lantern.mkv.zst needs 2.0 TiB of decode memory, 1.0 GiB allowed",
     );
 }

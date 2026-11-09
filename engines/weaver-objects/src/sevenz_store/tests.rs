@@ -726,12 +726,21 @@ fn a_password_ruled_wrong_on_its_proof_bytes_proves_again_on_their_repair() {
     let length = bytes.len() as u64;
     let mut mapped = Owner::single(store(), bytes.clone());
     mapped.frames(0, 4096);
-    let proof = mapped.object.proof.expect("a file proves the password").range;
+    let proof = mapped
+        .object
+        .proof
+        .expect("a file proves the password")
+        .range;
     let mut wrong = bytes.clone();
     wrong[proof.start as usize + 20] ^= 0x5a;
     let mut owner = Owner::single(store(), bytes.clone());
     owner.offer(PASSWORD);
-    owner.deliver_as(0, ByteRange::new(0, length), Provenance::Fresh, Some(&wrong));
+    owner.deliver_as(
+        0,
+        ByteRange::new(0, length),
+        Provenance::Fresh,
+        Some(&wrong),
+    );
     assert!(owner.members.values().all(|got| got.bytes.is_empty()));
     owner.deliver_as(0, proof, Provenance::Repaired, None);
     owner.close(0);
@@ -1070,4 +1079,95 @@ fn a_file_longer_than_its_container_does_not_restart_the_store() {
     );
     assert_eq!(owner.object.length, Some(bytes.len() as u64 + 17));
     streamed(&owner);
+}
+
+// A 7z of one LZMA2 folder whose coder names the widest dictionary, 4 GiB
+// less a byte (property 40), over one uncompressed LZMA2 chunk of 100
+// bytes. The header is plain, so only the property says how wide the
+// dictionary is: no writer sizes it so.
+fn wide_dictionary_small_folder() -> Vec<u8> {
+    let file: Vec<u8> = (0..100u8).collect();
+    let mut packed = vec![0x01, 0x00, (file.len() - 1) as u8];
+    packed.extend_from_slice(&file);
+    packed.push(0x00);
+    let name: Vec<u8> = "small.bin"
+        .encode_utf16()
+        .chain([0])
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let mut header = vec![
+        0x01, // Header
+        0x04, // MainStreamsInfo
+        0x06,
+        0x00,
+        0x01, // PackInfo: at 0, one stream
+        0x09,
+        packed.len() as u8, // its size
+        0x00,
+        0x07, // UnpackInfo
+        0x0B,
+        0x01,
+        0x00, // one folder, inline
+        0x01,
+        0x21,
+        0x21,
+        0x01,
+        40, // one coder: LZMA2, property 40
+        0x0C,
+        file.len() as u8, // its unpacked size
+        0x0A,
+        0x01, // every folder's CRC
+    ];
+    header.extend_from_slice(&crate::grid::crc32(&file).to_le_bytes());
+    header.extend_from_slice(&[0x00, 0x00]); // end UnpackInfo, MainStreamsInfo
+    header.extend_from_slice(&[0x05, 0x01, 0x11, (name.len() + 1) as u8, 0x00]);
+    header.extend_from_slice(&name);
+    header.extend_from_slice(&[0x00, 0x00]); // end FilesInfo, Header
+
+    let mut start = Vec::new();
+    start.extend_from_slice(&(packed.len() as u64).to_le_bytes());
+    start.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    start.extend_from_slice(&crate::grid::crc32(&header).to_le_bytes());
+    let mut bytes = vec![b'7', b'z', 0xBC, 0xAF, 0x27, 0x1C, 0, 4];
+    bytes.extend_from_slice(&crate::grid::crc32(&start).to_le_bytes());
+    bytes.extend_from_slice(&start);
+    bytes.extend_from_slice(&packed);
+    bytes.extend_from_slice(&header);
+    bytes
+}
+
+// A folder reserves what its decode holds: the coder's dictionary cut to
+// what the folder unpacks, no less than the 4 KiB the decoder keeps, and
+// the decoder's own state beside it. The engine the store gives the file
+// up to reserves the same.
+#[test]
+fn a_small_folder_of_a_wide_dictionary_reserves_its_own_size() {
+    // The decoder's estimate counts the whole dictionary, rounded up to
+    // sixteen, and its state beside it.
+    const DICTIONARY: u64 = 1 << 32;
+    let bytes = wide_dictionary_small_folder();
+    let archive =
+        sevenz_turbo::Archive::read(&mut Cursor::new(bytes.clone()), &Password::empty()).unwrap();
+    let estimate = sevenz_turbo::coder_memory_estimate(&archive.blocks[0].coders[0]).unwrap();
+    let window = estimate - DICTIONARY + (4 << 10);
+    assert!(window < 2 << 20, "{window}");
+
+    let mut owner = Owner::single(store(), bytes.clone());
+    owner.whole(4096);
+    assert!(has(&owner, &Emit::NeedsEngine(Why::Compressed)));
+    assert_eq!(owner.object.window, Some(window));
+
+    let carried = owner
+        .object
+        .engine_volume(VolumeIndex(0))
+        .expect("the store hands its file on");
+    let mut engine = crate::sevenz_engine::SevenZipEngine::new();
+    engine.adopt(
+        VolumeIndex(0),
+        "lantern.7z",
+        &bytes[..32],
+        Some(bytes.len() as u64),
+        carried,
+    );
+    assert_eq!(weaver_graph::Engine::reserve(&engine), Some(window));
 }

@@ -982,6 +982,7 @@ impl Object for RarStore {
         Some(Box::new(crate::engine::CarriedVolume {
             front: held.stated().cloned(),
             length: held.length,
+            window: held.stated().and_then(crate::rar_engine::window),
         }))
     }
 
