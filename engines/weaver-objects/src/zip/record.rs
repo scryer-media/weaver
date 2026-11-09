@@ -85,10 +85,8 @@ impl Zip {
                 }
                 let len = (run.len() as u64).min(wanted.end - cursor);
                 let part = ByteRange::at(cursor, len);
-                let provenance = if self.kept.verified(part) {
-                    Provenance::Fresh
-                } else {
-                    Provenance::Damaged
+                let Some(provenance) = self.kept.provenance_at(cursor) else {
+                    break;
                 };
                 runs.push((
                     part,

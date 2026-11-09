@@ -87,6 +87,7 @@ pub(in crate::pipeline) mod harness;
 mod lent_handed;
 mod lifecycle;
 mod lines;
+pub(in crate::pipeline) mod loans;
 mod nesting;
 mod pairings;
 mod par3;

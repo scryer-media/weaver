@@ -280,6 +280,37 @@ impl GraphJob {
         self.works.working()
     }
 
+    // Every work loan from here on stays in the test's hand.
+    #[cfg(test)]
+    pub(crate) fn hold_loans(&mut self) {
+        self.works.hold_loans();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_loans(&mut self) -> Vec<(NodeId, u64, Box<dyn weaver_graph::Object>)> {
+        self.works.take_held()
+    }
+
+    // A held loan does its work and comes back through the run mail, as one
+    // from the pool does.
+    #[cfg(test)]
+    pub(crate) fn return_loan(
+        &mut self,
+        (node, serial, mut object): (NodeId, u64, Box<dyn weaver_graph::Object>),
+        slots: &mut RepairSlots,
+        limit: usize,
+    ) -> Result<(), GraphError> {
+        let mut said = Vec::new();
+        object.work(&mut said);
+        let said = super::engine::Said {
+            scope: self.works.scope(),
+            node,
+            generation: serial,
+            heard: super::engine::Heard::Worked(Box::new(Worked { object, said })),
+        };
+        self.run_said(said, slots, limit)
+    }
+
     // A checkpoint found an object out for its work and took nothing: the
     // work stays on the loop until one is recorded.
     pub(crate) fn owe_checkpoint(&mut self) {
@@ -386,6 +417,7 @@ impl GraphJob {
             || self.tree.rewalks_owed()
             || self.writer.rechecks_waiting()
             || self.verifications_due()
+            || self.tree.work_due()
     }
 
     // A checksum obligation something can still meet: one an ended
@@ -719,7 +751,8 @@ impl GraphJob {
             )?;
             self.heard(out)?;
         }
-        Ok(())
+        // Saying the tail again may make work due.
+        self.lend_work()
     }
 
     // The volume's articles the root holds intact, at the ranges they were
@@ -934,6 +967,9 @@ impl GraphJob {
         if self.root.map.parked_since(from) {
             self.step_runs(Vec::new(), limit)?;
             self.lend(slots, limit)?;
+        } else {
+            // What the answers let an object hold may be due.
+            self.lend_work()?;
         }
         Ok(self.root.map.take_moves())
     }
@@ -1024,5 +1060,7 @@ impl SeekUp for Recorder<'_> {
     }
 }
 
+#[cfg(test)]
+mod loan_tests;
 #[cfg(test)]
 mod verification_tests;

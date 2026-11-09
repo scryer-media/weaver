@@ -60,6 +60,11 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     let Some(job) = pipeline.graph_jobs.get_mut(&job_id) else {
         return;
     };
+    // Work an object holds goes out before the verdict, which then waits
+    // for it: an object holding ciphertext it has keys for is not short.
+    if let Err(error) = job.lend_work() {
+        warn!(job_id = job_id.0, error = %error, "graph work lending failed");
+    }
     let step = drive(
         job,
         &mut pipeline.graph_status.repairs,

@@ -35,7 +35,15 @@ pub(crate) struct Works {
     // recorded, the work is done on the loop, so the next step takes it.
     owed: bool,
     hardware: Hardware,
+    // A test keeps every loan in hand, to send the job what it would hear
+    // while the object is out, and hands each back when it chooses.
+    #[cfg(test)]
+    held: Option<Vec<HeldLoan>>,
 }
+
+// A loan a test keeps in hand: its node, its number, and the object.
+#[cfg(test)]
+pub(crate) type HeldLoan = (NodeId, u64, Box<dyn Object>);
 
 struct Rewalking {
     serial: u64,
@@ -67,7 +75,25 @@ impl Works {
             rewalks: BTreeMap::new(),
             owed: false,
             hardware,
+            #[cfg(test)]
+            held: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn hold_loans(&mut self) {
+        self.held.get_or_insert_with(Vec::new);
+    }
+
+    // The loans kept in hand, by node, under their numbers.
+    #[cfg(test)]
+    pub(crate) fn take_held(&mut self) -> Vec<HeldLoan> {
+        self.held.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scope(&self) -> u64 {
+        self.scope
     }
 
     pub(crate) fn out(&self) -> bool {
@@ -172,6 +198,11 @@ impl Works {
         self.serial += 1;
         let (scope, serial) = (self.scope, self.serial);
         self.out.insert(node, serial);
+        #[cfg(test)]
+        if let Some(held) = &mut self.held {
+            held.push((node, serial, object));
+            return;
+        }
         let mail = self.mail.clone();
         let grant = self.hardware.grant();
         tokio::task::spawn_blocking(move || {
