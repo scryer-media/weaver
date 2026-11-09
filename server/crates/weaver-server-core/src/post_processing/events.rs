@@ -245,6 +245,9 @@ enum AdmissionHint {
     Possible,
 }
 
+// An event's admission: the run queued for it, none when nothing runs it.
+pub(crate) type Admitted = tokio::sync::oneshot::Receiver<Result<Option<String>, StateError>>;
+
 struct QueueAdmission {
     context: EventContext,
     completion: Option<tokio::sync::oneshot::Sender<Result<Option<String>, StateError>>>,
@@ -373,6 +376,16 @@ impl EventContext {
             instances: None,
             scratch: None,
         }
+    }
+
+    // The same event under the name `event`.
+    pub fn renamed(&self, event: QueueEvent) -> Self {
+        let mut context = self.clone();
+        context.event = ScriptEventLabel::Queue(event);
+        context
+            .env
+            .insert("NZBNA_EVENT".into(), event.as_str().into());
+        context
     }
 
     // What weaver's own variables say about the thing the event is about.
@@ -564,7 +577,8 @@ pub async fn run_event(
             let effects = db.job_script_effects(job_id)?;
             effects.merge_parameters(&mut context.facts.parameters);
             context.facts.marked_bad |= effects.marked_bad;
-            if effects.marked_bad && context.event != ScriptEventLabel::Queue(QueueEvent::NzbMarked)
+            if effects.marked_bad
+                && !matches!(context.event, ScriptEventLabel::Queue(event) if event.marked())
             {
                 break;
             }
@@ -1116,11 +1130,23 @@ impl Database {
 
     // Preserve actor event order while resolving manifests and writing SQL off
     // the actor. Only one pending file notification per job is necessary.
+    // A job's ADDED, DOWNLOADED or DELETED event brings its JOB_ twin, as
+    // `admit_queue_script_events` says.
     pub(crate) fn admit_queue_script_event(
         &self,
         context: EventContext,
         barrier: bool,
-    ) -> tokio::sync::oneshot::Receiver<Result<Option<String>, StateError>> {
+    ) -> Admitted {
+        self.admit_queue_script_events(context, barrier).0
+    }
+
+    // Admit `context`, and right after it the generic event the job raises
+    // beside it, if any: the admission of each, the generic one second.
+    pub(crate) fn admit_queue_script_events(
+        &self,
+        context: EventContext,
+        barrier: bool,
+    ) -> (Admitted, Option<Admitted>) {
         let (sender, receiver) = tokio::sync::oneshot::channel();
         let mut admissions = self
             .script_runtime
@@ -1134,11 +1160,25 @@ impl Database {
             })
         {
             let _ = sender.send(Ok(None));
-            return receiver;
+            return (receiver, None);
         }
+        let generic = match context.event {
+            ScriptEventLabel::Queue(event) => event.generic().map(|generic| {
+                let (sender, receiver) = tokio::sync::oneshot::channel();
+                (context.renamed(generic), sender, receiver)
+            }),
+            _ => None,
+        };
         admissions.pending.push_back(QueueAdmission {
             context,
             completion: Some(sender),
+        });
+        let generic = generic.map(|(context, sender, receiver)| {
+            admissions.pending.push_back(QueueAdmission {
+                context,
+                completion: Some(sender),
+            });
+            receiver
         });
         if !admissions.running {
             admissions.running = true;
@@ -1147,7 +1187,7 @@ impl Database {
                 drain_admissions(db).await;
             });
         }
-        receiver
+        (receiver, generic)
     }
 
     fn has_pending_script_admission(&self, job_id: u64) -> bool {
@@ -1307,8 +1347,10 @@ impl Database {
                     if event == QueueEvent::FileDownloaded
                         && tx.fetch_optional("SELECT run_id FROM script_event_queue WHERE job_id IS NOT DISTINCT FROM {} AND event = {} AND (state = 'queued' OR created_at > {}) LIMIT 1", &[SqlArg::OptI64(job_id), SqlArg::Text(event.as_str().into()), SqlArg::I64(if interval == 0 { i64::MAX } else { now_ms.saturating_sub(interval.saturating_mul(1000)) })]).await?.is_some() { return Ok(None); }
                     let seq = tx.fetch_optional("UPDATE script_output_state SET next_seq = next_seq + 1 WHERE singleton = 1 RETURNING next_seq", &[]).await?.ok_or_else(|| StateError::Database("script sequence is missing".into()))?.i64("next_seq")?;
-                    if event == QueueEvent::NzbDownloaded {
-                        tx.execute("DELETE FROM script_event_queue WHERE job_id IS NOT DISTINCT FROM {} AND state = 'queued'", &[SqlArg::OptI64(job_id)]).await?;
+                    // A download's end drops the job's events still queued,
+                    // all but the other names of that same end.
+                    if event.downloaded() {
+                        tx.execute("DELETE FROM script_event_queue WHERE job_id IS NOT DISTINCT FROM {} AND state = 'queued' AND (event = {} OR event NOT IN ('NZB_DOWNLOADED', 'TORRENT_DOWNLOADED', 'JOB_DOWNLOADED'))", &[SqlArg::OptI64(job_id), SqlArg::Text(event.as_str().into())]).await?;
                     }
                     let run_id = format!("script-event-{seq}");
                     tx.execute("INSERT INTO script_event_queue (run_id, job_id, event, priority, seq, state, payload, created_at) VALUES ({}, {}, {}, {}, {}, 'queued', {}, {})", &[SqlArg::Text(run_id.clone()), SqlArg::OptI64(job_id), SqlArg::Text(event.as_str().into()), SqlArg::I32(event as i32), SqlArg::I64(seq), SqlArg::Text(payload), SqlArg::I64(now_ms)]).await?;
@@ -1355,13 +1397,16 @@ impl Database {
         })
     }
 
+    // The latest `event` queued for the job, one of the names of its
+    // download's end, and whether it is over.
     pub fn downloaded_script_event(
         &self,
         job_id: u64,
+        event: QueueEvent,
     ) -> Result<Option<(String, bool)>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            SqlRuntime::fetch_optional(datastore.read_exec(), "SELECT run_id, state FROM script_event_queue WHERE job_id = {} AND event = 'NZB_DOWNLOADED' ORDER BY seq DESC LIMIT 1", &[SqlArg::I64(job_id as i64)]).await?
+            SqlRuntime::fetch_optional(datastore.read_exec(), "SELECT run_id, state FROM script_event_queue WHERE job_id = {} AND event = {} ORDER BY seq DESC LIMIT 1", &[SqlArg::I64(job_id as i64), SqlArg::Text(event.as_str().into())]).await?
                 .map(|row| Ok((row.text("run_id")?, matches!(row.text("state")?.as_str(), "done" | "interrupted")))).transpose()
         })
     }
@@ -1768,9 +1813,10 @@ async fn drain_admissions(db: Database) {
         };
         let worker_db = db.clone();
         let result = tokio::task::spawn_blocking(move || {
-            if admission.context.event == ScriptEventLabel::Queue(QueueEvent::NzbDownloaded)
+            if let ScriptEventLabel::Queue(event) = admission.context.event
+                && event.downloaded()
                 && let Some(job_id) = admission.context.job_id
-                && let Some((run_id, _)) = worker_db.downloaded_script_event(job_id)?
+                && let Some((run_id, _)) = worker_db.downloaded_script_event(job_id, event)?
             {
                 return Ok(Some(run_id));
             }
@@ -1879,9 +1925,9 @@ pub async fn drain_queue(db: Database) -> Result<(), StateError> {
 
 // Run one claimed queue event and record that it is over. A job no longer
 // in the queue runs only the events raised as or after it leaves:
-// NZB_DELETED, NZB_MARKED, SEEDING_STOPPED for a torrent that failed or was
-// removed while seeding, and SEEDING_FINISHED for a torrent its seeding goal
-// removed.
+// NZB_DELETED, TORRENT_DELETED, JOB_DELETED, NZB_MARKED, TORRENT_MARKED,
+// SEEDING_STOPPED for a torrent that failed or was removed while seeding, and
+// SEEDING_FINISHED for a torrent its seeding goal removed.
 async fn run_queue_event(
     db: Database,
     run_id: String,
@@ -1913,7 +1959,10 @@ async fn run_queue_event(
             context.event,
             ScriptEventLabel::Queue(
                 QueueEvent::NzbDeleted
+                    | QueueEvent::TorrentDeleted
+                    | QueueEvent::JobDeleted
                     | QueueEvent::NzbMarked
+                    | QueueEvent::TorrentMarked
                     | QueueEvent::SeedingStopped
                     | QueueEvent::SeedingFinished
             )

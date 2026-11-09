@@ -3036,7 +3036,7 @@ impl TorrentService {
         if downloaded {
             let live = self.inner.live.lock().await;
             if let Some(torrent) = live.get(&job_id) {
-                self.raise_script_event(torrent, QueueEvent::NzbDownloaded, &[]);
+                self.raise_script_event(torrent, QueueEvent::TorrentDownloaded, &[]);
             }
         }
     }
@@ -3634,7 +3634,7 @@ impl TorrentService {
                 let made = self.give_metainfo(&mut torrent, &parsed);
                 // Raised for an add, never for a restore (qBittorrent emits
                 // `torrentAdded` from `addTorrent_impl` alone).
-                self.raise_script_event(&torrent, QueueEvent::NzbAdded, &[]);
+                self.raise_script_event(&torrent, QueueEvent::TorrentAdded, &[]);
                 self.enqueue(torrent).await;
                 match made {
                     Ok(()) => self.attach(job_id, None).await,
@@ -3696,7 +3696,7 @@ impl TorrentService {
                 let identity = identity_of(torrent.rule(&rules), &torrent.identity);
                 let terms = PeerTerms::of(&self.settings(), torrent.rule(&rules));
                 torrent.route = Some(plan.key.clone());
-                self.raise_script_event(&torrent, QueueEvent::NzbAdded, &[]);
+                self.raise_script_event(&torrent, QueueEvent::TorrentAdded, &[]);
                 self.enqueue(torrent).await;
                 self.spawn_resolve(job_id, plan, uri, None, identity, terms)
                     .await;
@@ -4691,7 +4691,7 @@ impl TorrentService {
             }
             Ending::Asked if !torrent.complete() => self.script_event(
                 &torrent,
-                QueueEvent::NzbDeleted,
+                QueueEvent::TorrentDeleted,
                 &[("NZBNA_DELETESTATUS", "MANUAL")],
             ),
             Ending::Asked => None,

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// The scripts a torrent's job runs: the queue events an NZB job raises, at
-// the matching points of a torrent's life, and Weaver's own seeding events.
+// The scripts a torrent's job runs: TORRENT_ADDED, TORRENT_DOWNLOADED and
+// TORRENT_DELETED at the points an NZB job raises NZB_ADDED, NZB_DOWNLOADED
+// and NZB_DELETED, each with its JOB_ twin, and Weaver's own seeding events.
 // qBittorrent starts its external program detached
 // (`Application::runExternalProgram`), so the torrent never waits on it:
 // here each event is queued and the torrent goes on.

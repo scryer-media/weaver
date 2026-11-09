@@ -1,13 +1,27 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A torrent's job raises the queue events an NZB job raises, at the
-// matching points, and Weaver's seeding events, each once and with the
-// torrent's variables.
+// A torrent's job raises TORRENT_ADDED, TORRENT_DOWNLOADED and
+// TORRENT_DELETED where an NZB job raises its NZB_ events, each with its JOB_
+// twin and never an NZB_ event, and Weaver's seeding events, each once and
+// with the torrent's variables.
 
 use super::*;
 use crate::post_processing::events::EventContext;
 use crate::post_processing::model::{QueueEvent, ScriptEventLabel, vars};
+
+// No NZB_ event was queued for any job.
+fn assert_no_nzb_events(db: &Database) {
+    for event in [
+        QueueEvent::NzbMarked,
+        QueueEvent::NzbAdded,
+        QueueEvent::NzbNamed,
+        QueueEvent::NzbDownloaded,
+        QueueEvent::NzbDeleted,
+    ] {
+        assert!(db.queued_script_events(event).is_empty(), "{event:?}");
+    }
+}
 
 // The variables every event of `view`'s job carries.
 fn assert_torrent_vars(context: &EventContext, view: &TorrentView) {
@@ -24,8 +38,8 @@ fn assert_torrent_vars(context: &EventContext, view: &TorrentView) {
 }
 
 // Added, downloaded in this run, paused while seeding, restarted with no
-// event, then removed while seeding: NZB_ADDED, NZB_DOWNLOADED and each
-// SEEDING_STOPPED once, with the torrent's variables.
+// event, then removed while seeding: TORRENT_ADDED, TORRENT_DOWNLOADED, their
+// JOB_ twins and each SEEDING_STOPPED once, with the torrent's variables.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrents_job_raises_each_queue_event_once_with_its_variables() {
     let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
@@ -49,11 +63,15 @@ async fn a_torrents_job_raises_each_queue_event_once_with_its_variables() {
         .await
         .unwrap();
     rig.db.admitted_so_far().await;
-    let added = rig.db.queued_script_events(QueueEvent::NzbAdded);
+    let added = rig.db.queued_script_events(QueueEvent::TorrentAdded);
     assert_eq!(added.len(), 1);
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_torrent_vars(&added[0], &view);
-    assert_eq!(added[0].env["NZBNA_EVENT"], "NZB_ADDED");
+    assert_eq!(added[0].env["NZBNA_EVENT"], "TORRENT_ADDED");
+    let job_added = rig.db.queued_script_events(QueueEvent::JobAdded);
+    assert_eq!(job_added.len(), 1);
+    assert_torrent_vars(&job_added[0], &view);
+    assert_eq!(job_added[0].env["NZBNA_EVENT"], "JOB_ADDED");
 
     tracked(&rig.service, job_id, &url).await;
     handle_of(&rig.service, job_id)
@@ -63,12 +81,20 @@ async fn a_torrents_job_raises_each_queue_event_once_with_its_variables() {
         .unwrap();
     let downloaded = rig
         .db
-        .queued_script_events_once(QueueEvent::NzbDownloaded, 1)
+        .queued_script_events_once(QueueEvent::TorrentDownloaded, 1)
         .await;
     let view = rig.service.torrent(job_id).await.unwrap();
     assert_torrent_vars(&downloaded[0], &view);
     // The tracker it announced to.
     assert_eq!(downloaded[0].env[vars::TRACKER], url);
+    assert_eq!(downloaded[0].env["NZBNA_EVENT"], "TORRENT_DOWNLOADED");
+    let job_downloaded = rig
+        .db
+        .queued_script_events_once(QueueEvent::JobDownloaded, 1)
+        .await;
+    assert_torrent_vars(&job_downloaded[0], &view);
+    assert_eq!(job_downloaded[0].env[vars::TRACKER], url);
+    assert_eq!(job_downloaded[0].env["NZBNA_EVENT"], "JOB_DOWNLOADED");
 
     rig.service.pause(job_id).await.unwrap();
     rig.db.admitted_so_far().await;
@@ -79,7 +105,8 @@ async fn a_torrents_job_raises_each_queue_event_once_with_its_variables() {
     // Paused again, it seeds no more: nothing new.
     rig.service.pause(job_id).await.unwrap();
     rig.service.stop().await;
-    let added_before = rig.db.queued_script_events(QueueEvent::NzbAdded).len();
+    let added_before = rig.db.queued_script_events(QueueEvent::TorrentAdded).len();
+    let job_added_before = rig.db.queued_script_events(QueueEvent::JobAdded).len();
 
     // A restart raises nothing: the torrent was added, and downloaded, in
     // an earlier run.
@@ -90,11 +117,21 @@ async fn a_torrents_job_raises_each_queue_event_once_with_its_variables() {
     again.remove(job_id, false, true).await.unwrap();
     rig.db.admitted_so_far().await;
     assert_eq!(
-        rig.db.queued_script_events(QueueEvent::NzbAdded).len(),
+        rig.db.queued_script_events(QueueEvent::TorrentAdded).len(),
         added_before
     );
     assert_eq!(
-        rig.db.queued_script_events(QueueEvent::NzbDownloaded).len(),
+        rig.db
+            .queued_script_events(QueueEvent::TorrentDownloaded)
+            .len(),
+        1
+    );
+    assert_eq!(
+        rig.db.queued_script_events(QueueEvent::JobAdded).len(),
+        job_added_before
+    );
+    assert_eq!(
+        rig.db.queued_script_events(QueueEvent::JobDownloaded).len(),
         1
     );
     let stopped = rig.db.queued_script_events(QueueEvent::SeedingStopped);
@@ -106,15 +143,21 @@ async fn a_torrents_job_raises_each_queue_event_once_with_its_variables() {
     // A complete torrent removed is not a deleted download.
     assert!(
         rig.db
-            .queued_script_events(QueueEvent::NzbDeleted)
+            .queued_script_events(QueueEvent::TorrentDeleted)
             .is_empty()
     );
+    assert!(
+        rig.db
+            .queued_script_events(QueueEvent::JobDeleted)
+            .is_empty()
+    );
+    assert_no_nzb_events(&rig.db);
     again.stop().await;
     seeding.stop().await;
 }
 
 // A torrent added with its data in place downloads nothing in this run, so
-// it seeds without NZB_DOWNLOADED (libtorrent sends no `completed`, and
+// it seeds without TORRENT_DOWNLOADED or JOB_DOWNLOADED (libtorrent sends no `completed`, and
 // qBittorrent no `torrentFinished`, for it).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_added_complete_raises_no_download_event() {
@@ -146,17 +189,25 @@ async fn a_torrent_added_complete_raises_no_download_event() {
         );
     }
     rig.db.admitted_so_far().await;
-    assert_eq!(rig.db.queued_script_events(QueueEvent::NzbAdded).len(), 1);
+    assert_eq!(
+        rig.db.queued_script_events(QueueEvent::TorrentAdded).len(),
+        1
+    );
     assert!(
         rig.db
-            .queued_script_events(QueueEvent::NzbDownloaded)
+            .queued_script_events(QueueEvent::TorrentDownloaded)
+            .is_empty()
+    );
+    assert!(
+        rig.db
+            .queued_script_events(QueueEvent::JobDownloaded)
             .is_empty()
     );
     rig.service.stop().await;
 }
 
 // A torrent removed before it finished is a deleted download, as an NZB
-// job deleted by hand is.
+// job deleted by hand is: TORRENT_DELETED and JOB_DELETED, no NZB_ event.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_torrent_removed_before_it_finished_raises_its_deletion() {
     let rig = rig(set_clock());
@@ -171,10 +222,17 @@ async fn a_torrent_removed_before_it_finished_raises_its_deletion() {
     let view = rig.service.torrent(job_id).await.unwrap();
     rig.service.remove(job_id, false, true).await.unwrap();
     rig.db.admitted_so_far().await;
-    let deleted = rig.db.queued_script_events(QueueEvent::NzbDeleted);
+    let deleted = rig.db.queued_script_events(QueueEvent::TorrentDeleted);
     assert_eq!(deleted.len(), 1);
     assert_torrent_vars(&deleted[0], &view);
     assert_eq!(deleted[0].env["NZBNA_DELETESTATUS"], "MANUAL");
+    assert_eq!(deleted[0].env["NZBNA_EVENT"], "TORRENT_DELETED");
+    let job_deleted = rig.db.queued_script_events(QueueEvent::JobDeleted);
+    assert_eq!(job_deleted.len(), 1);
+    assert_torrent_vars(&job_deleted[0], &view);
+    assert_eq!(job_deleted[0].env["NZBNA_DELETESTATUS"], "MANUAL");
+    assert_eq!(job_deleted[0].env["NZBNA_EVENT"], "JOB_DELETED");
+    assert_no_nzb_events(&rig.db);
     assert!(
         rig.db
             .queued_script_events(QueueEvent::SeedingStopped)
@@ -246,7 +304,7 @@ async fn a_torrent_that_meets_its_goals_raises_seeding_finished_once() {
 }
 
 // A torrent whose goal removes it queues SEEDING_FINISHED once its row is
-// gone, and the queue worker still runs it. Its NZB_ADDED, run only now,
+// gone, and the queue worker still runs it. Its TORRENT_ADDED, run only now,
 // is skipped: the file its script writes comes from SEEDING_FINISHED.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_queue_runs_seeding_finished_of_a_torrent_its_goal_removed() {
@@ -293,7 +351,7 @@ async fn the_queue_runs_seeding_finished_of_a_torrent_its_goal_removed() {
     )));
     assert!(ran.contains(&(
         Some(job_id.0),
-        ScriptEventLabel::Queue(QueueEvent::NzbAdded)
+        ScriptEventLabel::Queue(QueueEvent::TorrentAdded)
     )));
     assert_eq!(
         std::fs::read_to_string(out.join(job_id.0.to_string())).unwrap(),
@@ -337,7 +395,7 @@ async fn a_torrents_queue_script_is_told_its_jobs_tags() {
         .await
         .unwrap();
     rig.db.admitted_so_far().await;
-    let mut added = rig.db.queued_script_events(QueueEvent::NzbAdded);
+    let mut added = rig.db.queued_script_events(QueueEvent::TorrentAdded);
     assert_eq!(added.len(), 1);
     rig.db.add_job_tags(&[job_id], ["iso"]).unwrap();
     let results = crate::post_processing::events::run_event(
@@ -382,11 +440,60 @@ async fn the_queue_runs_a_live_torrents_event() {
     }
     assert!(ran.contains(&(
         Some(job_id.0),
-        ScriptEventLabel::Queue(QueueEvent::NzbAdded)
+        ScriptEventLabel::Queue(QueueEvent::TorrentAdded)
     )));
     assert_eq!(
         std::fs::read_to_string(out.join(job_id.0.to_string())).unwrap(),
         "linux"
     );
+    rig.service.stop().await;
+}
+
+// One script saved for both TORRENT_ADDED and JOB_ADDED runs once for each,
+// told the name of the one it runs for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_script_on_the_own_and_the_generic_event_runs_for_each() {
+    use std::os::unix::fs::PermissionsExt;
+    let rig = rig(set_clock());
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    let out = rig.dir.path().join("told");
+    let supervisor = rig.db.tag_reporting_queue_script_for_test(&out);
+    let told = out.join("events");
+    let script = rig
+        .db
+        .post_processing_script_directory()
+        .unwrap()
+        .join("queue.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\necho \"$NZBNA_EVENT\" >> '{}'\n",
+            told.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    rig.service.publish_to(queue());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    rig.db.admitted_so_far().await;
+    while rig
+        .db
+        .run_next_queue_event_for_test(&supervisor)
+        .await
+        .is_some()
+    {}
+    let mut ran: Vec<String> = std::fs::read_to_string(&told)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    ran.sort();
+    assert_eq!(ran, ["JOB_ADDED", "TORRENT_ADDED"]);
+    assert!(rig.service.torrent(job_id).await.is_some());
     rig.service.stop().await;
 }

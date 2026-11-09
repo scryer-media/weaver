@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::post_processing::events::{EventContext, wait_for_event, wait_for_job_events};
-use crate::post_processing::model::{PipelineOutcome, QueueEvent};
+use crate::post_processing::model::{PipelineOutcome, QueueEvent, ScriptEventLabel};
 use crate::post_processing::runner::{CompatibilityFacts, JobExecutionContext};
 
 // Each arrival script event raised, counted for the tests.
@@ -128,16 +128,25 @@ impl Pipeline {
         self.raise_added_script_context(job_id, context);
     }
 
+    // NZB_ADDED and JOB_ADDED each hold the job while a script of theirs
+    // that blocks runs.
     fn raise_added_script_context(&mut self, job_id: JobId, context: EventContext) {
         #[cfg(test)]
         ADDED_SCRIPT_RAISES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let event = context.event.clone();
+        let events = [
+            context.event.clone(),
+            ScriptEventLabel::Queue(QueueEvent::JobAdded),
+        ];
         let category = context.category.clone();
-        let cached_blocks = self
-            .db
-            .cached_script_instances_for(&event, category.as_deref())
-            .map(|instances| instances.iter().any(|instance| instance.blocking));
-        let admission = self.db.admit_queue_script_event(context, false);
+        let cached_blocks = events
+            .iter()
+            .map(|event| {
+                self.db
+                    .cached_script_instances_for(event, category.as_deref())
+                    .map(|instances| instances.iter().any(|instance| instance.blocking))
+            })
+            .try_fold(false, |blocks, event| Some(blocks || event?));
+        let (own, generic) = self.db.admit_queue_script_events(context, false);
         if cached_blocks == Some(false) {
             return;
         }
@@ -151,18 +160,26 @@ impl Pipeline {
                 } else {
                     let lookup = db.clone();
                     tokio::task::spawn_blocking(move || {
-                        lookup
-                            .script_instances_for(&event, category.as_deref())
-                            .map(|instances| instances.iter().any(|instance| instance.blocking))
+                        events.iter().try_fold(false, |blocks, event| {
+                            Ok::<_, crate::StateError>(
+                                blocks
+                                    || lookup
+                                        .script_instances_for(event, category.as_deref())?
+                                        .iter()
+                                        .any(|instance| instance.blocking),
+                            )
+                        })
                     })
                     .await
                     .map_err(|error| crate::StateError::Database(error.to_string()))??
                 };
-                if let Some(run_id) = admission.await.map_err(|error| {
-                    crate::StateError::Database(format!("queue script admission lost: {error}"))
-                })?? && blocks
-                {
-                    wait_for_event(&db, &run_id).await?;
+                for admission in std::iter::once(own).chain(generic) {
+                    if let Some(run_id) = admission.await.map_err(|error| {
+                        crate::StateError::Database(format!("queue script admission lost: {error}"))
+                    })?? && blocks
+                    {
+                        wait_for_event(&db, &run_id).await?;
+                    }
                 }
                 Ok(())
             }
@@ -227,16 +244,21 @@ impl Pipeline {
         let Some(context) = self.queue_script_context(job_id, QueueEvent::NzbDownloaded) else {
             return false;
         };
-        let admission = self.db.admit_queue_script_event(context, true);
+        let (own, generic) = self.db.admit_queue_script_events(context, true);
         self.queue_script_waiters.insert(job_id);
         let db = self.db.clone();
         let sender = self.terminal_post_processing_done_tx.clone();
         tokio::spawn(async move {
             let result = async {
-                let run_id = admission.await.map_err(|error| {
+                let lost = |error: tokio::sync::oneshot::error::RecvError| {
                     crate::StateError::Database(format!("queue script admission lost: {error}"))
-                })??;
-                if run_id.is_some() {
+                };
+                let run_id = own.await.map_err(lost)??;
+                let generic_run = match generic {
+                    Some(generic) => generic.await.map_err(lost)??,
+                    None => None,
+                };
+                if run_id.is_some() || generic_run.is_some() {
                     sender
                         .send(TerminalPostProcessingEvent::QueueAdmitted(job_id))
                         .await
@@ -261,8 +283,9 @@ impl Pipeline {
             wait_for_event(db, run_id).await?;
         }
         // Admission has already applied NZB_DOWNLOADED supersession. Even
-        // without that subscriber, FILE_DOWNLOADED runs still own their
-        // captured working directory until they finish. Drain them before move.
+        // without that subscriber, JOB_DOWNLOADED and FILE_DOWNLOADED runs
+        // still own their captured working directory until they finish.
+        // Drain them before move.
         wait_for_job_events(db, job_id.0).await
     }
 

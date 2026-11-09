@@ -5,7 +5,9 @@ use super::*;
 use crate::post_processing::effects::JobScriptEffects;
 use crate::post_processing::events::EventContext;
 use crate::post_processing::instances::{InstanceTrigger, ScriptInstanceDraft};
-use crate::post_processing::model::{PostProcessingSettings, QueueEvent, ScriptName, ScriptStatus};
+use crate::post_processing::model::{
+    PostProcessingSettings, QueueEvent, ScriptEventLabel, ScriptName, ScriptStatus,
+};
 
 fn queue_instance(event: QueueEvent) -> ScriptInstanceDraft {
     ScriptInstanceDraft::new(
@@ -206,8 +208,8 @@ async fn a_late_queue_event_leaves_a_job_that_moved_on_alone() {
     assert!(!pipeline.queue_scripts_completed.contains(&job_id));
 }
 
-// An instance that blocks on a job's arrival keeps the job from downloading
-// until its run has ended.
+// An instance that blocks on a job's arrival, on NZB_ADDED or on JOB_ADDED,
+// keeps the job from downloading until its run has ended.
 #[tokio::test]
 async fn a_new_job_waits_for_the_instances_that_block_on_its_arrival() {
     let temp = tempfile::tempdir().unwrap();
@@ -249,10 +251,23 @@ async fn a_new_job_waits_for_the_instances_that_block_on_its_arrival() {
         JobStatus::Failed { .. }
     ));
 
-    let results = pipeline.db.event_script_results(job_id.0).unwrap();
-    assert_eq!(results.len(), 1, "{results:?}");
-    assert_eq!(results[0].status, ScriptStatus::Warning);
-    assert_eq!(results[0].instance_name.as_deref(), Some("queue.sh"));
+    let mut results = pipeline.db.event_script_results(job_id.0).unwrap();
+    results.sort_by_key(|result| result.event.to_string());
+    assert_eq!(
+        results
+            .iter()
+            .map(|result| result.event.clone())
+            .collect::<Vec<_>>(),
+        [
+            ScriptEventLabel::Queue(QueueEvent::JobAdded),
+            ScriptEventLabel::Queue(QueueEvent::NzbAdded),
+        ],
+        "{results:?}"
+    );
+    for result in &results {
+        assert_eq!(result.status, ScriptStatus::Warning);
+        assert_eq!(result.instance_name.as_deref(), Some("queue.sh"));
+    }
 
     // A second end for the same job changes nothing.
     pipeline.handle_added_scripts_done(job_id, Ok(()));
@@ -490,4 +505,62 @@ async fn a_health_failure_raises_the_jobs_deletion_for_health() {
             .await
             .is_empty()
     );
+}
+
+// The events queued for `job_id`, by name, in the order queued.
+fn job_events(db: &Database, job_id: JobId) -> Vec<String> {
+    let datastore = db.datastore();
+    db.run_sql_blocking_read(async move {
+        SqlRuntime::fetch_all(
+            datastore.read_exec(),
+            "SELECT event FROM script_event_queue WHERE job_id = {} ORDER BY seq",
+            &[SqlArg::I64(job_id.0 as i64)],
+        )
+        .await?
+        .iter()
+        .map(|row| row.text("event"))
+        .collect::<Result<Vec<_>, _>>()
+    })
+    .unwrap()
+}
+
+// An NZB job raises NZB_ADDED, NZB_DOWNLOADED and NZB_DELETED, each with its
+// JOB_ twin right after it and no TORRENT_ event. JOB_DOWNLOADED, queued
+// after NZB_DOWNLOADED, leaves it queued.
+#[tokio::test]
+async fn an_nzb_job_raises_its_nzb_events_and_their_job_twins() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    enable_queue_script(&pipeline.db, temp.path());
+    let (added, downloaded, deleted) = (JobId(9201), JobId(9202), JobId(9203));
+    for (job_id, name) in [
+        (added, "added"),
+        (downloaded, "downloaded"),
+        (deleted, "deleted"),
+    ] {
+        insert_active_job(&mut pipeline, job_id, standalone_job_spec(name, &[])).await;
+    }
+
+    pipeline.raise_added_script_event(added);
+    assert!(pipeline.queue_script_completion_gate(downloaded, true));
+    pipeline.raise_queue_script_event(deleted, QueueEvent::NzbDeleted, Some("MANUAL"));
+    pipeline.db.admitted_so_far().await;
+
+    assert_eq!(job_events(&pipeline.db, added), ["NZB_ADDED", "JOB_ADDED"]);
+    assert_eq!(
+        job_events(&pipeline.db, downloaded),
+        ["NZB_DOWNLOADED", "JOB_DOWNLOADED"]
+    );
+    assert_eq!(
+        job_events(&pipeline.db, deleted),
+        ["NZB_DELETED", "JOB_DELETED"]
+    );
+    let generic = pipeline.db.queued_script_events(QueueEvent::JobDeleted);
+    let generic = generic
+        .iter()
+        .find(|context| context.job_id == Some(deleted.0))
+        .unwrap();
+    assert_eq!(generic.env["NZBNA_EVENT"], "JOB_DELETED");
+    assert_eq!(generic.env["NZBNA_DELETESTATUS"], "MANUAL");
+    assert_eq!(generic.env["NZBNA_NZBNAME"], "deleted");
 }

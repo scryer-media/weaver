@@ -75,7 +75,8 @@ fn queue_priority_supersession_and_recovery_are_durable() {
     assert_eq!(db.claim_script_event().unwrap().unwrap().0, downloaded);
     db.finish_script_event(&downloaded).unwrap();
     assert_eq!(
-        db.downloaded_script_event(1).unwrap(),
+        db.downloaded_script_event(1, QueueEvent::NzbDownloaded)
+            .unwrap(),
         Some((downloaded, true))
     );
     assert_eq!(db.claim_script_event().unwrap().unwrap().0, added);
@@ -629,18 +630,26 @@ async fn admission_preserves_event_order_and_coalesces_pending_files() {
     let first = db.admit_queue_script_event(event(33, QueueEvent::FileDownloaded), false);
     let duplicate = db.admit_queue_script_event(event(33, QueueEvent::FileDownloaded), false);
     let marked = db.admit_queue_script_event(event(33, QueueEvent::NzbMarked), false);
-    let downloaded = db.admit_queue_script_event(event(33, QueueEvent::NzbDownloaded), true);
+    let (downloaded, generic) =
+        db.admit_queue_script_events(event(33, QueueEvent::NzbDownloaded), true);
+    // NZB_DOWNLOADED brings JOB_DOWNLOADED right after it.
     assert_eq!(
         db.script_runtime.admissions.lock().unwrap().pending.len(),
-        3
+        4
     );
     assert!(duplicate.await.unwrap().unwrap().is_none());
     drain_admissions(db.clone()).await;
     let first = first.await.unwrap().unwrap().unwrap();
     let marked = marked.await.unwrap().unwrap().unwrap();
     let downloaded = downloaded.await.unwrap().unwrap().unwrap();
+    let generic = generic.unwrap().await.unwrap().unwrap().unwrap();
     assert!(db.script_event_finished(&first).unwrap());
     assert!(db.script_event_finished(&marked).unwrap());
+    // JOB_DOWNLOADED, declared later, runs first; neither dropped the other.
+    let (claimed, context, _) = db.claim_script_event().unwrap().unwrap();
+    assert_eq!(claimed, generic);
+    assert_eq!(context.env["NZBNA_EVENT"], "JOB_DOWNLOADED");
+    db.finish_script_event(&generic).unwrap();
     assert_eq!(db.claim_script_event().unwrap().unwrap().0, downloaded);
 }
 
@@ -885,8 +894,9 @@ async fn the_queue_runs_a_route_down_that_belongs_to_no_job() {
 }
 
 // The queue worker skips the events of a job that is in no queue, except
-// the ones raised as or after a job leaves: NZB_DELETED, NZB_MARKED,
-// SEEDING_STOPPED and SEEDING_FINISHED.
+// the ones raised as or after a job leaves: NZB_DELETED, TORRENT_DELETED,
+// JOB_DELETED, NZB_MARKED, TORRENT_MARKED, SEEDING_STOPPED and
+// SEEDING_FINISHED.
 #[tokio::test]
 async fn the_queue_runs_only_leaving_events_of_a_job_in_no_queue() {
     let (db, data) = configured();
@@ -899,6 +909,13 @@ async fn the_queue_runs_only_leaving_events_of_a_job_in_no_queue() {
         (53, QueueEvent::NzbDeleted, true),
         (54, QueueEvent::NzbMarked, true),
         (55, QueueEvent::SeedingStopped, true),
+        (56, QueueEvent::TorrentAdded, false),
+        (57, QueueEvent::TorrentDownloaded, false),
+        (58, QueueEvent::TorrentDeleted, true),
+        (59, QueueEvent::TorrentMarked, true),
+        (60, QueueEvent::JobAdded, false),
+        (61, QueueEvent::JobDownloaded, false),
+        (62, QueueEvent::JobDeleted, true),
     ];
     for (job_id, kind, _) in cases {
         let mut context = event(job_id, kind);
@@ -923,4 +940,83 @@ async fn the_queue_runs_only_leaving_events_of_a_job_in_no_queue() {
             "{kind:?} of a job in no queue"
         );
     }
+}
+
+// A download's end drops its job's queued events but not the other names
+// of that end: JOB_DOWNLOADED queued after NZB_DOWNLOADED, or after
+// TORRENT_DOWNLOADED, leaves it queued.
+#[test]
+fn a_downloads_end_keeps_its_other_names_queued() {
+    let (db, _data) = configured();
+    for (job_id, own) in [
+        (70, QueueEvent::NzbDownloaded),
+        (71, QueueEvent::TorrentDownloaded),
+    ] {
+        let file = db
+            .enqueue_script_event(&event(job_id, QueueEvent::FileDownloaded), 1)
+            .unwrap()
+            .unwrap();
+        let own = db
+            .enqueue_script_event(&event(job_id, own), 2)
+            .unwrap()
+            .unwrap();
+        assert!(db.script_event_finished(&file).unwrap());
+        let generic = db
+            .enqueue_script_event(&event(job_id, QueueEvent::JobDownloaded), 3)
+            .unwrap()
+            .unwrap();
+        assert!(!db.script_event_finished(&own).unwrap());
+        assert!(!db.script_event_finished(&generic).unwrap());
+    }
+}
+
+// A torrent's history row marked raises TORRENT_MARKED, an NZB job's
+// NZB_MARKED, and neither raises the other.
+#[tokio::test]
+async fn a_mark_raises_the_marked_event_of_its_jobs_kind() {
+    let (db, _data) = configured();
+    for (job_id, protocol) in [
+        (80, crate::jobs::Protocol::Nzb),
+        (81, crate::jobs::Protocol::Torrent),
+    ] {
+        db.insert_job_history(&crate::JobHistoryRow {
+            job_id,
+            job_hash: None,
+            name: format!("marked-{job_id}"),
+            status: "complete".into(),
+            error_message: None,
+            total_bytes: 0,
+            downloaded_bytes: 0,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1000,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1,
+            completed_at: 2,
+            metadata: None,
+            server_attribution: None,
+            protocol,
+        })
+        .unwrap();
+        crate::post_processing::hooks::mark_history(
+            &db,
+            crate::JobId(job_id),
+            crate::history::NzbgetMarkStatus::Success,
+        )
+        .unwrap();
+    }
+    let jobs = |event| {
+        db.queued_script_events(event)
+            .iter()
+            .map(|context| context.job_id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(jobs(QueueEvent::NzbMarked), [Some(80)]);
+    assert_eq!(jobs(QueueEvent::TorrentMarked), [Some(81)]);
+    let marked = db.queued_script_events(QueueEvent::TorrentMarked);
+    assert_eq!(marked[0].env["NZBNA_EVENT"], "TORRENT_MARKED");
+    assert_eq!(marked[0].env["NZBNA_MARKSTATUS"], "SUCCESS");
 }
