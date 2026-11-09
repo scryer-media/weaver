@@ -898,8 +898,10 @@ impl super::Zip {
         }
         // Bytes said already are tried on a copy of the keys: what they
         // decrypt to replaces nothing until the suffix after them is
-        // replayed through the new feedback.
-        let trial = coverage.covered(range);
+        // replayed through the new feedback. A part that runs on past what
+        // was said is tried on what was said of it.
+        let trial = coverage.overlapping(range).next().is_some();
+        let mut heard = range.start;
         // The delivery's own provenance, not the chain's: a repair waits
         // as what it is, whatever damage stood before it.
         let source = provenance;
@@ -912,8 +914,17 @@ impl super::Zip {
         // The prefix before the change cannot change: the replay starts
         // at it, and runs to the member's end, as far as anything came.
         if trial {
-            let mut previous = Vec::new();
-            if plain(range, &mut previous) && previous != decrypted.plain {
+            let said: Vec<ByteRange> = coverage
+                .overlapping(range)
+                .filter_map(|run| run.range.intersect(range))
+                .collect();
+            let changed = said.into_iter().any(|said| {
+                let mut previous = Vec::new();
+                let from = (said.start - range.start) as usize;
+                plain(said, &mut previous)
+                    && previous[..] != decrypted.plain[from..from + said.len() as usize]
+            });
+            if changed {
                 cipher.changed();
                 cipher.pending.push((range, input.into_owned(), source));
                 let data = entry.data.unwrap();
@@ -943,6 +954,21 @@ impl super::Zip {
                         .map(|(volume, range)| Emit::Again { volume, range }),
                 );
                 return;
+            }
+            // What was said of its front, as it was, is not said again:
+            // the keys go on through all of it, and only the rest is heard,
+            // from where the said bytes end.
+            let mut said_end = range.start;
+            let mut same = true;
+            for run in coverage.overlapping(range) {
+                if run.range.start > said_end {
+                    break;
+                }
+                same &= run.provenance == source;
+                said_end = run.range.end.min(range.end);
+            }
+            if same && said_end < range.end {
+                heard = said_end;
             }
         }
         if offset <= cipher.proof.len() as u64 && offset < 32 {
@@ -977,7 +1003,22 @@ impl super::Zip {
             })
             .collect();
         entry.cipher = Some(cipher);
-        self.record(member, offset, Evidenced::from(bytes), provenance, out);
+        // The front stands for itself in the member's CRC, so the rest
+        // supersedes nothing it does not say again.
+        if heard > offset {
+            let front = &bytes[..(heard - offset) as usize];
+            self.grid.offer(
+                member,
+                crate::grid::WHOLE,
+                &weaver_graph::Segment {
+                    range: ByteRange::new(offset, heard),
+                    crc32: crate::grid::crc32(front),
+                    verified: provenance.is_verified(),
+                },
+            );
+        }
+        let bytes = Evidenced::from(bytes).slice((heard - offset) as usize..);
+        self.record(member, heard, bytes, provenance, out);
     }
 }
 

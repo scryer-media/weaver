@@ -217,7 +217,7 @@ impl Rig {
     }
 }
 
-fn holds(path: &Path, want: &[u8]) -> bool {
+pub(in crate::pipeline::graph::job) fn holds(path: &Path, want: &[u8]) -> bool {
     std::fs::read_dir(path).unwrap().any(|entry| {
         let path = entry.unwrap().path();
         if path.is_dir() {

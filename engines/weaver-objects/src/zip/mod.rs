@@ -41,7 +41,34 @@ pub mod counting {
     thread_local! {
         static DELIVERED: Cell<u64> = const { Cell::new(0) };
         static DECIPHERED: Cell<u64> = const { Cell::new(0) };
+        // The most ciphertext a zip held for its keys on this thread.
+        static QUEUED_MOST: Cell<u64> = const { Cell::new(0) };
+        // A smaller cap on what a zip holds for its keys, for a fixture
+        // smaller than the real one.
+        static CAP: Cell<Option<u64>> = const { Cell::new(None) };
     }
+
+    pub(super) fn queued(total: u64) {
+        QUEUED_MOST.with(|most| most.set(most.get().max(total)));
+    }
+
+    pub fn queued_most_here() -> u64 {
+        QUEUED_MOST.with(Cell::get)
+    }
+
+    pub(super) fn cap() -> Option<u64> {
+        CAP.with(Cell::get)
+    }
+
+    // Cap what a zip holds for its keys on this thread at `cap` bytes, the
+    // most held so far forgotten.
+    pub fn cap_here(cap: u64) {
+        CAP.with(|here| here.set(Some(cap)));
+        QUEUED_MOST.with(|most| most.set(0));
+    }
+
+    // The cap a zip holds its keys' ciphertext to, as built.
+    pub const CAP_BUILT: u64 = super::held::CAP;
     static DECIPHERED_EVERYWHERE: AtomicU64 = AtomicU64::new(0);
 
     pub(super) fn delivered(len: usize) {
@@ -741,7 +768,14 @@ impl Object for Zip {
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
-        if !self.gone {
+        // A length heard again, with no map waiting to take over, changes
+        // nothing what is held rests on: it waits for the pool.
+        let news = self.next.is_some()
+            || match self.disk(volume) {
+                Some(disk) => !self.geometry.knows(disk, length),
+                None => self.last_length != Some(length),
+            };
+        if !self.gone && news {
             self.run_held_first(out);
             self.install(out);
         }

@@ -200,6 +200,148 @@ fn articles_in_order_wait_for_the_loan_and_are_deciphered_away_from_the_loop() {
     );
 }
 
+// What the object holds for its keys is capped at 64 MiB as built.
+#[test]
+fn the_ciphertext_held_for_the_keys_is_capped_at_64_mib() {
+    assert_eq!(super::super::counting::CAP_BUILT, 64 * 1024 * 1024);
+}
+
+// The cap the fixtures below run under: two of their articles' ciphertext,
+// not three.
+const SMALL_CAP: u64 = 70_000;
+
+// An entry of eight articles, each about 30 KB of ciphertext, in an owner
+// that lends nothing until told, the cap at `SMALL_CAP`.
+fn capped(seed: u64) -> (Vec<u8>, Vec<u8>, u64, Owner) {
+    super::super::counting::cap_here(SMALL_CAP);
+    let plain = payload(seed, 240_017);
+    let archive = encrypted(&plain);
+    let start = records::local_len(&archive).unwrap() + super::super::crypto::HEADER;
+    let mut owner = Owner::single(Zip::new(), archive.clone());
+    owner.lend_late = true;
+    offer(&mut owner, PASSWORD);
+    (plain, archive, start, owner)
+}
+
+// The article `index` of eight.
+fn article(archive: &[u8], index: u64) -> ByteRange {
+    let length = archive.len() as u64;
+    let article = length.div_ceil(8);
+    ByteRange::new(index * article, ((index + 1) * article).min(length))
+}
+
+// The keys run over what is held, and what the owner holds comes back as
+// the object places it, until nothing is due; then the volume closes.
+fn drain(owner: &mut Owner) {
+    while owner.object.work_due() {
+        owner.work();
+        owner.settle();
+    }
+    owner.close(0);
+}
+
+fn assert_whole(owner: &Owner, plain: &[u8], archive: &[u8]) {
+    let got = owner.member("alpha.bin");
+    assert!(
+        got.bytes == plain,
+        "len={} said={:?}",
+        got.bytes.len(),
+        owner.said
+    );
+    // A cipher member closes only on its CRC intact.
+    assert!(got.closed, "{:?}", owner.said);
+    assert!(
+        !owner
+            .said
+            .iter()
+            .any(|emit| matches!(emit, Emit::Damaged { .. })),
+        "{:?}",
+        owner.said
+    );
+    assert!(owner.posted(0).as_deref() == Some(archive));
+    assert!(super::super::counting::queued_most_here() <= SMALL_CAP);
+}
+
+// In order, with the keys never run: the object holds no more than the cap
+// for them, deciphers nothing as the articles come, and places the rest of
+// the ciphertext as its owner's to hold. Run, the keys reach what the owner
+// held, which comes back and is deciphered in order, CRC intact.
+#[test]
+fn ciphertext_past_the_cap_waits_with_its_owner_and_comes_back_in_order() {
+    use super::super::counting;
+    let (plain, archive, start, mut owner) = capped(96);
+    let deciphered = counting::deciphered_here();
+    for index in 0..8 {
+        owner.deliver(0, article(&archive, index));
+    }
+    assert_eq!(
+        counting::deciphered_here(),
+        deciphered,
+        "deciphered on the loop"
+    );
+    assert!(owner.object.work_due());
+    let queued = owner.object.queued();
+    assert!(queued > 0 && queued <= SMALL_CAP, "{queued}");
+    assert!(counting::queued_most_here() <= SMALL_CAP);
+    // Every byte of the member past what is held for the keys is its
+    // owner's: none is placed in the member.
+    let mut placements = Vec::new();
+    owner.object.locate(
+        VolumeIndex(0),
+        ByteRange::new(start + queued, start + plain.len() as u64),
+        &mut placements,
+    );
+    assert!(
+        placements
+            .iter()
+            .all(|placement| !matches!(placement, weaver_graph::Placement::Member { .. })),
+        "{placements:?}"
+    );
+    assert!(owner.held_bytes() > 0);
+    drain(&mut owner);
+    assert_whole(&owner, &plain, &archive);
+}
+
+// An article that comes before the one ahead of it, past the cap, waits
+// with its owner too, and the member still comes in order.
+#[test]
+fn a_wrong_order_arrival_past_the_cap_deciphers_in_order() {
+    let (plain, archive, _, mut owner) = capped(97);
+    let deciphered = super::super::counting::deciphered_here();
+    for index in [0, 1, 3, 2, 4, 6, 5, 7] {
+        owner.deliver(0, article(&archive, index));
+    }
+    assert_eq!(super::super::counting::deciphered_here(), deciphered);
+    drain(&mut owner);
+    assert_whole(&owner, &plain, &archive);
+}
+
+// The second article arrived damaged and was held for the keys; the ones
+// after it parked at the cap. The keys run over what was held, and before
+// the owner hands anything back a repair arrives from inside the second
+// article across into the parked third: it is heard at once, what the
+// owner held of it is the repair's now, and the member comes whole.
+#[test]
+fn a_repair_across_the_cap_boundary_deciphers_correctly() {
+    let (plain, archive, _, mut owner) = capped(98);
+    let second = article(&archive, 1);
+    let mut damaged = archive[second.start as usize..second.end as usize].to_vec();
+    damaged[1000] ^= 0x5a;
+    owner.deliver(0, article(&archive, 0));
+    owner.deliver_as(0, second, Provenance::Damaged, Some(&damaged));
+    for index in 2..8 {
+        owner.deliver(0, article(&archive, index));
+    }
+    assert!(owner.object.queued() > 0);
+    owner.work();
+    assert_eq!(owner.object.queued(), 0);
+    let third = article(&archive, 2);
+    let across = ByteRange::new(second.start, third.start + third.len() / 2);
+    owner.deliver_as(0, across, Provenance::Repaired, None);
+    drain(&mut owner);
+    assert_whole(&owner, &plain, &archive);
+}
+
 // Facts holding ciphertext for a member the map does not give, or past its
 // entry's end, are facts no object could have written.
 #[test]
