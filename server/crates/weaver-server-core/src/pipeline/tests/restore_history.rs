@@ -89,9 +89,13 @@ async fn delete_history_with_files_removes_a_failed_job_s_whole_working_dir() {
     let job_id = JobId(30027);
     let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);
     tokio::fs::create_dir_all(&staging).await.unwrap();
-    tokio::fs::write(staging.join("lantern.mkv"), b"staged").await.unwrap();
+    tokio::fs::write(staging.join("lantern.mkv"), b"staged")
+        .await
+        .unwrap();
     let output_dir = intermediate_dir.join("history-failed-volumes-job");
-    tokio::fs::create_dir_all(output_dir.join("Sample")).await.unwrap();
+    tokio::fs::create_dir_all(output_dir.join("Sample"))
+        .await
+        .unwrap();
     crate::jobs::working_dir::mark_weaver_owned_working_dir(&intermediate_dir, &output_dir, job_id)
         .unwrap();
     for name in [
@@ -101,7 +105,9 @@ async fn delete_history_with_files_removes_a_failed_job_s_whole_working_dir() {
         "lantern.par2",
         "Sample/lantern-sample.mkv",
     ] {
-        tokio::fs::write(output_dir.join(name), b"kept").await.unwrap();
+        tokio::fs::write(output_dir.join(name), b"kept")
+            .await
+            .unwrap();
     }
     pipeline
         .db
@@ -116,7 +122,13 @@ async fn delete_history_with_files_removes_a_failed_job_s_whole_working_dir() {
     let outcome = delete_history_batch(&mut pipeline, &[job_id], true).await;
 
     assert!(outcome.refused.is_empty());
-    assert!(outcome.deleted[&job_id].as_ref().unwrap().left_in_place.is_empty());
+    assert!(
+        outcome.deleted[&job_id]
+            .as_ref()
+            .unwrap()
+            .left_in_place
+            .is_empty()
+    );
     assert!(!output_dir.exists());
     assert!(!staging.exists());
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
@@ -158,15 +170,22 @@ fn after_every_marker() -> std::time::SystemTime {
 #[tokio::test]
 async fn housekeeping_removes_an_old_failed_job_s_files_and_keeps_its_record() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let (pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30041);
     let output_dir = marked_working_dir(&intermediate_dir, "housekeeping-failed", job_id).await;
     let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);
     tokio::fs::create_dir_all(&staging).await.unwrap();
-    tokio::fs::write(staging.join("lantern.mkv"), b"staged").await.unwrap();
+    tokio::fs::write(staging.join("lantern.mkv"), b"staged")
+        .await
+        .unwrap();
     pipeline
         .db
-        .insert_job_history(&history_row_finished_at(job_id, "failed", output_dir.clone(), 100))
+        .insert_job_history(&history_row_finished_at(
+            job_id,
+            "failed",
+            output_dir.clone(),
+            100,
+        ))
         .unwrap();
     pipeline.report_all_for_test();
 
@@ -187,14 +206,19 @@ async fn housekeeping_removes_an_old_failed_job_s_files_and_keeps_its_record() {
 #[tokio::test]
 async fn housekeeping_with_the_setting_off_leaves_a_failed_job_s_files() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let (pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30042);
     let output_dir = marked_working_dir(&intermediate_dir, "housekeeping-off", job_id).await;
     let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);
     tokio::fs::create_dir_all(&staging).await.unwrap();
     pipeline
         .db
-        .insert_job_history(&history_row_finished_at(job_id, "failed", output_dir.clone(), 2))
+        .insert_job_history(&history_row_finished_at(
+            job_id,
+            "failed",
+            output_dir.clone(),
+            2,
+        ))
         .unwrap();
     pipeline.report_all_for_test();
 
@@ -224,19 +248,23 @@ async fn housekeeping_takes_only_what_an_old_failure_or_a_rowless_marker_account
     let partial = JobId(30044);
     let partial_dir = marked_working_dir(&intermediate_dir, "housekeeping-partial", partial).await;
     let complete = JobId(30045);
-    let complete_dir = marked_working_dir(&intermediate_dir, "housekeeping-complete", complete).await;
+    let complete_dir =
+        marked_working_dir(&intermediate_dir, "housekeeping-complete", complete).await;
     // A failed job's record names a directory another recorded job's marker owns.
     let foreign = JobId(30046);
     let foreign_dir = complete_dir.clone();
     // A failed job's marker stopped matching once its directory was renamed.
     let moved = JobId(30047);
-    let before_move = marked_working_dir(&intermediate_dir, "housekeeping-before-move", moved).await;
+    let before_move =
+        marked_working_dir(&intermediate_dir, "housekeeping-before-move", moved).await;
     let moved_dir = intermediate_dir.join("housekeeping-moved");
     tokio::fs::rename(&before_move, &moved_dir).await.unwrap();
     // No row and no marker.
     let unmarked_dir = intermediate_dir.join("housekeeping-unmarked");
     tokio::fs::create_dir_all(&unmarked_dir).await.unwrap();
-    tokio::fs::write(unmarked_dir.join("user.mkv"), b"theirs").await.unwrap();
+    tokio::fs::write(unmarked_dir.join("user.mkv"), b"theirs")
+        .await
+        .unwrap();
     // A marker whose job has no row.
     let rowless = JobId(30048);
     let rowless_dir = marked_working_dir(&intermediate_dir, "housekeeping-rowless", rowless).await;
@@ -306,9 +334,13 @@ async fn housekeeping_takes_only_what_an_old_failure_or_a_rowless_marker_account
 #[tokio::test]
 async fn housekeeping_leaves_a_rowless_marker_younger_than_the_cutoff() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
-    let rowless_dir =
-        marked_working_dir(&intermediate_dir, "housekeeping-young-rowless", JobId(30050)).await;
+    let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let rowless_dir = marked_working_dir(
+        &intermediate_dir,
+        "housekeeping-young-rowless",
+        JobId(30050),
+    )
+    .await;
     pipeline.report_all_for_test();
 
     pipeline

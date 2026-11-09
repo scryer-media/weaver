@@ -385,8 +385,7 @@ where
     let returned = staging.map_or(Ok(()), |staging| {
         return_staged_delivery_using(staging, working_dir, move_entry)
     });
-    let released =
-        crate::jobs::working_dir::release_failed_working_dir(root, working_dir, job_id);
+    let released = crate::jobs::working_dir::release_failed_working_dir(root, working_dir, job_id);
     returned.and(released)
 }
 

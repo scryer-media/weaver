@@ -144,7 +144,6 @@ impl GraphJob {
                                 );
                             }
                             Err(range) => {
-                                drop(placing);
                                 self.unread(node, volume, range, limit)?;
                             }
                         }

@@ -285,7 +285,11 @@ fn held_to_the_end(kind: Kind, shape: Shape, serve: Serve) {
 // goes out, though work is due. Once a slot opens, the gate lends it.
 #[test]
 fn nothing_is_lent_without_a_slot_and_the_due_work_goes_out_once_one_opens() {
-    let mut rig = Rig::new(posts(Kind::ZipCryptoSized, Shape::Flat), &[SECRET], Mode::Held);
+    let mut rig = Rig::new(
+        posts(Kind::ZipCryptoSized, Shape::Flat),
+        &[SECRET],
+        Mode::Held,
+    );
     for (volume, ordinal) in rig.articles(Serve::InOrder) {
         let (offset, bytes, length) = rig.bytes((volume, ordinal));
         rig.job
@@ -361,7 +365,12 @@ fn sent_back(kind: Kind, shape: Shape, serve: Serve, mode: Mode, at: At, lag: us
 // The bad copy is sent back once two more articles are in and a loan is
 // out; a post whose object lends nothing before its last article is sent
 // back after it, with the loan out. `then` is what follows the send-back.
-fn send_back_with_a_loan_out(kind: Kind, shape: Shape, serve: Serve, then: fn(&mut Rig, (u32, u32))) -> Rig {
+fn send_back_with_a_loan_out(
+    kind: Kind,
+    shape: Shape,
+    serve: Serve,
+    then: fn(&mut Rig, (u32, u32)),
+) -> Rig {
     let mut rig = Rig::new(posts(kind, shape), &[SECRET], Mode::Held);
     let articles = rig.articles(serve);
     let bad = articles.len() / 2;
@@ -439,8 +448,7 @@ macro_rules! rows {
 
 use At::{First, Late, Middle};
 use Kind::{
-    Rar4, Rar5, Rar5Sealed, SevenZipAes, ZipCryptoDescriptor as Described,
-    ZipCryptoSized as Sized,
+    Rar4, Rar5, Rar5Sealed, SevenZipAes, ZipCryptoDescriptor as Described, ZipCryptoSized as Sized,
 };
 use Mode::{Held, Inline};
 use Serve::{Backwards, InOrder, TailFirst};

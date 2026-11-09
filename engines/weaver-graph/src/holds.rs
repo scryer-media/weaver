@@ -173,7 +173,12 @@ impl HoldsAccountant {
 
     // How far a budget stands, as (held, limit): what a spill past it
     // reports. The disk reserve stands as the free space against it.
-    pub fn standing(&self, namespace: HoldsNamespace, budget: Budget, free_disk: u64) -> (u64, u64) {
+    pub fn standing(
+        &self,
+        namespace: HoldsNamespace,
+        budget: Budget,
+        free_disk: u64,
+    ) -> (u64, u64) {
         let accounts = self.lock();
         let budgets = accounts.budgets;
         match budget {
@@ -1367,7 +1372,10 @@ mod tests {
         assert_eq!(outcome.placed, Placed::Spilled(Budget::DiskReserve));
         assert_eq!(outcome.page_outs.len(), 1);
         assert_eq!(outcome.page_outs[0].volume, VolumeIndex(0));
-        assert_eq!(ledger.spilled_holds(), vec![(VolumeIndex(2), ByteRange::new(0, 8))]);
+        assert_eq!(
+            ledger.spilled_holds(),
+            vec![(VolumeIndex(2), ByteRange::new(0, 8))]
+        );
         ledger.discard();
         assert_idle(&accountant);
     }
@@ -1591,7 +1599,10 @@ mod tests {
                 bytes: bytes(1, 4),
             }]
         );
-        assert_eq!(ledger.spilled_holds(), vec![(VolumeIndex(0), ByteRange::new(0, 4))]);
+        assert_eq!(
+            ledger.spilled_holds(),
+            vec![(VolumeIndex(0), ByteRange::new(0, 4))]
+        );
         assert_eq!(ledger.resident_bytes(), 6);
         assert_eq!(
             accountant.namespace_usage(NS),

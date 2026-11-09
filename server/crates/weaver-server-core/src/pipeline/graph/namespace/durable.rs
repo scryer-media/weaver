@@ -80,14 +80,18 @@ impl NamespaceWriter {
         let Some(files) = self.files.get(&node) else {
             return Vec::new();
         };
-        let spilled = files.holds.spilled_holds().into_iter().map(|(volume, range)| {
-            let held = ScratchHold {
-                volume,
-                range,
-                scratch_offset: range.start,
-            };
-            (held, true)
-        });
+        let spilled = files
+            .holds
+            .spilled_holds()
+            .into_iter()
+            .map(|(volume, range)| {
+                let held = ScratchHold {
+                    volume,
+                    range,
+                    scratch_offset: range.start,
+                };
+                (held, true)
+            });
         files
             .holds
             .scratch_holds()
@@ -253,7 +257,11 @@ impl NamespaceWriter {
     ) -> Result<bool, WriteError> {
         let len = held.range.len();
         let reserve = self.accountant.budgets().disk_reserve;
-        if reserve != 0 && reserve.checked_add(len).is_none_or(|needed| needed > free_disk) {
+        if reserve != 0
+            && reserve
+                .checked_add(len)
+                .is_none_or(|needed| needed > free_disk)
+        {
             return Ok(false);
         }
         let member = super::held_member(held.volume);
@@ -273,7 +281,11 @@ impl NamespaceWriter {
     // The member's spill file as a checkpoint left it, opened where it lies
     // and never emptied.
     fn adopt_spill(&mut self, node: NodeId, member: MemberId) -> Result<(), WriteError> {
-        if self.files.get(&node).is_some_and(|files| files.spills.contains_key(&member)) {
+        if self
+            .files
+            .get(&node)
+            .is_some_and(|files| files.spills.contains_key(&member))
+        {
             return Ok(());
         }
         let spill = Leaf::found(&self.working_dir, &super::spill_name(node, member))?;

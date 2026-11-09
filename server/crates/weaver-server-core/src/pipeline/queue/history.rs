@@ -452,10 +452,7 @@ impl Queue {
     // is written, so a younger marker may be a job still being admitted. A
     // job the queue or a history operation holds, or whose scripts still
     // run, is left, as is a directory that cannot be removed.
-    async fn sweep_unrecorded_working_dirs(
-        self: Arc<Self>,
-        marked_before: std::time::SystemTime,
-    ) {
+    async fn sweep_unrecorded_working_dirs(self: Arc<Self>, marked_before: std::time::SystemTime) {
         let Some(resources) = self.resources.get().cloned() else {
             return;
         };

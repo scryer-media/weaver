@@ -9,10 +9,10 @@ use std::time::{Duration, SystemTime};
 
 use crate::Database;
 use crate::SchedulerHandle;
-use crate::settings::SharedConfig;
 use crate::persistence::maintenance::DbMaintenanceOptions;
 use crate::persistence::sql_runtime::SqlEngine;
 use crate::runtime::StartupDiskGate;
+use crate::settings::SharedConfig;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const STALE_STAGING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -114,7 +114,9 @@ async fn run_maintenance_pass(db: Database, complete_dir: PathBuf) {
 async fn run_job_files_sweep(handle: &SchedulerHandle, config: &SharedConfig) {
     let now = SystemTime::now();
     let delete_failed = config.read().await.delete_failed_job_files();
-    let cutoff = now.checked_sub(STALE_STAGING_TTL).unwrap_or(SystemTime::UNIX_EPOCH);
+    let cutoff = now
+        .checked_sub(STALE_STAGING_TTL)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
     let failed_finished_by = delete_failed.then(|| {
         cutoff
             .duration_since(SystemTime::UNIX_EPOCH)

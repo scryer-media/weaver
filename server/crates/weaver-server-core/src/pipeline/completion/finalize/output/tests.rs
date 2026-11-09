@@ -725,7 +725,11 @@ fn a_failed_return_still_releases_the_working_directory_and_keeps_the_rest_stage
     std::fs::create_dir_all(working.join(weaver_graph::names::CACHE_DIR)).unwrap();
     std::fs::create_dir_all(&staging).unwrap();
     crate::jobs::working_dir::mark_weaver_owned_working_dir(&root, &working, JobId(31)).unwrap();
-    std::fs::write(working.join(weaver_graph::names::INTERNAL_DIR).join("0"), b"chunk").unwrap();
+    std::fs::write(
+        working.join(weaver_graph::names::INTERNAL_DIR).join("0"),
+        b"chunk",
+    )
+    .unwrap();
     std::fs::write(staging.join(WORKING_DIR_MARKER), b"staging marker").unwrap();
     std::fs::write(staging.join("a.mkv"), b"first").unwrap();
     std::fs::write(staging.join("b.mkv"), b"second").unwrap();
@@ -752,12 +756,18 @@ fn a_failed_return_still_releases_the_working_directory_and_keeps_the_rest_stage
 
     assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
     let returned = moved.into_inner().pop().unwrap();
-    let kept = if returned == "a.mkv" { "b.mkv" } else { "a.mkv" };
+    let kept = if returned == "a.mkv" {
+        "b.mkv"
+    } else {
+        "a.mkv"
+    };
     assert!(working.join(&returned).is_file());
     assert!(!staging.join(&returned).exists());
     assert!(staging.join(kept).is_file());
     assert!(!working.join(kept).exists());
     assert!(!working.join(weaver_graph::names::INTERNAL_DIR).exists());
     assert!(!working.join(weaver_graph::names::CACHE_DIR).exists());
-    assert!(crate::jobs::working_dir::is_weaver_owned_working_dir(&working));
+    assert!(crate::jobs::working_dir::is_weaver_owned_working_dir(
+        &working
+    ));
 }

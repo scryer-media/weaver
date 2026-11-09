@@ -1618,10 +1618,10 @@ impl NamespaceWriter {
     fn spill_file(&mut self, node: NodeId, member: MemberId) -> Result<&mut Leaf, WriteError> {
         let dir = self.working_dir.clone();
         let files = self.files_mut(node);
-        if !files.spills.contains_key(&member) {
+        if let std::collections::btree_map::Entry::Vacant(vacant) = files.spills.entry(member) {
             let mut spill = Leaf::at(&dir, &spill_name(node, member));
             spill.truncate()?;
-            files.spills.insert(member, spill);
+            vacant.insert(spill);
             files.spills_empty.insert(member);
         }
         Ok(files.spills.get_mut(&member).expect("opened above"))
@@ -1976,8 +1976,7 @@ impl NamespaceWriter {
                 }
                 Location::Spilled => {
                     #[cfg(test)]
-                    tests::SPILL_READ_MOST
-                        .with(|most| most.set(most.get().max(piece.range.len())));
+                    tests::SPILL_READ_MOST.with(|most| most.set(most.get().max(piece.range.len())));
                     let mut buffer = Vec::new();
                     self.spill_file(node, member)?.read(
                         piece.range.start,

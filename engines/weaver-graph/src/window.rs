@@ -10,14 +10,14 @@
 
 use std::io;
 
-// Memory lent to one decoder for one window.
-//
-// # Safety
-//
-// An implementor promises that `as_mut_ptr` points at no fewer than `len`
-// writable bytes, that the address stays the same until the value is
-// dropped, and that nothing else reads or writes those bytes while the value
-// lives. The bytes need not be zeroed. Dropping the value releases them.
+/// Memory lent to one decoder for one window.
+///
+/// # Safety
+///
+/// An implementor promises that `as_mut_ptr` points at no fewer than `len`
+/// writable bytes, that the address stays the same until the value is
+/// dropped, and that nothing else reads or writes those bytes while the value
+/// lives. The bytes need not be zeroed. Dropping the value releases them.
 pub unsafe trait WindowMemory: Send + Sync {
     fn as_mut_ptr(&mut self) -> *mut u8;
     fn len(&self) -> usize;

@@ -36,13 +36,10 @@ impl std::fmt::Debug for Rewalked {
         f.debug_struct("Rewalked")
             .field(
                 "piece",
-                &self
-                    .piece
-                    .as_ref()
-                    .map(|(volume, piece)| match piece {
-                        Ok(posted) => (volume, posted.offset, Some(posted.bytes.len())),
-                        Err(range) => (volume, range.start, None),
-                    }),
+                &self.piece.as_ref().map(|(volume, piece)| match piece {
+                    Ok(posted) => (volume, posted.offset, Some(posted.bytes.len())),
+                    Err(range) => (volume, range.start, None),
+                }),
             )
             .field("whole", &self.whole)
             .finish()

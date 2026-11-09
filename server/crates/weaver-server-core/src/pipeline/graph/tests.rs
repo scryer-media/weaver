@@ -327,13 +327,16 @@ async fn a_failed_release_starts_with_no_graph_handle_open() {
 
     let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
     let heard = seen.clone();
-    *crate::pipeline::health::BEFORE_FAILED_RELEASE.lock().unwrap() =
-        Some(Box::new(move |dir: &std::path::Path, graph: Option<&job::GraphJob>| {
+    *crate::pipeline::health::BEFORE_FAILED_RELEASE
+        .lock()
+        .unwrap() = Some(Box::new(
+        move |dir: &std::path::Path, graph: Option<&job::GraphJob>| {
             *heard.lock().unwrap() = Some((
                 dir.to_path_buf(),
                 graph.map(|graph| graph.writer().open_files()),
             ));
-        }));
+        },
+    ));
     pipeline.fail_job(job_id, "the post failed it".to_string());
     let (dir, open) = seen
         .lock()

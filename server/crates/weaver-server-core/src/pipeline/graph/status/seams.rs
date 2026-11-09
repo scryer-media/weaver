@@ -93,7 +93,10 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     // its files and waits for the operator, as an unwritable checkpoint
     // does, and its resume reads the policy again.
     if let (Step::Deliver, Err(error)) = (&step, unread) {
-        pipeline.hold_graph_job_on_host_error(job_id, format!("{error}. Resolve the database error and resume to retry; files are retained."));
+        pipeline.hold_graph_job_on_host_error(
+            job_id,
+            format!("{error}. Resolve the database error and resume to retry; files are retained."),
+        );
         return;
     }
     settle(pipeline, job_id, step).await;

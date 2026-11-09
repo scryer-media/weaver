@@ -78,12 +78,7 @@ async fn a_scrambled_stored_set_whose_holds_run_out_delivers_its_member() {
     let body = payload(8 * 3 * FRAME + 13, 77);
     let scenario = scrambled_store_set(&body, 8).holds(TIGHT);
     let graph = run(&scenario).await;
-    assert!(
-        graph.completed(),
-        "{:?} {:?}",
-        graph.status,
-        graph.failure
-    );
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     let delivered = format!("lantern beacon/{MEMBER}");
     assert_eq!(
         graph.files.keys().cloned().collect::<Vec<_>>(),
@@ -116,7 +111,12 @@ async fn a_set_renamed_as_it_arrives_is_one_store() {
     let body = payload(8 * 3 * FRAME + 13, 77);
     let graph = run(&scrambled_store_set(&body, 8)).await;
     assert!(graph.completed(), "{:?}", graph.failure);
-    assert_eq!(store_nodes(&lines).len(), 1, "{:?}", lines.of("object bound"));
+    assert_eq!(
+        store_nodes(&lines).len(),
+        1,
+        "{:?}",
+        lines.of("object bound")
+    );
 }
 
 // Room for nothing much: a few articles in memory, as many on scratch. A
@@ -172,7 +172,10 @@ fn sevenz() -> Vec<Post> {
 }
 
 fn zip() -> Vec<Post> {
-    vec![Post::plain("silver.horizon.zip", stored_zip(MEMBER, &body()))]
+    vec![Post::plain(
+        "silver.horizon.zip",
+        stored_zip(MEMBER, &body()),
+    )]
 }
 
 fn nested() -> Vec<Post> {
@@ -245,7 +248,7 @@ const KINDS: &[Kind] = &[
 
 #[derive(Clone, Copy, Debug)]
 enum Order {
-    InOrder,
+    Forwards,
     Backwards,
     // The first volume's articles after every other volume's, or a lone
     // volume's front after the rest of it.
@@ -257,7 +260,7 @@ fn scenario(kind: &Kind, order: Order, budgets: HoldBudgets) -> Scenario {
         .framed(kind.article)
         .holds(budgets);
     match order {
-        Order::InOrder => scenario,
+        Order::Forwards => scenario,
         Order::Backwards => scenario.backwards(),
         Order::FirstVolumeLast if kind.volumes.len() == 1 => scenario.reversed(kind.volumes),
         Order::FirstVolumeLast => {
@@ -277,11 +280,9 @@ fn holds_files_left(root: &Path) -> Vec<String> {
             let path = entry.path();
             if path.is_dir() {
                 dirs.push(path);
-            } else if entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with("graph-holds-") || name.starts_with("graph-spill-"))
-            {
+            } else if entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with("graph-holds-") || name.starts_with("graph-spill-")
+            }) {
                 left.push(path.display().to_string());
             }
         }
@@ -305,7 +306,7 @@ async fn outcome(scenario: &Scenario) -> (Outcome, Vec<String>) {
 #[tokio::test]
 async fn every_kind_in_every_order_ends_under_tight_holds_as_under_unlimited_ones() {
     for kind in KINDS {
-        for order in [Order::InOrder, Order::Backwards, Order::FirstVolumeLast] {
+        for order in [Order::Forwards, Order::Backwards, Order::FirstVolumeLast] {
             let cell = format!("{} {order:?}", kind.name);
             let (unlimited, _) = outcome(&scenario(kind, order, UNLIMITED)).await;
             assert!(
@@ -424,7 +425,10 @@ async fn a_set_whose_holds_spilled_restarts_and_completes_from_them() {
     assert_eq!(restarted.restarts, 1);
     let (spilled, on_scratch, on_file) = at_shutdown.expect("the shutdown's checkpoint");
     assert!(spilled, "holds spilled before the shutdown");
-    assert!(on_file > 0, "rows on file: {on_file}, on scratch: {on_scratch}");
+    assert!(
+        on_file > 0,
+        "rows on file: {on_file}, on scratch: {on_scratch}"
+    );
     assert_eq!(restarted.status, Some(JobStatus::Complete));
     assert!(restarted.files[&format!("lantern beacon/{MEMBER}")] == body);
     // Every hold the checkpoint recorded, on file as on scratch, was
@@ -468,7 +472,11 @@ async fn a_member_refused_for_its_holds_in_a_checkpoint_is_delivered_after_its_r
             "{}",
             kind.name
         );
-        assert!(restarted.files == plain.files, "{}: delivered bytes", kind.name);
+        assert!(
+            restarted.files == plain.files,
+            "{}: delivered bytes",
+            kind.name
+        );
     }
 }
 
@@ -487,7 +495,12 @@ async fn a_set_whose_fronts_and_tails_come_first_holds_an_article_a_volume_at_mo
     let volume = |index: &&u32| (1..=volumes as u32).contains(*index);
     let mut first = vec![(0, 0)];
     first.extend(order.iter().filter(volume).map(|index| (*index, 0)));
-    first.extend(order.iter().filter(volume).map(|index| (*index, last(*index))));
+    first.extend(
+        order
+            .iter()
+            .filter(volume)
+            .map(|index| (*index, last(*index))),
+    );
     let shape = shape.first(&first);
     let run = run_restarting_at(&shape, &mut |_| {}, Down::Crash, &|_| false).await;
     assert_eq!(run.restarts, 0);

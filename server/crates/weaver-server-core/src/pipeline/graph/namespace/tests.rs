@@ -815,9 +815,15 @@ fn an_undecided_member_spilled_before_its_first_article_is_byte_identical() {
     // taken since commits, which names none of them, and is emptied then;
     // it stays the member's until its namespace goes.
     assert_eq!(job.writer.files[&NodeId::ROOT].holds.total_held(), 0);
-    assert_eq!(std::fs::metadata(job.spill(member)).expect("spill").len(), 16);
+    assert_eq!(
+        std::fs::metadata(job.spill(member)).expect("spill").len(),
+        16
+    );
     commit_checkpoint(&mut job);
-    assert_eq!(std::fs::metadata(job.spill(member)).expect("spill").len(), 0);
+    assert_eq!(
+        std::fs::metadata(job.spill(member)).expect("spill").len(),
+        0
+    );
 }
 
 // A checkpoint is taken of the job as it stands, and commits.
@@ -1002,7 +1008,10 @@ fn nothing_held(job: &Job, budget: &str) {
         assert!(files.spills_empty.contains(member), "{budget}");
         assert!(
             spill.len().expect("spill length") == 0
-                || job.writer.spills_emptying.contains_key(&(NodeId::ROOT, *member)),
+                || job
+                    .writer
+                    .spills_emptying
+                    .contains_key(&(NodeId::ROOT, *member)),
             "{budget}"
         );
     }
@@ -1047,7 +1056,10 @@ fn a_bound_member_past_each_budget_reaches_the_member_below_whole() {
         front.extend_from_slice(b"hello");
         job.send(member, 0, &front, Provenance::Fresh);
         assert!(!job.tree.is_undecided(NodeId::ROOT, member), "{budget}");
-        assert!(job.tree.child_of(NodeId::ROOT, member).is_some(), "{budget}");
+        assert!(
+            job.tree.child_of(NodeId::ROOT, member).is_some(),
+            "{budget}"
+        );
         assert_eq!(
             job.writer.held_bytes(NodeId::ROOT),
             body().len(),
@@ -1142,7 +1154,10 @@ fn holds_restored_under_a_lower_ceiling_come_back_on_file() {
         })
         .collect();
     assert_eq!(
-        records.iter().map(|record| record.on_file).collect::<Vec<_>>(),
+        records
+            .iter()
+            .map(|record| record.on_file)
+            .collect::<Vec<_>>(),
         vec![false, true],
         "{records:?}"
     );
@@ -1170,9 +1185,16 @@ fn holds_restored_under_a_lower_ceiling_come_back_on_file() {
     assert_eq!(job.accountant.usage().scratch, 0);
     assert_eq!(job.writer.held_bytes(NodeId::ROOT), 13);
     assert!(job.writer.files[&NodeId::ROOT].spills.contains_key(&member));
-    for (range, held) in [(ByteRange::new(10, 16), &b"tail.."[..]), (ByteRange::new(2, 9), b"r! mid.")] {
+    for (range, held) in [
+        (ByteRange::new(10, 16), &b"tail.."[..]),
+        (ByteRange::new(2, 9), b"r! mid."),
+    ] {
         let mut bytes = Vec::new();
-        assert!(job.writer.access(&job.tree).read_at(NodeId::ROOT, member, range, &mut bytes));
+        assert!(
+            job.writer
+                .access(&job.tree)
+                .read_at(NodeId::ROOT, member, range, &mut bytes)
+        );
         assert_eq!(bytes, held);
     }
 
@@ -1252,7 +1274,10 @@ fn a_member_that_spills_again_after_a_release_keeps_its_spill_file_through_a_com
     };
     store_says(&mut job, child, vec![announce(), bytes(10, b"first.")]);
     assert!(job.tree.is_undecided(child, late));
-    assert_eq!(std::fs::read(&spill).expect("spilled"), b"\0\0\0\0\0\0\0\0\0\0first.");
+    assert_eq!(
+        std::fs::read(&spill).expect("spilled"),
+        b"\0\0\0\0\0\0\0\0\0\0first."
+    );
 
     // Taken back: what it held is let go. Its spill file waits for a commit
     // to be emptied, and none comes first.
@@ -1266,7 +1291,10 @@ fn a_member_that_spills_again_after_a_release_keeps_its_spill_file_through_a_com
     store_says(&mut job, child, vec![announce(), bytes(10, b"again.")]);
     assert!(job.tree.is_undecided(child, late));
     assert_eq!(job.accountant.usage().resident, 6);
-    assert_eq!(std::fs::read(&spill).expect("kept"), b"\0\0\0\0\0\0\0\0\0\0first.");
+    assert_eq!(
+        std::fs::read(&spill).expect("kept"),
+        b"\0\0\0\0\0\0\0\0\0\0first."
+    );
     commit_checkpoint(&mut job);
     job.writer.page_out_holds().expect("page out");
     assert_eq!(job.accountant.usage().resident, 0);
@@ -1344,7 +1372,11 @@ fn a_released_spill_keeps_what_the_committed_checkpoint_names_until_the_next_com
         vec![(ByteRange::new(10, 16), true)]
     );
     commit_checkpoint(&mut job);
-    restarted(&mut job, Arc::new(HoldsAccountant::new(NO_ROOM)), &committed);
+    restarted(
+        &mut job,
+        Arc::new(HoldsAccountant::new(NO_ROOM)),
+        &committed,
+    );
     assert_eq!(job.writer.held_bytes(child), 6);
 
     store_says(&mut job, child, vec![Emit::Retract(late)]);
@@ -1355,7 +1387,11 @@ fn a_released_spill_keeps_what_the_committed_checkpoint_names_until_the_next_com
     );
 
     // Killed before another checkpoint commits.
-    restarted(&mut job, Arc::new(HoldsAccountant::new(NO_ROOM)), &committed);
+    restarted(
+        &mut job,
+        Arc::new(HoldsAccountant::new(NO_ROOM)),
+        &committed,
+    );
     assert_eq!(job.writer.held_bytes(child), 6);
     assert_eq!(
         read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
@@ -1391,7 +1427,11 @@ fn a_member_started_over_writes_nothing_a_committed_row_names_until_the_next_com
     job.writer.page_out_holds().expect("page out");
     let committed = hold_rows(&job, child);
     commit_checkpoint(&mut job);
-    restarted(&mut job, Arc::new(HoldsAccountant::new(NO_ROOM)), &committed);
+    restarted(
+        &mut job,
+        Arc::new(HoldsAccountant::new(NO_ROOM)),
+        &committed,
+    );
     assert_eq!(job.writer.held_bytes(child), 6);
 
     store_says(&mut job, child, vec![Emit::Retract(late)]);
@@ -1414,7 +1454,11 @@ fn a_member_started_over_writes_nothing_a_committed_row_names_until_the_next_com
     );
 
     // Killed before another checkpoint commits.
-    restarted(&mut job, Arc::new(HoldsAccountant::new(NO_ROOM)), &committed);
+    restarted(
+        &mut job,
+        Arc::new(HoldsAccountant::new(NO_ROOM)),
+        &committed,
+    );
     assert_eq!(
         read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
         Some(&b"first."[..])
@@ -1498,7 +1542,11 @@ fn scratch_a_committed_row_names_is_not_reused_before_the_next_commit() {
         vec![(0, false)]
     );
     commit_checkpoint(&mut job);
-    restarted(&mut job, Arc::new(HoldsAccountant::new(budgets)), &committed);
+    restarted(
+        &mut job,
+        Arc::new(HoldsAccountant::new(budgets)),
+        &committed,
+    );
     assert_eq!(job.accountant.usage().scratch, 6);
 
     // Taken back, nothing lives on scratch; another member pages out.
@@ -1517,7 +1565,11 @@ fn scratch_a_committed_row_names_is_not_reused_before_the_next_commit() {
     assert_eq!(&std::fs::read(&scratch).expect("scratch")[..6], b"first.");
 
     // Killed before another checkpoint commits.
-    restarted(&mut job, Arc::new(HoldsAccountant::new(budgets)), &committed);
+    restarted(
+        &mut job,
+        Arc::new(HoldsAccountant::new(budgets)),
+        &committed,
+    );
     assert_eq!(
         read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
         Some(&b"first."[..])
@@ -1546,7 +1598,9 @@ fn scratch_offsets_start_over_only_once_a_checkpoint_naming_none_commits() {
     assert_eq!(extent(&job), 5);
     assert!(job.writer.awaits_commit());
     assert!(job.writer.awaited() >= stamp);
-    job.writer.commit_moves(&mut job.tree, stamp).expect("commit");
+    job.writer
+        .commit_moves(&mut job.tree, stamp)
+        .expect("commit");
     assert_eq!(extent(&job), 0);
     assert!(job.writer.scratch_rewinding.is_empty());
 }
@@ -1601,12 +1655,13 @@ fn a_scratch_file_no_hold_came_back_to_keeps_what_its_rows_name() {
         vec![announce(other, "other.bin"), bytes(other, 10, b"oth")],
     );
     assert_eq!(job.accountant.usage().scratch, 3);
-    assert_eq!(
-        std::fs::read(&scratch).expect("scratch"),
-        b"first.oth"
-    );
+    assert_eq!(std::fs::read(&scratch).expect("scratch"), b"first.oth");
 
-    restarted(&mut job, Arc::new(HoldsAccountant::new(budgets)), &committed);
+    restarted(
+        &mut job,
+        Arc::new(HoldsAccountant::new(budgets)),
+        &committed,
+    );
     assert_eq!(
         read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
         Some(&b"first."[..])
@@ -1658,7 +1713,10 @@ fn a_restored_hold_that_cannot_be_kept_is_fetched_again_and_the_restore_stands()
         job.writer.page_out_holds().expect("page out");
         let records = hold_rows(&job, NodeId::ROOT);
         assert_eq!(
-            records.iter().map(|record| record.on_file).collect::<Vec<_>>(),
+            records
+                .iter()
+                .map(|record| record.on_file)
+                .collect::<Vec<_>>(),
             vec![false],
             "{case}"
         );
@@ -1675,7 +1733,11 @@ fn a_restored_hold_that_cannot_be_kept_is_fetched_again_and_the_restore_stands()
         restarted(&mut job, Arc::new(HoldsAccountant::new(budgets)), &records);
         assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0, "{case}");
         assert_eq!(job.accountant.usage().scratch, 0, "{case}");
-        assert_eq!(read_at(&job, NodeId::ROOT, member, ByteRange::new(10, 16)), None, "{case}");
+        assert_eq!(
+            read_at(&job, NodeId::ROOT, member, ByteRange::new(10, 16)),
+            None,
+            "{case}"
+        );
     }
 }
 
@@ -3622,7 +3684,9 @@ async fn the_deadline_counts_only_the_time_a_decoder_executes() {
     assert_eq!(refusal.reason(), ExtractionRejectionReason::Deadline);
     assert_eq!(
         refusal.job_failure_reason(),
-        format!("WEAVER_EXTRACTION_REJECTED[deadline]: extraction exceeded the {DEADLINE} second deadline")
+        format!(
+            "WEAVER_EXTRACTION_REJECTED[deadline]: extraction exceeded the {DEADLINE} second deadline"
+        )
     );
 }
 
@@ -3720,11 +3784,9 @@ fn names_placed_while_the_policy_is_unreadable_are_judged_once_it_reads() {
         })
     };
     let mut job = Job::new(PLENTY);
-    job.writer = job.writer.capped(Caps::new(
-        Arc::new(reserve_limits(0)),
-        read,
-        Vec::new(),
-    ));
+    job.writer = job
+        .writer
+        .capped(Caps::new(Arc::new(reserve_limits(0)), read, Vec::new()));
     let allowed = job.member("notes.bin", Some(5));
     job.member("beacon.exe", Some(5));
     assert!(job.writer.refusal().is_none());
@@ -3967,7 +4029,12 @@ fn unrelated_candidate_and_shared_scratch_activity_do_not_invalidate_repair_loan
             .unwrap()
             .run(weaver_graph::Budget::default(), &Default::default());
         job.writer
-            .keep_held(NodeId::ROOT, other, 25000, Bytes::from_static(b"held").into())
+            .keep_held(
+                NodeId::ROOT,
+                other,
+                25000,
+                Bytes::from_static(b"held").into(),
+            )
             .unwrap();
         job.send(other, 20000, b"new", Provenance::Fresh);
         assert_eq!(
@@ -3995,7 +4062,12 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
         }));
         let member = job.member("payload.bin", Some(8));
         job.writer
-            .keep_held(NodeId::ROOT, member, 0, Bytes::from_static(b"original").into())
+            .keep_held(
+                NodeId::ROOT,
+                member,
+                0,
+                Bytes::from_static(b"original").into(),
+            )
             .unwrap();
         job.tree
             .namespace_mut(NodeId::ROOT)
@@ -4044,8 +4116,13 @@ fn a_returned_ruling_stands_on_the_ranges_it_read_and_only_those() {
         let member = job.member("payload.bin", Some(16));
         let arrive = |job: &mut Job, offset: u64, bytes: &'static [u8]| {
             job.writer
-            .keep_held(NodeId::ROOT, member, offset, Bytes::from_static(bytes).into())
-            .unwrap();
+                .keep_held(
+                    NodeId::ROOT,
+                    member,
+                    offset,
+                    Bytes::from_static(bytes).into(),
+                )
+                .unwrap();
             job.tree
                 .namespace_mut(NodeId::ROOT)
                 .unwrap()

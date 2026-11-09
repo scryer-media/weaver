@@ -194,8 +194,8 @@ impl Kept {
             let Some(overlap) = piece.range.intersect(range) else {
                 return false;
             };
-            let from =
-                &bytes[(overlap.start - range.start) as usize..(overlap.end - range.start) as usize];
+            let from = &bytes
+                [(overlap.start - range.start) as usize..(overlap.end - range.start) as usize];
             let at = (overlap.start - piece.range.start) as usize;
             first_untrusted(&piece.coverage, overlap, provenance).is_some()
                 || piece.bytes.get(at..at + from.len()) != Some(from)
