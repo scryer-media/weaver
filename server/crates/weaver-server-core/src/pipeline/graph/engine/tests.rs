@@ -14,7 +14,7 @@ use weaver_graph::{
 
 use super::echo::{Echoes, HEADER, SIGNATURE};
 use super::volumes::RunVolumes;
-use super::{Heard, RUN_OVERHEAD, Reservation, RunMail, Runs};
+use super::{DecodePool, Heard, RUN_OVERHEAD, Reservation, RunMail, Runs};
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::envelope::{Envelopes, Shelf, envelope_name};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
@@ -464,11 +464,17 @@ impl Extraction for Quiet {
     fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>, _: weaver_graph::Budget) {}
 }
 
-fn unbounded() -> Arc<HoldsAccountant> {
+// A decode pool with no limit, and one of `limit` bytes.
+fn unbounded() -> Arc<DecodePool> {
     bounded(u64::MAX)
 }
 
-fn bounded(resident_limit: u64) -> Arc<HoldsAccountant> {
+fn bounded(limit: u64) -> Arc<DecodePool> {
+    Arc::new(DecodePool::new(limit))
+}
+
+// Holds that may keep `resident_limit` bytes resident, and page any more.
+fn holds(resident_limit: u64) -> Arc<HoldsAccountant> {
     Arc::new(HoldsAccountant::new(HoldBudgets {
         resident_limit,
         scratch_total: u64::MAX,
@@ -573,13 +579,24 @@ async fn a_run_spends_only_the_time_its_decoder_executes() {
     let mut runs = Runs::new(1, 1, mail.sender(), unbounded()).timed(clock.clone());
     let (first, second) = (NodeId(1), NodeId(2));
     assert_eq!(runs.ask(first, 1), vec![first]);
-    assert!(runs.ask(second, 1).is_empty(), "the second waits for a slot");
+    assert!(
+        runs.ask(second, 1).is_empty(),
+        "the second waits for a slot"
+    );
     tokio::time::advance(PAST).await;
-    assert_eq!(clock.spent(), Duration::ZERO, "admitted, queued, not started");
+    assert_eq!(
+        clock.spent(),
+        Duration::ZERO,
+        "admitted, queued, not started"
+    );
 
     let (decoding, decoded) = std::sync::mpsc::channel();
     let (finish, done) = std::sync::mpsc::channel();
-    runs.start(first, Box::new(Decodes { decoding, done }), envelopes.shelf(first));
+    runs.start(
+        first,
+        Box::new(Decodes { decoding, done }),
+        envelopes.shelf(first),
+    );
     idle_after(&clock, 1);
     tokio::time::advance(PAST).await;
     assert_eq!(clock.spent(), Duration::ZERO, "waiting for its first byte");
@@ -606,13 +623,21 @@ async fn a_run_starved_of_memory_spends_nothing() {
 
     const WINDOW: u64 = 1 << 20;
     let clock = DecodeClock::default();
-    let mut runs = Runs::new(1, 2, RunMail::default().sender(), bounded(WINDOW + RUN_OVERHEAD))
-        .timed(clock.clone());
+    let mut runs = Runs::new(
+        1,
+        2,
+        RunMail::default().sender(),
+        bounded(WINDOW + RUN_OVERHEAD),
+    )
+    .timed(clock.clone());
     let (first, second) = (NodeId(1), NodeId(2));
     assert_eq!(runs.ask(first, 2), vec![first]);
     assert_eq!(runs.reserve(first, WINDOW), Reservation::Granted);
     assert_eq!(runs.ask(second, 2), vec![second]);
-    assert_eq!(runs.reserve(second, WINDOW), Reservation::Starved(Vec::new()));
+    assert_eq!(
+        runs.reserve(second, WINDOW),
+        Reservation::Starved(Vec::new())
+    );
     tokio::time::advance(Duration::from_secs(100)).await;
     assert_eq!(clock.spent(), Duration::ZERO);
 }
@@ -687,42 +712,36 @@ fn raising_the_limit_admits_the_waiters_in_the_same_step() {
 }
 
 // The reservation is the declared window and the fixed overhead, exactly,
-// both on the run and against the accountant. Asking again with a wider
-// window, as a restart would, takes nothing more; the end gives back all
-// of it.
+// both on the run and in the decode pool. Asking again with a wider window,
+// as a restart would, takes nothing more; the end gives back all of it.
 #[test]
 fn memory_reserved_is_the_declared_window_plus_the_fixed_overhead_and_never_grows() {
     const WINDOW: u64 = 3 << 20;
-    let accountant = unbounded();
-    let mut runs = Runs::new(1, 1, RunMail::default().sender(), Arc::clone(&accountant));
+    let pool = unbounded();
+    let mut runs = Runs::new(1, 1, RunMail::default().sender(), Arc::clone(&pool));
     let node = NodeId(5);
-    let namespace = HoldsNamespace { scope: 1, node };
     assert_eq!(runs.ask(node, 1), vec![node]);
     assert_eq!(runs.reserve(node, WINDOW), Reservation::Granted);
     assert_eq!(runs.reserved(node), WINDOW + RUN_OVERHEAD);
-    assert_eq!(
-        accountant.namespace_usage(namespace).resident,
-        WINDOW + RUN_OVERHEAD
-    );
+    assert_eq!(pool.room().reserved, WINDOW + RUN_OVERHEAD);
 
     assert_eq!(runs.reserve(node, 4 * WINDOW), Reservation::Granted);
     assert_eq!(runs.reserved(node), WINDOW + RUN_OVERHEAD, "it never grows");
-    assert_eq!(accountant.usage().resident, WINDOW + RUN_OVERHEAD);
+    assert_eq!(pool.room().reserved, WINDOW + RUN_OVERHEAD);
 
     runs.ended(node, 0, 1);
     assert_eq!(runs.reserved(node), 0);
-    assert_eq!(accountant.usage().resident, 0);
-    assert_eq!(accountant.usage().namespaces, 0);
+    assert_eq!(pool.room().reserved, 0);
 }
 
-// A reservation that does not fit beside what is resident gives the slot
-// to the next waiter and waits; once resident bytes are released it asks
+// A reservation that does not fit beside what the pool holds gives the slot
+// to the next waiter and waits; once the pool is given bytes back it asks
 // again, through the same release that frees a slot.
 #[test]
 fn a_window_that_does_not_fit_yields_its_slot_and_asks_again_once_memory_is_released() {
     const WINDOW: u64 = 1 << 20;
-    let accountant = bounded(2 * (WINDOW + RUN_OVERHEAD));
-    let mut runs = Runs::new(1, 2, RunMail::default().sender(), Arc::clone(&accountant));
+    let pool = bounded(2 * (WINDOW + RUN_OVERHEAD));
+    let mut runs = Runs::new(1, 2, RunMail::default().sender(), pool);
     let (first, second, third) = (NodeId(1), NodeId(2), NodeId(3));
     assert_eq!(runs.ask(first, 2), vec![first]);
     assert_eq!(runs.reserve(first, WINDOW), Reservation::Granted);
@@ -745,13 +764,19 @@ fn a_window_that_does_not_fit_yields_its_slot_and_asks_again_once_memory_is_rele
     assert_eq!(runs.reserved(second), WINDOW + 1 + RUN_OVERHEAD);
 }
 
-// A reservation larger than the resident limit itself can never fit.
+// A reservation larger than the decode pool itself can never fit.
 #[test]
-fn a_window_larger_than_the_resident_limit_is_refused() {
+fn a_window_larger_than_the_decode_pool_is_refused() {
     let mut runs = Runs::new(1, 1, RunMail::default().sender(), bounded(RUN_OVERHEAD));
     let node = NodeId(1);
     assert_eq!(runs.ask(node, 1), vec![node]);
-    assert_eq!(runs.reserve(node, 1), Reservation::Refused);
+    assert_eq!(
+        runs.reserve(node, 1),
+        Reservation::Refused {
+            needed: 1 + RUN_OVERHEAD,
+            allowed: RUN_OVERHEAD
+        }
+    );
     assert_eq!(runs.reserved(node), 0);
 }
 
@@ -762,7 +787,8 @@ struct Echoing {
     bids: Arc<Mutex<Vec<Seek>>>,
     volumes: Vec<Vec<u8>>,
     dir: tempfile::TempDir,
-    accountant: Arc<HoldsAccountant>,
+    pool: Arc<DecodePool>,
+    holds: Arc<HoldsAccountant>,
 }
 
 // The body of volume `index`: bytes no format sniffs as its own, a length
@@ -777,19 +803,42 @@ fn echoing(count: u32) -> Echoing {
     echoing_within(count, 0, unbounded())
 }
 
-// Echo volumes whose engine declares `window`, reserved against `accountant`.
-fn echoing_within(count: u32, window: u64, accountant: Arc<HoldsAccountant>) -> Echoing {
-    echoing_as(
+// Echo volumes whose engine declares `window`, reserved from `pool`.
+fn echoing_within(count: u32, window: u64, pool: Arc<DecodePool>) -> Echoing {
+    echoing_in(1, count, window, pool, holds(u64::MAX))
+}
+
+// The same, as job `scope`, holding its members under `holds`: jobs that
+// share `pool` and `holds` share both.
+fn echoing_in(
+    scope: u64,
+    count: u32,
+    window: u64,
+    pool: Arc<DecodePool>,
+    holds: Arc<HoldsAccountant>,
+) -> Echoing {
+    echoing_scoped(
+        scope,
         Echoes {
             volumes: count,
             window,
             ..Echoes::default()
         },
-        accountant,
+        pool,
+        holds,
     )
 }
 
-fn echoing_as(echoes: Echoes, accountant: Arc<HoldsAccountant>) -> Echoing {
+fn echoing_as(echoes: Echoes, pool: Arc<DecodePool>) -> Echoing {
+    echoing_scoped(1, echoes, pool, holds(u64::MAX))
+}
+
+fn echoing_scoped(
+    scope: u64,
+    echoes: Echoes,
+    pool: Arc<DecodePool>,
+    holds: Arc<HoldsAccountant>,
+) -> Echoing {
     let count = echoes.volumes;
     let volumes: Vec<Vec<u8>> = (0..count)
         .map(|index| {
@@ -813,13 +862,13 @@ fn echoing_as(echoes: Echoes, accountant: Arc<HoldsAccountant>) -> Echoing {
     let bids = Arc::clone(&echoes.bids);
     let dir = tempfile::tempdir().unwrap();
     let writer = NamespaceWriter::new(
-        1,
+        scope,
         dir.path().to_path_buf(),
-        Arc::clone(&accountant),
+        Arc::clone(&holds),
         CapacityReader::unknown(),
     );
     let mail = RunMail::default();
-    let runs = Runs::new(1, 1, mail.sender(), Arc::clone(&accountant));
+    let runs = Runs::new(scope, 1, mail.sender(), Arc::clone(&pool));
     let job = GraphJob::new(&files, Box::new(echoes), writer, runs, u32::MAX);
     Echoing {
         job,
@@ -827,7 +876,8 @@ fn echoing_as(echoes: Echoes, accountant: Arc<HoldsAccountant>) -> Echoing {
         bids,
         volumes,
         dir,
-        accountant,
+        pool,
+        holds,
     }
 }
 
@@ -1050,66 +1100,182 @@ async fn a_job_holds_its_engines_window_while_the_run_is_live() {
     echoing.deliver(0);
     let engine = echoing.engine();
     assert_eq!(echoing.job.runs().reserved(engine), WINDOW + RUN_OVERHEAD);
+    assert_eq!(echoing.pool.room().reserved, WINDOW + RUN_OVERHEAD);
     assert_eq!(
         echoing
-            .accountant
+            .holds
             .namespace_usage(HoldsNamespace {
                 scope: 1,
                 node: engine
             })
             .resident,
-        WINDOW + RUN_OVERHEAD
+        0,
+        "the window is the decode pool's, never the holds'"
     );
     while !echoing.hear().await {}
     assert_eq!(echoing.echoed(0), body(0));
-    assert_eq!(echoing.accountant.usage().resident, 0);
+    assert_eq!(echoing.pool.room().reserved, 0);
 }
 
-// An engine whose window can never fit is refused to the tree, and its
-// volume is a leaf that says why.
+// An engine whose window can never fit is refused to the tree as too large,
+// with what it needs against the decode pool, and its volume is a leaf that
+// says why.
 #[tokio::test]
-async fn an_engine_whose_window_can_never_fit_is_refused_unsupported() {
+async fn an_engine_whose_window_can_never_fit_is_refused_too_large() {
     let mut echoing = echoing_within(1, 1 << 30, bounded(64 << 20));
     echoing.deliver(0);
     assert!(echoing.job.tree().engines().is_empty());
     assert_eq!(
         echoing.job.writer().refused(NodeId::ROOT, MemberId(0)),
-        Some(Why::Unsupported)
+        Some(Why::TooLarge {
+            needed: Some((1 << 30) + RUN_OVERHEAD),
+            allowed: Some(64 << 20),
+        })
     );
     assert!(!echoing.job.runs().live());
-    assert_eq!(echoing.accountant.usage().resident, 0);
+    assert_eq!(echoing.pool.room().reserved, 0);
 }
 
-// Another namespace holds most of the resident limit when the engine wants
-// to start, so its run waits; the next step after those bytes are released
-// starts it.
+// The holds keep every byte they may keep resident when the engine wants to
+// start: its run reserves from the decode pool, which the holds never touch,
+// so it starts at once, and its members are written past the full holds.
 #[tokio::test]
-async fn an_engine_turned_away_for_memory_starts_once_resident_bytes_are_released() {
+async fn a_decode_at_the_ceiling_runs_while_the_holds_are_full() {
     const WINDOW: u64 = 1 << 20;
-    let accountant = bounded(WINDOW + RUN_OVERHEAD);
+    const HELD: u64 = 64 << 10;
+    let full = holds(HELD);
     let other = HoldsNamespace {
         scope: 2,
         node: NodeId::ROOT,
     };
     assert_eq!(
-        accountant.reserve_resident(other, WINDOW),
+        full.reserve_resident(other, HELD),
         weaver_graph::holds::Reserve::Granted
     );
-    let mut echoing = echoing_within(2, WINDOW, Arc::clone(&accountant));
+    let pool = bounded(WINDOW + RUN_OVERHEAD);
+    let mut echoing = echoing_in(1, 2, WINDOW, Arc::clone(&pool), Arc::clone(&full));
     echoing.deliver(0);
     let engine = echoing.engine();
-    assert_eq!(echoing.job.runs().reserved(engine), 0, "it did not fit");
-    assert!(echoing.job.runs().holding().is_empty(), "nor holds a slot");
-    assert!(echoing.job.runs().live(), "it waits for memory");
-
-    accountant.release_resident(other, WINDOW);
-    echoing.deliver(1);
     assert_eq!(echoing.job.runs().reserved(engine), WINDOW + RUN_OVERHEAD);
+    assert_eq!(full.usage().resident, HELD, "the holds gave nothing up");
+    echoing.deliver(1);
     while !echoing.hear().await {}
     for member in 0..2 {
         assert_eq!(echoing.echoed(member), body(member));
     }
-    assert_eq!(accountant.usage().resident, 0);
+    assert_eq!(pool.room().reserved, 0);
+}
+
+// Two jobs share a pool their runs do not fit in together. The second's run
+// waits, holding no slot and no memory, until the first's end frees the
+// pool; the pipeline then steps it again, it starts, and both complete.
+// Bytes the holds take or give back meanwhile neither keep it waiting nor
+// wake it.
+#[tokio::test]
+async fn two_runs_that_do_not_fit_together_run_one_after_the_other() {
+    const WINDOW: u64 = 1 << 20;
+    let pool = bounded(WINDOW + RUN_OVERHEAD);
+    let shared = holds(u64::MAX);
+    let mut first = echoing_in(1, 1, WINDOW, Arc::clone(&pool), Arc::clone(&shared));
+    let mut second = echoing_in(2, 1, WINDOW, Arc::clone(&pool), Arc::clone(&shared));
+    first.deliver(0);
+    second.deliver(0);
+    let engine = second.engine();
+    assert_eq!(second.job.runs().reserved(engine), 0, "it did not fit");
+    assert!(second.job.runs().holding().is_empty(), "nor holds a slot");
+    assert!(second.job.runs().live(), "it waits for memory");
+    assert!(!second.job.memory_freed(), "nothing was freed yet");
+    let other = HoldsNamespace {
+        scope: 3,
+        node: NodeId::ROOT,
+    };
+    assert_eq!(
+        shared.reserve_resident(other, WINDOW),
+        weaver_graph::holds::Reserve::Granted
+    );
+    shared.release_resident(other, WINDOW);
+    assert!(
+        !second.job.memory_freed(),
+        "held bytes given back are not decode memory"
+    );
+
+    while !first.hear().await {}
+    assert_eq!(first.echoed(0), body(0));
+    assert!(second.job.memory_freed(), "the first's end freed the pool");
+    second
+        .job
+        .resume_runs(&mut RepairSlots::default(), 1)
+        .unwrap();
+    assert_eq!(second.job.runs().reserved(engine), WINDOW + RUN_OVERHEAD);
+    while !second.hear().await {}
+    assert_eq!(second.echoed(0), body(0));
+    assert_eq!(second.job.phase(), RootPhase::Done);
+    assert_eq!(pool.room().reserved, 0);
+}
+
+// A job cancelled while its run waits for memory has nothing out on a
+// thread, so the pipeline lets it go at once, and its waiter with it: the
+// pool's release after wakes nothing of it.
+#[tokio::test]
+async fn a_run_waiting_for_memory_goes_with_its_cancelled_job() {
+    const WINDOW: u64 = 1 << 20;
+    let pool = bounded(WINDOW + RUN_OVERHEAD);
+    let shared = holds(u64::MAX);
+    let mut first = echoing_in(1, 1, WINDOW, Arc::clone(&pool), Arc::clone(&shared));
+    let mut second = echoing_in(2, 1, WINDOW, Arc::clone(&pool), Arc::clone(&shared));
+    first.deliver(0);
+    second.deliver(0);
+    assert!(second.job.runs().live(), "it waits for memory");
+    second.job.request_stop();
+    assert!(!second.job.awaits_mail(), "nothing of it is out");
+    drop(second);
+    while !first.hear().await {}
+    assert_eq!(pool.room().reserved, 0);
+    assert_eq!(shared.usage().resident, 0);
+    assert_eq!(shared.usage().namespaces, 0);
+}
+
+// A job stopped while its run waits for memory stops the waiter where it
+// stands: no release wakes it, and it holds nothing.
+#[test]
+fn a_run_waiting_for_memory_is_stopped_with_its_job() {
+    const WINDOW: u64 = 1 << 20;
+    let pool = bounded(WINDOW + RUN_OVERHEAD);
+    let mut first = Runs::new(1, 1, RunMail::default().sender(), Arc::clone(&pool));
+    let mut second = Runs::new(2, 1, RunMail::default().sender(), Arc::clone(&pool));
+    let node = NodeId(1);
+    assert_eq!(first.ask(node, 1), vec![node]);
+    assert_eq!(first.reserve(node, WINDOW), Reservation::Granted);
+    assert_eq!(second.ask(node, 1), vec![node]);
+    assert_eq!(
+        second.reserve(node, WINDOW),
+        Reservation::Starved(Vec::new())
+    );
+    second.stop(1);
+    first.ended(node, 0, 1);
+    assert_eq!(pool.room().reserved, 0);
+    assert!(!second.wakeable(), "a stopped waiter is not woken");
+    assert!(second.forget(Vec::new(), 1).is_empty());
+    assert_eq!(second.reserved(node), 0);
+}
+
+// A raised pool wakes a run turned away for memory, as a release does.
+#[test]
+fn a_raised_pool_wakes_a_run_turned_away_for_memory() {
+    const WINDOW: u64 = 1 << 20;
+    let pool = bounded(WINDOW + RUN_OVERHEAD);
+    let mut other = Runs::new(2, 1, RunMail::default().sender(), Arc::clone(&pool));
+    let mut runs = Runs::new(1, 1, RunMail::default().sender(), Arc::clone(&pool));
+    let node = NodeId(1);
+    assert_eq!(other.ask(node, 1), vec![node]);
+    assert_eq!(other.reserve(node, 0), Reservation::Granted);
+    assert_eq!(runs.ask(node, 1), vec![node]);
+    assert_eq!(runs.reserve(node, WINDOW), Reservation::Starved(Vec::new()));
+    assert!(!runs.wakeable());
+    pool.set_limit(WINDOW + 2 * RUN_OVERHEAD);
+    assert!(runs.wakeable());
+    assert_eq!(runs.forget(Vec::new(), 1), vec![node]);
+    assert_eq!(runs.reserve(node, WINDOW), Reservation::Granted);
 }
 
 // A posted volume the run already read closes again at another length, as

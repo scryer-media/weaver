@@ -96,6 +96,9 @@ impl Pipeline {
 
         let extract_threads = self.tuner.params().extract_thread_count;
         self.graph_hardware.follow(&self.tuner);
+        // The decode pool follows the profile; reservations already granted
+        // stand.
+        self.graph_decode.follow(&self.graph_hardware.grant().run);
 
         info!(
             hardware_profile = in_force.active.as_str(),
@@ -109,7 +112,8 @@ impl Pipeline {
         );
 
         // A raised download cap is used at once rather than at the next
-        // completion.
+        // completion, and a raised pool admits the runs waiting for it.
         self.dispatch_downloads();
+        self.wake_memory_waiters();
     }
 }

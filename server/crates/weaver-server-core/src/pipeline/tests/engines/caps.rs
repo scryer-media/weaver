@@ -10,7 +10,7 @@
 // decoders execute, which a row here cannot hold still, so it is pinned
 // beside the clock and the namespace instead.
 
-use super::harness::{ARTICLE, Post, Scenario, assert_fetched_once, payload, run};
+use super::harness::{ARTICLE, Post, Scenario, assert_fetched_once, payload, run, run_then};
 use super::restart::run_restarting;
 use super::streams::{gzip, tar, xz};
 use crate::history::HistoryFailureKind;
@@ -309,11 +309,11 @@ async fn a_member_the_policy_allows_is_untouched() {
     }
 }
 
-// A failed read of the operator's policy is the host's, not the post's: a
-// job built while the settings cannot be read is not failed, and the names
-// it placed are judged once a read succeeds, before anything is delivered.
+// A stored policy that does not parse is no reason to hold a job: the job is
+// judged by the default unacceptable extensions, not the operator's list,
+// and the stored value is left as it is.
 #[tokio::test]
-async fn a_job_built_while_the_policy_is_unreadable_is_judged_once_it_reads() {
+async fn a_job_whose_policy_does_not_parse_is_judged_by_the_default() {
     let refused = vec![
         vec![Post::plain("beacon.exe", payload(ARTICLE, 75))],
         vec![Post::plain(
@@ -322,7 +322,7 @@ async fn a_job_built_while_the_policy_is_unreadable_is_judged_once_it_reads() {
         )],
     ];
     for posts in refused {
-        let scenario = Scenario::new(posts).unacceptable(&["exe"]).policy_unread(1);
+        let scenario = Scenario::new(posts).unacceptable(&["iso"]).policy_corrupt();
         let graph = run(&scenario).await;
         assert_eq!(
             graph.failure.as_deref(),
@@ -334,75 +334,90 @@ async fn a_job_built_while_the_policy_is_unreadable_is_judged_once_it_reads() {
         assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
     }
 
+    // The operator's list would refuse it; the default does not.
     let body = payload(2 * ARTICLE + 3, 76);
     let scenario = Scenario::new(vec![Post::plain(
         "lantern.tar",
-        tar(&[("beacon.bin", body.clone())]),
+        tar(&[("disc.iso", body.clone())]),
     )])
-    .unacceptable(&["exe"])
-    .policy_unread(1);
-    let graph = run(&scenario).await;
+    .unacceptable(&["iso"])
+    .policy_corrupt();
+    let mut stored = None;
+    let graph = run_then(&scenario, async |pipeline, _| {
+        stored = pipeline
+            .db
+            .get_setting(crate::post_processing::settings::SETTINGS_KEY)
+            .unwrap();
+    })
+    .await;
     assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     assert!(
         graph
             .files
             .iter()
-            .any(|(path, bytes)| path.ends_with("beacon.bin") && *bytes == body),
+            .any(|(path, bytes)| path.ends_with("disc.iso") && *bytes == body),
         "{:?}",
         graph.files.keys()
     );
+    assert_eq!(stored.as_deref(), Some(super::harness::CORRUPT_POLICY));
 }
 
-// A restored job is judged as one built fresh: names a run before placed
-// while the settings could not be read are judged by the restored job,
-// and a restore that cannot read them waits as admission does.
+// A restored job is judged as one built fresh: a stored policy that does not
+// parse is the default there too. The refused name comes out of the archive
+// only after the run has restarted.
 #[tokio::test]
-async fn a_restored_job_judges_names_placed_while_the_policy_was_unreadable() {
-    for pipelines in [1, 2] {
-        let scenario = Scenario::new(vec![Post::plain("beacon.exe", payload(4 * ARTICLE, 75))])
-            .unacceptable(&["exe"])
-            .policy_unread(pipelines);
-        let restarted = run_restarting(&scenario, &mut |_| {}).await;
-        assert!(restarted.restarts > 0, "{pipelines}: the run restarted");
-        assert_eq!(
-            restarted.status,
-            Some(JobStatus::Failed {
-                error: "unwanted extension '.exe' in 'beacon.exe'".into()
-            }),
-            "{pipelines}"
-        );
-        assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
-    }
-}
-
-// Settings that never read hold the job before it delivers: it pauses with
-// its files, naming the setting, and is not failed.
-#[tokio::test]
-async fn a_job_whose_policy_never_reads_pauses_before_it_delivers() {
-    let scenario = Scenario::new(vec![Post::plain("beacon.bin", payload(ARTICLE, 75))])
-        .unacceptable(&["exe"])
-        .policy_unread(usize::MAX);
-    let (_temp_dir, mut pipeline, _) = super::harness::admit(&scenario).await;
-    while let Some(work) = pipeline
-        .jobs
-        .get_mut(&super::harness::JOB)
-        .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
-    {
-        let article = (
-            work.segment_id.file_id.file_index,
-            work.segment_id.segment_number,
-        );
-        super::harness::serve(&mut pipeline, &scenario, article).await;
-    }
-    pipeline.check_job_completion(super::harness::JOB).await;
-    let state = &pipeline.jobs[&super::harness::JOB];
-    assert_eq!(state.status, JobStatus::Paused);
-    let reason = state.failure_error.clone().unwrap_or_default();
-    assert!(
-        reason.starts_with("The Unacceptable extensions setting could not be read: "),
-        "{reason}"
+async fn a_restored_job_whose_policy_does_not_parse_is_judged_by_the_default() {
+    let scenario = Scenario::new(vec![Post::plain(
+        "lantern.tar",
+        tar(&[
+            ("lantern.bin", payload(4 * ARTICLE, 74)),
+            ("beacon.exe", payload(ARTICLE, 75)),
+        ]),
+    )])
+    .unacceptable(&["iso"])
+    .policy_corrupt();
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert!(restarted.restarts > 0, "the run restarted");
+    assert_eq!(
+        restarted.status,
+        Some(JobStatus::Failed {
+            error: "unwanted extension '.exe' in 'beacon.exe'".into()
+        })
     );
-    crate::pipeline::tests::retire_pipeline_database(pipeline).await;
+    assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
+}
+
+// A pipeline starts on stored settings that do not parse, and its scripts are
+// admitted as under the defaults. The value stays as stored.
+#[tokio::test]
+async fn a_pipeline_starts_on_stored_settings_that_do_not_parse() {
+    use crate::pipeline::tests::{new_direct_pipeline, retire_pipeline_database};
+    use crate::post_processing::events::refresh_admission_hint;
+    use crate::post_processing::settings::SETTINGS_KEY;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let refused_by_default = refresh_admission_hint(&pipeline.db).unwrap();
+    pipeline
+        .db
+        .set_setting(SETTINGS_KEY, super::harness::CORRUPT_POLICY)
+        .unwrap();
+    retire_pipeline_database(pipeline).await;
+
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    assert_eq!(
+        refresh_admission_hint(&pipeline.db).unwrap(),
+        refused_by_default
+    );
+    assert_eq!(
+        pipeline.db.post_processing_settings().unwrap(),
+        Default::default()
+    );
+    assert_eq!(
+        pipeline.db.get_setting(SETTINGS_KEY).unwrap().as_deref(),
+        Some(super::harness::CORRUPT_POLICY)
+    );
+    retire_pipeline_database(pipeline).await;
 }
 
 #[tokio::test]

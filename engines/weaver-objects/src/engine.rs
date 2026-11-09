@@ -77,8 +77,17 @@ pub trait Format: Send + Sync {
     }
     fn run(password: Option<String>) -> Box<dyn Extraction>;
 
+    // The least a run of this format holds resident, whatever its volumes'
+    // fronts say.
     fn reserve() -> u64 {
         0
+    }
+
+    // What a decode of the members whose headers lie in a volume's front
+    // holds resident, as those headers state it: `None` where the front
+    // states nothing of it.
+    fn window(_first_bytes: &[u8]) -> Option<u64> {
+        None
     }
 }
 
@@ -94,6 +103,9 @@ pub struct Holding<'a, T> {
 pub(crate) struct CarriedVolume<T> {
     pub(crate) front: Option<T>,
     pub(crate) length: Option<u64>,
+    // What a decode of the volume holds resident, as the object that parsed
+    // it read that from headers the engine's front does not hold.
+    pub(crate) window: Option<u64>,
 }
 
 // A volume's name as its set numbers it.
@@ -129,6 +141,10 @@ pub struct EngineObject<F: Format> {
     // its volumes.
     #[serde(default)]
     lengths: BTreeMap<u32, u64>,
+    // What a decode of each volume bound holds resident, where its front or
+    // the object that handed it on said.
+    #[serde(default)]
+    windows: BTreeMap<u32, u64>,
     bound: BTreeSet<u32>,
     #[serde(skip)]
     password: Option<String>,
@@ -146,7 +162,8 @@ impl<F: Format> Durable for EngineObject<F> {
             .names
             .keys()
             .chain(self.fronts.keys())
-            .chain(self.lengths.keys());
+            .chain(self.lengths.keys())
+            .chain(self.windows.keys());
         let named = known.into_iter().all(|volume| self.bound.contains(volume));
         (!named).then_some("a volume named that is not bound")
     }
@@ -159,6 +176,7 @@ impl<F: Format> Default for EngineObject<F> {
             names: BTreeMap::new(),
             fronts: BTreeMap::new(),
             lengths: BTreeMap::new(),
+            windows: BTreeMap::new(),
             bound: BTreeSet::new(),
             password: None,
         }
@@ -247,11 +265,14 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         _out: &mut Vec<Emit>,
     ) {
         let volume = delivery.volume.0;
-        if delivery.offset == 0
-            && self.bound.contains(&volume)
-            && let Some(front) = F::front(delivery.bytes)
-        {
+        if delivery.offset != 0 || !self.bound.contains(&volume) {
+            return;
+        }
+        if let Some(front) = F::front(delivery.bytes) {
             self.fronts.entry(volume).or_insert(front);
+        }
+        if let Some(window) = F::window(delivery.bytes) {
+            self.windows.entry(volume).or_insert(window);
         }
     }
 
@@ -304,6 +325,9 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         {
             self.names.insert(volume.0, parsed);
         }
+        if let Some(window) = F::window(front) {
+            self.windows.insert(volume.0, window);
+        }
         if let Some(front) = F::front(front) {
             self.fronts.insert(volume.0, front);
         }
@@ -340,6 +364,7 @@ impl<F: Format + 'static> Object for EngineObject<F> {
             Box::new(CarriedVolume {
                 front: self.fronts.remove(&volume.0),
                 length: self.lengths.remove(&volume.0),
+                window: self.windows.remove(&volume.0),
             }) as weaver_graph::Carried
         })
     }
@@ -381,6 +406,9 @@ impl<F: Format + 'static> Object for EngineObject<F> {
         if let Some(front) = carried.front {
             self.fronts.insert(volume.0, front);
         }
+        if let Some(window) = carried.window {
+            self.windows.insert(volume.0, window);
+        }
     }
 
     // The place the volume's facts give it, held or not: whether it takes
@@ -411,8 +439,12 @@ impl<F: Format + 'static> Engine for EngineObject<F> {
         F::run(self.password.clone())
     }
 
+    // The widest decode any volume bound states, and the format's least.
+    // A volume whose front states nothing adds nothing: what its members
+    // hold cannot be known before the run reads their headers.
     fn reserve(&self) -> Option<u64> {
-        Some(F::reserve())
+        let widest = self.windows.values().copied().max().unwrap_or(0);
+        Some(F::reserve().max(widest))
     }
 
     // The volumes after the one the run is on, the nearest first: weighed

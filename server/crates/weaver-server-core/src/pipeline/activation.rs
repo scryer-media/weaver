@@ -423,6 +423,11 @@ impl Pipeline {
         graph.request_stop();
         if graph.awaits_mail() {
             self.retiring_graph_jobs.insert(job_id, graph);
+        } else {
+            // Gone with what its runs reserved: the memory goes to whoever
+            // waits for it.
+            drop(graph);
+            self.wake_memory_waiters();
         }
     }
 }

@@ -446,6 +446,7 @@ fn a_volume_given_back_is_answered_as_one_offered_fresh() {
         let engine = crate::engine::CarriedVolume {
             front: stated(short),
             length: None,
+            window: None,
         };
         assert_eq!(object.reclaim(name, short, None, &engine), fresh, "{case}");
     }

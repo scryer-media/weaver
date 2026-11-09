@@ -945,6 +945,7 @@ impl Recovery for Par3 {
                         window_bytes: budget.window_bytes,
                         threads: budget.threads,
                         pool: budget.pool.clone(),
+                        lender: budget.lender.clone(),
                     },
                     access,
                 )

@@ -47,9 +47,66 @@ pub(crate) fn sevenz(error: &sevenz_turbo::Error) -> Emit {
         Error::ChecksumVerificationFailed | Error::NextHeaderCrcMismatch | Error::Corrupted(_) => {
             DAMAGED
         }
+        // The folder's coders need more memory than a decode may hold.
+        Error::MemoryLimited {
+            limit_bytes,
+            required_bytes,
+        } => Emit::Refuse(Why::TooLarge {
+            needed: Some(*required_bytes),
+            allowed: Some(*limit_bytes),
+        }),
+        Error::LimitExceeded {
+            what: sevenz_turbo::Limit::MemoryBytes,
+            limit,
+            requested,
+        } => Emit::Refuse(Why::TooLarge {
+            needed: Some(*requested),
+            allowed: Some(*limit),
+        }),
         Error::Io(error, _) | Error::FileOpen(error, _) => self::io(error),
         _ => TERMINAL,
     }
+}
+
+// A decode that needs more memory than it may hold, from an I/O error: an
+// LZMA decoder's limit, with the sizes it states, or memory the allocator
+// would not give, which states none.
+pub(crate) fn too_large(error: &io::Error) -> Option<Why> {
+    use lzma_turbo::xz::{XzError, XzErrorKind};
+    let limit = |error: &lzma_turbo::Error| match *error {
+        lzma_turbo::Error::MemoryLimit { needed, limit, .. } => Some(Why::TooLarge {
+            needed: Some(needed),
+            allowed: Some(limit),
+        }),
+        _ => None,
+    };
+    let inner = error.get_ref();
+    if let Some(error) = inner.and_then(|inner| inner.downcast_ref::<XzError>()) {
+        match &error.kind {
+            XzErrorKind::MemoryLimit { needed, limit, .. } => {
+                return Some(Why::TooLarge {
+                    needed: Some(*needed),
+                    allowed: Some(*limit),
+                });
+            }
+            XzErrorKind::Lzma(error) => {
+                if let Some(why) = limit(error) {
+                    return Some(why);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(why) = inner
+        .and_then(|inner| inner.downcast_ref::<lzma_turbo::Error>())
+        .and_then(limit)
+    {
+        return Some(why);
+    }
+    (error.kind() == io::ErrorKind::OutOfMemory).then_some(Why::TooLarge {
+        needed: None,
+        allowed: None,
+    })
 }
 
 // An entry the library refuses to open without a password is the zip form of
@@ -88,6 +145,9 @@ pub(crate) fn io(error: &io::Error) -> Emit {
         if let Some(error) = inner.downcast_ref::<io::Error>() {
             return self::io(error);
         }
+    }
+    if let Some(why) = too_large(error) {
+        return Emit::Refuse(why);
     }
     let text = error.to_string();
     let damaged = std_read_exact_eof(&text)

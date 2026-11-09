@@ -21,7 +21,6 @@ use super::rar_rev::lz_four;
 use super::restart::{Down, run_restarting_at};
 use super::streams;
 use crate::jobs::model::JobStatus;
-use crate::pipeline::graph::engine::RUN_OVERHEAD;
 use crate::pipeline::graph::lines::Lines;
 use crate::pipeline::tests::direct_store::scenarios::sevenz_store::{
     Entry, build_7z_shaped, split_volumes,
@@ -120,12 +119,12 @@ async fn a_set_renamed_as_it_arrives_is_one_store() {
     assert_eq!(store_nodes(&lines).len(), 1, "{:?}", lines.of("object bound"));
 }
 
-// Room for nothing much: a few articles in memory past what the kind's
-// decoding run reserves, as many on scratch.
+// Room for nothing much: a few articles in memory, as many on scratch. A
+// kind's decoding run reserves from the decode pool, never from these.
 fn tight(kind: &Kind) -> HoldBudgets {
     let article = kind.article as u64;
     HoldBudgets {
-        resident_limit: kind.run + 4 * article,
+        resident_limit: 4 * article,
         scratch_total: 8 * article,
         scratch_ceiling: 4 * article,
         disk_reserve: 0,
@@ -142,14 +141,12 @@ const UNLIMITED: HoldBudgets = HoldBudgets {
 const ARTICLE: usize = 4096;
 
 // A kind of post: its posts, which of them are its volumes in volume
-// order, the size it is cut into articles at, and what a run decoding it
-// reserves in memory before it starts.
+// order, and the size it is cut into articles at.
 struct Kind {
     name: &'static str,
     posts: fn() -> Vec<Post>,
     volumes: &'static [u32],
     article: usize,
-    run: u64,
 }
 
 fn body() -> Vec<u8> {
@@ -207,50 +204,42 @@ const KINDS: &[Kind] = &[
         posts: stored_rar,
         volumes: &[0, 1, 2, 3],
         article: ARTICLE,
-        run: 0,
     },
     Kind {
         name: "compressed rar",
         posts: compressed_rar,
         volumes: &[0, 1, 2, 3],
         article: 1024,
-        // The run's overhead and the set's 4 MiB dictionary.
-        run: RUN_OVERHEAD + (4 << 20),
     },
     Kind {
         name: "7z",
         posts: sevenz,
         volumes: &[0, 1, 2, 3],
         article: ARTICLE,
-        run: 0,
     },
     Kind {
         name: "zip",
         posts: zip,
         volumes: &[0],
         article: ARTICLE,
-        run: 0,
     },
     Kind {
         name: "zip in a stored rar",
         posts: nested,
         volumes: &[0, 1, 2, 3],
         article: ARTICLE,
-        run: 0,
     },
     Kind {
         name: "tar",
         posts: tar,
         volumes: &[0],
         article: ARTICLE,
-        run: 0,
     },
     Kind {
         name: "split",
         posts: split,
         volumes: &[0, 1, 2, 3, 4],
         article: ARTICLE,
-        run: 0,
     },
 ];
 
@@ -358,12 +347,12 @@ async fn every_kind_in_every_order_ends_under_tight_holds_as_under_unlimited_one
 }
 
 // The cells whose holds run past memory and scratch. What arrives before
-// the headers that place it is held until they come: every kind but the
-// compressed rar, whose run's reservation leaves the holds room for its
-// small set, spills backwards, and all of those but the split spill with
-// their first volume last too. In order, nothing waits long enough to.
+// the headers that place it is held until they come: every kind spills
+// backwards, and all but the compressed rar and the split spill with their
+// first volume last too. In order, nothing waits long enough to.
 const SPILLS: &[&str] = &[
     "stored rar with par2 Backwards",
+    "compressed rar Backwards",
     "stored rar with par2 FirstVolumeLast",
     "7z Backwards",
     "7z FirstVolumeLast",

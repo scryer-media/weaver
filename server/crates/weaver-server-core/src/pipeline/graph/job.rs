@@ -83,9 +83,10 @@ impl GraphError {
 }
 
 // Where a graph job writes and what it may hold: its working directory, the
-// process-wide holds accountant every job shares, the free space of the
-// volume its scratch lives on, how many engines it may run at once, and
-// where their runs speak, and the extraction budget its writes are held to.
+// process-wide holds accountant and decode pool every job shares, the free
+// space of the volume its scratch lives on, how many engines it may run at
+// once, and where their runs speak, and the extraction budget its writes are
+// held to.
 pub(crate) struct Storage {
     pub(crate) working_dir: PathBuf,
     // Where the files of the members it delivers lie, and the free space of
@@ -93,6 +94,7 @@ pub(crate) struct Storage {
     // on another device.
     pub(crate) output: Option<(PathBuf, CapacityReader)>,
     pub(crate) accountant: Arc<HoldsAccountant>,
+    pub(crate) decode: Arc<super::engine::DecodePool>,
     pub(crate) free_disk: CapacityReader,
     pub(crate) slots: usize,
     pub(crate) mail: mpsc::Sender<Said>,
@@ -106,6 +108,27 @@ pub(crate) struct Storage {
     pub(crate) hardware: super::hardware::Hardware,
     // Where the job's writes publish what they take, in a pipeline.
     pub(crate) metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+    // Weaver's data folder and the free space of its disk: where a decode
+    // window goes when the working directory cannot hold it.
+    pub(crate) data_dir: Option<(PathBuf, CapacityReader)>,
+}
+
+impl Storage {
+    // The decode windows job `scope`'s runs may borrow: scratch files in
+    // its working directory, else in the data folder, out of the free space
+    // the holds keep.
+    pub(crate) fn windows(&self, scope: u64) -> Arc<super::window::Windows> {
+        let windows = super::window::Windows::new(
+            self.working_dir.clone(),
+            self.free_disk.clone(),
+            Arc::clone(&self.accountant),
+            super::window::WINDOW_CEILING_BYTES,
+        );
+        Arc::new(match &self.data_dir {
+            Some((dir, free_disk)) => windows.or_spare(dir.clone(), scope, free_disk.clone()),
+            None => windows,
+        })
+    }
 }
 
 pub(crate) struct GraphJob {
@@ -163,13 +186,10 @@ impl GraphJob {
     // The runtime a job admitted fresh gets. `scope` is the job's
     // process-wide id.
     pub(crate) fn admit(scope: u64, files: &[RootFile], storage: Storage) -> Self {
-        let runs = Runs::new(
-            scope,
-            storage.slots,
-            storage.mail,
-            Arc::clone(&storage.accountant),
-        )
-        .on(storage.hardware);
+        let windows = storage.windows(scope);
+        let runs = Runs::new(scope, storage.slots, storage.mail, storage.decode)
+            .on(storage.hardware)
+            .lending(windows);
         let writer = NamespaceWriter::new(
             scope,
             storage.working_dir,
@@ -880,6 +900,12 @@ impl GraphJob {
     ) -> Result<(), GraphError> {
         self.step_runs(Vec::new(), limit)?;
         self.lend(slots, limit)
+    }
+
+    // Whether a run of the job waits for decode memory that was freed since
+    // it was turned away, by this job or another.
+    pub(crate) fn memory_freed(&self) -> bool {
+        self.runs.wakeable()
     }
 
     // `limit` is the slot limit the pipeline reads now, which every step

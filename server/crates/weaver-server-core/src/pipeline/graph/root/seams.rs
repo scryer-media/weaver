@@ -59,6 +59,7 @@ impl Pipeline {
             })
             .collect();
         let caps = self.graph_caps(&files);
+        let data_dir = self.window_data_dir();
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -72,6 +73,7 @@ impl Pipeline {
                 )
             }),
             accountant: Arc::clone(&self.graph_holds),
+            decode: Arc::clone(&self.graph_decode),
             free_disk: self
                 .storage_capacity
                 .reader(crate::operations::StorageRoot::Intermediate),
@@ -82,6 +84,7 @@ impl Pipeline {
             nesting: limits::NESTING,
             hardware: self.graph_hardware.clone(),
             metrics: Some(Arc::clone(&self.metrics)),
+            data_dir: Some(data_dir),
         };
         let mut graph = GraphJob::admit(job_id.0, &files, storage);
         let mut queued = std::collections::HashSet::new();
@@ -409,6 +412,7 @@ impl Pipeline {
                 self.download_dispatch_wake = true;
             }
             self.wake_repair_waiters();
+            self.wake_memory_waiters();
             return;
         }
         let limit = self.graph_job_slot_limit(job_id);
@@ -515,6 +519,28 @@ impl Pipeline {
         self.after_graph_step(job_id);
         // The step's bytes are written: the checkpoint can say so.
         self.step_graph_checkpoint(job_id);
+        self.wake_memory_waiters();
+    }
+
+    // Decode memory a step, a retired job or a new profile freed goes to the
+    // runs of every job waiting for it, each of which steps its runs again.
+    // A job that holds no slot now is woken when it is given one.
+    pub(in crate::pipeline) fn wake_memory_waiters(&mut self) {
+        let waiting: Vec<JobId> = self
+            .graph_jobs
+            .iter()
+            .filter(|(_, graph)| graph.memory_freed())
+            .map(|(job_id, _)| *job_id)
+            .collect();
+        for job_id in waiting {
+            if self
+                .graph_jobs
+                .get(&job_id)
+                .is_some_and(GraphJob::memory_freed)
+            {
+                self.resume_graph_work(job_id);
+            }
+        }
     }
 
     // Lend the job's due repairs under the repair slots every graph job

@@ -281,7 +281,7 @@ pub(super) fn borrowed_node_rows(
                 .map(|window| (window.start as i64, window.end as i64)),
             kind: kind.to_string(),
             state: super::state_name(node.state).to_owned(),
-            reason: node.reason.map(|why| super::why_name(why).to_owned()),
+            reason: node.reason.map(super::why_text),
             facts_version: i64::from(facts.version),
             facts: facts.bytes.clone(),
             winning_password: password,
@@ -316,7 +316,7 @@ pub(super) fn borrowed_node_rows(
             undecided: member.undecided,
             has_file: state.has_file,
             on_disk: state.on_disk,
-            refused: state.refused.map(|why| super::why_name(why).to_owned()),
+            refused: state.refused.map(super::why_text),
             copy_of: member.copy_of.map(|into| i64::from(into.0)),
             refuted_kind: member.refuted.map(|kind| kind.to_string()),
         }
@@ -545,6 +545,7 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
         format!("{INTERNAL_DIR}/graph-recovery-0-3.repaired"),
         format!("{INTERNAL_DIR}/graph-recovery-0-3/set.par2"),
         format!("{INTERNAL_DIR}/graph-waiting-0-2"),
+        crate::pipeline::graph::window::window_name(NodeId(1), 0),
         "inner/stray.bin".to_owned(),
         "set.par2".to_owned(),
         "set.part1.rar".to_owned(),
@@ -584,6 +585,32 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
     left.sort();
     assert_eq!(left, named);
     assert!(!dir.path().join("stray").exists());
+}
+
+// A decode window's scratch file is never named by a checkpoint: a restore
+// removes every one its job left, and touches none in a folder that is not
+// the job's.
+#[test]
+fn a_restore_removes_leftover_decode_windows_only_in_its_own_folder() {
+    use crate::pipeline::graph::window::window_name;
+    let dir = tempfile::tempdir().unwrap();
+    let job = dir.path().join("job");
+    let other = dir.path().join("other");
+    let windows = [window_name(NodeId(0), 0), window_name(NodeId(2), 7)];
+    for root in [&job, &other] {
+        for name in &windows {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"window").unwrap();
+        }
+    }
+    let rows = rows(&full());
+    let restored = snapshot(&rows).unwrap();
+    crate::pipeline::graph::restore::sweep_unnamed(&job, &restored, &rows.held_parts).unwrap();
+    for name in &windows {
+        assert!(!job.join(name).exists(), "{name} survived the restore");
+        assert!(other.join(name).exists(), "{name} went from another folder");
+    }
 }
 
 // A directory member the checkpoint names stays, but what is in it is the
@@ -1218,6 +1245,7 @@ fn restored(
                 scratch_ceiling: u64::MAX,
                 disk_reserve: 0,
             })),
+            decode: crate::pipeline::graph::engine::DecodePool::unbounded(),
             free_disk: CapacityReader::unknown(),
             slots: 1,
             mail: mail.sender(),
@@ -1226,6 +1254,7 @@ fn restored(
             nesting: u32::MAX,
             hardware: Default::default(),
             metrics: None,
+            data_dir: None,
         },
         0,
     )
@@ -1841,4 +1870,37 @@ fn a_file_cut_short_before_a_restore_fetches_again_what_it_lost() {
         std::fs::read(&path).unwrap() == whole,
         "the file holds every byte"
     );
+}
+
+// Every reason a checkpoint row keeps reads back as itself, and a decode
+// too large keeps the sizes it carried, each one it did not say read back
+// unsaid. A name it never wrote is no reason.
+#[test]
+fn every_reason_a_row_keeps_reads_back_with_its_sizes() {
+    let too_large = |needed, allowed| Why::TooLarge { needed, allowed };
+    let reasons = super::REASONS.into_iter().chain([
+        too_large(Some(2 << 30), Some(1 << 30)),
+        too_large(Some(2 << 30), None),
+        too_large(None, Some(1 << 30)),
+    ]);
+    for why in reasons {
+        assert_eq!(
+            super::why_named(&super::why_text(why)),
+            Some(why),
+            "{why:?}"
+        );
+    }
+    assert_eq!(
+        super::why_text(too_large(Some(2 << 30), None)),
+        "too_large:2147483648:-"
+    );
+    for text in [
+        "too_large",
+        "too_large:1",
+        "unsupported:1:2",
+        "too_large:x:-",
+        "nothing",
+    ] {
+        assert_eq!(super::why_named(text), None, "{text}");
+    }
 }

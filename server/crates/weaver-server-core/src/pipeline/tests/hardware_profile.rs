@@ -86,6 +86,15 @@ fn assert_limits_of(pipeline: &Pipeline, profile: HardwareProfile) {
     );
     let grant = pipeline.graph_hardware.grant();
     assert_eq!(pool_size(&grant), tuning.extract_threads);
+    // The decode pool fits one run at the profile's ceiling, and its
+    // overhead.
+    assert_eq!(
+        pipeline.graph_decode.room().limit,
+        tuning
+            .sevenz_decode_memory_bytes
+            .max(tuning.decode_window_bytes)
+            + crate::pipeline::graph::engine::RUN_OVERHEAD
+    );
     assert_eq!(
         lent(&grant.run),
         (
@@ -153,6 +162,32 @@ async fn a_chosen_profile_is_in_force_for_the_next_activity() {
         pipeline.graph_hardware.grant().pool.as_ref().unwrap()
     ));
     assert_eq!(pool_size(&running), 6);
+}
+
+// The holds keep exactly what their settings resolve to under every profile:
+// the decode pool is apart from them and never raises their limit.
+#[tokio::test]
+async fn the_holds_keep_their_settings_on_every_profile() {
+    use crate::pipeline::graph::limits::{HoldSettings, HostFacts};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = pipeline_on_twelve_cores(&temp_dir).await;
+    let settings = HoldSettings::resolve(
+        &*pipeline.config.read().await,
+        HostFacts::probe(
+            &temp_dir.path().join("intermediate"),
+            HardwareProfile::Balanced
+                .tuning(pipeline.tuner.system_profile())
+                .direct_store_resident_default_cap_bytes,
+        ),
+    )
+    .budgets();
+    assert_eq!(pipeline.graph_holds.budgets(), settings);
+    for profile in [HardwareProfile::Efficient, HardwareProfile::Balanced] {
+        choose(&mut pipeline, profile).await;
+        assert_limits_of(&pipeline, profile);
+        assert_eq!(pipeline.graph_holds.budgets(), settings);
+    }
 }
 
 #[tokio::test]
@@ -280,22 +315,16 @@ impl weaver_graph::Extraction for Told {
 // run after the change starts on the new profile's.
 #[tokio::test]
 async fn a_profile_change_reaches_the_next_run_and_not_the_running_one() {
-    use crate::pipeline::graph::engine::{RunMail, Runs};
+    use crate::pipeline::graph::engine::{DecodePool, RunMail, Runs};
     use crate::pipeline::graph::envelope::Envelopes;
     use weaver_graph::NodeId;
-    use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 
     let temp_dir = tempfile::tempdir().unwrap();
     let mut pipeline = pipeline_on_twelve_cores(&temp_dir).await;
     let mut envelopes = Envelopes::new(temp_dir.path().join("envelopes"));
     let mut mail = RunMail::default();
-    let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
-        resident_limit: u64::MAX,
-        scratch_total: u64::MAX,
-        scratch_ceiling: u64::MAX,
-        disk_reserve: 0,
-    }));
-    let mut runs = Runs::new(1, 2, mail.sender(), accountant).on(pipeline.graph_hardware.clone());
+    let pool = Arc::new(DecodePool::new(u64::MAX));
+    let mut runs = Runs::new(1, 2, mail.sender(), pool).on(pipeline.graph_hardware.clone());
     let (first, second) = (NodeId(1), NodeId(2));
     let (told, heard) = std::sync::mpsc::channel();
 
@@ -370,6 +399,7 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
             window_bytes: None,
             threads: 6,
             pool: None,
+            lender: None,
         }
     );
 
@@ -386,6 +416,7 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
             window_bytes: None,
             threads: 4,
             pool: None,
+            lender: None,
         }
     );
     assert_eq!(grant.install(rayon::current_num_threads), 4);

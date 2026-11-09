@@ -582,6 +582,59 @@ async fn hear_repair(pipeline: &mut Pipeline, job_id: JobId) {
     }
 }
 
+// Two jobs whose runs do not fit in the decode pool together: the second
+// job's run waits for memory, and the first's end wakes it through the
+// pipeline, with nothing else of the second job stepping it. Both complete.
+#[tokio::test]
+async fn a_run_waiting_for_another_jobs_memory_starts_when_that_run_ends() {
+    const WINDOW: u64 = 1 << 20;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (first, second) = (JobId(92_150), JobId(92_151));
+    let first_body = payload(ARTICLE + 3, 4);
+    let second_body = payload(ARTICLE + 5, 5);
+    let first_posts = vec![echo_volume(0, &first_body)];
+    let second_posts = vec![echo_volume(0, &second_body)];
+    let (mut pipeline, first_dir) = graph_job(&temp_dir, first, &first_posts).await;
+    let second_dir = insert_active_job(
+        &mut pipeline,
+        second,
+        spec("lantern beside", &second_posts, ARTICLE),
+    )
+    .await;
+    pipeline
+        .graph_decode
+        .set_limit(WINDOW + engine::RUN_OVERHEAD);
+    for job_id in [first, second] {
+        pipeline
+            .graph_jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .set_builder(Box::new(Echoes {
+                volumes: 1,
+                window: WINDOW,
+                ..Echoes::default()
+            }));
+    }
+    decode_all(&mut pipeline, first, &first_posts, 0).await;
+    decode_all(&mut pipeline, second, &second_posts, 0).await;
+    assert!(pipeline.graph_jobs[&first].runs().in_flight());
+    assert!(!pipeline.graph_jobs[&second].runs().in_flight());
+    assert!(
+        pipeline.graph_jobs[&second].runs().live(),
+        "it waits for memory"
+    );
+
+    drain_runs(&mut pipeline, first).await;
+    assert_eq!(read(&first_dir.join("echo-0.mkv")), first_body);
+    assert!(
+        pipeline.graph_jobs[&second].runs().in_flight(),
+        "the first's end started it"
+    );
+    drain_runs(&mut pipeline, second).await;
+    assert_eq!(read(&second_dir.join("echo-0.mkv")), second_body);
+    retire_pipeline_database(pipeline).await;
+}
+
 // A turn hears everything the runs said since the last one, not one piece:
 // a run speaks its output 64 KiB at a time, so one heard a turn runs as
 // slowly as the pipeline's turns are busy with everything else.

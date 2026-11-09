@@ -22,8 +22,6 @@
 //
 // Step 1, refusing a graph job with no checkpoint, is the caller's.
 
-use std::sync::Arc;
-
 use weaver_graph::{MemberId, NodeId, RestoreError, Tree, VolumeIndex};
 
 use super::loans::Loans;
@@ -69,13 +67,10 @@ impl GraphJob {
         tree.nest_at_most(storage.nesting);
         let root = ArticleRoot::restore(files, &snapshot.root)?;
         same_post(&tree, files)?;
-        let runs = Runs::new(
-            scope,
-            storage.slots,
-            storage.mail,
-            Arc::clone(&storage.accountant),
-        )
-        .on(storage.hardware);
+        let windows = storage.windows(scope);
+        let runs = Runs::new(scope, storage.slots, storage.mail, storage.decode)
+            .on(storage.hardware)
+            .lending(windows);
         let mut writer = NamespaceWriter::new(
             scope,
             storage.working_dir,

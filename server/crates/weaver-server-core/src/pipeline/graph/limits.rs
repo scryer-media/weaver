@@ -214,9 +214,10 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //   disk reserve       the free space a write would leave, against the
 //                      reading the holds already take
 //   content policy     the operator's unacceptable extensions, on every
-//                      name a namespace places; a name placed before the
-//                      setting could be read waits, and is judged when a
-//                      read of it succeeds, before the job delivers
+//                      name a namespace places; a name placed while the
+//                      database could not be read waits, and is judged when
+//                      a read succeeds, before the job delivers; a stored
+//                      setting that does not parse is the default
 pub(crate) struct Caps {
     limits: Arc<ExtractionLimits>,
     read_policy: PolicyRead,
@@ -246,8 +247,9 @@ pub(crate) struct Caps {
 }
 
 // A read of the operator's settings, answering with them or with why the
-// read failed. A failed read is the host's, never the post's: it is tried
-// again when the policy is next needed.
+// database could not be read. A failed read is the host's, never the
+// post's: it is tried again when the policy is next needed. A stored value
+// that does not parse is no failed read: it answers with the default.
 pub(crate) type PolicyRead =
     Arc<dyn Fn() -> Result<Arc<PostProcessingSettings>, String> + Send + Sync>;
 
@@ -688,6 +690,8 @@ pub(in crate::pipeline::graph) fn caps_for(
     files: &[RootFile],
 ) -> Caps {
     let db = db.clone();
+    // A stored value that does not parse reads as the default policy; only
+    // a failed read leaves the policy unknown.
     let policy: PolicyRead = Arc::new(move || {
         db.post_processing_settings()
             .map(Arc::new)

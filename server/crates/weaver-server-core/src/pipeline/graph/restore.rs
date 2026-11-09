@@ -14,6 +14,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use weaver_graph::holds::HoldsAccountant;
 
+use super::engine::DecodePool;
+
 use super::checkpoint::{self, CheckpointError};
 use super::engine::Said;
 use super::hardware::Hardware;
@@ -108,6 +110,7 @@ pub(crate) struct RestoreSeat {
     output: Option<(PathBuf, CapacityReader)>,
     output_free_disk: CapacityReader,
     accountant: Arc<HoldsAccountant>,
+    decode: Arc<DecodePool>,
     free_disk: CapacityReader,
     slots: usize,
     mail: mpsc::Sender<Said>,
@@ -115,6 +118,7 @@ pub(crate) struct RestoreSeat {
     metrics: Arc<PipelineMetrics>,
     extraction_limits: Arc<ExtractionLimits>,
     spec_password: Option<String>,
+    data_dir: Option<(PathBuf, CapacityReader)>,
 }
 
 impl Pipeline {
@@ -131,6 +135,7 @@ impl Pipeline {
                 .storage_capacity
                 .reader(crate::operations::StorageRoot::Complete),
             accountant: Arc::clone(&self.graph_holds),
+            decode: Arc::clone(&self.graph_decode),
             free_disk: self
                 .storage_capacity
                 .reader(crate::operations::StorageRoot::Intermediate),
@@ -143,6 +148,7 @@ impl Pipeline {
             metrics: Arc::clone(&self.metrics),
             extraction_limits: Arc::clone(&self.extraction_limits),
             spec_password,
+            data_dir: Some(self.window_data_dir()),
         }
     }
 }
@@ -244,12 +250,14 @@ impl RestoreSeat {
             working_dir: self.working_dir,
             output: self.output,
             accountant: self.accountant,
+            decode: self.decode,
             free_disk: self.free_disk,
             slots: self.slots,
             mail: self.mail,
             nesting: super::limits::NESTING,
             hardware: self.hardware,
             metrics: Some(self.metrics),
+            data_dir: self.data_dir,
         };
         let limit = storage.slots;
         let Restored {

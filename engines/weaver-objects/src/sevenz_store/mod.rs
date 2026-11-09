@@ -67,6 +67,48 @@ pub(crate) fn measured(first_bytes: &[u8]) -> Option<u64> {
     }
 }
 
+// What a decode of the widest folder holds resident, as the header's coders
+// state it: every coder of a folder at once, each as the decoder sizes it,
+// an LZMA or LZMA2 dictionary cut to what its coder unpacks, as the decoder
+// cuts it when it allocates. A PPMd model is its declared size. `None` when a
+// coder states no size the decoder knows.
+pub(crate) fn window(archive: &sevenz_turbo::Archive) -> Option<u64> {
+    archive.blocks.iter().try_fold(0u64, |widest, block| {
+        let held = block.coders.iter().try_fold(0u64, |sum, coder| {
+            let estimate = sevenz_turbo::coder_memory_estimate(coder).ok()?;
+            let held = match dictionary(coder) {
+                Some(dict) => estimate
+                    .saturating_sub(dict)
+                    .saturating_add(dict.min(block.get_unpack_size_for_coder(coder).max(1 << 12))),
+                None => estimate,
+            };
+            Some(sum.saturating_add(held))
+        })?;
+        Some(widest.max(held))
+    })
+}
+
+// The dictionary an LZMA or LZMA2 coder declares, as the decoder's estimate
+// counts it.
+fn dictionary(coder: &sevenz_turbo::Coder) -> Option<u64> {
+    let method = coder.encoder_method_id();
+    let properties = coder.properties();
+    if method == sevenz_turbo::EncoderMethod::ID_LZMA {
+        let dict = properties.get(1..5)?;
+        Some(u64::from(u32::from_le_bytes(dict.try_into().ok()?)))
+    } else if method == sevenz_turbo::EncoderMethod::ID_LZMA2 {
+        let bits = u64::from(*properties.first()?);
+        let dict = match bits {
+            40 => u64::from(u32::MAX),
+            0..40 => (2 | (bits & 1)) << (bits / 2 + 11),
+            _ => return None,
+        };
+        Some((dict + 15) & !15)
+    } else {
+        None
+    }
+}
+
 // The one envelope: container coordinates, for every byte that belongs to no
 // member.
 const ENVELOPE: u32 = 0;
@@ -223,6 +265,10 @@ pub struct SevenZipStore {
     stale: bool,
     // The object gave its container up; it says nothing more.
     gone: bool,
+    // What a decode of its widest folder holds resident, as the header's
+    // coders state it, once it is given up to the engine.
+    #[serde(default)]
+    window: Option<u64>,
     // Candidates whose folder keys the cache has no answer for: derived
     // away from the loop while the store is lent out, and the folders open
     // once it is back. Neither is kept: a restart offers the password
@@ -324,6 +370,7 @@ impl SevenZipStore {
             recovery_said: false,
             stale: true,
             gone: false,
+            window: None,
             derive_due: BTreeSet::new(),
             derived: BTreeMap::new(),
         }
@@ -501,7 +548,10 @@ impl SevenZipStore {
     fn build(&mut self, archive: &sevenz_turbo::Archive, read: &[ByteRange], out: &mut Vec<Emit>) {
         let map = match map::build(archive) {
             Ok(map) => map,
-            Err(why) => return self.give_up(Emit::NeedsEngine(why), out),
+            Err(why) => {
+                self.window = window(archive);
+                return self.give_up(Emit::NeedsEngine(why), out);
+            }
         };
         self.basis = read
             .iter()
@@ -746,7 +796,9 @@ impl Object for SevenZipStore {
                 // A candidate the proof ruled wrong was wrong for the bytes
                 // it read: bytes of the proof that came again are tried
                 // under every candidate again.
-                if proof.is_some_and(|proof| proof.intersect(ByteRange::new(at, range.end)).is_some()) {
+                if proof
+                    .is_some_and(|proof| proof.intersect(ByteRange::new(at, range.end)).is_some())
+                {
                     for candidate in &mut self.candidates {
                         candidate.folder_wrong = false;
                     }
@@ -930,6 +982,7 @@ impl Object for SevenZipStore {
         Some(Box::new(crate::engine::CarriedVolume {
             front: self.measured,
             length: self.length,
+            window: self.window,
         }))
     }
 
