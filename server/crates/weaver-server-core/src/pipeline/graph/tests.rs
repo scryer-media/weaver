@@ -1929,3 +1929,43 @@ async fn only_the_declared_size_arriving_is_repaired_by_par2() {
     assert_eq!((written.len(), differs), (data.len(), None));
     retire_pipeline_database(pipeline).await;
 }
+
+// A graph job renamed halfway keeps its working folder: the graph holds the
+// folder's paths, so the rest of the job is written beside the first half.
+#[tokio::test]
+async fn a_graph_job_renamed_halfway_keeps_its_working_folder() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_040);
+    let data = payload(4 * ARTICLE, 40);
+    let posts = vec![Post::plain("lantern.bin", data.clone())];
+    let (mut pipeline, dir) = graph_job(&temp_dir, job_id, &posts).await;
+    // The add path stamps the marker with the job id; the harness leaves it
+    // empty, which would refuse any move for a reason other than the graph.
+    crate::jobs::working_dir::stamp_working_dir(&pipeline.intermediate_dir, &dir, job_id)
+        .await
+        .unwrap();
+    for ordinal in 0..2 {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    assert!(
+        pipeline
+            .rename_working_dir_when_quiet(job_id, "lantern renamed")
+            .await
+    );
+    assert_eq!(pipeline.jobs[&job_id].working_dir, dir);
+    assert!(!pipeline.intermediate_dir.join("lantern renamed").exists());
+    for ordinal in 2..4 {
+        decode(&mut pipeline, job_id, &posts, 0, ordinal, true).await;
+    }
+    pipeline.flush_graph_checkpoint(job_id);
+    pipeline.db.flush_write_queue().await.unwrap();
+    assert_eq!(
+        member_file(&pipeline, job_id, 0),
+        Some(dir.join("lantern.bin"))
+    );
+    assert!(
+        read(&dir.join("lantern.bin")) == data,
+        "the file is not whole"
+    );
+    retire_pipeline_database(pipeline).await;
+}
