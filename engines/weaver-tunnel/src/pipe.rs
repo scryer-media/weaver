@@ -13,6 +13,8 @@ mod inbound;
 mod natpmp;
 #[path = "pipe_sockets.rs"]
 mod sockets;
+#[path = "pipe_socks5_udp.rs"]
+mod socks5_udp;
 pub use inbound::{Inbound, InboundListener, PortForwarding, PortMapping, gateway_of};
 pub use sockets::{SessionSockets, SocketClass, SocketPermit, SocketShares};
 
@@ -570,10 +572,17 @@ pub trait Dialer: Send + Sync {
     fn offers(&self) -> Transports {
         Transports::Tcp
     }
-    // Datagrams through this stage, for a WireGuard tunnel stacked on it.
-    // Only a WireGuard stage carries them.
+    // Datagrams through this stage, for a WireGuard tunnel stacked on it or
+    // a torrent session's UDP. A WireGuard stage carries them, and so does a
+    // SOCKS5 hop whose stage beneath carries datagrams to its relay.
     fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
         None
+    }
+    // Datagrams a proxy stacked on this stage sends to its UDP relay. An
+    // egress sends them from its own sockets; any other stage only through
+    // what it carries.
+    fn relay_datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        self.datagrams()
     }
     // Stream connections arriving through this stage, for a session that
     // listens on it. Only a WireGuard stage takes them: the hop at the top of
@@ -770,6 +779,9 @@ impl Dialer for Egress {
     fn offers(&self) -> Transports {
         Transports::TcpUdp
     }
+    fn relay_datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        Some(Arc::new(socks5_udp::EgressDatagrams(self)))
+    }
     fn bind_local_udp(&self, local: SocketAddr) -> Option<io::Result<std::net::UdpSocket>> {
         Some(self.binding.bind_udp_at(local))
     }
@@ -931,6 +943,15 @@ impl Dialer for TransportHop {
         self.inner
             .failing_hop()
             .or_else(|| self.failure.of(self.id))
+    }
+    // A SOCKS5 hop carries datagrams by UDP ASSOCIATE when the stage beneath
+    // carries them to its relay. An HTTP CONNECT hop carries none.
+    fn datagrams(self: Arc<Self>) -> Option<Arc<dyn DatagramTransport>> {
+        if !matches!(self.spec.kind, crate::transport::TransportKind::Socks5) {
+            return None;
+        }
+        let relay = Arc::clone(&self.inner).relay_datagrams()?;
+        Some(Arc::new(socks5_udp::Socks5Datagrams::new(self, relay)))
     }
     fn budget(&self) -> Duration {
         self.inner

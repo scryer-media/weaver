@@ -810,7 +810,7 @@ impl NetworkRuntime {
                                 .with_udp_factory(bottom.clone())
                                 .with_endpoint_resolver(Arc::new(EndpointNames(bottom.clone()))),
                             // A WireGuard tunnel rides only on another
-                            // WireGuard tunnel: nothing else carries UDP.
+                            // WireGuard tunnel.
                             Some(beneath) => {
                                 if config.profiles.get(beneath).map(|p| p.kind)
                                     != Some(ProxyKind::WireGuard)

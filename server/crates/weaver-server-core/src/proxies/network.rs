@@ -593,8 +593,9 @@ impl Route {
                     if !seen.insert(id) {
                         return Err(NetworkRefusal::RouteProxyRepeated);
                     }
-                    // Only a WireGuard hop carries the UDP that WireGuard
-                    // and HTTP/3 travel over, and only WireGuard can use it.
+                    // A WireGuard hop may sit above another WireGuard hop.
+                    // Above anything else, and HTTP/3 above anything, the
+                    // chain is refused.
                     let carried = position > 0
                         && profile.kind == ProxyKind::WireGuard
                         && profiles

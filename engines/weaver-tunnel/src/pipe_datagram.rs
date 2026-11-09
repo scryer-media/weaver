@@ -28,7 +28,7 @@ impl SessionDatagrams {
     }
 }
 
-fn tunnel_error(error: DialError) -> TunnelError {
+pub(super) fn tunnel_error(error: DialError) -> TunnelError {
     match error {
         DialError::Fatal(error) => error,
         error => TunnelError::Engine(error.to_string()),

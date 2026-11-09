@@ -1350,6 +1350,8 @@ mod carried_tests;
 mod tests {
     use super::*;
     use crate::proxies::Rung;
+    use weaver_tunnel::pipe::TransportHop;
+    use weaver_tunnel::transport::{TransportKind, TransportProxy};
 
     fn ladder() -> LegPath {
         LegPath::Ladder {
@@ -1524,6 +1526,78 @@ mod tests {
         let shape = LegKind::Ladder.shape(Some(&carrying()));
         assert!(shape.datagrams && shape.dht);
         assert!(!shape.listen && !shape.upnp && !shape.own_sockets);
+    }
+
+    // A SOCKS5 hop on the leg's egress, or an HTTP CONNECT one, aimed at
+    // `endpoint`.
+    fn proxy_hop(kind: TransportKind, endpoint: SocketAddr) -> Arc<dyn Dialer> {
+        Arc::new(TransportHop {
+            id: 1,
+            spec: TransportProxy {
+                kind,
+                host: endpoint.ip().to_string(),
+                port: endpoint.port(),
+                username: None,
+                password: None,
+            },
+            inner: Arc::new(weaver_tunnel::pipe::Egress::new(
+                4,
+                weaver_tunnel::egress::SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
+                std::time::Duration::from_secs(30),
+            )),
+            timeout: std::time::Duration::from_secs(30),
+            naming: weaver_tunnel::pipe::Naming::Proxy,
+            failure: Default::default(),
+        })
+    }
+
+    // A ladder leg on `rung`, as the runtime builds one.
+    fn ladder_leg(rung: Arc<dyn Dialer>) -> Arc<dyn Dialer> {
+        Arc::new(weaver_tunnel::pipe::Revocable::new(Arc::new(
+            weaver_tunnel::pipe::Fallback::new(vec![rung]),
+        )))
+    }
+
+    #[test]
+    fn a_ladder_leg_over_a_socks5_rung_carries_udp_and_one_over_http_connect_does_not() {
+        let endpoint: SocketAddr = "192.0.2.1:1080".parse().unwrap();
+        let shape = LegKind::Ladder.shape(Some(&ladder_leg(proxy_hop(
+            TransportKind::Socks5,
+            endpoint,
+        ))));
+        assert!(shape.datagrams && shape.dht && shape.utp);
+        assert!(!shape.listen && !shape.upnp && !shape.own_sockets);
+
+        let shape = LegKind::Ladder.shape(Some(&ladder_leg(proxy_hop(
+            TransportKind::HttpConnect,
+            endpoint,
+        ))));
+        assert!(!shape.datagrams && !shape.dht && !shape.utp);
+    }
+
+    // The session's UDP socket on a SOCKS5 ladder leg reaches a peer from
+    // the proxy's relay, and the peer's answer comes back through it.
+    #[tokio::test]
+    async fn a_socks5_ladder_legs_udp_rides_the_proxys_relay() {
+        let double =
+            weaver_tunnel::test_support::proxy::ProxyServerDouble::start_udp(None, false).await;
+        let leg = ladder_leg(proxy_hop(TransportKind::Socks5, double.addr));
+        let sockets = LegSockets::new(leg, &LegKind::Ladder);
+        let udp = sockets
+            .bind_udp(SocketAddr::from(([0, 0, 0, 0], 0)))
+            .await
+            .unwrap();
+        let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let address = peer.local_addr().unwrap();
+        udp.send_to(b"ping", address).await.unwrap();
+        let mut buffer = [0; 64];
+        let (len, from) = peer.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..len], b"ping");
+        assert_eq!(Some(from), double.relay_outbound());
+        peer.send_to(b"pong", from).await.unwrap();
+        let (len, from) = udp.recv_from(&mut buffer).await.unwrap();
+        assert_eq!(&buffer[..len], b"pong");
+        assert_eq!(from, address);
     }
 
     #[test]
