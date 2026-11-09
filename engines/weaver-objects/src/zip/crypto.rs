@@ -214,6 +214,8 @@ impl Open {
     ) -> Option<Decrypted> {
         let mut passed = Vec::new();
         let before = self.walk(offset, coverage, read, &mut passed)?;
+        #[cfg(any(test, feature = "test-support"))]
+        super::counting::deciphered(cipher.len());
         let mut state = before.clone();
         state.provenance = crate::crypt::worse(state.provenance, provenance);
         let mut plain = Vec::with_capacity(cipher.len());

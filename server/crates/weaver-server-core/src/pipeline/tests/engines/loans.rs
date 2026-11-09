@@ -249,6 +249,37 @@ async fn restarted(kind: Kind, shape: Shape) {
     assert_worked(kind, &whole);
 }
 
+// A ZipCrypto member's keys never run on the loop, which runs on the test's
+// thread: every byte of its ciphertext is deciphered once, on a loan.
+async fn deciphered_on_loans(kind: Kind, order: Order) {
+    use weaver_objects::zip::counting;
+    let outcome = run(&scenario(kind, Shape::Flat, order)).await;
+    assert_delivered(kind, &outcome);
+    assert!(counting::delivered_here() > 0, "the loop delivered here");
+    assert_eq!(counting::deciphered_here(), 0, "deciphered on the loop");
+    assert_eq!(counting::deciphered_everywhere(), BODY as u64);
+}
+
+#[tokio::test]
+async fn zipcrypto_sized_tail_first_deciphers_on_loans() {
+    deciphered_on_loans(Kind::ZipCryptoSized, Order::TailFirst).await
+}
+
+#[tokio::test]
+async fn zipcrypto_sized_backwards_deciphers_on_loans() {
+    deciphered_on_loans(Kind::ZipCryptoSized, Order::Backwards).await
+}
+
+#[tokio::test]
+async fn zipcrypto_descriptor_in_order_deciphers_on_loans() {
+    deciphered_on_loans(Kind::ZipCryptoDescriptor, Order::Forwards).await
+}
+
+#[tokio::test]
+async fn zipcrypto_descriptor_leased_deciphers_on_loans() {
+    deciphered_on_loans(Kind::ZipCryptoDescriptor, Order::Leased).await
+}
+
 macro_rules! delivery_rows {
     ($($kind:ident => $flat:ident, $nested:ident;)*) => {
         $(

@@ -30,6 +30,42 @@ mod walk;
 #[cfg(test)]
 mod tests;
 
+// What a test reads of where a zip's work ran: the bytes delivered to it on
+// this thread, and the cipher bytes its keys ran over on this thread and on
+// every thread.
+#[cfg(any(test, feature = "test-support"))]
+pub mod counting {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    thread_local! {
+        static DELIVERED: Cell<u64> = const { Cell::new(0) };
+        static DECIPHERED: Cell<u64> = const { Cell::new(0) };
+    }
+    static DECIPHERED_EVERYWHERE: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn delivered(len: usize) {
+        DELIVERED.with(|here| here.set(here.get() + len as u64));
+    }
+
+    pub(super) fn deciphered(len: usize) {
+        DECIPHERED.with(|here| here.set(here.get() + len as u64));
+        DECIPHERED_EVERYWHERE.fetch_add(len as u64, Ordering::Relaxed);
+    }
+
+    pub fn delivered_here() -> u64 {
+        DELIVERED.with(Cell::get)
+    }
+
+    pub fn deciphered_here() -> u64 {
+        DECIPHERED.with(Cell::get)
+    }
+
+    pub fn deciphered_everywhere() -> u64 {
+        DECIPHERED_EVERYWHERE.load(Ordering::Relaxed)
+    }
+}
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -457,6 +493,8 @@ impl Object for Zip {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
+        #[cfg(any(test, feature = "test-support"))]
+        counting::delivered(delivery.bytes.len());
         if self.gone {
             return;
         }
