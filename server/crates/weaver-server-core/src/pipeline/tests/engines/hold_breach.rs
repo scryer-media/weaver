@@ -5,9 +5,12 @@
 // place them are held in memory, then on scratch; a set whose every byte
 // arrives whole delivers its members whatever the holds could keep.
 
+use std::collections::BTreeSet;
+
 use weaver_graph::holds::HoldBudgets;
 
 use super::harness::{Post, Scenario, par2_set, payload, run};
+use crate::pipeline::graph::lines::Lines;
 use crate::pipeline::tests::direct_store::single_member_store_set;
 
 const MEMBER: &str = "beacon.bin";
@@ -74,4 +77,30 @@ async fn a_scrambled_stored_set_whose_holds_run_out_delivers_its_member() {
         "delivered names"
     );
     assert!(graph.files[&delivered] == body, "member bytes");
+}
+
+// The stores bound over the job's members, by node.
+fn store_nodes(lines: &Lines) -> BTreeSet<String> {
+    lines
+        .of("object bound")
+        .into_iter()
+        .filter(|line| line.contains("kind=rar_store"))
+        .filter_map(|line| {
+            line.split_whitespace()
+                .find(|field| field.starts_with("node="))
+                .map(str::to_owned)
+        })
+        .collect()
+}
+
+// A set its recovery set renames volume by volume as their fronts arrive is
+// one store all the same: a volume still under its posted name joins the
+// volumes renamed before it, and no store is founded beside the set.
+#[tokio::test]
+async fn a_set_renamed_as_it_arrives_is_one_store() {
+    let (lines, _guard) = Lines::capture();
+    let body = payload(8 * 3 * FRAME + 13, 77);
+    let graph = run(&scrambled_store_set(&body, 8)).await;
+    assert!(graph.completed(), "{:?}", graph.failure);
+    assert_eq!(store_nodes(&lines).len(), 1, "{:?}", lines.of("object bound"));
 }
