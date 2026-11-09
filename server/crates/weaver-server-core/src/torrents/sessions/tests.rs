@@ -704,7 +704,23 @@ async fn a_route_shows_where_it_listens_and_how_its_ports_are_mapped() {
         .unwrap();
     assert_eq!(
         sessions.view(&plan.key).await.unwrap().mappings,
-        [renewed, mapped]
+        [renewed.clone(), mapped.clone()]
+    );
+
+    // The SSL listener's mapping by the same mapper is a mapping of its own.
+    let ssl = PortMapped {
+        local_port: listen.port().wrapping_add(1),
+        external_port: Some(40_003),
+        ..mapped.clone()
+    };
+    events.send(ssl.clone()).unwrap();
+    reported
+        .wait_for(|mappings| mappings.len() == 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        sessions.view(&plan.key).await.unwrap().mappings,
+        [renewed, mapped, ssl]
     );
     sessions.stop_all().await;
 }
@@ -1097,8 +1113,16 @@ fn a_session_maps_its_announce_port_when_it_maps() {
         ..upnp.clone()
     };
     assert_eq!(maps(&off, system, 6881), None);
+    // A leg held to a source address or a device maps as the host's does.
     let address = LegKind::SourceAddress("192.0.2.4".parse().unwrap()).shape(None);
-    assert_eq!(maps(&upnp, address, 6881), None);
+    assert_eq!(maps(&upnp, address, 6881), Some(51_413));
+    let device = LegKind::Interface("en1".into()).shape(None);
+    assert_eq!(maps(&upnp, device, 6881), Some(51_413));
+    assert_eq!(maps(&off, device, 6881), None);
+    // A ladder leg maps nothing, however it listens.
+    let mut ladder = LegKind::Ladder.shape(None);
+    ladder.listen = true;
+    assert_eq!(maps(&upnp, ladder, 6881), None);
 }
 
 // `future` polled once: its output, if it is ready.
@@ -1688,7 +1712,7 @@ fn session_options_follow_the_leg() {
     );
     assert!(interface.dht.is_some());
     assert_eq!(interface.bind_device_name.as_deref(), Some("en1"));
-    assert!(!interface.listen.unwrap().enable_upnp_port_forwarding);
+    assert!(interface.listen.unwrap().enable_upnp_port_forwarding);
 
     let address: IpAddr = "192.0.2.4".parse().unwrap();
     let source = session_options(
@@ -1701,10 +1725,11 @@ fn session_options_follow_the_leg() {
         &IDENTITY.identity(),
     );
     assert!(source.dht.is_some());
-    assert_eq!(
-        source.listen.unwrap().listen_addr,
-        SocketAddr::new(address, 6882)
-    );
+    let listen = source.listen.unwrap();
+    assert_eq!(listen.listen_addr, SocketAddr::new(address, 6882));
+    // The port-mapping setting is on by default.
+    assert!(listen.enable_upnp_port_forwarding);
+    assert_eq!(source.bind_device_name, None);
     assert!(source.disable_local_service_discovery);
 
     let ladder = session_options(
@@ -2251,8 +2276,13 @@ fn port_mapping_is_what_a_mapping_leg_opens_with() {
         opening(&off, LegKind::System),
         opening(&on, LegKind::System)
     );
-    let address = LegKind::SourceAddress("127.0.0.1".parse().unwrap());
-    assert_eq!(opening(&off, address.clone()), opening(&on, address));
+    for kind in [
+        LegKind::SourceAddress("127.0.0.1".parse().unwrap()),
+        LegKind::Interface("en1".into()),
+    ] {
+        assert!(opening(&on, kind.clone()).upnp, "{kind:?}");
+        assert!(!opening(&off, kind.clone()).upnp, "{kind:?}");
+    }
     assert_eq!(
         opening(&off, LegKind::Ladder),
         opening(&on, LegKind::Ladder)

@@ -78,10 +78,12 @@ impl LegKind {
                 utp: true,
                 datagrams: true,
             },
+            // A leg held to a device or a source address maps its ports on
+            // that interface's own gateway, asking from the leg's sockets.
             Self::Interface(_) => Shape {
                 own_sockets: true,
                 dht: true,
-                upnp: false,
+                upnp: true,
                 listen: true,
                 utp: true,
                 datagrams: true,
@@ -89,7 +91,7 @@ impl LegKind {
             Self::SourceAddress(_) => Shape {
                 own_sockets: false,
                 dht: true,
-                upnp: false,
+                upnp: true,
                 listen: true,
                 utp: true,
                 datagrams: true,
@@ -1166,11 +1168,19 @@ where
     ) -> anyhow::Result<reqwest::ClientBuilder> {
         if shape.used_for == ClientUse::Gateway {
             // The port mapper asks the gateway whatever the leg's own
-            // settings make of its builder.
-            let builder = (self.base)().unwrap_or_else(|error| {
-                tracing::debug!(%error, "the leg's builder failed; the gateway's client is built plain");
-                plain_builder(&self.kind)
-            });
+            // settings make of its builder. A leg held to a device has no
+            // client off it: its mapper does not run rather than ask by the
+            // host's default route.
+            let builder = match (self.base)() {
+                Ok(builder) => builder,
+                Err(error) if matches!(self.kind, LegKind::Interface(_)) => {
+                    anyhow::bail!("the gateway's client is not held to the leg's device: {error}")
+                }
+                Err(error) => {
+                    tracing::debug!(%error, "the leg's builder failed; the gateway's client is built plain");
+                    plain_builder(&self.kind)
+                }
+            };
             return shape.apply(builder.no_proxy().dns_resolver(Arc::new(NoLookups)));
         }
         let builder = (self.base)().map_err(anyhow::Error::msg)?;
@@ -1269,6 +1279,16 @@ where
         local: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
         gateway_socket(&self.dialer, local)
+    }
+
+    // The UPnP search's socket, bound by the leg's route as the mapper's
+    // is: at `from`, on the leg's device or its source address, sending its
+    // multicast out of the interface holding `from`.
+    fn ssdp_socket<'a>(
+        &'a self,
+        from: std::net::Ipv4Addr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        gateway_socket(&self.dialer, SocketAddr::from((from, 0)))
     }
 }
 
@@ -1391,15 +1411,108 @@ mod tests {
     }
 
     #[test]
-    fn upnp_runs_only_on_system_egress() {
+    fn upnp_runs_on_every_leg_of_the_hosts_own_networks() {
         assert!(LegKind::System.shape(None).upnp);
-        assert!(!LegKind::Interface("en1".into()).shape(None).upnp);
+        assert!(LegKind::Interface("en1".into()).shape(None).upnp);
         assert!(
-            !LegKind::SourceAddress("192.0.2.4".parse().unwrap())
+            LegKind::SourceAddress("192.0.2.4".parse().unwrap())
                 .shape(None)
                 .upnp
         );
         assert!(!LegKind::Ladder.shape(Some(&carrying())).upnp);
+        assert!(!LegKind::Ladder.shape(None).upnp);
+    }
+
+    // A leg on the host's sockets, its device or its source address, and
+    // the leg's dialer.
+    fn own_network_legs() -> Vec<(LegKind, Arc<dyn Dialer>)> {
+        let held = |egress| -> Arc<dyn Dialer> {
+            Arc::new(weaver_tunnel::pipe::Revocable::new(Arc::new(
+                weaver_tunnel::pipe::Egress::new(4, egress, std::time::Duration::from_secs(30)),
+            )))
+        };
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        vec![
+            (LegKind::System, system_dialer()),
+            (
+                LegKind::Interface(LOOPBACK_DEVICE.into()),
+                held(weaver_tunnel::egress::SocketEgress::Interface(
+                    LOOPBACK_DEVICE.into(),
+                )),
+            ),
+            (
+                LegKind::SourceAddress(loopback),
+                held(weaver_tunnel::egress::SocketEgress::SourceAddress(loopback)),
+            ),
+        ]
+    }
+
+    // A session's port mapper asks the gateway through its leg's clients:
+    // from the leg's own address, on its device or from its source address,
+    // and the port and address the gateway gives come back to the session
+    // as on the host's own leg.
+    #[tokio::test]
+    async fn each_own_network_leg_asks_the_gateway_from_its_own_sockets() {
+        use weaver_torrent::natpmp::{GatewayRoute, NatPmpMapper};
+        use weaver_torrent::upnp::PortMapRequest;
+        use weaver_tunnel::test_support::natpmp::NatPmpGateway;
+
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        for (kind, dialer) in own_network_legs() {
+            let clients = tracker_client(&kind, dialer, None).unwrap();
+            let gateway = NatPmpGateway::granting(|_| 40_001).await;
+            let route = GatewayRoute {
+                local_ip: loopback,
+                gateway: gateway.address(),
+                interface_addresses: vec![loopback],
+            };
+            let requests = vec![PortMapRequest {
+                protocol: PortmapProtocol::Tcp,
+                local_port: 6881,
+                external_port: 6881,
+            }];
+            let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel();
+            // A token never cancelled: the mapper ends with its task.
+            let task = tokio::spawn(
+                NatPmpMapper::new(Ok(route), requests, None, clients.clone())
+                    .run(Default::default(), events_tx),
+            );
+            // NAT-PMP opcode 2 maps TCP.
+            let granted = gateway.granted(2, 6881).await;
+            assert_eq!(granted.from.ip(), loopback, "{kind:?}");
+            let mapped = events.recv().await.unwrap();
+            assert_eq!(mapped.transport, PortmapTransport::NatPmp, "{kind:?}");
+            assert_eq!(mapped.local_port, 6881, "{kind:?}");
+            assert_eq!(mapped.external_port, Some(40_001), "{kind:?}");
+            assert_eq!(mapped.error, None, "{kind:?}");
+
+            // The UPnP search's socket is the leg's too, at the address.
+            let search = clients
+                .ssdp_socket(std::net::Ipv4Addr::LOCALHOST)
+                .await
+                .unwrap();
+            assert_eq!(search.bind_addr().ip(), loopback, "{kind:?}");
+
+            task.abort();
+        }
+    }
+
+    // A leg held to a device whose clients cannot be held to it builds no
+    // client for the gateway, so its UPnP mapper does not run; the host's
+    // own leg still builds one plain.
+    #[test]
+    fn a_device_leg_builds_no_gateway_client_off_its_device() {
+        let failing = || -> Result<reqwest::ClientBuilder, String> { Err("no such device".into()) };
+        let device = LegClients::new(
+            failing,
+            None,
+            LegKind::Interface("wv-missing0".into()),
+            system_dialer(),
+        );
+        let error = device.client(None, &ClientShape::GATEWAY).unwrap_err();
+        assert!(format!("{error:#}").contains("no such device"), "{error:#}");
+        let system = LegClients::new(failing, None, LegKind::System, system_dialer());
+        assert!(system.client(None, &ClientShape::GATEWAY).is_ok());
     }
 
     #[test]

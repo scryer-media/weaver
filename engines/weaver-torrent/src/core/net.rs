@@ -350,6 +350,19 @@ pub trait HttpClients: Send + Sync + 'static {
             ))
         })
     }
+
+    /// The socket a UPnP search goes out on: bound at `from`, an address of
+    /// the interface the gateway is on, its multicast sent out of that
+    /// interface. By default a host socket; an embedder whose sockets keep
+    /// to a route gives one bound as its own are.
+    fn ssdp_socket<'a>(
+        &'a self,
+        from: std::net::Ipv4Addr,
+    ) -> BoxFuture<'a, io::Result<Arc<dyn DatagramSocket>>> {
+        Box::pin(async move {
+            Ok(Arc::new(crate::upnp::host_ssdp_socket(from)?) as Arc<dyn DatagramSocket>)
+        })
+    }
 }
 
 /// The clients of a session given none: it makes no HTTP request, so it

@@ -494,13 +494,16 @@ impl Joined {
         let mut mappings: Vec<PortMapped> = Vec::new();
         while let Ok(event) = self.mapped.try_recv() {
             mappings.retain(|mapping| {
-                (mapping.transport, mapping.protocol) != (event.transport, event.protocol)
+                (mapping.transport, mapping.protocol, mapping.local_port)
+                    != (event.transport, event.protocol, event.local_port)
             });
             mappings.push(event);
         }
+        let listen_port = self.session.listen_addr().map(|addr| addr.port());
         let mapped_port = mappings
             .iter()
             .filter(|mapping| mapping.protocol == PortmapProtocol::Tcp)
+            .filter(|mapping| Some(mapping.local_port) == listen_port)
             .find_map(|mapping| mapping.external_port);
         (
             Exposure::of(&self.session, path.leg.shape, path.names, &mappings),

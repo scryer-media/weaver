@@ -828,7 +828,7 @@ impl Slot {
 }
 
 /// The last report of each of a session's port mappings, one for each
-/// mapper and protocol, kept as the mappers make them.
+/// mapper, protocol and listen port, kept as the mappers make them.
 #[derive(Clone)]
 struct PortMappings(Arc<tokio::sync::watch::Sender<Vec<PortMapped>>>);
 
@@ -842,7 +842,9 @@ impl PortMappings {
     fn record(&self, event: PortMapped) {
         self.0.send_modify(|mappings| {
             match mappings.iter_mut().find(|mapping| {
-                mapping.transport == event.transport && mapping.protocol == event.protocol
+                mapping.transport == event.transport
+                    && mapping.protocol == event.protocol
+                    && mapping.local_port == event.local_port
             }) {
                 Some(mapping) => *mapping = event,
                 None => mappings.push(event),

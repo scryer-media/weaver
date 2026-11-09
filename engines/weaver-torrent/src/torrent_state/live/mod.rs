@@ -56,7 +56,7 @@ pub(crate) use rate_tick::RateTick;
 mod smart_ban;
 pub mod stats;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 pub(crate) mod web_seed;
 
 use std::{

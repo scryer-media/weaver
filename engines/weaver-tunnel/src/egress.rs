@@ -213,9 +213,16 @@ impl SocketEgress {
 
     // Bind a datagram socket a direct leg's consumer sends from itself, on
     // `local`'s port: at the source address this egress pins, else at
-    // `local`'s address, on the egress's device when it names one.
+    // `local`'s address, on the egress's device when it names one. A socket
+    // bound at an IPv4 host address sends its multicast out of the interface
+    // holding that address, never where the host routes multicast.
     pub(crate) fn bind_udp_at(&self, local: SocketAddr) -> io::Result<UdpSocket> {
         let (socket, local, _) = self.local_socket(local, Type::DGRAM, Protocol::UDP)?;
+        if let IpAddr::V4(ip) = local.ip()
+            && !ip.is_unspecified()
+        {
+            socket.set_multicast_if_v4(&ip)?;
+        }
         socket.bind(&local.into())?;
         socket.set_nonblocking(true)?;
         Ok(socket.into())
@@ -304,6 +311,37 @@ mod connect_tests {
         let pinned = SocketEgress::SourceAddress(loopback);
         assert_eq!(pinned.source_toward(to).unwrap(), loopback);
         assert!(pinned.source_toward("[::1]:9".parse().unwrap()).is_err());
+    }
+
+    // A socket bound at an IPv4 host address, or at the source address its
+    // egress pins, sends its multicast out of that address's interface; one
+    // bound at no address leaves it to the host.
+    #[test]
+    fn a_socket_at_a_host_address_sends_its_multicast_from_there() {
+        let loopback = Ipv4Addr::LOCALHOST;
+        let pinned = SocketEgress::SourceAddress(loopback.into())
+            .bind_udp_at(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&pinned).multicast_if_v4().unwrap(),
+            loopback
+        );
+        let at = SocketEgress::System
+            .bind_udp_at(SocketAddr::from((loopback, 0)))
+            .unwrap();
+        assert_eq!(
+            socket2::SockRef::from(&at).multicast_if_v4().unwrap(),
+            loopback
+        );
+        let anywhere = SocketEgress::System
+            .bind_udp_at(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)))
+            .unwrap();
+        assert!(
+            socket2::SockRef::from(&anywhere)
+                .multicast_if_v4()
+                .unwrap()
+                .is_unspecified()
+        );
     }
 
     // A socket bound at the unspecified IPv6 address takes IPv4 as well.
