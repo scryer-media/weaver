@@ -101,6 +101,27 @@ pub(crate) struct Storage {
     pub(crate) hardware: super::hardware::Hardware,
     // Where the job's writes publish what they take, in a pipeline.
     pub(crate) metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+    // Weaver's data folder and the free space of its disk: where a decode
+    // window goes when the working directory cannot hold it.
+    pub(crate) data_dir: Option<(PathBuf, CapacityReader)>,
+}
+
+impl Storage {
+    // The decode windows job `scope`'s runs may borrow: scratch files in
+    // its working directory, else in the data folder, out of the free space
+    // the holds keep.
+    pub(crate) fn windows(&self, scope: u64) -> Arc<super::window::Windows> {
+        let windows = super::window::Windows::new(
+            self.working_dir.clone(),
+            self.free_disk.clone(),
+            Arc::clone(&self.accountant),
+            super::window::WINDOW_CEILING_BYTES,
+        );
+        Arc::new(match &self.data_dir {
+            Some((dir, free_disk)) => windows.or_spare(dir.clone(), scope, free_disk.clone()),
+            None => windows,
+        })
+    }
 }
 
 pub(crate) struct GraphJob {
@@ -158,13 +179,15 @@ impl GraphJob {
     // The runtime a job admitted fresh gets. `scope` is the job's
     // process-wide id.
     pub(crate) fn admit(scope: u64, files: &[RootFile], storage: Storage) -> Self {
+        let windows = storage.windows(scope);
         let runs = Runs::new(
             scope,
             storage.slots,
             storage.mail,
             Arc::clone(&storage.accountant),
         )
-        .on(storage.hardware);
+        .on(storage.hardware)
+        .lending(windows);
         let writer = NamespaceWriter::new(
             scope,
             storage.working_dir,

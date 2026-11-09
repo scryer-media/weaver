@@ -107,6 +107,10 @@ pub struct Budget {
     // starting its own, so the threads of every job together stay within
     // the pool. None lends threads of the work's own, started for it.
     pub pool: Option<Arc<dyn Pool>>,
+    // Where a decoder whose window is larger than `window_or` grants in RAM
+    // may borrow one instead, up to the lender's ceiling. None lends nothing:
+    // such a window is refused, as it always was.
+    pub lender: Option<Arc<dyn crate::window::WindowLender>>,
 }
 
 // Threads the owner lends work that spreads. A pool thread must never wait
@@ -154,18 +158,24 @@ impl std::fmt::Debug for Budget {
             .field("window_bytes", &self.window_bytes)
             .field("threads", &self.threads)
             .field("pool", &self.pool.is_some())
+            .field("lender", &self.lender.is_some())
             .finish()
     }
 }
 
 // Two grants are alike when they grant the same memory, window and threads
-// on the same pool.
+// on the same pool, lending through the same lender.
 impl PartialEq for Budget {
     fn eq(&self, other: &Self) -> bool {
         self.memory_bytes == other.memory_bytes
             && self.window_bytes == other.window_bytes
             && self.threads == other.threads
             && match (&self.pool, &other.pool) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.lender, &other.lender) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 (None, None) => true,
                 _ => false,

@@ -169,6 +169,9 @@ impl Pipeline {
         );
 
         tokio::fs::create_dir_all(&data_dir).await?;
+        // No job lends a decode window yet: any in the data folder is a past
+        // process's.
+        crate::pipeline::graph::window::sweep_spare(&data_dir);
         // A download folder on a drive that is gone must not stop Weaver from
         // starting, or it could never be pointed at another one.
         for dir in [&intermediate_dir, &complete_dir] {

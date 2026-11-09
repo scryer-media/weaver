@@ -370,6 +370,7 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
             window_bytes: None,
             threads: 6,
             pool: None,
+            lender: None,
         }
     );
 
@@ -386,6 +387,7 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
             window_bytes: None,
             threads: 4,
             pool: None,
+            lender: None,
         }
     );
     assert_eq!(grant.install(rayon::current_num_threads), 4);
