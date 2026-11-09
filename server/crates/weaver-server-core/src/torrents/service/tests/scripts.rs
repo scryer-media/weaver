@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::post_processing::events::EventContext;
-use crate::post_processing::model::{QueueEvent, vars};
+use crate::post_processing::model::{QueueEvent, ScriptEventLabel, vars};
 
 // The variables every event of `view`'s job carries.
 fn assert_torrent_vars(context: &EventContext, view: &TorrentView) {
@@ -297,6 +297,40 @@ async fn a_torrents_queue_script_is_told_its_jobs_tags() {
     assert_eq!(
         std::fs::read_to_string(out.join(job_id.0.to_string())).unwrap(),
         "iso,linux"
+    );
+    rig.service.stop().await;
+}
+
+// The queue worker runs a live torrent's event: its job has a row in
+// `torrents`, not `active_jobs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_queue_runs_a_live_torrents_event() {
+    let rig = rig(set_clock());
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    let out = rig.dir.path().join("told");
+    let supervisor = rig.db.tag_reporting_queue_script_for_test(&out);
+    rig.service.publish_to(queue());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            tags: vec!["linux".into()],
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    rig.db.admitted_so_far().await;
+    let mut ran = Vec::new();
+    while let Some(context) = rig.db.run_next_queue_event_for_test(&supervisor).await {
+        ran.push((context.job_id, context.event));
+    }
+    assert!(ran.contains(&(
+        Some(job_id.0),
+        ScriptEventLabel::Queue(QueueEvent::NzbAdded)
+    )));
+    assert_eq!(
+        std::fs::read_to_string(out.join(job_id.0.to_string())).unwrap(),
+        "linux"
     );
     rig.service.stop().await;
 }

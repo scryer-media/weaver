@@ -855,3 +855,44 @@ async fn a_queue_script_is_told_the_jobs_tags_as_it_starts() {
     );
     assert_eq!(told("none"), "unset");
 }
+
+// The queue worker skips the events of a job that is in no queue, except
+// the ones raised as or after a job leaves: NZB_DELETED, NZB_MARKED and
+// SEEDING_STOPPED.
+#[tokio::test]
+async fn the_queue_runs_only_leaving_events_of_a_job_in_no_queue() {
+    let (db, data) = configured();
+    let out = data.path().join("told");
+    let supervisor = db.tag_reporting_queue_script_for_test(&out);
+    let cases = [
+        (50, QueueEvent::NzbAdded, false),
+        (51, QueueEvent::NzbDownloaded, false),
+        (52, QueueEvent::SeedingFinished, false),
+        (53, QueueEvent::NzbDeleted, true),
+        (54, QueueEvent::NzbMarked, true),
+        (55, QueueEvent::SeedingStopped, true),
+    ];
+    for (job_id, kind, _) in cases {
+        let mut context = event(job_id, kind);
+        context.cwd = data.path().to_path_buf();
+        context.env.insert("NZBNA_NZBID".into(), job_id.to_string());
+        db.enqueue_script_event(&context, 1).unwrap().unwrap();
+    }
+    for _ in cases {
+        db.run_next_queue_event_for_test(&supervisor)
+            .await
+            .expect("an event is queued");
+    }
+    assert!(
+        db.run_next_queue_event_for_test(&supervisor)
+            .await
+            .is_none()
+    );
+    for (job_id, kind, runs) in cases {
+        assert_eq!(
+            out.join(job_id.to_string()).exists(),
+            runs,
+            "{kind:?} of a job in no queue"
+        );
+    }
+}
