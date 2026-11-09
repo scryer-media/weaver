@@ -351,8 +351,6 @@ impl EventContext {
             ("NZBNA_DUPEKEY", parameter("nzbget.dupe_key", "")),
             ("NZBNA_DUPESCORE", parameter("nzbget.dupe_score", "0")),
             ("NZBNA_DUPEMODE", parameter("nzbget.dupe_mode", "SCORE")),
-            // Job tags go here, one variable for every job, NZB or torrent,
-            // once jobs carry tags (qBittorrent passes a torrent's as `%G`).
         ]
         .into_iter()
         .map(|(key, value)| (key.into(), value))
@@ -370,7 +368,7 @@ impl EventContext {
     }
 
     // What weaver's own variables say about the thing the event is about.
-    pub(super) fn weaver_env(&self) -> BTreeMap<String, String> {
+    fn weaver_env(&self) -> BTreeMap<String, String> {
         let mut env = BTreeMap::new();
         if let Some(job_id) = self.job_id {
             env.insert("WEAVER_JOB_ID".to_string(), job_id.to_string());
@@ -389,6 +387,20 @@ impl EventContext {
             "WEAVER_DIRECTORY".into(),
             self.cwd.to_string_lossy().into_owned(),
         );
+        env
+    }
+
+    // Every variable the script is told: weaver's own, then the event's.
+    // A queue event of a job also carries the job's tags, comma separated
+    // as `NZBPP_TAGS` is (qBittorrent passes a torrent's as `%G`). They are
+    // the tags in `facts`, read again as each script starts, not the ones
+    // the job had when the event was queued. A jobless event has none.
+    pub(super) fn script_env(&self) -> BTreeMap<String, String> {
+        let mut env = self.weaver_env();
+        env.extend(self.env.clone());
+        if self.job_id.is_some() && matches!(self.event, ScriptEventLabel::Queue(_)) {
+            env.insert("NZBNA_TAGS".into(), self.facts.tags.join(","));
+        }
         env
     }
 }
@@ -692,8 +704,7 @@ async fn run_entry(
                         Err(error)
                     }
                     Ok((inputs, mut identity)) => {
-                        let mut env = context.weaver_env();
-                        env.extend(context.env.clone());
+                        let env = context.script_env();
                         let timeout = entry.time_limit(&settings);
                         // The run is live, and its token good, until this is
                         // dropped at the end of the block.
@@ -1511,6 +1522,42 @@ impl Database {
             ))
             .unwrap();
         }
+    }
+
+    // Make every queue instance's `queue.sh` write what `NZBNA_TAGS` tells
+    // it, or `unset`, to a file under `out` named for the job id, or `none`
+    // for a jobless event. Returns the supervisor a run must be given: this
+    // test binary, run as the real one.
+    #[cfg(test)]
+    pub(crate) fn tag_reporting_queue_script_for_test(
+        &self,
+        out: &std::path::Path,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::create_dir_all(out).unwrap();
+        let scripts = self.post_processing_script_directory().unwrap();
+        let script = scripts.join("queue.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nprintf '%s' \"${{NZBNA_TAGS-unset}}\" > '{}'/\"${{NZBNA_NZBID-none}}\"\n",
+                out.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let supervisor = out.join("supervisor.sh");
+        let binary = std::env::current_exe().unwrap();
+        let binary = binary.to_str().unwrap().replace('\'', "'\"'\"'");
+        std::fs::write(
+            &supervisor,
+            format!(
+                "#!/bin/sh\nexport WEAVER_TEST_POST_PROCESSING_SUPERVISOR=1\nexec '{binary}' --exact pipeline::tests::post_processing_completion::post_processing_supervisor_child --nocapture 3>&1 1>/dev/null\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755)).unwrap();
+        supervisor
     }
 
     fn finish_script_event(&self, run_id: &str) -> Result<(), StateError> {

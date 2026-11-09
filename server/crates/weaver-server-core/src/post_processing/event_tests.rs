@@ -783,3 +783,64 @@ async fn every_script_shares_one_pool_whose_size_applies_to_the_next_waiter() {
     drop(held);
     assert_eq!(db.script_runtime.slots.running(), 0);
 }
+
+// A queue script is told the job's tags as it starts, comma separated, not
+// the tags the job had when its event was queued. A job with no tag is told
+// an empty list; a jobless event is told nothing.
+#[tokio::test]
+async fn a_queue_script_is_told_the_jobs_tags_as_it_starts() {
+    let (db, data) = configured();
+    let out = data.path().join("told");
+    let supervisor = db.tag_reporting_queue_script_for_test(&out);
+    let job = |job_id| {
+        EventContext::from_job(
+            &JobExecutionContext {
+                job_id,
+                name: format!("job-{job_id}"),
+                nzb_filename: format!("job-{job_id}.nzb"),
+                category: None,
+                group: None,
+                source_url: None,
+                working_directory: data.path().to_path_buf(),
+                final_directory: data.path().to_path_buf(),
+                pipeline_outcome: super::super::model::PipelineOutcome::Succeeded,
+                par_status: 0,
+                unpack_status: 0,
+                compatibility: Default::default(),
+            },
+            QueueEvent::NzbAdded,
+        )
+    };
+    db.tag_new_job(crate::jobs::JobId(41), ["tv", "hd"]).unwrap();
+    for (job_id, now) in [(41, 1), (42, 2)] {
+        db.enqueue_script_event(&job(job_id), now).unwrap().unwrap();
+    }
+    // Put on after the event was queued, before its script starts.
+    db.tag_new_job(crate::jobs::JobId(41), ["late"]).unwrap();
+    for _ in 0..2 {
+        let (run_id, mut context, claim) = db.claim_script_event().unwrap().unwrap();
+        let results = run_event(
+            &db,
+            &mut context,
+            &run_id,
+            Some(claim.cancellation.clone()),
+            Some(supervisor.clone()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, ScriptStatus::Succeeded, "{:?}", results[0]);
+    }
+    let told = |name: &str| std::fs::read_to_string(out.join(name)).unwrap();
+    assert_eq!(told("41"), "hd,late,tv");
+    assert_eq!(told("42"), "");
+
+    let mut quota = event(43, QueueEvent::QuotaStopped);
+    quota.job_id = None;
+    quota.cwd = data.path().to_path_buf();
+    let results = run_event(&db, &mut quota, "quota", None, Some(supervisor))
+        .await
+        .unwrap();
+    assert_eq!(results[0].status, ScriptStatus::Succeeded, "{:?}", results[0]);
+    assert_eq!(told("none"), "unset");
+}
