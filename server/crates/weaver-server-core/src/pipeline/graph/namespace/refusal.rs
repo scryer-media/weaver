@@ -48,7 +48,7 @@ impl NamespaceWriter {
             .is_some_and(|files| files.leaves.contains_key(&member))
         {
             // What the object held came from the file, which still has it.
-            self.take_held(node, member, super::ALL)?;
+            self.drop_held(node, member, super::ALL)?;
             if tree.child_of(node, member).is_some() {
                 self.replay_file(tree, builder, segments, node, member, None, out)?;
             }

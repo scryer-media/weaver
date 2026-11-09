@@ -572,6 +572,9 @@ pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) limits: Option<ExtractionLimits>,
     // The operator's unacceptable extensions, when not the stored ones.
     pub(in crate::pipeline::tests) unacceptable: Option<Vec<String>>,
+    // The hold budgets every graph job of the pipeline shares, when not the
+    // host's.
+    pub(in crate::pipeline::tests) holds: Option<weaver_graph::holds::HoldBudgets>,
     // How many of the pipelines the scenario prepares, the first that
     // admits the job and then each that restores it, find the stored
     // settings unreadable when they build the job; each reads them again
@@ -605,6 +608,7 @@ impl Scenario {
             leased: false,
             limits: None,
             unacceptable: None,
+            holds: None,
             policy_unread: 0,
             prepared: std::sync::atomic::AtomicUsize::new(0),
             stat_servers: std::sync::Mutex::new(Vec::new()),
@@ -698,12 +702,25 @@ impl Scenario {
         if let Some(limits) = &self.limits {
             pipeline.extraction_limits = std::sync::Arc::new(limits.clone());
         }
+        if let Some(budgets) = self.holds {
+            pipeline.graph_holds =
+                std::sync::Arc::new(weaver_graph::holds::HoldsAccountant::new(budgets));
+        }
         if prepared < self.policy_unread {
             pipeline
                 .db
                 .set_setting(crate::post_processing::settings::SETTINGS_KEY, "{unreadable")
                 .unwrap();
         }
+    }
+
+    // The job's holds run under these budgets.
+    pub(in crate::pipeline::tests) fn holds(
+        mut self,
+        budgets: weaver_graph::holds::HoldBudgets,
+    ) -> Self {
+        self.holds = Some(budgets);
+        self
     }
 
     // Whatever the download queue hands out at once arrives in reverse.
@@ -921,6 +938,9 @@ pub(in crate::pipeline::tests) struct GraphView {
     // The most the job's working directory held at any look, every file
     // under it by its length.
     pub(in crate::pipeline::tests) scratch: u64,
+    // The most the job's holds kept at any look, in memory, on scratch and
+    // on file, over every namespace.
+    pub(in crate::pipeline::tests) held: u64,
 }
 
 #[derive(Debug)]
@@ -1722,6 +1742,12 @@ pub(in crate::pipeline::tests) fn observe(
         })
         .sum();
     view.resident = view.resident.max(resident);
+    let held = tree
+        .live()
+        .into_iter()
+        .map(|node| job.writer().held_bytes(node))
+        .sum();
+    view.held = view.held.max(held);
     *reads = job.writer().read_backs();
     view.observed += looked.elapsed();
 }

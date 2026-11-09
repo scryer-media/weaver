@@ -856,7 +856,7 @@ impl NamespaceWriter {
     // who owns it again; what the refusing object kept goes with it, made
     // over by whatever reads the volumes again, and a member no object
     // takes is a leaf for no reason.
-    fn reopen(
+    pub(super) fn reopen(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,

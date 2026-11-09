@@ -55,8 +55,8 @@ pub(crate) enum GraphError {
 
 impl GraphError {
     // What the failure is to the job: a file's I/O error classed as the
-    // extractors class theirs, a refusal as the refusal, anything else
-    // terminal.
+    // extractors class theirs, and named as a full disk when it is one, a
+    // refusal as the refusal, anything else terminal.
     pub(crate) fn to_extraction(&self) -> ExtractionError {
         let write = match self {
             Self::Write(write) => write,
@@ -67,6 +67,11 @@ impl GraphError {
         let message = format!("{self}: {write}");
         match write {
             WriteError::Leaf(LeafError::Io { source, .. }) => {
+                let message = if crate::operations::is_out_of_space(source) {
+                    format!("{message}: filesystem out of space or over quota")
+                } else {
+                    message
+                };
                 ExtractionError::from_io(message, source)
             }
             WriteError::Refused(failure) => ExtractionError::rejected(failure.clone()),
