@@ -23,6 +23,14 @@ use super::runner::{
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 use crate::persistence::{Database, StateError};
 
+// Rows of a job still in the queue: an NZB job's in `active_jobs`, a
+// torrent's in `torrents`. Each `{}` is the job id.
+macro_rules! queued_job_sql {
+    () => {
+        "SELECT job_id FROM active_jobs WHERE job_id = {} UNION ALL SELECT job_id FROM torrents WHERE job_id = {}"
+    };
+}
+
 type EventCancellations = BTreeMap<String, (Option<u64>, watch::Sender<bool>)>;
 type BackgroundRuns = BTreeMap<u64, (Option<u64>, watch::Sender<bool>)>;
 
@@ -1293,7 +1301,7 @@ impl Database {
                     };
                     tx.fetch_optional(lock, &[]).await?.ok_or_else(|| StateError::Database("script sequence is missing".into()))?;
                     if require_job && let Some(job_id) = job_id
-                        && tx.fetch_optional("SELECT job_id FROM active_jobs WHERE job_id = {} UNION ALL SELECT job_id FROM job_history WHERE job_id = {} UNION ALL SELECT job_id FROM torrents WHERE job_id = {} LIMIT 1", &[SqlArg::I64(job_id), SqlArg::I64(job_id), SqlArg::I64(job_id)]).await?.is_none() {
+                        && tx.fetch_optional(concat!(queued_job_sql!(), " UNION ALL SELECT job_id FROM job_history WHERE job_id = {} LIMIT 1"), &[SqlArg::I64(job_id), SqlArg::I64(job_id), SqlArg::I64(job_id)]).await?.is_none() {
                         return Ok(None);
                     }
                     if event == QueueEvent::FileDownloaded
@@ -1555,6 +1563,27 @@ impl Database {
         .unwrap();
         std::fs::set_permissions(&supervisor, std::fs::Permissions::from_mode(0o755)).unwrap();
         supervisor
+    }
+
+    // Claim the next queued event and run it to its end as the queue worker
+    // does, with `supervisor` running its scripts. Returns the event, or
+    // none when nothing is queued.
+    #[cfg(test)]
+    pub(crate) async fn run_next_queue_event_for_test(
+        &self,
+        supervisor: &std::path::Path,
+    ) -> Option<EventContext> {
+        let (run_id, context, claim) = self.claim_script_event().unwrap()?;
+        run_queue_event(
+            self.clone(),
+            run_id,
+            context.clone(),
+            claim,
+            Some(supervisor.to_path_buf()),
+        )
+        .await
+        .unwrap();
+        Some(context)
     }
 
     fn finish_script_event(&self, run_id: &str) -> Result<(), StateError> {
@@ -1823,7 +1852,7 @@ pub async fn drain_queue(db: Database) -> Result<(), StateError> {
                 .and_then(std::convert::identity);
             match claimed {
                 Ok(Some((run_id, context, claim))) => {
-                    running.spawn(run_queue_event(db.clone(), run_id, context, claim));
+                    running.spawn(run_queue_event(db.clone(), run_id, context, claim, None));
                 }
                 Ok(None) => break,
                 Err(error) => failure = Some(error),
@@ -1848,12 +1877,17 @@ pub async fn drain_queue(db: Database) -> Result<(), StateError> {
     failure.map_or(Ok(()), Err)
 }
 
-// Run one claimed queue event and record that it is over.
+// Run one claimed queue event and record that it is over. A job no longer
+// in the queue runs only the events raised as or after it leaves:
+// NZB_DELETED, NZB_MARKED, SEEDING_STOPPED for a torrent that failed or was
+// removed while seeding, and SEEDING_FINISHED for a torrent its seeding goal
+// removed.
 async fn run_queue_event(
     db: Database,
     run_id: String,
     mut context: EventContext,
     claim: QueueClaimRegistration,
+    supervisor_executable: Option<PathBuf>,
 ) -> Result<(), StateError> {
     let execution: Result<(), StateError> = async {
         let deleted = if let Some(job_id) = context.job_id {
@@ -1863,8 +1897,8 @@ async fn run_queue_event(
                 worker_db.run_sql_blocking_read(async move {
                     Ok(SqlRuntime::fetch_optional(
                         datastore.read_exec(),
-                        "SELECT job_id FROM active_jobs WHERE job_id = {}",
-                        &[SqlArg::I64(job_id as i64)],
+                        concat!(queued_job_sql!(), " LIMIT 1"),
+                        &[SqlArg::I64(job_id as i64), SqlArg::I64(job_id as i64)],
                     )
                     .await?
                     .is_none())
@@ -1877,7 +1911,12 @@ async fn run_queue_event(
         };
         let allow_deleted = matches!(
             context.event,
-            ScriptEventLabel::Queue(QueueEvent::NzbDeleted | QueueEvent::NzbMarked)
+            ScriptEventLabel::Queue(
+                QueueEvent::NzbDeleted
+                    | QueueEvent::NzbMarked
+                    | QueueEvent::SeedingStopped
+                    | QueueEvent::SeedingFinished
+            )
         );
         if !deleted || allow_deleted {
             run_event(
@@ -1885,7 +1924,7 @@ async fn run_queue_event(
                 &mut context,
                 &run_id,
                 Some(claim.cancellation.clone()),
-                None,
+                supervisor_executable,
             )
             .await?;
         }

@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::post_processing::events::EventContext;
-use crate::post_processing::model::{QueueEvent, vars};
+use crate::post_processing::model::{QueueEvent, ScriptEventLabel, vars};
 
 // The variables every event of `view`'s job carries.
 fn assert_torrent_vars(context: &EventContext, view: &TorrentView) {
@@ -245,6 +245,62 @@ async fn a_torrent_that_meets_its_goals_raises_seeding_finished_once() {
     assert!(rig.db.get_torrent(views[1].job_id).unwrap().is_none());
 }
 
+// A torrent whose goal removes it queues SEEDING_FINISHED once its row is
+// gone, and the queue worker still runs it. Its NZB_ADDED, run only now,
+// is skipped: the file its script writes comes from SEEDING_FINISHED.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_queue_runs_seeding_finished_of_a_torrent_its_goal_removed() {
+    let rig = rig(set_clock());
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    let out = rig.dir.path().join("told");
+    let supervisor = rig.db.tag_reporting_queue_script_for_test(&out);
+    rig.service.publish_to(queue());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            policy_override: Some(SeedingPolicy {
+                seed_time_counting: Default::default(),
+                ratio_goal: Leaf::Set(0.0),
+                seed_time_goal_minutes: Leaf::Inherit,
+                inactive_goal_minutes: Leaf::Inherit,
+                mode: Leaf::Set(SeedingGoalMode::Any),
+                action: Leaf::Set(SeedingAction::Remove),
+            }),
+            ..request(AddSource::Metainfo(plain("goes", 1)))
+        })
+        .await
+        .unwrap();
+    rig.service
+        .inner
+        .live
+        .lock()
+        .await
+        .get_mut(&job_id)
+        .unwrap()
+        .record
+        .completed_at_ms = Some(EPOCH_MS);
+    rig.service.apply_goals(EPOCH_MS).await;
+    rig.db.admitted_so_far().await;
+    assert!(rig.db.get_torrent(job_id).unwrap().is_none());
+    let mut ran = Vec::new();
+    while let Some(context) = rig.db.run_next_queue_event_for_test(&supervisor).await {
+        ran.push((context.job_id, context.event));
+    }
+    assert!(ran.contains(&(
+        Some(job_id.0),
+        ScriptEventLabel::Queue(QueueEvent::SeedingFinished)
+    )));
+    assert!(ran.contains(&(
+        Some(job_id.0),
+        ScriptEventLabel::Queue(QueueEvent::NzbAdded)
+    )));
+    assert_eq!(
+        std::fs::read_to_string(out.join(job_id.0.to_string())).unwrap(),
+        ""
+    );
+}
+
 // With no queue script saved, a torrent raises nothing: NZB jobs and the
 // queue are as they were.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -297,6 +353,40 @@ async fn a_torrents_queue_script_is_told_its_jobs_tags() {
     assert_eq!(
         std::fs::read_to_string(out.join(job_id.0.to_string())).unwrap(),
         "iso,linux"
+    );
+    rig.service.stop().await;
+}
+
+// The queue worker runs a live torrent's event: its job has a row in
+// `torrents`, not `active_jobs`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_queue_runs_a_live_torrents_event() {
+    let rig = rig(set_clock());
+    rig.db.enable_queue_scripts_for_test(rig.dir.path());
+    let out = rig.dir.path().join("told");
+    let supervisor = rig.db.tag_reporting_queue_script_for_test(&out);
+    rig.service.publish_to(queue());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            tags: vec!["linux".into()],
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    rig.db.admitted_so_far().await;
+    let mut ran = Vec::new();
+    while let Some(context) = rig.db.run_next_queue_event_for_test(&supervisor).await {
+        ran.push((context.job_id, context.event));
+    }
+    assert!(ran.contains(&(
+        Some(job_id.0),
+        ScriptEventLabel::Queue(QueueEvent::NzbAdded)
+    )));
+    assert_eq!(
+        std::fs::read_to_string(out.join(job_id.0.to_string())).unwrap(),
+        "linux"
     );
     rig.service.stop().await;
 }
