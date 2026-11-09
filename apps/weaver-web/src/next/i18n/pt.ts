@@ -689,6 +689,7 @@ export const nextPt: LocaleDictionary = {
   "next.general.completeDirHelp": "Uma categoria sem destino próprio ganha uma pasta dentro dela.",
   "next.general.cleanup": "Limpar após descompactar",
   "next.general.cleanupHelp": "Excluir arquivos compactados e de reparo depois que um lançamento é descompactado com sucesso.",
+  "next.general.deleteFailedJobFiles": "Excluir arquivos incompletos de trabalhos com falha durante a manutenção",
   "next.general.duplicates": "Duplicatas",
   "next.general.duplicatesNote": "o que acontece quando um NZB novo corresponde a algo que o weaver já viu",
   "next.weekday.mon": "Segunda-feira",

@@ -689,6 +689,7 @@ export const nextKo: LocaleDictionary = {
   "next.general.completeDirHelp": "대상을 따로 지정하지 않은 카테고리는 이 안에 폴더가 만들어집니다.",
   "next.general.cleanup": "압축 해제 후 정리",
   "next.general.cleanupHelp": "릴리스 압축 해제에 성공하면 아카이브와 복구 파일을 삭제합니다.",
+  "next.general.deleteFailedJobFiles": "유지 관리 중 실패한 작업의 불완전한 파일 삭제",
   "next.general.duplicates": "중복",
   "next.general.duplicatesNote": "새 NZB가 weaver가 이미 본 항목과 일치할 때의 동작",
   "next.weekday.mon": "월요일",

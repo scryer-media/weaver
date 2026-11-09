@@ -450,6 +450,7 @@ const GENERAL_SETTINGS_FIELDS = `
     intermediateDir
     completeDir
     cleanupAfterExtract
+    deleteFailedJobFiles
     maxDownloadSpeed
     maxRetries
     propagationDelaySecs

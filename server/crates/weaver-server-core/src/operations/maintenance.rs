@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::Database;
+use crate::SchedulerHandle;
+use crate::settings::SharedConfig;
 use crate::persistence::maintenance::DbMaintenanceOptions;
 use crate::persistence::sql_runtime::SqlEngine;
 use crate::runtime::StartupDiskGate;
@@ -21,11 +23,14 @@ const STALE_STAGING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub fn spawn_maintenance_worker(
     db: Database,
     complete_dir: PathBuf,
+    handle: SchedulerHandle,
+    config: SharedConfig,
     startup_disk_work: StartupDiskGate,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         startup_disk_work.wait().await;
         run_maintenance_pass(db.clone(), complete_dir.clone()).await;
+        run_job_files_sweep(&handle, &config).await;
 
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now() + MAINTENANCE_INTERVAL,
@@ -36,6 +41,7 @@ pub fn spawn_maintenance_worker(
         loop {
             interval.tick().await;
             run_maintenance_pass(db.clone(), complete_dir.clone()).await;
+            run_job_files_sweep(&handle, &config).await;
         }
     })
 }
@@ -100,6 +106,21 @@ async fn run_maintenance_pass(db: Database, complete_dir: PathBuf) {
             tracing::warn!(error = %error, "stale staging cleanup worker panicked");
         }
     }
+}
+
+// What jobs left on disk a day ago: a failed job's files when the setting
+// asks for it, measured from when the job failed, and a marked working
+// directory of a job with no row, measured from when its marker was written.
+async fn run_job_files_sweep(handle: &SchedulerHandle, config: &SharedConfig) {
+    let now = SystemTime::now();
+    let delete_failed = config.read().await.delete_failed_job_files();
+    let cutoff = now.checked_sub(STALE_STAGING_TTL).unwrap_or(SystemTime::UNIX_EPOCH);
+    let failed_finished_by = delete_failed.then(|| {
+        cutoff
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64)
+    });
+    handle.sweep_job_files(failed_finished_by, cutoff).await;
 }
 
 fn run_staging_cleanup(db: &Database, complete_dir: &Path) -> Result<StagingCleanupReport, String> {

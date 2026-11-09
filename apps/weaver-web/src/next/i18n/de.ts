@@ -689,6 +689,7 @@ export const nextDe: LocaleDictionary = {
   "next.general.completeDirHelp": "Eine Kategorie ohne eigenes Ziel bekommt darin einen Unterordner.",
   "next.general.cleanup": "Nach dem Entpacken aufräumen",
   "next.general.cleanupHelp": "Archive und Reparaturdateien löschen, sobald ein Release erfolgreich entpackt wurde.",
+  "next.general.deleteFailedJobFiles": "Unvollständige Dateien fehlgeschlagener Aufträge bei der Wartung löschen",
   "next.general.duplicates": "Duplikate",
   "next.general.duplicatesNote": "was passiert, wenn eine neue NZB zu etwas Bekanntem passt",
   "next.weekday.mon": "Montag",

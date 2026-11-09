@@ -480,6 +480,51 @@ pub fn remove_weaver_owned_working_dir(root: &Path, path: &Path) -> std::io::Res
     owned_working_directory(root, path)?.remove_open_dir_all()
 }
 
+// Every working directory under `root` whose ownership marker matches it,
+// with the job the marker names, that `keep` does not claim. A directory
+// without a marker that matches is never one of them.
+pub(crate) fn unclaimed_working_dirs(
+    root: &Path,
+    keep: impl Fn(JobId, &Path) -> bool,
+) -> std::io::Result<Vec<(JobId, PathBuf)>> {
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut unclaimed = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        let Some(owner) = working_dir_owner(root, &path).ok().flatten() else {
+            continue;
+        };
+        if !keep(owner, &path) {
+            unclaimed.push((owner, path));
+        }
+    }
+    Ok(unclaimed)
+}
+
+// Removes one directory `unclaimed_working_dirs` found, checking its marker
+// again as it goes. One that still holds what it cannot give up stays for a
+// later cleanup.
+pub(crate) fn remove_unclaimed_working_dir(root: &Path, path: &Path) -> bool {
+    match remove_weaver_owned_working_dir(root, path) {
+        Ok(()) => {
+            tracing::info!(dir = %path.display(), "removed an unreferenced intermediate directory");
+            true
+        }
+        Err(error) => {
+            tracing::warn!(
+                dir = %path.display(),
+                error = %error,
+                "could not remove an unreferenced intermediate directory; it stays for a later cleanup"
+            );
+            false
+        }
+    }
+}
+
 // What a history cleanup did with one job's working directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HistoryWorkingDir {

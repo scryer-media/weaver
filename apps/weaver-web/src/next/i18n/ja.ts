@@ -689,6 +689,7 @@ export const nextJa: LocaleDictionary = {
   "next.general.completeDirHelp": "保存先を指定していないカテゴリには、この中にフォルダーが作られます。",
   "next.general.cleanup": "展開後に後片付け",
   "next.general.cleanupHelp": "リリースの展開に成功したら、アーカイブと修復ファイルを削除します。",
+  "next.general.deleteFailedJobFiles": "メンテナンス時に失敗したジョブの不完全なファイルを削除",
   "next.general.duplicates": "重複",
   "next.general.duplicatesNote": "新しい NZB が weaver の既知のものと一致したときの動作",
   "next.weekday.mon": "月曜日",

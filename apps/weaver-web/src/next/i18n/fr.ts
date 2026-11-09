@@ -689,6 +689,7 @@ export const nextFr: LocaleDictionary = {
   "next.general.completeDirHelp": "Une catégorie sans destination propre y reçoit un sous-dossier.",
   "next.general.cleanup": "Nettoyer après décompression",
   "next.general.cleanupHelp": "Supprimer les archives et les fichiers de réparation une fois une publication décompressée avec succès.",
+  "next.general.deleteFailedJobFiles": "Supprimer les fichiers incomplets des tâches échouées lors de l'entretien",
   "next.general.duplicates": "Doublons",
   "next.general.duplicatesNote": "ce qui se passe quand un nouveau NZB correspond à quelque chose que weaver a déjà vu",
   "next.weekday.mon": "Lundi",
