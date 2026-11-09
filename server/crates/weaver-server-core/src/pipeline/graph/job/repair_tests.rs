@@ -178,8 +178,9 @@ fn an_article_asks_only_its_own_member_whether_it_was_proved() {
 // over each part the zip holds as work. Inside a stored outer zip the outer
 // member's bytes reach the inner zip only as the writer lets them go: each
 // round of work lets the next part go, which the inner zip holds in turn.
-// While a checkpoint is owed the work is done here, and it goes on until
-// nothing is due: none is left for a gate that rules without lending it.
+// While a checkpoint is owed the work of a job that may run, one slot to
+// run in, is done here, and it goes on until nothing is due: none is left
+// for a gate that rules without lending it.
 fn owed_rows(nested: bool, backwards: bool) {
     let inner = zipcrypto_descriptor(&body());
     let archive = match nested {
@@ -225,7 +226,7 @@ fn owed_rows(nested: bool, backwards: bool) {
         job.intake(
             decoded(0, ordinal as u32, offset, chunk, length),
             &mut slots,
-            0,
+            1,
         )
         .unwrap();
         assert!(
