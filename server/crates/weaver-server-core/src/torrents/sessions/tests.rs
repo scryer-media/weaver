@@ -659,7 +659,23 @@ async fn a_route_shows_where_it_listens_and_how_its_ports_are_mapped() {
         .unwrap();
     assert_eq!(
         sessions.view(&plan.key).await.unwrap().mappings,
-        [renewed, mapped]
+        [renewed.clone(), mapped.clone()]
+    );
+
+    // The SSL listener's mapping by the same mapper is a mapping of its own.
+    let ssl = PortMapped {
+        local_port: listen.port().wrapping_add(1),
+        external_port: Some(40_003),
+        ..mapped.clone()
+    };
+    events.send(ssl.clone()).unwrap();
+    reported
+        .wait_for(|mappings| mappings.len() == 3)
+        .await
+        .unwrap();
+    assert_eq!(
+        sessions.view(&plan.key).await.unwrap().mappings,
+        [renewed, mapped, ssl]
     );
     sessions.stop_all().await;
 }
