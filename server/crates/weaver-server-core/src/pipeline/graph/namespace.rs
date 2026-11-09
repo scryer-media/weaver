@@ -1238,6 +1238,21 @@ impl NamespaceWriter {
                 );
                 self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
             }
+            Effect::Lost {
+                origin,
+                node,
+                volume,
+                range,
+            } => {
+                self.lost_from(
+                    tree,
+                    builder,
+                    segments,
+                    *origin,
+                    (*node, vec![(*volume, *range)]),
+                    out,
+                )?;
+            }
             Effect::Renamed { .. } => self.moved(tree, std::slice::from_ref(&effect))?,
             Effect::NeedsPassword { .. } => {}
             // Every effect before it is applied, so what the object reads
