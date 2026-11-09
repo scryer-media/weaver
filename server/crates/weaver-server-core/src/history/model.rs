@@ -34,6 +34,10 @@ pub struct HistoryFilter {
     pub category: Option<String>,
     pub metadata_has_key: Option<String>,
     pub metadata_equals: Option<HistoryMetadataEquals>,
+    // Keep rows whose job carries this tag. The empty tag keeps rows whose
+    // job carries none (qBittorrent's rule, as `TagSnapshot::passes`). The
+    // tag is trimmed first, as a filter's tag always is.
+    pub tag: Option<String>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
 }
