@@ -23,6 +23,10 @@ pub struct ProfileTuning {
     // extraction ceiling still bounds it; this only stops one archive from
     // taking the whole allowance.
     pub sevenz_decode_memory_bytes: u64,
+    // The largest window one decoder of a run may hold in memory: a RAR
+    // dictionary, an xz or zstd window. A member that asks for more is
+    // refused. Never more than the run's memory above.
+    pub decode_window_bytes: u64,
     // The extraction memory ceiling, before the `[64 MiB, 64 GiB]` clamp and
     // before an explicit environment override replaces it.
     pub extraction_memory_bytes: u64,
@@ -80,6 +84,7 @@ struct ProfileRow {
     // Physical cores, after any cgroup limit, the machine must have.
     min_cores: usize,
     sevenz_decode_memory_bytes: u64,
+    decode_window_bytes: u64,
     // The share of the machine's memory extraction may reserve.
     extraction_memory_divisor: u64,
     max_concurrent_downloads_cap: Option<usize>,
@@ -96,6 +101,7 @@ const TABLE: [ProfileRow; 3] = [
         min_memory_bytes: 0,
         min_cores: 0,
         sevenz_decode_memory_bytes: 512 * MIB,
+        decode_window_bytes: 256 * MIB,
         extraction_memory_divisor: 4,
         max_concurrent_downloads_cap: Some(10),
         max_concurrent_extractions: 2,
@@ -110,6 +116,7 @@ const TABLE: [ProfileRow; 3] = [
         min_memory_bytes: 4 * GIB,
         min_cores: 4,
         sevenz_decode_memory_bytes: GIB,
+        decode_window_bytes: GIB,
         extraction_memory_divisor: 2,
         max_concurrent_downloads_cap: None,
         max_concurrent_extractions: 4,
@@ -124,6 +131,7 @@ const TABLE: [ProfileRow; 3] = [
         min_memory_bytes: 16 * GIB,
         min_cores: 8,
         sevenz_decode_memory_bytes: 4 * GIB,
+        decode_window_bytes: 4 * GIB,
         extraction_memory_divisor: 2,
         max_concurrent_downloads_cap: None,
         max_concurrent_extractions: 6,
@@ -263,6 +271,7 @@ impl HardwareProfile {
         };
         ProfileTuning {
             sevenz_decode_memory_bytes: row.sevenz_decode_memory_bytes,
+            decode_window_bytes: row.decode_window_bytes,
             extraction_memory_bytes: memory / row.extraction_memory_divisor,
             decode_threads: match self {
                 Self::Efficient => 2,

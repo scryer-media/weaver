@@ -942,6 +942,7 @@ impl Recovery for Par3 {
                     coming,
                     weaver_graph::Budget {
                         memory_bytes: Some(budget.memory_or(self.memory_limit)),
+                        window_bytes: budget.window_bytes,
                         threads: budget.threads,
                         pool: budget.pool.clone(),
                     },
