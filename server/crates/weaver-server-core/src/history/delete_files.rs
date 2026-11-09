@@ -164,6 +164,7 @@ async fn cleanup_owned_output_dir(dir: Option<&std::path::Path>) {
 pub(crate) async fn delete_history_rows(
     db: &crate::Database,
     intermediate_dir: &std::path::Path,
+    complete_dir: &std::path::Path,
     job_ids: BTreeSet<JobId>,
     delete_files: bool,
 ) -> (
@@ -300,7 +301,14 @@ pub(crate) async fn delete_history_rows(
         match dirs.remove(intermediate_dir, job_id).await {
             Ok(left_in_place) => {
                 cleanup_owned_output_dir(output_dirs.get(&job_id).map(PathBuf::as_path)).await;
-                deleted.insert(job_id, Ok(crate::HistoryDeleteOutcome { left_in_place }));
+                // What the staging directory still holds is the rest of the
+                // delivery the working directory held, and goes the way it
+                // went, with or without the files.
+                let staged = crate::pipeline::queue::remove_job_staging(complete_dir, job_id).await;
+                deleted.insert(
+                    job_id,
+                    staged.map(|()| crate::HistoryDeleteOutcome { left_in_place }),
+                );
             }
             Err(error) => {
                 deleted.insert(job_id, Err(error));

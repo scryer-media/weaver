@@ -358,6 +358,12 @@ impl Pipeline {
             match restart.as_ref().filter(|restart| restart.reprocess) {
                 Some(restart) => {
                     let working_dir = restart.working_dir.clone();
+                    crate::pipeline::queue::clear_left_working_dirs(
+                        &resources.intermediate_dir,
+                        job_id,
+                        &working_dir,
+                    )
+                    .await?;
                     let directory_existed = tokio::fs::try_exists(&working_dir).await?;
                     tokio::fs::create_dir_all(&working_dir)
                         .await

@@ -52,34 +52,51 @@ pub(crate) async fn clear_restart_artifacts(
             tokio::fs::remove_dir_all(working_dir).await?;
         }
     }
-    // A working directory that kept the job's marker for what its move could
-    // not remove goes too: the restarted job claims its own.
-    let root = resources.intermediate_dir.clone();
-    let left = tokio::task::spawn_blocking(move || {
+    clear_left_working_dirs(&resources.intermediate_dir, id, working_dir).await?;
+    remove_job_staging(&resources.complete_dir, id).await
+}
+
+// A working directory that kept the job's marker for what its move could
+// not remove goes before the job runs again: the restarted job claims its
+// own, or works in `keep`, and no second directory carries its marker.
+pub(crate) async fn clear_left_working_dirs(
+    intermediate_dir: &std::path::Path,
+    id: JobId,
+    keep: &std::path::Path,
+) -> Result<(), SchedulerError> {
+    let root = intermediate_dir.to_path_buf();
+    let keep = keep.to_path_buf();
+    tokio::task::spawn_blocking(move || {
         let jobs = BTreeSet::from([id]);
         let marked = crate::jobs::working_dir::job_working_dirs(&root, &jobs)?;
-        for dir in marked.into_values().flatten() {
+        for dir in marked.into_values().flatten().filter(|dir| *dir != keep) {
             crate::jobs::working_dir::remove_job_working_dir(&root, &dir, id)?;
         }
         Ok::<_, std::io::Error>(())
     })
     .await
-    .map_err(|error| SchedulerError::Internal(error.to_string()))?;
-    left?;
-    let staging = super::staging_dir_for(&resources.complete_dir, id);
-    match tokio::fs::symlink_metadata(&staging).await {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(SchedulerError::Conflict(
-                "restart staging directory is a symbolic link".into(),
-            ));
-        }
-        Ok(_) => {
-            tokio::fs::remove_dir_all(staging).await?;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error.into()),
-    }
+    .map_err(|error| SchedulerError::Internal(error.to_string()))??;
     Ok(())
+}
+
+// The job's staging directory under the complete directory, whatever it
+// still holds. A symbolic link in its place is never followed.
+pub(crate) async fn remove_job_staging(
+    complete_dir: &std::path::Path,
+    id: JobId,
+) -> Result<(), SchedulerError> {
+    let staging = super::staging_dir_for(complete_dir, id);
+    match tokio::fs::symlink_metadata(&staging).await {
+        Ok(meta) if meta.file_type().is_symlink() => Err(SchedulerError::Conflict(
+            "the job's staging directory is a symbolic link".into(),
+        )),
+        Ok(_) => match tokio::fs::remove_dir_all(staging).await {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+            _ => Ok(()),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 struct HistoryOperation {
@@ -360,6 +377,7 @@ impl Queue {
             let (removed, result) = crate::history::delete_files::delete_history_rows(
                 &resources.db,
                 &resources.intermediate_dir,
+                &resources.complete_dir,
                 accepted,
                 delete_files,
             )
