@@ -434,7 +434,7 @@ macro_rules! rows {
 
 use At::{First, Late, Middle};
 use Kind::{
-    Rar4, Rar5, Rar5Sealed, SevenZipAes, ZipAes, ZipCryptoDescriptor as Described,
+    Rar4, Rar5, Rar5Sealed, SevenZipAes, ZipCryptoDescriptor as Described,
     ZipCryptoSized as Sized,
 };
 use Mode::{Held, Inline};
@@ -527,15 +527,6 @@ rows! {
     send_back_after_the_last_nested_in_order: sent_back_after_the_last(Described, Nested, InOrder);
     send_back_after_the_last_nested_backwards: sent_back_after_the_last(Described, Nested, Backwards);
     send_back_after_the_last_rar5: sent_back_after_the_last(Rar5, Flat, Backwards);
-
-    held_zip_aes_in_order: served(ZipAes, Flat, InOrder, &[SECRET]);
-    held_zip_aes_nested_backwards: served(ZipAes, Nested, Backwards, &[SECRET]);
-    held_zip_aes_tail_first: served(ZipAes, Flat, TailFirst, &[SECRET]);
-    to_the_end_zip_aes_in_order: held_to_the_end(ZipAes, Flat, InOrder);
-    send_back_held_zip_aes_middle: sent_back(ZipAes, Flat, InOrder, Held, Middle, 2);
-    send_back_returned_zip_aes: sent_back_then_returned(ZipAes, Flat, InOrder);
-    send_back_lost_zip_aes: sent_back_then_lost(ZipAes, Flat, InOrder);
-    send_back_after_the_last_zip_aes: sent_back_after_the_last(ZipAes, Flat, InOrder);
 
     held_sevenz_aes_in_order: served(SevenZipAes, Flat, InOrder, &[SECRET]);
     held_sevenz_aes_backwards: served(SevenZipAes, Flat, Backwards, &[SECRET]);

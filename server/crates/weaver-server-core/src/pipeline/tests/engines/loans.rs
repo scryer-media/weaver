@@ -167,8 +167,22 @@ fn scenario(kind: Kind, shape: Shape, order: Order) -> Scenario {
     ordered(scenario, order)
 }
 
-fn assert_delivered(outcome: &Outcome) {
-    assert!(outcome.graph().loans > 0, "a loan went out");
+// Where the member's work was done: an AES zip entry is refused by the store
+// and its key is derived and its bytes deciphered by an engine run, which
+// lends nothing; every other kind lends its work out.
+fn assert_worked(kind: Kind, outcome: &Outcome) {
+    let graph = outcome.graph();
+    match kind {
+        Kind::ZipAes => {
+            assert!(graph.kinds.contains("zip_engine"), "{:?}", graph.kinds);
+            assert_eq!(graph.loans, 0, "a loan went out");
+        }
+        _ => assert!(graph.loans > 0, "a loan went out"),
+    }
+}
+
+fn assert_delivered(kind: Kind, outcome: &Outcome) {
+    assert_worked(kind, outcome);
     assert!(
         outcome.completed(),
         "{:?} {:?}",
@@ -188,7 +202,7 @@ fn assert_delivered(outcome: &Outcome) {
 }
 
 async fn delivers(kind: Kind, shape: Shape, order: Order) {
-    assert_delivered(&run(&scenario(kind, shape, order)).await);
+    assert_delivered(kind, &run(&scenario(kind, shape, order)).await);
 }
 
 // One article of the first post damaged beside a PAR2 set over every post:
@@ -210,7 +224,7 @@ async fn repaired(kind: Kind, shape: Shape, order: Order) {
         .framed(FRAME)
         .password(SECRET)
         .damaged(0, middle);
-    assert_delivered(&run(&ordered(scenario, order)).await);
+    assert_delivered(kind, &run(&ordered(scenario, order)).await);
 }
 
 // One article of the first post damaged and nothing to rebuild it: it is
@@ -219,7 +233,7 @@ async fn repaired(kind: Kind, shape: Shape, order: Order) {
 async fn lost(kind: Kind, shape: Shape, order: Order) {
     let middle = posts(kind, shape, &body())[0].articles(FRAME).count() as u32 / 2;
     let outcome = run(&scenario(kind, shape, order).damaged(0, middle)).await;
-    assert!(outcome.graph().loans > 0, "a loan went out");
+    assert_worked(kind, &outcome);
     assert!(
         matches!(outcome.status, Some(crate::JobStatus::Failed { .. })),
         "{:?} {:?}",
@@ -232,7 +246,7 @@ async fn lost(kind: Kind, shape: Shape, order: Order) {
 // pipeline goes down is found again on restore.
 async fn restarted(kind: Kind, shape: Shape) {
     let whole = restart_row(scenario(kind, shape, Order::Forwards)).await;
-    assert!(whole.graph().loans > 0, "a loan went out");
+    assert_worked(kind, &whole);
 }
 
 macro_rules! delivery_rows {

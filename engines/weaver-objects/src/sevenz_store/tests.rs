@@ -709,6 +709,40 @@ fn a_repaired_cipher_stretch_gives_the_members_whole() {
     assert!(failed.is_empty(), "{failed:?}");
 }
 
+// Verified bytes of the file that proves the password, posted wrong, rule
+// the right password wrong for those bytes only: their repair proves it
+// again, and every member comes out whole.
+#[test]
+fn a_password_ruled_wrong_on_its_proof_bytes_proves_again_on_their_repair() {
+    let small = [
+        ("ember.bin", payload(41, 5 * 64 + 11)),
+        ("quill.bin", payload(42, 3 * 64 - 3)),
+    ];
+    let entries: Vec<_> = small
+        .iter()
+        .map(|(name, bytes)| (None, Entry::File(name, bytes)))
+        .collect();
+    let bytes = write(aes(), false, &entries);
+    let length = bytes.len() as u64;
+    let mut mapped = Owner::single(store(), bytes.clone());
+    mapped.frames(0, 4096);
+    let proof = mapped.object.proof.expect("a file proves the password").range;
+    let mut wrong = bytes.clone();
+    wrong[proof.start as usize + 20] ^= 0x5a;
+    let mut owner = Owner::single(store(), bytes.clone());
+    owner.offer(PASSWORD);
+    owner.deliver_as(0, ByteRange::new(0, length), Provenance::Fresh, Some(&wrong));
+    assert!(owner.members.values().all(|got| got.bytes.is_empty()));
+    owner.deliver_as(0, proof, Provenance::Repaired, None);
+    owner.close(0);
+    for (name, bytes) in &small {
+        let got = owner.member(name);
+        assert!(got.closed, "{name}");
+        assert_eq!(&got.bytes, bytes, "{name}");
+    }
+    assert_eq!(owner.posted(0).as_deref(), Some(bytes.as_slice()));
+}
+
 // One file past the largest a password is proved against: the store has
 // nothing to prove a candidate by, so the first one left opens on trial.
 fn unprovable() -> (Vec<u8>, Vec<u8>) {
