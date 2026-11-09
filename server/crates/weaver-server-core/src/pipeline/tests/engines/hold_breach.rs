@@ -413,3 +413,32 @@ async fn a_set_whose_holds_spilled_restarts_and_completes_from_them() {
     assert!(restarted.files[&format!("lantern beacon/{MEMBER}")] == body);
     assert!(restarted.from_disk.is_empty(), "{:?}", restarted.from_disk);
 }
+
+// The layout needs of each volume only its front, where its headers are,
+// and its tail, where its end record says another volume follows: never
+// the data between. A set whose fronts and tails come before the rest, in
+// the order a crowd of workers lands them, holds no more than the data
+// riding in those articles, one article a volume, whatever the budgets.
+#[tokio::test]
+async fn a_set_whose_fronts_and_tails_come_first_holds_an_article_a_volume_at_most() {
+    let volumes = 24;
+    let body = payload(volumes * 3 * FRAME + 13, 77);
+    let shape = scrambled_store_set(&body, volumes);
+    let order = shape.together.clone();
+    let last = |index: u32| shape.posts[index as usize].articles(FRAME).count() as u32 - 1;
+    let volume = |index: &&u32| (1..=volumes as u32).contains(*index);
+    let mut first = vec![(0, 0)];
+    first.extend(order.iter().filter(volume).map(|index| (*index, 0)));
+    first.extend(order.iter().filter(volume).map(|index| (*index, last(*index))));
+    let shape = shape.first(&first);
+    let run = run_restarting_at(&shape, &mut |_| {}, Down::Crash, &|_| false).await;
+    assert_eq!(run.restarts, 0);
+    assert_eq!(run.status, Some(JobStatus::Complete));
+    assert!(run.files[&format!("lantern beacon/{MEMBER}")] == body);
+    assert!(
+        run.graph.held <= (volumes * FRAME) as u64,
+        "held {} of {} volumes",
+        run.graph.held,
+        volumes
+    );
+}

@@ -885,6 +885,9 @@ pub(in crate::pipeline::tests) struct GraphView {
     // The most the job's working directory held at any look, every file
     // under it by its length.
     pub(in crate::pipeline::tests) scratch: u64,
+    // The most the job's holds kept at any look, in memory, on scratch and
+    // on file, over every namespace.
+    pub(in crate::pipeline::tests) held: u64,
 }
 
 #[derive(Debug)]
@@ -1684,6 +1687,12 @@ pub(in crate::pipeline::tests) fn observe(
         })
         .sum();
     view.resident = view.resident.max(resident);
+    let held = tree
+        .live()
+        .into_iter()
+        .map(|node| job.writer().held_bytes(node))
+        .sum();
+    view.held = view.held.max(held);
     *reads = job.writer().read_backs();
     view.observed += looked.elapsed();
 }
