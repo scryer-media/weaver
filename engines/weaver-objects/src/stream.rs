@@ -259,7 +259,7 @@ impl<D: Decoder> Engine for Stream<D> {
         Box::new(run::Run::<D>::new(
             D::member(&self.name),
             D::window(&self.first, &self.budget),
-            D::declared(&self.first),
+            self.first.clone(),
         ))
     }
 

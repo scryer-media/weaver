@@ -1822,7 +1822,7 @@ fn provenance_named(name: &str) -> Option<Provenance> {
     .find(|provenance| provenance_name(*provenance) == name)
 }
 
-pub(crate) const REASONS: [Why; 14] = [
+pub(crate) const REASONS: [Why; 15] = [
     Why::Compressed,
     Why::TailUnreachable,
     Why::EncryptedHeader,
@@ -1839,6 +1839,10 @@ pub(crate) const REASONS: [Why; 14] = [
     Why::TooLarge {
         needed: None,
         allowed: None,
+    },
+    Why::OverMachine {
+        needed: 0,
+        memory: 0,
     },
 ];
 
@@ -1858,17 +1862,22 @@ pub(crate) fn why_name(why: Why) -> &'static str {
         Why::TooDeep => "too_deep",
         Why::InvalidArchive => "invalid_archive",
         Why::TooLarge { .. } => "too_large",
+        Why::OverMachine { .. } => "over_machine",
     }
 }
 
 // A reason as a checkpoint row keeps it: its name, and for a decode too
 // large the sizes it carried, each `-` where it said none, as
-// `too_large:2147483648:-`.
+// `too_large:2147483648:-`; for a decode the machine cannot hold, what it
+// needed and the machine's memory, as `over_machine:68719476736:34359738368`.
 pub(crate) fn why_text(why: Why) -> String {
     let size = |size: Option<u64>| size.map_or_else(|| "-".to_owned(), |size| size.to_string());
     match why {
         Why::TooLarge { needed, allowed } => {
             format!("{}:{}:{}", why_name(why), size(needed), size(allowed))
+        }
+        Why::OverMachine { needed, memory } => {
+            format!("{}:{needed}:{memory}", why_name(why))
         }
         why => why_name(why).to_owned(),
     }
@@ -1878,7 +1887,7 @@ fn why_named(text: &str) -> Option<Why> {
     let Some((name, sizes)) = text.split_once(':') else {
         return REASONS
             .into_iter()
-            .filter(|why| !matches!(why, Why::TooLarge { .. }))
+            .filter(|why| !matches!(why, Why::TooLarge { .. } | Why::OverMachine { .. }))
             .find(|why| why_name(*why) == text);
     };
     let size = |size: &str| match size {
@@ -1886,11 +1895,17 @@ fn why_named(text: &str) -> Option<Why> {
         size => size.parse().ok().map(Some),
     };
     let (needed, allowed) = sizes.split_once(':')?;
-    (name == "too_large").then_some(())?;
-    Some(Why::TooLarge {
-        needed: size(needed)?,
-        allowed: size(allowed)?,
-    })
+    match name {
+        "too_large" => Some(Why::TooLarge {
+            needed: size(needed)?,
+            allowed: size(allowed)?,
+        }),
+        "over_machine" => Some(Why::OverMachine {
+            needed: needed.parse().ok()?,
+            memory: allowed.parse().ok()?,
+        }),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

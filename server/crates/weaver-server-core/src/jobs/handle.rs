@@ -1207,10 +1207,29 @@ impl SchedulerHandle {
         job_id: JobId,
         password: Option<String>,
     ) -> Result<(), SchedulerError> {
+        self.reprocess_job_with_options(job_id, password, false)
+            .await
+    }
+
+    // Reprocess with `no_memory_limit`: the job's decode windows over the
+    // profile's ceiling are lent from scratch, then RAM, whatever the
+    // profile says. Other jobs keep their limits.
+    pub async fn reprocess_job_with_options(
+        &self,
+        job_id: JobId,
+        password: Option<String>,
+        no_memory_limit: bool,
+    ) -> Result<(), SchedulerError> {
         self.state
             .queue
             .clone()
-            .restart(job_id, password, true, self.event_tx.clone())
+            .restart(
+                job_id,
+                password,
+                true,
+                no_memory_limit,
+                self.event_tx.clone(),
+            )
             .await
     }
 
@@ -1227,7 +1246,7 @@ impl SchedulerHandle {
         self.state
             .queue
             .clone()
-            .restart(job_id, password, false, self.event_tx.clone())
+            .restart(job_id, password, false, false, self.event_tx.clone())
             .await
     }
 

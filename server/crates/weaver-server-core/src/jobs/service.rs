@@ -771,7 +771,16 @@ impl Pipeline {
         job_id: JobId,
         password: Option<String>,
     ) -> Result<(), crate::SchedulerError> {
-        self.restart_through_control_plane(job_id, password, true)
+        self.restart_through_control_plane(job_id, password, true, false)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn reprocess_job_with_no_memory_limit(
+        &mut self,
+        job_id: JobId,
+    ) -> Result<(), crate::SchedulerError> {
+        self.restart_through_control_plane(job_id, None, true, true)
             .await
     }
 
@@ -789,7 +798,7 @@ impl Pipeline {
         job_id: JobId,
         password: Option<String>,
     ) -> Result<(), crate::SchedulerError> {
-        self.restart_through_control_plane(job_id, password, false)
+        self.restart_through_control_plane(job_id, password, false, false)
             .await
     }
 
@@ -799,6 +808,7 @@ impl Pipeline {
         job_id: JobId,
         password: Option<String>,
         reprocess: bool,
+        no_memory_limit: bool,
     ) -> Result<(), crate::SchedulerError> {
         if let Some(state) = self.jobs.get(&job_id) {
             if !crate::pipeline::is_terminal_status(&state.status) {
@@ -824,7 +834,13 @@ impl Pipeline {
         self.shared_state
             .queue
             .clone()
-            .restart(job_id, password, reprocess, self.event_tx.clone())
+            .restart(
+                job_id,
+                password,
+                reprocess,
+                no_memory_limit,
+                self.event_tx.clone(),
+            )
             .await?;
         self.run_queue_intents().await;
         Ok(())
@@ -1718,11 +1734,13 @@ async fn read_restored(
     let graph = if waiting_summaries.is_some() || delivering {
         None
     } else if let Some(graph) = graph {
-        let seat = graph.for_job(
-            spec.password.clone(),
-            &working_dir,
-            staging_exists.then_some(staging_dir),
-        );
+        let seat = graph
+            .for_job(
+                spec.password.clone(),
+                &working_dir,
+                staging_exists.then_some(staging_dir),
+            )
+            .lifted(&spec.metadata);
         let files = crate::pipeline::graph::restore::root_files(&spec);
         match tokio::task::spawn_blocking(move || seat.restore(job_id, files))
             .await

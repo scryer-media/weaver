@@ -151,6 +151,26 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(performance.max_concurrent_downloads_cap, None);
 }
 
+// A window over the ceiling fails only the efficient profile; the others lend
+// it from scratch, then RAM.
+#[test]
+fn only_the_efficient_profile_fails_a_window_over_its_ceiling() {
+    for probe in [machine(4, 8), machine(16, 64)] {
+        assert_eq!(
+            HardwareProfile::Efficient.tuning(&probe).over_limit,
+            OverLimit::Fail
+        );
+        assert_eq!(
+            HardwareProfile::Balanced.tuning(&probe).over_limit,
+            OverLimit::ScratchThenRam
+        );
+        assert_eq!(
+            HardwareProfile::Performance.tuning(&probe).over_limit,
+            OverLimit::ScratchThenRam
+        );
+    }
+}
+
 // The extraction, PAR3 and holds limits shrink with the profile, and the
 // widest profile leaves each exactly where the machine alone put it.
 #[test]

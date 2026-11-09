@@ -580,6 +580,10 @@ pub(in crate::pipeline::tests) struct Scenario {
     // The hold budgets every graph job of the pipeline shares, when not the
     // host's.
     pub(in crate::pipeline::tests) holds: Option<weaver_graph::holds::HoldBudgets>,
+    // The hardware profile the operator chose, when not the recommendation.
+    profile: Option<crate::runtime::HardwareProfile>,
+    // Metadata the job is submitted with beside the post's own.
+    metadata: Vec<(String, String)>,
     // The STAT server of every pipeline the scenario prepared, held as long
     // as the scenario is.
     stat_servers: std::sync::Mutex<Vec<Listener>>,
@@ -609,8 +613,25 @@ impl Scenario {
             unacceptable: None,
             policy_corrupt: false,
             holds: None,
+            profile: None,
+            metadata: Vec::new(),
             stat_servers: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    // The operator chose this hardware profile.
+    pub(in crate::pipeline::tests) fn profile(
+        mut self,
+        profile: crate::runtime::HardwareProfile,
+    ) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    // The job carries this metadata entry, as a reprocess or a client sets it.
+    pub(in crate::pipeline::tests) fn metadata(mut self, key: &str, value: &str) -> Self {
+        self.metadata.push((key.to_string(), value.to_string()));
+        self
     }
 
     // The stored settings are present but do not parse, on every pipeline
@@ -674,6 +695,9 @@ impl Scenario {
         if let Some(budgets) = self.holds {
             pipeline.graph_holds =
                 std::sync::Arc::new(weaver_graph::holds::HoldsAccountant::new(budgets));
+        }
+        if let Some(profile) = self.profile {
+            pipeline.set_configured_hardware_profile(profile);
         }
         if self.policy_corrupt {
             pipeline
@@ -803,10 +827,12 @@ impl Scenario {
     }
 
     pub(in crate::pipeline::tests) fn spec(&self) -> JobSpec {
-        JobSpec {
+        let mut spec = JobSpec {
             password: self.password.clone(),
             ..spec(JOB_NAME, &self.posts, self.article)
-        }
+        };
+        spec.metadata.extend(self.metadata.iter().cloned());
+        spec
     }
 }
 

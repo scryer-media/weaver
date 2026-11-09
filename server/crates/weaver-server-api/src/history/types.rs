@@ -72,6 +72,16 @@ impl HistoryItem {
             })
             .collect()
     }
+
+    /// Whether the job failed because a decode window was over the memory
+    /// profile's ceiling, so `reprocessJob(noMemoryLimit: true)` may finish it.
+    async fn failed_for_memory(&self) -> bool {
+        self.state == QueueItemState::Failed
+            && self
+                .error
+                .as_deref()
+                .is_some_and(weaver_server_core::history::attributes::failed_for_memory)
+    }
 }
 
 /// A file Weaver named other than its full name, because the full name was

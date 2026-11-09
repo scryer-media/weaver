@@ -184,6 +184,16 @@ impl RestoreSeat {
         self
     }
 
+    // The seat for a job whose metadata asks for no memory limit: its runs
+    // are granted a window over the ceiling, as the reprocess that set it
+    // granted them.
+    pub(crate) fn lifted(mut self, metadata: &[(String, String)]) -> Self {
+        self.hardware = self
+            .hardware
+            .lifted(crate::history::attributes::no_memory_limit(metadata));
+        self
+    }
+
     pub(crate) fn working_dir(&self) -> &Path {
         &self.working_dir
     }

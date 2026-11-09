@@ -297,6 +297,52 @@ async fn archive_password_override_is_durable_for_history_reprocess_and_redownlo
     }
 }
 
+// A reprocess with no memory limit keeps the flag with the job, so a
+// restart restores it; a later plain reprocess of a row that carried it
+// drops it, so it never reaches the next run unasked.
+#[tokio::test]
+async fn the_no_memory_limit_flag_is_kept_with_the_job_and_dropped_by_a_plain_reprocess() {
+    use crate::history::attributes::{NO_MEMORY_LIMIT_ATTRIBUTE_KEY, no_memory_limit};
+    for lifted in [true, false] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30903);
+        let mut row = history_row_with_output_dir(
+            job_id,
+            "Wide Fixture",
+            "failed",
+            temp_dir.path().join("unused-output"),
+        );
+        row.output_dir = None;
+        row.error_message =
+            Some("lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed".into());
+        // A row from a run that already carried the flag.
+        row.metadata =
+            Some(serde_json::to_string(&vec![(NO_MEMORY_LIMIT_ATTRIBUTE_KEY, "1")]).unwrap());
+        insert_history_row_with_nzb_zstd(&pipeline.db, &row, &sample_nzb_zstd());
+        if lifted {
+            pipeline
+                .reprocess_job_with_no_memory_limit(job_id)
+                .await
+                .unwrap();
+        } else {
+            pipeline.reprocess_job(job_id).await.unwrap();
+        }
+        let metadata = &pipeline.jobs.get(&job_id).unwrap().spec.metadata;
+        assert_eq!(no_memory_limit(metadata), lifted);
+        assert_eq!(
+            metadata
+                .iter()
+                .filter(|(key, _)| key == NO_MEMORY_LIMIT_ATTRIBUTE_KEY)
+                .count(),
+            usize::from(lifted),
+            "{metadata:?}"
+        );
+        let restored = pipeline.db.load_active_jobs().unwrap();
+        assert_eq!(no_memory_limit(&restored[&job_id].metadata), lifted);
+    }
+}
+
 // A reprocess over nothing on disk fetches the job again: its spec is
 // rebuilt from the history row's persisted NZB, and its articles are queued.
 async fn reprocess_rebuilds_from_history(job_id: JobId, name: &str, status: &str) {

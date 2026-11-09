@@ -131,6 +131,7 @@ impl Queue {
         id: JobId,
         password: Option<String>,
         reprocess: bool,
+        no_memory_limit: bool,
         events: tokio::sync::broadcast::Sender<crate::events::model::PipelineEvent>,
     ) -> Result<(), SchedulerError> {
         let mut resources = self
@@ -204,10 +205,17 @@ impl Queue {
                         .transpose()
                         .map_err(|error| SchedulerError::Internal(error.to_string()))?
                         .unwrap_or_default();
+                    use crate::history::attributes::NO_MEMORY_LIMIT_ATTRIBUTE_KEY;
                     metadata.retain(|(key, _)| {
                         !crate::history::attributes::is_password_attribute_key(key)
+                            && key != NO_MEMORY_LIMIT_ATTRIBUTE_KEY
                             && (reprocess || key != crate::ingest::FULL_FILE_NAMES_METADATA_KEY)
                     });
+                    // Kept with the job, so a restart or a restore of it
+                    // keeps the limit lifted; a later restart decides again.
+                    if no_memory_limit {
+                        metadata.push((NO_MEMORY_LIMIT_ATTRIBUTE_KEY.to_string(), "1".to_string()));
+                    }
                     let mut spec = crate::ingest::nzb_to_spec(&nzb, &path, row.category, metadata);
                     if let Some(password) = password {
                         spec.password = Some(password);

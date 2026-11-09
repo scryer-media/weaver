@@ -474,6 +474,14 @@ fn withheld_because(why: Why) -> String {
         Why::Unmapped => "never placed every member it named",
         Why::InvalidArchive => "is an invalid archive rejected by validation",
         Why::TooLarge { needed, allowed } => return too_large(needed, allowed),
+        Why::OverMachine { needed, memory } => {
+            use crate::support::human_bytes;
+            return format!(
+                "needs {} of decode memory, this machine has {}",
+                human_bytes(needed),
+                human_bytes(memory)
+            );
+        }
         _ => "was refused",
     };
     said.to_owned()

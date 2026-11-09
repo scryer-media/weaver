@@ -39,6 +39,7 @@ use super::decoding::DecodeClock;
 use super::envelope::Shelf;
 use super::hardware::Hardware;
 use super::namespace::Returned;
+use crate::runtime::OverLimit;
 
 // How many things a run may have said before it waits for the pipeline to
 // hear them: a bound on the bytes in flight, not on the run.
@@ -164,9 +165,9 @@ impl RunMail {
 enum Life {
     Queued,
     // Its reservation did not fit beside what the decode pool holds. It
-    // holds no slot, and asks for one again once the pool holds less than
-    // when it was turned away, or its limit rose.
-    Starved { reserved: u64, limit: u64 },
+    // holds no slot, and asks for one again once the pool was given room
+    // back since it was turned away, or its limit rose.
+    Starved { freed: u64, limit: u64 },
     Running { generation: u64 },
     Ended { generation: u64 },
     // Stopped where it stood because the job is going down, under the
@@ -186,6 +187,43 @@ struct Run {
     // The bytes reserved for the run in the decode pool, held from before
     // it starts until it ends or is forgotten; zero while none is taken.
     reserved: u64,
+    // The window the run decodes at above the grant's ceiling, where the
+    // policy lets it go above: the widest its object or its decoder named.
+    wide: Option<u64>,
+    // Where that window is: lent from a scratch file, or in RAM.
+    placed: Placed,
+    // The run refused a window its policy lets it have: it starts again,
+    // wider, once it ends, and what it says before then is not heard.
+    rerun: bool,
+    // Whether it is counted among the runs waiting for the whole pool.
+    whole: bool,
+}
+
+impl Run {
+    fn queued() -> Self {
+        Self {
+            life: Life::Queued,
+            ticket: None,
+            volumes: None,
+            reserved: 0,
+            wide: None,
+            placed: Placed::Grant,
+            rerun: false,
+            whole: false,
+        }
+    }
+}
+
+// Where a run's decode window is.
+#[derive(Debug, Default)]
+enum Placed {
+    // Within the grant, in RAM.
+    #[default]
+    Grant,
+    // Over the ceiling, on a scratch file lent before the run starts.
+    Scratch(super::window::Window),
+    // Over the ceiling, in RAM: this many bytes of it.
+    Ram(u64),
 }
 
 // The e2e hook for a job that is extracting, on the run's own thread: with
@@ -208,6 +246,9 @@ pub(crate) enum Reservation {
     // It is larger than the decode pool itself, so it can never fit:
     // `needed` bytes against the `allowed` pool.
     Refused { needed: u64, allowed: u64 },
+    // Its window may go above the ceiling, but it needs more RAM than the
+    // machine's `memory` leaves a run: `needed` bytes of window.
+    Beyond { needed: u64, memory: u64 },
 }
 
 // A run's last word, said when the run's thread lets it go, however the run
@@ -388,12 +429,7 @@ impl Runs {
         let mut admitted = self.follow(limit);
         admitted.extend(self.wake());
         self.marks.mark(node);
-        let run = self.runs.entry(node).or_insert(Run {
-            life: Life::Queued,
-            ticket: None,
-            volumes: None,
-            reserved: 0,
-        });
+        let run = self.runs.entry(node).or_insert_with(Run::queued);
         if run.ticket.is_some() {
             if !admitted.contains(&node) {
                 admitted.push(node);
@@ -412,33 +448,83 @@ impl Runs {
     // only narrows as the object's first bytes say more, so a restarted run
     // never needs more than the first. It is bookkeeping: nothing is
     // allocated for it.
+    #[cfg(test)]
     pub(crate) fn reserve(&mut self, node: NodeId, window: u64) -> Reservation {
-        let run_budget = self.hardware.grant().run;
+        self.reserve_for(node, window, false)
+    }
+
+    // As `reserve`, for a run whose decoder borrows a window over the
+    // ceiling from its lender when `lends`.
+    //
+    // Where the grant's policy lets a window go over the ceiling, and the
+    // run's window is over it, as its object declares or as its decoder
+    // refused (`widen`), the window is placed here: lent from a scratch
+    // file for a decoder that borrows one, with only the run's RAM inside
+    // the ceiling reserved; or, for one that does not, or a scratch file
+    // refused for any reason, in RAM above the ceiling, reserved whole from
+    // the decode pool, up to what the machine leaves a run. A reservation
+    // larger than the pool waits for it to be empty, then takes it.
+    pub(crate) fn reserve_for(&mut self, node: NodeId, window: u64, lends: bool) -> Reservation {
+        let grant = self.hardware.grant();
         let Some(run) = self.runs.get_mut(&node) else {
             return Reservation::Granted;
         };
         if run.reserved > 0 {
             return Reservation::Granted;
         }
-        let ceiling = run_budget
-            .memory_bytes
-            .max(run_budget.window_bytes)
-            .unwrap_or(u64::MAX);
-        let len = window.min(ceiling).saturating_add(RUN_OVERHEAD);
+        let ceiling = grant.ceiling();
+        if grant.over_limit == OverLimit::ScratchThenRam && window > ceiling {
+            run.wide = run.wide.max(Some(window));
+        }
+        let len = match run.wide {
+            None => window.min(ceiling).saturating_add(RUN_OVERHEAD),
+            Some(wide) => {
+                if !matches!(run.placed, Placed::Scratch(_)) {
+                    run.placed = self
+                        .windows
+                        .as_ref()
+                        .filter(|_| lends)
+                        .and_then(|windows| {
+                            windows.allocate(node, usize::try_from(wide).ok()?).ok()
+                        })
+                        .map_or(Placed::Ram(wide), Placed::Scratch);
+                }
+                match run.placed {
+                    Placed::Scratch(_) => window.min(ceiling).saturating_add(RUN_OVERHEAD),
+                    _ => {
+                        let len = wide.saturating_add(RUN_OVERHEAD);
+                        if len > grant.above_ceiling() {
+                            return Reservation::Beyond {
+                                needed: wide,
+                                memory: grant.machine_bytes.unwrap_or(u64::MAX),
+                            };
+                        }
+                        len
+                    }
+                }
+            }
+        };
         let room = self.pool.room();
-        if len > room.limit {
+        let taken = if len <= room.limit {
+            self.pool.stop_waiting(&mut run.whole);
+            self.pool.take(len)
+        } else if run.wide.is_some() {
+            self.pool.take_whole(len, &mut run.whole)
+        } else {
             return Reservation::Refused {
                 needed: len,
                 allowed: room.limit,
             };
-        }
-        if self.pool.reserve(len) {
-            run.reserved = len;
-            return Reservation::Granted;
-        }
-        let room = self.pool.room();
+        };
+        let room = match taken {
+            Ok(()) => {
+                run.reserved = len;
+                return Reservation::Granted;
+            }
+            Err(room) => room,
+        };
         run.life = Life::Starved {
-            reserved: room.reserved,
+            freed: room.freed,
             limit: room.limit,
         };
         self.marks.mark(node);
@@ -466,8 +552,29 @@ impl Runs {
         self.marks.mark(node);
         let volumes = Arc::new(RunVolumes::new(shelf, generation));
         run.volumes = Some(Arc::clone(&volumes));
-        let mut budget = self.hardware.grant().run;
+        let grant = self.hardware.grant();
+        let mut budget = grant.run.clone();
         budget.lender = self.windows.as_ref().map(|windows| windows.for_node(node));
+        match &mut run.placed {
+            Placed::Grant => {}
+            // The decoder borrows the window lent for it first. A run
+            // started again under the same reservation borrows through
+            // the lender alone.
+            placed @ Placed::Scratch(_) => {
+                if let Placed::Scratch(window) = std::mem::take(placed) {
+                    budget.lender = self
+                        .windows
+                        .as_ref()
+                        .map(|windows| windows.prelent(node, window));
+                }
+            }
+            // The decoder may hold the window in RAM: what was reserved.
+            Placed::Ram(wide) => {
+                let most = Some((*wide).max(grant.ceiling()));
+                budget.memory_bytes = most;
+                budget.window_bytes = most;
+            }
+        }
         let (scope, mail, clock) = (self.scope, self.mail.clone(), self.clock.clone());
         let said = move |heard| Said {
             scope,
@@ -516,6 +623,23 @@ impl Runs {
     // returns the nodes that may start now.
     pub(crate) fn ended(&mut self, node: NodeId, generation: u64, limit: usize) -> Vec<NodeId> {
         let mut admitted = self.follow(limit);
+        if let Some(run) = self.runs.get_mut(&node)
+            && std::mem::take(&mut run.rerun)
+        {
+            // Widened: it gives back what it reserved at the narrower
+            // window and starts again under the slot it holds, reserving
+            // the wider one.
+            run.life = Life::Queued;
+            run.volumes = None;
+            run.placed = Placed::Grant;
+            self.pool.release(std::mem::take(&mut run.reserved));
+            self.marks.mark(node);
+            if run.ticket.is_some() {
+                admitted.push(node);
+            }
+            admitted.extend(self.wake());
+            return admitted;
+        }
         if let Some(run) = self.runs.get_mut(&node) {
             run.life = Life::Ended { generation };
             self.marks.mark(node);
@@ -523,6 +647,36 @@ impl Runs {
         }
         admitted.extend(self.wake());
         admitted
+    }
+
+    // The node's run refused a window of `needed` bytes that the grant's
+    // policy lets it have above the ceiling, and wider than any it was
+    // given: it is stopped where it stands, what it says from here is not
+    // heard, and once it ends it starts again at that window. `false` when
+    // the policy holds it to the ceiling, or it already had that window:
+    // its refusal stands.
+    pub(crate) fn widen(&mut self, node: NodeId, needed: u64) -> bool {
+        let grant = self.hardware.grant();
+        let Some(run) = self.runs.get_mut(&node) else {
+            return false;
+        };
+        let wider = grant.over_limit == OverLimit::ScratchThenRam
+            && needed > grant.ceiling()
+            && run.wide.is_none_or(|wide| needed > wide)
+            && matches!(run.life, Life::Running { .. });
+        if wider {
+            run.wide = Some(needed);
+            run.rerun = true;
+            if let Some(volumes) = &run.volumes {
+                volumes.stop();
+            }
+        }
+        wider
+    }
+
+    // Whether the node's run was widened and is ending, to start again.
+    pub(crate) fn rerunning(&self, node: NodeId) -> bool {
+        self.runs.get(&node).is_some_and(|run| run.rerun)
     }
 
     // Stop every run where it stands: the job is going down. What a run read
@@ -637,6 +791,9 @@ impl Runs {
             return Vec::new();
         };
         self.pool.release(std::mem::take(&mut run.reserved));
+        self.pool.stop_waiting(&mut run.whole);
+        run.placed = Placed::Grant;
+        run.rerun = false;
         let admissions = run
             .ticket
             .take()
@@ -661,14 +818,15 @@ impl Runs {
 // job would count it against the decode pool for good.
 impl Drop for Runs {
     fn drop(&mut self) {
-        for run in self.runs.values() {
+        for run in self.runs.values_mut() {
             self.pool.release(run.reserved);
+            self.pool.stop_waiting(&mut run.whole);
         }
     }
 }
 
 fn woken(life: Life, room: pool::Room) -> bool {
-    matches!(life, Life::Starved { reserved, limit } if room.reserved < reserved || room.limit > limit)
+    matches!(life, Life::Starved { freed, limit } if room.freed > freed || room.limit > limit)
 }
 
 fn asker(node: NodeId) -> AskerId {

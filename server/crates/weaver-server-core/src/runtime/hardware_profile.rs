@@ -57,6 +57,21 @@ pub struct ProfileTuning {
     // machine's memory. It never touches a configured limit. `None` leaves
     // the derived value alone.
     pub direct_store_resident_default_cap_bytes: Option<u64>,
+    // What a run whose decode window is wider than the profile's ceiling
+    // gets.
+    pub over_limit: OverLimit,
+}
+
+// What a decode window wider than the profile's ceiling gets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverLimit {
+    // The run is refused and the job ends Failed, with the sizes.
+    #[default]
+    Fail,
+    // The window is lent from a scratch file, so RAM stays at the ceiling;
+    // where the scratch file is refused, the window goes into RAM above the
+    // ceiling, up to what the machine has.
+    ScratchThenRam,
 }
 
 // A share of the machine's memory: a fraction of it, up to a ceiling.
@@ -91,6 +106,7 @@ struct ProfileRow {
     max_concurrent_extractions: usize,
     par3_memory: MemoryShare,
     direct_store_resident_default_cap_bytes: Option<u64>,
+    over_limit: OverLimit,
 }
 
 // Ordered from the least demanding to the most: `available` preserves this
@@ -110,6 +126,7 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: 256 * MIB,
         },
         direct_store_resident_default_cap_bytes: Some(256 * MIB),
+        over_limit: OverLimit::Fail,
     },
     ProfileRow {
         profile: HardwareProfile::Balanced,
@@ -125,6 +142,7 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: GIB,
         },
         direct_store_resident_default_cap_bytes: None,
+        over_limit: OverLimit::ScratchThenRam,
     },
     ProfileRow {
         profile: HardwareProfile::Performance,
@@ -140,6 +158,7 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: 2 * GIB,
         },
         direct_store_resident_default_cap_bytes: None,
+        over_limit: OverLimit::ScratchThenRam,
     },
 ];
 
@@ -287,6 +306,7 @@ impl HardwareProfile {
                 Self::Performance => None,
             },
             direct_store_resident_default_cap_bytes: row.direct_store_resident_default_cap_bytes,
+            over_limit: row.over_limit,
         }
     }
 

@@ -529,6 +529,20 @@ function JobDetailContent() {
                 >
                   {t("next.job.reprocess")}
                 </SecondaryButton>
+                {job.failedForMemory ? (
+                  <SecondaryButton
+                    icon="reprocess"
+                    size="compact"
+                    disabled={busy}
+                    onClick={() => {
+                      void run(t("next.job.report.reprocessing"), () =>
+                        reprocessJob({ id: job.id, noMemoryLimit: true }),
+                      );
+                    }}
+                  >
+                    {t("next.job.retryNoLimit")}
+                  </SecondaryButton>
+                ) : null}
                 <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("delete")}>
                   {t("next.job.deleteSaveFiles")}
                 </DangerButton>

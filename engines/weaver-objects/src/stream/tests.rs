@@ -221,6 +221,9 @@ fn decode<D: Decoder>(
 ) -> Vec<Said> {
     let gate = Gate::new(bytes);
     let extraction = stream.start();
+    // The run is granted what the stream was built with, as its owner
+    // grants both from the one profile.
+    let granted = stream.budget.clone();
     let runner = {
         let gate = Arc::clone(&gate);
         thread::spawn(move || {
@@ -232,7 +235,7 @@ fn decode<D: Decoder>(
                     emits.push(emit);
                     true
                 },
-                weaver_graph::Budget::default(),
+                granted,
             );
             gate.finish();
             emits
@@ -671,6 +674,52 @@ fn a_zstd_frame_wider_than_the_granted_window_is_refused() {
         &fronted(&mut held, zstd_window(29)),
         Some(512 * MIB),
         Some(256 * MIB),
+    );
+}
+
+// A run granted a wider window than the stream was built with, as an owner
+// grants a run whose window it lets go above its ceiling, decodes a frame
+// the build's grant refused; it never holds less than the build's window.
+#[test]
+fn a_run_granted_a_wider_window_than_the_build_decodes_the_wider_frame() {
+    let built = weaver_graph::Budget {
+        memory_bytes: Some(GIB),
+        window_bytes: Some(MIB),
+        threads: 1,
+        ..Default::default()
+    };
+    let mut stream = stream::<Zstd>("a.zst").within(built);
+    let bytes = zstd_window(21);
+    stream.deliver(
+        Delivery {
+            volume: VolumeIndex(0),
+            offset: 0,
+            bytes: &weaver_graph::Evidenced::from(bytes.clone()),
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut Vec::new(),
+    );
+    let wider = weaver_graph::Budget {
+        memory_bytes: Some(2 * MIB),
+        window_bytes: Some(2 * MIB),
+        threads: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        closed_run(&mut stream, bytes.clone(), wider),
+        decoded("a", b"z".to_vec())
+    );
+    let narrower = weaver_graph::Budget {
+        memory_bytes: Some(1 << 10),
+        window_bytes: Some(1 << 10),
+        threads: 1,
+        ..Default::default()
+    };
+    too_large(
+        &closed_run(&mut stream, bytes, narrower),
+        Some(2 * MIB),
+        Some(MIB),
     );
 }
 

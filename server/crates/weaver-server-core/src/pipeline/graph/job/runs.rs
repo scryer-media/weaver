@@ -184,6 +184,18 @@ impl GraphJob {
             }
             Heard::CheckpointBlocked { .. } | Heard::CheckpointDue { .. } => return Ok(()),
             _ if !self.runs.current(node, said.generation) => return Ok(()),
+            // A run widened is ending, to start again at the wider window.
+            Heard::Emit(_) if self.runs.rerunning(node) => return Ok(()),
+            // A window over the ceiling that the grant's policy lets the run
+            // have: what it built is retracted, and it starts again once it
+            // ends, its window placed above the ceiling.
+            Heard::Emit(Emit::Refuse(Why::TooLarge {
+                needed: Some(needed),
+                ..
+            })) if self.runs.widen(node, needed) => {
+                self.retract_run(node)?;
+                return Ok(());
+            }
             Heard::Emit(emit) => {
                 // The tree is told the run is asking, as it is told how far
                 // the run read: the object rules on it when the job is quiet.
@@ -310,27 +322,34 @@ impl GraphJob {
     // can never fit is refused to the tree as a run's own refusal is; one
     // that does not fit now hands back the nodes its slot admitted.
     fn start_run(&mut self, node: NodeId) -> Result<Vec<NodeId>, GraphError> {
-        let Some(window) = self.tree.engine(node).and_then(Engine::reserve) else {
+        let Some(engine) = self.tree.engine(node) else {
             return Ok(Vec::new());
         };
-        match self.runs.reserve(node, window) {
-            Reservation::Granted => {}
+        let Some(window) = engine.reserve() else {
+            return Ok(Vec::new());
+        };
+        // Whether the decoder borrows a window over the ceiling from a
+        // scratch file, or is given it in RAM: `Engine::lends`.
+        let lends = engine.lends();
+        let refused = match self.runs.reserve_for(node, window, lends) {
+            Reservation::Granted => None,
             Reservation::Starved(admitted) => return Ok(admitted),
-            Reservation::Refused { needed, allowed } => {
-                let mut effects = Vec::new();
-                let why = Why::TooLarge {
-                    needed: Some(needed),
-                    allowed: Some(allowed),
-                };
-                self.tree.emitted(
-                    node,
-                    vec![Emit::Refuse(why)],
-                    &mut self.writer.placing(&mut *self.builder),
-                    &mut effects,
-                );
-                self.settle(effects)?;
-                return Ok(Vec::new());
-            }
+            Reservation::Refused { needed, allowed } => Some(Why::TooLarge {
+                needed: Some(needed),
+                allowed: Some(allowed),
+            }),
+            Reservation::Beyond { needed, memory } => Some(Why::OverMachine { needed, memory }),
+        };
+        if let Some(why) = refused {
+            let mut effects = Vec::new();
+            self.tree.emitted(
+                node,
+                vec![Emit::Refuse(why)],
+                &mut self.writer.placing(&mut *self.builder),
+                &mut effects,
+            );
+            self.settle(effects)?;
+            return Ok(Vec::new());
         }
         if let Some(extraction) = self.tree.start(node) {
             let shelf = self.writer.shelf(node);

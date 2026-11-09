@@ -89,6 +89,8 @@ export interface JobData {
   createdAt?: number | null;
   completedAt?: number | null;
   error?: string | null;
+  /** Failed for a decode window over the memory profile's ceiling; history rows only. */
+  failedForMemory?: boolean;
   outputDir?: string | null;
   metadata: { key: string; value: string }[];
   deleteOperation?: DeleteOperationData | null;

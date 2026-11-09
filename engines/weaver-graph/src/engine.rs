@@ -246,4 +246,13 @@ pub trait Engine {
     fn reserve(&self) -> Option<u64> {
         Some(0)
     }
+
+    // Whether a run's decoder borrows a window wider than the grant holds in
+    // RAM from `Budget::lender`. The owner then lends that window from a
+    // scratch file before the run starts, where the owner's policy allows a
+    // window over its ceiling at all; an engine that does not borrow is
+    // given that window in RAM instead.
+    fn lends(&self) -> bool {
+        false
+    }
 }

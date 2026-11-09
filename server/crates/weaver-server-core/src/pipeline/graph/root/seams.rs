@@ -82,7 +82,10 @@ impl Pipeline {
             passwords,
             caps,
             nesting: limits::NESTING,
-            hardware: self.graph_hardware.clone(),
+            // A job reprocessed with no memory limit keeps it lifted.
+            hardware: self.graph_hardware.clone().lifted(
+                crate::history::attributes::no_memory_limit(&state.spec.metadata),
+            ),
             metrics: Some(Arc::clone(&self.metrics)),
             data_dir: Some(data_dir),
         };

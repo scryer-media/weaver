@@ -371,6 +371,7 @@ export const nextIt: LocaleDictionary = {
   "next.job.report.cancelled": "Download annullato",
   "next.job.report.forgotten": "Identità dimenticata",
   "next.job.reprocess": "Rielabora",
+  "next.job.retryNoLimit": "Riprova senza limite",
   "next.job.pipeline": "Pipeline",
   "next.job.outputFiles": "File prodotti",
   "next.job.eventLog": "Registro eventi",
