@@ -18,7 +18,7 @@ use crate::pipeline::graph::root::tests::{decoded, file};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::tests::engines::harness::{ARTICLE, par2_set, payload};
 use crate::pipeline::tests::engines::loans::{
-    FRAME, SECRET, body, stored_zip, zipcrypto_descriptor,
+    FRAME, Kind, SECRET, body, stored_zip, volumes, zipcrypto_descriptor,
 };
 
 thread_local! {
@@ -265,4 +265,112 @@ fn owed_work_on_a_nested_zip_in_order_leaves_none_due() {
 #[test]
 fn owed_work_on_a_nested_zip_served_backwards_leaves_none_due() {
     owed_rows(true, true)
+}
+
+// A ZipCrypto member downloaded by a job with no slot to run its keys in.
+// The tail comes first, so the zip knows the entry as its data comes: the
+// first article proves the password where it arrives, and past it the zip
+// holds no more than its cap of ciphertext for the keys; the rest waits in
+// the holds ledger, deciphered nowhere. The last article closes the volume,
+// which hears what the zip holds before anything else, as it must, and the
+// cap still stands. Granted a slot, the keys run over what the zip holds,
+// the ledger hands back the rest as they reach it, and the member comes
+// whole. The entry is larger than the tail the zip keeps to find its
+// directory, and its articles are larger than the loans' rows', so they
+// are few.
+#[test]
+fn ciphertext_past_the_cap_waits_in_the_ledger_until_a_slot_comes() {
+    use weaver_objects::zip::counting;
+    const ARTICLE: usize = 16 * 1024;
+    const CAP: u64 = 4 * ARTICLE as u64;
+    counting::cap_here(CAP);
+    let plain = payload(32 * ARTICLE + 77, 67);
+    let [(name, archive)] = <[_; 1]>::try_from(volumes(Kind::ZipCryptoSized, &plain, 1)).unwrap();
+    let sizes: Vec<u32> = archive
+        .chunks(ARTICLE)
+        .map(|chunk| chunk.len() as u32)
+        .collect();
+    let files = vec![file(&name, &sizes)];
+    let directory = tempfile::tempdir().unwrap();
+    let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+        resident_limit: u64::MAX,
+        scratch_total: u64::MAX,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    }));
+    let writer = NamespaceWriter::new(
+        1,
+        directory.path().to_owned(),
+        accountant,
+        CapacityReader::unknown(),
+    );
+    let runs = Runs::new(
+        1,
+        0,
+        RunMail::default().sender(),
+        crate::pipeline::graph::engine::DecodePool::unbounded(),
+    );
+    let mut job = GraphJob::new(
+        &files,
+        Box::new(Hardware::default()),
+        writer,
+        runs,
+        u32::MAX,
+    )
+    .offering(vec![SECRET.to_string()]);
+    let length = Some(archive.len() as u64);
+    let mut slots = RepairSlots::default();
+    let deciphered = counting::deciphered_here();
+    let mut articles: Vec<(usize, &[u8])> = archive.chunks(ARTICLE).enumerate().collect();
+    // The tail first, as far as the zip looks for its directory.
+    articles.rotate_right(5);
+    let last = articles.pop().unwrap();
+    let mut intake = |job: &mut GraphJob, (ordinal, chunk): (usize, &[u8])| {
+        let offset = (ordinal * ARTICLE) as u64;
+        job.intake(
+            decoded(0, ordinal as u32, offset, chunk, length),
+            &mut slots,
+            0,
+        )
+        .unwrap();
+    };
+    for article in articles {
+        intake(&mut job, article);
+    }
+    let proved = counting::deciphered_here() - deciphered;
+    assert!(
+        proved <= ARTICLE as u64,
+        "deciphered with no slot: {proved}"
+    );
+    assert_eq!(counting::queued_most_here(), CAP, "held for the keys");
+    // The ledger holds the rest, short of the article that proved the
+    // password and the tail the zip keeps for its directory, and none of
+    // what the zip holds for the keys.
+    let held = job.writer.held_bytes(NodeId::ROOT);
+    let tail = 5 * ARTICLE as u64;
+    assert!(
+        held >= plain.len() as u64 - ARTICLE as u64 - CAP - tail,
+        "the ledger holds {held} of {}",
+        plain.len()
+    );
+    assert!(held + CAP <= archive.len() as u64, "held twice: {held}");
+    assert!(!job.tree.working().is_empty(), "the keys' work waits");
+    intake(&mut job, last);
+    assert!(counting::queued_most_here() <= CAP);
+    assert_ne!(job.phase(), RootPhase::Done);
+
+    // A slot: the work is done here, as while a checkpoint is owed.
+    job.owe_checkpoint();
+    job.lend(&mut slots, 1).unwrap();
+    assert!(job.tree.working().is_empty(), "work left due");
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 0, "left in the ledger");
+    assert_eq!(job.phase(), RootPhase::Done, "the member delivered");
+    assert!(super::super::loan_tests::holds(directory.path(), &plain));
+    assert!(counting::queued_most_here() <= CAP);
+    // Deciphered once, every byte: crossing the cap asks for nothing again.
+    assert_eq!(
+        counting::deciphered_here() - deciphered,
+        plain.len() as u64,
+        "deciphered again"
+    );
 }
