@@ -83,7 +83,7 @@ impl NamespaceWriter {
     // A graceful stop: every namespace pages what it holds in RAM to
     // scratch, under the same budgets as any page-out, so the checkpoint
     // after it records them and a restart reads them back. What scratch
-    // cannot take stays in RAM and is fetched again.
+    // cannot take goes to its member's spill file.
     pub(crate) fn page_out_holds(&mut self) -> Result<(), WriteError> {
         self.stopped = true;
         let nodes: Vec<NodeId> = self
@@ -94,11 +94,15 @@ impl NamespaceWriter {
             .collect();
         let mut free_disk = self.free_disk_bytes();
         for node in nodes {
-            let page_outs = self.files_mut(node).holds.page_out_all(free_disk);
+            let (page_outs, spills) = self.files_mut(node).holds.page_out_all(free_disk);
             for page_out in &page_outs {
                 free_disk = free_disk.saturating_sub(page_out.range.len());
                 self.scratch(node)?
                     .write(page_out.scratch_offset, &page_out.bytes, None)?;
+            }
+            for spill in &spills {
+                self.spill_file(node, super::held_member(spill.volume))?
+                    .write(spill.range.start, &spill.bytes, None)?;
             }
         }
         Ok(())

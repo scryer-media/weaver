@@ -193,6 +193,8 @@ struct Taken {
     // The bytes held for it, in offset order.
     held: Vec<(ByteRange, Location)>,
     scratch: Option<File>,
+    // Its spill file, for the bytes held past the budgets.
+    spill: Option<File>,
     bound: Option<(NodeId, VolumeIndex)>,
 }
 
@@ -588,6 +590,10 @@ impl NamespaceWriter {
                     .and_then(|files| files.scratch.as_ref())
                     .filter(|_| access.defer_holds)
                     .and_then(|leaf| File::open(leaf.path()).ok()),
+                spill: files
+                    .and_then(|files| files.spills.get(&member))
+                    .filter(|_| access.defer_holds)
+                    .and_then(|leaf| File::open(leaf.path()).ok()),
                 bound,
             },
         );
@@ -620,6 +626,15 @@ impl NamespaceWriter {
                             .scratch
                             .as_ref()?
                             .read(offset, index(len), &mut bytes)
+                            .ok()?;
+                        Bytes::from(bytes)
+                    }
+                    Location::Spilled => {
+                        let mut bytes = Vec::new();
+                        files
+                            .spills
+                            .get(&member)?
+                            .read(piece.range.start, index(piece.range.len()), &mut bytes)
                             .ok()?;
                         Bytes::from(bytes)
                     }
@@ -740,6 +755,7 @@ impl Source for Lent {
                         offset: offset + from,
                         len: inside.len(),
                     },
+                    Location::Spilled => Location::Spilled,
                 };
                 Some((inside, location))
             })
@@ -764,6 +780,29 @@ impl Source for Lent {
         let start = into.len();
         into.resize(start + index(len), 0);
         if read_exact_at(file, offset, &mut into[start..]).is_err() {
+            into.truncate(start);
+            return false;
+        }
+        true
+    }
+
+    fn spilled(
+        &self,
+        node: NodeId,
+        member: MemberId,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        let Some(file) = self
+            .members
+            .get(&(node, member))
+            .and_then(|taken| taken.spill.as_ref())
+        else {
+            return false;
+        };
+        let start = into.len();
+        into.resize(start + index(range.len()), 0);
+        if read_exact_at(file, range.start, &mut into[start..]).is_err() {
             into.truncate(start);
             return false;
         }

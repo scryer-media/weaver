@@ -633,6 +633,13 @@ impl Job {
         }
     }
 
+    // Where the member's bytes past the holds budgets lie.
+    fn spill(&self, member: MemberId) -> std::path::PathBuf {
+        self.dir
+            .path()
+            .join(super::spill_name(NodeId::ROOT, member))
+    }
+
     fn file(&self, name: &str) -> Vec<u8> {
         std::fs::read(self.dir.path().join(name)).expect("leaf file")
     }
@@ -752,10 +759,11 @@ fn routed_deliveries_reuse_the_writer_s_effect_room() {
     assert_eq!(job.file("notes.bin"), b"Raws, world");
 }
 
-// Members nothing held, each refused for breaching the holds, are one
-// archive given up on in their namespace: one event.
+// Members whose holds run past every budget are given up by none of them:
+// each stays undecided, its bytes held in its spill file, and nothing is
+// refused or given back.
 #[test]
-fn members_nothing_held_breaching_the_holds_are_one_event() {
+fn members_past_the_holds_are_held_and_given_up_by_none() {
     let mut job = Job::new(HoldBudgets {
         resident_limit: 4,
         scratch_total: 0,
@@ -767,47 +775,45 @@ fn members_nothing_held_breaching_the_holds_are_one_event() {
     for member in [first, second] {
         job.send(member, 0, b"Ra", Provenance::Fresh);
         job.send(member, 10, b"tail..", Provenance::Fresh);
-        assert_eq!(
-            job.writer.refused(NodeId::ROOT, member),
-            Some(Why::HoldsBreached)
-        );
+        assert_eq!(job.writer.refused(NodeId::ROOT, member), None);
+        assert!(job.tree.is_undecided(NodeId::ROOT, member));
+        assert!(job.spill(member).is_file());
     }
-    assert_eq!(
-        job.writer.take_given_back(),
-        [super::GivenBack {
-            member: "pack.r00".to_string(),
-            container: String::new(),
-            why: Why::HoldsBreached,
-        }]
+    assert!(job.writer.take_given_back().is_empty());
+    assert!(
+        !job.out
+            .iter()
+            .any(|effect| matches!(effect, Effect::Refused { .. }))
     );
 }
 
+// An undecided member whose bytes spill before its first article comes
+// gets every byte back, at its offset, once it is decided: the file is
+// byte-identical, the spill file is let go, and no budget counted it.
 #[test]
-fn a_breach_refuses_the_member_to_a_leaf_which_receives_every_byte() {
+fn an_undecided_member_spilled_before_its_first_article_is_byte_identical() {
     let mut job = Job::new(HoldBudgets {
-        resident_limit: 4,
+        resident_limit: 0,
         scratch_total: 0,
         scratch_ceiling: 0,
         disk_reserve: 0,
     });
     let member = job.member("notes.bin", None);
-    job.send(member, 0, b"Ra", Provenance::Fresh);
     job.send(member, 10, b"tail..", Provenance::Fresh);
-    assert_eq!(
-        job.writer.refused(NodeId::ROOT, member),
-        Some(Why::HoldsBreached)
-    );
-    assert!(job.out.contains(&Effect::Refused {
-        node: NodeId::ROOT,
-        member,
-        why: Why::HoldsBreached,
-    }));
+    assert!(job.spill(member).is_file());
     assert_eq!(job.accountant.usage().resident, 0);
-
-    // Decided now: the rest goes straight to the file.
+    assert_eq!(job.accountant.usage().scratch, 0);
     job.send(member, 2, b"r! mid.", Provenance::Fresh);
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    assert_eq!(job.writer.refused(NodeId::ROOT, member), None);
     job.close(member);
     assert_eq!(job.file("notes.bin"), b"Rar! mid.\0tail..");
+    assert_eq!(job.writer.refused(NodeId::ROOT, member), None);
+    // Nothing is held, and the spill file goes as any discarded file does,
+    // once a checkpoint stops naming it.
+    let files = &job.writer.files[&NodeId::ROOT];
+    assert_eq!(files.holds.total_held(), 0);
+    assert!(!files.spills.contains_key(&member));
 }
 
 #[test]
@@ -2668,7 +2674,8 @@ fn a_store_bound_over_a_member_logs_object_bound() {
 }
 
 // A member given back is said once, with the object that gave it back and
-// why; one no object held names none.
+// why. Holds past a budget give nothing back: the spill is said once per
+// budget, with how far that budget stands.
 #[test]
 fn a_member_given_back_logs_object_refused() {
     let (lines, _guard) = Lines::capture();
@@ -2701,9 +2708,11 @@ fn a_member_given_back_logs_object_refused() {
     job.send(member, 0, b"Ra", Provenance::Fresh);
     job.send(member, 10, b"tail..", Provenance::Fresh);
     job.send(member, 2, b"r! mid.", Provenance::Fresh);
+    job.send(member, 20, b"later", Provenance::Fresh);
+    assert!(lines.of("object refused").is_empty());
     assert_eq!(
-        lines.of("object refused"),
-        ["object refused job_id=1 node=0 kind= member=notes.bin why=holds_breached"]
+        lines.of("holds spilled"),
+        ["holds spilled job_id=1 node=0 member=0 budget=scratch_ceiling held=0 limit=0"]
     );
 }
 
@@ -3045,16 +3054,9 @@ fn unrelated_candidate_and_shared_scratch_activity_do_not_invalidate_repair_loan
             .pop()
             .unwrap()
             .run(weaver_graph::Budget::default(), &Default::default());
-        assert!(
-            !job.writer
-                .keep_held(
-                    NodeId::ROOT,
-                    other,
-                    25000,
-                    Bytes::from_static(b"held").into()
-                )
-                .unwrap()
-        );
+        job.writer
+            .keep_held(NodeId::ROOT, other, 25000, Bytes::from_static(b"held").into())
+            .unwrap();
         job.send(other, 20000, b"new", Provenance::Fresh);
         assert_eq!(
             job.writer.files[&NodeId::ROOT].leaves[&member].revision(),
@@ -3080,16 +3082,9 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
             fix: (2, b"OK"),
         }));
         let member = job.member("payload.bin", Some(8));
-        assert!(
-            !job.writer
-                .keep_held(
-                    NodeId::ROOT,
-                    member,
-                    0,
-                    Bytes::from_static(b"original").into()
-                )
-                .unwrap()
-        );
+        job.writer
+            .keep_held(NodeId::ROOT, member, 0, Bytes::from_static(b"original").into())
+            .unwrap();
         job.tree
             .namespace_mut(NodeId::ROOT)
             .unwrap()
@@ -3112,11 +3107,9 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
             Some(b"original".as_slice())
         );
         assert!(!job.writer.moved_since(&job.tree, &returned));
-        assert!(
-            !job.writer
-                .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new").into())
-                .unwrap()
-        );
+        job.writer
+            .keep_held(NodeId::ROOT, member, 2, Bytes::from_static(b"new").into())
+            .unwrap();
         assert!(
             job.writer.moved_since(&job.tree, &returned),
             "borrowed RAM and scratch sources keep their own identities"
@@ -3138,16 +3131,9 @@ fn a_returned_ruling_stands_on_the_ranges_it_read_and_only_those() {
         }));
         let member = job.member("payload.bin", Some(16));
         let arrive = |job: &mut Job, offset: u64, bytes: &'static [u8]| {
-            assert!(
-                !job.writer
-                    .keep_held(
-                        NodeId::ROOT,
-                        member,
-                        offset,
-                        Bytes::from_static(bytes).into()
-                    )
-                    .unwrap()
-            );
+            job.writer
+            .keep_held(NodeId::ROOT, member, offset, Bytes::from_static(bytes).into())
+            .unwrap();
             job.tree
                 .namespace_mut(NodeId::ROOT)
                 .unwrap()
