@@ -1268,6 +1268,22 @@ impl SchedulerHandle {
             .await
     }
 
+    // Housekeeping for what jobs left on disk. With `failed_finished_by`, in
+    // epoch seconds, the files of every failed job that finished by then go
+    // and their records stay; a marked working directory of a job with no
+    // row goes once its marker is older than `marked_before`.
+    pub(crate) async fn sweep_job_files(
+        &self,
+        failed_finished_by: Option<i64>,
+        marked_before: std::time::SystemTime,
+    ) {
+        self.state
+            .queue
+            .clone()
+            .sweep_job_files(failed_finished_by, marked_before)
+            .await
+    }
+
     // Get info about a specific job (reads from shared state, no channel round-trip).
     pub fn get_job(&self, job_id: JobId) -> Result<JobInfo, SchedulerError> {
         self.state

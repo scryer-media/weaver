@@ -556,37 +556,14 @@ fn cleanup_unreferenced_intermediate_dirs(
     referenced_dirs: &HashSet<PathBuf>,
     live_jobs: &HashSet<crate::jobs::ids::JobId>,
 ) -> Result<usize, std::io::Error> {
-    if !intermediate_dir.exists() {
-        return Ok(0);
-    }
-
-    let mut removed = 0usize;
-    for entry in std::fs::read_dir(intermediate_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        let owner = crate::jobs::working_dir::working_dir_owner(intermediate_dir, &path)
-            .ok()
-            .flatten();
-        let Some(owner) = owner else {
-            continue;
-        };
-        if live_jobs.contains(&owner) || referenced_dirs.contains(&path) {
-            continue;
-        }
-        match crate::jobs::working_dir::remove_weaver_owned_working_dir(intermediate_dir, &path) {
-            Ok(()) => removed += 1,
-            Err(error) => warn!(
-                dir = %path.display(),
-                error = %error,
-                "could not remove an unreferenced intermediate directory; it stays for the next start"
-            ),
-        }
-    }
-
-    Ok(removed)
+    use crate::jobs::working_dir::{remove_unclaimed_working_dir, unclaimed_working_dirs};
+    let unclaimed = unclaimed_working_dirs(intermediate_dir, |owner, path| {
+        live_jobs.contains(&owner) || referenced_dirs.contains(path)
+    })?;
+    Ok(unclaimed
+        .iter()
+        .filter(|(_, path)| remove_unclaimed_working_dir(intermediate_dir, path))
+        .count())
 }
 
 #[cfg(test)]
@@ -797,6 +774,38 @@ mod tests {
         assert_eq!(removed, 1);
         assert!(live.join("lantern.vol00+01.par2/held").exists());
         assert!(!finished.exists());
+    }
+
+    // A directory with neither a marker nor a row is never Weaver's to take,
+    // nor one whose marker stopped matching it.
+    #[test]
+    fn startup_cleanup_leaves_unmarked_and_mismatched_directories() {
+        let temp = TempDir::new().unwrap();
+        let intermediate_dir = temp.path().join("intermediate");
+        let unmarked = intermediate_dir.join("lantern unmarked");
+        std::fs::create_dir_all(&unmarked).unwrap();
+        std::fs::write(unmarked.join("user.mkv"), b"theirs").unwrap();
+        let before_move = intermediate_dir.join("lantern before move");
+        std::fs::create_dir_all(&before_move).unwrap();
+        crate::jobs::working_dir::mark_weaver_owned_working_dir(
+            &intermediate_dir,
+            &before_move,
+            JobId(7),
+        )
+        .unwrap();
+        let moved = intermediate_dir.join("lantern moved");
+        std::fs::rename(&before_move, &moved).unwrap();
+
+        let removed = super::cleanup_unreferenced_intermediate_dirs(
+            &intermediate_dir,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 0);
+        assert!(unmarked.join("user.mkv").exists());
+        assert!(moved.exists());
     }
 
     #[tokio::test]

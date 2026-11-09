@@ -160,6 +160,7 @@ impl TestHarness {
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
+            delete_failed_job_files: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: Some(crate::settings::DirectStoreOverrides {
@@ -643,6 +644,7 @@ async fn new_direct_pipeline_on_machine(
         propagation_delay_secs: None,
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
+        delete_failed_job_files: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: Some(direct_store),

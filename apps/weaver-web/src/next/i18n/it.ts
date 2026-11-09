@@ -689,6 +689,7 @@ export const nextIt: LocaleDictionary = {
   "next.general.completeDirHelp": "Una categoria senza una destinazione propria riceve qui una sottocartella.",
   "next.general.cleanup": "Pulisci dopo l'estrazione",
   "next.general.cleanupHelp": "Eliminare archivi e file di riparazione una volta estratta correttamente una release.",
+  "next.general.deleteFailedJobFiles": "Elimina i file incompleti dei lavori non riusciti durante la manutenzione",
   "next.general.duplicates": "Duplicati",
   "next.general.duplicatesNote": "cosa succede quando un nuovo NZB corrisponde a qualcosa che weaver ha già visto",
   "next.weekday.mon": "Lunedì",

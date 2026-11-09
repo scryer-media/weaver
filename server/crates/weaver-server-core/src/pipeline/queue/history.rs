@@ -326,6 +326,215 @@ impl Queue {
         .map_err(|error| SchedulerError::Internal(error.to_string()))?
     }
 
+    // Housekeeping for what jobs left on disk: the failed jobs' files when
+    // `failed_finished_by` is given, then the working directories of jobs
+    // with no row.
+    pub(crate) async fn sweep_job_files(
+        self: Arc<Self>,
+        failed_finished_by: Option<i64>,
+        marked_before: std::time::SystemTime,
+    ) {
+        if let Some(finished_by) = failed_finished_by {
+            self.clone().sweep_failed_job_files(finished_by).await;
+        }
+        self.sweep_unrecorded_working_dirs(marked_before).await;
+    }
+
+    // Every failed job whose record says it finished by `finished_by`, in
+    // epoch seconds, gives up the working directories that carry its marker
+    // and its staging directory, and keeps its record. A job the queue or a
+    // history operation holds is left for the next sweep, as is one whose
+    // cleanup fails.
+    async fn sweep_failed_job_files(self: Arc<Self>, finished_by: i64) {
+        let Some(mut resources) = self.resources.get().cloned() else {
+            return;
+        };
+        if let Some(paths) = self.read(|inner| inner.globals.runtime_paths.clone()) {
+            resources.intermediate_dir = paths.intermediate;
+            resources.complete_dir = paths.complete;
+        }
+        let db = resources.db.clone();
+        let failed = match tokio::task::spawn_blocking(move || {
+            db.failed_job_history_finished_by(finished_by)
+        })
+        .await
+        {
+            Ok(Ok(failed)) => failed,
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "could not list failed jobs for housekeeping");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "could not list failed jobs for housekeeping");
+                return;
+            }
+        };
+        if failed.is_empty() {
+            return;
+        }
+        let root = resources.intermediate_dir.clone();
+        let owners = failed.keys().copied().collect::<BTreeSet<_>>();
+        let mut marked = match tokio::task::spawn_blocking(move || {
+            crate::jobs::working_dir::job_working_dirs(&root, &owners)
+        })
+        .await
+        {
+            Ok(Ok(marked)) => marked,
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "could not scan the intermediate directory for housekeeping");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "could not scan the intermediate directory for housekeeping");
+                return;
+            }
+        };
+        for (id, recorded) in failed {
+            let held = self.write(|inner| {
+                Change::unchanged(
+                    !inner.contains_job(id)
+                        && !inner.admissions.contains(&id)
+                        && inner.history_operations.insert(id),
+                )
+            });
+            if !held {
+                continue;
+            }
+            let _guard = HistoryOperation {
+                queue: self.clone(),
+                ids: BTreeSet::from([id]),
+            };
+            // The job's record is read again under the hold: a restart or a
+            // delete that ran since the listing has the last word.
+            let db = resources.db.clone();
+            let still_failed = tokio::task::spawn_blocking(move || {
+                db.get_job_history(id.0).map(|row| {
+                    row.is_some_and(|row| row.status == "failed" && row.completed_at <= finished_by)
+                })
+            })
+            .await;
+            if !matches!(still_failed, Ok(Ok(true))) {
+                continue;
+            }
+            if let Err(error) = crate::history::delete_files::sweep_failed_job_files(
+                &resources.db,
+                &resources.intermediate_dir,
+                &resources.complete_dir,
+                id,
+                recorded.map(std::path::PathBuf::from),
+                marked.remove(&id).unwrap_or_default(),
+            )
+            .await
+            {
+                tracing::warn!(
+                    job_id = id.0,
+                    error = %error,
+                    "could not remove a failed job's files; the next housekeeping sweep tries again"
+                );
+            }
+        }
+    }
+
+    // Housekeeping: a working directory whose matching marker names a job
+    // with neither an active nor a history row goes once the marker is older
+    // than `marked_before`, as at start-up. A job is stamped before its row
+    // is written, so a younger marker may be a job still being admitted. A
+    // job the queue or a history operation holds, or whose scripts still
+    // run, is left, as is a directory that cannot be removed.
+    async fn sweep_unrecorded_working_dirs(
+        self: Arc<Self>,
+        marked_before: std::time::SystemTime,
+    ) {
+        let Some(resources) = self.resources.get().cloned() else {
+            return;
+        };
+        let root = self
+            .read(|inner| inner.globals.runtime_paths.clone())
+            .map_or(resources.intermediate_dir, |paths| paths.intermediate);
+        let recorded = |db: crate::Database| async move {
+            match tokio::task::spawn_blocking(move || db.recorded_job_ids()).await {
+                Ok(Ok(ids)) => Some(ids),
+                Ok(Err(error)) => {
+                    tracing::warn!(error = %error, "could not list recorded jobs for housekeeping");
+                    None
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "could not list recorded jobs for housekeeping");
+                    None
+                }
+            }
+        };
+        let Some(known) = recorded(resources.db.clone()).await else {
+            return;
+        };
+        let scan_root = root.clone();
+        let unclaimed = match tokio::task::spawn_blocking(move || {
+            crate::jobs::working_dir::unclaimed_working_dirs(&scan_root, |owner, path| {
+                known.contains(&owner.0)
+                    || std::fs::metadata(crate::jobs::working_dir::working_dir_marker_path(path))
+                        .and_then(|marker| marker.modified())
+                        .map_or(true, |stamped| stamped >= marked_before)
+            })
+        })
+        .await
+        {
+            Ok(Ok(unclaimed)) => unclaimed,
+            Ok(Err(error)) => {
+                tracing::warn!(error = %error, "could not scan the intermediate directory for housekeeping");
+                return;
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, "could not scan the intermediate directory for housekeeping");
+                return;
+            }
+        };
+        if unclaimed.is_empty() {
+            return;
+        }
+        let mut held = Vec::new();
+        for (owner, path) in unclaimed {
+            let hold = self.write(|inner| {
+                Change::unchanged(
+                    !inner.contains_job(owner)
+                        && !inner.admissions.contains(&owner)
+                        && inner.history_operations.insert(owner),
+                )
+            });
+            if hold {
+                held.push((
+                    HistoryOperation {
+                        queue: self.clone(),
+                        ids: BTreeSet::from([owner]),
+                    },
+                    owner,
+                    path,
+                ));
+            }
+        }
+        // The rows are read again under the holds: a job admitted or
+        // restored since the scan has the last word.
+        let Some(known) = recorded(resources.db.clone()).await else {
+            return;
+        };
+        for (_guard, owner, path) in held {
+            if known.contains(&owner.0)
+                || crate::post_processing::events::wait_for_job_events_stopped(
+                    &resources.db,
+                    owner.0,
+                )
+                .await
+                .is_err()
+            {
+                continue;
+            }
+            let root = root.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::jobs::working_dir::remove_unclaimed_working_dir(&root, &path)
+            })
+            .await;
+        }
+    }
+
     pub(crate) async fn delete_history(
         self: Arc<Self>,
         ids: BTreeSet<JobId>,

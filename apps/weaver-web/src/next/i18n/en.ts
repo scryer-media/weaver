@@ -696,6 +696,7 @@ export const nextEn: LocaleDictionary = {
   "next.general.completeDirHelp": "A category without its own destination gets a folder here.",
   "next.general.cleanup": "Clean up after unpacking",
   "next.general.cleanupHelp": "Delete archives and repair files once a release has been unpacked successfully.",
+  "next.general.deleteFailedJobFiles": "Delete incomplete files for failed jobs during housekeeping",
   "next.general.duplicates": "Duplicates",
   "next.general.duplicatesNote": "what happens when a new NZB matches something weaver has seen",
   "next.weekday.mon": "Monday",

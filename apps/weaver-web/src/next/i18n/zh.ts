@@ -689,6 +689,7 @@ export const nextZh: LocaleDictionary = {
   "next.general.completeDirHelp": "未单独指定目标的分类会在其中获得自己的文件夹。",
   "next.general.cleanup": "解压后清理",
   "next.general.cleanupHelp": "发布成功解压后,删除压缩包和修复文件。",
+  "next.general.deleteFailedJobFiles": "维护时删除失败任务的不完整文件",
   "next.general.duplicates": "重复项",
   "next.general.duplicatesNote": "新 NZB 与 weaver 已见过的内容匹配时如何处理",
   "next.weekday.mon": "星期一",

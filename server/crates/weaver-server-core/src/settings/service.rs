@@ -56,6 +56,9 @@ impl Database {
         let cleanup_after_extract = settings
             .get("cleanup_after_extract")
             .and_then(|v| v.parse().ok());
+        let delete_failed_job_files = settings
+            .get("delete_failed_job_files")
+            .and_then(|v| v.parse().ok());
         let watch_folder = WatchFolderConfig {
             mode: settings
                 .get("watch_folder.mode")
@@ -219,6 +222,7 @@ impl Database {
             retry,
             max_download_speed,
             cleanup_after_extract,
+            delete_failed_job_files,
             propagation_delay_secs,
             max_concurrent_nzbs: settings
                 .get("max_concurrent_nzbs")
@@ -253,6 +257,9 @@ impl Database {
         }
         if let Some(cleanup) = config.cleanup_after_extract {
             self.set_setting("cleanup_after_extract", &cleanup.to_string())?;
+        }
+        if let Some(delete) = config.delete_failed_job_files {
+            self.set_setting("delete_failed_job_files", &delete.to_string())?;
         }
         self.set_setting("watch_folder.mode", config.watch_folder.mode.as_str())?;
         match config.watch_folder.normalized_path() {

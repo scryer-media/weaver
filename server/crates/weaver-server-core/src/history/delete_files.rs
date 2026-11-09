@@ -321,6 +321,57 @@ pub(crate) async fn delete_history_rows(
     )
 }
 
+// Housekeeping for a failed job: once its scripts have stopped, every
+// working directory carrying its marker and its staging directory go the
+// way a history delete takes them, and its record stays. `marked` is what a
+// marker scan found for the job; the directory its record names is among
+// them when it still carries the job's marker, and is left, and said,
+// when it does not.
+pub(crate) async fn sweep_failed_job_files(
+    db: &crate::Database,
+    intermediate_dir: &std::path::Path,
+    complete_dir: &std::path::Path,
+    job_id: JobId,
+    recorded: Option<PathBuf>,
+    marked: Vec<PathBuf>,
+) -> Result<(), crate::SchedulerError> {
+    retry_script_stop_wait(job_id, || {
+        crate::post_processing::events::wait_for_job_events_stopped(db, job_id.0)
+    })
+    .await
+    .map_err(crate::SchedulerError::State)?;
+    if let Some(recorded) = recorded
+        .as_deref()
+        .and_then(|dir| cleanupable_history_output_dir(intermediate_dir, dir))
+        .filter(|dir| !marked.contains(dir))
+        && tokio::fs::symlink_metadata(&recorded).await.is_ok()
+    {
+        warn!(
+            job_id = job_id.0,
+            dir = %recorded.display(),
+            "a failed job's working directory has no ownership marker of the job; housekeeping leaves it"
+        );
+    }
+    let mut dirs = JobCleanupDirs::default();
+    for path in marked {
+        dirs.admit(intermediate_dir, job_id, path).await?;
+    }
+    for dir in dirs.remove(intermediate_dir, job_id).await? {
+        warn!(
+            job_id = job_id.0,
+            dir = %dir.display(),
+            "a failed job's working directory stopped matching its marker; housekeeping leaves it"
+        );
+    }
+    let staging = crate::pipeline::queue::staging_dir_for(complete_dir, job_id);
+    let staged = tokio::fs::symlink_metadata(&staging).await.is_ok();
+    crate::pipeline::queue::remove_job_staging(complete_dir, job_id).await?;
+    if staged {
+        info!(dir = %staging.display(), "removed a failed job's staging directory");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
