@@ -1866,19 +1866,11 @@ async fn file_prio(ctx: &TorrentFacadeContext, params: &Params) -> Response {
     }
 }
 
-// qBittorrent `TorrentImpl::currentTracker`: libtorrent's `current_tracker`,
-// the tracker that last answered (`torrent::status`), else the first one
-// listed. Weaver keeps each tracker's latest outcome only, so the one that
-// last answered is the working one announced to most recently. The URL is
-// redacted for a caller that only reads, as in `torrents/trackers`.
+// qBittorrent `TorrentImpl::currentTracker`, as `TorrentView::current_tracker`
+// says it. The URL is redacted for a caller that only reads, as in
+// `torrents/trackers`.
 fn current_tracker(view: &TorrentView, scope: CallerScope) -> String {
-    let current = view
-        .trackers
-        .iter()
-        .filter(|tracker| tracker.status == TrackerStatus::Working)
-        .max_by_key(|tracker| tracker.last_announce_ms)
-        .or_else(|| view.trackers.first());
-    match current {
+    match view.current_tracker() {
         None => String::new(),
         Some(tracker) if scope.can_control() => tracker.url.clone(),
         Some(tracker) => redacted_tracker_url(&tracker.url),

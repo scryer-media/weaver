@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-//! The torrents' rates under the global limits, laid over their open
-//! sessions.
+//! The torrents' rates under the global limits and each egress's own, laid
+//! over their open sessions.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 use tokio::time::Instant;
 
@@ -15,6 +16,12 @@ use crate::bandwidth::TorrentRates;
 /// The download and upload rates torrents may move at, each shared between
 /// the open sessions by the same work-conserving predicate that shares the
 /// global download limit between usenet and torrents.
+///
+/// Each egress may hold its sessions lower: its own rate caps, and its
+/// quota state (a trickle past the upload soft cap, nothing past the hard
+/// cap or once the download quota is used). What an egress allows is shared
+/// between the sessions on it the same way, and a session moves at the
+/// lower of its two shares.
 #[derive(Default)]
 pub struct SessionRates {
     state: Mutex<State>,
@@ -23,12 +30,16 @@ pub struct SessionRates {
 #[derive(Default)]
 struct State {
     rates: TorrentRates,
+    // What each egress a session runs on allows now.
+    egresses: HashMap<u32, TorrentRates>,
     sessions: Vec<Held>,
 }
 
 // An open session and what the split knows of it.
 struct Held {
     session: Weak<Session>,
+    // The egress its leg runs on.
+    egress_id: u32,
     // When it was last measured, and what it had received and sent by then.
     seen_at: Instant,
     seen: (u64, u64),
@@ -43,11 +54,14 @@ struct Held {
 }
 
 impl SessionRates {
-    /// Put the torrents' rates in force on a session that just opened.
-    pub fn add(&self, session: &Arc<Session>) {
+    /// Put the torrents' rates in force on a session that just opened on
+    /// egress `egress_id`, which allows `egress` now.
+    pub fn add(&self, session: &Arc<Session>, egress_id: u32, egress: TorrentRates) {
         let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.egresses.insert(egress_id, egress);
         state.sessions.push(Held {
             session: Arc::downgrade(session),
+            egress_id,
             seen_at: Instant::now(),
             seen: session.transferred(),
             used: (0, 0),
@@ -91,6 +105,22 @@ impl SessionRates {
         state.rates = rates;
         state.lay_over();
     }
+
+    /// Read again what each egress an open session runs on allows, from
+    /// `allows`, and put it in force. The work is one read per egress and
+    /// one pass over the open sessions, however many torrents they run.
+    pub fn set_egresses(&self, allows: impl Fn(u32) -> TorrentRates) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        state.retain_open();
+        let mut egresses = HashMap::new();
+        for held in &state.sessions {
+            egresses
+                .entry(held.egress_id)
+                .or_insert_with(|| allows(held.egress_id));
+        }
+        state.egresses = egresses;
+        state.lay_over();
+    }
 }
 
 impl State {
@@ -107,34 +137,57 @@ impl State {
 
     fn lay_over(&mut self) {
         self.retain_open();
-        let held = &self.sessions;
-        let download = session_rates(
-            self.rates.download,
-            &held
-                .iter()
-                .map(|held| held.given.download)
-                .collect::<Vec<_>>(),
-            &held.iter().map(|held| held.used.0).collect::<Vec<_>>(),
-        );
-        let upload = session_rates(
-            self.rates.upload,
-            &held
-                .iter()
-                .map(|held| held.given.upload)
-                .collect::<Vec<_>>(),
-            &held.iter().map(|held| held.used.1).collect::<Vec<_>>(),
-        );
-        for ((held, download), upload) in self.sessions.iter_mut().zip(download).zip(upload) {
-            let rates = TorrentRates { download, upload };
+        let all = (0..self.sessions.len()).collect::<Vec<_>>();
+        let mut rates = self.shares(self.rates, &all);
+        // Each egress's allowance, shared between the sessions on it.
+        let mut on_egress = HashMap::<u32, Vec<usize>>::new();
+        for (index, held) in self.sessions.iter().enumerate() {
+            on_egress.entry(held.egress_id).or_default().push(index);
+        }
+        for (egress_id, indices) in on_egress {
+            let allows = self.egresses.get(&egress_id).copied().unwrap_or_default();
+            for (index, share) in indices.iter().zip(self.shares(allows, &indices)) {
+                let rate = &mut rates[*index];
+                rate.download = crate::bandwidth::lower(rate.download, share.download);
+                rate.upload = crate::bandwidth::lower(rate.upload, share.upload);
+            }
+        }
+        for (held, rates) in self.sessions.iter_mut().zip(rates) {
             held.applied = rates;
             held.held = TorrentRates {
-                download: crate::bandwidth::lower(held.held.download, download),
-                upload: crate::bandwidth::lower(held.held.upload, upload),
+                download: crate::bandwidth::lower(held.held.download, rates.download),
+                upload: crate::bandwidth::lower(held.held.upload, rates.upload),
             };
             if let Some(session) = held.session.upgrade() {
                 apply_torrent_rates(&session, rates);
             }
         }
+    }
+
+    // Each of the sessions at `indices`' share of `rates`, in that order.
+    fn shares(&self, rates: TorrentRates, indices: &[usize]) -> Vec<TorrentRates> {
+        let held = indices.iter().map(|&index| &self.sessions[index]);
+        let download = session_rates(
+            rates.download,
+            &held
+                .clone()
+                .map(|held| held.given.download)
+                .collect::<Vec<_>>(),
+            &held.clone().map(|held| held.used.0).collect::<Vec<_>>(),
+        );
+        let upload = session_rates(
+            rates.upload,
+            &held
+                .clone()
+                .map(|held| held.given.upload)
+                .collect::<Vec<_>>(),
+            &held.map(|held| held.used.1).collect::<Vec<_>>(),
+        );
+        download
+            .into_iter()
+            .zip(upload)
+            .map(|(download, upload)| TorrentRates { download, upload })
+            .collect()
     }
 }
 
@@ -251,14 +304,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let rates = SessionRates::default();
         let one = session(&dir.path().join("one")).await;
-        rates.add(&one);
+        rates.add(&one, 1, TorrentRates::default());
         assert_eq!(limits(&one), (None, None));
 
         rates.set(both(Some(1_000_000), Some(400_000)));
         assert_eq!(limits(&one), (Some(1_000_000), Some(400_000)));
 
         let two = session(&dir.path().join("two")).await;
-        rates.add(&two);
+        rates.add(&two, 1, TorrentRates::default());
         assert_eq!(limits(&one), (Some(500_000), Some(200_000)));
         assert_eq!(limits(&two), (Some(500_000), Some(200_000)));
 
@@ -280,8 +333,8 @@ mod tests {
         let rates = SessionRates::default();
         let one = session(&dir.path().join("one")).await;
         let two = session(&dir.path().join("two")).await;
-        rates.add(&one);
-        rates.add(&two);
+        rates.add(&one, 1, TorrentRates::default());
+        rates.add(&two, 1, TorrentRates::default());
         rates.set(both(Some(1_000_000), Some(400_000)));
         assert_eq!(limits(&one), (Some(500_000), Some(200_000)));
 
@@ -294,5 +347,44 @@ mod tests {
         assert_eq!(rates.sample(), 0);
 
         one.stop().await;
+    }
+
+    // Each egress's allowance is shared between the sessions on it, and a
+    // session moves at the lower of that share and its global one. A
+    // session on another egress keeps its global share alone.
+    #[tokio::test]
+    async fn each_egress_holds_its_own_sessions_under_the_global_rates() {
+        let dir = tempfile::tempdir().unwrap();
+        let rates = SessionRates::default();
+        let one = session(&dir.path().join("one")).await;
+        let two = session(&dir.path().join("two")).await;
+        let other = session(&dir.path().join("other")).await;
+        rates.add(&one, 1, both(None, Some(2_048)));
+        rates.add(&two, 1, both(None, Some(2_048)));
+        rates.add(&other, 2, TorrentRates::default());
+        rates.set(both(Some(900_000), Some(300_000)));
+        assert_eq!(limits(&one), (Some(300_000), Some(1_024)));
+        assert_eq!(limits(&two), (Some(300_000), Some(1_024)));
+        assert_eq!(limits(&other), (Some(300_000), Some(100_000)));
+
+        // The egress's uploads stop and its downloads are capped; the other
+        // egress is untouched.
+        let allows = |egress_id| match egress_id {
+            1 => both(Some(100_000), Some(0)),
+            _ => TorrentRates::default(),
+        };
+        rates.set_egresses(allows);
+        assert_eq!(limits(&one), (Some(50_000), Some(0)));
+        assert_eq!(limits(&two), (Some(50_000), Some(0)));
+        assert_eq!(limits(&other), (Some(300_000), Some(100_000)));
+
+        // Lifted, the global shares come back.
+        rates.set_egresses(|_| TorrentRates::default());
+        assert_eq!(limits(&one), (Some(300_000), Some(100_000)));
+        assert_eq!(limits(&other), (Some(300_000), Some(100_000)));
+
+        one.stop().await;
+        two.stop().await;
+        other.stop().await;
     }
 }

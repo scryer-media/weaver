@@ -88,6 +88,13 @@ pub(crate) struct FakeRoutes {
     // The network whose route gives each leg opened, when one is set: the
     // leg is its route's, and is revoked as the route changes.
     pub(crate) network: Mutex<Option<Arc<NetworkRuntime>>>,
+    // The egress each scope's route runs on; the system egress when unset.
+    pub(crate) egress_of: Mutex<BTreeMap<String, u32>>,
+    // What each egress allows its sessions, unlimited when unset, and the
+    // signals rung as it changes.
+    pub(crate) egress_rates: Mutex<BTreeMap<u32, crate::bandwidth::TorrentRates>>,
+    pub(crate) egress_policy: tokio::sync::watch::Sender<u64>,
+    pub(crate) egress_capacity: tokio::sync::watch::Sender<u64>,
 }
 
 // The route of a scope mapped to `proxy`.
@@ -168,6 +175,20 @@ impl FakeRoutes {
         *self.refuse.lock().unwrap() = error.map(str::to_owned);
     }
 
+    // `scope`'s route runs on egress `egress_id`.
+    pub(crate) fn route_on_egress(&self, scope: TorrentScope, egress_id: u32) {
+        self.egress_of
+            .lock()
+            .unwrap()
+            .insert(scope_name(scope), egress_id);
+    }
+
+    // Egress `egress_id` allows `rates` from now, and says so.
+    pub(crate) fn set_egress_rates(&self, egress_id: u32, rates: crate::bandwidth::TorrentRates) {
+        self.egress_rates.lock().unwrap().insert(egress_id, rates);
+        self.egress_policy.send_modify(|revision| *revision += 1);
+    }
+
     pub(crate) fn set_leg(&self, kind: LegKind, factory: Arc<dyn SocketFactory>) {
         *self.leg.lock().unwrap() = Some((kind, factory));
     }
@@ -216,10 +237,17 @@ impl Routes for FakeRoutes {
             .unwrap()
             .as_ref()
             .map_or(LegKind::Ladder, |(kind, _)| kind.clone());
+        let egress_id = self
+            .egress_of
+            .lock()
+            .unwrap()
+            .get(&scope_name(scope))
+            .copied()
+            .unwrap_or(SYSTEM_EGRESS_ID);
         RoutePlan {
             scope,
             policy: RoutingPolicy::default(),
-            egress_id: SYSTEM_EGRESS_ID,
+            egress_id,
             names: Some(match kind {
                 LegKind::Ladder => ResolvedBy::Proxy,
                 _ => ResolvedBy::Host,
@@ -286,6 +314,23 @@ impl Routes for FakeRoutes {
                 .start_torrent_route(plan.scope, 8, Duration::from_secs(30))
                 .unwrap();
         }
+    }
+
+    fn egress_rates(&self, egress_id: u32) -> crate::bandwidth::TorrentRates {
+        self.egress_rates
+            .lock()
+            .unwrap()
+            .get(&egress_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn egress_limit_changes(&self) -> Option<EgressLimitChanges> {
+        Some(EgressLimitChanges::new(
+            self.egress_policy.subscribe(),
+            self.egress_capacity.subscribe(),
+            self.egress_capacity.subscribe(),
+        ))
     }
 
     async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String> {

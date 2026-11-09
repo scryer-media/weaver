@@ -201,6 +201,9 @@ pub(crate) enum BodyTransferAccounting {
 struct RegistryCapacitySignal {
     revision: AtomicU64,
     changed: watch::Sender<u64>,
+    // Rung each time a holder starts or stops turning work away for its
+    // quota.
+    quota: watch::Sender<u64>,
 }
 
 impl Default for RegistryCapacitySignal {
@@ -209,11 +212,17 @@ impl Default for RegistryCapacitySignal {
         Self {
             revision: AtomicU64::new(1),
             changed,
+            quota: watch::channel(0).0,
         }
     }
 }
 
 impl RegistryCapacitySignal {
+    fn quota_changed(&self) {
+        self.quota
+            .send_modify(|count| *count = count.wrapping_add(1));
+    }
+
     fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
     }
@@ -305,6 +314,12 @@ impl ServerTransferRegistry {
     // changes racing selection cannot be missed.
     pub fn subscribe_capacity_changes(&self) -> watch::Receiver<u64> {
         self.capacity.subscribe()
+    }
+
+    // Rings each time a holder, here or in a sibling, starts or stops
+    // turning work away for its quota.
+    pub fn subscribe_quota_changes(&self) -> watch::Receiver<u64> {
+        self.capacity.quota.subscribe()
     }
 
     // Return an existing durable control without creating one.
@@ -864,9 +879,13 @@ impl ServerTransferControl {
     }
 
     // Called at the end of every change to the quota's state, under its lock.
+    // A change of whether it turns work away is heard by every subscriber
+    // to the registry's quota changes.
     fn publish_quota_blocked(&self, state: &TransferState) {
-        self.quota_blocked
-            .store(self.quota_blocked_locked(state), Ordering::Release);
+        let blocked = self.quota_blocked_locked(state);
+        if self.quota_blocked.swap(blocked, Ordering::AcqRel) != blocked {
+            self.registry_capacity.quota_changed();
+        }
     }
 
     fn quota_blocked_locked(&self, state: &TransferState) -> bool {

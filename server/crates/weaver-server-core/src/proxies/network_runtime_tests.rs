@@ -814,6 +814,179 @@ async fn a_used_up_egress_quota_takes_its_leg_down_and_its_share_moves_to_the_ot
     runtime.shutdown().await;
 }
 
+// What an egress lets torrent sessions move at follows its caps and its
+// upload quota as torrent bytes cross them: its rate caps, then the trickle
+// past the soft cap, then nothing past the hard cap, and a reset brings the
+// caps back. Each crossing rings. Another egress adds no limit.
+#[tokio::test]
+async fn torrent_rates_on_an_egress_follow_its_caps_and_upload_quota() {
+    use crate::bandwidth::TorrentRates;
+
+    let db = Database::open_in_memory().unwrap();
+    let mut capped = metered_egress(1_000_000);
+    capped.download_bps = Some(80_000);
+    capped.upload_bps = Some(50_000);
+    capped.quota.upload_soft_bytes = Some(1_000);
+    capped.quota.upload_trickle_bps = 512;
+    capped.quota.upload_hard_bytes = Some(2_000);
+    let capped = db.create_egress_interface(&capped).unwrap();
+    let policy = Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(db.clone(), &[])
+            .unwrap(),
+    );
+    let runtime = NetworkRuntime::with_quota_policy(
+        db,
+        tokio::runtime::Handle::current(),
+        Some(policy.clone()),
+    )
+    .unwrap();
+    let mut changes = runtime.egress_limit_changes().unwrap();
+    let rates = |download, upload| TorrentRates { download, upload };
+    assert_eq!(
+        runtime.torrent_egress_rates(capped.id),
+        rates(Some(80_000), Some(50_000))
+    );
+
+    runtime.record_torrent_bytes(capped.id, 0, 1_000);
+    assert!(changes.changed().await);
+    assert_eq!(
+        runtime.torrent_egress_rates(capped.id),
+        rates(Some(80_000), Some(512))
+    );
+
+    runtime.record_torrent_bytes(capped.id, 0, 1_000);
+    assert!(changes.changed().await);
+    assert_eq!(
+        runtime.torrent_egress_rates(capped.id),
+        rates(Some(80_000), Some(0))
+    );
+    assert_eq!(
+        runtime.torrent_egress_rates(capped.id + 1),
+        TorrentRates::default()
+    );
+
+    policy.reset_egress_usage(capped.id).unwrap();
+    assert!(changes.changed().await);
+    assert_eq!(
+        runtime.torrent_egress_rates(capped.id),
+        rates(Some(80_000), Some(50_000))
+    );
+    runtime.shutdown().await;
+}
+
+// Each state an egress's upload quota comes to raises its quota event once,
+// naming the egress, the direction and the state, and the download
+// direction, which does not change, raises none.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_egress_quota_coming_to_each_state_raises_its_event_once() {
+    use crate::bandwidth::QuotaState;
+    use crate::post_processing::model::{QueueEvent, vars};
+    use crate::post_processing::quota_events::{QuotaEventDirs, spawn_quota_events};
+
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    db.enable_queue_scripts_for_test(root.path());
+    let mut capped = metered_egress(1_000_000);
+    capped.quota.upload_soft_bytes = Some(1_000);
+    capped.quota.upload_trickle_bps = 512;
+    capped.quota.upload_hard_bytes = Some(2_000);
+    let capped = db.create_egress_interface(&capped).unwrap();
+    let policy = Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(db.clone(), &[])
+            .unwrap(),
+    );
+    let runtime = NetworkRuntime::with_quota_policy(
+        db.clone(),
+        tokio::runtime::Handle::current(),
+        Some(policy.clone()),
+    )
+    .unwrap();
+    let dirs = QuotaEventDirs {
+        data: root.path().to_path_buf(),
+        ..QuotaEventDirs::default()
+    };
+    let follower = spawn_quota_events(&policy, db.clone(), dirs);
+
+    let quota_events = |event| db.queued_script_events_once(event, 1);
+    runtime.record_torrent_bytes(capped.id, 0, 1_000);
+    let trickle = quota_events(QueueEvent::QuotaTrickle).await;
+    runtime.record_torrent_bytes(capped.id, 0, 1_000);
+    let stopped = quota_events(QueueEvent::QuotaStopped).await;
+    policy.reset_egress_usage(capped.id).unwrap();
+    let normal = quota_events(QueueEvent::QuotaNormal).await;
+    for (queued, state) in [
+        (trickle, QuotaState::Trickle),
+        (stopped, QuotaState::Stopped),
+        (normal, QuotaState::Normal),
+    ] {
+        assert_eq!(queued.len(), 1);
+        let context = &queued[0];
+        assert_eq!(context.job_id, None);
+        assert_eq!(context.cwd, root.path());
+        assert_eq!(
+            context.env["NZBNA_EVENT"],
+            QueueEvent::quota(state).as_str()
+        );
+        assert_eq!(context.env[vars::EGRESS_ID], capped.id.to_string());
+        assert_eq!(context.env[vars::QUOTA_DIRECTION], "upload");
+        assert_eq!(context.env[vars::QUOTA_STATE], state.as_str());
+    }
+    follower.abort();
+    runtime.shutdown().await;
+}
+
+// A download quota that turns work away stops torrent downloads on its
+// egress and says so, though the bytes used stay short of the budget, as
+// reservations are taken at their estimate. A larger allowance lets them
+// move again. Each turn rings.
+#[tokio::test]
+async fn a_download_quota_that_turns_work_away_stops_torrent_downloads_on_its_egress() {
+    let db = Database::open_in_memory().unwrap();
+    let metered = db
+        .create_egress_interface(&metered_egress(1_000_000))
+        .unwrap();
+    let policy = Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(db.clone(), &[])
+            .unwrap(),
+    );
+    let runtime = NetworkRuntime::with_quota_policy(
+        db,
+        tokio::runtime::Handle::current(),
+        Some(policy.clone()),
+    )
+    .unwrap();
+    spend(&runtime, metered.id, 900_000);
+    assert_eq!(runtime.torrent_egress_rates(metered.id).download, None);
+
+    // Only the refusal rings from here: nothing else changes.
+    let mut changes = runtime.egress_limit_changes().unwrap();
+    assert!(
+        runtime
+            .egress_controls
+            .control(weaver_nntp::transfer::StableServerId(metered.id))
+            .try_reserve(200_000)
+            .is_err()
+    );
+    assert!(changes.changed().await);
+    assert_eq!(runtime.torrent_egress_rates(metered.id).download, Some(0));
+    assert_eq!(
+        policy.egress_quota_states(metered.id).unwrap().download,
+        crate::bandwidth::QuotaState::Stopped
+    );
+
+    let mut raised = metered.clone();
+    raised.quota.download_bytes = Some(10_000_000);
+    policy.reconfigure_egresses(&[raised]).unwrap();
+    while runtime.torrent_egress_rates(metered.id).download.is_some() {
+        assert!(changes.changed().await);
+    }
+    assert_eq!(
+        policy.egress_quota_states(metered.id).unwrap().download,
+        crate::bandwidth::QuotaState::Normal
+    );
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn egress_quota_usage_survives_a_network_recompile_and_a_rebuilt_runtime() {
     let db = Database::open_in_memory().unwrap();

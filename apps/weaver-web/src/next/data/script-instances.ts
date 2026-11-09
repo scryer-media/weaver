@@ -35,6 +35,11 @@ export const QUEUE_EVENTS = [
   "NZB_NAMED",
   "NZB_DOWNLOADED",
   "NZB_DELETED",
+  "SEEDING_FINISHED",
+  "SEEDING_STOPPED",
+  "QUOTA_NORMAL",
+  "QUOTA_TRICKLE",
+  "QUOTA_STOPPED",
 ] as const;
 
 export type QueueEvent = (typeof QUEUE_EVENTS)[number];

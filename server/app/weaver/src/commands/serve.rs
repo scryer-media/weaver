@@ -151,6 +151,15 @@ pub(crate) async fn run(
         .await??,
     );
     let server_transfer_maintenance = server_transfer_policy.spawn_maintenance();
+    let quota_events = weaver_server_core::post_processing::quota_events::spawn_quota_events(
+        &server_transfer_policy,
+        db.clone(),
+        weaver_server_core::post_processing::quota_events::QuotaEventDirs {
+            data: data_dir.clone(),
+            intermediate: intermediate_dir.clone(),
+            complete: complete_dir.clone(),
+        },
+    );
     let proxy_db = db.clone();
     let runtime_handle = tokio::runtime::Handle::current();
     let proxy_policy = Arc::clone(&server_transfer_policy);
@@ -661,6 +670,7 @@ pub(crate) async fn run(
             update_check_task.abort();
             semantic_promotion_task.abort();
             server_transfer_maintenance.abort();
+            quota_events.abort();
             wiring::flush_server_transfer_usage(
                 Arc::clone(&server_transfer_policy),
                 "serve pipeline exit",
@@ -693,6 +703,7 @@ pub(crate) async fn run(
             update_check_task.abort();
             semantic_promotion_task.abort();
             server_transfer_maintenance.abort();
+            quota_events.abort();
             wiring::flush_server_transfer_usage(
                 Arc::clone(&server_transfer_policy),
                 "serve HTTP exit",
@@ -742,6 +753,7 @@ pub(crate) async fn run(
     maintenance_task.abort();
     semantic_promotion_task.abort();
     server_transfer_maintenance.abort();
+    quota_events.abort();
     wiring::flush_server_transfer_usage(Arc::clone(&server_transfer_policy), stop.flush_context())
         .await;
     usage::record_and_flush(&usage_recorder, &usage_sources, &db).await;

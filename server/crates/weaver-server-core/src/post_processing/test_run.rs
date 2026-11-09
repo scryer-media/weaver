@@ -24,7 +24,7 @@ use super::executor::{execution_refusal, strict_security_enabled};
 use super::instances::InstanceTrigger;
 use super::listing::resolve_script;
 use super::model::{
-    PipelineOutcome, QueueEvent, ScriptAdapter, ScriptEventLabel, ScriptName, ScriptStatus,
+    PipelineOutcome, QueueEvent, ScriptAdapter, ScriptEventLabel, ScriptName, ScriptStatus, vars,
 };
 use super::runner::{
     CompatibilityFacts, ExecutionDisposition, ExecutionSpec, InterpreterConfig,
@@ -589,6 +589,25 @@ fn simulated_queue_event(job: &JobExecutionContext, event: QueueEvent) -> EventC
         | QueueEvent::NzbAdded
         | QueueEvent::NzbNamed
         | QueueEvent::NzbDownloaded => &[],
+        QueueEvent::SeedingFinished => {
+            &[(vars::PROTOCOL, "torrent"), (vars::SEEDING_ACTION, "stop")]
+        }
+        QueueEvent::SeedingStopped => &[
+            (vars::PROTOCOL, "torrent"),
+            (vars::SEEDING_STOPPED_REASON, "paused"),
+        ],
+        QueueEvent::QuotaNormal => &[
+            (vars::QUOTA_DIRECTION, "upload"),
+            (vars::QUOTA_STATE, "normal"),
+        ],
+        QueueEvent::QuotaTrickle => &[
+            (vars::QUOTA_DIRECTION, "upload"),
+            (vars::QUOTA_STATE, "trickle"),
+        ],
+        QueueEvent::QuotaStopped => &[
+            (vars::QUOTA_DIRECTION, "upload"),
+            (vars::QUOTA_STATE, "stopped"),
+        ],
     };
     for (name, value) in reported {
         context.env.insert((*name).into(), (*value).into());

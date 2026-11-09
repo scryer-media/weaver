@@ -20,6 +20,7 @@ use crate::torrents::sessions::tests::{
 use crate::torrents::storage::PieceStorage;
 
 mod scale_bench;
+mod scripts;
 
 const EPOCH_MS: i64 = 1_700_000_000_000;
 
@@ -3715,6 +3716,101 @@ async fn a_route_going_down_ends_the_seeding_run() {
         (kept.finished_duration_s, kept.consecutive_seeding_s),
         (whole, 0)
     );
+    seeded.stop().await;
+}
+
+// The download and upload limits a session holds now.
+fn session_limits(session: &Session) -> (Option<u32>, Option<u32>) {
+    (
+        session.ratelimits.get_download_bps().into(),
+        session.ratelimits.get_upload_bps().into(),
+    )
+}
+
+// An egress's upload quota reaches the open session on it live. Past the
+// soft cap its uploads trickle and the torrent still seeds; at the hard cap
+// they move nothing, and the torrent still seeds and still announces; lifted,
+// the rate comes back. A torrent on another egress is untouched throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
+    use crate::bandwidth::TorrentRates;
+
+    let mut seeded = seeded().await;
+    let service = seeded.rig.service.clone();
+    let routes = Arc::clone(&seeded.rig.routes);
+    let mut applied = service.inner.sessions.egress_limits_applied();
+    // The follower put the limits in force once as it started, and waits.
+    applied.wait_for(|applied| *applied >= 1).await.unwrap();
+    let mut rings = *applied.borrow_and_update();
+    let mut ring = |egress_id, rates| {
+        routes.set_egress_rates(egress_id, rates);
+        rings += 1;
+        rings
+    };
+
+    routes.route(TorrentScope::Category(1), 2);
+    routes.route_on_egress(TorrentScope::Category(1), 7);
+    let other = service
+        .add(AddRequest {
+            category: Some("tv".into()),
+            ..request(AddSource::Metainfo(plain("other", 2)))
+        })
+        .await
+        .unwrap();
+    service.tick().await;
+    let seeding = session_of(&service, seeded.job_id).await;
+    let elsewhere = session_of(&service, other).await;
+    assert!(!Arc::ptr_eq(&seeding, &elsewhere));
+    assert_eq!(session_limits(&seeding), (None, None));
+
+    // Past the soft cap: the egress's uploads trickle.
+    let trickle = TorrentRates {
+        download: None,
+        upload: Some(crate::proxies::DEFAULT_UPLOAD_TRICKLE_BPS),
+    };
+    let at = ring(SYSTEM_EGRESS_ID, trickle);
+    applied.wait_for(|applied| *applied >= at).await.unwrap();
+    assert_eq!(
+        session_limits(&seeding),
+        (
+            None,
+            Some(crate::proxies::DEFAULT_UPLOAD_TRICKLE_BPS as u32)
+        )
+    );
+    assert_eq!(session_limits(&elsewhere), (None, None));
+    assert_eq!(seeded.view().await.state, TorrentState::Seeding);
+
+    // At the hard cap: a budget of no bytes. The torrent still seeds, and
+    // its next announce still goes out as a seed's.
+    let stopped = TorrentRates {
+        download: None,
+        upload: Some(0),
+    };
+    let at = ring(SYSTEM_EGRESS_ID, stopped);
+    applied.wait_for(|applied| *applied >= at).await.unwrap();
+    assert_eq!(session_limits(&seeding), (None, Some(0)));
+    assert_eq!(session_limits(&elsewhere), (None, None));
+    assert_eq!(seeded.view().await.state, TorrentState::Seeding);
+    let heard = seeded.answered.borrow_and_update().len();
+    service.reannounce(seeded.job_id).await.unwrap();
+    let answered = seeded
+        .answered
+        .wait_for(|answered| answered.len() > heard)
+        .await
+        .unwrap()
+        .clone();
+    assert_eq!(answered[heard].0, "");
+    assert_eq!(seeded.view().await.state, TorrentState::Seeding);
+
+    // Lifted: the session moves as it did.
+    let at = ring(SYSTEM_EGRESS_ID, TorrentRates::default());
+    applied.wait_for(|applied| *applied >= at).await.unwrap();
+    assert_eq!(session_limits(&seeding), (None, None));
+    assert_eq!(session_limits(&elsewhere), (None, None));
+    assert!(Arc::ptr_eq(
+        &seeding,
+        &session_of(&service, seeded.job_id).await
+    ));
     seeded.stop().await;
 }
 

@@ -17,6 +17,7 @@ pub mod manifest;
 pub mod model;
 pub mod output;
 pub mod preset;
+pub mod quota_events;
 pub mod run_metrics;
 pub mod runner;
 pub mod scan;

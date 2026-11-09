@@ -27,11 +27,12 @@ use weaver_torrent::{
 use weaver_tunnel::pipe::Dialer;
 
 use crate::StateError;
+use crate::bandwidth::TorrentRates;
 use crate::persistence::Database;
 use crate::proxies::{
-    Consumer, EgressBinding, EgressHealth, EgressInterface, FetchOptions, LegPath, NetworkRuntime,
-    ProxyRuntime, ResolvedBy, Route, RoutingPolicy, Rung, SYSTEM_EGRESS_ID, TorrentLeg,
-    TorrentScope, pool_of, routed_fetch,
+    Consumer, EgressBinding, EgressHealth, EgressInterface, EgressLimitChanges, FetchOptions,
+    LegPath, NetworkRuntime, ProxyRuntime, ResolvedBy, Route, RoutingPolicy, Rung,
+    SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope, pool_of, routed_fetch,
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::IDENTITY;
@@ -377,6 +378,16 @@ pub trait Routes: Send + Sync {
     fn join(&self, _plan: &RoutePlan, _peers: usize) {}
     /// The blocklist at `url`, which every route's session shares.
     async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String>;
+    /// What egress `egress_id` lets its sessions move at now: its own caps
+    /// under its quota state. No limit by default.
+    fn egress_rates(&self, _egress_id: u32) -> TorrentRates {
+        TorrentRates::default()
+    }
+    /// What rings as an egress's caps or quota state may change; none when
+    /// no egress limits torrents.
+    fn egress_limit_changes(&self) -> Option<EgressLimitChanges> {
+        None
+    }
 }
 
 /// Routes as the network runtime resolves them.
@@ -504,6 +515,14 @@ impl Routes for NetworkRoutes {
                 "a joining scope's route did not start"
             );
         }
+    }
+
+    fn egress_rates(&self, egress_id: u32) -> TorrentRates {
+        self.network().torrent_egress_rates(egress_id)
+    }
+
+    fn egress_limit_changes(&self) -> Option<EgressLimitChanges> {
+        self.network().egress_limit_changes()
     }
 
     // Fetched once for every route, so on Default outbound, which carries
@@ -899,6 +918,8 @@ pub struct Sessions {
     // Rung by every session as an announce table or a metadata fetch's
     // phase changes.
     trackers_changed: Arc<tokio::sync::Notify>,
+    // Counts the times the egresses' limits were put in force.
+    egress_limits_applied: tokio::sync::watch::Sender<u64>,
     // The connection budget and check turns every session shares, made
     // with the first session: the process has one descriptor limit and
     // one disk however many routes it runs.
@@ -921,6 +942,7 @@ impl Sessions {
             closing: Closing::default(),
             revoked: Arc::default(),
             trackers_changed: Arc::default(),
+            egress_limits_applied: tokio::sync::watch::Sender::new(0),
             shared_limits: std::sync::OnceLock::new(),
         }
     }
@@ -969,6 +991,21 @@ impl Sessions {
     /// The torrents' download rate across the open sessions.
     pub fn rates(&self) -> &SessionRates {
         &self.rates
+    }
+
+    /// Put in force what each egress an open session runs on allows now.
+    /// Run whenever an egress's caps or quota state may have changed: the
+    /// open sessions take it live, with no restart.
+    pub fn apply_egress_limits(&self) {
+        self.rates
+            .set_egresses(|egress_id| self.routes.egress_rates(egress_id));
+        self.egress_limits_applied
+            .send_modify(|applied| *applied = applied.wrapping_add(1));
+    }
+
+    /// Counts the times the egresses' limits were put in force.
+    pub fn egress_limits_applied(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.egress_limits_applied.subscribe()
     }
 
     /// The torrent settings. The open sessions take the limits, the
@@ -1175,7 +1212,11 @@ impl Sessions {
         let mappings = PortMappings::default();
         match self.build(plan, opener, port_slot, peers, &mappings).await {
             Ok((session, leg, port, maps, opening)) => {
-                self.rates.add(&session);
+                self.rates.add(
+                    &session,
+                    plan.egress_id,
+                    self.routes.egress_rates(plan.egress_id),
+                );
                 self.configured().add(&session);
                 if let Some(leg) = &leg {
                     self.watch(&plan.key, leg, &session);
