@@ -524,6 +524,12 @@ impl Pieces for Watched {
         self.store.read(file, offset, out)
     }
 
+    // The store's own run read, as the session reads it, so the bench
+    // measures one read a run and not one a block.
+    fn readv(&self, file: usize, offset: u64, outs: &mut [&mut [u8]]) -> std::io::Result<()> {
+        self.store.readv(file, offset, outs)
+    }
+
     fn grow(&self, file: usize, length: u64) -> std::io::Result<()> {
         self.store.grow(file, length)
     }

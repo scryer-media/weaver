@@ -16,7 +16,10 @@
 // 4096), WEAVER_BENCH_FILES (default 2), WEAVER_BENCH_PIECE_KIB (default
 // 4096), WEAVER_BENCH_PEERS (default 8), WEAVER_BENCH_DEPTH (requests a
 // scripted leecher keeps out, default 250), WEAVER_BENCH_DIR (where the torrent
-// writes, default the system temporary directory).
+// writes, default the system temporary directory), WEAVER_BENCH_SEED_PATH
+// (what the piece storage hands pieces to and reads them back from:
+// "watched", the default, the store as the storage tests watch it, or
+// "intake", the store behind the intake, as the service runs a torrent).
 
 use std::collections::{HashSet, VecDeque};
 use std::process::Stdio;
@@ -28,6 +31,7 @@ use weaver_torrent::core::merkle;
 use weaver_torrent::sha1w::{ISha1, Sha1};
 
 use super::*;
+use crate::torrents::intake::{Heard, Intake, Room};
 
 const COUNTERPART: &str = "torrents::storage::tests::bench::torrent_loopback_counterpart";
 const BLOCK: u32 = 16 * 1024;
@@ -346,6 +350,29 @@ async fn line<R: tokio::io::AsyncBufRead + Unpin>(
     }
 }
 
+// The torrent's store behind the intake, as the service joins them for a
+// torrent it runs: the session's reads of a seeded piece go through the
+// intake to the store's files. The intake's disk budget never refuses, and
+// what it hears tells the bench when every piece is had.
+fn intake_store(layout: &Arc<PieceLayout>, dir: &Path) -> (Arc<dyn Pieces>, watch::Receiver<bool>) {
+    let (whole, in_hand) = watch::channel(false);
+    let store = store_in(layout, dir, None);
+    let told = Arc::clone(&store);
+    let intake = Intake::new(
+        store as Arc<dyn Pieces>,
+        Room::new(
+            Arc::new(crate::pipeline::ExtractionLimits::unbounded()),
+            crate::operations::disk::CapacityReader::unknown(),
+        ),
+        Box::new(move |heard| {
+            if heard == Heard::Changed {
+                whole.send_replace(told.count() == told.layout().piece_count());
+            }
+        }),
+    );
+    (Arc::new(intake), in_hand)
+}
+
 // A session on loopback alone, as the tests' own, that takes every scripted
 // peer: they all come from one address (libtorrent
 // `allow_multiple_connections_per_ip`). Its peers time out as production's
@@ -452,12 +479,19 @@ async fn torrent_loopback_throughput() {
         .split(',')
         .map(|port| SocketAddr::from((Ipv4Addr::LOCALHOST, port.parse::<u16>().unwrap())))
         .collect();
-    let (watched, mut in_hand) = watched_store(&layout, &dir.path().join("job"));
-    let factory = PieceStorageFactory::new(
-        Arc::clone(&layout),
-        Arc::clone(&watched) as Arc<dyn Pieces>,
-        unbounded(),
+    let (pieces, mut in_hand) = match std::env::var("WEAVER_BENCH_SEED_PATH").as_deref() {
+        Ok("intake") => intake_store(&layout, &dir.path().join("job")),
+        Ok("watched") | Err(_) => {
+            let (watched, in_hand) = watched_store(&layout, &dir.path().join("job"));
+            (watched as Arc<dyn Pieces>, in_hand)
+        }
+        Ok(other) => panic!("no seed path {other}"),
+    };
+    println!(
+        "BENCH seed path: {}",
+        std::env::var("WEAVER_BENCH_SEED_PATH").unwrap_or_else(|_| "watched".into())
     );
+    let factory = PieceStorageFactory::new(Arc::clone(&layout), pieces, unbounded());
     let leecher = bench_session(&dir.path().join("session")).await;
     let started = usage();
     let _handle = leecher
