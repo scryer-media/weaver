@@ -38,28 +38,29 @@ impl Rewalk {
     }
 
     // Piece `index` read through the map. `read` answers a placement of a
-    // volume. `None` when it does not read back whole: it is not said, and
-    // the next restore asks for it again.
+    // volume. `Err` with the piece's range when it does not read back
+    // whole: what arrived there is no longer where it was put, and the
+    // range is fetched again. `None` past the last piece.
     pub fn read(
         &self,
         index: usize,
         read: &mut dyn FnMut(VolumeIndex, &Placement, &mut Vec<u8>) -> bool,
-    ) -> Option<(VolumeIndex, Posted)> {
+    ) -> Option<(VolumeIndex, Result<Posted, ByteRange>)> {
         let &(volume, piece, provenance) = self.pieces.get(index)?;
         let mut bytes = Vec::new();
         let mut placed = |placement: &Placement, into: &mut Vec<u8>| read(volume, placement, into);
         if !self.posting.posted(volume, piece, &mut placed, &mut bytes)
             || bytes.len() as u64 != piece.len()
         {
-            return None;
+            return Some((volume, Err(piece)));
         }
         Some((
             volume,
-            Posted {
+            Ok(Posted {
                 offset: piece.start,
                 bytes: Evidenced::from(bytes),
                 provenance,
-            },
+            }),
         ))
     }
 }
@@ -84,15 +85,17 @@ impl Tree {
     }
 
     // What the object at `node` asked again at its restore, taken to be
-    // read. `None` when it asked nothing or is no longer live; what it
-    // asked is dropped then, as a retired node hears nothing.
+    // read. `None` when it asked nothing, is no longer live, or is not home
+    // to say where its volumes lie. A retired node's asks are dropped, as it
+    // hears nothing; one not home keeps them, and is asked again.
     pub fn take_rewalk(&mut self, node: NodeId) -> Option<Rewalk> {
-        let ranges = self.rewalks.remove(&node)?;
         if !self.is_live(node) {
+            self.rewalks.remove(&node);
             return None;
         }
+        let ranges = self.rewalks.get(&node)?;
         let pieces: Vec<(VolumeIndex, ByteRange, Provenance)> = self
-            .forgets(node, &ranges, false)
+            .forgets(node, ranges, false)
             .into_iter()
             .flat_map(|(volume, range)| {
                 self.again_pieces(node, volume, range)
@@ -105,6 +108,7 @@ impl Tree {
             .map(|&(volume, piece, _)| (volume, piece))
             .collect();
         let posting = self.object(node)?.posting(&taken);
+        self.rewalks.remove(&node);
         self.rewalking.insert(node);
         Some(Rewalk {
             node,
