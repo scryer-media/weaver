@@ -2106,8 +2106,6 @@ export const nextJa: LocaleDictionary = {
   "next.networking.speed.decoded": "デコード済み",
   "next.networking.speed.upload": "アップロード",
   "next.networking.speed.uploadPeers": "ピアへのアップロード（下限）",
-  "next.networking.speed.uploadPeerCount.one": "{{count}} ピア",
-  "next.networking.speed.uploadPeerCount.other": "{{count}} ピア",
   "next.networking.speed.uploadOutcome.UNAVAILABLE": "{{provider}} はアップロードを受け付けません",
   "next.networking.speed.uploadOutcome.NO_DEMAND": "需要なし",
   "next.networking.speed.uploadOutcome.FAILED": "失敗",

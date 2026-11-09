@@ -227,13 +227,38 @@ async fn the_piece_is_served_to_a_leecher_the_tracker_sends() {
     let report = run_probe(&fixture, LegKind::Ladder, Some(u64::from(PIECE_LEN))).await;
 
     match &report.upload {
-        Some(PeerUpload::Measured { bytes, peers, .. }) => {
+        Some(PeerUpload::Measured { bytes, .. }) => {
             assert_eq!(*bytes, u64::from(PIECE_LEN));
-            assert_eq!(*peers, 1);
         }
         other => panic!("not measured: {other:?} in {report:?}"),
     }
     assert_eq!(*fixture.taken().borrow(), u64::from(PIECE_LEN));
+    fixture.stop().await;
+}
+
+// A leecher that speaks encrypted alone is served the piece, and the bytes
+// it took are counted as for a plain one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_piece_is_served_to_a_leecher_that_speaks_encrypted() {
+    let fixture = TorrentFixture::start(true).await;
+    let leecher = fixture.encrypted_leecher().await;
+    fixture.answer(Answer {
+        peers: vec![fixture.seeder(), leecher.addr()],
+        seeders: 1,
+        leechers: 1,
+        ..Answer::default()
+    });
+    let report = run_probe(&fixture, LegKind::Ladder, Some(u64::from(PIECE_LEN))).await;
+
+    match &report.upload {
+        Some(PeerUpload::Measured { bytes, .. }) => {
+            assert_eq!(*bytes, u64::from(PIECE_LEN));
+        }
+        other => panic!("not measured: {other:?} in {report:?}"),
+    }
+    leecher.has_first_piece().await;
+    assert_eq!(leecher.fetched(), u64::from(PIECE_LEN));
+    leecher.stop().await;
     fixture.stop().await;
 }
 

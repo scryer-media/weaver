@@ -6884,3 +6884,40 @@ async fn a_hundred_idle_torrents_cost_the_rate_tick_nothing() {
 async fn ten_thousand_idle_torrents_cost_the_rate_tick_nothing() {
     idle_torrents_cost_the_rate_tick_nothing(10_000).await;
 }
+
+// A watch on what the run uploads is rung once a write that carried block
+// bytes is written: the woken waiter reads the write's bytes in the run's
+// total and the write's stamp. Blocks told one by one move neither until
+// their write is. A torrent nobody watches has no listener to ring.
+#[tokio::test]
+async fn an_upload_watch_is_rung_by_a_written_batch_and_reads_its_stamp() {
+    use crate::peer_connection::PeerConnectionHandler;
+    let h = Harness::seeding("upload_watch").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let watch = h.live.upload_watch();
+    assert_eq!(h.upload_watches.load(Ordering::SeqCst), 1);
+    let seen = watch.uploaded();
+    assert_eq!(watch.last_uploaded_at(), None);
+
+    let before = tokio::time::Instant::now();
+    {
+        let mut rung = std::pin::pin!(watch.changed_from(seen));
+        assert!(futures::poll!(rung.as_mut()).is_pending());
+        (&peer).on_uploaded_bytes(CHUNK_SIZE);
+        (&peer).on_uploaded_bytes(CHUNK_SIZE);
+        assert!(futures::poll!(rung.as_mut()).is_pending());
+        assert_eq!(watch.last_uploaded_at(), None);
+        (&peer).on_payload_written(2 * u64::from(CHUNK_SIZE));
+        rung.await;
+    }
+    let after = tokio::time::Instant::now();
+
+    assert_eq!(watch.uploaded(), seen + 2 * u64::from(CHUNK_SIZE));
+    let stamp = watch.last_uploaded_at().unwrap();
+    assert!(
+        before <= stamp && stamp <= after,
+        "{before:?} {stamp:?} {after:?}"
+    );
+    drop(watch);
+    assert_eq!(h.upload_watches.load(Ordering::SeqCst), 0);
+}

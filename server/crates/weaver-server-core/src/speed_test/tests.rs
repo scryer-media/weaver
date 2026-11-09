@@ -1596,9 +1596,8 @@ async fn a_torrent_run_pulls_from_the_swarm_and_serves_what_it_held() {
     let upload = result.upload.unwrap();
     assert_eq!(upload.http, None);
     match upload.peers {
-        Some(PeerUpload::Measured { bytes, peers, .. }) => {
+        Some(PeerUpload::Measured { bytes, .. }) => {
             assert_eq!(bytes, u64::from(PIECE_LEN));
-            assert_eq!(peers, 1);
         }
         other => panic!("not measured: {other:?}"),
     }

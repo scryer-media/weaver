@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll};
 
 use anyhow::bail;
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::watch;
 use weaver_torrent::core::lengths::ValidPieceIndex;
 use weaver_torrent::network::{
@@ -39,12 +39,7 @@ pub(super) struct Watched {
     settled: AtomicUsize,
     answered: AtomicUsize,
     inbound: AtomicUsize,
-    // Piece bytes sent to peers, and when the last of them went.
-    sent: AtomicU64,
-    last_sent: Mutex<Option<tokio::time::Instant>>,
     errors: Mutex<Vec<String>>,
-    // The connections that carried piece bytes.
-    takers: AtomicUsize,
 }
 
 impl Watched {
@@ -55,10 +50,7 @@ impl Watched {
             settled: AtomicUsize::new(0),
             answered: AtomicUsize::new(0),
             inbound: AtomicUsize::new(0),
-            sent: AtomicU64::new(0),
-            last_sent: Mutex::new(None),
             errors: Mutex::new(Vec::new()),
-            takers: AtomicUsize::new(0),
         }
     }
 
@@ -86,26 +78,11 @@ impl Watched {
         self.inbound.load(Ordering::Acquire)
     }
 
-    pub(super) fn sent(&self) -> u64 {
-        self.sent.load(Ordering::Acquire)
-    }
-
-    pub(super) fn takers(&self) -> usize {
-        self.takers.load(Ordering::Acquire)
-    }
-
     pub(super) fn errors(&self) -> Vec<String> {
         self.errors
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
-    }
-
-    pub(super) fn last_sent(&self) -> Option<tokio::time::Instant> {
-        *self
-            .last_sent
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
     }
 
     fn error(&self, error: String) {
@@ -140,7 +117,6 @@ impl SocketFactory for ProbeSockets {
                     peer: addr,
                     outgoing: true,
                     read: AtomicU64::new(0),
-                    frames: Mutex::default(),
                     watched: self.watched.clone(),
                 })
                 .wrap(read, write)),
@@ -205,7 +181,6 @@ impl StreamListener for WatchedListener {
                 peer,
                 outgoing: false,
                 read: AtomicU64::new(0),
-                frames: Mutex::default(),
                 watched: self.watched.clone(),
             });
             let (read, write) = state.wrap(read, write);
@@ -214,84 +189,13 @@ impl StreamListener for WatchedListener {
     }
 }
 
-// One peer connection as the test sees it.
+// One peer connection as the test sees it: what it read, to tell whether
+// the peer answered. What it sends is the engine's to count.
 struct Connection {
     peer: SocketAddr,
     outgoing: bool,
     read: AtomicU64,
-    frames: Mutex<Frames>,
     watched: Arc<Watched>,
-}
-
-// The plain BitTorrent stream a connection sends: the handshake, then
-// length-prefixed messages. Only the blocks of piece messages are served
-// bytes. A stream that does not open with the plain handshake is encrypted,
-// and none of its bytes can be told for blocks.
-#[derive(Default)]
-struct Frames {
-    handshake: u64,
-    encrypted: bool,
-    header: [u8; 5],
-    header_len: usize,
-    // Body bytes left in the message being sent.
-    left: u64,
-    // The piece message's index and offset, not yet passed.
-    preamble: u64,
-    piece: bool,
-    served: u64,
-}
-
-// A piece message's id.
-const PIECE: u8 = 7;
-// How a plain handshake opens: the protocol name's length, then the name.
-const PLAIN_OPENING: &[u8] = b"\x13BitTorrent protocol";
-
-impl Frames {
-    // The block bytes among `bytes`, the next ones sent.
-    fn feed(&mut self, mut bytes: &[u8]) -> u64 {
-        let mut served = 0;
-        while !bytes.is_empty() && !self.encrypted {
-            if self.handshake < HANDSHAKE_LEN {
-                let take = (HANDSHAKE_LEN - self.handshake).min(bytes.len() as u64);
-                let at = self.handshake as usize;
-                let opening = PLAIN_OPENING.get(at..).unwrap_or_default();
-                let checked = opening.len().min(take as usize);
-                self.encrypted = bytes[..checked] != opening[..checked];
-                self.handshake += take;
-                bytes = &bytes[take as usize..];
-            } else if self.left > 0 {
-                let take = self.left.min(bytes.len() as u64);
-                let preamble = self.preamble.min(take);
-                self.preamble -= preamble;
-                if self.piece {
-                    served += take - preamble;
-                }
-                self.left -= take;
-                bytes = &bytes[take as usize..];
-            } else {
-                self.header[self.header_len] = bytes[0];
-                self.header_len += 1;
-                bytes = &bytes[1..];
-                let len = u32::from_be_bytes([
-                    self.header[0],
-                    self.header[1],
-                    self.header[2],
-                    self.header[3],
-                ]);
-                if self.header_len == 4 && len == 0 {
-                    // A keep-alive.
-                    self.header_len = 0;
-                } else if self.header_len == 5 {
-                    self.header_len = 0;
-                    self.piece = self.header[4] == PIECE;
-                    self.left = u64::from(len) - 1;
-                    self.preamble = if self.piece { 8 } else { 0 };
-                }
-            }
-        }
-        self.served += served;
-        served
-    }
 }
 
 impl Connection {
@@ -305,10 +209,7 @@ impl Connection {
                 inner: read,
                 connection: self.clone(),
             }),
-            Box::new(WatchedWrite {
-                inner: write,
-                connection: self.clone(),
-            }),
+            write,
         )
     }
 
@@ -322,29 +223,6 @@ impl Connection {
             self.watched.settled.fetch_add(1, Ordering::AcqRel);
             self.watched.wake();
         }
-    }
-
-    // `bytes` went out, in order.
-    fn on_sent<'b>(&self, bytes: impl IntoIterator<Item = &'b [u8]>) {
-        let (served, first) = {
-            let mut frames = self.frames.lock().unwrap_or_else(PoisonError::into_inner);
-            let before = frames.served;
-            let served: u64 = bytes.into_iter().map(|chunk| frames.feed(chunk)).sum();
-            (served, before == 0)
-        };
-        if served == 0 {
-            return;
-        }
-        if first {
-            self.watched.takers.fetch_add(1, Ordering::AcqRel);
-        }
-        self.watched.sent.fetch_add(served, Ordering::AcqRel);
-        *self
-            .watched
-            .last_sent
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(tokio::time::Instant::now());
-        self.watched.wake();
     }
 }
 
@@ -394,54 +272,6 @@ impl AsyncReadVectored for WatchedRead {
             self.connection.on_read(read);
         }
         polled
-    }
-}
-
-struct WatchedWrite {
-    inner: BoxAsyncWrite,
-    connection: Arc<Connection>,
-}
-
-impl AsyncWrite for WatchedWrite {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<io::Result<usize>> {
-        let polled = Pin::new(&mut self.inner).poll_write(cx, buf);
-        if let Poll::Ready(Ok(sent)) = polled {
-            self.connection.on_sent([&buf[..sent]]);
-        }
-        polled
-    }
-
-    fn poll_write_vectored(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[io::IoSlice<'_>],
-    ) -> Poll<io::Result<usize>> {
-        let polled = Pin::new(&mut self.inner).poll_write_vectored(cx, bufs);
-        if let Poll::Ready(Ok(sent)) = polled {
-            let mut left = sent;
-            self.connection.on_sent(bufs.iter().map_while(|buf| {
-                let take = left.min(buf.len());
-                left -= take;
-                (take > 0).then(|| &buf[..take])
-            }));
-        }
-        polled
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        self.inner.is_write_vectored()
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_flush(cx)
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -772,39 +602,5 @@ mod tests {
         dialed.unwrap();
         accepted.unwrap();
         assert_eq!(watched.inbound(), 1);
-    }
-
-    // A piece message after the plain handshake: length, id, index, offset,
-    // then the block.
-    fn piece_message(block: &[u8]) -> Vec<u8> {
-        let mut message = (9 + block.len() as u32).to_be_bytes().to_vec();
-        message.push(PIECE);
-        message.extend_from_slice(&[0; 8]);
-        message.extend_from_slice(block);
-        message
-    }
-
-    // A plain stream's block bytes are served bytes, whichever writes they
-    // go out in.
-    #[test]
-    fn a_plain_streams_block_is_counted() {
-        let mut stream = PLAIN_OPENING.to_vec();
-        stream.resize(HANDSHAKE_LEN as usize, 0);
-        stream.extend_from_slice(&[0, 0, 0, 1, 2]);
-        stream.extend_from_slice(&piece_message(&[0xab; 100]));
-        let mut frames = Frames::default();
-        let served: u64 = stream.chunks(7).map(|chunk| frames.feed(chunk)).sum();
-        assert_eq!(served, 100);
-    }
-
-    // An encrypted stream's bytes are never told for blocks, even where
-    // they read as a piece message.
-    #[test]
-    fn an_encrypted_stream_counts_nothing() {
-        let mut stream = vec![0x5a; HANDSHAKE_LEN as usize];
-        stream.extend_from_slice(&piece_message(&[0xab; 100]));
-        let mut frames = Frames::default();
-        assert_eq!(frames.feed(&stream), 0);
-        assert_eq!(frames.feed(&piece_message(&[0xab; 100])), 0);
     }
 }

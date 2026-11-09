@@ -64,6 +64,7 @@ pub struct TorrentFixture {
     shared: Arc<Shared>,
     seeder: Arc<Session>,
     leecher: SocketAddr,
+    torrent: bytes::Bytes,
     taken: watch::Receiver<u64>,
     _dir: tempfile::TempDir,
 }
@@ -122,11 +123,15 @@ impl TorrentFixture {
         )
         .await
         .unwrap();
-        let bytes = created.as_bytes().unwrap();
+        let bytes: bytes::Bytes = created.as_bytes().unwrap();
         *shared.info_hash.lock().unwrap() = created.info_hash().0;
         *shared.torrent.lock().unwrap() = bytes.to_vec();
 
-        let seeder = session(&dir.path().join("seeder")).await;
+        let seeder = session(
+            &dir.path().join("seeder"),
+            weaver_torrent::EncryptionPolicy::Prefer,
+        )
+        .await;
         let seeding = seeder
             .add_torrent(
                 AddTorrent::from_bytes(bytes.clone()),
@@ -149,6 +154,7 @@ impl TorrentFixture {
             shared,
             seeder,
             leecher,
+            torrent: bytes,
             taken,
             _dir: dir,
         }
@@ -168,6 +174,38 @@ impl TorrentFixture {
         self.taken.clone()
     }
 
+    // A session that speaks encrypted alone and wants the first piece. It
+    // knows no peer: it takes the one that dials it.
+    pub async fn encrypted_leecher(&self) -> EncryptedLeecher {
+        let dir = tempfile::tempdir().unwrap();
+        let session = session(dir.path(), weaver_torrent::EncryptionPolicy::Require).await;
+        let pieces = (CONTENT_LEN as u32).div_ceil(PIECE_LEN);
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(self.torrent.clone()),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().join("output").display().to_string()),
+                    overwrite: true,
+                    piece_priorities: Some(
+                        (1..pieces)
+                            .map(|index| (index, weaver_torrent::PiecePriority::Skip))
+                            .collect(),
+                    ),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        handle.wait_until_initialized().await.unwrap();
+        EncryptedLeecher {
+            session,
+            handle,
+            _dir: dir,
+        }
+    }
+
     pub fn answer(&self, answer: Answer) {
         *self.shared.answer.lock().unwrap() = answer;
     }
@@ -181,14 +219,43 @@ impl TorrentFixture {
     }
 }
 
-// A session on loopback alone: no DHT, no trackers, no discovery. It takes
-// encrypted and plain handshakes, as the probe may open with either.
-async fn session(dir: &Path) -> Arc<Session> {
+pub struct EncryptedLeecher {
+    session: Arc<Session>,
+    handle: Arc<weaver_torrent::ManagedTorrent>,
+    _dir: tempfile::TempDir,
+}
+
+impl EncryptedLeecher {
+    pub fn addr(&self) -> SocketAddr {
+        self.session.listen_addr().unwrap()
+    }
+
+    // Resolves once the first piece arrived and passed its check.
+    pub async fn has_first_piece(&self) {
+        self.handle.wait_until_completed().await.unwrap();
+    }
+
+    // The block bytes it fetched.
+    pub fn fetched(&self) -> u64 {
+        self.handle
+            .live()
+            .map_or(0, |live| live.stats_snapshot().fetched_bytes)
+    }
+
+    pub async fn stop(self) {
+        self.session.stop().await;
+    }
+}
+
+// A session on loopback alone: no DHT, no trackers, no discovery, taking
+// the handshakes `encryption` allows. The seeder takes encrypted and plain,
+// as the probe may open with either.
+async fn session(dir: &Path, encryption: weaver_torrent::EncryptionPolicy) -> Arc<Session> {
     Session::new_with_opts(
         dir.to_path_buf(),
         SessionOptions {
             dht: None,
-            encryption: weaver_torrent::EncryptionPolicy::Prefer,
+            encryption,
             disable_trackers: true,
             disable_local_service_discovery: true,
             persistence: None,

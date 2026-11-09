@@ -29,7 +29,6 @@ import { Eyebrow, MetricCell, MetricStrip } from "../../components/chrome";
 import { ConfirmDialog } from "../../components/ConfirmDialog";
 import { DangerButton, NumberField, PrimaryButton, SecondaryButton, Segmented, Select, TextField } from "../../components/controls";
 import { EM_DASH, splitBytes, splitSpeed } from "../../data/format";
-import { countLabel } from "../../i18n/labels";
 import { useNextDataSelector } from "../../data/next-data";
 import type { Consumer } from "./data";
 import { LiveChart, type RatePoint } from "./LiveChart";
@@ -771,7 +770,6 @@ function UploadResult({ upload }: { upload: SpeedTestUpload }) {
             variant="stat"
             eyebrow={t("next.networking.speed.uploadPeers")}
             {...rate(peers.bps)}
-            note={countLabel(t, "next.networking.speed.uploadPeerCount", peers.peers ?? 0)}
           />
         ) : (
           <MetricCell

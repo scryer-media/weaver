@@ -2106,8 +2106,6 @@ export const nextEs: LocaleDictionary = {
   "next.networking.speed.decoded": "Decodificado",
   "next.networking.speed.upload": "Subida",
   "next.networking.speed.uploadPeers": "Subida a pares, como mínimo",
-  "next.networking.speed.uploadPeerCount.one": "{{count}} par",
-  "next.networking.speed.uploadPeerCount.other": "{{count}} pares",
   "next.networking.speed.uploadOutcome.UNAVAILABLE": "{{provider}} no admite subidas",
   "next.networking.speed.uploadOutcome.NO_DEMAND": "Sin demanda",
   "next.networking.speed.uploadOutcome.FAILED": "Fallida",

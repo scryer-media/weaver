@@ -74,6 +74,11 @@ pub trait PeerConnectionHandler {
     ) -> anyhow::Result<()>;
     async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()>;
     fn on_uploaded_bytes(&self, bytes: u32);
+    /// One write handed the connection's writer `bytes` of block payload,
+    /// each block already told to [`Self::on_uploaded_bytes`]. Told once per
+    /// write that carried a block (libtorrent stamps `m_last_sent_payload`
+    /// once per completed send, in `peer_connection::sent_bytes`).
+    fn on_payload_written(&self, _bytes: u64) {}
     /// Waits for the limits over the connection's `channel` to grant some of
     /// the `bytes` it asks for, and returns how many they granted: one or
     /// more when `bytes` is not zero. A grant pays for bytes that cross the
@@ -924,14 +929,19 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     return_batch_buf(lent);
                 }
 
+                let mut sent_payload = 0u64;
                 for framed in batch.drain(..) {
                     let payload = framed.chunk.map_or(0, |chunk| chunk.size as usize);
                     self.handler
                         .on_protocol_bytes(Channel::Upload, (framed.len - payload) as u64);
                     if let Some(chunk) = framed.chunk {
+                        sent_payload += u64::from(chunk.size);
                         self.handler.on_uploaded_bytes(chunk.size);
                         self.handler.upload_done(&chunk);
                     }
+                }
+                if sent_payload > 0 {
+                    self.handler.on_payload_written(sent_payload);
                 }
 
                 if let Some(e) = failed.or(ending) {
@@ -1802,6 +1812,7 @@ mod tests {
         Protocol(u64),
         Uploaded(u32),
         Done(u32),
+        Written(u64),
     }
 
     /// Serves every block, filled from its piece index, and logs what the
@@ -1831,6 +1842,9 @@ mod tests {
         }
         fn on_uploaded_bytes(&self, bytes: u32) {
             self.told.lock().push(Told::Uploaded(bytes));
+        }
+        fn on_payload_written(&self, bytes: u64) {
+            self.told.lock().push(Told::Written(bytes));
         }
         fn claim_upload(&self, _: &ChunkInfo) -> bool {
             true
@@ -2087,6 +2101,15 @@ mod tests {
                     Told::Protocol(9),
                 ]
             );
+            // The one write that carried both blocks is told once, after
+            // them, with both blocks' payload.
+            let written: Vec<_> = told
+                .iter()
+                .filter(|t| matches!(t, Told::Written(_)))
+                .cloned()
+                .collect();
+            assert_eq!(written, [Told::Written(2 * u64::from(BLOCK))]);
+            assert_eq!(told[done0 + 5], Told::Written(2 * u64::from(BLOCK)));
         }
         // The two blocks' payloads, as the receiver sees them.
         for piece in 0..2u32 {

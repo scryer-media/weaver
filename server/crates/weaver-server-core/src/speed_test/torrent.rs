@@ -118,11 +118,7 @@ pub struct P2pRung {
 pub enum PeerUpload {
     // No peer asked for anything.
     NoDemand,
-    Measured {
-        bytes: u64,
-        elapsed: Duration,
-        peers: u32,
-    },
+    Measured { bytes: u64, elapsed: Duration },
     // The piece to serve never arrived.
     Failed(String),
 }
@@ -560,7 +556,7 @@ async fn run_joined(
             let started = store
                 .verified_at()
                 .unwrap_or_else(tokio::time::Instant::now);
-            Some(serve(path, handle, &watched, budget, started, stop.as_mut()).await)
+            Some(serve(path, handle, budget, started, stop.as_mut()).await)
         }
         (_, Some(_)) => Some(PeerUpload::Failed("no piece arrived to serve".into())),
         (_, None) => None,
@@ -668,7 +664,6 @@ pub(crate) async fn seed(
             serve(
                 path,
                 &joined.handle,
-                &watched,
                 budget,
                 tokio::time::Instant::now(),
                 stop,
@@ -746,21 +741,24 @@ fn announce_failed(table: &[TrackerAnnounce]) -> bool {
 }
 
 // Serve the verified piece until `budget` bytes went to peers, or until no
-// peer wants it.
+// peer wants it. The bytes are the engine's count of block bytes handed to
+// the peers' connections, before any encryption, on every transport.
 async fn serve(
     path: &P2pPath,
     handle: &Arc<ManagedTorrent>,
-    watched: &Watched,
     budget: u64,
     // When the piece was there to serve.
     started: tokio::time::Instant,
     mut stop: Pin<&mut (dyn Future<Output = ()> + Send)>,
 ) -> PeerUpload {
-    let mut wake = watched.subscribe();
+    let Some(live) = handle.live() else {
+        return PeerUpload::Failed("the torrent is not running".into());
+    };
+    let uploads = live.upload_watch();
     let mut announces = handle.tracker_status().map(|status| status.subscribe());
     let deadline = path.clock.deadline(UPLOAD_WAIT);
     loop {
-        let sent = watched.sent();
+        let sent = uploads.uploaded();
         if sent >= budget {
             break;
         }
@@ -772,7 +770,7 @@ async fn serve(
             biased;
             () = stop.as_mut() => break,
             () = deadline.wait() => break,
-            _ = wake.changed() => {}
+            () = uploads.changed_from(sent) => {}
             _ = async {
                 match announces.as_mut() {
                     Some(announces) => announces.changed().await.ok(),
@@ -781,17 +779,19 @@ async fn serve(
             } => {}
         }
     }
-    let bytes = watched.sent();
+    // Bytes sent as the wait ended count too. The stamp is read after the
+    // bytes, so it is the stamp of the last write among them or later.
+    let bytes = uploads.uploaded();
     if bytes == 0 {
         return PeerUpload::NoDemand;
     }
-    // Timed to the last byte sent, not to the end of the wait.
+    // Timed to the last write that carried block bytes, not to the end of
+    // the wait.
     PeerUpload::Measured {
         bytes,
-        elapsed: watched.last_sent().map_or(Duration::ZERO, |last| {
+        elapsed: uploads.last_uploaded_at().map_or(Duration::ZERO, |last| {
             last.saturating_duration_since(started)
         }),
-        peers: u32::try_from(watched.takers()).unwrap_or(u32::MAX),
     }
 }
 
