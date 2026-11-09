@@ -60,6 +60,11 @@ pub struct HistoryItem {
 
 #[ComplexObject]
 impl HistoryItem {
+    /// The job's tags, in tag order.
+    async fn tags(&self, ctx: &async_graphql::Context<'_>) -> async_graphql::Result<Vec<String>> {
+        crate::tags::tags_of(ctx, self.id).await
+    }
+
     /// The files Weaver gave a name other than their full one, each with its
     /// full name. Empty when every file carries its full name.
     async fn full_file_names(&self) -> Vec<FullFileName> {
@@ -184,6 +189,9 @@ pub struct HistoryPageInput {
     /// with no category at all, which is how "uncategorised" is asked for
     /// without a second field.
     pub categories: Option<Vec<String>>,
+    /// Keep only rows whose job carries this tag; the empty string keeps rows
+    /// whose job carries none.
+    pub tag: Option<String>,
     pub sort_field: Option<HistorySortField>,
     pub sort_direction: Option<HistorySortDirection>,
     /// Keep only rows that finished at or after this epoch second.

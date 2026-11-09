@@ -238,6 +238,15 @@ export function AddNzbDialog({
               onChange={upload.setCategory}
             />
           </FormRow>
+          <FormRow label={t("next.tags.title")}>
+            <TextField
+              label={t("next.tags.title")}
+              value={upload.tags}
+              onChange={upload.setTags}
+              placeholder={t("next.tags.placeholder")}
+              className="w-[268px] max-w-full"
+            />
+          </FormRow>
           <FormRow label={t("table.priority")}>
             <Select
               label={t("table.priority")}

@@ -297,6 +297,7 @@ impl RssService {
             upload_limit: None,
             download_limit: None,
             placement: Default::default(),
+            tags: Vec::new(),
         };
         match torrents.add(request).await {
             Ok(job_id) => Ok(job_id.0),

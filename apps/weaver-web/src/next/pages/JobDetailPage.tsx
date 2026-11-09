@@ -44,6 +44,7 @@ import { ConfirmDialog } from "../components/ConfirmDialog";
 import { ArchivePassword, ArchivePasswordDialog } from "../components/ArchivePassword";
 import { DangerButton, SecondaryButton } from "../components/controls";
 import { Icon } from "../components/icons";
+import { TagEditor } from "../components/Tags";
 import { PhaseBars, useJobProgress } from "../components/PhaseBars";
 import { GridRow } from "../components/rows";
 import { Waterfall } from "../components/Waterfall";
@@ -903,6 +904,11 @@ function JobDetailContent() {
               variant="stacked"
               label={t("table.category")}
               value={job.category || t("next.categories.uncategorised")}
+            />
+            <Field
+              variant="stacked"
+              label={t("next.tags.title")}
+              value={<TagEditor jobId={job.id} tags={job.tags ?? []} />}
             />
             {job.metadata.map((entry) => (
               <Field

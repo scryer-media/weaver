@@ -13,6 +13,7 @@ use std::collections::HashMap;
 
 use weaver_server_core::pipeline::queue::QueueInner;
 use weaver_server_core::pipeline::queue::paging::JobView;
+use weaver_server_core::tags::TagSnapshot;
 use weaver_server_core::{JobId, JobInfo, SharedPipelineState};
 
 use super::types::{
@@ -405,6 +406,10 @@ pub(crate) struct QueueSelection<'a> {
     states: Option<&'a [QueueItemState]>,
     priorities: Option<&'a [QueuePriority]>,
     categories: Option<&'a [String]>,
+    // A tag the job carries, the empty one naming jobs with none, read
+    // against `tags`. With no tags given, no job passes a tag.
+    tag: Option<&'a str>,
+    tags: Option<&'a TagSnapshot>,
 }
 
 fn non_empty<T>(values: Option<&Vec<T>>) -> Option<&[T]> {
@@ -421,6 +426,7 @@ impl<'a> QueueSelection<'a> {
             input.states.as_ref(),
             input.priorities.as_ref(),
             input.categories.as_ref(),
+            input.tag.as_deref(),
         )
     }
 
@@ -431,6 +437,7 @@ impl<'a> QueueSelection<'a> {
             input.states.as_ref(),
             input.priorities.as_ref(),
             input.categories.as_ref(),
+            input.tag.as_deref(),
         )
     }
 
@@ -440,6 +447,7 @@ impl<'a> QueueSelection<'a> {
         states: Option<&'a Vec<QueueItemState>>,
         priorities: Option<&'a Vec<QueuePriority>>,
         categories: Option<&'a Vec<String>>,
+        tag: Option<&'a str>,
     ) -> Self {
         Self {
             search: search.and_then(SearchQuery::parse),
@@ -447,17 +455,26 @@ impl<'a> QueueSelection<'a> {
             states: non_empty(states),
             priorities: non_empty(priorities),
             categories: non_empty(categories),
+            tag,
+            tags: None,
         }
     }
 
+    /// The tags a tag filter reads.
+    pub(crate) fn tagged(mut self, tags: Option<&'a TagSnapshot>) -> Self {
+        self.tags = tags;
+        self
+    }
+
     /// Whether the selection keeps every job: no search, protocol, state,
-    /// priority or category filter.
+    /// priority, category or tag filter.
     pub(crate) fn is_unfiltered(&self) -> bool {
         self.search.is_none()
             && self.protocol.is_none()
             && self.states.is_none()
             && self.priorities.is_none()
             && self.categories.is_none()
+            && self.tag.is_none()
     }
 
     pub(crate) fn needs(&self, sort: Option<QueueSortField>) -> WalkNeeds {
@@ -466,11 +483,16 @@ impl<'a> QueueSelection<'a> {
         }
     }
 
-    // Search and priorities: the stage category counts are taken after.
+    // Search, priorities and tag: the stage category counts are taken after.
     fn matches_search(&self, row: &WalkedRow) -> bool {
         if self
             .priorities
             .is_some_and(|priorities| !priorities.contains(&row.priority))
+        {
+            return false;
+        }
+        if let Some(tag) = self.tag
+            && !self.tags.is_some_and(|tags| tags.passes(row.id, tag))
         {
             return false;
         }
@@ -593,8 +615,13 @@ pub(crate) struct PageWants {
 }
 
 impl PagePlan {
-    pub(crate) fn plan(walk: &QueueWalk, input: &QueuePageInput, wants: PageWants) -> Self {
-        let selection = QueueSelection::of_page(input);
+    pub(crate) fn plan(
+        walk: &QueueWalk,
+        input: &QueuePageInput,
+        wants: PageWants,
+        tags: Option<&TagSnapshot>,
+    ) -> Self {
+        let selection = QueueSelection::of_page(input).tagged(tags);
 
         // Everything a page counts follows from three nested stages: search
         // (with priorities), then categories and protocol (each counted under
@@ -919,11 +946,12 @@ impl PageRead {
         state: &SharedPipelineState,
         input: &QueuePageInput,
         wants: PageWants,
+        tags: Option<&TagSnapshot>,
     ) -> Self {
         let needs = QueueSelection::of_page(input).needs(input.sort_field);
         state.read_queue(|inner| {
             let walk = QueueWalk::of(inner, needs);
-            let plan = PagePlan::plan(&walk, input, wants);
+            let plan = PagePlan::plan(&walk, input, wants, tags);
             let rows = plan
                 .ids
                 .iter()
@@ -1102,6 +1130,7 @@ mod tests {
             states: None,
             priorities: None,
             categories: None,
+            tag: None,
             sort_field: None,
             sort_direction: None,
         }
@@ -1130,13 +1159,13 @@ mod tests {
         let walk = QueueWalk::read(&state, WalkNeeds::default());
         assert_eq!(walk.rows.len(), 1_200);
 
-        let first = PagePlan::plan(&walk, &page_input(0, 500), ROWS);
+        let first = PagePlan::plan(&walk, &page_input(0, 500), ROWS, None);
         assert_eq!(first.total_count, 1_200);
         let mut expected = vec![700, 900];
         expected.extend((1..=498).collect::<Vec<_>>());
         assert_eq!(ids(&first), expected);
 
-        let last = PagePlan::plan(&walk, &page_input(2, 500), ROWS);
+        let last = PagePlan::plan(&walk, &page_input(2, 500), ROWS, None);
         let expected: Vec<u64> = (1_001..=1_200).collect();
         assert_eq!(ids(&last), expected);
 
@@ -1182,7 +1211,7 @@ mod tests {
         input.sort_direction = Some(QueueSortDirection::Desc);
         let selection = QueueSelection::of_page(&input);
         let walk = QueueWalk::read(&state, selection.needs(input.sort_field));
-        let plan = PagePlan::plan(&walk, &input, ROWS);
+        let plan = PagePlan::plan(&walk, &input, ROWS, None);
 
         // Each word matches anywhere in the name, as LIKE '%0001%' does:
         // "show 0001" finds Show.00001 and Show.00010..=00019.
@@ -1241,7 +1270,10 @@ mod tests {
             &state,
             QueueSelection::of_page(&input).needs(input.sort_field),
         );
-        assert_eq!(ids(&PagePlan::plan(&walk, &input, ROWS)), vec![1, 2, 3]);
+        assert_eq!(
+            ids(&PagePlan::plan(&walk, &input, ROWS, None)),
+            vec![1, 2, 3]
+        );
     }
 
     #[test]
@@ -1291,7 +1323,7 @@ mod tests {
             .map(|id| job(id, JobStatus::Queued, None, 1))
             .collect();
         let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
-        let read = PageRead::read(&state, &page_input(1, 20), ROWS);
+        let read = PageRead::read(&state, &page_input(1, 20), ROWS, None);
         assert_eq!(ids(&read.plan), (21..=40).collect::<Vec<_>>());
         assert_eq!(
             read.rows.iter().map(|job| job.job_id.0).collect::<Vec<_>>(),
@@ -1320,16 +1352,16 @@ mod tests {
             .collect();
         let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
         let walk = QueueWalk::read(&state, WalkNeeds::default());
-        let first = PagePlan::plan(&walk, &page_input(0, 4), ROWS);
+        let first = PagePlan::plan(&walk, &page_input(0, 4), ROWS, None);
         assert_eq!(ids(&first), vec![1_800, 1_500, 1_600, 1]);
-        let last = PagePlan::plan(&walk, &page_input(499, 4), ROWS);
+        let last = PagePlan::plan(&walk, &page_input(499, 4), ROWS, None);
         assert_eq!(ids(&last), vec![1_998, 1_999, 2_000, 1_700]);
 
         // A sort keeps the sections and orders by its field within each.
         let mut by_size = page_input(0, 3);
         by_size.sort_field = Some(QueueSortField::Size);
         assert_eq!(
-            ids(&PagePlan::plan(&walk, &by_size, ROWS)),
+            ids(&PagePlan::plan(&walk, &by_size, ROWS, None)),
             vec![1_500, 1_800, 1_600]
         );
     }
@@ -1354,7 +1386,7 @@ mod tests {
             &state,
             QueueSelection::of_page(&input).needs(input.sort_field),
         );
-        let ordered: Vec<&str> = ids(&PagePlan::plan(&walk, &input, ROWS))
+        let ordered: Vec<&str> = ids(&PagePlan::plan(&walk, &input, ROWS, None))
             .iter()
             .map(|id| names[*id as usize - 1])
             .collect();
@@ -1383,7 +1415,7 @@ mod tests {
             .collect();
         let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
         let walk = QueueWalk::read(&state, WalkNeeds::default());
-        let plan = PagePlan::plan(&walk, &page_input(0, 6), ROWS);
+        let plan = PagePlan::plan(&walk, &page_input(0, 6), ROWS, None);
         let through: Vec<(u64, u64)> = plan
             .eta_through
             .iter()
@@ -1418,7 +1450,7 @@ mod tests {
         let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
         let walk = QueueWalk::read(&state, WalkNeeds::default());
         let before = crate::alloc_probe::allocations();
-        let plan = PagePlan::plan(&walk, &page_input(0, 1), TOTALS);
+        let plan = PagePlan::plan(&walk, &page_input(0, 1), TOTALS, None);
         let made = crate::alloc_probe::allocations() - before;
         assert_eq!(plan.total_count as u64, rows);
         assert!(plan.ids.is_empty() && plan.eta_through.is_empty());
@@ -1440,7 +1472,7 @@ mod tests {
         let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
         let walk = QueueWalk::read(&state, WalkNeeds::default());
         let before = crate::alloc_probe::allocations();
-        let plan = PagePlan::plan(&walk, &page_input(3, 50), ROWS);
+        let plan = PagePlan::plan(&walk, &page_input(3, 50), ROWS, None);
         let made = crate::alloc_probe::allocations() - before;
         assert_eq!(plan.ids.len(), 50);
         made
@@ -1495,7 +1527,7 @@ mod tests {
         queued.remaining_bytes = 150;
         let state = SharedPipelineState::new(PipelineMetrics::new(), vec![downloading, queued]);
         let walk = QueueWalk::read(&state, WalkNeeds::default());
-        let plan = PagePlan::plan(&walk, &page_input(0, 10), ROWS);
+        let plan = PagePlan::plan(&walk, &page_input(0, 10), ROWS, None);
 
         assert_eq!(plan.remaining_bytes, 150);
         assert_eq!(plan.eta_total_bytes, 1_300);

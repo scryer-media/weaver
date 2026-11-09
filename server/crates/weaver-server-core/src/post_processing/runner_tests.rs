@@ -203,6 +203,7 @@ fn nzbget_variables_reach_a_script_alongside_the_positional_arguments() {
         temp_dir: Some(PathBuf::from("/tmp")),
         app_dir: Some(PathBuf::from("/opt/weaver")),
         previous_script_status: NzbgetScriptStatus::Success,
+        tags: vec!["hd".to_owned(), "TV".to_owned()],
         ..CompatibilityFacts::default()
     };
     let (args, env) = contract(&request);
@@ -218,6 +219,7 @@ fn nzbget_variables_reach_a_script_alongside_the_positional_arguments() {
     assert_eq!(env.get("NZBPP_QUEUEDFILE").unwrap(), "example.nzb");
     assert_eq!(env.get("NZBPP_FINALDIR").unwrap(), "/complete/job");
     assert_eq!(env.get("NZBPP_CATEGORY").unwrap(), "movies");
+    assert_eq!(env.get("NZBPP_TAGS").unwrap(), "hd,TV");
     assert_eq!(env.get("NZBPP_STATUS").unwrap(), "FAILURE/UNPACK");
     assert_eq!(env.get("NZBPP_TOTALSTATUS").unwrap(), "FAILURE");
     assert_eq!(env.get("NZBPP_SCRIPTSTATUS").unwrap(), "SUCCESS");

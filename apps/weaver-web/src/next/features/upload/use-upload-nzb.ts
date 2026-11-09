@@ -6,6 +6,7 @@ import { useQuery } from "urql";
 import { authHeaders, fetchWithSessionRetry } from "@/graphql/client";
 import { CATEGORIES_QUERY } from "@/graphql/queries";
 import { useTranslate } from "@/lib/context/translate-context";
+import { splitTags } from "@/next/data/tags";
 import { shouldCloseAfterSubmit } from "@/next/features/upload/close-decision";
 import {
   duplicateSubmissionInput,
@@ -205,6 +206,7 @@ async function submitStagedNzbs(input: {
   stagedUploadIds: string[];
   password: string;
   category: string;
+  tags: string[];
   priority: string;
   paused: boolean;
   duplicate: ReturnType<typeof duplicateSubmissionInput>;
@@ -226,6 +228,7 @@ async function submitStagedNzbs(input: {
             input.category.trim() && input.category !== NO_CATEGORY_VALUE
               ? input.category
               : null,
+          tags: input.tags,
           attributes: [{ key: "priority", value: input.priority }],
           paused: input.paused,
           ...input.duplicate,
@@ -259,6 +262,7 @@ async function submitOne(input: {
   text?: string;
   file?: File;
   category: string;
+  tags: string[];
   paused: boolean;
   password: string;
   /** Whether a torrent's archives are extracted; null inherits. */
@@ -272,6 +276,7 @@ async function submitOne(input: {
         upload: null,
         category:
           input.category.trim() && input.category !== NO_CATEGORY_VALUE ? input.category : null,
+        tags: input.tags,
         paused: input.paused,
         password: input.password.trim() || null,
         unpack: input.unpack,
@@ -350,6 +355,7 @@ export function useUploadNzb(options?: {
   const [entries, setEntries] = useState<UploadNzbEntry[]>([]);
   const [password, setPassword] = useState("");
   const [category, setCategory] = useState(NO_CATEGORY_VALUE);
+  const [tags, setTags] = useState("");
   const [priority, setPriority] = useState("NORMAL");
   const [paused, setPaused] = useState(false);
   const [unpack, setUnpack] = useState<boolean | null>(null);
@@ -540,6 +546,7 @@ export function useUploadNzb(options?: {
       replaceEntries([]);
       setPassword("");
       setCategory(NO_CATEGORY_VALUE);
+      setTags("");
       setPriority("NORMAL");
       setPaused(false);
       setUnpack(null);
@@ -681,7 +688,7 @@ export function useUploadNzb(options?: {
     );
 
     // The text and each torrent go on their own; a refusal stays on its row for another try.
-    const shared = { category, paused, password, unpack };
+    const shared = { category, tags: splitTags(tags), paused, password, unpack };
     let anyAccepted = false;
     const textOutcome: UploadNzbEntryStatus[] = [];
     if (sentText !== "") {
@@ -734,6 +741,7 @@ export function useUploadNzb(options?: {
           .filter((value): value is string => !!value),
         password,
         category,
+        tags: splitTags(tags),
         priority,
         paused,
         duplicate: duplicateSubmissionInput({
@@ -852,6 +860,7 @@ export function useUploadNzb(options?: {
     priority,
     setEntriesState,
     t,
+    tags,
     text,
     unpack,
   ]);
@@ -886,6 +895,8 @@ export function useUploadNzb(options?: {
     duplicateScore,
     category,
     setCategory,
+    tags,
+    setTags,
     setDragging,
     setPassword,
     setPriority,

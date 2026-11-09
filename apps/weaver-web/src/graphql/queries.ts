@@ -37,6 +37,7 @@ const FACADE_QUEUE_ITEM_FIELDS = `
     health
     hasPassword
     category
+    tags
     metadata: attributes {
       key
       value
@@ -75,6 +76,7 @@ const QUEUE_TABLE_ITEM_FIELDS = `
     health
     hasPassword
     category
+    tags
     metadata: attributes {
       key
       value
@@ -102,6 +104,7 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
     health
     hasPassword
     category
+    tags
     outputDir
     createdAt
     completedAt
@@ -3029,5 +3032,33 @@ export const SET_UNACCEPTABLE_EXTENSIONS_MUTATION = gql`
 export const VALIDATED_ARCHIVE_PASSWORD_QUERY = gql`
   query ValidatedArchivePassword($id: Int!) {
     validatedArchivePassword(id: $id)
+  }
+`;
+
+/** Every tag made, with how many jobs carry each, queued or in history. */
+export const JOB_TAGS_QUERY = gql`
+  query JobTags {
+    jobTags {
+      name
+      count
+    }
+  }
+`;
+
+export const ADD_JOB_TAGS_MUTATION = gql`
+  mutation AddJobTags($ids: [Int!]!, $tags: [String!]!) {
+    addJobTags(ids: $ids, tags: $tags) {
+      name
+      count
+    }
+  }
+`;
+
+export const REMOVE_JOB_TAGS_MUTATION = gql`
+  mutation RemoveJobTags($ids: [Int!]!, $tags: [String!]!) {
+    removeJobTags(ids: $ids, tags: $tags) {
+      name
+      count
+    }
   }
 `;

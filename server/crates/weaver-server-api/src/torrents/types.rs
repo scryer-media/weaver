@@ -542,6 +542,8 @@ pub struct Torrent {
     /// Why its route holds it, while its state comes from that hold.
     pub route_reason: Option<TorrentRouteReasonGql>,
     pub category: Option<String>,
+    /// Its job's tags, in tag order.
+    pub tags: Vec<String>,
     pub private: bool,
     pub forced: bool,
     pub progress: f64,
@@ -663,6 +665,7 @@ impl From<TorrentView> for Torrent {
             detail: view.detail,
             route_reason: view.route_reason.map(Into::into),
             category: view.category,
+            tags: view.tags,
             private: view.private,
             forced: view.forced,
             progress: view.progress,
@@ -865,4 +868,7 @@ pub struct SubmitTorrentInput {
     pub seeding: Option<SeedingPolicyInput>,
     /// Whether its archives are extracted; absent inherits.
     pub unpack: Option<bool>,
+    /// The tags its job is added with.
+    #[graphql(default)]
+    pub tags: Vec<String>,
 }

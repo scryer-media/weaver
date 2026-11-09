@@ -163,11 +163,11 @@ impl TagSnapshot {
     /// empty tag, carries none (qBittorrent `TorrentFilter::matchTag`).
     pub fn passes(&self, job_id: JobId, tag: &str) -> bool {
         let tags = self.of(job_id);
-        match clean_tag(tag) {
-            Some(tag) => tags.contains(&tag),
-            None if tag.trim().is_empty() => tags.is_empty(),
-            None => false,
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return tags.is_empty();
         }
+        tags.iter().any(|carried| carried == tag)
     }
 }
 
@@ -263,6 +263,11 @@ async fn make_tags_tx(tx: &mut SqlTx<'_>, tags: &[String]) -> Result<(), StateEr
 }
 
 async fn put_tags_tx(tx: &mut SqlTx<'_>, ids: &[i64], tags: &[String]) -> Result<(), StateError> {
+    // A tag is made as a job takes it: put on no job, it is not made
+    // (qBittorrent `TorrentImpl::addTag`).
+    if ids.is_empty() {
+        return Ok(());
+    }
     make_tags_tx(tx, tags).await?;
     for &id in ids {
         for tag in tags {
@@ -413,6 +418,12 @@ impl Database {
             state.snapshot = Some(snapshot.clone());
         }
         Ok(snapshot)
+    }
+
+    /// The tags as last read, when nothing changed them since: read from
+    /// memory alone, never from the database.
+    pub fn cached_tag_snapshot(&self) -> Option<Arc<TagSnapshot>> {
+        self.tags.lock().snapshot.clone()
     }
 
     /// The revision of the tags: it moves on every change to them.

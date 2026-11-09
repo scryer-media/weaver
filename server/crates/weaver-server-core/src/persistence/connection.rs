@@ -720,7 +720,6 @@ pub(crate) struct DatabaseWriterExecutor {
     sql_services: DatabaseServices,
     sql_worker: DatabaseRuntimeWorker,
     job_history_cache: Arc<Mutex<JobHistoryCache>>,
-    pub(crate) tags: Arc<crate::tags::TagCache>,
 }
 
 impl DatabaseWriterExecutor {
@@ -729,7 +728,6 @@ impl DatabaseWriterExecutor {
             sql_services: db.sql_services.clone(),
             sql_worker: db.sql_worker.clone(),
             job_history_cache: db.job_history_cache.clone(),
-            tags: db.tags.clone(),
         }
     }
 

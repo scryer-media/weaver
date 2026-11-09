@@ -2701,8 +2701,7 @@ async fn postgres_reserve_next_job_id_is_unique_under_concurrency_when_configure
 
 #[tokio::test]
 async fn postgres_tags_follow_the_rules_when_configured() {
-    let Some((admin_pool, schema, target_url)) =
-        create_postgres_test_schema("postgres_tags").await
+    let Some((admin_pool, schema, target_url)) = create_postgres_test_schema("postgres_tags").await
     else {
         return;
     };

@@ -86,6 +86,7 @@ impl TorrentView {
             file_have,
             trackers,
             metadata,
+            tags,
             // The fields that move with the clock alone: the time run and
             // seeded, the averages over that time, the countdowns, the
             // seeding goal's time left, and when it was last seen complete,
@@ -161,7 +162,7 @@ impl TorrentView {
         )
             .hash(hasher);
         (route, files, sequential, first_last_piece_first, file_have).hash(hasher);
-        (trackers, metadata).hash(hasher);
+        (trackers, metadata, tags).hash(hasher);
         if parts == ViewParts::Whole {
             (active_seconds, seeding_seconds, consecutive_seeding_seconds).hash(hasher);
             (download_avg_bps, upload_avg_bps, reannounce_seconds).hash(hasher);

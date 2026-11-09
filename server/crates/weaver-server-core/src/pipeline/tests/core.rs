@@ -298,6 +298,30 @@ async fn phase_end_removes_only_the_ended_phase_snapshot() {
 }
 
 #[tokio::test]
+async fn a_submitted_nzb_takes_its_tags() {
+    let harness = TestHarness::new().await;
+    let submitted = crate::ingest::submit_nzb_bytes_with_options(
+        &harness.db,
+        &harness.handle,
+        &harness.config,
+        &sample_nzb_bytes(),
+        Some("Tagged.nzb".to_string()),
+        None,
+        None,
+        Vec::new(),
+        crate::ingest::SubmissionOptions {
+            tags: vec![" tv ".to_string(), "".to_string(), "HD".to_string()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(harness.db.job_tags(submitted.job_id).unwrap(), ["HD", "tv"]);
+
+    harness.shutdown().await;
+}
+
+#[tokio::test]
 async fn submit_nzb_persists_zstd_and_creates_active_job() {
     let harness = TestHarness::new().await;
     let nzb_bytes = sample_nzb_bytes();

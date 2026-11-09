@@ -207,6 +207,7 @@ fn request(source: AddSource) -> AddRequest {
         upload_limit: None,
         download_limit: None,
         placement: Default::default(),
+        tags: Vec::new(),
     }
 }
 
@@ -216,6 +217,39 @@ fn queue() -> SchedulerHandle {
     let state = crate::jobs::SharedPipelineState::new(crate::PipelineMetrics::new(), vec![]);
     let (event_tx, _) = tokio::sync::broadcast::channel(16);
     SchedulerHandle::new(event_tx, state)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_takes_the_tags_it_was_added_with_and_its_view_shows_them() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            tags: vec!["tv".to_owned(), "HD".to_owned()],
+            ..request(AddSource::Metainfo(plain("set", 1)))
+        })
+        .await
+        .unwrap();
+    assert_eq!(rig.db.job_tags(job_id).unwrap(), ["HD", "tv"]);
+    let before = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(before.tags, ["HD", "tv"]);
+    rig.db.add_job_tags(&[job_id], ["new"]).unwrap();
+    assert_eq!(
+        rig.service.torrents(None).await.remove(0).tags,
+        ["HD", "new", "tv"]
+    );
+    let after = rig.service.torrent(job_id).await.unwrap();
+    let steady = super::fingerprint::ViewParts::Steady;
+    let before_without = TorrentView {
+        tags: after.tags.clone(),
+        ..before.clone()
+    };
+    assert_eq!(before_without.tags, after.tags);
+    assert_ne!(
+        before.fingerprint(steady),
+        before_without.fingerprint(steady)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -493,6 +527,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         trackers: Vec::new(),
         file_have: Vec::new(),
         metadata: Vec::new(),
+        tags: Vec::new(),
         seeding_override: None,
         seeding_policy: Seeding::default(),
         seeding_levels: SeedingLevels::default(),

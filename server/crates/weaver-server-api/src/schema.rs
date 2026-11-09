@@ -67,6 +67,7 @@ pub struct QueryRoot(
     settings_query::SettingsQuery,
     system_query::SystemQuery,
     crate::torrents::TorrentsQuery,
+    crate::tags::TagsQuery,
 );
 
 #[derive(Default, MergedObject)]
@@ -82,6 +83,7 @@ struct ConnectivityMutations(
     auth_mutation::AuthMutation,
     rss_mutation::RssMutation,
     servers_mutation::ServersMutation,
+    crate::tags::TagsMutation,
 );
 
 #[derive(Default, MergedObject)]

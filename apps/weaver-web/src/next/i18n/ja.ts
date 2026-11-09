@@ -66,6 +66,12 @@ export const nextJa: LocaleDictionary = {
   "next.provider.state.disabled": "無効",
   "next.categories.all": "すべてのカテゴリ",
   "next.categories.uncategorised": "カテゴリなし",
+  "next.tags.title": "タグ",
+  "next.tags.all": "すべてのタグ",
+  "next.tags.none": "タグなし",
+  "next.tags.add": "追加",
+  "next.tags.remove": "{{tag}} を削除",
+  "next.tags.placeholder": "tv, hd",
 
   // Error page
   "next.errorPage.notFound": "ページが見つかりません",

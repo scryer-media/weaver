@@ -110,6 +110,9 @@ pub struct CompatibilityFacts {
     pub temp_dir: Option<PathBuf>,
     pub app_dir: Option<PathBuf>,
     pub previous_script_status: NzbgetScriptStatus,
+    // The job's tags, read as the script starts.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 // Which run this is, as the script itself is told.
@@ -898,6 +901,8 @@ fn adapter_environment_and_args(
         "NZBPP_CATEGORY",
         context.category.as_deref().unwrap_or_default(),
     )?;
+    // The job's tags, comma separated: a tag never holds a comma.
+    insert_env(env, "NZBPP_TAGS", &context.compatibility.tags.join(","))?;
     insert_env(env, "NZBPP_STATUS", status)?;
     insert_env(env, "NZBPP_TOTALSTATUS", total_status)?;
     insert_env(

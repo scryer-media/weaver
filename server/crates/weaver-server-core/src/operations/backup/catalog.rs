@@ -71,6 +71,10 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("job_history", Export, RequireEmpty),
     table!("job_history_attributes", Export, RequireEmpty),
     table!("job_events", Export, RequireEmpty),
+    // A history job keeps its tags across a move; a queued job does not
+    // come back, so neither do its tags. Every tag made comes back.
+    table!("job_tags", Export, RequireEmpty),
+    table!("tags", Export, Replace),
     // Execution queues and output caches cannot be resumed from a logical
     // configuration backup. History keeps its result excerpts.
     table!("script_event_queue", ResetOnRestore, RequireEmpty),
@@ -151,7 +155,9 @@ pub(crate) fn export_query(table: &str, columns: &[String]) -> String {
         .join(", ");
     let predicate = match table {
         "settings" => "key <> 'nzbget.scheduled_resume_at'",
-        "job_history_attributes" | "job_events" => "job_id IN (SELECT job_id FROM job_history)",
+        "job_history_attributes" | "job_events" | "job_tags" => {
+            "job_id IN (SELECT job_id FROM job_history)"
+        }
         "duplicate_job_snapshots" => "lifecycle IN ('succeeded', 'failed', 'cancelled')",
         "job_fingerprints" | "duplicate_admission_claims" | "submission_idempotency" => {
             "job_id IN (

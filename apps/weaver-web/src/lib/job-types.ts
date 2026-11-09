@@ -91,6 +91,8 @@ export interface JobData {
   health: number;
   hasPassword: boolean;
   category: string | null;
+  /** The job's tags, in tag order. */
+  tags?: string[];
   createdAt?: number | null;
   completedAt?: number | null;
   error?: string | null;

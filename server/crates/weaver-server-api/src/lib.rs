@@ -18,6 +18,7 @@ pub mod servers;
 pub mod settings;
 pub mod speed_test;
 pub mod system;
+pub mod tags;
 pub mod torrents;
 
 // Allocation counter for the tests that assert a page push allocates by its

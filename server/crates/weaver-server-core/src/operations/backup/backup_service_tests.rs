@@ -1331,6 +1331,69 @@ async fn logical_restore_persists_selected_paths_when_source_used_defaults() {
 }
 
 #[tokio::test]
+async fn a_restore_brings_back_history_tags_and_every_tag_made() {
+    let source_db = open_temp_db();
+    populate_source_db(&source_db);
+    let history = crate::jobs::JobId(41);
+    source_db.add_job_tags(&[history], ["kept"]).unwrap();
+    // A queued job does not come back, so neither do its tags.
+    source_db
+        .tag_new_job(crate::jobs::JobId(500), ["queued"])
+        .unwrap();
+    source_db.create_tags(["spare"]).unwrap();
+    let (source_service, _, _) = build_service(source_db, sample_config());
+    let artifact = source_service
+        .create_backup(Some("tag-secret".into()))
+        .await
+        .unwrap();
+
+    let target_root = tempfile::tempdir().unwrap();
+    let target_db = open_temp_db();
+    let mut target_config = sample_config();
+    target_config.data_dir = target_root.path().to_string_lossy().into_owned();
+    let (target_service, _, _) = build_service(target_db.clone(), target_config);
+    target_service
+        .restore_backup(
+            &artifact.path,
+            Some("tag-secret".into()),
+            RestoreOptions {
+                data_dir: target_root
+                    .path()
+                    .join("restored")
+                    .to_string_lossy()
+                    .into_owned(),
+                intermediate_dir: None,
+                complete_dir: None,
+                category_remaps: vec![CategoryRemapInput {
+                    category_name: "movies".into(),
+                    new_dest_dir: target_root
+                        .path()
+                        .join("movies")
+                        .to_string_lossy()
+                        .into_owned(),
+                }],
+            },
+        )
+        .await
+        .unwrap();
+    drop(target_service);
+
+    let (restored_db, outcome) = apply_pending_restore(target_db, target_root.path()).unwrap();
+    assert!(outcome.is_some());
+    assert_eq!(restored_db.job_tags(history).unwrap(), ["kept"]);
+    assert!(
+        restored_db
+            .job_tags(crate::jobs::JobId(500))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        restored_db.tag_snapshot().unwrap().made(),
+        ["kept", "queued", "spare"]
+    );
+}
+
+#[tokio::test]
 async fn staged_restore_rewrites_paths_without_mutating_the_live_runtime() {
     let source_db = open_temp_db();
     populate_source_db(&source_db);

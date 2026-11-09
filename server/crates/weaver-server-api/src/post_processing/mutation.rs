@@ -548,6 +548,7 @@ impl PostProcessingMutation {
                     .ok()
                     .and_then(|path| path.parent().map(PathBuf::from)),
                 previous_script_status: Default::default(),
+                tags: Vec::new(),
                 parameters: metadata,
                 marked_bad: false,
                 final_directory_override: None,

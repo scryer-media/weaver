@@ -1850,6 +1850,7 @@ impl Pipeline {
                     .ok()
                     .and_then(|path| path.parent().map(std::path::PathBuf::from)),
                 previous_script_status: Default::default(),
+                tags: Vec::new(),
                 parameters: state.spec.metadata.clone(),
                 marked_bad: false,
                 final_directory_override: None,

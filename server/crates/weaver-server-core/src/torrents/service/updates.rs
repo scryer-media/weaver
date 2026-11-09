@@ -32,6 +32,8 @@ pub struct TorrentUpdates {
     job_id: Option<JobId>,
     beat: Interval,
     queue: Option<watch::Receiver<u64>>,
+    // The tags' revision: a view shows its job's tags.
+    tags: Option<watch::Receiver<u64>>,
     // Each torrent last given, by its fingerprint.
     last: Option<HashMap<JobId, u64>>,
 }
@@ -61,6 +63,7 @@ impl TorrentService {
             queue: self
                 .queue()
                 .map(|queue| queue.state().subscribe_job_changes()),
+            tags: Some(self.inner.db.subscribe_tag_changes()),
             last: None,
         }
     }
@@ -95,8 +98,8 @@ impl TorrentUpdates {
             // What is waited on is taken before the views are read, so a
             // move after the read wakes the wait.
             let mut tables = self.service.announce_tables(self.job_id).await;
-            if let Some(queue) = &mut self.queue {
-                queue.borrow_and_update();
+            for changes in [&mut self.queue, &mut self.tags].into_iter().flatten() {
+                changes.borrow_and_update();
             }
             let views = self.read().await;
             let parts = self.parts();
@@ -106,6 +109,7 @@ impl TorrentUpdates {
             tokio::select! {
                 () = moved(&mut tables) => {}
                 () = published(&mut self.queue) => {}
+                () = published(&mut self.tags) => {}
                 _ = self.beat.tick() => {}
             }
         }
@@ -184,8 +188,8 @@ async fn moved(tables: &mut [watch::Receiver<Vec<TrackerAnnounce>>]) {
     .await
 }
 
-// Once the service publishes its torrents to the queue. Never, once the
-// queue is gone or when there is none.
+// Once `changes` moves: the service publishing its torrents to the queue, or
+// the tags changing. Never, once its sender is gone or when there is none.
 async fn published(queue: &mut Option<watch::Receiver<u64>>) {
     let gone = match queue {
         Some(changes) => changes.changed().await.is_err(),

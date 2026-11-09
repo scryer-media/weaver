@@ -695,6 +695,7 @@ fn held_torrent(
         }],
         file_have: Vec::new(),
         metadata: Vec::new(),
+        tags: Vec::new(),
         seeding_override: None,
         seeding_policy: Seeding {
             ratio_goal: Some(2.0),

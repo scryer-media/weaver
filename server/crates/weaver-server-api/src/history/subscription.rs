@@ -71,8 +71,12 @@ impl HistorySubscription {
         ))
         .map(|_| JobDetailTrigger::Heartbeat);
         let initial = tokio_stream::once(JobDetailTrigger::Initial);
+        // The first value is the tags as they are now, which the initial
+        // read already shows.
+        let tags = tokio_stream::wrappers::WatchStream::from_changes(db.subscribe_tag_changes())
+            .map(|_| JobDetailTrigger::Tags);
         let triggers = throttle(
-            initial.merge(event_stream).merge(heartbeat),
+            initial.merge(event_stream).merge(tags).merge(heartbeat),
             JOB_DETAIL_THROTTLE,
         );
 
@@ -167,6 +171,8 @@ fn raw_pipeline_event_stream(handle: SchedulerHandle) -> impl Stream<Item = Pipe
 enum JobDetailTrigger {
     Initial,
     Event,
+    // The tags changed; the job may show other ones.
+    Tags,
     Heartbeat,
 }
 

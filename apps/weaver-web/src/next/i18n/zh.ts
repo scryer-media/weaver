@@ -66,6 +66,12 @@ export const nextZh: LocaleDictionary = {
   "next.provider.state.disabled": "已禁用",
   "next.categories.all": "全部分类",
   "next.categories.uncategorised": "无分类",
+  "next.tags.title": "标签",
+  "next.tags.all": "所有标签",
+  "next.tags.none": "无标签",
+  "next.tags.add": "添加",
+  "next.tags.remove": "移除 {{tag}}",
+  "next.tags.placeholder": "tv, hd",
 
   // Error page
   "next.errorPage.notFound": "页面未找到",

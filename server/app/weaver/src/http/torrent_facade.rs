@@ -41,6 +41,7 @@ use weaver_server_core::settings::{
     Leaf, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig, TorrentEncryption,
     TorrentLimit, TorrentPeerProtocol,
 };
+use weaver_server_core::tags::{TagSnapshot, split_tags};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::fingerprint::ViewParts;
 use weaver_server_core::torrents::service::{
@@ -1016,10 +1017,12 @@ async fn torrents(
         "addTrackers" => ctx.api().without_result(add_trackers(ctx, params).await),
         "editTracker" => ctx.api().edited_tracker(edit_tracker(ctx, params).await),
         "removeTrackers" => ctx.api().without_result(remove_trackers(ctx, params).await),
-        // Tags are not kept.
-        "addTags" | "removeTags" | "createTags" | "deleteTags" => ok(),
-        "setTags" => ctx.api().no_result(),
-        "tags" => axum::Json(json!([])).into_response(),
+        "addTags" | "setTags" | "removeTags" => tag_torrents(ctx, action, params).await,
+        "createTags" | "deleteTags" => make_tags(ctx, action, params).await,
+        "tags" => match tag_snapshot(ctx).await {
+            Ok(tags) => axum::Json(json!(tags.made())).into_response(),
+            Err(error) => internal(error),
+        },
         "addWebSeeds" | "editWebSeed" | "removeWebSeeds" => unavailable("Web seeds"),
         "addPeers" => unavailable("Adding peers"),
         "pieceHashes" | "pieceStates" | "pieceAvailability" => unavailable("Piece detail"),
@@ -1375,7 +1378,8 @@ fn steady_fields(view: &TorrentView, scope: CallerScope) -> Vec<(&'static str, V
         ("seq_dl", json!(view.sequential)),
         ("f_l_piece_prio", json!(view.first_last_piece_first)),
         ("category", json!(view.category.clone().unwrap_or_default())),
-        ("tags", json!("")),
+        // qBittorrent `serialize_torrent.cpp` joins them with ", ".
+        ("tags", json!(view.tags.join(", "))),
         ("super_seeding", json!(false)),
         ("force_start", json!(view.forced)),
         ("save_path", json!(save_path)),
@@ -1519,14 +1523,20 @@ async fn torrents_info(
         .collect();
     let filter = params.get("filter").unwrap_or_default();
     let private = params.flag_value("private");
-    // Tags are not kept: every torrent is untagged.
-    let tagged = params.get("tag").is_some_and(|tag| !tag.trim().is_empty());
+    // A tag the torrent carries; the empty tag passes the untagged ones
+    // (qBittorrent `TorrentFilter::matchTag`).
+    let tag = params.get("tag").map(str::trim);
     let with_files = params.flag("includeFiles").unwrap_or(false);
     let with_trackers = params.flag("includeTrackers").unwrap_or(false);
     let mut list: Vec<Value> = Vec::new();
     for view in ctx.views().await {
-        let passes = !tagged
-            && wanted(&view, filter)
+        let passes = tag.is_none_or(|tag| {
+            if tag.is_empty() {
+                view.tags.is_empty()
+            } else {
+                view.tags.iter().any(|carried| carried == tag)
+            }
+        }) && wanted(&view, filter)
             && (hashes.is_empty()
                 || hashes
                     .iter()
@@ -2234,6 +2244,8 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
     // Off unless asked, as qBittorrent's `isAddTorrentToQueueTop` is.
     let to_top = params.flag_value("addToTopOfQueue").unwrap_or(false);
     let placement = placement(&params);
+    // A comma list; empty parts are skipped (qBittorrent `torrents/add`).
+    let tags = params.get("tags").map(split_tags).unwrap_or_default();
     let mut ids = Vec::new();
     let mut failed = 0usize;
     let mut refusal: Option<String> = None;
@@ -2251,6 +2263,7 @@ async fn add(ctx: &TorrentFacadeContext, params: Params) -> Response {
                     upload_limit,
                     download_limit,
                     placement: placement.clone(),
+                    tags: tags.clone(),
                 })
                 .await
                 .map_err(|error| match error {
@@ -2483,6 +2496,95 @@ async fn delete(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         ok()
     } else {
         text(StatusCode::CONFLICT, refused.join("\n"))
+    }
+}
+
+// The tags as stored: from memory when nothing changed them since the last
+// read, else read off the async workers.
+async fn tag_snapshot(
+    ctx: &TorrentFacadeContext,
+) -> Result<Arc<TagSnapshot>, weaver_server_core::StateError> {
+    if let Some(tags) = ctx.inner.db.cached_tag_snapshot() {
+        return Ok(tags);
+    }
+    let db = ctx.inner.db.clone();
+    tokio::task::spawn_blocking(move || db.tag_snapshot())
+        .await
+        .map_err(|error| weaver_server_core::StateError::Database(error.to_string()))?
+}
+
+// One change to the tags, run off the async workers.
+async fn change_tags(
+    ctx: &TorrentFacadeContext,
+    change: impl FnOnce(&Database) -> Result<(), weaver_server_core::StateError> + Send + 'static,
+) -> Result<(), Response> {
+    let db = ctx.inner.db.clone();
+    match tokio::task::spawn_blocking(move || change(&db)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(internal(error)),
+        Err(error) => Err(internal(error)),
+    }
+}
+
+// qBittorrent `addTagsAction`, `setTagsAction` and `removeTagsAction` on the
+// torrents `hashes` names, unknown ones skipped. Adding or setting a tag
+// makes it; removing no tag takes every tag off.
+async fn tag_torrents(ctx: &TorrentFacadeContext, action: &str, params: &Params) -> Response {
+    let named = params.get("tags").unwrap_or_default();
+    let tags = split_tags(named);
+    let any_named = named.split(',').any(|part| !part.is_empty());
+    let jobs: Vec<JobId> = ctx
+        .targets(params)
+        .await
+        .iter()
+        .map(|view| view.job_id)
+        .collect();
+    let changed = match action {
+        "addTags" => {
+            change_tags(ctx, move |db| {
+                db.add_job_tags(&jobs, tags.iter().map(String::as_str))
+            })
+            .await
+        }
+        "setTags" => {
+            change_tags(ctx, move |db| {
+                db.set_job_tags(&jobs, tags.iter().map(String::as_str))
+            })
+            .await
+        }
+        // A list that names only tags that are not tags removes nothing.
+        _ if any_named && tags.is_empty() => Ok(()),
+        _ => {
+            change_tags(ctx, move |db| {
+                db.remove_job_tags(&jobs, tags.iter().map(String::as_str))
+            })
+            .await
+        }
+    };
+    match changed {
+        Ok(()) if action == "setTags" => ctx.api().no_result(),
+        Ok(()) => ok(),
+        Err(response) => response,
+    }
+}
+
+// qBittorrent `createTagsAction` and `deleteTagsAction`.
+async fn make_tags(ctx: &TorrentFacadeContext, action: &str, params: &Params) -> Response {
+    let tags = split_tags(params.get("tags").unwrap_or_default());
+    let changed = if action == "createTags" {
+        change_tags(ctx, move |db| {
+            db.create_tags(tags.iter().map(String::as_str))
+        })
+        .await
+    } else {
+        change_tags(ctx, move |db| {
+            db.delete_tags(tags.iter().map(String::as_str))
+        })
+        .await
+    };
+    match changed {
+        Ok(()) => ok(),
+        Err(response) => response,
     }
 }
 
@@ -3119,6 +3221,10 @@ async fn maindata(
         .and_then(|rid| rid.trim().parse::<u64>().ok())
         .unwrap_or(0);
     let views = ctx.views().await;
+    let tags = match tag_snapshot(ctx).await {
+        Ok(tags) => tags.made().to_vec(),
+        Err(error) => return internal(error),
+    };
     let config = ctx.inner.config.read().await;
     // The view's fingerprint leaves out the fields that move with the clock
     // alone, which `clock_fields` reads; whether the caller may control
@@ -3208,7 +3314,7 @@ async fn maindata(
                 .collect(),
             _ => Vec::new(),
         },
-        tags: Vec::new(),
+        tags,
         server_state: match server_state {
             Value::Object(state) => state,
             _ => Map::new(),

@@ -12,6 +12,7 @@ import { CheckBox } from "@/next/components/controls";
 import { Icon, type IconName } from "@/next/components/icons";
 import { PhaseBars, useJobProgress } from "@/next/components/PhaseBars";
 import { ListRow, ValueCell } from "@/next/components/rows";
+import { TagChips } from "@/next/components/Tags";
 import { EM_DASH, formatRate, formatSize } from "@/next/data/format";
 
 import { statusColor, WV } from "@/next/data/palette";
@@ -101,6 +102,7 @@ export const DownloadRow = memo(function DownloadRow({
           <span className="max-w-full min-w-0 flex-[1_1_auto] text-[13.5px] font-medium tracking-[-0.005em] [overflow-wrap:anywhere] text-wv-fg">
             {name}
           </span>
+          <TagChips tags={job.tags} />
           <PhaseBars
             job={job}
             view={progress}

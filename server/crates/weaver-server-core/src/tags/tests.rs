@@ -83,6 +83,8 @@ pub(crate) fn exercise_tags(db: &Database) {
     assert_eq!(db.job_tags(one).unwrap(), ["TV", "tv"]);
     assert_eq!(db.job_tags(two).unwrap(), ["hd", "TV", "tv"]);
     assert!(db.job_tags(absent).unwrap().is_empty());
+    // Put on no job, a tag is not made.
+    db.add_job_tags(&[absent], ["nowhere"]).unwrap();
     assert_eq!(
         names(db),
         [
@@ -164,4 +166,14 @@ fn a_tagged_id_is_never_handed_out_again() {
     db.tag_new_job(JobId(first.0 + 50), ["ahead"]).unwrap();
     db.set_setting("next_job_id", &first.0.to_string()).unwrap();
     assert!(db.reserve_next_job_id().unwrap().0 > first.0 + 50);
+}
+
+#[test]
+fn a_script_is_given_its_jobs_tags() {
+    let db = Database::open_in_memory().unwrap();
+    let job = JobId(30_002);
+    db.tag_new_job(job, ["tv", "hd"]).unwrap();
+    let mut facts = crate::post_processing::runner::CompatibilityFacts::default();
+    db.refresh_script_job_inputs(job.0, &mut facts).unwrap();
+    assert_eq!(facts.tags, ["hd", "tv"]);
 }

@@ -314,6 +314,36 @@
       "rationale": "The release flow asserts individual queue controls; the server API tests cover this batch by ids and by selection, and no release spec calls it."
     },
     {
+      "name": "createTags",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "Tags are labels only; the server API tests cover this tag mutation on queued and history jobs, and no release spec calls it."
+    },
+    {
+      "name": "deleteTags",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "Tags are labels only; the server API tests cover this tag mutation on queued and history jobs, and no release spec calls it."
+    },
+    {
+      "name": "addJobTags",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "Tags are labels only; the server API tests cover this tag mutation on queued and history jobs, and no release spec calls it."
+    },
+    {
+      "name": "removeJobTags",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "Tags are labels only; the server API tests cover this tag mutation on queued and history jobs, and no release spec calls it."
+    },
+    {
+      "name": "setJobTags",
+      "owner": "duplicate-and-queue-policy",
+      "oracle": "unit-only",
+      "rationale": "Tags are labels only; the server API tests cover this tag mutation on queued and history jobs, and no release spec calls it."
+    },
+    {
       "name": "testConfiguredServerConnection",
       "owner": "encryption-key-lifecycle",
       "oracle": "api-metrics"
