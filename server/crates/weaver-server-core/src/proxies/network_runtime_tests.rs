@@ -814,6 +814,66 @@ async fn a_used_up_egress_quota_takes_its_leg_down_and_its_share_moves_to_the_ot
     runtime.shutdown().await;
 }
 
+// What an egress lets torrent sessions move at follows its caps and its
+// upload quota as torrent bytes cross them: its rate caps, then the trickle
+// past the soft cap, then nothing past the hard cap, and a reset brings the
+// caps back. Each crossing rings. Another egress adds no limit.
+#[tokio::test]
+async fn torrent_rates_on_an_egress_follow_its_caps_and_upload_quota() {
+    use crate::bandwidth::TorrentRates;
+
+    let db = Database::open_in_memory().unwrap();
+    let mut capped = metered_egress(1_000_000);
+    capped.download_bps = Some(80_000);
+    capped.upload_bps = Some(50_000);
+    capped.quota.upload_soft_bytes = Some(1_000);
+    capped.quota.upload_trickle_bps = 512;
+    capped.quota.upload_hard_bytes = Some(2_000);
+    let capped = db.create_egress_interface(&capped).unwrap();
+    let policy = Arc::new(
+        crate::servers::transfer_policy::ServerTransferPolicyRegistry::new(db.clone(), &[])
+            .unwrap(),
+    );
+    let runtime = NetworkRuntime::with_quota_policy(
+        db,
+        tokio::runtime::Handle::current(),
+        Some(policy.clone()),
+    )
+    .unwrap();
+    let mut changes = runtime.egress_limit_changes().unwrap();
+    let rates = |download, upload| TorrentRates { download, upload };
+    assert_eq!(
+        runtime.torrent_egress_rates(capped.id),
+        rates(Some(80_000), Some(50_000))
+    );
+
+    runtime.record_torrent_bytes(capped.id, 0, 1_000);
+    assert!(changes.changed().await);
+    assert_eq!(
+        runtime.torrent_egress_rates(capped.id),
+        rates(Some(80_000), Some(512))
+    );
+
+    runtime.record_torrent_bytes(capped.id, 0, 1_000);
+    assert!(changes.changed().await);
+    assert_eq!(
+        runtime.torrent_egress_rates(capped.id),
+        rates(Some(80_000), Some(0))
+    );
+    assert_eq!(
+        runtime.torrent_egress_rates(capped.id + 1),
+        TorrentRates::default()
+    );
+
+    policy.reset_egress_usage(capped.id).unwrap();
+    assert!(changes.changed().await);
+    assert_eq!(
+        runtime.torrent_egress_rates(capped.id),
+        rates(Some(80_000), Some(50_000))
+    );
+    runtime.shutdown().await;
+}
+
 #[tokio::test]
 async fn egress_quota_usage_survives_a_network_recompile_and_a_rebuilt_runtime() {
     let db = Database::open_in_memory().unwrap();

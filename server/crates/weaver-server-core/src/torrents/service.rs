@@ -2520,7 +2520,27 @@ impl TorrentService {
         }
         self.spawn_settle();
         self.spawn_follow_trackers();
+        self.spawn_follow_egress_limits();
         self.restore().await
+    }
+
+    // Each egress's caps and quota state reach the open sessions as they
+    // change: a quota crossing its soft or hard cap, a reset, a new period
+    // or a saved egress. A session is never closed for it; its uploads
+    // trickle or move nothing, and it keeps announcing.
+    fn spawn_follow_egress_limits(&self) {
+        let Some(mut changes) = self.inner.sessions.routes().egress_limit_changes() else {
+            return;
+        };
+        let service = self.clone();
+        self.keep(tokio::spawn(async move {
+            loop {
+                service.inner.sessions.apply_egress_limits();
+                if !changes.changed().await {
+                    break;
+                }
+            }
+        }));
     }
 
     // A tracker's answer, and a fetch moving on, are published as the

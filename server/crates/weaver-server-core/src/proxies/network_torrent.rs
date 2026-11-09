@@ -404,6 +404,31 @@ impl SessionTraffic {
     }
 }
 
+/// Rings as an egress's caps or quota state may have changed: on a change
+/// to the egresses' policies, or to their quota counters' capacity.
+pub struct EgressLimitChanges {
+    policy: tokio::sync::watch::Receiver<u64>,
+    capacity: tokio::sync::watch::Receiver<u64>,
+}
+
+impl EgressLimitChanges {
+    pub fn new(
+        policy: tokio::sync::watch::Receiver<u64>,
+        capacity: tokio::sync::watch::Receiver<u64>,
+    ) -> Self {
+        Self { policy, capacity }
+    }
+
+    /// Resolves once either rings since last asked; false once either is
+    /// gone.
+    pub async fn changed(&mut self) -> bool {
+        tokio::select! {
+            changed = self.policy.changed() => changed.is_ok(),
+            changed = self.capacity.changed() => changed.is_ok(),
+        }
+    }
+}
+
 /// A torrent a session runs on a leg, as it holds it now.
 pub trait LegTenant: Send + Sync {
     /// What the torrent holds on its leg at this instant.
@@ -482,6 +507,37 @@ impl NetworkRuntime {
             true
         });
         legs
+    }
+
+    /// What `egress_id` lets torrent sessions move at now, each direction:
+    /// its own rate cap under its quota state. Uploads past the soft cap
+    /// trickle, and past the hard cap move nothing; downloads move nothing
+    /// once the download quota is used. The global limits are not in it.
+    /// An egress with no policy adds no limit.
+    pub fn torrent_egress_rates(&self, egress_id: u32) -> crate::bandwidth::TorrentRates {
+        let Some(policy) = &self.quota_policy else {
+            return crate::bandwidth::TorrentRates::default();
+        };
+        crate::bandwidth::TorrentRates {
+            download: policy.egress_rate(
+                egress_id,
+                crate::bandwidth::Direction::Download,
+                None,
+                None,
+            ),
+            upload: policy.egress_rate(egress_id, crate::bandwidth::Direction::Upload, None, None),
+        }
+    }
+
+    /// What rings as any egress's caps or quota state may change: a saved
+    /// egress, a quota crossing a cap, a reset, or a new period. None
+    /// without a policy, as then no egress limits torrents.
+    pub fn egress_limit_changes(&self) -> Option<EgressLimitChanges> {
+        let policy = self.quota_policy.as_ref()?;
+        Some(EgressLimitChanges::new(
+            policy.subscribe_changes(),
+            policy.subscribe_capacity_changes(),
+        ))
     }
 
     /// Bytes ever uploaded over `egress_id`, as its upload count holds them.
