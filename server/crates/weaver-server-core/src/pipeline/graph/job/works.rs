@@ -39,6 +39,9 @@ pub(crate) struct Works {
     // while the object is out, and hands each back when it chooses.
     #[cfg(test)]
     held: Option<Vec<HeldLoan>>,
+    // How many objects went out for their work.
+    #[cfg(test)]
+    lent: u64,
 }
 
 // A loan a test keeps in hand: its node, its number, and the object.
@@ -77,6 +80,8 @@ impl Works {
             hardware,
             #[cfg(test)]
             held: None,
+            #[cfg(test)]
+            lent: 0,
         }
     }
 
@@ -89,6 +94,11 @@ impl Works {
     #[cfg(test)]
     pub(crate) fn take_held(&mut self) -> Vec<HeldLoan> {
         self.held.as_mut().map(std::mem::take).unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn lent(&self) -> u64 {
+        self.lent
     }
 
     #[cfg(test)]
@@ -198,6 +208,10 @@ impl Works {
         self.serial += 1;
         let (scope, serial) = (self.scope, self.serial);
         self.out.insert(node, serial);
+        #[cfg(test)]
+        {
+            self.lent += 1;
+        }
         #[cfg(test)]
         if let Some(held) = &mut self.held {
             held.push((node, serial, object));

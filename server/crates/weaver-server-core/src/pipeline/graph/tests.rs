@@ -1759,6 +1759,76 @@ async fn a_restart_reads_a_recovery_volume_after_the_restore_and_writes_nothing(
     retire_pipeline_database(pipeline).await;
 }
 
+// The same restart, the recovery volume's file emptied before it: what
+// arrived of the volume cannot be read again, so the rewalk does not count
+// it as heard. Each article it was is no longer arrived and is fetched
+// again.
+#[tokio::test]
+async fn a_restart_fetches_again_what_a_recovery_volume_cannot_read_back() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let job_id = JobId(92_034);
+    let posts = three_volumes(34);
+    let working_dir = {
+        let (mut pipeline, working_dir) = graph_job(&temp_dir, job_id, &posts).await;
+        decode_all(&mut pipeline, job_id, &posts, 1).await;
+        decode_head(&mut pipeline, job_id, &posts, 2).await;
+        pipeline.flush_graph_checkpoint(job_id);
+        pipeline.db.flush_write_queue().await.unwrap();
+        retire_pipeline_database(pipeline).await;
+        std::fs::File::options()
+            .write(true)
+            .open(working_dir.join(&posts[2].name))
+            .and_then(|file| file.set_len(0))
+            .unwrap();
+        working_dir
+    };
+
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline
+        .restore_job(crate::RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: spec("lantern joined", &posts, ARTICLE),
+            detected_archives: Default::default(),
+            file_identities: Default::default(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+            restart: None,
+        })
+        .await
+        .unwrap();
+    crate::pipeline::tests::hear_rewalks(&mut pipeline, job_id).await;
+    let state = &pipeline.jobs[&job_id];
+    let queued = |ordinal: u32| {
+        let id = segment_id(job_id, 2, ordinal);
+        let articles = state.articles.active().unwrap();
+        articles
+            .download_queue
+            .count_matching(|work| work.segment_id == id)
+            + articles
+                .recovery_queue
+                .count_matching(|work| work.segment_id == id)
+    };
+    for ordinal in 0..HEAD {
+        assert!(
+            pipeline.graph_jobs[&job_id]
+                .article_class(weaver_graph::VolumeIndex(2), ordinal)
+                .is_some(),
+            "article {ordinal} still counted as arrived"
+        );
+        assert_eq!(queued(ordinal), 1, "article {ordinal} fetched again");
+    }
+    retire_pipeline_database(pipeline).await;
+}
+
 // The field post: 750 KiB articles whose every header declares the file
 // 1536000 bytes long while the parts run to 21504000. The reference
 // decoders write each part where its own `=ypart` puts it and never cut a

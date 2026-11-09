@@ -10,7 +10,7 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
-use weaver_graph::{NodeId, Placement, Posted, Rewalk, Tree, VolumeIndex};
+use weaver_graph::{ByteRange, NodeId, Placement, Posted, Rewalk, Tree, VolumeIndex};
 
 use super::super::super::hardware::Shutdown;
 use super::super::super::leaf::LeafError;
@@ -22,11 +22,12 @@ pub(crate) struct RewalkLoan {
     access: Lent,
 }
 
-// One piece read again, or the end of them (`None`): `whole` when every
-// piece was read, not when a shutdown or the working directory going cut
-// the reading short.
+// One piece read again, or the range of one that did not read back
+// (`Err`), or the end of them (`None`): `whole` when every piece was
+// taken, not when a shutdown or the working directory going cut the
+// reading short.
 pub(crate) struct Rewalked {
-    pub(crate) piece: Option<(VolumeIndex, Posted)>,
+    pub(crate) piece: Option<(VolumeIndex, Result<Posted, ByteRange>)>,
     pub(crate) whole: bool,
 }
 
@@ -38,7 +39,10 @@ impl std::fmt::Debug for Rewalked {
                 &self
                     .piece
                     .as_ref()
-                    .map(|(volume, posted)| (volume, posted.offset, posted.bytes.len())),
+                    .map(|(volume, piece)| match piece {
+                        Ok(posted) => (volume, posted.offset, Some(posted.bytes.len())),
+                        Err(range) => (volume, range.start, None),
+                    }),
             )
             .field("whole", &self.whole)
             .finish()
@@ -50,14 +54,14 @@ impl RewalkLoan {
         self.rewalk.node
     }
 
-    // Read each piece and hand it to `said`, which answers whether to go
-    // on, and whether every piece was. A shutdown, or the job's working
-    // directory going, ends it short: what was not read is asked again by
-    // the next restore.
+    // Read each piece and hand it to `said`, or the range of one that did
+    // not read back, which answers whether to go on, and whether every
+    // piece was taken. A shutdown, or the job's working directory going,
+    // ends it short: what was not read is asked again by the next restore.
     pub(crate) fn run(
         mut self,
         shutdown: &Shutdown,
-        said: &mut dyn FnMut(VolumeIndex, Posted) -> bool,
+        said: &mut dyn FnMut(VolumeIndex, Result<Posted, ByteRange>) -> bool,
     ) -> bool {
         self.access.shutdown = shutdown.clone();
         let access = &self.access;
@@ -74,8 +78,8 @@ impl RewalkLoan {
                 whole = false;
                 break;
             }
-            if let Some((volume, posted)) = self.rewalk.read(index, &mut placed)
-                && !said(volume, posted)
+            if let Some((volume, piece)) = self.rewalk.read(index, &mut placed)
+                && !said(volume, piece)
             {
                 whole = false;
                 break;

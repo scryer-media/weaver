@@ -129,12 +129,20 @@ impl GraphJob {
                 let mut effects = Vec::new();
                 let mut placing = self.writer.placing(&mut *self.builder);
                 match rewalked.piece {
-                    Some((volume, posted)) => {
+                    Some((volume, piece)) => {
                         if !self.works.rewalking(node, said.generation) {
                             return Ok(());
                         }
-                        self.tree
-                            .rewalked(node, volume, posted, &mut placing, &mut effects);
+                        match piece {
+                            Ok(posted) => {
+                                self.tree
+                                    .rewalked(node, volume, posted, &mut placing, &mut effects);
+                            }
+                            Err(range) => {
+                                drop(placing);
+                                self.unread(node, volume, range, limit)?;
+                            }
+                        }
                     }
                     None => {
                         if !self.works.rewalk_returned(node, said.generation) {
@@ -157,6 +165,9 @@ impl GraphJob {
                 // taken after it, which commits once nothing reads.
                 self.settle_worked(effects)?;
                 self.step_runs(Vec::new(), limit)?;
+                // The end of one rewalk lends the next, as the job's install
+                // lent the first, whether or not the job may run.
+                self.lend_rewalks()?;
                 return self.lend(slots, limit);
             }
             Heard::Written { stamp, control } => {

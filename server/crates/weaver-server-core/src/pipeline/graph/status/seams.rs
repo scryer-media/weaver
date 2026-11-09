@@ -62,8 +62,10 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     };
     // Work an object holds goes out before the verdict, which then waits
     // for it: an object holding ciphertext it has keys for is not short.
-    if let Err(error) = job.lend_work() {
-        warn!(job_id = job_id.0, error = %error, "graph work lending failed");
+    // Work done here that could not write fails the job as any step does.
+    if let Err(error) = job.lend_work(limit) {
+        pipeline.after_graph_result(job_id, Err(error));
+        return;
     }
     let step = drive(
         job,
@@ -797,6 +799,17 @@ impl Pipeline {
                         reason: crate::pipeline::graph::checkpoint::why_name(given_back.why)
                             .to_owned(),
                     });
+                }
+                // The queue fetches it again as first dispatched.
+                Note::Unread(volume, ordinal) => {
+                    let segment_id = crate::jobs::ids::SegmentId {
+                        file_id: NzbFileId {
+                            job_id,
+                            file_index: volume.0,
+                        },
+                        segment_number: ordinal,
+                    };
+                    self.push_requeued_segment(segment_id);
                 }
             }
         }

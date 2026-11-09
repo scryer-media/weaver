@@ -30,6 +30,42 @@ mod walk;
 #[cfg(test)]
 mod tests;
 
+// What a test reads of where a zip's work ran: the bytes delivered to it on
+// this thread, and the cipher bytes its keys ran over on this thread and on
+// every thread.
+#[cfg(any(test, feature = "test-support"))]
+pub mod counting {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    thread_local! {
+        static DELIVERED: Cell<u64> = const { Cell::new(0) };
+        static DECIPHERED: Cell<u64> = const { Cell::new(0) };
+    }
+    static DECIPHERED_EVERYWHERE: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn delivered(len: usize) {
+        DELIVERED.with(|here| here.set(here.get() + len as u64));
+    }
+
+    pub(super) fn deciphered(len: usize) {
+        DECIPHERED.with(|here| here.set(here.get() + len as u64));
+        DECIPHERED_EVERYWHERE.fetch_add(len as u64, Ordering::Relaxed);
+    }
+
+    pub fn delivered_here() -> u64 {
+        DELIVERED.with(Cell::get)
+    }
+
+    pub fn deciphered_here() -> u64 {
+        DECIPHERED.with(Cell::get)
+    }
+
+    pub fn deciphered_everywhere() -> u64 {
+        DECIPHERED_EVERYWHERE.load(Ordering::Relaxed)
+    }
+}
+
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use serde::{Deserialize, Serialize};
@@ -120,7 +156,8 @@ impl Durable for Zip {
         self.grid.restore_parts(give)
     }
 
-    // A member said is an entry of the map, and every entry's member is one.
+    // A member said is an entry of the map, and every entry's member is one,
+    // as is every member something is held for.
     fn impossible(&self) -> Option<&'static str> {
         let sound = |map: &Map| {
             map.members.iter().all(|entry| *entry < map.entries.len())
@@ -145,7 +182,8 @@ impl Durable for Zip {
             .next
             .as_ref()
             .is_none_or(|next| self.map.is_some() && sound(next));
-        (!mapped || !next || !self.kept.sound()).then_some("members no map gives")
+        (!mapped || !next || !self.kept.sound() || !self.held_sound())
+            .then_some("members no map gives")
     }
 }
 
@@ -430,6 +468,18 @@ impl Zip {
                 .iter()
                 .any(|wanted| wanted.intersect(range).is_some())
     }
+
+    // Whether a delivery reaches nothing ahead of its members but what is
+    // kept: a map stands with none waiting to take over, nothing is to be
+    // looked at again, and where the last disk is is not being decided.
+    fn only_routes(&self, delivery: &Delivery<'_>) -> bool {
+        let deciding = if self.opens_alone {
+            self.bound.iter().any(|volume| *volume != LAST)
+        } else {
+            delivery.volume.0 == LAST && self.last_disk.is_none()
+        };
+        self.map.is_some() && self.next.is_none() && !self.stale && !deciding
+    }
 }
 
 impl Object for Zip {
@@ -443,10 +493,16 @@ impl Object for Zip {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
+        #[cfg(any(test, feature = "test-support"))]
+        counting::delivered(delivery.bytes.len());
         if self.gone {
             return;
         }
-        if self.holds_any() {
+        // What the object holds is heard before anything that could change
+        // what it rests on. A delivery that only routes member bytes waits
+        // behind it, for the pool: route hears a member's held parts first
+        // where one of the member's own cannot wait.
+        if self.holds_any() && !self.only_routes(&delivery) {
             self.run_held(Some(&mut *read), out);
         }
         self.install(out);
@@ -466,6 +522,11 @@ impl Object for Zip {
         let kept = self.under_pending(range, delivery.bytes);
         loop {
             let generation = self.kept.generation();
+            // What the delivery changes of what is kept can move the map or
+            // its keys: what is held is heard first.
+            if self.holds_any() && self.kept.absorbs(range, &kept, delivery.provenance) {
+                self.run_held(Some(&mut *read), out);
+            }
             if self
                 .kept
                 .absorb(range, &kept, delivery.provenance)

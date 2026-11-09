@@ -422,11 +422,13 @@ pub(in crate::pipeline::tests) fn assert_restarted(restarted: &Restarted, whole:
     );
 }
 
-pub(in crate::pipeline::tests) async fn restart_row(scenario: Scenario) {
+// The run with no restart is given back, for a row to ask more of it.
+pub(in crate::pipeline::tests) async fn restart_row(scenario: Scenario) -> Outcome {
     let whole = run(&scenario).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     let restarted = run_restarting(&scenario, &mut |_| {}).await;
     assert_restarted(&restarted, &whole);
+    whole
 }
 
 fn with_par2(mut posts: Vec<Post>, blocks: u32) -> Vec<Post> {
