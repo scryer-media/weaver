@@ -218,13 +218,15 @@ impl GraphJob {
                 warn!(member = member.0, error = %error, "graph member announcement failed");
             }
         }
+        // The deadline counts the time the runs and the loans decode.
+        let runs = runs.timed(writer.decode_clock());
         Self {
             tree,
             root,
             builder,
             writer,
             loans: Loans::new(runs.scope(), runs.mail(), runs.hardware()),
-            works: Works::new(runs.scope(), runs.mail(), runs.hardware()),
+            works: Works::new(runs.scope(), runs.mail(), runs.hardware()).timed(runs.clock()),
             runs,
             passwords: Passwords::default(),
             reported: None,
@@ -310,7 +312,10 @@ impl GraphJob {
         limit: usize,
     ) -> Result<(), GraphError> {
         let mut said = Vec::new();
-        object.work(&mut said);
+        {
+            let _decoding = self.works.decoding();
+            object.work(&mut said);
+        }
         let said = super::engine::Said {
             scope: self.works.scope(),
             node,
@@ -462,6 +467,12 @@ impl GraphJob {
     #[cfg(test)]
     pub(crate) fn clock_held(&self) -> bool {
         self.writer.clock_held()
+    }
+
+    // Read the job's content policy if it is still unread, and judge the
+    // names that waited for it.
+    pub(crate) fn learn_policy(&mut self) -> Result<(), String> {
+        self.writer.learn_policy()
     }
 
     pub(crate) fn pending(&self) -> &Pending {

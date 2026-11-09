@@ -361,10 +361,20 @@ impl NamespaceWriter {
         self.caps.refusal()
     }
 
+    // Read the job's content policy if it is still unread, and judge the
+    // names that waited for it.
+    pub(crate) fn learn_policy(&mut self) -> Result<(), String> {
+        self.caps.learn_policy()
+    }
+
     // The job paused or resumed: its extraction deadline does not run
     // while it is paused.
     pub(crate) fn hold_clock(&mut self, paused: bool) {
         self.caps.hold_clock(paused);
+    }
+
+    pub(crate) fn decode_clock(&self) -> super::decoding::DecodeClock {
+        self.caps.decode_clock()
     }
 
     #[cfg(test)]
@@ -2008,8 +2018,12 @@ impl NamespaceWriter {
         member: MemberId,
         end: u64,
     ) -> Result<(), WriteError> {
-        self.caps
-            .admit_write(tree, (node, member), end, self.output_free_disk.current())?;
+        self.caps.admit_write(
+            tree,
+            (node, member),
+            end,
+            (&self.output_dir, self.output_free_disk.current()),
+        )?;
         Ok(())
     }
 

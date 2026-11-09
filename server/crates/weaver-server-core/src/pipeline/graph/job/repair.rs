@@ -76,7 +76,10 @@ impl GraphJob {
                     continue;
                 }
                 let mut said = Vec::new();
-                object.work(&mut said);
+                {
+                    let _decoding = self.works.decoding();
+                    object.work(&mut said);
+                }
                 moved |= !said.is_empty();
                 let mut effects = Vec::new();
                 self.tree.take_back_worked(

@@ -101,6 +101,7 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
         new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
+    scenario.built(&pipeline);
 
     let mut requests = BTreeMap::new();
     let mut order = Vec::new();
@@ -385,6 +386,7 @@ async fn restart_heard(
         })
         .await
         .unwrap();
+    scenario.built(&pipeline);
     assert!(
         !pipeline.blocked_restores.contains_key(&JOB),
         "a checkpointed graph job restores"
