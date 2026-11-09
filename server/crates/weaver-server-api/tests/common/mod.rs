@@ -222,6 +222,7 @@ impl TestHarness {
                             total_bytes: 8 * 1024 * 1024 * 1024,
                             available_bytes: 4 * 1024 * 1024 * 1024,
                             cgroup_limit: None,
+                            guessed: false,
                         },
                         disk: weaver_server_core::runtime::system_profile::DiskProfile {
                             storage_class:

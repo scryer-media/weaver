@@ -25,19 +25,21 @@ pub(super) const CHUNK: usize = 64 << 10;
 pub(super) struct Run<D> {
     decoder: PhantomData<fn() -> D>,
     name: String,
+    // The window the stream's front sized against the grant it was built
+    // with.
     window: u64,
-    // What the stream's front declares its decoder needs, where the
-    // decoder's own refusal does not say.
-    declared: Option<u64>,
+    // The stream's front, which sizes the window again against the grant
+    // the run is given, where that is wider.
+    first: Vec<u8>,
 }
 
 impl<D: Decoder> Run<D> {
-    pub(super) fn new(name: String, window: u64, declared: Option<u64>) -> Self {
+    pub(super) fn new(name: String, window: u64, first: Vec<u8>) -> Self {
         Self {
             decoder: PhantomData,
             name,
             window,
-            declared,
+            first,
         }
     }
 }
@@ -57,6 +59,19 @@ impl<D: Decoder> Extraction for Run<D> {
         // Asked before anything is read, so a volume still growing is
         // never waited on for its tail.
         let closed = volumes.len(weaver_graph::VolumeIndex(0)).is_some();
+        // The window the stream was built to, or the run's grant's where
+        // that is wider: an owner that lets a window go above its ceiling
+        // grants the run the wider one. An owner that reserved the whole
+        // grant for the run gives the decoder all of it, since a later
+        // block or frame may need more than the first declares.
+        let window = if budget.window_reserved {
+            budget.window_or(self.window).max(self.window)
+        } else {
+            self.window.max(D::window(&self.first, &budget))
+        };
+        // What the front declares the decoder needs, where the decoder's
+        // own refusal does not say.
+        let declared = D::declared(&self.first);
         let input = Front::new(Arc::clone(&volumes));
         let failed = input.failure();
         let announced = sink(Emit::Member {
@@ -67,7 +82,7 @@ impl<D: Decoder> Extraction for Run<D> {
         if !announced {
             return;
         }
-        let pumped = D::open_with(input, self.window, budget, closed)
+        let pumped = D::open_with(input, window, budget, closed)
             .and_then(|mut reader| pump(&mut *reader, sink));
         let error = match pumped {
             Ok(Ended::Whole) => {
@@ -81,7 +96,7 @@ impl<D: Decoder> Extraction for Run<D> {
         if failed.load(Ordering::Acquire) || !sink(Emit::Retract(MEMBER)) {
             return;
         }
-        sink(Emit::Refuse(why(&error, self.window, self.declared)));
+        sink(Emit::Refuse(why(&error, window, declared)));
     }
 }
 

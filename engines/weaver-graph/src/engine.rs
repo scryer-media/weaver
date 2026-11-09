@@ -102,6 +102,10 @@ pub struct Budget {
     // an xz or zstd window. A member that asks for more is refused. None
     // leaves each decoder its own limit. Never more than `memory_bytes`.
     pub window_bytes: Option<u64>,
+    // The owner reserved the whole of `window_bytes` for this run, so its
+    // decoder may hold all of it whatever the work's first bytes declared:
+    // a later block or frame may need more than the first.
+    pub window_reserved: bool,
     pub threads: usize,
     // The owner's threads, which work that spreads borrows instead of
     // starting its own, so the threads of every job together stay within
@@ -156,6 +160,7 @@ impl std::fmt::Debug for Budget {
         f.debug_struct("Budget")
             .field("memory_bytes", &self.memory_bytes)
             .field("window_bytes", &self.window_bytes)
+            .field("window_reserved", &self.window_reserved)
             .field("threads", &self.threads)
             .field("pool", &self.pool.is_some())
             .field("lender", &self.lender.is_some())
@@ -169,6 +174,7 @@ impl PartialEq for Budget {
     fn eq(&self, other: &Self) -> bool {
         self.memory_bytes == other.memory_bytes
             && self.window_bytes == other.window_bytes
+            && self.window_reserved == other.window_reserved
             && self.threads == other.threads
             && match (&self.pool, &other.pool) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
@@ -245,5 +251,21 @@ pub trait Engine {
     // library sizes its own memory.
     fn reserve(&self) -> Option<u64> {
         Some(0)
+    }
+
+    // Whether a run's decoder borrows a window wider than the grant holds in
+    // RAM from `Budget::lender`. The owner then lends that window from a
+    // scratch file before the run starts, where the owner's policy allows a
+    // window over its ceiling at all; an engine that does not borrow is
+    // given that window in RAM instead.
+    fn lends(&self) -> bool {
+        false
+    }
+
+    // The widest window the format's decoder can be given, for a decoder
+    // whose refusal does not say what it needs: a run refused so may start
+    // again at this. `None` where every refusal says, or nothing is wider.
+    fn widest(&self) -> Option<u64> {
+        None
     }
 }

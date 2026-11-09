@@ -71,6 +71,10 @@ enum WhyMirror {
         needed: Option<u64>,
         allowed: Option<u64>,
     },
+    OverMachine {
+        needed: u64,
+        memory: u64,
+    },
 }
 through!(Why, WhyMirror);
 

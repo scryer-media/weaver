@@ -27,7 +27,7 @@ pub mod system_profile;
 pub mod thread_release;
 pub mod tuning;
 
-pub use hardware_profile::{HardwareProfile, MemoryShare, ProfileTuning};
+pub use hardware_profile::{HardwareProfile, MemoryShare, OverLimit, ProfileTuning};
 pub use reload::{load_global_pause_from_db, rebuild_nntp_from_config, reload_runtime_from_db};
 pub use system_probe::{
     DiskMeasurement, StartupDiskGate, StartupDiskGateOpener, detect as detect_system_profile,

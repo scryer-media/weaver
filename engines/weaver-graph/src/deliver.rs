@@ -213,6 +213,12 @@ pub enum Why {
         needed: Option<u64>,
         allowed: Option<u64>,
     },
+    // Decoding it needs more memory than the machine can give it, with the
+    // owner's ceiling lifted: `needed` bytes against the machine's `memory`.
+    OverMachine {
+        needed: u64,
+        memory: u64,
+    },
 }
 
 impl Why {
@@ -227,7 +233,8 @@ impl Why {
             | Why::Compressed
             | Why::Unmapped
             | Why::InvalidArchive
-            | Why::TooLarge { .. } => true,
+            | Why::TooLarge { .. }
+            | Why::OverMachine { .. } => true,
             Why::TailUnreachable
             | Why::UnboundedEntry
             | Why::NotAFile
@@ -257,7 +264,8 @@ impl Why {
             | Why::HoldsBreached
             | Why::Unmapped
             | Why::InvalidArchive
-            | Why::TooLarge { .. } => false,
+            | Why::TooLarge { .. }
+            | Why::OverMachine { .. } => false,
         }
     }
 }
@@ -356,6 +364,10 @@ mod tests {
             Why::TooLarge {
                 needed: Some(2 << 30),
                 allowed: Some(1 << 30),
+            },
+            Why::OverMachine {
+                needed: 64 << 30,
+                memory: 32 << 30,
             },
         ];
         let delivered = [

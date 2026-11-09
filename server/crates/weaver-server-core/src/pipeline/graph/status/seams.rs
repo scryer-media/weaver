@@ -124,6 +124,7 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
                 // broke, whatever the root showed.
                 let stage = pipeline.graph_shortfall(job_id).map(|(stage, _)| stage);
                 pipeline.enter_short_stage(job_id, stage);
+                pipeline.mark_failed_for_memory(job_id);
                 if pipeline.graph_failure_is_health(job_id) {
                     pipeline.fail_job_on_health(job_id, error);
                 } else {
@@ -609,6 +610,33 @@ impl Pipeline {
                 Some(failure) => failure.rejection.is_none(),
                 None => delivery.withheld.is_empty(),
             })
+    }
+
+    // Record with a failing graph job that what it withheld was refused
+    // only because the policy holds runs to the profile's ceiling, so its
+    // history offers a reprocess with no memory limit. A window over the
+    // machine, or any other refusal, records nothing.
+    fn mark_failed_for_memory(&mut self, job_id: JobId) {
+        use crate::history::attributes::{FAILED_FOR_MEMORY_ATTRIBUTE_KEY, failed_for_memory};
+        let too_large = self.graph_ruling(job_id).is_some_and(|(delivery, _)| {
+            delivery
+                .withheld
+                .iter()
+                .any(|(_, why)| matches!(why, weaver_graph::Why::TooLarge { .. }))
+        });
+        let held = self
+            .graph_jobs
+            .get(&job_id)
+            .is_some_and(GraphJob::held_to_ceiling);
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if too_large && held && !failed_for_memory(&state.spec.metadata) {
+            state
+                .spec
+                .metadata
+                .push((FAILED_FOR_MEMORY_ATTRIBUTE_KEY.to_string(), "1".to_string()));
+        }
     }
 
     // Whether a graph job's failure is the feed's: no set failed and the

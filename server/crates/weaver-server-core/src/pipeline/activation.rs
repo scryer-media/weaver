@@ -77,11 +77,10 @@ impl Pipeline {
         let spec_password = state.spec.password.clone();
         let expected = summaries.clone();
         state.articles = JobArticles::Activating(summaries, activation);
-        let seat = self.graph_restore_seat(None, &working_dir).for_job(
-            spec_password,
-            &working_dir,
-            staging_dir.as_deref(),
-        );
+        let seat = self
+            .graph_restore_seat(None, &working_dir)
+            .for_job(spec_password, &working_dir, staging_dir.as_deref())
+            .lifted(&metadata);
         // The read waits for every write already queued for the job, so a
         // checkpoint taken as the job paused is the one it reads back.
         let (written_tx, written_rx) = tokio::sync::oneshot::channel();

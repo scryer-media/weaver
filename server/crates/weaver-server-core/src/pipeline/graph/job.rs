@@ -376,6 +376,13 @@ impl GraphJob {
         self.writer.moves_waiting()
     }
 
+    // Whether a run's refusal stands only because the policy holds runs to
+    // the profile's ceiling, so a reprocess with no memory limit could
+    // finish what it withheld.
+    pub(crate) fn held_to_ceiling(&self) -> bool {
+        self.runs.held_to_ceiling()
+    }
+
     // Whether anything of the job waits for a checkpoint to commit. Not
     // while a rewalk reads: no file moves under it, so nothing hurries a
     // checkpoint on, and the first one after its last piece commits.

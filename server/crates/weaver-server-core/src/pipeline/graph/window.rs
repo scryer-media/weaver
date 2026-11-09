@@ -303,6 +303,18 @@ impl Windows {
         })
     }
 
+    // What the node's run borrows its windows through, lending `window`,
+    // allocated for it before it started, to the first borrow it fits.
+    pub(crate) fn prelent(self: &Arc<Self>, node: NodeId, window: Window) -> Arc<dyn WindowLender> {
+        Arc::new(Prelent {
+            window: Mutex::new(Some(window)),
+            rest: NodeWindows {
+                windows: Arc::clone(self),
+                node,
+            },
+        })
+    }
+
     // The windows lent now, and their bytes.
     pub(crate) fn live(&self) -> (u64, u64) {
         let lent = self.lock();
@@ -420,6 +432,31 @@ impl WindowLender for NodeWindows {
 
     fn ceiling(&self) -> u64 {
         self.windows.ceiling
+    }
+}
+
+// A run's lender holding the window allocated for it before it started: the
+// first borrow it fits takes it, and every other is lent as `rest` lends.
+struct Prelent {
+    window: Mutex<Option<Window>>,
+    rest: NodeWindows,
+}
+
+impl WindowLender for Prelent {
+    fn lend(&self, len: usize) -> io::Result<Box<dyn WindowMemory>> {
+        let held = self
+            .window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take_if(|window| WindowMemory::len(window) >= len);
+        match held {
+            Some(window) => Ok(Box::new(window)),
+            None => self.rest.lend(len),
+        }
+    }
+
+    fn ceiling(&self) -> u64 {
+        self.rest.ceiling()
     }
 }
 

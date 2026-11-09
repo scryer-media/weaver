@@ -1882,6 +1882,10 @@ fn every_reason_a_row_keeps_reads_back_with_its_sizes() {
         too_large(Some(2 << 30), Some(1 << 30)),
         too_large(Some(2 << 30), None),
         too_large(None, Some(1 << 30)),
+        Why::OverMachine {
+            needed: 1 << 41,
+            memory: 8 << 30,
+        },
     ]);
     for why in reasons {
         assert_eq!(
@@ -1893,6 +1897,13 @@ fn every_reason_a_row_keeps_reads_back_with_its_sizes() {
     assert_eq!(
         super::why_text(too_large(Some(2 << 30), None)),
         "too_large:2147483648:-"
+    );
+    assert_eq!(
+        super::why_text(Why::OverMachine {
+            needed: 1 << 41,
+            memory: 8 << 30,
+        }),
+        "over_machine:2199023255552:8589934592"
     );
     for text in [
         "too_large",

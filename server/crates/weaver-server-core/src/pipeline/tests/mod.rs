@@ -195,6 +195,7 @@ impl TestHarness {
                 total_bytes: 8 * 1024 * 1024 * 1024,
                 available_bytes: 8 * 1024 * 1024 * 1024,
                 cgroup_limit: None,
+                guessed: false,
             },
             disk: DiskProfile {
                 storage_class: StorageClass::Ssd,
@@ -597,6 +598,7 @@ async fn new_direct_pipeline_at_roots(
                 total_bytes: 8 * 1024 * 1024 * 1024,
                 available_bytes: 8 * 1024 * 1024 * 1024,
                 cgroup_limit: None,
+                guessed: false,
             },
             disk: DiskProfile {
                 storage_class: StorageClass::Ssd,

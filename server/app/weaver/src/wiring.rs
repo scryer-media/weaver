@@ -226,6 +226,7 @@ mod tests {
                 total_bytes: 1024 * 1024 * 1024,
                 available_bytes: 1024 * 1024 * 1024,
                 cgroup_limit: None,
+                guessed: false,
             },
             disk: DiskProfile {
                 storage_class: StorageClass::Unknown,

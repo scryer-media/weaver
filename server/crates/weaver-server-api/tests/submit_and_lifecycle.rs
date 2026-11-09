@@ -1358,6 +1358,29 @@ async fn archive_password_retry_arguments_reach_job_validation() {
     }
 }
 
+// The no-limit reprocess takes its argument and reaches the queue, which
+// refuses a job it does not know.
+#[tokio::test]
+async fn reprocess_with_no_memory_limit_reaches_the_queue() {
+    let h = TestHarness::new().await;
+    for no_memory_limit in ["true", "false"] {
+        let response = h
+            .execute(&format!(
+                "mutation {{ reprocessJob(id: 999999, noMemoryLimit: {no_memory_limit}) }}"
+            ))
+            .await;
+        assert_has_errors(&response);
+        assert!(
+            !response
+                .errors
+                .iter()
+                .any(|error| error.message.contains("Unknown argument")),
+            "{:?}",
+            response.errors
+        );
+    }
+}
+
 #[tokio::test]
 async fn reprocess_nonexistent_job() {
     let h = TestHarness::new().await;
