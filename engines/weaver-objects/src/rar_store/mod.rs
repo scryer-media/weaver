@@ -62,6 +62,11 @@ pub(crate) struct Volume {
     // Where the name puts the volume in its set's numbering, read once as
     // the name is given.
     numbered: Option<naming::VolumeName>,
+    // The name it was first given, as posted, and where that puts it: a
+    // recovery set may rename it, and its siblings still posted under the
+    // same numbering are this set's all the same.
+    posted: Option<String>,
+    posted_numbered: Option<naming::VolumeName>,
     length: Option<u64>,
     closed: bool,
     kept: Kept,
@@ -79,6 +84,8 @@ impl Volume {
         Self {
             name: None,
             numbered: None,
+            posted: None,
+            posted_numbered: None,
             length: None,
             closed: false,
             kept: Kept::default(),
@@ -110,6 +117,21 @@ impl Volume {
     fn name_as(&mut self, name: &str) {
         self.numbered = numbering(name);
         self.name = Some(name.to_owned());
+        if self.posted.is_none() {
+            self.posted = Some(name.to_owned());
+            self.posted_numbered = self.numbered.clone();
+        }
+    }
+
+    // Where each name the volume carried puts it: the one it has now and
+    // the one it was posted under.
+    fn numberings(&self) -> impl Iterator<Item = &naming::VolumeName> {
+        self.numbered.iter().chain(self.posted_numbered.iter())
+    }
+
+    fn posted_as(&mut self, name: &str) {
+        self.posted_numbered = numbering(name);
+        self.posted = Some(name.to_owned());
     }
 }
 

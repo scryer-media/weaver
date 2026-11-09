@@ -69,13 +69,15 @@ impl GraphJob {
         tree.nest_at_most(storage.nesting);
         let root = ArticleRoot::restore(files, &snapshot.root)?;
         same_post(&tree, files)?;
+        let windows = storage.windows(scope);
         let runs = Runs::new(
             scope,
             storage.slots,
             storage.mail,
             Arc::clone(&storage.accountant),
         )
-        .on(storage.hardware);
+        .on(storage.hardware)
+        .lending(windows);
         let mut writer = NamespaceWriter::new(
             scope,
             storage.working_dir,
@@ -144,6 +146,7 @@ impl GraphJob {
         job.tree
             .restored(&mut job.writer.placing(&mut *job.builder), &mut effects);
         job.settle(effects)?;
+        job.lift_hold_refusals()?;
         job.writer.queue_rechecks(rejected);
         job.mark_damage()?;
         let mut effects = Vec::new();
@@ -165,6 +168,42 @@ impl GraphJob {
             refetched,
             job,
         })
+    }
+
+    // Refusals an older build gave when holds ran past their budgets are
+    // taken back, and their sets read their volumes again from their files.
+    fn lift_hold_refusals(&mut self) -> Result<(), GraphError> {
+        let mut out = Vec::new();
+        self.writer
+            .lift_hold_refusals(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
+        self.heard(out)
+    }
+
+    // What an older build left when a member's holds ran past their
+    // budgets: the object bound over the first root member that has one
+    // refuses it for its holds, as that build's object said.
+    #[cfg(test)]
+    pub(crate) fn refuse_for_holds(&mut self) -> Result<NodeId, GraphError> {
+        let node = self
+            .tree
+            .namespace(NodeId::ROOT)
+            .and_then(|root| {
+                root.records()
+                    .find_map(|record| self.tree.child_of(NodeId::ROOT, record.id))
+            })
+            .map(|(node, _)| node)
+            .expect("an object bound over a root member");
+        let mut out = Vec::new();
+        self.writer.said(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            node,
+            weaver_graph::Emit::Refuse(weaver_graph::Why::HoldsBreached),
+            &mut out,
+        )?;
+        self.heard(out)?;
+        Ok(node)
     }
 
     // The node was offered this candidate last: it is offered again, so the

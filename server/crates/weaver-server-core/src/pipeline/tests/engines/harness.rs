@@ -577,6 +577,9 @@ pub(in crate::pipeline::tests) struct Scenario {
     // Every pipeline the scenario prepares finds the stored settings
     // present but not parsing.
     policy_corrupt: bool,
+    // The hold budgets every graph job of the pipeline shares, when not the
+    // host's.
+    pub(in crate::pipeline::tests) holds: Option<weaver_graph::holds::HoldBudgets>,
     // The STAT server of every pipeline the scenario prepared, held as long
     // as the scenario is.
     stat_servers: std::sync::Mutex<Vec<Listener>>,
@@ -605,6 +608,7 @@ impl Scenario {
             limits: None,
             unacceptable: None,
             policy_corrupt: false,
+            holds: None,
             stat_servers: std::sync::Mutex::new(Vec::new()),
         }
     }
@@ -686,6 +690,10 @@ impl Scenario {
         if let Some(limits) = &self.limits {
             pipeline.extraction_limits = std::sync::Arc::new(limits.clone());
         }
+        if let Some(budgets) = self.holds {
+            pipeline.graph_holds =
+                std::sync::Arc::new(weaver_graph::holds::HoldsAccountant::new(budgets));
+        }
         if self.policy_corrupt {
             pipeline
                 .db
@@ -695,6 +703,15 @@ impl Scenario {
                 )
                 .unwrap();
         }
+    }
+
+    // The job's holds run under these budgets.
+    pub(in crate::pipeline::tests) fn holds(
+        mut self,
+        budgets: weaver_graph::holds::HoldBudgets,
+    ) -> Self {
+        self.holds = Some(budgets);
+        self
     }
 
     // Whatever the download queue hands out at once arrives in reverse.
@@ -912,6 +929,9 @@ pub(in crate::pipeline::tests) struct GraphView {
     // The most the job's working directory held at any look, every file
     // under it by its length.
     pub(in crate::pipeline::tests) scratch: u64,
+    // The most the job's holds kept at any look, in memory, on scratch and
+    // on file, over every namespace.
+    pub(in crate::pipeline::tests) held: u64,
 }
 
 #[derive(Debug)]
@@ -1712,6 +1732,12 @@ pub(in crate::pipeline::tests) fn observe(
         })
         .sum();
     view.resident = view.resident.max(resident);
+    let held = tree
+        .live()
+        .into_iter()
+        .map(|node| job.writer().held_bytes(node))
+        .sum();
+    view.held = view.held.max(held);
     *reads = job.writer().read_backs();
     view.observed += looked.elapsed();
 }

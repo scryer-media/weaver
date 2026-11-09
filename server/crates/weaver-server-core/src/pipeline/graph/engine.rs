@@ -240,6 +240,9 @@ pub(crate) struct Runs {
     hardware: Hardware,
     // Where the runs keep the time their decoders spend executing.
     clock: DecodeClock,
+    // The scratch-file windows a run's decoders may borrow, when the job
+    // lends any.
+    windows: Option<Arc<super::window::Windows>>,
 }
 
 impl Runs {
@@ -258,7 +261,14 @@ impl Runs {
             marks: Marks::default(),
             hardware: Hardware::default(),
             clock: DecodeClock::default(),
+            windows: None,
         }
+    }
+
+    // The runs, lending their decoders windows from `windows`.
+    pub(crate) fn lending(mut self, windows: Arc<super::window::Windows>) -> Self {
+        self.windows = Some(windows);
+        self
     }
 
     // The runs, granted what `hardware` grants as each starts.
@@ -454,7 +464,8 @@ impl Runs {
         self.marks.mark(node);
         let volumes = Arc::new(RunVolumes::new(shelf, generation));
         run.volumes = Some(Arc::clone(&volumes));
-        let budget = self.hardware.grant().run;
+        let mut budget = self.hardware.grant().run;
+        budget.lender = self.windows.as_ref().map(|windows| windows.for_node(node));
         let (scope, mail, clock) = (self.scope, self.mail.clone(), self.clock.clone());
         let said = move |heard| Said {
             scope,

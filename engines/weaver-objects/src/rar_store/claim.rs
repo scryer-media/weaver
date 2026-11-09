@@ -322,7 +322,7 @@ impl RarStore {
         let mut numbered = self
             .volumes
             .values()
-            .filter_map(|volume| volume.numbered.as_ref())
+            .flat_map(Volume::numberings)
             .peekable();
         let bound = numbered.peek().is_some();
         let ours = wanted

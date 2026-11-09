@@ -180,6 +180,7 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
             nesting: u32::MAX,
             hardware: Default::default(),
             metrics: None,
+            data_dir: None,
         },
         0,
     )

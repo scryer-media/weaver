@@ -77,11 +77,13 @@ pub(crate) struct Snapshot {
     pub(crate) passwords: BTreeMap<NodeId, usize>,
 }
 
-// A hold of the namespace at `node` paged to its scratch file.
+// A hold of the namespace at `node` paged to its scratch file, or,
+// `on_file`, in its member's spill file at its own offset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HoldRecord {
     pub(crate) node: NodeId,
     pub(crate) held: ScratchHold,
+    pub(crate) on_file: bool,
 }
 
 // The generations a checkpoint read the job at: of the tree, of the
@@ -1308,17 +1310,18 @@ fn audit(job: &GraphJob, held: &Held) {
     }
 }
 
-// A namespace's holds on scratch, in key order, as the ledger lists them.
-fn hold_rows(node: NodeId, holds: &[ScratchHold]) -> Vec<HoldRow> {
+// A namespace's holds on disk, in key order, as the ledger lists them.
+fn hold_rows(node: NodeId, holds: &[(ScratchHold, bool)]) -> Vec<HoldRow> {
     let node = i64::from(node.0);
     let mut out: Vec<HoldRow> = holds
         .iter()
-        .map(|held| HoldRow {
+        .map(|(held, on_file)| HoldRow {
             node,
             volume: i64::from(held.volume.0),
             start: held.range.start as i64,
             end: held.range.end as i64,
             scratch_offset: held.scratch_offset as i64,
+            on_file: *on_file,
         })
         .collect();
     out.sort_by_key(Row::key);
@@ -1710,6 +1713,7 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
                 range: range(row.node, row.start, row.end)?,
                 scratch_offset,
             },
+            on_file: row.on_file,
         });
     }
     Ok(Snapshot {

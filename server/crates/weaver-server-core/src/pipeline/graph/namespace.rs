@@ -11,8 +11,8 @@
 // What becomes of a delivery depends only on what its member is:
 //
 //   undecided   its first bytes have not said what it is; the bytes are held,
-//               and replayed once it is decided. A breach of the holds
-//               budgets decides it a leaf on the spot, and nothing pauses.
+//               and replayed once it is decided. Past the holds budgets
+//               they are held in its spill file, and nothing pauses.
 //   a leaf      the bytes are written to its file at their offset, damaged
 //               or not; the namespace's coverage is the record of which.
 //   bound       the bytes go down the tree to the object that owns it, and
@@ -28,7 +28,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use weaver_graph::Posted;
-use weaver_graph::holds::{HoldLedger, HoldsAccountant, HoldsNamespace, Location, Placed};
+use weaver_graph::holds::{Budget, HoldLedger, HoldsAccountant, HoldsNamespace, Location, Placed};
 use weaver_graph::member::FIRST_BYTES;
 use weaver_graph::{
     Algorithm, Builder, ByteRange, Coverage, Effect, Emit, Evidenced, Kind, Marked, MemberId,
@@ -127,6 +127,23 @@ struct Files {
     holds: HoldLedger,
     // Where held bytes go when RAM runs short; opened on the first page-out.
     scratch: Option<Leaf>,
+    // Where a member's held bytes go past the budgets, at their own offsets.
+    //
+    // A member's spill file, once made, is this one leaf until its
+    // namespace goes, when it is discarded with the namespace's other files
+    // (or a restore sweeps it, unnamed). It never goes through `discard` on
+    // its own, so its path is never queued to leave while it can still be
+    // written: a member that spills, releases and spills again writes the
+    // same file. Once the ledger holds nothing of the member on file the
+    // file is emptied, never removed, and not at once: bytes a committed
+    // checkpoint names on file stay as it left them until a later one
+    // commits (`release_spill`). A repair out with a handle on it reads
+    // that range as changed, since the holds it read moved.
+    spills: BTreeMap<MemberId, Leaf>,
+    // The members the ledger holds nothing of on file since their spill
+    // file's last write. The file may still have bytes, until it is emptied
+    // at a commit.
+    spills_empty: BTreeSet<MemberId>,
     // Why a member is a leaf when something refused to own it. Changed only
     // through `refuse` and `unrefuse`, which mark the member.
     refused: BTreeMap<MemberId, Why>,
@@ -138,6 +155,8 @@ impl Files {
             leaves: Marked::default(),
             holds: HoldLedger::new(namespace, accountant),
             scratch: None,
+            spills: BTreeMap::new(),
+            spills_empty: BTreeSet::new(),
             refused: BTreeMap::new(),
         }
     }
@@ -203,9 +222,9 @@ pub(crate) struct NamespaceWriter {
     // Sparse durable obligations, retained until a current verification answers.
     verifications: BTreeSet<(NodeId, MemberId)>,
     // Whether the job's holds have been paged out for a stop. Only then do
-    // the holds on scratch go in the checkpoint: scratch space is reused
-    // once nothing lives on it, so a row written mid-run could name bytes a
-    // later hold replaced before the next checkpoint reached the database.
+    // the holds on scratch go in the checkpoint. Once rows are written, the
+    // bytes they name are kept until a later checkpoint commits, as
+    // `scratch_rewinding` and `spills_emptying` say.
     stopped: bool,
     renamed: Vec<MemberId>,
     // Members whose files wait to move to the names the ledger gave them,
@@ -219,6 +238,23 @@ pub(crate) struct NamespaceWriter {
     // once one is taken. Until that checkpoint commits, the one the
     // database holds may name it, so it stays on disk until then.
     leaving: Vec<(Leaf, Option<u64>)>,
+    // Every spill file the ledger holds nothing of on file, each with the
+    // first checkpoint taken since, which names none of its bytes. The one
+    // the database holds may still name them, so the file is emptied only
+    // once that checkpoint commits, and not at all if the member spills
+    // again first. Until then no new byte enters the file below the length
+    // it had when let go: the ledger keeps the member's bytes there in RAM,
+    // since a member started over brings different bytes to the same
+    // offsets, and a restore would pair them with the state that checkpoint
+    // recorded. Bytes past that length spill as ever.
+    spills_emptying: BTreeMap<(NodeId, MemberId), Option<u64>>,
+    // Each node whose scratch file nothing lives on, with the first
+    // checkpoint taken since, which names none of it, and the extent then.
+    // The one the database holds may name any byte below the extent, so
+    // scratch offsets start over only once that checkpoint commits, and
+    // only if nothing was allocated meanwhile: until then every page-out
+    // lands past every byte a committed row names.
+    scratch_rewinding: BTreeMap<NodeId, (u64, u64)>,
     // The latest checkpoint the database has committed.
     committed: u64,
     segments: Vec<Segment>,
@@ -238,6 +274,8 @@ pub(crate) struct NamespaceWriter {
     // back (true), or the namespace whose members nothing held (false). One
     // archive is one event however many volumes it had.
     given_up: BTreeSet<(NodeId, bool)>,
+    // The budgets each member has spilled past, said once each.
+    spills_said: BTreeSet<(NodeId, MemberId, Budget)>,
     #[cfg(test)]
     diagnostics: Vec<weaver_graph::recovery::RepairDiagnostic>,
     placements: Vec<Placement>,
@@ -293,6 +331,8 @@ impl NamespaceWriter {
             moves: Vec::new(),
             left: BTreeMap::new(),
             leaving: Vec::new(),
+            spills_emptying: BTreeMap::new(),
+            scratch_rewinding: BTreeMap::new(),
             committed: 0,
             segments: Vec::new(),
             effects: Vec::new(),
@@ -300,6 +340,7 @@ impl NamespaceWriter {
             refused_in_batch: BTreeSet::new(),
             given_back: Vec::new(),
             given_up: BTreeSet::new(),
+            spills_said: BTreeSet::new(),
             #[cfg(test)]
             diagnostics: Vec::new(),
             placements: Vec::new(),
@@ -399,6 +440,9 @@ impl NamespaceWriter {
             if let Some(scratch) = &mut files.scratch {
                 scratch.release_handle();
             }
+            for spill in files.spills.values_mut() {
+                spill.release_handle();
+            }
             let members: Vec<_> = files.leaves.keys().copied().collect();
             for member in members {
                 files
@@ -417,7 +461,13 @@ impl NamespaceWriter {
     pub(crate) fn open_files(&self) -> Vec<PathBuf> {
         self.files
             .values()
-            .flat_map(|files| files.leaves.values().chain(files.scratch.iter()))
+            .flat_map(|files| {
+                files
+                    .leaves
+                    .values()
+                    .chain(files.scratch.iter())
+                    .chain(files.spills.values())
+            })
             .chain(self.leaving.iter().map(|(leaf, _)| leaf))
             .filter(|leaf| leaf.is_open())
             .map(|leaf| leaf.path().to_path_buf())
@@ -906,11 +956,9 @@ impl NamespaceWriter {
     // for the member as it holds any bytes whose place is not known.
     fn capture(
         &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
+        tree: &Tree,
         (child, volume): (NodeId, VolumeIndex),
         arrival: &Arrival,
-        effects: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let mut placements = std::mem::take(&mut self.placements);
         placements.clear();
@@ -952,14 +1000,7 @@ impl NamespaceWriter {
             .collect();
         self.placements = placements;
         kept?;
-        self.hold_for(
-            tree,
-            builder,
-            child,
-            (arrival.node, arrival.member),
-            held,
-            effects,
-        )
+        self.hold_for((arrival.node, arrival.member), held)
     }
 
     // What the object at `child` kept in its envelope of its volume, the
@@ -967,11 +1008,8 @@ impl NamespaceWriter {
     // and held for the member until the object places it again.
     fn unkept(
         &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
         (node, member, child): (NodeId, MemberId, NodeId),
         (range, envelope, at): (ByteRange, u32, u64),
-        effects: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
         let mut bytes = Vec::new();
         if !self
@@ -981,39 +1019,18 @@ impl NamespaceWriter {
             return Ok(());
         }
         let held = vec![(range.start, Bytes::from(bytes).into())];
-        self.hold_for(tree, builder, child, (node, member), held, effects)
+        self.hold_for((node, member), held)
     }
 
-    // Bytes of a bound member, held until its object places them. A breach
-    // of the holds budgets refuses the object, as it would refuse an
-    // undecided member, and the bytes that breached go to the member's own
-    // file, which it is now.
+    // Bytes of a bound member, held until its object places them, as any
+    // member's bytes are held: the member stays its object's.
     fn hold_for(
         &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        child: NodeId,
         (node, member): (NodeId, MemberId),
         held: Vec<(u64, Evidenced)>,
-        effects: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        let mut breached = Vec::new();
         for (offset, bytes) in held {
-            if self.keep_held(node, member, offset, bytes.clone())? {
-                breached.push((offset, bytes));
-            }
-        }
-        if breached.is_empty() {
-            return Ok(());
-        }
-        tree.emitted(
-            child,
-            vec![weaver_graph::Emit::Refuse(Why::HoldsBreached)],
-            &mut self.placing(builder),
-            effects,
-        );
-        for (offset, bytes) in breached {
-            self.write_file(tree, node, member, offset, &bytes)?;
+            self.keep_held(node, member, offset, bytes)?;
         }
         Ok(())
     }
@@ -1069,7 +1086,7 @@ impl NamespaceWriter {
                     provenance: *provenance,
                 };
                 self.taken(tree, segments, &arrival, write);
-                return self.write_leaf(tree, builder, segments, arrival, write, out);
+                return self.write_leaf(tree, arrival);
             }
             Effect::Reached {
                 node,
@@ -1094,9 +1111,7 @@ impl NamespaceWriter {
                 if tree.recovers(*child) {
                     return self.write_file(tree, *node, *member, *offset, bytes);
                 }
-                let mut effects = Vec::new();
-                self.capture(tree, builder, (*child, *volume), &arrival, &mut effects)?;
-                return self.apply_each(tree, builder, segments, effects, write, out);
+                return self.capture(tree, (*child, *volume), &arrival);
             }
             Effect::Announced { node, member } => {
                 self.announce(tree, builder, segments, *node, *member, out)?;
@@ -1197,15 +1212,7 @@ impl NamespaceWriter {
                 at,
                 ..
             } => {
-                let mut effects = Vec::new();
-                self.unkept(
-                    tree,
-                    builder,
-                    (*node, *member, *child),
-                    (*range, *envelope, *at),
-                    &mut effects,
-                )?;
-                self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
+                self.unkept((*node, *member, *child), (*range, *envelope, *at))?;
             }
             Effect::Retracted { node, member } => {
                 self.retract(tree, *node, *member)?;
@@ -1544,64 +1551,29 @@ impl NamespaceWriter {
         }
     }
 
-    fn write_leaf(
-        &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        segments: &dyn Segments,
-        arrival: Arrival,
-        write: Write,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), WriteError> {
+    fn write_leaf(&mut self, tree: &mut Tree, arrival: Arrival) -> Result<(), WriteError> {
         let (node, member) = (arrival.node, arrival.member);
+        // Bytes whose member is not yet decided wait for it to be.
         if tree.is_undecided(node, member) {
-            return self.hold(tree, builder, segments, arrival, write, out);
+            return self.keep_held(node, member, arrival.offset, arrival.bytes);
         }
         self.release_to_leaf(tree, node, member)?;
         self.write_file(tree, node, member, arrival.offset, &arrival.bytes)
     }
 
-    // Hold bytes whose member is not yet decided. A breach settles it: the
-    // object that takes it is handed everything held and the new bytes; a
-    // leaf has them go to its file.
-    fn hold(
-        &mut self,
-        tree: &mut Tree,
-        builder: &mut dyn Builder,
-        segments: &dyn Segments,
-        arrival: Arrival,
-        write: Write,
-        out: &mut Vec<Effect>,
-    ) -> Result<(), WriteError> {
-        let (node, member) = (arrival.node, arrival.member);
-        if self.keep_held(node, member, arrival.offset, arrival.bytes.clone())? {
-            if let Some(owner) = self.settle(tree, builder, segments, node, member, out)? {
-                let mut effects = Vec::new();
-                self.capture(tree, builder, owner, &arrival, &mut effects)?;
-                return self.apply_each(tree, builder, segments, effects, write, out);
-            }
-            self.refuse(tree, node, member, Why::HoldsBreached, true);
-            self.write_file(tree, node, member, arrival.offset, &arrival.bytes)?;
-            out.push(Effect::Refused {
-                node,
-                member,
-                why: Why::HoldsBreached,
-            });
-        }
-        Ok(())
-    }
-
-    // Hold bytes of the member in its namespace's ledger, paging to scratch
-    // as the ledger says. True when they breached the budgets and were not
-    // held.
+    // Hold bytes of the member in its namespace's ledger: in RAM, paged to
+    // scratch as the ledger says, and past the budgets in the member's spill
+    // file. Every byte a member waits with comes through here, bound or
+    // undecided, and every one stays held: pressure never gives a member up.
     fn keep_held(
         &mut self,
         node: NodeId,
         member: MemberId,
         offset: u64,
         bytes: Evidenced,
-    ) -> Result<bool, WriteError> {
+    ) -> Result<(), WriteError> {
         let free_disk = self.free_disk_bytes();
+        let spilled = bytes.clone();
         let outcome =
             self.files_mut(node)
                 .holds
@@ -1610,7 +1582,115 @@ impl NamespaceWriter {
             self.scratch(node)?
                 .write(page_out.scratch_offset, &page_out.bytes, None)?;
         }
-        Ok(matches!(outcome.placed, Placed::Breached(_)))
+        if let Placed::Spilled(budget) = outcome.placed {
+            self.spill_write(node, member, offset, &spilled)?;
+            self.said_spill(node, member, budget, free_disk);
+            return Ok(());
+        }
+        // The new bytes may have replaced the last the member held on file.
+        self.release_spill(node, member)
+    }
+
+    // A member's first spill past a budget is said once, with how far that
+    // budget stands.
+    fn said_spill(&mut self, node: NodeId, member: MemberId, budget: Budget, free_disk: u64) {
+        if !self.spills_said.insert((node, member, budget)) {
+            return;
+        }
+        let namespace = HoldsNamespace {
+            scope: self.scope,
+            node,
+        };
+        let (held, limit) = self.accountant.standing(namespace, budget, free_disk);
+        tracing::info!(
+            job_id = self.scope,
+            node = node.0,
+            member = member.0,
+            budget = %budget_name(budget),
+            held,
+            limit,
+            "holds spilled"
+        );
+    }
+
+    // The member's spill file, made empty on its first spill and the same
+    // leaf from then on, as `Files::spills` says.
+    fn spill_file(&mut self, node: NodeId, member: MemberId) -> Result<&mut Leaf, WriteError> {
+        let dir = self.working_dir.clone();
+        let files = self.files_mut(node);
+        if !files.spills.contains_key(&member) {
+            let mut spill = Leaf::at(&dir, &spill_name(node, member));
+            spill.truncate()?;
+            files.spills.insert(member, spill);
+            files.spills_empty.insert(member);
+        }
+        Ok(files.spills.get_mut(&member).expect("opened above"))
+    }
+
+    // Bytes of the member written to its spill file at their own offset,
+    // which the ledger already holds there.
+    fn spill_write(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        offset: u64,
+        bytes: &[u8],
+    ) -> Result<(), WriteError> {
+        self.spill_file(node, member)?.write(offset, bytes, None)?;
+        self.files_mut(node).spills_empty.remove(&member);
+        Ok(())
+    }
+
+    // Once the ledger holds nothing of the member on file, its spill file's
+    // handle is let go and the file waits to be emptied at the commit of
+    // the next checkpoint, as `spills_emptying` says, with nothing new
+    // written below its length meanwhile; the file and its leaf stay, so no
+    // later spill of the member meets a path queued to leave.
+    fn release_spill(&mut self, node: NodeId, member: MemberId) -> Result<(), WriteError> {
+        let Some(files) = self.files.get_mut(&node) else {
+            return Ok(());
+        };
+        if files.spills_empty.contains(&member) || files.holds.spills(held_volume(member)) {
+            return Ok(());
+        }
+        let Some(spill) = files.spills.get_mut(&member) else {
+            return Ok(());
+        };
+        // A length that cannot be read keeps the whole file.
+        let written = spill.len().unwrap_or(u64::MAX);
+        spill.release_handle();
+        files.holds.keep_off_file(held_volume(member), written);
+        files.spills_empty.insert(member);
+        self.spills_emptying.insert((node, member), None);
+        Ok(())
+    }
+
+    // The checkpoints through `committed` have committed: each spill file
+    // released before one of them was taken holds no bytes the database
+    // names, so it takes new bytes anywhere again, and, not written since,
+    // is emptied.
+    fn empty_released_spills(&mut self, committed: u64) -> Result<(), WriteError> {
+        let due: Vec<(NodeId, MemberId)> = self
+            .spills_emptying
+            .iter()
+            .filter(|(_, stamp)| stamp.is_some_and(|stamp| stamp <= committed))
+            .map(|(key, _)| *key)
+            .collect();
+        for (node, member) in due {
+            self.spills_emptying.remove(&(node, member));
+            let Some(files) = self.files.get_mut(&node) else {
+                continue;
+            };
+            files.holds.allow_file(held_volume(member));
+            if !files.spills_empty.contains(&member) || files.holds.spills(held_volume(member)) {
+                continue;
+            }
+            if let Some(spill) = files.spills.get_mut(&member) {
+                spill.truncate()?;
+                spill.release_handle();
+            }
+        }
+        Ok(())
     }
 
     // A member whose front will say no more is settled by the tree: an
@@ -1644,8 +1724,10 @@ impl NamespaceWriter {
         node: NodeId,
         member: MemberId,
     ) -> Result<(), WriteError> {
-        for (offset, bytes) in self.take_held(node, member, ALL)? {
-            self.write_file(tree, node, member, offset, &bytes)?;
+        for span in self.held_spans(node, member, ALL) {
+            for (offset, bytes) in self.take_held(node, member, span)? {
+                self.write_file(tree, node, member, offset, &bytes)?;
+            }
         }
         Ok(())
     }
@@ -1671,13 +1753,8 @@ impl NamespaceWriter {
         said: Option<&Coverage>,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        let held = self
-            .files
-            .get(&node)
-            .map(|files| files.holds.held_in(held_volume(member), range))
-            .unwrap_or_default();
-        for hold in held {
-            for piece in self.take_held(node, member, hold)? {
+        for span in self.held_spans(node, member, range) {
+            for piece in self.take_held(node, member, span)? {
                 self.replay_piece(tree, builder, segments, (node, member), piece, said, out)?;
             }
         }
@@ -1833,8 +1910,51 @@ impl NamespaceWriter {
         Ok(released)
     }
 
+    // The spans the held parts of `range` of the member leave the ledger
+    // in, in offset order, for `take_held`: a hold in RAM or on scratch
+    // whole, as the budgets bound it, and one in the spill file, which no
+    // budget bounds, a `READ_BACK` at a time. However much a member spilled,
+    // no more than that of it is read back into memory at once, and what is
+    // not yet read stays held on file, so a refusal or a second release
+    // among the pieces still sees it there.
+    fn held_spans(&self, node: NodeId, member: MemberId, range: ByteRange) -> Vec<ByteRange> {
+        let Some(files) = self.files.get(&node) else {
+            return Vec::new();
+        };
+        let mut spans = Vec::new();
+        for piece in files.holds.peek(held_volume(member), range) {
+            if piece.location != Location::Spilled {
+                spans.push(piece.range);
+                continue;
+            }
+            let mut at = piece.range.start;
+            while at < piece.range.end {
+                let end = piece.range.end.min(at.saturating_add(READ_BACK));
+                spans.push(ByteRange::new(at, end));
+                at = end;
+            }
+        }
+        spans
+    }
+
+    // What is held of `range` of the member leaves the ledger unread: the
+    // member's bytes are in hand elsewhere, or it is gone.
+    fn drop_held(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        range: ByteRange,
+    ) -> Result<(), WriteError> {
+        let Some(files) = self.files.get_mut(&node) else {
+            return Ok(());
+        };
+        files.holds.take(held_volume(member), range);
+        self.release_spill(node, member)
+    }
+
     // What is held of `range` of the member, in offset order, read back
-    // from scratch where it was paged.
+    // from scratch where it was paged and from the spill file where it
+    // spilled. Callers that deliver what they take ask by `held_spans`.
     fn take_held(
         &mut self,
         node: NodeId,
@@ -1854,9 +1974,22 @@ impl NamespaceWriter {
                     self.scratch(node)?.read(offset, index(len), &mut buffer)?;
                     Bytes::from(buffer)
                 }
+                Location::Spilled => {
+                    #[cfg(test)]
+                    tests::SPILL_READ_MOST
+                        .with(|most| most.set(most.get().max(piece.range.len())));
+                    let mut buffer = Vec::new();
+                    self.spill_file(node, member)?.read(
+                        piece.range.start,
+                        index(piece.range.len()),
+                        &mut buffer,
+                    )?;
+                    Bytes::from(buffer)
+                }
             };
             held.push((piece.range.start, Evidenced::with(bytes, piece.evidence)));
         }
+        self.release_spill(node, member)?;
         Ok(held)
     }
 
@@ -2028,7 +2161,7 @@ impl NamespaceWriter {
     }
 
     fn retract(&mut self, tree: &Tree, node: NodeId, member: MemberId) -> Result<(), WriteError> {
-        self.take_held(node, member, ALL)?;
+        self.drop_held(node, member, ALL)?;
         if let Some(leaf) = self
             .files
             .get_mut(&node)
@@ -2063,7 +2196,13 @@ impl NamespaceWriter {
                     for member in files.leaves.keys() {
                         self.caps.forget(tree, node, *member);
                     }
-                    for leaf in files.leaves.into_map().into_values().chain(files.scratch) {
+                    for leaf in files
+                        .leaves
+                        .into_map()
+                        .into_values()
+                        .chain(files.scratch)
+                        .chain(files.spills.into_values())
+                    {
                         self.discard(leaf)?;
                     }
                 }
@@ -2078,7 +2217,7 @@ impl NamespaceWriter {
                 })
                 .collect();
             for member in gone {
-                self.take_held(node, member, ALL)?;
+                self.drop_held(node, member, ALL)?;
                 let files = self.files_mut(node);
                 files.unrefuse(member);
                 if let Some(leaf) = files.leaves.remove(&member) {
@@ -2281,6 +2420,10 @@ pub(crate) trait Source {
         len: u64,
         into: &mut Vec<u8>,
     ) -> bool;
+    // Bytes of the member's held parts kept in its spill file, at their own
+    // offsets.
+    fn spilled(&self, node: NodeId, member: MemberId, range: ByteRange, into: &mut Vec<u8>)
+    -> bool;
 }
 
 pub(crate) fn read_member(
@@ -2379,6 +2522,7 @@ fn read_held(
         range,
         into,
         |offset, len, into| source.scratch(node, member, offset, len, into),
+        |piece, into| source.spilled(node, member, piece, into),
     )
 }
 
@@ -2389,6 +2533,7 @@ fn read_pieces<'p>(
     range: ByteRange,
     into: &mut Vec<u8>,
     mut scratch: impl FnMut(u64, u64, &mut Vec<u8>) -> bool,
+    mut spilled: impl FnMut(ByteRange, &mut Vec<u8>) -> bool,
 ) -> bool {
     let start = into.len();
     let mut at = range.start;
@@ -2402,6 +2547,7 @@ fn read_pieces<'p>(
                 true
             }
             Location::Scratch { offset, len } => scratch(*offset, *len, into),
+            Location::Spilled => spilled(piece, into),
         };
         if !read {
             break;
@@ -2548,6 +2694,22 @@ impl Source for Probe<'_, '_> {
             .is_some_and(|scratch| scratch.len().is_ok_and(|length| length >= offset + len))
             && Self::zeros(into, len)
     }
+
+    fn spilled(
+        &self,
+        node: NodeId,
+        member: MemberId,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        self.0
+            .writer
+            .files
+            .get(&node)
+            .and_then(|files| files.spills.get(&member))
+            .is_some_and(|spill| spill.len().is_ok_and(|length| length >= range.end))
+            && Self::zeros(into, range.len())
+    }
 }
 
 impl Source for Access<'_> {
@@ -2629,6 +2791,20 @@ impl Source for Access<'_> {
             .and_then(|files| files.scratch.as_ref())
             .is_some_and(|scratch| scratch.read(offset, index(len), into).is_ok())
     }
+
+    fn spilled(
+        &self,
+        node: NodeId,
+        member: MemberId,
+        range: ByteRange,
+        into: &mut Vec<u8>,
+    ) -> bool {
+        self.writer
+            .files
+            .get(&node)
+            .and_then(|files| files.spills.get(&member))
+            .is_some_and(|spill| spill.read(range.start, index(range.len()), into).is_ok())
+    }
 }
 
 // Holds are kept per namespace, keyed by member, which the ledger calls a
@@ -2664,6 +2840,25 @@ pub(crate) fn scratch_name(node: NodeId) -> String {
         weaver_graph::names::INTERNAL_DIR,
         node.0
     )
+}
+
+// A member's spill file, under the working directory.
+pub(crate) fn spill_name(node: NodeId, member: MemberId) -> String {
+    format!(
+        "{}/graph-spill-{}-{}.spill",
+        weaver_graph::names::INTERNAL_DIR,
+        node.0,
+        member.0
+    )
+}
+
+fn budget_name(budget: Budget) -> &'static str {
+    match budget {
+        Budget::ResidentLimit => "resident_limit",
+        Budget::ScratchTotal => "scratch_total",
+        Budget::ScratchCeiling => "scratch_ceiling",
+        Budget::DiskReserve => "disk_reserve",
+    }
 }
 
 fn held_volume(member: MemberId) -> VolumeIndex {

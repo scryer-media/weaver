@@ -12,7 +12,8 @@ use std::collections::BTreeMap;
 
 use weaver_graph::holds::{Reserve, ScratchHold};
 use weaver_graph::{
-    ByteRange, Coverage, Digest, MemberId, NodeId, Provenance, Segment, Tree, VolumeIndex,
+    Builder, ByteRange, Coverage, Digest, Effect, MemberId, NodeId, Provenance, Segment, Tree,
+    VolumeIndex, Why,
 };
 
 use super::{NamespaceWriter, Segments, WriteError, scratch_name};
@@ -67,23 +68,43 @@ impl NamespaceWriter {
             .flat_map(move |files| files.leaves.marks().since(at))
     }
 
-    // The holds the node's namespace has on scratch, once the job has paged
-    // them out for a stop; none before, so no row names bytes a later hold
-    // may replace.
-    pub(crate) fn hold_records(&self, node: NodeId) -> Vec<ScratchHold> {
+    // The holds the node's namespace has on scratch and in its members'
+    // spill files, each with whether it is in a spill file, once the job has
+    // paged them out for a stop; none before, so no row names bytes a later
+    // hold may replace. A spilled hold lies at its own offset, so its
+    // scratch offset is that offset.
+    pub(crate) fn hold_records(&self, node: NodeId) -> Vec<(ScratchHold, bool)> {
         if !self.stopped {
             return Vec::new();
         }
-        self.files
-            .get(&node)
-            .map(|files| files.holds.scratch_holds())
-            .unwrap_or_default()
+        let Some(files) = self.files.get(&node) else {
+            return Vec::new();
+        };
+        let spilled = files.holds.spilled_holds().into_iter().map(|(volume, range)| {
+            let held = ScratchHold {
+                volume,
+                range,
+                scratch_offset: range.start,
+            };
+            (held, true)
+        });
+        files
+            .holds
+            .scratch_holds()
+            .into_iter()
+            .map(|held| (held, false))
+            .chain(spilled)
+            .collect()
     }
 
     // A graceful stop: every namespace pages what it holds in RAM to
-    // scratch, under the same budgets as any page-out, so the checkpoint
-    // after it records them and a restart reads them back. What scratch
-    // cannot take stays in RAM and is fetched again.
+    // scratch, under the same budgets as any page-out, and what scratch
+    // cannot take goes to its member's spill file as far as the disk
+    // reserve leaves room, so the checkpoint after it records those holds
+    // and a restart reads each back. The stop keeps the reserve for the
+    // checkpoint and the database: what neither scratch nor the reserve
+    // takes stays in RAM, unrecorded, and is fetched again after the
+    // restart.
     pub(crate) fn page_out_holds(&mut self) -> Result<(), WriteError> {
         self.stopped = true;
         let nodes: Vec<NodeId> = self
@@ -94,59 +115,169 @@ impl NamespaceWriter {
             .collect();
         let mut free_disk = self.free_disk_bytes();
         for node in nodes {
-            let page_outs = self.files_mut(node).holds.page_out_all(free_disk);
+            let (page_outs, spills) = self.files_mut(node).holds.page_out_all(free_disk);
             for page_out in &page_outs {
                 free_disk = free_disk.saturating_sub(page_out.range.len());
                 self.scratch(node)?
                     .write(page_out.scratch_offset, &page_out.bytes, None)?;
             }
+            for spill in &spills {
+                free_disk = free_disk.saturating_sub(spill.range.len());
+                self.spill_write(
+                    node,
+                    super::held_member(spill.volume),
+                    spill.range.start,
+                    &spill.bytes,
+                )?;
+            }
         }
         Ok(())
     }
 
-    // The holds a checkpoint recorded on scratch, adopted where they lie:
-    // the node's scratch file is opened as it was left, never emptied, and
-    // each hold goes back into its ledger. A hold of a namespace or member
-    // the tree no longer has, one past the end of the file, or one the
-    // budgets refuse is not adopted, so its article reads as missing and is
-    // fetched again. Bytes the rows do not describe are never read.
+    // The holds a checkpoint recorded, adopted where they lie: the node's
+    // scratch file and its members' spill files are opened as they were
+    // left, never emptied, and each hold goes back into its ledger. A hold
+    // on scratch the budgets now refuse, under a lower ceiling say, moves to
+    // its member's spill file when the disk reserve has room for the copy.
+    // A hold that cannot be kept, one the reserve has no room for, one
+    // whose move fails, one of a namespace or member the tree no longer
+    // has, or one past the end of its file, is not adopted, so its article
+    // reads as missing and is fetched again: a restore never fails for a
+    // hold. Bytes the rows do not describe are never read.
     pub(crate) fn restore_holds(
         &mut self,
         tree: &Tree,
         records: &[HoldRecord],
     ) -> Result<(), WriteError> {
-        let mut by_node: BTreeMap<NodeId, Vec<ScratchHold>> = BTreeMap::new();
+        // The space a move to a spill file may take: what is free now, as
+        // the copy adds to the scratch file it leaves on disk.
+        let mut spill_free = self.free_disk_bytes();
+        // Every scratch byte a row names, adopted or not, is named by the
+        // checkpoint the database holds: the ledger allocates past the end
+        // of the last until one taken after this restore commits, as
+        // `scratch_rewinding` says, and the file is opened as left.
+        let mut by_node: BTreeMap<NodeId, (u64, Vec<(ScratchHold, bool)>)> = BTreeMap::new();
         for record in records {
-            let member = MemberId(record.held.volume.0);
-            if tree
-                .namespace(record.node)
-                .is_some_and(|namespace| namespace.get(member).is_some())
-            {
-                by_node.entry(record.node).or_default().push(record.held);
+            let Some(namespace) = tree.namespace(record.node) else {
+                continue;
+            };
+            let (named, holds) = by_node.entry(record.node).or_default();
+            if !record.on_file {
+                let end = record
+                    .held
+                    .scratch_offset
+                    .saturating_add(record.held.range.len());
+                *named = (*named).max(end);
+            }
+            if namespace.get(MemberId(record.held.volume.0)).is_some() {
+                holds.push((record.held, record.on_file));
             }
         }
-        for (node, holds) in by_node {
+        for (node, (named, holds)) in by_node {
+            if named > 0 {
+                self.files_mut(node).holds.keep_scratch_to(named);
+            }
             let scratch = Leaf::found(&self.working_dir, &scratch_name(node))?;
             let written = scratch.len().unwrap_or(0);
             // The file's bytes are already on disk, so the disk reserve
             // judges them against the space they would leave if absent.
             let mut free_disk = self.free_disk_bytes().saturating_add(written);
-            let files = self.files_mut(node);
             let mut adopted = false;
-            for held in holds {
+            for (held, on_file) in holds {
+                let member = super::held_member(held.volume);
+                if on_file {
+                    self.adopt_spill(node, member)?;
+                    let files = self.files_mut(node);
+                    let reaches = files
+                        .spills
+                        .get(&member)
+                        .and_then(|spill| spill.len().ok())
+                        .is_some_and(|len| held.range.end <= len);
+                    if reaches {
+                        files.holds.restore_spilled(held.volume, held.range);
+                    }
+                    continue;
+                }
                 let within = held
                     .scratch_offset
                     .checked_add(held.range.len())
                     .is_some_and(|end| end <= written);
-                if within && files.holds.restore(held, free_disk) == Reserve::Granted {
+                if !within {
+                    continue;
+                }
+                if self.files_mut(node).holds.restore(held, free_disk) == Reserve::Granted {
                     free_disk = free_disk.saturating_sub(held.range.len());
                     adopted = true;
+                    continue;
+                }
+                match self.move_to_spill(&scratch, node, held, spill_free) {
+                    Ok(true) => {
+                        spill_free = spill_free.saturating_sub(held.range.len());
+                        self.files_mut(node)
+                            .holds
+                            .restore_spilled(held.volume, held.range);
+                    }
+                    // Not adopted: its article reads as missing and is
+                    // fetched again.
+                    Ok(false) => {}
+                    Err(error) => tracing::warn!(
+                        job_id = self.scope,
+                        node = node.0,
+                        member = member.0,
+                        error = %error,
+                        "a restored hold could not move to its spill file; fetching it again"
+                    ),
                 }
             }
-            if adopted {
-                files.scratch = Some(scratch);
+            // A file with bytes is kept as left even when no hold came back,
+            // so the first page-out never empties what a row names.
+            if adopted || written > 0 {
+                self.files_mut(node).scratch = Some(scratch);
             }
         }
+        Ok(())
+    }
+
+    // A restored hold on scratch moved to its member's spill file, a
+    // `READ_BACK` at a time, when the disk reserve leaves room for it beside
+    // `free_disk`. False when it has no room. The member's spill file may
+    // hold other rows' bytes: it is opened as left, never emptied, and a
+    // move cut short leaves bytes in it that no row names and nothing
+    // reads.
+    fn move_to_spill(
+        &mut self,
+        scratch: &Leaf,
+        node: NodeId,
+        held: ScratchHold,
+        free_disk: u64,
+    ) -> Result<bool, WriteError> {
+        let len = held.range.len();
+        let reserve = self.accountant.budgets().disk_reserve;
+        if reserve != 0 && reserve.checked_add(len).is_none_or(|needed| needed > free_disk) {
+            return Ok(false);
+        }
+        let member = super::held_member(held.volume);
+        self.adopt_spill(node, member)?;
+        let mut done = 0;
+        let mut bytes = Vec::new();
+        while done < len {
+            let take = (len - done).min(super::READ_BACK);
+            bytes.clear();
+            scratch.read(held.scratch_offset + done, super::index(take), &mut bytes)?;
+            self.spill_write(node, member, held.range.start + done, &bytes)?;
+            done += take;
+        }
+        Ok(true)
+    }
+
+    // The member's spill file as a checkpoint left it, opened where it lies
+    // and never emptied.
+    fn adopt_spill(&mut self, node: NodeId, member: MemberId) -> Result<(), WriteError> {
+        if self.files.get(&node).is_some_and(|files| files.spills.contains_key(&member)) {
+            return Ok(());
+        }
+        let spill = Leaf::found(&self.working_dir, &super::spill_name(node, member))?;
+        self.files_mut(node).spills.insert(member, spill);
         Ok(())
     }
 
@@ -219,6 +350,36 @@ impl NamespaceWriter {
         }
         if let Some(why) = state.refused {
             self.files_mut(node).refuse(member, why);
+        }
+        Ok(())
+    }
+
+    // A checkpoint from a build that refused a member when its holds ran
+    // past their budgets keeps that refusal, which was never a ruling on
+    // the member's bytes: every byte went to the member's file. The tree
+    // takes each such refusal back, the object that gave the member up goes
+    // whole, and whatever owns its volumes now reads them from their files,
+    // as after a repair proves a member.
+    pub(crate) fn lift_hold_refusals(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let refused: Vec<(NodeId, MemberId)> = self
+            .files
+            .iter()
+            .flat_map(|(node, files)| {
+                files
+                    .refused
+                    .iter()
+                    .filter(|(_, why)| **why == Why::HoldsBreached)
+                    .map(|(member, _)| (*node, *member))
+            })
+            .collect();
+        for refused in refused {
+            self.reopen(tree, builder, segments, refused, out)?;
         }
         Ok(())
     }

@@ -59,6 +59,7 @@ impl Pipeline {
             })
             .collect();
         let caps = self.graph_caps(&files);
+        let data_dir = self.window_data_dir();
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -82,6 +83,7 @@ impl Pipeline {
             nesting: limits::NESTING,
             hardware: self.graph_hardware.clone(),
             metrics: Some(Arc::clone(&self.metrics)),
+            data_dir: Some(data_dir),
         };
         let mut graph = GraphJob::admit(job_id.0, &files, storage);
         let mut queued = std::collections::HashSet::new();
