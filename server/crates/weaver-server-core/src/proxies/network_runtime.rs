@@ -372,6 +372,9 @@ pub struct NetworkRuntime {
     // The torrents sessions run on the legs, each counted on its leg while
     // its tenancy lives.
     torrent_legs: Mutex<Vec<std::sync::Weak<torrent::LegTenancy>>>,
+    // What the saved routes' egresses and hops last showed of their health.
+    // A probe of a draft has none: its hops are no saved route's.
+    route_health: Option<Arc<RouteHealth>>,
 }
 
 impl NetworkRuntime {
@@ -384,6 +387,8 @@ impl NetworkRuntime {
         quota_policy: Option<Arc<crate::servers::transfer_policy::ServerTransferPolicyRegistry>>,
     ) -> Result<Arc<Self>, String> {
         let configuration = Configuration::load(&db)?;
+        let route_health = RouteHealth::new();
+        route_health.configure(&configuration.egresses, &configuration.profiles);
         let interfaces = Arc::new(InterfaceMonitor::start(
             Arc::new(SystemInterfaceSource),
             &handle,
@@ -432,6 +437,7 @@ impl NetworkRuntime {
             cap_watch: Mutex::new(None),
             health_inputs: Mutex::new(None),
             torrent_legs: Mutex::default(),
+            route_health: Some(route_health),
         });
         let weak = Arc::downgrade(&runtime);
         *runtime.poll.lock().expect("network health task") = Some(handle.spawn(async move {
@@ -538,6 +544,10 @@ impl NetworkRuntime {
     }
     pub fn interfaces(&self) -> InterfaceSnapshot {
         self.interfaces.snapshot()
+    }
+    // The saved routes' health, which tells of each route that goes down.
+    pub fn route_health(&self) -> Option<Arc<RouteHealth>> {
+        self.route_health.clone()
     }
     pub fn egress_configuration(&self, id: u32) -> Option<EgressInterface> {
         self.configuration
@@ -682,6 +692,12 @@ impl NetworkRuntime {
         *self.health_inputs.lock().expect("network health inputs") =
             Some((snapshot.clone(), quota_blocked.clone()));
         let config = self.configuration.read().expect("network configuration");
+        // An egress out of quota is not down here: its quota events say so.
+        if let Some(health) = &self.route_health {
+            for egress in config.egresses.values() {
+                health.egress(egress.id, &snapshot.health(egress, None));
+            }
+        }
         for route in self.routes.lock().expect("network routes").values() {
             for (position, leg) in route.legs.read().expect("route legs").iter().enumerate() {
                 let health = config.egress_health(
@@ -764,6 +780,15 @@ impl NetworkRuntime {
         });
         let mut transport = None;
         let mut resolver = None;
+        // The hop tells the saved route's health how its dials go.
+        let failure = || match &self.route_health {
+            Some(health) => weaver_tunnel::pipe::HopFailure::watched(health.watcher(
+                bottom.id(),
+                id,
+                profile.revision,
+            )),
+            None => Default::default(),
+        };
         let stage: Arc<dyn Dialer> = match profile.kind {
             ProxyKind::Socks5 | ProxyKind::HttpConnect => Arc::new(TransportHop {
                 id,
@@ -781,7 +806,7 @@ impl NetworkRuntime {
                 inner,
                 timeout: profile.timeout(),
                 naming: profile.naming(bottom.clone()),
-                failure: Default::default(),
+                failure: failure(),
             }),
             _ => {
                 let provider: Arc<dyn TunnelProvider> = match profile.kind {
@@ -890,7 +915,7 @@ impl NetworkRuntime {
                     naming: profile.naming(bottom.clone()),
                     resolver,
                     forwarding: profile.port_forwarding(),
-                    failure: Default::default(),
+                    failure: failure(),
                 })
             }
         };
@@ -1196,6 +1221,7 @@ impl NetworkRuntime {
             cap_watch: Mutex::new(None),
             health_inputs: Mutex::new(None),
             torrent_legs: Mutex::default(),
+            route_health: self.route_health.clone(),
             egress_controls: self.egress_controls.clone(),
             quota_policy: None,
             #[cfg(test)]
@@ -1369,6 +1395,9 @@ impl NetworkRuntime {
         };
         for pool in retired_pools {
             pool.set_members(Vec::new());
+        }
+        if let Some(health) = &self.route_health {
+            health.configure(&next.egresses, &next.profiles);
         }
         *configuration = next;
         // Only new or re-membered pools warm up; an unchanged idle member must

@@ -2586,3 +2586,74 @@ async fn a_cooling_rung_that_is_full_gives_its_share_signal_too() {
     assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &skipped)));
     assert!(waits.iter().any(|wait| Arc::ptr_eq(wait, &freed)));
 }
+
+// Records each turn a watched hop tells of.
+#[derive(Default)]
+struct Turns(Mutex<Vec<Option<ProxyFault>>>);
+impl HopWatcher for Turns {
+    fn working(&self) {
+        self.0.lock().unwrap().push(None);
+    }
+    fn failing(&self, fault: &ProxyFault) {
+        self.0.lock().unwrap().push(Some(fault.clone()));
+    }
+}
+impl Turns {
+    fn taken(&self) -> Vec<Option<ProxyFault>> {
+        std::mem::take(&mut *self.0.lock().unwrap())
+    }
+}
+
+// A watched hop tells only of turns: working once however many dials work,
+// failing once however many fail, and nothing for a dial that never tried.
+#[test]
+fn a_watched_hop_tells_each_turn_once() {
+    let turns = Arc::new(Turns::default());
+    let failure = HopFailure::watched(turns.clone());
+    let closed = || ProxyFault::ConnectionClosed;
+    failure.clear();
+    failure.clear();
+    assert_eq!(turns.taken(), vec![None]);
+    failure.record(closed());
+    failure.record(closed());
+    failure.note(&DialError::Skipped("full".into()), Duration::from_secs(1));
+    assert_eq!(turns.taken(), vec![Some(closed())]);
+    assert_eq!(failure.of(7).map(|hop| hop.proxy), Some(7));
+    failure.clear();
+    assert_eq!(turns.taken(), vec![None]);
+    assert!(failure.of(7).is_none());
+
+    // A hop never tried that fails tells of that too: its watcher decides
+    // what a failure before any success means.
+    let turns = Arc::new(Turns::default());
+    let failure = HopFailure::watched(turns.clone());
+    failure.record(closed());
+    assert_eq!(turns.taken(), vec![Some(closed())]);
+}
+
+// A proxy that answers turns its hop working; once it is gone, the next
+// dial turns it failing, and the dial after says nothing new.
+#[tokio::test]
+async fn a_watched_proxy_hop_turns_failing_when_its_proxy_goes() {
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin_address = origin.local_addr().unwrap();
+    let (proxy, proxy_task) = connect_proxy(origin_address.to_string(), origin_address).await;
+    let turns = Arc::new(Turns::default());
+    let hop = TransportHop {
+        failure: HopFailure::watched(turns.clone()),
+        ..Arc::into_inner(hop(7, proxy, bottom())).unwrap()
+    };
+    let dialed = hop.dial(&target(origin_address)).await.unwrap();
+    let (peer, _) = origin.accept().await.unwrap();
+    assert_eq!(turns.taken(), vec![None]);
+    drop(peer);
+    drop(dialed);
+    // The proxy served its one connection and closed its listener.
+    proxy_task.await.unwrap();
+    for _ in 0..2 {
+        assert!(hop.dial(&target(origin_address)).await.is_err());
+    }
+    let told = turns.taken();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].is_some());
+}

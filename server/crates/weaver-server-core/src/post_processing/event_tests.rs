@@ -856,6 +856,34 @@ async fn a_queue_script_is_told_the_jobs_tags_as_it_starts() {
     assert_eq!(told("none"), "unset");
 }
 
+// ROUTE_DOWN belongs to no job, and the queue worker runs it.
+#[tokio::test]
+async fn the_queue_runs_a_route_down_that_belongs_to_no_job() {
+    let (db, data) = configured();
+    let out = data.path().join("told");
+    let supervisor = db.tag_reporting_queue_script_for_test(&out);
+    let dirs = super::super::quota_events::QuotaEventDirs {
+        data: data.path().to_path_buf(),
+        ..Default::default()
+    };
+    let down = crate::proxies::RouteDown {
+        egress_id: 2,
+        kind: crate::proxies::RouteKind::WireGuard,
+        name: "Home VPN".into(),
+        reason: "the handshake timed out".into(),
+    };
+    let context = super::super::route_events::route_event(&down, &dirs);
+    db.enqueue_script_event(&context, 1).unwrap().unwrap();
+    let ran = db
+        .run_next_queue_event_for_test(&supervisor)
+        .await
+        .expect("an event is queued");
+    assert_eq!(ran.job_id, None);
+    assert_eq!(ran.env["NZBNA_EVENT"], "ROUTE_DOWN");
+    assert_eq!(ran.env[super::super::model::vars::ROUTE_NAME], "Home VPN");
+    assert_eq!(std::fs::read_to_string(out.join("none")).unwrap(), "unset");
+}
+
 // The queue worker skips the events of a job that is in no queue, except
 // the ones raised as or after a job leaves: NZB_DELETED, NZB_MARKED,
 // SEEDING_STOPPED and SEEDING_FINISHED.

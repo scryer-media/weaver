@@ -935,6 +935,135 @@ async fn an_egress_quota_coming_to_each_state_raises_its_event_once() {
     runtime.shutdown().await;
 }
 
+// An HTTP CONNECT proxy on loopback that serves one connection and then
+// closes, so the next dial through it finds nothing listening.
+async fn one_connect_proxy() -> (u16, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let task = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        drop(listener);
+        let mut header = Vec::new();
+        while !header.ends_with(b"\r\n\r\n") {
+            header.push(stream.read_u8().await.unwrap());
+        }
+        let header = String::from_utf8(header).unwrap();
+        let destination = header.split(' ').nth(1).unwrap().to_owned();
+        let mut upstream = tokio::net::TcpStream::connect(destination).await.unwrap();
+        stream
+            .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+            .await
+            .unwrap();
+        drop(tokio::io::copy_bidirectional(&mut stream, &mut upstream).await);
+    });
+    (port, task)
+}
+
+// A proxy whose dials worked and then failed raises ROUTE_DOWN once, as
+// does an interface seen up and then gone; neither belongs to a job. The
+// interface goes down after the proxy's second failed dial, so its event
+// coming second shows the proxy raised no other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_route_seen_up_and_then_down_raises_route_down_once() {
+    use crate::post_processing::model::{QueueEvent, vars};
+    use crate::post_processing::quota_events::QuotaEventDirs;
+    use crate::post_processing::route_events::spawn_route_events;
+
+    let root = tempfile::tempdir().unwrap();
+    let db = Database::open_in_memory().unwrap();
+    db.enable_queue_scripts_for_test(root.path());
+    let runtime = NetworkRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let dirs = QuotaEventDirs {
+        data: root.path().to_path_buf(),
+        ..QuotaEventDirs::default()
+    };
+    let follower = spawn_route_events(&runtime.route_health().unwrap(), db.clone(), dirs);
+
+    let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let (proxy_port, proxy_task) = one_connect_proxy().await;
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.profiles.insert(
+        1,
+        ProxyProfile {
+            kind: ProxyKind::HttpConnect,
+            host: "127.0.0.1".into(),
+            port: proxy_port,
+            timeout_seconds: 30,
+            ..proxy()
+        },
+    );
+    let link = EgressInterface {
+        id: 9,
+        name: "Test link".into(),
+        binding: EgressBinding::Interface {
+            name: "weaver-test0".into(),
+        },
+        enabled: true,
+        download_bps: None,
+        upload_bps: None,
+        quota: Default::default(),
+    };
+    config.egresses.insert(link.id, link);
+    runtime.apply_configuration(config.clone()).unwrap();
+
+    let bottom =
+        NetworkRuntime::bottom(&config, SYSTEM_EGRESS_ID, Duration::from_secs(30)).unwrap();
+    let hop = runtime
+        .hop(&config, 1, bottom.clone(), bottom, &[])
+        .unwrap();
+    let target = Target {
+        host: "127.0.0.1".into(),
+        port: origin.local_addr().unwrap().port(),
+        purpose: weaver_tunnel::pipe::Purpose::Probe,
+        addresses: Vec::new(),
+    };
+    let dialed = hop.dial(&target).await.unwrap();
+    let (peer, _) = origin.accept().await.unwrap();
+    drop(peer);
+    drop(dialed);
+    proxy_task.await.unwrap();
+    for _ in 0..2 {
+        assert!(hop.dial(&target).await.is_err());
+    }
+
+    let up = InterfaceSnapshot {
+        interfaces: vec![DiscoveredInterface {
+            name: "weaver-test0".into(),
+            index: Some(90),
+            up: true,
+            addresses: vec![InterfaceAddress {
+                address: "10.20.30.40".parse().unwrap(),
+                deprecated: false,
+                tentative: false,
+            }],
+        }],
+        error: None,
+    };
+    runtime.refresh_health_from(up, HashSet::new());
+    runtime.refresh_health_from(InterfaceSnapshot::default(), HashSet::new());
+
+    let queued = db.queued_script_events_once(QueueEvent::RouteDown, 2).await;
+    assert_eq!(queued.len(), 2);
+    for context in &queued {
+        assert_eq!(context.job_id, None);
+        assert_eq!(context.cwd, root.path());
+        assert_eq!(context.env["NZBNA_EVENT"], "ROUTE_DOWN");
+    }
+    let proxy_down = &queued[0].env;
+    assert_eq!(proxy_down[vars::EGRESS_ID], SYSTEM_EGRESS_ID.to_string());
+    assert_eq!(proxy_down[vars::ROUTE_KIND], "http_connect");
+    assert_eq!(proxy_down[vars::ROUTE_NAME], "fixture");
+    assert!(!proxy_down[vars::ROUTE_REASON].is_empty());
+    let link_down = &queued[1].env;
+    assert_eq!(link_down[vars::EGRESS_ID], "9");
+    assert_eq!(link_down[vars::ROUTE_KIND], "interface");
+    assert_eq!(link_down[vars::ROUTE_NAME], "Test link");
+    assert_eq!(link_down[vars::ROUTE_REASON], "Interface is missing");
+    follower.abort();
+    runtime.shutdown().await;
+}
+
 // A download quota that turns work away stops torrent downloads on its
 // egress and says so, though the bytes used stay short of the budget, as
 // reservations are taken at their estimate. A larger allowance lets them
