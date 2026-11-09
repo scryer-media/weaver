@@ -282,7 +282,11 @@ impl NamespaceWriter {
             .shelves
             .iter()
             .any(|(shelf, generation)| shelf.generation() != *generation);
-        if replayed.read.stopped || changed || moved {
+        // An object out for its work cannot say the cipher tail its window
+        // forgets, so nothing would read it back: the window is checked
+        // again once the object is home.
+        let lent = tree.lent(replayed.node);
+        if replayed.read.stopped || changed || moved || lent {
             if !replayed.read.stopped {
                 self.queue_rechecks(vec![(replayed.node, replayed.ranges.clone())]);
             }

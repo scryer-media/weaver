@@ -371,12 +371,29 @@ impl Tree {
                 range,
                 down,
             } => match down {
-                Down::Lost { origin } => effects.push(Effect::Lost {
-                    origin,
-                    node,
-                    volume,
-                    range,
-                }),
+                // Marked now, in its turn: bytes that waited behind it land
+                // after it, as they came.
+                Down::Lost { origin } => {
+                    let from = effects.len();
+                    self.descend(vec![(node, volume, range)], down, effects);
+                    let marked: Vec<Effect> = effects[from..]
+                        .iter()
+                        .filter_map(|effect| match *effect {
+                            Effect::Damaged {
+                                node,
+                                member,
+                                range,
+                            } => Some(Effect::Lost {
+                                origin,
+                                node,
+                                member,
+                                range,
+                            }),
+                            _ => None,
+                        })
+                        .collect();
+                    effects.extend(marked);
+                }
                 Down::Refuted => self.descend(vec![(node, volume, range)], down, effects),
                 Down::Forget { keep_repairs } => {
                     self.forget_input(node, volume, range, keep_repairs);
