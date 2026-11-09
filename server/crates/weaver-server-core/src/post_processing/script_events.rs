@@ -36,6 +36,8 @@ impl ScriptKind {
 }
 
 // Declaration order is NZBGet's event priority, from lowest to highest.
+// Weaver's own events follow NZBGet's, so each keeps the priority a queued
+// event was stored with.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum QueueEvent {
@@ -46,11 +48,20 @@ pub enum QueueEvent {
     NzbNamed,
     NzbDownloaded,
     NzbDeleted,
+    // A torrent met its seeding goals.
+    SeedingFinished,
+    // A torrent stopped seeding before its goals were met.
+    SeedingStopped,
+    // An egress's quota, in one direction, came to a state: back to normal,
+    // trickling past an upload soft cap, or stopped.
+    QuotaNormal,
+    QuotaTrickle,
+    QuotaStopped,
 }
 
 impl QueueEvent {
     // NZB_NAMED is retained for truthful declarations, but Weaver does not raise it.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 12] = [
         Self::FileDownloaded,
         Self::UrlCompleted,
         Self::NzbMarked,
@@ -58,6 +69,11 @@ impl QueueEvent {
         Self::NzbNamed,
         Self::NzbDownloaded,
         Self::NzbDeleted,
+        Self::SeedingFinished,
+        Self::SeedingStopped,
+        Self::QuotaNormal,
+        Self::QuotaTrickle,
+        Self::QuotaStopped,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -69,8 +85,43 @@ impl QueueEvent {
             Self::NzbNamed => "NZB_NAMED",
             Self::NzbDownloaded => "NZB_DOWNLOADED",
             Self::NzbDeleted => "NZB_DELETED",
+            Self::SeedingFinished => "SEEDING_FINISHED",
+            Self::SeedingStopped => "SEEDING_STOPPED",
+            Self::QuotaNormal => "QUOTA_NORMAL",
+            Self::QuotaTrickle => "QUOTA_TRICKLE",
+            Self::QuotaStopped => "QUOTA_STOPPED",
         }
     }
+
+    // The event for an egress's quota coming to `state`.
+    pub fn quota(state: crate::bandwidth::QuotaState) -> Self {
+        match state {
+            crate::bandwidth::QuotaState::Normal => Self::QuotaNormal,
+            crate::bandwidth::QuotaState::Trickle => Self::QuotaTrickle,
+            crate::bandwidth::QuotaState::Stopped => Self::QuotaStopped,
+        }
+    }
+}
+
+// The variables Weaver's own events give a script, beside NZBGet's.
+pub mod vars {
+    // `torrent` for a torrent's job.
+    pub const PROTOCOL: &str = "WEAVER_PROTOCOL";
+    // A torrent's hashes in hex, empty when it has none of that version.
+    pub const INFOHASH_V1: &str = "WEAVER_INFOHASH_V1";
+    pub const INFOHASH_V2: &str = "WEAVER_INFOHASH_V2";
+    // The tracker a torrent last announced to, else its first.
+    pub const TRACKER: &str = "WEAVER_TRACKER";
+    // SEEDING_FINISHED: what the goal does now, `stop`, `remove` or
+    // `remove_with_data`.
+    pub const SEEDING_ACTION: &str = "WEAVER_SEEDING_ACTION";
+    // SEEDING_STOPPED: why, `paused`, `removed` or `failed`.
+    pub const SEEDING_STOPPED_REASON: &str = "WEAVER_SEEDING_STOPPED_REASON";
+    // QUOTA_*: the egress, the direction (`download` or `upload`) and the
+    // state it came to (`normal`, `trickle` or `stopped`).
+    pub const EGRESS_ID: &str = "WEAVER_EGRESS_ID";
+    pub const QUOTA_DIRECTION: &str = "WEAVER_QUOTA_DIRECTION";
+    pub const QUOTA_STATE: &str = "WEAVER_QUOTA_STATE";
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]

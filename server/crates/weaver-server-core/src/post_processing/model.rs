@@ -552,7 +552,7 @@ impl<'de> Deserialize<'de> for ScriptOption {
 
 #[path = "script_events.rs"]
 mod script_events;
-pub use script_events::{QueueEvent, ScriptEventLabel, ScriptKind, ScriptTaskTime};
+pub use script_events::{QueueEvent, ScriptEventLabel, ScriptKind, ScriptTaskTime, vars};
 
 // Validated internal representation of a discovered script manifest.
 //

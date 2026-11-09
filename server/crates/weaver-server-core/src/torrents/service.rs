@@ -71,6 +71,7 @@ use crate::torrents::sessions::{
     NetworkRoutes, RouteFailure, RouteKey, RoutePlan, SessionEnv, SessionError, SessionView,
     Sessions, TorrentRouteReason, encryption_policy,
 };
+use crate::post_processing::model::{QueueEvent, vars};
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces};
 use crate::torrents::store::{Kept, Replayed, TorrentStore};
@@ -78,10 +79,13 @@ use crate::torrents::tee::{Parts, Plan, Tee, plan_outputs};
 use crate::torrents::{
     ContentLayout, FilePriority, Infohash, NamedBy, PeerInfo, TorrentCounters, TorrentFile,
     TorrentInsert, TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker,
-    TrackerEntry,
+    TrackerEntry, TrackerStatus,
 };
 
 pub mod fingerprint;
+mod scripts;
+use scripts::Ending;
+pub use scripts::ScriptDirs;
 #[cfg(test)]
 mod tests;
 pub mod updates;
@@ -547,6 +551,9 @@ pub struct JobEnv {
     // With no pipeline to hear the mail, the mail itself, until the service
     // hears it in the pipeline's stead.
     alone: Arc<Mutex<Option<RunMail>>>,
+    // Where the scripts a torrent's job runs are told weaver keeps things,
+    // as the pipeline tells its jobs' scripts.
+    pub(crate) script_dirs: ScriptDirs,
 }
 
 impl JobEnv {
@@ -565,6 +572,11 @@ impl JobEnv {
             work: budget.work,
             repairs: Arc::default(),
             alone: Arc::default(),
+            script_dirs: ScriptDirs {
+                data: Some(pipeline.script_data_dir.clone()),
+                intermediate: Some(pipeline.intermediate_dir.clone()),
+                complete: Some(pipeline.complete_dir.clone()),
+            },
         }
     }
 
@@ -594,6 +606,7 @@ impl JobEnv {
             work,
             repairs: Arc::default(),
             alone: Arc::new(Mutex::new(Some(mail))),
+            script_dirs: ScriptDirs::default(),
         }
     }
 
@@ -977,6 +990,19 @@ impl TorrentView {
         )
     }
 
+    /// The tracker it goes by (qBittorrent `TorrentImpl::currentTracker`:
+    /// libtorrent's `current_tracker`, the tracker that last answered, else
+    /// the first one listed). Weaver keeps each tracker's latest outcome
+    /// only, so the one that last answered is the working one announced to
+    /// most recently.
+    pub fn current_tracker(&self) -> Option<&TorrentTracker> {
+        self.trackers
+            .iter()
+            .filter(|tracker| tracker.status == TrackerStatus::Working)
+            .max_by_key(|tracker| tracker.last_announce_ms)
+            .or_else(|| self.trackers.first())
+    }
+
     /// How much of `file` is in hand, from 0 to 1.
     pub fn file_progress(&self, file: &TorrentFile) -> f64 {
         let have = self
@@ -1279,6 +1305,9 @@ struct Live {
     held: Option<Held>,
     about: About,
     counters: TorrentCounters,
+    // The payload its ledger held as downloaded when this run of weaver took
+    // it: more since means it downloaded in this run.
+    downloaded_at_start: u64,
     // What the session reported at the last kept reading, for the ledger's
     // deltas; the next session it runs in counts on from here.
     seen: TorrentTotals,
@@ -1437,6 +1466,7 @@ impl Live {
             route: None,
             held: None,
             about: About::default(),
+            downloaded_at_start: counters.downloaded_bytes,
             counters,
             seen: TorrentTotals::default(),
             timed: Timed::at(now),
@@ -2950,7 +2980,7 @@ impl TorrentService {
     // written beside it keeps it, and the ledger and peers as they stand.
     async fn completed(&self, job_id: JobId) {
         let now = self.inner.clock.now_ms();
-        let landing = {
+        let (landing, downloaded) = {
             let mut live = self.inner.live.lock().await;
             let Some(torrent) = live.get_mut(&job_id) else {
                 return;
@@ -2960,6 +2990,13 @@ impl TorrentService {
             }
             torrent.settle(now);
             let was_seeding = torrent.seeding();
+            // Its download finished in this run only if it downloaded in
+            // this run: one added with its data in place, or restored with
+            // nothing left to fetch, did not (qBittorrent marks a torrent
+            // finished after its check, or added in seed mode, without
+            // `torrentFinished`; libtorrent sends `completed` only for a run
+            // that began short of a seed).
+            let downloaded = torrent.counters.downloaded_bytes > torrent.downloaded_at_start;
             torrent.record.completed_at_ms = Some(now);
             // It seeds now: its slot and rank go to the torrents after it.
             // One that seeded already, as a seed-mode add does, held none.
@@ -2971,8 +3008,11 @@ impl TorrentService {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's completion");
             }
             (
-                self.queue_resume(torrent, now, true),
-                torrent.record.move_to.take(),
+                (
+                    self.queue_resume(torrent, now, true),
+                    torrent.record.move_to.take(),
+                ),
+                downloaded,
             )
         };
         let (landing, move_to) = landing;
@@ -2986,6 +3026,13 @@ impl TorrentService {
             }
             if let Err(error) = self.move_storage(job_id, to, Existing::Replace).await {
                 tracing::warn!(job_id = job_id.0, error = %error, "a complete torrent did not move under its save path");
+            }
+        }
+        // Raised where its files now are, once any move is over.
+        if downloaded {
+            let live = self.inner.live.lock().await;
+            if let Some(torrent) = live.get(&job_id) {
+                self.raise_script_event(torrent, QueueEvent::NzbDownloaded, &[]);
             }
         }
     }
@@ -3580,6 +3627,9 @@ impl TorrentService {
                     }
                 };
                 let made = self.give_metainfo(&mut torrent, &parsed);
+                // Raised for an add, never for a restore (qBittorrent emits
+                // `torrentAdded` from `addTorrent_impl` alone).
+                self.raise_script_event(&torrent, QueueEvent::NzbAdded, &[]);
                 self.enqueue(torrent).await;
                 match made {
                     Ok(()) => self.attach(job_id, None).await,
@@ -3640,6 +3690,7 @@ impl TorrentService {
                 let identity = identity_of(torrent.rule(&rules), &torrent.identity);
                 let terms = PeerTerms::of(&self.settings(), torrent.rule(&rules));
                 torrent.route = Some(plan.key.clone());
+                self.raise_script_event(&torrent, QueueEvent::NzbAdded, &[]);
                 self.enqueue(torrent).await;
                 self.spawn_resolve(job_id, plan, uri, None, identity, terms)
                     .await;
@@ -4496,11 +4547,13 @@ impl TorrentService {
     async fn fail(&self, job_id: JobId, error: String) {
         let torrent = self.inner.live.lock().await.remove(&job_id);
         let Some(mut torrent) = torrent else { return };
+        let stopped = self.seeding_stopped(&torrent, "failed");
         // Its slot and rank go to the torrents after it.
         self.inner.signal.want_pass();
         self.inner.counters.event(TorrentEvent::Failed);
         self.detach(&mut torrent).await;
         self.retire(torrent, "failed", Some(error)).await;
+        self.queue_script_event(stopped);
     }
 
     // Unpacking refused the torrent's output. Its job goes to history as
@@ -4522,6 +4575,7 @@ impl TorrentService {
             let Some(torrent) = live.get_mut(&job_id) else {
                 return;
             };
+            self.queue_script_event(self.seeding_stopped(torrent, "failed"));
             let landing = self.stop_torrent(torrent, now);
             let report = report(
                 self.view(&settings, torrent, now),
@@ -4583,6 +4637,17 @@ impl TorrentService {
         delete_files: bool,
         confirm_unmet_goal: bool,
     ) -> Result<(), ActionError> {
+        self.remove_as(job_id, delete_files, confirm_unmet_goal, Ending::Asked)
+            .await
+    }
+
+    async fn remove_as(
+        &self,
+        job_id: JobId,
+        delete_files: bool,
+        confirm_unmet_goal: bool,
+        ending: Ending,
+    ) -> Result<(), ActionError> {
         // Its outcome is its job's: a job still waiting for the tick is
         // restored first.
         self.restore_job(job_id).await;
@@ -4598,6 +4663,20 @@ impl TorrentService {
         }
         let mut torrent = live.remove(&job_id).ok_or(ActionError::NotFound(job_id))?;
         drop(live);
+        // What its scripts hear of a removal asked for: a seed stops
+        // seeding; a download is cancelled, as an NZB job's is.
+        let ended = match ending {
+            Ending::Goal => None,
+            Ending::Asked if torrent.seeding() && torrent.resumed() => {
+                self.seeding_stopped(&torrent, "removed")
+            }
+            Ending::Asked if !torrent.complete() => self.script_event(
+                &torrent,
+                QueueEvent::NzbDeleted,
+                &[("NZBNA_DELETESTATUS", "MANUAL")],
+            ),
+            Ending::Asked => None,
+        };
         // Its slot and rank go to the torrents after it.
         self.inner.signal.want_pass();
         if let Some(Resolving::Fetching(fetch)) = torrent.resolving.take() {
@@ -4629,6 +4708,7 @@ impl TorrentService {
         };
         self.inner.counters.event(TorrentEvent::Removed);
         self.retire(torrent, status, error).await;
+        self.queue_script_event(ended);
         Ok(())
     }
 
@@ -4895,7 +4975,11 @@ impl TorrentService {
     }
 
     pub async fn pause(&self, job_id: JobId) -> Result<(), ActionError> {
+        let stopped = self
+            .with_torrent(job_id, |torrent| Ok(self.seeding_stopped(torrent, "paused")))
+            .await?;
         self.set_intent(job_id, TorrentIntent::Paused).await?;
+        self.queue_script_event(stopped);
         self.with_torrent(job_id, |torrent| {
             if let Some(Resolving::Fetching(fetch)) = &torrent.resolving {
                 fetch.abort();
@@ -5803,19 +5887,36 @@ impl TorrentService {
                 if status::goal_left(&policy, &torrent.counters, torrent.total, now).is_some() {
                     continue;
                 }
+                let finished = self.script_event(
+                    torrent,
+                    QueueEvent::SeedingFinished,
+                    &[(vars::SEEDING_ACTION, policy.action.as_str())],
+                );
                 match policy.action {
-                    SeedingAction::Stop => landings.extend(self.stop_torrent(torrent, now)),
-                    SeedingAction::Remove => actions.push((torrent.record.job_id, false)),
-                    SeedingAction::RemoveWithData => actions.push((torrent.record.job_id, true)),
+                    SeedingAction::Stop => {
+                        landings.extend(self.stop_torrent(torrent, now));
+                        self.queue_script_event(finished);
+                    }
+                    SeedingAction::Remove => {
+                        actions.push((torrent.record.job_id, false, finished));
+                    }
+                    SeedingAction::RemoveWithData => {
+                        actions.push((torrent.record.job_id, true, finished));
+                    }
                 }
             }
         }
         for landing in landings {
             let _ = self.landed(Some(landing)).await;
         }
-        for (job_id, delete_files) in actions {
-            if let Err(error) = self.remove(job_id, delete_files, true).await {
-                tracing::warn!(job_id = job_id.0, error = %error, "a torrent that met its goal was not removed");
+        // A removed torrent's event is queued once its job is in history,
+        // where the queue finds it.
+        for (job_id, delete_files, finished) in actions {
+            match self.remove_as(job_id, delete_files, true, Ending::Goal).await {
+                Ok(()) => self.queue_script_event(finished),
+                Err(error) => {
+                    tracing::warn!(job_id = job_id.0, error = %error, "a torrent that met its goal was not removed");
+                }
             }
         }
     }

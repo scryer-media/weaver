@@ -351,6 +351,8 @@ impl EventContext {
             ("NZBNA_DUPEKEY", parameter("nzbget.dupe_key", "")),
             ("NZBNA_DUPESCORE", parameter("nzbget.dupe_score", "0")),
             ("NZBNA_DUPEMODE", parameter("nzbget.dupe_mode", "SCORE")),
+            // Job tags go here, one variable for every job, NZB or torrent,
+            // once jobs carry tags (qBittorrent passes a torrent's as `%G`).
         ]
         .into_iter()
         .map(|(key, value)| (key.into(), value))
@@ -1280,7 +1282,7 @@ impl Database {
                     };
                     tx.fetch_optional(lock, &[]).await?.ok_or_else(|| StateError::Database("script sequence is missing".into()))?;
                     if require_job && let Some(job_id) = job_id
-                        && tx.fetch_optional("SELECT job_id FROM active_jobs WHERE job_id = {} UNION ALL SELECT job_id FROM job_history WHERE job_id = {} LIMIT 1", &[SqlArg::I64(job_id), SqlArg::I64(job_id)]).await?.is_none() {
+                        && tx.fetch_optional("SELECT job_id FROM active_jobs WHERE job_id = {} UNION ALL SELECT job_id FROM job_history WHERE job_id = {} UNION ALL SELECT job_id FROM torrents WHERE job_id = {} LIMIT 1", &[SqlArg::I64(job_id), SqlArg::I64(job_id), SqlArg::I64(job_id)]).await?.is_none() {
                         return Ok(None);
                     }
                     if event == QueueEvent::FileDownloaded
@@ -1424,6 +1426,91 @@ impl Database {
         self.finish_script_event(run_id)?;
         self.script_runtime.changed.notify_waiters();
         Ok(())
+    }
+
+    // Every `event` the queue holds, in the order queued.
+    #[cfg(test)]
+    pub(crate) fn queued_script_events(&self, event: QueueEvent) -> Vec<EventContext> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT payload FROM script_event_queue WHERE event = {} ORDER BY seq",
+                &[SqlArg::Text(event.as_str().into())],
+            )
+            .await?
+            .iter()
+            .map(|row| row.text("payload"))
+            .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap()
+        .iter()
+        .map(|payload| serde_json::from_str(payload).unwrap())
+        .collect()
+    }
+
+    // Every `event` the queue holds, once it holds at least `count`.
+    #[cfg(test)]
+    pub(crate) async fn queued_script_events_once(
+        &self,
+        event: QueueEvent,
+        count: usize,
+    ) -> Vec<EventContext> {
+        let mut queued = Vec::new();
+        wait_for_test_script_change(self, || {
+            queued = self.queued_script_events(event);
+            queued.len() >= count
+        })
+        .await;
+        queued
+    }
+
+    // Returns once every event raised before it is admitted: admissions
+    // are taken in the order raised, so once one raised after them is in,
+    // they are.
+    #[cfg(test)]
+    pub(crate) async fn admitted_so_far(&self) {
+        let marker = EventContext {
+            job_id: None,
+            event: ScriptEventLabel::Queue(QueueEvent::UrlCompleted),
+            category: None,
+            cwd: PathBuf::new(),
+            env: BTreeMap::new(),
+            facts: CompatibilityFacts::default(),
+            instances: None,
+            scratch: None,
+        };
+        let _ = self.admit_queue_script_event(marker, false).await;
+    }
+
+    // Queue scripts on, with one instance of `queue.sh` for every queue
+    // event, under `root`. None runs: the queue keeps every event raised
+    // as it was queued.
+    #[cfg(test)]
+    pub(crate) fn enable_queue_scripts_for_test(&self, root: &std::path::Path) {
+        self.script_runtime
+            .worker_active
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let scripts = self
+            .initialize_post_processing_script_directory(root, None)
+            .unwrap();
+        std::fs::write(
+            scripts.join("queue.sh"),
+            "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nexit 0\n",
+        )
+        .unwrap();
+        self.save_post_processing_settings(&super::model::PostProcessingSettings {
+            execution_enabled: true,
+            ..Default::default()
+        })
+        .unwrap();
+        for event in QueueEvent::ALL {
+            self.create_script_instance(super::instances::ScriptInstanceDraft::new(
+                super::model::ScriptName::new("queue.sh").unwrap(),
+                InstanceTrigger::Queue(event),
+            ))
+            .unwrap();
+        }
     }
 
     fn finish_script_event(&self, run_id: &str) -> Result<(), StateError> {

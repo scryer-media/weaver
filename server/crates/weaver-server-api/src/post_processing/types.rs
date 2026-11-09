@@ -891,6 +891,11 @@ pub enum QueueEventGql {
     NzbNamed,
     NzbDownloaded,
     NzbDeleted,
+    SeedingFinished,
+    SeedingStopped,
+    QuotaNormal,
+    QuotaTrickle,
+    QuotaStopped,
 }
 
 impl From<weaver_server_core::post_processing::model::QueueEvent> for QueueEventGql {
@@ -904,6 +909,11 @@ impl From<weaver_server_core::post_processing::model::QueueEvent> for QueueEvent
             QueueEvent::NzbNamed => Self::NzbNamed,
             QueueEvent::NzbDownloaded => Self::NzbDownloaded,
             QueueEvent::NzbDeleted => Self::NzbDeleted,
+            QueueEvent::SeedingFinished => Self::SeedingFinished,
+            QueueEvent::SeedingStopped => Self::SeedingStopped,
+            QueueEvent::QuotaNormal => Self::QuotaNormal,
+            QueueEvent::QuotaTrickle => Self::QuotaTrickle,
+            QueueEvent::QuotaStopped => Self::QuotaStopped,
         }
     }
 }
@@ -918,6 +928,11 @@ impl From<QueueEventGql> for weaver_server_core::post_processing::model::QueueEv
             QueueEventGql::NzbNamed => Self::NzbNamed,
             QueueEventGql::NzbDownloaded => Self::NzbDownloaded,
             QueueEventGql::NzbDeleted => Self::NzbDeleted,
+            QueueEventGql::SeedingFinished => Self::SeedingFinished,
+            QueueEventGql::SeedingStopped => Self::SeedingStopped,
+            QueueEventGql::QuotaNormal => Self::QuotaNormal,
+            QueueEventGql::QuotaTrickle => Self::QuotaTrickle,
+            QueueEventGql::QuotaStopped => Self::QuotaStopped,
         }
     }
 }
