@@ -164,8 +164,8 @@ enum Life {
     Queued,
     // Its reservation did not fit beside what is resident. It holds no
     // slot, and asks for one again once fewer resident bytes are held than
-    // when it was turned away.
-    Starved { resident: u64 },
+    // when it was turned away, or the limit they are held to rose.
+    Starved { resident: u64, limit: u64 },
     Running { generation: u64 },
     Ended { generation: u64 },
     // Stopped where it stood because the job is going down, under the
@@ -204,8 +204,9 @@ pub(crate) enum Reservation {
     // It does not fit beside what is resident now: its slot went to the
     // nodes named, which may start now.
     Starved(Vec<NodeId>),
-    // It is larger than the resident limit itself, so it can never fit.
-    Refused,
+    // It is larger than the resident limit itself, so it can never fit:
+    // `needed` bytes against the `allowed` limit.
+    Refused { needed: u64, allowed: u64 },
 }
 
 // A run's last word, said when the run's thread lets it go, however the run
@@ -402,21 +403,33 @@ impl Runs {
     }
 
     // Reserve what the node's run holds resident before it starts: the
-    // window its object declares and the run's fixed overhead. A
+    // window its object declares, no more than the hardware lets one
+    // decoder hold, and the run's fixed overhead. A window wider than that
+    // is the decoder's to refuse, with the sizes its headers state. A
     // reservation is taken once and kept across restarts; a window only
     // narrows as the object's first bytes say more, so a restarted run
-    // never needs more than the first.
+    // never needs more than the first. It is bookkeeping: nothing is
+    // allocated for it.
     pub(crate) fn reserve(&mut self, node: NodeId, window: u64) -> Reservation {
         let namespace = self.namespace(node);
+        let run_budget = self.hardware.grant().run;
         let Some(run) = self.runs.get_mut(&node) else {
             return Reservation::Granted;
         };
         if run.reserved > 0 {
             return Reservation::Granted;
         }
-        let len = window.saturating_add(RUN_OVERHEAD);
-        if len > self.accountant.budgets().resident_limit {
-            return Reservation::Refused;
+        let ceiling = run_budget
+            .memory_bytes
+            .max(run_budget.window_bytes)
+            .unwrap_or(u64::MAX);
+        let len = window.min(ceiling).saturating_add(RUN_OVERHEAD);
+        let allowed = self.accountant.budgets().resident_limit;
+        if len > allowed {
+            return Reservation::Refused {
+                needed: len,
+                allowed,
+            };
         }
         if self.accountant.reserve_resident(namespace, len) == Reserve::Granted {
             run.reserved = len;
@@ -424,6 +437,7 @@ impl Runs {
         }
         run.life = Life::Starved {
             resident: self.accountant.usage().resident,
+            limit: allowed,
         };
         self.marks.mark(node);
         let admissions = run
@@ -577,16 +591,31 @@ impl Runs {
         self.admit(admissions)
     }
 
+    // Whether a run turned away for memory may ask again: resident bytes
+    // were released since, by this job or any other, or the limit rose.
+    pub(crate) fn wakeable(&self) -> bool {
+        let (resident, limit) = self.room();
+        self.runs
+            .values()
+            .any(|run| woken(run.life, resident, limit))
+    }
+
+    fn room(&self) -> (u64, u64) {
+        (
+            self.accountant.usage().resident,
+            self.accountant.budgets().resident_limit,
+        )
+    }
+
     // Starved runs ask for a slot again once resident bytes were released
-    // since they were turned away, in the order they first asked.
+    // since they were turned away, or the limit rose, in the order they
+    // first asked.
     fn wake(&mut self) -> Vec<NodeId> {
-        let resident = self.accountant.usage().resident;
+        let (resident, limit) = self.room();
         let woken: Vec<NodeId> = self
             .runs
             .iter()
-            .filter(
-                |(_, run)| matches!(run.life, Life::Starved { resident: then } if resident < then),
-            )
+            .filter(|(_, run)| woken(run.life, resident, limit))
             .map(|(node, _)| *node)
             .collect();
         woken
@@ -657,6 +686,10 @@ impl Drop for Runs {
             }
         }
     }
+}
+
+fn woken(life: Life, resident: u64, limit: u64) -> bool {
+    matches!(life, Life::Starved { resident: then, limit: before } if resident < then || limit > before)
 }
 
 fn asker(node: NodeId) -> AskerId {

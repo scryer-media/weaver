@@ -206,6 +206,13 @@ pub enum Why {
     // Recognised container rejected by structural or security validation.
     // Its posted bytes are not a usable substitute for its members.
     InvalidArchive,
+    // Decoding it needs more memory than a decode may hold: `needed` bytes
+    // against the `allowed` ceiling. Either is `None` where the decoder that
+    // refused did not say it, as an allocator that failed names no ceiling.
+    TooLarge {
+        needed: Option<u64>,
+        allowed: Option<u64>,
+    },
 }
 
 impl Why {
@@ -219,7 +226,8 @@ impl Why {
             | Why::EncryptedHeader
             | Why::Compressed
             | Why::Unmapped
-            | Why::InvalidArchive => true,
+            | Why::InvalidArchive
+            | Why::TooLarge { .. } => true,
             Why::TailUnreachable
             | Why::UnboundedEntry
             | Why::NotAFile
@@ -248,7 +256,8 @@ impl Why {
             | Why::FirstBytesLost
             | Why::HoldsBreached
             | Why::Unmapped
-            | Why::InvalidArchive => false,
+            | Why::InvalidArchive
+            | Why::TooLarge { .. } => false,
         }
     }
 }
@@ -344,6 +353,10 @@ mod tests {
             Why::Compressed,
             Why::Unmapped,
             Why::InvalidArchive,
+            Why::TooLarge {
+                needed: Some(2 << 30),
+                allowed: Some(1 << 30),
+            },
         ];
         let delivered = [
             Why::TailUnreachable,

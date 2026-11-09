@@ -62,9 +62,7 @@ impl Run {
 pub(super) fn limits(budget: &Budget) -> unrar_rs::Limits {
     let mut limits = unrar_rs::Limits::default();
     limits.max_dict_size = budget.window_or(limits.max_dict_size);
-    limits.max_ppmd_arena_size = limits
-        .max_ppmd_arena_size
-        .min(budget.window_or(u64::MAX));
+    limits.max_ppmd_arena_size = limits.max_ppmd_arena_size.min(budget.window_or(u64::MAX));
     limits
 }
 
@@ -867,11 +865,41 @@ fn terminal(error: &RarError, encrypted: bool) -> Emit {
         | RarError::UnsupportedEncryption { .. }
         | RarError::UnsupportedEncryptionKdf { .. }
         | RarError::UnsupportedFilter { .. }
-        | RarError::DictionaryTooLarge { .. }
         | RarError::ResourceLimit { .. }
         | RarError::VolumeProviderRequired { .. }
-        | RarError::SolidOrderViolation { .. } => Emit::Refuse(Why::Unsupported),
-        _ => Emit::Refuse(Why::Unrepairable),
+        | RarError::SolidOrderViolation { .. } => {
+            Emit::Refuse(too_large(error).unwrap_or(Why::Unsupported))
+        }
+        _ => Emit::Refuse(too_large(error).unwrap_or(Why::Unrepairable)),
+    }
+}
+
+// A member whose decode needs more memory than the run may hold: a
+// dictionary or a PPMd model over its limit, or memory the allocator would
+// not give. A dictionary of no size names no limit either: the decoder
+// refused a window it could not build.
+fn too_large(error: &RarError) -> Option<Why> {
+    let known = |size: u64| (size > 0).then_some(size);
+    match error {
+        RarError::DictionaryTooLarge { size, max } => Some(Why::TooLarge {
+            needed: known(*size),
+            allowed: known(*max),
+        }),
+        RarError::ResourceLimit {
+            kind: unrar_rs::LimitKind::PpmdArena,
+            requested,
+            max,
+            ..
+        } => Some(Why::TooLarge {
+            needed: Some(*requested),
+            allowed: Some(*max),
+        }),
+        RarError::AllocationFailed { bytes } => Some(Why::TooLarge {
+            needed: known(*bytes),
+            allowed: None,
+        }),
+        RarError::Io(error) => too_large(error.get_ref()?.downcast_ref::<RarError>()?),
+        _ => None,
     }
 }
 

@@ -281,7 +281,7 @@ pub(super) fn borrowed_node_rows(
                 .map(|window| (window.start as i64, window.end as i64)),
             kind: kind.to_string(),
             state: super::state_name(node.state).to_owned(),
-            reason: node.reason.map(|why| super::why_name(why).to_owned()),
+            reason: node.reason.map(super::why_text),
             facts_version: i64::from(facts.version),
             facts: facts.bytes.clone(),
             winning_password: password,
@@ -316,7 +316,7 @@ pub(super) fn borrowed_node_rows(
             undecided: member.undecided,
             has_file: state.has_file,
             on_disk: state.on_disk,
-            refused: state.refused.map(|why| super::why_name(why).to_owned()),
+            refused: state.refused.map(super::why_text),
             copy_of: member.copy_of.map(|into| i64::from(into.0)),
             refuted_kind: member.refuted.map(|kind| kind.to_string()),
         }
@@ -1869,4 +1869,37 @@ fn a_file_cut_short_before_a_restore_fetches_again_what_it_lost() {
         std::fs::read(&path).unwrap() == whole,
         "the file holds every byte"
     );
+}
+
+// Every reason a checkpoint row keeps reads back as itself, and a decode
+// too large keeps the sizes it carried, each one it did not say read back
+// unsaid. A name it never wrote is no reason.
+#[test]
+fn every_reason_a_row_keeps_reads_back_with_its_sizes() {
+    let too_large = |needed, allowed| Why::TooLarge { needed, allowed };
+    let reasons = super::REASONS.into_iter().chain([
+        too_large(Some(2 << 30), Some(1 << 30)),
+        too_large(Some(2 << 30), None),
+        too_large(None, Some(1 << 30)),
+    ]);
+    for why in reasons {
+        assert_eq!(
+            super::why_named(&super::why_text(why)),
+            Some(why),
+            "{why:?}"
+        );
+    }
+    assert_eq!(
+        super::why_text(too_large(Some(2 << 30), None)),
+        "too_large:2147483648:-"
+    );
+    for text in [
+        "too_large",
+        "too_large:1",
+        "unsupported:1:2",
+        "too_large:x:-",
+        "nothing",
+    ] {
+        assert_eq!(super::why_named(text), None, "{text}");
+    }
 }

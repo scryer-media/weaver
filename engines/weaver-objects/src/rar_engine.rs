@@ -66,9 +66,38 @@ impl Format for Rar {
     fn run(password: Option<String>) -> Box<dyn Extraction> {
         Box::new(run::Run::new(password))
     }
+
+    fn window(first_bytes: &[u8]) -> Option<u64> {
+        window(&Self::front(first_bytes)?)
+    }
 }
 
 pub type RarEngine = EngineObject<Rar>;
+
+// The widest window a decode of the compressed members a front's headers
+// name will hold: the dictionary each header declares, or the member's whole
+// unpacked size where that is less. A solid archive keeps one window across
+// its members, whose sum no single front states, so it holds the whole
+// dictionary. A RAR3 PPMd model's size is in the packed data, not a header,
+// and members whose headers lie past the front, or under a password, state
+// nothing here.
+pub(crate) fn window(facts: &RarVolumeFacts) -> Option<u64> {
+    facts
+        .members
+        .iter()
+        .filter(|member| !member.is_directory && member.compression_method != 0)
+        .filter(|member| member.dict_size != 0)
+        .map(|member| {
+            if facts.is_solid || member.compression_solid {
+                member.dict_size
+            } else {
+                member
+                    .unpacked_size
+                    .map_or(member.dict_size, |size| size.min(member.dict_size))
+            }
+        })
+        .max()
+}
 
 fn held<'a>(bound: &BTreeMap<u32, Holding<'a, RarVolumeFacts>>) -> BTreeMap<u32, Held<'a>> {
     bound

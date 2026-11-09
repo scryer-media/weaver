@@ -1351,7 +1351,7 @@ fn own_rows(node: NodeRecord, password: Option<i64>) -> GraphCheckpoint {
                 .map(|window| (window.start as i64, window.end as i64)),
             kind: kind.to_string(),
             state: state_name(node.state).to_owned(),
-            reason: node.reason.map(|why| why_name(why).to_owned()),
+            reason: node.reason.map(why_text),
             facts_version: i64::from(facts.version),
             facts: facts.bytes,
             winning_password: password,
@@ -1408,7 +1408,7 @@ fn member_row(node: i64, member: MemberRecord, state: FileState) -> MemberRow {
         undecided: member.undecided,
         has_file: state.has_file,
         on_disk: state.on_disk,
-        refused: state.refused.map(|why| why_name(why).to_owned()),
+        refused: state.refused.map(why_text),
         copy_of: member.copy_of.map(|into| i64::from(into.0)),
         refuted_kind: member.refuted.map(|kind| kind.to_string()),
     }
@@ -1822,7 +1822,7 @@ fn provenance_named(name: &str) -> Option<Provenance> {
     .find(|provenance| provenance_name(*provenance) == name)
 }
 
-pub(crate) const REASONS: [Why; 13] = [
+pub(crate) const REASONS: [Why; 14] = [
     Why::Compressed,
     Why::TailUnreachable,
     Why::EncryptedHeader,
@@ -1836,6 +1836,10 @@ pub(crate) const REASONS: [Why; 13] = [
     Why::Unmapped,
     Why::TooDeep,
     Why::InvalidArchive,
+    Why::TooLarge {
+        needed: None,
+        allowed: None,
+    },
 ];
 
 pub(crate) fn why_name(why: Why) -> &'static str {
@@ -1853,11 +1857,40 @@ pub(crate) fn why_name(why: Why) -> &'static str {
         Why::Unmapped => "unmapped",
         Why::TooDeep => "too_deep",
         Why::InvalidArchive => "invalid_archive",
+        Why::TooLarge { .. } => "too_large",
     }
 }
 
-fn why_named(name: &str) -> Option<Why> {
-    REASONS.into_iter().find(|why| why_name(*why) == name)
+// A reason as a checkpoint row keeps it: its name, and for a decode too
+// large the sizes it carried, each `-` where it said none, as
+// `too_large:2147483648:-`.
+pub(crate) fn why_text(why: Why) -> String {
+    let size = |size: Option<u64>| size.map_or_else(|| "-".to_owned(), |size| size.to_string());
+    match why {
+        Why::TooLarge { needed, allowed } => {
+            format!("{}:{}:{}", why_name(why), size(needed), size(allowed))
+        }
+        why => why_name(why).to_owned(),
+    }
+}
+
+fn why_named(text: &str) -> Option<Why> {
+    let Some((name, sizes)) = text.split_once(':') else {
+        return REASONS
+            .into_iter()
+            .filter(|why| !matches!(why, Why::TooLarge { .. }))
+            .find(|why| why_name(*why) == text);
+    };
+    let size = |size: &str| match size {
+        "-" => Some(None),
+        size => size.parse().ok().map(Some),
+    };
+    let (needed, allowed) = sizes.split_once(':')?;
+    (name == "too_large").then_some(())?;
+    Some(Why::TooLarge {
+        needed: size(needed)?,
+        allowed: size(allowed)?,
+    })
 }
 
 #[cfg(test)]

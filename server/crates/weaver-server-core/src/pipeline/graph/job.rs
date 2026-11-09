@@ -905,6 +905,12 @@ impl GraphJob {
         self.lend(slots, limit)
     }
 
+    // Whether a run of the job waits for decode memory that was freed since
+    // it was turned away, by this job or another.
+    pub(crate) fn memory_freed(&self) -> bool {
+        self.runs.wakeable()
+    }
+
     // `limit` is the slot limit the pipeline reads now, which every step
     // that asks or frees a run follows, and a repair the step lends asks
     // `slots` under it. The runs step before the lend, so a run the step
