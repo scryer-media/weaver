@@ -282,6 +282,16 @@ impl Kept {
         &piece.bytes[at..end]
     }
 
+    // How the run in hand at `offset`, the one `from` reads, arrived.
+    pub(crate) fn provenance_at(&self, offset: u64) -> Option<Provenance> {
+        let (_, piece) = self.pieces.range(..=offset).next_back()?;
+        piece
+            .coverage
+            .runs()
+            .find(|run| run.range.contains(offset))
+            .map(|run| run.provenance)
+    }
+
     // Every run in hand, in order, with its bytes and how they arrived.
     pub(crate) fn runs(&self) -> Vec<(ByteRange, &[u8], Provenance)> {
         #[cfg(test)]

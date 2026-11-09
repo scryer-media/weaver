@@ -1127,6 +1127,14 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        // An object out hears the offer once it is back, after what came
+        // before it.
+        if self
+            .wait(node, Waiting::Told(Told::Password(secret.to_owned())))
+            .is_none()
+        {
+            return;
+        }
         let mut emits = std::mem::take(&mut self.emits);
         emits.clear();
         if let Some(object) = self
@@ -3702,7 +3710,12 @@ impl Tree {
         let Some(binding) = found.binding.clone() else {
             return;
         };
-        let kind = found.object.as_ref().map(|object| object.kind());
+        // An object out still has the kind it left as.
+        let kind = found
+            .object
+            .as_ref()
+            .map(|object| object.kind())
+            .or_else(|| self.lent_kind(node));
         self.retire(node);
         if binding.window.is_some() {
             // A window owns none of its member: nothing is given up, and
@@ -6599,6 +6612,44 @@ mod tests {
                 node: child,
                 member: MemberId(1)
             }]
+        );
+    }
+
+    #[test]
+    fn a_password_offered_while_the_object_is_out_is_heard_once_it_is_back() {
+        let (mut tree, _, child, _) = bound_tree();
+        let object = tree.lend_for_test(child).unwrap();
+        let mut effects = Vec::new();
+        tree.offer_password(child, "open", &mut Build, &mut effects);
+        assert!(effects.is_empty(), "nothing hears the offer while out");
+        tree.take_back(child, object, &mut Build, &mut effects);
+        assert_eq!(
+            effects,
+            vec![Effect::Announced {
+                node: child,
+                member: MemberId(1)
+            }]
+        );
+    }
+
+    #[test]
+    fn offers_made_while_the_object_is_out_are_heard_in_the_order_made() {
+        let (mut tree, _, child, _) = bound_tree();
+        let object = tree.lend_for_test(child).unwrap();
+        let mut effects = Vec::new();
+        tree.offer_password(child, "wrong", &mut Build, &mut effects);
+        tree.offer_password(child, "open", &mut Build, &mut effects);
+        assert!(effects.is_empty());
+        tree.take_back(child, object, &mut Build, &mut effects);
+        assert_eq!(
+            effects,
+            vec![
+                Effect::NeedsPassword { node: child },
+                Effect::Announced {
+                    node: child,
+                    member: MemberId(1)
+                }
+            ]
         );
     }
 

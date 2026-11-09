@@ -463,11 +463,12 @@ impl Object for Zip {
         }
         // Absorbing can make the object want more of this very delivery: the
         // tail names the directory, the directory names the local headers.
+        let kept = self.under_pending(range, delivery.bytes);
         loop {
             let generation = self.kept.generation();
             if self
                 .kept
-                .absorb(range, delivery.bytes, delivery.provenance)
+                .absorb(range, &kept, delivery.provenance)
                 .is_some()
             {
                 self.stale = true;

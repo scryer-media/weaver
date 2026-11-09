@@ -99,6 +99,8 @@ pub(super) enum Told {
         member: MemberId,
         range: ByteRange,
     },
+    // A password the job offered while the object was out.
+    Password(String),
 }
 
 impl Lent {
@@ -136,6 +138,15 @@ impl Tree {
 
     // The nodes whose object holds work to be lent out for, in node order.
     pub fn working(&self) -> Vec<NodeId> {
+        self.due_work().collect()
+    }
+
+    // Whether any object holds work to be lent out for.
+    pub fn work_due(&self) -> bool {
+        self.due_work().next().is_some()
+    }
+
+    fn due_work(&self) -> impl Iterator<Item = NodeId> + '_ {
         self.nodes
             .iter()
             .filter(|(_, found)| !found.retired && found.lent.is_none())
@@ -146,7 +157,6 @@ impl Tree {
                     .is_some_and(|object| object.work_due())
             })
             .map(|(node, _)| *node)
-            .collect()
     }
 
     // Lend the object at `node` out to do the work it holds. `None` when it
@@ -411,6 +421,13 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        // An offer is heard as the job makes it, with what it opened.
+        let told = match told {
+            Told::Password(secret) => {
+                return self.offer_password(node, &secret, builder, effects);
+            }
+            told => told,
+        };
         let mut emits = std::mem::take(&mut self.emits);
         emits.clear();
         if let Some(object) = self
@@ -450,6 +467,8 @@ impl Tree {
                         recovery.refused(member, range);
                     }
                 }
+                // Heard as an offer, above.
+                Told::Password(_) => {}
             }
         }
         self.apply(node, &mut emits, builder, effects);

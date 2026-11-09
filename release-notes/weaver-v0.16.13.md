@@ -41,6 +41,16 @@ Everything below is new since 0.16.12.
   article lost while that work runs waits for it and is placed through
   the archive's own map once it is done, so recovery files still mend the
   member it falls in.
+- **A nested encrypted zip fetched from its tail no longer crashes.** A
+  zip inside a zip, encrypted, whose last article came first could replay
+  the same bytes forever and end the process with a stack overflow.
+- **A split encrypted 7z with PAR2 no longer fails after a repair.** A
+  repair could come back while the 7z was off deriving its key, and
+  reading the repaired bytes back through it failed the job with `lost
+  proven bytes`. Key work now waits for a repair that is out, and a
+  recovery set rules only once no archive has work pending.
+- **A password given while an archive derives its key is kept.** It was
+  offered to an archive that was not there, and the archive never heard it.
 - **Large stored members are no longer refused by the extraction ratio.**
   A stored member split over many volumes was counted at its full size
   while only the volumes seen so far counted toward the archive. A
@@ -114,6 +124,10 @@ Everything below is new since 0.16.12.
 - **A loss during key derivation is tested on every pull request.** An
   encrypted stored RAR under a PAR2 set loses its last articles while its
   key is derived, and must still deliver its member whole.
+- **Lent work is tested under every serve order.** 180 new tests run
+  encrypted zip, 7z and RAR posts, flat and nested, in order, backwards,
+  tail first, with articles lost or damaged beside PAR2, restarted after
+  every article, and with each loan held and handed back late.
 - **The extraction ratio test fails without its fix.** Its articles are
   now cut so the first volume is written before the later ones are seen,
   as in a real 100 MiB volume set.
