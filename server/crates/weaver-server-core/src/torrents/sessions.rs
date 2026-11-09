@@ -27,17 +27,16 @@ use weaver_torrent::{
 use weaver_tunnel::pipe::Dialer;
 
 use crate::StateError;
+use crate::bandwidth::TorrentRates;
 use crate::persistence::Database;
 use crate::proxies::{
     Consumer, EgressBinding, EgressHealth, EgressInterface, EgressLimitChanges, FetchOptions,
-    LegPath, NetworkRuntime,
-    ProxyRuntime, ResolvedBy, Route, RoutingPolicy, Rung, SYSTEM_EGRESS_ID, TorrentLeg,
-    TorrentScope, pool_of, routed_fetch,
+    LegPath, NetworkRuntime, ProxyRuntime, ResolvedBy, Route, RoutingPolicy, Rung,
+    SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope, pool_of, routed_fetch,
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::IDENTITY;
 use crate::torrents::net::{Exposure, LegKind, LegNames, LegSockets, Shape, tracker_client};
-use crate::bandwidth::TorrentRates;
 use crate::torrents::rate::SessionRates;
 
 /// The most sessions that run at once.

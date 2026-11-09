@@ -3737,7 +3737,10 @@ async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
     applied.wait_for(|applied| *applied >= at).await.unwrap();
     assert_eq!(
         session_limits(&seeding),
-        (None, Some(crate::proxies::DEFAULT_UPLOAD_TRICKLE_BPS as u32))
+        (
+            None,
+            Some(crate::proxies::DEFAULT_UPLOAD_TRICKLE_BPS as u32)
+        )
     );
     assert_eq!(session_limits(&elsewhere), (None, None));
     assert_eq!(seeded.view().await.state, TorrentState::Seeding);

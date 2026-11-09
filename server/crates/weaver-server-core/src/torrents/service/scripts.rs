@@ -28,7 +28,11 @@ pub struct ScriptDirs {
 // file when it is one file named as the torrent, else its folder. The
 // script runs in the folder that holds it, or weaver's complete directory
 // before the torrent is placed.
-pub(crate) fn torrent_event(view: &TorrentView, event: QueueEvent, dirs: &ScriptDirs) -> EventContext {
+pub(crate) fn torrent_event(
+    view: &TorrentView,
+    event: QueueEvent,
+    dirs: &ScriptDirs,
+) -> EventContext {
     let (save, content) = view.paths();
     let content = PathBuf::from(content);
     let mut context = EventContext::from_job(
@@ -94,7 +98,12 @@ impl TorrentService {
     // Queue `event` for the scripts of `torrent`'s job, with `env` beside
     // the job's own variables. Nothing waits for it: a script never holds a
     // torrent's download or its seeding.
-    pub(super) fn raise_script_event(&self, torrent: &Live, event: QueueEvent, env: &[(&str, &str)]) {
+    pub(super) fn raise_script_event(
+        &self,
+        torrent: &Live,
+        event: QueueEvent,
+        env: &[(&str, &str)],
+    ) {
         self.queue_script_event(self.script_event(torrent, event, env));
     }
 

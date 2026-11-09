@@ -177,7 +177,10 @@ impl State {
         );
         let upload = session_rates(
             rates.upload,
-            &held.clone().map(|held| held.given.upload).collect::<Vec<_>>(),
+            &held
+                .clone()
+                .map(|held| held.given.upload)
+                .collect::<Vec<_>>(),
             &held.map(|held| held.used.1).collect::<Vec<_>>(),
         );
         download

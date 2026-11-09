@@ -104,7 +104,11 @@ async fn a_torrents_job_raises_each_queue_event_once_with_its_variables() {
         .collect();
     assert_eq!(reasons, ["paused", "removed"]);
     // A complete torrent removed is not a deleted download.
-    assert!(rig.db.queued_script_events(QueueEvent::NzbDeleted).is_empty());
+    assert!(
+        rig.db
+            .queued_script_events(QueueEvent::NzbDeleted)
+            .is_empty()
+    );
     again.stop().await;
     seeding.stop().await;
 }
@@ -224,10 +228,7 @@ async fn a_torrent_that_meets_its_goals_raises_seeding_finished_once() {
     rig.db.admitted_so_far().await;
     let finished = rig.db.queued_script_events(QueueEvent::SeedingFinished);
     assert_eq!(finished.len(), 2);
-    for (context, (view, action)) in finished
-        .iter()
-        .zip(views.iter().zip(["stop", "remove"]))
-    {
+    for (context, (view, action)) in finished.iter().zip(views.iter().zip(["stop", "remove"])) {
         assert_torrent_vars(context, view);
         assert_eq!(context.env[vars::SEEDING_ACTION], action);
     }
@@ -238,11 +239,7 @@ async fn a_torrent_that_meets_its_goals_raises_seeding_finished_once() {
             .is_empty()
     );
     assert_eq!(
-        rig.db
-            .get_torrent(views[0].job_id)
-            .unwrap()
-            .unwrap()
-            .intent,
+        rig.db.get_torrent(views[0].job_id).unwrap().unwrap().intent,
         TorrentIntent::Stopped
     );
     assert!(rig.db.get_torrent(views[1].job_id).unwrap().is_none());

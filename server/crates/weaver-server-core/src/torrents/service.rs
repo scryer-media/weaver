@@ -47,6 +47,7 @@ use crate::pipeline::graph::engine::{Outside, RunMail, Said};
 use crate::pipeline::graph::job::Storage;
 use crate::pipeline::graph::limits::{self, Caps};
 use crate::pipeline::graph::status::RepairSlots;
+use crate::post_processing::model::{QueueEvent, vars};
 use crate::proxies::{
     Consumer, LegTenancy, LegTenant, NetworkRuntime, ResolvedBy, SessionTraffic, TorrentScope,
 };
@@ -71,7 +72,6 @@ use crate::torrents::sessions::{
     NetworkRoutes, RouteFailure, RouteKey, RoutePlan, SessionEnv, SessionError, SessionView,
     Sessions, TorrentRouteReason, encryption_policy,
 };
-use crate::post_processing::model::{QueueEvent, vars};
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces};
 use crate::torrents::store::{Kept, Replayed, TorrentStore};
@@ -4976,7 +4976,10 @@ impl TorrentService {
 
     pub async fn pause(&self, job_id: JobId) -> Result<(), ActionError> {
         let stopped = self
-            .with_torrent(job_id, |torrent| Ok(self.seeding_stopped(torrent, "paused")))
+            .with_torrent(
+                job_id,
+                |torrent| Ok(self.seeding_stopped(torrent, "paused")),
+            )
             .await?;
         self.set_intent(job_id, TorrentIntent::Paused).await?;
         self.queue_script_event(stopped);
@@ -5912,7 +5915,10 @@ impl TorrentService {
         // A removed torrent's event is queued once its job is in history,
         // where the queue finds it.
         for (job_id, delete_files, finished) in actions {
-            match self.remove_as(job_id, delete_files, true, Ending::Goal).await {
+            match self
+                .remove_as(job_id, delete_files, true, Ending::Goal)
+                .await
+            {
                 Ok(()) => self.queue_script_event(finished),
                 Err(error) => {
                     tracing::warn!(job_id = job_id.0, error = %error, "a torrent that met its goal was not removed");

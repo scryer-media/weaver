@@ -589,10 +589,9 @@ fn simulated_queue_event(job: &JobExecutionContext, event: QueueEvent) -> EventC
         | QueueEvent::NzbAdded
         | QueueEvent::NzbNamed
         | QueueEvent::NzbDownloaded => &[],
-        QueueEvent::SeedingFinished => &[
-            (vars::PROTOCOL, "torrent"),
-            (vars::SEEDING_ACTION, "stop"),
-        ],
+        QueueEvent::SeedingFinished => {
+            &[(vars::PROTOCOL, "torrent"), (vars::SEEDING_ACTION, "stop")]
+        }
         QueueEvent::SeedingStopped => &[
             (vars::PROTOCOL, "torrent"),
             (vars::SEEDING_STOPPED_REASON, "paused"),
