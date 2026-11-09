@@ -78,6 +78,9 @@ async fn rig_on(routes: Arc<dyn crate::torrents::sessions::Routes>) -> Rig {
         ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap(),
     );
     let service = SpeedTestService::new(handle.clone(), config.clone(), db.clone(), true);
+    // A clock no one moves: no run ends on its maximum duration or a wait's
+    // time, only on what the test checks.
+    service.run_clock_for_tests(super::HandClock::new().clock());
     let sessions = crate::torrents::sessions::Sessions::new(
         routes,
         crate::torrents::sessions::tests::env(dir.path()),

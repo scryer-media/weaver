@@ -39,6 +39,9 @@ fn leg(kind: LegKind) -> P2pLeg {
         torrent: quiet(),
         ip_filter: Ok(IpFilter::default()),
         allow_private_network: true,
+        // A clock no one moves: no wait ends on time, only on what the
+        // test checks.
+        clock: crate::speed_test::HandClock::new().clock(),
     }
 }
 

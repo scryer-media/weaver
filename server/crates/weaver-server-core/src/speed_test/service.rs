@@ -19,7 +19,7 @@ use super::nearest::{Nearest, nearest};
 use super::overrides::{TestedLeg, TestedRoute};
 use super::progress::{LegRecorder, Progress, UsenetFacts};
 use super::providers::{self, Endpoints, ProviderServer};
-use super::runner::Stop;
+use super::runner::{RunClock, Stop};
 use super::torrent::{
     P2pLeg, P2pOutcome, P2pPath, P2pPlan, PeerUpload, Pulled, TestTorrent, TestTorrentSource,
 };
@@ -92,6 +92,9 @@ pub struct ServiceInner {
     torrent_source: Mutex<Option<TestTorrentSource>>,
     // The most the test torrent serves to peers; only tests lower it.
     peer_budget: AtomicU64,
+    // What a run's maximum duration and waits are timed by; only tests
+    // set one of their own.
+    clock: Mutex<RunClock>,
 }
 
 #[derive(Default)]
@@ -167,6 +170,7 @@ impl SpeedTestService {
                 until_stopped: AtomicBool::new(false),
                 torrent_source: Mutex::new(None),
                 peer_budget: AtomicU64::new(PEER_UPLOAD_BYTES),
+                clock: Mutex::new(RunClock::default()),
             }),
         }
     }
@@ -181,6 +185,11 @@ impl SpeedTestService {
         torrent: &crate::settings::TorrentConfig,
     ) -> Result<weaver_torrent::IpFilter, String> {
         self.inner.ip_filter(torrent).await
+    }
+
+    /// What a speed test's or a path test's waits are timed by.
+    pub fn clock(&self) -> RunClock {
+        self.inner.clock()
     }
 
     // The scheduler's one service, created on first use. A handle runs one
@@ -252,6 +261,12 @@ impl SpeedTestService {
     #[cfg(any(test, feature = "test-support"))]
     pub fn peer_upload_budget_for_tests(&self, budget: u64) {
         self.inner.peer_budget.store(budget, Ordering::Release);
+    }
+
+    // Time every later run's maximum duration and waits by `clock`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn run_clock_for_tests(&self, clock: RunClock) {
+        *self.inner.clock.lock().expect("speed test clock") = clock;
     }
 
     // Abort the task driving run `id`, as a runtime shutting down would.
@@ -980,6 +995,10 @@ impl ServiceInner {
         }
     }
 
+    fn clock(&self) -> RunClock {
+        self.clock.lock().expect("speed test clock").clone()
+    }
+
     // The test torrent's path over the draft's leg at `position`, as a
     // saved route's session would ride that leg.
     async fn p2p_path(
@@ -1001,6 +1020,7 @@ impl ServiceInner {
                 .runtime()
                 .map_err(|error| error.to_string())?
                 .allow_private_network(),
+            clock: self.clock(),
         })
         .await
     }
@@ -1484,7 +1504,7 @@ async fn execute(
                 },
                 cell.progress.clone(),
                 metrics,
-                stop.with_duration(max_duration),
+                stop.with_deadline(inner.clock().deadline(max_duration)),
             )
             .await;
             drop(sampler);
@@ -1541,7 +1561,7 @@ async fn execute(
             let sampler = spawn_sampler(cell.progress.clone());
             let progress = cell.progress.clone();
             let leg = first.position;
-            let mut measure = stop.with_duration(max_duration);
+            let mut measure = stop.with_deadline(inner.clock().deadline(max_duration));
             pulled = Some(
                 super::torrent::pull(
                     path,

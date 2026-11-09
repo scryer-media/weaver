@@ -802,6 +802,8 @@ async fn a_torrent_route_runs_the_test_torrent_over_each_path() {
                 torrent: quiet,
                 ip_filter: Ok(weaver_torrent::IpFilter::default()),
                 allow_private_network: true,
+                // A clock no one moves: the piece wait ends on the piece.
+                clock: crate::speed_test::HandClock::new().clock(),
             },
         )
         .await

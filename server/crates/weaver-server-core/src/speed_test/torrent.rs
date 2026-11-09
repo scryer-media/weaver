@@ -29,6 +29,7 @@ use weaver_torrent::{
 use weaver_tunnel::pipe::Dialer;
 
 use super::progress::StreamProvider;
+use super::runner::RunClock;
 use super::torrent_net::{PieceStore, ProbeSockets, Watched};
 use crate::proxies::{
     AttemptError, FetchOptions, FetchPath, PathBridge, ResolvedBy, fetch_on, read_body,
@@ -163,6 +164,8 @@ pub(crate) struct P2pLeg {
     pub torrent: TorrentConfig,
     pub ip_filter: Result<IpFilter, String>,
     pub allow_private_network: bool,
+    // What the test's waits are timed by.
+    pub clock: RunClock,
 }
 
 // The path a test torrent runs over: the leg its session rides, opened as a
@@ -177,6 +180,7 @@ pub(crate) struct P2pPath {
     torrent: TorrentConfig,
     ip_filter: Result<IpFilter, String>,
     allow_private_network: bool,
+    clock: RunClock,
 }
 
 impl P2pPath {
@@ -198,6 +202,7 @@ impl P2pPath {
                 torrent: leg.torrent,
                 ip_filter: leg.ip_filter,
                 allow_private_network: leg.allow_private_network,
+                clock: leg.clock,
             }),
             Err(error) => {
                 if let Some(bridge) = bridge {
@@ -542,11 +547,11 @@ async fn run_joined(
     let handle = &joined.handle;
 
     let mut verified = store.verified();
-    let deadline = tokio::time::Instant::now() + PIECE_WAIT;
+    let deadline = path.clock.deadline(PIECE_WAIT);
     let ended = tokio::select! {
         biased;
         () = stop.as_mut() => Ended::Stopped,
-        () = tokio::time::sleep_until(deadline) => Ended::TimedOut,
+        () = deadline.wait() => Ended::TimedOut,
         ended = wait_pieces(handle, &watched, &mut verified, 1) => ended,
     };
     let announces = handle.tracker_announces();
@@ -555,7 +560,7 @@ async fn run_joined(
             let started = store
                 .verified_at()
                 .unwrap_or_else(tokio::time::Instant::now);
-            Some(serve(handle, &watched, budget, started, stop.as_mut()).await)
+            Some(serve(path, handle, &watched, budget, started, stop.as_mut()).await)
         }
         (_, Some(_)) => Some(PeerUpload::Failed("no piece arrived to serve".into())),
         (_, None) => None,
@@ -661,6 +666,7 @@ pub(crate) async fn seed(
     let upload = match joined.handle.wait_until_initialized().await {
         Ok(()) => {
             serve(
+                path,
                 &joined.handle,
                 &watched,
                 budget,
@@ -742,6 +748,7 @@ fn announce_failed(table: &[TrackerAnnounce]) -> bool {
 // Serve the verified piece until `budget` bytes went to peers, or until no
 // peer wants it.
 async fn serve(
+    path: &P2pPath,
     handle: &Arc<ManagedTorrent>,
     watched: &Watched,
     budget: u64,
@@ -751,7 +758,7 @@ async fn serve(
 ) -> PeerUpload {
     let mut wake = watched.subscribe();
     let mut announces = handle.tracker_status().map(|status| status.subscribe());
-    let deadline = tokio::time::Instant::now() + UPLOAD_WAIT;
+    let deadline = path.clock.deadline(UPLOAD_WAIT);
     loop {
         let sent = watched.sent();
         if sent >= budget {
@@ -764,7 +771,7 @@ async fn serve(
         tokio::select! {
             biased;
             () = stop.as_mut() => break,
-            () = tokio::time::sleep_until(deadline) => break,
+            () = deadline.wait() => break,
             _ = wake.changed() => {}
             _ = async {
                 match announces.as_mut() {

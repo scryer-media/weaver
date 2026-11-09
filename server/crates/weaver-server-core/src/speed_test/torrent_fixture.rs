@@ -102,13 +102,14 @@ impl TorrentFixture {
         let content = dir.path().join("content");
         std::fs::create_dir(&content).unwrap();
         let file = content.join("netinst.iso");
-        std::fs::write(
-            &file,
-            (0..CONTENT_LEN)
-                .map(|i| (i * 7 % 251) as u8)
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+        // The content opens with the listing's port, which no other live
+        // fixture on this host holds, so every fixture's torrent has an info
+        // hash of its own and no fixture's peers can find another's swarm.
+        let mut bytes = (0..CONTENT_LEN)
+            .map(|i| (i * 7 % 251) as u8)
+            .collect::<Vec<_>>();
+        bytes[..2].copy_from_slice(&addr.port().to_be_bytes());
+        std::fs::write(&file, bytes).unwrap();
         let created = create_torrent(
             &file,
             CreateTorrentOptions {
@@ -340,6 +341,11 @@ async fn leech_one(
 ) -> std::io::Result<()> {
     let mut theirs = [0u8; 68];
     stream.read_exact(&mut theirs).await?;
+    // It speaks plain alone, and drops a stream that opens any other way, so
+    // an encrypted attempt ends at once and the dialer comes back plain.
+    if theirs[..20] != handshake(info_hash)[..20] {
+        return Ok(());
+    }
     stream.write_all(&handshake(info_hash)).await?;
     // A bitfield with no piece, then interested.
     stream.write_all(&[0, 0, 0, 2, 5, 0]).await?;

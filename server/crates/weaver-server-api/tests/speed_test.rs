@@ -10,13 +10,24 @@ use weaver_server_core::proxies::ProxyRuntime;
 use weaver_server_core::speed_test::fixture::{
     FixtureArticle, HttpFixture, NntpFixture, librespeed_list, loopback_tls, nzb,
 };
-use weaver_server_core::speed_test::{SpeedTestService, SpeedTestStatus};
+use weaver_server_core::speed_test::{HandClock, SpeedTestService, SpeedTestStatus};
 
 async fn harness() -> TestHarness {
     let h = TestHarness::new().await;
     h.handle.set_proxy_runtime(
         ProxyRuntime::new(h.db.clone(), tokio::runtime::Handle::current()).unwrap(),
     );
+    // Sessions that reach no host beyond the fixtures: no DHT bootstrap node
+    // and no port mapping.
+    {
+        let mut config = h.config.write().await;
+        config.torrent.dht_bootstrap_nodes = String::new();
+        config.torrent.upnp = false;
+    }
+    // A clock no one moves: no run ends on its maximum duration or a wait's
+    // time, only on what the test checks.
+    SpeedTestService::for_handle(&h.handle, h.config.clone(), h.db.clone(), true)
+        .run_clock_for_tests(HandClock::new().clock());
     h
 }
 
