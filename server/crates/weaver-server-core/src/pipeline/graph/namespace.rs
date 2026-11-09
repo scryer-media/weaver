@@ -135,11 +135,14 @@ struct Files {
     // its own, so its path is never queued to leave while it can still be
     // written: a member that spills, releases and spills again writes the
     // same file. Once the ledger holds nothing of the member on file the
-    // file is emptied, never removed (`release_spill`); a repair out with a
-    // handle on it reads that range as changed, since the holds it read
-    // and the file's revision both moved.
+    // file is emptied, never removed, and not at once: bytes a committed
+    // checkpoint names on file stay as it left them until a later one
+    // commits (`release_spill`). A repair out with a handle on it reads
+    // that range as changed, since the holds it read moved.
     spills: BTreeMap<MemberId, Leaf>,
-    // The members whose spill file is empty, emptied since its last write.
+    // The members the ledger holds nothing of on file since their spill
+    // file's last write. The file may still have bytes, until it is emptied
+    // at a commit.
     spills_empty: BTreeSet<MemberId>,
     // Why a member is a leaf when something refused to own it. Changed only
     // through `refuse` and `unrefuse`, which mark the member.
@@ -235,6 +238,14 @@ pub(crate) struct NamespaceWriter {
     // once one is taken. Until that checkpoint commits, the one the
     // database holds may name it, so it stays on disk until then.
     leaving: Vec<(Leaf, Option<u64>)>,
+    // Every spill file the ledger holds nothing of on file, each with the
+    // first checkpoint taken since, which names none of its bytes. The one
+    // the database holds may still name them, so the file is emptied only
+    // once that checkpoint commits, and not at all if the member spills
+    // again first: a member's bytes at an offset are its bytes there, so the
+    // new spill writes over nothing a committed row names but those bytes,
+    // or the ones the member was started over with.
+    spills_emptying: BTreeMap<(NodeId, MemberId), Option<u64>>,
     // The latest checkpoint the database has committed.
     committed: u64,
     segments: Vec<Segment>,
@@ -311,6 +322,7 @@ impl NamespaceWriter {
             moves: Vec::new(),
             left: BTreeMap::new(),
             leaving: Vec::new(),
+            spills_emptying: BTreeMap::new(),
             committed: 0,
             segments: Vec::new(),
             effects: Vec::new(),
@@ -1614,14 +1626,16 @@ impl NamespaceWriter {
         offset: u64,
         bytes: &[u8],
     ) -> Result<(), WriteError> {
+        self.spills_emptying.remove(&(node, member));
         self.spill_file(node, member)?.write(offset, bytes, None)?;
         self.files_mut(node).spills_empty.remove(&member);
         Ok(())
     }
 
-    // Once the ledger holds nothing of the member on file, its spill file is
-    // emptied and its handle let go; the file and its leaf stay, so no later
-    // spill of the member meets a path queued to leave.
+    // Once the ledger holds nothing of the member on file, its spill file's
+    // handle is let go and the file waits to be emptied at the commit of
+    // the next checkpoint, as `spills_emptying` says; the file and its leaf
+    // stay, so no later spill of the member meets a path queued to leave.
     fn release_spill(&mut self, node: NodeId, member: MemberId) -> Result<(), WriteError> {
         let Some(files) = self.files.get_mut(&node) else {
             return Ok(());
@@ -1632,9 +1646,35 @@ impl NamespaceWriter {
         let Some(spill) = files.spills.get_mut(&member) else {
             return Ok(());
         };
-        spill.truncate()?;
         spill.release_handle();
         files.spills_empty.insert(member);
+        self.spills_emptying.insert((node, member), None);
+        Ok(())
+    }
+
+    // The checkpoints through `committed` have committed: each spill file
+    // released before one of them was taken, and not written since, holds
+    // no bytes the database names, and is emptied.
+    fn empty_released_spills(&mut self, committed: u64) -> Result<(), WriteError> {
+        let due: Vec<(NodeId, MemberId)> = self
+            .spills_emptying
+            .iter()
+            .filter(|(_, stamp)| stamp.is_some_and(|stamp| stamp <= committed))
+            .map(|(key, _)| *key)
+            .collect();
+        for (node, member) in due {
+            self.spills_emptying.remove(&(node, member));
+            let Some(files) = self.files.get_mut(&node) else {
+                continue;
+            };
+            if !files.spills_empty.contains(&member) || files.holds.spills(held_volume(member)) {
+                continue;
+            }
+            if let Some(spill) = files.spills.get_mut(&member) {
+                spill.truncate()?;
+                spill.release_handle();
+            }
+        }
         Ok(())
     }
 

@@ -198,6 +198,9 @@ impl NamespaceWriter {
         for (_, gone) in &mut self.leaving {
             gone.get_or_insert(stamp);
         }
+        for emptied in self.spills_emptying.values_mut() {
+            emptied.get_or_insert(stamp);
+        }
     }
 
     // Whether a file still waits to move, or a name a file left waits for
@@ -207,10 +210,10 @@ impl NamespaceWriter {
     }
 
     // Whether anything waits for a checkpoint to commit: a move, a name a
-    // file left, or a file that goes which the one the database holds may
-    // name.
+    // file left, or a file that goes or is emptied which the one the
+    // database holds may name.
     pub(crate) fn awaits_commit(&self) -> bool {
-        self.moves_waiting() || !self.leaving.is_empty()
+        self.moves_waiting() || !self.leaving.is_empty() || !self.spills_emptying.is_empty()
     }
 
     // The checkpoint whose commit lets every waiting move run, as far as
@@ -219,7 +222,8 @@ impl NamespaceWriter {
         let moves = self.moves.iter().filter_map(|waiting| waiting.stamp);
         let left = self.left.values().filter_map(|stamp| *stamp);
         let gone = self.leaving.iter().filter_map(|(_, stamp)| *stamp);
-        moves.chain(left).chain(gone).max().unwrap_or(0)
+        let emptied = self.spills_emptying.values().filter_map(|stamp| *stamp);
+        moves.chain(left).chain(gone).chain(emptied).max().unwrap_or(0)
     }
 
     // The checkpoints through `stamp` have committed. Every name a file
@@ -242,6 +246,7 @@ impl NamespaceWriter {
         });
         let moved = self
             .remove_left(committed)
+            .and_then(|()| self.empty_released_spills(committed))
             .and_then(|()| self.run_moves(committed));
         (freed, moved)
     }

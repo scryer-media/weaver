@@ -811,11 +811,22 @@ fn an_undecided_member_spilled_before_its_first_article_is_byte_identical() {
     job.close(member);
     assert_eq!(job.file("notes.bin"), b"Rar! mid.\0tail..");
     assert_eq!(job.writer.refused(NodeId::ROOT, member), None);
-    // Nothing is held, and the spill file is emptied; it stays the member's
-    // until its namespace goes.
-    let files = &job.writer.files[&NodeId::ROOT];
-    assert_eq!(files.holds.total_held(), 0);
+    // Nothing is held. The spill file keeps its bytes until a checkpoint
+    // taken since commits, which names none of them, and is emptied then;
+    // it stays the member's until its namespace goes.
+    assert_eq!(job.writer.files[&NodeId::ROOT].holds.total_held(), 0);
+    assert_eq!(std::fs::metadata(job.spill(member)).expect("spill").len(), 16);
+    commit_checkpoint(&mut job);
     assert_eq!(std::fs::metadata(job.spill(member)).expect("spill").len(), 0);
+}
+
+// A checkpoint is taken of the job as it stands, and commits.
+fn commit_checkpoint(job: &mut Job) {
+    let stamp = job.writer.committed + 1;
+    job.writer.recorded(stamp);
+    job.writer
+        .commit_moves(&mut job.tree, stamp)
+        .expect("commit");
 }
 
 #[test]
@@ -985,8 +996,15 @@ const PAST: [(&str, HoldBudgets); 4] = [
 fn nothing_held(job: &Job, budget: &str) {
     let files = &job.writer.files[&NodeId::ROOT];
     assert_eq!(files.holds.total_held(), 0, "{budget}");
-    for spill in files.spills.values() {
-        assert_eq!(spill.len().expect("spill length"), 0, "{budget}");
+    // Each spill file holds nothing the ledger holds, and is empty or is
+    // emptied at the next commit.
+    for (member, spill) in &files.spills {
+        assert!(files.spills_empty.contains(member), "{budget}");
+        assert!(
+            spill.len().expect("spill length") == 0
+                || job.writer.spills_emptying.contains_key(&(NodeId::ROOT, *member)),
+            "{budget}"
+        );
     }
     assert_eq!(job.accountant.usage().resident, 0, "{budget}");
     assert_eq!(job.accountant.usage().scratch, 0, "{budget}");
@@ -1235,10 +1253,11 @@ fn a_member_that_spills_again_after_a_release_keeps_its_spill_file_through_a_com
     assert!(job.tree.is_undecided(child, late));
     assert_eq!(std::fs::read(&spill).expect("spilled"), b"\0\0\0\0\0\0\0\0\0\0first.");
 
-    // Taken back: what it held is let go, and its spill file emptied.
+    // Taken back: what it held is let go. Its spill file waits for a commit
+    // to be emptied, and none comes first.
     store_says(&mut job, child, vec![Emit::Retract(late)]);
     assert_eq!(job.writer.held_bytes(child), 0);
-    assert_eq!(std::fs::metadata(&spill).expect("emptied, not gone").len(), 0);
+    assert_eq!(std::fs::metadata(&spill).expect("not gone").len(), 16);
 
     // Said again, it spills again, and a stop's checkpoint commits.
     store_says(&mut job, child, vec![announce(), bytes(10, b"again.")]);
@@ -1252,6 +1271,7 @@ fn a_member_that_spills_again_after_a_release_keeps_its_spill_file_through_a_com
             .collect::<Vec<_>>(),
         vec![(ByteRange::new(10, 16), true)]
     );
+    commit_checkpoint(&mut job);
     job.commit();
     assert!(spill.is_file());
     assert_eq!(
@@ -1278,6 +1298,61 @@ fn a_member_that_spills_again_after_a_release_keeps_its_spill_file_through_a_com
     assert_eq!(
         read_at(&job, child, late, ByteRange::new(0, 16)).as_deref(),
         Some(&b"0123456789again."[..])
+    );
+}
+
+// A spill file keeps the bytes a committed checkpoint names on file until a
+// later checkpoint commits. The member spills, a checkpoint naming that hold
+// commits, the member is taken back, and it spills again further on before
+// another commits. The process dies there: a restore from the committed
+// checkpoint reads the first spill's bytes where its row says, never zeros.
+#[test]
+fn a_released_spill_keeps_what_the_committed_checkpoint_names_until_the_next_commit() {
+    let mut job = Job::new(NO_ROOM);
+    let (_, child) = bound_store(&mut job);
+    let late = MemberId(5);
+    let spill = job.dir.path().join(super::spill_name(child, late));
+    let bytes = |offset: u64, text: &'static [u8]| Emit::Bytes {
+        member: late,
+        offset,
+        bytes: Bytes::from_static(text).into(),
+        provenance: Provenance::Fresh,
+    };
+    let announce = || Emit::Member {
+        member: late,
+        name: "late.bin".into(),
+        length: Some(32),
+    };
+    store_says(&mut job, child, vec![announce(), bytes(10, b"first.")]);
+    // A stop's checkpoint names the hold on file, and commits; the restart
+    // adopts it, and until the restored job's first checkpoint commits the
+    // database still names it.
+    job.writer.page_out_holds().expect("page out");
+    let committed = hold_rows(&job, child);
+    assert_eq!(
+        committed
+            .iter()
+            .map(|record| (record.held.range, record.on_file))
+            .collect::<Vec<_>>(),
+        vec![(ByteRange::new(10, 16), true)]
+    );
+    commit_checkpoint(&mut job);
+    restarted(&mut job, Arc::new(HoldsAccountant::new(NO_ROOM)), &committed);
+    assert_eq!(job.writer.held_bytes(child), 6);
+
+    store_says(&mut job, child, vec![Emit::Retract(late)]);
+    store_says(&mut job, child, vec![announce(), bytes(20, b"again.")]);
+    assert_eq!(
+        std::fs::read(&spill).expect("spilled"),
+        [&[0u8; 10][..], b"first.", &[0; 4], b"again."].concat()
+    );
+
+    // Killed before another checkpoint commits.
+    restarted(&mut job, Arc::new(HoldsAccountant::new(NO_ROOM)), &committed);
+    assert_eq!(job.writer.held_bytes(child), 6);
+    assert_eq!(
+        read_at(&job, child, late, ByteRange::new(10, 16)).as_deref(),
+        Some(&b"first."[..])
     );
 }
 
