@@ -21,7 +21,7 @@ pub(crate) use admission::{
 };
 #[cfg(test)]
 pub(crate) use counters::COUNTER_SAMPLES;
-pub(crate) use history::clear_restart_artifacts;
+pub(crate) use history::{clear_left_working_dirs, clear_restart_artifacts, remove_job_staging};
 
 /// The control plane's shared facts. A guard never leaves a synchronous
 /// closure, so callers copy inputs out before doing asynchronous work.

@@ -354,7 +354,50 @@ where
 // does on one device: what its staging directory holds goes back there,
 // joining the directories both hold, and the staging directory goes. The
 // marker and the chunk directory are the staging directory's own.
-pub(crate) fn return_staged_delivery(staging: &Path, working_dir: &Path) -> std::io::Result<()> {
+// The working directory is released whether or not the delivery made it
+// back whole: what stays in the staging directory is still the job's, and
+// stays there while the job has a record.
+pub(crate) fn release_failed_delivery(
+    root: &Path,
+    working_dir: &Path,
+    staging: Option<&Path>,
+    job_id: JobId,
+) -> std::io::Result<()> {
+    release_failed_delivery_using(
+        root,
+        working_dir,
+        staging,
+        job_id,
+        move_path_with_safe_rename_or_copy_fallback,
+    )
+}
+
+fn release_failed_delivery_using<M>(
+    root: &Path,
+    working_dir: &Path,
+    staging: Option<&Path>,
+    job_id: JobId,
+    move_entry: M,
+) -> std::io::Result<()>
+where
+    M: Fn(&Path, &Path, u64, Arc<PhaseCounters>) -> Result<(), (std::io::Error, std::io::Error)>,
+{
+    let returned = staging.map_or(Ok(()), |staging| {
+        return_staged_delivery_using(staging, working_dir, move_entry)
+    });
+    let released =
+        crate::jobs::working_dir::release_failed_working_dir(root, working_dir, job_id);
+    returned.and(released)
+}
+
+fn return_staged_delivery_using<M>(
+    staging: &Path,
+    working_dir: &Path,
+    move_entry: M,
+) -> std::io::Result<()>
+where
+    M: Fn(&Path, &Path, u64, Arc<PhaseCounters>) -> Result<(), (std::io::Error, std::io::Error)>,
+{
     let entries = match std::fs::read_dir(staging) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         result => result?,
@@ -371,7 +414,7 @@ pub(crate) fn return_staged_delivery(staging: &Path, working_dir: &Path) -> std:
             merge_delivered_dir(&from, &to, Arc::clone(&counters)).map(|_| ())
         } else {
             let bytes = entry.metadata().map_or(0, |metadata| metadata.len());
-            move_path_with_safe_rename_or_copy_fallback(&from, &to, bytes, Arc::clone(&counters))
+            move_entry(&from, &to, bytes, Arc::clone(&counters))
         };
         moved.map_err(|(_, fallback)| fallback)?;
     }
@@ -919,33 +962,61 @@ async fn run_move_to_claimed_destination(
         }
     }
 
-    let marker_path = working_dir.join(WORKING_DIR_MARKER);
-    if let Err(error) = tokio::fs::remove_file(&marker_path).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(
-            job_id = job_id.0,
-            path = %marker_path.display(),
-            error = %error,
-            "failed to remove working directory marker during final move"
-        );
-    }
-
-    if let Err(error) = tokio::fs::remove_dir(&working_dir).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
+    // The marker goes only with the directory. One still holding something
+    // the move left, a consumed input that could not be removed, stays the
+    // job's: a history delete, or the next start once the job is gone, takes
+    // it whole.
+    if holds_more_than_marker(&working_dir).await {
         warn!(
             job_id = job_id.0,
             dir = %working_dir.display(),
-            error = %error,
-            "failed to remove intermediate directory after move"
+            "the intermediate directory keeps what could not be removed; it stays the job's until it can go"
         );
+    } else {
+        let marker_path = working_dir.join(WORKING_DIR_MARKER);
+        if let Err(error) = tokio::fs::remove_file(&marker_path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                job_id = job_id.0,
+                path = %marker_path.display(),
+                error = %error,
+                "failed to remove working directory marker during final move"
+            );
+        }
+
+        if let Err(error) = tokio::fs::remove_dir(&working_dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                job_id = job_id.0,
+                dir = %working_dir.display(),
+                error = %error,
+                "failed to remove intermediate directory after move"
+            );
+        }
     }
 
     Ok(MoveToCompleteResult {
         moved_entries: moved,
         renamed_members,
     })
+}
+
+// A directory that cannot be read is taken to hold something: its marker
+// stays rather than go on a guess.
+async fn holds_more_than_marker(dir: &Path) -> bool {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+    };
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) if entry.file_name() == WORKING_DIR_MARKER => {}
+            Ok(None) => return false,
+            Ok(Some(_)) | Err(_) => return true,
+        }
+    }
 }
 
 fn complete_parent_for_category(

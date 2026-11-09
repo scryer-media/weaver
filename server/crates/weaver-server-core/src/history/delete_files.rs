@@ -164,6 +164,7 @@ async fn cleanup_owned_output_dir(dir: Option<&std::path::Path>) {
 pub(crate) async fn delete_history_rows(
     db: &crate::Database,
     intermediate_dir: &std::path::Path,
+    complete_dir: &std::path::Path,
     job_ids: BTreeSet<JobId>,
     delete_files: bool,
 ) -> (
@@ -196,6 +197,29 @@ pub(crate) async fn delete_history_rows(
         }
     };
 
+    // A job's working directory is the one its record names, or one that
+    // still carries its marker: a delivered job's record names where it
+    // delivered, and its working directory stays only for what it could not
+    // remove.
+    let root = intermediate_dir.to_path_buf();
+    let owners = job_ids.clone();
+    let mut marked = match tokio::task::spawn_blocking(move || {
+        crate::jobs::working_dir::job_working_dirs(&root, &owners)
+    })
+    .await
+    {
+        Ok(Ok(marked)) => marked,
+        Ok(Err(error)) => return (BTreeSet::new(), Err(crate::SchedulerError::Io(error))),
+        Err(error) => {
+            return (
+                BTreeSet::new(),
+                Err(crate::SchedulerError::Internal(format!(
+                    "failed to join working directory lookup task: {error}"
+                ))),
+            );
+        }
+    };
+
     let mut cleanup = BTreeMap::new();
     let mut delete_ids = Vec::with_capacity(job_ids.len());
     for job_id in job_ids {
@@ -203,12 +227,16 @@ pub(crate) async fn delete_history_rows(
         let mut dirs = JobCleanupDirs::default();
         let candidates = recorded
             .as_deref()
-            .and_then(|dir| cleanupable_history_output_dir(intermediate_dir, dir));
-        let admitted = if let Some(path) = candidates {
-            dirs.admit(intermediate_dir, job_id, path).await
-        } else {
-            Ok(())
-        };
+            .and_then(|dir| cleanupable_history_output_dir(intermediate_dir, dir))
+            .into_iter()
+            .chain(marked.remove(&job_id).unwrap_or_default());
+        let mut admitted = Ok(());
+        for path in candidates {
+            admitted = dirs.admit(intermediate_dir, job_id, path).await;
+            if admitted.is_err() {
+                break;
+            }
+        }
         if let Err(error) = admitted {
             refused.insert(job_id, error);
             output_dirs.remove(&job_id);
@@ -273,7 +301,14 @@ pub(crate) async fn delete_history_rows(
         match dirs.remove(intermediate_dir, job_id).await {
             Ok(left_in_place) => {
                 cleanup_owned_output_dir(output_dirs.get(&job_id).map(PathBuf::as_path)).await;
-                deleted.insert(job_id, Ok(crate::HistoryDeleteOutcome { left_in_place }));
+                // What the staging directory still holds is the rest of the
+                // delivery the working directory held, and goes the way it
+                // went, with or without the files.
+                let staged = crate::pipeline::queue::remove_job_staging(complete_dir, job_id).await;
+                deleted.insert(
+                    job_id,
+                    staged.map(|()| crate::HistoryDeleteOutcome { left_in_place }),
+                );
             }
             Err(error) => {
                 deleted.insert(job_id, Err(error));

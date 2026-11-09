@@ -294,10 +294,12 @@ impl Pipeline {
         tokio::spawn(async move {
             let dir = working_dir.clone();
             let released = tokio::task::spawn_blocking(move || {
-                if let Some(staging) = staging {
-                    crate::pipeline::completion::finalize::return_staged_delivery(&staging, &dir)?;
-                }
-                crate::jobs::working_dir::release_failed_working_dir(&root, &dir, job_id)
+                crate::pipeline::completion::finalize::release_failed_delivery(
+                    &root,
+                    &dir,
+                    staging.as_deref(),
+                    job_id,
+                )
             })
             .await;
             let failure = match released {

@@ -133,17 +133,48 @@ pub(crate) fn find_job_working_dir(root: &Path, job_id: JobId) -> std::io::Resul
 // job's ownership marker: the job's own working directory, by identity,
 // never by where it sits.
 pub(crate) fn is_job_working_dir(root: &Path, path: &Path, job_id: JobId) -> std::io::Result<bool> {
+    Ok(working_dir_owner(root, path)? == Some(job_id))
+}
+
+// The job whose ownership marker `path`, a working directory under `root`,
+// carries, if it carries one that matches it.
+pub(crate) fn working_dir_owner(root: &Path, path: &Path) -> std::io::Result<Option<JobId>> {
     let Ok(dir) = open_working_directory(root, path) else {
-        return Ok(false);
+        return Ok(None);
     };
     let Ok(stored) = read_working_marker(&dir) else {
-        return Ok(false);
+        return Ok(None);
     };
-    Ok(marker_job_id(&stored) == Some(job_id)
-        && !matches!(
-            match_marker(&dir, path, &stored, job_id)?,
-            MarkerMatch::Mismatch
-        ))
+    let Some(job_id) = marker_job_id(&stored) else {
+        return Ok(None);
+    };
+    Ok((!matches!(
+        match_marker(&dir, path, &stored, job_id)?,
+        MarkerMatch::Mismatch
+    ))
+    .then_some(job_id))
+}
+
+// Every working directory under `root` whose ownership marker is one of
+// `jobs`. A finished job's directory keeps its marker while it still holds
+// something the job could not remove, and is found here by its job.
+pub(crate) fn job_working_dirs(
+    root: &Path,
+    jobs: &std::collections::BTreeSet<JobId>,
+) -> std::io::Result<std::collections::BTreeMap<JobId, Vec<PathBuf>>> {
+    let mut found = std::collections::BTreeMap::<JobId, Vec<PathBuf>>::new();
+    let entries = match std::fs::read_dir(root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if let Some(owner) = working_dir_owner(root, &path)?.filter(|owner| jobs.contains(owner)) {
+            found.entry(owner).or_default().push(path);
+        }
+    }
+    Ok(found)
 }
 
 fn open_working_directory(root: &Path, path: &Path) -> std::io::Result<Dir> {

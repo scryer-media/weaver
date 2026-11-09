@@ -4,7 +4,7 @@
 // What a graph job spends is left out of what it hands over: recovery
 // volumes, bound or only named so, and the pieces a join consumed.
 
-use super::harness::{ARTICLE, Post, Scenario, par2_set, payload, run};
+use super::harness::{ARTICLE, JOB, Post, Scenario, par2_set, payload, run, run_then};
 use crate::jobs::model::JobStatus;
 
 // A PAR2 volume whose first article is lost never says by its bytes which
@@ -67,6 +67,62 @@ async fn a_consumed_input_that_cannot_be_removed_stays_and_the_job_completes() {
         "the consumed input left the working directory: {:?}",
         graph.retained_files.keys().collect::<Vec<_>>()
     );
+}
+
+// The working directory a consumed input stayed in stays the job's, marker
+// and all, once the job is done: deleting the job's history with its files
+// takes it, as it takes the complete directory, once the input can go.
+#[tokio::test]
+async fn a_left_input_s_working_directory_goes_with_the_history_delete() {
+    let data = payload(4 * ARTICLE, 53);
+    let mut posts = vec![Post::plain("lantern.bin", data.clone())];
+    posts.extend(par2_set("lantern", &[("lantern.bin", &data)], 2));
+    *crate::pipeline::completion::finalize::BEFORE_SPENT_REMOVAL
+        .lock()
+        .unwrap() = Some(Box::new(move |spent: &[std::path::PathBuf]| {
+        let pinned = spent
+            .iter()
+            .find(|path| path.is_file())
+            .expect("a recovery set is spent before delivery");
+        std::fs::remove_file(pinned).unwrap();
+        std::fs::create_dir(pinned).unwrap();
+        std::fs::write(pinned.join("held"), b"held").unwrap();
+        // The harness admits with the empty marker older versions wrote; an
+        // admission now writes the job's own.
+        let working_dir = pinned.parent().unwrap();
+        crate::jobs::working_dir::mark_weaver_owned_working_dir(
+            working_dir.parent().unwrap(),
+            working_dir,
+            JOB,
+        )
+        .unwrap();
+    }));
+    let graph = run_then(&Scenario::new(posts), async |pipeline, complete_dir| {
+        let jobs = std::collections::BTreeSet::from([JOB]);
+        let owned =
+            crate::jobs::working_dir::job_working_dirs(&pipeline.intermediate_dir, &jobs).unwrap();
+        let [working_dir] = owned[&JOB].as_slice() else {
+            panic!("the job owns one working directory: {owned:?}");
+        };
+        let delivered = complete_dir.join("lantern beacon");
+        assert!(delivered.join("lantern.bin").is_file());
+
+        pipeline.report_all_for_test();
+        let outcome = pipeline
+            .shared_state
+            .queue
+            .clone()
+            .delete_history(jobs, true)
+            .await
+            .unwrap();
+        assert!(outcome.refused.is_empty(), "{:?}", outcome.refused);
+        let deleted = outcome.deleted[&JOB].as_ref().unwrap();
+        assert!(deleted.left_in_place.is_empty());
+        assert!(!working_dir.exists(), "the intermediate directory stayed");
+        assert!(!delivered.exists(), "the complete directory stayed");
+    })
+    .await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
 }
 
 // While the root fetches recovery volumes for a lost article the job shows

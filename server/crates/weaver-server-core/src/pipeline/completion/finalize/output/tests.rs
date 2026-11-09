@@ -688,7 +688,12 @@ fn a_failed_job_s_staged_delivery_returns_to_its_working_directory() {
     std::fs::write(staging.join("Sample/sample.mkv"), b"sample").unwrap();
     std::fs::write(working.join("Sample/sample.srt"), b"subs").unwrap();
 
-    return_staged_delivery(&staging, &working).unwrap();
+    return_staged_delivery_using(
+        &staging,
+        &working,
+        move_path_with_safe_rename_or_copy_fallback,
+    )
+    .unwrap();
 
     assert_eq!(std::fs::read(working.join("movie.mkv")).unwrap(), b"movie");
     assert_eq!(
@@ -704,4 +709,55 @@ fn a_failed_job_s_staged_delivery_returns_to_its_working_directory() {
         b"working marker"
     );
     assert!(!staging.exists());
+}
+
+// A staged delivery that cannot all go back still releases the working
+// directory: the graph's internals go, what came back stays, and what could
+// not move stays in the staging directory, the job's for as long as its
+// record stands.
+#[test]
+fn a_failed_return_still_releases_the_working_directory_and_keeps_the_rest_staged() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path().join("intermediate");
+    let working = root.join("Silver Horizon");
+    let staging = temp.path().join("complete/.weaver-staging/31");
+    std::fs::create_dir_all(working.join(weaver_graph::names::INTERNAL_DIR)).unwrap();
+    std::fs::create_dir_all(working.join(weaver_graph::names::CACHE_DIR)).unwrap();
+    std::fs::create_dir_all(&staging).unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_working_dir(&root, &working, JobId(31)).unwrap();
+    std::fs::write(working.join(weaver_graph::names::INTERNAL_DIR).join("0"), b"chunk").unwrap();
+    std::fs::write(staging.join(WORKING_DIR_MARKER), b"staging marker").unwrap();
+    std::fs::write(staging.join("a.mkv"), b"first").unwrap();
+    std::fs::write(staging.join("b.mkv"), b"second").unwrap();
+
+    // The first entry moves; the second finds the disk full.
+    let moved = std::cell::RefCell::new(Vec::new());
+    let error = release_failed_delivery_using(
+        &root,
+        &working,
+        Some(&staging),
+        JobId(31),
+        |src: &Path, dst: &Path, bytes: u64, counters: Arc<PhaseCounters>| {
+            if !moved.borrow().is_empty() {
+                return Err((
+                    std::io::Error::from(std::io::ErrorKind::CrossesDevices),
+                    std::io::Error::from(std::io::ErrorKind::StorageFull),
+                ));
+            }
+            moved.borrow_mut().push(src.file_name().unwrap().to_owned());
+            move_path_with_safe_rename_or_copy_fallback(src, dst, bytes, counters)
+        },
+    )
+    .unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+    let returned = moved.into_inner().pop().unwrap();
+    let kept = if returned == "a.mkv" { "b.mkv" } else { "a.mkv" };
+    assert!(working.join(&returned).is_file());
+    assert!(!staging.join(&returned).exists());
+    assert!(staging.join(kept).is_file());
+    assert!(!working.join(kept).exists());
+    assert!(!working.join(weaver_graph::names::INTERNAL_DIR).exists());
+    assert!(!working.join(weaver_graph::names::CACHE_DIR).exists());
+    assert!(crate::jobs::working_dir::is_weaver_owned_working_dir(&working));
 }
