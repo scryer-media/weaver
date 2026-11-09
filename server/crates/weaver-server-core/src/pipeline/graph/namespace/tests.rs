@@ -942,6 +942,246 @@ fn a_hold_record_past_its_scratch_file_is_not_adopted() {
     ));
 }
 
+// Each budget a hold can run past. Memory past its limit pages to scratch;
+// scratch past any of its budgets spills to the member's file.
+const PAST: [(&str, HoldBudgets); 4] = [
+    (
+        "resident_limit",
+        HoldBudgets {
+            resident_limit: 0,
+            ..PLENTY
+        },
+    ),
+    (
+        "scratch_total",
+        HoldBudgets {
+            resident_limit: 0,
+            scratch_total: 0,
+            ..PLENTY
+        },
+    ),
+    (
+        "scratch_ceiling",
+        HoldBudgets {
+            resident_limit: 0,
+            scratch_ceiling: 0,
+            ..PLENTY
+        },
+    ),
+    (
+        "disk_reserve",
+        HoldBudgets {
+            resident_limit: 0,
+            disk_reserve: u64::MAX,
+            ..PLENTY
+        },
+    ),
+];
+
+// Nothing of the namespace is held, on scratch or on file, and no budget
+// counts anything.
+fn nothing_held(job: &Job, budget: &str) {
+    let files = &job.writer.files[&NodeId::ROOT];
+    assert_eq!(files.holds.total_held(), 0, "{budget}");
+    assert!(files.spills.is_empty(), "{budget}");
+    assert_eq!(job.accountant.usage().resident, 0, "{budget}");
+    assert_eq!(job.accountant.usage().scratch, 0, "{budget}");
+}
+
+// A member not yet decided, past each budget: it stays undecided, and once
+// its front decides it every byte reaches its file.
+#[test]
+fn an_undecided_member_past_each_budget_is_written_whole() {
+    for (budget, budgets) in PAST {
+        let mut job = Job::new(budgets);
+        let member = job.member("notes.bin", None);
+        job.send(member, 10, b"tail..", Provenance::Fresh);
+        job.send(member, 2, b"r! mid.", Provenance::Fresh);
+        assert!(job.tree.is_undecided(NodeId::ROOT, member), "{budget}");
+        assert_eq!(
+            job.spill(member).is_file(),
+            budget != "resident_limit",
+            "{budget}"
+        );
+        assert_eq!(job.accountant.usage().resident, 0, "{budget}");
+
+        job.send(member, 0, b"Ra", Provenance::Fresh);
+        job.close(member);
+        assert_eq!(job.writer.refused(NodeId::ROOT, member), None, "{budget}");
+        assert_eq!(job.file("notes.bin"), b"Rar! mid.\0tail..", "{budget}");
+        nothing_held(&job, budget);
+    }
+}
+
+// A member bound to a store that has not yet placed its bytes, past each
+// budget: it stays bound, and once the store's map places them the member
+// below gets every byte.
+#[test]
+fn a_bound_member_past_each_budget_reaches_the_member_below_whole() {
+    for (budget, budgets) in PAST {
+        let mut job = Job::new(budgets);
+        let member = job.member("a.7z", Some(map_at().end));
+        let mut front = seven_z().to_vec();
+        front.extend_from_slice(b"hello");
+        job.send(member, 0, &front, Provenance::Fresh);
+        assert!(!job.tree.is_undecided(NodeId::ROOT, member), "{budget}");
+        assert!(job.tree.child_of(NodeId::ROOT, member).is_some(), "{budget}");
+        assert_eq!(
+            job.writer.held_bytes(NodeId::ROOT),
+            body().len(),
+            "{budget}"
+        );
+        assert_eq!(
+            job.spill(member).is_file(),
+            budget != "resident_limit",
+            "{budget}"
+        );
+
+        job.send(member, map_at().start, MAP, Provenance::Fresh);
+        assert_eq!(job.writer.refused(NodeId::ROOT, member), None, "{budget}");
+        assert_eq!(job.file("inner.bin"), b"hello", "{budget}");
+        nothing_held(&job, budget);
+    }
+}
+
+// Two jobs share the budgets. The first fills them, and the second's holds
+// go to its member's file; neither job loses a byte, and what the first
+// holds stays where it is.
+#[test]
+fn a_job_whose_holds_find_the_budgets_full_spills_and_the_first_keeps_its_own() {
+    let budgets = HoldBudgets {
+        resident_limit: 0,
+        scratch_total: 6,
+        scratch_ceiling: u64::MAX,
+        disk_reserve: 0,
+    };
+    let mut first = Job::new(budgets);
+    let mut second = Job::new(budgets);
+    second.accountant = Arc::clone(&first.accountant);
+    second.writer = NamespaceWriter::new(
+        2,
+        second.dir.path().to_path_buf(),
+        Arc::clone(&first.accountant),
+        CapacityReader::unknown(),
+    );
+
+    let early = first.member("notes.bin", None);
+    first.send(early, 10, b"tail..", Provenance::Fresh);
+    assert!(!first.spill(early).is_file());
+    assert_eq!(first.accountant.usage().scratch, 6);
+
+    let late = second.member("notes.bin", None);
+    second.send(late, 10, b"other.", Provenance::Fresh);
+    assert!(second.spill(late).is_file());
+    assert_eq!(first.accountant.usage().scratch, 6);
+
+    second.send(late, 0, b"Rar! two.\0", Provenance::Fresh);
+    second.close(late);
+    assert_eq!(second.file("notes.bin"), b"Rar! two.\0other.");
+    assert_eq!(second.writer.refused(NodeId::ROOT, late), None);
+
+    // The first job's hold never moved.
+    assert!(!first.spill(early).is_file());
+    assert_eq!(first.accountant.usage().scratch, 6);
+    first.send(early, 0, b"Rar! one.\0", Provenance::Fresh);
+    first.close(early);
+    assert_eq!(first.file("notes.bin"), b"Rar! one.\0tail..");
+    assert_eq!(first.writer.refused(NodeId::ROOT, early), None);
+    nothing_held(&first, "first");
+    nothing_held(&second, "second");
+}
+
+// Holds paged to scratch and holds on file at a stop come back in a process
+// whose ceiling is now lower than what the scratch file holds: what scratch
+// cannot take goes to the member's file, and the member is written whole
+// with nothing fetched again.
+#[test]
+fn holds_restored_under_a_lower_ceiling_come_back_on_file() {
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 0,
+        scratch_ceiling: 6,
+        ..PLENTY
+    });
+    let member = job.member("notes.bin", None);
+    job.send(member, 10, b"tail..", Provenance::Fresh);
+    job.send(member, 2, b"r! mid.", Provenance::Fresh);
+    assert_eq!(job.accountant.usage().scratch, 6);
+    assert!(job.spill(member).is_file());
+
+    job.writer.page_out_holds().expect("page out");
+    let records: Vec<HoldRecord> = job
+        .writer
+        .hold_records(NodeId::ROOT)
+        .into_iter()
+        .map(|(held, on_file)| HoldRecord {
+            node: NodeId::ROOT,
+            held,
+            on_file,
+        })
+        .collect();
+    assert_eq!(
+        records.iter().map(|record| record.on_file).collect::<Vec<_>>(),
+        vec![false, true],
+        "{records:?}"
+    );
+
+    // The process goes away; its scratch and spill files stay. The next
+    // has no scratch room at all.
+    let lower = Arc::new(HoldsAccountant::new(HoldBudgets {
+        resident_limit: 0,
+        scratch_ceiling: 0,
+        ..PLENTY
+    }));
+    job.accountant = Arc::clone(&lower);
+    drop(std::mem::replace(
+        &mut job.writer,
+        NamespaceWriter::new(
+            1,
+            job.dir.path().to_path_buf(),
+            lower,
+            CapacityReader::unknown(),
+        ),
+    ));
+    job.writer
+        .restore_holds(&job.tree, &records)
+        .expect("restore holds");
+    assert_eq!(job.accountant.usage().scratch, 0);
+    assert_eq!(job.writer.held_bytes(NodeId::ROOT), 13);
+    assert!(job.writer.files[&NodeId::ROOT].spills.contains_key(&member));
+    for (range, held) in [(ByteRange::new(10, 16), &b"tail.."[..]), (ByteRange::new(2, 9), b"r! mid.")] {
+        let mut bytes = Vec::new();
+        assert!(job.writer.access(&job.tree).read_at(NodeId::ROOT, member, range, &mut bytes));
+        assert_eq!(bytes, held);
+    }
+
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    job.close(member);
+    assert_eq!(job.file("notes.bin"), b"Rar! mid.\0tail..");
+    nothing_held(&job, "restored");
+}
+
+// A member an older build refused because its holds ran past their budgets
+// is taken back: the refusal was never a ruling on its bytes, so the store
+// that owned it is asked again and the member below comes out whole.
+#[test]
+fn a_member_refused_for_its_holds_is_reopened_and_delivered() {
+    let mut job = Job::new(PLENTY);
+    let (member, child) = bound_store(&mut job);
+    store_says(&mut job, child, vec![Emit::Refuse(Why::HoldsBreached)]);
+    assert_eq!(
+        job.writer.refused(NodeId::ROOT, member),
+        Some(Why::HoldsBreached)
+    );
+
+    let mut build = job.build();
+    job.writer
+        .lift_hold_refusals(&mut job.tree, &mut build, &Source, &mut job.out)
+        .expect("lift");
+    assert_eq!(job.writer.refused(NodeId::ROOT, member), None);
+    assert!(job.tree.child_of(NodeId::ROOT, member).is_some());
+    assert_eq!(job.file("inner.bin"), b"hello");
+}
+
 #[test]
 fn two_members_that_want_one_name_are_both_written() {
     let mut job = Job::new(PLENTY);
