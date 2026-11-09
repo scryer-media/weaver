@@ -387,6 +387,39 @@ async fn a_restored_job_whose_policy_does_not_parse_is_judged_by_the_default() {
     assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
 }
 
+// A pipeline starts on stored settings that do not parse, and its scripts are
+// admitted as under the defaults. The value stays as stored.
+#[tokio::test]
+async fn a_pipeline_starts_on_stored_settings_that_do_not_parse() {
+    use crate::pipeline::tests::{new_direct_pipeline, retire_pipeline_database};
+    use crate::post_processing::events::refresh_admission_hint;
+    use crate::post_processing::settings::SETTINGS_KEY;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let refused_by_default = refresh_admission_hint(&pipeline.db).unwrap();
+    pipeline
+        .db
+        .set_setting(SETTINGS_KEY, super::harness::CORRUPT_POLICY)
+        .unwrap();
+    retire_pipeline_database(pipeline).await;
+
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    assert_eq!(
+        refresh_admission_hint(&pipeline.db).unwrap(),
+        refused_by_default
+    );
+    assert_eq!(
+        pipeline.db.post_processing_settings().unwrap(),
+        Default::default()
+    );
+    assert_eq!(
+        pipeline.db.get_setting(SETTINGS_KEY).unwrap().as_deref(),
+        Some(super::harness::CORRUPT_POLICY)
+    );
+    retire_pipeline_database(pipeline).await;
+}
+
 #[tokio::test]
 async fn a_job_restarted_mid_extraction_keeps_counting_its_bytes() {
     let body = payload(40 * ARTICLE, 78);

@@ -620,25 +620,6 @@ impl Scenario {
         self
     }
 
-    // A restarting run's pipeline has built or restored the job: the
-    // settings are saved again, as the operator would, so the next pipeline
-    // can start; a pipeline does not start on settings that do not parse.
-    pub(in crate::pipeline::tests) fn built(&self, pipeline: &Pipeline) {
-        if self.policy_corrupt {
-            let settings = crate::post_processing::model::PostProcessingSettings {
-                unacceptable_extensions: self.unacceptable.clone().unwrap_or_default(),
-                ..Default::default()
-            };
-            pipeline
-                .db
-                .set_setting(
-                    crate::post_processing::settings::SETTINGS_KEY,
-                    &serde_json::to_string(&settings).unwrap(),
-                )
-                .unwrap();
-        }
-    }
-
     // The job runs under these extraction limits.
     pub(in crate::pipeline::tests) fn limits(mut self, limits: ExtractionLimits) -> Self {
         self.limits = Some(limits);
