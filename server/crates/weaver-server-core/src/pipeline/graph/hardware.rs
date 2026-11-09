@@ -72,8 +72,8 @@ impl Grant {
 
     // What the profile the tuner holds grants, on `pool`.
     //
-    //   run     the profile's 7z decoder allowance, on its extract threads,
-    //           lent from `pool`
+    //   run     the profile's 7z decoder allowance, and the window any one
+    //           decoder may hold, on its extract threads, lent from `pool`
     //   repair  the profile's PAR3 share of the machine's memory, which a
     //           PAR2 repair is held to as well, on every core but one, no
     //           more than the profile's repair cap
@@ -89,6 +89,7 @@ impl Grant {
             pool: Some(pool),
             run: Budget {
                 memory_bytes: Some(tuning.sevenz_decode_memory_bytes),
+                window_bytes: Some(tuning.decode_window_bytes),
                 threads,
                 pool: Some(lent),
             },
@@ -98,6 +99,7 @@ impl Grant {
                         .par3_memory
                         .of(HardwareProfile::effective_memory_bytes(probe)),
                 ),
+                window_bytes: None,
                 threads: tuning.par3_cpu_cap.map_or(host, |cap| host.min(cap)).max(1),
                 pool: None,
             },

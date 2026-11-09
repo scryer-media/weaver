@@ -19,19 +19,20 @@ use super::{Decoder, Front};
 pub struct Xz;
 
 const STREAM_HEADER: usize = 12;
-// The most an xz decoder may hold when the run was granted no memory:
-// enough for the dictionary `xz -9` writes, and no tiny stream may ask for
-// more.
+// The largest dictionary an xz decoder may hold when the run was granted no
+// window: enough for the dictionary `xz -9` writes. The decoder holds its
+// limit against a block's dictionary, so a grant of 1 GiB admits a 1 GiB
+// dictionary.
 const MEMORY_LIMIT: u64 = 128 << 20;
 
 impl Decoder for Xz {
     const KIND: Kind = Kind::Xz;
 
-    // No more than the run was granted, and never more than the most an xz
-    // decoder may hold: a grant narrows the window and never widens it, so
-    // a stream whose front has not said reserves no more than that.
+    // What the first block's dictionary needs, no more than the window the
+    // run was granted: a stream whose front has not said reserves the whole
+    // grant.
     fn window(first: &[u8], budget: &Budget) -> u64 {
-        let most = budget.memory_or(MEMORY_LIMIT).min(MEMORY_LIMIT);
+        let most = budget.window_or(MEMORY_LIMIT);
         dictionary(first)
             .and_then(|property| Lzma2Reader::<io::Empty>::memory_required(property).ok())
             .map_or(most, |window| window.min(most))
@@ -57,7 +58,7 @@ impl Decoder for Xz {
         closed: bool,
     ) -> io::Result<Box<dyn Read + Send>> {
         if closed && budget.threads() > 1 && decoder_kind(&mut input) == DecoderKind::Parallel {
-            return parallel(input, budget.memory_or(MEMORY_LIMIT), budget.threads())
+            return parallel(input, budget.window_or(MEMORY_LIMIT), budget.threads())
                 .map(|reader| Box::new(reader) as Box<dyn Read + Send>);
         }
         Self::open(input, window)

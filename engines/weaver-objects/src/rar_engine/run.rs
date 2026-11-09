@@ -56,12 +56,15 @@ impl Run {
     }
 }
 
-fn limits(budget: &Budget) -> unrar_rs::Limits {
+// A member's dictionary is held to the window the run was granted, or the
+// decoder's own limit when none was. A RAR3 PPMd arena keeps the format's
+// own ceiling, narrowed by the window too.
+pub(super) fn limits(budget: &Budget) -> unrar_rs::Limits {
     let mut limits = unrar_rs::Limits::default();
-    if let Some(memory) = budget.memory_bytes {
-        limits.max_dict_size = limits.max_dict_size.min(memory);
-        limits.max_ppmd_arena_size = limits.max_ppmd_arena_size.min(memory);
-    }
+    limits.max_dict_size = budget.window_or(limits.max_dict_size);
+    limits.max_ppmd_arena_size = limits
+        .max_ppmd_arena_size
+        .min(budget.window_or(u64::MAX));
     limits
 }
 
