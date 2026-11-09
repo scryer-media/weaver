@@ -83,9 +83,10 @@ impl GraphError {
 }
 
 // Where a graph job writes and what it may hold: its working directory, the
-// process-wide holds accountant every job shares, the free space of the
-// volume its scratch lives on, how many engines it may run at once, and
-// where their runs speak, and the extraction budget its writes are held to.
+// process-wide holds accountant and decode pool every job shares, the free
+// space of the volume its scratch lives on, how many engines it may run at
+// once, and where their runs speak, and the extraction budget its writes are
+// held to.
 pub(crate) struct Storage {
     pub(crate) working_dir: PathBuf,
     // Where the files of the members it delivers lie, and the free space of
@@ -93,6 +94,7 @@ pub(crate) struct Storage {
     // on another device.
     pub(crate) output: Option<(PathBuf, CapacityReader)>,
     pub(crate) accountant: Arc<HoldsAccountant>,
+    pub(crate) decode: Arc<super::engine::DecodePool>,
     pub(crate) free_disk: CapacityReader,
     pub(crate) slots: usize,
     pub(crate) mail: mpsc::Sender<Said>,
@@ -185,14 +187,9 @@ impl GraphJob {
     // process-wide id.
     pub(crate) fn admit(scope: u64, files: &[RootFile], storage: Storage) -> Self {
         let windows = storage.windows(scope);
-        let runs = Runs::new(
-            scope,
-            storage.slots,
-            storage.mail,
-            Arc::clone(&storage.accountant),
-        )
-        .on(storage.hardware)
-        .lending(windows);
+        let runs = Runs::new(scope, storage.slots, storage.mail, storage.decode)
+            .on(storage.hardware)
+            .lending(windows);
         let writer = NamespaceWriter::new(
             scope,
             storage.working_dir,

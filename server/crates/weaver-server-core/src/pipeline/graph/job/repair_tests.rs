@@ -67,10 +67,15 @@ pub(in crate::pipeline::graph::job) fn archives() -> Archives {
     let writer = NamespaceWriter::new(
         1,
         directory.path().to_owned(),
-        Arc::clone(&accountant),
+        accountant,
         CapacityReader::unknown(),
     );
-    let runs = Runs::new(1, 0, RunMail::default().sender(), accountant);
+    let runs = Runs::new(
+        1,
+        0,
+        RunMail::default().sender(),
+        crate::pipeline::graph::engine::DecodePool::unbounded(),
+    );
     let mut job = GraphJob::new(
         &files,
         Box::new(Echoes {
@@ -202,10 +207,15 @@ fn owed_rows(nested: bool, backwards: bool) {
     let writer = NamespaceWriter::new(
         1,
         directory.path().to_owned(),
-        Arc::clone(&accountant),
+        accountant,
         CapacityReader::unknown(),
     );
-    let runs = Runs::new(1, 0, RunMail::default().sender(), accountant);
+    let runs = Runs::new(
+        1,
+        0,
+        RunMail::default().sender(),
+        crate::pipeline::graph::engine::DecodePool::unbounded(),
+    );
     let mut job = GraphJob::new(
         &files,
         Box::new(Hardware::default()),

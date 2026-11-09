@@ -82,11 +82,16 @@ fn refusing(mode: Mode, count: u32, candidates: &[&str]) -> Refusing {
     let writer = NamespaceWriter::new(
         1,
         dir.path().to_path_buf(),
-        Arc::clone(&accountant),
+        accountant,
         CapacityReader::unknown(),
     );
     let mail = RunMail::default();
-    let runs = Runs::new(1, 1, mail.sender(), accountant);
+    let runs = Runs::new(
+        1,
+        1,
+        mail.sender(),
+        crate::pipeline::graph::engine::DecodePool::unbounded(),
+    );
     let job = GraphJob::new(&files, Box::new(fakes), writer, runs, u32::MAX).offering(
         candidates
             .iter()

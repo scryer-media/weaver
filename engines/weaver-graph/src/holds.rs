@@ -166,6 +166,7 @@ impl HoldsAccountant {
 
     // New budgets judge the next reservation. Nothing already held is evicted
     // when a ceiling falls below it: the holds drain as their headers come.
+    #[cfg(test)]
     pub fn set_budgets(&self, budgets: HoldBudgets) {
         self.lock().budgets = budgets;
     }

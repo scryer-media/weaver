@@ -1330,9 +1330,9 @@ pub struct Pipeline {
     // The holds accountant every graph job's namespaces share, so the
     // budgets bound the process, not each job.
     pub(super) graph_holds: Arc<weaver_graph::holds::HoldsAccountant>,
-    // The hold budgets as resolved, before the decode pool raises the
-    // resident limit to the hardware profile in force.
-    pub(super) graph_hold_budgets: weaver_graph::holds::HoldBudgets,
+    // The decode pool every graph job's engine runs share, apart from the
+    // holds, sized to the hardware profile in force.
+    pub(super) graph_decode: Arc<graph::engine::DecodePool>,
     // Where the engines graph jobs run say what they found.
     pub(super) graph_runs: graph::engine::RunMail,
     // Each graph job's health probe, and where its rounds say what they
