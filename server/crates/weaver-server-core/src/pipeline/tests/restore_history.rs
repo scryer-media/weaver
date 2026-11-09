@@ -79,6 +79,45 @@ async fn delete_history_removes_intermediate_output_dir() {
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
 }
 
+// A failed job's record names its working directory: deleting the history
+// with its files takes all of it, what it delivered and the volumes and
+// recovery files beside it.
+#[tokio::test]
+async fn delete_history_with_files_removes_a_failed_job_s_whole_working_dir() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30027);
+    let output_dir = intermediate_dir.join("history-failed-volumes-job");
+    tokio::fs::create_dir_all(output_dir.join("Sample")).await.unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_working_dir(&intermediate_dir, &output_dir, job_id)
+        .unwrap();
+    for name in [
+        "lantern.part01.rar",
+        "lantern.part02.rar",
+        "lantern.vol00+01.par2",
+        "lantern.par2",
+        "Sample/lantern-sample.mkv",
+    ] {
+        tokio::fs::write(output_dir.join(name), b"kept").await.unwrap();
+    }
+    pipeline
+        .db
+        .insert_job_history(&history_row_with_output_dir(
+            job_id,
+            "History Failed Volumes",
+            "failed",
+            output_dir.clone(),
+        ))
+        .unwrap();
+
+    let outcome = delete_history_batch(&mut pipeline, &[job_id], true).await;
+
+    assert!(outcome.refused.is_empty());
+    assert!(outcome.deleted[&job_id].as_ref().unwrap().left_in_place.is_empty());
+    assert!(!output_dir.exists());
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+}
+
 #[tokio::test]
 async fn delete_history_with_a_stale_marker_removes_the_row_and_keeps_the_dir() {
     // A marker that names this job but whose hash the directory no longer

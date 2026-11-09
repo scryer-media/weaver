@@ -52,6 +52,20 @@ pub(crate) async fn clear_restart_artifacts(
             tokio::fs::remove_dir_all(working_dir).await?;
         }
     }
+    // A working directory that kept the job's marker for what its move could
+    // not remove goes too: the restarted job claims its own.
+    let root = resources.intermediate_dir.clone();
+    let left = tokio::task::spawn_blocking(move || {
+        let jobs = BTreeSet::from([id]);
+        let marked = crate::jobs::working_dir::job_working_dirs(&root, &jobs)?;
+        for dir in marked.into_values().flatten() {
+            crate::jobs::working_dir::remove_job_working_dir(&root, &dir, id)?;
+        }
+        Ok::<_, std::io::Error>(())
+    })
+    .await
+    .map_err(|error| SchedulerError::Internal(error.to_string()))?;
+    left?;
     let staging = super::staging_dir_for(&resources.complete_dir, id);
     match tokio::fs::symlink_metadata(&staging).await {
         Ok(meta) if meta.file_type().is_symlink() => {

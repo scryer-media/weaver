@@ -1001,6 +1001,24 @@ pub(in crate::pipeline::tests) async fn admit_with(
 
 // A run that may stall, for a row that asserts the job does.
 pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<Outcome, Stall> {
+    try_run_then(scenario, async |_, _| {}).await
+}
+
+// [`run`], with `after` given the pipeline and the complete directory once
+// the job has finished and its outcome is read, before the pipeline goes.
+pub(in crate::pipeline::tests) async fn run_then(
+    scenario: &Scenario,
+    after: impl AsyncFnOnce(&mut Pipeline, &Path),
+) -> Outcome {
+    try_run_then(scenario, after)
+        .await
+        .unwrap_or_else(|stall| panic!("job stalled at {:?}: {}", stall.status, stall.state))
+}
+
+async fn try_run_then(
+    scenario: &Scenario,
+    after: impl AsyncFnOnce(&mut Pipeline, &Path),
+) -> Result<Outcome, Stall> {
     let (_temp_dir, mut pipeline, complete_dir) = admit(scenario).await;
     // Events the run sends are heard from admission on; nothing sent before
     // the job was admitted belongs to it.
@@ -1123,6 +1141,7 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
         .into_iter()
         .map(|(stage, histogram)| (stage, histogram.count))
         .collect();
+    after(&mut pipeline, &complete_dir).await;
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
         status,

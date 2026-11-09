@@ -179,3 +179,63 @@ fn staging_cleanup_preserves_non_numeric_staging_dirs() {
     assert_eq!(report.removed_count, 0);
     assert!(staging.exists());
 }
+
+// A failed job whose delivery could not go back to its working directory
+// leaves it in staging, and the job is in the history, not live. The sweep
+// leaves it for as long as the record stands, however old it is, and takes
+// it once the record is deleted.
+#[test]
+fn staging_cleanup_keeps_a_history_job_s_staging_until_its_record_goes() {
+    let temp = tempfile::tempdir().unwrap();
+    let staging = temp.path().join(".weaver-staging").join("31");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("Silver Horizon.mkv"), b"delivered").unwrap();
+    let db = Database::open_in_memory().unwrap();
+    db.insert_job_history(&crate::JobHistoryRow {
+        job_id: 31,
+        job_hash: None,
+        name: "Silver Horizon".to_string(),
+        status: "failed".to_string(),
+        error_message: Some("a volume could not be repaired".to_string()),
+        total_bytes: 9,
+        downloaded_bytes: 9,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_001_000,
+        metadata: None,
+        server_attribution: None,
+    })
+    .unwrap();
+    let past_the_ttl = SystemTime::now() + STALE_STAGING_TTL * 2;
+
+    let report = cleanup_stale_staging_dirs_at(
+        temp.path(),
+        &db.recorded_job_ids().unwrap(),
+        STALE_STAGING_TTL,
+        past_the_ttl,
+    )
+    .unwrap();
+    assert_eq!(report.removed_count, 0);
+    assert_eq!(
+        std::fs::read(staging.join("Silver Horizon.mkv")).unwrap(),
+        b"delivered"
+    );
+
+    db.delete_job_histories_and_forget_duplicate_identities(&[crate::JobId(31)])
+        .unwrap();
+    let report = cleanup_stale_staging_dirs_at(
+        temp.path(),
+        &db.recorded_job_ids().unwrap(),
+        STALE_STAGING_TTL,
+        past_the_ttl,
+    )
+    .unwrap();
+    assert_eq!(report.removed_count, 1);
+    assert!(!staging.exists());
+}

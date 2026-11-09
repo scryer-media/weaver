@@ -11,7 +11,6 @@ use crate::Database;
 use crate::history::HistoryFilter;
 use crate::ingest;
 use crate::jobs::FINISHED_JOBS_RUNTIME_CAP;
-use crate::jobs::working_dir::is_weaver_owned_working_dir;
 use crate::runtime::load_global_pause_from_db;
 use crate::{
     DownloadState, JobInfo, JobStatus, PostState, RestoreJobRequest, RunState,
@@ -206,18 +205,10 @@ pub async fn recover_server_state(
         .filter(|recovered| recovered.output_dir.starts_with(intermediate_dir))
         .map(|recovered| recovered.output_dir.clone())
         .collect();
-    // A moving job's row names its destination; the working directory it
-    // is still moving out of is its own all the same.
-    for (job_id, _) in active_jobs
-        .iter()
-        .filter(|(_, recovered)| recovered.status == "moving")
-    {
-        if let Some(working_dir) =
-            crate::jobs::working_dir::find_job_working_dir(intermediate_dir, *job_id)?
-        {
-            referenced_intermediate_dirs.insert(working_dir);
-        }
-    }
+    // A live job's row may name its destination, not the working directory
+    // it is moving out of or that holds what its move left: a directory
+    // carrying a live job's marker is that job's all the same.
+    let live_jobs: HashSet<crate::jobs::ids::JobId> = active_jobs.keys().copied().collect();
 
     // Split recovered jobs into finished (history) vs in-progress (to restore).
     let mut initial_history = Vec::new();
@@ -416,7 +407,11 @@ pub async fn recover_server_state(
     }
     initial_history.truncate(FINISHED_JOBS_RUNTIME_CAP);
 
-    match cleanup_unreferenced_intermediate_dirs(intermediate_dir, &referenced_intermediate_dirs) {
+    match cleanup_unreferenced_intermediate_dirs(
+        intermediate_dir,
+        &referenced_intermediate_dirs,
+        &live_jobs,
+    ) {
         Ok(removed) if removed > 0 => {
             info!(
                 removed,
@@ -554,9 +549,12 @@ fn try_archive_unfinished_terminal_job(
     Ok(())
 }
 
+// A directory that still holds what it cannot give up stays for the next
+// start, and the others go all the same.
 fn cleanup_unreferenced_intermediate_dirs(
     intermediate_dir: &Path,
     referenced_dirs: &HashSet<PathBuf>,
+    live_jobs: &HashSet<crate::jobs::ids::JobId>,
 ) -> Result<usize, std::io::Error> {
     if !intermediate_dir.exists() {
         return Ok(0);
@@ -569,14 +567,23 @@ fn cleanup_unreferenced_intermediate_dirs(
             continue;
         }
         let path = entry.path();
-        if !is_weaver_owned_working_dir(&path) {
+        let owner = crate::jobs::working_dir::working_dir_owner(intermediate_dir, &path)
+            .ok()
+            .flatten();
+        let Some(owner) = owner else {
+            continue;
+        };
+        if live_jobs.contains(&owner) || referenced_dirs.contains(&path) {
             continue;
         }
-        if referenced_dirs.contains(&path) {
-            continue;
+        match crate::jobs::working_dir::remove_weaver_owned_working_dir(intermediate_dir, &path) {
+            Ok(()) => removed += 1,
+            Err(error) => warn!(
+                dir = %path.display(),
+                error = %error,
+                "could not remove an unreferenced intermediate directory; it stays for the next start"
+            ),
         }
-        crate::jobs::working_dir::remove_weaver_owned_working_dir(intermediate_dir, &path)?;
-        removed += 1;
     }
 
     Ok(removed)
@@ -762,6 +769,34 @@ mod tests {
             assert!(db.load_nzb_admissions().unwrap().is_empty());
             assert!(db.get_job_history(1).unwrap().is_some());
         }
+    }
+
+    // A finished job whose move left a consumed input keeps its working
+    // directory marked; the next start takes it, and never a directory a live
+    // job's marker names, whatever the live job's row points at.
+    #[test]
+    fn startup_cleanup_takes_a_finished_job_s_left_directory_and_keeps_a_live_one() {
+        let temp = TempDir::new().unwrap();
+        let intermediate_dir = temp.path().join("intermediate");
+        let live = intermediate_dir.join("lantern live");
+        let finished = intermediate_dir.join("lantern finished");
+        for (dir, job_id) in [(&live, JobId(5)), (&finished, JobId(6))] {
+            std::fs::create_dir_all(dir.join("lantern.vol00+01.par2")).unwrap();
+            std::fs::write(dir.join("lantern.vol00+01.par2").join("held"), b"held").unwrap();
+            crate::jobs::working_dir::mark_weaver_owned_working_dir(&intermediate_dir, dir, job_id)
+                .unwrap();
+        }
+
+        let removed = super::cleanup_unreferenced_intermediate_dirs(
+            &intermediate_dir,
+            &std::collections::HashSet::new(),
+            &std::collections::HashSet::from([JobId(5)]),
+        )
+        .unwrap();
+
+        assert_eq!(removed, 1);
+        assert!(live.join("lantern.vol00+01.par2/held").exists());
+        assert!(!finished.exists());
     }
 
     #[tokio::test]
