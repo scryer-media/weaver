@@ -172,6 +172,9 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
                 };
                 let before = figures(&pipeline);
                 pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut going_down).await;
+                // Its recovery reads what arrived of it again before the job
+                // fetches: the figures stand once that is heard.
+                crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;
                 if let (Some(before), Some(after)) = (before, figures(&pipeline)) {
                     graph.restored_remaining.push((before, after));
                 }
@@ -826,6 +829,53 @@ async fn a_members_checksum_survives_a_restart() {
     );
     let whole = run(&scenario).await;
     assert_restarted(&restarted, &whole);
+}
+
+// A stored member is open at every checkpoint but the last. The store
+// checksummed its bytes as they came and keeps those runs, so the restored
+// member's own check folds them and reads nothing of its file at the close.
+#[tokio::test]
+async fn a_stored_member_open_across_a_restart_closes_with_no_check_read() {
+    use crate::pipeline::graph::namespace::checked;
+    let body = payload(11 * ARTICLE + 9, 73);
+    let scenario = Scenario::new(volumes(single_member_store_set("beacon.bin", &body, 3)));
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let unbroken = checked::so_far();
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert_restarted(&restarted, &whole);
+    assert_eq!(
+        (unbroken, checked::so_far() - unbroken),
+        (0, 0),
+        "bytes a member check read back: unbroken, restarted"
+    );
+}
+
+// One byte of the member posted wrong under articles that decode whole,
+// in a set of one volume: no part checksum of its own catches it, only the
+// member's. The runs the store kept checksum the bytes as they came, so a
+// member restored open still fails its own check, as it does with no
+// restart.
+#[tokio::test]
+async fn a_member_byte_posted_wrong_still_fails_its_check_across_a_restart() {
+    use crate::pipeline::graph::namespace::checked;
+    let body = payload(11 * ARTICLE + 9, 79);
+    let mut posts = volumes(single_member_store_set("beacon.bin", &body, 1));
+    let only = &mut posts[0].bytes;
+    let at = only.len() / 2;
+    only[at] ^= 0x5a;
+    let scenario = Scenario::new(posts);
+    let whole = run(&scenario).await;
+    assert!(!whole.completed(), "a wrong byte delivered whole");
+    let unbroken = checked::so_far();
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert_restarted(&restarted, &whole);
+    // The restarted run reads nothing back: the folded runs failed it.
+    assert_eq!(
+        checked::so_far() - unbroken,
+        0,
+        "bytes a member check read back after a restart"
+    );
 }
 
 #[tokio::test]

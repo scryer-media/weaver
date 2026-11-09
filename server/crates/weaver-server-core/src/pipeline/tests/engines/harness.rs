@@ -1269,6 +1269,16 @@ fn handed_out(
         works.reverse();
         return Some((works, Some(lease.checkpoint_plan)));
     }
+    // The scheduler hands a restored job nothing while its recovery reads
+    // back what arrived of its volumes; the queue popped by hand
+    // here holds back the same.
+    if pipeline
+        .graph_jobs
+        .get(&JOB)
+        .is_some_and(|graph| graph.rewalks_owed())
+    {
+        return None;
+    }
     let queue = &mut pipeline
         .jobs
         .get_mut(&JOB)?

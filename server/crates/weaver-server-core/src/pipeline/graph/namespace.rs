@@ -2661,9 +2661,12 @@ mod recovery;
 mod refusal;
 mod verification;
 
+#[cfg(test)]
+pub(crate) use verification::checked;
 pub(crate) use verification::{Verification, Verified};
 
 pub(crate) use loan::replay::{Replay, Replayed};
+pub(crate) use loan::rewalk::{RewalkLoan, Rewalked};
 pub(crate) use loan::{Loan, Returned};
 pub(crate) use moves::restored_at;
 #[cfg(test)]

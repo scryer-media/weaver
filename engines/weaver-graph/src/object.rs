@@ -447,6 +447,12 @@ pub trait Object: Send + Sync {
         }))
     }
 
+    // The runs of my member's bytes I checksummed as they came and keep
+    // across a restart, each with its CRC32, end to end where they abut:
+    // what a restore folds for the member's own check, so the check at its
+    // close reads nothing of its file. An object that keeps none says none.
+    fn vouched(&self, _member: MemberId, _out: &mut Vec<(ByteRange, u32)>) {}
+
     // My volume's length is known: its member declared one, or it closed at
     // the length it reached. Said ahead of every delivery while it is known
     // and once more at the close, so an object acts on it once and ignores

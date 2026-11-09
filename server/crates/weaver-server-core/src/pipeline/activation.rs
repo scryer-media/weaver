@@ -378,11 +378,15 @@ impl Pipeline {
     }
 
     // Whether anything of the job is still out: an article a lane holds, a
-    // result a lane released and the pipeline has yet to take, or a decode
-    // queued or running.
+    // result a lane released and the pipeline has yet to take, a decode
+    // queued or running, or what a restored recovery object reads again of
+    // its volumes, without which its root would say less than it did.
     fn job_has_results_out(&self, job_id: JobId) -> bool {
         let counted = |counts: &HashMap<JobId, usize>| counts.get(&job_id).is_some_and(|n| *n > 0);
-        counted(&self.active_downloads_by_job)
+        self.graph_jobs
+            .get(&job_id)
+            .is_some_and(|graph| graph.rewalks_owed())
+            || counted(&self.active_downloads_by_job)
             || counted(&self.pending_released_download_results_by_job)
             || self
                 .active_decodes_by_job

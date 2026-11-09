@@ -119,6 +119,10 @@ pub(crate) struct GraphJob {
     // A member's file waits to move on a checkpoint the database has not
     // said it committed, and the run mail will say when it has.
     mail_owed: Option<u64>,
+    // The checkpoints committed through this stamp while a rewalk read its
+    // volumes' files where they lay as it was lent: what they move or
+    // remove waits for the last piece to be heard.
+    commit_held: Option<u64>,
     // What the job did since the pipeline last asked, for its events.
     notes: Vec<Note>,
     // What the steps brought the engines' shelves up to.
@@ -223,6 +227,7 @@ impl GraphJob {
             reported: None,
             pending: Pending::default(),
             mail_owed: None,
+            commit_held: None,
             notes: Vec::new(),
             fed: runs::Fed::default(),
             sealed_at: None,
@@ -272,7 +277,7 @@ impl GraphJob {
     // taken meanwhile: its facts as it left hold the work undone, which a
     // restart could not always do without the tree.
     pub(crate) fn working(&self) -> bool {
-        self.works.out()
+        self.works.working()
     }
 
     // A checkpoint found an object out for its work and took nothing: the
@@ -301,9 +306,11 @@ impl GraphJob {
         self.writer.moves_waiting()
     }
 
-    // Whether anything of the job waits for a checkpoint to commit.
+    // Whether anything of the job waits for a checkpoint to commit. Not
+    // while a rewalk reads: no file moves under it, so nothing hurries a
+    // checkpoint on, and the first one after its last piece commits.
     pub(crate) fn awaits_commit(&self) -> bool {
-        self.writer.awaits_commit()
+        self.writer.awaits_commit() && !self.works.rewalks_out()
     }
 
     // The checkpoint whose commit lets every waiting move run.
@@ -321,6 +328,16 @@ impl GraphJob {
     // record runs, and the names the files left are free in the ledger.
     // True when the next checkpoint has something to record.
     pub(crate) fn committed(&mut self, stamp: u64) -> Result<bool, WriteError> {
+        // No file moves or goes under a rewalk reading it: the commit waits
+        // for the last piece, and runs then.
+        let stamp = self
+            .commit_held
+            .take()
+            .map_or(stamp, |held| held.max(stamp));
+        if self.works.rewalks_out() {
+            self.commit_held = Some(stamp);
+            return Ok(false);
+        }
         self.writer.commit_moves(&mut self.tree, stamp)
     }
 
@@ -366,6 +383,7 @@ impl GraphJob {
     pub(crate) fn work_pending(&self) -> bool {
         self.loans.out()
             || self.works.out()
+            || self.tree.rewalks_owed()
             || self.writer.rechecks_waiting()
             || self.verifications_due()
     }
@@ -465,6 +483,12 @@ impl GraphJob {
     // something asks for them.
     pub(crate) fn wanted_bytes(&self) -> u64 {
         self.root.map.wanted_bytes()
+    }
+
+    // Whether a restored recovery object is still to hear what arrived of
+    // its volumes again: the job fetches nothing until none is.
+    pub(crate) fn rewalks_owed(&self) -> bool {
+        self.tree.rewalks_owed()
     }
 
     // Seam for status: the bytes still to come and out to bring of the

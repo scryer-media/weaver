@@ -110,6 +110,10 @@ async fn restart_paused(
         })
         .await
         .unwrap();
+    // A paused job parks once its recovery heard what arrived of it again,
+    // on the turn after, as every turn asks.
+    crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;
+    pipeline.park_drained_jobs();
     pipeline
 }
 

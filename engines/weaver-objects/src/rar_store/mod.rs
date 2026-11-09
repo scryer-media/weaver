@@ -922,6 +922,23 @@ impl Object for RarStore {
         self.unsay(volume, range);
     }
 
+    // A file's plaintext runs, as its facts keep them from version 5 on:
+    // only those its bytes verified, each CRC32 the bytes had as they came.
+    // A restart folds them for the file's own check rather than read it.
+    fn vouched(&self, member: MemberId, out: &mut Vec<(ByteRange, u32)>) {
+        let Some(entry) = self.entries.get(member.0 as usize) else {
+            return;
+        };
+        out.extend(
+            entry
+                .plain_runs
+                .kept()
+                .into_iter()
+                .filter(|&(_, _, _, verified)| verified)
+                .map(|(start, len, crc, _)| (ByteRange::at(start, len), crc)),
+        );
+    }
+
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
         // A length said anew is the producer's word now: the volume is
         // walked again against it.

@@ -143,12 +143,15 @@ impl Pipeline {
     }
 
     // Start the job's runs and lend its repairs under the slots it may hold
-    // now: none while it holds no NZB slot or is paused.
+    // now: none while it holds no NZB slot or is paused. What a restored
+    // recovery object reads again takes no slot and is read either way, so
+    // a job held or paused reports what it reported before it went down.
     fn start_graph_runs(&mut self, job_id: JobId) -> Result<(), GraphError> {
         let limit = self.graph_job_slot_limit(job_id);
         match self.graph_jobs.get_mut(&job_id) {
             Some(graph) if limit > 0 => graph.resume_runs(&mut self.graph_status.repairs, limit),
-            _ => Ok(()),
+            Some(graph) => graph.lend_rewalks(),
+            None => Ok(()),
         }
     }
 
@@ -345,7 +348,11 @@ impl Pipeline {
             if self.pending_graph_terminals.contains_key(&job_id)
                 || matches!(
                     &said.heard,
-                    Heard::Repaired(_) | Heard::Replayed(_) | Heard::Verified(_) | Heard::Worked(_)
+                    Heard::Repaired(_)
+                        | Heard::Replayed(_)
+                        | Heard::Verified(_)
+                        | Heard::Worked(_)
+                        | Heard::Rewalked(_)
                 )
             {
                 if let Err(error) = graph.drain_failed_run(said) {
@@ -413,7 +420,7 @@ impl Pipeline {
                 | Heard::Replayed(_)
                 | Heard::Verified(_)
                 | Heard::Worked(_)
-        );
+        ) || matches!(&said.heard, Heard::Rewalked(rewalked) if rewalked.piece.is_none());
         let moving = graph.moves_waiting();
         let result = graph.run_said(said, &mut self.graph_status.repairs, limit);
         self.after_graph_result(job_id, result);

@@ -663,10 +663,19 @@ async fn run_restarting_once(
     let mut requests = BTreeMap::new();
     let mut restarted = false;
     loop {
+        // A job whose restored recovery object is still to hear what of
+        // its volumes arrived fetches nothing, as the scheduler holds it.
         while let Some(work) = pipeline
-            .jobs
-            .get_mut(&JOB)
-            .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
+            .graph_jobs
+            .get(&JOB)
+            .is_none_or(|job| !job.rewalks_owed())
+            .then(|| {
+                pipeline
+                    .jobs
+                    .get_mut(&JOB)
+                    .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
+            })
+            .flatten()
         {
             let article = (
                 work.segment_id.file_id.file_index,
