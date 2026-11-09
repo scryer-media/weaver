@@ -327,13 +327,14 @@ pub enum Effect {
         member: MemberId,
         range: ByteRange,
     },
-    // A loss told at `origin` reached the object at `node` while it was
-    // lent, and waited for it: it is back now, so the owner marks this range
-    // of its volume lost below it, as it marked the loss at `origin`.
+    // A loss told at `origin` waited for an object lent out below it, and
+    // marked this member range of `node`'s namespace once the object was
+    // back, in its turn among what waited. The owner hears it as it hears
+    // every member a loss it told marked (`Effect::Damaged` came with it).
     Lost {
         origin: NodeId,
         node: NodeId,
-        volume: VolumeIndex,
+        member: MemberId,
         range: ByteRange,
     },
     // The member's output name changed: a member higher in the tree took
@@ -4052,20 +4053,11 @@ impl Tree {
         range: ByteRange,
         effects: &mut Vec<Effect>,
     ) {
-        self.damage_from(node, node, volume, range, effects);
-    }
-
-    // A loss told at `origin` that goes on below `node`: the owner's word
-    // for one that waited for a lent object (`Effect::Lost`).
-    pub fn damage_from(
-        &mut self,
-        origin: NodeId,
-        node: NodeId,
-        volume: VolumeIndex,
-        range: ByteRange,
-        effects: &mut Vec<Effect>,
-    ) {
-        self.descend(vec![(node, volume, range)], Down::Lost { origin }, effects);
+        self.descend(
+            vec![(node, volume, range)],
+            Down::Lost { origin: node },
+            effects,
+        );
     }
 
     // The member's bytes, every one of them in, fail the checksum its
@@ -4788,9 +4780,9 @@ impl Tree {
     //
     // A node whose object is lent out cannot say where the bytes went, and
     // it is not the root: what reaches it waits in its loan, in the order
-    // it came, and goes on down from it once it is back. A loss goes back
-    // to the owner then (`Effect::Lost`), since the owner hears every
-    // member a loss marks.
+    // it came, and goes on down from it once it is back. What a loss marks
+    // then goes to the owner too (`Effect::Lost`), since the owner hears
+    // every member a loss marks.
     fn walk_down(
         &mut self,
         mut pending: Vec<(NodeId, VolumeIndex, ByteRange)>,
@@ -5704,31 +5696,23 @@ mod tests {
         assert_eq!(inner.length, length);
         let mut back = Vec::new();
         tree.take_back_worked(child, object, Vec::new(), &mut Build, &mut back);
+        // Marked through the object's map once it is back, and told to the
+        // owner as a loss from the root.
         assert_eq!(
             back,
-            vec![Effect::Lost {
-                origin: NodeId::ROOT,
-                node: child,
-                volume: VolumeIndex(0),
-                range: ByteRange::new(10, 13)
-            }]
-        );
-        // The owner marks it from there, through the object's map.
-        let mut marked = Vec::new();
-        tree.damage_from(
-            NodeId::ROOT,
-            child,
-            VolumeIndex(0),
-            ByteRange::new(10, 13),
-            &mut marked,
-        );
-        assert_eq!(
-            marked,
-            vec![Effect::Damaged {
-                node: child,
-                member: MemberId(0),
-                range: ByteRange::new(3, 6)
-            }]
+            vec![
+                Effect::Damaged {
+                    node: child,
+                    member: MemberId(0),
+                    range: ByteRange::new(3, 6)
+                },
+                Effect::Lost {
+                    origin: NodeId::ROOT,
+                    node: child,
+                    member: MemberId(0),
+                    range: ByteRange::new(3, 6)
+                },
+            ]
         );
         let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
         assert_eq!(
@@ -5736,6 +5720,44 @@ mod tests {
             vec![ByteRange::new(3, 6)]
         );
         assert_eq!(inner.length, length);
+    }
+
+    #[test]
+    fn bytes_that_waited_behind_a_loss_land_after_it() {
+        let (mut tree, first, child, _) = bound_tree();
+        let object = tree.lend_for_test(child).expect("lent");
+        let mut effects = Vec::new();
+        tree.damage(
+            NodeId::ROOT,
+            VolumeIndex(first.0),
+            ByteRange::new(10, 13),
+            &mut effects,
+        );
+        // Another posting brings the same bytes clean while the object is
+        // still out.
+        tree.deliver(
+            NodeId::ROOT,
+            first,
+            Posted {
+                offset: 10,
+                bytes: b"llo".to_vec().into(),
+                provenance: Provenance::Fresh,
+            },
+            &mut Build,
+            &mut effects,
+        );
+        let mut back = Vec::new();
+        tree.take_back_worked(child, object, Vec::new(), &mut Build, &mut back);
+        let inner = tree.namespace(child).unwrap().get(MemberId(0)).unwrap();
+        assert_eq!(inner.coverage.damaged_ranges().count(), 0, "{back:?}");
+        let runs: Vec<_> = inner.coverage.overlapping(ByteRange::new(3, 6)).collect();
+        assert!(
+            !runs.is_empty()
+                && runs.iter().all(|run| run.provenance == Provenance::Fresh)
+                && runs.first().unwrap().range.start <= 3
+                && runs.last().unwrap().range.end >= 6,
+            "the clean bytes reached the member: {runs:?}"
+        );
     }
 
     #[test]

@@ -1238,20 +1238,22 @@ impl NamespaceWriter {
                 );
                 self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
             }
+            // Its `Effect::Damaged` is applied on its own.
             Effect::Lost {
                 origin,
                 node,
-                volume,
+                member,
                 range,
             } => {
-                self.lost_from(
+                let mut effects = Vec::new();
+                self.marked_lost(
                     tree,
                     builder,
-                    segments,
                     *origin,
-                    (*node, vec![(*volume, *range)]),
-                    out,
-                )?;
+                    (*node, *member, *range),
+                    &mut effects,
+                );
+                self.apply_each(tree, builder, segments, effects, write, out)?;
             }
             Effect::Renamed { .. } => self.moved(tree, std::slice::from_ref(&effect))?,
             Effect::NeedsPassword { .. } => {}
