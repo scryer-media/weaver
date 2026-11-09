@@ -57,11 +57,13 @@ pub enum QueueEvent {
     QuotaNormal,
     QuotaTrickle,
     QuotaStopped,
+    // A configured route went from up to down.
+    RouteDown,
 }
 
 impl QueueEvent {
     // NZB_NAMED is retained for truthful declarations, but Weaver does not raise it.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::FileDownloaded,
         Self::UrlCompleted,
         Self::NzbMarked,
@@ -74,6 +76,7 @@ impl QueueEvent {
         Self::QuotaNormal,
         Self::QuotaTrickle,
         Self::QuotaStopped,
+        Self::RouteDown,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -90,6 +93,7 @@ impl QueueEvent {
             Self::QuotaNormal => "QUOTA_NORMAL",
             Self::QuotaTrickle => "QUOTA_TRICKLE",
             Self::QuotaStopped => "QUOTA_STOPPED",
+            Self::RouteDown => "ROUTE_DOWN",
         }
     }
 
@@ -117,11 +121,17 @@ pub mod vars {
     pub const SEEDING_ACTION: &str = "WEAVER_SEEDING_ACTION";
     // SEEDING_STOPPED: why, `paused`, `removed` or `failed`.
     pub const SEEDING_STOPPED_REASON: &str = "WEAVER_SEEDING_STOPPED_REASON";
-    // QUOTA_*: the egress, the direction (`download` or `upload`) and the
+    // QUOTA_* and ROUTE_DOWN: the egress. QUOTA_*: the direction (`download` or `upload`) and the
     // state it came to (`normal`, `trickle` or `stopped`).
     pub const EGRESS_ID: &str = "WEAVER_EGRESS_ID";
     pub const QUOTA_DIRECTION: &str = "WEAVER_QUOTA_DIRECTION";
     pub const QUOTA_STATE: &str = "WEAVER_QUOTA_STATE";
+    // ROUTE_DOWN: the route's kind (`interface`, `source_address`,
+    // `http_connect`, `http3_connect`, `socks5`, `ssh` or `wireguard`), its
+    // name, and why it is down.
+    pub const ROUTE_KIND: &str = "WEAVER_ROUTE_KIND";
+    pub const ROUTE_NAME: &str = "WEAVER_ROUTE_NAME";
+    pub const ROUTE_REASON: &str = "WEAVER_ROUTE_REASON";
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize)]

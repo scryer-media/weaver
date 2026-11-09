@@ -607,6 +607,12 @@ fn simulated_queue_event(job: &JobExecutionContext, event: QueueEvent) -> EventC
             (vars::QUOTA_DIRECTION, "upload"),
             (vars::QUOTA_STATE, "stopped"),
         ],
+        QueueEvent::RouteDown => &[
+            (vars::EGRESS_ID, "1"),
+            (vars::ROUTE_KIND, "wireguard"),
+            (vars::ROUTE_NAME, "WireGuard"),
+            (vars::ROUTE_REASON, "the tunnel's handshake timed out"),
+        ],
     };
     for (name, value) in reported {
         context.env.insert((*name).into(), (*value).into());

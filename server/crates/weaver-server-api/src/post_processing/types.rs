@@ -896,6 +896,7 @@ pub enum QueueEventGql {
     QuotaNormal,
     QuotaTrickle,
     QuotaStopped,
+    RouteDown,
 }
 
 impl From<weaver_server_core::post_processing::model::QueueEvent> for QueueEventGql {
@@ -914,6 +915,7 @@ impl From<weaver_server_core::post_processing::model::QueueEvent> for QueueEvent
             QueueEvent::QuotaNormal => Self::QuotaNormal,
             QueueEvent::QuotaTrickle => Self::QuotaTrickle,
             QueueEvent::QuotaStopped => Self::QuotaStopped,
+            QueueEvent::RouteDown => Self::RouteDown,
         }
     }
 }
@@ -933,6 +935,7 @@ impl From<QueueEventGql> for weaver_server_core::post_processing::model::QueueEv
             QueueEventGql::QuotaNormal => Self::QuotaNormal,
             QueueEventGql::QuotaTrickle => Self::QuotaTrickle,
             QueueEventGql::QuotaStopped => Self::QuotaStopped,
+            QueueEventGql::RouteDown => Self::RouteDown,
         }
     }
 }

@@ -40,6 +40,7 @@ export const QUEUE_EVENTS = [
   "QUOTA_NORMAL",
   "QUOTA_TRICKLE",
   "QUOTA_STOPPED",
+  "ROUTE_DOWN",
 ] as const;
 
 export type QueueEvent = (typeof QUEUE_EVENTS)[number];

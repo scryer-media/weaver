@@ -19,7 +19,8 @@ use crate::Database;
 use crate::bandwidth::QuotaState;
 use crate::servers::transfer_policy::{EgressQuotaStates, ServerTransferPolicyRegistry};
 
-/// The folders a quota event's script is told of; it runs in `data`.
+/// The folders a quota or route event's script is told of; it runs in
+/// `data`.
 #[derive(Debug, Clone, Default)]
 pub struct QuotaEventDirs {
     pub data: PathBuf,

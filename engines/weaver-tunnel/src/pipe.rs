@@ -496,9 +496,38 @@ pub struct FailingHop {
 // a path can name its first failing hop however the failure travelled up: a
 // hop stacked on a broken one fails too, and its error names only itself.
 // `wait` is the hop's own timeout, which a fault that ran out of time names.
+//
+// A watched hop tells its watcher each time it turns: it works after it was
+// untried or failing, or it fails after it was untried or working.
 #[derive(Default)]
-pub struct HopFailure(Mutex<Option<ProxyFault>>);
+pub struct HopFailure {
+    state: Mutex<HopState>,
+    watcher: Option<Arc<dyn HopWatcher>>,
+}
+
+#[derive(Default)]
+enum HopState {
+    #[default]
+    Untried,
+    Working,
+    Failing(ProxyFault),
+}
+
+// Told when a watched hop turns. It is called with the hop's state held, so
+// turns arrive in order; it must not dial or wait.
+pub trait HopWatcher: Send + Sync {
+    fn working(&self);
+    fn failing(&self, fault: &ProxyFault);
+}
+
 impl HopFailure {
+    // A record that tells `watcher` each time the hop turns.
+    pub fn watched(watcher: Arc<dyn HopWatcher>) -> Self {
+        Self {
+            state: Mutex::default(),
+            watcher: Some(watcher),
+        }
+    }
     // Records `error` when it is evidence against the hop. A destination
     // the hop answered for clears the record, and an attempt that was never
     // made, such as one skipped for capacity, says nothing either way.
@@ -519,14 +548,31 @@ impl HopFailure {
         self.record(fault::classify(source, wait));
     }
     fn record(&self, fault: ProxyFault) {
-        *self.0.lock().expect("hop failure") = Some(fault);
+        let mut state = self.state.lock().expect("hop failure");
+        let turned = !matches!(*state, HopState::Failing(_));
+        if turned && let Some(watcher) = &self.watcher {
+            watcher.failing(&fault);
+        }
+        *state = HopState::Failing(fault);
     }
     fn clear(&self) {
-        self.0.lock().expect("hop failure").take();
+        let mut state = self.state.lock().expect("hop failure");
+        if matches!(*state, HopState::Working) {
+            return;
+        }
+        if let Some(watcher) = &self.watcher {
+            watcher.working();
+        }
+        *state = HopState::Working;
     }
     fn of(&self, proxy: u32) -> Option<FailingHop> {
-        let fault = self.0.lock().expect("hop failure").clone()?;
-        Some(FailingHop { proxy, fault })
+        match &*self.state.lock().expect("hop failure") {
+            HopState::Failing(fault) => Some(FailingHop {
+                proxy,
+                fault: fault.clone(),
+            }),
+            _ => None,
+        }
     }
 }
 

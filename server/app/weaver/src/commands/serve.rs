@@ -172,6 +172,17 @@ pub(crate) async fn run(
     })
     .await??;
     proxies.set_allow_private_network(security.rss_allow_private_network);
+    let route_events = proxies.network.route_health().map(|health| {
+        weaver_server_core::post_processing::route_events::spawn_route_events(
+            &health,
+            db.clone(),
+            weaver_server_core::post_processing::quota_events::QuotaEventDirs {
+                data: data_dir.clone(),
+                intermediate: intermediate_dir.clone(),
+                complete: complete_dir.clone(),
+            },
+        )
+    });
     let nntp = wiring::build_nntp_client(&config, &profile, &server_transfer_policy, &proxies)?;
     let total_connections: usize = config
         .servers
@@ -657,6 +668,10 @@ pub(crate) async fn run(
             let _ = auto_backup_scheduler.await;
             tokio::join!(backup.shutdown(), schedule_task.shutdown());
             stop_torrents(torrents.as_ref()).await;
+            // A route the shutdown takes down is not down.
+            if let Some(task) = &route_events {
+                task.abort();
+            }
             proxies.stop_all().await;
             let error = shutdown::pipeline_exit_error(result);
             finalize_event_persistence(event_persistence_task, &event_persistence_shutdown).await;
@@ -689,6 +704,10 @@ pub(crate) async fn run(
             // routes it rides go away.
             stop_torrents(torrents.as_ref()).await;
             handle.shutdown().await.ok();
+            // A route the shutdown takes down is not down.
+            if let Some(task) = &route_events {
+                task.abort();
+            }
             proxies.stop_all().await;
             if let Err(join_error) = pipeline_task.await {
                 error!(error = %join_error, "pipeline task failed during HTTP shutdown");
@@ -735,6 +754,10 @@ pub(crate) async fn run(
     // Before the network stops; see the HTTP shutdown arm above.
     stop_torrents(torrents.as_ref()).await;
     handle.shutdown().await.ok();
+    // A route the shutdown takes down is not down.
+    if let Some(task) = &route_events {
+        task.abort();
+    }
     proxies.stop_all().await;
     if let Err(join_error) = pipeline_task.await {
         error!(error = %join_error, "pipeline task failed during shutdown");

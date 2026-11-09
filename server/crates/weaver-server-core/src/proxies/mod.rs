@@ -14,6 +14,7 @@ mod pool_stage;
 mod refusal;
 #[cfg(test)]
 mod route_guard_tests;
+mod route_health;
 mod routed_http;
 mod runtime;
 mod socket_ledger;
@@ -25,6 +26,7 @@ pub use network::*;
 pub use network_runtime::*;
 pub use pool_stage::*;
 pub use refusal::*;
+pub use route_health::{RouteDown, RouteHealth, RouteKind};
 pub(crate) use routed_http::{
     AdmitError, Admitted, AttemptError, admit, fetch_on, pinned, start_bridge, through_bridge,
 };
