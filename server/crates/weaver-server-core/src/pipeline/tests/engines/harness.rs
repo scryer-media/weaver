@@ -832,6 +832,9 @@ pub(in crate::pipeline::tests) struct GraphView {
     pub(in crate::pipeline::tests) rulings: Vec<(String, Option<RepairOutcome>)>,
     // The kind of every object the tree held at any look, by its name.
     pub(in crate::pipeline::tests) kinds: BTreeSet<String>,
+    // How many objects the job had sent out for their work, at the last
+    // look.
+    pub(in crate::pipeline::tests) loans: u64,
     // How many password candidates each node was offered, at the last look.
     pub(in crate::pipeline::tests) offered: BTreeMap<weaver_graph::NodeId, usize>,
     // The files the job hands over at every depth, by output name.
@@ -1570,6 +1573,7 @@ pub(in crate::pipeline::tests) fn observe(
         }
         view.report = Some(report);
     }
+    view.loans = view.loans.max(job.loans_lent());
     let tree = job.tree();
     if let Some(namespace) = tree.namespace(weaver_graph::NodeId::ROOT) {
         let sets = tree.recovery_nodes(weaver_graph::NodeId::ROOT);

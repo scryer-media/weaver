@@ -24,6 +24,9 @@ use crate::pipeline::tests::engines::loans::{FRAME, Kind, SECRET, body, stored_z
 
 type Loan = (NodeId, u64, Box<dyn Object>);
 
+// The job runs under one slot: under none it lends nothing.
+const LIMIT: usize = 1;
+
 // How the loans go: kept in hand, or done on the loop as they are while a
 // checkpoint is owed.
 #[derive(Clone, Copy, PartialEq)]
@@ -159,7 +162,7 @@ impl Rig {
             .intake(
                 decoded(volume, ordinal, offset, bytes, Some(length)),
                 &mut self.slots,
-                0,
+                LIMIT,
             )
             .unwrap();
         self.take();
@@ -167,7 +170,7 @@ impl Rig {
 
     fn send_back(&mut self, (volume, ordinal): (u32, u32)) {
         self.job
-            .send_back(weaver_graph::VolumeIndex(volume), ordinal)
+            .send_back(weaver_graph::VolumeIndex(volume), ordinal, LIMIT)
             .unwrap();
         self.take();
     }
@@ -178,7 +181,7 @@ impl Rig {
                 weaver_graph::VolumeIndex(volume),
                 ordinal,
                 &mut self.slots,
-                0,
+                LIMIT,
             )
             .unwrap();
         self.take();
@@ -188,7 +191,7 @@ impl Rig {
     // lends is kept in hand.
     fn give_back(&mut self) {
         for loan in std::mem::take(&mut self.in_hand) {
-            self.job.return_loan(loan, &mut self.slots, 0).unwrap();
+            self.job.return_loan(loan, &mut self.slots, LIMIT).unwrap();
             self.take();
         }
     }
@@ -197,7 +200,7 @@ impl Rig {
     // is out; then the gate lends what is due, as it does before it rules.
     fn settle(&mut self) {
         loop {
-            self.job.lend_work().unwrap();
+            self.job.lend_work(LIMIT).unwrap();
             self.take();
             if self.in_hand.is_empty() {
                 break;
@@ -265,11 +268,38 @@ fn held_to_the_end(kind: Kind, shape: Shape, serve: Serve) {
     for article in rig.articles(serve) {
         rig.intake(article);
     }
-    if rig.lent {
-        assert!(rig.job.work_pending(), "a loan out is pending work");
-        assert_ne!(rig.job.phase(), RootPhase::Done, "not done with a loan out");
-        assert!(!rig.delivered(), "nothing delivered with a loan out");
+    assert!(!rig.in_hand.is_empty(), "a loan is out at the last article");
+    assert!(rig.job.work_pending(), "a loan out is pending work");
+    assert_ne!(rig.job.phase(), RootPhase::Done, "not done with a loan out");
+    assert!(!rig.delivered(), "nothing delivered with a loan out");
+    rig.settle();
+    assert!(rig.delivered(), "the member delivered whole");
+}
+
+// Every article served with no slot to run in, as a paused job is: no loan
+// goes out, though work is due. Once a slot opens, the gate lends it.
+#[test]
+fn nothing_is_lent_without_a_slot_and_the_due_work_goes_out_once_one_opens() {
+    let mut rig = Rig::new(posts(Kind::ZipCryptoSized, Shape::Flat), &[SECRET], Mode::Held);
+    for (volume, ordinal) in rig.articles(Serve::InOrder) {
+        let (offset, bytes, length) = rig.bytes((volume, ordinal));
+        rig.job
+            .intake(
+                decoded(volume, ordinal, offset, &bytes, Some(length)),
+                &mut rig.slots,
+                0,
+            )
+            .unwrap();
+        rig.take();
     }
+    assert!(!rig.lent, "a loan went out with no slot");
+    assert!(rig.job.work_pending(), "work is due");
+    rig.job.lend_work(0).unwrap();
+    rig.take();
+    assert!(!rig.lent, "a loan went out with no slot");
+    rig.job.lend_work(LIMIT).unwrap();
+    rig.take();
+    assert!(rig.lent, "the due work went out once a slot opened");
     rig.settle();
     assert!(rig.delivered(), "the member delivered whole");
 }
@@ -323,46 +353,51 @@ fn sent_back(kind: Kind, shape: Shape, serve: Serve, mode: Mode, at: At, lag: us
     assert_eq!(rig.job.phase(), RootPhase::Done);
 }
 
-// As `sent_back`, but the loans come back before the good copy does.
-fn sent_back_then_returned(kind: Kind, shape: Shape, serve: Serve) {
+// The bad copy is sent back once two more articles are in and a loan is
+// out; a post whose object lends nothing before its last article is sent
+// back after it, with the loan out. `then` is what follows the send-back.
+fn send_back_with_a_loan_out(kind: Kind, shape: Shape, serve: Serve, then: fn(&mut Rig, (u32, u32))) -> Rig {
     let mut rig = Rig::new(posts(kind, shape), &[SECRET], Mode::Held);
     let articles = rig.articles(serve);
     let bad = articles.len() / 2;
+    let mut done = false;
     for (index, article) in articles.iter().copied().enumerate() {
         if index == bad {
             rig.intake_damaged(article);
         } else {
             rig.intake(article);
         }
-        if index == bad + 2 {
+        if !done && index >= bad + 2 && !rig.in_hand.is_empty() {
             rig.send_back(articles[bad]);
-            rig.give_back();
-            rig.intake(articles[bad]);
+            then(&mut rig, articles[bad]);
+            done = true;
         }
     }
+    if !done {
+        assert!(!rig.in_hand.is_empty(), "a loan is out at the send-back");
+        rig.send_back(articles[bad]);
+        then(&mut rig, articles[bad]);
+    }
     rig.settle();
+    rig
+}
+
+// As `sent_back`, but the loans come back before the good copy does.
+fn sent_back_then_returned(kind: Kind, shape: Shape, serve: Serve) {
+    let rig = send_back_with_a_loan_out(kind, shape, serve, |rig, bad| {
+        rig.give_back();
+        rig.intake(bad);
+    });
     assert!(rig.delivered(), "the member delivered whole");
 }
 
 // The sent-back article's next copy never comes: every server failed it.
 // Nothing rebuilds the member, and the job ends with nothing out.
 fn sent_back_then_lost(kind: Kind, shape: Shape, serve: Serve) {
-    let mut rig = Rig::new(posts(kind, shape), &[SECRET], Mode::Held);
-    let articles = rig.articles(serve);
-    let bad = articles.len() / 2;
-    for (index, article) in articles.iter().copied().enumerate() {
-        if index == bad {
-            rig.intake_damaged(article);
-        } else {
-            rig.intake(article);
-        }
-        if index == bad + 2 {
-            rig.send_back(articles[bad]);
-            rig.lost(articles[bad]);
-            rig.give_back();
-        }
-    }
-    rig.settle();
+    let rig = send_back_with_a_loan_out(kind, shape, serve, |rig, bad| {
+        rig.lost(bad);
+        rig.give_back();
+    });
     assert!(!rig.delivered(), "a member short an article is not whole");
 }
 
@@ -398,7 +433,10 @@ macro_rules! rows {
 }
 
 use At::{First, Late, Middle};
-use Kind::{Rar4, Rar5, Rar5Sealed, ZipCryptoDescriptor as Described, ZipCryptoSized as Sized};
+use Kind::{
+    Rar4, Rar5, Rar5Sealed, SevenZipAes, ZipAes, ZipCryptoDescriptor as Described,
+    ZipCryptoSized as Sized,
+};
 use Mode::{Held, Inline};
 use Serve::{Backwards, InOrder, TailFirst};
 use Shape::{Flat, Nested};
@@ -489,4 +527,22 @@ rows! {
     send_back_after_the_last_nested_in_order: sent_back_after_the_last(Described, Nested, InOrder);
     send_back_after_the_last_nested_backwards: sent_back_after_the_last(Described, Nested, Backwards);
     send_back_after_the_last_rar5: sent_back_after_the_last(Rar5, Flat, Backwards);
+
+    held_zip_aes_in_order: served(ZipAes, Flat, InOrder, &[SECRET]);
+    held_zip_aes_nested_backwards: served(ZipAes, Nested, Backwards, &[SECRET]);
+    held_zip_aes_tail_first: served(ZipAes, Flat, TailFirst, &[SECRET]);
+    to_the_end_zip_aes_in_order: held_to_the_end(ZipAes, Flat, InOrder);
+    send_back_held_zip_aes_middle: sent_back(ZipAes, Flat, InOrder, Held, Middle, 2);
+    send_back_returned_zip_aes: sent_back_then_returned(ZipAes, Flat, InOrder);
+    send_back_lost_zip_aes: sent_back_then_lost(ZipAes, Flat, InOrder);
+    send_back_after_the_last_zip_aes: sent_back_after_the_last(ZipAes, Flat, InOrder);
+
+    held_sevenz_aes_in_order: served(SevenZipAes, Flat, InOrder, &[SECRET]);
+    held_sevenz_aes_backwards: served(SevenZipAes, Flat, Backwards, &[SECRET]);
+    held_sevenz_aes_tail_first: served(SevenZipAes, Flat, TailFirst, &[SECRET]);
+    to_the_end_sevenz_aes_in_order: held_to_the_end(SevenZipAes, Flat, InOrder);
+    send_back_held_sevenz_aes_middle: sent_back(SevenZipAes, Flat, InOrder, Held, Middle, 2);
+    send_back_returned_sevenz_aes: sent_back_then_returned(SevenZipAes, Flat, InOrder);
+    send_back_lost_sevenz_aes: sent_back_then_lost(SevenZipAes, Flat, InOrder);
+    send_back_after_the_last_sevenz_aes: sent_back_after_the_last(SevenZipAes, Flat, InOrder);
 }

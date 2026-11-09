@@ -168,6 +168,7 @@ fn scenario(kind: Kind, shape: Shape, order: Order) -> Scenario {
 }
 
 fn assert_delivered(outcome: &Outcome) {
+    assert!(outcome.graph().loans > 0, "a loan went out");
     assert!(
         outcome.completed(),
         "{:?} {:?}",
@@ -212,10 +213,26 @@ async fn repaired(kind: Kind, shape: Shape, order: Order) {
     assert_delivered(&run(&ordered(scenario, order)).await);
 }
 
+// One article of the first post damaged and nothing to rebuild it: it is
+// sent back while the work is out or due, its server has no other copy, and
+// the one member is short. No usable file came whole, so the job fails.
+async fn lost(kind: Kind, shape: Shape, order: Order) {
+    let middle = posts(kind, shape, &body())[0].articles(FRAME).count() as u32 / 2;
+    let outcome = run(&scenario(kind, shape, order).damaged(0, middle)).await;
+    assert!(outcome.graph().loans > 0, "a loan went out");
+    assert!(
+        matches!(outcome.status, Some(crate::JobStatus::Failed { .. })),
+        "{:?} {:?}",
+        outcome.status,
+        outcome.files.keys().collect::<Vec<_>>()
+    );
+}
+
 // Restarted after every article served: a loan out or due when the
 // pipeline goes down is found again on restore.
 async fn restarted(kind: Kind, shape: Shape) {
-    restart_row(scenario(kind, shape, Order::Forwards)).await;
+    let whole = restart_row(scenario(kind, shape, Order::Forwards)).await;
+    assert!(whole.graph().loans > 0, "a loan went out");
 }
 
 macro_rules! delivery_rows {
@@ -237,6 +254,10 @@ macro_rules! delivery_rows {
                 async fn repaired_backwards() { repaired(Kind::$kind, Shape::Flat, Order::Backwards).await }
                 #[tokio::test]
                 async fn restarted_after_every_article() { restarted(Kind::$kind, Shape::Flat).await }
+                #[tokio::test]
+                async fn lost_in_order() { lost(Kind::$kind, Shape::Flat, Order::Forwards).await }
+                #[tokio::test]
+                async fn lost_backwards() { lost(Kind::$kind, Shape::Flat, Order::Backwards).await }
             }
             mod $nested {
                 use super::*;
@@ -254,6 +275,8 @@ macro_rules! delivery_rows {
                 async fn repaired_backwards() { repaired(Kind::$kind, Shape::Nested, Order::Backwards).await }
                 #[tokio::test]
                 async fn restarted_after_every_article() { restarted(Kind::$kind, Shape::Nested).await }
+                #[tokio::test]
+                async fn lost_in_order() { lost(Kind::$kind, Shape::Nested, Order::Forwards).await }
             }
         )*
     };

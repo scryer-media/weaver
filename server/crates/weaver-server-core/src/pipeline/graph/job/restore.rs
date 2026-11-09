@@ -202,8 +202,9 @@ impl GraphJob {
         }
         missing.extend(self.root.map.unseen());
         let mut refetched = Vec::with_capacity(missing.len());
+        // Nothing is lent inside a restore: the job lends once installed.
         for (volume, ordinal) in missing {
-            self.unarrive(volume, ordinal)?;
+            self.unarrive(volume, ordinal, 0)?;
             if let Some(found) = self
                 .tree
                 .namespace_mut(NodeId::ROOT)
