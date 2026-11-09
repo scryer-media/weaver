@@ -178,8 +178,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn duration_deadline_uses_the_monotonic_clock() {
         let (_cancel, receiver) = watch::channel(false);
-        let mut stop =
-            Stop::new(receiver).with_deadline(RunClock::default().deadline(Duration::from_secs(10)));
+        let mut stop = Stop::new(receiver)
+            .with_deadline(RunClock::default().deadline(Duration::from_secs(10)));
         assert!(!stop.is_stopped());
         tokio::time::advance(Duration::from_secs(9)).await;
         assert!(!stop.is_stopped());
@@ -194,7 +194,8 @@ mod tests {
     async fn a_hand_moved_deadline_passes_only_as_the_clock_moves() {
         let hand = HandClock::new();
         let (_cancel, receiver) = watch::channel(false);
-        let mut stop = Stop::new(receiver).with_deadline(hand.clock().deadline(Duration::from_secs(10)));
+        let mut stop =
+            Stop::new(receiver).with_deadline(hand.clock().deadline(Duration::from_secs(10)));
         hand.advance(Duration::from_secs(9));
         assert!(!stop.is_stopped());
         let waiting = tokio::spawn(async move {
@@ -208,8 +209,8 @@ mod tests {
     #[tokio::test]
     async fn an_article_boundary_hold_can_be_cancelled_before_its_deadline() {
         let (cancel, receiver) = watch::channel(false);
-        let mut stop =
-            Stop::new(receiver).with_deadline(RunClock::default().deadline(Duration::from_secs(600)));
+        let mut stop = Stop::new(receiver)
+            .with_deadline(RunClock::default().deadline(Duration::from_secs(600)));
         cancel.send_replace(true);
         stop.stopped().await;
         assert!(stop.cancelled());

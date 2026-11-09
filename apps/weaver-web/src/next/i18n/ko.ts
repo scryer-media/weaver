@@ -2106,8 +2106,6 @@ export const nextKo: LocaleDictionary = {
   "next.networking.speed.decoded": "디코딩됨",
   "next.networking.speed.upload": "업로드",
   "next.networking.speed.uploadPeers": "피어로 업로드(최소)",
-  "next.networking.speed.uploadPeerCount.one": "피어 {{count}}개",
-  "next.networking.speed.uploadPeerCount.other": "피어 {{count}}개",
   "next.networking.speed.uploadOutcome.UNAVAILABLE": "{{provider}}은(는) 업로드를 받지 않습니다",
   "next.networking.speed.uploadOutcome.NO_DEMAND": "수요 없음",
   "next.networking.speed.uploadOutcome.FAILED": "실패",

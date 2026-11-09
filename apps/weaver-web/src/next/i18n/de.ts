@@ -2106,8 +2106,6 @@ export const nextDe: LocaleDictionary = {
   "next.networking.speed.decoded": "Dekodiert",
   "next.networking.speed.upload": "Upload",
   "next.networking.speed.uploadPeers": "Upload an Peers, mindestens",
-  "next.networking.speed.uploadPeerCount.one": "{{count}} Peer",
-  "next.networking.speed.uploadPeerCount.other": "{{count}} Peers",
   "next.networking.speed.uploadOutcome.UNAVAILABLE": "{{provider}} nimmt keinen Upload an",
   "next.networking.speed.uploadOutcome.NO_DEMAND": "Keine Nachfrage",
   "next.networking.speed.uploadOutcome.FAILED": "Fehlgeschlagen",

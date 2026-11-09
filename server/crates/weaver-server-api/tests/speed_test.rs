@@ -963,7 +963,7 @@ async fn a_torrent_run_pulls_and_serves_on_a_torrent_route() {
     wait_until(&h, id, |run| run.status != SpeedTestStatus::Running).await;
     let response = h
         .execute(&format!(
-            "{{speedTestRun(id:{id}){{status result{{bytes legs{{bytes}} upload{{http{{outcome}} peers{{outcome bytes peers}}}}}}}}}}"
+            "{{speedTestRun(id:{id}){{status result{{bytes legs{{bytes}} upload{{http{{outcome}} peers{{outcome bytes}}}}}}}}}}"
         ))
         .await;
     assert_no_errors(&response);
@@ -976,7 +976,7 @@ async fn a_torrent_run_pulls_and_serves_on_a_torrent_route() {
     assert_eq!(result["upload"]["http"], serde_json::Value::Null);
     assert_eq!(
         result["upload"]["peers"],
-        serde_json::json!({"outcome": "MEASURED", "bytes": f64::from(PIECE_LEN), "peers": 1})
+        serde_json::json!({"outcome": "MEASURED", "bytes": f64::from(PIECE_LEN)})
     );
     fixture.stop().await;
 }

@@ -65,7 +65,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -331,9 +331,64 @@ pub struct TorrentStateLive {
     upload_mode: watch::Sender<Option<tokio::time::Instant>>,
     // The torrent's files as its web seeds serve them.
     web_layout: web_seed::Layout,
+    // Rings once per write that carried block bytes while an
+    // [`UploadWatch`] listens. The write stamps its time, counts its bytes,
+    // then rings only when `upload_watches` says someone listens: a torrent
+    // nobody watches takes no lock for it.
+    uploaded_notify: Notify,
+    upload_watches: AtomicUsize,
+    // When the last write that carried block bytes was handed to its
+    // connection's writer, in nanoseconds after `upload_origin`, plus one;
+    // zero before any (libtorrent `peer_connection::m_last_sent_payload`,
+    // kept per torrent).
+    upload_origin: tokio::time::Instant,
+    last_upload: AtomicU64,
 
     // Whether the session connects over uTP, which a holepunch needs.
     utp: bool,
+}
+
+/// The block bytes a run sends its peers, as each connection hands them to
+/// its writer: the payload of piece messages alone, before any encryption,
+/// on every transport (libtorrent `stat::total_payload_upload`). While a
+/// watch lives, each write that carried block bytes rings it.
+pub struct UploadWatch {
+    live: Arc<TorrentStateLive>,
+}
+
+impl UploadWatch {
+    /// The block bytes sent this run.
+    pub fn uploaded(&self) -> u64 {
+        self.live.stats.uploaded_bytes.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once the bytes sent are no longer `seen`.
+    pub async fn changed_from(&self, seen: u64) {
+        loop {
+            // Taken before the total is read: a send after the read rings it.
+            let rung = self.live.uploaded_notify.notified();
+            if self.uploaded() != seen {
+                return;
+            }
+            rung.await;
+        }
+    }
+
+    /// When the last write that carried block bytes was handed to its
+    /// connection's writer: no older than the bytes [`Self::uploaded`] read
+    /// before it counts.
+    pub fn last_uploaded_at(&self) -> Option<tokio::time::Instant> {
+        match self.live.last_upload.load(Ordering::Relaxed) {
+            0 => None,
+            at => Some(self.live.upload_origin + Duration::from_nanos(at - 1)),
+        }
+    }
+}
+
+impl Drop for UploadWatch {
+    fn drop(&mut self) {
+        self.live.upload_watches.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 // One connection's place under the torrent's cap and under the session's.
@@ -466,6 +521,10 @@ impl TorrentStateLive {
             last_seen_complete: Mutex::new(None),
             upload_mode: watch::Sender::new(None),
             web_layout: web_seed::Layout::new(&paused.metadata, paused.shared.info_hash),
+            uploaded_notify: Notify::new(),
+            upload_watches: AtomicUsize::new(0),
+            upload_origin: tokio::time::Instant::now(),
+            last_upload: AtomicU64::new(0),
             utp: session.utp,
         });
         state.shared.run.store(Some(Arc::new(RunGauges {
@@ -1248,6 +1307,15 @@ impl TorrentStateLive {
     pub fn get_uploaded_bytes(&self) -> u64 {
         self.stats.uploaded_bytes.load(Ordering::Relaxed)
     }
+
+    /// A listener on the block bytes this run sends its peers.
+    pub fn upload_watch(self: &Arc<Self>) -> UploadWatch {
+        self.upload_watches.fetch_add(1, Ordering::SeqCst);
+        UploadWatch {
+            live: Arc::clone(self),
+        }
+    }
+
     pub fn get_downloaded_bytes(&self) -> u64 {
         self.stats
             .downloaded_and_checked_bytes
@@ -2433,14 +2501,31 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             .uploaded_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
         self.state
-            .stats
-            .uploaded_bytes
-            .fetch_add(bytes as u64, Ordering::Relaxed);
-        self.state
             .session_stats
             .counters
             .uploaded_bytes
             .fetch_add(bytes as u64, Ordering::Relaxed);
+    }
+
+    // The torrent's count moves once per write, after its stamp: whoever
+    // reads the count with these bytes in it reads this stamp or a later
+    // one, never an older.
+    fn on_payload_written(&self, bytes: u64) {
+        let state = &self.state;
+        let at = u64::try_from(state.upload_origin.elapsed().as_nanos()).unwrap_or(u64::MAX - 1);
+        state.last_upload.fetch_max(at + 1, Ordering::Relaxed);
+        // Sequentially consistent with the watch's count of listeners, so
+        // the add and a listener's arrival cannot both miss each other: a
+        // listener that read the total before this add is counted by the
+        // load below and rung. The add also publishes the stamp above to
+        // whoever reads the total.
+        state
+            .stats
+            .uploaded_bytes
+            .fetch_add(bytes, Ordering::SeqCst);
+        if state.upload_watches.load(Ordering::SeqCst) > 0 {
+            state.uploaded_notify.notify_waiters();
+        }
     }
 
     // A block cancelled or choked off while the writer held it gave its

@@ -422,7 +422,6 @@ pub struct PeerUploadResult {
     pub bytes: f64,
     pub elapsed_ms: u32,
     pub bps: f64,
-    pub peers: u32,
     pub error: Option<String>,
 }
 
@@ -476,19 +475,13 @@ impl From<core::UploadResult> for UploadResult {
                 bytes: 0.0,
                 elapsed_ms: 0,
                 bps: 0.0,
-                peers: 0,
                 error: None,
             },
-            core::PeerUpload::Measured {
-                bytes,
-                elapsed,
-                peers,
-            } => PeerUploadResult {
+            core::PeerUpload::Measured { bytes, elapsed } => PeerUploadResult {
                 outcome: UploadOutcome::Measured,
                 bytes: bytes as f64,
                 elapsed_ms: small(elapsed.as_millis() as u64),
                 bps: bytes as f64 / elapsed.as_secs_f64().max(0.001),
-                peers,
                 error: None,
             },
             core::PeerUpload::Failed(error) => PeerUploadResult {
@@ -496,7 +489,6 @@ impl From<core::UploadResult> for UploadResult {
                 bytes: 0.0,
                 elapsed_ms: 0,
                 bps: 0.0,
-                peers: 0,
                 error: Some(error),
             },
         });

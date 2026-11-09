@@ -2106,8 +2106,6 @@ export const nextZh: LocaleDictionary = {
   "next.networking.speed.decoded": "已解码",
   "next.networking.speed.upload": "上传",
   "next.networking.speed.uploadPeers": "向对等方上传（至少）",
-  "next.networking.speed.uploadPeerCount.one": "{{count}} 个对等方",
-  "next.networking.speed.uploadPeerCount.other": "{{count}} 个对等方",
   "next.networking.speed.uploadOutcome.UNAVAILABLE": "{{provider}} 不接受上传",
   "next.networking.speed.uploadOutcome.NO_DEMAND": "无需求",
   "next.networking.speed.uploadOutcome.FAILED": "失败",

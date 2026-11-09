@@ -241,7 +241,7 @@ export type UploadOutcome = "UNAVAILABLE" | "MEASURED" | "FAILED" | "NO_DEMAND";
  */
 export type SpeedTestUpload = {
   http: { outcome: UploadOutcome; provider: string | null; url: string | null; bytes: number | null; elapsedMs: number | null; bps: number | null; failure: SpeedTestFailure | null } | null;
-  peers: { outcome: UploadOutcome; bytes: number | null; elapsedMs: number | null; bps: number | null; peers: number | null; error: string | null } | null;
+  peers: { outcome: UploadOutcome; bytes: number | null; elapsedMs: number | null; bps: number | null; error: string | null } | null;
 };
 /** Why a run failed: the web words each code; OTHER, or a code it does not know, shows `message`. */
 export type SpeedTestFailureCode =

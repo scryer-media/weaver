@@ -61,7 +61,7 @@ const SPEED_TEST_RUN_FIELDS = `id consumer consumerName kind status phase starte
     connections { leg connectMs path { egressId rung poolId memberId proxyIds } sourceAddress bytes bytesPerSecond error }
     usenet { articlesRequested delivered missing failed declaredBytes decodedBytes pipelining tls tlsCipherSuite }
     bandwidth { providerId server url connections }
-    upload { http { outcome provider url bytes elapsedMs bps failure { code message params } } peers { outcome bytes elapsedMs bps peers error } }
+    upload { http { outcome provider url bytes elapsedMs bps failure { code message params } } peers { outcome bytes elapsedMs bps error } }
     samples { atMs leg bytes decodedBytes } }`;
 export const SPEED_TEST_QUERY = gql`query SpeedTest { bandwidthProviders { id name host needsServer } speedTestRuns { ${SPEED_TEST_RUN_FIELDS} } }`;
 export const SPEED_TEST_RUN_QUERY = gql`query SpeedTestRun($id:Int!) { speedTestRun(id:$id) { ${SPEED_TEST_RUN_FIELDS} } }`;
