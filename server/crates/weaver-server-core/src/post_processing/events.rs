@@ -1879,8 +1879,9 @@ pub async fn drain_queue(db: Database) -> Result<(), StateError> {
 
 // Run one claimed queue event and record that it is over. A job no longer
 // in the queue runs only the events raised as or after it leaves:
-// NZB_DELETED, NZB_MARKED, and SEEDING_STOPPED for a torrent that failed or
-// was removed while seeding.
+// NZB_DELETED, NZB_MARKED, SEEDING_STOPPED for a torrent that failed or was
+// removed while seeding, and SEEDING_FINISHED for a torrent its seeding goal
+// removed.
 async fn run_queue_event(
     db: Database,
     run_id: String,
@@ -1911,7 +1912,10 @@ async fn run_queue_event(
         let allow_deleted = matches!(
             context.event,
             ScriptEventLabel::Queue(
-                QueueEvent::NzbDeleted | QueueEvent::NzbMarked | QueueEvent::SeedingStopped
+                QueueEvent::NzbDeleted
+                    | QueueEvent::NzbMarked
+                    | QueueEvent::SeedingStopped
+                    | QueueEvent::SeedingFinished
             )
         );
         if !deleted || allow_deleted {

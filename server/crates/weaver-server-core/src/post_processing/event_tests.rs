@@ -857,8 +857,8 @@ async fn a_queue_script_is_told_the_jobs_tags_as_it_starts() {
 }
 
 // The queue worker skips the events of a job that is in no queue, except
-// the ones raised as or after a job leaves: NZB_DELETED, NZB_MARKED and
-// SEEDING_STOPPED.
+// the ones raised as or after a job leaves: NZB_DELETED, NZB_MARKED,
+// SEEDING_STOPPED and SEEDING_FINISHED.
 #[tokio::test]
 async fn the_queue_runs_only_leaving_events_of_a_job_in_no_queue() {
     let (db, data) = configured();
@@ -867,7 +867,7 @@ async fn the_queue_runs_only_leaving_events_of_a_job_in_no_queue() {
     let cases = [
         (50, QueueEvent::NzbAdded, false),
         (51, QueueEvent::NzbDownloaded, false),
-        (52, QueueEvent::SeedingFinished, false),
+        (52, QueueEvent::SeedingFinished, true),
         (53, QueueEvent::NzbDeleted, true),
         (54, QueueEvent::NzbMarked, true),
         (55, QueueEvent::SeedingStopped, true),
