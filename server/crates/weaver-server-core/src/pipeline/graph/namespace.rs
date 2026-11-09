@@ -222,9 +222,9 @@ pub(crate) struct NamespaceWriter {
     // Sparse durable obligations, retained until a current verification answers.
     verifications: BTreeSet<(NodeId, MemberId)>,
     // Whether the job's holds have been paged out for a stop. Only then do
-    // the holds on scratch go in the checkpoint: scratch space is reused
-    // once nothing lives on it, so a row written mid-run could name bytes a
-    // later hold replaced before the next checkpoint reached the database.
+    // the holds on scratch go in the checkpoint. Once rows are written, the
+    // bytes they name are kept until a later checkpoint commits, as
+    // `scratch_rewinding` and `spills_emptying` say.
     stopped: bool,
     renamed: Vec<MemberId>,
     // Members whose files wait to move to the names the ledger gave them,
@@ -242,10 +242,19 @@ pub(crate) struct NamespaceWriter {
     // first checkpoint taken since, which names none of its bytes. The one
     // the database holds may still name them, so the file is emptied only
     // once that checkpoint commits, and not at all if the member spills
-    // again first: a member's bytes at an offset are its bytes there, so the
-    // new spill writes over nothing a committed row names but those bytes,
-    // or the ones the member was started over with.
+    // again first. Until then no new byte enters the file below the length
+    // it had when let go: the ledger keeps the member's bytes there in RAM,
+    // since a member started over brings different bytes to the same
+    // offsets, and a restore would pair them with the state that checkpoint
+    // recorded. Bytes past that length spill as ever.
     spills_emptying: BTreeMap<(NodeId, MemberId), Option<u64>>,
+    // Each node whose scratch file nothing lives on, with the first
+    // checkpoint taken since, which names none of it, and the extent then.
+    // The one the database holds may name any byte below the extent, so
+    // scratch offsets start over only once that checkpoint commits, and
+    // only if nothing was allocated meanwhile: until then every page-out
+    // lands past every byte a committed row names.
+    scratch_rewinding: BTreeMap<NodeId, (u64, u64)>,
     // The latest checkpoint the database has committed.
     committed: u64,
     segments: Vec<Segment>,
@@ -323,6 +332,7 @@ impl NamespaceWriter {
             left: BTreeMap::new(),
             leaving: Vec::new(),
             spills_emptying: BTreeMap::new(),
+            scratch_rewinding: BTreeMap::new(),
             committed: 0,
             segments: Vec::new(),
             effects: Vec::new(),
@@ -1626,7 +1636,6 @@ impl NamespaceWriter {
         offset: u64,
         bytes: &[u8],
     ) -> Result<(), WriteError> {
-        self.spills_emptying.remove(&(node, member));
         self.spill_file(node, member)?.write(offset, bytes, None)?;
         self.files_mut(node).spills_empty.remove(&member);
         Ok(())
@@ -1634,8 +1643,9 @@ impl NamespaceWriter {
 
     // Once the ledger holds nothing of the member on file, its spill file's
     // handle is let go and the file waits to be emptied at the commit of
-    // the next checkpoint, as `spills_emptying` says; the file and its leaf
-    // stay, so no later spill of the member meets a path queued to leave.
+    // the next checkpoint, as `spills_emptying` says, with nothing new
+    // written below its length meanwhile; the file and its leaf stay, so no
+    // later spill of the member meets a path queued to leave.
     fn release_spill(&mut self, node: NodeId, member: MemberId) -> Result<(), WriteError> {
         let Some(files) = self.files.get_mut(&node) else {
             return Ok(());
@@ -1646,15 +1656,19 @@ impl NamespaceWriter {
         let Some(spill) = files.spills.get_mut(&member) else {
             return Ok(());
         };
+        // A length that cannot be read keeps the whole file.
+        let written = spill.len().unwrap_or(u64::MAX);
         spill.release_handle();
+        files.holds.keep_off_file(held_volume(member), written);
         files.spills_empty.insert(member);
         self.spills_emptying.insert((node, member), None);
         Ok(())
     }
 
     // The checkpoints through `committed` have committed: each spill file
-    // released before one of them was taken, and not written since, holds
-    // no bytes the database names, and is emptied.
+    // released before one of them was taken holds no bytes the database
+    // names, so it takes new bytes anywhere again, and, not written since,
+    // is emptied.
     fn empty_released_spills(&mut self, committed: u64) -> Result<(), WriteError> {
         let due: Vec<(NodeId, MemberId)> = self
             .spills_emptying
@@ -1667,6 +1681,7 @@ impl NamespaceWriter {
             let Some(files) = self.files.get_mut(&node) else {
                 continue;
             };
+            files.holds.allow_file(held_volume(member));
             if !files.spills_empty.contains(&member) || files.holds.spills(held_volume(member)) {
                 continue;
             }

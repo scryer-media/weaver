@@ -201,6 +201,22 @@ impl NamespaceWriter {
         for emptied in self.spills_emptying.values_mut() {
             emptied.get_or_insert(stamp);
         }
+        // A scratch file nothing lives on, as `scratch_rewinding` says: this
+        // checkpoint names none of it. One allocated past since an earlier
+        // checkpoint found it empty waits for this one instead.
+        for (node, files) in self.files.iter() {
+            let extent = files.holds.scratch_extent();
+            if files.holds.scratch_bytes() != 0 || extent == 0 {
+                continue;
+            }
+            let waiting = self
+                .scratch_rewinding
+                .entry(*node)
+                .or_insert((stamp, extent));
+            if waiting.1 != extent {
+                *waiting = (stamp, extent);
+            }
+        }
     }
 
     // Whether a file still waits to move, or a name a file left waits for
@@ -210,10 +226,13 @@ impl NamespaceWriter {
     }
 
     // Whether anything waits for a checkpoint to commit: a move, a name a
-    // file left, or a file that goes or is emptied which the one the
-    // database holds may name.
+    // file left, a file that goes or is emptied, or scratch offsets to
+    // start over, which the one the database holds may name.
     pub(crate) fn awaits_commit(&self) -> bool {
-        self.moves_waiting() || !self.leaving.is_empty() || !self.spills_emptying.is_empty()
+        self.moves_waiting()
+            || !self.leaving.is_empty()
+            || !self.spills_emptying.is_empty()
+            || !self.scratch_rewinding.is_empty()
     }
 
     // The checkpoint whose commit lets every waiting move run, as far as
@@ -223,7 +242,14 @@ impl NamespaceWriter {
         let left = self.left.values().filter_map(|stamp| *stamp);
         let gone = self.leaving.iter().filter_map(|(_, stamp)| *stamp);
         let emptied = self.spills_emptying.values().filter_map(|stamp| *stamp);
-        moves.chain(left).chain(gone).chain(emptied).max().unwrap_or(0)
+        let rewound = self.scratch_rewinding.values().map(|(stamp, _)| *stamp);
+        moves
+            .chain(left)
+            .chain(gone)
+            .chain(emptied)
+            .chain(rewound)
+            .max()
+            .unwrap_or(0)
     }
 
     // The checkpoints through `stamp` have committed. Every name a file
@@ -244,11 +270,34 @@ impl NamespaceWriter {
             }
             shut
         });
+        self.rewind_scratches(committed);
         let moved = self
             .remove_left(committed)
             .and_then(|()| self.empty_released_spills(committed))
             .and_then(|()| self.run_moves(committed));
         (freed, moved)
+    }
+
+    // The checkpoints through `committed` have committed: each scratch file
+    // found empty when one of them was taken, and allocated nothing since,
+    // holds no bytes the database names, so its offsets start over.
+    fn rewind_scratches(&mut self, committed: u64) {
+        let due: Vec<(NodeId, u64)> = self
+            .scratch_rewinding
+            .iter()
+            .filter(|(_, (stamp, _))| *stamp <= committed)
+            .map(|(node, (_, extent))| (*node, *extent))
+            .collect();
+        for (node, extent) in due {
+            self.scratch_rewinding.remove(&node);
+            let unchanged = self
+                .files
+                .get(&node)
+                .is_some_and(|files| files.holds.scratch_extent() == extent);
+            if unchanged && let Some(files) = self.files.get_mut(&node) {
+                files.holds.rewind_scratch();
+            }
+        }
     }
 
     // Remove every file that goes which the checkpoints through

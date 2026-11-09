@@ -152,20 +152,31 @@ impl NamespaceWriter {
         // The space a move to a spill file may take: what is free now, as
         // the copy adds to the scratch file it leaves on disk.
         let mut spill_free = self.free_disk_bytes();
-        let mut by_node: BTreeMap<NodeId, Vec<(ScratchHold, bool)>> = BTreeMap::new();
+        // Every scratch byte a row names, adopted or not, is named by the
+        // checkpoint the database holds: the ledger allocates past the end
+        // of the last until one taken after this restore commits, as
+        // `scratch_rewinding` says, and the file is opened as left.
+        let mut by_node: BTreeMap<NodeId, (u64, Vec<(ScratchHold, bool)>)> = BTreeMap::new();
         for record in records {
-            let member = MemberId(record.held.volume.0);
-            if tree
-                .namespace(record.node)
-                .is_some_and(|namespace| namespace.get(member).is_some())
-            {
-                by_node
-                    .entry(record.node)
-                    .or_default()
-                    .push((record.held, record.on_file));
+            let Some(namespace) = tree.namespace(record.node) else {
+                continue;
+            };
+            let (named, holds) = by_node.entry(record.node).or_default();
+            if !record.on_file {
+                let end = record
+                    .held
+                    .scratch_offset
+                    .saturating_add(record.held.range.len());
+                *named = (*named).max(end);
+            }
+            if namespace.get(MemberId(record.held.volume.0)).is_some() {
+                holds.push((record.held, record.on_file));
             }
         }
-        for (node, holds) in by_node {
+        for (node, (named, holds)) in by_node {
+            if named > 0 {
+                self.files_mut(node).holds.keep_scratch_to(named);
+            }
             let scratch = Leaf::found(&self.working_dir, &scratch_name(node))?;
             let written = scratch.len().unwrap_or(0);
             // The file's bytes are already on disk, so the disk reserve
@@ -218,7 +229,9 @@ impl NamespaceWriter {
                     ),
                 }
             }
-            if adopted {
+            // A file with bytes is kept as left even when no hold came back,
+            // so the first page-out never empties what a row names.
+            if adopted || written > 0 {
                 self.files_mut(node).scratch = Some(scratch);
             }
         }
