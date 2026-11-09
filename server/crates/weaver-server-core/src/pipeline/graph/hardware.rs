@@ -76,6 +76,12 @@ impl Grant {
             .map_or(u64::MAX, |memory| memory - memory / 4)
     }
 
+    // The widest window the grant holds one decoder to: its window, no
+    // more than its memory, or no limit when it grants neither.
+    pub(crate) fn held(&self) -> u64 {
+        self.run.window_or(u64::MAX)
+    }
+
     // The widest window a run decodes at the grant: the wider of its memory
     // and its window, or no ceiling when it grants neither.
     pub(crate) fn ceiling(&self) -> u64 {
@@ -116,6 +122,7 @@ impl Grant {
             run: Budget {
                 memory_bytes: Some(tuning.sevenz_decode_memory_bytes),
                 window_bytes: Some(tuning.decode_window_bytes),
+                window_reserved: false,
                 threads,
                 pool: Some(lent),
                 lender: None,
@@ -127,12 +134,16 @@ impl Grant {
                         .of(HardwareProfile::effective_memory_bytes(probe)),
                 ),
                 window_bytes: None,
+                window_reserved: false,
                 threads: tuning.par3_cpu_cap.map_or(host, |cap| host.min(cap)).max(1),
                 pool: None,
                 lender: None,
             },
             over_limit: tuning.over_limit,
-            machine_bytes: Some(HardwareProfile::effective_memory_bytes(probe)),
+            // Only memory read from the machine bounds a run: a guessed
+            // size is no hard stop.
+            machine_bytes: (!probe.memory.guessed)
+                .then(|| HardwareProfile::effective_memory_bytes(probe)),
         }
     }
 }

@@ -61,8 +61,14 @@ impl<D: Decoder> Extraction for Run<D> {
         let closed = volumes.len(weaver_graph::VolumeIndex(0)).is_some();
         // The window the stream was built to, or the run's grant's where
         // that is wider: an owner that lets a window go above its ceiling
-        // grants the run the wider one.
-        let window = self.window.max(D::window(&self.first, &budget));
+        // grants the run the wider one. An owner that reserved the whole
+        // grant for the run gives the decoder all of it, since a later
+        // block or frame may need more than the first declares.
+        let window = if budget.window_reserved {
+            budget.window_or(self.window).max(self.window)
+        } else {
+            self.window.max(D::window(&self.first, &budget))
+        };
         // What the front declares the decoder needs, where the decoder's
         // own refusal does not say.
         let declared = D::declared(&self.first);

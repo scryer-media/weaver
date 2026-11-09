@@ -26,7 +26,7 @@ pub(crate) mod echo;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
@@ -187,15 +187,21 @@ struct Run {
     // The bytes reserved for the run in the decode pool, held from before
     // it starts until it ends or is forgotten; zero while none is taken.
     reserved: u64,
-    // The window the run decodes at above the grant's ceiling, where the
-    // policy lets it go above: the widest its object or its decoder named.
+    // The window the run decodes at past what its object declared: above
+    // the grant's ceiling where the policy lets it go above, or within it,
+    // the widest its object or its decoder named.
     wide: Option<u64>,
+    // The window the run was given when it was reserved.
+    window: u64,
+    // Whether its reservation is held above the ceiling, apart from the
+    // pool.
+    above: bool,
     // Where that window is: lent from a scratch file, or in RAM.
     placed: Placed,
     // The run refused a window its policy lets it have: it starts again,
     // wider, once it ends, and what it says before then is not heard.
     rerun: bool,
-    // Whether it is counted among the runs waiting for the whole pool.
+    // Whether it is counted among the runs waiting above the ceiling.
     whole: bool,
 }
 
@@ -207,6 +213,8 @@ impl Run {
             volumes: None,
             reserved: 0,
             wide: None,
+            window: 0,
+            above: false,
             placed: Placed::Grant,
             rerun: false,
             whole: false,
@@ -222,7 +230,8 @@ enum Placed {
     Grant,
     // Over the ceiling, on a scratch file lent before the run starts.
     Scratch(super::window::Window),
-    // Over the ceiling, in RAM: this many bytes of it.
+    // Past what its object declared, in RAM, reserved whole: this many
+    // bytes of it.
     Ram(u64),
 }
 
@@ -286,6 +295,12 @@ pub(crate) struct Runs {
     // The scratch-file windows a run's decoders may borrow, when the job
     // lends any.
     windows: Option<Arc<super::window::Windows>>,
+    // The nodes whose decoder's refusal stands only because the policy
+    // holds runs to the ceiling: a job lifted of its memory limit would be
+    // given the window refused, within what the machine leaves a run. A
+    // refused node's run is forgotten, so this outlives it; a node that
+    // runs again leaves it.
+    held_back: BTreeSet<NodeId>,
 }
 
 impl Runs {
@@ -305,6 +320,7 @@ impl Runs {
             hardware: Hardware::default(),
             clock: DecodeClock::default(),
             windows: None,
+            held_back: BTreeSet::new(),
         }
     }
 
@@ -461,11 +477,16 @@ impl Runs {
     // refused (`widen`), the window is placed here: lent from a scratch
     // file for a decoder that borrows one, with only the run's RAM inside
     // the ceiling reserved; or, for one that does not, or a scratch file
-    // refused for any reason, in RAM above the ceiling, reserved whole from
-    // the decode pool, up to what the machine leaves a run. A reservation
-    // larger than the pool waits for it to be empty, then takes it.
+    // refused for any reason, in RAM above the ceiling, reserved whole
+    // apart from the pool. It is admitted once it, every other run above the
+    // ceiling, and the whole pool fit under what the machine leaves a run.
+    // A window its decoder refused within the ceiling is reserved whole
+    // from the pool. Under a policy that holds runs to the ceiling, a
+    // window a run was widened to above it is dropped: the run is held to
+    // the ceiling, and its decoder refuses with the sizes.
     pub(crate) fn reserve_for(&mut self, node: NodeId, window: u64, lends: bool) -> Reservation {
         let grant = self.hardware.grant();
+        self.held_back.remove(&node);
         let Some(run) = self.runs.get_mut(&node) else {
             return Reservation::Granted;
         };
@@ -473,11 +494,23 @@ impl Runs {
             return Reservation::Granted;
         }
         let ceiling = grant.ceiling();
-        if grant.over_limit == OverLimit::ScratchThenRam && window > ceiling {
+        let above = grant.over_limit == OverLimit::ScratchThenRam;
+        if above && window > ceiling {
             run.wide = run.wide.max(Some(window));
         }
+        if !above {
+            run.wide = run.wide.filter(|wide| *wide <= grant.held());
+        }
+        run.window = run.wide.unwrap_or(window.min(ceiling));
         let len = match run.wide {
-            None => window.min(ceiling).saturating_add(RUN_OVERHEAD),
+            None => {
+                run.placed = Placed::Grant;
+                window.min(ceiling).saturating_add(RUN_OVERHEAD)
+            }
+            Some(wide) if wide <= ceiling => {
+                run.placed = Placed::Ram(wide);
+                wide.saturating_add(RUN_OVERHEAD)
+            }
             Some(wide) => {
                 if !matches!(run.placed, Placed::Scratch(_)) {
                     run.placed = self
@@ -491,16 +524,7 @@ impl Runs {
                 }
                 match run.placed {
                     Placed::Scratch(_) => window.min(ceiling).saturating_add(RUN_OVERHEAD),
-                    _ => {
-                        let len = wide.saturating_add(RUN_OVERHEAD);
-                        if len > grant.above_ceiling() {
-                            return Reservation::Beyond {
-                                needed: wide,
-                                memory: grant.machine_bytes.unwrap_or(u64::MAX),
-                            };
-                        }
-                        len
-                    }
+                    _ => wide.saturating_add(RUN_OVERHEAD),
                 }
             }
         };
@@ -508,8 +532,19 @@ impl Runs {
         let taken = if len <= room.limit {
             self.pool.stop_waiting(&mut run.whole);
             self.pool.take(len)
-        } else if run.wide.is_some() {
-            self.pool.take_whole(len, &mut run.whole)
+        } else if let Some(wide) = run.wide {
+            let stop = grant.above_ceiling();
+            if !self.pool.could_fit_above(len, stop) {
+                self.pool.stop_waiting(&mut run.whole);
+                run.placed = Placed::Grant;
+                return Reservation::Beyond {
+                    needed: wide,
+                    memory: grant.machine_bytes.unwrap_or(u64::MAX),
+                };
+            }
+            self.pool
+                .take_above(len, stop, &mut run.whole)
+                .map(|()| run.above = true)
         } else {
             return Reservation::Refused {
                 needed: len,
@@ -568,11 +603,12 @@ impl Runs {
                         .map(|windows| windows.prelent(node, window));
                 }
             }
-            // The decoder may hold the window in RAM: what was reserved.
+            // The decoder may hold the window in RAM: what was reserved,
+            // the whole of it, whatever its first bytes declare.
             Placed::Ram(wide) => {
-                let most = Some((*wide).max(grant.ceiling()));
-                budget.memory_bytes = most;
-                budget.window_bytes = most;
+                budget.memory_bytes = budget.memory_bytes.max(Some(*wide));
+                budget.window_bytes = Some(*wide);
+                budget.window_reserved = true;
             }
         }
         let (scope, mail, clock) = (self.scope, self.mail.clone(), self.clock.clone());
@@ -632,7 +668,7 @@ impl Runs {
             run.life = Life::Queued;
             run.volumes = None;
             run.placed = Placed::Grant;
-            self.pool.release(std::mem::take(&mut run.reserved));
+            give_back(&self.pool, run);
             self.marks.mark(node);
             if run.ticket.is_some() {
                 admitted.push(node);
@@ -649,21 +685,51 @@ impl Runs {
         admitted
     }
 
-    // The node's run refused a window of `needed` bytes that the grant's
-    // policy lets it have above the ceiling, and wider than any it was
-    // given: it is stopped where it stands, what it says from here is not
-    // heard, and once it ends it starts again at that window. `false` when
-    // the policy holds it to the ceiling, or it already had that window:
-    // its refusal stands.
-    pub(crate) fn widen(&mut self, node: NodeId, needed: u64) -> bool {
+    // The node's run refused a window of `needed` bytes, wider than the
+    // one it was given, that the grant lets it have: within the window the
+    // grant holds one decoder to, or above it where the policy lets a run go
+    // above. A decoder that does not say what it needs is given the grant's
+    // window first, then the `widest` its format has where the policy lets
+    // it go above. The run is stopped
+    // where it stands, what it says from here is not heard, and once it
+    // ends it starts again at that window. `false` when the grant holds it
+    // narrower, or it already had that window: its refusal stands. Each
+    // widening is wider than the last, so a run that refuses again with
+    // nothing wider to ask for stands refused.
+    pub(crate) fn widen(&mut self, node: NodeId, needed: Option<u64>, widest: Option<u64>) -> bool {
         let grant = self.hardware.grant();
+        self.held_back.remove(&node);
         let Some(run) = self.runs.get_mut(&node) else {
             return false;
         };
-        let wider = grant.over_limit == OverLimit::ScratchThenRam
-            && needed > grant.ceiling()
-            && run.wide.is_none_or(|wide| needed > wide)
-            && matches!(run.life, Life::Running { .. });
+        let held = grant.held();
+        let most = match grant.over_limit {
+            OverLimit::ScratchThenRam => u64::MAX,
+            OverLimit::Fail => held,
+        };
+        // What a run lifted of its memory limit would be given.
+        let lifted = needed.or(widest);
+        let Some(needed) = needed.or_else(|| {
+            widest.map(|widest| match widest.min(held) {
+                within if within > run.window => within,
+                _ => widest.min(most),
+            })
+        }) else {
+            return false;
+        };
+        let wider =
+            needed <= most && needed > run.window && matches!(run.life, Life::Running { .. });
+        let held_back = !wider
+            && grant.over_limit == OverLimit::Fail
+            && lifted.is_some_and(|lifted| {
+                lifted > run.window.max(held)
+                    && self
+                        .pool
+                        .could_fit_above(lifted.saturating_add(RUN_OVERHEAD), grant.above_ceiling())
+            });
+        if held_back {
+            self.held_back.insert(node);
+        }
         if wider {
             run.wide = Some(needed);
             run.rerun = true;
@@ -672,6 +738,12 @@ impl Runs {
             }
         }
         wider
+    }
+
+    // Whether a refusal stands in the job only because the policy holds runs
+    // to the ceiling, so a reprocess with no memory limit could finish it.
+    pub(crate) fn held_to_ceiling(&self) -> bool {
+        !self.held_back.is_empty()
     }
 
     // Whether the node's run was widened and is ending, to start again.
@@ -790,7 +862,7 @@ impl Runs {
         let Some(run) = self.runs.get_mut(&node) else {
             return Vec::new();
         };
-        self.pool.release(std::mem::take(&mut run.reserved));
+        give_back(&self.pool, run);
         self.pool.stop_waiting(&mut run.whole);
         run.placed = Placed::Grant;
         run.rerun = false;
@@ -819,9 +891,20 @@ impl Runs {
 impl Drop for Runs {
     fn drop(&mut self) {
         for run in self.runs.values_mut() {
-            self.pool.release(run.reserved);
+            give_back(&self.pool, run);
             self.pool.stop_waiting(&mut run.whole);
         }
+    }
+}
+
+// Give back what the run reserved, to the pool or above the ceiling where it
+// was taken, once.
+fn give_back(pool: &DecodePool, run: &mut Run) {
+    let len = std::mem::take(&mut run.reserved);
+    if std::mem::take(&mut run.above) {
+        pool.release_above(len);
+    } else {
+        pool.release(len);
     }
 }
 

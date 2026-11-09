@@ -19,6 +19,7 @@ fn machine(cores: usize, memory_gib: u64) -> SystemProfile {
             total_bytes: memory_gib * GIB,
             available_bytes: memory_gib * GIB / 2,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Ssd,

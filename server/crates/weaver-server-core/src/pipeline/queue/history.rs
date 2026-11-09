@@ -205,10 +205,13 @@ impl Queue {
                         .transpose()
                         .map_err(|error| SchedulerError::Internal(error.to_string()))?
                         .unwrap_or_default();
-                    use crate::history::attributes::NO_MEMORY_LIMIT_ATTRIBUTE_KEY;
+                    use crate::history::attributes::{
+                        FAILED_FOR_MEMORY_ATTRIBUTE_KEY, NO_MEMORY_LIMIT_ATTRIBUTE_KEY,
+                    };
                     metadata.retain(|(key, _)| {
                         !crate::history::attributes::is_password_attribute_key(key)
                             && key != NO_MEMORY_LIMIT_ATTRIBUTE_KEY
+                            && key != FAILED_FOR_MEMORY_ATTRIBUTE_KEY
                             && (reprocess || key != crate::ingest::FULL_FILE_NAMES_METADATA_KEY)
                     });
                     // Kept with the job, so a restart or a restore of it

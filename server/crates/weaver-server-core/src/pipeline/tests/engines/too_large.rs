@@ -108,6 +108,7 @@ async fn a_rar_whose_dictionary_is_wider_than_the_efficient_window_fails_with_th
         },
         "silver.rar needs 4.0 GiB of decode memory, 256.0 MiB allowed",
     );
+    assert!(offers_retry(&outcome));
 }
 
 // Balanced grants the 4 GiB dictionary above its 1 GiB ceiling: the decoder
@@ -190,6 +191,7 @@ async fn a_7z_whose_coder_needs_more_than_the_efficient_memory_fails_with_the_si
         },
         "lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed",
     );
+    assert!(offers_retry(&outcome));
 }
 
 // Balanced grants the coder's 4 GiB above its 1 GiB ceiling, within the
@@ -249,6 +251,9 @@ async fn a_zstd_frame_wider_than_the_efficient_window_fails_with_the_sizes() {
         },
         "lantern.mkv.zst needs 2.0 TiB of decode memory, 256.0 MiB allowed",
     );
+    // More than the machine leaves a run: a retry with no limit would fail
+    // again, so none is offered.
+    assert!(!offers_retry(&outcome));
 }
 
 // Balanced would grant the window above its ceiling, but 2 TiB is past
@@ -269,4 +274,110 @@ async fn a_zstd_frame_wider_than_the_machine_fails_naming_the_machine() {
         },
         "lantern.mkv.zst needs 2.0 TiB of decode memory, this machine has 8.0 GiB",
     );
+    assert!(!offers_retry(&outcome));
+}
+
+// A zstd frame of one raw byte whose header names a window of 1 << `log`.
+fn zstd_frame(log: u8) -> Vec<u8> {
+    vec![
+        0x28,
+        0xB5,
+        0x2F,
+        0xFD,
+        0x00,
+        (log - 10) << 3,
+        0x09,
+        0x00,
+        0x00,
+        b'z',
+    ]
+}
+
+// Two frames, a narrow one first, so the front declares only it, and one a
+// window of 1 << `log` after it.
+fn later_wide_zstd(log: u8) -> Vec<u8> {
+    [zstd_frame(20), zstd_frame(log)].concat()
+}
+
+fn decoded_zstd(outcome: &Outcome) {
+    granted(outcome);
+    assert_eq!(outcome.status, Some(JobStatus::Complete), "{outcome:?}");
+    assert_eq!(
+        outcome.files.get("lantern beacon/lantern.mkv"),
+        Some(&b"zz".to_vec()),
+        "{:?}",
+        outcome.files.keys()
+    );
+}
+
+// A later frame wider than the decoder's own 128 MiB, within the window the
+// profile grants a decoder: libzstd does not say how wide, and the run
+// starts again at the profile's window, which holds it.
+#[tokio::test]
+async fn a_later_zstd_frame_within_the_profiles_window_decodes() {
+    for profile in [HardwareProfile::Efficient, HardwareProfile::Balanced] {
+        let outcome = run(&Scenario::new(vec![Post::plain(
+            "lantern.mkv.zst",
+            later_wide_zstd(28),
+        )])
+        .profile(profile))
+        .await;
+        decoded_zstd(&outcome);
+    }
+}
+
+// A later 2 GiB frame, above Balanced's 1 GiB ceiling: the run starts again
+// at the ceiling, is refused again, and starts once more at the widest
+// window libzstd has, in RAM above the ceiling.
+#[tokio::test]
+async fn a_later_zstd_frame_above_the_balanced_ceiling_decodes() {
+    let outcome = run(
+        &Scenario::new(vec![Post::plain("lantern.mkv.zst", later_wide_zstd(31))])
+            .profile(HardwareProfile::Balanced),
+    )
+    .await;
+    decoded_zstd(&outcome);
+}
+
+// The same under efficient fails, held to its window, and the job is
+// marked as failed for memory: a retry with no limit can help.
+#[tokio::test]
+async fn a_later_zstd_frame_above_the_efficient_window_fails_and_is_lifted_by_a_retry() {
+    let outcome = run(
+        &Scenario::new(vec![Post::plain("lantern.mkv.zst", later_wide_zstd(31))])
+            .profile(HardwareProfile::Efficient),
+    )
+    .await;
+    failed(
+        &outcome,
+        "lantern.mkv.zst",
+        Why::TooLarge {
+            needed: None,
+            allowed: Some(256 * MIB),
+        },
+        &outcome_error(&outcome),
+    );
+    assert!(offers_retry(&outcome));
+    let outcome = run(
+        &Scenario::new(vec![Post::plain("lantern.mkv.zst", later_wide_zstd(31))])
+            .profile(HardwareProfile::Efficient)
+            .metadata(NO_MEMORY_LIMIT_ATTRIBUTE_KEY, "1"),
+    )
+    .await;
+    decoded_zstd(&outcome);
+}
+
+// Whether the job's history row says it failed for memory, offering a
+// retry with no limit.
+fn offers_retry(outcome: &Outcome) -> bool {
+    crate::history::attributes::failed_for_memory(&crate::parse_history_metadata(
+        outcome.history_metadata.as_deref(),
+    ))
+}
+
+fn outcome_error(outcome: &Outcome) -> String {
+    match &outcome.status {
+        Some(JobStatus::Failed { error }) => error.clone(),
+        other => panic!("{other:?}"),
+    }
 }

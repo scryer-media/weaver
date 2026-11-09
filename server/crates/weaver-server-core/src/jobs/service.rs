@@ -779,8 +779,9 @@ impl Pipeline {
     pub(crate) async fn reprocess_job_with_no_memory_limit(
         &mut self,
         job_id: JobId,
+        password: Option<String>,
     ) -> Result<(), crate::SchedulerError> {
-        self.restart_through_control_plane(job_id, None, true, true)
+        self.restart_through_control_plane(job_id, password, true, true)
             .await
     }
 

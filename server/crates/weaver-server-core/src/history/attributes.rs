@@ -20,12 +20,17 @@ pub fn no_memory_limit(metadata: &[(String, String)]) -> bool {
         .any(|(key, value)| key == NO_MEMORY_LIMIT_ATTRIBUTE_KEY && value == "1")
 }
 
-// Whether a failed job's error says a decode window was over the profile's
-// ceiling ("needs 4.0 GiB of decode memory, 1.0 GiB allowed"), so a reprocess
-// with no limit could finish it. A window over the machine itself ("this
-// machine has") would fail again, so it is not one.
-pub fn failed_for_memory(error: &str) -> bool {
-    error.contains("decode memory") && !error.contains("this machine has")
+// Set on a job that failed because a decode window was over the profile's
+// ceiling under a policy that fails it, so a reprocess with no limit could
+// finish it. A window over the machine itself would fail again, so it never
+// sets this. A reprocess drops it.
+pub const FAILED_FOR_MEMORY_ATTRIBUTE_KEY: &str = "__weaver_failed_for_memory";
+
+// Whether a job's metadata says it failed over the profile's ceiling.
+pub fn failed_for_memory(metadata: &[(String, String)]) -> bool {
+    metadata
+        .iter()
+        .any(|(key, value)| key == FAILED_FOR_MEMORY_ATTRIBUTE_KEY && value == "1")
 }
 
 // The attributes that speak for a job's password. A job started again from
@@ -97,18 +102,17 @@ mod tests {
         assert!(public_history_attributes(&flagged).is_empty());
     }
 
-    // The efficient ceiling's error offers a retry with no limit; the
-    // machine's does not, nor does any other failure.
+    // Only the mark the failure recorded offers a retry with no limit: an
+    // error's text never does, and the mark stays out of the attributes.
     #[test]
-    fn only_a_failure_over_the_profile_ceiling_is_failed_for_memory() {
-        assert!(failed_for_memory(
-            "lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed"
-        ));
-        assert!(!failed_for_memory(
-            "lantern.mkv.zst needs 2.0 TiB of decode memory, this machine has 8.0 GiB"
-        ));
-        assert!(!failed_for_memory(
-            "lantern.rar needs a password and none was given"
-        ));
+    fn only_a_job_marked_failed_over_the_ceiling_is_failed_for_memory() {
+        let marked = vec![(FAILED_FOR_MEMORY_ATTRIBUTE_KEY.to_string(), "1".to_string())];
+        assert!(failed_for_memory(&marked));
+        assert!(!failed_for_memory(&[]));
+        assert!(!failed_for_memory(&[(
+            "error".to_string(),
+            "lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed".to_string()
+        )]));
+        assert!(public_history_attributes(&marked).is_empty());
     }
 }

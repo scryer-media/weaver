@@ -30,6 +30,10 @@ const SKIPPABLE_MASK: u32 = 0xFFFF_FFF0;
 impl Decoder for Zstd {
     const KIND: Kind = Kind::Zstd;
 
+    // libzstd refuses a later frame too wide without saying how wide, and
+    // the front declares only the first.
+    const WIDEST: Option<u64> = Some(1 << LOG_MAX);
+
     // The window the first frame declares, at least the decoder's own
     // default and no wider than the run was granted. A stream whose front
     // does not say reserves the decoder's own default, never the whole grant.

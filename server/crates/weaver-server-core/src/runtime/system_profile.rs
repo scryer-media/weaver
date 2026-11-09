@@ -45,6 +45,10 @@ pub struct MemoryProfile {
     pub available_bytes: u64,
     // Memory limit from cgroup (containers).
     pub cgroup_limit: Option<u64>,
+    // The machine's memory could not be read, so the sizes above are a
+    // default. Whatever must hold to the machine's real memory has none.
+    #[serde(default)]
+    pub guessed: bool,
 }
 
 // Disk/storage capabilities for the working directory.

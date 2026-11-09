@@ -586,7 +586,12 @@ fn profiles() -> [weaver_graph::Budget; 3] {
 // An xz stream whose first block names dictionary property `property`.
 // Only the header says so: the block was written with a 1 MiB dictionary.
 fn xz_declaring(property: u8) -> Vec<u8> {
-    let mut bytes = xz_at(&first_payload(), 1 << 20);
+    declaring(xz_at(&first_payload(), 1 << 20), property)
+}
+
+// `bytes`, an xz stream written with a 1 MiB dictionary, whose first block
+// names dictionary property `property` instead.
+fn declaring(mut bytes: Vec<u8>, property: u8) -> Vec<u8> {
     let end = 12 + (usize::from(bytes[12]) + 1) * 4;
     let at = 12
         + bytes[12..end]
@@ -720,6 +725,92 @@ fn a_run_granted_a_wider_window_than_the_build_decodes_the_wider_frame() {
         &closed_run(&mut stream, bytes, narrower),
         Some(2 * MIB),
         Some(MIB),
+    );
+}
+
+// A stream handed its front, so its window is sized from the first block or
+// frame, built within `window`.
+fn fronted_within<D: Decoder>(name: &str, bytes: &[u8], window: u64) -> Stream<D> {
+    let mut stream = stream::<D>(name).within(weaver_graph::Budget {
+        memory_bytes: Some(window),
+        window_bytes: Some(window),
+        threads: 1,
+        ..Default::default()
+    });
+    stream.deliver(
+        Delivery {
+            volume: VolumeIndex(0),
+            offset: 0,
+            bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut Vec::new(),
+    );
+    stream
+}
+
+// A run granted `window`, reserved whole for it or not.
+fn granted(window: u64, reserved: bool) -> weaver_graph::Budget {
+    weaver_graph::Budget {
+        memory_bytes: Some(window),
+        window_bytes: Some(window),
+        window_reserved: reserved,
+        threads: 1,
+        ..Default::default()
+    }
+}
+
+fn refused_too_large(said: &[Said]) {
+    assert!(
+        matches!(
+            ending(said),
+            [Said::Retract, Said::Refuse(Why::TooLarge { .. })]
+        ),
+        "{said:?}"
+    );
+}
+
+// An xz whose later stream's dictionary is wider than the first's: a run
+// granted a wider window sizes its decoder from the first block and is
+// refused at the later one. A run whose owner reserved the whole wider
+// window for it gives the decoder all of it and decodes whole.
+#[test]
+fn a_later_xz_block_wider_than_the_first_decodes_within_a_window_reserved_whole() {
+    // The decoder holds no more dictionary than a block's content, so the
+    // later block's content is larger than the first's dictionary.
+    let later = payload(2, 3_000).repeat(1_500);
+    let mut bytes = xz_at(&first_payload(), 1 << 20);
+    bytes.extend(xz_at(&later, 8 << 20));
+    let plain = [first_payload(), later].concat();
+    let mut stream = fronted_within::<Xz>("a.xz", &bytes, 2 * MIB);
+    refused_too_large(&closed_run(
+        &mut stream,
+        bytes.clone(),
+        granted(16 * MIB, false),
+    ));
+    assert_eq!(
+        closed_run(&mut stream, bytes, granted(16 * MIB, true)),
+        decoded("a", plain)
+    );
+}
+
+// The same for zstd, past the decoder's own 128 MiB: a later frame of
+// 256 MiB is refused unless the run's window was reserved whole for it. Its
+// refusal cannot say what the later frame needs.
+#[test]
+fn a_later_zstd_frame_wider_than_the_first_decodes_within_a_window_reserved_whole() {
+    let mut bytes = zstd_window(20);
+    bytes.extend(zstd_window(28));
+    let mut stream = fronted_within::<Zstd>("a.zst", &bytes, MIB);
+    too_large(
+        &closed_run(&mut stream, bytes.clone(), granted(512 * MIB, false)),
+        None,
+        Some(128 * MIB),
+    );
+    assert_eq!(
+        closed_run(&mut stream, bytes, granted(512 * MIB, true)),
+        decoded("a", b"zz".to_vec())
     );
 }
 

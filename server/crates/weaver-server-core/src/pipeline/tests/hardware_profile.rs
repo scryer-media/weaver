@@ -24,6 +24,7 @@ fn twelve_core_machine() -> SystemProfile {
             total_bytes: 8 * 1024 * 1024 * 1024,
             available_bytes: 8 * 1024 * 1024 * 1024,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Ssd,
@@ -397,6 +398,7 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
         Budget {
             memory_bytes: Some(1024 * 1024 * 1024),
             window_bytes: None,
+            window_reserved: false,
             threads: 6,
             pool: None,
             lender: None,
@@ -414,6 +416,7 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
         Budget {
             memory_bytes: Some(256 * 1024 * 1024),
             window_bytes: None,
+            window_reserved: false,
             threads: 4,
             pool: None,
             lender: None,
@@ -421,4 +424,44 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
     );
     assert_eq!(grant.install(rayon::current_num_threads), 4);
     assert_eq!(balanced.install(rayon::current_num_threads), 6);
+}
+
+// Only memory read from the machine is a hard stop for a run above the
+// ceiling. Where it could not be read, the sizes the profile works from are
+// a default, and nothing bounds the run: no hard stop, and no "this machine
+// has" to say.
+#[tokio::test]
+async fn a_hard_stop_holds_only_to_memory_read_from_the_machine() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let pipeline = pipeline_on_twelve_cores(&temp_dir).await;
+    let grant = pipeline.graph_hardware.grant();
+    assert_eq!(grant.machine_bytes, Some(8 * 1024 * 1024 * 1024));
+    assert_eq!(grant.above_ceiling(), 6 * 1024 * 1024 * 1024);
+
+    let mut guessed = twelve_core_machine();
+    guessed.memory.guessed = true;
+    let other = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline_on_machine(
+        other.path().join("data"),
+        other.path().join("intermediate"),
+        other.path().join("complete"),
+        other.path().join("weaver.db"),
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        20,
+        None,
+        guessed,
+    )
+    .await;
+    let grant = pipeline.graph_hardware.grant();
+    assert_eq!(grant.machine_bytes, None);
+    assert_eq!(grant.above_ceiling(), u64::MAX);
+    // What the guessed size feeds elsewhere is as before.
+    assert_eq!(
+        pipeline.tuner.profile_tuning(),
+        HardwareProfile::Balanced.tuning(&twelve_core_machine())
+    );
 }

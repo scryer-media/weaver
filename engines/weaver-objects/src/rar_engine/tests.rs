@@ -1095,6 +1095,7 @@ fn on_budget(volumes: Vec<Vec<u8>>, memory_bytes: Option<u64>, threads: usize) -
             threads,
             pool: Some(Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>),
             lender: None,
+            ..Default::default()
         },
     );
     let reads = std::mem::take(&mut *counted.reads.lock().unwrap());
@@ -1359,6 +1360,7 @@ fn a_volume_whose_bytes_are_not_all_in_decodes_one_by_one() {
             threads: 4,
             pool: Some(Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>),
             lender: None,
+            ..Default::default()
         },
     );
     assert_eq!(said(&emits), on_threads(six_files(0), 1).said);
@@ -1635,6 +1637,7 @@ fn arriving_on(
                     threads,
                     pool: Some(pool),
                     lender: None,
+                    ..Default::default()
                 },
             );
             emits
@@ -1799,6 +1802,7 @@ fn a_run_stopped_while_files_decode_beside_it_joins_them_and_the_next_says_all()
                     threads: 4,
                     pool: Some(Arc::clone(&held) as Arc<dyn weaver_graph::Pool>),
                     lender: None,
+                    ..Default::default()
                 },
             );
             held.returned()
@@ -1888,6 +1892,7 @@ fn arrived(
             threads,
             pool: Some(lent as Arc<dyn weaver_graph::Pool>),
             lender: None,
+            ..Default::default()
         },
     );
     (said(&emits), checksums(&emits))

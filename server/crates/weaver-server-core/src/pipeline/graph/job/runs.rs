@@ -186,13 +186,17 @@ impl GraphJob {
             _ if !self.runs.current(node, said.generation) => return Ok(()),
             // A run widened is ending, to start again at the wider window.
             Heard::Emit(_) if self.runs.rerunning(node) => return Ok(()),
-            // A window over the ceiling that the grant's policy lets the run
-            // have: what it built is retracted, and it starts again once it
-            // ends, its window placed above the ceiling.
-            Heard::Emit(Emit::Refuse(Why::TooLarge {
-                needed: Some(needed),
-                ..
-            })) if self.runs.widen(node, needed) => {
+            // A wider window than the run had, which the grant lets it have:
+            // what it built is retracted, and it starts again once it ends,
+            // its window reserved whole. A decoder that cannot say what it
+            // needs is given the widest its format has.
+            Heard::Emit(Emit::Refuse(Why::TooLarge { needed, .. }))
+                if self.runs.widen(
+                    node,
+                    needed,
+                    self.tree.engine(node).and_then(Engine::widest),
+                ) =>
+            {
                 self.retract_run(node)?;
                 return Ok(());
             }

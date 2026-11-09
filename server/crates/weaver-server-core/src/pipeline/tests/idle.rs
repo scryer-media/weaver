@@ -60,6 +60,7 @@ async fn idle_pipeline(
             total_bytes: 8 * 1024 * 1024 * 1024,
             available_bytes: 8 * 1024 * 1024 * 1024,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Ssd,
