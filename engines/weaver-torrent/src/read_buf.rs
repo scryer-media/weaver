@@ -21,6 +21,12 @@ use tokio::io::AsyncReadExt;
 // grows it.
 const BUFLEN: usize = 0x8000; // 32kb
 
+// The most a buffer grows to for a peer that keeps the socket full, so one
+// read takes many blocks (libtorrent grows its receive buffer to what the
+// socket holds, up to `max_peer_recv_buffer_size`, 2 MiB by default). As
+// long as the peer writer's batch.
+const GROWN_MAX: usize = 0x8_0000; // 512 KiB
+
 /// A ringbuffer for reading bittorrent messages from socket.
 /// Messages may thus span 2 slices (notably, Piece message and UtMetadata messages), which is reflected in their contents.
 ///
@@ -33,6 +39,9 @@ pub struct ReadBuf {
     len: usize,
     // Bytes of the messages read so far, frames whole.
     consumed: u64,
+    // The size the reads so far ask the buffer to be, from BUFLEN to
+    // GROWN_MAX; it takes it between messages, once what it holds fits.
+    wanted: usize,
 }
 
 /// How much a read may take off the socket: as much as the connection holds
@@ -80,6 +89,7 @@ impl ReadBuf {
             start: 0,
             len: 0,
             consumed: 0,
+            wanted: BUFLEN,
         }
     }
 
@@ -220,9 +230,10 @@ impl ReadBuf {
         num_pieces: Option<u32>,
         quota: &mut impl ReadQuota,
     ) -> Result<Message<'_>> {
-        // The frame that grew the buffer was read.
-        if self.buf.len() > BUFLEN && self.len <= BUFLEN {
-            self.relocate(BUFLEN);
+        // The buffer takes the size the reads asked for, and a frame that
+        // grew it past that was read.
+        if self.buf.len() != self.wanted && self.len <= self.wanted {
+            self.relocate(self.wanted);
         }
         loop {
             let err = {
@@ -270,6 +281,15 @@ impl ReadBuf {
                         if size == 0 {
                             return Err(Error::PeerDisconnected);
                         }
+                        // A read that filled all the room, more than the
+                        // frame needed, may have left more in the socket:
+                        // the buffer doubles. One that took a quarter of it
+                        // or less halves it.
+                        if size == room && size > need_additional_bytes {
+                            self.wanted = (self.buf.len() * 2).min(GROWN_MAX);
+                        } else if size <= self.buf.len() / 4 {
+                            self.wanted = (self.buf.len() / 2).max(BUFLEN);
+                        }
                         self.len += size;
                         need_additional_bytes = need_additional_bytes.saturating_sub(size)
                     }
@@ -304,7 +324,7 @@ mod tests {
         vectored_traits::AsyncReadVectoredIntoCompat,
     };
 
-    use super::{BUFLEN, ReadBuf, ReadQuota, Unlimited};
+    use super::{BUFLEN, GROWN_MAX, ReadBuf, ReadQuota, Unlimited};
 
     #[test]
     fn test_ringbuf_ranges() {
@@ -672,5 +692,59 @@ mod tests {
             );
             assert_eq!(rb.buf.len(), BUFLEN);
         }
+    }
+
+    // A peer that keeps the socket full grows the buffer, a read at a time,
+    // to GROWN_MAX, and every message still comes out whole and in order.
+    #[tokio::test(start_paused = true)]
+    async fn a_full_socket_grows_the_buffer() {
+        let count = 100_000u32;
+        let mut wire = vec![0u8; 9 * count as usize];
+        for (i, frame) in wire.chunks_mut(9).enumerate() {
+            Message::Have(u32::try_from(i).unwrap())
+                .serialize(frame, &Default::default)
+                .unwrap();
+        }
+        let mut reader = reader_of(&wire).await;
+        let mut rb = ReadBuf::new();
+        let mut largest = 0;
+        for i in 0..count {
+            match rb
+                .read_message(&mut reader, Duration::from_secs(10), None, &mut Unlimited)
+                .await
+            {
+                Ok(Message::Have(n)) => assert_eq!(n, i),
+                other => panic!("{other:?}"),
+            }
+            largest = largest.max(rb.buf.len());
+        }
+        assert_eq!(largest, GROWN_MAX);
+    }
+
+    // Reads that each take a quarter of the buffer or less halve it, back
+    // to BUFLEN.
+    #[tokio::test(start_paused = true)]
+    async fn short_reads_shrink_the_buffer() {
+        let mut wire = vec![0u8; 9 * 8];
+        for (i, frame) in wire.chunks_mut(9).enumerate() {
+            Message::Have(u32::try_from(i).unwrap())
+                .serialize(frame, &Default::default)
+                .unwrap();
+        }
+        let mut reader = reader_of(&wire).await;
+        let mut rb = ReadBuf::new();
+        rb.relocate(GROWN_MAX);
+        rb.wanted = GROWN_MAX;
+        let mut quota = Drip { each: 9, reads: 0 };
+        for i in 0..8 {
+            match rb
+                .read_message(&mut reader, Duration::from_secs(10), None, &mut quota)
+                .await
+            {
+                Ok(Message::Have(n)) => assert_eq!(n, i),
+                other => panic!("{other:?}"),
+            }
+        }
+        assert_eq!(rb.buf.len(), BUFLEN);
     }
 }
