@@ -2763,12 +2763,13 @@ fn a_set_binding_a_member_by_content_logs_recovery_bound() {
     );
 }
 
-// The deadline runs from the first member an object produced, never from
-// when the job's budget was built: a job that sat queued past it extracts
-// its first bytes, and the posts' own writes are never under it. Once the
-// extraction itself overruns, its next write is refused.
+// The deadline counts the time a decoder executes, never the wall clock: a
+// job that sat queued past it extracts its first bytes, and a stored
+// member whose bytes come straight from the posts writes on however long
+// they take to come. Once a decoder has executed past it, the next write
+// of what objects produced is refused, worded as the deadline.
 #[tokio::test(start_paused = true)]
-async fn the_deadline_runs_from_the_first_produced_member_not_from_admission() {
+async fn the_deadline_counts_only_the_time_a_decoder_executes() {
     use crate::pipeline::extraction::{ExtractionLimits, ExtractionRejectionReason};
     use crate::post_processing::model::PostProcessingSettings;
 
@@ -2809,27 +2810,55 @@ async fn the_deadline_runs_from_the_first_produced_member_not_from_admission() {
     assert!(job.writer.refusal().is_none());
     assert_eq!(job.file("inner.bin")[..5], *b"hello");
 
+    // The stored member's bytes keep coming, past the deadline twice over.
     tokio::time::advance(past).await;
-    let arrival = Arrival {
+    let arrival = |offset: u64, bytes: &'static [u8]| Arrival {
         node: NodeId::ROOT,
         member: store,
-        offset: front.len() as u64,
-        bytes: Bytes::from_static(b"world").into(),
+        offset,
+        bytes: Bytes::from_static(bytes).into(),
         provenance: Provenance::Fresh,
     };
     let mut build = job.build();
-    let refused = job
-        .writer
-        .deliver(&mut job.tree, &mut build, &Source, arrival, &mut job.out);
+    let written = job.writer.deliver(
+        &mut job.tree,
+        &mut build,
+        &Source,
+        arrival(front.len() as u64, b"wor"),
+        &mut job.out,
+    );
+    assert!(written.is_ok());
+    assert!(job.writer.refusal().is_none());
+
+    // A decoder that waits is not decoding; one that executes past the
+    // deadline is.
+    let decoding = job.writer.decode_clock().decoding();
+    {
+        let _waiting = decoding.wait();
+        tokio::time::advance(past).await;
+    }
+    tokio::time::advance(past).await;
+    drop(decoding);
+    let mut build = job.build();
+    let refused = job.writer.deliver(
+        &mut job.tree,
+        &mut build,
+        &Source,
+        arrival(front.len() as u64 + 3, b"ld"),
+        &mut job.out,
+    );
     assert!(refused.is_err());
+    let refusal = job.writer.refusal().expect("refused");
+    assert_eq!(refusal.reason(), ExtractionRejectionReason::Deadline);
     assert_eq!(
-        job.writer.refusal().map(ExtractionFailure::reason),
-        Some(ExtractionRejectionReason::Deadline)
+        refusal.job_failure_reason(),
+        format!("WEAVER_EXTRACTION_REJECTED[deadline]: extraction exceeded the {DEADLINE} second deadline")
     );
 }
 
-// Time the job spends paused is not extraction: a job paused past the
-// deadline after its first produced member writes on once it resumes.
+// Time the job spends paused is not extraction: a decoder that executes
+// past the deadline while the job is paused leaves it writing on once it
+// resumes.
 #[tokio::test(start_paused = true)]
 async fn the_deadline_does_not_run_while_the_job_is_paused() {
     use crate::pipeline::extraction::ExtractionLimits;
@@ -2864,9 +2893,11 @@ async fn the_deadline_does_not_run_while_the_job_is_paused() {
     job.send(store, 0, &front, Provenance::Fresh);
     assert!(job.writer.refusal().is_none());
 
+    let decoding = job.writer.decode_clock().decoding();
     job.writer.hold_clock(true);
     tokio::time::advance(std::time::Duration::from_secs(DEADLINE + 1)).await;
     job.writer.hold_clock(false);
+    drop(decoding);
     let arrival = Arrival {
         node: NodeId::ROOT,
         member: store,

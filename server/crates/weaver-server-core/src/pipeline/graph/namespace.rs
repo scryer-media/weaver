@@ -373,6 +373,10 @@ impl NamespaceWriter {
         self.caps.hold_clock(paused);
     }
 
+    pub(crate) fn decode_clock(&self) -> super::decoding::DecodeClock {
+        self.caps.decode_clock()
+    }
+
     #[cfg(test)]
     pub(crate) fn clock_held(&self) -> bool {
         self.caps.clock_held()

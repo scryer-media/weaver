@@ -110,13 +110,17 @@ impl GraphJob {
             writer.restore_kept(kept)?;
         }
         writer.restore_holds(&tree, &snapshot.holds)?;
+        // The deadline counts the time the runs and the loans decode. What
+        // a run before spent is not in the checkpoint: it counts again.
+        let runs = runs.timed(writer.decode_clock());
         let mut job = Self {
             tree,
             root,
             builder: Box::new(runs.hardware()),
             writer,
             loans: Loans::new(runs.scope(), runs.mail(), runs.hardware()),
-            works: super::works::Works::new(runs.scope(), runs.mail(), runs.hardware()),
+            works: super::works::Works::new(runs.scope(), runs.mail(), runs.hardware())
+                .timed(runs.clock()),
             runs,
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.root.reported,

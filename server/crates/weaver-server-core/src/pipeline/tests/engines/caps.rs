@@ -6,8 +6,9 @@
 // word, at the extraction stage; a name the operator's policy refuses fails
 // it with the policy's sentence. The depth limit is no breach: the tree
 // never builds an object past it, the member is delivered as the container
-// it is, and the job goes on. The deadline has no row: it is a wall clock,
-// and no row here races one.
+// it is, and the job goes on. The deadline has no row: it counts the time
+// decoders execute, which a row here cannot hold still, so it is pinned
+// beside the clock and the namespace instead.
 
 use super::harness::{ARTICLE, Post, Scenario, assert_fetched_once, payload, run};
 use super::restart::run_restarting;

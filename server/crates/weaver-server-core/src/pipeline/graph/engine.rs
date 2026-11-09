@@ -34,6 +34,7 @@ use weaver_graph::slots::{Admissions, Asked, AskerId, Slots, Ticket};
 use weaver_graph::{Emit, Extraction, Marks, NodeId, Why};
 
 use self::volumes::RunVolumes;
+use super::decoding::DecodeClock;
 use super::envelope::Shelf;
 use super::hardware::Hardware;
 use super::namespace::Returned;
@@ -236,6 +237,8 @@ pub(crate) struct Runs {
     marks: Marks<NodeId>,
     // What a run is granted as it starts, and the job's repairs too.
     hardware: Hardware,
+    // Where the runs keep the time their decoders spend executing.
+    clock: DecodeClock,
 }
 
 impl Runs {
@@ -253,6 +256,7 @@ impl Runs {
             runs: BTreeMap::new(),
             marks: Marks::default(),
             hardware: Hardware::default(),
+            clock: DecodeClock::default(),
         }
     }
 
@@ -260,6 +264,16 @@ impl Runs {
     pub(crate) fn on(mut self, hardware: Hardware) -> Self {
         self.hardware = hardware;
         self
+    }
+
+    // The runs, keeping the time they decode on `clock`.
+    pub(crate) fn timed(mut self, clock: DecodeClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub(crate) fn clock(&self) -> DecodeClock {
+        self.clock.clone()
     }
 
     pub(crate) fn hardware(&self) -> Hardware {
@@ -427,7 +441,7 @@ impl Runs {
         let volumes = Arc::new(RunVolumes::new(shelf, generation));
         run.volumes = Some(Arc::clone(&volumes));
         let budget = self.hardware.grant().run;
-        let (scope, mail) = (self.scope, self.mail.clone());
+        let (scope, mail, clock) = (self.scope, self.mail.clone(), self.clock.clone());
         let said = move |heard| Said {
             scope,
             node,
@@ -445,11 +459,16 @@ impl Runs {
                 mail: mail.clone(),
                 said: Some(said(Heard::Ended)),
             };
+            // The decoder executes from here until it returns, but while it
+            // waits on its volumes or on the job to hear it.
+            let decoding = Arc::new(clock.decoding());
+            volumes.decoding(Arc::downgrade(&decoding));
             let reader = Arc::clone(&volumes);
             let mut sink = |emit: Emit| {
                 if matches!(emit, Emit::Member { .. }) {
                     crate::e2e_failpoint::fire(crate::e2e_failpoint::EXTRACT_MEMBER_START);
                 }
+                let _waiting = decoding.wait();
                 extracting_hook(&volumes);
                 volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok()
             };
@@ -461,6 +480,7 @@ impl Runs {
             if volumes.lost() {
                 sink(Emit::Refuse(Why::Unrepairable));
             }
+            drop(decoding);
             extracting_hook(&volumes);
         });
     }

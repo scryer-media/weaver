@@ -218,13 +218,15 @@ impl GraphJob {
                 warn!(member = member.0, error = %error, "graph member announcement failed");
             }
         }
+        // The deadline counts the time the runs and the loans decode.
+        let runs = runs.timed(writer.decode_clock());
         Self {
             tree,
             root,
             builder,
             writer,
             loans: Loans::new(runs.scope(), runs.mail(), runs.hardware()),
-            works: Works::new(runs.scope(), runs.mail(), runs.hardware()),
+            works: Works::new(runs.scope(), runs.mail(), runs.hardware()).timed(runs.clock()),
             runs,
             passwords: Passwords::default(),
             reported: None,
@@ -310,7 +312,10 @@ impl GraphJob {
         limit: usize,
     ) -> Result<(), GraphError> {
         let mut said = Vec::new();
-        object.work(&mut said);
+        {
+            let _decoding = self.works.decoding();
+            object.work(&mut said);
+        }
         let said = super::engine::Said {
             scope: self.works.scope(),
             node,

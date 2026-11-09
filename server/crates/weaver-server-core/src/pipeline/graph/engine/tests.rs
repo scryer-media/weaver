@@ -533,6 +533,90 @@ async fn a_run_that_panics_still_says_it_ended() {
     assert_eq!(runs.ended(first, said.generation, 1), vec![second]);
 }
 
+// A run that waits for its first byte, then decodes until it is told to
+// stop: it says it is decoding as it begins.
+struct Decodes {
+    decoding: std::sync::mpsc::Sender<()>,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+impl Extraction for Decodes {
+    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, _: &mut Sink<'_>, _: weaver_graph::Budget) {
+        let mut byte = [0; 1];
+        volumes.read_at(FIRST, 0, &mut byte).unwrap();
+        self.decoding.send(()).unwrap();
+        let _ = self.done.recv();
+    }
+}
+
+// Until no decoder executes, having executed `after` times. A decoder's
+// thread does not need the test's runtime to get there.
+fn idle_after(clock: &crate::pipeline::graph::decoding::DecodeClock, after: u64) {
+    while !clock.idle_after(after) {
+        std::thread::yield_now();
+    }
+}
+
+// The deadline counts a decoder executing, and nothing a run waits for:
+// not a slot, not its admission before it starts, not its bytes, and not
+// the time after it returned.
+#[tokio::test(start_paused = true)]
+async fn a_run_spends_only_the_time_its_decoder_executes() {
+    use crate::pipeline::graph::decoding::DecodeClock;
+    use std::time::Duration;
+
+    const PAST: Duration = Duration::from_secs(100);
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let mut mail = RunMail::default();
+    let clock = DecodeClock::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), unbounded()).timed(clock.clone());
+    let (first, second) = (NodeId(1), NodeId(2));
+    assert_eq!(runs.ask(first, 1), vec![first]);
+    assert!(runs.ask(second, 1).is_empty(), "the second waits for a slot");
+    tokio::time::advance(PAST).await;
+    assert_eq!(clock.spent(), Duration::ZERO, "admitted, queued, not started");
+
+    let (decoding, decoded) = std::sync::mpsc::channel();
+    let (finish, done) = std::sync::mpsc::channel();
+    runs.start(first, Box::new(Decodes { decoding, done }), envelopes.shelf(first));
+    idle_after(&clock, 1);
+    tokio::time::advance(PAST).await;
+    assert_eq!(clock.spent(), Duration::ZERO, "waiting for its first byte");
+
+    envelopes
+        .keep(first, 0, 0, b"x", Provenance::Fresh)
+        .unwrap();
+    decoded.recv().unwrap();
+    tokio::time::advance(Duration::from_secs(61)).await;
+    assert_eq!(clock.spent(), Duration::from_secs(61), "decoding");
+    finish.send(()).unwrap();
+    let said = mail.recv().await.unwrap();
+    assert!(matches!(said.heard, Heard::Ended));
+    idle_after(&clock, 2);
+    tokio::time::advance(PAST).await;
+    assert_eq!(clock.spent(), Duration::from_secs(61), "returned");
+}
+
+// A run turned away for memory spends nothing while it waits for it.
+#[tokio::test(start_paused = true)]
+async fn a_run_starved_of_memory_spends_nothing() {
+    use crate::pipeline::graph::decoding::DecodeClock;
+    use std::time::Duration;
+
+    const WINDOW: u64 = 1 << 20;
+    let clock = DecodeClock::default();
+    let mut runs = Runs::new(1, 2, RunMail::default().sender(), bounded(WINDOW + RUN_OVERHEAD))
+        .timed(clock.clone());
+    let (first, second) = (NodeId(1), NodeId(2));
+    assert_eq!(runs.ask(first, 2), vec![first]);
+    assert_eq!(runs.reserve(first, WINDOW), Reservation::Granted);
+    assert_eq!(runs.ask(second, 2), vec![second]);
+    assert_eq!(runs.reserve(second, WINDOW), Reservation::Starved(Vec::new()));
+    tokio::time::advance(Duration::from_secs(100)).await;
+    assert_eq!(clock.spent(), Duration::ZERO);
+}
+
 // A run stopped as the job goes down keeps the generation it ran under, so
 // no run starts on its node under that generation again: what its thread
 // says once stopped, its end included, is not heard as any run's. It gives
