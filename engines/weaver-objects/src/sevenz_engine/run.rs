@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use sevenz_turbo::{ArchiveEntry, ArchiveReader, EntryRead, Error, Password, ReadAt};
-use weaver_graph::{Budget, Emit, Extraction, MemberId, Provenance, Sink, Volumes};
+use weaver_graph::{Budget, Emit, Extraction, MemberId, Provenance, Sink, Volumes, Why};
 
 use crate::engine::Joined;
 use crate::verdict;
@@ -45,12 +45,22 @@ impl Extraction for Run {
             stopped: false,
         };
         // The decoder holds no more than the run was granted, and decodes on
-        // as many threads.
+        // as many threads, or fewer where what they would borrow at once is
+        // more than the run's lender has room for.
         let limits = crate::sevenz_store::limits(&budget);
-        let threads = u32::try_from(budget.threads()).unwrap_or(u32::MAX);
+        let most = u32::try_from(budget.threads()).unwrap_or(u32::MAX);
+        let mut in_ram = None;
         let walked = ArchiveReader::from_read_at(input, password, limits).and_then(|mut reader| {
             reader.set_verify_checksums(true);
-            reader.set_threads(threads);
+            if budget.lender.is_some() {
+                let limits = reader.limits();
+                let archive = reader.archive();
+                let threads = crate::lent::sevenz_threads(archive, &limits, &budget, most);
+                in_ram = crate::lent::sevenz_in_ram(archive, &limits);
+                reader.set_threads(threads);
+            } else {
+                reader.set_threads(most);
+            }
             reader.for_each_entries_direct(|entry, read| walk.entry(entry, read))
         });
         let Err(error) = walked else {
@@ -66,7 +76,20 @@ impl Extraction for Run {
         {
             return;
         }
-        (walk.sink)(verdict::sevenz(&error));
+        // A window the scratch had no room for asks for the decode in RAM:
+        // all of what it holds there on one thread, so one start in RAM is
+        // enough, not just the window refused.
+        let said = match verdict::sevenz(&error) {
+            Emit::Refuse(Why::TooLarge {
+                needed: Some(needed),
+                allowed: None,
+            }) => Emit::Refuse(Why::TooLarge {
+                needed: Some(needed.max(in_ram.unwrap_or(0))),
+                allowed: None,
+            }),
+            said => said,
+        };
+        (walk.sink)(said);
     }
 }
 

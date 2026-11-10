@@ -262,6 +262,14 @@ pub trait Engine {
         false
     }
 
+    // Whether a run's decoder holds in RAM whatever `Budget::memory_bytes`
+    // grants, whatever its object declared: its library sizes its buffers,
+    // and its threads, to the memory it is handed. The owner then reserves
+    // that memory for the run and hands it no more than it reserved.
+    fn holds_memory(&self) -> bool {
+        false
+    }
+
     // The widest window the format's decoder can be given, for a decoder
     // whose refusal does not say what it needs: a run refused so may start
     // again at this. `None` where every refusal says, or nothing is wider.

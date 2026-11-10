@@ -20,10 +20,14 @@ pub(crate) struct TestLender {
     asked: Mutex<Vec<usize>>,
     live: Arc<AtomicUsize>,
     peak: AtomicUsize,
+    // The bytes lent and not yet dropped.
+    lent: Arc<Mutex<u64>>,
     refuse: Option<io::ErrorKind>,
     // How many asks are lent before the refusals begin.
     lends_first: usize,
     ceiling: Option<u64>,
+    // The room it says it has, all its windows together.
+    room: Option<u64>,
 }
 
 impl TestLender {
@@ -53,6 +57,15 @@ impl TestLender {
     pub(crate) fn up_to(ceiling: u64) -> Arc<Self> {
         Arc::new(Self {
             ceiling: Some(ceiling),
+            ..Self::default()
+        })
+    }
+
+    // A lender that says it has room for `room` bytes, all its windows
+    // together, and refuses, for want of room, any window past that.
+    pub(crate) fn with_room(room: u64) -> Arc<Self> {
+        Arc::new(Self {
+            room: Some(room),
             ..Self::default()
         })
     }
@@ -92,27 +105,46 @@ impl WindowLender for TestLender {
             return Err(io::Error::new(kind, "test lender refuses"));
         }
         drop(asked);
+        if let Some(room) = self.room {
+            let mut lent = self.lent.lock().unwrap_or_else(PoisonError::into_inner);
+            if *lent + len as u64 > room {
+                return Err(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    "test lender has no room",
+                ));
+            }
+            *lent += len as u64;
+        }
         let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
         self.peak.fetch_max(live, Ordering::SeqCst);
         Ok(Box::new(Garbage {
             bytes: vec![GARBAGE; len].into_boxed_slice(),
             live: Arc::clone(&self.live),
+            lent: Arc::clone(&self.lent),
         }))
     }
 
     fn ceiling(&self) -> u64 {
         self.ceiling.unwrap_or(64 << 30)
     }
+
+    fn room(&self) -> Option<u64> {
+        let lent = *self.lent.lock().unwrap_or_else(PoisonError::into_inner);
+        self.room.map(|room| room.saturating_sub(lent))
+    }
 }
 
 struct Garbage {
     bytes: Box<[u8]>,
     live: Arc<AtomicUsize>,
+    lent: Arc<Mutex<u64>>,
 }
 
 impl Drop for Garbage {
     fn drop(&mut self) {
         self.live.fetch_sub(1, Ordering::SeqCst);
+        let mut lent = self.lent.lock().unwrap_or_else(PoisonError::into_inner);
+        *lent = lent.saturating_sub(self.bytes.len() as u64);
     }
 }
 

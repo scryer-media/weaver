@@ -617,7 +617,8 @@ impl Cursor {
 // in, so a worker on the lent pool never waits on a download, which a later
 // header shows runs on no further, whose length is known, and which fits in
 // the memory the budget grants beside what is held. It holds its bytes,
-// decoded whole before it is said, and its decoder's window.
+// decoded whole before it is said, its decoder's window, and the PPMd arena
+// its decoder may keep in RAM.
 fn may_start(
     archive: &RarArchive,
     input: &Input,
@@ -636,11 +637,26 @@ fn may_start(
     let whole = after.volumes.first_volume >= *span.end();
     let settled = span.clone().all(|volume| input.settled(volume));
     let length = info.unpacked_size.filter(|_| plain && whole && settled)?;
-    let total = held.checked_add(length)?.checked_add(window(&info))?;
+    let total = held
+        .checked_add(length)?
+        .checked_add(window(&info))?
+        .checked_add(arena(&info, budget))?;
     budget
         .memory_bytes
         .is_none_or(|memory| total <= memory)
         .then_some(total)
+}
+
+// What member `at` of `archive`, over `volumes`, holds once it decodes beside
+// nothing, if it may.
+#[cfg(test)]
+pub(super) fn may_start_alone(
+    archive: &RarArchive,
+    volumes: &Arc<dyn Volumes>,
+    budget: &Budget,
+    at: usize,
+) -> Option<u64> {
+    may_start(archive, &Input::beside(volumes), budget, at, 0, false)
 }
 
 // The window a member's decoder holds: as large as the dictionary its
@@ -650,6 +666,25 @@ fn window(info: &unrar_rs::MemberInfo) -> u64 {
         CompressionMethod::Store => 0,
         _ => info.compression.dict_size,
     }
+}
+
+// The PPMd arena a member's decoder may hold in RAM beside its window. Only
+// RAR 2.9 compression (unpack version 29) has PPMd blocks, and a member's
+// header does not say whether it uses one, nor how large: its blocks do. So
+// such a member counts the largest arena the run keeps in RAM; one over
+// that is borrowed (`crate::lent::rar`), or refused.
+fn arena(info: &unrar_rs::MemberInfo, budget: &Budget) -> u64 {
+    let compression = &info.compression;
+    if compression.format != ArchiveFormat::Rar4
+        || compression.version != 29
+        || compression.method == CompressionMethod::Store
+    {
+        return 0;
+    }
+    let limits = limits(budget);
+    limits
+        .max_ppmd_arena_size
+        .min(limits.max_heap_ppmd_arena_size)
 }
 
 // Read on every header of the volumes from the cursor on whose bytes are

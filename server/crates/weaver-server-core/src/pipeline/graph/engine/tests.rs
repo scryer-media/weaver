@@ -14,7 +14,7 @@ use weaver_graph::{
 
 use super::echo::{Echoes, HEADER, SIGNATURE};
 use super::volumes::RunVolumes;
-use super::{DecodePool, Heard, RUN_OVERHEAD, Reservation, RunMail, Runs};
+use super::{DecodePool, Decoder, Heard, RUN_OVERHEAD, Reservation, RunMail, Runs};
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::envelope::{Envelopes, Shelf, envelope_name};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
@@ -1767,10 +1767,12 @@ fn an_inner_run_reserved_first_never_holds_back_the_outer_run_it_waits_on() {
 
 // Scratch for a job's runs, under `dir`, on a disk whose free space is
 // not known: nothing but the platform refuses a window.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn scratch(dir: &Path) -> Arc<crate::pipeline::graph::window::Windows> {
     Arc::new(crate::pipeline::graph::window::Windows::new(
         dir.to_path_buf(),
         CapacityReader::unknown(),
+        Default::default(),
         holds(u64::MAX),
         64 << 20,
     ))
@@ -1778,6 +1780,15 @@ fn scratch(dir: &Path) -> Arc<crate::pipeline::graph::window::Windows> {
 
 // Scratch on a disk with room for `room` bytes over a one-byte reserve.
 fn scratch_with_room(dir: &Path, room: u64) -> Arc<crate::pipeline::graph::window::Windows> {
+    scratch_up_to(dir, room, 64 << 20)
+}
+
+// As `scratch_with_room`, lending windows up to `ceiling`.
+fn scratch_up_to(
+    dir: &Path,
+    room: u64,
+    ceiling: u64,
+) -> Arc<crate::pipeline::graph::window::Windows> {
     use crate::operations::{Capacity, CapacityReading};
     let sampled_at = std::time::Instant::now();
     let free = CapacityReader::from_fn(move || {
@@ -1797,10 +1808,23 @@ fn scratch_with_room(dir: &Path, room: u64) -> Arc<crate::pipeline::graph::windo
     Arc::new(crate::pipeline::graph::window::Windows::new(
         dir.to_path_buf(),
         free,
+        Default::default(),
         accountant,
-        64 << 20,
+        ceiling,
     ))
 }
+
+// A decoder that borrows windows over its grant.
+const LENDS: Decoder = Decoder {
+    lends: true,
+    holds_memory: false,
+};
+
+// A decoder that borrows, and holds whatever memory it is granted: 7z's.
+const HOLDS: Decoder = Decoder {
+    lends: true,
+    holds_memory: true,
+};
 
 // A run whose decoder borrows reserves what a run inside its grant
 // reserves, whatever window its object declares, for every window over its
@@ -1808,6 +1832,7 @@ fn scratch_with_room(dir: &Path, room: u64) -> Arc<crate::pipeline::graph::windo
 // no folder is made, and nothing is held above the ceiling. A grant whose
 // memory is wider than its window reserves to its ceiling, as a run inside
 // it does.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_lending_run_over_its_ceiling_reserves_its_grant_and_is_lent_nothing_before_it_asks() {
     let wider = crate::pipeline::graph::hardware::Hardware::granting(
@@ -1834,7 +1859,10 @@ fn a_lending_run_over_its_ceiling_reserves_its_grant_and_is_lent_nothing_before_
                 .lending(Arc::clone(&windows));
             let node = NodeId(1);
             assert_eq!(runs.ask(node, 1), vec![node]);
-            assert_eq!(runs.reserve_for(node, declared, true), Reservation::Granted);
+            assert_eq!(
+                runs.reserve_for(node, declared, LENDS),
+                Reservation::Granted
+            );
             let in_grant = declared.min(ceiling) + RUN_OVERHEAD;
             assert_eq!(runs.reserved(node), in_grant, "{declared}");
             assert_eq!(pool.room().reserved, in_grant);
@@ -1852,6 +1880,7 @@ fn a_lending_run_over_its_ceiling_reserves_its_grant_and_is_lent_nothing_before_
 // it was lent.
 #[derive(Debug, PartialEq, Eq)]
 struct Found {
+    memory_bytes: Option<u64>,
     window_bytes: Option<u64>,
     window_reserved: bool,
     lent: Option<Vec<Result<usize, std::io::ErrorKind>>>,
@@ -1899,6 +1928,7 @@ impl Extraction for Asks {
                 .collect()
         });
         let found = Found {
+            memory_bytes: budget.memory_bytes,
             window_bytes: budget.window_bytes,
             window_reserved: budget.window_reserved,
             lent,
@@ -1930,7 +1960,7 @@ async fn a_lending_run_holds_every_window_it_asks_for_and_gives_each_back() {
             .lending(Arc::clone(&windows));
         let node = NodeId(1);
         assert_eq!(runs.ask(node, 1), vec![node]);
-        assert_eq!(runs.reserve_for(node, WIDE, true), Reservation::Granted);
+        assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
         let (seen, saw) = std::sync::mpsc::channel();
         let mut decoder = Asks::new(&asks, &windows, &seen);
         decoder.panics = exit == "panics";
@@ -1952,7 +1982,7 @@ async fn a_lending_run_holds_every_window_it_asks_for_and_gives_each_back() {
             // scratch's: the run starts again wider, still lent.
             assert!(runs.widen(node, Some(2 * CEILING), None));
             runs.ended(node, said.generation, 1);
-            assert_eq!(runs.reserve_for(node, WIDE, true), Reservation::Granted);
+            assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
             assert_eq!(runs.reserved(node), 2 * CEILING + RUN_OVERHEAD);
             runs.start(
                 node,
@@ -1998,7 +2028,7 @@ async fn a_run_the_scratch_refuses_during_decode_starts_again_in_ram() {
             .lending(Arc::clone(&windows));
         let node = NodeId(1);
         assert_eq!(runs.ask(node, 1), vec![node]);
-        assert_eq!(runs.reserve_for(node, WIDE, true), Reservation::Granted);
+        assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
         assert_eq!(runs.reserved(node), CEILING + RUN_OVERHEAD);
         let (seen, saw) = std::sync::mpsc::channel();
         runs.start(
@@ -2023,7 +2053,7 @@ async fn a_run_the_scratch_refuses_during_decode_starts_again_in_ram() {
         assert_eq!(windows.live(), (0, 0));
         assert_eq!(pool.room().reserved, 0);
 
-        assert_eq!(runs.reserve_for(node, WIDE, true), Reservation::Granted);
+        assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
         assert_eq!(runs.reserved(node), wide + RUN_OVERHEAD, "{needed:?}");
         assert_eq!(pool.room().above, wide + RUN_OVERHEAD);
         runs.start(
@@ -2050,6 +2080,7 @@ async fn a_run_the_scratch_refuses_during_decode_starts_again_in_ram() {
 // Where the scratch refuses the first window a run asks for, as it does on
 // a full disk and wherever no window can be mapped, the run starts again
 // once in RAM above the ceiling, reserved whole, and no file is made.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn a_run_the_scratch_has_no_room_for_starts_again_in_ram_above_the_ceiling() {
     let dir = tempfile::tempdir().unwrap();
@@ -2062,7 +2093,7 @@ async fn a_run_the_scratch_has_no_room_for_starts_again_in_ram_above_the_ceiling
         .lending(Arc::clone(&windows));
     let node = NodeId(1);
     assert_eq!(runs.ask(node, 1), vec![node]);
-    assert_eq!(runs.reserve_for(node, WIDE, true), Reservation::Granted);
+    assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
     assert_eq!(runs.reserved(node), CEILING + RUN_OVERHEAD);
     let (seen, saw) = std::sync::mpsc::channel();
     runs.start(
@@ -2078,7 +2109,7 @@ async fn a_run_the_scratch_has_no_room_for_starts_again_in_ram_above_the_ceiling
     assert!(runs.widen(node, Some(WIDE), None));
     runs.ended(node, said.generation, 1);
 
-    assert_eq!(runs.reserve_for(node, WIDE, true), Reservation::Granted);
+    assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
     assert_eq!(runs.reserved(node), WIDE + RUN_OVERHEAD);
     assert_eq!(pool.room().above, WIDE + RUN_OVERHEAD);
     runs.start(
@@ -2115,7 +2146,7 @@ async fn a_lending_run_under_the_fail_policy_is_handed_no_lender() {
             .lending(Arc::clone(&windows));
         let node = NodeId(1);
         assert_eq!(runs.ask(node, 1), vec![node]);
-        assert_eq!(runs.reserve_for(node, WIDE, true), Reservation::Granted);
+        assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
         assert_eq!(runs.reserved(node), CEILING + RUN_OVERHEAD);
         assert_eq!(windows.live(), (0, 0));
         let (seen, saw) = std::sync::mpsc::channel();
@@ -2134,4 +2165,269 @@ async fn a_lending_run_under_the_fail_policy_is_handed_no_lender() {
         assert_eq!(windows.live(), (0, 0));
         assert_eq!(pool.room().reserved, 0);
     }
+}
+
+// A machine of 32 cores and 64 GiB, which every stock profile is offered.
+fn stock_machine() -> crate::runtime::system_profile::SystemProfile {
+    use crate::runtime::system_profile::*;
+    const GIB: u64 = 1 << 30;
+    SystemProfile {
+        cpu: CpuProfile {
+            physical_cores: 32,
+            logical_cores: 64,
+            simd: SimdSupport::default(),
+            cgroup_limit: None,
+        },
+        memory: MemoryProfile {
+            total_bytes: 64 * GIB,
+            available_bytes: 32 * GIB,
+            cgroup_limit: None,
+            guessed: false,
+        },
+        disk: DiskProfile {
+            storage_class: StorageClass::Ssd,
+            filesystem: FilesystemType::Ext4,
+            sequential_write_mbps: 2000.0,
+            random_read_iops: 50000.0,
+            same_filesystem: true,
+        },
+    }
+}
+
+// A run whose decoder holds whatever memory it is granted, as 7z's does,
+// reserves that memory on every stock profile, whatever window its object
+// declares, and is handed no more memory than it reserved: lent, and in RAM
+// once the scratch refused it, at the widest window it asked for, when that
+// is more. The efficient profile lifted of its memory limit is the case of
+// 512 MiB of memory and a 256 MiB window: a 300 MiB dictionary stays in the
+// RAM it reserved (the 7z engine's tests hold that), so what its decoder
+// asks the scratch for is over 512 MiB. Nothing is allocated: the pool is
+// bookkeeping, and the scratch refuses before it makes a file.
+#[tokio::test]
+async fn a_run_that_holds_its_memory_reserves_it_and_is_handed_no_more_on_every_profile() {
+    use crate::runtime::hardware_profile::HardwareProfile;
+    const MIB: u64 = 1 << 20;
+    let machine = stock_machine();
+    for (profile, lifted) in HardwareProfile::ALL
+        .into_iter()
+        .map(|profile| (profile, false))
+        .chain([(HardwareProfile::Efficient, true)])
+    {
+        let tuning = profile.tuning(&machine);
+        let memory = tuning.sevenz_decode_memory_bytes;
+        let hardware = crate::pipeline::graph::hardware::Hardware::granting(
+            crate::pipeline::graph::hardware::Grant {
+                run: weaver_graph::Budget {
+                    memory_bytes: Some(memory),
+                    window_bytes: Some(tuning.decode_window_bytes),
+                    threads: 1,
+                    ..weaver_graph::Budget::default()
+                },
+                over_limit: tuning.over_limit,
+                machine_bytes: Some(machine.memory.total_bytes),
+                ..Default::default()
+            },
+        )
+        .lifted(lifted);
+        let name = format!("{profile:?}, lifted {lifted}");
+        let dir = tempfile::tempdir().unwrap();
+        let mut envelopes = Envelopes::new(dir.path().join("envelopes"));
+        let windows = scratch_up_to(
+            dir.path(),
+            0,
+            crate::pipeline::graph::window::WINDOW_CEILING_BYTES,
+        );
+        let pool = bounded(memory.max(tuning.decode_window_bytes) + RUN_OVERHEAD);
+        let mut mail = RunMail::default();
+        let mut runs = Runs::new(1, 1, mail.sender(), Arc::clone(&pool))
+            .on(hardware)
+            .lending(Arc::clone(&windows));
+        let node = NodeId(1);
+        assert_eq!(runs.ask(node, 1), vec![node]);
+        // 7z states no window before its run reads its tail.
+        assert_eq!(runs.reserve_for(node, 0, HOLDS), Reservation::Granted);
+        assert_eq!(runs.reserved(node), memory + RUN_OVERHEAD, "{name}");
+        let (seen, saw) = std::sync::mpsc::channel();
+        let dictionary = 300 * MIB;
+        runs.start(
+            node,
+            Asks::new(&[dictionary.max(memory + MIB)], &windows, &seen),
+            envelopes.shelf(node),
+        );
+        let said = mail.recv().await.unwrap();
+        let found = saw.recv().unwrap();
+        let handed = found.memory_bytes.unwrap();
+        assert!(
+            handed + RUN_OVERHEAD <= runs.reserved(node),
+            "{name}: {found:?}"
+        );
+        assert_eq!(handed, memory, "{name}");
+        let lent = found.lent.is_some();
+        assert_eq!(
+            lent,
+            crate::pipeline::graph::window::MAPS
+                && (lifted || tuning.over_limit == crate::runtime::OverLimit::ScratchThenRam),
+            "{name}"
+        );
+        if !lent {
+            runs.ended(node, said.generation, 1);
+            assert_eq!(pool.room().reserved, 0, "{name}");
+            continue;
+        }
+        // The decoder asks the scratch for the decode in RAM: all it holds
+        // there, a little over its memory.
+        let needed = memory + MIB;
+        assert!(runs.widen(node, Some(needed), None), "{name}");
+        runs.ended(node, said.generation, 1);
+        assert_eq!(runs.reserve_for(node, 0, HOLDS), Reservation::Granted);
+        let reserved = runs.reserved(node);
+        assert!(reserved >= dictionary.max(needed) + RUN_OVERHEAD, "{name}");
+        runs.start(node, Asks::new(&[], &windows, &seen), envelopes.shelf(node));
+        let said = mail.recv().await.unwrap();
+        let found = saw.recv().unwrap();
+        assert_eq!(found.lent, None, "{name}");
+        let handed = found.memory_bytes.unwrap();
+        assert!(handed + RUN_OVERHEAD <= reserved, "{name}: {found:?}");
+        assert!(handed >= needed, "{name}: {found:?}");
+        runs.ended(node, said.generation, 1);
+        assert_eq!(pool.room().reserved, 0, "{name}");
+        assert_eq!(pool.room().above, 0, "{name}");
+    }
+}
+
+// A run the scratch refuses a small window after it lent it a wide one
+// starts again in RAM wide enough for both, so one start in RAM is enough:
+// the reviewer's case of a 1.5 GiB dictionary lent and a 600 MiB worker
+// buffer refused, at a sixth of the size.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_run_the_scratch_refuses_starts_again_in_ram_at_the_widest_window_it_asked_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().join("envelopes"));
+    let (wide, narrow) = (3 * WIDE, WIDE);
+    let windows = scratch_with_room(dir.path(), wide);
+    let pool = profile_pool();
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), Arc::clone(&pool))
+        .on(over_limit(crate::runtime::OverLimit::ScratchThenRam))
+        .lending(Arc::clone(&windows));
+    let node = NodeId(1);
+    assert_eq!(runs.ask(node, 1), vec![node]);
+    assert_eq!(runs.reserve_for(node, 0, LENDS), Reservation::Granted);
+    let (seen, saw) = std::sync::mpsc::channel();
+    runs.start(
+        node,
+        Asks::new(&[wide, narrow], &windows, &seen),
+        envelopes.shelf(node),
+    );
+    let said = mail.recv().await.unwrap();
+    let found = saw.recv().unwrap();
+    assert_eq!(
+        found.lent,
+        Some(vec![
+            Ok(wide as usize),
+            Err(std::io::ErrorKind::StorageFull)
+        ])
+    );
+    // The decoder names the window it was refused.
+    assert!(runs.widen(node, Some(narrow), None));
+    runs.ended(node, said.generation, 1);
+    assert_eq!(runs.reserve_for(node, 0, LENDS), Reservation::Granted);
+    assert_eq!(runs.reserved(node), wide + RUN_OVERHEAD);
+    runs.start(
+        node,
+        Asks::new(&[wide, narrow], &windows, &seen),
+        envelopes.shelf(node),
+    );
+    let said = mail.recv().await.unwrap();
+    let found = saw.recv().unwrap();
+    assert_eq!(found.lent, None);
+    assert_eq!(found.window_bytes, Some(wide));
+    runs.ended(node, said.generation, 1);
+    assert_eq!(windows.live(), (0, 0));
+    assert_eq!(pool.room().above, 0);
+}
+
+// A run stopped by a retraction may still ask its lender after its node
+// started again: what the old lender is refused is not the new run's, so
+// the new run's own refusal is weighed as any run's, not as the scratch's.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_refusal_heard_by_a_lender_handed_for_an_earlier_start_is_not_the_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().join("envelopes"));
+    let windows = scratch_with_room(dir.path(), 0);
+    let pool = profile_pool();
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), Arc::clone(&pool))
+        .on(over_limit(crate::runtime::OverLimit::ScratchThenRam))
+        .lending(Arc::clone(&windows));
+    let node = NodeId(1);
+    // The lender an earlier start of the node was handed, still held.
+    let (old, _) = windows.for_node(node);
+    assert_eq!(runs.ask(node, 1), vec![node]);
+    assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
+    let (seen, saw) = std::sync::mpsc::channel();
+    runs.start(node, Asks::new(&[], &windows, &seen), envelopes.shelf(node));
+    let said = mail.recv().await.unwrap();
+    let found = saw.recv().unwrap();
+    assert!(found.lent.is_some());
+    let Err(error) = old.lend(WIDE as usize) else {
+        panic!("a disk with no room lends nothing");
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+    // The new run's decoder refuses a window over its ceiling, as its own
+    // grant's refusal: started again at it, not in RAM for the scratch.
+    assert!(runs.widen(node, Some(2 * CEILING), None));
+    runs.ended(node, said.generation, 1);
+    assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
+    // At what its decoder named, not at the window the old lender was
+    // refused, and still lent: the scratch did not refuse this run.
+    assert_eq!(runs.reserved(node), 2 * CEILING + RUN_OVERHEAD);
+    runs.start(node, Asks::new(&[], &windows, &seen), envelopes.shelf(node));
+    let said = mail.recv().await.unwrap();
+    let found = saw.recv().unwrap();
+    assert!(found.lent.is_some());
+    runs.ended(node, said.generation, 1);
+}
+
+// Where no window can be mapped a run whose decoder borrows is lent
+// nothing: it is placed in RAM above the ceiling from the start, reserved
+// whole, and starts once.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[tokio::test]
+async fn a_lending_run_where_no_window_can_be_mapped_starts_in_ram_above_the_ceiling() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().join("envelopes"));
+    let windows = scratch_with_room(dir.path(), WIDE);
+    let pool = profile_pool();
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), Arc::clone(&pool))
+        .on(over_limit(crate::runtime::OverLimit::ScratchThenRam))
+        .lending(Arc::clone(&windows));
+    let node = NodeId(1);
+    assert_eq!(runs.ask(node, 1), vec![node]);
+    assert_eq!(runs.reserve_for(node, WIDE, LENDS), Reservation::Granted);
+    assert_eq!(runs.reserved(node), WIDE + RUN_OVERHEAD);
+    assert_eq!(pool.room().above, WIDE + RUN_OVERHEAD);
+    let (seen, saw) = std::sync::mpsc::channel();
+    runs.start(
+        node,
+        Asks::new(&[WIDE], &windows, &seen),
+        envelopes.shelf(node),
+    );
+    let said = mail.recv().await.unwrap();
+    let found = saw.recv().unwrap();
+    assert_eq!(
+        found,
+        Found {
+            memory_bytes: Some(WIDE),
+            window_bytes: Some(WIDE),
+            window_reserved: true,
+            lent: None,
+            held: (0, 0),
+        }
+    );
+    runs.ended(node, said.generation, 1);
+    assert_eq!(pool.room().above, 0);
 }

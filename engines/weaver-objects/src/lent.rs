@@ -15,8 +15,9 @@
 // Without a lender every library is configured exactly as it always was.
 //
 // sevenz-turbo is adapted the same way: an `unsafe impl` of its memory trait
-// for `Lent`, an `impl` of its allocator trait for `Lender`, and its limits
-// built from the same two numbers (`sevenz`).
+// for `Lent` and an `impl` of its allocator trait for `Lender`. It keeps in
+// RAM what the run's memory holds, not its window, since the owner reserves
+// a 7z run its memory (`sevenz`).
 //
 // A library keeps only the `io::ErrorKind` of a refusal, so a refusal means
 // what its kind says (`refused`).
@@ -139,24 +140,67 @@ impl sevenz_turbo::WindowAllocator for Lender {
 // decoder's own limits when none was. Without a lender that is all, as it
 // always was.
 //
-// With a lender, every decode buffer over the window the run was granted (a
+// With a lender, every decode buffer the run's memory cannot hold (a
 // dictionary, a PPMd arena, a threaded LZMA2 worker's buffer) is borrowed,
 // up to the lender's ceiling, and counts nothing against the memory limit,
-// which bounds what stays in RAM. A threaded decode, or folders decoded side
-// by side, borrows several windows at once.
+// which bounds what stays in RAM. A buffer the memory holds stays in RAM:
+// the owner reserved that memory for the run (`Engine::holds_memory`). A
+// threaded decode, or folders decoded side by side, borrows several windows
+// at once (`sevenz_threads`).
 pub(crate) fn sevenz(budget: &Budget) -> sevenz_turbo::ArchiveLimits {
     let own = sevenz_turbo::ArchiveLimits::default();
+    let memory = budget.memory_or(own.memory_limit_bytes);
     let limits = sevenz_turbo::ArchiveLimits {
-        memory_limit_bytes: budget.memory_or(own.memory_limit_bytes),
+        memory_limit_bytes: memory,
         ..own
     };
     let Some(lender) = Lender::of(budget) else {
         return limits;
     };
     let ceiling = lender.ceiling();
-    let mut limits = limits.with_window_allocator(lender, budget.window_or(u64::MAX));
+    let mut limits = limits.with_window_allocator(lender, memory);
     limits.max_lent_window_bytes = ceiling;
     limits
+}
+
+// The threads a 7z decode of `archive` under `limits` runs on: `most`, or
+// fewer, down to one, so the windows it can have lent at once fit the room
+// its lender has now. A lender that cannot tell its room, or none, leaves
+// `most`. One thread is the least: a refusal from there is the scratch's.
+pub(crate) fn sevenz_threads(
+    archive: &sevenz_turbo::Archive,
+    limits: &sevenz_turbo::ArchiveLimits,
+    budget: &Budget,
+    most: u32,
+) -> u32 {
+    let Some(room) = budget.lender.as_ref().and_then(|lender| lender.room()) else {
+        return most;
+    };
+    (1..=most.max(1))
+        .rev()
+        .find(|&threads| {
+            archive
+                .decoder_memory(limits, threads)
+                .is_ok_and(|memory| memory.lent_bytes <= room)
+        })
+        .unwrap_or(1)
+}
+
+// What a 7z decode of `archive` holds in RAM on one thread with nothing
+// lent: the memory a run the scratch refused needs to decode it in RAM.
+pub(crate) fn sevenz_in_ram(
+    archive: &sevenz_turbo::Archive,
+    limits: &sevenz_turbo::ArchiveLimits,
+) -> Option<u64> {
+    let limits = sevenz_turbo::ArchiveLimits {
+        window_allocator: None,
+        max_in_ram_window_bytes: u64::MAX,
+        ..limits.clone()
+    };
+    archive
+        .decoder_memory(&limits, 1)
+        .ok()
+        .map(|memory| memory.resident_bytes)
 }
 
 // The xz decoder's backing for a run that was handed a lender: a dictionary
