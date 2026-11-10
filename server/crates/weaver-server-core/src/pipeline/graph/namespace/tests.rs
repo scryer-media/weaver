@@ -1235,6 +1235,36 @@ fn restarted(job: &mut Job, accountant: Arc<HoldsAccountant>, records: &[HoldRec
         .expect("a restore never fails for a hold");
 }
 
+// A job stopped twice in a row: the holds the first stop paged to scratch
+// are restored there, so the second stop has nothing in RAM to page out. It
+// is still the stop that makes a checkpoint record them, so it marks their
+// namespace, and the checkpoint after it reads the same rows again.
+#[test]
+fn a_second_stop_marks_a_namespace_whose_holds_are_already_on_scratch() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("notes.bin", Some(11));
+    job.send(member, 0, b"Ra", Provenance::Fresh);
+    job.send(member, 6, b"world", Provenance::Fresh);
+    job.writer.page_out_holds().expect("page out");
+    let records = hold_rows(&job, NodeId::ROOT);
+    assert_eq!(records.len(), 2);
+
+    let accountant = Arc::clone(&job.accountant);
+    restarted(&mut job, accountant, &records);
+    assert_eq!(job.accountant.usage().resident, 0);
+    assert_eq!(job.accountant.usage().scratch, 7);
+    assert!(hold_rows(&job, NodeId::ROOT).is_empty());
+
+    let before = job.writer.files_generation();
+    job.writer.page_out_holds().expect("page out");
+    assert_eq!(
+        job.writer.files_changed_since(before).collect::<Vec<_>>(),
+        vec![NodeId::ROOT],
+        "the stop changed what the namespace's holds say to a checkpoint"
+    );
+    assert_eq!(hold_rows(&job, NodeId::ROOT), records);
+}
+
 fn read_at(job: &Job, node: NodeId, member: MemberId, range: ByteRange) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
     job.writer

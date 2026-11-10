@@ -114,7 +114,14 @@ impl NamespaceWriter {
         let nodes: Vec<NodeId> = self
             .files
             .iter()
-            .filter(|(_, files)| files.holds.resident_bytes() > 0)
+            // A namespace whose holds are already on scratch or in a spill
+            // file has nothing to page out, but the stop is what makes a
+            // checkpoint record them, so it is marked with the rest.
+            .filter(|(_, files)| {
+                files.holds.resident_bytes() > 0
+                    || !files.holds.scratch_holds().is_empty()
+                    || !files.holds.spilled_holds().is_empty()
+            })
             .map(|(node, _)| *node)
             .collect();
         let mut free_disk = self.free_disk_bytes();
