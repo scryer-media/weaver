@@ -2289,9 +2289,12 @@ impl Tree {
     }
 
     // The fronts a restart can bring again, parents first: each member
-    // whose front came and is not in hand, with the runs its record says
-    // arrived inside its first FIRST_BYTES. No record keeps a front, so the
-    // owner reads these from where the bytes went.
+    // with no front in hand, with the runs its record says arrived inside
+    // its first FIRST_BYTES. No record keeps a front, so the owner reads
+    // these from where the bytes went. A member whose first byte never
+    // came, or was lost, is among them: what arrived past that hole is
+    // kept again, so the front is whole the moment a repair or a later
+    // fetch fills the hole, as it is in a job that never restarted.
     pub fn fronts_away(&self) -> Vec<(NodeId, MemberId, Vec<ByteRange>)> {
         let window = ByteRange::new(0, FIRST_BYTES as u64);
         let mut out = Vec::new();
@@ -2300,7 +2303,7 @@ impl Tree {
                 continue;
             };
             for record in namespace.members() {
-                if namespace.front_away(record.id) != Some(false) {
+                if !namespace.first_bytes(record.id).is_empty() {
                     continue;
                 }
                 let runs: Vec<ByteRange> = record
