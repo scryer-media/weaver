@@ -12,8 +12,7 @@ use serde::{Deserialize, Serialize};
 use weaver_server_core::operations::{
     FinishedJobCounts, REMOVED_SERVER_ID_PREFIX, RecoveryBytes, UsageConsumerKind as CoreKind,
     UsageConsumerSummary, UsageCounts, UsagePeriod, UsageStart, UsageSummary, period_bounds,
-    summarize_usage,
-    summary_read_from,
+    summarize_usage, summary_read_from,
 };
 use weaver_server_core::torrents::metrics::Published;
 use weaver_server_core::{Database, StateError};
@@ -392,7 +391,11 @@ pub struct IntegrityHistory {
 /// day when it starts later. `None` is every day, for a range with no
 /// start over a ledger whose first days are folded together, which is
 /// every day it counted.
-fn history_from(start: Option<NaiveDate>, ledger: UsageStart, today: NaiveDate) -> Option<NaiveDate> {
+fn history_from(
+    start: Option<NaiveDate>,
+    ledger: UsageStart,
+    today: NaiveDate,
+) -> Option<NaiveDate> {
     let ledger = match ledger {
         UsageStart::Folded => return start,
         // Nothing counted yet: the ledger, like the range it shows, starts
@@ -413,8 +416,8 @@ pub fn load_integrity_history(
     let (start, _) = period_bounds(period, today);
     let jobs = read_summary(db, today, period, Some(CoreKind::Job))?;
     let stages = read_summary(db, today, period, Some(CoreKind::Stage))?;
-    let since = history_from(start, db.read_usage_start(CoreKind::Job)?, today)
-        .map(local_day_start);
+    let since =
+        history_from(start, db.read_usage_start(CoreKind::Job)?, today).map(local_day_start);
     let until = local_day_start(next_day(jobs.range_end));
     let recovery = db.sum_recovery_bytes(since, until)?;
     let failures = db.count_failures_by_cause(since, until)?;

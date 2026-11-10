@@ -2171,21 +2171,22 @@ impl TrackerComms {
 
         // One announce per route, at once; the peers of every answer are
         // kept, the rest of the first, as UDP's two families are.
-        let answers = futures::future::join_all(routes.iter().zip(&queries).map(|((family, _), query)| {
-            tracker_comms_http::get(
-                &*self.http_clients,
-                self.udp_client.resolver(),
-                &self.reachable,
-                tracker_url,
-                tracker.named_by,
-                Ask::Announce,
-                *family,
-                query,
-                &self.identity.user_agent,
-                tracker_comms_http::Shape::of(&self.identity.peer_id),
-            )
-        }))
-        .await;
+        let answers =
+            futures::future::join_all(routes.iter().zip(&queries).map(|((family, _), query)| {
+                tracker_comms_http::get(
+                    &*self.http_clients,
+                    self.udp_client.resolver(),
+                    &self.reachable,
+                    tracker_url,
+                    tracker.named_by,
+                    Ask::Announce,
+                    *family,
+                    query,
+                    &self.identity.user_agent,
+                    tracker_comms_http::Shape::of(&self.identity.peer_id),
+                )
+            }))
+            .await;
         let (mut announced, mut error) = (None::<Announced>, None);
         for answer in answers {
             match answer.and_then(|answer| self.read_http_announce(tracker_url, &answer)) {
@@ -2376,9 +2377,9 @@ mod tests {
 
     use super::{
         AnnounceErrorKind, AnnounceOk, MIN_ANNOUNCE_INTERVAL, Reachable, ReannounceDelay, Refused,
-        ScrapeOk, StoppedAnnounces, SupportedTracker, ToldPorts, Tracker, TrackerAnnounce, TrackerComms,
-        TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerScrape, TrackerTask,
-        UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
+        ScrapeOk, StoppedAnnounces, SupportedTracker, ToldPorts, Tracker, TrackerAnnounce,
+        TrackerComms, TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerScrape,
+        TrackerTask, UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
         udp_tracker_to_socket_addrs,
     };
     use crate::Identity;
@@ -2700,7 +2701,10 @@ mod tests {
         // a fails: it backs off to the end of its tier, b is tried at once.
         list.on_failure(&http("a"), t0, Duration::ZERO);
         assert_eq!(order(&list), [http("b"), http("a"), http("c")]);
-        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("b"), STARTED)]);
+        assert_eq!(
+            list.start_due(t0, ToldPorts::default(), &stats),
+            [(http("b"), STARTED)]
+        );
 
         // b fails too: its tier has none left to try until the back-off is
         // up; c, answering, is not asked again.
@@ -2771,7 +2775,10 @@ mod tests {
         // at once; c accepts it.
         list.on_failure(&http("a"), t1, Duration::ZERO);
         list.on_success(&http("c"), COMPLETED, t1, &delay);
-        assert_eq!(list.start_due(t1, ToldPorts::default(), &seed), [(http("b"), STARTED)]);
+        assert_eq!(
+            list.start_due(t1, ToldPorts::default(), &seed),
+            [(http("b"), STARTED)]
+        );
         list.on_success(&http("b"), STARTED, t1, &delay);
 
         // Once a tracker accepted it, no other is sent `completed`: b,
@@ -2823,10 +2830,16 @@ mod tests {
         let mut list = list(&[&["a"]], t0);
         let seeding = live(0, 0, false);
         assert!(!may_complete(&seeding));
-        assert_eq!(list.start_due(t0, ToldPorts::default(), &seeding), [(http("a"), STARTED)]);
+        assert_eq!(
+            list.start_due(t0, ToldPorts::default(), &seeding),
+            [(http("a"), STARTED)]
+        );
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
         let t1 = t0 + ANSWERED.regular;
-        assert_eq!(list.start_due(t1, ToldPorts::default(), &seeding), [(http("a"), None)]);
+        assert_eq!(
+            list.start_due(t1, ToldPorts::default(), &seeding),
+            [(http("a"), None)]
+        );
     }
 
     #[test]
@@ -2867,7 +2880,10 @@ mod tests {
         // a fails and b takes over: until b accepts `started`, a, failing,
         // is still owed `stopped`.
         list.on_failure(&http("a"), t0, Duration::ZERO);
-        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("b"), STARTED)]);
+        assert_eq!(
+            list.start_due(t0, ToldPorts::default(), &stats),
+            [(http("b"), STARTED)]
+        );
         assert_eq!(list.stop(), [http("a"), http("c")]);
         // Then b, the tracker in use in its tier, is.
         list.on_success(&http("b"), STARTED, t0, &ANSWERED);
@@ -5446,7 +5462,10 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a", "b"]], t0);
         let stats = live(0, 90, false);
-        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("a"), STARTED)]);
+        assert_eq!(
+            list.start_due(t0, ToldPorts::default(), &stats),
+            [(http("a"), STARTED)]
+        );
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
 
         list.replace(
@@ -5493,7 +5512,10 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a", "b"]], t0);
         let stats = live(0, 90, false);
-        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("a"), STARTED)]);
+        assert_eq!(
+            list.start_due(t0, ToldPorts::default(), &stats),
+            [(http("a"), STARTED)]
+        );
         let delay = ReannounceDelay {
             floor: s(900),
             regular: s(1800),
@@ -5508,7 +5530,10 @@ mod tests {
         // Lifting it, a is due now, and once in flight a second force sends
         // nothing more.
         assert!(list.force(t1, None, true));
-        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), [(http("a"), None)]);
+        assert_eq!(
+            list.start_due(t1, ToldPorts::default(), &stats),
+            [(http("a"), None)]
+        );
         assert!(list.force(t1, None, true));
         assert!(list.force(t1, Some(&http("a")), true));
         assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), []);
@@ -5516,7 +5541,10 @@ mod tests {
         // Forced alone, b goes though a works and the walk would stop there.
         list.on_success(&http("a"), None, t1, &delay);
         assert!(list.force(t1, Some(&http("b")), true));
-        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), [(http("b"), STARTED)]);
+        assert_eq!(
+            list.start_due(t1, ToldPorts::default(), &stats),
+            [(http("b"), STARTED)]
+        );
         assert!(!list.force(t1, Some(&http("x")), true));
     }
 
@@ -5530,7 +5558,10 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a"]], t0);
         let stats = live(0, 90, false);
-        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("a"), STARTED)]);
+        assert_eq!(
+            list.start_due(t0, ToldPorts::default(), &stats),
+            [(http("a"), STARTED)]
+        );
         let delay = ReannounceDelay {
             floor: s(900),
             regular: s(1800),
@@ -5786,14 +5817,20 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a"]], t0);
         let stats = live(0, 90, false);
-        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("a"), STARTED)]);
+        assert_eq!(
+            list.start_due(t0, ToldPorts::default(), &stats),
+            [(http("a"), STARTED)]
+        );
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
         assert_eq!(list.next_due(), Some(t0 + s(1800)));
 
         let t1 = t0 + s(60);
         list.replace(&[vec![http("a")], vec![http("b")]], t1);
         assert_eq!(list.next_due(), Some(t1));
-        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), [(http("b"), STARTED)]);
+        assert_eq!(
+            list.start_due(t1, ToldPorts::default(), &stats),
+            [(http("b"), STARTED)]
+        );
         list.on_success(&http("b"), STARTED, t1, &ANSWERED);
 
         assert_eq!(list.next_due(), Some(t0 + s(1800)));
