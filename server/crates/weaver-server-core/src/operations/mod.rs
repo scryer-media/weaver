@@ -59,5 +59,5 @@ pub use usage_history::{
     RemovedServerUsage, ServerStateReading, ServerUsageReading, StageReading, TorrentUsageReading,
     USAGE_FLUSH_INTERVAL_SECS, USAGE_RETENTION_DAYS, UsageConsumerKind, UsageConsumerSummary,
     UsageConsumerTotal, UsageCounts, UsageDayRow, UsageFlush, UsagePeriod, UsageReading,
-    UsageRecorder, UsageSummary, period_bounds, summarize_usage, summary_read_from, week_start,
+    UsageRecorder, UsageStart, UsageSummary, period_bounds, summarize_usage, summary_read_from, week_start,
 };

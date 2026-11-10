@@ -11,7 +11,8 @@ use serde::{Deserialize, Serialize};
 
 use weaver_server_core::operations::{
     FinishedJobCounts, REMOVED_SERVER_ID_PREFIX, RecoveryBytes, UsageConsumerKind as CoreKind,
-    UsageConsumerSummary, UsageCounts, UsagePeriod, UsageSummary, period_bounds, summarize_usage,
+    UsageConsumerSummary, UsageCounts, UsagePeriod, UsageStart, UsageSummary, period_bounds,
+    summarize_usage,
     summary_read_from,
 };
 use weaver_server_core::torrents::metrics::Published;
@@ -386,6 +387,22 @@ pub struct IntegrityHistory {
     pub failures: Vec<FailureCount>,
 }
 
+/// The first day the history figures of a range count from, so they cover
+/// the days the ledger's do: the range's own start, or the ledger's first
+/// day when it starts later. `None` is every day, for a range with no
+/// start over a ledger whose first days are folded together, which is
+/// every day it counted.
+fn history_from(start: Option<NaiveDate>, ledger: UsageStart, today: NaiveDate) -> Option<NaiveDate> {
+    let ledger = match ledger {
+        UsageStart::Folded => return start,
+        // Nothing counted yet: the ledger, like the range it shows, starts
+        // today.
+        UsageStart::Empty => today,
+        UsageStart::Day(day) => day,
+    };
+    Some(start.map_or(ledger, |start| start.max(ledger)))
+}
+
 /// Read the integrity ledger and history for one request, against `today`.
 pub fn load_integrity_history(
     db: &Database,
@@ -396,7 +413,8 @@ pub fn load_integrity_history(
     let (start, _) = period_bounds(period, today);
     let jobs = read_summary(db, today, period, Some(CoreKind::Job))?;
     let stages = read_summary(db, today, period, Some(CoreKind::Stage))?;
-    let since = start.map(local_day_start);
+    let since = history_from(start, db.read_usage_start(CoreKind::Job)?, today)
+        .map(local_day_start);
     let until = local_day_start(next_day(jobs.range_end));
     let recovery = db.sum_recovery_bytes(since, until)?;
     let failures = db.count_failures_by_cause(since, until)?;

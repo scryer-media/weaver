@@ -1280,6 +1280,64 @@ fn what_the_recorder_holds_of_a_removed_server_follows_its_rows() {
     );
 }
 
+// A new server on a reused id counts what it moved by its first reading:
+// totals below the old server's are its own, from zero, and totals that
+// carry on from the old server's count only what moved past them.
+#[test]
+fn a_new_server_on_a_reused_id_counts_its_first_reading() {
+    let today = date(2026, 11, 9);
+    let first = |old: ServerUsageReading, new: ServerUsageReading| {
+        let recorder = UsageRecorder::new();
+        recorder.prime(&reading(vec![server(3, 1_000, 0, 0)], &[]), 0);
+        recorder.observe(&reading(vec![old], &[]), today, 5);
+        recorder.retire_server(3, Some("removed-3-1"));
+        let _ = recorder.take(today);
+        recorder.reuse_server_id(3);
+        recorder.observe(&reading(vec![new], &[]), today, 10);
+        recorder.take(today).rows
+    };
+    let as_new = |bytes, tried, ok| {
+        vec![counted(
+            UsageConsumerKind::Server,
+            "3",
+            UsageCounts {
+                bytes,
+                articles_tried: tried,
+                articles_succeeded: ok,
+                ..UsageCounts::default()
+            },
+            today,
+        )]
+    };
+    // Its own totals, started from zero.
+    assert_eq!(
+        first(server(3, 1_500, 5, 5), server(3, 60, 2, 1)),
+        as_new(60, 2, 1)
+    );
+    // Totals that carry on from the old server's.
+    assert_eq!(
+        first(server(3, 1_500, 5, 5), server(3, 1_560, 7, 6)),
+        as_new(60, 2, 1)
+    );
+    // A server the recorder never saw before the id was reused.
+    let recorder = UsageRecorder::new();
+    recorder.prime(&reading(vec![], &[]), 0);
+    recorder.reuse_server_id(3);
+    recorder.observe(&reading(vec![server(3, 60, 2, 1)], &[]), today, 5);
+    assert_eq!(recorder.take(today).rows, as_new(60, 2, 1));
+    // Bytes a reading does not show yet are judged when one does.
+    let recorder = UsageRecorder::new();
+    recorder.prime(&reading(vec![server(3, 1_000, 0, 0)], &[]), 0);
+    recorder.reuse_server_id(3);
+    let no_bytes = ServerUsageReading {
+        bytes: None,
+        ..server(3, 0, 2, 1)
+    };
+    recorder.observe(&reading(vec![no_bytes], &[]), today, 5);
+    recorder.observe(&reading(vec![server(3, 60, 2, 1)], &[]), today, 10);
+    assert_eq!(recorder.take(today).rows, as_new(60, 2, 1));
+}
+
 #[test]
 fn what_the_recorder_holds_of_a_server_whose_rows_went_is_dropped() {
     let today = date(2026, 11, 9);

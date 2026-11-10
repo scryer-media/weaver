@@ -413,6 +413,107 @@ async fn integrity_reads_the_job_ledger_and_the_history() {
     );
 }
 
+// Every figure of the Integrity page covers the days the ledger does: a
+// job that finished before the ledger's first day is in the history but in
+// no ledger count, so its failure and recovery are left out, for All and
+// for any range that reaches back before that day. The range bar still
+// shows the range asked for.
+#[tokio::test]
+async fn integrity_history_figures_start_where_the_ledger_does() {
+    let harness = TestHarness::new().await;
+    harness
+        .db
+        .write_usage_flush(&UsageFlush {
+            rows: vec![counted(
+                day(2024, 5, 2),
+                UsageConsumerKind::Job,
+                "finished",
+                UsageCounts {
+                    events: 1,
+                    ..UsageCounts::default()
+                },
+            )],
+            fold_before: None,
+            expire_removed_at: None,
+        })
+        .unwrap();
+    let noon = |date: NaiveDate| {
+        chrono::Local
+            .from_local_datetime(&date.and_hms_opt(12, 0, 0).unwrap())
+            .earliest()
+            .unwrap()
+            .timestamp()
+    };
+    for (id, at, recovery) in [
+        (1, noon(day(2024, 4, 10).unwrap()), 7),
+        (2, noon(day(2024, 5, 1).unwrap()), 5),
+        (3, noon(day(2024, 5, 2).unwrap()), 40),
+    ] {
+        let mut row = finished_row(id, "failed", at);
+        row.optional_recovery_bytes = recovery;
+        harness.insert_history_row(&row);
+    }
+    for (range, range_start) in [
+        (serde_json::json!({ "period": "ALL" }), "2024-05-02"),
+        (
+            serde_json::json!({ "period": "CUSTOM", "fromDay": "2024-04-01", "toDay": "2024-05-03" }),
+            "2024-04-01",
+        ),
+    ] {
+        let response = harness
+            .execute_with_variables(INTEGRITY, variables(serde_json::json!({ "range": range })))
+            .await;
+        assert_no_errors(&response);
+        let data = response_data(&response);
+        let integrity = &data["integrityHistory"];
+        assert_eq!(integrity["rangeStart"], range_start, "{range}");
+        assert_eq!(integrity["finished"]["range"]["events"], 1, "{range}");
+        assert_eq!(
+            integrity["failures"],
+            serde_json::json!([{ "cause": "", "count": 1 }]),
+            "{range}"
+        );
+        assert_eq!(
+            integrity["recovery"],
+            serde_json::json!({ "availableBytes": 40, "fetchedBytes": 0 }),
+            "{range}"
+        );
+    }
+
+    // Once days past retention fold together the ledger's first day is no
+    // longer known, and All reads every history row.
+    harness
+        .db
+        .write_usage_flush(&UsageFlush {
+            rows: vec![counted(
+                None,
+                UsageConsumerKind::Job,
+                "finished",
+                UsageCounts {
+                    events: 2,
+                    ..UsageCounts::default()
+                },
+            )],
+            fold_before: None,
+            expire_removed_at: None,
+        })
+        .unwrap();
+    let response = harness
+        .execute_with_variables(
+            INTEGRITY,
+            variables(serde_json::json!({ "range": { "period": "ALL" } })),
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let integrity = &data["integrityHistory"];
+    assert_eq!(integrity["finished"]["range"]["events"], 3);
+    assert_eq!(
+        integrity["failures"],
+        serde_json::json!([{ "cause": "", "count": 3 }])
+    );
+}
+
 #[tokio::test]
 async fn integrity_with_no_jobs_reads_as_zero() {
     let harness = TestHarness::new().await;
