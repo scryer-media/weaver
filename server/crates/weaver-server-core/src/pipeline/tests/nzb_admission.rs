@@ -588,7 +588,9 @@ async fn assert_added_but_not_dispatched(pipeline: &mut Pipeline, id: JobId) {
     assert!(pipeline.held_for_added_scripts(id));
     finish_added_scripts(pipeline, &[id]).await;
     let results = pipeline.db.event_script_results(id.0).unwrap();
-    assert_eq!(results.len(), 1, "{results:?}");
+    // An added NZB runs its own event's script and the one for a job of
+    // either kind.
+    assert_eq!(results.len(), 2, "{results:?}");
     assert!(!pipeline.nzb_admitted.contains(&id));
     assert!(!pipeline.download_scheduler_eligible_jobs().contains(&id));
 }
@@ -616,7 +618,7 @@ async fn nzb_added_under_global_pause_is_installed_and_announced_before_resume()
             .download_scheduler_eligible_jobs()
             .contains(&JobId(1))
     );
-    assert_eq!(pipeline.db.event_script_results(1).unwrap().len(), 1);
+    assert_eq!(pipeline.db.event_script_results(1).unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -649,7 +651,7 @@ async fn nzb_added_under_scheduled_pause_is_installed_and_announced_before_resum
             .download_scheduler_eligible_jobs()
             .contains(&JobId(1))
     );
-    assert_eq!(pipeline.db.event_script_results(1).unwrap().len(), 1);
+    assert_eq!(pipeline.db.event_script_results(1).unwrap().len(), 2);
 }
 
 #[tokio::test]
@@ -712,7 +714,7 @@ async fn nzb_added_with_every_slot_taken_is_announced_and_waits_to_dispatch() {
             .download_scheduler_eligible_jobs()
             .contains(&JobId(2))
     );
-    assert_eq!(pipeline.db.event_script_results(2).unwrap().len(), 1);
+    assert_eq!(pipeline.db.event_script_results(2).unwrap().len(), 2);
 }
 
 // Adds a job whose spec is the one its saved NZB parses to, so a restart
