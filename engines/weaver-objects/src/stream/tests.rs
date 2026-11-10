@@ -1202,11 +1202,12 @@ fn a_multiblock_xz_wider_than_the_grant_borrows_one_window_at_a_time() {
     assert_eq!(lent_run(&bytes, 4, Some(&lender)), decoded("a", plain));
     let asked = lender.asked();
     let said = weaver_graph::Engine::lent(&fronted_within::<Xz>("a.xz", &bytes, LENT_GRANT));
-    assert!(!asked.is_empty());
+    assert!(asked.len() > 1, "{asked:?}");
     assert!(
         asked.iter().all(|asked| Some(*asked as u64) == said),
         "{asked:?} {said:?}"
     );
+    assert_eq!(lender.peak(), 1, "one window at a time");
     assert_eq!(lender.live(), 0);
 }
 

@@ -19,7 +19,10 @@ pub(crate) const GARBAGE: u8 = 0xA5;
 pub(crate) struct TestLender {
     asked: Mutex<Vec<usize>>,
     live: Arc<AtomicUsize>,
+    peak: AtomicUsize,
     refuse: Option<io::ErrorKind>,
+    // How many asks are lent before the refusals begin.
+    lends_first: usize,
     ceiling: Option<u64>,
 }
 
@@ -32,6 +35,16 @@ impl TestLender {
     pub(crate) fn refusing(kind: io::ErrorKind) -> Arc<Self> {
         Arc::new(Self {
             refuse: Some(kind),
+            ..Self::default()
+        })
+    }
+
+    // A lender that lends the first `lends` windows asked for and refuses
+    // every later one with an error of `kind`.
+    pub(crate) fn refusing_after(lends: usize, kind: io::ErrorKind) -> Arc<Self> {
+        Arc::new(Self {
+            refuse: Some(kind),
+            lends_first: lends,
             ..Self::default()
         })
     }
@@ -57,6 +70,11 @@ impl TestLender {
         self.live.load(Ordering::SeqCst)
     }
 
+    // The most windows lent at once.
+    pub(crate) fn peak(&self) -> usize {
+        self.peak.load(Ordering::SeqCst)
+    }
+
     // `budget`, lending through this lender.
     pub(crate) fn lending(self: &Arc<Self>, budget: Budget) -> Budget {
         Budget {
@@ -68,14 +86,14 @@ impl TestLender {
 
 impl WindowLender for TestLender {
     fn lend(&self, len: usize) -> io::Result<Box<dyn WindowMemory>> {
-        self.asked
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(len);
-        if let Some(kind) = self.refuse {
+        let mut asked = self.asked.lock().unwrap_or_else(PoisonError::into_inner);
+        asked.push(len);
+        if let Some(kind) = self.refuse.filter(|_| asked.len() > self.lends_first) {
             return Err(io::Error::new(kind, "test lender refuses"));
         }
-        self.live.fetch_add(1, Ordering::SeqCst);
+        drop(asked);
+        let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+        self.peak.fetch_max(live, Ordering::SeqCst);
         Ok(Box::new(Garbage {
             bytes: vec![GARBAGE; len].into_boxed_slice(),
             live: Arc::clone(&self.live),

@@ -304,7 +304,7 @@ impl Windows {
     }
 
     // What the node's run borrows its windows through, lending `window`,
-    // allocated for it before it started, to the first borrow it fits.
+    // allocated for it before it started, to the borrow of its length.
     pub(crate) fn prelent(self: &Arc<Self>, node: NodeId, window: Window) -> Arc<dyn WindowLender> {
         Arc::new(Prelent {
             window: Mutex::new(Some(window)),
@@ -436,7 +436,10 @@ impl WindowLender for NodeWindows {
 }
 
 // A run's lender holding the window allocated for it before it started: the
-// first borrow it fits takes it, and every other is lent as `rest` lends.
+// borrow it was made for, of exactly its length, takes it, and every other
+// is lent as `rest` lends. A smaller borrow before it takes a file of its
+// own: a decoder keeps the length it asked for, so one that took the larger
+// file would ask for another of that size when it grows.
 struct Prelent {
     window: Mutex<Option<Window>>,
     rest: NodeWindows,
@@ -448,7 +451,7 @@ impl WindowLender for Prelent {
             .window
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .take_if(|window| WindowMemory::len(window) >= len);
+            .take_if(|window| WindowMemory::len(window) == len);
         match held {
             Some(window) => Ok(Box::new(window)),
             None => self.rest.lend(len),

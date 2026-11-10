@@ -2288,3 +2288,30 @@ fn a_rar_dictionary_over_the_lenders_ceiling_is_refused_unasked() {
     );
     assert_eq!(low.asked(), Vec::<usize>::new());
 }
+
+// A lender that lends the RAR 2.9 dictionary and refuses the PPMd arena
+// after it: the arena's refusal is the member's verdict, with the arena's
+// size, the dictionary it lent is given back, and nothing is said of the
+// member's bytes that the arena never decoded.
+#[test]
+fn a_rar3_ppmd_arena_the_lender_refuses_says_why_with_its_size() {
+    use crate::lent::testing::TestLender;
+    let full = TestLender::refusing_after(1, io::ErrorKind::StorageFull);
+    let said = lent_run(PPMD, 512 << 10, Some(&full));
+    assert_eq!(full.asked(), [MIB as usize, MIB as usize]);
+    assert!(
+        said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(MIB),
+            allowed: None,
+        })),
+        "{said:?}"
+    );
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+    assert_eq!(full.live(), 0);
+
+    let denied = TestLender::refusing_after(1, io::ErrorKind::PermissionDenied);
+    let said = lent_run(PPMD, 512 << 10, Some(&denied));
+    assert_eq!(denied.asked().len(), 2);
+    assert!(said.contains(&Said::Refuse(Why::Unsupported)), "{said:?}");
+    assert_eq!(denied.live(), 0);
+}
