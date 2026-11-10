@@ -1165,6 +1165,35 @@ async fn a_compressed_rar5_volume_under_par2_with_its_front_lost_restarted_after
     restart_row(Scenario::new(posts).framed(64).lost(0, 0)).await;
 }
 
+// A file posted under a name its PAR2 set does not give, damaged: the set
+// knows it by its contents. No checkpoint keeps that, so a restored set
+// binds over the restored members before it rules, and never takes the file
+// it describes for absent while the member that is it sits there complete.
+// Whenever the restart lands, the file is repaired and delivered once,
+// under the name the set describes.
+#[tokio::test]
+async fn a_damaged_file_under_another_name_restarted_after_every_article_is_repaired_under_its_own()
+{
+    let body = payload(5 * ARTICLE, 121);
+    let mut posts = with_par2(vec![Post::plain("lantern.bin", body.clone())], 2);
+    posts[0] = Post::plain("a1b2c3d4e5", body.clone());
+    let whole = restart_row(Scenario::new(posts).damaged(0, 1)).await;
+    assert_eq!(
+        whole.files.values().collect::<Vec<_>>(),
+        vec![&body],
+        "{:?}",
+        whole.files.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        whole
+            .files
+            .keys()
+            .all(|path| path.ends_with("/lantern.bin")),
+        "{:?}",
+        whole.files.keys().collect::<Vec<_>>()
+    );
+}
+
 // The five encrypted RARLAB volumes, offered their password again at every
 // restore, in 64 KiB articles so a restart lands inside every volume.
 #[tokio::test]

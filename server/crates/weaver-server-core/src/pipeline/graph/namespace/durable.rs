@@ -403,6 +403,29 @@ impl NamespaceWriter {
         Ok(())
     }
 
+    // No checkpoint keeps which member a set bound to which file: a set
+    // binds from the names, lengths and fronts of the members beside it,
+    // and a restored set has bound none. Each namespace's sets bind over it
+    // as it was restored, parents first, before any of them rules: a set
+    // asked what it describes that no member carries answers from what it
+    // bound.
+    pub(crate) fn bind_restored(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let mut bound = None;
+        while let Some(node) = tree.next_recovery_home(bound) {
+            bound = Some(node);
+            if tree.is_live(node) {
+                self.bind_recoveries(tree, builder, segments, node, out)?;
+            }
+        }
+        Ok(())
+    }
+
     // The restored tree's members, counted and charged against the job's
     // budget as the tree holds them.
     pub(crate) fn restore_members(&mut self, tree: &Tree) {
