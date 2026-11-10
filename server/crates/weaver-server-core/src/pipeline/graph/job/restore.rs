@@ -146,6 +146,7 @@ impl GraphJob {
         job.tree
             .close_again(&mut job.writer.placing(&mut *job.builder), &mut effects);
         job.settle(effects)?;
+        job.bind_again()?;
         for volume in 0..job.root.map.volume_count() {
             job.after_member(VolumeIndex(volume as u32))?;
         }
@@ -161,6 +162,16 @@ impl GraphJob {
             refetched,
             job,
         })
+    }
+
+    // The restored sets bind over their namespaces, now every front that
+    // came is in hand again and every close was told again, and before the
+    // job first rules them.
+    fn bind_again(&mut self) -> Result<(), GraphError> {
+        let mut out = Vec::new();
+        self.writer
+            .bind_restored(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
+        self.heard(out)
     }
 
     // Refusals an older build gave when holds ran past their budgets are
