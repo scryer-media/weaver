@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::{Change, JobRow, Queue};
@@ -21,6 +21,10 @@ pub(crate) struct PreparedAdd {
     pub spec: JobSpec,
     pub options: AddJobOptions,
     pub working_dir: PathBuf,
+    // The job's staging directory on the complete device, where the files
+    // it delivers are written, when the intermediate directory is on
+    // another device.
+    pub staging_dir: Option<PathBuf>,
     pub nzb_hash: [u8; 32],
     pub nzb_password_candidates: Option<Vec<crate::jobs::ArchivePasswordCandidate>>,
     pub restart: Option<RestartAdmission>,
@@ -219,5 +223,89 @@ pub(super) fn initial_info(
         download_wait_reason: None,
         download_retry_at_epoch_ms: None,
         created_at_epoch_ms: crate::jobs::model::epoch_ms_now(),
+    }
+}
+
+// Where a job writes the files it delivers when its intermediate and
+// complete directories lie on different devices: its staging directory on
+// the complete device, so finalize renames them into place there instead of
+// copying every byte across. On one device nothing is staged.
+pub(crate) fn delivery_staging_dir(
+    intermediate_dir: &Path,
+    complete_dir: &Path,
+    job_id: JobId,
+) -> Option<PathBuf> {
+    (!crate::runtime::fs::same_device(intermediate_dir, complete_dir))
+        .then(|| staging_dir_for(complete_dir, job_id))
+}
+
+pub(crate) fn staging_dir_for(complete_dir: &Path, job_id: JobId) -> PathBuf {
+    complete_dir
+        .join(".weaver-staging")
+        .join(job_id.0.to_string())
+}
+
+// Make the job's staging directory and mark it the job's, as its working
+// directory is.
+pub(crate) fn make_staging_dir(
+    complete_dir: &Path,
+    staging_dir: &Path,
+    job_id: JobId,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(staging_dir)?;
+    crate::jobs::working_dir::mark_weaver_owned_working_dir(
+        &complete_dir.join(".weaver-staging"),
+        staging_dir,
+        job_id,
+    )
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+
+    #[test]
+    fn one_device_stages_nothing() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let intermediate = root.path().join("intermediate");
+        let complete = root.path().join("complete");
+        assert_eq!(
+            delivery_staging_dir(&intermediate, &complete, JobId(7)),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn two_devices_stage_under_the_complete_directory() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().expect("temp dir");
+        let other = Path::new("/dev");
+        let ours = std::fs::metadata(root.path()).expect("meta").dev();
+        if std::fs::metadata(other).expect("meta").dev() == ours {
+            return;
+        }
+        assert_eq!(
+            delivery_staging_dir(root.path(), other, JobId(7)),
+            Some(other.join(".weaver-staging").join("7"))
+        );
+    }
+
+    #[test]
+    fn a_staging_directory_is_made_and_marked_the_job_s() {
+        let complete = tempfile::tempdir().expect("temp dir");
+        let staging = staging_dir_for(complete.path(), JobId(9));
+        make_staging_dir(complete.path(), &staging, JobId(9)).expect("staging");
+        assert!(crate::jobs::working_dir::is_weaver_owned_working_dir(
+            &staging
+        ));
+        assert!(
+            crate::jobs::working_dir::is_job_working_dir(
+                &complete.path().join(".weaver-staging"),
+                &staging,
+                JobId(9)
+            )
+            .expect("marker")
+        );
     }
 }

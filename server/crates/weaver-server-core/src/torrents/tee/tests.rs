@@ -78,6 +78,10 @@ fn parts(
 fn storage(work: &Path, mail: &RunMail, free_disk: CapacityReader) -> Storage {
     Storage {
         working_dir: work.to_path_buf(),
+        output: None,
+        decode: crate::pipeline::graph::engine::DecodePool::unbounded(),
+        data_dir: None,
+        window_ledger: Default::default(),
         accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
             resident_limit: u64::MAX,
             scratch_total: u64::MAX,

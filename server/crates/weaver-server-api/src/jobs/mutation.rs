@@ -525,16 +525,19 @@ impl JobsMutation {
             .collect())
     }
     /// Reprocess a completed or failed job (re-run post-download stages without re-downloading).
+    /// With `noMemoryLimit`, a decode window over the memory profile's ceiling
+    /// is granted for this job alone, up to what the machine can hold.
     #[graphql(guard = "ControlGuard")]
     async fn reprocess_job(
         &self,
         ctx: &Context<'_>,
         id: u64,
         password: Option<String>,
+        no_memory_limit: Option<bool>,
     ) -> Result<bool> {
         let handle = ctx.data::<SchedulerHandle>()?;
         handle
-            .reprocess_job_with_password(JobId(id), password)
+            .reprocess_job_with_options(JobId(id), password, no_memory_limit.unwrap_or(false))
             .await?;
         Ok(true)
     }

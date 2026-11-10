@@ -858,6 +858,7 @@ fn hdd_profile_allocates_more_write_backlog_than_ssd() {
             total_bytes: 8 * 1024 * 1024 * 1024,
             available_bytes: 8 * 1024 * 1024 * 1024,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Ssd,
@@ -894,6 +895,7 @@ fn decode_backlog_budget_is_separate_bounded_raw_article_cache() {
             total_bytes: 8 * 1024 * 1024 * 1024,
             available_bytes: 8 * 1024 * 1024 * 1024,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Ssd,
@@ -931,6 +933,7 @@ fn decode_backlog_budget_respects_effective_memory_cap() {
             total_bytes: 512 * 1024 * 1024,
             available_bytes: 512 * 1024 * 1024,
             cgroup_limit: Some(512 * 1024 * 1024),
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Ssd,
@@ -966,6 +969,7 @@ fn backlog_budgets_share_one_memory_ceiling() {
             total_bytes: 16 * GIB,
             available_bytes: 16 * GIB,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Ssd,

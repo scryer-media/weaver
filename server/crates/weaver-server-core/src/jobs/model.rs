@@ -843,6 +843,10 @@ pub struct JobState {
     // What the graph ruled of a delivery restored after its final move
     // began, read back from the job's row; the graph itself is not restored.
     pub delivered: Option<crate::post_processing::model::DeliveredVerdict>,
+    // The consumed inputs the final move leaves in the working directory,
+    // relative to it: set when the move begins, or read back from the row of
+    // a move a restart interrupted.
+    pub delivery_left_behind: Vec<PathBuf>,
     // Per-job working directory (subdirectory under intermediate_dir).
     // All download/decode/verify/repair/extract I/O happens here.
     pub working_dir: PathBuf,

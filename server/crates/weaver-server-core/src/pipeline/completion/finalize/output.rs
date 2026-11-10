@@ -74,7 +74,7 @@ fn validate_delivery_sources(
         source_exists |= scan_delivery_root(
             staging_dir,
             "staging",
-            &[".weaver-chunks"],
+            &[".weaver-chunks", WORKING_DIR_MARKER],
             &HashSet::new(),
             settings,
             &mut validation,
@@ -350,6 +350,120 @@ where
 // had not finished moving, so whatever already stands at its destination is
 // an interrupted copy and gives way to it. A destination entry whose source
 // is gone moved whole before the restart, and nothing here reaches it.
+// A failed job keeps what it delivered in its working directory, as it
+// does on one device: what its staging directory holds goes back there,
+// joining the directories both hold, and the staging directory goes. The
+// marker and the chunk directory are the staging directory's own.
+// The working directory is released whether or not the delivery made it
+// back whole: what stays in the staging directory is still the job's, and
+// stays there while the job has a record.
+pub(crate) fn release_failed_delivery(
+    root: &Path,
+    working_dir: &Path,
+    staging: Option<&Path>,
+    job_id: JobId,
+) -> std::io::Result<()> {
+    release_failed_delivery_using(
+        root,
+        working_dir,
+        staging,
+        job_id,
+        move_path_with_safe_rename_or_copy_fallback,
+    )
+}
+
+fn release_failed_delivery_using<M>(
+    root: &Path,
+    working_dir: &Path,
+    staging: Option<&Path>,
+    job_id: JobId,
+    move_entry: M,
+) -> std::io::Result<()>
+where
+    M: Fn(&Path, &Path, u64, Arc<PhaseCounters>) -> Result<(), (std::io::Error, std::io::Error)>,
+{
+    let returned = staging.map_or(Ok(()), |staging| {
+        return_staged_delivery_using(staging, working_dir, move_entry)
+    });
+    let released = crate::jobs::working_dir::release_failed_working_dir(root, working_dir, job_id);
+    returned.and(released)
+}
+
+fn return_staged_delivery_using<M>(
+    staging: &Path,
+    working_dir: &Path,
+    move_entry: M,
+) -> std::io::Result<()>
+where
+    M: Fn(&Path, &Path, u64, Arc<PhaseCounters>) -> Result<(), (std::io::Error, std::io::Error)>,
+{
+    let entries = match std::fs::read_dir(staging) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        result => result?,
+    };
+    let counters = Arc::new(PhaseCounters::default());
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name == WORKING_DIR_MARKER || name == ".weaver-chunks" {
+            continue;
+        }
+        let (from, to) = (entry.path(), working_dir.join(&name));
+        let moved = if std::fs::symlink_metadata(&to).is_ok() {
+            merge_delivered_dir(&from, &to, Arc::clone(&counters)).map(|_| ())
+        } else {
+            let bytes = entry.metadata().map_or(0, |metadata| metadata.len());
+            move_entry(&from, &to, bytes, Arc::clone(&counters))
+        };
+        moved.map_err(|(_, fallback)| fallback)?;
+    }
+    std::fs::remove_dir_all(staging)
+}
+
+// Move what `src` holds into `dst` when both are real directories, entry by
+// entry, a directory both hold joined the same way. An entry whose name is
+// already taken in `dst` stays where it is. Whether they were directories
+// to join.
+fn merge_delivered_dir(
+    src: &std::path::Path,
+    dst: &std::path::Path,
+    phase_counters: Arc<PhaseCounters>,
+) -> Result<bool, (std::io::Error, std::io::Error)> {
+    let real_dir = |path: &std::path::Path| {
+        std::fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata_is_link_or_reparse(&metadata))
+    };
+    if !real_dir(src) || !real_dir(dst) {
+        return Ok(false);
+    }
+    let unread = |error: std::io::Error| {
+        (
+            error,
+            std::io::Error::other("the directory to join was not read"),
+        )
+    };
+    for entry in std::fs::read_dir(src).map_err(unread)? {
+        let entry = entry.map_err(unread)?;
+        let (from, to) = (entry.path(), dst.join(entry.file_name()));
+        if std::fs::symlink_metadata(&to).is_ok() {
+            merge_delivered_dir(&from, &to, Arc::clone(&phase_counters))?;
+            continue;
+        }
+        let bytes = std::fs::symlink_metadata(&from)
+            .ok()
+            .filter(std::fs::Metadata::is_file)
+            .map_or(0, |metadata| metadata.len());
+        move_path_with_safe_rename_or_copy_fallback(
+            &from,
+            &to,
+            bytes,
+            Arc::clone(&phase_counters),
+        )?;
+    }
+    let _ = std::fs::remove_dir(src);
+    Ok(true)
+}
+
 fn move_delivered_entry(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -626,6 +740,9 @@ async fn run_move_to_claimed_destination(
     {
         while let Ok(Some(entry)) = entries.next_entry().await {
             let file_name = entry.file_name();
+            if file_name == WORKING_DIR_MARKER {
+                continue;
+            }
             if file_name == ".weaver-chunks" {
                 let src = entry.path();
                 if let Err(error) = tokio::fs::remove_dir_all(&src).await
@@ -689,6 +806,31 @@ async fn run_move_to_claimed_destination(
             }
             let dst = dest.join(&file_name);
             if !resumed && dst.exists() && !runtime_fs::paths_equivalent_for_placement(&src, &dst) {
+                // A directory the staging directory delivered first, which
+                // the working directory also holds delivered files of: they
+                // join it, and a name the staging directory already filled
+                // keeps what it holds.
+                let counters = Arc::clone(&phase_counters);
+                let (src_fb, dst_fb) = (src.clone(), dst.clone());
+                match crate::runtime::panic_trap::spawn_blocking(move || {
+                    merge_delivered_dir(&src_fb, &dst_fb, counters)
+                })
+                .await
+                {
+                    Ok(Ok(true)) => moved += 1,
+                    Ok(Ok(false)) => {}
+                    Ok(Err((rename_err, copy_err))) => failures.push(format!(
+                        "{}: rename failed: {}; fallback failed: {}",
+                        file_name.to_string_lossy(),
+                        rename_err,
+                        copy_err
+                    )),
+                    Err(join_err) => failures.push(format!(
+                        "{}: move task failed: {}",
+                        file_name.to_string_lossy(),
+                        join_err
+                    )),
+                }
                 continue;
             }
             let source_bytes = validation.root_entry_bytes.get(&src).copied().unwrap_or(0);
@@ -819,33 +961,61 @@ async fn run_move_to_claimed_destination(
         }
     }
 
-    let marker_path = working_dir.join(WORKING_DIR_MARKER);
-    if let Err(error) = tokio::fs::remove_file(&marker_path).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(
-            job_id = job_id.0,
-            path = %marker_path.display(),
-            error = %error,
-            "failed to remove working directory marker during final move"
-        );
-    }
-
-    if let Err(error) = tokio::fs::remove_dir(&working_dir).await
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
+    // The marker goes only with the directory. One still holding something
+    // the move left, a consumed input that could not be removed, stays the
+    // job's: a history delete, or the next start once the job is gone, takes
+    // it whole.
+    if holds_more_than_marker(&working_dir).await {
         warn!(
             job_id = job_id.0,
             dir = %working_dir.display(),
-            error = %error,
-            "failed to remove intermediate directory after move"
+            "the intermediate directory keeps what could not be removed; it stays the job's until it can go"
         );
+    } else {
+        let marker_path = working_dir.join(WORKING_DIR_MARKER);
+        if let Err(error) = tokio::fs::remove_file(&marker_path).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                job_id = job_id.0,
+                path = %marker_path.display(),
+                error = %error,
+                "failed to remove working directory marker during final move"
+            );
+        }
+
+        if let Err(error) = tokio::fs::remove_dir(&working_dir).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(
+                job_id = job_id.0,
+                dir = %working_dir.display(),
+                error = %error,
+                "failed to remove intermediate directory after move"
+            );
+        }
     }
 
     Ok(MoveToCompleteResult {
         moved_entries: moved,
         renamed_members,
     })
+}
+
+// A directory that cannot be read is taken to hold something: its marker
+// stays rather than go on a guess.
+async fn holds_more_than_marker(dir: &Path) -> bool {
+    let mut entries = match tokio::fs::read_dir(dir).await {
+        Ok(entries) => entries,
+        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
+    };
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) if entry.file_name() == WORKING_DIR_MARKER => {}
+            Ok(None) => return false,
+            Ok(Some(_)) | Err(_) => return true,
+        }
+    }
 }
 
 fn complete_parent_for_category(
@@ -1264,6 +1434,20 @@ impl Pipeline {
         let phase_counters = self.phase_begin(job_id, JobPhase::Moving, None);
         self.reserved_complete_destinations
             .insert(job_id, dest.clone());
+        // The moving row keeps what the move leaves, relative to the working
+        // directory, so a restart that finds the job elsewhere leaves the
+        // same inputs.
+        if let Some(state) = self.jobs.get_mut(&job_id) {
+            let mut kept: Vec<PathBuf> = left_behind
+                .iter()
+                .map(|path| {
+                    path.strip_prefix(&working_dir)
+                        .map_or_else(|_| path.clone(), Path::to_path_buf)
+                })
+                .collect();
+            kept.sort();
+            state.delivery_left_behind = kept;
+        }
         // The moving row, naming `dest`, must be durable before the first file
         // leaves the working directory: a restart then finds the delivery and
         // never fetches the job again. SABnzbd keeps a finished download in
@@ -1412,6 +1596,19 @@ impl Pipeline {
             "resuming final move after a restart"
         );
         let naming = self.delivery_naming_plan(job_id, &job_name).await;
+        // The consumed inputs the move was told to leave before the restart
+        // stay where they are.
+        let left_behind = self
+            .jobs
+            .get(&job_id)
+            .map(|state| {
+                state
+                    .delivery_left_behind
+                    .iter()
+                    .map(|path| working_dir.join(path))
+                    .collect()
+            })
+            .unwrap_or_default();
         self.spawn_final_move(FinalMove {
             job_id,
             working_dir,
@@ -1423,7 +1620,7 @@ impl Pipeline {
             phase_counters,
             naming,
             policy_source: DeliveryPolicySource::Persisted(self.db.clone()),
-            left_behind: HashSet::new(),
+            left_behind,
         });
     }
 
@@ -1757,11 +1954,17 @@ impl Pipeline {
             0
         };
         let delivered = verdict.filter(|_| pipeline_failure_stage.is_none());
+        let left_behind = self
+            .jobs
+            .get(&job_id)
+            .map(|state| state.delivery_left_behind.clone())
+            .unwrap_or_default();
         crate::post_processing::model::PostProcessingFacts {
             outcome,
             par_status,
             unpack_status,
             delivered,
+            left_behind,
         }
     }
 

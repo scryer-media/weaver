@@ -54,6 +54,10 @@ pub struct Config {
     // after successful extraction. Defaults to true.
     #[serde(default)]
     pub cleanup_after_extract: Option<bool>,
+    // Whether housekeeping deletes what a failed job left in the intermediate
+    // and staging directories a day after it failed. Defaults to true.
+    #[serde(default)]
+    pub delete_failed_job_files: Option<bool>,
     // Watched-folder NZB intake settings.
     #[serde(default)]
     pub watch_folder: WatchFolderConfig,
@@ -111,6 +115,12 @@ impl Config {
     // Defaults to `true` when not explicitly configured.
     pub fn cleanup_after_extract(&self) -> bool {
         self.cleanup_after_extract.unwrap_or(true)
+    }
+
+    // Whether housekeeping deletes a failed job's files. Defaults to `true`
+    // when not explicitly configured.
+    pub fn delete_failed_job_files(&self) -> bool {
+        self.delete_failed_job_files.unwrap_or(true)
     }
 
     // Whether a finished job may rename a delivered member that still wears an
@@ -1224,6 +1234,7 @@ mod tests {
             retry: None,
             bandwidth: Default::default(),
             cleanup_after_extract: None,
+            delete_failed_job_files: None,
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             watch_folder: WatchFolderConfig::default(),

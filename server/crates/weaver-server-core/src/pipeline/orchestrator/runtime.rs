@@ -170,6 +170,9 @@ impl Pipeline {
         );
 
         tokio::fs::create_dir_all(&data_dir).await?;
+        // No job lends a decode window yet: any in the data folder is a past
+        // process's.
+        crate::pipeline::graph::window::sweep_spare(&data_dir);
         // A download folder on a drive that is gone must not stop Weaver from
         // starting, or it could never be pointed at another one.
         for dir in [&intermediate_dir, &complete_dir] {
@@ -252,6 +255,9 @@ impl Pipeline {
         let graph_holds = Arc::new(weaver_graph::holds::HoldsAccountant::new(
             hold_settings.budgets(),
         ));
+        let graph_decode = Arc::new(crate::pipeline::graph::engine::DecodePool::for_run(
+            &graph_hardware.grant().run,
+        ));
         let mut pipeline = Self {
             _control_runtime: crate::pipeline::queue::RuntimeGuard(shared_state.queue.clone()),
             event_tx,
@@ -266,6 +272,7 @@ impl Pipeline {
             retiring_graph_jobs: HashMap::new(),
             graph_status: Default::default(),
             graph_holds,
+            graph_decode,
             graph_runs: Default::default(),
             graph_outside: Default::default(),
             post_probes: Default::default(),
@@ -439,6 +446,7 @@ impl Pipeline {
             unanchored_requeues: HashMap::new(),
             pending_unanchored_release: Vec::new(),
             storage_capacity,
+            window_ledgers: Default::default(),
             extraction_limits,
             process_memory_budget,
             job_article_memory: HashMap::new(),

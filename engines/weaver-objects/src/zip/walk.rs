@@ -2,9 +2,10 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Walking the local headers from the front, when the directory cannot be
-// had first. Each header says its entry's name and sizes, so a stored entry
-// streams as soon as its header is in; the walk stops at the directory,
-// which every header walked must then agree with. A header whose sizes
+// had first or a ZipCrypto entry should not wait for it. Each header says
+// its entry's name and sizes, so a stored entry streams as soon as its
+// header is in; the walk stops at the directory, which every header walked
+// must then agree with, or leaves for it at an entry only it can size. A header whose sizes
 // follow the data cannot say where its entry ends, and a local header
 // carries no file mode, so here a link reads as a file.
 
@@ -80,6 +81,15 @@ impl Zip {
                 return self.say_damaged(range, out);
             };
             if let Some(why) = walk_refusal(&header) {
+                // An entry whose extent only the directory says leaves the
+                // walk for the directory once its tail is in: the members
+                // walked stand where it agrees with them. Without the tail
+                // the bytes after it would be held until it came.
+                if why == Why::UnboundedEntry && self.tail_in_hand() {
+                    self.walking = false;
+                    self.stale = true;
+                    return;
+                }
                 return self.give_up(Emit::NeedsEngine(why), out);
             }
             self.basis.push((range, crc32(&bytes)));
@@ -133,6 +143,13 @@ impl Zip {
             }
             self.emit_kept(member, out);
         }
+    }
+
+    fn tail_in_hand(&self) -> bool {
+        self.total().is_some_and(|total| {
+            let tail = ByteRange::new(total.saturating_sub(records::TAIL), total);
+            self.kept.read(tail).is_some()
+        })
     }
 
     fn advance(&mut self, by: u64) {

@@ -86,6 +86,12 @@ impl Pipeline {
         let Some(state) = self.jobs.get(&job_id) else {
             return false;
         };
+        // A job with a graph, live or retiring, keeps its working folder: the
+        // graph holds its paths from the build, and the folder's name never
+        // reaches the user. The new name still names the complete folder.
+        if self.graph_jobs.contains_key(&job_id) || self.retiring_graph_jobs.contains_key(&job_id) {
+            return true;
+        }
         if self
             .active_downloads_by_job
             .get(&job_id)
@@ -132,9 +138,6 @@ impl Pipeline {
                 return false;
             }
         };
-        if let Some(cache) = self.repeated_articles.get(&job_id) {
-            cache.relocate_working_dir(&old_dir, &new_dir);
-        }
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.working_dir = new_dir;
         }

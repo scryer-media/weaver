@@ -1689,10 +1689,29 @@ impl SchedulerHandle {
         job_id: JobId,
         password: Option<String>,
     ) -> Result<(), SchedulerError> {
+        self.reprocess_job_with_options(job_id, password, false)
+            .await
+    }
+
+    // Reprocess with `no_memory_limit`: the job's decode windows over the
+    // profile's ceiling are lent from scratch, then RAM, whatever the
+    // profile says. Other jobs keep their limits.
+    pub async fn reprocess_job_with_options(
+        &self,
+        job_id: JobId,
+        password: Option<String>,
+        no_memory_limit: bool,
+    ) -> Result<(), SchedulerError> {
         self.state
             .queue
             .clone()
-            .restart(job_id, password, true, self.event_tx.clone())
+            .restart(
+                job_id,
+                password,
+                true,
+                no_memory_limit,
+                self.event_tx.clone(),
+            )
             .await
     }
 
@@ -1709,7 +1728,7 @@ impl SchedulerHandle {
         self.state
             .queue
             .clone()
-            .restart(job_id, password, false, self.event_tx.clone())
+            .restart(job_id, password, false, false, self.event_tx.clone())
             .await
     }
 
@@ -1747,6 +1766,22 @@ impl SchedulerHandle {
             .queue
             .clone()
             .delete_history(job_ids, delete_files)
+            .await
+    }
+
+    // Housekeeping for what jobs left on disk. With `failed_finished_by`, in
+    // epoch seconds, the files of every failed job that finished by then go
+    // and their records stay; a marked working directory of a job with no
+    // row goes once its marker is older than `marked_before`.
+    pub(crate) async fn sweep_job_files(
+        &self,
+        failed_finished_by: Option<i64>,
+        marked_before: std::time::SystemTime,
+    ) {
+        self.state
+            .queue
+            .clone()
+            .sweep_job_files(failed_finished_by, marked_before)
             .await
     }
 

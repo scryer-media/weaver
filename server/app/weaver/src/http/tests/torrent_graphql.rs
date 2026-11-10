@@ -121,6 +121,7 @@ fn profile() -> SystemProfile {
             total_bytes: 8 << 30,
             available_bytes: 4 << 30,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Unknown,

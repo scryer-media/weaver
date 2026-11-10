@@ -36,6 +36,8 @@ pub(in crate::pipeline) const ARTICLE: usize = 64;
 // Every run is its own pipeline, so one id serves every scenario.
 pub(in crate::pipeline::tests) const JOB: JobId = JobId(93_001);
 const JOB_NAME: &str = "lantern beacon";
+// A stored settings value that does not parse.
+pub(in crate::pipeline::tests) const CORRUPT_POLICY: &str = "{unreadable";
 
 pub(in crate::pipeline) struct Post {
     pub(in crate::pipeline) name: String,
@@ -526,6 +528,11 @@ pub(super) async fn hear_probe(pipeline: &mut Pipeline) {
     }
 }
 
+// What a scenario sets on a pipeline it prepares, and what it is told of a
+// word a run says.
+type Setup = std::sync::Arc<dyn Fn(&mut Pipeline) + Send + Sync>;
+type HeardHook = std::sync::Arc<dyn Fn(&crate::pipeline::graph::engine::Said) + Send + Sync>;
+
 pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) posts: Vec<Post>,
     pub(in crate::pipeline::tests) damage: Vec<(u32, u32)>,
@@ -572,9 +579,25 @@ pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) limits: Option<ExtractionLimits>,
     // The operator's unacceptable extensions, when not the stored ones.
     pub(in crate::pipeline::tests) unacceptable: Option<Vec<String>>,
+    // Every pipeline the scenario prepares finds the stored settings
+    // present but not parsing.
+    policy_corrupt: bool,
+    // The hold budgets every graph job of the pipeline shares, when not the
+    // host's.
+    pub(in crate::pipeline::tests) holds: Option<weaver_graph::holds::HoldBudgets>,
+    // The hardware profile the operator chose, when not the recommendation.
+    profile: Option<crate::runtime::HardwareProfile>,
+    // Metadata the job is submitted with beside the post's own.
+    metadata: Vec<(String, String)>,
     // The STAT server of every pipeline the scenario prepared, held as long
     // as the scenario is.
     stat_servers: std::sync::Mutex<Vec<Listener>>,
+    // What the scenario sets on every pipeline it prepares, last, once the
+    // rest is set.
+    setup: Option<Setup>,
+    // What the scenario is told of everything a run says, as the run loop
+    // hears it and before the job does.
+    heard: Option<HeardHook>,
 }
 
 impl Scenario {
@@ -599,8 +622,58 @@ impl Scenario {
             leased: false,
             limits: None,
             unacceptable: None,
+            policy_corrupt: false,
+            holds: None,
+            profile: None,
+            metadata: Vec::new(),
             stat_servers: std::sync::Mutex::new(Vec::new()),
+            setup: None,
+            heard: None,
         }
+    }
+
+    // Everything a run says is told to `heard` first. Only the rows that
+    // lend windows listen, and only where windows are mapped.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(in crate::pipeline::tests) fn heard(
+        mut self,
+        heard: impl Fn(&crate::pipeline::graph::engine::Said) + Send + Sync + 'static,
+    ) -> Self {
+        self.heard = Some(std::sync::Arc::new(heard));
+        self
+    }
+
+    // Every pipeline the scenario prepares is set this way, last. Only the
+    // rows that lend windows set it, and only where windows are mapped.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(in crate::pipeline::tests) fn setup(
+        mut self,
+        setup: impl Fn(&mut Pipeline) + Send + Sync + 'static,
+    ) -> Self {
+        self.setup = Some(std::sync::Arc::new(setup));
+        self
+    }
+
+    // The operator chose this hardware profile.
+    pub(in crate::pipeline::tests) fn profile(
+        mut self,
+        profile: crate::runtime::HardwareProfile,
+    ) -> Self {
+        self.profile = Some(profile);
+        self
+    }
+
+    // The job carries this metadata entry, as a reprocess or a client sets it.
+    pub(in crate::pipeline::tests) fn metadata(mut self, key: &str, value: &str) -> Self {
+        self.metadata.push((key.to_string(), value.to_string()));
+        self
+    }
+
+    // The stored settings are present but do not parse, on every pipeline
+    // that runs the job.
+    pub(in crate::pipeline::tests) fn policy_corrupt(mut self) -> Self {
+        self.policy_corrupt = true;
+        self
     }
 
     // The job runs under these extraction limits.
@@ -654,6 +727,34 @@ impl Scenario {
         if let Some(limits) = &self.limits {
             pipeline.extraction_limits = std::sync::Arc::new(limits.clone());
         }
+        if let Some(budgets) = self.holds {
+            pipeline.graph_holds =
+                std::sync::Arc::new(weaver_graph::holds::HoldsAccountant::new(budgets));
+        }
+        if let Some(profile) = self.profile {
+            pipeline.set_configured_hardware_profile(profile);
+        }
+        if self.policy_corrupt {
+            pipeline
+                .db
+                .set_setting(
+                    crate::post_processing::settings::SETTINGS_KEY,
+                    CORRUPT_POLICY,
+                )
+                .unwrap();
+        }
+        if let Some(setup) = &self.setup {
+            setup(pipeline);
+        }
+    }
+
+    // The job's holds run under these budgets.
+    pub(in crate::pipeline::tests) fn holds(
+        mut self,
+        budgets: weaver_graph::holds::HoldBudgets,
+    ) -> Self {
+        self.holds = Some(budgets);
+        self
     }
 
     // Whatever the download queue hands out at once arrives in reverse.
@@ -764,10 +865,12 @@ impl Scenario {
     }
 
     pub(in crate::pipeline::tests) fn spec(&self) -> JobSpec {
-        JobSpec {
+        let mut spec = JobSpec {
             password: self.password.clone(),
             ..spec(JOB_NAME, &self.posts, self.article)
-        }
+        };
+        spec.metadata.extend(self.metadata.iter().cloned());
+        spec
     }
 }
 
@@ -832,6 +935,9 @@ pub(in crate::pipeline::tests) struct GraphView {
     pub(in crate::pipeline::tests) rulings: Vec<(String, Option<RepairOutcome>)>,
     // The kind of every object the tree held at any look, by its name.
     pub(in crate::pipeline::tests) kinds: BTreeSet<String>,
+    // How many objects the job had sent out for their work, at the last
+    // look.
+    pub(in crate::pipeline::tests) loans: u64,
     // How many password candidates each node was offered, at the last look.
     pub(in crate::pipeline::tests) offered: BTreeMap<weaver_graph::NodeId, usize>,
     // The files the job hands over at every depth, by output name.
@@ -858,6 +964,9 @@ pub(in crate::pipeline::tests) struct GraphView {
     // Across each restart: the bytes still to come and wanted the report
     // showed as the pipeline went down, and as the new one restored the job.
     pub(in crate::pipeline::tests) restored_remaining: Vec<((u64, u64), (u64, u64))>,
+    // The restarts after which the restored job had a run out and articles
+    // queued to fetch at once: it downloads while its runs decode again.
+    pub(in crate::pipeline::tests) fetching_while_running: usize,
     // At each look, for every root member a set covers: its name, whether
     // its sets proved it (every one covering it ruled clean or repaired and
     // none is out), and whether the root still keeps its checksums.
@@ -865,6 +974,9 @@ pub(in crate::pipeline::tests) struct GraphView {
     // The most the job's working directory held at any look, every file
     // under it by its length.
     pub(in crate::pipeline::tests) scratch: u64,
+    // The most the job's holds kept at any look, in memory, on scratch and
+    // on file, over every namespace.
+    pub(in crate::pipeline::tests) held: u64,
 }
 
 #[derive(Debug)]
@@ -998,6 +1110,24 @@ pub(in crate::pipeline::tests) async fn admit_with(
 
 // A run that may stall, for a row that asserts the job does.
 pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<Outcome, Stall> {
+    try_run_then(scenario, async |_, _| {}).await
+}
+
+// [`run`], with `after` given the pipeline and the complete directory once
+// the job has finished and its outcome is read, before the pipeline goes.
+pub(in crate::pipeline::tests) async fn run_then(
+    scenario: &Scenario,
+    after: impl AsyncFnOnce(&mut Pipeline, &Path),
+) -> Outcome {
+    try_run_then(scenario, after)
+        .await
+        .unwrap_or_else(|stall| panic!("job stalled at {:?}: {}", stall.status, stall.state))
+}
+
+async fn try_run_then(
+    scenario: &Scenario,
+    after: impl AsyncFnOnce(&mut Pipeline, &Path),
+) -> Result<Outcome, Stall> {
     let (_temp_dir, mut pipeline, complete_dir) = admit(scenario).await;
     // Events the run sends are heard from admission on; nothing sent before
     // the job was admitted belongs to it.
@@ -1060,6 +1190,9 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
             .is_some_and(|job| job.awaits_mail())
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            if let Some(heard) = &scenario.heard {
+                heard(&said);
+            }
             pipeline.graph_run_said(said);
             observe(&pipeline, &mut graph, &mut reads);
             continue;
@@ -1120,6 +1253,7 @@ pub(in crate::pipeline::tests) async fn try_run(scenario: &Scenario) -> Result<O
         .into_iter()
         .map(|(stage, histogram)| (stage, histogram.count))
         .collect();
+    after(&mut pipeline, &complete_dir).await;
     retire_pipeline_database(pipeline).await;
     Ok(Outcome {
         status,
@@ -1265,6 +1399,16 @@ fn handed_out(
         let mut works = lease.works;
         works.reverse();
         return Some((works, Some(lease.checkpoint_plan)));
+    }
+    // The scheduler hands a restored job nothing while its recovery reads
+    // back what arrived of its volumes; the queue popped by hand
+    // here holds back the same.
+    if pipeline
+        .graph_jobs
+        .get(&JOB)
+        .is_some_and(|graph| graph.rewalks_owed())
+    {
+        return None;
     }
     let queue = &mut pipeline
         .jobs
@@ -1557,6 +1701,7 @@ pub(in crate::pipeline::tests) fn observe(
         }
         view.report = Some(report);
     }
+    view.loans = view.loans.max(job.loans_lent());
     let tree = job.tree();
     if let Some(namespace) = tree.namespace(weaver_graph::NodeId::ROOT) {
         let sets = tree.recovery_nodes(weaver_graph::NodeId::ROOT);
@@ -1635,6 +1780,12 @@ pub(in crate::pipeline::tests) fn observe(
         })
         .sum();
     view.resident = view.resident.max(resident);
+    let held = tree
+        .live()
+        .into_iter()
+        .map(|node| job.writer().held_bytes(node))
+        .sum();
+    view.held = view.held.max(held);
     *reads = job.writer().read_backs();
     view.observed += looked.elapsed();
 }

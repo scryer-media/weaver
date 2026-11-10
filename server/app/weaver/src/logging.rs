@@ -22,6 +22,7 @@ use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::fmt::{FmtContext, FormattedFields};
 use tracing_subscriber::registry::LookupSpan;
+use weaver_server_core::runtime::log_delivery::{DeliveryGuard, LogDelivery};
 
 // Renders a log timestamp as RFC 3339 in the zone of `now`.
 //
@@ -288,6 +289,56 @@ impl Visit for OrderedFields {
         self.0
             .push((field.name(), Value::String(format!("{value:?}"))));
     }
+}
+
+// Hands each formatted event to a delivery, whose own thread writes it.
+pub(crate) struct DeliveredWriter(pub(crate) LogDelivery);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DeliveredWriter {
+    type Writer = weaver_server_core::runtime::log_delivery::EventWriter<'a>;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.0.make_writer()
+    }
+}
+
+// A console or file layer: the event is formatted on the thread that logged
+// it and written by the delivery's thread. A sink that stops taking writes,
+// such as a stdout pipe nobody reads, costs counted dropped events, never a
+// thread that logs.
+pub(crate) fn delivered_layer<S>(
+    format: LogFormat,
+    ansi: bool,
+    delivery: LogDelivery,
+) -> Box<dyn tracing_subscriber::Layer<S> + Send + Sync>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    let writer = DeliveredWriter(delivery);
+    match format {
+        LogFormat::Json => Box::new(
+            tracing_subscriber::fmt::layer()
+                .fmt_fields(JsonSpanFields)
+                .event_format(JsonRecord)
+                .with_writer(writer)
+                .with_ansi(false),
+        ),
+        LogFormat::Text => Box::new(
+            tracing_subscriber::fmt::layer()
+                .with_timer(LocalTimer)
+                .with_writer(writer)
+                .with_ansi(ansi),
+        ),
+    }
+}
+
+// Standard output as a delivered sink: the process-wide stdout lock is taken
+// by the delivery's thread alone.
+pub(crate) fn open_stdout_delivery() -> std::io::Result<(LogDelivery, DeliveryGuard)> {
+    LogDelivery::new("stdout", |bytes| {
+        let mut stdout = std::io::stdout().lock();
+        stdout.write_all(bytes)?;
+        stdout.flush()
+    })
 }
 
 static CONSOLE_FORMAT: OnceLock<LogFormat> = OnceLock::new();
@@ -739,6 +790,66 @@ mod tests {
             parsed.offset().local_minus_utc(),
             Local::now().offset().local_minus_utc()
         );
+    }
+
+    // A console sink that stops taking writes, as a stdout pipe whose reader
+    // stalled does, holds no thread that logs: a task on the runtime keeps
+    // logging and finishes while the sink holds its first event, and each
+    // event the full queue cannot take is counted as dropped.
+    #[test]
+    fn a_stalled_console_sink_never_holds_a_thread_that_logs() {
+        use std::sync::mpsc;
+        use tracing_subscriber::layer::SubscriberExt;
+        use weaver_server_core::runtime::log_delivery::counter_snapshot;
+
+        const SINK: &str = "stdout-stall-fixture";
+        const EVENTS: u64 = 1_000;
+        let (entered, entering) = mpsc::channel();
+        let (release, released) = mpsc::channel::<()>();
+        let (written, writes) = mpsc::channel();
+        let mut first = true;
+        let (delivery, guard) = LogDelivery::new(SINK, move |bytes| {
+            if std::mem::take(&mut first) {
+                entered.send(()).unwrap();
+                released.recv().unwrap();
+            }
+            written.send(bytes.to_vec()).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        let subscriber =
+            tracing_subscriber::registry().with(delivered_layer(LogFormat::Json, false, delivery));
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+
+        let logged = tracing::subscriber::with_default(subscriber, || {
+            tracing::info!("held by the sink");
+            entering.recv().unwrap();
+            // The runtime has this one thread, so a write that waited on the
+            // held sink would stop the task, and the test, here.
+            runtime.block_on(async {
+                tokio::spawn(async {
+                    for beat in 0..EVENTS {
+                        tracing::info!(beat, "weaver heartbeat");
+                    }
+                    EVENTS
+                })
+                .await
+                .unwrap()
+            })
+        });
+
+        assert_eq!(logged, EVENTS);
+        let dropped = counter_snapshot()[SINK].0;
+        assert!(dropped > 0, "a full queue drops events and counts them");
+        release.send(()).unwrap();
+        // Every event is written or counted dropped, never both.
+        for _ in 0..1 + EVENTS - dropped {
+            writes.recv().unwrap();
+        }
+        drop(guard);
+        assert!(writes.recv().is_err(), "nothing past the count is written");
     }
 }
 

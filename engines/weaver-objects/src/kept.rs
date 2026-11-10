@@ -187,6 +187,21 @@ impl Kept {
             .filter(move |piece| piece.range.intersect(range).is_some())
     }
 
+    // Whether absorbing a delivery would change anything kept, in its bytes
+    // or in how far they can be trusted.
+    pub(crate) fn absorbs(&self, range: ByteRange, bytes: &[u8], provenance: Provenance) -> bool {
+        self.overlapping(range).any(|piece| {
+            let Some(overlap) = piece.range.intersect(range) else {
+                return false;
+            };
+            let from = &bytes
+                [(overlap.start - range.start) as usize..(overlap.end - range.start) as usize];
+            let at = (overlap.start - piece.range.start) as usize;
+            first_untrusted(&piece.coverage, overlap, provenance).is_some()
+                || piece.bytes.get(at..at + from.len()) != Some(from)
+        })
+    }
+
     // Keep what of a delivery lands in a wanted range. The first offset where
     // anything kept changed, in its bytes or in how far they can be trusted;
     // `None` when nothing did.
@@ -280,6 +295,16 @@ impl Kept {
         let at = (offset - piece.range.start) as usize;
         let end = (run.range.end - piece.range.start) as usize;
         &piece.bytes[at..end]
+    }
+
+    // How the run in hand at `offset`, the one `from` reads, arrived.
+    pub(crate) fn provenance_at(&self, offset: u64) -> Option<Provenance> {
+        let (_, piece) = self.pieces.range(..=offset).next_back()?;
+        piece
+            .coverage
+            .runs()
+            .find(|run| run.range.contains(offset))
+            .map(|run| run.provenance)
     }
 
     // Every run in hand, in order, with its bytes and how they arrived.

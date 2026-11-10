@@ -164,6 +164,7 @@ impl TestHarness {
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
+            delete_failed_job_files: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: Some(crate::settings::DirectStoreOverrides {
@@ -198,6 +199,7 @@ impl TestHarness {
                 total_bytes: 8 * 1024 * 1024 * 1024,
                 available_bytes: 8 * 1024 * 1024 * 1024,
                 cgroup_limit: None,
+                guessed: false,
             },
             disk: DiskProfile {
                 storage_class: StorageClass::Ssd,
@@ -370,6 +372,7 @@ fn minimal_job_state(job_id: JobId, name: &str, working_dir: PathBuf) -> JobStat
         paused_resume_post_state: None,
         failure_error: None,
         delivered: None,
+        delivery_left_behind: Vec::new(),
         working_dir,
         downloaded_bytes: 0,
         restored_download_floor_bytes: 0,
@@ -534,7 +537,7 @@ async fn settle_lane_dials(pipeline: &mut Pipeline) {
     }
 }
 
-async fn new_direct_pipeline_with_buffers(
+pub(crate) async fn new_direct_pipeline_with_buffers(
     temp_dir: &TempDir,
     buffer_config: BufferPoolConfig,
     total_connections: usize,
@@ -602,6 +605,7 @@ async fn new_direct_pipeline_at_roots(
                 total_bytes: 8 * 1024 * 1024 * 1024,
                 available_bytes: 8 * 1024 * 1024 * 1024,
                 cgroup_limit: None,
+                guessed: false,
             },
             disk: DiskProfile {
                 storage_class: StorageClass::Ssd,
@@ -652,6 +656,7 @@ async fn new_direct_pipeline_on_machine(
         propagation_delay_secs: None,
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
+        delete_failed_job_files: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: Some(direct_store),
@@ -790,6 +795,20 @@ pub(in crate::pipeline) async fn hear_graph_mail(pipeline: &mut Pipeline, job_id
         .get(&job_id)
         .or_else(|| pipeline.retiring_graph_jobs.get(&job_id))
         .is_some_and(|job| job.awaits_mail())
+    {
+        let said = pipeline.graph_runs.recv().await.unwrap();
+        pipeline.graph_run_said(said);
+    }
+}
+
+// Hear the run mail until every restored recovery object of the graph job
+// heard what of its volumes arrived again, as it does before the job
+// fetches anything.
+pub(in crate::pipeline) async fn hear_rewalks(pipeline: &mut Pipeline, job_id: JobId) {
+    while pipeline
+        .graph_jobs
+        .get(&job_id)
+        .is_some_and(|job| job.rewalks_owed())
     {
         let said = pipeline.graph_runs.recv().await.unwrap();
         pipeline.graph_run_said(said);
@@ -1746,6 +1765,7 @@ async fn insert_active_job_with_persisted_nzb_named(
             paused_resume_post_state: None,
             failure_error: None,
             delivered: None,
+            delivery_left_behind: Vec::new(),
             working_dir: working_dir.clone(),
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
@@ -2063,6 +2083,17 @@ async fn pump_pipeline_runtime_queues(pipeline: &mut Pipeline) {
     pipeline.pump_decode_queue();
     while let Some(queued_job) = pipeline.pending_completion_checks.pop_front() {
         pipeline.check_job_completion(queued_job).await;
+        pipeline.pump_decode_queue();
+    }
+    // An object lent out for its work comes back before the next article,
+    // as the runtime's loop takes its mail while a lane fetches.
+    while pipeline.graph_jobs.values().any(|job| job.working()) {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("an object out for its work comes back");
+        pipeline.graph_run_said(said);
         pipeline.pump_decode_queue();
     }
     settle_inflight_moves(pipeline).await;

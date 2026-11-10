@@ -77,11 +77,13 @@ pub(crate) struct Snapshot {
     pub(crate) passwords: BTreeMap<NodeId, usize>,
 }
 
-// A hold of the namespace at `node` paged to its scratch file.
+// A hold of the namespace at `node` paged to its scratch file, or,
+// `on_file`, in its member's spill file at its own offset.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct HoldRecord {
     pub(crate) node: NodeId,
     pub(crate) held: ScratchHold,
+    pub(crate) on_file: bool,
 }
 
 // The generations a checkpoint read the job at: of the tree, of the
@@ -904,6 +906,22 @@ impl Pipeline {
         {
             return;
         }
+        self.hold_graph_job_on_host_error(
+            job_id,
+            format!(
+                "Checkpoint could not be persisted: {error}. Resolve the storage error and resume to retry; files are retained."
+            ),
+        );
+    }
+
+    // The host failed the job a step it cannot go on without: the job
+    // pauses, keeping its files, with the reason the operator resolves
+    // before resuming it. A host error never fails a job.
+    pub(in crate::pipeline) fn hold_graph_job_on_host_error(
+        &mut self,
+        job_id: JobId,
+        reason: String,
+    ) {
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
@@ -919,9 +937,7 @@ impl Pipeline {
             );
         }
         if let Some(state) = self.jobs.get_mut(&job_id) {
-            state.failure_error = Some(format!(
-                "Checkpoint could not be persisted: {error}. Resolve the storage error and resume to retry; files are retained."
-            ));
+            state.failure_error = Some(reason);
         }
         self.report_job(job_id);
     }
@@ -944,6 +960,13 @@ impl Pipeline {
                 return;
             };
             if graph.pending().control().cancelled() {
+                return;
+            }
+            // The steps stay unread until the object out for its work is
+            // back. Nothing more goes out until a checkpoint is recorded, so
+            // the step that takes it back takes them.
+            if graph.working() {
+                graph.owe_checkpoint();
                 return;
             }
             let feed_verdict = self.post_probes.verdicts.get(&job_id);
@@ -1303,17 +1326,18 @@ fn audit(job: &GraphJob, held: &Held) {
     }
 }
 
-// A namespace's holds on scratch, in key order, as the ledger lists them.
-fn hold_rows(node: NodeId, holds: &[ScratchHold]) -> Vec<HoldRow> {
+// A namespace's holds on disk, in key order, as the ledger lists them.
+fn hold_rows(node: NodeId, holds: &[(ScratchHold, bool)]) -> Vec<HoldRow> {
     let node = i64::from(node.0);
     let mut out: Vec<HoldRow> = holds
         .iter()
-        .map(|held| HoldRow {
+        .map(|(held, on_file)| HoldRow {
             node,
             volume: i64::from(held.volume.0),
             start: held.range.start as i64,
             end: held.range.end as i64,
             scratch_offset: held.scratch_offset as i64,
+            on_file: *on_file,
         })
         .collect();
     out.sort_by_key(Row::key);
@@ -1343,7 +1367,7 @@ fn own_rows(node: NodeRecord, password: Option<i64>) -> GraphCheckpoint {
                 .map(|window| (window.start as i64, window.end as i64)),
             kind: kind.to_string(),
             state: state_name(node.state).to_owned(),
-            reason: node.reason.map(|why| why_name(why).to_owned()),
+            reason: node.reason.map(why_text),
             facts_version: i64::from(facts.version),
             facts: facts.bytes,
             winning_password: password,
@@ -1400,7 +1424,7 @@ fn member_row(node: i64, member: MemberRecord, state: FileState) -> MemberRow {
         undecided: member.undecided,
         has_file: state.has_file,
         on_disk: state.on_disk,
-        refused: state.refused.map(|why| why_name(why).to_owned()),
+        refused: state.refused.map(why_text),
         copy_of: member.copy_of.map(|into| i64::from(into.0)),
         refuted_kind: member.refuted.map(|kind| kind.to_string()),
     }
@@ -1705,6 +1729,7 @@ pub(crate) fn snapshot(rows: &GraphCheckpoint) -> Result<Snapshot, CheckpointErr
                 range: range(row.node, row.start, row.end)?,
                 scratch_offset,
             },
+            on_file: row.on_file,
         });
     }
     Ok(Snapshot {
@@ -1813,7 +1838,7 @@ fn provenance_named(name: &str) -> Option<Provenance> {
     .find(|provenance| provenance_name(*provenance) == name)
 }
 
-pub(crate) const REASONS: [Why; 13] = [
+pub(crate) const REASONS: [Why; 15] = [
     Why::Compressed,
     Why::TailUnreachable,
     Why::EncryptedHeader,
@@ -1827,6 +1852,14 @@ pub(crate) const REASONS: [Why; 13] = [
     Why::Unmapped,
     Why::TooDeep,
     Why::InvalidArchive,
+    Why::TooLarge {
+        needed: None,
+        allowed: None,
+    },
+    Why::OverMachine {
+        needed: 0,
+        memory: 0,
+    },
 ];
 
 pub(crate) fn why_name(why: Why) -> &'static str {
@@ -1844,11 +1877,51 @@ pub(crate) fn why_name(why: Why) -> &'static str {
         Why::Unmapped => "unmapped",
         Why::TooDeep => "too_deep",
         Why::InvalidArchive => "invalid_archive",
+        Why::TooLarge { .. } => "too_large",
+        Why::OverMachine { .. } => "over_machine",
     }
 }
 
-fn why_named(name: &str) -> Option<Why> {
-    REASONS.into_iter().find(|why| why_name(*why) == name)
+// A reason as a checkpoint row keeps it: its name, and for a decode too
+// large the sizes it carried, each `-` where it said none, as
+// `too_large:2147483648:-`; for a decode the machine cannot hold, what it
+// needed and the machine's memory, as `over_machine:68719476736:34359738368`.
+pub(crate) fn why_text(why: Why) -> String {
+    let size = |size: Option<u64>| size.map_or_else(|| "-".to_owned(), |size| size.to_string());
+    match why {
+        Why::TooLarge { needed, allowed } => {
+            format!("{}:{}:{}", why_name(why), size(needed), size(allowed))
+        }
+        Why::OverMachine { needed, memory } => {
+            format!("{}:{needed}:{memory}", why_name(why))
+        }
+        why => why_name(why).to_owned(),
+    }
+}
+
+fn why_named(text: &str) -> Option<Why> {
+    let Some((name, sizes)) = text.split_once(':') else {
+        return REASONS
+            .into_iter()
+            .filter(|why| !matches!(why, Why::TooLarge { .. } | Why::OverMachine { .. }))
+            .find(|why| why_name(*why) == text);
+    };
+    let size = |size: &str| match size {
+        "-" => Some(None),
+        size => size.parse().ok().map(Some),
+    };
+    let (needed, allowed) = sizes.split_once(':')?;
+    match name {
+        "too_large" => Some(Why::TooLarge {
+            needed: size(needed)?,
+            allowed: size(allowed)?,
+        }),
+        "over_machine" => Some(Why::OverMachine {
+            needed: needed.parse().ok()?,
+            memory: allowed.parse().ok()?,
+        }),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

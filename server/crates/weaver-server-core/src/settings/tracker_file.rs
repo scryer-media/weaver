@@ -866,13 +866,13 @@ fn rar(bytes: &[u8], password: Option<&str>) -> Result<Members, String> {
         None => unrar_rs::RarArchive::open(source),
     }
     .map_err(|error| refusal(error, true))?;
-    archive.set_limits(unrar_rs::Limits {
-        max_header_size: MAX_HEADER_BYTES,
-        max_data_segment: MAX_DECODED_BYTES,
-        max_unpacked_size: MAX_DECODED_BYTES,
-        max_dict_size: MAX_DICTIONARY_BYTES,
-        max_ppmd_arena_size: MAX_DICTIONARY_BYTES,
-    });
+    let mut limits = unrar_rs::Limits::default();
+    limits.max_header_size = MAX_HEADER_BYTES;
+    limits.max_data_segment = MAX_DECODED_BYTES;
+    limits.max_unpacked_size = MAX_DECODED_BYTES;
+    limits.max_dict_size = MAX_DICTIONARY_BYTES;
+    limits.max_ppmd_arena_size = MAX_DICTIONARY_BYTES;
+    archive.set_limits(limits);
     if archive.more_volumes() {
         return Err(MULTI_VOLUME.to_owned());
     }

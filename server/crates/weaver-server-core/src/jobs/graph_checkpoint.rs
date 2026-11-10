@@ -119,9 +119,10 @@ pub(crate) struct CryptRow {
     pub(crate) seed: Vec<u8>,
 }
 
-// A hold of a namespace paged to scratch: a range of one of its members,
-// named as the ledger's volume, and where its bytes start in the node's
-// scratch file.
+// A hold of a namespace on disk: a range of one of its members, named as
+// the ledger's volume, and where its bytes start in the node's scratch
+// file, or, `on_file`, that they lie in the member's spill file at their
+// own offset.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HoldRow {
     pub(crate) node: i64,
@@ -129,6 +130,7 @@ pub(crate) struct HoldRow {
     pub(crate) start: i64,
     pub(crate) end: i64,
     pub(crate) scratch_offset: i64,
+    pub(crate) on_file: bool,
 }
 
 // A part that arrived and waits to be placed, spooled to a file under the
@@ -379,7 +381,8 @@ impl Row for HoldRow {
     type Key = (i64, i64, i64);
     const TABLE: &'static str = "graph_holds";
     const KEY: &'static [&'static str] = &["node_id", "volume", "range_start"];
-    const COLUMNS: &'static str = "job_id, node_id, volume, range_start, range_end, scratch_offset";
+    const COLUMNS: &'static str =
+        "job_id, node_id, volume, range_start, range_end, scratch_offset, on_file";
 
     fn key(&self) -> (i64, i64, i64) {
         (self.node, self.volume, self.start)
@@ -397,6 +400,7 @@ impl Row for HoldRow {
             SqlArg::I64(self.start),
             SqlArg::I64(self.end),
             SqlArg::I64(self.scratch_offset),
+            SqlArg::Bool(self.on_file),
         ]
     }
 }
@@ -803,7 +807,7 @@ async fn fetch_checkpoint(
             .await?,
         holds: tx
             .fetch_all(
-                "SELECT node_id, volume, range_start, range_end, scratch_offset \
+                "SELECT node_id, volume, range_start, range_end, scratch_offset, on_file \
                  FROM graph_holds WHERE job_id = {} ORDER BY node_id, volume, range_start",
                 &args,
             )
@@ -939,6 +943,7 @@ fn interpret(fetched: Fetched) -> Result<GraphCheckpoint, StateError> {
                 start: row.i64("range_start")?,
                 end: row.i64("range_end")?,
                 scratch_offset: row.i64("scratch_offset")?,
+                on_file: row.bool("on_file")?,
             })
         })
         .collect::<Result<_, StateError>>()?;

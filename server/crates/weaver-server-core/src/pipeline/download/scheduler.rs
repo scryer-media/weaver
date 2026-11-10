@@ -288,10 +288,7 @@ impl Pipeline {
             .into_iter()
             .filter_map(|(job_id, position)| {
                 let state = self.jobs.get(&job_id)?;
-                if !state.articles.has_queued_download_work()
-                    || !Self::status_allows_download_dispatch(&state.status)
-                    || self.held_for_added_scripts(job_id)
-                {
+                if !Self::has_dispatchable_work(state) || self.held_for_added_scripts(job_id) {
                     return None;
                 }
                 Some((Self::job_dispatch_priority(state), position, job_id))
@@ -390,9 +387,19 @@ impl Pipeline {
     // A job is handed work only once its articles are built. The first time
     // the walk reaches a job waiting its turn, its articles are sent for, and
     // until they arrive the job is blocked on every server, so its turn
-    // passes down the walk as any blocked job's does.
+    // passes down the walk as any blocked job's does. A restored job whose
+    // recovery is still reading back what arrived of its volumes is still
+    // finishing its activation: it fetches nothing until that is heard.
     fn job_articles_built(&mut self, job_id: JobId) -> Result<(), BlockedBy> {
         match self.jobs.get(&job_id).map(|state| &state.articles) {
+            None | Some(JobArticles::Active(_))
+                if self
+                    .graph_jobs
+                    .get(&job_id)
+                    .is_some_and(|graph| graph.rewalks_owed()) =>
+            {
+                Err(BlockedBy::only(SchedulerBlockClause::Activation))
+            }
             None | Some(JobArticles::Active(_)) => Ok(()),
             Some(JobArticles::Activating(..)) => {
                 Err(BlockedBy::only(SchedulerBlockClause::Activation))

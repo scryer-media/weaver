@@ -496,6 +496,7 @@ const GENERAL_SETTINGS_FIELDS = `
     intermediateDir
     completeDir
     cleanupAfterExtract
+    deleteFailedJobFiles
     maxRetries
     propagationDelaySecs
     maxConcurrentNzbs
@@ -849,6 +850,7 @@ export const JOB_QUERY = gql`
       historyItem {
         ...FacadeHistoryItemFields
         error
+        failedForMemory
       }
       jobTimeline {
         ...JobTimelineFields
@@ -936,6 +938,7 @@ export const JOB_DETAIL_UPDATES_SUBSCRIPTION = gql`
       historyItem {
         ...FacadeHistoryItemFields
         error
+        failedForMemory
       }
       jobTimeline {
         ...JobTimelineFields
@@ -1225,8 +1228,8 @@ export const CANCEL_JOB_MUTATION = gql`
 `;
 
 export const REPROCESS_JOB_MUTATION = gql`
-  mutation ReprocessJob($id: Int!, $password: String) {
-    reprocessJob(id: $id, password: $password)
+  mutation ReprocessJob($id: Int!, $password: String, $noMemoryLimit: Boolean) {
+    reprocessJob(id: $id, password: $password, noMemoryLimit: $noMemoryLimit)
   }
 `;
 

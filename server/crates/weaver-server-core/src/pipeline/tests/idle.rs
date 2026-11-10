@@ -40,6 +40,7 @@ async fn idle_pipeline(
         propagation_delay_secs: None,
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
+        delete_failed_job_files: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
@@ -62,6 +63,7 @@ async fn idle_pipeline(
             total_bytes: 8 * 1024 * 1024 * 1024,
             available_bytes: 8 * 1024 * 1024 * 1024,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Ssd,

@@ -1332,6 +1332,9 @@ pub struct Pipeline {
     // The holds accountant every graph job's namespaces share, so the
     // budgets bound the process, not each job.
     pub(super) graph_holds: Arc<weaver_graph::holds::HoldsAccountant>,
+    // The decode pool every graph job's engine runs share, apart from the
+    // holds, sized to the hardware profile in force.
+    pub(super) graph_decode: Arc<graph::engine::DecodePool>,
     // Where the engines graph jobs run say what they found.
     pub(super) graph_runs: graph::engine::RunMail,
     // The jobs outside the pipeline whose runs speak on that mail too.
@@ -1739,6 +1742,9 @@ pub struct Pipeline {
     // One background free-space sampler per configured root. Everything on
     // the pipeline that gates work on free space reads these readings.
     pub(super) storage_capacity: Arc<crate::operations::StorageCapacity>,
+    // What decode windows took from each disk they go on, for every graph
+    // job together.
+    pub(super) window_ledgers: graph::window::WindowLedgers,
     // Largest refused UU spill. Dispatch preserves cursor progress until
     // this many bytes can be parked in memory or admitted to the spool.
     pub(super) uu_spool_blocked_spill_bytes: Option<usize>,

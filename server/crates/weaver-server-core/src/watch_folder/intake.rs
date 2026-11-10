@@ -637,11 +637,10 @@ fn total_nzb_bytes_limit(per_member_limit: u64) -> u64 {
 }
 
 fn rar_limits(per_member_limit: u64) -> unrar_rs::Limits {
-    unrar_rs::Limits {
-        max_data_segment: per_member_limit,
-        max_unpacked_size: per_member_limit,
-        ..unrar_rs::Limits::default()
-    }
+    let mut limits = unrar_rs::Limits::default();
+    limits.max_data_segment = per_member_limit;
+    limits.max_unpacked_size = per_member_limit;
+    limits
 }
 
 fn extract_split_nzb(path: &Path, name: &str, limit: u64) -> Result<IntakeOutput, IntakeError> {

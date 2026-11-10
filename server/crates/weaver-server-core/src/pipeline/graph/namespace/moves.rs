@@ -154,14 +154,15 @@ impl NamespaceWriter {
         (node, member): (NodeId, MemberId),
         name: &str,
         held_off: bool,
+        root: &Path,
     ) -> Leaf {
         if !held_off && self.free_at(name, (node, member)) {
-            return Leaf::at(&self.working_dir, name);
+            return Leaf::at(root, name);
         }
         #[cfg(test)]
         count(|tally| tally.waiting_opens += 1);
-        let waiting = waiting_name(&self.working_dir, node, member, name);
-        let mut leaf = Leaf::at(&self.working_dir, &waiting);
+        let waiting = waiting_name(root, node, member, name);
+        let mut leaf = Leaf::at(root, &waiting);
         leaf.intend(name);
         self.moves.push(Waiting {
             node,
@@ -197,6 +198,25 @@ impl NamespaceWriter {
         for (_, gone) in &mut self.leaving {
             gone.get_or_insert(stamp);
         }
+        for emptied in self.spills_emptying.values_mut() {
+            emptied.get_or_insert(stamp);
+        }
+        // A scratch file nothing lives on, as `scratch_rewinding` says: this
+        // checkpoint names none of it. One allocated past since an earlier
+        // checkpoint found it empty waits for this one instead.
+        for (node, files) in self.files.iter() {
+            let extent = files.holds.scratch_extent();
+            if files.holds.scratch_bytes() != 0 || extent == 0 {
+                continue;
+            }
+            let waiting = self
+                .scratch_rewinding
+                .entry(*node)
+                .or_insert((stamp, extent));
+            if waiting.1 != extent {
+                *waiting = (stamp, extent);
+            }
+        }
     }
 
     // Whether a file still waits to move, or a name a file left waits for
@@ -206,10 +226,13 @@ impl NamespaceWriter {
     }
 
     // Whether anything waits for a checkpoint to commit: a move, a name a
-    // file left, or a file that goes which the one the database holds may
-    // name.
+    // file left, a file that goes or is emptied, or scratch offsets to
+    // start over, which the one the database holds may name.
     pub(crate) fn awaits_commit(&self) -> bool {
-        self.moves_waiting() || !self.leaving.is_empty()
+        self.moves_waiting()
+            || !self.leaving.is_empty()
+            || !self.spills_emptying.is_empty()
+            || !self.scratch_rewinding.is_empty()
     }
 
     // The checkpoint whose commit lets every waiting move run, as far as
@@ -218,7 +241,15 @@ impl NamespaceWriter {
         let moves = self.moves.iter().filter_map(|waiting| waiting.stamp);
         let left = self.left.values().filter_map(|stamp| *stamp);
         let gone = self.leaving.iter().filter_map(|(_, stamp)| *stamp);
-        moves.chain(left).chain(gone).max().unwrap_or(0)
+        let emptied = self.spills_emptying.values().filter_map(|stamp| *stamp);
+        let rewound = self.scratch_rewinding.values().map(|(stamp, _)| *stamp);
+        moves
+            .chain(left)
+            .chain(gone)
+            .chain(emptied)
+            .chain(rewound)
+            .max()
+            .unwrap_or(0)
     }
 
     // The checkpoints through `stamp` have committed. Every name a file
@@ -239,10 +270,34 @@ impl NamespaceWriter {
             }
             shut
         });
+        self.rewind_scratches(committed);
         let moved = self
             .remove_left(committed)
+            .and_then(|()| self.empty_released_spills(committed))
             .and_then(|()| self.run_moves(committed));
         (freed, moved)
+    }
+
+    // The checkpoints through `committed` have committed: each scratch file
+    // found empty when one of them was taken, and allocated nothing since,
+    // holds no bytes the database names, so its offsets start over.
+    fn rewind_scratches(&mut self, committed: u64) {
+        let due: Vec<(NodeId, u64)> = self
+            .scratch_rewinding
+            .iter()
+            .filter(|(_, (stamp, _))| *stamp <= committed)
+            .map(|(node, (_, extent))| (*node, *extent))
+            .collect();
+        for (node, extent) in due {
+            self.scratch_rewinding.remove(&node);
+            let unchanged = self
+                .files
+                .get(&node)
+                .is_some_and(|files| files.holds.scratch_extent() == extent);
+            if unchanged && let Some(files) = self.files.get_mut(&node) {
+                files.holds.rewind_scratch();
+            }
+        }
     }
 
     // Remove every file that goes which the checkpoints through
@@ -285,7 +340,9 @@ impl NamespaceWriter {
                     })
                 });
             if !held {
-                Leaf::at(&self.working_dir, &format!("{name}/")).remove()?;
+                for root in self.roots() {
+                    Leaf::at(root, &format!("{name}/")).remove()?;
+                }
             }
         }
         Ok(())
@@ -311,7 +368,6 @@ impl NamespaceWriter {
                 at += 1;
                 continue;
             }
-            let dir = self.working_dir.clone();
             let leaf = self
                 .files
                 .get_mut(&waiting.node)
@@ -320,7 +376,7 @@ impl NamespaceWriter {
             if leaf.as_ref().is_some_and(|leaf| leaf.on_disk()) {
                 count(|tally| tally.moves += 1);
             }
-            let left = leaf.map(|leaf| leaf.move_on(&dir)).transpose()?.flatten();
+            let left = leaf.map(Leaf::move_on).transpose()?.flatten();
             if let Some(left) = left {
                 self.left.insert(key(&left), None);
                 self.remove_emptied(above(left.trim_end_matches('/')).collect())?;
@@ -351,15 +407,21 @@ impl NamespaceWriter {
     // A restored member's file, where `restored_at` finds it. One found
     // at the name it wants has moved there and leaves the name it sat at
     // shut until a commit; one still where it sat waits to move again.
+    // The file lies under the directory its member's class gives, unless
+    // it is found under the other one only, as a member whose class changed
+    // after its file was opened left it.
     pub(super) fn restored_leaf(
         &mut self,
-        node: NodeId,
-        member: MemberId,
+        (node, member): (NodeId, MemberId),
         output_name: &str,
         on_disk: Option<&str>,
+        root: &Path,
     ) -> Result<Leaf, WriteError> {
-        let at = restored_at(&self.working_dir, output_name, on_disk)?;
-        let mut leaf = Leaf::found(&self.working_dir, at)?;
+        let root = self
+            .restored_root(root, output_name, on_disk)?
+            .to_path_buf();
+        let at = restored_at(&root, output_name, on_disk)?;
+        let mut leaf = Leaf::found(&root, at)?;
         let Some(sat) = on_disk else {
             return Ok(leaf);
         };
@@ -374,6 +436,42 @@ impl NamespaceWriter {
             stamp: Some(0),
         });
         Ok(leaf)
+    }
+
+    // The directories the job's files lie under: the working directory,
+    // and the output directory when it is another.
+    pub(super) fn roots(&self) -> impl Iterator<Item = &Path> {
+        std::iter::once(self.working_dir.as_path())
+            .chain((self.output_dir != self.working_dir).then_some(self.output_dir.as_path()))
+    }
+
+    fn restored_root<'a>(
+        &'a self,
+        root: &'a Path,
+        output_name: &str,
+        on_disk: Option<&str>,
+    ) -> Result<&'a Path, WriteError> {
+        let there = |dir: &Path| -> Result<bool, WriteError> {
+            for name in std::iter::once(output_name).chain(on_disk) {
+                let path = Leaf::path_at(dir, name);
+                if path
+                    .try_exists()
+                    .map_err(|source| super::super::leaf::LeafError::Io { path, source })?
+                {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        };
+        if there(root)? {
+            return Ok(root);
+        }
+        for other in self.roots().filter(|other| *other != root) {
+            if there(other)? {
+                return Ok(other);
+            }
+        }
+        Ok(root)
     }
 
     // Whether a file may enter `name`: no other member's file sits there or

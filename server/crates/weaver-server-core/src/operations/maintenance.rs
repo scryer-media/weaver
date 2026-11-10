@@ -8,9 +8,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 use crate::Database;
+use crate::SchedulerHandle;
 use crate::persistence::maintenance::DbMaintenanceOptions;
 use crate::persistence::sql_runtime::SqlEngine;
 use crate::runtime::StartupDiskGate;
+use crate::settings::SharedConfig;
 
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 const STALE_STAGING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -21,11 +23,14 @@ const STALE_STAGING_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 pub fn spawn_maintenance_worker(
     db: Database,
     complete_dir: PathBuf,
+    handle: SchedulerHandle,
+    config: SharedConfig,
     startup_disk_work: StartupDiskGate,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         startup_disk_work.wait().await;
         run_maintenance_pass(db.clone(), complete_dir.clone()).await;
+        run_job_files_sweep(&handle, &config).await;
 
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now() + MAINTENANCE_INTERVAL,
@@ -36,6 +41,7 @@ pub fn spawn_maintenance_worker(
         loop {
             interval.tick().await;
             run_maintenance_pass(db.clone(), complete_dir.clone()).await;
+            run_job_files_sweep(&handle, &config).await;
         }
     })
 }
@@ -102,9 +108,26 @@ async fn run_maintenance_pass(db: Database, complete_dir: PathBuf) {
     }
 }
 
+// What jobs left on disk a day ago: a failed job's files when the setting
+// asks for it, measured from when the job failed, and a marked working
+// directory of a job with no row, measured from when its marker was written.
+async fn run_job_files_sweep(handle: &SchedulerHandle, config: &SharedConfig) {
+    let now = SystemTime::now();
+    let delete_failed = config.read().await.delete_failed_job_files();
+    let cutoff = now
+        .checked_sub(STALE_STAGING_TTL)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let failed_finished_by = delete_failed.then(|| {
+        cutoff
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |since| since.as_secs() as i64)
+    });
+    handle.sweep_job_files(failed_finished_by, cutoff).await;
+}
+
 fn run_staging_cleanup(db: &Database, complete_dir: &Path) -> Result<StagingCleanupReport, String> {
-    let active_job_ids = db.active_job_ids().map_err(|error| error.to_string())?;
-    cleanup_stale_staging_dirs(complete_dir, &active_job_ids, STALE_STAGING_TTL)
+    let recorded_job_ids = db.recorded_job_ids().map_err(|error| error.to_string())?;
+    cleanup_stale_staging_dirs(complete_dir, &recorded_job_ids, STALE_STAGING_TTL)
         .map_err(|error| error.to_string())
 }
 
@@ -114,7 +137,10 @@ struct StagingCleanupReport {
     removed_bytes: u64,
 }
 
-// Per-job roots swept for directories whose job is gone.
+// Per-job roots swept for directories whose job is gone: no live job and no
+// history record names it. A job in the history still owns what its
+// directories hold, such as a failed job's delivery that could not go back
+// to its working directory, and a history delete is what lets it go.
 //
 // Direct unpack stages its members outside the conventional tree so a demotion
 // can delete them without the conventional extractor ever seeing them — which
@@ -125,21 +151,21 @@ const SWEPT_STAGING_ROOTS: [&str; 2] = [".weaver-staging", ".weaver-direct-unpac
 
 fn cleanup_stale_staging_dirs(
     complete_dir: &Path,
-    active_job_ids: &HashSet<u64>,
+    recorded_job_ids: &HashSet<u64>,
     ttl: Duration,
 ) -> io::Result<StagingCleanupReport> {
-    cleanup_stale_staging_dirs_at(complete_dir, active_job_ids, ttl, SystemTime::now())
+    cleanup_stale_staging_dirs_at(complete_dir, recorded_job_ids, ttl, SystemTime::now())
 }
 
 fn cleanup_stale_staging_dirs_at(
     complete_dir: &Path,
-    active_job_ids: &HashSet<u64>,
+    recorded_job_ids: &HashSet<u64>,
     ttl: Duration,
     now: SystemTime,
 ) -> io::Result<StagingCleanupReport> {
     let mut report = StagingCleanupReport::default();
     for root in SWEPT_STAGING_ROOTS {
-        let one = cleanup_stale_staging_root(&complete_dir.join(root), active_job_ids, ttl, now)?;
+        let one = cleanup_stale_staging_root(&complete_dir.join(root), recorded_job_ids, ttl, now)?;
         report.removed_count += one.removed_count;
         report.removed_bytes = report.removed_bytes.saturating_add(one.removed_bytes);
     }
@@ -148,7 +174,7 @@ fn cleanup_stale_staging_dirs_at(
 
 fn cleanup_stale_staging_root(
     staging_root: &Path,
-    active_job_ids: &HashSet<u64>,
+    recorded_job_ids: &HashSet<u64>,
     ttl: Duration,
     now: SystemTime,
 ) -> io::Result<StagingCleanupReport> {
@@ -175,7 +201,7 @@ fn cleanup_stale_staging_root(
         else {
             continue;
         };
-        if active_job_ids.contains(&job_id) {
+        if recorded_job_ids.contains(&job_id) {
             continue;
         }
         let age = match metadata.modified().and_then(|modified| {

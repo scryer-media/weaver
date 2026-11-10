@@ -1377,6 +1377,7 @@ mod tests {
                 hardware_profile: None,
                 intermediate_dir: None,
                 complete_dir: None,
+                delete_failed_job_files: None,
                 buffer_pool: None,
                 servers: vec![],
                 categories: vec![tv()],

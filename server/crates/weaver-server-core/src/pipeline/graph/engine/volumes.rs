@@ -17,11 +17,12 @@ use std::collections::BTreeSet;
 use std::fs::File;
 use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 
 use weaver_graph::{ByteRange, Coverage, Lost, VolumeIndex, Volumes};
 
-use crate::pipeline::graph::envelope::{ReadFiles, Shelf};
+use crate::pipeline::graph::decoding::Decoding;
+use crate::pipeline::graph::envelope::{ReadFiles, Shelf, Shelved};
 use crate::pipeline::graph::leaf::read_exact_at;
 
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +56,9 @@ pub(crate) struct RunVolumes {
     // The lost spans reads failed on that the run has not read on past.
     lost: Mutex<BTreeSet<(u32, u64, u64)>>,
     stopped: AtomicBool,
+    // The run's decoder while it executes: a read waiting on the shelf is
+    // the decoder waiting, not decoding.
+    decoding: Mutex<Weak<Decoding>>,
 }
 
 impl std::fmt::Debug for RunVolumes {
@@ -75,7 +79,23 @@ impl RunVolumes {
             generation,
             lost: Mutex::default(),
             stopped: AtomicBool::new(false),
+            decoding: Mutex::default(),
         }
+    }
+
+    // The run's decoder began executing: it is done once the handle goes.
+    pub(crate) fn decoding(&self, decoding: Weak<Decoding>) {
+        *self.decoding.lock().unwrap_or_else(PoisonError::into_inner) = decoding;
+    }
+
+    fn wait<'a>(&self, state: MutexGuard<'a, Shelved>) -> MutexGuard<'a, Shelved> {
+        let decoding = self
+            .decoding
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .upgrade();
+        let _waiting = decoding.as_deref().map(Decoding::wait);
+        self.shelf.wait(state)
     }
 
     // The run's owner stops it where it stands: its next read fails, and
@@ -173,7 +193,7 @@ impl RunVolumes {
                 }
                 _ => {}
             }
-            state = self.shelf.wait(state);
+            state = self.wait(state);
         }
     }
 }
@@ -199,7 +219,7 @@ impl Volumes for RunVolumes {
                 None if !state.deciding => return Ok(None),
                 _ => {}
             }
-            state = self.shelf.wait(state);
+            state = self.wait(state);
         }
     }
 
@@ -212,6 +232,42 @@ impl Volumes for RunVolumes {
         let length = kept.closed?;
         kept.length_read = Some(length);
         Some(length)
+    }
+
+    fn bound(&self) -> io::Result<Vec<VolumeIndex>> {
+        let mut state = self.shelf.lock();
+        loop {
+            if state.generation != self.generation || self.stopped() {
+                return Err(Unreadable::Stopped.into());
+            }
+            if !state.volumes.is_empty() || state.complete {
+                return Ok(state.volumes.iter().copied().map(VolumeIndex).collect());
+            }
+            state = self.wait(state);
+        }
+    }
+
+    // The length read is one the run built on, as a closed one is: the
+    // volume closing at another starts the run over.
+    fn sized(&self, volume: VolumeIndex) -> io::Result<Option<u64>> {
+        let mut state = self.shelf.lock();
+        loop {
+            if state.generation != self.generation || self.stopped() {
+                return Err(Unreadable::Stopped.into());
+            }
+            let known = state.volumes.contains(&volume.0);
+            let complete = state.complete;
+            if let Some(kept) = state.kept.get_mut(&volume.0)
+                && let Some(length) = kept.closed.or(kept.sized)
+            {
+                kept.length_read = Some(length);
+                return Ok(Some(length));
+            }
+            if complete && !known {
+                return Ok(None);
+            }
+            state = self.wait(state);
+        }
     }
 
     // A volume with bytes nothing will bring is not settled: a read of them

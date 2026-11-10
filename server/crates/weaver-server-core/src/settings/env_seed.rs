@@ -1163,6 +1163,7 @@ mod tests {
             retry: None,
             bandwidth: Default::default(),
             cleanup_after_extract: None,
+            delete_failed_job_files: None,
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),

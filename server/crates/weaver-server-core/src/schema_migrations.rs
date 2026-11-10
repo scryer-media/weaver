@@ -18,12 +18,12 @@ use crate::migration_hook_ids;
 use crate::persistence::sql_runtime::SqlConn;
 
 pub(crate) mod egress_quotas_v53;
-pub(crate) mod networking_bandwidth_v81;
+pub(crate) mod networking_bandwidth_v82;
 pub(crate) mod proxy_resolver_v64;
 mod schedule_tracks_v55;
 pub(crate) mod script_concurrency_v58;
 pub(crate) mod script_instances_v55;
-pub(crate) mod tracker_hosts_v92;
+pub(crate) mod tracker_hosts_v93;
 pub(crate) mod unwanted_extensions_v56;
 
 const EMBEDDED_MIGRATION_CATALOG: &[u8] =
@@ -35,7 +35,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 105;
+const CURRENT_SCHEMA_VERSION: i64 = 106;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -869,11 +869,11 @@ async fn run_rust_hook(
         proxy_resolver_v64::HOOK_ID => {
             proxy_resolver_v64::name_proxy_resolvers(&mut SqlConn::Sqlite(tx)).await
         }
-        networking_bandwidth_v81::HOOK_ID => {
-            networking_bandwidth_v81::move_bandwidth_to_networking(&mut SqlConn::Sqlite(tx)).await
+        networking_bandwidth_v82::HOOK_ID => {
+            networking_bandwidth_v82::move_bandwidth_to_networking(&mut SqlConn::Sqlite(tx)).await
         }
-        tracker_hosts_v92::HOOK_ID => {
-            tracker_hosts_v92::fill_tracker_hosts(&mut SqlConn::Sqlite(tx)).await
+        tracker_hosts_v93::HOOK_ID => {
+            tracker_hosts_v93::fill_tracker_hosts(&mut SqlConn::Sqlite(tx)).await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"
@@ -1623,7 +1623,7 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 91 gives each torrent its saved peers and bans: an existing
+    // Migration 92 gives each torrent its saved peers and bans: an existing
     // torrent starts with none. They sit on its ledger row once the lean
     // resume migration moves them there.
     #[tokio::test]
@@ -1646,7 +1646,7 @@ mod tests {
 
         let db_path = temp.path().join("pre-torrent-peers.db");
         let pool = open_test_pool(&db_path).await;
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(88), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(89), true)
             .await
             .unwrap();
         assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 0);
@@ -1706,7 +1706,7 @@ mod tests {
 
         let db_path = temp.path().join("pre-lean-resume.db");
         let pool = open_test_pool(&db_path).await;
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(94), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(95), true)
             .await
             .unwrap();
         assert_eq!(
@@ -1766,7 +1766,7 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 92 keeps the hosts the torrents already announce to, each once
+    // Migration 93 keeps the hosts the torrents already announce to, each once
     // and as a rule matches it.
     #[tokio::test]
     async fn sqlite_migration_86_fills_tracker_hosts_from_the_torrents() {
@@ -1775,7 +1775,7 @@ mod tests {
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(91), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(92), true)
             .await
             .unwrap();
         for (job_id, hash) in [(7_i64, 7_u8), (8, 8)] {
@@ -1812,7 +1812,7 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 93 gives each torrent its own upload and download limits: a
+    // Migration 94 gives each torrent its own upload and download limits: a
     // fresh database has them, and an existing torrent is unlimited both
     // ways.
     #[tokio::test]
@@ -1831,7 +1831,7 @@ mod tests {
 
         let db_path = temp.path().join("pre-rate-limits.db");
         let pool = open_test_pool(&db_path).await;
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(92), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(93), true)
             .await
             .unwrap();
         assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 0);
@@ -1890,7 +1890,7 @@ mod tests {
 
         let db_path = temp.path().join("pre-file-priority.db");
         let pool = open_test_pool(&db_path).await;
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(93), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(94), true)
             .await
             .unwrap();
         assert_eq!(pragma_column_count(&pool, "torrents", &columns).await, 0);
@@ -1926,7 +1926,7 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 84 keeps each tracker's place in the announce list and drops
+    // Migration 85 keeps each tracker's place in the announce list and drops
     // the announce columns, which the session answers instead.
     #[tokio::test]
     async fn sqlite_migration_78_keeps_only_the_tracker_listing() {
@@ -1935,7 +1935,7 @@ mod tests {
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(83), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(84), true)
             .await
             .unwrap();
         sqlx::query(
@@ -2002,7 +2002,7 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 98 records who named each tracker; every row before it is
+    // Migration 99 records who named each tracker; every row before it is
     // the torrent's, as nothing recorded which were added by hand.
     #[tokio::test]
     async fn sqlite_migration_92_marks_every_existing_tracker_the_torrents() {
@@ -2011,7 +2011,7 @@ mod tests {
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(97), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(98), true)
             .await
             .unwrap();
         sqlx::query(
@@ -2056,7 +2056,7 @@ mod tests {
         pool.close().await;
     }
 
-    // Migration 99 forgets the mapped ports a test kept for routes; the
+    // Migration 100 forgets the mapped ports a test kept for routes; the
     // settings beside them stay.
     #[tokio::test]
     async fn sqlite_migration_93_forgets_saved_mapped_ports() {
@@ -2065,7 +2065,7 @@ mod tests {
         let pool = open_test_pool(&db_path).await;
         let catalog = embedded_catalog().unwrap();
         let payload = embedded_payload_bytes().unwrap();
-        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(98), true)
+        replay_catalog_into_fresh_db(&pool, &catalog, &payload, Some(99), true)
             .await
             .unwrap();
         sqlx::query(

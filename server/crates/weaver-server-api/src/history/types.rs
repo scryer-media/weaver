@@ -56,6 +56,11 @@ pub struct HistoryItem {
     #[graphql(skip)]
     #[serde(default)]
     pub full_file_names_record: Option<String>,
+    // The job's failure recorded that a decode window was over the memory
+    // profile's ceiling, so a reprocess with no limit may finish it.
+    #[graphql(skip)]
+    #[serde(default)]
+    pub failed_over_ceiling: bool,
 }
 
 #[ComplexObject]
@@ -78,6 +83,12 @@ impl HistoryItem {
                 full_name: file.full_name,
             })
             .collect()
+    }
+
+    /// Whether the job failed because a decode window was over the memory
+    /// profile's ceiling, so `reprocessJob(noMemoryLimit: true)` may finish it.
+    async fn failed_for_memory(&self) -> bool {
+        self.state == QueueItemState::Failed && self.failed_over_ceiling
     }
 }
 
@@ -610,6 +621,7 @@ fn history_item_from_display(
         duplicate_summary: None,
         full_file_names_record: weaver_server_core::ingest::full_file_names_record(metadata)
             .map(str::to_string),
+        failed_over_ceiling: weaver_server_core::history::attributes::failed_for_memory(metadata),
     }
 }
 

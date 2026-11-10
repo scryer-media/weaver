@@ -474,14 +474,12 @@ impl Pipeline {
             return;
         };
         let target = explorer.target_rung();
-        // A step up is still on trial, so it must not be written through: a
-        // restart would resume at a depth nothing has yet paid for. Every other
-        // outcome is a settled verdict, including the ones that lower the rung
-        // — a persisted depth that over-promises is the one worth correcting.
-        let persist_depth = if matches!(change, RungChange::Stepped { from, to } if to > from) {
-            None
-        } else {
+        // See `RungChange::settles_the_rung`: a step up is never written
+        // through, and every other outcome is.
+        let persist_depth = if change.settles_the_rung() {
             explorer.take_persist_request()
+        } else {
+            None
         };
         match change {
             RungChange::Stepped { from, to } => {

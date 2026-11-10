@@ -273,7 +273,14 @@ impl SqliteDatabaseRuntimeWorker {
         std::thread::Builder::new()
             .name("weaver-sqlite-db-runtime".to_string())
             .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
+                // sqlx hands a dropped connection back to the pool from a
+                // spawned task. A current-thread runtime only runs that task
+                // inside the next job's `block_on`, so an idle writer kept its
+                // last connection checked out and a one-connection pool timed
+                // out on the next read. One worker thread runs it at once.
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .thread_name("weaver-sqlite-db-runtime-worker")
                     .enable_all()
                     .build()
                     .map_err(|error| error.to_string());
@@ -1415,17 +1422,24 @@ impl Database {
         })
     }
 
+    // Closes every connection this database opened, the WAL checkpoint
+    // task's last, even while another owner, such as the background writer,
+    // still holds a handle to the services: a file is then free to be
+    // replaced, which Windows refuses while any handle is open.
     pub(crate) fn close(self) -> Result<(), StateError> {
         let datastore = self.datastore();
+        let services = self.sql_services.clone();
         let worker = self.sql_worker.clone();
         drop(self);
-        worker.block_on(std::panic::Location::caller(), async move {
+        let closed = worker.block_on(std::panic::Location::caller(), async move {
             match datastore {
                 StoreDatastore::Sqlite { pool, .. } => pool.close().await,
                 StoreDatastore::Postgres { pool } => pool.close().await,
             }
             Ok(())
-        })
+        });
+        services.stop_checkpointer();
+        closed
     }
 
     pub(crate) fn get_cached_job_history(&self, job_id: u64) -> Option<JobHistoryRow> {

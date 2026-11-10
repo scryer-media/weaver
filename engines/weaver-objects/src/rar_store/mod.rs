@@ -62,6 +62,11 @@ pub(crate) struct Volume {
     // Where the name puts the volume in its set's numbering, read once as
     // the name is given.
     numbered: Option<naming::VolumeName>,
+    // The name it was first given, as posted, and where that puts it: a
+    // recovery set may rename it, and its siblings still posted under the
+    // same numbering are this set's all the same.
+    posted: Option<String>,
+    posted_numbered: Option<naming::VolumeName>,
     length: Option<u64>,
     closed: bool,
     kept: Kept,
@@ -79,6 +84,8 @@ impl Volume {
         Self {
             name: None,
             numbered: None,
+            posted: None,
+            posted_numbered: None,
             length: None,
             closed: false,
             kept: Kept::default(),
@@ -110,6 +117,21 @@ impl Volume {
     fn name_as(&mut self, name: &str) {
         self.numbered = numbering(name);
         self.name = Some(name.to_owned());
+        if self.posted.is_none() {
+            self.posted = Some(name.to_owned());
+            self.posted_numbered = self.numbered.clone();
+        }
+    }
+
+    // Where each name the volume carried puts it: the one it has now and
+    // the one it was posted under.
+    fn numberings(&self) -> impl Iterator<Item = &naming::VolumeName> {
+        self.numbered.iter().chain(self.posted_numbered.iter())
+    }
+
+    fn posted_as(&mut self, name: &str) {
+        self.posted_numbered = numbering(name);
+        self.posted = Some(name.to_owned());
     }
 }
 
@@ -333,6 +355,13 @@ pub struct RarStore {
     // changed, a volume touched, a condemned file's cipher taken or let go.
     // Data that only passes through moves nothing.
     placed: u64,
+    // The keys a file needs of a candidate that the cache holds no answer
+    // for, as (candidate, entry): derived away from the loop while the
+    // store is lent out, and the files open once it is back.
+    derive_due: BTreeSet<(usize, usize)>,
+    // What the pool derived for them, until the files take it: the
+    // process's cache is shared and may drop an entry before then.
+    derived: BTreeMap<(usize, usize), lock::Derived>,
 }
 
 // Every store's placement numbers, so no two stores, a store restored in
@@ -379,6 +408,8 @@ impl RarStore {
             stale: false,
             gone: false,
             placed: next_placed(),
+            derive_due: BTreeSet::new(),
+            derived: BTreeMap::new(),
         }
     }
 
@@ -704,6 +735,17 @@ impl Object for RarStore {
         facts::of(self)
     }
 
+    // A file key the cache has no answer for: the derivation is the
+    // slowest thing the store does, done away from the loop.
+    fn work_due(&self) -> bool {
+        !self.gone && !self.derive_due.is_empty()
+    }
+
+    fn work(&mut self, out: &mut Vec<Emit>) {
+        self.derive_due();
+        self.settle(None, out);
+    }
+
     fn deliver(
         &mut self,
         delivery: Delivery<'_>,
@@ -902,6 +944,23 @@ impl Object for RarStore {
         self.unsay(volume, range);
     }
 
+    // A file's plaintext runs, as its facts keep them from version 5 on:
+    // only those its bytes verified, each CRC32 the bytes had as they came.
+    // A restart folds them for the file's own check rather than read it.
+    fn vouched(&self, member: MemberId, out: &mut Vec<(ByteRange, u32)>) {
+        let Some(entry) = self.entries.get(member.0 as usize) else {
+            return;
+        };
+        out.extend(
+            entry
+                .plain_runs
+                .kept()
+                .into_iter()
+                .filter(|&(_, _, _, verified)| verified)
+                .map(|(start, len, crc, _)| (ByteRange::at(start, len), crc)),
+        );
+    }
+
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
         // A length said anew is the producer's word now: the volume is
         // walked again against it.
@@ -945,6 +1004,7 @@ impl Object for RarStore {
         Some(Box::new(crate::engine::CarriedVolume {
             front: held.stated().cloned(),
             length: held.length,
+            window: held.stated().and_then(crate::rar_engine::window),
         }))
     }
 

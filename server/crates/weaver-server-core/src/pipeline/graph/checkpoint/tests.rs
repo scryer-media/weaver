@@ -207,6 +207,7 @@ fn full() -> Snapshot {
                     range: ByteRange::new(0, 64),
                     scratch_offset: 128,
                 },
+                on_file: false,
             },
             HoldRecord {
                 node: NodeId(1),
@@ -215,14 +216,16 @@ fn full() -> Snapshot {
                     range: ByteRange::new(20, 300),
                     scratch_offset: 0,
                 },
+                on_file: false,
             },
             HoldRecord {
                 node: NodeId(1),
                 held: ScratchHold {
                     volume: VolumeIndex(0),
                     range: ByteRange::new(400, 410),
-                    scratch_offset: 280,
+                    scratch_offset: 400,
                 },
+                on_file: true,
             },
         ],
         passwords: BTreeMap::from([(NodeId(1), 2)]),
@@ -278,7 +281,7 @@ pub(super) fn borrowed_node_rows(
                 .map(|window| (window.start as i64, window.end as i64)),
             kind: kind.to_string(),
             state: super::state_name(node.state).to_owned(),
-            reason: node.reason.map(|why| super::why_name(why).to_owned()),
+            reason: node.reason.map(super::why_text),
             facts_version: i64::from(facts.version),
             facts: facts.bytes.clone(),
             winning_password: password,
@@ -313,7 +316,7 @@ pub(super) fn borrowed_node_rows(
             undecided: member.undecided,
             has_file: state.has_file,
             on_disk: state.on_disk,
-            refused: state.refused.map(|why| super::why_name(why).to_owned()),
+            refused: state.refused.map(super::why_text),
             copy_of: member.copy_of.map(|into| i64::from(into.0)),
             refuted_kind: member.refuted.map(|kind| kind.to_string()),
         }
@@ -415,11 +418,11 @@ fn rows(taken: &Snapshot) -> GraphCheckpoint {
         out.coverage.extend(rows.coverage);
         out.crypt.extend(rows.crypt);
         out.parts.extend(rows.parts);
-        let holds: Vec<ScratchHold> = taken
+        let holds: Vec<(ScratchHold, bool)> = taken
             .holds
             .iter()
             .filter(|record| record.node == node.node)
-            .map(|record| record.held)
+            .map(|record| (record.held, record.on_file))
             .collect();
         out.holds.extend(hold_rows(node.node, &holds));
     }
@@ -490,7 +493,10 @@ fn hold_rows_come_back_as_the_holds_a_restore_adopts() {
     let taken = full();
     let rows = rows(&taken);
     assert_eq!(rows.holds.len(), 3);
-    assert_eq!(rows.holds[2].scratch_offset, 280);
+    assert_eq!(rows.holds[1].scratch_offset, 0);
+    // A hold in its member's spill file lies at its own offset.
+    assert!(rows.holds[2].on_file);
+    assert_eq!(rows.holds[2].scratch_offset, 400);
     assert_eq!(snapshot(&rows).map(|back| back.holds), Ok(taken.holds));
     // A change to one hold rewrites that row alone.
     let mut moved = rows.clone();
@@ -526,6 +532,7 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
         format!("{INTERNAL_DIR}/graph-envelope-1-1-1"),
         format!("{INTERNAL_DIR}/graph-holds-0.scratch"),
         format!("{INTERNAL_DIR}/graph-holds-1.scratch"),
+        format!("{INTERNAL_DIR}/graph-spill-1-0.spill"),
         format!("{INTERNAL_DIR}/graph-waiting-0-1"),
         format!("{INTERNAL_DIR}/held-0-1.uu"),
         crate::jobs::working_dir::WORKING_DIR_MARKER.to_owned(),
@@ -534,9 +541,11 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
     let unnamed = [
         format!("{INTERNAL_DIR}/graph-envelope-1-2"),
         format!("{INTERNAL_DIR}/graph-holds-2.scratch"),
+        format!("{INTERNAL_DIR}/graph-spill-1-1.spill"),
         format!("{INTERNAL_DIR}/graph-recovery-0-3.repaired"),
         format!("{INTERNAL_DIR}/graph-recovery-0-3/set.par2"),
         format!("{INTERNAL_DIR}/graph-waiting-0-2"),
+        crate::pipeline::graph::window::window_name(NodeId(1), 0),
         "inner/stray.bin".to_owned(),
         "set.par2".to_owned(),
         "set.part1.rar".to_owned(),
@@ -576,6 +585,32 @@ fn a_restore_removes_what_its_checkpoint_does_not_name() {
     left.sort();
     assert_eq!(left, named);
     assert!(!dir.path().join("stray").exists());
+}
+
+// A decode window's scratch file is never named by a checkpoint: a restore
+// removes every one its job left, and touches none in a folder that is not
+// the job's.
+#[test]
+fn a_restore_removes_leftover_decode_windows_only_in_its_own_folder() {
+    use crate::pipeline::graph::window::window_name;
+    let dir = tempfile::tempdir().unwrap();
+    let job = dir.path().join("job");
+    let other = dir.path().join("other");
+    let windows = [window_name(NodeId(0), 0), window_name(NodeId(2), 7)];
+    for root in [&job, &other] {
+        for name in &windows {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"window").unwrap();
+        }
+    }
+    let rows = rows(&full());
+    let restored = snapshot(&rows).unwrap();
+    crate::pipeline::graph::restore::sweep_unnamed(&job, &restored, &rows.held_parts).unwrap();
+    for name in &windows {
+        assert!(!job.join(name).exists(), "{name} survived the restore");
+        assert!(other.join(name).exists(), "{name} went from another folder");
+    }
 }
 
 // A directory member the checkpoint names stays, but what is in it is the
@@ -1203,12 +1238,14 @@ fn restored(
         2,
         Storage {
             working_dir: dir.to_owned(),
+            output: None,
             accountant: Arc::new(HoldsAccountant::new(HoldBudgets {
                 resident_limit: u64::MAX,
                 scratch_total: u64::MAX,
                 scratch_ceiling: u64::MAX,
                 disk_reserve: 0,
             })),
+            decode: crate::pipeline::graph::engine::DecodePool::unbounded(),
             free_disk: CapacityReader::unknown(),
             slots: 1,
             mail: mail.sender(),
@@ -1217,6 +1254,8 @@ fn restored(
             nesting: u32::MAX,
             hardware: Default::default(),
             metrics: None,
+            data_dir: None,
+            window_ledger: Default::default(),
         },
         0,
     )
@@ -1707,4 +1746,173 @@ async fn a_forced_write_leaves_a_crash_nothing_to_fetch_again() {
     let read = snapshot(&db.load_graph_checkpoint(id).unwrap().unwrap()).unwrap();
     let (restored, _mail) = restored(&read, &files, dir.path());
     assert_eq!(restored.job.on_disk(), job.on_disk());
+}
+
+// A plain file's article, 8 KiB of bytes its file and ordinal say.
+const PIECE: u32 = 8 * 1024;
+// The front a namespace keeps of each member, which no record keeps.
+const FRONT: u64 = 16 * 1024;
+
+fn piece(volume: u32, ordinal: u32) -> Vec<u8> {
+    (0..PIECE)
+        .map(|at| (at as u8).wrapping_mul(31) ^ (volume as u8 * 16 + ordinal as u8))
+        .collect()
+}
+
+// Three plain files of six articles, the first four of each in: each is
+// on disk well past its front.
+fn plain_files() -> (GraphJob, tempfile::TempDir, Vec<RootFile>) {
+    let files: Vec<RootFile> = (0..3)
+        .map(|index| file(&format!("part{index}.mkv"), &[PIECE; 6]))
+        .collect();
+    let (mut job, dir, _) = job_with(&files, Vec::new());
+    for volume in 0..3 {
+        for ordinal in 0..4 {
+            plain(&mut job, volume, ordinal);
+        }
+    }
+    (job, dir, files)
+}
+
+fn plain(job: &mut GraphJob, volume: u32, ordinal: u32) {
+    job.intake(
+        decoded(
+            volume,
+            ordinal,
+            u64::from(ordinal * PIECE),
+            &piece(volume, ordinal),
+            Some(u64::from(6 * PIECE)),
+        ),
+        &mut RepairSlots::default(),
+        1,
+    )
+    .unwrap();
+}
+
+// The job's checkpoint as the database would hold it now.
+fn checkpointed(job: &GraphJob) -> Snapshot {
+    let pending = Pending::default();
+    assert!(pending.put(job, Vec::new()));
+    snapshot(&held(&pending.take().0.unwrap())).unwrap()
+}
+
+// What `step` read from and wrote to the job's files, and hashed.
+fn touched<T>(step: impl FnOnce() -> T) -> (T, u64, u64, u64) {
+    use crate::pipeline::graph::leaf::counting;
+    let (read, written) = counting::so_far();
+    let hashed = weaver_graph::evidence::counting::hashed();
+    let out = step();
+    let (read_after, written_after) = counting::so_far();
+    (
+        out,
+        read_after - read,
+        written_after - written,
+        weaver_graph::evidence::counting::hashed() - hashed,
+    )
+}
+
+// A restart trusts its checkpoint: a restore of plain files reads none of
+// their bytes to check them, hashes none and writes none. The one thing it
+// reads is each member's front, which no record keeps, as far as it came;
+// nothing is fetched again, and the job holds what it held.
+#[test]
+fn a_restore_of_plain_files_reads_only_their_fronts_and_writes_nothing() {
+    let (job, dir, files) = plain_files();
+    let read = checkpointed(&job);
+    let ((restored, _mail), bytes_read, written, hashed) =
+        touched(|| restored(&read, &files, dir.path()));
+    assert_eq!(written, 0, "a restore writes nothing");
+    assert_eq!(hashed, 0, "a restore hashes nothing");
+    // A test build's restore ends by asking its crash oracle what is on
+    // disk, which reads every arrived article back: that read is the
+    // test's, not the restore's.
+    let (_, oracle, _, _) = touched(|| restored.job.on_disk());
+    assert_eq!(oracle, 3 * 4 * u64::from(PIECE));
+    assert_eq!(
+        bytes_read - oracle,
+        3 * FRONT,
+        "a restore reads the fronts alone"
+    );
+    assert!(restored.refetched.is_empty());
+    assert_eq!(restored.job.on_disk(), job.on_disk());
+    let coverage = |job: &GraphJob| job.tree().record(NodeId::ROOT).unwrap().coverage;
+    assert_eq!(coverage(&restored.job), coverage(&job));
+}
+
+// A file cut shorter than its record says, as a disk that lost its tail
+// leaves it: the restore reads no byte of it to find that, only its length,
+// and the articles past the cut are fetched again. The articles that come
+// again land, and the file holds every byte as it came.
+#[test]
+fn a_file_cut_short_before_a_restore_fetches_again_what_it_lost() {
+    let (job, dir, files) = plain_files();
+    let read = checkpointed(&job);
+    let path = dir.path().join("part1.mkv");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(u64::from(2 * PIECE) + 100)
+        .unwrap();
+    let ((restored, _mail), _, written, hashed) = touched(|| restored(&read, &files, dir.path()));
+    assert_eq!(written, 0, "a restore writes nothing");
+    assert_eq!(hashed, 0, "a restore hashes nothing");
+    assert_eq!(
+        restored.refetched,
+        vec![(VolumeIndex(1), 2), (VolumeIndex(1), 3)],
+        "the articles past the cut, and no other, are fetched again"
+    );
+    let mut job = restored.job;
+    for ordinal in 2..6 {
+        plain(&mut job, 1, ordinal);
+    }
+    let whole: Vec<u8> = (0..6).flat_map(|ordinal| piece(1, ordinal)).collect();
+    assert!(
+        std::fs::read(&path).unwrap() == whole,
+        "the file holds every byte"
+    );
+}
+
+// Every reason a checkpoint row keeps reads back as itself, and a decode
+// too large keeps the sizes it carried, each one it did not say read back
+// unsaid. A name it never wrote is no reason.
+#[test]
+fn every_reason_a_row_keeps_reads_back_with_its_sizes() {
+    let too_large = |needed, allowed| Why::TooLarge { needed, allowed };
+    let reasons = super::REASONS.into_iter().chain([
+        too_large(Some(2 << 30), Some(1 << 30)),
+        too_large(Some(2 << 30), None),
+        too_large(None, Some(1 << 30)),
+        Why::OverMachine {
+            needed: 1 << 41,
+            memory: 8 << 30,
+        },
+    ]);
+    for why in reasons {
+        assert_eq!(
+            super::why_named(&super::why_text(why)),
+            Some(why),
+            "{why:?}"
+        );
+    }
+    assert_eq!(
+        super::why_text(too_large(Some(2 << 30), None)),
+        "too_large:2147483648:-"
+    );
+    assert_eq!(
+        super::why_text(Why::OverMachine {
+            needed: 1 << 41,
+            memory: 8 << 30,
+        }),
+        "over_machine:2199023255552:8589934592"
+    );
+    for text in [
+        "too_large",
+        "too_large:1",
+        "unsupported:1:2",
+        "too_large:x:-",
+        "nothing",
+    ] {
+        assert_eq!(super::why_named(text), None, "{text}");
+    }
 }

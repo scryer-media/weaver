@@ -19,11 +19,11 @@ use serde_json::{Map, Value};
 use crate::StateError;
 use crate::persistence::sql_runtime::{SqlArg, SqlConn};
 
-pub(crate) const HOOK_ID: &str = "move_bandwidth_to_networking_v81";
+pub(crate) const HOOK_ID: &str = "move_bandwidth_to_networking_v82";
 // The schema that first keeps bandwidth limits in networking. A backup taken
 // below it carries the global limit as a setting and egress rows in the
 // older columns.
-pub(crate) const SCHEMA_VERSION: i64 = 81;
+pub(crate) const SCHEMA_VERSION: i64 = 82;
 
 const SPEED_KEY: &str = "max_download_speed";
 const SCHEDULES_KEY: &str = "schedules";

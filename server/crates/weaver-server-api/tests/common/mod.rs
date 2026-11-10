@@ -127,6 +127,7 @@ impl TestHarness {
             retry: None,
             bandwidth: Default::default(),
             cleanup_after_extract: None,
+            delete_failed_job_files: None,
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
@@ -224,6 +225,7 @@ impl TestHarness {
                             total_bytes: 8 * 1024 * 1024 * 1024,
                             available_bytes: 4 * 1024 * 1024 * 1024,
                             cgroup_limit: None,
+                            guessed: false,
                         },
                         disk: weaver_server_core::runtime::system_profile::DiskProfile {
                             storage_class:

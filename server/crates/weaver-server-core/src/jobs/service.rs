@@ -358,6 +358,12 @@ impl Pipeline {
             match restart.as_ref().filter(|restart| restart.reprocess) {
                 Some(restart) => {
                     let working_dir = restart.working_dir.clone();
+                    crate::pipeline::queue::clear_left_working_dirs(
+                        &resources.intermediate_dir,
+                        job_id,
+                        &working_dir,
+                    )
+                    .await?;
                     let directory_existed = tokio::fs::try_exists(&working_dir).await?;
                     tokio::fs::create_dir_all(&working_dir)
                         .await
@@ -385,6 +391,35 @@ impl Pipeline {
                 .await
                 .map_err(crate::SchedulerError::Io)?;
         }
+        let staging_dir = crate::pipeline::queue::delivery_staging_dir(
+            &resources.intermediate_dir,
+            &resources.complete_dir,
+            job_id,
+        );
+        let output_kind = {
+            let complete_dir = resources.complete_dir.clone();
+            let staging = staging_dir.clone();
+            let output_root = staging.clone().unwrap_or_else(|| working_dir.clone());
+            tokio::task::spawn_blocking(move || {
+                if let Some(staging) = &staging {
+                    crate::pipeline::queue::make_staging_dir(&complete_dir, staging, job_id)?;
+                }
+                Ok::<_, std::io::Error>(crate::runtime::storage_kind::storage_kind(&output_root))
+            })
+            .await
+            .map_err(|error| {
+                crate::SchedulerError::Internal(format!(
+                    "staging directory worker panicked: {error}"
+                ))
+            })?
+            .map_err(crate::SchedulerError::Io)?
+        };
+        info!(
+            job_id = job_id.0,
+            storage = output_kind.as_str(),
+            split = staging_dir.is_some(),
+            "output storage"
+        );
         crate::runtime::perf_probe::record(
             "pipeline.add_job.working_dir_ready",
             stage_start.elapsed(),
@@ -506,6 +541,7 @@ impl Pipeline {
                 {
                     warn!(job_id = job_id.0, error = %cleanup_error, "failed to clean working directory after active job persistence failure");
                 }
+                remove_unadmitted_staging(job_id, staging_dir.as_deref()).await;
                 return Err(error.into());
             }
             Ok(false) => {
@@ -515,6 +551,7 @@ impl Pipeline {
                 {
                     warn!(job_id = job_id.0, error = %cleanup_error, "failed to clean superseded job working directory");
                 }
+                remove_unadmitted_staging(job_id, staging_dir.as_deref()).await;
                 return Err(crate::SchedulerError::SemanticSuperseded);
             }
             Ok(true) => {}
@@ -534,6 +571,7 @@ impl Pipeline {
             spec,
             options,
             working_dir,
+            staging_dir,
             nzb_hash,
             nzb_password_candidates,
             restart,
@@ -549,6 +587,7 @@ impl Pipeline {
             spec,
             options,
             working_dir,
+            staging_dir,
             nzb_hash,
             nzb_password_candidates,
             restart,
@@ -613,6 +652,7 @@ impl Pipeline {
                 .then_some(crate::jobs::model::PostState::Idle),
             failure_error: None,
             delivered: None,
+            delivery_left_behind: Vec::new(),
             working_dir: working_dir.clone(),
             downloaded_bytes: restart
                 .as_ref()
@@ -627,7 +667,7 @@ impl Pipeline {
             support_facts: Default::default(),
             detected_archives: HashMap::new(),
             file_identities,
-            staging_dir: None,
+            staging_dir,
             category_bytes: Some(category_bytes),
             nzb_password_candidates: nzb_password_candidates
                 .map(std::sync::OnceLock::from)
@@ -732,7 +772,17 @@ impl Pipeline {
         job_id: JobId,
         password: Option<String>,
     ) -> Result<(), crate::SchedulerError> {
-        self.restart_through_control_plane(job_id, password, true)
+        self.restart_through_control_plane(job_id, password, true, false)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn reprocess_job_with_no_memory_limit(
+        &mut self,
+        job_id: JobId,
+        password: Option<String>,
+    ) -> Result<(), crate::SchedulerError> {
+        self.restart_through_control_plane(job_id, password, true, true)
             .await
     }
 
@@ -750,7 +800,7 @@ impl Pipeline {
         job_id: JobId,
         password: Option<String>,
     ) -> Result<(), crate::SchedulerError> {
-        self.restart_through_control_plane(job_id, password, false)
+        self.restart_through_control_plane(job_id, password, false, false)
             .await
     }
 
@@ -760,6 +810,7 @@ impl Pipeline {
         job_id: JobId,
         password: Option<String>,
         reprocess: bool,
+        no_memory_limit: bool,
     ) -> Result<(), crate::SchedulerError> {
         if let Some(state) = self.jobs.get(&job_id) {
             if !crate::pipeline::is_terminal_status(&state.status) {
@@ -785,7 +836,13 @@ impl Pipeline {
         self.shared_state
             .queue
             .clone()
-            .restart(job_id, password, reprocess, self.event_tx.clone())
+            .restart(
+                job_id,
+                password,
+                reprocess,
+                no_memory_limit,
+                self.event_tx.clone(),
+            )
             .await?;
         self.run_queue_intents().await;
         Ok(())
@@ -971,6 +1028,7 @@ impl Pipeline {
             paused_resume_post_state: request.paused_resume_post_state,
             failure_error: Some(reason),
             delivered: None,
+            delivery_left_behind: Vec::new(),
             working_dir: request.working_dir.clone(),
             downloaded_bytes: 0,
             restored_download_floor_bytes: 0,
@@ -1110,6 +1168,7 @@ impl Pipeline {
             nzb_password_candidates,
             finalization_open,
             delivered,
+            delivery_left_behind,
         } = restored;
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
@@ -1325,6 +1384,7 @@ impl Pipeline {
                 _ => None,
             },
             delivered: None,
+            delivery_left_behind: Vec::new(),
             working_dir,
             downloaded_bytes,
             restored_download_floor_bytes,
@@ -1383,6 +1443,7 @@ impl Pipeline {
         // decides from this.
         if delivering && let Some(state) = self.jobs.get_mut(&job_id) {
             state.delivered = delivered;
+            state.delivery_left_behind = delivery_left_behind;
         }
         self.schedule_job_completion_check(job_id);
         // An interrupted move goes on once the install's turn is done; its
@@ -1495,6 +1556,8 @@ pub(crate) struct RestoredFacts {
     // What the graph ruled before the delivery began, read back from the
     // row of a job restored past its download.
     delivered: Option<crate::post_processing::model::DeliveredVerdict>,
+    // What that delivery's move was told to leave in the working directory.
+    delivery_left_behind: Vec<PathBuf>,
 }
 
 // One job of a batch a walk installs: a restart's restore, or a job entering
@@ -1673,10 +1736,19 @@ async fn read_restored(
             "failed to stamp restored working directory as Weaver-owned"
         );
     }
+    // A staging directory on the complete device holds the files the job
+    // delivers, where its intermediate directory is on another device.
+    let staging_exists = tokio::fs::try_exists(staging_dir).await.unwrap_or(false);
     let graph = if waiting_summaries.is_some() || delivering {
         None
     } else if let Some(graph) = graph {
-        let seat = graph.for_job(spec.password.clone(), &working_dir);
+        let seat = graph
+            .for_job(
+                spec.password.clone(),
+                &working_dir,
+                staging_exists.then_some(staging_dir),
+            )
+            .lifted(&spec.metadata);
         let files = crate::pipeline::graph::restore::root_files(&spec);
         match tokio::task::spawn_blocking(move || seat.restore(job_id, files))
             .await
@@ -1692,7 +1764,6 @@ async fn read_restored(
     } else {
         None
     };
-    let staging_exists = tokio::fs::try_exists(staging_dir).await.unwrap_or(false);
     // One read of the row, decrypt of the supplied passwords and parse of
     // the persisted NZB per restored job, instead of one per archive file.
     // Anything short of a parsed NZB leaves the harvest to read the row
@@ -1722,16 +1793,18 @@ async fn read_restored(
     );
     // A delivery that had begun keeps what its graph ruled, read back from
     // its row.
-    let delivered = if delivering {
+    let (delivered, delivery_left_behind) = if delivering {
         match off_thread(db, move |db| db.job_post_processing_facts(job_id.0)).await {
-            Ok(facts) => facts.and_then(|facts| facts.delivered),
+            Ok(facts) => facts.map_or((None, Vec::new()), |facts| {
+                (facts.delivered, facts.left_behind)
+            }),
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, %error, "could not read what the delivery ruled");
-                None
+                (None, Vec::new())
             }
         }
     } else {
-        None
+        (None, Vec::new())
     };
     Ok(RestoredFacts {
         spec,
@@ -1741,7 +1814,21 @@ async fn read_restored(
         nzb_password_candidates,
         finalization_open,
         delivered,
+        delivery_left_behind,
     })
+}
+
+// The staging directory an admission made, gone with the admission that
+// failed: nothing was written to it.
+async fn remove_unadmitted_staging(job_id: JobId, staging_dir: Option<&std::path::Path>) {
+    let Some(staging_dir) = staging_dir else {
+        return;
+    };
+    if let Err(error) = tokio::fs::remove_dir_all(staging_dir).await
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(job_id = job_id.0, error = %error, "failed to clean staging directory after a failed admission");
+    }
 }
 
 #[cfg(test)]

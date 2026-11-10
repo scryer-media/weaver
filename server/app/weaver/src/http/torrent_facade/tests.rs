@@ -125,6 +125,7 @@ fn config(complete_dir: &std::path::Path) -> SharedConfig {
         hardware_profile: None,
         intermediate_dir: None,
         complete_dir: Some(complete_dir.to_string_lossy().into_owned()),
+        delete_failed_job_files: None,
         buffer_pool: None,
         servers: vec![],
         categories: vec![],

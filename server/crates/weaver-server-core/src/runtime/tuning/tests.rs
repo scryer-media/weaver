@@ -17,6 +17,7 @@ fn ssd_profile(cores: usize) -> SystemProfile {
             total_bytes: 16 * 1024 * 1024 * 1024,
             available_bytes: 8 * 1024 * 1024 * 1024,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Ssd,
@@ -40,6 +41,7 @@ fn hdd_profile(cores: usize) -> SystemProfile {
             total_bytes: 16 * 1024 * 1024 * 1024,
             available_bytes: 8 * 1024 * 1024 * 1024,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Hdd,

@@ -43,10 +43,11 @@ use crate::operations::disk::CapacityReader;
 use crate::persistence::Database;
 use crate::pipeline::ExtractionLimits;
 use crate::pipeline::claim_complete_destination_path;
-use crate::pipeline::graph::engine::{Outside, RunMail, Said};
+use crate::pipeline::graph::engine::{DecodePool, Outside, RunMail, Said};
 use crate::pipeline::graph::job::Storage;
 use crate::pipeline::graph::limits::{self, Caps};
 use crate::pipeline::graph::status::RepairSlots;
+use crate::pipeline::graph::window::ScratchLedger;
 use crate::post_processing::model::{QueueEvent, vars};
 use crate::proxies::{
     Consumer, LegTenancy, LegTenant, NetworkRuntime, ResolvedBy, SessionTraffic, TorrentScope,
@@ -538,6 +539,11 @@ pub struct JobEnv {
     pub(crate) free_disk: CapacityReader,
     pub(crate) slots: usize,
     pub(crate) limits: Arc<ExtractionLimits>,
+    // The decode pool the pipeline's jobs share, and where a decode window
+    // goes: under `work`, else in weaver's data folder.
+    pub(crate) decode: Arc<DecodePool>,
+    pub(crate) window_ledger: ScratchLedger,
+    pub(crate) data_dir: Option<(PathBuf, CapacityReader, ScratchLedger)>,
     // Where the jobs' runs speak, where the database's word on their
     // checkpoints comes, and where a job joins to hear both.
     pub(crate) mail: mpsc::Sender<Said>,
@@ -566,6 +572,9 @@ impl JobEnv {
             free_disk: budget.free_disk,
             slots: budget.slots.max(1),
             limits: budget.limits,
+            decode: budget.decode,
+            window_ledger: budget.window_ledger,
+            data_dir: Some(budget.data_dir),
             mail: budget.mail,
             written: budget.written,
             outside: budget.outside,
@@ -600,6 +609,9 @@ impl JobEnv {
             free_disk: CapacityReader::unknown(),
             slots: 1,
             limits: Arc::new(ExtractionLimits::unbounded()),
+            decode: Arc::new(DecodePool::new(u64::MAX)),
+            window_ledger: ScratchLedger::default(),
+            data_dir: None,
             mail: mail.sender(),
             written: mail.written(),
             outside: Arc::default(),
@@ -3111,16 +3123,18 @@ impl TorrentService {
         plan: &Plan,
         passwords: Vec<String>,
     ) -> Storage {
-        let policy = self
-            .inner
-            .db
-            .post_processing_settings()
-            .map(Arc::new)
-            .map_err(state_error);
+        let db = self.inner.db.clone();
+        let policy: limits::PolicyRead = Arc::new(move || {
+            db.post_processing_settings()
+                .map(Arc::new)
+                .map_err(state_error)
+        });
         let env = &self.inner.env;
         Storage {
             working_dir: work,
+            output: None,
             accountant: Arc::clone(&env.accountant),
+            decode: Arc::clone(&env.decode),
             free_disk: env.free_disk.clone(),
             slots: env.slots,
             mail: env.mail.clone(),
@@ -3129,6 +3143,8 @@ impl TorrentService {
             nesting: limits::NESTING,
             hardware: Default::default(),
             metrics: None,
+            data_dir: env.data_dir.clone(),
+            window_ledger: env.window_ledger.clone(),
         }
     }
 

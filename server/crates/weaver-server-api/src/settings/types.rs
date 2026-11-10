@@ -153,6 +153,7 @@ pub struct GeneralSettings {
     pub intermediate_dir: String,
     pub complete_dir: String,
     pub cleanup_after_extract: bool,
+    pub delete_failed_job_files: bool,
     pub max_retries: u32,
     pub propagation_delay_secs: u32,
     pub max_concurrent_nzbs: u32,
@@ -171,6 +172,7 @@ pub struct GeneralSettingsInput {
     pub intermediate_dir: MaybeUndefined<String>,
     pub complete_dir: MaybeUndefined<String>,
     pub cleanup_after_extract: Option<bool>,
+    pub delete_failed_job_files: Option<bool>,
     pub max_retries: Option<u32>,
     pub propagation_delay_secs: Option<u32>,
     #[graphql(validator(minimum = 1, maximum = 2147483647))]
@@ -845,6 +847,7 @@ mod schedule_input_tests {
                 total_bytes: 1024 * 1024 * 1024,
                 available_bytes: 1024 * 1024 * 1024,
                 cgroup_limit: None,
+                guessed: false,
             },
             disk: DiskProfile {
                 storage_class: StorageClass::Unknown,
@@ -1857,6 +1860,7 @@ impl From<&weaver_server_core::settings::Config> for GeneralSettings {
             intermediate_dir: cfg.intermediate_dir(),
             complete_dir: cfg.complete_dir(),
             cleanup_after_extract: cfg.cleanup_after_extract(),
+            delete_failed_job_files: cfg.delete_failed_job_files(),
             propagation_delay_secs: cfg.propagation_delay_secs(),
             max_concurrent_nzbs: cfg.max_concurrent_nzbs(),
             max_retries: cfg.retry.as_ref().and_then(|r| r.max_retries).unwrap_or(3),

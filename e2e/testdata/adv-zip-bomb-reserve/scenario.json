@@ -8,7 +8,7 @@
     "group": "reserve",
     "outcome": "failed",
     "errorContains": "WEAVER_EXTRACTION_REJECTED[disk_reserve]",
-    "failureKind": "unpack",
+    "failureKind": "disk_full",
     "budgetRefusals": 1,
     "rejectionMetric": "disk_reserve",
     "extractsNothing": true

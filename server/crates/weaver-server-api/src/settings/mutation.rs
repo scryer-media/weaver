@@ -151,6 +151,7 @@ impl SettingsMutation {
         let normalized_intermediate_dir = normalize_settings_path_update(&input.intermediate_dir);
         let normalized_complete_dir = normalize_settings_path_update(&input.complete_dir);
         let cleanup_after_extract = input.cleanup_after_extract;
+        let delete_failed_job_files = input.delete_failed_job_files;
         let max_retries = input.max_retries;
         let propagation_delay_secs = input.propagation_delay_secs;
         let max_concurrent_nzbs = input
@@ -210,6 +211,7 @@ impl SettingsMutation {
             torrent_update.clone(),
             max_concurrent_nzbs,
             upload_cap_update,
+            delete_failed_job_files,
         );
         let settings_persist = {
             let db = db.clone();
@@ -323,6 +325,9 @@ impl SettingsMutation {
                         if let Some(ref torrent) = persist_input.9 {
                             db.save_torrent_config(torrent)?;
                         }
+                        if let Some(delete) = persist_input.12 {
+                            db.set_setting("delete_failed_job_files", &delete.to_string())?;
+                        }
                         Ok(())
                     },
                 )
@@ -351,6 +356,9 @@ impl SettingsMutation {
                 }
                 if let Some(cleanup) = cleanup_after_extract {
                     cfg.cleanup_after_extract = Some(cleanup);
+                }
+                if let Some(delete) = delete_failed_job_files {
+                    cfg.delete_failed_job_files = Some(delete);
                 }
                 if let Some(limit) = max_concurrent_nzbs {
                     cfg.max_concurrent_nzbs = Some(limit);
@@ -872,6 +880,7 @@ mod tests {
             retry: None,
             bandwidth: Default::default(),
             cleanup_after_extract: None,
+            delete_failed_job_files: None,
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
