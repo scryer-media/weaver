@@ -1140,6 +1140,7 @@ export const USAGE_HISTORY_QUERY = gql`
         allTime { ${USAGE_TOTALS_FIELDS} }
         range { ${USAGE_TOTALS_FIELDS} }
         days { day ${USAGE_TOTALS_FIELDS} }
+        removedHost
       }
       finishedToday { complete partial failed }
       finishedInRange { complete partial failed }

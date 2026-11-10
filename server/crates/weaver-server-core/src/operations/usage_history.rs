@@ -38,6 +38,12 @@ pub const USAGE_MAX_DOWN_STEP_SECS: i64 = 60;
 /// every real date, so a range with a start never reads it.
 const EARLIER_DAY: &str = "0000-00-00";
 const DAY_FORMAT: &str = "%Y-%m-%d";
+/// The start of the server consumer id a removed server's kept rows move
+/// to. A live server's id is a number, so no live server ever has one.
+pub const REMOVED_SERVER_ID_PREFIX: &str = "removed-";
+/// How often a batch also drops the kept rows of removed servers whose
+/// time is up.
+pub const USAGE_EXPIRY_INTERVAL_SECS: i64 = 60;
 
 /// Who used the data a row counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -146,6 +152,20 @@ pub struct UsageConsumerTotal {
     pub kind: String,
     pub consumer_id: String,
     pub counts: UsageCounts,
+}
+
+/// A removed server whose rows are kept until its quota's next reset after
+/// the removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemovedServerUsage {
+    /// The server consumer id its rows are kept under.
+    pub consumer_id: String,
+    /// The id the server had.
+    pub server_id: u32,
+    /// The server's name when it was removed.
+    pub host: String,
+    /// When the rows go, in epoch seconds.
+    pub remove_at_epoch_sec: i64,
 }
 
 /// Finished jobs by how they ended.
@@ -488,9 +508,23 @@ struct RecorderState {
     last_tick_epoch_sec: Option<i64>,
     pending: HashMap<PendingKey, UsageCounts>,
     pruned_through: Option<NaiveDate>,
+    /// Removed servers whose id no new server has taken yet: the consumer
+    /// id what readings still show of them goes to, or `None` to drop it.
+    retired: HashMap<u32, Option<String>>,
+    /// The reading time the last batch asked for an expiry at.
+    expired_at: Option<i64>,
 }
 
 impl RecorderState {
+    /// The consumer id a server's counts go under: its own id, the id its
+    /// rows moved to once removed, or none when its rows were deleted.
+    fn server_consumer(&self, server_id: u32) -> Option<String> {
+        match self.retired.get(&server_id) {
+            Some(kept) => kept.clone(),
+            None => Some(server_id.to_string()),
+        }
+    }
+
     fn add_pending(
         &mut self,
         day: NaiveDate,
@@ -505,17 +539,20 @@ impl RecorderState {
     }
 }
 
-/// A batch ready to write: the rows to add, and the cutoff to fold older
-/// days at when the date has moved since the last batch.
+/// A batch ready to write: the rows to add, the cutoff to fold older days
+/// at when the date has moved since the last batch, and, about once a
+/// minute, the moment to drop removed servers' kept rows whose time is up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageFlush {
     pub rows: Vec<UsageDayRow>,
     pub fold_before: Option<NaiveDate>,
+    /// In epoch seconds: kept rows whose removal time is at or before it go.
+    pub expire_removed_at: Option<i64>,
 }
 
 impl UsageFlush {
     pub fn is_empty(&self) -> bool {
-        self.rows.is_empty() && self.fold_before.is_none()
+        self.rows.is_empty() && self.fold_before.is_none() && self.expire_removed_at.is_none()
     }
 }
 
@@ -528,6 +565,9 @@ impl UsageFlush {
 #[derive(Debug, Default)]
 pub struct UsageRecorder {
     state: Mutex<RecorderState>,
+    /// Held from a reading to its batch's write, and while a server is
+    /// removed, so a batch taken before a removal is never written after it.
+    writes: tokio::sync::Mutex<()>,
 }
 
 impl UsageRecorder {
@@ -539,6 +579,48 @@ impl UsageRecorder {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Wait for any batch being written, and hold off the next one while
+    /// the guard lives.
+    pub async fn hold_writes(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.writes.lock().await
+    }
+
+    /// Stop counting `server_id` as a live server, once its row is deleted.
+    ///
+    /// What it has waiting, and whatever later readings still show of it
+    /// before the pool lets it go, goes under `kept`, the consumer id its
+    /// rows moved to, or is dropped when its rows were deleted. Call it with
+    /// [`hold_writes`] held across the delete.
+    ///
+    /// [`hold_writes`]: UsageRecorder::hold_writes
+    pub fn retire_server(&self, server_id: u32, kept: Option<&str>) {
+        let mut state = self.lock();
+        let id = server_id.to_string();
+        let waiting: Vec<PendingKey> = state
+            .pending
+            .keys()
+            .filter(|(_, kind, consumer)| *kind == UsageConsumerKind::Server && *consumer == id)
+            .cloned()
+            .collect();
+        for key in waiting {
+            let Some(counts) = state.pending.remove(&key) else {
+                continue;
+            };
+            if let Some(kept) = kept {
+                state.add_pending(key.0, UsageConsumerKind::Server, kept, counts);
+            }
+        }
+        state.states.remove(&server_id);
+        state.retired.insert(server_id, kept.map(str::to_string));
+    }
+
+    /// Count `server_id` as a live server again, for a new server given
+    /// that id. The old baseline stays: a total that carries on counts what
+    /// moves from it, and a total that starts again below it is a restart.
+    pub fn reuse_server_id(&self, server_id: u32) {
+        self.lock().retired.remove(&server_id);
     }
 
     /// Take `reading` as the starting point: nothing in it is counted.
@@ -654,14 +736,13 @@ impl UsageRecorder {
                     },
                 );
             }
-            if !counts.is_zero() {
+            if counts.is_zero() {
+                continue;
+            }
+            if let Some(consumer) = state.server_consumer(server.server_id) {
                 let pending = state
                     .pending
-                    .entry((
-                        today,
-                        UsageConsumerKind::Server,
-                        server.server_id.to_string(),
-                    ))
+                    .entry((today, UsageConsumerKind::Server, consumer))
                     .or_default();
                 pending.add(&counts);
                 pending.down_seconds = pending.down_seconds.min(day_seconds);
@@ -780,24 +861,50 @@ impl UsageRecorder {
             state.pruned_through = Some(today);
             Some(retention_cutoff(today))
         };
-        UsageFlush { rows, fold_before }
+        // Expiry goes by the last reading's time, so it needs one.
+        let expire_removed_at = state.last_tick_epoch_sec.filter(|now| {
+            state
+                .expired_at
+                .is_none_or(|last| now.saturating_sub(last) >= USAGE_EXPIRY_INTERVAL_SECS)
+        });
+        if expire_removed_at.is_some() {
+            state.expired_at = expire_removed_at;
+        }
+        UsageFlush {
+            rows,
+            fold_before,
+            expire_removed_at,
+        }
     }
 
-    /// Put back a batch whose write failed, to go with the next one.
+    /// Put back a batch whose write failed, to go with the next one. A row
+    /// of a server removed since goes where that server's counts now go.
     pub fn restore(&self, flush: UsageFlush) {
         let mut state = self.lock();
         for row in flush.rows {
             let (Some(day), Some(kind)) = (row.day, UsageConsumerKind::parse(&row.kind)) else {
                 continue;
             };
+            let consumer = match row.consumer_id.parse::<u32>() {
+                Ok(server_id) if kind == UsageConsumerKind::Server => {
+                    state.server_consumer(server_id)
+                }
+                _ => Some(row.consumer_id),
+            };
+            let Some(consumer) = consumer else {
+                continue;
+            };
             state
                 .pending
-                .entry((day, kind, row.consumer_id))
+                .entry((day, kind, consumer))
                 .or_default()
                 .add(&row.counts);
         }
         if flush.fold_before.is_some() {
             state.pruned_through = None;
+        }
+        if flush.expire_removed_at.is_some() {
+            state.expired_at = None;
         }
     }
 
@@ -899,6 +1006,15 @@ const FOLD_OLD_DAYS: &str = "INSERT INTO usage_daily
 
 const DELETE_OLD_DAYS: &str = "DELETE FROM usage_daily WHERE day < {} AND day <> {}";
 
+// A removed server's kept rows go at their removal time, then its record.
+const DELETE_EXPIRED_REMOVED_ROWS: &str = "DELETE FROM usage_daily
+      WHERE consumer_kind = {}
+        AND consumer_id IN
+            (SELECT consumer_id FROM usage_removed_servers WHERE remove_at <= {})";
+
+const DELETE_EXPIRED_REMOVED_SERVERS: &str =
+    "DELETE FROM usage_removed_servers WHERE remove_at <= {}";
+
 impl Database {
     /// Write a batch: add each row onto its day, and fold days older than
     /// the batch's cutoff. One transaction whatever the row count.
@@ -945,6 +1061,16 @@ impl Database {
                 DELETE_OLD_DAYS,
                 vec![SqlArg::Text(cutoff), SqlArg::Text(EARLIER_DAY.to_string())],
             ));
+        }
+        if let Some(now) = flush.expire_removed_at {
+            statements.push((
+                DELETE_EXPIRED_REMOVED_ROWS,
+                vec![
+                    SqlArg::Text(UsageConsumerKind::Server.as_str().to_string()),
+                    SqlArg::I64(now),
+                ],
+            ));
+            statements.push((DELETE_EXPIRED_REMOVED_SERVERS, vec![SqlArg::I64(now)]));
         }
         let statements = std::sync::Arc::new(statements);
         let datastore = self.datastore();
@@ -1039,6 +1165,30 @@ impl Database {
                     })
                 })
                 .collect()
+        })
+    }
+
+    /// The removed servers whose rows are still kept.
+    pub fn read_removed_servers(&self) -> Result<Vec<RemovedServerUsage>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT consumer_id, server_id, host, remove_at
+                   FROM usage_removed_servers ORDER BY consumer_id",
+                &[],
+            )
+            .await?
+            .iter()
+            .map(|row| {
+                Ok(RemovedServerUsage {
+                    consumer_id: row.text("consumer_id")?,
+                    server_id: u32::try_from(row.i64("server_id")?).unwrap_or(0),
+                    host: row.text("host")?,
+                    remove_at_epoch_sec: row.i64("remove_at")?,
+                })
+            })
+            .collect()
         })
     }
 

@@ -104,6 +104,7 @@ fn rows_only(flush: UsageFlush) -> UsageFlush {
     UsageFlush {
         rows: flush.rows,
         fold_before: None,
+        expire_removed_at: None,
     }
 }
 
@@ -289,6 +290,7 @@ fn a_day_never_holds_more_down_time_than_it_has_seconds() {
         db.write_usage_flush(&UsageFlush {
             rows: vec![down(seconds)],
             fold_before: None,
+            expire_removed_at: None,
         })
         .unwrap();
     }
@@ -307,6 +309,7 @@ fn removing_a_server_removes_its_data_used() {
             row(day, UsageConsumerKind::Category, "3", 30),
         ],
         fold_before: None,
+        expire_removed_at: None,
     })
     .unwrap();
     db.delete_server(3).unwrap();
@@ -409,6 +412,7 @@ fn seed(db: &Database) {
             row(date(2026, 3, 4), UsageConsumerKind::Category, "tv", 1_100),
         ],
         fold_before: None,
+        expire_removed_at: None,
     })
     .unwrap();
 }
@@ -502,6 +506,7 @@ fn a_write_adds_onto_the_day_already_kept() {
             ..row(today, UsageConsumerKind::Server, "1", 0)
         }],
         fold_before: None,
+        expire_removed_at: None,
     })
     .unwrap();
     let rows = db
@@ -564,6 +569,7 @@ fn assert_retention_fold(db: &Database) {
             row(cutoff, UsageConsumerKind::Server, "1", 5),
         ],
         fold_before: None,
+        expire_removed_at: None,
     })
     .unwrap();
     for _ in 0..2 {
@@ -571,6 +577,7 @@ fn assert_retention_fold(db: &Database) {
         db.write_usage_flush(&UsageFlush {
             rows: Vec::new(),
             fold_before: Some(cutoff),
+            expire_removed_at: None,
         })
         .unwrap();
     }
@@ -720,6 +727,7 @@ async fn postgres_keeps_the_same_ledger() {
     assert_finished_counts(&db);
     assert_new_columns_survive_flush_and_fold(&db);
     assert_recovery_and_failure_causes(&db);
+    assert_removed_server_kept_until_reset(&db);
     drop(db);
     drop_postgres_usage_test_schema(admin, schema).await;
 }
@@ -907,6 +915,7 @@ fn assert_new_columns_survive_flush_and_fold(db: &Database) {
     db.write_usage_flush(&UsageFlush {
         rows: Vec::new(),
         fold_before: Some(retention_cutoff(today)),
+        expire_removed_at: None,
     })
     .unwrap();
     // Folding past retention moves the job rows, never their totals.
@@ -1046,4 +1055,326 @@ fn assert_recovery_and_failure_causes(db: &Database) {
 #[test]
 fn recovery_and_failure_causes_read_from_history() {
     assert_recovery_and_failure_causes(&Database::open_in_memory().unwrap());
+}
+
+// ---------------------------------------------------------------------------
+// Removed servers
+// ---------------------------------------------------------------------------
+
+fn configured_server(
+    id: u32,
+    host: &str,
+    enabled: bool,
+    period: crate::servers::ServerDownloadQuotaPeriod,
+) -> crate::servers::ServerConfig {
+    crate::servers::ServerConfig {
+        id,
+        host: host.to_string(),
+        port: 563,
+        tls: true,
+        username: None,
+        password: None,
+        connections: 4,
+        active: true,
+        supports_pipelining: false,
+        pipelining_depth: None,
+        tls_name_mismatch_certificate_der: None,
+        priority: 0,
+        backfill: false,
+        retention_days: 0,
+        max_download_speed: 0,
+        download_quota: crate::servers::ServerDownloadQuotaConfig {
+            enabled,
+            limit_bytes: if enabled { 1_000_000 } else { 0 },
+            period,
+            monthly_reset_day: 1,
+            ..crate::servers::ServerDownloadQuotaConfig::default()
+        },
+        tls_ca_cert: None,
+    }
+}
+
+fn local(y: i32, m: u32, d: u32, h: u32) -> chrono::DateTime<Local> {
+    Local.with_ymd_and_hms(y, m, d, h, 0, 0).earliest().unwrap()
+}
+
+fn expire_at(now: i64) -> UsageFlush {
+    UsageFlush {
+        expire_removed_at: Some(now),
+        ..UsageFlush::default()
+    }
+}
+
+fn server_totals(db: &Database) -> Vec<(String, u64)> {
+    db.read_usage_totals(Some(UsageConsumerKind::Server))
+        .unwrap()
+        .into_iter()
+        .map(|total| (total.consumer_id, total.counts.bytes))
+        .collect()
+}
+
+fn seed_servers(db: &Database, day: NaiveDate) {
+    db.write_usage_flush(&UsageFlush {
+        rows: vec![
+            row(day, UsageConsumerKind::Server, "3", 10),
+            row(day, UsageConsumerKind::Server, "4", 20),
+        ],
+        ..UsageFlush::default()
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_removed_server_with_a_monthly_reset_keeps_its_rows_until_the_reset() {
+    assert_removed_server_kept_until_reset(&Database::open_in_memory().unwrap());
+}
+
+fn assert_removed_server_kept_until_reset(db: &Database) {
+    use crate::servers::ServerDownloadQuotaPeriod::Monthly;
+    db.insert_server(&configured_server(3, "news.eweka.nl", true, Monthly))
+        .unwrap();
+    seed_servers(db, date(2026, 11, 2));
+    // Only the servers seeded here; a shared database may hold others.
+    let server_totals = |db: &Database| -> Vec<(String, u64)> {
+        server_totals(db)
+            .into_iter()
+            .filter(|(id, _)| id == "3" || id == "4" || id.starts_with(REMOVED_SERVER_ID_PREFIX))
+            .collect()
+    };
+
+    let removal = db.delete_server_at(3, local(2026, 11, 9, 12)).unwrap();
+    assert!(removal.removed);
+    let kept = removal.kept_usage.expect("a monthly quota keeps the rows");
+    assert!(kept.starts_with(REMOVED_SERVER_ID_PREFIX));
+    assert_eq!(
+        server_totals(db),
+        vec![("4".to_string(), 20), (kept.clone(), 10)]
+    );
+    let reset = local(2026, 12, 1, 0).timestamp();
+    assert_eq!(
+        db.read_removed_servers().unwrap(),
+        vec![RemovedServerUsage {
+            consumer_id: kept.clone(),
+            server_id: 3,
+            host: "news.eweka.nl".to_string(),
+            remove_at_epoch_sec: reset,
+        }]
+    );
+
+    // Before the reset nothing goes; at it, the rows and their record go.
+    db.write_usage_flush(&expire_at(reset - 1)).unwrap();
+    assert_eq!(server_totals(db).len(), 2);
+    db.write_usage_flush(&expire_at(reset)).unwrap();
+    assert_eq!(server_totals(db), vec![("4".to_string(), 20)]);
+    assert!(db.read_removed_servers().unwrap().is_empty());
+}
+
+#[test]
+fn a_removed_server_with_no_reset_loses_its_rows_at_once() {
+    use crate::servers::ServerDownloadQuotaPeriod::{Monthly, OneTime};
+    // A one-time quota, and a monthly period with the quota off.
+    for server in [
+        configured_server(3, "one-time.example", true, OneTime),
+        configured_server(3, "no-quota.example", false, Monthly),
+    ] {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_server(&server).unwrap();
+        seed_servers(&db, date(2026, 11, 2));
+        let removal = db.delete_server_at(3, local(2026, 11, 9, 12)).unwrap();
+        assert!(removal.removed);
+        assert_eq!(removal.kept_usage, None, "{}", server.host);
+        assert_eq!(server_totals(&db), vec![("4".to_string(), 20)]);
+        assert!(db.read_removed_servers().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn a_new_server_given_the_id_starts_from_zero() {
+    use crate::servers::ServerDownloadQuotaPeriod::Monthly;
+    let db = Database::open_in_memory().unwrap();
+    db.insert_server(&configured_server(3, "news.eweka.nl", true, Monthly))
+        .unwrap();
+    seed_servers(&db, date(2026, 11, 2));
+    let kept = db
+        .delete_server_at(3, local(2026, 11, 9, 12))
+        .unwrap()
+        .kept_usage
+        .unwrap();
+
+    db.insert_server(&configured_server(3, "news.other.example", true, Monthly))
+        .unwrap();
+    db.write_usage_flush(&UsageFlush {
+        rows: vec![row(date(2026, 11, 10), UsageConsumerKind::Server, "3", 5)],
+        ..UsageFlush::default()
+    })
+    .unwrap();
+    assert_eq!(
+        server_totals(&db),
+        vec![
+            ("3".to_string(), 5),
+            ("4".to_string(), 20),
+            (kept.clone(), 10)
+        ]
+    );
+
+    // Removing the new one too keeps both apart, each under its own id.
+    let again = db
+        .delete_server_at(3, local(2026, 11, 9, 12))
+        .unwrap()
+        .kept_usage
+        .unwrap();
+    assert_ne!(again, kept);
+    assert_eq!(
+        server_totals(&db),
+        vec![
+            ("4".to_string(), 20),
+            (kept.clone(), 10),
+            (again.clone(), 5)
+        ]
+    );
+}
+
+#[test]
+fn what_the_recorder_holds_of_a_removed_server_follows_its_rows() {
+    let today = date(2026, 11, 9);
+    let recorder = UsageRecorder::new();
+    recorder.prime(&reading(vec![server(3, 1_000, 0, 0)], &[]), 0);
+    recorder.observe(&reading(vec![server(3, 1_400, 4, 4)], &[]), today, 5);
+
+    recorder.retire_server(3, Some("removed-3-1"));
+    // A reading taken before the pool let the server go still shows it.
+    recorder.observe(&reading(vec![server(3, 1_500, 5, 5)], &[]), today, 10);
+    let rows = recorder.take(today).rows;
+    assert_eq!(
+        rows,
+        vec![counted(
+            UsageConsumerKind::Server,
+            "removed-3-1",
+            UsageCounts {
+                bytes: 500,
+                articles_tried: 5,
+                articles_succeeded: 5,
+                ..UsageCounts::default()
+            },
+            today,
+        )]
+    );
+
+    // A new server given the id counts as itself from its own totals.
+    recorder.reuse_server_id(3);
+    recorder.observe(&reading(vec![server(3, 0, 0, 0)], &[]), today, 15);
+    recorder.observe(&reading(vec![server(3, 60, 2, 1)], &[]), today, 20);
+    assert_eq!(
+        recorder.take(today).rows,
+        vec![counted(
+            UsageConsumerKind::Server,
+            "3",
+            UsageCounts {
+                bytes: 60,
+                articles_tried: 2,
+                articles_succeeded: 1,
+                ..UsageCounts::default()
+            },
+            today,
+        )]
+    );
+}
+
+#[test]
+fn what_the_recorder_holds_of_a_server_whose_rows_went_is_dropped() {
+    let today = date(2026, 11, 9);
+    let recorder = UsageRecorder::new();
+    recorder.prime(
+        &reading(vec![server(3, 0, 0, 0), server(4, 0, 0, 0)], &[]),
+        0,
+    );
+    recorder.observe(
+        &reading(vec![server(3, 100, 0, 0), server(4, 10, 0, 0)], &[]),
+        today,
+        5,
+    );
+    let failed = recorder.take(today);
+    recorder.retire_server(3, None);
+    // A batch that failed before the removal comes back without it.
+    recorder.restore(failed);
+    recorder.observe(
+        &reading(vec![server(3, 150, 0, 0), server(4, 10, 0, 0)], &[]),
+        today,
+        10,
+    );
+    assert_eq!(
+        recorder.take(today).rows,
+        vec![row(today, UsageConsumerKind::Server, "4", 10)]
+    );
+}
+
+#[test]
+fn a_restored_batch_of_a_kept_server_goes_to_its_kept_rows() {
+    let today = date(2026, 11, 9);
+    let recorder = UsageRecorder::new();
+    recorder.prime(&reading(vec![server(3, 0, 0, 0)], &[]), 0);
+    recorder.observe(&reading(vec![server(3, 100, 0, 0)], &[]), today, 5);
+    let failed = recorder.take(today);
+    recorder.retire_server(3, Some("removed-3-1"));
+    recorder.restore(failed);
+    assert_eq!(
+        recorder.take(today).rows,
+        vec![row(today, UsageConsumerKind::Server, "removed-3-1", 100)]
+    );
+}
+
+#[test]
+fn expiry_is_asked_for_about_once_a_minute_of_readings() {
+    let today = date(2026, 11, 9);
+    let recorder = UsageRecorder::new();
+    // No reading yet, so no time to expire against.
+    assert_eq!(recorder.take(today).expire_removed_at, None);
+    recorder.prime(&reading(vec![], &[]), 1_000);
+    assert_eq!(recorder.take(today).expire_removed_at, Some(1_000));
+    recorder.observe(&reading(vec![], &[]), today, 1_030);
+    assert_eq!(recorder.take(today).expire_removed_at, None);
+    recorder.observe(&reading(vec![], &[]), today, 1_060);
+    let due = recorder.take(today);
+    assert_eq!(due.expire_removed_at, Some(1_060));
+    // A failed write asks again with the next batch.
+    recorder.restore(due);
+    recorder.observe(&reading(vec![], &[]), today, 1_065);
+    assert_eq!(recorder.take(today).expire_removed_at, Some(1_065));
+}
+
+#[test]
+fn kept_rows_and_their_removal_survive_a_restart() {
+    use crate::servers::ServerDownloadQuotaPeriod::Daily;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("weaver.db");
+    let today = date(2026, 11, 9);
+    let removed_at = local(2026, 11, 9, 12);
+    let kept = {
+        let db = Database::open(&path).unwrap();
+        db.insert_server(&configured_server(3, "news.eweka.nl", true, Daily))
+            .unwrap();
+        let recorder = UsageRecorder::new();
+        recorder.prime(&reading(vec![server(3, 0, 0, 0)], &[]), 0);
+        recorder.observe(&reading(vec![server(3, 300, 0, 0)], &[]), today, 5);
+        let removal = db.delete_server_at(3, removed_at).unwrap();
+        let kept = removal.kept_usage.unwrap();
+        recorder.retire_server(3, Some(&kept));
+        db.write_usage_flush(&rows_only(recorder.take(today)))
+            .unwrap();
+        kept
+    };
+    let db = Database::open(&path).unwrap();
+    assert_eq!(server_totals(&db), vec![(kept.clone(), 300)]);
+    let reset = local(2026, 11, 10, 0).timestamp();
+    assert_eq!(
+        db.read_removed_servers().unwrap()[0].remove_at_epoch_sec,
+        reset
+    );
+    // A new process asks for expiry with its first batch.
+    let recorder = UsageRecorder::new();
+    recorder.prime(&reading(vec![], &[]), reset);
+    db.write_usage_flush(&recorder.take(date(2026, 11, 10)))
+        .unwrap();
+    assert!(server_totals(&db).is_empty());
+    assert!(db.read_removed_servers().unwrap().is_empty());
 }

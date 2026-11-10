@@ -1,10 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+use chrono::{DateTime, Local, Utc};
+
 use crate::StateError;
+use crate::operations::REMOVED_SERVER_ID_PREFIX;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-use crate::servers::{ServerConfig, record::ServerRecord};
+use crate::persistence::sql_runtime::{SqlArg, SqlResult, SqlRuntime, SqlTx};
+use crate::servers::{
+    ServerConfig, ServerDownloadQuotaConfig, ServerDownloadQuotaPeriod, record::ServerRecord,
+};
 
 impl Database {
     pub fn insert_server(&self, server: &ServerConfig) -> Result<(), StateError> {
@@ -125,10 +130,27 @@ impl Database {
     }
 
     pub fn delete_server(&self, id: u32) -> Result<bool, StateError> {
+        self.delete_server_at(id, Local::now())
+            .map(|removal| removal.removed)
+    }
+
+    /// Delete a server as of `now`.
+    ///
+    /// A new server can take this id, so the removed server's data used
+    /// never stays under it. A server whose quota resets on a calendar keeps
+    /// its rows, moved to a consumer id no live server can have, until that
+    /// quota's next reset after `now`; housekeeping then drops them. Any
+    /// other server's rows go at once.
+    pub fn delete_server_at(
+        &self,
+        id: u32,
+        now: DateTime<Local>,
+    ) -> Result<ServerRemoval, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_routed_consumer", |tx| {
                 Box::pin(async move {
+                    let kept_usage = keep_removed_usage(tx, id, now).await?;
                     Database::remove_server_schedules(tx, id).await?;
                     let changed = tx
                         .execute(
@@ -142,25 +164,133 @@ impl Database {
                     )
                     .await?;
                     // A new server can take this id; it must not inherit the
-                    // removed server's data used.
-                    tx.execute(
-                        "DELETE FROM usage_daily WHERE consumer_kind = {} AND consumer_id = {}",
-                        &[
-                            SqlArg::Text(
-                                crate::operations::UsageConsumerKind::Server
-                                    .as_str()
-                                    .to_string(),
-                            ),
-                            SqlArg::Text(id.to_string()),
-                        ],
-                    )
-                    .await?;
-                    Ok(changed > 0)
+                    // removed server's data used. Kept rows moved above.
+                    if kept_usage.is_none() {
+                        tx.execute(
+                            "DELETE FROM usage_daily WHERE consumer_kind = {} AND consumer_id = {}",
+                            &[server_kind(), SqlArg::Text(id.to_string())],
+                        )
+                        .await?;
+                    }
+                    Ok(ServerRemoval {
+                        removed: changed > 0,
+                        kept_usage,
+                    })
                 })
             })
             .await
         })
     }
+}
+
+/// What deleting a server did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerRemoval {
+    /// Whether a server had the id.
+    pub removed: bool,
+    /// The server consumer id its data used is kept under until its quota
+    /// resets, or `None` when that was deleted with it.
+    pub kept_usage: Option<String>,
+}
+
+/// When a removed server's data used goes: its quota's next reset after
+/// `now`. `None` for no quota, or one that never resets by itself.
+pub fn removed_usage_kept_until(
+    quota: &ServerDownloadQuotaConfig,
+    now: DateTime<Local>,
+) -> Option<DateTime<Utc>> {
+    if !quota.enabled {
+        return None;
+    }
+    crate::servers::transfer_policy::quota_window(now, quota.into()).map(|window| window.end)
+}
+
+fn server_kind() -> SqlArg {
+    SqlArg::Text(
+        crate::operations::UsageConsumerKind::Server
+            .as_str()
+            .to_string(),
+    )
+}
+
+// Move a server's rows under a fresh removed-server consumer id with a
+// record of its name and removal time, when its quota has a next reset.
+async fn keep_removed_usage(
+    tx: &mut SqlTx<'_>,
+    id: u32,
+    now: DateTime<Local>,
+) -> SqlResult<Option<String>> {
+    let Some(row) = tx
+        .fetch_optional(
+            "SELECT host, download_quota_enabled, download_quota_period,
+                    download_quota_reset_time_minutes_local,
+                    download_quota_weekly_reset_weekday,
+                    download_quota_monthly_reset_day
+               FROM servers WHERE id = {}",
+            &[SqlArg::I64(i64::from(id))],
+        )
+        .await?
+    else {
+        return Ok(None);
+    };
+    // A quota this cannot read has no reset to wait for.
+    let period = ServerDownloadQuotaPeriod::parse(&row.text("download_quota_period")?);
+    let weekday = crate::servers::record::parse_quota_weekday(
+        &row.text("download_quota_weekly_reset_weekday")?,
+    );
+    let (Some(period), Some(weekly_reset_weekday)) = (period, weekday) else {
+        return Ok(None);
+    };
+    let quota = ServerDownloadQuotaConfig {
+        enabled: row.bool("download_quota_enabled")?,
+        limit_bytes: 0,
+        period,
+        reset_time_minutes_local: u16::try_from(
+            row.i64("download_quota_reset_time_minutes_local")?,
+        )
+        .unwrap_or(0),
+        weekly_reset_weekday,
+        monthly_reset_day: u8::try_from(row.i64("download_quota_monthly_reset_day")?).unwrap_or(1),
+    };
+    let Some(until) = removed_usage_kept_until(&quota, now) else {
+        return Ok(None);
+    };
+
+    let base = format!("{REMOVED_SERVER_ID_PREFIX}{id}-{}", now.timestamp());
+    let mut consumer_id = base.clone();
+    let mut attempt = 1u32;
+    while tx
+        .fetch_optional(
+            "SELECT consumer_id FROM usage_removed_servers WHERE consumer_id = {}",
+            &[SqlArg::Text(consumer_id.clone())],
+        )
+        .await?
+        .is_some()
+    {
+        attempt += 1;
+        consumer_id = format!("{base}-{attempt}");
+    }
+    tx.execute(
+        "INSERT INTO usage_removed_servers (consumer_id, server_id, host, remove_at)
+         VALUES ({}, {}, {}, {})",
+        &[
+            SqlArg::Text(consumer_id.clone()),
+            SqlArg::I64(i64::from(id)),
+            SqlArg::Text(row.text("host")?),
+            SqlArg::I64(until.timestamp()),
+        ],
+    )
+    .await?;
+    tx.execute(
+        "UPDATE usage_daily SET consumer_id = {} WHERE consumer_kind = {} AND consumer_id = {}",
+        &[
+            SqlArg::Text(consumer_id.clone()),
+            server_kind(),
+            SqlArg::Text(id.to_string()),
+        ],
+    )
+    .await?;
+    Ok(Some(consumer_id))
 }
 
 pub(crate) fn server_args(

@@ -38,6 +38,7 @@ fn seed(harness: &TestHarness) {
                 usage(day(2024, 5, 3), UsageConsumerKind::Category, "tv", 340),
             ],
             fold_before: None,
+            expire_removed_at: None,
         })
         .unwrap();
 }
@@ -351,6 +352,7 @@ async fn integrity_reads_the_job_ledger_and_the_history() {
                 ),
             ],
             fold_before: None,
+            expire_removed_at: None,
         })
         .unwrap();
     let noon = chrono::Local
@@ -476,6 +478,7 @@ async fn torrents_read_the_total_and_each_tracker() {
                 ),
             ],
             fold_before: None,
+            expire_removed_at: None,
         })
         .unwrap();
     let response = harness
@@ -506,4 +509,102 @@ async fn torrents_read_the_total_and_each_tracker() {
         torrents["peers"],
         serde_json::json!({ "torrents": 0, "connected": 0, "seeds": 0 })
     );
+}
+
+fn quota_server(id: u32, host: &str) -> weaver_server_core::servers::ServerConfig {
+    weaver_server_core::servers::ServerConfig {
+        id,
+        host: host.to_string(),
+        port: 563,
+        tls: true,
+        username: None,
+        password: None,
+        connections: 4,
+        active: true,
+        supports_pipelining: false,
+        pipelining_depth: None,
+        tls_name_mismatch_certificate_der: None,
+        priority: 0,
+        backfill: false,
+        retention_days: 0,
+        max_download_speed: 0,
+        download_quota: weaver_server_core::servers::ServerDownloadQuotaConfig {
+            enabled: true,
+            limit_bytes: 1_000_000,
+            period: weaver_server_core::servers::ServerDownloadQuotaPeriod::Monthly,
+            monthly_reset_day: 1,
+            ..weaver_server_core::servers::ServerDownloadQuotaConfig::default()
+        },
+        tls_ca_cert: None,
+    }
+}
+
+#[tokio::test]
+async fn a_removed_server_shows_under_its_old_name_apart_from_a_new_one_with_its_id() {
+    let harness = TestHarness::new().await;
+    seed(&harness);
+    let db = harness.db.clone();
+    let removed_at = chrono::Local
+        .with_ymd_and_hms(2024, 5, 3, 12, 0, 0)
+        .earliest()
+        .unwrap();
+    let kept = tokio::task::spawn_blocking(move || {
+        db.insert_server(&quota_server(9, "news.eweka.nl")).unwrap();
+        db.write_usage_flush(&UsageFlush {
+            rows: vec![usage(day(2024, 5, 2), UsageConsumerKind::Server, "9", 70)],
+            ..UsageFlush::default()
+        })
+        .unwrap();
+        let kept = db
+            .delete_server_at(9, removed_at)
+            .unwrap()
+            .kept_usage
+            .unwrap();
+        // A new server takes the id and starts from zero.
+        db.insert_server(&quota_server(9, "news.other.example"))
+            .unwrap();
+        db.write_usage_flush(&UsageFlush {
+            rows: vec![usage(day(2024, 5, 3), UsageConsumerKind::Server, "9", 5)],
+            ..UsageFlush::default()
+        })
+        .unwrap();
+        kept
+    })
+    .await
+    .unwrap();
+
+    let response = harness
+        .execute_with_variables(
+            r#"query Usage($range: UsageRange!) {
+              usageHistory(range: $range, kind: SERVER) {
+                total { range { bytes } }
+                consumers { id removedHost range { bytes } }
+              }
+            }"#,
+            variables(serde_json::json!({
+                "range": { "period": "CUSTOM", "fromDay": "2024-05-01", "toDay": "2024-05-03" },
+            })),
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let usage = &data["usageHistory"];
+    // The removed server's bytes still count in the servers' total.
+    assert_eq!(usage["total"]["range"]["bytes"], 440 + 70 + 5);
+    let consumer = |id: &str| {
+        usage["consumers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|consumer| consumer["id"] == id)
+            .cloned()
+            .unwrap_or_else(|| panic!("no consumer {id}"))
+    };
+    let removed = consumer(&kept);
+    assert_eq!(removed["removedHost"], "news.eweka.nl");
+    assert_eq!(removed["range"]["bytes"], 70);
+    let reused = consumer("9");
+    assert_eq!(reused["removedHost"], serde_json::Value::Null);
+    assert_eq!(reused["range"]["bytes"], 5);
+    assert_eq!(consumer("1")["removedHost"], serde_json::Value::Null);
 }
