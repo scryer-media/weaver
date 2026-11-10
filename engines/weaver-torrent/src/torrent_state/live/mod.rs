@@ -2748,15 +2748,18 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 .map_or(-1, |ago| i32::try_from(ago.as_secs()).unwrap_or(i32::MAX)),
         );
         // Where we listen, on a connection we made: a peer that reached us
-        // knows it (libtorrent `bt_peer_connection::write_extensions`, the
-        // port `session_impl::listen_port` gives: the one mapped on the
-        // gateway, else the one we listen on, whatever announce port is set).
+        // knows it (libtorrent `bt_peer_connection::write_extensions`,
+        // bt_peer_connection.cpp:2459-2463, the port
+        // `session_impl::listen_port(ssl, local_addr)` gives: the one mapped
+        // on the gateway over the connection's family, else the one we
+        // listen on, whatever announce port is set).
         if !self.incoming {
             let shared = &self.state.shared;
+            let ipv6 = self.addr.ip().to_canonical().is_ipv6();
             handshake.p = shared
                 .session
                 .upgrade()
-                .and_then(|session| session.external_port_of(shared.ssl.is_some()))
+                .and_then(|session| session.external_port_of(shared.ssl.is_some(), ipv6))
                 .map(u32::from);
         }
 

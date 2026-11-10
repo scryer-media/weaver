@@ -160,11 +160,38 @@ impl TorrentStatsProvider for () {
 
 type Sender = tokio::sync::mpsc::Sender<SocketAddr>;
 
-/// The port peers reach this session on, None when it accepts no
-/// connections. It can change while a torrent runs (a gateway mapping that
-/// lands after start), so each announce reads it as it goes out (libtorrent
-/// `session_impl::queue_tracker_request` sets `req.listen_port` per request).
-pub type ListenPort = tokio::sync::watch::Receiver<Option<u16>>;
+/// The ports peers reach this session on, one for each address family,
+/// None when it accepts no connections. They can change while a torrent
+/// runs (a gateway mapping that lands after start), so each announce reads
+/// them as it goes out (libtorrent `session_impl::queue_tracker_request`
+/// sets `req.listen_port` per request, from the listen socket it goes out
+/// of).
+pub type ListenPort = tokio::sync::watch::Receiver<ToldPorts>;
+
+/// The port told over each address family.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ToldPorts {
+    pub v4: Option<u16>,
+    pub v6: Option<u16>,
+}
+
+impl ToldPorts {
+    /// `port` over both families.
+    pub const fn both(port: Option<u16>) -> Self {
+        Self { v4: port, v6: port }
+    }
+
+    /// The port told over IPv6, or over IPv4.
+    pub const fn of(self, ipv6: bool) -> Option<u16> {
+        if ipv6 { self.v6 } else { self.v4 }
+    }
+
+    /// The port told to `ip`, an IPv4 address written as IPv6 included in
+    /// IPv4.
+    pub fn to(self, ip: IpAddr) -> Option<u16> {
+        self.of(ip.to_canonical().is_ipv6())
+    }
+}
 
 /// Takes the vote of a tracker that accepted an announce: the address it
 /// says we are at (`external ip`), then the tracker's own address, the one
@@ -333,11 +360,11 @@ struct Entry {
     min_announce: Instant,
     /// An announce to it is waiting for its answer.
     updating: bool,
-    /// The listen port our last announce to it carried; one that differs
-    /// from the current port is due at once (libtorrent
+    /// The listen ports our last announce to it carried; one that differs
+    /// from the current ports is due at once (libtorrent
     /// `session_impl::reopen_listen_sockets` forces every tracker's request
     /// when the listen port changes).
-    port: Option<u16>,
+    port: ToldPorts,
     start_sent: bool,
     complete_sent: bool,
 }
@@ -351,7 +378,7 @@ impl Entry {
             next_announce: now,
             min_announce: now,
             updating: false,
-            port: None,
+            port: ToldPorts::default(),
             start_sent: false,
             complete_sent: false,
         }
@@ -366,7 +393,7 @@ impl Entry {
     /// libtorrent `announce_infohash::can_announce`, with no fail limit: due,
     /// past its `min interval` unless it is owed `completed`, and not
     /// waiting for an answer. A second of slack takes trackers due together.
-    fn can_announce(&self, now: Instant, seed: bool, port: Option<u16>) -> bool {
+    fn can_announce(&self, now: Instant, seed: bool, port: ToldPorts) -> bool {
         let due = now + Duration::from_secs(1) >= self.next_announce
             && (now >= self.min_announce || (seed && !self.complete_sent));
         (due || self.port != port) && !self.updating
@@ -517,11 +544,11 @@ impl TrackerList {
     }
 
     /// The regular announces due at `now`, each with its event, marked as
-    /// waiting for their answers; `port` is the listen port they carry.
+    /// waiting for their answers; `port` is the listen ports they carry.
     fn start_due(
         &mut self,
         now: Instant,
-        port: Option<u16>,
+        port: ToldPorts,
         stats: &TrackerCommsStats,
     ) -> Vec<(SupportedTracker, Option<TrackerRequestEvent>)> {
         let seed = stats.completed_during_run;
@@ -2113,10 +2140,11 @@ impl TrackerComms {
             .filter_map(|(_, from)| *from)
             .filter(|ip| stats.private && is_public(*ip))
             .collect();
-        let request = tracker_comms_http::TrackerRequest {
+        // The port is set for each route below.
+        let mut request = tracker_comms_http::TrackerRequest {
             info_hash: &self.info_hash,
             peer_id: &self.identity.peer_id,
-            port: announced_port(*self.announce_port.borrow()),
+            port: 0,
             uploaded: stats.uploaded_bytes,
             downloaded: stats.downloaded_bytes,
             left: stats.announced_left(),
@@ -2131,11 +2159,19 @@ impl TrackerComms {
             encryption: stats.encryption,
             own_addrs: &own_addrs,
         };
-        let query = request.as_querystring();
+        // Each route's announce carries the port of its family, as each of
+        // libtorrent's listen sockets announces its own; one held to no
+        // family carries the IPv4 one, libtorrent's first listen socket's.
+        let ports = *self.announce_port.borrow();
+        let mut queries = Vec::with_capacity(routes.len());
+        for (family, _) in &routes {
+            request.port = announced_port(ports.of(*family == Some(Family::V6)));
+            queries.push(request.as_querystring());
+        }
 
         // One announce per route, at once; the peers of every answer are
         // kept, the rest of the first, as UDP's two families are.
-        let answers = futures::future::join_all(routes.iter().map(|(family, _)| {
+        let answers = futures::future::join_all(routes.iter().zip(&queries).map(|((family, _), query)| {
             tracker_comms_http::get(
                 &*self.http_clients,
                 self.udp_client.resolver(),
@@ -2144,7 +2180,7 @@ impl TrackerComms {
                 tracker.named_by,
                 Ask::Announce,
                 *family,
-                &query,
+                query,
                 &self.identity.user_agent,
                 tracker_comms_http::Shape::of(&self.identity.peer_id),
             )
@@ -2286,7 +2322,7 @@ impl TrackerComms {
             event: udp_event(event),
             key: self.identity.tracker_key,
             num_want: numwant(event),
-            port: announced_port(*self.announce_port.borrow()),
+            port: announced_port(self.announce_port.borrow().to(addr.ip())),
         };
 
         match self.udp_client.announce(addr, request).await {
@@ -2340,7 +2376,7 @@ mod tests {
 
     use super::{
         AnnounceErrorKind, AnnounceOk, MIN_ANNOUNCE_INTERVAL, Reachable, ReannounceDelay, Refused,
-        ScrapeOk, StoppedAnnounces, SupportedTracker, Tracker, TrackerAnnounce, TrackerComms,
+        ScrapeOk, StoppedAnnounces, SupportedTracker, ToldPorts, Tracker, TrackerAnnounce, TrackerComms,
         TrackerCommsStats, TrackerCommsStatsState, TrackerList, TrackerScrape, TrackerTask,
         UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
         udp_tracker_to_socket_addrs,
@@ -2615,7 +2651,7 @@ mod tests {
                 (MAX_INTERVAL, MAX_INTERVAL)
             );
             let mut list = list(&[&["a"]], t0);
-            list.start_due(t0, None, &live(0, 90, false));
+            list.start_due(t0, ToldPorts::default(), &live(0, 90, false));
             let delay = ReannounceDelay::new(response.interval, response.min_interval, None);
             list.on_success(&http("a"), STARTED, t0, &delay);
             assert_eq!(list.next_due(), Some(t0 + MAX_INTERVAL));
@@ -2623,7 +2659,7 @@ mod tests {
             let refusal = format!("d14:failure reason4:nope8:intervali{secs}ee").into_bytes();
             let retry = Refused::retry_interval(&read_answer(&refusal).unwrap_err());
             assert_eq!(retry, MAX_INTERVAL);
-            list.start_due(t0 + MAX_INTERVAL, None, &live(0, 90, false));
+            list.start_due(t0 + MAX_INTERVAL, ToldPorts::default(), &live(0, 90, false));
             list.on_failure(&http("a"), t0 + MAX_INTERVAL, retry);
             assert_eq!(list.next_due(), Some(t0 + MAX_INTERVAL + MAX_INTERVAL));
         }
@@ -2655,31 +2691,31 @@ mod tests {
         // The first tracker of each tier is announced to, and nothing more
         // while they wait for their answers.
         assert_eq!(
-            list.start_due(t0, None, &stats),
+            list.start_due(t0, ToldPorts::default(), &stats),
             [(http("a"), STARTED), (http("c"), STARTED)]
         );
-        assert_eq!(list.start_due(t0, None, &stats), []);
+        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), []);
         assert_eq!(list.next_due(), None);
 
         // a fails: it backs off to the end of its tier, b is tried at once.
         list.on_failure(&http("a"), t0, Duration::ZERO);
         assert_eq!(order(&list), [http("b"), http("a"), http("c")]);
-        assert_eq!(list.start_due(t0, None, &stats), [(http("b"), STARTED)]);
+        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("b"), STARTED)]);
 
         // b fails too: its tier has none left to try until the back-off is
         // up; c, answering, is not asked again.
         list.on_failure(&http("b"), t0, Duration::ZERO);
         assert_eq!(order(&list), [http("a"), http("b"), http("c")]);
-        assert_eq!(list.start_due(t0, None, &stats), []);
+        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), []);
         list.on_success(&http("c"), STARTED, t0, &ANSWERED);
-        assert_eq!(list.start_due(t0, None, &stats), []);
+        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), []);
 
         // The failing trackers come due after their back-off; c, which
         // works, is not due yet.
         assert_eq!(list.next_due(), Some(t0 + s(17)));
         let t1 = t0 + s(17);
         assert_eq!(
-            list.start_due(t1, None, &stats),
+            list.start_due(t1, ToldPorts::default(), &stats),
             [(http("a"), STARTED), (http("b"), STARTED)]
         );
 
@@ -2691,13 +2727,13 @@ mod tests {
         assert_eq!(list.entries[1].next_announce, t1 + s(55));
         assert_eq!(list.next_due(), Some(t0 + s(1800)));
         assert_eq!(
-            list.start_due(t0 + s(1800), None, &stats),
+            list.start_due(t0 + s(1800), ToldPorts::default(), &stats),
             [(http("c"), None)]
         );
         list.on_success(&http("c"), None, t0 + s(1800), &ANSWERED);
         assert_eq!(list.next_due(), Some(t1 + s(1800)));
         assert_eq!(
-            list.start_due(t1 + s(1800), None, &stats),
+            list.start_due(t1 + s(1800), ToldPorts::default(), &stats),
             [(http("a"), None)]
         );
     }
@@ -2710,7 +2746,7 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a", "b"], &["c"]], t0);
         assert_eq!(
-            list.start_due(t0, None, &live(0, 90, false)),
+            list.start_due(t0, ToldPorts::default(), &live(0, 90, false)),
             [(http("a"), STARTED), (http("c"), STARTED)]
         );
         let delay = ReannounceDelay {
@@ -2724,10 +2760,10 @@ mod tests {
         // min interval, with `completed`.
         let seed = live(90, 0, true);
         let t1 = t0 + s(10);
-        assert_eq!(list.start_due(t1, None, &seed), []);
+        assert_eq!(list.start_due(t1, ToldPorts::default(), &seed), []);
         list.completed(t1);
         assert_eq!(
-            list.start_due(t1, None, &seed),
+            list.start_due(t1, ToldPorts::default(), &seed),
             [(http("a"), COMPLETED), (http("c"), COMPLETED)]
         );
 
@@ -2735,14 +2771,14 @@ mod tests {
         // at once; c accepts it.
         list.on_failure(&http("a"), t1, Duration::ZERO);
         list.on_success(&http("c"), COMPLETED, t1, &delay);
-        assert_eq!(list.start_due(t1, None, &seed), [(http("b"), STARTED)]);
+        assert_eq!(list.start_due(t1, ToldPorts::default(), &seed), [(http("b"), STARTED)]);
         list.on_success(&http("b"), STARTED, t1, &delay);
 
         // Once a tracker accepted it, no other is sent `completed`: b,
         // working, is the one of its tier announced to.
         assert_eq!(list.event(&list.entries[0], &seed), None);
         assert_eq!(
-            list.start_due(t1 + s(1800), None, &seed),
+            list.start_due(t1 + s(1800), ToldPorts::default(), &seed),
             [(http("b"), None), (http("c"), None)]
         );
     }
@@ -2757,26 +2793,26 @@ mod tests {
         };
         // `started` still goes first.
         assert_eq!(
-            list.start_due(t0, None, &selection_done),
+            list.start_due(t0, ToldPorts::default(), &selection_done),
             [(http("a"), STARTED)]
         );
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
         let t1 = t0 + ANSWERED.regular;
         assert_eq!(
-            list.start_due(t1, None, &selection_done),
+            list.start_due(t1, ToldPorts::default(), &selection_done),
             [(http("a"), Some(TrackerRequestEvent::Paused))]
         );
         list.on_success(&http("a"), Some(TrackerRequestEvent::Paused), t1, &ANSWERED);
         // A seed announces without an event, and one still fetching too.
         let t2 = t1 + ANSWERED.regular;
         assert_eq!(
-            list.start_due(t2, None, &live(0, 0, false)),
+            list.start_due(t2, ToldPorts::default(), &live(0, 0, false)),
             [(http("a"), None)]
         );
         list.on_success(&http("a"), None, t2, &ANSWERED);
         let t3 = t2 + ANSWERED.regular;
         assert_eq!(
-            list.start_due(t3, None, &live(0, 30, false)),
+            list.start_due(t3, ToldPorts::default(), &live(0, 30, false)),
             [(http("a"), None)]
         );
     }
@@ -2787,10 +2823,10 @@ mod tests {
         let mut list = list(&[&["a"]], t0);
         let seeding = live(0, 0, false);
         assert!(!may_complete(&seeding));
-        assert_eq!(list.start_due(t0, None, &seeding), [(http("a"), STARTED)]);
+        assert_eq!(list.start_due(t0, ToldPorts::default(), &seeding), [(http("a"), STARTED)]);
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
         let t1 = t0 + ANSWERED.regular;
-        assert_eq!(list.start_due(t1, None, &seeding), [(http("a"), None)]);
+        assert_eq!(list.start_due(t1, ToldPorts::default(), &seeding), [(http("a"), None)]);
     }
 
     #[test]
@@ -2820,7 +2856,7 @@ mod tests {
         let stats = live(0, 90, false);
         assert_eq!(list.stop(), []);
 
-        list.start_due(t0, None, &stats);
+        list.start_due(t0, ToldPorts::default(), &stats);
         // Not yet accepted: nothing is owed.
         assert_eq!(list.stop(), []);
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
@@ -2831,7 +2867,7 @@ mod tests {
         // a fails and b takes over: until b accepts `started`, a, failing,
         // is still owed `stopped`.
         list.on_failure(&http("a"), t0, Duration::ZERO);
-        assert_eq!(list.start_due(t0, None, &stats), [(http("b"), STARTED)]);
+        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("b"), STARTED)]);
         assert_eq!(list.stop(), [http("a"), http("c")]);
         // Then b, the tracker in use in its tier, is.
         list.on_success(&http("b"), STARTED, t0, &ANSWERED);
@@ -2993,7 +3029,7 @@ mod tests {
             op(vec![vec![url]]),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             crate::test_support::loopback(),
             reach_all(),
@@ -3047,7 +3083,7 @@ mod tests {
             op(vec![vec![a_url.clone()]]),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             crate::test_support::loopback(),
             reach_all(),
@@ -3126,7 +3162,7 @@ mod tests {
             op(vec![vec![a_url.clone()]]),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             crate::test_support::loopback(),
             reach_all(),
@@ -3228,7 +3264,7 @@ mod tests {
                 waiting,
             }),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             crate::test_support::loopback(),
             reach_all(),
@@ -3290,7 +3326,7 @@ mod tests {
                 waiting,
             }),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             crate::test_support::loopback(),
             reach_all(),
@@ -3411,7 +3447,7 @@ mod tests {
         // port per request. The tracker's interval is 1800 s on the real
         // clock, so only the port change brings the second announce.
         let (listener, url) = http_listener().await;
-        let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
+        let (port, listen_port) = tokio::sync::watch::channel(ToldPorts::both(Some(6881)));
         let token = CancellationToken::new();
         let udp_sock = crate::test_support::loopback_udp().await;
         let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
@@ -3435,7 +3471,7 @@ mod tests {
         };
         assert_eq!(query_param(&first, "port"), Some("6881"));
         assert_eq!(query_param(&first, "event"), Some("started"));
-        port.send_replace(Some(40001));
+        port.send_replace(ToldPorts::both(Some(40001)));
         let second = tokio::select! {
             _ = peers.next() => panic!("the tracker sent no peers"),
             q = next_announce(&listener) => q,
@@ -3460,7 +3496,7 @@ mod tests {
             }),
             completed: tokio::sync::watch::channel(false).0,
         });
-        let (port, listen_port) = tokio::sync::watch::channel(Some(6881));
+        let (port, listen_port) = tokio::sync::watch::channel(ToldPorts::both(Some(6881)));
         let token = CancellationToken::new();
         let udp_sock = crate::test_support::loopback_udp().await;
         let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
@@ -3490,7 +3526,7 @@ mod tests {
             redundant_bytes: 21,
             ..live(0, 90, false)
         };
-        port.send_replace(Some(40001));
+        port.send_replace(ToldPorts::both(Some(40001)));
         let second = tokio::select! {
             _ = peers.next() => panic!("the tracker sent no peers"),
             q = next_announce(&listener) => q,
@@ -3526,7 +3562,7 @@ mod tests {
             op(vec![vec![tracker]]),
             Box::new(stats.clone()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             crate::test_support::loopback(),
             reach_all(),
@@ -3599,7 +3635,7 @@ mod tests {
             op(vec![vec![url]]),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             crate::test_support::loopback(),
             reach_all(),
@@ -3639,7 +3675,7 @@ mod tests {
             op(vec![vec![url]]),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             Arc::new(crate::test_support::Loopback::with(|| {
                 reqwest::Client::builder()
@@ -3701,7 +3737,7 @@ mod tests {
             op(vec![vec![url]]),
             Box::new(stats.clone()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             crate::test_support::loopback(),
             reach_all(),
@@ -3845,7 +3881,7 @@ mod tests {
             ]]),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             Arc::new(crate::test_support::Loopback::with(
                 reqwest::Client::builder,
@@ -3886,7 +3922,7 @@ mod tests {
             op(tiers),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             crate::test_support::loopback(),
             reach_all(),
@@ -4150,7 +4186,7 @@ mod tests {
             op(vec![vec![refusing_url], vec![url]]),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             Arc::new(move |ours, by| votes.send((ours, by)).unwrap()),
             crate::test_support::loopback(),
             reach_all(),
@@ -4411,7 +4447,7 @@ mod tests {
             op(tiers),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             crate::test_support::loopback(),
             reach_all(),
@@ -4544,7 +4580,7 @@ mod tests {
             op(vec![vec![url]]),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             clients.clone(),
             reach_all(),
@@ -4673,7 +4709,7 @@ mod tests {
             tiers,
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             clients,
             reach_all(),
@@ -5274,7 +5310,7 @@ mod tests {
             op(refused.iter().map(|(u, _)| vec![u.clone()]).collect()),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             clients.clone(),
             reach_but(vec![loopback], true),
@@ -5329,7 +5365,7 @@ mod tests {
             op(vec![vec![url.clone()]]),
             Box::new(()),
             None,
-            tokio::sync::watch::channel(Some(6881)).1,
+            tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
             clients.clone(),
             reach_but(vec![blocked], true),
@@ -5410,7 +5446,7 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a", "b"]], t0);
         let stats = live(0, 90, false);
-        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("a"), STARTED)]);
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
 
         list.replace(
@@ -5428,7 +5464,7 @@ mod tests {
         assert!(a.start_sent);
         assert_eq!(a.next_announce, t0 + ANSWERED.regular);
         assert_eq!(
-            list.start_due(t0 + s(10), None, &stats),
+            list.start_due(t0 + s(10), ToldPorts::default(), &stats),
             [(http("c"), STARTED), (http("d"), STARTED)]
         );
     }
@@ -5439,7 +5475,7 @@ mod tests {
         let mut list = list(&[&["a", "b"], &["c"]], t0);
         let stats = live(0, 90, false);
         assert_eq!(
-            list.start_due(t0, None, &stats),
+            list.start_due(t0, ToldPorts::default(), &stats),
             [(http("a"), STARTED), (http("c"), STARTED)]
         );
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
@@ -5457,7 +5493,7 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a", "b"]], t0);
         let stats = live(0, 90, false);
-        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("a"), STARTED)]);
         let delay = ReannounceDelay {
             floor: s(900),
             regular: s(1800),
@@ -5467,20 +5503,20 @@ mod tests {
         // Within a's min interval, a force that respects it waits for it.
         let t1 = t0 + s(60);
         assert!(list.force(t1, None, false));
-        assert_eq!(list.start_due(t1, None, &stats), []);
+        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), []);
         assert_eq!(list.next_due(), Some(t0 + s(901)));
         // Lifting it, a is due now, and once in flight a second force sends
         // nothing more.
         assert!(list.force(t1, None, true));
-        assert_eq!(list.start_due(t1, None, &stats), [(http("a"), None)]);
+        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), [(http("a"), None)]);
         assert!(list.force(t1, None, true));
         assert!(list.force(t1, Some(&http("a")), true));
-        assert_eq!(list.start_due(t1, None, &stats), []);
+        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), []);
 
         // Forced alone, b goes though a works and the walk would stop there.
         list.on_success(&http("a"), None, t1, &delay);
         assert!(list.force(t1, Some(&http("b")), true));
-        assert_eq!(list.start_due(t1, None, &stats), [(http("b"), STARTED)]);
+        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), [(http("b"), STARTED)]);
         assert!(!list.force(t1, Some(&http("x")), true));
     }
 
@@ -5494,7 +5530,7 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a"]], t0);
         let stats = live(0, 90, false);
-        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("a"), STARTED)]);
         let delay = ReannounceDelay {
             floor: s(900),
             regular: s(1800),
@@ -5504,12 +5540,12 @@ mod tests {
         let t1 = t0 + s(5);
         assert!(list.force(t1, None, true));
         assert!(list.force(t1, Some(&http("a")), true));
-        assert_eq!(list.start_due(t1, None, &stats), []);
+        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), []);
         assert_eq!(list.next_due(), None);
 
         // Answered: due at the answer's interval, the force gone.
         list.on_success(&http("a"), STARTED, t1, &delay);
-        assert_eq!(list.start_due(t1, None, &stats), []);
+        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), []);
         assert_eq!(list.next_due(), Some(t1 + s(1800)));
     }
 
@@ -5750,25 +5786,25 @@ mod tests {
         let t0 = Instant::now();
         let mut list = list(&[&["a"]], t0);
         let stats = live(0, 90, false);
-        assert_eq!(list.start_due(t0, None, &stats), [(http("a"), STARTED)]);
+        assert_eq!(list.start_due(t0, ToldPorts::default(), &stats), [(http("a"), STARTED)]);
         list.on_success(&http("a"), STARTED, t0, &ANSWERED);
         assert_eq!(list.next_due(), Some(t0 + s(1800)));
 
         let t1 = t0 + s(60);
         list.replace(&[vec![http("a")], vec![http("b")]], t1);
         assert_eq!(list.next_due(), Some(t1));
-        assert_eq!(list.start_due(t1, None, &stats), [(http("b"), STARTED)]);
+        assert_eq!(list.start_due(t1, ToldPorts::default(), &stats), [(http("b"), STARTED)]);
         list.on_success(&http("b"), STARTED, t1, &ANSWERED);
 
         assert_eq!(list.next_due(), Some(t0 + s(1800)));
         assert_eq!(
-            list.start_due(t0 + s(1800), None, &stats),
+            list.start_due(t0 + s(1800), ToldPorts::default(), &stats),
             [(http("a"), None)]
         );
         list.on_success(&http("a"), None, t0 + s(1800), &ANSWERED);
         assert_eq!(list.next_due(), Some(t1 + s(1800)));
         assert_eq!(
-            list.start_due(t1 + s(1800), None, &stats),
+            list.start_due(t1 + s(1800), ToldPorts::default(), &stats),
             [(http("b"), None)]
         );
     }
