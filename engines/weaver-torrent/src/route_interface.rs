@@ -6,19 +6,19 @@
 
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
 };
 
 use anyhow::{Context, bail};
 
 use crate::core::net::{Egress, HttpClients};
 
-/// One IPv4 address of one interface.
+/// One address of one interface: an IPv4 one, or a global IPv6 one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RouteInterface {
     pub name: String,
     /// The address the route's traffic leaves from.
-    pub ip: Ipv4Addr,
+    pub ip: IpAddr,
     /// A point-to-point link, as a tunnel is: no network lies behind it to
     /// search for a gateway on.
     pub point_to_point: bool,
@@ -30,7 +30,7 @@ impl RouteInterface {
     /// the internet, so no mapper runs on it (libtorrent marks such a
     /// listen socket `local_network` and starts neither mapper on it).
     pub fn local_network_only(&self) -> bool {
-        local_network_address(IpAddr::V4(self.ip))
+        local_network_address(self.ip)
     }
 }
 
@@ -49,6 +49,12 @@ pub fn local_network_address(ip: IpAddr) -> bool {
 /// the way it sends any public address: where traffic toward it leaves
 /// from names the interface.
 const PUBLIC_PROBE: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 9);
+
+/// The IPv6 documentation address, probed as [`PUBLIC_PROBE`] is.
+const PUBLIC_PROBE_V6: SocketAddr = SocketAddr::new(
+    IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1)),
+    9,
+);
 
 /// The interface the route's traffic takes: `device` when the session is
 /// bound to one, otherwise the one `clients` say public traffic leaves
@@ -77,7 +83,7 @@ fn pick(
     };
     interfaces
         .into_iter()
-        .find(|i| i.ip == ip)
+        .find(|i| i.ip == IpAddr::V4(ip))
         .with_context(|| format!("no interface holds {ip}, the address traffic leaves from"))
 }
 
@@ -89,6 +95,74 @@ fn source_toward(clients: &dyn HttpClients, to: SocketAddr) -> anyhow::Result<Ip
         Egress::NoRoute => bail!("no route toward {to}"),
         Egress::Proxied => bail!("the route toward {to} leaves through a proxy"),
     }
+}
+
+/// The interface a session's IPv6 traffic leaves through, holding the
+/// global IPv6 address a PCP mapper asks from: `listen` itself when the
+/// session is held to it; else, on `device`, the global address traffic
+/// toward a public IPv6 address leaves from, or the device's first global
+/// address. `None` when there is none to map: an address only the local
+/// network reaches, link-local or unique local, is never mapped
+/// (libtorrent `session_impl::start_natpmp` maps no local IPv6 address,
+/// and `get_gateway` finds no gateway for one). A session bound to no
+/// device and held to no IPv6 address maps none.
+pub fn ipv6_route_interface(
+    listen: Ipv6Addr,
+    device: Option<&str>,
+    clients: &dyn HttpClients,
+) -> anyhow::Result<Option<RouteInterface>> {
+    if listen.is_unspecified() && device.is_none() {
+        return Ok(None);
+    }
+    let addresses = interface_addresses().context("error listing network interfaces")?;
+    pick_v6(addresses, listen, device, || {
+        clients.egress(PUBLIC_PROBE_V6)
+    })
+}
+
+fn pick_v6(
+    addresses: Vec<InterfaceAddress>,
+    listen: Ipv6Addr,
+    device: Option<&str>,
+    egress: impl FnOnce() -> Egress,
+) -> anyhow::Result<Option<RouteInterface>> {
+    let interface = |a: InterfaceAddress| RouteInterface {
+        name: a.name,
+        ip: a.ip,
+        point_to_point: a.point_to_point,
+    };
+    if !listen.is_unspecified() {
+        if local_network_address(listen.into()) {
+            return Ok(None);
+        }
+        return addresses
+            .into_iter()
+            .find(|a| a.ip == IpAddr::V6(listen))
+            .map(|a| Some(interface(a)))
+            .with_context(|| {
+                format!("no interface holds {listen}, the address the session listens on")
+            });
+    }
+    let Some(device) = device else {
+        return Ok(None);
+    };
+    let mut global: Vec<InterfaceAddress> = addresses
+        .into_iter()
+        .filter(|a| {
+            a.name == device
+                && a.ip.is_ipv6()
+                && !a.ip.is_unspecified()
+                && !local_network_address(a.ip)
+        })
+        .collect();
+    if global.is_empty() {
+        return Ok(None);
+    }
+    let at = match egress() {
+        Egress::From(source) => global.iter().position(|a| a.ip == source).unwrap_or(0),
+        Egress::NoRoute | Egress::Proxied => 0,
+    };
+    Ok(Some(interface(global.swap_remove(at))))
 }
 
 /// Every address `name` holds, IPv4 and IPv6: any of them is the
@@ -107,7 +181,7 @@ fn ipv4_interfaces() -> io::Result<Vec<RouteInterface>> {
         .filter_map(|a| match a.ip {
             IpAddr::V4(ip) => Some(RouteInterface {
                 name: a.name,
-                ip,
+                ip: ip.into(),
                 point_to_point: a.point_to_point,
             }),
             IpAddr::V6(_) => None,
@@ -192,7 +266,7 @@ mod tests {
 
     use std::net::{IpAddr, SocketAddr};
 
-    use super::{RouteInterface, ipv4_interfaces, pick, source_toward};
+    use super::{InterfaceAddress, RouteInterface, ipv4_interfaces, pick, pick_v6, source_toward};
     use crate::{ClientShape, Egress, HttpClients, HttpTarget};
 
     // A route on which every request leaves from `0`.
@@ -246,7 +320,7 @@ mod tests {
         let route = LeavesFrom(Ipv4Addr::LOCALHOST.into());
         let source = || source_toward(&route, super::PUBLIC_PROBE);
         let found = pick(ipv4_interfaces().unwrap(), None, source).unwrap();
-        assert_eq!(found.ip, Ipv4Addr::LOCALHOST);
+        assert_eq!(found.ip, IpAddr::V4(Ipv4Addr::LOCALHOST));
         assert!(!found.point_to_point, "{found:?}");
     }
 
@@ -317,6 +391,77 @@ mod tests {
         let kernel = crate::NoClients::over(crate::test_support::socket_factory());
         assert_eq!(kernel.egress(to), Egress::Proxied);
         assert!(source_toward(&kernel, to).is_err());
+    }
+
+    fn address(name: &str, ip: &str) -> InterfaceAddress {
+        InterfaceAddress {
+            name: name.into(),
+            ip: ip.parse().unwrap(),
+            point_to_point: false,
+        }
+    }
+
+    fn host() -> Vec<InterfaceAddress> {
+        vec![
+            address("en0", "192.168.1.20"),
+            address("en0", "fe80::5"),
+            address("en0", "fd12:3456::5"),
+            address("en0", "2001:db8::5"),
+            address("en0", "2001:db8::6"),
+            address("en1", "fe80::9"),
+            address("en1", "fd00::9"),
+        ]
+    }
+
+    fn unprobed() -> Egress {
+        unreachable!("the address is known without a probe")
+    }
+
+    // A session held to a global IPv6 address maps on the interface that
+    // holds it; one held to a link-local or unique local address maps
+    // nothing over IPv6.
+    #[test]
+    fn a_session_held_to_an_ipv6_address_maps_from_it_when_it_is_global() {
+        let held = |ip: &str| pick_v6(host(), ip.parse().unwrap(), None, unprobed);
+        assert_eq!(
+            held("2001:db8::5").unwrap(),
+            Some(RouteInterface {
+                name: "en0".into(),
+                ip: "2001:db8::5".parse().unwrap(),
+                point_to_point: false,
+            })
+        );
+        assert_eq!(held("fe80::5").unwrap(), None);
+        assert_eq!(held("fd12:3456::5").unwrap(), None);
+        assert_eq!(
+            format!("{:#}", held("2001:db8::99").unwrap_err()),
+            "no interface holds 2001:db8::99, the address the session listens on"
+        );
+    }
+
+    // A session bound to a device maps from the global address its IPv6
+    // traffic leaves from, else the device's first; a device with only
+    // local IPv6 addresses, or a session bound to none, maps nothing.
+    #[test]
+    fn a_session_bound_to_a_device_maps_from_its_global_ipv6_address() {
+        let any = std::net::Ipv6Addr::UNSPECIFIED;
+        let from = |ip: &str| {
+            let ip: IpAddr = ip.parse().unwrap();
+            move || Egress::From(ip)
+        };
+        let on_en0 = pick_v6(host(), any, Some("en0"), from("2001:db8::6"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_en0.ip, "2001:db8::6".parse::<IpAddr>().unwrap());
+        let first = pick_v6(host(), any, Some("en0"), || Egress::NoRoute)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.ip, "2001:db8::5".parse::<IpAddr>().unwrap());
+        assert_eq!(
+            pick_v6(host(), any, Some("en1"), from("fe80::9")).unwrap(),
+            None
+        );
+        assert_eq!(pick_v6(host(), any, None, unprobed).unwrap(), None);
     }
 
     #[test]

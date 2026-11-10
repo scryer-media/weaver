@@ -16,7 +16,7 @@ import {
 import { useTranslate } from "@/lib/context/translate-context";
 import type { JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
-import { torrentErrorText, type TorrentSummaryData } from "@/lib/torrents";
+import { torrentErrorText, torrentStateLabelKey, type TorrentSummaryData } from "@/lib/torrents";
 import { Eyebrow } from "@/next/components/chrome";
 import { DangerButton, SecondaryButton, Select, Toggle } from "@/next/components/controls";
 import { Icon } from "@/next/components/icons";
@@ -174,6 +174,7 @@ export function DownloadInspector({
     progress.status,
   );
   const isPaused = token === "paused";
+  const stateKey = torrentStateLabelKey(torrent?.state);
 
   return (
     <aside className="flex max-h-[46vh] min-h-0 w-full flex-none flex-col border-t border-wv-line-strong bg-wv-input xl:max-h-none xl:w-[344px] xl:border-t-0 xl:border-l">
@@ -209,7 +210,7 @@ export function DownloadInspector({
             label={t("table.status")}
             value={[
               statusLabel(progress.status),
-              torrent?.state === "NEEDS_CERTIFICATE" ? t("next.torrent.needsCertificate") : null,
+              stateKey ? t(stateKey) : null,
               detail,
             ]
               .filter((part) => part)

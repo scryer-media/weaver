@@ -1882,6 +1882,7 @@ export const nextEs: LocaleDictionary = {
   "next.torrent.seedingCell": "Ratio · subida",
   "next.torrent.force": "Forzar",
   "next.torrent.needsCertificate": "Necesita certificado",
+  "next.torrent.checkingResumeData": "Comprobando datos de reanudación",
   "next.torrent.unforce": "No forzar",
   "next.torrent.forced": "Forzado",
   "next.torrent.unforced": "Ya no forzado",

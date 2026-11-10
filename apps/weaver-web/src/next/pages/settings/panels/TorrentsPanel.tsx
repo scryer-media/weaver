@@ -526,7 +526,7 @@ function Locked({ by, children }: { by: string; children: ReactNode }) {
 }
 
 interface TorrentPortMapping {
-  mapper: "UPNP" | "NAT_PMP";
+  mapper: "UPNP" | "NAT_PMP" | "PCP_IPV6";
   protocol: "TCP" | "UDP";
   localPort: number;
   /** Null once the mapping failed or was removed. */
@@ -551,7 +551,11 @@ interface TorrentRoute {
   exposure: TorrentExposure | null;
 }
 
-const MAPPERS: Record<TorrentPortMapping["mapper"], string> = { UPNP: "UPnP", NAT_PMP: "NAT-PMP" };
+const MAPPERS: Record<TorrentPortMapping["mapper"], string> = {
+  UPNP: "UPnP",
+  NAT_PMP: "NAT-PMP",
+  PCP_IPV6: "PCP (IPv6)",
+};
 
 function mappingText(mapping: TorrentPortMapping): string {
   const what = `${MAPPERS[mapping.mapper]} ${mapping.protocol}`;

@@ -24,7 +24,7 @@ import { cn } from "@/lib/utils";
 import { formatEtaFromRemainingBytes, useStableEtaSpeed } from "@/lib/hooks/use-stable-queue-eta";
 import { useTranslate } from "@/lib/context/translate-context";
 import { statusToken } from "@/lib/status-tokens";
-import { showsSeeding, torrentErrorText, type TorrentSummaryData } from "@/lib/torrents";
+import { showsSeeding, torrentErrorText, torrentStateLabelKey, type TorrentSummaryData } from "@/lib/torrents";
 import { BulkBar, BulkButton, BulkCluster, BulkMenu } from "../components/BulkBar";
 import { EmptyState, MetricCell, SectionHeader } from "../components/chrome";
 import { ConfirmDialog } from "../components/ConfirmDialog";
@@ -1067,6 +1067,10 @@ const QueueGroup = memo(function QueueGroup({
 }: QueueGroupProps) {
   const t = useTranslate();
   const sorted = sortJobs(rows, sort, etaById);
+  const stateLabel = (torrent: TorrentSummaryData | undefined) => {
+    const key = torrentStateLabelKey(torrent?.state);
+    return key ? t(key) : null;
+  };
   return (
     <section className="flex flex-none flex-col">
       <SectionHeader
@@ -1093,9 +1097,7 @@ const QueueGroup = memo(function QueueGroup({
           onPause={onPause}
           onCancel={onCancel}
           held={heldOf(job)}
-          hold={
-            torrents.get(job.id)?.state === "NEEDS_CERTIFICATE" ? t("next.torrent.needsCertificate") : holdOf(job)
-          }
+          hold={stateLabel(torrents.get(job.id)) ?? holdOf(job)}
           seeding={seedingOf(torrents.get(job.id))}
           seedingColumn={seedingColumn}
           statusTitle={

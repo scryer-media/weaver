@@ -334,19 +334,21 @@ impl crate::network::SocketFactory for Forwarding {
     }
 }
 
-/// A session whose peer listener's transport forwards a port announces
-/// that port, as it does one its own NAT-PMP mapper got, in place of the
-/// configured one; when the transport stops forwarding, the configured port
-/// is announced again.
+/// A session whose peer listener's transport forwards a port takes it as
+/// it takes one its own NAT-PMP mapper got: peers are told it in the
+/// extended handshake, but trackers are told the announce port set in the
+/// options (libtorrent `session_impl::queue_tracker_request`,
+/// session_impl.cpp:1279-1281). When the transport stops forwarding,
+/// peers are told the listen port again.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_a_listener_whose_transport_forwards_a_port_announces_it() -> anyhow::Result<()> {
+async fn test_a_set_announce_port_is_told_over_a_port_the_transport_forwards() -> anyhow::Result<()>
+{
     use crate::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
     setup_test_logging();
     const FORWARDED: u16 = 50002;
-    // The fixture listens on loopback, which announces no port of its own;
-    // the configured port stands in for the listener's.
     const CONFIGURED: u16 = 6881;
     let (reports, received) = tokio::sync::mpsc::unbounded_channel();
+    let (forward, mut forwarded) = tokio::sync::mpsc::unbounded_channel();
     reports.send(PortMapped {
         transport: PortmapTransport::NatPmp,
         protocol: PortmapProtocol::Tcp,
@@ -363,6 +365,7 @@ async fn test_a_listener_whose_transport_forwards_a_port_announces_it() -> anyho
             ..Default::default()
         }),
         socket_factory: std::sync::Arc::new(Forwarding(std::sync::Mutex::new(Some(received)))),
+        port_map_events: Some(forward),
         ..tracker_session_opts()?
     };
     let t = TestTorrent::new("test_forwarded_port", 2048, 1024).await?;
@@ -370,11 +373,10 @@ async fn test_a_listener_whose_transport_forwards_a_port_announces_it() -> anyho
     let url = format!("http://{}/announce", tracker.local_addr()?);
     let out = TempDir::with_prefix("test_forwarded_port_out")?;
     let session = Session::new_with_opts(out.path().into(), opts).await?;
-    let mut announced = session.announce_port_changes();
-    announced
-        .wait_for(|port| *port == Some(FORWARDED))
-        .await
-        .context("the session stopped")?;
+    let report = forwarded.recv().await.context("no forwarded port")?;
+    assert_eq!(report.external_port, Some(FORWARDED));
+    assert_eq!(session.external_port_of(false), Some(FORWARDED));
+    assert_eq!(session.announce_port(), Some(CONFIGURED));
     session
         .add_torrent(
             AddTorrent::from_bytes(t.torrent.clone()),
@@ -388,11 +390,13 @@ async fn test_a_listener_whose_transport_forwards_a_port_announces_it() -> anyho
         .into_handle()
         .context("expected a handle")?;
     let (conn, query) = read_announce_query(&tracker).await?;
-    assert_eq!(param(&query, "port"), Some(FORWARDED.to_string().as_str()));
+    assert_eq!(param(&query, "port"), Some(CONFIGURED.to_string().as_str()));
     respond(conn, "d8:intervali1800e5:peers0:e").await?;
-    assert_ne!(session.listen_addr().map(|a| a.port()), Some(FORWARDED));
+    let listening = session.listen_addr().map(|a| a.port());
+    assert_ne!(listening, Some(FORWARDED));
 
-    // A report that the transport stopped forwarding hands the port back.
+    // A report that the transport stopped forwarding hands peers the
+    // listen port back.
     reports.send(PortMapped {
         transport: PortmapTransport::NatPmp,
         protocol: PortmapProtocol::Tcp,
@@ -401,10 +405,10 @@ async fn test_a_listener_whose_transport_forwards_a_port_announces_it() -> anyho
         external_ip: None,
         error: Some("the gateway did not answer NAT-PMP".into()),
     })?;
-    announced
-        .wait_for(|port| *port == Some(CONFIGURED))
-        .await
-        .context("the session stopped")?;
+    let report = forwarded.recv().await.context("no failure report")?;
+    assert_eq!(report.external_port, None);
+    assert_eq!(session.external_port_of(false), listening);
+    assert_eq!(session.announce_port(), Some(CONFIGURED));
     Ok(())
 }
 

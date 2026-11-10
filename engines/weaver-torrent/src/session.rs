@@ -165,13 +165,21 @@ impl SessionDatabase {
     }
 }
 
-/// The port the session announces (libtorrent `listen_socket_t::
-/// tcp_external_port`): the TCP port a mapper got on the gateway, NAT-PMP's
-/// before UPnP's, else the configured one. Announces subscribe to it and
-/// read it as they go out, so a mapping that lands after a torrent starts
-/// is announced by that torrent.
+/// The ports one listener gives out. Trackers and the DHT are told the
+/// announce port set in the options, whatever a mapper gets (libtorrent
+/// `session_impl::queue_tracker_request`, session_impl.cpp:1279-1281;
+/// `torrent::dht_announce`, torrent.cpp:3060-3073). With none set they are
+/// told the external port. That is the TCP port a mapper got on the
+/// gateway, NAT-PMP's before UPnP's, else the listen port (libtorrent
+/// `listen_socket_t::tcp_external_port`), and it is what the extended
+/// handshake always carries. Announces subscribe to the told port and read
+/// it as they go out, so a mapping that lands after a torrent starts is
+/// announced by that torrent.
 struct AnnouncePort {
-    configured: Option<u16>,
+    /// The listen port, while the session gives out a port at all.
+    listen: Option<u16>,
+    /// The announce port set in the options.
+    set: Option<u16>,
     mapped: parking_lot::Mutex<MappedPorts>,
     port: tokio::sync::watch::Sender<Option<u16>>,
 }
@@ -180,23 +188,39 @@ struct AnnouncePort {
 struct MappedPorts {
     natpmp: Option<u16>,
     upnp: Option<u16>,
+    pcp_ipv6: Option<u16>,
+}
+
+impl MappedPorts {
+    /// One port for the session: an IPv4 mapper's before the IPv6 one's.
+    fn port(&self) -> Option<u16> {
+        self.natpmp.or(self.upnp).or(self.pcp_ipv6)
+    }
 }
 
 impl AnnouncePort {
-    fn new(configured: Option<u16>) -> Self {
+    fn new(listen: Option<u16>, set: Option<u16>) -> Self {
         Self {
-            configured,
+            listen,
+            set,
             mapped: Default::default(),
-            port: tokio::sync::watch::channel(configured).0,
+            port: tokio::sync::watch::channel(set.or(listen)).0,
         }
     }
 
+    /// The port trackers and the DHT are told.
     fn get(&self) -> Option<u16> {
         *self.port.borrow()
     }
 
     fn subscribe(&self) -> ListenPort {
         self.port.subscribe()
+    }
+
+    /// The port peers reach: the mapped one, else the listen port.
+    fn external(&self) -> Option<u16> {
+        let mapped = self.mapped.lock().port();
+        self.listen.map(|listen| mapped.unwrap_or(listen))
     }
 
     /// libtorrent `session_impl::on_port_mapping`: a mapper's TCP report,
@@ -209,14 +233,15 @@ impl AnnouncePort {
         let port = match event.transport {
             PortmapTransport::NatPmp => &mut mapped.natpmp,
             PortmapTransport::Upnp => &mut mapped.upnp,
+            PortmapTransport::PcpIpv6 => &mut mapped.pcp_ipv6,
         };
         *port = event.external_port;
-        let announced = self
-            .configured
-            .map(|configured| mapped.natpmp.or(mapped.upnp).unwrap_or(configured));
+        let told = self
+            .set
+            .or(self.listen.map(|listen| mapped.port().unwrap_or(listen)));
         self.port.send_if_modified(|port| {
-            let changed = *port != announced;
-            *port = announced;
+            let changed = *port != told;
+            *port = told;
             changed
         });
     }
@@ -254,13 +279,11 @@ fn dht_peers(
 
 /// The ports to map: each of `listen`'s listeners, over the protocols it
 /// listens on (libtorrent `session_impl::remap_ports` maps every listen
-/// socket, the SSL one included, and a socket only once it is open). The
-/// plain listener asks for `announce_port`; the SSL one asks for its own
-/// port, as libtorrent asks for the local port.
-fn port_map_requests(
-    listen: &crate::listen::ListenResult,
-    announce_port: u16,
-) -> Vec<PortMapRequest> {
+/// socket, the SSL one included, and a socket only once it is open). Each
+/// listener asks for its own port, never the announce port (libtorrent
+/// `session_impl::map_port`, session_impl.cpp:2375-2390, asks for the
+/// socket's local port).
+fn port_map_requests(listen: &crate::listen::ListenResult) -> Vec<PortMapRequest> {
     fn protocols(tcp: bool, utp: bool) -> impl Iterator<Item = PortmapProtocol> {
         [
             tcp.then_some(PortmapProtocol::Tcp),
@@ -269,25 +292,28 @@ fn port_map_requests(
         .into_iter()
         .flatten()
     }
-    let plain =
-        protocols(listen.tcp_socket.is_some(), listen.utp_socket.is_some()).map(|protocol| {
-            PortMapRequest {
-                protocol,
-                local_port: listen.addr.port(),
-                external_port: announce_port,
-            }
-        });
-    let ssl = listen.ssl.iter().flat_map(|ssl| {
-        let port = ssl.addr.port();
-        protocols(ssl.tcp_socket.is_some(), ssl.utp_socket.is_some()).map(move |protocol| {
-            PortMapRequest {
+    let plain = (
+        listen.addr.port(),
+        listen.tcp_socket.is_some(),
+        listen.utp_socket.is_some(),
+    );
+    let ssl = listen.ssl.iter().map(|ssl| {
+        (
+            ssl.addr.port(),
+            ssl.tcp_socket.is_some(),
+            ssl.utp_socket.is_some(),
+        )
+    });
+    std::iter::once(plain)
+        .chain(ssl)
+        .flat_map(|(port, tcp, utp)| {
+            protocols(tcp, utp).map(move |protocol| PortMapRequest {
                 protocol,
                 local_port: port,
                 external_port: port,
-            }
+            })
         })
-    });
-    plain.chain(ssl).collect()
+        .collect()
 }
 
 pub struct Session {
@@ -1741,7 +1767,12 @@ impl Session {
                 swarm,
                 swarm_tasks,
                 announce_port: Arc::new(AnnouncePort::new(
-                    listen_result.as_ref().and_then(|l| l.announce_port),
+                    listen_result
+                        .as_ref()
+                        .and_then(|l| l.announce_port.and(Some(l.addr.port()))),
+                    listen_result
+                        .as_ref()
+                        .and_then(|l| l.announce_port.filter(|_| l.announce_port_set)),
                 )),
                 listen_addr: listen_result.as_ref().map(|l| l.addr),
                 ssl_port: Arc::new(AnnouncePort::new(
@@ -1749,6 +1780,7 @@ impl Session {
                         .as_ref()
                         .and_then(|l| l.ssl.as_ref().zip(l.announce_port))
                         .map(|(ssl, _)| ssl.addr.port()),
+                    None,
                 )),
                 ssl_listen_addr: listen_result
                     .as_ref()
@@ -1795,10 +1827,9 @@ impl Session {
             });
 
             if let Some(mut listen) = listen_result {
-                let requests = listen
-                    .announce_port
-                    .filter(|_| listen.enable_upnp_port_forwarding)
-                    .map(|announce_port| port_map_requests(&listen, announce_port));
+                let requests = (listen.announce_port.is_some()
+                    && listen.enable_upnp_port_forwarding)
+                    .then(|| port_map_requests(&listen));
                 let max = listen.max_pending_incoming_handshake_checks;
                 let forwarded = listen
                     .tcp_socket
@@ -2149,7 +2180,10 @@ impl Session {
     /// interface the session's traffic leaves through: the bound device, or
     /// the one holding the address the session's clients send public
     /// traffic from. Neither runs on an interface that reaches only the
-    /// local network.
+    /// local network. A session held to a global IPv6 address, or bound to
+    /// a device with one, also maps from that address over PCP (libtorrent
+    /// starts a NAT-PMP / PCP mapper on each IPv6 listen socket that is not
+    /// local); one held to an IPv6 address maps over IPv4 not at all.
     fn start_port_mapping(
         &self,
         requests: Vec<PortMapRequest>,
@@ -2166,6 +2200,32 @@ impl Session {
             info!(%ip, "no port mapping on an address only the local network reaches");
             return;
         }
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let held_to_ipv6 = listen_ip.is_some_and(|ip| ip.is_ipv6() && !ip.is_unspecified());
+        if held_to_ipv6 {
+            // SSDP and NAT-PMP run over IPv4 alone (libtorrent
+            // `start_upnp`; `natpmp::on_reply` falls back to NAT-PMP only
+            // on an IPv4 socket).
+            info!("no UPnP or IPv4 NAT-PMP on a session held to an IPv6 address");
+        } else {
+            self.map_ipv4(requests.clone(), bind_device_name, events_tx.clone());
+        }
+        if let Some(IpAddr::V6(listen)) = listen_ip
+            && !self.ipv4_only
+        {
+            self.map_ipv6(listen, requests, bind_device_name, events_tx);
+        }
+        self.follow_port_mappings(events, self.ssl_mapped_port(), forward);
+    }
+
+    /// Map `requests` over UPnP and over PCP / NAT-PMP from the IPv4
+    /// interface the session's traffic leaves through.
+    fn map_ipv4(
+        &self,
+        requests: Vec<PortMapRequest>,
+        bind_device_name: Option<&str>,
+        events_tx: PortMapEvents,
+    ) {
         let interface =
             crate::route_interface::route_interface(bind_device_name, self.http_clients.as_ref())
                 .map_err(|e| format!("{e:#}"));
@@ -2183,32 +2243,56 @@ impl Session {
             ?interface,
             "starting UPnP and NAT-PMP / PCP port mapping"
         );
-        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let upnp_opts = UpnpPortForwarderOptions {
             description: self.identity.user_agent.clone(),
             ..Default::default()
         };
-        // SSDP runs over IPv4 alone: a session held to an IPv6 address
-        // searches for no UPnP gateway (libtorrent `start_upnp`).
-        if listen_ip.is_some_and(|ip| ip.is_ipv6() && !ip.is_unspecified()) {
-            info!("no UPnP on a session held to an IPv6 address");
-        } else {
-            match UpnpPortForwarder::new(
-                requests.clone(),
-                Some(upnp_opts),
-                interface.clone(),
-                self.http_clients.clone(),
-            ) {
-                Ok(upnp) => self.spawn_port_mapper(
-                    "upnp_forward",
-                    upnp.run(self.cancellation_token.clone(), events_tx.clone()),
-                ),
-                Err(e) => warn!("error starting UPnP port mapping: {e:#}"),
-            }
+        match UpnpPortForwarder::new(
+            requests.clone(),
+            Some(upnp_opts),
+            interface.clone(),
+            self.http_clients.clone(),
+        ) {
+            Ok(upnp) => self.spawn_port_mapper(
+                "upnp_forward",
+                upnp.run(self.cancellation_token.clone(), events_tx.clone()),
+            ),
+            Err(e) => warn!("error starting UPnP port mapping: {e:#}"),
         }
         let route = interface.and_then(|i| GatewayRoute::of(&i).map_err(|e| format!("{e:#}")));
         self.map_over(route, requests, events_tx);
-        self.follow_port_mappings(events, self.ssl_mapped_port(), forward);
+    }
+
+    /// Map `requests` over PCP from the session's global IPv6 address:
+    /// `listen` when the session is held to it, else one of its device's.
+    /// A session with no such address maps nothing over IPv6.
+    fn map_ipv6(
+        &self,
+        listen: Ipv6Addr,
+        requests: Vec<PortMapRequest>,
+        bind_device_name: Option<&str>,
+        events_tx: PortMapEvents,
+    ) {
+        let interface = match crate::route_interface::ipv6_route_interface(
+            listen,
+            bind_device_name,
+            self.http_clients.as_ref(),
+        ) {
+            Ok(None) => {
+                debug!("no global IPv6 address to map over PCP");
+                return;
+            }
+            Ok(Some(interface)) => Ok(interface),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        info!(?requests, ?interface, "starting PCP port mapping over IPv6");
+        let route = interface.and_then(|i| GatewayRoute::of(&i).map_err(|e| format!("{e:#}")));
+        self.spawn_port_mapper(
+            "pcp_ipv6_forward",
+            NatPmpMapper::new(route, requests, None, self.http_clients.clone())
+                .ipv6()
+                .run(self.cancellation_token.clone(), events_tx),
+        );
     }
 
     /// Run a NAT-PMP / PCP mapper for `requests` over `route`, through the
@@ -2229,7 +2313,7 @@ impl Session {
     /// The local port whose mapping SSL torrents announce: the SSL
     /// listener's, while it announces a port at all.
     fn ssl_mapped_port(&self) -> Option<u16> {
-        self.ssl_port.configured
+        self.ssl_port.listen
     }
 
     /// Announce the TCP port each of `events` reports, count the address
@@ -3530,13 +3614,15 @@ impl Session {
         // `torrent::start_announcing` runs only after `files_checked`, never
         // while paused).
         let lsd_rx = self.lsd.as_ref().filter(|_| discovery.lsd).map(|lsd| {
-            // Local peers reach the listen port itself.
+            // Local peers reach the listen port itself, whatever announce
+            // port is set (libtorrent `session_impl::announce_lsd`,
+            // session_impl.cpp:5877).
             let port = if !announce {
                 None
             } else if ssl.is_some() {
-                self.ssl_port.configured
+                self.ssl_port.listen
             } else {
-                self.announce_port.configured
+                self.announce_port.listen
             };
             futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
                 let lsd = lsd.clone();
@@ -3637,8 +3723,9 @@ impl Session {
         self.external_ips.get()
     }
 
-    /// The port peers are told to connect to: the one a mapper got on the
-    /// gateway, else the configured one.
+    /// The port trackers and the DHT are told: the announce port set in the
+    /// options, else the one a mapper got on the gateway, else the listen
+    /// port.
     pub fn announce_port(&self) -> Option<u16> {
         self.announce_port.get()
     }
@@ -3655,13 +3742,26 @@ impl Session {
         self.ssl_listen_addr
     }
 
-    /// The port a torrent's peers are told to reach it at: the SSL
-    /// listener's for an SSL torrent, else [`Self::announce_port`].
+    /// The port a torrent's trackers and DHT are told: the SSL listener's
+    /// for an SSL torrent, else [`Self::announce_port`].
+    #[cfg(test)]
     pub(crate) fn announce_port_of(&self, ssl: bool) -> Option<u16> {
         if ssl {
             self.ssl_port.get()
         } else {
             self.announce_port()
+        }
+    }
+
+    /// The port a torrent's peers reach it at, for the extended handshake:
+    /// the one a mapper got for the torrent's listener, else that
+    /// listener's port, whatever announce port is set (libtorrent
+    /// `session_impl::listen_port`, session_impl.cpp:5791).
+    pub(crate) fn external_port_of(&self, ssl: bool) -> Option<u16> {
+        if ssl {
+            self.ssl_port.external()
+        } else {
+            self.announce_port.external()
         }
     }
 
@@ -4026,7 +4126,7 @@ mod tests {
             external_ip: None,
             error: None,
         };
-        let port = AnnouncePort::new(Some(6881));
+        let port = AnnouncePort::new(Some(6881), None);
         assert_eq!(port.get(), Some(6881));
         port.on_port_mapping(&event(Upnp, Tcp, Some(40001)));
         assert_eq!(port.get(), Some(40001));
@@ -4049,9 +4149,32 @@ mod tests {
         assert!(announce.has_changed().unwrap());
         assert_eq!(*announce.borrow_and_update(), Some(40001));
         // Nothing to announce stays nothing.
-        let none = AnnouncePort::new(None);
+        let none = AnnouncePort::new(None, None);
         none.on_port_mapping(&event(Upnp, Tcp, Some(40001)));
         assert_eq!(none.get(), None);
+        assert_eq!(none.external(), None);
+    }
+
+    // libtorrent `session_impl::queue_tracker_request` tells trackers the
+    // announce port set in the options whatever was mapped; the mapped
+    // port is still where peers reach the session.
+    #[test]
+    fn a_set_announce_port_is_told_whatever_a_mapper_gets() {
+        use super::AnnouncePort;
+        use crate::upnp::{PortMapped, PortmapProtocol::Tcp, PortmapTransport::NatPmp};
+        let port = AnnouncePort::new(Some(6881), Some(40000));
+        assert_eq!((port.get(), port.external()), (Some(40000), Some(6881)));
+        let told = port.subscribe();
+        port.on_port_mapping(&PortMapped {
+            transport: NatPmp,
+            protocol: Tcp,
+            local_port: 6881,
+            external_port: Some(50000),
+            external_ip: None,
+            error: None,
+        });
+        assert!(!told.has_changed().unwrap());
+        assert_eq!((port.get(), port.external()), (Some(40000), Some(50000)));
     }
 
     // A listening session whose port a mapper got on the gateway announces
@@ -4123,8 +4246,9 @@ mod tests {
         session.stop().await;
     }
 
-    // An SSL torrent announces the port a mapper got for the SSL listener,
-    // and every other torrent the one it got for the plain listener: each
+    // An SSL torrent announces the port a mapper got for the SSL listener.
+    // Every other torrent announces the announce port set in the options,
+    // and peers reach it at the port mapped for the plain listener: each
     // mapping moves only its own listener's port.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_ssl_torrent_announces_the_port_mapped_for_the_ssl_listener() {
@@ -4160,17 +4284,17 @@ mod tests {
         let gateway =
             NatPmpGateway::granting(move |internal| if internal == ssl { 50001 } else { 50000 })
                 .await;
-        let requests = [(plain, 6881), (ssl, ssl)]
+        let requests = [plain, ssl]
             .into_iter()
-            .map(|(local_port, external_port)| PortMapRequest {
+            .map(|port| PortMapRequest {
                 protocol: PortmapProtocol::Tcp,
-                local_port,
-                external_port,
+                local_port: port,
+                external_port: port,
             })
             .collect();
         let mut ssl_announced = session.ssl_port.subscribe();
-        let mut announced = session.announce_port_changes();
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (forward, mut forwarded) = tokio::sync::mpsc::unbounded_channel();
         session.map_over(
             Ok(GatewayRoute {
                 local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
@@ -4180,18 +4304,184 @@ mod tests {
             requests,
             events_tx,
         );
-        session.follow_port_mappings(events, session.ssl_mapped_port(), None);
+        session.follow_port_mappings(events, session.ssl_mapped_port(), Some(forward));
 
+        let mut granted = Vec::new();
+        while granted.len() < 2 {
+            let event = forwarded.recv().await.unwrap();
+            granted.push((event.local_port, event.external_port));
+        }
+        granted.sort_unstable();
+        let mut wanted = vec![(plain, Some(50000)), (ssl, Some(50001))];
+        wanted.sort_unstable();
+        assert_eq!(granted, wanted);
         ssl_announced
             .wait_for(|port| *port == Some(50001))
             .await
             .unwrap();
-        announced
-            .wait_for(|port| *port == Some(50000))
+        assert_eq!(session.announce_port_of(true), Some(50001));
+        assert_eq!(session.announce_port_of(false), Some(6881));
+        assert_eq!(session.external_port_of(false), Some(50000));
+        session.stop().await;
+    }
+
+    // Two legs behind one gateway with one announce port set: each asks the
+    // gateway for its own listen port (libtorrent `session_impl::map_port`,
+    // session_impl.cpp:2375-2390) and gets its own mapping, and both still
+    // tell trackers and the DHT the set port (session_impl.cpp:1279-1281).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn legs_behind_one_gateway_map_their_own_ports_and_announce_the_set_one() {
+        use crate::{natpmp::GatewayRoute, upnp::PortMapRequest, upnp::PortmapProtocol};
+        use weaver_tunnel::test_support::natpmp::NatPmpGateway;
+
+        let dirs = [TempDir::new().unwrap(), TempDir::new().unwrap()];
+        let mut sessions = Vec::new();
+        for dir in &dirs {
+            let session = Session::new_with_opts(
+                dir.path().into(),
+                SessionOptions {
+                    dht: None,
+                    persistence: None,
+                    disable_trackers: true,
+                    disable_local_service_discovery: true,
+                    listen: Some(crate::ListenerOptions {
+                        mode: crate::ListenerMode::TcpOnly,
+                        listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                        announce_port: Some(40000),
+                        ..Default::default()
+                    }),
+                    ..crate::test_support::session_options()
+                },
+            )
             .await
             .unwrap();
-        assert_eq!(session.announce_port_of(true), Some(50001));
-        assert_eq!(session.announce_port_of(false), Some(50000));
+            sessions.push(session);
+        }
+        let ports: Vec<u16> = sessions
+            .iter()
+            .map(|s| s.listen_addr().unwrap().port())
+            .collect();
+        assert_ne!(ports[0], ports[1]);
+        let first = ports[0];
+        let gateway =
+            NatPmpGateway::granting(move |internal| if internal == first { 50000 } else { 50001 })
+                .await;
+
+        let mut forwarded = Vec::new();
+        for (session, &port) in sessions.iter().zip(&ports) {
+            let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+            let (forward, reports) = tokio::sync::mpsc::unbounded_channel();
+            session.map_over(
+                Ok(GatewayRoute {
+                    local_ip: std::net::Ipv4Addr::LOCALHOST.into(),
+                    gateway: gateway.address(),
+                    interface_addresses: vec![std::net::Ipv4Addr::LOCALHOST.into()],
+                }),
+                vec![PortMapRequest {
+                    protocol: PortmapProtocol::Tcp,
+                    local_port: port,
+                    external_port: port,
+                }],
+                events_tx,
+            );
+            session.follow_port_mappings(events, None, Some(forward));
+            forwarded.push(reports);
+        }
+
+        for ((session, reports), (port, granted)) in sessions
+            .iter()
+            .zip(&mut forwarded)
+            .zip(ports.iter().zip([50000, 50001]))
+        {
+            let report = reports.recv().await.unwrap();
+            assert_eq!(
+                (report.local_port, report.external_port),
+                (*port, Some(granted))
+            );
+            assert_eq!(gateway.granted(2, *port).await.external, granted);
+            assert_eq!(session.announce_port(), Some(40000));
+            assert_eq!(session.external_port_of(false), Some(granted));
+        }
+        for session in sessions {
+            session.stop().await;
+        }
+    }
+
+    // A session mapping from an IPv6 address asks its gateway over PCP for
+    // its listen port and announces the port the gateway grants.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ipv6_mapping_over_pcp_moves_the_announced_port() {
+        use crate::{natpmp::GatewayRoute, upnp::PortMapRequest, upnp::PortmapProtocol};
+        use std::net::Ipv6Addr;
+
+        let dir = TempDir::new().unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (Ipv6Addr::UNSPECIFIED, 0).into(),
+                    ..Default::default()
+                }),
+                ..crate::test_support::session_options()
+            },
+        )
+        .await
+        .unwrap();
+        let port = session.listen_addr().unwrap().port();
+        assert_eq!(session.announce_port(), Some(port));
+
+        // A PCP gateway on the IPv6 loopback that grants 50002 for the
+        // first MAP it hears, and hands the request back.
+        let gateway = crate::test_support::udp((Ipv6Addr::LOCALHOST, 0)).await;
+        let gateway_addr = gateway.bind_addr();
+        let heard = tokio::spawn(async move {
+            let mut buf = [0u8; 1100];
+            let (n, from) = gateway.recv_from(&mut buf).await.unwrap();
+            let request = buf[..n].to_vec();
+            let mut answer = vec![2, 0x80 | 1, 0, 0];
+            answer.extend_from_slice(&7200u32.to_be_bytes());
+            answer.extend_from_slice(&1000u32.to_be_bytes());
+            answer.extend_from_slice(&[0; 12]);
+            answer.extend_from_slice(&request[24..42]);
+            answer.extend_from_slice(&50002u16.to_be_bytes());
+            answer.extend_from_slice(&"2001:db8::5".parse::<Ipv6Addr>().unwrap().octets());
+            gateway.send_to(&answer, from).await.unwrap();
+            request
+        });
+
+        let mut announced = session.announce_port_changes();
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        session.map_over(
+            Ok(GatewayRoute {
+                local_ip: Ipv6Addr::LOCALHOST.into(),
+                gateway: gateway_addr,
+                interface_addresses: vec![Ipv6Addr::LOCALHOST.into()],
+            }),
+            vec![PortMapRequest {
+                protocol: PortmapProtocol::Tcp,
+                local_port: port,
+                external_port: port,
+            }],
+            events_tx,
+        );
+        session.follow_port_mappings(events, None, None);
+
+        let request = heard.await.unwrap();
+        assert_eq!(request[0], 2, "PCP");
+        assert_eq!(&request[8..24], &Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(
+            &request[40..44],
+            &[port.to_be_bytes(), port.to_be_bytes()].concat()[..]
+        );
+        announced
+            .wait_for(|announced| *announced == Some(50002))
+            .await
+            .unwrap();
         session.stop().await;
     }
 
@@ -4318,16 +4608,16 @@ mod tests {
                 )
                 .await
                 .unwrap();
-                // The plain listener asks for the announced port; the SSL one,
-                // when there is one, for its own port.
+                // Each listener asks for its own port, whatever announce
+                // port is set.
                 let plain = listen.addr.port();
-                let mut wanted: Vec<_> = expected.iter().map(|&p| (p, plain, 40001)).collect();
+                let mut wanted: Vec<_> = expected.iter().map(|&p| (p, plain, plain)).collect();
                 if let Some(ssl) = &listen.ssl {
                     let port = ssl.addr.port();
                     assert_ne!(port, plain);
                     wanted.extend(expected.iter().map(|&p| (p, port, port)));
                 }
-                let requests: Vec<_> = port_map_requests(&listen, 40001)
+                let requests: Vec<_> = port_map_requests(&listen)
                     .into_iter()
                     .map(|r| (r.protocol, r.local_port, r.external_port))
                     .collect();

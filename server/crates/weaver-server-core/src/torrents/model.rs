@@ -86,6 +86,9 @@ impl ContentLayout {
 #[serde(rename_all = "snake_case")]
 pub enum TorrentState {
     Queued,
+    // In a session, starting from what was saved, before it runs or checks
+    // (qBittorrent's checkingResumeData).
+    CheckingResumeData,
     FetchingMetadata,
     CheckingFiles,
     Downloading,
@@ -105,6 +108,7 @@ impl TorrentState {
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Queued => "queued",
+            Self::CheckingResumeData => "checking_resume_data",
             Self::FetchingMetadata => "fetching_metadata",
             Self::CheckingFiles => "checking_files",
             Self::Downloading => "downloading",
@@ -120,6 +124,7 @@ impl TorrentState {
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "queued" => Some(Self::Queued),
+            "checking_resume_data" => Some(Self::CheckingResumeData),
             "fetching_metadata" => Some(Self::FetchingMetadata),
             "checking_files" => Some(Self::CheckingFiles),
             "downloading" => Some(Self::Downloading),

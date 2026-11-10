@@ -6868,6 +6868,9 @@ fn job_status(view: &TorrentView) -> JobStatus {
         TorrentState::Queued => JobStatus::Queued,
         TorrentState::FetchingMetadata => JobStatus::FetchingMetadata,
         TorrentState::CheckingFiles => JobStatus::CheckingFiles,
+        // Read back from what was saved: a check, as qBittorrent's filter
+        // counts it (torrentfilter.cpp:190).
+        TorrentState::CheckingResumeData => JobStatus::CheckingFiles,
         TorrentState::Downloading => JobStatus::Downloading,
         TorrentState::Stalled => JobStatus::Stalled,
         TorrentState::Seeding => JobStatus::Seeding,

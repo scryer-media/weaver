@@ -1092,17 +1092,17 @@ async fn a_base_port_change_listens_on_the_new_port_while_the_old_stopped_announ
     }
 }
 
-// A mapping session asks the gateway for its announce port, else its
-// listen port; one that does not map asks for none.
+// A mapping session asks the gateway for its own listen port, whatever
+// announce port is set; one that does not map asks for none.
 #[test]
-fn a_session_maps_its_announce_port_when_it_maps() {
+fn a_session_maps_its_listen_port_when_it_maps() {
     let upnp = TorrentConfig {
         upnp: true,
         announce_port: Some(51_413),
         ..TorrentConfig::default()
     };
     let system = LegKind::System.shape(None);
-    assert_eq!(maps(&upnp, system, 6881), Some(51_413));
+    assert_eq!(maps(&upnp, system, 6881), Some(6881));
     let own = TorrentConfig {
         announce_port: None,
         ..upnp.clone()
@@ -1115,9 +1115,9 @@ fn a_session_maps_its_announce_port_when_it_maps() {
     assert_eq!(maps(&off, system, 6881), None);
     // A leg held to a source address or a device maps as the host's does.
     let address = LegKind::SourceAddress("192.0.2.4".parse().unwrap()).shape(None);
-    assert_eq!(maps(&upnp, address, 6881), Some(51_413));
+    assert_eq!(maps(&upnp, address, 6881), Some(6881));
     let device = LegKind::Interface("en1".into()).shape(None);
-    assert_eq!(maps(&upnp, device, 6881), Some(51_413));
+    assert_eq!(maps(&upnp, device, 6882), Some(6882));
     assert_eq!(maps(&off, device, 6881), None);
     // A ladder leg maps nothing, however it listens.
     let mut ladder = LegKind::Ladder.shape(None);

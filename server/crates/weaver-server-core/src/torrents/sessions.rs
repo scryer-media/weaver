@@ -597,10 +597,11 @@ struct Opening {
 }
 
 /// The external port a session on a leg of `shape`, listening on `port`
-/// under `torrent`, asks a gateway to map: its announce port, else its listen
-/// port, when it maps at all.
+/// under `torrent`, asks a gateway to map, when it maps at all: its own
+/// listen port, whatever announce port is set (libtorrent
+/// `session_impl::map_port`, session_impl.cpp:2375-2390).
 fn maps(torrent: &TorrentConfig, shape: Shape, port: u16) -> Option<u16> {
-    (shape.listen && shape.upnp && torrent.upnp).then(|| torrent.announce_port.unwrap_or(port))
+    (shape.listen && shape.upnp && torrent.upnp).then_some(port)
 }
 
 impl Opening {
