@@ -721,6 +721,46 @@ mod tests {
         );
     }
 
+    // A torrent past its saved state and waiting its turn to hash reads as
+    // checking its files, with nothing hashed yet, and follows the rules of
+    // a check; only one still loading what was saved checks its resume data.
+    #[test]
+    fn a_torrent_waiting_its_turn_to_hash_checks_its_files() {
+        let initializing = |checking| TorrentStats {
+            state: TorrentStatsState::Initializing {
+                paused: false,
+                checking,
+            },
+            file_progress: vec![0],
+            error: None,
+            progress_bytes: 0,
+            uploaded_bytes: 0,
+            total_bytes: 8192,
+            finished: false,
+            live: None,
+        };
+        let waiting = seen(Engine::of(&initializing(true)));
+        assert_eq!(project(&waiting), (TorrentState::CheckingFiles, None));
+        assert_eq!(
+            project(&Observed {
+                queued: true,
+                ..waiting.clone()
+            }),
+            (TorrentState::CheckingFiles, None)
+        );
+        assert_eq!(
+            project(&Observed {
+                intent: TorrentIntent::Paused,
+                ..waiting
+            }),
+            (TorrentState::Paused, None)
+        );
+        assert_eq!(
+            project(&seen(Engine::of(&initializing(false)))),
+            (TorrentState::CheckingResumeData, None)
+        );
+    }
+
     // A torrent whose directory is on the move says so, whatever its
     // session is doing.
     #[test]

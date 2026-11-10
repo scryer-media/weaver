@@ -5716,12 +5716,14 @@ async fn the_extended_handshake_carries_the_port_mapped_for_the_peers_family() {
         error: None,
     };
 
-    h._session.port_mapped(&mapped(PortmapTransport::PcpIpv6, 2002));
+    h._session
+        .port_mapped(&mapped(PortmapTransport::PcpIpv6, 2002));
     assert_eq!(
         (ours(&v4), ours(&mapped_v4), ours(&v6)),
         (listen, listen, Some(2002))
     );
-    h._session.port_mapped(&mapped(PortmapTransport::NatPmp, 2000));
+    h._session
+        .port_mapped(&mapped(PortmapTransport::NatPmp, 2000));
     assert_eq!(
         (ours(&v4), ours(&mapped_v4), ours(&v6)),
         (Some(2000), Some(2000), Some(2002))
@@ -6272,7 +6274,7 @@ async fn a_checked_torrent_keeps_its_peer_list_until_its_state_changes() {
         _ => panic!("the added torrent is not being checked"),
     });
 
-    let paused = init.check().await.unwrap();
+    let paused = init.check(&|| {}).await.unwrap();
     assert_eq!(handle.resume_peers().unwrap(), saved);
     drop(paused);
 }
