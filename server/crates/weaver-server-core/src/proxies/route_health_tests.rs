@@ -188,7 +188,7 @@ fn an_interface_up_then_down_is_told_once_per_turn() {
 #[test]
 fn a_route_down_at_the_start_is_not_told() {
     let (health, mut downs) = configured(&[interface(3)], &[wireguard(5, 1)]);
-    let hop = health.watcher(3, 5, 1);
+    let hop = health.watcher(3, &[], 5, 1);
     health.egress(3, &down("Interface is missing"));
     hop.failing(&ProxyFault::ConnectionClosed);
     assert_eq!(told(&mut downs), vec![]);
@@ -250,7 +250,7 @@ fn an_egress_renamed_keeps_what_was_seen() {
 #[test]
 fn a_proxy_up_then_down_is_told_once() {
     let (health, mut downs) = configured(&[interface(3)], &[wireguard(5, 1)]);
-    let hop = health.watcher(3, 5, 1);
+    let hop = health.watcher(3, &[], 5, 1);
     hop.working();
     hop.failing(&ProxyFault::ConnectionClosed);
     assert_eq!(
@@ -264,7 +264,7 @@ fn a_proxy_up_then_down_is_told_once() {
         }]
     );
     // Another hop of the same proxy on the same egress is the same route.
-    let other = health.watcher(3, 5, 1);
+    let other = health.watcher(3, &[], 5, 1);
     other.failing(&ProxyFault::ConnectionClosed);
     hop.failing(&ProxyFault::ConnectionClosed);
     assert_eq!(told(&mut downs), vec![]);
@@ -275,11 +275,11 @@ fn a_proxy_up_then_down_is_told_once() {
 #[test]
 fn a_disabled_deleted_or_edited_proxy_is_not_told() {
     let (health, mut downs) = configured(&[interface(3)], &[wireguard(5, 1)]);
-    let old = health.watcher(3, 5, 1);
+    let old = health.watcher(3, &[], 5, 1);
     old.working();
     configure(&health, &[interface(3)], &[wireguard(5, 2)]);
     old.failing(&ProxyFault::ConnectionClosed);
-    let new = health.watcher(3, 5, 2);
+    let new = health.watcher(3, &[], 5, 2);
     new.failing(&ProxyFault::ConnectionClosed);
     assert_eq!(told(&mut downs), vec![]);
 
@@ -308,8 +308,8 @@ fn a_pool_is_down_only_once_every_member_is() {
         &[pool(10, &[5, 6])],
         vec![route(3, vec![Rung::Pool { id: 10 }])],
     );
-    let first = health.watcher(3, 5, 1);
-    let second = health.watcher(3, 6, 1);
+    let first = health.watcher(3, &[], 5, 1);
+    let second = health.watcher(3, &[], 6, 1);
     first.working();
     second.working();
     first.failing(&ProxyFault::ConnectionClosed);
@@ -348,7 +348,7 @@ fn a_proxy_used_alone_or_in_a_chain_tells_as_itself() {
         ],
     );
     for proxy in [5, 7] {
-        let hop = health.watcher(3, proxy, 1);
+        let hop = health.watcher(3, &[], proxy, 1);
         hop.working();
         hop.failing(&ProxyFault::ConnectionClosed);
     }
@@ -431,7 +431,7 @@ fn a_flapping_route_is_told_one_down_and_one_up() {
 #[test]
 fn a_proxy_is_silent_while_its_egress_is_down() {
     let (health, mut events, _) = clocked(&[interface(3)], &[wireguard(5, 1)], &[], vec![]);
-    let hop = health.watcher(3, 5, 1);
+    let hop = health.watcher(3, &[], 5, 1);
     health.egress(3, &EgressHealth::Up);
     hop.working();
     hop.failing(&ProxyFault::NoRouteVia { via: "eth3".into() });
@@ -463,4 +463,260 @@ fn a_proxy_is_silent_while_its_egress_is_down() {
         changes(&told(&mut events)),
         vec![(RouteChange::Up, RouteKind::WireGuard, "wg-5")]
     );
+}
+
+fn http(id: u32) -> ProxyProfile {
+    ProxyProfile {
+        name: format!("http-{id}"),
+        kind: ProxyKind::HttpConnect,
+        ..wireguard(id, 1)
+    }
+}
+
+// What the stage beneath a test hop does with the hop's next dial to its
+// proxy's endpoint.
+#[derive(Clone, Copy)]
+enum Beneath {
+    // The endpoint is an HTTP proxy that takes the CONNECT.
+    Answers,
+    // The endpoint refuses the connection.
+    Refuses,
+    // The egress has no route to the endpoint.
+    NoRoute,
+}
+
+struct Stage {
+    next: Mutex<Beneath>,
+    far: Mutex<Vec<tokio::io::DuplexStream>>,
+}
+#[async_trait::async_trait]
+impl weaver_tunnel::pipe::Dialer for Stage {
+    async fn dial(
+        &self,
+        _: &weaver_tunnel::pipe::Target,
+    ) -> Result<weaver_tunnel::pipe::Dialed, weaver_tunnel::pipe::DialError> {
+        use std::io;
+        use tokio::io::AsyncWriteExt;
+        use weaver_tunnel::pipe::{DialError, Dialed, DialedStream};
+        let next = *self.next.lock().unwrap();
+        match next {
+            Beneath::Refuses => Err(DialError::Refused(io::Error::from(
+                io::ErrorKind::ConnectionRefused,
+            ))),
+            Beneath::NoRoute => Err(DialError::Egress(io::Error::new(
+                io::ErrorKind::NetworkUnreachable,
+                "no route via eth3: network is unreachable",
+            ))),
+            Beneath::Answers => {
+                let (near, mut far) = tokio::io::duplex(1024);
+                far.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                // The far end stays open so the hop can write its request.
+                self.far.lock().unwrap().push(far);
+                Ok(Dialed {
+                    stream: DialedStream::Tunnel(Box::new(near)),
+                    outcome: Default::default(),
+                    path: Default::default(),
+                    peer: None,
+                    source: None,
+                    setup: None,
+                })
+            }
+        }
+    }
+    fn budget(&self) -> Duration {
+        Duration::from_secs(5)
+    }
+    fn describe(&self) -> String {
+        "scripted stage".into()
+    }
+}
+
+// A real HTTP CONNECT hop for proxy `proxy` on egress 3, above the proxies
+// `beneath`, telling route health of its turns as a running one does.
+struct Hop {
+    stage: Arc<Stage>,
+    hop: weaver_tunnel::pipe::TransportHop,
+}
+impl Hop {
+    fn new(health: &Arc<RouteHealth>, beneath: &[u32], proxy: u32) -> Self {
+        let stage = Arc::new(Stage {
+            next: Mutex::new(Beneath::Answers),
+            far: Mutex::default(),
+        });
+        let hop = weaver_tunnel::pipe::TransportHop {
+            id: proxy,
+            spec: weaver_tunnel::transport::TransportProxy {
+                kind: weaver_tunnel::transport::TransportKind::HttpConnect,
+                host: "192.0.2.1".into(),
+                port: 8080,
+                username: None,
+                password: None,
+            },
+            inner: stage.clone(),
+            timeout: Duration::from_secs(5),
+            naming: weaver_tunnel::pipe::Naming::Proxy,
+            failure: weaver_tunnel::pipe::HopFailure::watched(health.watcher(3, beneath, proxy, 1)),
+        };
+        Self { stage, hop }
+    }
+    // Whether a dial through the hop works, with the stage beneath doing
+    // `beneath`.
+    async fn dial(&self, beneath: Beneath) -> bool {
+        use weaver_tunnel::pipe::Dialer;
+        *self.stage.next.lock().unwrap() = beneath;
+        self.hop
+            .dial(&weaver_tunnel::pipe::Target {
+                host: "192.0.2.9".into(),
+                port: 119,
+                purpose: weaver_tunnel::pipe::Purpose::Probe,
+                addresses: Vec::new(),
+            })
+            .await
+            .is_ok()
+    }
+}
+
+// A proxy seen up before its egress went down, and not failing since, is
+// told down when it fails once the egress is back, and so is a pool of
+// such proxies once every member fails.
+#[tokio::test]
+async fn a_proxy_failing_after_its_egress_came_back_is_told() {
+    let (health, mut events, _) = clocked(
+        &[interface(3)],
+        &[http(5), http(6), http(7)],
+        &[pool(10, &[6, 7])],
+        vec![
+            route(3, vec![Rung::Proxy { id: 5 }]),
+            route(3, vec![Rung::Pool { id: 10 }]),
+        ],
+    );
+    health.egress(3, &EgressHealth::Up);
+    let hops = [5, 6, 7].map(|proxy| Hop::new(&health, &[], proxy));
+    for hop in &hops {
+        assert!(hop.dial(Beneath::Answers).await);
+    }
+    health.egress(3, &down("Interface is down"));
+    health.egress(3, &EgressHealth::Up);
+    assert_eq!(
+        changes(&told(&mut events)),
+        vec![
+            (RouteChange::Down, RouteKind::Interface, "eth-3"),
+            (RouteChange::Up, RouteKind::Interface, "eth-3"),
+        ]
+    );
+    for hop in &hops {
+        assert!(!hop.dial(Beneath::Refuses).await);
+    }
+    assert_eq!(
+        changes(&told(&mut events)),
+        vec![
+            (RouteChange::Down, RouteKind::HttpConnect, "http-5"),
+            (RouteChange::Down, RouteKind::Pool, "pool-10"),
+        ]
+    );
+}
+
+// A dial that fails for the egress tells nothing of the proxy, and the
+// proxy's own outage after it is told.
+#[tokio::test]
+async fn a_proxy_failing_after_a_fault_of_its_egress_is_told() {
+    let (health, mut events, _) = clocked(
+        &[interface(3)],
+        &[http(5)],
+        &[],
+        vec![route(3, vec![Rung::Proxy { id: 5 }])],
+    );
+    health.egress(3, &EgressHealth::Up);
+    let hop = Hop::new(&health, &[], 5);
+    assert!(hop.dial(Beneath::Answers).await);
+    assert!(!hop.dial(Beneath::NoRoute).await);
+    assert_eq!(told(&mut events), vec![]);
+    assert!(!hop.dial(Beneath::Refuses).await);
+    assert_eq!(
+        changes(&told(&mut events)),
+        vec![(RouteChange::Down, RouteKind::HttpConnect, "http-5")]
+    );
+}
+
+// Proxy 7 used alone and at the top of chain [6, 7] has two hops. One
+// failing while the other works leaves it up; once both fail it is down,
+// and either working again is it up.
+#[tokio::test]
+async fn a_proxy_with_two_hops_is_down_only_once_both_fail() {
+    let (health, mut events, _) = clocked(
+        &[interface(3)],
+        &[http(6), http(7)],
+        &[],
+        vec![
+            route(3, vec![Rung::Proxy { id: 7 }]),
+            route(3, vec![Rung::Chain { ids: vec![6, 7] }]),
+        ],
+    );
+    let alone = Hop::new(&health, &[], 7);
+    let chained = Hop::new(&health, &[6], 7);
+    assert!(alone.dial(Beneath::Answers).await);
+    assert!(chained.dial(Beneath::Answers).await);
+    assert!(!chained.dial(Beneath::Refuses).await);
+    assert_eq!(told(&mut events), vec![]);
+    assert!(!alone.dial(Beneath::Refuses).await);
+    assert_eq!(
+        changes(&told(&mut events)),
+        vec![(RouteChange::Down, RouteKind::HttpConnect, "http-7")]
+    );
+    assert!(chained.dial(Beneath::Answers).await);
+    assert_eq!(
+        changes(&told(&mut events)),
+        vec![(RouteChange::Up, RouteKind::HttpConnect, "http-7")]
+    );
+}
+
+// A clock that reads tokio's, so a paused runtime moves it.
+struct TokioClock;
+impl RouteClock for TokioClock {
+    fn now(&self) -> Instant {
+        tokio::time::Instant::now().into_std()
+    }
+}
+
+// The follower raises each turn as it is told. A second down inside the
+// quiet period wakes it to sleep to the period's end, and is raised then,
+// the route still down. It ends once route health is dropped.
+#[tokio::test(start_paused = true)]
+async fn the_follower_raises_a_held_down_when_the_quiet_period_ends() {
+    let health = RouteHealth::with_clock(Arc::new(TokioClock));
+    configure(&health, &[interface(3)], &[]);
+    let (sender, mut raised) = mpsc::unbounded_channel();
+    let follower = crate::post_processing::route_events::follow_routes(&health, move |event| {
+        drop(sender.send(event.clone()));
+    });
+    let mut next = async || {
+        let event = raised.recv().await.expect("a raised route");
+        (event.change, event.kind, event.name)
+    };
+    let started = tokio::time::Instant::now();
+    health.egress(3, &EgressHealth::Up);
+    health.egress(3, &down("Interface is down"));
+    assert_eq!(
+        next().await,
+        (RouteChange::Down, RouteKind::Interface, "eth-3".into())
+    );
+    health.egress(3, &EgressHealth::Up);
+    assert_eq!(
+        next().await,
+        (RouteChange::Up, RouteKind::Interface, "eth-3".into())
+    );
+
+    health.egress(3, &down("Interface is down"));
+    assert_eq!(health.due(), Some((started + QUIET_PERIOD).into_std()));
+    assert_eq!(
+        next().await,
+        (RouteChange::Down, RouteKind::Interface, "eth-3".into())
+    );
+    assert!(tokio::time::Instant::now() >= started + QUIET_PERIOD);
+    assert_eq!(health.due(), None);
+
+    drop(health);
+    follower.await.unwrap();
 }

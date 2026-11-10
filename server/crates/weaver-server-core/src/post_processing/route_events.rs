@@ -23,6 +23,19 @@ pub fn spawn_route_events(
     db: Database,
     dirs: QuotaEventDirs,
 ) -> tokio::task::JoinHandle<()> {
+    follow_routes(health, move |event| {
+        if db.queue_scripts_possible() {
+            drop(db.admit_queue_script_event(route_event(event, &dirs), false));
+        }
+    })
+}
+
+// Hand `raise` each route `health` tells of, and tell the downs that waited
+// out the quiet period when it ends. Ends once `health` is dropped.
+pub(crate) fn follow_routes(
+    health: &Arc<RouteHealth>,
+    mut raise: impl FnMut(&RouteEvent) + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
     let mut events = health.subscribe();
     let rearmed = health.rearmed();
     let health = Arc::downgrade(health);
@@ -43,9 +56,7 @@ pub fn spawn_route_events(
                     let Some(event) = event else {
                         return;
                     };
-                    if db.queue_scripts_possible() {
-                        drop(db.admit_queue_script_event(route_event(&event, &dirs), false));
-                    }
+                    raise(&event);
                 }
                 () = rearmed.notified() => {}
                 () = wait => {

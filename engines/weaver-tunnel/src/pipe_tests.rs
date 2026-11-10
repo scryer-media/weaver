@@ -2798,3 +2798,71 @@ async fn a_watched_proxy_hop_turns_failing_when_its_proxy_goes() {
     assert_eq!(told.len(), 1, "{told:?}");
     assert!(told[0].is_some());
 }
+
+// A hop that fails for its egress and then for itself tells both turns: a
+// fault that is the egress's own and one that is not are not the same kind
+// of failing, so the watcher hears the real outage after the egress's.
+#[test]
+fn a_hop_failing_for_its_egress_and_then_itself_tells_both() {
+    let turns = Arc::new(Turns::default());
+    let failure = HopFailure::watched(turns.clone());
+    let no_route = || ProxyFault::NoRouteVia { via: "eth3".into() };
+    failure.clear();
+    failure.record(no_route());
+    failure.record(no_route());
+    failure.record(ProxyFault::ConnectionClosed);
+    failure.record(ProxyFault::ConnectionRefused);
+    failure.record(no_route());
+    assert_eq!(
+        turns.taken(),
+        vec![
+            None,
+            Some(no_route()),
+            Some(ProxyFault::ConnectionClosed),
+            Some(no_route()),
+        ]
+    );
+}
+
+// A SOCKS5 proxy silent at its own greeting is failing however lately it
+// answered: only a quiet CONNECT after an answered greeting is the
+// destination's.
+#[tokio::test(start_paused = true)]
+async fn a_socks5_proxy_silent_at_its_greeting_is_failing() {
+    let stage = Arc::new(Answered {
+        reply: Mutex::new(&[5, 0]),
+        far: Default::default(),
+    });
+    let turns = Arc::new(Turns::default());
+    let socks = TransportHop {
+        id: 9,
+        spec: TransportProxy {
+            kind: crate::transport::TransportKind::Socks5,
+            host: "192.0.2.3".into(),
+            port: 1080,
+            username: None,
+            password: None,
+        },
+        inner: stage.clone(),
+        timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
+        failure: HopFailure::watched(turns.clone()),
+    };
+    let target = target("192.0.2.9:119".parse().unwrap());
+    assert!(matches!(
+        socks.dial(&target).await,
+        Err(DialError::Destination(_))
+    ));
+    assert_eq!(socks.failing_hop(), None);
+    assert_eq!(turns.taken(), vec![None]);
+
+    *stage.reply.lock().unwrap() = b"";
+    assert!(matches!(
+        socks.dial(&target).await,
+        Err(DialError::Timeout { .. })
+    ));
+    assert_eq!(socks.failing_hop().map(|hop| hop.proxy), Some(9));
+    let told = turns.taken();
+    assert_eq!(told.len(), 1, "{told:?}");
+    assert!(told[0].is_some());
+}

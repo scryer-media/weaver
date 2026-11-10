@@ -792,10 +792,12 @@ impl NetworkRuntime {
         });
         let mut transport = None;
         let mut resolver = None;
-        // The hop tells the saved route's health how its dials go.
+        // The hop tells the saved route's health how its dials go, as one
+        // hop of its proxy: the same proxy alone and atop a chain are two.
         let failure = || match &self.route_health {
             Some(health) => weaver_tunnel::pipe::HopFailure::watched(health.watcher(
                 bottom.id(),
+                prefix,
                 id,
                 profile.revision,
             )),
