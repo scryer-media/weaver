@@ -467,6 +467,7 @@ pub(crate) async fn run(
     let usage_sources = usage::UsageSources {
         handle: handle.clone(),
         transfer_policy: Arc::clone(&server_transfer_policy),
+        torrents: torrents.clone(),
     };
     usage::prime(&usage_recorder, &usage_sources).await;
 

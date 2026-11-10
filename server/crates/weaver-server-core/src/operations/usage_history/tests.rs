@@ -42,6 +42,49 @@ fn reading(servers: Vec<ServerUsageReading>, categories: &[(&str, u64)]) -> Usag
             .iter()
             .map(|(name, bytes)| ((*name).to_string(), *bytes))
             .collect(),
+        ..UsageReading::default()
+    }
+}
+
+fn jobs(finished: u64, repaired: u64, stages: &[(&'static str, u64, u64)]) -> UsageReading {
+    UsageReading {
+        jobs_finished: finished,
+        jobs_repaired: repaired,
+        stages: stages
+            .iter()
+            .map(|(stage, runs, total_ms)| StageReading {
+                stage,
+                runs: *runs,
+                total_ms: *total_ms,
+            })
+            .collect(),
+        ..UsageReading::default()
+    }
+}
+
+fn torrent(job_id: u64, trackers: &[&str], down: u64, up: u64, seeded: u64) -> TorrentUsageReading {
+    TorrentUsageReading {
+        job_id,
+        trackers: trackers.iter().map(|host| (*host).to_string()).collect(),
+        downloaded_bytes: down,
+        uploaded_bytes: up,
+        seeding_seconds: seeded,
+    }
+}
+
+fn torrents(list: Vec<TorrentUsageReading>) -> UsageReading {
+    UsageReading {
+        torrents: list,
+        ..UsageReading::default()
+    }
+}
+
+fn counted(kind: UsageConsumerKind, id: &str, counts: UsageCounts, day: NaiveDate) -> UsageDayRow {
+    UsageDayRow {
+        day: Some(day),
+        kind: kind.as_str().to_string(),
+        consumer_id: id.to_string(),
+        counts,
     }
 }
 
@@ -91,6 +134,7 @@ fn priming_counts_nothing_and_later_readings_count_the_difference() {
                     articles_tried: 7,
                     articles_succeeded: 6,
                     down_seconds: 0,
+                    ..UsageCounts::default()
                 },
                 ..row(today, UsageConsumerKind::Server, "1", 0)
             },
@@ -119,6 +163,7 @@ fn readings_between_flushes_add_into_one_row_per_day_and_consumer() {
             articles_tried: 20,
             articles_succeeded: 10,
             down_seconds: 0,
+            ..UsageCounts::default()
         }
     );
     // Nothing moved since: the next batch holds no rows.
@@ -171,6 +216,7 @@ fn a_server_added_later_counts_articles_from_zero_and_bytes_from_now() {
             articles_tried: 3,
             articles_succeeded: 3,
             down_seconds: 0,
+            ..UsageCounts::default()
         }
     );
 }
@@ -451,6 +497,7 @@ fn a_write_adds_onto_the_day_already_kept() {
                 articles_tried: 4,
                 articles_succeeded: 3,
                 down_seconds: 2,
+                ..UsageCounts::default()
             },
             ..row(today, UsageConsumerKind::Server, "1", 0)
         }],
@@ -467,6 +514,7 @@ fn a_write_adds_onto_the_day_already_kept() {
             articles_tried: 4,
             articles_succeeded: 3,
             down_seconds: 2,
+            ..UsageCounts::default()
         }
     );
 }
@@ -670,6 +718,332 @@ async fn postgres_keeps_the_same_ledger() {
     assert_range_sums(&db);
     assert_retention_fold(&db);
     assert_finished_counts(&db);
+    assert_new_columns_survive_flush_and_fold(&db);
+    assert_recovery_and_failure_causes(&db);
     drop(db);
     drop_postgres_usage_test_schema(admin, schema).await;
+}
+
+#[test]
+fn jobs_and_stages_count_once_at_their_event() {
+    let today = date(2026, 3, 4);
+    let recorder = UsageRecorder::new();
+    recorder.prime(&jobs(0, 0, &[("repair", 0, 0)]), 0);
+    recorder.observe(&jobs(2, 1, &[("repair", 1, 1_500)]), today, 5);
+    // The same totals read again add nothing.
+    recorder.observe(&jobs(2, 1, &[("repair", 1, 1_500)]), today, 10);
+    // A stage first seen after priming counts from zero.
+    recorder.observe(
+        &jobs(3, 1, &[("repair", 1, 1_500), ("extract", 2, 400)]),
+        today,
+        15,
+    );
+    let flush = recorder.take(today);
+    assert_eq!(
+        sorted(flush.rows),
+        sorted(vec![
+            counted(
+                UsageConsumerKind::Job,
+                JOBS_FINISHED,
+                UsageCounts {
+                    events: 3,
+                    ..UsageCounts::default()
+                },
+                today,
+            ),
+            counted(
+                UsageConsumerKind::Job,
+                JOBS_REPAIRED,
+                UsageCounts {
+                    events: 1,
+                    ..UsageCounts::default()
+                },
+                today,
+            ),
+            counted(
+                UsageConsumerKind::Stage,
+                "extract",
+                UsageCounts {
+                    events: 2,
+                    duration_ms: 400,
+                    ..UsageCounts::default()
+                },
+                today,
+            ),
+            counted(
+                UsageConsumerKind::Stage,
+                "repair",
+                UsageCounts {
+                    events: 1,
+                    duration_ms: 1_500,
+                    ..UsageCounts::default()
+                },
+                today,
+            ),
+        ])
+    );
+}
+
+#[test]
+fn a_torrent_counts_from_now_under_each_tracker_and_once_in_the_total() {
+    let today = date(2026, 3, 4);
+    let recorder = UsageRecorder::new();
+    // The kept lifetime at priming is not today's.
+    recorder.prime(
+        &torrents(vec![torrent(1, &["a.test", "b.test"], 1_000, 500, 60)]),
+        0,
+    );
+    recorder.observe(
+        &torrents(vec![
+            torrent(1, &["a.test", "b.test"], 1_100, 800, 70),
+            // First seen after priming, with a kept lifetime: from now.
+            torrent(2, &[], 9_000, 9_000, 9_000),
+        ]),
+        today,
+        5,
+    );
+    recorder.observe(
+        &torrents(vec![
+            torrent(1, &["a.test", "b.test"], 1_100, 800, 70),
+            torrent(2, &[], 9_010, 9_000, 9_000),
+        ]),
+        today,
+        10,
+    );
+    let one = UsageCounts {
+        bytes: 100,
+        bytes_uploaded: 300,
+        duration_ms: 10_000,
+        ..UsageCounts::default()
+    };
+    let two = UsageCounts {
+        bytes: 10,
+        ..UsageCounts::default()
+    };
+    let mut whole = one;
+    whole.add(&two);
+    assert_eq!(
+        sorted(recorder.take(today).rows),
+        sorted(vec![
+            counted(UsageConsumerKind::Torrent, "", whole, today),
+            counted(UsageConsumerKind::Tracker, "a.test", one, today),
+            counted(UsageConsumerKind::Tracker, "b.test", one, today),
+            counted(UsageConsumerKind::Tracker, "", two, today),
+        ])
+    );
+    // A torrent removed and its id seen again starts from its new totals.
+    recorder.observe(&torrents(Vec::new()), today, 15);
+    recorder.observe(&torrents(vec![torrent(1, &["a.test"], 5, 5, 5)]), today, 20);
+    assert!(recorder.take(today).rows.is_empty());
+}
+
+fn assert_new_columns_survive_flush_and_fold(db: &Database) {
+    let today = date(2026, 3, 4);
+    let old = retention_cutoff(today).pred_opt().unwrap();
+    let recorder = UsageRecorder::new();
+    recorder.prime(&UsageReading::default(), 0);
+    let mut reading = jobs(4, 1, &[("verify", 3, 900)]);
+    reading.torrents = vec![torrent(9, &["t.test"], 0, 0, 0)];
+    recorder.observe(&reading, old, 5);
+    reading.torrents = vec![torrent(9, &["t.test"], 200, 600, 30)];
+    recorder.observe(&reading, today, 10);
+    db.write_usage_flush(&rows_only(recorder.take(today)))
+        .unwrap();
+
+    let read = |kind| {
+        db.read_usage_totals(Some(kind))
+            .unwrap()
+            .into_iter()
+            .map(|total| (total.consumer_id, total.counts))
+            .collect::<Vec<_>>()
+    };
+    let check = || {
+        assert_eq!(
+            read(UsageConsumerKind::Job),
+            vec![
+                (
+                    JOBS_FINISHED.to_string(),
+                    UsageCounts {
+                        events: 4,
+                        ..UsageCounts::default()
+                    }
+                ),
+                (
+                    JOBS_REPAIRED.to_string(),
+                    UsageCounts {
+                        events: 1,
+                        ..UsageCounts::default()
+                    }
+                ),
+            ]
+        );
+        assert_eq!(
+            read(UsageConsumerKind::Stage),
+            vec![(
+                "verify".to_string(),
+                UsageCounts {
+                    events: 3,
+                    duration_ms: 900,
+                    ..UsageCounts::default()
+                }
+            )]
+        );
+        let seeded = UsageCounts {
+            bytes: 200,
+            bytes_uploaded: 600,
+            duration_ms: 30_000,
+            ..UsageCounts::default()
+        };
+        assert_eq!(
+            read(UsageConsumerKind::Torrent),
+            vec![(String::new(), seeded)]
+        );
+        assert_eq!(
+            read(UsageConsumerKind::Tracker),
+            vec![("t.test".to_string(), seeded)]
+        );
+    };
+    check();
+    db.write_usage_flush(&UsageFlush {
+        rows: Vec::new(),
+        fold_before: Some(retention_cutoff(today)),
+    })
+    .unwrap();
+    // Folding past retention moves the job rows, never their totals.
+    check();
+    let folded = db
+        .read_usage_days(None, today, Some(UsageConsumerKind::Job))
+        .unwrap();
+    assert!(folded.iter().all(|row| row.day.is_none()));
+}
+
+#[test]
+fn new_columns_survive_a_flush_and_a_fold() {
+    assert_new_columns_survive_flush_and_fold(&Database::open_in_memory().unwrap());
+}
+
+fn assert_recovery_and_failure_causes(db: &Database) {
+    use crate::history::HistoryFailureKind;
+    // Apart from the other history tests' times, which share a Postgres
+    // schema with this one.
+    for (id, status, protocol, at, available, fetched, cause) in [
+        (
+            11,
+            "complete",
+            crate::jobs::Protocol::Nzb,
+            101_000,
+            100,
+            0,
+            None,
+        ),
+        (
+            12,
+            "partial",
+            crate::jobs::Protocol::Nzb,
+            101_100,
+            50,
+            50,
+            None,
+        ),
+        (
+            13,
+            "failed",
+            crate::jobs::Protocol::Nzb,
+            101_200,
+            10,
+            10,
+            Some(HistoryFailureKind::Repair),
+        ),
+        (
+            14,
+            "failed",
+            crate::jobs::Protocol::Nzb,
+            101_300,
+            0,
+            0,
+            Some(HistoryFailureKind::Repair),
+        ),
+        (
+            15,
+            "failed",
+            crate::jobs::Protocol::Nzb,
+            101_400,
+            0,
+            0,
+            None,
+        ),
+        (
+            16,
+            "cancelled",
+            crate::jobs::Protocol::Nzb,
+            101_500,
+            70,
+            70,
+            None,
+        ),
+        (
+            17,
+            "failed",
+            crate::jobs::Protocol::Torrent,
+            101_600,
+            0,
+            0,
+            None,
+        ),
+        (
+            18,
+            "failed",
+            crate::jobs::Protocol::Nzb,
+            105_000,
+            1,
+            1,
+            None,
+        ),
+    ] {
+        db.insert_job_history(&crate::JobHistoryRow {
+            protocol,
+            job_id: id,
+            job_hash: None,
+            name: format!("job-{id}"),
+            status: status.to_string(),
+            error_message: None,
+            total_bytes: 0,
+            downloaded_bytes: 0,
+            optional_recovery_bytes: available,
+            optional_recovery_downloaded_bytes: fetched,
+            failed_bytes: 0,
+            health: 1000,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: at - 10,
+            completed_at: at,
+            metadata: None,
+            server_attribution: None,
+        })
+        .unwrap();
+        if cause.is_some() {
+            assert!(db.set_history_failure_kind(id, cause).unwrap());
+        }
+    }
+    assert_eq!(
+        db.sum_recovery_bytes(Some(101_000), 102_000).unwrap(),
+        RecoveryBytes {
+            available: 160,
+            fetched: 60,
+        }
+    );
+    assert_eq!(
+        db.count_failures_by_cause(Some(101_000), 102_000).unwrap(),
+        vec![(String::new(), 1), ("repair".to_string(), 2)]
+    );
+    assert_eq!(
+        db.count_failures_by_cause(Some(100_000), 110_000).unwrap(),
+        vec![(String::new(), 2), ("repair".to_string(), 2)]
+    );
+}
+
+#[test]
+fn recovery_and_failure_causes_read_from_history() {
+    assert_recovery_and_failure_causes(&Database::open_in_memory().unwrap());
 }

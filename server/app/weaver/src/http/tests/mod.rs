@@ -1347,6 +1347,7 @@ fn sample_job_lifecycle() -> instr::JobLifecycleMetricsSnapshot {
             .map(|outcome| (outcome.as_str(), 2u64))
             .collect(),
         repair_slices_repaired_total: 17,
+        jobs_repaired_total: 0,
         extractions: instr::StageOutcomeKind::ALL
             .iter()
             .map(|outcome| (outcome.as_str(), 1u64))

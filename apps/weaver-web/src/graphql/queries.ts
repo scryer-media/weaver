@@ -1107,6 +1107,9 @@ const USAGE_TOTALS_FIELDS = `
   articlesTried
   articlesSucceeded
   downSeconds
+  bytesUploaded
+  events
+  durationMs
 `;
 
 export const USAGE_HISTORY_QUERY = gql`
@@ -1140,6 +1143,46 @@ export const USAGE_HISTORY_QUERY = gql`
       }
       finishedToday { complete partial failed }
       finishedInRange { complete partial failed }
+    }
+  }
+`;
+
+const USAGE_CONSUMER_FIELDS = `
+  kind
+  id
+  today { ${USAGE_TOTALS_FIELDS} }
+  week { ${USAGE_TOTALS_FIELDS} }
+  month { ${USAGE_TOTALS_FIELDS} }
+  year { ${USAGE_TOTALS_FIELDS} }
+  allTime { ${USAGE_TOTALS_FIELDS} }
+  range { ${USAGE_TOTALS_FIELDS} }
+  days { day ${USAGE_TOTALS_FIELDS} }
+`;
+
+export const INTEGRITY_HISTORY_QUERY = gql`
+  query IntegrityHistory($range: UsageRange!) {
+    integrityHistory(range: $range) {
+      today
+      rangeStart
+      rangeEnd
+      finished { ${USAGE_CONSUMER_FIELDS} }
+      repaired { ${USAGE_CONSUMER_FIELDS} }
+      stages { ${USAGE_CONSUMER_FIELDS} }
+      recovery { availableBytes fetchedBytes }
+      failures { cause count }
+    }
+  }
+`;
+
+export const TORRENT_HISTORY_QUERY = gql`
+  query TorrentHistory($range: UsageRange!) {
+    torrentHistory(range: $range) {
+      today
+      rangeStart
+      rangeEnd
+      total { ${USAGE_CONSUMER_FIELDS} }
+      trackers { ${USAGE_CONSUMER_FIELDS} }
+      peers { torrents connected seeds }
     }
   }
 `;

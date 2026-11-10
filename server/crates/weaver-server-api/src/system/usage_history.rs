@@ -10,9 +10,10 @@ use chrono::{Days, Local, NaiveDate, TimeZone};
 use serde::{Deserialize, Serialize};
 
 use weaver_server_core::operations::{
-    FinishedJobCounts, UsageConsumerKind as CoreKind, UsageConsumerSummary, UsageCounts,
-    UsagePeriod, UsageSummary, period_bounds, summarize_usage, summary_read_from,
+    FinishedJobCounts, RecoveryBytes, UsageConsumerKind as CoreKind, UsageConsumerSummary,
+    UsageCounts, UsagePeriod, UsageSummary, period_bounds, summarize_usage, summary_read_from,
 };
+use weaver_server_core::torrents::metrics::Published;
 use weaver_server_core::{Database, StateError};
 
 /// The longest custom range one request may ask for, in days.
@@ -36,6 +37,14 @@ pub enum UsagePeriodGql {
 pub enum UsageConsumerKindGql {
     Server,
     Category,
+    /// NZB jobs finished and repaired.
+    Job,
+    /// Job stages, by name.
+    Stage,
+    /// Every torrent together.
+    Torrent,
+    /// Torrents by the tracker hosts they list.
+    Tracker,
 }
 
 impl From<UsageConsumerKindGql> for CoreKind {
@@ -43,6 +52,10 @@ impl From<UsageConsumerKindGql> for CoreKind {
         match value {
             UsageConsumerKindGql::Server => Self::Server,
             UsageConsumerKindGql::Category => Self::Category,
+            UsageConsumerKindGql::Job => Self::Job,
+            UsageConsumerKindGql::Stage => Self::Stage,
+            UsageConsumerKindGql::Torrent => Self::Torrent,
+            UsageConsumerKindGql::Tracker => Self::Tracker,
         }
     }
 }
@@ -62,6 +75,12 @@ pub struct UsageTotals {
     pub articles_tried: u64,
     pub articles_succeeded: u64,
     pub down_seconds: u64,
+    /// Sent to peers, for a torrent or tracker.
+    pub bytes_uploaded: u64,
+    /// Jobs for a job row, timed runs for a stage.
+    pub events: u64,
+    /// Stage time, or seeding time, in milliseconds.
+    pub duration_ms: u64,
 }
 
 impl From<UsageCounts> for UsageTotals {
@@ -71,6 +90,9 @@ impl From<UsageCounts> for UsageTotals {
             articles_tried: value.articles_tried,
             articles_succeeded: value.articles_succeeded,
             down_seconds: value.down_seconds,
+            bytes_uploaded: value.bytes_uploaded,
+            events: value.events,
+            duration_ms: value.duration_ms,
         }
     }
 }
@@ -83,6 +105,9 @@ pub struct UsageDay {
     pub articles_tried: u64,
     pub articles_succeeded: u64,
     pub down_seconds: u64,
+    pub bytes_uploaded: u64,
+    pub events: u64,
+    pub duration_ms: u64,
 }
 
 #[derive(Debug, Clone, SimpleObject)]
@@ -121,6 +146,9 @@ impl From<UsageConsumerSummary> for UsageConsumer {
                     articles_tried: counts.articles_tried,
                     articles_succeeded: counts.articles_succeeded,
                     down_seconds: counts.down_seconds,
+                    bytes_uploaded: counts.bytes_uploaded,
+                    events: counts.events,
+                    duration_ms: counts.duration_ms,
                 })
                 .collect(),
         }
@@ -234,16 +262,8 @@ pub fn load_usage_history(
     period: UsagePeriod,
     kind: Option<CoreKind>,
 ) -> Result<UsageHistory, StateError> {
-    let (start, end) = period_bounds(period, today);
-    let rows = db.read_usage_days(summary_read_from(period, today), end.max(today), kind)?;
-    let totals = db.read_usage_totals(kind)?;
-    let summary: UsageSummary = summarize_usage(
-        &rows,
-        &totals,
-        today,
-        period,
-        kind.unwrap_or(CoreKind::Server),
-    );
+    let (start, _) = period_bounds(period, today);
+    let summary = read_summary(db, today, period, kind)?;
     let today_start = local_day_start(today);
     let tomorrow_start = local_day_start(next_day(today));
     let finished_today = db.count_finished_jobs(Some(today_start), tomorrow_start)?;
@@ -267,4 +287,184 @@ pub fn load_usage_history(
 /// This host's local date now.
 pub fn local_today() -> NaiveDate {
     Local::now().date_naive()
+}
+
+/// The ledger read and summed for one kind, or every kind with servers as
+/// the total.
+fn read_summary(
+    db: &Database,
+    today: NaiveDate,
+    period: UsagePeriod,
+    kind: Option<CoreKind>,
+) -> Result<UsageSummary, StateError> {
+    let (_, end) = period_bounds(period, today);
+    let rows = db.read_usage_days(summary_read_from(period, today), end.max(today), kind)?;
+    let totals = db.read_usage_totals(kind)?;
+    Ok(summarize_usage(
+        &rows,
+        &totals,
+        today,
+        period,
+        kind.unwrap_or(CoreKind::Server),
+    ))
+}
+
+fn day_text(date: NaiveDate) -> String {
+    date.format("%Y-%m-%d").to_string()
+}
+
+#[derive(Debug, Clone, Copy, Default, SimpleObject)]
+pub struct RecoveryTotals {
+    /// Recovery the jobs posted.
+    pub available_bytes: u64,
+    /// Of that, what they fetched.
+    pub fetched_bytes: u64,
+}
+
+impl From<RecoveryBytes> for RecoveryTotals {
+    fn from(value: RecoveryBytes) -> Self {
+        Self {
+            available_bytes: value.available,
+            fetched_bytes: value.fetched,
+        }
+    }
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct FailureCount {
+    /// `repair`, `password`, `disk_full`, `unpack`, `move`, `health` or
+    /// `duplicate`; empty when the job's row keeps no cause.
+    pub cause: String,
+    pub count: u64,
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct IntegrityHistory {
+    /// This host's local date, `YYYY-MM-DD`.
+    pub today: String,
+    pub range_start: String,
+    pub range_end: String,
+    /// NZB jobs finished, counted in `events`, under the id `finished`.
+    pub finished: UsageConsumer,
+    /// Of those, the ones a repair was applied to, under the id `repaired`.
+    pub repaired: UsageConsumer,
+    /// Each job stage timed: its runs in `events`, its time in `durationMs`.
+    pub stages: Vec<UsageConsumer>,
+    /// From the history rows of the NZB jobs that finished in the range.
+    pub recovery: RecoveryTotals,
+    /// From the history rows of the NZB jobs that failed in the range.
+    pub failures: Vec<FailureCount>,
+}
+
+/// Read the integrity ledger and history for one request, against `today`.
+pub fn load_integrity_history(
+    db: &Database,
+    today: NaiveDate,
+    period: UsagePeriod,
+) -> Result<IntegrityHistory, StateError> {
+    use weaver_server_core::operations::{JOBS_FINISHED, JOBS_REPAIRED};
+    let (start, _) = period_bounds(period, today);
+    let jobs = read_summary(db, today, period, Some(CoreKind::Job))?;
+    let stages = read_summary(db, today, period, Some(CoreKind::Stage))?;
+    let since = start.map(local_day_start);
+    let until = local_day_start(next_day(jobs.range_end));
+    let recovery = db.sum_recovery_bytes(since, until)?;
+    let failures = db.count_failures_by_cause(since, until)?;
+    let job = |id: &str| -> UsageConsumer {
+        let mut row = jobs
+            .consumers
+            .iter()
+            .find(|consumer| consumer.consumer_id == id)
+            .cloned()
+            .unwrap_or_else(|| UsageConsumerSummary {
+                kind: String::new(),
+                consumer_id: id.to_string(),
+                today: UsageCounts::default(),
+                week: UsageCounts::default(),
+                month: UsageCounts::default(),
+                year: UsageCounts::default(),
+                all_time: UsageCounts::default(),
+                range: UsageCounts::default(),
+                days: jobs
+                    .total
+                    .days
+                    .iter()
+                    .map(|(day, _)| (*day, UsageCounts::default()))
+                    .collect(),
+            });
+        row.kind = CoreKind::Job.as_str().to_string();
+        row.into()
+    };
+    Ok(IntegrityHistory {
+        today: day_text(jobs.today),
+        range_start: day_text(jobs.range_start),
+        range_end: day_text(jobs.range_end),
+        finished: job(JOBS_FINISHED),
+        repaired: job(JOBS_REPAIRED),
+        stages: stages.consumers.into_iter().map(Into::into).collect(),
+        recovery: recovery.into(),
+        failures: failures
+            .into_iter()
+            .map(|(cause, count)| FailureCount { cause, count })
+            .collect(),
+    })
+}
+
+#[derive(Debug, Clone, Copy, Default, SimpleObject)]
+pub struct TorrentPeers {
+    /// Torrents the client holds now.
+    pub torrents: u32,
+    /// Peers connected now, across every torrent.
+    pub connected: u32,
+    /// Of those, the ones that have every piece.
+    pub seeds: u32,
+}
+
+impl TorrentPeers {
+    pub fn of(published: &Published) -> Self {
+        published
+            .torrents
+            .iter()
+            .fold(Self::default(), |sum, torrent| Self {
+                torrents: sum.torrents.saturating_add(1),
+                connected: sum.connected.saturating_add(torrent.peers_established),
+                seeds: sum.seeds.saturating_add(torrent.peer_seeders),
+            })
+    }
+}
+
+#[derive(Debug, Clone, SimpleObject)]
+pub struct TorrentHistory {
+    /// This host's local date, `YYYY-MM-DD`.
+    pub today: String,
+    pub range_start: String,
+    pub range_end: String,
+    /// Every torrent together: from peers in `bytes`, to peers in
+    /// `bytesUploaded`, seeding time in `durationMs`.
+    pub total: UsageConsumer,
+    /// Each tracker host, by the torrents that list it; the empty id is
+    /// the torrents that list none. A torrent counts under each host it
+    /// lists, so trackers are never added together.
+    pub trackers: Vec<UsageConsumer>,
+    /// Now, as the torrent client last published its torrents.
+    pub peers: TorrentPeers,
+}
+
+/// Read the torrent ledger for one request, against `today`.
+pub fn load_torrent_history(
+    db: &Database,
+    today: NaiveDate,
+    period: UsagePeriod,
+    peers: TorrentPeers,
+) -> Result<TorrentHistory, StateError> {
+    let total = read_summary(db, today, period, Some(CoreKind::Torrent))?;
+    let trackers = read_summary(db, today, period, Some(CoreKind::Tracker))?;
+    Ok(TorrentHistory {
+        today: day_text(total.today),
+        range_start: day_text(total.range_start),
+        range_end: day_text(total.range_end),
+        total: total.total.into(),
+        trackers: trackers.consumers.into_iter().map(Into::into).collect(),
+        peers,
+    })
 }

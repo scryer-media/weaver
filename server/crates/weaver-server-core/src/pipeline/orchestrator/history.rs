@@ -133,6 +133,9 @@ impl Pipeline {
             state.spec.category.as_deref().unwrap_or(""),
             Some(state.created_at.elapsed()),
         );
+        if state.repaired {
+            self.metrics.job_lifecycle.note_job_repaired();
+        }
 
         // The job's article buffers are all free by now; the allocator is only
         // still holding their pages because it was told to recycle them within

@@ -779,6 +779,9 @@ impl Pipeline {
                     self.metrics
                         .job_lifecycle
                         .note_repair(StageOutcomeKind::Complete, slices);
+                    if let Some(state) = self.jobs.get_mut(&job_id) {
+                        state.repaired = true;
+                    }
                     let _ = self.event_tx.send(PipelineEvent::RepairComplete {
                         job_id,
                         slices_repaired: u32::try_from(slices).unwrap_or(u32::MAX),

@@ -9,6 +9,11 @@
 //! difference since its last reading against the host's local date, and a
 //! flush adds the differences to one row per day and consumer. A lost last
 //! batch costs a few seconds of counts, never a double count.
+//!
+//! The same reading carries the job counters the exporter already keeps
+//! (jobs finished and repaired, each stage's timed runs) and each torrent's
+//! seeding ledger as the torrent service last published it, so those too
+//! are kept per day.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -41,6 +46,17 @@ pub enum UsageConsumerKind {
     Server,
     /// A category, by its name; the empty name is no category.
     Category,
+    /// NZB jobs: `finished` counts each one that ended complete, partial or
+    /// failed, `repaired` each of those that had a repair applied.
+    Job,
+    /// A job stage, by its name: the runs timed and their time.
+    Stage,
+    /// Every torrent together, under the empty id.
+    Torrent,
+    /// The torrents that list a tracker, by the tracker's host; the empty
+    /// host is the torrents that list none. A torrent counts under each host
+    /// it lists, so trackers are never added together.
+    Tracker,
 }
 
 impl UsageConsumerKind {
@@ -48,6 +64,10 @@ impl UsageConsumerKind {
         match self {
             Self::Server => "server",
             Self::Category => "category",
+            Self::Job => "job",
+            Self::Stage => "stage",
+            Self::Torrent => "torrent",
+            Self::Tracker => "tracker",
         }
     }
 
@@ -55,18 +75,35 @@ impl UsageConsumerKind {
         match value {
             "server" => Some(Self::Server),
             "category" => Some(Self::Category),
+            "job" => Some(Self::Job),
+            "stage" => Some(Self::Stage),
+            "torrent" => Some(Self::Torrent),
+            "tracker" => Some(Self::Tracker),
             _ => None,
         }
     }
 }
 
+/// The ids a [`UsageConsumerKind::Job`] row is kept under.
+pub const JOBS_FINISHED: &str = "finished";
+pub const JOBS_REPAIRED: &str = "repaired";
+
 /// What one consumer used over some span.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct UsageCounts {
+    /// Downloaded: body bytes for a server or category, bytes from peers for
+    /// a torrent or tracker.
     pub bytes: u64,
     pub articles_tried: u64,
     pub articles_succeeded: u64,
     pub down_seconds: u64,
+    /// Sent to peers, for a torrent or tracker.
+    pub bytes_uploaded: u64,
+    /// Jobs for a job row, timed runs for a stage.
+    pub events: u64,
+    /// A stage's time, or a torrent's or tracker's seeding time, in
+    /// milliseconds; torrents seeding at once each add their own.
+    pub duration_ms: u64,
 }
 
 impl UsageCounts {
@@ -77,6 +114,9 @@ impl UsageCounts {
             .articles_succeeded
             .saturating_add(other.articles_succeeded);
         self.down_seconds = self.down_seconds.saturating_add(other.down_seconds);
+        self.bytes_uploaded = self.bytes_uploaded.saturating_add(other.bytes_uploaded);
+        self.events = self.events.saturating_add(other.events);
+        self.duration_ms = self.duration_ms.saturating_add(other.duration_ms);
     }
 
     pub const fn is_zero(&self) -> bool {
@@ -84,6 +124,9 @@ impl UsageCounts {
             && self.articles_tried == 0
             && self.articles_succeeded == 0
             && self.down_seconds == 0
+            && self.bytes_uploaded == 0
+            && self.events == 0
+            && self.duration_ms == 0
     }
 }
 
@@ -366,12 +409,37 @@ pub struct ServerUsageReading {
     pub state: Option<ServerStateReading>,
 }
 
+/// One stage's timed runs since the process started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StageReading {
+    pub stage: &'static str,
+    pub runs: u64,
+    pub total_ms: u64,
+}
+
+/// One torrent's seeding ledger, as the torrent service last published it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TorrentUsageReading {
+    pub job_id: u64,
+    /// The tracker hosts it lists, each once.
+    pub trackers: Vec<String>,
+    /// Over the torrent's whole kept life.
+    pub downloaded_bytes: u64,
+    pub uploaded_bytes: u64,
+    pub seeding_seconds: u64,
+}
+
 /// Every running total the ledger reads, at one moment.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UsageReading {
     pub servers: Vec<ServerUsageReading>,
     /// Bytes per category since the process started.
     pub categories: Vec<(String, u64)>,
+    /// NZB jobs finished, and of those repaired, since the process started.
+    pub jobs_finished: u64,
+    pub jobs_repaired: u64,
+    pub stages: Vec<StageReading>,
+    pub torrents: Vec<TorrentUsageReading>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -379,6 +447,23 @@ struct ServerBaseline {
     bytes: Option<u64>,
     articles_tried: u64,
     articles_succeeded: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct TorrentBaseline {
+    downloaded_bytes: u64,
+    uploaded_bytes: u64,
+    seeding_seconds: u64,
+}
+
+impl TorrentBaseline {
+    fn of(torrent: &TorrentUsageReading) -> Self {
+        Self {
+            downloaded_bytes: torrent.downloaded_bytes,
+            uploaded_bytes: torrent.uploaded_bytes,
+            seeding_seconds: torrent.seeding_seconds,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -395,10 +480,29 @@ struct RecorderState {
     primed: bool,
     servers: HashMap<u32, ServerBaseline>,
     categories: HashMap<String, u64>,
+    jobs_finished: u64,
+    jobs_repaired: u64,
+    stages: HashMap<&'static str, (u64, u64)>,
+    torrents: HashMap<u64, TorrentBaseline>,
     states: HashMap<u32, StateMark>,
     last_tick_epoch_sec: Option<i64>,
     pending: HashMap<PendingKey, UsageCounts>,
     pruned_through: Option<NaiveDate>,
+}
+
+impl RecorderState {
+    fn add_pending(
+        &mut self,
+        day: NaiveDate,
+        kind: UsageConsumerKind,
+        id: &str,
+        counts: UsageCounts,
+    ) {
+        self.pending
+            .entry((day, kind, id.to_string()))
+            .or_default()
+            .add(&counts);
+    }
 }
 
 /// A batch ready to write: the rows to add, and the cutoff to fold older
@@ -466,6 +570,18 @@ impl UsageRecorder {
         for (category, bytes) in &reading.categories {
             state.categories.insert(category.clone(), *bytes);
         }
+        state.jobs_finished = reading.jobs_finished;
+        state.jobs_repaired = reading.jobs_repaired;
+        for stage in &reading.stages {
+            state
+                .stages
+                .insert(stage.stage, (stage.runs, stage.total_ms));
+        }
+        state.torrents = reading
+            .torrents
+            .iter()
+            .map(|torrent| (torrent.job_id, TorrentBaseline::of(torrent)))
+            .collect();
         state.last_tick_epoch_sec = Some(now_epoch_sec);
         state.primed = true;
     }
@@ -510,7 +626,7 @@ impl UsageRecorder {
                 },
                 articles_tried: forward(baseline.articles_tried, server.articles_tried),
                 articles_succeeded: forward(baseline.articles_succeeded, server.articles_succeeded),
-                down_seconds: 0,
+                ..UsageCounts::default()
             };
             state.servers.insert(
                 server.server_id,
@@ -566,6 +682,79 @@ impl UsageRecorder {
                         ..UsageCounts::default()
                     });
             }
+        }
+
+        // Job and stage counters start with the process, so a stage first
+        // seen after priming counts from zero.
+        let jobs = [
+            (
+                JOBS_FINISHED,
+                forward(state.jobs_finished, reading.jobs_finished),
+            ),
+            (
+                JOBS_REPAIRED,
+                forward(state.jobs_repaired, reading.jobs_repaired),
+            ),
+        ];
+        state.jobs_finished = reading.jobs_finished;
+        state.jobs_repaired = reading.jobs_repaired;
+        for (id, moved) in jobs {
+            if moved > 0 {
+                state.add_pending(
+                    today,
+                    UsageConsumerKind::Job,
+                    id,
+                    UsageCounts {
+                        events: moved,
+                        ..UsageCounts::default()
+                    },
+                );
+            }
+        }
+        for stage in &reading.stages {
+            let (runs, total_ms) = state.stages.get(stage.stage).copied().unwrap_or((0, 0));
+            state
+                .stages
+                .insert(stage.stage, (stage.runs, stage.total_ms));
+            let counts = UsageCounts {
+                events: forward(runs, stage.runs),
+                duration_ms: forward(total_ms, stage.total_ms),
+                ..UsageCounts::default()
+            };
+            if !counts.is_zero() {
+                state.add_pending(today, UsageConsumerKind::Stage, stage.stage, counts);
+            }
+        }
+
+        // A torrent's ledger carries its kept lifetime, so a torrent first
+        // seen counts from now. A torrent gone from the reading is dropped.
+        let mut torrents = HashMap::with_capacity(reading.torrents.len());
+        let mut whole = UsageCounts::default();
+        for torrent in &reading.torrents {
+            let now = TorrentBaseline::of(torrent);
+            let before = state.torrents.get(&torrent.job_id).copied().unwrap_or(now);
+            torrents.insert(torrent.job_id, now);
+            let counts = UsageCounts {
+                bytes: forward(before.downloaded_bytes, now.downloaded_bytes),
+                bytes_uploaded: forward(before.uploaded_bytes, now.uploaded_bytes),
+                duration_ms: forward(before.seeding_seconds, now.seeding_seconds)
+                    .saturating_mul(1000),
+                ..UsageCounts::default()
+            };
+            if counts.is_zero() {
+                continue;
+            }
+            whole.add(&counts);
+            if torrent.trackers.is_empty() {
+                state.add_pending(today, UsageConsumerKind::Tracker, "", counts);
+            }
+            for host in &torrent.trackers {
+                state.add_pending(today, UsageConsumerKind::Tracker, host, counts);
+            }
+        }
+        state.torrents = torrents;
+        if !whole.is_zero() {
+            state.add_pending(today, UsageConsumerKind::Torrent, "", whole);
         }
     }
 
@@ -659,17 +848,24 @@ fn counts_from_row(row: &SqlRow) -> Result<UsageCounts, StateError> {
         articles_tried: to_u64(row.i64("articles_tried")?),
         articles_succeeded: to_u64(row.i64("articles_succeeded")?),
         down_seconds: to_u64(row.i64("down_seconds")?),
+        bytes_uploaded: to_u64(row.i64("bytes_uploaded")?),
+        events: to_u64(row.i64("events")?),
+        duration_ms: to_u64(row.i64("duration_ms")?),
     })
 }
 
 const ADD_USAGE_DAY: &str = "INSERT INTO usage_daily
         (day, consumer_kind, consumer_id, bytes_downloaded,
-         articles_tried, articles_succeeded, down_seconds)
-     VALUES ({}, {}, {}, {}, {}, {}, {})
+         articles_tried, articles_succeeded, down_seconds,
+         bytes_uploaded, events, duration_ms)
+     VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})
      ON CONFLICT(day, consumer_kind, consumer_id) DO UPDATE SET
         bytes_downloaded = usage_daily.bytes_downloaded + excluded.bytes_downloaded,
         articles_tried = usage_daily.articles_tried + excluded.articles_tried,
         articles_succeeded = usage_daily.articles_succeeded + excluded.articles_succeeded,
+        bytes_uploaded = usage_daily.bytes_uploaded + excluded.bytes_uploaded,
+        events = usage_daily.events + excluded.events,
+        duration_ms = usage_daily.duration_ms + excluded.duration_ms,
         down_seconds = CASE
             WHEN usage_daily.down_seconds + excluded.down_seconds > {}
             THEN {}
@@ -679,12 +875,16 @@ const ADD_USAGE_DAY: &str = "INSERT INTO usage_daily
 // Rows past retention add into the consumer's earlier row, then go.
 const FOLD_OLD_DAYS: &str = "INSERT INTO usage_daily
         (day, consumer_kind, consumer_id, bytes_downloaded,
-         articles_tried, articles_succeeded, down_seconds)
+         articles_tried, articles_succeeded, down_seconds,
+         bytes_uploaded, events, duration_ms)
      SELECT {}, consumer_kind, consumer_id,
             CAST(SUM(bytes_downloaded) AS BIGINT),
             CAST(SUM(articles_tried) AS BIGINT),
             CAST(SUM(articles_succeeded) AS BIGINT),
-            CAST(SUM(down_seconds) AS BIGINT)
+            CAST(SUM(down_seconds) AS BIGINT),
+            CAST(SUM(bytes_uploaded) AS BIGINT),
+            CAST(SUM(events) AS BIGINT),
+            CAST(SUM(duration_ms) AS BIGINT)
        FROM usage_daily
       WHERE day < {} AND day <> {}
       GROUP BY consumer_kind, consumer_id
@@ -692,7 +892,10 @@ const FOLD_OLD_DAYS: &str = "INSERT INTO usage_daily
         bytes_downloaded = usage_daily.bytes_downloaded + excluded.bytes_downloaded,
         articles_tried = usage_daily.articles_tried + excluded.articles_tried,
         articles_succeeded = usage_daily.articles_succeeded + excluded.articles_succeeded,
-        down_seconds = usage_daily.down_seconds + excluded.down_seconds";
+        down_seconds = usage_daily.down_seconds + excluded.down_seconds,
+        bytes_uploaded = usage_daily.bytes_uploaded + excluded.bytes_uploaded,
+        events = usage_daily.events + excluded.events,
+        duration_ms = usage_daily.duration_ms + excluded.duration_ms";
 
 const DELETE_OLD_DAYS: &str = "DELETE FROM usage_daily WHERE day < {} AND day <> {}";
 
@@ -719,6 +922,9 @@ impl Database {
                         SqlArg::I64(to_i64(row.counts.articles_tried)),
                         SqlArg::I64(to_i64(row.counts.articles_succeeded)),
                         SqlArg::I64(to_i64(row.counts.down_seconds)),
+                        SqlArg::I64(to_i64(row.counts.bytes_uploaded)),
+                        SqlArg::I64(to_i64(row.counts.events)),
+                        SqlArg::I64(to_i64(row.counts.duration_ms)),
                         day_cap.clone(),
                         day_cap,
                     ],
@@ -766,7 +972,8 @@ impl Database {
     ) -> Result<Vec<UsageDayRow>, StateError> {
         let mut sql = String::from(
             "SELECT day, consumer_kind, consumer_id, bytes_downloaded,
-                    articles_tried, articles_succeeded, down_seconds
+                    articles_tried, articles_succeeded, down_seconds,
+                    bytes_uploaded, events, duration_ms
                FROM usage_daily
               WHERE day <= {}",
         );
@@ -807,7 +1014,10 @@ impl Database {
                     CAST(SUM(bytes_downloaded) AS BIGINT) AS bytes_downloaded,
                     CAST(SUM(articles_tried) AS BIGINT) AS articles_tried,
                     CAST(SUM(articles_succeeded) AS BIGINT) AS articles_succeeded,
-                    CAST(SUM(down_seconds) AS BIGINT) AS down_seconds
+                    CAST(SUM(down_seconds) AS BIGINT) AS down_seconds,
+                    CAST(SUM(bytes_uploaded) AS BIGINT) AS bytes_uploaded,
+                    CAST(SUM(events) AS BIGINT) AS events,
+                    CAST(SUM(duration_ms) AS BIGINT) AS duration_ms
                FROM usage_daily",
         );
         let mut args = Vec::new();
@@ -866,4 +1076,85 @@ impl Database {
             Ok(counts)
         })
     }
+
+    /// The recovery the NZB jobs that finished in `[since, until)` posted,
+    /// and how much of it they fetched, from their history rows.
+    pub fn sum_recovery_bytes(
+        &self,
+        since_epoch_sec: Option<i64>,
+        until_epoch_sec: i64,
+    ) -> Result<RecoveryBytes, StateError> {
+        let (sql, args) = finished_nzb_jobs(
+            "SELECT CAST(COALESCE(SUM(optional_recovery_bytes), 0) AS BIGINT) AS available,
+                    CAST(COALESCE(SUM(optional_recovery_downloaded_bytes), 0) AS BIGINT) AS fetched
+               FROM job_history",
+            since_epoch_sec,
+            until_epoch_sec,
+        );
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+            let Some(row) = rows.first() else {
+                return Ok(RecoveryBytes::default());
+            };
+            Ok(RecoveryBytes {
+                available: to_u64(row.i64("available")?),
+                fetched: to_u64(row.i64("fetched")?),
+            })
+        })
+    }
+
+    /// The NZB jobs that failed in `[since, until)`, by the cause their
+    /// history row keeps; the empty cause is a row that keeps none.
+    pub fn count_failures_by_cause(
+        &self,
+        since_epoch_sec: Option<i64>,
+        until_epoch_sec: i64,
+    ) -> Result<Vec<(String, u64)>, StateError> {
+        let (mut sql, args) = finished_nzb_jobs(
+            "SELECT COALESCE(failure_kind, '') AS cause, COUNT(*) AS count
+               FROM job_history",
+            since_epoch_sec,
+            until_epoch_sec,
+        );
+        sql.push_str(
+            " AND LOWER(status) = 'failed' GROUP BY COALESCE(failure_kind, '') ORDER BY cause",
+        );
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args)
+                .await?
+                .iter()
+                .map(|row| Ok((row.text("cause")?, to_u64(row.i64("count")?))))
+                .collect()
+        })
+    }
+}
+
+/// What a span's finished jobs posted as recovery and fetched of it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecoveryBytes {
+    pub available: u64,
+    pub fetched: u64,
+}
+
+// `select` over the NZB history rows that finished complete, partial or
+// failed in `[since, until)`; a cancelled job never finished.
+fn finished_nzb_jobs(
+    select: &str,
+    since_epoch_sec: Option<i64>,
+    until_epoch_sec: i64,
+) -> (String, Vec<SqlArg>) {
+    let mut sql = format!(
+        "{select}
+          WHERE protocol = 'nzb'
+            AND LOWER(status) IN ('complete', 'partial', 'failed')
+            AND completed_at < {{}}"
+    );
+    let mut args = vec![SqlArg::I64(until_epoch_sec)];
+    if let Some(since) = since_epoch_sec {
+        sql.push_str(" AND completed_at >= {}");
+        args.push(SqlArg::I64(since));
+    }
+    (sql, args)
 }
