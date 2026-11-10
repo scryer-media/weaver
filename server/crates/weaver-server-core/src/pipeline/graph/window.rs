@@ -29,6 +29,7 @@
 // What none of this can turn into an error: a real I/O error of the disk
 // under a page the decoder touches later raises SIGBUS like any mapped file.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -249,6 +250,9 @@ struct Lent {
     debits: Vec<CapacityDebits>,
     windows: u64,
     bytes: u64,
+    // The widest window each node's run was refused for want of room on
+    // every folder, since its run was last handed a lender.
+    refused: HashMap<NodeId, u64>,
 }
 
 impl fmt::Debug for Windows {
@@ -312,24 +316,21 @@ impl Windows {
         self
     }
 
-    // What the node's run borrows its windows through.
+    // What the node's run borrows its windows through, as its decoder asks
+    // for them. A run handed it starts with no refusal on record.
     pub(crate) fn for_node(self: &Arc<Self>, node: NodeId) -> Arc<dyn WindowLender> {
+        self.lock().refused.remove(&node);
         Arc::new(NodeWindows {
             windows: Arc::clone(self),
             node,
         })
     }
 
-    // What the node's run borrows its windows through, lending `window`,
-    // allocated for it before it started, to the borrow of its length.
-    pub(crate) fn prelent(self: &Arc<Self>, node: NodeId, window: Window) -> Arc<dyn WindowLender> {
-        Arc::new(Prelent {
-            window: Mutex::new(Some(window)),
-            rest: NodeWindows {
-                windows: Arc::clone(self),
-                node,
-            },
-        })
+    // The widest window the node's run was refused because no folder had
+    // room for it (`io::ErrorKind::StorageFull`), since it was last handed
+    // a lender: `None` while none was.
+    pub(crate) fn refused(&self, node: NodeId) -> Option<u64> {
+        self.lock().refused.get(&node).copied()
     }
 
     // The windows lent now, and their bytes.
@@ -443,40 +444,24 @@ struct NodeWindows {
 }
 
 impl WindowLender for NodeWindows {
+    // A refusal for want of room is kept, before the decoder hears it, so
+    // the owner reads it when the decoder's refusal reaches it.
     fn lend(&self, len: usize) -> io::Result<Box<dyn WindowMemory>> {
-        Ok(Box::new(self.windows.allocate(self.node, len)?))
-    }
-
-    fn ceiling(&self) -> u64 {
-        self.windows.ceiling
-    }
-}
-
-// A run's lender holding the window allocated for it before it started: the
-// borrow it was made for, of exactly its length, takes it, and every other
-// is lent as `rest` lends. A smaller borrow before it takes a file of its
-// own: a decoder keeps the length it asked for, so one that took the larger
-// file would ask for another of that size when it grows.
-struct Prelent {
-    window: Mutex<Option<Window>>,
-    rest: NodeWindows,
-}
-
-impl WindowLender for Prelent {
-    fn lend(&self, len: usize) -> io::Result<Box<dyn WindowMemory>> {
-        let held = self
-            .window
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take_if(|window| WindowMemory::len(window) == len);
-        match held {
-            Some(window) => Ok(Box::new(window)),
-            None => self.rest.lend(len),
+        match self.windows.allocate(self.node, len) {
+            Ok(window) => Ok(Box::new(window)),
+            Err(error) => {
+                if error.kind() == io::ErrorKind::StorageFull {
+                    let mut lent = self.windows.lock();
+                    let widest = lent.refused.entry(self.node).or_default();
+                    *widest = (*widest).max(len as u64);
+                }
+                Err(error)
+            }
         }
     }
 
     fn ceiling(&self) -> u64 {
-        self.rest.ceiling()
+        self.windows.ceiling
     }
 }
 

@@ -160,31 +160,48 @@ fn a_run_borrows_its_windows_through_the_lender() {
     assert_eq!(windows.live(), (0, 0));
 }
 
-// A window made before the run started goes to the borrow of its length
-// alone: a smaller borrow before it is lent a file of its own, the borrow
-// it was made for takes it with no file made, and one after is lent anew.
+// A lender keeps the widest window it refused a node's run for want of
+// room, and nothing else: a window over the ceiling is not kept, another
+// node's refusal is its own, and a run handed a lender again starts with
+// none on record.
 #[test]
-fn a_window_made_before_the_run_goes_to_the_borrow_it_was_made_for() {
+fn a_lender_keeps_the_widest_window_it_had_no_room_for() {
     let dir = tempfile::tempdir().unwrap();
-    let windows = windows(dir.path());
-    let made = windows.allocate(NodeId(4), 2 * MIB as usize).unwrap();
-    let made_path = made.path().to_path_buf();
-    let lender = windows.prelent(NodeId(4), made);
-    assert_eq!(windows.live(), (1, 2 * MIB));
+    let windows = Arc::new(Windows::new(
+        dir.path().to_path_buf(),
+        free(10 * MIB),
+        accountant(8 * MIB),
+        4 * MIB,
+    ));
+    let lender = windows.for_node(NodeId(4));
+    assert_eq!(windows.refused(NodeId(4)), None);
+    let held = lender.lend(MIB as usize).unwrap();
+    assert_eq!(windows.refused(NodeId(4)), None, "lent");
 
-    let small = lender.lend(MIB as usize).unwrap();
-    assert_eq!(small.len(), MIB as usize);
-    assert_eq!(windows.live(), (2, 3 * MIB), "a file of its own");
+    let Err(error) = lender.lend(5 * MIB as usize) else {
+        panic!("lent over the ceiling");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+    assert_eq!(windows.refused(NodeId(4)), None, "over the ceiling");
 
-    let exact = lender.lend(2 * MIB as usize).unwrap();
-    assert_eq!(exact.len(), 2 * MIB as usize);
-    assert_eq!(windows.live(), (2, 3 * MIB), "no file made for it");
-    assert!(made_path.exists());
-    let after = lender.lend(2 * MIB as usize).unwrap();
-    assert_eq!(windows.live(), (3, 5 * MIB), "lent anew");
+    for (asked, widest) in [(2 * MIB, 2 * MIB), (3 * MIB, 3 * MIB), (2 * MIB, 3 * MIB)] {
+        let Err(error) = lender.lend(asked as usize) else {
+            panic!("lent {asked} bytes");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull, "{error}");
+        assert_eq!(windows.refused(NodeId(4)), Some(widest));
+    }
+    assert_eq!(windows.refused(NodeId(5)), None);
+    assert_eq!(windows.live(), (1, MIB));
 
-    drop((small, exact, after, lender));
-    assert!(left(dir.path()).is_empty());
+    drop((held, lender));
+    assert_eq!(
+        windows.refused(NodeId(4)),
+        Some(3 * MIB),
+        "kept past the run"
+    );
+    let _again = windows.for_node(NodeId(4));
+    assert_eq!(windows.refused(NodeId(4)), None);
     assert_eq!(windows.live(), (0, 0));
 }
 

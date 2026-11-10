@@ -2169,24 +2169,10 @@ fn lent_run(
     said(&emits)
 }
 
-// What the archive's headers say a run lends before it starts, read as a
-// volume's front is read (`claim::front_facts`, which keeps them only for a
-// volume of a set).
-fn lent_before(archive: &[u8]) -> Option<u64> {
-    let facts = unrar_rs::RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
-        io::Cursor::new(archive.to_vec()),
-        None,
-        Arc::new(KdfCache::new()),
-    )
-    .unwrap()
-    .facts;
-    super::lent(&facts)
-}
-
 // A run handed a lender borrows the dictionary its grant cannot hold, and
 // decodes through it what a run with room for it on the heap decodes,
-// although every lent byte held garbage first. It asks for the window its
-// front said it would, once, and gives it back.
+// although every lent byte held garbage first. It asks for the dictionary
+// once, as it opens the member, and gives it back.
 #[test]
 fn a_rar5_dictionary_over_the_grant_is_lent_and_given_back() {
     use crate::lent::testing::TestLender;
@@ -2196,7 +2182,6 @@ fn a_rar5_dictionary_over_the_grant_is_lent_and_given_back() {
     assert!(said.contains(&Said::Closed(0)), "{said:?}");
     let asked = lender.asked();
     assert_eq!(asked, [256 << 10]);
-    assert_eq!(lent_before(LZ), Some(256 << 10));
     assert_eq!(lender.live(), 0);
 }
 
@@ -2237,8 +2222,8 @@ fn a_rar_window_the_lender_refuses_says_why() {
 }
 
 // A RAR 2.9 PPMd model arena over the grant is lent under the same rule as
-// its dictionary: a solid run of three members borrows the dictionary its
-// front said and one arena, keeps both across the members, decodes what a
+// its dictionary: a solid run of three members borrows the dictionary and
+// one arena, keeps both across the members, decodes what a
 // run with room for both on the heap decodes, and gives both back. Without
 // a lender the member is refused.
 #[test]
@@ -2249,12 +2234,9 @@ fn a_rar3_ppmd_arena_over_the_grant_is_lent_as_a_dictionary_is() {
     let said = lent_run(PPMD, grant, Some(&lender));
     assert_eq!(said, run(&mut RarEngine::new(), vec![PPMD.to_vec()]));
     assert!(said.contains(&Said::Closed(2)), "{said:?}");
-    let asked = lender.asked();
-    let window = lent_before(PPMD).unwrap();
-    assert_eq!(window, MIB);
-    // The dictionary, then the arena its block header declares, `(mem + 1)
-    // << 20` bytes: no front states the arena.
-    assert_eq!(asked, [window as usize, MIB as usize]);
+    // The 1 MiB dictionary its headers declare, then the arena its block
+    // header declares, `(mem + 1) << 20` bytes.
+    assert_eq!(lender.asked(), [MIB as usize, MIB as usize]);
     assert_eq!(lender.live(), 0);
 
     let said = lent_run(PPMD, grant, None);

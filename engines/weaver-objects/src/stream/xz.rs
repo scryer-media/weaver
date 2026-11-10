@@ -41,13 +41,6 @@ impl Decoder for Xz {
 
     const LENDS: bool = true;
 
-    // The first block's dictionary buffer, as the decoder sizes the window
-    // it asks its lender for.
-    fn lent(first: &[u8]) -> Option<u64> {
-        let block = first_block(first)?;
-        lent_window(block.chain.dict_prop, block.uncompressed_size)
-    }
-
     // Held to the first block's window: a later block that asks for more
     // fails instead of growing the reservation.
     fn open(input: Front, window: u64) -> io::Result<Box<dyn Read + Send>> {
@@ -111,30 +104,6 @@ fn first_block(first: &[u8]) -> Option<BlockHeader> {
 // The dictionary property of the first block's LZMA2 filter.
 fn dictionary(first: &[u8]) -> Option<u8> {
     Some(first_block(first)?.chain.dict_prop)
-}
-
-// The window lzma-turbo 0.12 asks its window allocator for, for a block of
-// LZMA2 dictionary property `prop` that declares `uncompressed` bytes, if it
-// declares any: the dictionary the property states, no larger than the
-// block (but never under 4 KiB), rounded up as the SDK rounds a dictionary
-// buffer (`LzmaProps::dic_buf_size`, C: `LzmaDec_Allocate`). The tests pin
-// it to what the decoder asks.
-fn lent_window(prop: u8, uncompressed: Option<u64>) -> Option<u64> {
-    const DIC_MIN: u64 = 1 << 12;
-    let declared = match prop {
-        0..=39 => u64::from((2u32 | u32::from(prop & 1)) << (u32::from(prop) / 2 + 11)),
-        40 => u64::from(u32::MAX),
-        _ => return None,
-    };
-    let dict = uncompressed
-        .map_or(declared, |size| declared.min(size.max(DIC_MIN)))
-        .max(DIC_MIN);
-    let mask: u64 = match dict {
-        dict if dict >= 1 << 30 => (1 << 22) - 1,
-        dict if dict >= 1 << 22 => (1 << 20) - 1,
-        _ => (1 << 12) - 1,
-    };
-    Some((dict + mask) & !mask)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

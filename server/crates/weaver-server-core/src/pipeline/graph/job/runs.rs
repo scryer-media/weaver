@@ -13,7 +13,7 @@ use weaver_graph::tree::Mark;
 use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
 use super::{GraphError, GraphJob};
-use crate::pipeline::graph::engine::{Heard, Lent, Reservation, Said};
+use crate::pipeline::graph::engine::{Heard, Reservation, Said};
 use crate::pipeline::graph::namespace::{Coming, Returned, WriteError};
 use crate::pipeline::graph::status::RepairSlots;
 
@@ -332,10 +332,9 @@ impl GraphJob {
             return Ok(Vec::new());
         };
         // Whether the decoder borrows a window over its grant from a
-        // scratch file, or is given it in RAM (`Engine::lends`), and the
-        // window it asks for first (`Engine::lent`).
-        let lent = engine.lends().then(|| Lent(engine.lent()));
-        let refused = match self.runs.reserve_for(node, window, lent) {
+        // scratch file as it asks for it, or is given it in RAM
+        // (`Engine::lends`).
+        let refused = match self.runs.reserve_for(node, window, engine.lends()) {
             Reservation::Granted => None,
             Reservation::Starved(admitted) => return Ok(admitted),
             Reservation::Refused { needed, allowed } => Some(Why::TooLarge {

@@ -196,17 +196,14 @@ struct Run {
     // Whether its reservation is held above the ceiling, apart from the
     // pool.
     above: bool,
-    // Where that window is: lent from a scratch file, or in RAM.
+    // Where that window is: within the grant, or past it in RAM.
     placed: Placed,
-    // Its decoder is handed the job's lender, to borrow a window over its
-    // grant: it borrows (`Engine::lends`), and the policy lets a window go
-    // over the ceiling.
+    // Its decoder is handed the job's lender, to borrow every window over
+    // its grant as it asks for it: it borrows (`Engine::lends`), the policy
+    // lets a window go over the ceiling, and the scratch has not refused it.
     lends: bool,
-    // Its window was placed on a scratch file when it was reserved: a
-    // window at or under that one it comes back too large for was refused
-    // by the scratch, not by its grant.
-    scratched: bool,
-    // The scratch refused it once: from here its window is placed in RAM.
+    // The scratch refused it once: from here it is not lent, and its window
+    // is placed in RAM.
     in_ram: bool,
     // The run refused a window its policy lets it have: it starts again,
     // wider, once it ends, and what it says before then is not heard.
@@ -227,7 +224,6 @@ impl Run {
             above: false,
             placed: Placed::Grant,
             lends: false,
-            scratched: false,
             in_ram: false,
             rerun: false,
             whole: false,
@@ -235,20 +231,12 @@ impl Run {
     }
 }
 
-// How a run's decoder borrows, for one that does (`Engine::lends`): the
-// widest window it asks its lender for first, as its object's first bytes
-// declare it, when they do (`Engine::lent`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Lent(pub(crate) Option<u64>);
-
-// Where a run's decode window is.
-#[derive(Debug, Default)]
+// Where a run's decode window is. A window a lending run borrows is on a
+// scratch file, asked for as its decoder asks, and is no part of either.
+#[derive(Clone, Copy, Debug)]
 enum Placed {
     // Within the grant, in RAM.
-    #[default]
     Grant,
-    // Over the ceiling, on a scratch file lent before the run starts.
-    Scratch(super::window::Window),
     // Past what its object declared, in RAM, reserved whole: this many
     // bytes of it.
     Ram(u64),
@@ -485,38 +473,29 @@ impl Runs {
     // allocated for it.
     #[cfg(test)]
     pub(crate) fn reserve(&mut self, node: NodeId, window: u64) -> Reservation {
-        self.reserve_for(node, window, None)
+        self.reserve_for(node, window, false)
     }
 
     // As `reserve`, for a run whose decoder borrows a window over its grant
-    // from its lender, as `lent` says, or `None` for one that does not.
+    // from its lender (`Engine::lends`) when `lends` says so.
     //
-    // Where the grant's policy lets a window go over the ceiling, and the
-    // run's window is over it, as its object declares or as its decoder
-    // refused (`widen`), the window is placed here: lent from a scratch
-    // file for a decoder that borrows one, reserving only what a run inside
-    // its grant reserves, for the lent window is not in RAM; or, for one
-    // that does not, a scratch file refused for any reason, or a run the
-    // scratch refused once (`widen`), in RAM above the ceiling, reserved
-    // whole apart from the pool. It is admitted once it,
-    // every other run above the ceiling, and the whole pool fit under what
-    // the machine leaves a run. A window its decoder refused within the
-    // ceiling is reserved whole from the pool. Under a policy that holds
-    // runs to the ceiling, a window a run was widened to above it is
-    // dropped: the run is held to the ceiling, and its decoder refuses with
-    // the sizes, handed no lender.
+    // Where the grant's policy lets a window go over the ceiling, such a
+    // run is handed the job's lender and borrows every window over its grant
+    // as its decoder asks for it: nothing is lent before it starts. It
+    // reserves what a run inside its grant reserves, whatever window its
+    // object declares, for a lent window is scratch, not RAM. A run the
+    // scratch refused (`widen`) is not lent again: it is placed in RAM.
     //
-    // A decoder that borrows keeps in RAM no more than the window the grant
-    // holds one decoder to (`Grant::held`) and borrows what is over it, so
-    // that, not the ceiling, is what its window is placed against; the
-    // window it is lent first is the one its first bytes declare it asks
-    // for, sized as it sizes it.
-    pub(crate) fn reserve_for(
-        &mut self,
-        node: NodeId,
-        window: u64,
-        lent: Option<Lent>,
-    ) -> Reservation {
+    // Any other run whose window is over the ceiling, as its object
+    // declares or as its decoder refused (`widen`), is placed in RAM above
+    // the ceiling where the policy lets it go above, reserved whole apart
+    // from the pool. It is admitted once it, every other run above the
+    // ceiling, and the whole pool fit under what the machine leaves a run.
+    // A window its decoder refused within the ceiling is reserved whole from
+    // the pool. Under a policy that holds runs to the ceiling, a window a
+    // run was widened to above it is dropped: the run is held to the
+    // ceiling, and its decoder refuses with the sizes, handed no lender.
+    pub(crate) fn reserve_for(&mut self, node: NodeId, window: u64, lends: bool) -> Reservation {
         let grant = self.hardware.grant();
         self.held_back.remove(&node);
         let Some(run) = self.runs.get_mut(&node) else {
@@ -527,55 +506,26 @@ impl Runs {
         }
         let ceiling = grant.ceiling();
         let above = grant.over_limit == OverLimit::ScratchThenRam;
-        let lent = lent.filter(|_| above);
-        run.lends = lent.is_some();
-        let over = if run.lends { grant.held() } else { ceiling };
-        if above && window > ceiling {
+        run.lends = lends && above && !run.in_ram && self.windows.is_some();
+        if above && !run.lends && window > ceiling {
             run.wide = run.wide.max(Some(window));
-        }
-        if let Some(Lent(Some(asked))) = lent
-            && asked > over
-        {
-            run.wide = run.wide.max(Some(asked));
         }
         if !above {
             run.wide = run.wide.filter(|wide| *wide <= grant.held());
         }
         run.window = run.wide.unwrap_or(window.min(ceiling));
-        // What a run inside its grant reserves: the window its object
-        // declares, to the ceiling, and its overhead.
-        let in_grant = window.min(ceiling).saturating_add(RUN_OVERHEAD);
         let len = match run.wide {
+            // What a run inside its grant reserves: the window its object
+            // declares, to the ceiling, and its overhead.
             None => {
                 run.placed = Placed::Grant;
-                in_grant
+                window.min(ceiling).saturating_add(RUN_OVERHEAD)
             }
-            Some(wide) if wide <= over => {
+            Some(wide) => {
                 run.placed = Placed::Ram(wide);
                 wide.saturating_add(RUN_OVERHEAD)
             }
-            Some(wide) => {
-                if !matches!(run.placed, Placed::Scratch(_)) {
-                    let in_ram = run.in_ram;
-                    run.placed = self
-                        .windows
-                        .as_ref()
-                        .filter(|_| lent.is_some() && !in_ram)
-                        .and_then(|windows| {
-                            windows.allocate(node, usize::try_from(wide).ok()?).ok()
-                        })
-                        .map_or(Placed::Ram(wide), Placed::Scratch);
-                }
-                match run.placed {
-                    // The lent window is scratch, not RAM; what its decoder
-                    // may still hold on its own heap, to the grant, is
-                    // reserved as a run inside its grant reserves it.
-                    Placed::Scratch(_) => in_grant,
-                    _ => wide.saturating_add(RUN_OVERHEAD),
-                }
-            }
         };
-        run.scratched = matches!(run.placed, Placed::Scratch(_));
         let room = self.pool.room();
         let taken = if len <= room.limit {
             self.pool.stop_waiting(&mut run.whole);
@@ -638,33 +588,20 @@ impl Runs {
         let grant = self.hardware.grant();
         let mut budget = grant.run.clone();
         // Only a decoder that borrows, under a policy that lets a window go
-        // over the ceiling, is handed the lender: every other is held to its
-        // grant and refuses a window over it with the sizes.
+        // over the ceiling, is handed the lender, and borrows every window
+        // as it asks for it: every other is held to its grant and refuses a
+        // window over it with the sizes.
         budget.lender = self
             .windows
             .as_ref()
             .filter(|_| run.lends)
             .map(|windows| windows.for_node(node));
-        match &mut run.placed {
-            Placed::Grant => {}
-            // The decoder borrows the window lent for it first. A run
-            // started again under the same reservation borrows through
-            // the lender alone.
-            placed @ Placed::Scratch(_) => {
-                if let Placed::Scratch(window) = std::mem::take(placed) {
-                    budget.lender = self
-                        .windows
-                        .as_ref()
-                        .map(|windows| windows.prelent(node, window));
-                }
-            }
-            // The decoder may hold the window in RAM: what was reserved,
-            // the whole of it, whatever its first bytes declare.
-            Placed::Ram(wide) => {
-                budget.memory_bytes = budget.memory_bytes.max(Some(*wide));
-                budget.window_bytes = Some(*wide);
-                budget.window_reserved = true;
-            }
+        // The decoder may hold the window in RAM: what was reserved, the
+        // whole of it, whatever its first bytes declare.
+        if let Placed::Ram(wide) = run.placed {
+            budget.memory_bytes = budget.memory_bytes.max(Some(wide));
+            budget.window_bytes = Some(wide);
+            budget.window_reserved = true;
         }
         let (scope, mail, clock) = (self.scope, self.mail.clone(), self.clock.clone());
         let said = move |heard| Said {
@@ -759,17 +696,24 @@ impl Runs {
         };
         let held = grant.held();
         let running = matches!(run.life, Life::Running { .. });
-        // A run placed on scratch that comes back too large for a window no
-        // wider than the one it was placed with was refused by the scratch:
-        // it starts again with that window in RAM, under the machine's hard
-        // stop. Once only: a run in RAM refused again stands refused.
-        let scratch_refused = run.scratched
-            && !run.in_ram
-            && grant.over_limit == OverLimit::ScratchThenRam
-            && needed.is_some_and(|needed| needed <= run.window);
-        if scratch_refused && running {
+        // A lending run whose lender found no folder with room for a window
+        // it asked for was refused by the scratch, not by its grant: it
+        // starts again, not lent, with the widest of that window, what its
+        // decoder said it needs and the window it had, in RAM under the
+        // machine's hard stop. Once only: a run in RAM is lent nothing, so
+        // the scratch cannot refuse it again, and what its decoder refuses
+        // from there is weighed as any run's refusal is.
+        let refused = self
+            .windows
+            .as_ref()
+            .filter(|_| run.lends && !run.in_ram)
+            .filter(|_| grant.over_limit == OverLimit::ScratchThenRam)
+            .and_then(|windows| windows.refused(node));
+        if let Some(refused) = refused
+            && running
+        {
             run.in_ram = true;
-            run.wide = Some(run.window);
+            run.wide = Some(run.window.max(refused).max(needed.unwrap_or(0)));
             run.rerun = true;
             if let Some(volumes) = &run.volumes {
                 volumes.stop();
@@ -937,7 +881,7 @@ impl Runs {
         give_back(&self.pool, run);
         self.pool.stop_waiting(&mut run.whole);
         run.placed = Placed::Grant;
-        run.scratched = false;
+        run.lends = false;
         run.in_ram = false;
         run.rerun = false;
         let admissions = run

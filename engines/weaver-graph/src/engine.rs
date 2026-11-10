@@ -254,20 +254,12 @@ pub trait Engine {
     }
 
     // Whether a run's decoder borrows a window wider than the grant holds in
-    // RAM from `Budget::lender`. The owner then lends that window from a
-    // scratch file before the run starts, where the owner's policy allows a
-    // window over its ceiling at all; an engine that does not borrow is
-    // given that window in RAM instead.
+    // RAM from `Budget::lender`, as it asks for it. Where the owner's policy
+    // allows a window over its ceiling at all, the run is then handed a
+    // lender and reserves what a run inside its grant reserves; an engine
+    // that does not borrow is given that window in RAM instead.
     fn lends(&self) -> bool {
         false
-    }
-
-    // The widest window a run's decoder asks its lender for, as the first
-    // bytes the object was delivered declare it, sized exactly as the
-    // decoder sizes it: what the owner lends before the run starts. `None`
-    // for an engine that does not lend, or while nothing declares it.
-    fn lent(&self) -> Option<u64> {
-        None
     }
 
     // The widest window the format's decoder can be given, for a decoder
