@@ -69,6 +69,16 @@ impl Format for SevenZip {
     fn run(password: Option<String>) -> Box<dyn Extraction> {
         Box::new(run::Run::new(password))
     }
+
+    // A run's decoder borrows each buffer over its window from the run's
+    // lender: `crate::lent::sevenz`. No front states the first it asks for:
+    // a 7z names its coders only in the end header at its tail, and a
+    // threaded LZMA2 decode asks first for whichever worker's buffer its
+    // workers take first, sized by the run it was handed. Every window is
+    // lent as the decoder asks.
+    fn lends() -> bool {
+        true
+    }
 }
 
 pub type SevenZipEngine = EngineObject<SevenZip>;

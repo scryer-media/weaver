@@ -113,7 +113,7 @@ fn dictionary(first: &[u8]) -> Option<u8> {
     Some(first_block(first)?.chain.dict_prop)
 }
 
-// The window lzma-turbo 0.11 asks its window allocator for, for a block of
+// The window lzma-turbo 0.12 asks its window allocator for, for a block of
 // LZMA2 dictionary property `prop` that declares `uncompressed` bytes, if it
 // declares any: the dictionary the property states, no larger than the
 // block (but never under 4 KiB), rounded up as the SDK rounds a dictionary

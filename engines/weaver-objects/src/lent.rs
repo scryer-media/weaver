@@ -14,9 +14,9 @@
 //
 // Without a lender every library is configured exactly as it always was.
 //
-// A library that lends later (sevenz-turbo) is adapted here the same way: an
-// `unsafe impl` of its memory trait for `Lent`, an `impl` of its allocator
-// trait for `Lender`, and its limits built from the same two numbers.
+// sevenz-turbo is adapted the same way: an `unsafe impl` of its memory trait
+// for `Lent`, an `impl` of its allocator trait for `Lender`, and its limits
+// built from the same two numbers (`sevenz`).
 //
 // A library keeps only the `io::ErrorKind` of a refusal, so a refusal means
 // what its kind says (`refused`).
@@ -94,9 +94,29 @@ unsafe impl unrar_rs::WindowMemory for Lent {
     }
 }
 
-// Both libraries may ask from any thread, and more than once at a time
-// (one window per xz block in flight, or per RAR worker): the lender is
-// `Send + Sync` and lends each window on its own.
+// SAFETY: sevenz-turbo asks, from `as_mut_ptr` until drop: a non-null
+// pointer valid for reads and writes of `len()` bytes, at least the length
+// it asked; those bytes initialized, to any value; an address stable until
+// drop, also when the `Box` holding the value moves; and the memory
+// exclusive to the decoder. The wrapped `weaver_graph::WindowMemory`
+// promises each, as above, and `weaver_graph::WindowLender::lend` lends at
+// least the length asked; sevenz-turbo checks null and short memory itself
+// before use. It asks only `Send`, which the wrapped `Send + Sync` memory
+// gives.
+unsafe impl sevenz_turbo::WindowMemory for Lent {
+    fn as_mut_ptr(&mut self) -> *mut u8 {
+        self.ptr()
+    }
+
+    fn len(&self) -> usize {
+        Lent::len(self)
+    }
+}
+
+// Each library may ask from any thread, and more than once at a time (one
+// window per xz block in flight, per RAR worker, or per 7z folder and
+// threaded LZMA2 worker): the lender is `Send + Sync` and lends each window
+// on its own.
 impl lzma_turbo::WindowAllocator for Lender {
     fn allocate(&self, len: usize) -> io::Result<Box<dyn lzma_turbo::WindowMemory>> {
         Ok(Box::new(self.lend(len)?))
@@ -107,6 +127,36 @@ impl unrar_rs::WindowAllocator for Lender {
     fn allocate(&self, len: usize) -> io::Result<Box<dyn unrar_rs::WindowMemory>> {
         Ok(Box::new(self.lend(len)?))
     }
+}
+
+impl sevenz_turbo::WindowAllocator for Lender {
+    fn allocate(&self, len: usize) -> io::Result<Box<dyn sevenz_turbo::WindowMemory>> {
+        Ok(Box::new(self.lend(len)?))
+    }
+}
+
+// The 7z decoder's limits for a run: the memory the run was granted, or the
+// decoder's own limits when none was. Without a lender that is all, as it
+// always was.
+//
+// With a lender, every decode buffer over the window the run was granted (a
+// dictionary, a PPMd arena, a threaded LZMA2 worker's buffer) is borrowed,
+// up to the lender's ceiling, and counts nothing against the memory limit,
+// which bounds what stays in RAM. A threaded decode, or folders decoded side
+// by side, borrows several windows at once.
+pub(crate) fn sevenz(budget: &Budget) -> sevenz_turbo::ArchiveLimits {
+    let own = sevenz_turbo::ArchiveLimits::default();
+    let limits = sevenz_turbo::ArchiveLimits {
+        memory_limit_bytes: budget.memory_or(own.memory_limit_bytes),
+        ..own
+    };
+    let Some(lender) = Lender::of(budget) else {
+        return limits;
+    };
+    let ceiling = lender.ceiling();
+    let mut limits = limits.with_window_allocator(lender, budget.window_or(u64::MAX));
+    limits.max_lent_window_bytes = ceiling;
+    limits
 }
 
 // The xz decoder's backing for a run that was handed a lender: a dictionary

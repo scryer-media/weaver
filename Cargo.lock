@@ -905,9 +905,9 @@ dependencies = [
 
 [[package]]
 name = "bzip2-turbo"
-version = "0.1.1"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f542fbec5f6cd891cb388b7e45670b56624a5e207ad507d830e64956aaf64a0"
+checksum = "dea2375497e8f23dc1c0e6c23088a2c6e025707ab9a362973a5d2d64785b8ae6"
 dependencies = [
  "crc-turbo",
 ]
@@ -2925,19 +2925,7 @@ dependencies = [
 
 [[package]]
 name = "lzma-turbo"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3af35044209c991b5cafb0821392f36b3b3eb3bdd5411c21562716705139a621"
-dependencies = [
- "aws-lc-rs",
- "crc-turbo",
-]
-
-[[package]]
-name = "lzma-turbo"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7ad5ebe868656c79696a8d4ee5336e516b332f7147ec2dd9bd32ba28280255b"
+version = "0.12.0"
 dependencies = [
  "aws-lc-rs",
  "crc-turbo",
@@ -4594,9 +4582,7 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.29.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d874c46bb2ea4a1921628682fc80e3875dae43e13517172312781f8250e9a4db"
+version = "0.30.0"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -4606,7 +4592,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "lz4_flex",
- "lzma-turbo 0.10.2",
+ "lzma-turbo",
  "ppmd-turbo",
  "wasm-bindgen",
  "zeroize",
@@ -6148,7 +6134,7 @@ dependencies = [
  "bzip2",
  "crc-turbo",
  "flate2",
- "lzma-turbo 0.11.0",
+ "lzma-turbo",
  "par2-rs",
  "par3-rs",
  "rmp-serde",
@@ -6175,7 +6161,7 @@ dependencies = [
  "chrono",
  "flate2",
  "hex",
- "lzma-turbo 0.11.0",
+ "lzma-turbo",
  "regex",
  "reqwest",
  "scryer-release-parser",
@@ -6229,7 +6215,7 @@ dependencies = [
  "keyring",
  "keyring-core",
  "libc",
- "lzma-turbo 0.11.0",
+ "lzma-turbo",
  "notify",
  "par2-rs",
  "par3-rs",

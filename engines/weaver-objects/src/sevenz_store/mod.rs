@@ -46,15 +46,11 @@ use map::Map;
 // The store's one volume: the file. Its coordinates are the container's.
 const FILE: VolumeIndex = VolumeIndex(0);
 
-// What a 7z decode within `budget` may hold: the memory granted, or the
-// decoder's own limits when none was. Header parses, key derivations and
-// runs alike are held to it.
+// What a 7z decode within `budget` may hold, and borrow where the budget
+// lends: `crate::lent::sevenz`. Header parses, key derivations and runs
+// alike are held to it.
 pub(crate) fn limits(budget: &Budget) -> sevenz_turbo::ArchiveLimits {
-    let limits = sevenz_turbo::ArchiveLimits::default();
-    sevenz_turbo::ArchiveLimits {
-        memory_limit_bytes: budget.memory_or(limits.memory_limit_bytes),
-        ..limits
-    }
+    crate::lent::sevenz(budget)
 }
 
 // The length of the container a front's signature header states, when the

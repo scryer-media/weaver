@@ -539,3 +539,296 @@ fn an_owner_read_failure_is_no_format_refusal() {
         assert!(emits.is_empty(), "{kind:?}: {emits:?}");
     }
 }
+
+// The grant the lender tests hold a run to: room in RAM for a folder's
+// input buffer and coder state, none for its dictionary or model.
+const GRANT: u64 = 2 << 20;
+// A dictionary over the grant, and a member larger than it, so the decoder
+// does not clamp the dictionary to the member.
+const DICTIONARY: u32 = 4 << 20;
+
+fn big() -> Vec<u8> {
+    payload(9, 4_096).repeat(3 * DICTIONARY as usize / 4_096)
+}
+
+// One LZMA2 folder of `bytes` whose dictionary is over the grant: one solid
+// stream, or, `threaded`, runs a dictionary long that a threaded decoder
+// decodes side by side.
+fn lzma2_over_grant(bytes: &[u8], threaded: bool) -> Vec<u8> {
+    let mut options = if threaded {
+        Lzma2Options::from_level_mt(1, 4, u64::from(DICTIONARY))
+    } else {
+        Lzma2Options::from_level(1)
+    };
+    options.set_dictionary_size(DICTIONARY);
+    archive(
+        vec![EncoderConfiguration::from(options)],
+        &[("big.bin", bytes)],
+    )
+}
+
+// One PPMd folder of `bytes` whose model is over the grant.
+fn ppmd_over_grant(bytes: &[u8]) -> Vec<u8> {
+    let options = sevenz_turbo::encoder_options::PpmdOptions::from_order_memory_size(6, DICTIONARY);
+    archive(
+        vec![EncoderConfiguration::from(options)],
+        &[("big.bin", bytes)],
+    )
+}
+
+// A run whose memory and window are both the grant: it decodes a folder on
+// one thread whatever it is handed, since a threaded LZMA2 decode needs room
+// in flight (sevenz-turbo plans one only with 32 MiB beyond the decoder's
+// own state).
+fn grant(threads: usize) -> weaver_graph::Budget {
+    weaver_graph::Budget {
+        memory_bytes: Some(GRANT),
+        window_bytes: Some(GRANT),
+        threads,
+        ..Default::default()
+    }
+}
+
+// A run whose memory affords a threaded LZMA2 decode while its window still
+// holds no dictionary, as a 1 GiB grant meets a 2 GiB dictionary: the
+// dictionary and every worker buffer over the window are lent.
+fn room_to_thread(threads: usize) -> weaver_graph::Budget {
+    weaver_graph::Budget {
+        memory_bytes: Some(64 << 20),
+        ..grant(threads)
+    }
+}
+
+// A run over `archive` under `budget`, handed `lender`.
+fn lent_run(
+    archive: &[u8],
+    budget: weaver_graph::Budget,
+    lender: Option<&Arc<crate::lent::testing::TestLender>>,
+) -> Vec<Said> {
+    let budget = match lender {
+        Some(lender) => lender.lending(budget),
+        None => budget,
+    };
+    let mut emits = Vec::new();
+    SevenZipEngine::new().start().run(
+        Gate::whole(vec![archive.to_vec()]),
+        &mut |emit| {
+            emits.push(emit);
+            true
+        },
+        budget,
+    );
+    said(&emits)
+}
+
+// The most windows the decoder says a run on `threads` threads under
+// `budget` can have lent at once.
+fn lent_windows(archive: &[u8], budget: &weaver_graph::Budget, threads: u32) -> usize {
+    sevenz_turbo::Archive::read(&mut Cursor::new(archive), &Password::empty())
+        .unwrap()
+        .decoder_memory(&crate::lent::sevenz(budget), threads)
+        .unwrap()
+        .lent_windows
+}
+
+fn refusals(said: &[Said]) -> Vec<Why> {
+    said.iter()
+        .filter_map(|said| match said {
+            Said::Refuse(why) => Some(*why),
+            _ => None,
+        })
+        .collect()
+}
+
+// A run handed a lender borrows each buffer its window cannot hold, and
+// decodes through them what a run with room for them on the heap decodes,
+// although every lent byte held garbage first. Every window asked for is
+// over the window, no more are out at once than the decoder says a run on
+// as many threads can have, and every one is given back.
+//
+// On one thread, or with too little memory to decode side by side, the
+// folder's dictionary is the one window asked for. With memory to thread,
+// a stream of three runs is decoded by workers that each borrow their own
+// buffer: more than one is asked for. How many are out at once is the
+// workers' timing, so only its bound is held.
+#[test]
+fn a_7z_lzma2_dictionary_over_the_grant_is_lent_and_given_back() {
+    use crate::lent::testing::TestLender;
+    let bytes = big();
+    let solid = lzma2_over_grant(&bytes, false);
+    let runs = lzma2_over_grant(&bytes, true);
+    for (name, archive, budget) in [
+        ("one stream, one thread", &solid, grant(1)),
+        ("one stream, four threads", &solid, room_to_thread(4)),
+        ("three runs, one thread", &runs, room_to_thread(1)),
+        ("three runs, no memory to thread", &runs, grant(4)),
+        ("three runs, four threads", &runs, room_to_thread(4)),
+    ] {
+        let threads = budget.threads();
+        let lender = TestLender::new();
+        let said = lent_run(archive, budget.clone(), Some(&lender));
+        assert_eq!(
+            said,
+            run(&mut SevenZipEngine::new(), vec![archive.clone()]),
+            "{name}"
+        );
+        assert!(said.contains(&Said::Bytes(0, bytes.clone())), "{name}");
+        let asked = lender.asked();
+        if name == "three runs, four threads" {
+            assert!(asked.len() > 1, "{name}: {asked:?}");
+        } else {
+            assert_eq!(asked, [DICTIONARY as usize], "{name}");
+        }
+        assert!(
+            asked.iter().all(|&ask| ask as u64 > GRANT),
+            "{name}: {asked:?}"
+        );
+        let most = lent_windows(archive, &lender.lending(budget), threads as u32);
+        assert!(
+            lender.peak() <= most,
+            "{name}: {} lent at once, {most} said",
+            lender.peak()
+        );
+        assert_eq!(lender.live(), 0, "{name}");
+    }
+}
+
+// Without a lender the same grant refuses the folder with its sizes, as it
+// always did.
+#[test]
+fn a_7z_dictionary_over_the_grant_without_a_lender_is_refused() {
+    let bytes = big();
+    for (threaded, threads) in [(false, 1), (true, 4)] {
+        let said = lent_run(&lzma2_over_grant(&bytes, threaded), grant(threads), None);
+        assert!(
+            matches!(
+                refusals(&said).as_slice(),
+                [Why::TooLarge {
+                    needed: Some(needed),
+                    allowed: Some(GRANT),
+                }] if *needed > GRANT
+            ),
+            "threaded {threaded}: {said:?}"
+        );
+        assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+    }
+}
+
+// A lender's refusal is the member's verdict: a filesystem's refusal asks
+// for the window in RAM, with its size, which the owner gives or refuses by
+// its policy; any other refusal stands.
+#[test]
+fn a_7z_window_the_lender_refuses_says_why() {
+    use crate::lent::testing::TestLender;
+    let archive = lzma2_over_grant(&big(), false);
+    let full = TestLender::refusing(io::ErrorKind::StorageFull);
+    let said = lent_run(&archive, grant(1), Some(&full));
+    let asked = full.asked();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert_eq!(
+        refusals(&said),
+        [Why::TooLarge {
+            needed: Some(asked[0] as u64),
+            allowed: None,
+        }],
+        "{said:?}"
+    );
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+
+    let denied = TestLender::refusing(io::ErrorKind::PermissionDenied);
+    let said = lent_run(&archive, grant(1), Some(&denied));
+    assert_eq!(refusals(&said), [Why::Unsupported], "{said:?}");
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+}
+
+// A threaded decode whose lender lends the first window and refuses the
+// rest says a refusal of one of the windows refused, with its size, and
+// gives back the window it was lent.
+#[test]
+fn a_threaded_7z_decode_whose_lender_runs_out_gives_back_what_it_was_lent() {
+    use crate::lent::testing::TestLender;
+    let archive = lzma2_over_grant(&big(), true);
+    let full = TestLender::refusing_after(1, io::ErrorKind::StorageFull);
+    let said = lent_run(&archive, room_to_thread(4), Some(&full));
+    let asked = full.asked();
+    assert!(asked.len() > 1, "{asked:?}");
+    let refused = refusals(&said);
+    assert!(
+        matches!(
+            refused.as_slice(),
+            [Why::TooLarge {
+                needed: Some(needed),
+                allowed: None,
+            }] if asked[1..].contains(&(*needed as usize))
+        ),
+        "{said:?}, asked {asked:?}"
+    );
+    assert!(!said.iter().any(|said| matches!(said, Said::Closed(0))));
+    assert_eq!(full.live(), 0);
+}
+
+// A window over the lender's ceiling is not asked for: the decoder refuses
+// it with its size against the ceiling.
+#[test]
+fn a_7z_dictionary_over_the_lenders_ceiling_is_refused_unasked() {
+    use crate::lent::testing::TestLender;
+    let ceiling = 3 << 20;
+    let low = TestLender::up_to(ceiling);
+    let said = lent_run(&lzma2_over_grant(&big(), false), grant(1), Some(&low));
+    assert!(
+        matches!(
+            refusals(&said).as_slice(),
+            [Why::TooLarge {
+                needed: Some(needed),
+                allowed: Some(allowed),
+            }] if *needed > ceiling && *allowed == ceiling
+        ),
+        "{said:?}"
+    );
+    assert_eq!(low.asked(), Vec::<usize>::new());
+}
+
+// A PPMd model over the grant is lent under the same rule as a dictionary,
+// decodes what a run with room for it on the heap decodes, and is given
+// back; without a lender the folder is refused with its sizes.
+//
+// The archive is two PPMd folders, the link's nine bytes and the member,
+// each declaring the same model. A model is the size its coder declares,
+// not clamped to the folder's output, so each folder borrows its own, one
+// at a time.
+#[test]
+fn a_7z_ppmd_model_over_the_grant_is_lent_as_a_dictionary_is() {
+    use crate::lent::testing::TestLender;
+    let bytes = payload(10, 4_096).repeat(256);
+    let archive = ppmd_over_grant(&bytes);
+    let parsed =
+        sevenz_turbo::Archive::read(&mut Cursor::new(&archive), &Password::empty()).unwrap();
+    let models: Vec<&[u8]> = parsed
+        .blocks
+        .iter()
+        .flat_map(|block| &block.coders)
+        .map(|coder| coder.properties())
+        .collect();
+    let declared = [6, 0, 0, 0x40, 0];
+    assert_eq!(models, [&declared[..], &declared[..]]);
+
+    let lender = TestLender::new();
+    let said = lent_run(&archive, grant(1), Some(&lender));
+    assert_eq!(said, run(&mut SevenZipEngine::new(), vec![archive.clone()]));
+    assert!(said.contains(&Said::Bytes(0, bytes)));
+    assert_eq!(lender.asked(), [DICTIONARY as usize; 2]);
+    assert!(lender.peak() <= lent_windows(&archive, &lender.lending(grant(1)), 1));
+    assert_eq!(lender.live(), 0);
+
+    let said = lent_run(&archive, grant(1), None);
+    assert!(
+        matches!(
+            refusals(&said).as_slice(),
+            [Why::TooLarge {
+                needed: Some(needed),
+                allowed: Some(GRANT),
+            }] if *needed > GRANT
+        ),
+        "{said:?}"
+    );
+}
