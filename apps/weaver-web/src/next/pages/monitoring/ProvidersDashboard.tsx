@@ -10,9 +10,9 @@ import {
   averageDailySpeed,
   dayKey,
   foundPercent,
+  providerRowName,
   providerRows,
   providerUp,
-  type ProviderRow,
 } from "../../data/dashboards";
 import {
   EM_DASH,
@@ -41,10 +41,6 @@ const COLUMNS =
 
 const cell = "truncate text-right font-wv-mono text-[12.5px] text-wv-secondary";
 
-function rowName(row: ProviderRow, removed: (id: string) => string): string {
-  return row.provider?.host ?? removed(row.serverId ?? "");
-}
-
 export function ProvidersDashboard() {
   const t = useTranslate();
   const { providers } = useNextData("providers");
@@ -67,7 +63,7 @@ export function ProvidersDashboard() {
       const last = values[values.length - 1] ?? 0;
       return {
         key: row.key,
-        label: rowName(row, removed),
+        label: providerRowName(row, removed),
         color: SERIES_COLORS[index % SERIES_COLORS.length]!,
         values,
         value: formatRate(last),
@@ -134,7 +130,7 @@ export function ProvidersDashboard() {
                       <span
                         className={`truncate font-wv-mono text-[12.5px] ${provider === null ? "text-wv-muted" : "text-wv-fg"}`}
                       >
-                        {rowName(row, removed)}
+                        {providerRowName(row, removed)}
                       </span>
                     </span>
                     <span className={cell}>{totals ? formatSize(totals.today.bytes) : EM_DASH}</span>

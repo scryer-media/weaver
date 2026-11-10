@@ -10,8 +10,9 @@ use chrono::{Days, Local, NaiveDate, TimeZone};
 use serde::{Deserialize, Serialize};
 
 use weaver_server_core::operations::{
-    FinishedJobCounts, RecoveryBytes, UsageConsumerKind as CoreKind, UsageConsumerSummary,
-    UsageCounts, UsagePeriod, UsageSummary, period_bounds, summarize_usage, summary_read_from,
+    FinishedJobCounts, REMOVED_SERVER_ID_PREFIX, RecoveryBytes, UsageConsumerKind as CoreKind,
+    UsageConsumerSummary, UsageCounts, UsagePeriod, UsageSummary, period_bounds, summarize_usage,
+    summary_read_from,
 };
 use weaver_server_core::torrents::metrics::Published;
 use weaver_server_core::{Database, StateError};
@@ -124,6 +125,9 @@ pub struct UsageConsumer {
     pub range: UsageTotals,
     /// Every date of the range in order, days with nothing at zero.
     pub days: Vec<UsageDay>,
+    /// For a removed server whose rows are kept until its quota resets: the
+    /// server's name when it was removed. Absent for every other consumer.
+    pub removed_host: Option<String>,
 }
 
 impl From<UsageConsumerSummary> for UsageConsumer {
@@ -151,6 +155,7 @@ impl From<UsageConsumerSummary> for UsageConsumer {
                     duration_ms: counts.duration_ms,
                 })
                 .collect(),
+            removed_host: None,
         }
     }
 }
@@ -272,16 +277,41 @@ pub fn load_usage_history(
         local_day_start(next_day(summary.range_end)),
     )?;
     let day = |date: NaiveDate| date.format("%Y-%m-%d").to_string();
+    let mut consumers: Vec<UsageConsumer> = summary.consumers.into_iter().map(Into::into).collect();
+    if kind.is_none_or(|kind| kind == CoreKind::Server) {
+        name_removed_servers(db, &mut consumers)?;
+    }
     Ok(UsageHistory {
         today: day(summary.today),
         range_start: day(summary.range_start),
         range_end: day(summary.range_end),
         today_start_epoch_sec: today_start,
         total: summary.total.into(),
-        consumers: summary.consumers.into_iter().map(Into::into).collect(),
+        consumers,
         finished_today: finished_today.into(),
         finished_in_range: finished_in_range.into(),
     })
+}
+
+/// Give each removed server's kept rows the name the server had.
+fn name_removed_servers(db: &Database, consumers: &mut [UsageConsumer]) -> Result<(), StateError> {
+    let server = CoreKind::Server.as_str();
+    if !consumers.iter().any(|consumer| {
+        consumer.kind == server && consumer.id.starts_with(REMOVED_SERVER_ID_PREFIX)
+    }) {
+        return Ok(());
+    }
+    let removed = db.read_removed_servers()?;
+    for consumer in consumers
+        .iter_mut()
+        .filter(|consumer| consumer.kind == server)
+    {
+        consumer.removed_host = removed
+            .iter()
+            .find(|entry| entry.consumer_id == consumer.id)
+            .map(|entry| entry.host.clone());
+    }
+    Ok(())
 }
 
 /// This host's local date now.

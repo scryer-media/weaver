@@ -98,6 +98,11 @@ impl ServersMutation {
 
         let tls_diagnostics = persist_tls_diagnostics(db, id, probe.as_ref()).await?;
         info!(id, "server added");
+        // A removed server may have had this id; the ledger counts it as this
+        // server from here on.
+        if let Some(recorder) = usage_recorder(ctx) {
+            recorder.reuse_server_id(id);
+        }
 
         crate::proxies::refresh(ctx).await?;
         activate_nntp_runtime("add_server", id, config, handle).await?;
@@ -253,13 +258,23 @@ impl ServersMutation {
                 None => None,
             };
         {
+            // No data-used batch is written while the rows move, and what the
+            // ledger still holds of this server follows them.
+            let recorder = usage_recorder(ctx);
+            let _usage_writes = match &recorder {
+                Some(recorder) => Some(recorder.hold_writes().await),
+                None => None,
+            };
             let db = db.clone();
-            let deleted = spawn_blocking_db("servers.mutation.remove_server.persist", move || {
-                db.delete_server(id)
+            let removal = spawn_blocking_db("servers.mutation.remove_server.persist", move || {
+                db.delete_server_at(id, chrono::Local::now())
             })
             .await?;
-            if !deleted {
+            if !removal.removed {
                 return Err(async_graphql::Error::new(format!("server {id} not found")));
+            }
+            if let Some(recorder) = &recorder {
+                recorder.retire_server(id, removal.kept_usage.as_deref());
             }
         }
 
@@ -540,6 +555,14 @@ impl NormalizedServerInput {
             tls_name_mismatch_certificate_der: self.tls_name_mismatch_certificate_der.clone(),
         }
     }
+}
+
+// The data-used ledger's recorder, when the server runs one.
+fn usage_recorder(
+    ctx: &Context<'_>,
+) -> Option<std::sync::Arc<weaver_server_core::operations::UsageRecorder>> {
+    ctx.data_opt::<Option<std::sync::Arc<weaver_server_core::operations::UsageRecorder>>>()
+        .and_then(Clone::clone)
 }
 
 // Hand a successful probe's first-byte latency to the download runtime, so a

@@ -17,3 +17,14 @@ CREATE TABLE usage_daily (
     duration_ms INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (day, consumer_kind, consumer_id)
 );
+
+-- A removed server whose quota resets on a calendar keeps its rows until its
+-- next reset after the removal. Its rows move to the consumer id kept here,
+-- which no live server id can take, and go with this row at `remove_at`, in
+-- epoch seconds. `host` is the server's name when it was removed.
+CREATE TABLE usage_removed_servers (
+    consumer_id TEXT PRIMARY KEY,
+    server_id INTEGER NOT NULL,
+    host TEXT NOT NULL,
+    remove_at INTEGER NOT NULL
+);

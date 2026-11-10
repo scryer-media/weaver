@@ -35,6 +35,8 @@ export interface UsageConsumer {
   allTime: UsageTotals;
   range: UsageTotals;
   days: UsageDay[];
+  /** A removed server's name, while its usage is kept until its quota resets. */
+  removedHost?: string | null;
 }
 
 export interface FinishedJobs {
@@ -287,6 +289,15 @@ export interface ProviderRow {
   serverId: string | null;
   provider: ProviderHealth | null;
   usage: UsageConsumer | null;
+}
+
+/**
+ * A row's name: the configured server's host, or, for a server no longer
+ * configured, `removed` of the name it had, or of its id when the ledger
+ * keeps no name.
+ */
+export function providerRowName(row: ProviderRow, removed: (name: string) => string): string {
+  return row.provider?.host ?? removed(row.usage?.removedHost ?? row.serverId ?? "");
 }
 
 /**

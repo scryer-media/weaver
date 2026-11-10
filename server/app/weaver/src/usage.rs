@@ -178,12 +178,14 @@ fn epoch_sec_now() -> i64 {
 }
 
 /// Read once and write what moved. A failed write keeps its counts for the
-/// next one.
+/// next one. A server removal waits for this, so what the batch holds of a
+/// removed server is written before its rows move, never after.
 pub(crate) async fn record_and_flush(
     recorder: &Arc<UsageRecorder>,
     sources: &UsageSources,
     db: &Database,
 ) {
+    let _writes = recorder.hold_writes().await;
     let reading = sources.read().await;
     let today = Local::now().date_naive();
     recorder.observe(&reading, today, epoch_sec_now());

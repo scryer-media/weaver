@@ -55,9 +55,9 @@ pub use metrics_store::{
 pub use recovery::{RecoveredServerState, RestoreCandidate, recover_server_state};
 pub(crate) use recovery::{read_stored_files, restore_request};
 pub use usage_history::{
-    FinishedJobCounts, JOBS_FINISHED, JOBS_REPAIRED, RecoveryBytes, ServerStateReading,
-    ServerUsageReading, StageReading, TorrentUsageReading, USAGE_FLUSH_INTERVAL_SECS,
-    USAGE_RETENTION_DAYS, UsageConsumerKind, UsageConsumerSummary, UsageConsumerTotal, UsageCounts,
-    UsageDayRow, UsageFlush, UsagePeriod, UsageReading, UsageRecorder, UsageSummary, period_bounds,
-    summarize_usage, summary_read_from, week_start,
+    FinishedJobCounts, JOBS_FINISHED, JOBS_REPAIRED, REMOVED_SERVER_ID_PREFIX, RecoveryBytes,
+    RemovedServerUsage, ServerStateReading, ServerUsageReading, StageReading, TorrentUsageReading,
+    USAGE_FLUSH_INTERVAL_SECS, USAGE_RETENTION_DAYS, UsageConsumerKind, UsageConsumerSummary,
+    UsageConsumerTotal, UsageCounts, UsageDayRow, UsageFlush, UsagePeriod, UsageReading,
+    UsageRecorder, UsageSummary, period_bounds, summarize_usage, summary_read_from, week_start,
 };

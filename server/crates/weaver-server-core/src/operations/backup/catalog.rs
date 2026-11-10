@@ -55,6 +55,8 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("server_tls_diagnostics", Export, Replace),
     // Data used per day is history a person keeps across a move.
     table!("usage_daily", Export, Replace),
+    // The removed servers whose rows usage_daily still keeps, with them.
+    table!("usage_removed_servers", Export, Replace),
     table!("categories", Export, Replace),
     // Tracker rules are configuration. The torrents that matched one are
     // reset on restore and match the rules again when added.

@@ -16,6 +16,7 @@ import {
   lastDays,
   noTorrents,
   percentOf,
+  providerRowName,
   providerRows,
   providersUp,
   secondsInDay,
@@ -219,6 +220,22 @@ test("provider rows sort by data in the range and keep removed servers the ledge
     ["b.example.test", "removed 9", "a.example.test", "new.example.test"],
   );
   assert.equal(rows[3]!.usage, null);
+});
+
+test("a removed server whose usage is kept shows under its old name, apart from a new server with its id", () => {
+  const kept = { ...consumer("removed-3-1762714800", 40), removedHost: "news.eweka.nl" };
+  const rows = providerRows([provider({ host: "news.other.test", serverId: 3 })], [consumer("3", 5), kept]);
+  const removed = (name: string) => `removed server ${name}`;
+  assert.deepEqual(
+    rows.map((row) => providerRowName(row, removed)),
+    ["removed server news.eweka.nl", "news.other.test"],
+  );
+  assert.equal(rows[1]!.usage?.range.bytes, 5);
+  // A row the ledger keeps no name for falls back to its id.
+  assert.equal(
+    providerRowName({ key: "ledger:9", serverId: "9", provider: null, usage: consumer("9", 1) }, removed),
+    "removed server 9",
+  );
 });
 
 test("repair share is repaired over finished, and no finished jobs is no figure", () => {
