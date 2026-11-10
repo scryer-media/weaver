@@ -23,6 +23,49 @@ Everything below is new since 0.16.12.
   after the download ended. It now reads the archive's directory from the
   last volume's tail as soon as it arrives, and inflates each entry as its
   bytes land, the way the 7z engine already did.
+- **Archives with large dictionaries no longer fail on memory.** A RAR,
+  xz or 7z set whose dictionary is wider than the hardware profile allows
+  now decodes with that window on a scratch file in the job's folder (or
+  the data folder, if the job's folder has no room) instead of in RAM.
+  An archive that still cannot get the memory it needs fails with the
+  sizes, and the job offers **Retry with no limit**.
+
+## Memory
+
+- **Each hardware profile sets the window one decoder may hold.**
+  Efficient allows 256 MiB, Balanced 1 GiB and Performance 4 GiB, for RAR,
+  xz and zstd alike. RAR was held to 256 MiB on every profile, and xz and
+  zstd to 128 MiB.
+- **A wider window goes to a scratch file.** A run that needs more than
+  its profile's window borrows the rest from a preallocated scratch file,
+  which is probed before use. On Balanced and Performance, a run the
+  scratch file cannot take starts again once in RAM, up to the machine's
+  memory less a quarter. On Efficient it fails. Where no scratch window
+  can be mapped (some Windows setups), the run stays in RAM above the
+  profile's window.
+- **Archives share one decode pool and wait for room.** Decode runs from
+  every job reserve from one pool sized to fit one run at the profile's
+  window. A run that does not fit beside the others waits for memory
+  instead of failing. Only a run larger than the whole pool is refused.
+  The pool is separate from download holds, so the most Weaver uses is
+  the hold limit plus the decode pool.
+- **A job that needs too much decode memory says so.** A dictionary or
+  PPMd model over the limit used to fail as unsupported. It now fails as
+  too large, with what the decoder needed and what was allowed, for
+  example `needs 2.0 GiB of decode memory, 1.0 GiB allowed`. Retry with
+  no limit asks for the password again where the archive has one, as
+  Reprocess does.
+- **Holds past their budget spill to disk instead of failing the job.**
+  Bytes that arrive before their place in an archive is known are held in
+  RAM, then in scratch. When both are full, they now go to a spill file
+  beside the member instead of refusing the volume. A multi-volume stored
+  RAR posted under other names than its PAR2 set, fetched out of order,
+  used to fail with nothing delivered. Spilled bytes survive a restart,
+  and a member an older build refused for its holds is reopened from its
+  files.
+- **ZipCrypto data held for its keys is capped at 64 MiB.** Past that,
+  the bytes wait in the job's ordinary holds and are deciphered in order,
+  each byte once.
 
 ## Archives
 
@@ -57,6 +100,20 @@ Everything below is new since 0.16.12.
   27.5 GB member in 100 MiB volumes was refused with
   `WEAVER_EXTRACTION_REJECTED[ratio]`. The ratio is now taken over every
   file in the post except recovery data.
+- **The extraction deadline counts only decoding time.** It ran on the
+  wall clock from the first extracted member, so a job whose articles came
+  slowly, or that waited for a slot, could fail on time no decoder spent.
+  Waiting for articles, a slot, memory or a thread, and time paused, no
+  longer count.
+- **A RAR volume still under its posted name joins its set.** Once PAR2
+  renamed a set's volumes, a volume that still carried the posted name was
+  taken for a different set. Each arrival then started the set over, and
+  a volume could be left behind.
+- **A 7z password ruled wrong on damaged bytes is tried again.** When the
+  bytes that checked the password were damaged, the password was marked
+  wrong for good. It is now tried again when good bytes arrive.
+- **Pausing waits for archive work in progress,** and work that fails off
+  the main loop now fails the job instead of being lost.
 
 ## Restarts
 
@@ -112,6 +169,38 @@ Everything below is new since 0.16.12.
   folder; a job still waiting in the queue still has its folder moved. The new name still
   names the completed folder.
 
+## Housekeeping
+
+- **A failed job's files are deleted a day after it fails.** A new
+  setting, **Delete incomplete files for failed jobs during housekeeping**,
+  is on by default. Housekeeping removes the job's working and staging
+  folders 24 hours after the failure; the history entry stays. It also
+  removes a working folder whose marker names a job that no longer exists,
+  once the marker is a day old. Folders without a Weaver marker are never
+  touched.
+- **Deleting a job from history removes its staging folder,** with or
+  without its files. Reprocess and restart from history clear the job's
+  old working folders first.
+
+## Settings
+
+- **Settings that do not parse fall back to the defaults.** Stored
+  post-processing settings or a content policy that cannot be read used to
+  stop Weaver from starting, or pause and fail jobs. Weaver now uses the
+  defaults until the setting is saved again.
+- **A failed read of the unacceptable-extensions setting no longer refuses
+  every file.** Files wait until the setting can be read. If it still
+  cannot when the job would deliver, the job pauses and names the setting.
+- **Out-of-space errors say so.** A disk reserve refusal now names the
+  folder, the free space, the write and the reserve, in GiB and MiB.
+
+## Dependencies
+
+- sevenz-turbo 0.30.0, lzma-turbo 0.12.0 and unrar-rs 0.16.1, which let
+  Weaver lend their decoders a window.
+- RUSTSEC-2026-0459 is allowed until 2026-12-09. The fix needs
+  libsqlite3-sys 0.39, which sqlx 0.9.0 does not accept yet.
+
 ## Regression coverage
 
 - **The crash test's read-back checks runs of articles.** The archive
@@ -131,6 +220,10 @@ Everything below is new since 0.16.12.
 - **The extraction ratio test fails without its fix.** Its articles are
   now cut so the first volume is written before the later ones are seen,
   as in a real 100 MiB volume set.
+- **Holds are tested at every budget.** Every hold budget at every site,
+  two jobs on one budget, a lower ceiling after a restart, and every
+  archive kind in every serve order under tight holds.
+- **ZipCrypto keys run on loans only,** reading every cipher byte once.
 - **The e2e compose retry removes dependent containers first.** Podman
   refuses to remove a container while another still shares its network,
   so the port-collision retry failed before it ran.
