@@ -1122,6 +1122,8 @@ pub(super) fn state(view: &TorrentView) -> &'static str {
         TorrentState::Queued if view.paused_by.is_some() => side("stoppedDL", "stoppedUP"),
         TorrentState::Queued => side("queuedDL", "queuedUP"),
         TorrentState::FetchingMetadata => "metaDL",
+        // qBittorrent serialize_torrent.cpp:80-81.
+        TorrentState::CheckingResumeData => "checkingResumeData",
         TorrentState::CheckingFiles => side("checkingDL", "checkingUP"),
         TorrentState::Downloading if view.forced => "forcedDL",
         TorrentState::Downloading => "downloading",

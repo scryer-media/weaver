@@ -186,7 +186,14 @@ impl Observed {
 /// The state and the reason behind it, when there is one to give.
 pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
     let detail = |text: &str| Some(text.into());
-    // A move shows first: the torrent's files are on their way, whatever
+    // A torrent starting from what was saved shows that before anything
+    // else, a move or a stop included (qBittorrent
+    // `TorrentImpl::updateState`, torrentimpl.cpp:1291-1293, decides
+    // CheckingResumeData first).
+    if matches!(seen.engine, Engine::Starting) {
+        return (TorrentState::CheckingResumeData, None);
+    }
+    // A move shows next: the torrent's files are on their way, whatever
     // else the engine is doing with them (qBittorrent
     // `TorrentImpl::updateState` decides Moving before Checking).
     if seen.moving {
@@ -233,7 +240,9 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
         return (TorrentState::Queued, None);
     }
     match &seen.engine {
-        Engine::Absent | Engine::Starting => (TorrentState::Queued, None),
+        // In no session yet: it waits for one to take it.
+        Engine::Absent => (TorrentState::Queued, None),
+        Engine::Starting => (TorrentState::CheckingResumeData, None),
         Engine::Checking => (TorrentState::CheckingFiles, None),
         Engine::Live { .. } | Engine::Paused { .. } if seen.seeding() => {
             (TorrentState::Seeding, None)
@@ -665,6 +674,53 @@ mod tests {
         );
     }
 
+    // A torrent starting from what was saved says so before anything else,
+    // as qBittorrent decides CheckingResumeData first
+    // (torrentimpl.cpp:1291-1293). One in no session yet is queued.
+    #[test]
+    fn a_starting_torrent_checks_its_resume_data_before_anything_else() {
+        let starting = seen(Engine::Starting);
+        for observed in [
+            starting.clone(),
+            Observed {
+                moving: true,
+                ..starting.clone()
+            },
+            Observed {
+                intent: TorrentIntent::Stopped,
+                complete: true,
+                ..starting.clone()
+            },
+            Observed {
+                intent: TorrentIntent::Paused,
+                ..starting.clone()
+            },
+            Observed {
+                paused_by: Some(HoldOrigin::Scheduled),
+                ..starting.clone()
+            },
+            Observed {
+                queued: true,
+                has_metadata: false,
+                ..starting.clone()
+            },
+        ] {
+            assert_eq!(
+                project(&observed),
+                (TorrentState::CheckingResumeData, None),
+                "{observed:?}"
+            );
+        }
+        assert_eq!(project(&seen(Engine::Absent)), (TorrentState::Queued, None));
+        assert_eq!(
+            project(&Observed {
+                queued: true,
+                ..seen(Engine::Absent)
+            }),
+            (TorrentState::Queued, None)
+        );
+    }
+
     // A torrent whose directory is on the move says so, whatever its
     // session is doing.
     #[test]
@@ -715,8 +771,9 @@ mod tests {
         );
         assert_eq!(
             project(&seen(Engine::Starting)),
-            (TorrentState::Queued, None)
+            (TorrentState::CheckingResumeData, None)
         );
+        assert_eq!(project(&seen(Engine::Absent)), (TorrentState::Queued, None));
         assert_eq!(
             project(&seen(Engine::Checking)),
             (TorrentState::CheckingFiles, None)

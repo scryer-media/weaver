@@ -28,6 +28,7 @@ import { useTranslate, type Translate } from "@/lib/context/translate-context";
 import { openUrlAsDownload, readDownloadErrorMessage, saveResponseAsDownload } from "@/lib/download";
 import { normalizeJobData, type GraphqlJobData, type JobData } from "@/lib/job-types";
 import { statusToken } from "@/lib/status-tokens";
+import { torrentStateLabelKey } from "@/lib/torrents";
 import {
   Bar,
   DetailBlock,
@@ -251,6 +252,7 @@ function JobDetailContent() {
   const progress = useJobProgress(job ?? NO_JOB);
   const isTorrent = job?.protocol === "TORRENT";
   const { torrent, refresh: refreshTorrent } = useTorrent(jobId, isTorrent);
+  const stateKey = torrentStateLabelKey(torrent?.state);
   // The output folder fills in as the job moves through post-processing and
   // settles when it finishes, so the listing is re-read on each status change
   // rather than kept from the page's first render.
@@ -446,11 +448,7 @@ function JobDetailContent() {
               {job.displayTitle || job.name}
             </h1>
             <StateChip
-              label={
-                torrent?.state === "NEEDS_CERTIFICATE"
-                  ? t("next.torrent.needsCertificate")
-                  : statusLabel(progress.status)
-              }
+              label={stateKey ? t(stateKey) : statusLabel(progress.status)}
               tone={failed ? "bad" : "ok"}
             />
           </div>

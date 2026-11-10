@@ -31,7 +31,8 @@ export type TorrentState =
   | "PAUSED"
   | "STOPPED"
   | "MOVING"
-  | "NEEDS_CERTIFICATE";
+  | "NEEDS_CERTIFICATE"
+  | "CHECKING_RESUME_DATA";
 
 /** A level a torrent takes a setting from. */
 export type SettingLevel = "TORRENT" | "TRACKER_RULE" | "CATEGORY" | "GLOBAL";
@@ -230,6 +231,22 @@ export interface TorrentData extends TorrentSummaryData {
   /** Whether each file's first and last pieces are fetched first. */
   firstLastPieceFirst: boolean;
   trackers: TorrentTrackerData[];
+}
+
+/**
+ * The label key of a torrent state its job's status does not name: a torrent
+ * waiting for a certificate, or one starting from what was saved (qBittorrent's
+ * "Checking resume data"). Null for every other state.
+ */
+export function torrentStateLabelKey(state: TorrentState | undefined): string | null {
+  switch (state) {
+    case "NEEDS_CERTIFICATE":
+      return "next.torrent.needsCertificate";
+    case "CHECKING_RESUME_DATA":
+      return "next.torrent.checkingResumeData";
+    default:
+      return null;
+  }
 }
 
 /** A torrent seeding, or stopped by its goal, shows its ratio and upload in the queue. */

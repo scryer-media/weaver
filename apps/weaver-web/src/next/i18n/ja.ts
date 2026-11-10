@@ -1882,6 +1882,7 @@ export const nextJa: LocaleDictionary = {
   "next.torrent.seedingCell": "比率 · アップロード",
   "next.torrent.force": "強制",
   "next.torrent.needsCertificate": "証明書が必要",
+  "next.torrent.checkingResumeData": "再開データを確認中",
   "next.torrent.unforce": "強制解除",
   "next.torrent.forced": "強制中",
   "next.torrent.unforced": "強制を解除しました",

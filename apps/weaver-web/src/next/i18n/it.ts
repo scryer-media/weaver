@@ -1882,6 +1882,7 @@ export const nextIt: LocaleDictionary = {
   "next.torrent.seedingCell": "Rapporto · upload",
   "next.torrent.force": "Forza",
   "next.torrent.needsCertificate": "Serve un certificato",
+  "next.torrent.checkingResumeData": "Verifica dei dati di ripresa",
   "next.torrent.unforce": "Non forzare",
   "next.torrent.forced": "Forzato",
   "next.torrent.unforced": "Non più forzato",

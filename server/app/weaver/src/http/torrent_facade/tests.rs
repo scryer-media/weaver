@@ -588,6 +588,14 @@ fn every_weaver_state_maps_to_one_client_state() {
             "queuedUP",
         ),
         (view(TorrentState::FetchingMetadata), "metaDL"),
+        (view(TorrentState::CheckingResumeData), "checkingResumeData"),
+        (
+            TorrentView {
+                completed_at_ms: done,
+                ..view(TorrentState::CheckingResumeData)
+            },
+            "checkingResumeData",
+        ),
         (view(TorrentState::CheckingFiles), "checkingDL"),
         (
             TorrentView {
@@ -662,6 +670,30 @@ fn every_weaver_state_maps_to_one_client_state() {
     for (view, expected) in cases {
         assert_eq!(state(&view), expected, "{:?}", view.state);
     }
+}
+
+// A torrent checking its resume data passes the checking filter alone of
+// the state filters (qBittorrent torrentfilter.cpp:186-190); a queued one
+// still reads as queued.
+#[test]
+fn a_starting_torrent_passes_the_checking_filter() {
+    let starting = view(TorrentState::CheckingResumeData);
+    assert!(wanted(&starting, "checking"));
+    for filter in [
+        "downloading",
+        "seeding",
+        "completed",
+        "stopped",
+        "stalled",
+        "moving",
+        "errored",
+    ] {
+        assert!(!wanted(&starting, filter), "{filter}");
+    }
+    assert!(wanted(&starting, "running"));
+    let queued = view(TorrentState::Queued);
+    assert_eq!(state(&queued), "queuedDL");
+    assert!(!wanted(&queued, "checking"));
 }
 
 fn file(index: u32, path: &str) -> TorrentFile {

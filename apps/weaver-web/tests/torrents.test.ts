@@ -10,6 +10,7 @@ import {
   routeReasonText,
   TORRENT_ROUTE_REASONS,
   showsSeeding,
+  torrentStateLabelKey,
   trackerSourceKey,
   type TorrentData,
 } from "../src/lib/torrents.ts";
@@ -259,4 +260,15 @@ test("a torrentUpdates push lands on the torrents held: whole when full, else wh
   assert.deepEqual([...full.values()], [row(1, 0), row(2, 0)]);
   const again = applyTorrentChanges(moved, { fullUpdate: true, torrents: [row(3, 0)], removedIds: [] });
   assert.deepEqual([...again.values()], [row(3, 0)]);
+});
+
+test("a torrent starting from what was saved and one needing a certificate name their own state", () => {
+  assert.equal(torrentStateLabelKey("CHECKING_RESUME_DATA"), "next.torrent.checkingResumeData");
+  assert.equal(torrentStateLabelKey("NEEDS_CERTIFICATE"), "next.torrent.needsCertificate");
+  assert.equal(torrentStateLabelKey("QUEUED"), null);
+  assert.equal(torrentStateLabelKey(undefined), null);
+  assert.equal(t("next.torrent.checkingResumeData"), "Checking resume data");
+  for (const [locale, dictionary] of Object.entries({ en: nextEn, de: nextDe, es: nextEs, fr: nextFr, it: nextIt, ja: nextJa, ko: nextKo, pt: nextPt, zh: nextZh })) {
+    assert.ok(dictionary["next.torrent.checkingResumeData"], locale);
+  }
 });
