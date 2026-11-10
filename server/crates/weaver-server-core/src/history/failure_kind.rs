@@ -172,6 +172,17 @@ mod tests {
             derive(Some(PipelineFailureStage::Move), "No space left on device"),
             HistoryFailureKind::DiskFull
         );
+        // The extraction budget's disk reserve refusal reports a full disk,
+        // whichever stage the job was in when it crossed the reserve.
+        assert_eq!(
+            derive(
+                Some(PipelineFailureStage::Download),
+                "WEAVER_EXTRACTION_REJECTED[disk_reserve]: out of disk space: the disk holding \
+                 /data/intermediate/job has 1.5 GiB free, writing 10 B more would leave 1.5 GiB, \
+                 and 2.0 GiB must stay free"
+            ),
+            HistoryFailureKind::DiskFull
+        );
     }
 
     #[test]
