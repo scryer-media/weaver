@@ -250,7 +250,10 @@ impl AnnouncePort {
             PortmapTransport::PcpIpv6 => &mut mapped.pcp_ipv6,
         };
         *port = event.external_port;
-        let external = |ipv6| self.listen.map(|listen| mapped.port(ipv6).unwrap_or(listen));
+        let external = |ipv6| {
+            self.listen
+                .map(|listen| mapped.port(ipv6).unwrap_or(listen))
+        };
         let told = match self.set {
             Some(set) => ToldPorts::both(Some(set)),
             None => ToldPorts {
@@ -2201,7 +2204,8 @@ impl Session {
     /// the one holding the address the session's clients send public
     /// traffic from. Neither runs on an interface that reaches only the
     /// local network. A session held to a global IPv6 address, or bound to
-    /// a device with one, also maps from that address over PCP (libtorrent
+    /// a device with one, also maps from that address over PCP, and one on
+    /// `[::]` bound to no device from each global IPv6 address (libtorrent
     /// starts a NAT-PMP / PCP mapper on each IPv6 listen socket that is not
     /// local); one held to an IPv6 address maps over IPv4 not at all.
     fn start_port_mapping(
@@ -2233,7 +2237,13 @@ impl Session {
         if let Some(IpAddr::V6(listen)) = listen_ip
             && !self.ipv4_only
         {
-            self.map_ipv6(listen, requests, bind_device_name, events_tx);
+            self.map_ipv6(
+                listen,
+                requests,
+                bind_device_name,
+                events_tx,
+                forward.clone(),
+            );
         }
         self.follow_port_mappings(events, self.ssl_mapped_port(), forward);
     }
@@ -2283,8 +2293,14 @@ impl Session {
         self.map_over(route, requests, events_tx);
     }
 
-    /// Map `requests` over PCP from the session's global IPv6 address:
-    /// `listen` when the session is held to it, else one of its device's.
+    /// Map `requests` over PCP from the session's global IPv6 addresses:
+    /// `listen` when the session is held to it, else one of its device's,
+    /// else, on `[::]` bound to no device, each global IPv6 address of each
+    /// interface, every one from its own interface's IPv6 gateway
+    /// (libtorrent starts a PCP mapper on each IPv6 listen socket that is
+    /// not local). The session tells one IPv6 port, so only the first
+    /// address's mapping is announced: the one public IPv6 traffic leaves
+    /// from. The others are still requested, and their reports passed on.
     /// A session with no such address maps nothing over IPv6.
     fn map_ipv6(
         &self,
@@ -2292,27 +2308,61 @@ impl Session {
         requests: Vec<PortMapRequest>,
         bind_device_name: Option<&str>,
         events_tx: PortMapEvents,
+        forward: Option<PortMapEvents>,
     ) {
-        let interface = match crate::route_interface::ipv6_route_interface(
-            listen,
-            bind_device_name,
-            self.http_clients.as_ref(),
-        ) {
-            Ok(None) => {
-                debug!("no global IPv6 address to map over PCP");
-                return;
-            }
-            Ok(Some(interface)) => Ok(interface),
-            Err(e) => Err(format!("{e:#}")),
-        };
-        info!(?requests, ?interface, "starting PCP port mapping over IPv6");
-        let route = interface.and_then(|i| GatewayRoute::of(&i).map_err(|e| format!("{e:#}")));
-        self.spawn_port_mapper(
-            "pcp_ipv6_forward",
-            NatPmpMapper::new(route, requests, None, self.http_clients.clone())
-                .ipv6()
-                .run(self.cancellation_token.clone(), events_tx),
-        );
+        let interfaces: Vec<Result<crate::route_interface::RouteInterface, String>> =
+            match crate::route_interface::ipv6_route_interfaces(
+                listen,
+                bind_device_name,
+                self.http_clients.as_ref(),
+            ) {
+                Ok(each) => each.into_iter().map(Ok).collect(),
+                Err(e) => vec![Err(format!("{e:#}"))],
+            };
+        if interfaces.is_empty() {
+            debug!("no global IPv6 address to map over PCP");
+            return;
+        }
+        let routes = interfaces
+            .into_iter()
+            .map(|interface| {
+                info!(?requests, ?interface, "starting PCP port mapping over IPv6");
+                interface.and_then(|i| GatewayRoute::of(&i).map_err(|e| format!("{e:#}")))
+            })
+            .collect();
+        self.map_ipv6_over(routes, requests, events_tx, forward);
+    }
+
+    /// Run a PCP mapper for `requests` over each of `routes`, each from its
+    /// own address to its own gateway. Only the first's reports move the
+    /// port the session announces; every one's are passed on to `forward`.
+    fn map_ipv6_over(
+        &self,
+        routes: Vec<Result<GatewayRoute, String>>,
+        requests: Vec<PortMapRequest>,
+        events_tx: PortMapEvents,
+        forward: Option<PortMapEvents>,
+    ) {
+        let mut unannounced: Option<PortMapEvents> = None;
+        for (at, route) in routes.into_iter().enumerate() {
+            let events = if at == 0 {
+                events_tx.clone()
+            } else {
+                unannounced
+                    .get_or_insert_with(|| {
+                        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                        self.pass_on_port_mappings(rx, forward.clone());
+                        tx
+                    })
+                    .clone()
+            };
+            self.spawn_port_mapper(
+                "pcp_ipv6_forward",
+                NatPmpMapper::new(route, requests.clone(), None, self.http_clients.clone())
+                    .ipv6()
+                    .run(self.cancellation_token.clone(), events),
+            );
+        }
     }
 
     /// Run a NAT-PMP / PCP mapper for `requests` over `route`, through the
@@ -2365,6 +2415,26 @@ impl Session {
                     announce_port.on_port_mapping(&event);
                 }
                 external_ips.on_port_mapping(&event, tokio::time::Instant::now());
+                if let Some(forward) = &forward {
+                    let _ = forward.send(event);
+                }
+            }
+            Ok(())
+        });
+    }
+
+    /// Log each of `events` and pass it on to `forward`, with no port
+    /// announced from it and no external address counted: the mappings of
+    /// an IPv6 address the session does not announce.
+    fn pass_on_port_mappings(&self, mut events: PortMapReceiver, forward: Option<PortMapEvents>) {
+        self.spawn_port_mapper("port_mapping_unannounced", async move {
+            while let Some(event) = events.recv().await {
+                match &event.error {
+                    None => info!(?event, "port mapping, not announced"),
+                    Some(error) => {
+                        warn!(?event.transport, ?event.protocol, "port mapping failed: {error}")
+                    }
+                }
                 if let Some(forward) = &forward {
                     let _ = forward.send(event);
                 }
@@ -4360,6 +4430,95 @@ mod tests {
             let wanted = if mapped { "2002" } else { listening.as_str() };
             assert_eq!(port, wanted, "a tracker at {tracker}");
         }
+        Ok(())
+    }
+
+    // A session on `[::]` maps its port over PCP from each global IPv6
+    // address, each from its own gateway (libtorrent starts a mapper on each
+    // expanded IPv6 listen socket, session_impl.cpp:5912-5919). It tells
+    // one IPv6 port: the one the first address got. Every report is passed
+    // on, the other address's too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn each_ipv6_address_is_mapped_and_the_first_one_announced() -> anyhow::Result<()> {
+        use crate::natpmp::GatewayRoute;
+        use crate::upnp::{PortMapRequest, PortmapProtocol};
+        use anyhow::Context;
+        use std::net::Ipv6Addr;
+        let dir = TempDir::new()?;
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (Ipv6Addr::UNSPECIFIED, 0).into(),
+                    ..Default::default()
+                }),
+                ..crate::test_support::session_options()
+            },
+        )
+        .await?;
+        let local_port = session.listen_addr().context("no listener")?.port();
+        let gateways = [
+            crate::test_support::udp((Ipv6Addr::LOCALHOST, 0)).await,
+            crate::test_support::udp((Ipv6Addr::LOCALHOST, 0)).await,
+        ];
+        let routes = gateways
+            .iter()
+            .map(|gateway| {
+                Ok(GatewayRoute {
+                    local_ip: Ipv6Addr::LOCALHOST.into(),
+                    gateway: gateway.bind_addr(),
+                    interface_addresses: vec![Ipv6Addr::LOCALHOST.into()],
+                })
+            })
+            .collect();
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let (forward, mut forwarded) = tokio::sync::mpsc::unbounded_channel();
+        session.map_ipv6_over(
+            routes,
+            vec![PortMapRequest {
+                protocol: PortmapProtocol::Tcp,
+                local_port,
+                external_port: local_port,
+            }],
+            events_tx,
+            Some(forward.clone()),
+        );
+        session.follow_port_mappings(events, None, Some(forward));
+        for (gateway, granted) in gateways.iter().zip([2004u16, 2006]) {
+            let mut buf = [0u8; 1100];
+            let (n, mapper) = gateway.recv_from(&mut buf).await?;
+            let request = &buf[..n];
+            let mut answer = vec![2, 0x80 | 1, 0, 0];
+            answer.extend_from_slice(&7200u32.to_be_bytes());
+            answer.extend_from_slice(&1u32.to_be_bytes());
+            answer.extend_from_slice(&[0; 12]);
+            answer.extend_from_slice(&request[24..42]);
+            answer.extend_from_slice(&granted.to_be_bytes());
+            answer.extend_from_slice(&Ipv6Addr::UNSPECIFIED.octets());
+            gateway.send_to(&answer, mapper).await?;
+        }
+        let mut granted = Vec::new();
+        while granted.len() < 2 {
+            let report = forwarded.recv().await.context("the reports stopped")?;
+            if let Some(port) = report.external_port {
+                granted.push(port);
+            }
+        }
+        granted.sort_unstable();
+        assert_eq!(granted, [2004, 2006]);
+        assert_eq!(
+            session.announce_ports(),
+            ToldPorts {
+                v4: Some(local_port),
+                v6: Some(2004),
+            }
+        );
+        session.stop().await;
         Ok(())
     }
 
