@@ -21,6 +21,7 @@ fn usage(date: Option<NaiveDate>, kind: UsageConsumerKind, id: &str, bytes: u64)
             articles_tried: bytes / 10,
             articles_succeeded: bytes / 20,
             down_seconds: 0,
+            ..UsageCounts::default()
         },
     }
 }
@@ -273,4 +274,236 @@ async fn the_finished_count_matches_the_history_it_links_to() {
     assert_eq!(finished["complete"], 1);
     assert_eq!(finished["failed"], 2);
     assert_eq!(data["historyPage"]["totalCount"], 3);
+}
+
+fn counted(
+    date: Option<NaiveDate>,
+    kind: UsageConsumerKind,
+    id: &str,
+    counts: UsageCounts,
+) -> UsageDayRow {
+    UsageDayRow {
+        day: date,
+        kind: kind.as_str().to_string(),
+        consumer_id: id.to_string(),
+        counts,
+    }
+}
+
+const INTEGRITY: &str = r#"
+query Integrity($range: UsageRange!) {
+  integrityHistory(range: $range) {
+    rangeStart
+    rangeEnd
+    finished { id range { events } days { day events } }
+    repaired { id range { events } }
+    stages { id range { events durationMs } }
+    recovery { availableBytes fetchedBytes }
+    failures { cause count }
+  }
+}
+"#;
+
+#[tokio::test]
+async fn integrity_reads_the_job_ledger_and_the_history() {
+    let harness = TestHarness::new().await;
+    let events = |events| UsageCounts {
+        events,
+        ..UsageCounts::default()
+    };
+    harness
+        .db
+        .write_usage_flush(&UsageFlush {
+            rows: vec![
+                counted(
+                    day(2024, 5, 1),
+                    UsageConsumerKind::Job,
+                    "finished",
+                    events(3),
+                ),
+                counted(
+                    day(2024, 5, 3),
+                    UsageConsumerKind::Job,
+                    "finished",
+                    events(2),
+                ),
+                counted(
+                    day(2024, 5, 3),
+                    UsageConsumerKind::Job,
+                    "repaired",
+                    events(1),
+                ),
+                counted(
+                    day(2024, 4, 1),
+                    UsageConsumerKind::Job,
+                    "repaired",
+                    events(9),
+                ),
+                counted(
+                    day(2024, 5, 2),
+                    UsageConsumerKind::Stage,
+                    "repair",
+                    UsageCounts {
+                        events: 2,
+                        duration_ms: 4_000,
+                        ..UsageCounts::default()
+                    },
+                ),
+            ],
+            fold_before: None,
+        })
+        .unwrap();
+    let noon = chrono::Local
+        .from_local_datetime(&day(2024, 5, 2).unwrap().and_hms_opt(12, 0, 0).unwrap())
+        .earliest()
+        .unwrap()
+        .timestamp();
+    for (id, status, at, available, fetched) in [
+        (1, "complete", noon, 100, 0),
+        (2, "failed", noon + 60, 40, 40),
+        (3, "failed", noon - 30 * 86_400, 7, 7),
+    ] {
+        let mut row = finished_row(id, status, at);
+        row.optional_recovery_bytes = available;
+        row.optional_recovery_downloaded_bytes = fetched;
+        harness.insert_history_row(&row);
+    }
+    harness
+        .db
+        .set_history_failure_kind(
+            2,
+            Some(weaver_server_core::history::HistoryFailureKind::Repair),
+        )
+        .unwrap();
+    let response = harness
+        .execute_with_variables(
+            INTEGRITY,
+            variables(serde_json::json!({
+                "range": { "period": "CUSTOM", "fromDay": "2024-05-01", "toDay": "2024-05-03" },
+            })),
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let integrity = &data["integrityHistory"];
+    assert_eq!(integrity["finished"]["id"], "finished");
+    assert_eq!(integrity["finished"]["range"]["events"], 5);
+    assert_eq!(
+        integrity["finished"]["days"],
+        serde_json::json!([
+            { "day": "2024-05-01", "events": 3 },
+            { "day": "2024-05-02", "events": 0 },
+            { "day": "2024-05-03", "events": 2 },
+        ])
+    );
+    assert_eq!(integrity["repaired"]["range"]["events"], 1);
+    assert_eq!(
+        integrity["stages"],
+        serde_json::json!([{ "id": "repair", "range": { "events": 2, "durationMs": 4000 } }])
+    );
+    assert_eq!(
+        integrity["recovery"],
+        serde_json::json!({ "availableBytes": 140, "fetchedBytes": 40 })
+    );
+    assert_eq!(
+        integrity["failures"],
+        serde_json::json!([{ "cause": "repair", "count": 1 }])
+    );
+}
+
+#[tokio::test]
+async fn integrity_with_no_jobs_reads_as_zero() {
+    let harness = TestHarness::new().await;
+    let response = harness
+        .execute_with_variables(
+            INTEGRITY,
+            variables(serde_json::json!({ "range": { "period": "WEEK" } })),
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let integrity = &data["integrityHistory"];
+    assert_eq!(integrity["finished"]["range"]["events"], 0);
+    assert_eq!(integrity["repaired"]["id"], "repaired");
+    assert_eq!(integrity["stages"], serde_json::json!([]));
+    assert_eq!(integrity["failures"], serde_json::json!([]));
+    assert_eq!(
+        integrity["recovery"],
+        serde_json::json!({ "availableBytes": 0, "fetchedBytes": 0 })
+    );
+}
+
+const TORRENTS: &str = r#"
+query Torrents($range: UsageRange!) {
+  torrentHistory(range: $range) {
+    total { kind range { bytes bytesUploaded durationMs } }
+    trackers { id range { bytes bytesUploaded durationMs } }
+    peers { torrents connected seeds }
+  }
+}
+"#;
+
+#[tokio::test]
+async fn torrents_read_the_total_and_each_tracker() {
+    let harness = TestHarness::new().await;
+    let seeded = |bytes, uploaded, ms| UsageCounts {
+        bytes,
+        bytes_uploaded: uploaded,
+        duration_ms: ms,
+        ..UsageCounts::default()
+    };
+    harness
+        .db
+        .write_usage_flush(&UsageFlush {
+            rows: vec![
+                counted(
+                    day(2024, 5, 2),
+                    UsageConsumerKind::Torrent,
+                    "",
+                    seeded(30, 90, 5_000),
+                ),
+                counted(
+                    day(2024, 5, 2),
+                    UsageConsumerKind::Tracker,
+                    "a.test",
+                    seeded(20, 80, 4_000),
+                ),
+                counted(
+                    day(2024, 5, 2),
+                    UsageConsumerKind::Tracker,
+                    "",
+                    seeded(10, 10, 1_000),
+                ),
+            ],
+            fold_before: None,
+        })
+        .unwrap();
+    let response = harness
+        .execute_with_variables(
+            TORRENTS,
+            variables(serde_json::json!({
+                "range": { "period": "CUSTOM", "fromDay": "2024-05-01", "toDay": "2024-05-03" },
+            })),
+        )
+        .await;
+    assert_no_errors(&response);
+    let data = response_data(&response);
+    let torrents = &data["torrentHistory"];
+    assert_eq!(torrents["total"]["kind"], "torrent");
+    assert_eq!(
+        torrents["total"]["range"],
+        serde_json::json!({ "bytes": 30, "bytesUploaded": 90, "durationMs": 5000 })
+    );
+    assert_eq!(
+        torrents["trackers"],
+        serde_json::json!([
+            { "id": "", "range": { "bytes": 10, "bytesUploaded": 10, "durationMs": 1000 } },
+            { "id": "a.test", "range": { "bytes": 20, "bytesUploaded": 80, "durationMs": 4000 } },
+        ])
+    );
+    // No torrent client in this server: no peers.
+    assert_eq!(
+        torrents["peers"],
+        serde_json::json!({ "torrents": 0, "connected": 0, "seeds": 0 })
+    );
 }

@@ -1,11 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useTranslate } from "@/lib/context/translate-context";
 import { SectionHeader, Square } from "../../components/chrome";
 import { Chart, type ChartSeries } from "../../components/Chart";
-import { Segmented } from "../../components/controls";
 import { useNow } from "../../data/clock";
 import {
   averageDailySpeed,
@@ -13,9 +12,7 @@ import {
   foundPercent,
   providerRows,
   providerUp,
-  USAGE_KEPT_DAYS,
   type ProviderRow,
-  type UsagePeriod,
 } from "../../data/dashboards";
 import {
   EM_DASH,
@@ -33,9 +30,8 @@ import { providerStateLabel } from "../../i18n/labels";
 import { NextShell } from "../../shell/NextShell";
 import { AttentionBlock, UptimeBlock } from "../../shell/rail-blocks";
 import { DashboardNav } from "./dashboards";
-import { useUsageHistory, type UsageRangeInput } from "./usage";
-
-const PERIODS: readonly UsagePeriod[] = ["TODAY", "WEEK", "MONTH", "YEAR", "ALL", "CUSTOM"];
+import { UsageRangeBar, useUsageRange } from "./RangeBar";
+import { useUsageHistory } from "./usage";
 
 // One colour per server line, in row order, wrapping after the last.
 const SERIES_COLORS = [WV.accent, WV.info, WV.violet, WV.gold, WV.green, WV.warn, WV.error, WV.slate];
@@ -54,19 +50,8 @@ export function ProvidersDashboard() {
   const { providers } = useNextData("providers");
   const now = useNow(60_000);
   const today = dayKey(now);
-  const [period, setPeriod] = useState<UsagePeriod>("MONTH");
-  const [fromDay, setFromDay] = useState(() => dayKey(now - 29 * 86_400_000));
-  const [toDay, setToDay] = useState(today);
-  // Daily rows go back only as far as the server keeps them.
-  const earliestDay = dayKey(now - (USAGE_KEPT_DAYS - 1) * 86_400_000);
-
-  const range = useMemo<UsageRangeInput | null>(() => {
-    if (period !== "CUSTOM") return { period };
-    // Wait for both dates before asking; a half-typed range is not a range.
-    if (!fromDay || !toDay) return null;
-    return { period, fromDay: fromDay < earliestDay ? earliestDay : fromDay, toDay };
-  }, [period, fromDay, toDay, earliestDay]);
-  const { usage, isLoading, error } = useUsageHistory(range, "SERVER");
+  const rangeState = useUsageRange(now);
+  const { usage, isLoading, error } = useUsageHistory(rangeState.range, "SERVER");
 
   const rows = useMemo(
     () => providerRows(providers, usage?.consumers ?? []),
@@ -104,47 +89,7 @@ export function ProvidersDashboard() {
       statusRight={error ?? undefined}
     >
       <div className="flex min-h-0 flex-1 flex-col overflow-y-auto bg-wv-list">
-        <div className="flex flex-none flex-wrap items-center gap-3 border-b border-wv-hairline bg-wv-app px-4 py-3 sm:px-6">
-          <Segmented
-            label={t("next.usage.range")}
-            value={period}
-            onChange={setPeriod}
-            options={PERIODS.map((value) => ({
-              value,
-              label: t(`next.usage.period.${value.toLowerCase()}`),
-            }))}
-          />
-          {period === "CUSTOM" ? (
-            <div className="flex items-center gap-2 font-wv-mono text-[12.5px] text-wv-secondary">
-              <input
-                type="date"
-                aria-label={t("next.usage.from")}
-                value={fromDay}
-                min={earliestDay}
-                max={toDay || today}
-                onChange={(event) => setFromDay(event.target.value)}
-                className="border border-wv-control bg-wv-input px-2 py-1"
-              />
-              <span aria-hidden>–</span>
-              <input
-                type="date"
-                aria-label={t("next.usage.to")}
-                value={toDay}
-                min={fromDay || earliestDay}
-                max={today}
-                onChange={(event) => setToDay(event.target.value)}
-                className="border border-wv-control bg-wv-input px-2 py-1"
-              />
-            </div>
-          ) : null}
-          {usage ? (
-            <span className="ml-auto font-wv-mono text-[11.5px] text-wv-muted">
-              {usage.rangeStart === usage.rangeEnd
-                ? usage.rangeStart
-                : `${usage.rangeStart} – ${usage.rangeEnd}`}
-            </span>
-          ) : null}
-        </div>
+        <UsageRangeBar state={rangeState} rangeStart={usage?.rangeStart} rangeEnd={usage?.rangeEnd} />
 
         <section className="flex flex-none flex-col">
           <SectionHeader label={t("next.rail.providers")} sticky={false} />

@@ -875,6 +875,9 @@ pub struct JobState {
     pub failed_bytes: u64,
     // Total bytes of PAR2 recovery files, cached from spec at job creation.
     pub par2_bytes: u64,
+    // A repair came back applied in this process. Reporting only: the
+    // monitoring ledger counts the job repaired when it finishes.
+    pub repaired: bool,
     // Persisted probe facts used for pre-extraction classification.
     pub detected_archives: std::collections::HashMap<u32, DetectedArchiveIdentity>,
     // Mutable file identity used by runtime/archive logic after rename/classification.

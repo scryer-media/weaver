@@ -29,6 +29,16 @@ const DASHBOARDS: readonly Dashboard[] = [
     page: lazy(() => import("./ProvidersDashboard").then((module) => ({ default: module.ProvidersDashboard }))),
   },
   {
+    id: "integrity",
+    label: "next.monitoring.dash.integrity",
+    page: lazy(() => import("./IntegrityDashboard").then((module) => ({ default: module.IntegrityDashboard }))),
+  },
+  {
+    id: "torrents",
+    label: "next.monitoring.dash.torrents",
+    page: lazy(() => import("./TorrentsDashboard").then((module) => ({ default: module.TorrentsDashboard }))),
+  },
+  {
     id: "engine",
     label: "next.monitoring.dash.engine",
     page: lazy(() => import("../MonitoringPage").then((module) => ({ default: module.MonitoringPage }))),

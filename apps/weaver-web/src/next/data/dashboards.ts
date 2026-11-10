@@ -12,6 +12,12 @@ export interface UsageTotals {
   articlesTried: number;
   articlesSucceeded: number;
   downSeconds: number;
+  /** Sent to peers, for a torrent or tracker. */
+  bytesUploaded: number;
+  /** Jobs for a job row, timed runs for a stage. */
+  events: number;
+  /** Stage time, or seeding time. */
+  durationMs: number;
 }
 
 export interface UsageDay extends UsageTotals {
@@ -55,6 +61,9 @@ export const NO_USAGE: UsageTotals = {
   articlesTried: 0,
   articlesSucceeded: 0,
   downSeconds: 0,
+  bytesUploaded: 0,
+  events: 0,
+  durationMs: 0,
 };
 
 /** A local date as the server spells it. */
@@ -80,6 +89,9 @@ export function sumDays(days: readonly UsageTotals[]): UsageTotals {
       articlesTried: total.articlesTried + day.articlesTried,
       articlesSucceeded: total.articlesSucceeded + day.articlesSucceeded,
       downSeconds: total.downSeconds + day.downSeconds,
+      bytesUploaded: total.bytesUploaded + day.bytesUploaded,
+      events: total.events + day.events,
+      durationMs: total.durationMs + day.durationMs,
     }),
     NO_USAGE,
   );
@@ -89,6 +101,94 @@ export function sumDays(days: readonly UsageTotals[]): UsageTotals {
 export function foundPercent(totals: UsageTotals): number | null {
   if (totals.articlesTried <= 0) return null;
   return (Math.min(totals.articlesSucceeded, totals.articlesTried) / totals.articlesTried) * 100;
+}
+
+export interface RecoveryTotals {
+  availableBytes: number;
+  fetchedBytes: number;
+}
+
+export interface FailureCount {
+  /** The server's failure kind; empty when the job kept none. */
+  cause: string;
+  count: number;
+}
+
+export interface IntegrityHistory {
+  today: string;
+  rangeStart: string;
+  rangeEnd: string;
+  finished: UsageConsumer;
+  repaired: UsageConsumer;
+  stages: UsageConsumer[];
+  recovery: RecoveryTotals;
+  failures: FailureCount[];
+}
+
+export interface TorrentPeers {
+  torrents: number;
+  connected: number;
+  seeds: number;
+}
+
+export interface TorrentHistory {
+  today: string;
+  rangeStart: string;
+  rangeEnd: string;
+  total: UsageConsumer;
+  /** A torrent counts under each tracker it lists, so these never add up. */
+  trackers: UsageConsumer[];
+  peers: TorrentPeers;
+}
+
+/** Part out of whole, 0 to 100; `null` when the whole is nothing. */
+export function percentOf(part: number, whole: number): number | null {
+  if (whole <= 0) return null;
+  return (Math.min(Math.max(part, 0), whole) / whole) * 100;
+}
+
+/** Each day's share of finished jobs that needed a repair, 0 to 100. */
+export function dailyRepairShare(finished: readonly UsageDay[], repaired: readonly UsageDay[]): number[] {
+  const byDay = new Map(repaired.map((day) => [day.day, day.events]));
+  return finished.map((day) => percentOf(byDay.get(day.day) ?? 0, day.events) ?? 0);
+}
+
+/** A stage's average run in seconds; `null` when it never ran. */
+export function averageSeconds(totals: UsageTotals): number | null {
+  return totals.events > 0 ? totals.durationMs / totals.events / 1000 : null;
+}
+
+/** Sent over received; `null` when nothing was received. */
+export function shareRatio(totals: UsageTotals): number | null {
+  return totals.bytes > 0 ? totals.bytesUploaded / totals.bytes : null;
+}
+
+/** Job stages in the order a job meets them; the server names them. */
+export const STAGE_ORDER = ["download", "verify", "repair", "extract", "move", "post_process"] as const;
+
+/** Stages in job order; a stage the web does not know goes last. */
+export function stagesInOrder(stages: readonly UsageConsumer[]): UsageConsumer[] {
+  const rank = (id: string) => {
+    const at = (STAGE_ORDER as readonly string[]).indexOf(id);
+    return at < 0 ? STAGE_ORDER.length : at;
+  };
+  return [...stages].sort((left, right) => rank(left.id) - rank(right.id) || left.id.localeCompare(right.id));
+}
+
+/** Whether the server has never held or seeded a torrent. */
+export function noTorrents(history: TorrentHistory): boolean {
+  const all = history.total.allTime;
+  return history.peers.torrents === 0 && all.bytes === 0 && all.bytesUploaded === 0 && all.durationMs === 0;
+}
+
+/** Trackers with the most sent in the range first; the no-tracker row last. */
+export function trackersInOrder(trackers: readonly UsageConsumer[]): UsageConsumer[] {
+  return [...trackers].sort(
+    (left, right) =>
+      Number(left.id === "") - Number(right.id === "") ||
+      right.range.bytesUploaded - left.range.bytesUploaded ||
+      left.id.localeCompare(right.id),
+  );
 }
 
 /** How many daily rows the server keeps; older days fold into all time. */

@@ -1476,10 +1476,14 @@ async fn an_engine_waits_at_a_damaged_article_until_its_repair_and_reads_it_once
     assert!(std::fs::read(&echoed).unwrap_or_default().len() < body.len());
     let started = run_generation(&pipeline, job_id);
     assert!(started.is_some());
+    assert!(!pipeline.jobs[&job_id].repaired);
 
     repair_the_wrong_article(&mut pipeline, job_id, &posts).await;
     assert!(pipeline.graph_jobs[&job_id].runs().live());
     drain_runs(&mut pipeline, job_id).await;
+    // The applied repair marks the job, for the ledger to count it once
+    // when it finishes.
+    assert!(pipeline.jobs[&job_id].repaired);
     assert_eq!(read(&echoed), body);
     assert_eq!(
         run_generation(&pipeline, job_id),

@@ -608,6 +608,8 @@ pub struct JobLifecycleMetricsSnapshot {
     // Keyed by [`StageOutcomeKind::as_str`].
     pub repairs: Vec<(&'static str, u64)>,
     pub repair_slices_repaired_total: u64,
+    // Jobs that finished complete, partial or failed with a repair applied.
+    pub jobs_repaired_total: u64,
     // Keyed by [`StageOutcomeKind::as_str`].
     pub extractions: Vec<(&'static str, u64)>,
     pub files_missing_total: u64,
@@ -638,6 +640,7 @@ pub struct JobLifecycleMetrics {
     verifications: [AtomicU64; 4],
     repairs: [AtomicU64; 2],
     repair_slices_repaired_total: AtomicU64,
+    jobs_repaired_total: AtomicU64,
     extractions: [AtomicU64; 2],
     files_missing_total: AtomicU64,
     missing_segments_total: AtomicU64,
@@ -660,6 +663,7 @@ impl JobLifecycleMetrics {
             verifications: std::array::from_fn(|_| AtomicU64::new(0)),
             repairs: std::array::from_fn(|_| AtomicU64::new(0)),
             repair_slices_repaired_total: AtomicU64::new(0),
+            jobs_repaired_total: AtomicU64::new(0),
             extractions: std::array::from_fn(|_| AtomicU64::new(0)),
             files_missing_total: AtomicU64::new(0),
             missing_segments_total: AtomicU64::new(0),
@@ -711,6 +715,11 @@ impl JobLifecycleMetrics {
             self.repair_slices_repaired_total
                 .fetch_add(slices_repaired, Ordering::Relaxed);
         }
+    }
+
+    // Low-frequency: one per job that finished with a repair applied.
+    pub fn note_job_repaired(&self) {
+        self.jobs_repaired_total.fetch_add(1, Ordering::Relaxed);
     }
 
     // Low-frequency: one per file that could not be assembled.
@@ -836,6 +845,7 @@ impl JobLifecycleMetrics {
                 })
                 .collect(),
             repair_slices_repaired_total: self.repair_slices_repaired_total.load(Ordering::Relaxed),
+            jobs_repaired_total: self.jobs_repaired_total.load(Ordering::Relaxed),
             extractions: StageOutcomeKind::ALL
                 .iter()
                 .map(|outcome| {

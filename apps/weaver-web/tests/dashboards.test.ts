@@ -7,24 +7,51 @@ import type { DownloadBlockState } from "../src/lib/context/live-data-context.ts
 import type { ProviderHealth } from "../src/next/data/next-data.tsx";
 import {
   averageDailySpeed,
+  averageSeconds,
   barHeights,
+  dailyRepairShare,
   dayKey,
   downloadsState,
   foundPercent,
   lastDays,
+  noTorrents,
+  percentOf,
   providerRows,
   providersUp,
   secondsInDay,
+  shareRatio,
+  stagesInOrder,
   sumDays,
+  trackersInOrder,
+  type TorrentHistory,
   type UsageConsumer,
   type UsageDay,
+  type UsageTotals,
 } from "../src/next/data/dashboards.ts";
 import { englishTranslate as t } from "./english-translate.ts";
 
 const NOW = new Date(2026, 10, 3, 9, 30).getTime();
 
 function day(date: string, bytes: number, tried = 0, succeeded = 0, down = 0): UsageDay {
-  return { day: date, bytes, articlesTried: tried, articlesSucceeded: succeeded, downSeconds: down };
+  return {
+    day: date,
+    bytes,
+    articlesTried: tried,
+    articlesSucceeded: succeeded,
+    downSeconds: down,
+    bytesUploaded: 0,
+    events: 0,
+    durationMs: 0,
+  };
+}
+
+function counted(date: string, fields: Partial<UsageTotals>): UsageDay {
+  return { ...day(date, 0), ...fields };
+}
+
+function ledger(kind: string, id: string, range: Partial<UsageTotals>, days: UsageDay[] = []): UsageConsumer {
+  const totals = counted("", range);
+  return { kind, id, today: totals, week: totals, month: totals, year: totals, allTime: totals, range: totals, days };
 }
 
 function provider(overrides: Partial<ProviderHealth> = {}): ProviderHealth {
@@ -84,8 +111,21 @@ test("days add up field by field", () => {
   const total = sumDays([day("2026-11-01", 100, 10, 9, 60), day("2026-11-02", 50, 5, 5, 0)]);
   assert.deepEqual(
     { ...total },
-    { bytes: 150, articlesTried: 15, articlesSucceeded: 14, downSeconds: 60 },
+    {
+      bytes: 150,
+      articlesTried: 15,
+      articlesSucceeded: 14,
+      downSeconds: 60,
+      bytesUploaded: 0,
+      events: 0,
+      durationMs: 0,
+    },
   );
+  const counts = sumDays([
+    counted("2026-11-01", { bytesUploaded: 7, events: 2, durationMs: 1_500 }),
+    counted("2026-11-02", { bytesUploaded: 3, events: 1, durationMs: 500 }),
+  ]);
+  assert.deepEqual([counts.bytesUploaded, counts.events, counts.durationMs], [10, 3, 2_000]);
   assert.equal(sumDays([]).bytes, 0);
 });
 
@@ -179,4 +219,59 @@ test("provider rows sort by data in the range and keep removed servers the ledge
     ["b.example.test", "removed 9", "a.example.test", "new.example.test"],
   );
   assert.equal(rows[3]!.usage, null);
+});
+
+test("repair share is repaired over finished, and no finished jobs is no figure", () => {
+  assert.equal(percentOf(1, 4), 25);
+  assert.equal(percentOf(0, 0), null);
+  // A share never runs past the whole.
+  assert.equal(percentOf(5, 4), 100);
+  const finished = [counted("2026-11-01", { events: 4 }), counted("2026-11-02", { events: 0 }), counted("2026-11-03", { events: 2 })];
+  const repaired = [counted("2026-11-01", { events: 1 }), counted("2026-11-03", { events: 2 })];
+  assert.deepEqual(dailyRepairShare(finished, repaired), [25, 0, 100]);
+});
+
+test("a stage's average is its time over its runs", () => {
+  assert.equal(averageSeconds(counted("", { events: 4, durationMs: 10_000 })), 2.5);
+  assert.equal(averageSeconds(counted("", { events: 0, durationMs: 0 })), null);
+});
+
+test("stages read in the order a job meets them", () => {
+  const stages = ["move", "later", "download", "repair", "verify"].map((id) => ledger("stage", id, {}));
+  assert.deepEqual(
+    stagesInOrder(stages).map((stage) => stage.id),
+    ["download", "verify", "repair", "move", "later"],
+  );
+});
+
+test("ratio is uploaded over downloaded, and nothing downloaded is no figure", () => {
+  assert.equal(shareRatio(counted("", { bytes: 200, bytesUploaded: 300 })), 1.5);
+  assert.equal(shareRatio(counted("", { bytes: 0, bytesUploaded: 300 })), null);
+});
+
+test("trackers sort by uploaded in the range, the no-tracker row last", () => {
+  const trackers = [
+    ledger("tracker", "", { bytesUploaded: 900 }),
+    ledger("tracker", "b.example.test", { bytesUploaded: 10 }),
+    ledger("tracker", "a.example.test", { bytesUploaded: 50 }),
+  ];
+  assert.deepEqual(
+    trackersInOrder(trackers).map((tracker) => tracker.id),
+    ["a.example.test", "b.example.test", ""],
+  );
+});
+
+test("a server with no torrent ever reads as no torrents", () => {
+  const history = (all: Partial<UsageTotals>, torrents = 0): TorrentHistory => ({
+    today: "2026-11-03",
+    rangeStart: "2026-11-01",
+    rangeEnd: "2026-11-03",
+    total: { ...ledger("torrent", "", {}), allTime: counted("", all) },
+    trackers: [],
+    peers: { torrents, connected: 0, seeds: 0 },
+  });
+  assert.equal(noTorrents(history({})), true);
+  assert.equal(noTorrents(history({}, 1)), false);
+  assert.equal(noTorrents(history({ durationMs: 1 })), false);
+  assert.equal(noTorrents(history({ bytesUploaded: 1 })), false);
 });

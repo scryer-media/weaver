@@ -224,6 +224,47 @@ impl SystemQuery {
         .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
         .map_err(|error| graphql_error("INTERNAL", error.to_string()))
     }
+    /// NZB jobs finished and repaired per day, each stage's runs and time,
+    /// and, from the history of the jobs that finished in the range, the
+    /// recovery they posted and fetched and why the failed ones failed.
+    #[graphql(guard = "ReadGuard")]
+    async fn integrity_history(
+        &self,
+        ctx: &Context<'_>,
+        range: crate::system::usage_history::UsageRange,
+    ) -> Result<crate::system::usage_history::IntegrityHistory> {
+        use crate::system::usage_history::{load_integrity_history, local_today, usage_period};
+        let period = usage_period(&range)
+            .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || load_integrity_history(&db, local_today(), period))
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+    }
+    /// Torrent data per day, all together and by tracker: from peers, to
+    /// peers and seeding time; and the peers connected now.
+    #[graphql(guard = "ReadGuard")]
+    async fn torrent_history(
+        &self,
+        ctx: &Context<'_>,
+        range: crate::system::usage_history::UsageRange,
+    ) -> Result<crate::system::usage_history::TorrentHistory> {
+        use crate::system::usage_history::{
+            TorrentPeers, load_torrent_history, local_today, usage_period,
+        };
+        let period = usage_period(&range)
+            .map_err(|error| graphql_error("INVALID_INPUT", error.to_string()))?;
+        let peers = ctx
+            .data_opt::<weaver_server_core::torrents::service::TorrentService>()
+            .map(|torrents| TorrentPeers::of(&torrents.metrics().published))
+            .unwrap_or_default();
+        let db = ctx.data::<Database>()?.clone();
+        tokio::task::spawn_blocking(move || load_torrent_history(&db, local_today(), period, peers))
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))
+    }
     #[graphql(guard = "AdminGuard")]
     async fn browse_directories(
         &self,
