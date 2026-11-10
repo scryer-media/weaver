@@ -26,7 +26,7 @@ pub use network::*;
 pub use network_runtime::*;
 pub use pool_stage::*;
 pub use refusal::*;
-pub use route_health::{RouteDown, RouteHealth, RouteKind};
+pub use route_health::{QUIET_PERIOD, RouteChange, RouteClock, RouteEvent, RouteHealth, RouteKind};
 pub(crate) use routed_http::{
     AdmitError, Admitted, AttemptError, admit, fetch_on, pinned, start_bridge, through_bridge,
 };

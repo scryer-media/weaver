@@ -116,6 +116,18 @@ impl Configuration {
         configuration.warn_peer_clamps(db.torrent_peer_limit().map_err(|e| e.to_string())?);
         Ok(configuration)
     }
+    // Hand route health the routes of every consumer that still exists.
+    fn configure_health(&self, health: &RouteHealth) {
+        health.configure(
+            &self.egresses,
+            &self.profiles,
+            &self.pools,
+            self.policies
+                .iter()
+                .filter(|(key, _)| self.consumers.contains(*key))
+                .map(|(_, policy)| policy.route()),
+        );
+    }
     // Add `warning` to the leg's, after any it already carries.
     fn warn(&mut self, slot: (String, usize), warning: String) {
         self.warnings
@@ -388,7 +400,7 @@ impl NetworkRuntime {
     ) -> Result<Arc<Self>, String> {
         let configuration = Configuration::load(&db)?;
         let route_health = RouteHealth::new();
-        route_health.configure(&configuration.egresses, &configuration.profiles);
+        configuration.configure_health(&route_health);
         let interfaces = Arc::new(InterfaceMonitor::start(
             Arc::new(SystemInterfaceSource),
             &handle,
@@ -1397,7 +1409,7 @@ impl NetworkRuntime {
             pool.set_members(Vec::new());
         }
         if let Some(health) = &self.route_health {
-            health.configure(&next.egresses, &next.profiles);
+            next.configure_health(health);
         }
         *configuration = next;
         // Only new or re-membered pools warm up; an unchanged idle member must

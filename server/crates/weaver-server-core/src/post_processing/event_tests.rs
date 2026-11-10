@@ -875,7 +875,8 @@ async fn the_queue_runs_a_route_down_that_belongs_to_no_job() {
         data: data.path().to_path_buf(),
         ..Default::default()
     };
-    let down = crate::proxies::RouteDown {
+    let down = crate::proxies::RouteEvent {
+        change: crate::proxies::RouteChange::Down,
         egress_id: 2,
         kind: crate::proxies::RouteKind::WireGuard,
         name: "Home VPN".into(),
@@ -891,6 +892,51 @@ async fn the_queue_runs_a_route_down_that_belongs_to_no_job() {
     assert_eq!(ran.env["NZBNA_EVENT"], "ROUTE_DOWN");
     assert_eq!(ran.env[super::super::model::vars::ROUTE_NAME], "Home VPN");
     assert_eq!(std::fs::read_to_string(out.join("none")).unwrap(), "unset");
+}
+
+// ROUTE_UP reaches a queue script with the route's egress, kind and name,
+// and no reason at all.
+#[tokio::test]
+async fn a_queue_script_gets_route_up_with_its_route() {
+    use std::os::unix::fs::PermissionsExt;
+    let (db, data) = configured();
+    let out = data.path().join("told");
+    let supervisor = db.tag_reporting_queue_script_for_test(&out);
+    let script = db
+        .post_processing_script_directory()
+        .unwrap()
+        .join("queue.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n### NZBGET QUEUE SCRIPT ###\nprintf '%s|%s|%s|%s|%s' \"$NZBNA_EVENT\" \"$WEAVER_EGRESS_ID\" \"$WEAVER_ROUTE_KIND\" \"$WEAVER_ROUTE_NAME\" \"${{WEAVER_ROUTE_REASON-absent}}\" > '{}'/route\n",
+            out.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dirs = super::super::quota_events::QuotaEventDirs {
+        data: data.path().to_path_buf(),
+        ..Default::default()
+    };
+    let up = crate::proxies::RouteEvent {
+        change: crate::proxies::RouteChange::Up,
+        egress_id: 2,
+        kind: crate::proxies::RouteKind::Pool,
+        name: "Exits".into(),
+        reason: String::new(),
+    };
+    let context = super::super::route_events::route_event(&up, &dirs);
+    db.enqueue_script_event(&context, 1).unwrap().unwrap();
+    let ran = db
+        .run_next_queue_event_for_test(&supervisor)
+        .await
+        .expect("an event is queued");
+    assert_eq!(ran.job_id, None);
+    assert_eq!(
+        std::fs::read_to_string(out.join("route")).unwrap(),
+        "ROUTE_UP|2|pool|Exits|absent"
+    );
 }
 
 // The queue worker skips the events of a job that is in no queue, except

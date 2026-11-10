@@ -48,6 +48,7 @@ export const QUEUE_EVENTS = [
   "JOB_ADDED",
   "JOB_DOWNLOADED",
   "JOB_DELETED",
+  "ROUTE_UP",
 ] as const;
 
 export type QueueEvent = (typeof QUEUE_EVENTS)[number];

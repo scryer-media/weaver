@@ -904,6 +904,7 @@ pub enum QueueEventGql {
     JobAdded,
     JobDownloaded,
     JobDeleted,
+    RouteUp,
 }
 
 impl From<weaver_server_core::post_processing::model::QueueEvent> for QueueEventGql {
@@ -930,6 +931,7 @@ impl From<weaver_server_core::post_processing::model::QueueEvent> for QueueEvent
             QueueEvent::JobAdded => Self::JobAdded,
             QueueEvent::JobDownloaded => Self::JobDownloaded,
             QueueEvent::JobDeleted => Self::JobDeleted,
+            QueueEvent::RouteUp => Self::RouteUp,
         }
     }
 }
@@ -957,6 +959,7 @@ impl From<QueueEventGql> for weaver_server_core::post_processing::model::QueueEv
             QueueEventGql::JobAdded => Self::JobAdded,
             QueueEventGql::JobDownloaded => Self::JobDownloaded,
             QueueEventGql::JobDeleted => Self::JobDeleted,
+            QueueEventGql::RouteUp => Self::RouteUp,
         }
     }
 }
