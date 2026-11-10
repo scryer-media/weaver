@@ -1154,6 +1154,17 @@ async fn a_compressed_rar5_volume_restarted_after_every_article_replays_the_engi
     restart_row(Scenario::new(vec![Post::plain("mixed.rar", bytes)]).framed(64)).await;
 }
 
+// The same archive under PAR2 with its first article lost: whenever the
+// restart lands, the restored job repairs the front it never had and the
+// engine delivers every member.
+#[tokio::test]
+async fn a_compressed_rar5_volume_under_par2_with_its_front_lost_restarted_after_every_article_is_repaired()
+ {
+    let bytes = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
+    let posts = with_par2(vec![Post::plain("mixed.rar", bytes)], 8);
+    restart_row(Scenario::new(posts).framed(64).lost(0, 0)).await;
+}
+
 // The five encrypted RARLAB volumes, offered their password again at every
 // restore, in 64 KiB articles so a restart lands inside every volume.
 #[tokio::test]
