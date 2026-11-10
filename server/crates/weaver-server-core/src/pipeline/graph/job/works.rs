@@ -154,6 +154,10 @@ impl Works {
         self.owed = true;
     }
 
+    pub(crate) fn owed(&self) -> bool {
+        self.owed
+    }
+
     pub(crate) fn checkpointed(&mut self) {
         self.owed = false;
     }

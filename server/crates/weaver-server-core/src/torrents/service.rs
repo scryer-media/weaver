@@ -2104,6 +2104,9 @@ struct Inner {
     queue: Mutex<Option<SchedulerHandle>>,
     tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
     tick: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    // The service hearing the mail no pipeline hears, which a stop ends
+    // last: an object out for its work comes back through it.
+    hearing: Mutex<Option<tokio::task::JoinHandle<()>>>,
     // Rung by a settings change: the tick runs then, not at its next turn.
     settings_changed: Notify,
     // The torrents and their sessions as last published, for the exporter.
@@ -2167,6 +2170,7 @@ impl TorrentService {
                 queue: Mutex::new(None),
                 tasks: Mutex::new(Vec::new()),
                 tick: Mutex::new(None),
+                hearing: Mutex::new(None),
                 settings_changed: Notify::new(),
                 published: watch::channel(Arc::default()).0,
                 sessions_read: Mutex::default(),
@@ -2473,7 +2477,8 @@ impl TorrentService {
         let now = self.inner.clock.now_ms();
         self.read(now, true).await;
         self.inner.sessions.stop_all().await;
-        // Every tee's checkpoint goes at once, whether or not it was due.
+        // Every tee's checkpoint goes at once, whether or not it was due,
+        // once every object of its job out for its work is back.
         let tees: Vec<(JobId, Arc<Tee>)> = {
             let live = self.inner.live.lock().await;
             live.iter()
@@ -2484,6 +2489,9 @@ impl TorrentService {
         };
         for (job_id, tee) in tees {
             self.checkpoint_tee(job_id, tee, true).await;
+        }
+        if let Some(hearing) = locked(&self.inner.hearing).take() {
+            hearing.abort();
         }
         self.save_checkpoints(self.inner.signal.take_unsaved())
             .await;
@@ -2572,7 +2580,7 @@ impl TorrentService {
     // Everything but the tick.
     pub(crate) async fn open(&self) -> Result<(), String> {
         if let Some(task) = self.inner.env.hear_alone() {
-            self.keep(task);
+            *locked(&self.inner.hearing) = Some(task);
         }
         self.spawn_settle();
         self.spawn_follow_trackers();
@@ -2957,9 +2965,17 @@ impl TorrentService {
 
     // Queue a checkpoint of the torrent's unpacking on a blocking thread:
     // it waits on the job, which an intake writing to disk may hold. Its
-    // write goes at once when `force`, and otherwise once it is due.
+    // write goes at once when `force`, a stop's, once every object out for
+    // its work is back; otherwise once it is due.
     async fn checkpoint_tee(&self, job_id: JobId, tee: Arc<Tee>, force: bool) {
-        let queued = tokio::task::spawn_blocking(move || tee.checkpoint(force)).await;
+        let queued = tokio::task::spawn_blocking(move || {
+            if force {
+                tee.checkpoint_stopped()
+            } else {
+                tee.checkpoint(false)
+            }
+        })
+        .await;
         if let Ok(Err(error)) = queued {
             tracing::warn!(job_id = job_id.0, error = %error, "could not checkpoint a torrent's unpacking");
         }

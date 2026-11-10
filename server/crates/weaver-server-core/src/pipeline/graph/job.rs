@@ -338,28 +338,43 @@ impl GraphJob {
     #[cfg(test)]
     pub(crate) fn return_loan(
         &mut self,
-        (node, serial, mut object): (NodeId, u64, Box<dyn weaver_graph::Object>),
+        loan: (NodeId, u64, Box<dyn weaver_graph::Object>),
         slots: &mut RepairSlots,
         limit: usize,
     ) -> Result<(), GraphError> {
+        let said = self.worked_loan(loan);
+        self.run_said(said, slots, limit)
+    }
+
+    // A held loan's work done, and the word it comes back with through the
+    // run mail, as one from the pool does.
+    #[cfg(test)]
+    pub(crate) fn worked_loan(
+        &self,
+        (node, serial, mut object): (NodeId, u64, Box<dyn weaver_graph::Object>),
+    ) -> super::engine::Said {
         let mut said = Vec::new();
         {
             let _decoding = self.works.decoding();
             object.work(&mut said);
         }
-        let said = super::engine::Said {
+        super::engine::Said {
             scope: self.works.scope(),
             node,
             generation: serial,
             heard: super::engine::Heard::Worked(Box::new(Worked { object, said })),
-        };
-        self.run_said(said, slots, limit)
+        }
     }
 
     // A checkpoint found an object out for its work and took nothing: the
     // work stays on the loop until one is recorded.
     pub(crate) fn owe_checkpoint(&mut self) {
         self.works.owe_checkpoint();
+    }
+
+    // Whether a checkpoint that found an object out is owed still.
+    pub(crate) fn owes_checkpoint(&self) -> bool {
+        self.works.owed()
     }
 
     // Whether something of the job is out on a thread and will speak

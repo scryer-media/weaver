@@ -306,6 +306,88 @@ fn a_restored_tee_retries_its_passwords_from_the_top() {
     );
 }
 
+const SECRET: &str = "tee-loan-secret";
+
+// One ZipCrypto member under `SECRET`, its sizes in a data descriptor
+// after it: its keystream runs over the ciphertext it holds as each piece
+// comes, work lent off the loop.
+fn zipcrypto() -> Vec<u8> {
+    use std::io::Write;
+    use zip::unstable::write::FileOptionsExt;
+    let options = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Stored)
+        .with_deprecated_encryption(SECRET.as_bytes())
+        .unwrap();
+    let mut writer = zip::ZipWriter::new_stream(Vec::new());
+    writer.start_file("feature.mkv", options).unwrap();
+    let body: Vec<u8> = (0..40 * 1024 + 77u32)
+        .map(|at| (at.wrapping_mul(61) >> 3) as u8)
+        .collect();
+    writer.write_all(&body).unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+// While an object of the job is out for its work, no checkpoint is taken,
+// forced or not: its facts as it left hold the work undone. The checkpoint
+// is owed, which keeps any more work from going out. The step that takes
+// the object back takes it, work goes out again, and a stop's checkpoint,
+// which waits for the object, is taken.
+#[tokio::test]
+async fn no_checkpoint_is_taken_while_an_object_is_out_for_its_work() {
+    let dir = tempfile::tempdir().unwrap();
+    let mail = RunMail::default();
+    let archive = zipcrypto();
+    let layout =
+        Arc::new(PieceLayout::new(1024, vec![file("lantern.zip", archive.len() as u64)]).unwrap());
+    let mut storage = storage(dir.path(), &mail, CapacityReader::unknown());
+    storage.passwords = vec![SECRET.to_owned()];
+    let tee = Tee::fresh(parts(&layout, dir.path(), &mail, Arc::default()), storage);
+    tee.with(|job| job.hold_loans());
+    // Every piece but the first leaves its step unread: only the job's
+    // first checkpoint is due at once.
+    for index in 0..layout.piece_count() {
+        assert!(tee.deliver(index, &piece(&layout, &archive, index)));
+    }
+    assert!(
+        tee.with(|job| job.working()),
+        "an object is out for its work"
+    );
+    let mut loans = tee.with(|job| job.held_loans());
+    assert_eq!(loans.len(), 1, "one object out for its work");
+    let stamp = tee.with(|job| job.pending().stamp());
+
+    tee.checkpoint(false).unwrap();
+    tee.checkpoint(true).unwrap();
+    assert_eq!(
+        tee.with(|job| job.pending().stamp()),
+        stamp,
+        "nothing taken while out"
+    );
+    assert!(
+        tee.with(|job| job.owes_checkpoint()),
+        "the checkpoint is owed"
+    );
+
+    let stop = tokio::task::spawn_blocking({
+        let tee = Arc::clone(&tee);
+        move || tee.checkpoint_stopped()
+    });
+    let said = tee.with(|job| job.worked_loan(loans.pop().unwrap()));
+    tee.take(super::Word::Said(said, 1), (false, false));
+    assert!(!tee.with(|job| job.working()), "the object is back");
+    assert!(
+        tee.with(|job| job.pending().stamp()) > stamp,
+        "the step that took it back took the checkpoint"
+    );
+    assert!(
+        !tee.with(|job| job.owes_checkpoint()),
+        "work goes out again"
+    );
+    stop.await.unwrap().unwrap();
+    assert!(!tee.with(|job| job.owes_checkpoint()), "the stop took it");
+    tee.forget();
+}
+
 const LZ: &[u8] = include_bytes!(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/rar5/rar5_multifile_lz.rar"
