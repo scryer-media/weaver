@@ -205,10 +205,6 @@ struct Run {
     // The start its lender was handed for, while it is lent: what the
     // lender heard under any other is not this run's.
     lent: Option<super::window::Start>,
-    // Its decoder holds whatever memory it is granted
-    // (`Engine::holds_memory`): it reserved that memory, and is handed what
-    // it reserved, no more.
-    holds: bool,
     // The scratch refused it once: from here it is not lent, and its window
     // is placed in RAM.
     in_ram: bool,
@@ -232,28 +228,9 @@ impl Run {
             placed: Placed::Grant,
             lends: false,
             lent: None,
-            holds: false,
             in_ram: false,
             rerun: false,
             whole: false,
-        }
-    }
-}
-
-// What the owner knows of a run's decoder as it reserves the run.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct Decoder {
-    // It borrows a window over its grant (`Engine::lends`).
-    pub(crate) lends: bool,
-    // It holds whatever memory it is granted (`Engine::holds_memory`).
-    pub(crate) holds_memory: bool,
-}
-
-impl Decoder {
-    pub(crate) fn of(engine: &dyn weaver_graph::Engine) -> Self {
-        Self {
-            lends: engine.lends(),
-            holds_memory: engine.holds_memory(),
         }
     }
 }
@@ -500,24 +477,21 @@ impl Runs {
     // allocated for it.
     #[cfg(test)]
     pub(crate) fn reserve(&mut self, node: NodeId, window: u64) -> Reservation {
-        self.reserve_for(node, window, Decoder::default())
+        self.reserve_for(node, window, false)
     }
 
     // As `reserve`, for a run whose decoder borrows a window over its grant
-    // from its lender (`Engine::lends`), or holds whatever memory it is
-    // granted (`Engine::holds_memory`), as `decoder` says.
+    // from its lender (`Engine::lends`) when `lends` says so.
     //
-    // A decoder that holds its memory reserves the memory its grant gives,
-    // whatever window its object declares, and is handed no more than it
-    // reserved: its library sizes what it keeps in RAM, and its threads, to
-    // that memory.
-    //
-    // Where the grant's policy lets a window go over the ceiling, such a
-    // run is handed the job's lender and borrows every window over its grant
-    // as its decoder asks for it: nothing is lent before it starts. It
-    // reserves what a run inside its grant reserves, whatever window its
-    // object declares, for a lent window is scratch, not RAM. A run the
-    // scratch refused (`widen`) is not lent again: it is placed in RAM.
+    // Under every policy such a run is handed the job's lender and borrows
+    // every window over its grant as its decoder asks for it: nothing is
+    // lent before it starts. It reserves the window its object declares, to
+    // the grant's window (`Grant::held`), and its overhead: what its decoder
+    // keeps in RAM, for a lent window is scratch, not RAM. On efficient a
+    // RAR naming a 4 GiB dictionary reserves 256 MiB and the overhead, not
+    // the whole pool. A run the scratch refused (`widen`) is not lent
+    // again: it is placed in RAM where the policy lets a run go above the
+    // ceiling, and its refusal stands where it does not.
     //
     // Any other run whose window is over the ceiling, as its object
     // declares or as its decoder refused (`widen`), is placed in RAM above
@@ -527,16 +501,12 @@ impl Runs {
     // A window its decoder refused within the ceiling is reserved whole from
     // the pool. Under a policy that holds runs to the ceiling, a window a
     // run was widened to above it is dropped: the run is held to the
-    // ceiling, and its decoder refuses with the sizes, handed no lender.
+    // ceiling, and its decoder refuses with the sizes.
     //
     // Where no window can be mapped (`window::MAPS`), no run is lent: one
-    // whose window is over the ceiling is placed in RAM from the start.
-    pub(crate) fn reserve_for(
-        &mut self,
-        node: NodeId,
-        window: u64,
-        decoder: Decoder,
-    ) -> Reservation {
+    // whose window is over the ceiling is placed in RAM from the start where
+    // the policy lets it go above, and is refused where it does not.
+    pub(crate) fn reserve_for(&mut self, node: NodeId, window: u64, lends: bool) -> Reservation {
         let grant = self.hardware.grant();
         self.held_back.remove(&node);
         let Some(run) = self.runs.get_mut(&node) else {
@@ -547,24 +517,26 @@ impl Runs {
         }
         let ceiling = grant.ceiling();
         let above = grant.over_limit == OverLimit::ScratchThenRam;
-        let memory = grant.run.memory_bytes.filter(|_| decoder.holds_memory);
-        run.holds = memory.is_some();
-        let window = window.max(memory.unwrap_or(0));
-        run.lends =
-            decoder.lends && above && !run.in_ram && self.windows.is_some() && super::window::MAPS;
+        run.lends = lends && !run.in_ram && self.windows.is_some() && super::window::MAPS;
         if above && !run.lends && window > ceiling {
             run.wide = run.wide.max(Some(window));
         }
         if !above {
             run.wide = run.wide.filter(|wide| *wide <= grant.held());
         }
-        run.window = run.wide.unwrap_or(window.min(ceiling));
+        // The window a run had, which a refusal must pass to ask for more.
+        // A lending run's decoder lends a window wider than its grant's, so
+        // that is the most it had: a refusal over it was never held in RAM.
+        let most = if run.lends { grant.held() } else { ceiling };
+        run.window = run.wide.unwrap_or(window.min(most));
         let len = match run.wide {
-            // What a run inside its grant reserves: the window its object
-            // declares, to the ceiling, and its overhead.
+            // What a run inside its grant reserves: the window it was
+            // given, to the ceiling, and its overhead. That is the window
+            // its object declares, or for a lending run no more than the
+            // grant's window, which is all of it the run keeps in RAM.
             None => {
                 run.placed = Placed::Grant;
-                window.min(ceiling).saturating_add(RUN_OVERHEAD)
+                run.window.min(ceiling).saturating_add(RUN_OVERHEAD)
             }
             Some(wide) => {
                 run.placed = Placed::Ram(wide);
@@ -632,10 +604,10 @@ impl Runs {
         run.volumes = Some(Arc::clone(&volumes));
         let grant = self.hardware.grant();
         let mut budget = grant.run.clone();
-        // Only a decoder that borrows, under a policy that lets a window go
-        // over the ceiling, is handed the lender, and borrows every window
-        // as it asks for it: every other is held to its grant and refuses a
-        // window over it with the sizes.
+        // Only a decoder that borrows, and that the scratch has not refused,
+        // is handed the lender, and borrows every window as it asks for it:
+        // every other is held to its grant and refuses a window over it with
+        // the sizes.
         let lending = self
             .windows
             .as_ref()
@@ -649,13 +621,6 @@ impl Runs {
             budget.memory_bytes = budget.memory_bytes.max(Some(wide));
             budget.window_bytes = Some(wide);
             budget.window_reserved = true;
-        }
-        // A decoder that holds whatever memory it is granted is granted what
-        // it reserved, past its overhead, and no more.
-        if run.holds {
-            let memory = run.reserved.saturating_sub(RUN_OVERHEAD);
-            budget.memory_bytes = Some(memory);
-            budget.window_bytes = budget.window_bytes.map(|window| window.min(memory));
         }
         let (scope, mail, clock) = (self.scope, self.mail.clone(), self.clock.clone());
         let said = move |heard| Said {
@@ -758,6 +723,9 @@ impl Runs {
         // run in RAM is lent nothing, so the scratch cannot refuse it again,
         // and what its decoder refuses from there is weighed as any run's
         // refusal is. Only what its lender heard under this start counts.
+        // Where the policy lets nothing go above the ceiling, the scratch's
+        // refusal stands, with the sizes, as a decoder's refusal over the
+        // ceiling does.
         let refused = self
             .windows
             .as_ref()
@@ -778,7 +746,7 @@ impl Runs {
         }
         let most = match grant.over_limit {
             OverLimit::ScratchThenRam => u64::MAX,
-            OverLimit::Fail => held,
+            OverLimit::ScratchThenFail => held,
         };
         // What a run lifted of its memory limit would be given.
         let lifted = needed.or(widest);
@@ -792,7 +760,7 @@ impl Runs {
         };
         let wider = needed <= most && needed > run.window && running;
         let held_back = !wider
-            && grant.over_limit == OverLimit::Fail
+            && grant.over_limit == OverLimit::ScratchThenFail
             && lifted.is_some_and(|lifted| {
                 lifted > run.window.max(held)
                     && self
@@ -810,6 +778,20 @@ impl Runs {
             }
         }
         wider
+    }
+
+    // What the node's run was allowed, when it is lent under a policy that
+    // holds runs to the ceiling and the scratch refused it a window for want
+    // of room: that refusal names no limit, and the run was held to the
+    // grant's window. Any other refusal naming no limit is left so.
+    pub(crate) fn allowed(&self, node: NodeId) -> Option<u64> {
+        let grant = self.hardware.grant();
+        let run = self
+            .runs
+            .get(&node)
+            .filter(|run| run.lends && grant.over_limit == OverLimit::ScratchThenFail)?;
+        let (windows, start) = self.windows.as_ref().zip(run.lent)?;
+        windows.refused(node, start).map(|_| grant.held())
     }
 
     // Whether a refusal stands in the job only because the policy holds runs
@@ -939,7 +921,6 @@ impl Runs {
         run.placed = Placed::Grant;
         run.lends = false;
         run.lent = None;
-        run.holds = false;
         run.in_ram = false;
         run.rerun = false;
         let admissions = run

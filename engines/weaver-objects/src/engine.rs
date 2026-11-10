@@ -95,12 +95,6 @@ pub trait Format: Send + Sync {
     fn lends() -> bool {
         false
     }
-
-    // Whether a run's decoder holds whatever memory it is granted:
-    // `Engine::holds_memory`.
-    fn holds_memory() -> bool {
-        false
-    }
 }
 
 // A volume bound, as far as it places the others: what its front states,
@@ -461,10 +455,6 @@ impl<F: Format + 'static> Engine for EngineObject<F> {
 
     fn lends(&self) -> bool {
         F::lends()
-    }
-
-    fn holds_memory(&self) -> bool {
-        F::holds_memory()
     }
 
     // The volumes after the one the run is on, the nearest first: weighed

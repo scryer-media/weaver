@@ -241,9 +241,11 @@ fn a_lender_from_an_earlier_start_records_nothing_for_the_new_one() {
     assert_eq!(windows.refused(NodeId(4), second), Some(2 * MIB));
 }
 
-// The lender says the room every folder has now past its reserve, all
-// together, less what is lent; nothing where a reading is unknown or no
-// reserve is kept.
+// The lender says the most room any one folder has now past its reserve,
+// less what is lent; nothing where a reading is unknown or no reserve is
+// kept. The job's folder has 3 MiB, the data folder 2 MiB: 3 MiB, not 5.
+// With 2 MiB lent in the job's folder, it has 1 MiB, and the data folder,
+// which may be the same disk, is counted less the 2 MiB lent beside it.
 #[test]
 fn a_lender_says_the_room_its_folders_have() {
     let job = tempfile::tempdir().unwrap();
@@ -264,11 +266,11 @@ fn a_lender_says_the_room_its_folders_have() {
         ),
     );
     let (lender, _) = windows.for_node(NodeId(1));
-    assert_eq!(lender.room(), Some(5 * MIB));
-    let held = lender.lend(2 * MIB as usize).unwrap();
     assert_eq!(lender.room(), Some(3 * MIB));
+    let held = lender.lend(2 * MIB as usize).unwrap();
+    assert_eq!(lender.room(), Some(MIB));
     drop(held);
-    assert_eq!(lender.room(), Some(5 * MIB));
+    assert_eq!(lender.room(), Some(3 * MIB));
 
     let unknown = Arc::new(
         Windows::new(
@@ -286,17 +288,92 @@ fn a_lender_says_the_room_its_folders_have() {
         ),
     );
     assert_eq!(unknown.room(), None);
-    assert_eq!(windows_of(job.path(), 0).room(), None, "no reserve kept");
-}
-
-fn windows_of(dir: &Path, reserve: u64) -> Arc<Windows> {
-    Arc::new(Windows::new(
-        dir.to_path_buf(),
+    let unkept = Arc::new(Windows::new(
+        job.path().to_path_buf(),
         free(10 * MIB),
         ScratchLedger::default(),
-        accountant(reserve),
+        accountant(0),
         super::WINDOW_CEILING_BYTES,
-    ))
+    ));
+    assert_eq!(unkept.room(), None, "no reserve kept");
+}
+
+// The job's folder inside the data folder, one disk read through one
+// reader, each folder on a ledger of its own as the pipeline keeps them:
+// 10 MiB free, 7 MiB kept, is room for 3 MiB, not 6, and once 3 MiB is
+// lent there is none, in either folder.
+#[test]
+fn two_folders_on_one_disk_say_its_room_once() {
+    let data = tempfile::tempdir().unwrap();
+    let job = data.path().join("job");
+    std::fs::create_dir(&job).unwrap();
+    let disk = free(10 * MIB);
+    let windows = Arc::new(
+        Windows::new(
+            job,
+            disk.clone(),
+            ScratchLedger::default(),
+            accountant(7 * MIB),
+            super::WINDOW_CEILING_BYTES,
+        )
+        .or_spare(
+            data.path().to_path_buf(),
+            42,
+            disk,
+            ScratchLedger::default(),
+        ),
+    );
+    let (lender, _) = windows.for_node(NodeId(1));
+    assert_eq!(lender.room(), Some(3 * MIB));
+    let held = lender.lend(3 * MIB as usize).unwrap();
+    assert_eq!(lender.room(), Some(0));
+    drop(held);
+    assert_eq!(lender.room(), Some(3 * MIB));
+}
+
+// A window given back after its disk was read again takes back nothing
+// from the ledger: the newer reading counts its file, and the charge on the
+// ledger now is another job's. On 10 MiB free with 7 MiB kept, the first
+// job lends 2 MiB; the disk then reads 8 MiB free; the second job lends 1
+// MiB. Giving the first back leaves the second's charge: a further 1 MiB is
+// refused until the disk is read again.
+#[test]
+fn a_window_given_back_after_a_new_reading_takes_back_only_its_own_charge() {
+    let (first_job, second_job) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let taken = std::time::Instant::now();
+    let reading = Arc::new(std::sync::Mutex::new((10 * MIB, taken)));
+    let disk = {
+        let reading = Arc::clone(&reading);
+        CapacityReader::from_fn(move || {
+            let (available_bytes, sampled_at) = *reading.lock().unwrap();
+            Capacity::Known(CapacityReading {
+                available_bytes,
+                total_bytes: 100 * MIB,
+                sampled_at,
+                stale: false,
+            })
+        })
+    };
+    let ledger = ScratchLedger::default();
+    let job = |dir: &Path| {
+        Arc::new(Windows::new(
+            dir.to_path_buf(),
+            disk.clone(),
+            ledger.clone(),
+            accountant(7 * MIB),
+            super::WINDOW_CEILING_BYTES,
+        ))
+    };
+    let (first, second) = (job(first_job.path()), job(second_job.path()));
+    let lent = first.allocate(NodeId(1), 2 * MIB as usize).unwrap();
+    *reading.lock().unwrap() = (8 * MIB, taken + std::time::Duration::from_secs(5));
+    let beside = second.allocate(NodeId(1), MIB as usize).unwrap();
+    drop(lent);
+    let error = second.allocate(NodeId(2), MIB as usize).unwrap_err();
+    assert_eq!(tried(&error)[0].step, Step::NoSpace, "{error}");
+    drop(beside);
+    let again = second.allocate(NodeId(2), MIB as usize).unwrap();
+    drop(again);
 }
 
 // Two jobs that lend on one disk charge one ledger: room for one window is
@@ -324,10 +401,10 @@ fn two_jobs_on_one_disk_never_both_take_the_same_room() {
     let lent = first.allocate(NodeId(1), 2 * MIB as usize).unwrap();
     let error = second.allocate(NodeId(1), 2 * MIB as usize).unwrap_err();
     assert_eq!(tried(&error)[0].step, Step::NoSpace, "{error}");
-    assert_eq!(second.room(), Some(MIB));
     drop(lent);
     let lent = second.allocate(NodeId(1), 2 * MIB as usize).unwrap();
-    assert_eq!(first.room(), Some(MIB));
+    let error = first.allocate(NodeId(1), 2 * MIB as usize).unwrap_err();
+    assert_eq!(tried(&error)[0].step, Step::NoSpace, "{error}");
     drop(lent);
 
     let apart = job(second_job.path(), &ScratchLedger::default());

@@ -4,12 +4,14 @@
 // An archive whose decode needs more memory than the profile's ceiling: one
 // row per family, a RAR, a 7z and a stream, each the only thing posted.
 //
-// Under the efficient profile the archive is withheld too large, nothing
-// usable comes out, and the job fails with the sizes in its message. Under
-// balanced the window is granted above the ceiling, up to what the machine
-// can hold; past that the job fails naming the machine's memory. A job
-// reprocessed with no memory limit is granted the window whatever its
-// profile.
+// Under the efficient profile a RAR or 7z window over the profile's is
+// lent from scratch; where the scratch has no room for it, or for a stream,
+// the archive is withheld too large, nothing usable comes out, and the job
+// fails with the sizes in its message. Under balanced the window is granted
+// above the ceiling, up to what the machine can hold; past that the job
+// fails naming the machine's memory. A job reprocessed with no memory limit
+// is granted the window whatever its profile. Rows that may lend set the
+// scratch room themselves, so none reads the machine's free disk.
 
 use weaver_graph::Why;
 
@@ -94,10 +96,36 @@ fn wide_rar() -> Vec<u8> {
     bytes
 }
 
+// `posts` as a job `more` sets, where no scratch has room for a window.
+// Where windows are mapped the data folder is given no room, so none reads
+// the machine's free disk, and none is mapped. Where none can be mapped,
+// nothing is lent: the decoder is held to its grant and refuses.
+async fn without_room(posts: Vec<Post>, more: impl FnOnce(Scenario) -> Scenario) -> Outcome {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let (outcome, lent) = super::lent_windows::with_room(posts, 0, more).await;
+        assert!(!lent);
+        outcome
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        run(&more(Scenario::new(posts))).await
+    }
+}
+
+// Under efficient a dictionary over the window is lent from scratch. With
+// no scratch room anywhere the scratch refuses it, and where no window can
+// be mapped the decoder refuses it: either way the job fails with the
+// dictionary's size and the window, offers a retry with no memory limit,
+// and nothing is mapped. The member's data is not a real compressed
+// stream, so only the refusal is read off it; real RAR dictionaries lent,
+// and refused, are `lent_windows`'s.
 #[tokio::test]
-async fn a_rar_whose_dictionary_is_wider_than_the_efficient_window_fails_with_the_sizes() {
-    let outcome = run(&Scenario::new(vec![Post::plain("silver.rar", wide_rar())])
-        .profile(HardwareProfile::Efficient))
+async fn a_rar_whose_dictionary_is_wider_than_the_efficient_window_and_its_scratch_fails_with_the_sizes()
+ {
+    let outcome = without_room(vec![Post::plain("silver.rar", wide_rar())], |s| {
+        s.profile(HardwareProfile::Efficient)
+    })
     .await;
     failed(
         &outcome,
@@ -111,12 +139,15 @@ async fn a_rar_whose_dictionary_is_wider_than_the_efficient_window_fails_with_th
     assert!(offers_retry(&outcome));
 }
 
-// Balanced grants the 4 GiB dictionary above its 1 GiB ceiling: the decoder
-// opens the member, and nothing says it was too large.
+// Balanced grants the 4 GiB dictionary above its 1 GiB ceiling once the
+// scratch has no room for it, or from the start where no window can be
+// mapped: the decoder opens the member in RAM, and nothing says it was too
+// large.
 #[tokio::test]
 async fn a_rar_whose_dictionary_is_wider_than_the_balanced_window_is_granted_it() {
-    let outcome = run(&Scenario::new(vec![Post::plain("silver.rar", wide_rar())])
-        .profile(HardwareProfile::Balanced))
+    let outcome = without_room(vec![Post::plain("silver.rar", wide_rar())], |s| {
+        s.profile(HardwareProfile::Balanced)
+    })
     .await;
     granted(&outcome);
 }
@@ -124,7 +155,7 @@ async fn a_rar_whose_dictionary_is_wider_than_the_balanced_window_is_granted_it(
 // A 7z of one LZMA2 folder whose coder names a dictionary of 4 GiB less a
 // byte, property 40, over one uncompressed LZMA2 chunk. The header is
 // plain, so nothing but the property says how wide the decoder must be.
-fn wide_7z() -> Vec<u8> {
+pub(super) fn wide_7z() -> Vec<u8> {
     let file = body();
     let mut packed = vec![0x01, 0x00, (file.len() - 1) as u8];
     packed.extend_from_slice(&file);
@@ -175,23 +206,105 @@ fn wide_7z() -> Vec<u8> {
     bytes
 }
 
+// The decoder holds a dictionary to its coder's output, so the 4 GiB this
+// coder names over 100 bytes fits in RAM under efficient: the member comes
+// out whole, and nothing is lent.
 #[tokio::test]
-async fn a_7z_whose_coder_needs_more_than_the_efficient_memory_fails_with_the_sizes() {
-    let outcome = run(&Scenario::new(vec![Post::plain("lantern.7z", wide_7z())])
-        .profile(HardwareProfile::Efficient))
+async fn a_7z_whose_coder_names_more_than_the_efficient_memory_over_a_few_bytes_decodes() {
+    let outcome = without_room(vec![Post::plain("lantern.7z", wide_7z())], |s| {
+        s.profile(HardwareProfile::Efficient)
+    })
     .await;
+    decoded(&outcome);
+}
+
+// A 7z of one file `name` holding `bytes`, through the coders `methods`.
+pub(super) fn sevenz(
+    methods: Vec<sevenz_turbo::EncoderConfiguration>,
+    name: &str,
+    bytes: &[u8],
+) -> Vec<u8> {
+    use std::io::Cursor;
+    let mut writer = sevenz_turbo::ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+    writer.set_content_methods(methods);
+    let mut entry = sevenz_turbo::ArchiveEntry::new_file(name);
+    entry.size = bytes.len() as u64;
+    writer
+        .push_archive_entry(entry, Some(Cursor::new(bytes.to_vec())))
+        .unwrap();
+    writer.finish().unwrap().into_inner()
+}
+
+// A 7z of one PPMd folder over `body()` whose model is 520 MiB: a model is
+// the size its coder declares, whatever the folder holds, so it is over
+// what the efficient profile's 512 MiB keeps in RAM.
+fn wide_ppmd_7z() -> Vec<u8> {
+    use sevenz_turbo::encoder_options::PpmdOptions;
+    let model = PpmdOptions::from_order_memory_size(6, 520 << 20);
+    sevenz(vec![model.into()], "beacon.bin", &body())
+}
+
+// What a decode of `archive` holds in RAM on one thread, nothing lent.
+fn in_ram(archive: &[u8]) -> u64 {
+    let parsed = sevenz_turbo::Archive::read(
+        &mut std::io::Cursor::new(archive),
+        &sevenz_turbo::Password::empty(),
+    )
+    .unwrap();
+    parsed
+        .decoder_memory(&sevenz_turbo::ArchiveLimits::default(), 1)
+        .unwrap()
+        .resident_bytes
+}
+
+// Under efficient a model over the memory is lent from scratch where the
+// scratch has room for it, and the member comes out whole.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[tokio::test]
+async fn a_7z_model_over_the_efficient_memory_is_lent_where_the_scratch_has_room() {
+    let post = vec![Post::plain("lantern.7z", wide_ppmd_7z())];
+    let (outcome, lent) =
+        super::lent_windows::with_room(post, 521 * MIB, |s| s.profile(HardwareProfile::Efficient))
+            .await;
+    assert!(lent);
+    decoded(&outcome);
+}
+
+// With no scratch room anywhere the scratch refuses the model, and where no
+// window can be mapped the decoder refuses it: either way the job fails
+// with what the decode holds in RAM and the memory it was allowed there,
+// and offers a retry with no memory limit, which decodes it in RAM.
+#[tokio::test]
+async fn a_7z_model_over_the_efficient_memory_without_scratch_fails_with_the_sizes() {
+    let archive = wide_ppmd_7z();
+    let post = || vec![Post::plain("lantern.7z", archive.clone())];
+    let efficient = |s: Scenario| s.profile(HardwareProfile::Efficient);
+
+    let outcome = without_room(post(), efficient).await;
+    let needed = in_ram(&archive);
+    assert!(needed > 520 * MIB, "{needed}");
+    let error = outcome_error(&outcome);
+    assert!(error.starts_with("lantern.7z needs "), "{error}");
+    assert!(
+        error.ends_with(" of decode memory, 512.0 MiB allowed"),
+        "{error}"
+    );
     failed(
         &outcome,
         "lantern.7z",
-        // What the decoder estimates its coder needs: the dictionary and
-        // the decoder's own buffers beside it.
         Why::TooLarge {
-            needed: Some(4_296_081_408),
+            needed: Some(needed),
             allowed: Some(512 * MIB),
         },
-        "lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed",
+        &error,
     );
     assert!(offers_retry(&outcome));
+
+    let outcome = without_room(post(), |s| {
+        efficient(s).metadata(NO_MEMORY_LIMIT_ATTRIBUTE_KEY, "1")
+    })
+    .await;
+    decoded(&outcome);
 }
 
 // Balanced grants the coder's 4 GiB above its 1 GiB ceiling, within the

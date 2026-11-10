@@ -2254,54 +2254,31 @@ fn a_rar3_ppmd_arena_over_the_grant_is_lent_as_a_dictionary_is() {
     assert_eq!(room.asked(), Vec::<usize>::new());
 }
 
-// A RAR 2.9 member decoding beside others counts the PPMd arena its decoder
-// may keep in RAM, not just its bytes and dictionary: the 256 MiB the format
-// allows, or the window a lent run keeps in RAM. A RAR5 member has no arena.
+// A RAR 2.9 member decoding beside others counts its bytes and its
+// dictionary, nothing for a PPMd arena it may never use: it fits a grant
+// of exactly those, lent or not.
 #[test]
-fn a_rar3_member_beside_others_counts_its_ppmd_arena() {
+fn a_rar3_member_beside_others_counts_its_bytes_and_dictionary() {
     use crate::lent::testing::TestLender;
-    let alone = |archive: &[u8], budget: &weaver_graph::Budget| {
-        let parsed = unrar_rs::RarArchive::open_prefix(
-            io::Cursor::new(archive.to_vec()),
-            None,
-            NonZeroUsize::MAX,
-        )
-        .unwrap();
-        let info = parsed.member_info(0).unwrap();
-        let bytes = info.unpacked_size.unwrap() + info.compression.dict_size;
-        let volumes = Gate::whole(vec![archive.to_vec()]) as Arc<dyn Volumes>;
-        (bytes, run::may_start_alone(&parsed, &volumes, budget, 0))
-    };
+    let parsed =
+        unrar_rs::RarArchive::open_prefix(io::Cursor::new(PPMD.to_vec()), None, NonZeroUsize::MAX)
+            .unwrap();
+    let info = parsed.member_info(0).unwrap();
+    let bytes = info.unpacked_size.unwrap() + info.compression.dict_size;
+    let volumes = Gate::whole(vec![PPMD.to_vec()]) as Arc<dyn Volumes>;
     let granted = |memory: u64| weaver_graph::Budget {
         memory_bytes: Some(memory),
-        window_bytes: Some(GIB),
+        window_bytes: Some(memory),
         threads: 1,
         ..Default::default()
     };
-    let arena = 256 * MIB;
-    let (bytes, held) = alone(PPMD, &granted(GIB));
-    assert_eq!(held, Some(bytes + arena));
-    assert_eq!(alone(PPMD, &granted(bytes + arena)).1, Some(bytes + arena));
-    assert_eq!(alone(PPMD, &granted(bytes + arena - 1)).1, None);
-
-    // A lent run keeps no arena over its window in RAM.
-    let lent = TestLender::new().lending(weaver_graph::Budget {
-        window_bytes: Some(4 * MIB),
-        ..granted(GIB)
-    });
-    assert_eq!(alone(PPMD, &lent).1, Some(bytes + 4 * MIB));
-
-    // RAR5 method 1, a 128 KiB dictionary, then a stored member after it.
-    let rar5 = [
-        rar5::start(None),
-        rar5::file_as("lz.bin", 0, &[0; 64], MIB, None, 1 << 7),
-        rar5::file("after.bin", 0, b"after", 5, None),
-        rar5::end(false),
-    ]
-    .concat();
-    let (bytes, held) = alone(&rar5, &granted(GIB));
-    assert_eq!(bytes, MIB + (128 << 10));
-    assert_eq!(held, Some(bytes));
+    let alone = |budget: &weaver_graph::Budget| run::may_start_alone(&parsed, &volumes, budget, 0);
+    assert_eq!(alone(&granted(bytes)), Some(bytes));
+    assert_eq!(alone(&granted(bytes - 1)), None);
+    assert_eq!(
+        alone(&TestLender::new().lending(granted(bytes))),
+        Some(bytes)
+    );
 }
 
 // A dictionary over the lender's ceiling is not asked for: the decoder
@@ -2346,4 +2323,27 @@ fn a_rar3_ppmd_arena_the_lender_refuses_says_why_with_its_size() {
     assert_eq!(denied.asked().len(), 2);
     assert!(said.contains(&Said::Refuse(Why::Unsupported)), "{said:?}");
     assert_eq!(denied.live(), 0);
+}
+
+// A lone archive is no volume, so its front places nothing, but its headers
+// still state the window its decode holds: its member's unpacked size where
+// that is under the dictionary, the whole dictionary when it is solid. The
+// owner books that window for the run.
+#[test]
+fn a_lone_archive_states_its_window() {
+    let fixture = |path: &str| {
+        std::fs::read(format!(
+            "{}/../../server/crates/weaver-server-core/tests/fixtures/extraction_profiles/{path}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    };
+    for (path, window) in [
+        ("rar5_lz.rar", 226_943),
+        ("rar4_solid_ppmd_plain.rar", 1 << 20),
+    ] {
+        let bytes = fixture(path);
+        assert!(<Rar as Format>::front(&bytes).is_none(), "{path}");
+        assert_eq!(<Rar as Format>::window(&bytes), Some(window), "{path}");
+    }
 }

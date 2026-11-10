@@ -67,8 +67,14 @@ impl Format for Rar {
         Box::new(run::Run::new(password))
     }
 
+    // A lone archive is no volume and places nothing, but its headers state
+    // its window all the same.
     fn window(first_bytes: &[u8]) -> Option<u64> {
-        window(&Self::front(first_bytes)?)
+        window(&claim::headers(
+            first_bytes,
+            None,
+            Arc::new(KdfCache::new()),
+        )?)
     }
 
     // A run's decoder borrows a dictionary or a PPMd arena over its window

@@ -793,6 +793,40 @@ fn a_7z_dictionary_the_runs_memory_holds_stays_in_ram() {
     }
 }
 
+// A dictionary as wide as the run's memory and window, as a 1 GiB
+// dictionary meets a 1 GiB grant, is lent: in RAM the decoder's state
+// beside it would not fit, so it is not kept there and refused for that.
+// Without a lender it is refused with its sizes, as it always was.
+#[test]
+fn a_7z_dictionary_as_wide_as_the_runs_memory_is_lent_not_refused_for_its_state() {
+    use crate::lent::testing::TestLender;
+    let bytes = big();
+    let archive = lzma2_over_grant(&bytes, false);
+    let budget = weaver_graph::Budget {
+        memory_bytes: Some(u64::from(DICTIONARY)),
+        window_bytes: Some(u64::from(DICTIONARY)),
+        ..grant(1)
+    };
+    let lender = TestLender::new();
+    let said = lent_run(&archive, budget.clone(), Some(&lender));
+    assert_eq!(refusals(&said), [], "{said:?}");
+    assert!(said.contains(&Said::Bytes(0, bytes)));
+    assert_eq!(lender.asked(), [DICTIONARY as usize]);
+    assert_eq!(lender.live(), 0);
+
+    let said = lent_run(&archive, budget, None);
+    assert!(
+        matches!(
+            refusals(&said).as_slice(),
+            [Why::TooLarge {
+                needed: Some(needed),
+                allowed: Some(allowed),
+            }] if *needed > u64::from(DICTIONARY) && *allowed == u64::from(DICTIONARY)
+        ),
+        "{said:?}"
+    );
+}
+
 // A threaded decode whose workers would borrow more at once than its
 // lender has room for runs on fewer threads, down to one, before it is
 // refused: on one thread this dictionary fits the memory, so a lender with
@@ -865,7 +899,7 @@ fn a_7z_window_the_lender_refuses_says_why() {
         refusals(&said),
         [Why::TooLarge {
             needed: Some(needed),
-            allowed: None,
+            allowed: Some(GRANT),
         }],
         "{said:?}"
     );
@@ -903,8 +937,9 @@ fn a_threaded_7z_decode_whose_lender_runs_out_gives_back_what_it_was_lent() {
             refused.as_slice(),
             [Why::TooLarge {
                 needed: Some(needed),
-                allowed: None,
-            }] if *needed >= least
+                allowed: Some(allowed),
+            }] if *allowed == 46 << 20
+                && *needed >= least
                 && (*needed == least || asked[1..].contains(&(*needed as usize)))
         ),
         "{said:?}, asked {asked:?}, {least} in RAM"
@@ -1012,8 +1047,8 @@ fn an_encrypted_7z_the_lender_refuses_is_refused_by_the_scratch() {
             refusals(&said).as_slice(),
             [Why::TooLarge {
                 needed: Some(needed),
-                allowed: None,
-            }] if *needed > 3 << 20
+                allowed: Some(allowed),
+            }] if *allowed == 3 << 20 && *needed > 3 << 20
         ),
         "{said:?}"
     );

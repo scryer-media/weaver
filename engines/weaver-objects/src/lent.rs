@@ -8,16 +8,17 @@
 // place the two meet, and the one place each library is told how much it
 // keeps in RAM and how much it may borrow:
 //
-//   in RAM    the window the run was granted (`Budget::window_or`), as
-//             without a lender
+//   in RAM    for RAR and xz, the window the run was granted
+//             (`Budget::window_or`), as without a lender; for 7z, what
+//             the run's memory holds beside the decoder's own state
+//             (`sevenz_of`)
 //   borrowed  anything over it, up to the lender's ceiling
 //
 // Without a lender every library is configured exactly as it always was.
 //
 // sevenz-turbo is adapted the same way: an `unsafe impl` of its memory trait
-// for `Lent` and an `impl` of its allocator trait for `Lender`. It keeps in
-// RAM what the run's memory holds, not its window, since the owner reserves
-// a 7z run its memory (`sevenz`).
+// for `Lent`, an `impl` of its allocator trait for `Lender`, and its limits
+// built from the same two numbers (`sevenz`).
 //
 // A library keeps only the `io::ErrorKind` of a refusal, so a refusal means
 // what its kind says (`refused`).
@@ -140,27 +141,59 @@ impl sevenz_turbo::WindowAllocator for Lender {
 // decoder's own limits when none was. Without a lender that is all, as it
 // always was.
 //
-// With a lender, every decode buffer the run's memory cannot hold (a
+// With a lender, every decode buffer over the window the run was granted (a
 // dictionary, a PPMd arena, a threaded LZMA2 worker's buffer) is borrowed,
 // up to the lender's ceiling, and counts nothing against the memory limit,
-// which bounds what stays in RAM. A buffer the memory holds stays in RAM:
-// the owner reserved that memory for the run (`Engine::holds_memory`). A
-// threaded decode, or folders decoded side by side, borrows several windows
-// at once (`sevenz_threads`).
+// which bounds what stays in RAM. A decode of a parsed archive keeps in RAM
+// what its memory holds instead (`sevenz_of`). A threaded decode, or folders
+// decoded side by side, borrows several windows at once (`sevenz_threads`).
 pub(crate) fn sevenz(budget: &Budget) -> sevenz_turbo::ArchiveLimits {
     let own = sevenz_turbo::ArchiveLimits::default();
-    let memory = budget.memory_or(own.memory_limit_bytes);
     let limits = sevenz_turbo::ArchiveLimits {
-        memory_limit_bytes: memory,
+        memory_limit_bytes: budget.memory_or(own.memory_limit_bytes),
         ..own
     };
     let Some(lender) = Lender::of(budget) else {
         return limits;
     };
     let ceiling = lender.ceiling();
-    let mut limits = limits.with_window_allocator(lender, memory);
+    let mut limits = limits.with_window_allocator(lender, budget.window_or(u64::MAX));
     limits.max_lent_window_bytes = ceiling;
     limits
+}
+
+// The 7z decoder's limits for a decode of `archive`: as `sevenz`, but with
+// a lender a buffer the run's memory holds beside the decoder's own state
+// stays in RAM, as it would without one, and only what would not fit there
+// is lent. A dictionary as wide as the memory is lent, not refused for the
+// state beside it. A folder with more than one such buffer keeps in RAM
+// what the run's window holds, or lends every one, whichever first fits.
+pub(crate) fn sevenz_of(
+    archive: &sevenz_turbo::Archive,
+    budget: &Budget,
+) -> sevenz_turbo::ArchiveLimits {
+    let limits = sevenz(budget);
+    if limits.window_allocator.is_none() {
+        return limits;
+    }
+    let memory = limits.memory_limit_bytes;
+    let keeping = |in_ram: u64| {
+        let limits = sevenz_turbo::ArchiveLimits {
+            max_in_ram_window_bytes: in_ram,
+            ..limits.clone()
+        };
+        let resident = archive.decoder_memory(&limits, 1).ok()?.resident_bytes;
+        Some((resident, limits))
+    };
+    // What the decoder holds in RAM with every buffer lent.
+    let Some((state, _)) = keeping(0) else {
+        return limits;
+    };
+    [memory.saturating_sub(state), budget.window_or(u64::MAX), 0]
+        .into_iter()
+        .filter_map(keeping)
+        .find(|(resident, _)| *resident <= memory)
+        .map_or(limits, |(_, limits)| limits)
 }
 
 // The threads a 7z decode of `archive` under `limits` runs on: `most`, or

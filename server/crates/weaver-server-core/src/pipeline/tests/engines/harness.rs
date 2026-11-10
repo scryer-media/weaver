@@ -528,6 +528,11 @@ pub(super) async fn hear_probe(pipeline: &mut Pipeline) {
     }
 }
 
+// What a scenario sets on a pipeline it prepares, and what it is told of a
+// word a run says.
+type Setup = std::sync::Arc<dyn Fn(&mut Pipeline) + Send + Sync>;
+type HeardHook = std::sync::Arc<dyn Fn(&crate::pipeline::graph::engine::Said) + Send + Sync>;
+
 pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) posts: Vec<Post>,
     pub(in crate::pipeline::tests) damage: Vec<(u32, u32)>,
@@ -587,6 +592,12 @@ pub(in crate::pipeline::tests) struct Scenario {
     // The STAT server of every pipeline the scenario prepared, held as long
     // as the scenario is.
     stat_servers: std::sync::Mutex<Vec<Listener>>,
+    // What the scenario sets on every pipeline it prepares, last, once the
+    // rest is set.
+    setup: Option<Setup>,
+    // What the scenario is told of everything a run says, as the run loop
+    // hears it and before the job does.
+    heard: Option<HeardHook>,
 }
 
 impl Scenario {
@@ -616,7 +627,31 @@ impl Scenario {
             profile: None,
             metadata: Vec::new(),
             stat_servers: std::sync::Mutex::new(Vec::new()),
+            setup: None,
+            heard: None,
         }
+    }
+
+    // Everything a run says is told to `heard` first. Only the rows that
+    // lend windows listen, and only where windows are mapped.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(in crate::pipeline::tests) fn heard(
+        mut self,
+        heard: impl Fn(&crate::pipeline::graph::engine::Said) + Send + Sync + 'static,
+    ) -> Self {
+        self.heard = Some(std::sync::Arc::new(heard));
+        self
+    }
+
+    // Every pipeline the scenario prepares is set this way, last. Only the
+    // rows that lend windows set it, and only where windows are mapped.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    pub(in crate::pipeline::tests) fn setup(
+        mut self,
+        setup: impl Fn(&mut Pipeline) + Send + Sync + 'static,
+    ) -> Self {
+        self.setup = Some(std::sync::Arc::new(setup));
+        self
     }
 
     // The operator chose this hardware profile.
@@ -707,6 +742,9 @@ impl Scenario {
                     CORRUPT_POLICY,
                 )
                 .unwrap();
+        }
+        if let Some(setup) = &self.setup {
+            setup(pipeline);
         }
     }
 
@@ -1152,6 +1190,9 @@ async fn try_run_then(
             .is_some_and(|job| job.awaits_mail())
         {
             let said = pipeline.graph_runs.recv().await.expect("a live run speaks");
+            if let Some(heard) = &scenario.heard {
+                heard(&said);
+            }
             pipeline.graph_run_said(said);
             observe(&pipeline, &mut graph, &mut reads);
             continue;

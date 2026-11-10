@@ -79,12 +79,6 @@ impl Format for SevenZip {
     fn lends() -> bool {
         true
     }
-
-    // sevenz-turbo keeps every buffer it can in RAM up to the memory it is
-    // handed, and threads into what is left: a run holds that memory.
-    fn holds_memory() -> bool {
-        true
-    }
 }
 
 pub type SevenZipEngine = EngineObject<SevenZip>;

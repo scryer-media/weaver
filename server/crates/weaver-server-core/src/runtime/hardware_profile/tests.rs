@@ -152,14 +152,15 @@ fn each_profile_decides_its_own_limits() {
     assert_eq!(performance.max_concurrent_downloads_cap, None);
 }
 
-// A window over the ceiling fails only the efficient profile; the others lend
-// it from scratch, then RAM.
+// Every profile lends a window over the ceiling from scratch; where the
+// scratch is refused, only the efficient profile fails it, the others go to
+// RAM.
 #[test]
-fn only_the_efficient_profile_fails_a_window_over_its_ceiling() {
+fn only_the_efficient_profile_fails_a_window_the_scratch_refused() {
     for probe in [machine(4, 8), machine(16, 64)] {
         assert_eq!(
             HardwareProfile::Efficient.tuning(&probe).over_limit,
-            OverLimit::Fail
+            OverLimit::ScratchThenFail
         );
         assert_eq!(
             HardwareProfile::Balanced.tuning(&probe).over_limit,
