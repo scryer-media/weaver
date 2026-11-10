@@ -87,9 +87,15 @@ impl Socket for MulticastSocket {
     }
 }
 
+/// The port an announce says the session listens on, read as each
+/// announce goes out, so a port a mapper gets on the gateway after a
+/// torrent starts is the one its later announces give (libtorrent
+/// `torrent::lsd_announce` asks `session_impl::listen_port` each time).
+pub type AnnouncedPort = Arc<dyn Fn() -> Option<u16> + Send + Sync>;
+
 struct Announce {
     tx: UnboundedSender<SocketAddr>,
-    port: Option<u16>,
+    port: Option<AnnouncedPort>,
     /// Which stream registered it; see [`Registry::unregister`].
     stream: u64,
 }
@@ -97,6 +103,8 @@ struct Announce {
 /// An announce with sends still to go (libtorrent `lsd::resend_announce`).
 struct Resend {
     info_hash: Id20,
+    /// The port the first send gave: a resend repeats that message.
+    port: u16,
     sent: u32,
     at: Instant,
 }
@@ -179,7 +187,7 @@ impl Registry {
     }
 
     fn port(&self, info_hash: Id20) -> Option<u16> {
-        self.receivers.get(&info_hash)?.port
+        self.receivers.get(&info_hash)?.port.as_ref()?()
     }
 
     fn wake_at(&self) -> Instant {
@@ -203,12 +211,9 @@ impl Registry {
             if r.at > now {
                 return true;
             }
-            due.extend(
-                receivers
-                    .get(&r.info_hash)
-                    .and_then(|a| a.port)
-                    .map(|p| (r.info_hash, p)),
-            );
+            if receivers.contains_key(&r.info_hash) {
+                due.push((r.info_hash, r.port));
+            }
             r.sent += 1;
             r.at = now + RESEND_STEP * r.sent;
             r.sent < SENDS_PER_ANNOUNCE
@@ -233,6 +238,7 @@ impl Registry {
             due.push((info_hash, port));
             self.resends.push(Resend {
                 info_hash,
+                port,
                 sent: 1,
                 at: now + RESEND_STEP,
             });
@@ -423,12 +429,12 @@ cookie: {cookie}\r
     }
 
     /// Streams the peers announcing `info_hash`, and announces it on the
-    /// schedule as listening on `announce_port`, if given, for as long as
-    /// the stream lives.
+    /// schedule as listening on the port `announce_port` gives at each
+    /// announce, if given, for as long as the stream lives.
     pub fn announce(
         &self,
         info_hash: Id20,
-        announce_port: Option<u16>,
+        announce_port: Option<AnnouncedPort>,
     ) -> impl Stream<Item = SocketAddr> + Send + Sync + 'static + use<> {
         let (tx, rx) = unbounded_channel::<SocketAddr>();
 
@@ -620,16 +626,20 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    use super::{LocalServiceDiscovery, Socket, try_parse_bt_search};
+    use super::{AnnouncedPort, LocalServiceDiscovery, Socket, try_parse_bt_search};
     use crate::core::Id20;
 
     const PORT: u16 = 6881;
+
+    fn fixed(port: u16) -> AnnouncedPort {
+        std::sync::Arc::new(move || Some(port))
+    }
 
     /// A socket that records what the LSD sends and hands it the packets a
     /// test injects.
     struct TestSocket {
         incoming: tokio::sync::Mutex<UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
-        sent: UnboundedSender<(Instant, Id20)>,
+        sent: UnboundedSender<(Instant, Id20, u16)>,
         nics: Vec<NetworkInterface>,
     }
 
@@ -637,8 +647,7 @@ mod tests {
         fn record(&self, payload: &str) {
             let mut headers = [httparse::EMPTY_HEADER; 16];
             let bts = try_parse_bt_search(payload.as_bytes(), &mut headers).unwrap();
-            assert_eq!(bts.port, PORT);
-            let _ = self.sent.send((Instant::now(), bts.hash));
+            let _ = self.sent.send((Instant::now(), bts.hash, bts.port));
         }
     }
 
@@ -671,7 +680,7 @@ mod tests {
 
     struct Harness {
         lsd: LocalServiceDiscovery,
-        sent: UnboundedReceiver<(Instant, Id20)>,
+        sent: UnboundedReceiver<(Instant, Id20, u16)>,
         incoming: UnboundedSender<(Vec<u8>, SocketAddr)>,
         start: Instant,
     }
@@ -706,10 +715,19 @@ mod tests {
             }
         }
 
-        /// The next send: whose, and how long after the start, in seconds.
+        /// The next send, on [`PORT`]: whose, and how long after the start,
+        /// in seconds.
         async fn next(&mut self) -> (Id20, u64) {
-            let (at, hash) = self.sent.recv().await.unwrap();
-            (hash, (at - self.start).as_secs())
+            let (hash, secs, port) = self.next_with_port().await;
+            assert_eq!(port, PORT);
+            (hash, secs)
+        }
+
+        /// The next send: whose, how long after the start in seconds, and
+        /// the port it gave.
+        async fn next_with_port(&mut self) -> (Id20, u64, u16) {
+            let (at, hash, port) = self.sent.recv().await.unwrap();
+            (hash, (at - self.start).as_secs(), port)
         }
 
         /// A peer at `from` announces `info_hash` on `port`.
@@ -747,7 +765,7 @@ mod tests {
     async fn each_announce_goes_out_three_times() {
         let mut h = Harness::new();
         let a = hash(1);
-        let _stream = h.lsd.announce(a, Some(PORT));
+        let _stream = h.lsd.announce(a, Some(fixed(PORT)));
         assert_eq!(
             h.until(300).await,
             [(a, 0), (a, 2), (a, 6), (a, 300)],
@@ -762,10 +780,10 @@ mod tests {
     async fn a_dropped_stream_stops_its_announces() {
         let mut h = Harness::new();
         let (a, b) = (hash(1), hash(2));
-        let stream = h.lsd.announce(a, Some(PORT));
+        let stream = h.lsd.announce(a, Some(fixed(PORT)));
         assert_eq!(h.next().await, (a, 0));
         drop(stream);
-        let _b = h.lsd.announce(b, Some(PORT));
+        let _b = h.lsd.announce(b, Some(fixed(PORT)));
         assert_eq!(
             h.until(300).await,
             [(b, 0), (b, 2), (b, 6), (b, 300)],
@@ -779,8 +797,8 @@ mod tests {
     async fn a_late_drop_of_an_old_stream_keeps_the_new_registration() {
         let h = Harness::new();
         let a = hash(1);
-        let old = h.lsd.announce(a, Some(PORT));
-        let new = h.lsd.announce(a, Some(PORT));
+        let old = h.lsd.announce(a, Some(fixed(PORT)));
+        let new = h.lsd.announce(a, Some(fixed(PORT)));
         drop(old);
         assert!(h.lsd.registered(a));
         drop(new);
@@ -793,10 +811,10 @@ mod tests {
     async fn a_resumed_torrent_announces_once_per_interval() {
         let mut h = Harness::new();
         let a = hash(1);
-        let stream = h.lsd.announce(a, Some(PORT));
+        let stream = h.lsd.announce(a, Some(fixed(PORT)));
         assert_eq!(h.next().await, (a, 0));
         drop(stream);
-        let _resumed = h.lsd.announce(a, Some(PORT));
+        let _resumed = h.lsd.announce(a, Some(fixed(PORT)));
         assert_eq!(
             h.until(600).await,
             [
@@ -818,8 +836,8 @@ mod tests {
     async fn turns_spread_over_the_interval() {
         let mut h = Harness::new();
         let (a, b) = (hash(1), hash(2));
-        let _a = h.lsd.announce(a, Some(PORT));
-        let _b = h.lsd.announce(b, Some(PORT));
+        let _a = h.lsd.announce(a, Some(fixed(PORT)));
+        let _b = h.lsd.announce(b, Some(fixed(PORT)));
         assert_eq!(
             h.until(304).await,
             [
@@ -837,13 +855,35 @@ mod tests {
         );
     }
 
+    // libtorrent `torrent::lsd_announce` reads the session's port at each
+    // announce: a port that changes after the torrent starts goes out with
+    // the next announce, and the resends repeat the message they resend.
+    #[tokio::test(start_paused = true)]
+    async fn each_announce_reads_the_port_as_it_goes_out() {
+        let mut h = Harness::new();
+        let a = hash(1);
+        let port = std::sync::Arc::new(std::sync::atomic::AtomicU16::new(PORT));
+        let read = port.clone();
+        let _stream = h.lsd.announce(
+            a,
+            Some(std::sync::Arc::new(move || {
+                Some(read.load(std::sync::atomic::Ordering::SeqCst))
+            })),
+        );
+        assert_eq!(h.next_with_port().await, (a, 0, PORT));
+        port.store(50000, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(h.next_with_port().await, (a, 2, PORT));
+        assert_eq!(h.next_with_port().await, (a, 6, PORT));
+        assert_eq!(h.next_with_port().await, (a, 300, 50000));
+    }
+
     // A stream without a port listens and never announces.
     #[tokio::test(start_paused = true)]
     async fn a_listening_stream_does_not_announce() {
         let mut h = Harness::new();
         let (a, b) = (hash(1), hash(2));
         let _a = h.lsd.announce(a, None);
-        let _b = h.lsd.announce(b, Some(PORT));
+        let _b = h.lsd.announce(b, Some(fixed(PORT)));
         assert_eq!(h.until(300).await, [(b, 0), (b, 2), (b, 6), (b, 300)]);
     }
 
@@ -867,7 +907,7 @@ mod tests {
     async fn a_received_announce_is_not_answered() {
         let mut h = Harness::new();
         let a = hash(1);
-        let mut peers = h.lsd.announce(a, Some(PORT));
+        let mut peers = h.lsd.announce(a, Some(fixed(PORT)));
         h.receive("10.0.0.7:6771", a, 7001);
         assert_eq!(peers.next().await, Some("10.0.0.7:7001".parse().unwrap()));
         assert_eq!(h.until(2).await, [(a, 0), (a, 2)]);

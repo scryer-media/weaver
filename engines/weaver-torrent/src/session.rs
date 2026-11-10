@@ -3614,18 +3614,24 @@ impl Session {
         // `torrent::start_announcing` runs only after `files_checked`, never
         // while paused).
         let lsd_rx = self.lsd.as_ref().filter(|_| discovery.lsd).map(|lsd| {
-            // Local peers reach the listen port itself, whatever announce
-            // port is set (libtorrent `session_impl::announce_lsd`,
-            // session_impl.cpp:5877).
-            let port = if !announce {
-                None
-            } else if ssl.is_some() {
-                self.ssl_port.listen
-            } else {
-                self.announce_port.listen
-            };
+            // Local peers are told the port the torrent's listener is
+            // reached at: the one a mapper got on the gateway, else the
+            // listen port, whatever announce port is set, read at each
+            // announce (libtorrent `torrent::lsd_announce`,
+            // torrent.cpp:2980-2983, takes `session_impl::listen_port` or
+            // `ssl_listen_port`, which give the listen socket's
+            // `tcp_external_port`, session_impl.cpp:5776-5805).
+            let port = announce.then(|| {
+                let port = match ssl {
+                    Some(_) => self.ssl_port.clone(),
+                    None => self.announce_port.clone(),
+                };
+                let port: crate::lsd::AnnouncedPort = Arc::new(move || port.external());
+                port
+            });
             futures::stream::select_all(info_hashes.ids20().map(|info_hash| {
                 let lsd = lsd.clone();
+                let port = port.clone();
                 futures::stream::once(async move { lsd.announce(info_hash, port) })
                     .flatten()
                     .boxed()
@@ -6584,6 +6590,86 @@ mod tests {
         handle.wait_until_initialized().await?;
         assert!(handle.is_paused());
         assert!(!lsd.registered(handle.info_hash()));
+        session.stop().await;
+        Ok(())
+    }
+
+    // libtorrent `torrent::lsd_announce` gives `session_impl::listen_port`,
+    // the listen socket's `tcp_external_port`: the listen port, then the
+    // port a mapper got once it has one, never the announce port set for
+    // trackers and the DHT.
+    #[tokio::test(start_paused = true)]
+    async fn the_local_network_is_told_the_mapped_port_not_the_set_one() -> anyhow::Result<()> {
+        use crate::{
+            lsd::RecordingSocket,
+            storage::StorageFactory,
+            tests::embedder_util::{MemoryStorageFactory, TestTorrent, isolated_session_opts},
+            upnp::{PortMapped, PortmapProtocol, PortmapTransport},
+        };
+        use anyhow::Context;
+
+        fn port_of(announce: &str) -> Option<u16> {
+            announce
+                .lines()
+                .find_map(|line| line.strip_prefix("Port: "))
+                .and_then(|port| port.trim().parse().ok())
+        }
+
+        let t = TestTorrent::new("test_lsd_mapped_port", 2 * 16384, 16384).await?;
+        let (sent_tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let out = TempDir::with_prefix("test_lsd_mapped_port_out")?;
+        let session = Session::new_with_opts(
+            out.path().into(),
+            SessionOptions {
+                disable_local_service_discovery: false,
+                lsd_socket: Some(Box::new(RecordingSocket(sent_tx))),
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    announce_port: Some(6881),
+                    ..Default::default()
+                }),
+                ..isolated_session_opts(false)
+            },
+        )
+        .await?;
+        let listening = session.listen_addr().context("no listener")?.port();
+        assert_ne!(listening, 6881);
+        let _handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(t.torrent.clone()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        let first = sent.recv().await.context("no announce")?;
+        assert_eq!(port_of(&first), Some(listening), "{first}");
+
+        session.announce_port.on_port_mapping(&PortMapped {
+            transport: PortmapTransport::NatPmp,
+            protocol: PortmapProtocol::Tcp,
+            local_port: listening,
+            external_port: Some(2000),
+            external_ip: None,
+            error: None,
+        });
+        // The resends of the first announce repeat it; the next announce,
+        // an interval on, gives the mapped port.
+        let mut told = Vec::new();
+        while told.last() != Some(&Some(2000)) {
+            let announce = sent.recv().await.context("no announce")?;
+            told.push(port_of(&announce));
+        }
+        assert_eq!(
+            told,
+            [Some(listening), Some(listening), Some(2000)],
+            "the resends, then the next announce"
+        );
+        assert_eq!(session.announce_port(), Some(6881));
         session.stop().await;
         Ok(())
     }
