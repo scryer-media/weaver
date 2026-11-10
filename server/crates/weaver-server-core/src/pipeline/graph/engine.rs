@@ -198,6 +198,10 @@ struct Run {
     above: bool,
     // Where that window is: lent from a scratch file, or in RAM.
     placed: Placed,
+    // Its decoder is handed the job's lender, to borrow a window over its
+    // grant: it borrows (`Engine::lends`), and the policy lets a window go
+    // over the ceiling.
+    lends: bool,
     // The run refused a window its policy lets it have: it starts again,
     // wider, once it ends, and what it says before then is not heard.
     rerun: bool,
@@ -216,11 +220,18 @@ impl Run {
             window: 0,
             above: false,
             placed: Placed::Grant,
+            lends: false,
             rerun: false,
             whole: false,
         }
     }
 }
+
+// How a run's decoder borrows, for one that does (`Engine::lends`): the
+// widest window it asks its lender for first, as its object's first bytes
+// declare it, when they do (`Engine::lent`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Lent(pub(crate) Option<u64>);
 
 // Where a run's decode window is.
 #[derive(Debug, Default)]
@@ -466,25 +477,37 @@ impl Runs {
     // allocated for it.
     #[cfg(test)]
     pub(crate) fn reserve(&mut self, node: NodeId, window: u64) -> Reservation {
-        self.reserve_for(node, window, false)
+        self.reserve_for(node, window, None)
     }
 
-    // As `reserve`, for a run whose decoder borrows a window over the
-    // ceiling from its lender when `lends`.
+    // As `reserve`, for a run whose decoder borrows a window over its grant
+    // from its lender, as `lent` says, or `None` for one that does not.
     //
     // Where the grant's policy lets a window go over the ceiling, and the
     // run's window is over it, as its object declares or as its decoder
     // refused (`widen`), the window is placed here: lent from a scratch
-    // file for a decoder that borrows one, with only the run's RAM inside
-    // the ceiling reserved; or, for one that does not, or a scratch file
-    // refused for any reason, in RAM above the ceiling, reserved whole
-    // apart from the pool. It is admitted once it, every other run above the
-    // ceiling, and the whole pool fit under what the machine leaves a run.
-    // A window its decoder refused within the ceiling is reserved whole
-    // from the pool. Under a policy that holds runs to the ceiling, a
-    // window a run was widened to above it is dropped: the run is held to
-    // the ceiling, and its decoder refuses with the sizes.
-    pub(crate) fn reserve_for(&mut self, node: NodeId, window: u64, lends: bool) -> Reservation {
+    // file for a decoder that borrows one, with only the run's fixed
+    // overhead reserved, for the window is not in RAM; or, for one that does
+    // not, or a scratch file refused for any reason, in RAM above the
+    // ceiling, reserved whole apart from the pool. It is admitted once it,
+    // every other run above the ceiling, and the whole pool fit under what
+    // the machine leaves a run. A window its decoder refused within the
+    // ceiling is reserved whole from the pool. Under a policy that holds
+    // runs to the ceiling, a window a run was widened to above it is
+    // dropped: the run is held to the ceiling, and its decoder refuses with
+    // the sizes, handed no lender.
+    //
+    // A decoder that borrows keeps in RAM no more than the window the grant
+    // holds one decoder to (`Grant::held`) and borrows what is over it, so
+    // that, not the ceiling, is what its window is placed against; the
+    // window it is lent first is the one its first bytes declare it asks
+    // for, sized as it sizes it.
+    pub(crate) fn reserve_for(
+        &mut self,
+        node: NodeId,
+        window: u64,
+        lent: Option<Lent>,
+    ) -> Reservation {
         let grant = self.hardware.grant();
         self.held_back.remove(&node);
         let Some(run) = self.runs.get_mut(&node) else {
@@ -495,8 +518,16 @@ impl Runs {
         }
         let ceiling = grant.ceiling();
         let above = grant.over_limit == OverLimit::ScratchThenRam;
+        let lent = lent.filter(|_| above);
+        run.lends = lent.is_some();
+        let over = if run.lends { grant.held() } else { ceiling };
         if above && window > ceiling {
             run.wide = run.wide.max(Some(window));
+        }
+        if let Some(Lent(Some(asked))) = lent
+            && asked > over
+        {
+            run.wide = run.wide.max(Some(asked));
         }
         if !above {
             run.wide = run.wide.filter(|wide| *wide <= grant.held());
@@ -507,7 +538,7 @@ impl Runs {
                 run.placed = Placed::Grant;
                 window.min(ceiling).saturating_add(RUN_OVERHEAD)
             }
-            Some(wide) if wide <= ceiling => {
+            Some(wide) if wide <= over => {
                 run.placed = Placed::Ram(wide);
                 wide.saturating_add(RUN_OVERHEAD)
             }
@@ -516,14 +547,14 @@ impl Runs {
                     run.placed = self
                         .windows
                         .as_ref()
-                        .filter(|_| lends)
+                        .filter(|_| lent.is_some())
                         .and_then(|windows| {
                             windows.allocate(node, usize::try_from(wide).ok()?).ok()
                         })
                         .map_or(Placed::Ram(wide), Placed::Scratch);
                 }
                 match run.placed {
-                    Placed::Scratch(_) => window.min(ceiling).saturating_add(RUN_OVERHEAD),
+                    Placed::Scratch(_) => RUN_OVERHEAD,
                     _ => wide.saturating_add(RUN_OVERHEAD),
                 }
             }
@@ -589,7 +620,14 @@ impl Runs {
         run.volumes = Some(Arc::clone(&volumes));
         let grant = self.hardware.grant();
         let mut budget = grant.run.clone();
-        budget.lender = self.windows.as_ref().map(|windows| windows.for_node(node));
+        // Only a decoder that borrows, under a policy that lets a window go
+        // over the ceiling, is handed the lender: every other is held to its
+        // grant and refuses a window over it with the sizes.
+        budget.lender = self
+            .windows
+            .as_ref()
+            .filter(|_| run.lends)
+            .map(|windows| windows.for_node(node));
         match &mut run.placed {
             Placed::Grant => {}
             // The decoder borrows the window lent for it first. A run

@@ -89,6 +89,18 @@ pub trait Format: Send + Sync {
     fn window(_first_bytes: &[u8]) -> Option<u64> {
         None
     }
+
+    // Whether a run's decoder borrows a window over the run's grant from
+    // `Budget::lender`: `Engine::lends`.
+    fn lends() -> bool {
+        false
+    }
+
+    // The widest window a run's decoder asks its lender for, as a volume's
+    // front states it: `Engine::lent`.
+    fn lent(_front: &Self::Front) -> Option<u64> {
+        None
+    }
 }
 
 // A volume bound, as far as it places the others: what its front states,
@@ -445,6 +457,18 @@ impl<F: Format + 'static> Engine for EngineObject<F> {
     fn reserve(&self) -> Option<u64> {
         let widest = self.windows.values().copied().max().unwrap_or(0);
         Some(F::reserve().max(widest))
+    }
+
+    fn lends(&self) -> bool {
+        F::lends()
+    }
+
+    // The widest window any bound volume's front says the decoder asks its
+    // lender for.
+    fn lent(&self) -> Option<u64> {
+        F::lends()
+            .then(|| self.fronts.values().filter_map(F::lent).max())
+            .flatten()
     }
 
     // The volumes after the one the run is on, the nearest first: weighed

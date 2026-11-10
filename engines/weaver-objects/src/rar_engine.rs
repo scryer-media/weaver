@@ -70,9 +70,40 @@ impl Format for Rar {
     fn window(first_bytes: &[u8]) -> Option<u64> {
         window(&Self::front(first_bytes)?)
     }
+
+    // A run's decoder borrows a dictionary or a PPMd arena over its window
+    // from the run's lender: `crate::lent::rar`.
+    fn lends() -> bool {
+        true
+    }
+
+    fn lent(front: &RarVolumeFacts) -> Option<u64> {
+        lent(front)
+    }
 }
 
 pub type RarEngine = EngineObject<Rar>;
+
+// The widest LZ window the decoder asks its lender for over the compressed
+// members a front's headers name: each header's dictionary, at least the
+// format's smallest window (256 KiB, for RAR5 and RAR 1.5 to 2.9 alike), as
+// unrar-rs sizes the window it builds. It is not narrowed to a member's
+// unpacked size: the decoder builds the whole window and touches what it
+// writes. A RAR3 PPMd arena is declared in the packed data, past every
+// header, so no front states it: it is lent as the decoder asks.
+pub(crate) fn lent(facts: &RarVolumeFacts) -> Option<u64> {
+    facts
+        .members
+        .iter()
+        .filter(|member| !member.is_directory && member.compression_method != 0)
+        .filter(|member| member.dict_size != 0)
+        .map(|member| {
+            member
+                .dict_size
+                .max(unrar_rs::limits::RAR_MIN_LZ_WINDOW_SIZE)
+        })
+        .max()
+}
 
 // The widest window a decode of the compressed members a front's headers
 // name will hold: the dictionary each header declares, or the member's whole

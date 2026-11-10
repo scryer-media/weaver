@@ -262,6 +262,14 @@ pub trait Engine {
         false
     }
 
+    // The widest window a run's decoder asks its lender for, as the first
+    // bytes the object was delivered declare it, sized exactly as the
+    // decoder sizes it: what the owner lends before the run starts. `None`
+    // for an engine that does not lend, or while nothing declares it.
+    fn lent(&self) -> Option<u64> {
+        None
+    }
+
     // The widest window the format's decoder can be given, for a decoder
     // whose refusal does not say what it needs: a run refused so may start
     // again at this. `None` where every refusal says, or nothing is wider.

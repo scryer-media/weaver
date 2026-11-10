@@ -7,11 +7,12 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use lzma_turbo::Lzma2Reader;
 use lzma_turbo::xz::block::header_size_from_first_byte;
 use lzma_turbo::xz::{
-    BlockHeader, StreamHeader, XzOptions, XzParallelReader, XzReader, single_stream_block_count,
+    BlockHeader, MAX_INDEX_SIZE, StreamHeader, XzIndex, XzOptions, XzParallelReader, XzReader,
+    read_stream_index_ending_at,
 };
+use lzma_turbo::{Lzma2Reader, WindowBacking};
 use weaver_graph::{Budget, Kind};
 
 use super::{Decoder, Front};
@@ -38,46 +39,109 @@ impl Decoder for Xz {
             .map_or(most.min(MEMORY_LIMIT), |window| window.min(most))
     }
 
+    const LENDS: bool = true;
+
+    // The first block's dictionary buffer, as the decoder sizes the window
+    // it asks its lender for.
+    fn lent(first: &[u8]) -> Option<u64> {
+        let block = first_block(first)?;
+        lent_window(block.chain.dict_prop, block.uncompressed_size)
+    }
+
     // Held to the first block's window: a later block that asks for more
     // fails instead of growing the reservation.
     fn open(input: Front, window: u64) -> io::Result<Box<dyn Read + Send>> {
-        let options = XzOptions::default()
-            .with_memory_limit(window.max(1))
-            .with_concatenated(true);
-        Ok(Box::new(XzReader::with_options(input, options)))
+        Ok(Box::new(sequential(input, window, None)))
     }
 
     // One stream of several blocks, already closed, decodes its blocks side
     // by side on the run's threads: its index, at the tail, says where each
     // lies before a byte is decoded. Anything else, or anything the index
     // does not say plainly, is read from the front.
+    //
+    // A run handed a lender borrows a dictionary over its window instead of
+    // refusing it. Side by side, each worker would hold a whole block, and a
+    // block over the run's memory would be lent once per worker; a stream
+    // with such a block is read from the front instead, so a run borrows one
+    // dictionary at a time, never more than one window per block.
     fn open_with(
         mut input: Front,
         window: u64,
         budget: Budget,
         closed: bool,
     ) -> io::Result<Box<dyn Read + Send>> {
-        if closed && budget.threads() > 1 && decoder_kind(&mut input) == DecoderKind::Parallel {
-            return parallel(input, budget.window_or(MEMORY_LIMIT), budget.threads())
-                .map(|reader| Box::new(reader) as Box<dyn Read + Send>);
+        let backing = crate::lent::xz(&budget, window);
+        let memory = budget.window_or(MEMORY_LIMIT);
+        if closed && budget.threads() > 1 {
+            let kind = decoder_kind(&mut input);
+            let fits = |largest: u64| backing.is_none() || largest <= memory;
+            if let DecoderKind::Parallel { largest } = kind
+                && fits(largest)
+            {
+                return parallel(input, memory, budget.threads())
+                    .map(|reader| Box::new(reader) as Box<dyn Read + Send>);
+            }
         }
-        Self::open(input, window)
+        Ok(Box::new(sequential(input, window, backing)))
     }
 }
 
-// The dictionary property of the first block's LZMA2 filter.
-fn dictionary(first: &[u8]) -> Option<u8> {
+// The sequential decoder, held to `window` in RAM, borrowing a dictionary
+// over it from `backing` where the run lends.
+fn sequential(input: Front, window: u64, backing: Option<WindowBacking>) -> XzReader<Front> {
+    let options = XzOptions::default()
+        .with_memory_limit(window.max(1))
+        .with_concatenated(true);
+    let options = match backing {
+        Some(backing) => options.with_window(backing),
+        None => options,
+    };
+    XzReader::with_options(input, options)
+}
+
+// The first block's header.
+fn first_block(first: &[u8]) -> Option<BlockHeader> {
     let header: &[u8; STREAM_HEADER] = first.get(..STREAM_HEADER)?.try_into().ok()?;
     StreamHeader::parse(header).ok()?;
     let size = header_size_from_first_byte(*first.get(STREAM_HEADER)?)?;
     let block = first.get(STREAM_HEADER..STREAM_HEADER + size)?;
-    Some(BlockHeader::parse(block).ok()?.chain.dict_prop)
+    BlockHeader::parse(block).ok()
+}
+
+// The dictionary property of the first block's LZMA2 filter.
+fn dictionary(first: &[u8]) -> Option<u8> {
+    Some(first_block(first)?.chain.dict_prop)
+}
+
+// The window lzma-turbo 0.11 asks its window allocator for, for a block of
+// LZMA2 dictionary property `prop` that declares `uncompressed` bytes, if it
+// declares any: the dictionary the property states, no larger than the
+// block (but never under 4 KiB), rounded up as the SDK rounds a dictionary
+// buffer (`LzmaProps::dic_buf_size`, C: `LzmaDec_Allocate`). The tests pin
+// it to what the decoder asks.
+fn lent_window(prop: u8, uncompressed: Option<u64>) -> Option<u64> {
+    const DIC_MIN: u64 = 1 << 12;
+    let declared = match prop {
+        0..=39 => u64::from((2u32 | u32::from(prop & 1)) << (u32::from(prop) / 2 + 11)),
+        40 => u64::from(u32::MAX),
+        _ => return None,
+    };
+    let dict = uncompressed
+        .map_or(declared, |size| declared.min(size.max(DIC_MIN)))
+        .max(DIC_MIN);
+    let mask: u64 = match dict {
+        dict if dict >= 1 << 30 => (1 << 22) - 1,
+        dict if dict >= 1 << 22 => (1 << 20) - 1,
+        _ => (1 << 12) - 1,
+    };
+    Some((dict + mask) & !mask)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DecoderKind {
     Sequential,
-    Parallel,
+    // The largest block's uncompressed bytes, as the index states them.
+    Parallel { largest: u64 },
 }
 
 // The block-parallel decoder for one stream, its index read first, so every
@@ -101,14 +165,24 @@ fn parallel<R: Read + Seek>(
 // decoder, which checks the format whole. The reader is left where it was.
 fn decoder_kind<R: Read + Seek>(reader: &mut R) -> DecoderKind {
     let position = reader.stream_position().ok();
-    let blocks = single_stream_block_count(reader);
+    let index = single_stream_index(reader);
     if let Some(position) = position {
         let _ = reader.seek(SeekFrom::Start(position));
     }
-    match blocks {
-        Some(count) if count > 1 => DecoderKind::Parallel,
+    match index {
+        Some(index) if index.block_count() > 1 => DecoderKind::Parallel {
+            largest: index.largest_block(),
+        },
         _ => DecoderKind::Sequential,
     }
+}
+
+// The index of the one stream the reader holds, starting at its front with
+// nothing after it: as `single_stream_block_count` reads it.
+fn single_stream_index<R: Read + Seek>(reader: &mut R) -> Option<XzIndex> {
+    let len = reader.seek(SeekFrom::End(0)).ok()?;
+    let found = read_stream_index_ending_at(reader, len, MAX_INDEX_SIZE).ok()?;
+    (found.stream_offset == 0).then_some(found.index)
 }
 
 #[cfg(test)]
@@ -183,7 +257,7 @@ mod tests {
         let input = compress_multiblock(&payload);
         assert_eq!(
             decoder_kind(&mut Cursor::new(&input)),
-            DecoderKind::Parallel
+            DecoderKind::Parallel { largest: 256 << 10 }
         );
         let mut output = Vec::new();
         parallel(Cursor::new(input), MEMORY_LIMIT, 2)
@@ -197,7 +271,10 @@ mod tests {
     fn decoder_selection_restores_the_callers_position() {
         let mut reader = Cursor::new(compress_multiblock(&payload()));
         reader.set_position(7);
-        assert_eq!(decoder_kind(&mut reader), DecoderKind::Parallel);
+        assert!(matches!(
+            decoder_kind(&mut reader),
+            DecoderKind::Parallel { .. }
+        ));
         assert_eq!(reader.position(), 7);
     }
 

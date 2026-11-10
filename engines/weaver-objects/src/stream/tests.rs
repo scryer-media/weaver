@@ -1090,3 +1090,144 @@ fn a_growing_multiblock_xz_is_read_from_the_front() {
     gate.close();
     assert_eq!(said(&runner.join().unwrap()), decoded("ember.bin", plain));
 }
+
+// An xz of a 1 MiB dictionary whose block is wider than a 64 KiB grant.
+const LENT_GRANT: u64 = 64 << 10;
+
+fn lent_plain() -> Vec<u8> {
+    payload(5, 4096).repeat(80)
+}
+
+fn lent_xz() -> Vec<u8> {
+    xz_at(&lent_plain(), 1 << 20)
+}
+
+// A run of the stream built within `LENT_GRANT`, granted it and handed
+// `lender`, over `bytes`.
+fn lent_run(
+    bytes: &[u8],
+    threads: usize,
+    lender: Option<&Arc<crate::lent::testing::TestLender>>,
+) -> Vec<Said> {
+    let mut stream = fronted_within::<Xz>("a.xz", bytes, LENT_GRANT);
+    let granted = weaver_graph::Budget {
+        threads,
+        ..granted(LENT_GRANT, false)
+    };
+    let granted = match lender {
+        Some(lender) => lender.lending(granted),
+        None => granted,
+    };
+    closed_run(&mut stream, bytes.to_vec(), granted)
+}
+
+// A run handed a lender borrows the dictionary its grant cannot hold, and
+// decodes through it what it decodes with the dictionary on its own heap,
+// although every lent byte held garbage first. It asks for the window the
+// stream said before the run it would ask for, once, and gives it back.
+#[test]
+fn an_xz_dictionary_over_the_grant_is_lent_and_given_back() {
+    use crate::lent::testing::TestLender;
+    let bytes = lent_xz();
+    let lender = TestLender::new();
+    assert_eq!(
+        lent_run(&bytes, 1, Some(&lender)),
+        decoded("a", lent_plain())
+    );
+    let said = weaver_graph::Engine::lent(&fronted_within::<Xz>("a.xz", &bytes, LENT_GRANT));
+    let asked = lender.asked();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(asked[0] as u64 > LENT_GRANT, "{asked:?}");
+    assert_eq!(said, Some(asked[0] as u64));
+    assert_eq!(lender.live(), 0);
+
+    // On the decoder's own heap, with room for the dictionary.
+    let room = 2 * MIB;
+    let mut own = fronted_within::<Xz>("a.xz", &bytes, room);
+    assert_eq!(
+        closed_run(&mut own, bytes.clone(), granted(room, false)),
+        decoded("a", lent_plain())
+    );
+}
+
+// Without a lender the same grant refuses the dictionary, as it always did,
+// with the sizes it refused.
+#[test]
+fn an_xz_dictionary_over_the_grant_without_a_lender_is_refused() {
+    let said = lent_run(&lent_xz(), 1, None);
+    let [
+        Said::Retract,
+        Said::Refuse(Why::TooLarge { needed, allowed }),
+    ] = ending(&said)
+    else {
+        panic!("{said:?}");
+    };
+    assert!(needed.is_some_and(|needed| needed > LENT_GRANT), "{said:?}");
+    assert_eq!(*allowed, Some(LENT_GRANT));
+}
+
+// A lender's refusal is the member's verdict: a filesystem's refusal asks
+// for the window it states in RAM, which the owner gives or refuses by its
+// policy; any other refusal stands.
+#[test]
+fn an_xz_window_the_lender_refuses_says_why() {
+    use crate::lent::testing::TestLender;
+    let bytes = lent_xz();
+    let full = TestLender::refusing(io::ErrorKind::StorageFull);
+    let said = lent_run(&bytes, 1, Some(&full));
+    let asked = full.asked()[0] as u64;
+    too_large(&said, Some(asked), None);
+
+    let denied = TestLender::refusing(io::ErrorKind::PermissionDenied);
+    let said = lent_run(&bytes, 1, Some(&denied));
+    assert_eq!(
+        ending(&said),
+        [Said::Retract, Said::Refuse(Why::Unsupported)],
+        "{said:?}"
+    );
+}
+
+// A closed xz of several blocks, each wider than the grant, is read from
+// the front by a run handed a lender, whatever its threads: side by side,
+// each worker would borrow a block of its own. Every window it borrowed it
+// gives back.
+#[test]
+fn a_multiblock_xz_wider_than_the_grant_borrows_one_window_at_a_time() {
+    use crate::lent::testing::TestLender;
+    let plain: Vec<u8> = (0..(1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let bytes = xz_multiblock(&plain);
+    let lender = TestLender::new();
+    assert_eq!(lent_run(&bytes, 4, Some(&lender)), decoded("a", plain));
+    let asked = lender.asked();
+    let said = weaver_graph::Engine::lent(&fronted_within::<Xz>("a.xz", &bytes, LENT_GRANT));
+    assert!(!asked.is_empty());
+    assert!(
+        asked.iter().all(|asked| Some(*asked as u64) == said),
+        "{asked:?} {said:?}"
+    );
+    assert_eq!(lender.live(), 0);
+}
+
+// A dictionary over the lender's ceiling is not asked for: the decoder
+// refuses it with its size against the ceiling, as a run with no lender
+// refuses one over its grant.
+#[test]
+fn an_xz_dictionary_over_the_lenders_ceiling_is_refused_unasked() {
+    use crate::lent::testing::TestLender;
+    let bytes = lent_xz();
+    let ceiling = 128 << 10;
+    let low = TestLender::up_to(ceiling);
+    let said = lent_run(&bytes, 1, Some(&low));
+    let [
+        Said::Retract,
+        Said::Refuse(Why::TooLarge { needed, allowed }),
+    ] = ending(&said)
+    else {
+        panic!("{said:?}");
+    };
+    assert!(needed.is_some_and(|needed| needed > ceiling), "{said:?}");
+    assert_eq!(*allowed, Some(ceiling));
+    assert_eq!(low.asked(), Vec::<usize>::new());
+}

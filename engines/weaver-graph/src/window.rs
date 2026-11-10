@@ -14,10 +14,20 @@ use std::io;
 ///
 /// # Safety
 ///
-/// An implementor promises that `as_mut_ptr` points at no fewer than `len`
-/// writable bytes, that the address stays the same until the value is
-/// dropped, and that nothing else reads or writes those bytes while the value
-/// lives. The bytes need not be zeroed. Dropping the value releases them.
+/// An implementor promises, from the call to `as_mut_ptr` until the value is
+/// dropped:
+///
+/// - the pointer is non-null and valid for reads and writes of `len` bytes;
+/// - those bytes are initialized, to any value: they need not be zeroed, but
+///   they must hold some value, as a file mapping's do and a raw `malloc`'s
+///   do not;
+/// - the address stays the same, also when the value or the `Box` holding
+///   it moves: the bytes live outside the value, as a mapping's do;
+/// - nothing else reads or writes those bytes while the value lives.
+///
+/// Dropping the value releases them. These are the terms the decoders'
+/// libraries ask of the memory they are lent (lzma-turbo's and unrar-rs's
+/// `WindowMemory`), so memory lent here may be handed to either.
 pub unsafe trait WindowMemory: Send + Sync {
     fn as_mut_ptr(&mut self) -> *mut u8;
     fn len(&self) -> usize;
@@ -27,9 +37,12 @@ pub unsafe trait WindowMemory: Send + Sync {
 }
 
 // What lends a run its windows. A run is handed one through its `Budget`
-// when its owner can lend; each call lends one window, refused with an
-// `io::Error` naming why (too large, no room on disk, the filesystem cannot
-// map it). A refusal is the member's "window too large", never a crash.
+// when its owner can lend; each call lends one window of at least `len`
+// bytes, from any thread, or is refused with an `io::Error` naming why. A
+// refusal of kind `StorageFull` means no folder could hold the window, a
+// filesystem's refusal; any other kind means the window may not be lent at
+// all (empty, or over the ceiling). A refusal is the member's "window too
+// large", never a crash.
 pub trait WindowLender: Send + Sync {
     fn lend(&self, len: usize) -> io::Result<Box<dyn WindowMemory>>;
 

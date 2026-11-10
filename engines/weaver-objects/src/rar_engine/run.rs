@@ -58,12 +58,10 @@ impl Run {
 
 // A member's dictionary is held to the window the run was granted, or the
 // decoder's own limit when none was. A RAR3 PPMd arena keeps the format's
-// own ceiling, narrowed by the window too.
+// own ceiling, narrowed by the window too. A run handed a lender borrows a
+// dictionary or an arena over that window: `crate::lent::rar`.
 pub(super) fn limits(budget: &Budget) -> unrar_rs::Limits {
-    let mut limits = unrar_rs::Limits::default();
-    limits.max_dict_size = budget.window_or(limits.max_dict_size);
-    limits.max_ppmd_arena_size = limits.max_ppmd_arena_size.min(budget.window_or(u64::MAX));
-    limits
+    crate::lent::rar(budget)
 }
 
 impl Extraction for Run {
@@ -875,8 +873,8 @@ fn terminal(error: &RarError, encrypted: bool) -> Emit {
 }
 
 // A member whose decode needs more memory than the run may hold: a
-// dictionary or a PPMd model over its limit, or memory the allocator would
-// not give. A dictionary of no size names no limit either: the decoder
+// dictionary or a PPMd model over its limit, or memory the allocator or the
+// run's lender would not give. A dictionary of no size names no limit either: the decoder
 // refused a window it could not build.
 fn too_large(error: &RarError) -> Option<Why> {
     let known = |size: u64| (size > 0).then_some(size);
@@ -898,6 +896,10 @@ fn too_large(error: &RarError) -> Option<Why> {
             needed: known(*bytes),
             allowed: None,
         }),
+        // A window or arena the run's lender refused.
+        RarError::WindowAllocatorFailed { bytes, error } => {
+            Some(crate::lent::refused(*bytes, error.kind(), None))
+        }
         RarError::Io(error) => too_large(error.get_ref()?.downcast_ref::<RarError>()?),
         _ => None,
     }

@@ -2934,6 +2934,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lzma-turbo"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7ad5ebe868656c79696a8d4ee5336e516b332f7147ec2dd9bd32ba28280255b"
+dependencies = [
+ "aws-lc-rs",
+ "crc-turbo",
+]
+
+[[package]]
 name = "managed"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3685,9 +3695,9 @@ checksum = "4a6394b9e965e73d0a289ee54f589087e2c676aedf60885baf52c76b771e4958"
 
 [[package]]
 name = "ppmd-turbo"
-version = "0.2.0"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6f79f9e9a62828a7cefa4885bc3223b2f3f3ac8cb4b4de2cab4835982dcb6194"
+checksum = "87b394d314ab49627003873ff55e00b05f0667a738ddfa176f59717994553937"
 
 [[package]]
 name = "ppv-lite86"
@@ -4596,7 +4606,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "lz4_flex",
- "lzma-turbo",
+ "lzma-turbo 0.10.2",
  "ppmd-turbo",
  "wasm-bindgen",
  "zeroize",
@@ -5782,9 +5792,9 @@ dependencies = [
 
 [[package]]
 name = "unrar-rs"
-version = "0.15.2"
+version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2208aebc13beba1e0b75f24d982f6e10053c7ba5df20436d988ece072899cdc"
+checksum = "99544e98c65185431a5e022f75ca1e86dd002342f6085bc9acbefd92b438866a"
 dependencies = [
  "aws-lc-rs",
  "blake2s_simd",
@@ -6138,7 +6148,7 @@ dependencies = [
  "bzip2",
  "crc-turbo",
  "flate2",
- "lzma-turbo",
+ "lzma-turbo 0.11.0",
  "par2-rs",
  "par3-rs",
  "rmp-serde",
@@ -6165,7 +6175,7 @@ dependencies = [
  "chrono",
  "flate2",
  "hex",
- "lzma-turbo",
+ "lzma-turbo 0.11.0",
  "regex",
  "reqwest",
  "scryer-release-parser",
@@ -6219,7 +6229,7 @@ dependencies = [
  "keyring",
  "keyring-core",
  "libc",
- "lzma-turbo",
+ "lzma-turbo 0.11.0",
  "notify",
  "par2-rs",
  "par3-rs",

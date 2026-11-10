@@ -14,7 +14,7 @@ use weaver_graph::{
 
 use super::echo::{Echoes, HEADER, SIGNATURE};
 use super::volumes::RunVolumes;
-use super::{DecodePool, Heard, RUN_OVERHEAD, Reservation, RunMail, Runs};
+use super::{DecodePool, Heard, Lent, RUN_OVERHEAD, Reservation, RunMail, Runs};
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::graph::envelope::{Envelopes, Shelf, envelope_name};
 use crate::pipeline::graph::job::{GraphJob, RootFile};
@@ -1766,8 +1766,9 @@ fn an_inner_run_reserved_first_never_holds_back_the_outer_run_it_waits_on() {
 }
 
 // A run whose decoder borrows its window is lent the window over the
-// ceiling from a scratch file, and reserves only its RAM inside the
-// ceiling. A scratch file refused for any reason puts the window in RAM.
+// ceiling from a scratch file, and reserves only its fixed overhead: the
+// window is not in RAM. A scratch file refused for any reason puts the
+// window in RAM.
 #[test]
 fn a_lending_run_is_lent_a_scratch_window_and_falls_back_to_ram_when_refused() {
     use crate::pipeline::graph::window::Windows;
@@ -1785,13 +1786,128 @@ fn a_lending_run_is_lent_a_scratch_window_and_falls_back_to_ram_when_refused() {
             .lending(Arc::clone(&windows));
         let node = NodeId(1);
         assert_eq!(runs.ask(node, 1), vec![node]);
-        assert_eq!(runs.reserve_for(node, WIDE, true), Reservation::Granted);
+        assert_eq!(
+            runs.reserve_for(node, WIDE, Some(Lent(Some(WIDE)))),
+            Reservation::Granted
+        );
         if scratch {
-            assert_eq!(runs.reserved(node), CEILING + RUN_OVERHEAD);
+            assert_eq!(runs.reserved(node), RUN_OVERHEAD);
             assert_eq!(windows.live(), (1, WIDE));
         } else {
             assert_eq!(runs.reserved(node), WIDE + RUN_OVERHEAD);
             assert_eq!(windows.live(), (0, 0));
         }
     }
+}
+
+// What a run's decoder found in its budget: whether it was handed a
+// lender, and the window it was lent for `asked` bytes, with the scratch
+// windows the job held while it held it.
+struct Borrows {
+    asked: usize,
+    windows: Arc<crate::pipeline::graph::window::Windows>,
+    seen: std::sync::mpsc::Sender<Option<(usize, (u64, u64))>>,
+}
+
+impl Extraction for Borrows {
+    fn run(self: Box<Self>, _: Arc<dyn Volumes>, _: &mut Sink<'_>, budget: weaver_graph::Budget) {
+        let seen = budget.lender.map(|lender| {
+            let window = lender.lend(self.asked).unwrap();
+            (window.len(), self.windows.live())
+        });
+        self.seen.send(seen).unwrap();
+    }
+}
+
+// A decoder that borrows declares the window it asks for first. Over the
+// window the grant holds one decoder to, that window is lent from scratch
+// before the run starts and the decoder's ask takes it: no second file is
+// made, and only the run's overhead is reserved. Within it, the window is
+// the decoder's own in RAM, reserved as declared, and the decoder is still
+// handed the lender for a later window over its grant.
+#[tokio::test]
+async fn a_lending_run_takes_the_window_lent_before_it_started() {
+    use crate::pipeline::graph::window::Windows;
+    for (asked, scratch) in [(WIDE, true), (CEILING / 2, false)] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut envelopes = Envelopes::new(dir.path().join("envelopes"));
+        let windows = Arc::new(Windows::new(
+            dir.path().to_path_buf(),
+            CapacityReader::unknown(),
+            holds(u64::MAX),
+            64 << 20,
+        ));
+        let pool = profile_pool();
+        let mut mail = RunMail::default();
+        let mut runs = Runs::new(1, 1, mail.sender(), Arc::clone(&pool))
+            .on(over_limit(crate::runtime::OverLimit::ScratchThenRam))
+            .lending(Arc::clone(&windows));
+        let node = NodeId(1);
+        assert_eq!(runs.ask(node, 1), vec![node]);
+        let declared = asked.min(CEILING);
+        assert_eq!(
+            runs.reserve_for(node, declared, Some(Lent(Some(asked)))),
+            Reservation::Granted
+        );
+        let (seen, saw) = std::sync::mpsc::channel();
+        let borrows = Borrows {
+            asked: asked as usize,
+            windows: Arc::clone(&windows),
+            seen,
+        };
+        runs.start(node, Box::new(borrows), envelopes.shelf(node));
+        let said = mail.recv().await.unwrap();
+        let (len, live) = saw.recv().unwrap().expect("handed the lender");
+        assert_eq!(len, asked as usize);
+        assert_eq!(live, (1, asked), "one window, the one asked for");
+        if scratch {
+            assert_eq!(runs.reserved(node), RUN_OVERHEAD);
+        } else {
+            assert_eq!(runs.reserved(node), declared + RUN_OVERHEAD);
+        }
+        runs.ended(node, said.generation, 1);
+        assert_eq!(windows.live(), (0, 0), "every window given back");
+        assert_eq!(pool.room().reserved, 0);
+    }
+}
+
+// Under the efficient policy a decoder that borrows is handed no lender
+// and lent nothing: it is held to the ceiling, as one that does not borrow
+// is, and refuses a wider window with the sizes.
+#[tokio::test]
+async fn a_lending_run_under_the_fail_policy_is_handed_no_lender() {
+    use crate::pipeline::graph::window::Windows;
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().join("envelopes"));
+    let windows = Arc::new(Windows::new(
+        dir.path().to_path_buf(),
+        CapacityReader::unknown(),
+        holds(u64::MAX),
+        64 << 20,
+    ));
+    let pool = profile_pool();
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), Arc::clone(&pool))
+        .on(over_limit(crate::runtime::OverLimit::Fail))
+        .lending(Arc::clone(&windows));
+    let node = NodeId(1);
+    assert_eq!(runs.ask(node, 1), vec![node]);
+    assert_eq!(
+        runs.reserve_for(node, WIDE, Some(Lent(Some(WIDE)))),
+        Reservation::Granted
+    );
+    assert_eq!(runs.reserved(node), CEILING + RUN_OVERHEAD);
+    assert_eq!(windows.live(), (0, 0));
+    let (seen, saw) = std::sync::mpsc::channel();
+    let borrows = Borrows {
+        asked: WIDE as usize,
+        windows: Arc::clone(&windows),
+        seen,
+    };
+    runs.start(node, Box::new(borrows), envelopes.shelf(node));
+    let said = mail.recv().await.unwrap();
+    assert_eq!(saw.recv().unwrap(), None, "no lender");
+    assert!(!runs.widen(node, Some(WIDE), None), "the refusal stands");
+    runs.ended(node, said.generation, 1);
+    assert_eq!(pool.room().reserved, 0);
 }
