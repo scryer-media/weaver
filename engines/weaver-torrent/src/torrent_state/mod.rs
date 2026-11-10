@@ -925,7 +925,10 @@ impl ManagedTorrent {
                             // (`TorrentStateInitializing::resume_or_check`):
                             // a torrent its resume data vouches for starts
                             // beside the others.
-                            let check_result = init.check().await;
+                            // Readers of the state see it move to checking
+                            // the files as the check waits its turn.
+                            let check_result =
+                                init.check(&|| t.state_change_notify.notify_waiters()).await;
 
                             match check_result {
                                 Ok(mut paused) => {

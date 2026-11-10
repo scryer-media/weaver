@@ -40,11 +40,13 @@ use super::{
 };
 
 // Where a torrent's check stands: none is under way; one began, and reads
-// what was saved or vouched for; or one reads every piece back, its progress
-// in `checked_bytes`.
+// what was saved or vouched for; one is past that and waits its turn to
+// read every piece back, with no progress yet; or one reads every piece
+// back, its progress in `checked_bytes`.
 const CHECK_IDLE: u8 = 0;
 const CHECK_STARTED: u8 = 1;
-const CHECK_READING: u8 = 2;
+const CHECK_WAITING: u8 = 2;
+const CHECK_READING: u8 = 3;
 
 /// What a torrent's check trusts of what was saved.
 pub(crate) enum InitialCheck {
@@ -229,10 +231,15 @@ impl TorrentStateInitializing {
         self.check.store(CHECK_IDLE, Ordering::Release);
     }
 
-    /// Whether the check reads every piece back now; one that starts from
-    /// a checkpoint or from saved pieces that hold up does not.
+    /// Whether the check reads every piece back now, or is past the saved
+    /// state and waits its turn to (libtorrent's torrent waiting for an
+    /// `active_checking` slot is in `checking_files` already); one that
+    /// starts from a checkpoint or from saved pieces that hold up does not.
     pub(crate) fn is_reading_pieces(&self) -> bool {
-        self.check.load(Ordering::Acquire) == CHECK_READING
+        matches!(
+            self.check.load(Ordering::Acquire),
+            CHECK_WAITING | CHECK_READING
+        )
     }
 
     async fn validate_fastresume(
@@ -406,11 +413,14 @@ impl TorrentStateInitializing {
 
     // The have set from fastresume data when it holds up, else from hashing
     // every piece; every piece when `full`.
+    // `waiting` is called once the check is past the saved state and waits
+    // its turn to hash.
     async fn resume_or_check(
         &self,
         bitv_factory: &dyn BitVFactory,
         id: TorrentIdOrHash,
         full: bool,
+        waiting: &(dyn Fn() + Sync),
     ) -> anyhow::Result<Box<dyn BitV>> {
         let have_pieces = if full {
             if let Err(e) = bitv_factory.clear(id).await {
@@ -429,7 +439,11 @@ impl TorrentStateInitializing {
         }
 
         // Torrents hash their files one at a time by default, each waiting
-        // its turn here (libtorrent `active_checking`).
+        // its turn here (libtorrent `active_checking`), as checking its
+        // files, with nothing hashed yet.
+        self.checked_bytes.store(0, Ordering::Relaxed);
+        self.check.store(CHECK_WAITING, Ordering::Release);
+        waiting();
         let session = self.shared.session.upgrade();
         let _turn = match &session {
             Some(session) => Some(
@@ -469,7 +483,9 @@ impl TorrentStateInitializing {
             .context("error storing initial check bitfield")
     }
 
-    pub async fn check(&self) -> anyhow::Result<TorrentStatePaused> {
+    /// Checks the torrent's data. `waiting` is called once the check is
+    /// past the saved state and waits its turn to hash the files.
+    pub async fn check(&self, waiting: &(dyn Fn() + Sync)) -> anyhow::Result<TorrentStatePaused> {
         let id: TorrentIdOrHash = self.shared.info_hash.into();
         let bitv_factory = self
             .shared
@@ -507,7 +523,8 @@ impl TorrentStateInitializing {
                 (have, blocks)
             }
             None => (
-                self.resume_or_check(&*bitv_factory, id, full_check).await?,
+                self.resume_or_check(&*bitv_factory, id, full_check, waiting)
+                    .await?,
                 None,
             ),
         };
@@ -981,12 +998,12 @@ mod tests {
             }
         }
 
-        // A torrent initializing reads as checking only while its check
-        // reads pieces back: not while it waits its turn to check, and
-        // until its check is done once it reads.
+        // A torrent initializing reads as checking once it is past its
+        // saved state: while it waits its turn to hash, with nothing hashed
+        // yet, as libtorrent's torrent waiting for an `active_checking` slot
+        // is in `checking_files`, and until its check is done once it reads.
         #[tokio::test(flavor = "multi_thread")]
-        async fn a_torrent_reads_as_checking_only_while_it_reads_pieces_back() -> anyhow::Result<()>
-        {
+        async fn a_torrent_reads_as_checking_from_the_wait_for_its_turn() -> anyhow::Result<()> {
             let name = "reads_as_checking";
             let t = TestTorrent::new(name, 8 * 1024, 1024).await?;
             let out = TempDir::with_prefix(name)?;
@@ -1016,13 +1033,25 @@ mod tests {
                 .await?
                 .into_handle()
                 .context("expected a handle")?;
-            assert!(matches!(
-                handle.stats().state,
-                TorrentStatsState::Initializing {
-                    checking: false,
-                    ..
+            let checking = |state: &TorrentStatsState| {
+                matches!(
+                    state,
+                    TorrentStatsState::Initializing { checking: true, .. }
+                )
+            };
+            let stats = loop {
+                let changed = handle.next_state_change();
+                let stats = handle.stats();
+                if checking(&stats.state) {
+                    break stats;
                 }
-            ));
+                changed.await;
+            };
+            assert_eq!(stats.progress_bytes, 0, "nothing is hashed while it waits");
+            assert!(
+                reading.try_recv().is_err(),
+                "it read pieces before its turn"
+            );
 
             drop(held);
             reading.recv().await.context("the check read nothing")?;

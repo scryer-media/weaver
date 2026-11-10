@@ -181,8 +181,17 @@ pub(crate) async fn started_port_after(
     opts: SessionOptions,
     before: impl FnOnce(&Session),
 ) -> anyhow::Result<(String, Option<u16>)> {
+    started_port_at(opts, Ipv4Addr::LOCALHOST.into(), before).await
+}
+
+/// [`started_port_after`], with the tracker listening on `tracker_ip`.
+pub(crate) async fn started_port_at(
+    opts: SessionOptions,
+    tracker_ip: std::net::IpAddr,
+    before: impl FnOnce(&Session),
+) -> anyhow::Result<(String, Option<u16>)> {
     let t = TestTorrent::new("test_announced_port", 2048, 1024).await?;
-    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let tracker = TcpListener::bind((tracker_ip, 0)).await?;
     let url = format!("http://{}/announce", tracker.local_addr()?);
     let out = TempDir::with_prefix("test_announced_port_out")?;
     let session = Session::new_with_opts(out.path().into(), opts).await?;
@@ -375,7 +384,7 @@ async fn test_a_set_announce_port_is_told_over_a_port_the_transport_forwards() -
     let session = Session::new_with_opts(out.path().into(), opts).await?;
     let report = forwarded.recv().await.context("no forwarded port")?;
     assert_eq!(report.external_port, Some(FORWARDED));
-    assert_eq!(session.external_port_of(false), Some(FORWARDED));
+    assert_eq!(session.external_port_of(false, false), Some(FORWARDED));
     assert_eq!(session.announce_port(), Some(CONFIGURED));
     session
         .add_torrent(
@@ -407,7 +416,7 @@ async fn test_a_set_announce_port_is_told_over_a_port_the_transport_forwards() -
     })?;
     let report = forwarded.recv().await.context("no failure report")?;
     assert_eq!(report.external_port, None);
-    assert_eq!(session.external_port_of(false), listening);
+    assert_eq!(session.external_port_of(false, false), listening);
     assert_eq!(session.announce_port(), Some(CONFIGURED));
     Ok(())
 }

@@ -15,7 +15,7 @@
 //! seeding ledger as the torrent service last published it, so those too
 //! are kept per day.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Mutex;
 
 use chrono::{Datelike, Days, Local, NaiveDate, TimeZone};
@@ -511,6 +511,8 @@ struct RecorderState {
     /// Removed servers whose id no new server has taken yet: the consumer
     /// id what readings still show of them goes to, or `None` to drop it.
     retired: HashMap<u32, Option<String>>,
+    /// Ids a new server took that no reading has shown since.
+    reused: HashSet<u32>,
     /// The reading time the last batch asked for an expiry at.
     expired_at: Option<i64>,
 }
@@ -617,10 +619,14 @@ impl UsageRecorder {
     }
 
     /// Count `server_id` as a live server again, for a new server given
-    /// that id. The old baseline stays: a total that carries on counts what
-    /// moves from it, and a total that starts again below it is a restart.
+    /// that id. At the next reading that shows the id, a total that carries
+    /// on from the old server's counts what moved past the old baseline,
+    /// and a total below it is the new server's own, started from zero, and
+    /// counts in full.
     pub fn reuse_server_id(&self, server_id: u32) {
-        self.lock().retired.remove(&server_id);
+        let mut state = self.lock();
+        state.retired.remove(&server_id);
+        state.reused.insert(server_id);
     }
 
     /// Take `reading` as the starting point: nothing in it is counted.
@@ -691,25 +697,38 @@ impl UsageRecorder {
         state.last_tick_epoch_sec = Some(now_epoch_sec);
 
         for server in &reading.servers {
+            // A new server on a reused id counts its totals from zero.
+            let reused = state.reused.remove(&server.server_id);
             let baseline =
                 state
                     .servers
                     .get(&server.server_id)
                     .copied()
                     .unwrap_or(ServerBaseline {
-                        bytes: server.bytes,
+                        bytes: if reused { Some(0) } else { server.bytes },
                         articles_tried: 0,
                         articles_succeeded: 0,
                     });
+            let moved = |before: u64, now: u64| {
+                if reused && now < before {
+                    now
+                } else {
+                    forward(before, now)
+                }
+            };
             let mut counts = UsageCounts {
                 bytes: match (baseline.bytes, server.bytes) {
-                    (Some(before), Some(now)) => forward(before, now),
+                    (Some(before), Some(now)) => moved(before, now),
                     _ => 0,
                 },
-                articles_tried: forward(baseline.articles_tried, server.articles_tried),
-                articles_succeeded: forward(baseline.articles_succeeded, server.articles_succeeded),
+                articles_tried: moved(baseline.articles_tried, server.articles_tried),
+                articles_succeeded: moved(baseline.articles_succeeded, server.articles_succeeded),
                 ..UsageCounts::default()
             };
+            // Its bytes are judged at the first reading that shows them.
+            if reused && server.bytes.is_none() {
+                state.reused.insert(server.server_id);
+            }
             state.servers.insert(
                 server.server_id,
                 ServerBaseline {
@@ -1168,6 +1187,28 @@ impl Database {
         })
     }
 
+    /// Where the kept rows of `kind` start.
+    pub fn read_usage_start(&self, kind: UsageConsumerKind) -> Result<UsageStart, StateError> {
+        let datastore = self.datastore();
+        let args = vec![SqlArg::Text(kind.as_str().to_string())];
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT MIN(day) AS day FROM usage_daily WHERE consumer_kind = {}",
+                &args,
+            )
+            .await?;
+            let first = match rows.first() {
+                Some(row) => row.opt_text("day")?,
+                None => None,
+            };
+            Ok(match first {
+                None => UsageStart::Empty,
+                Some(day) => parse_day(&day)?.map_or(UsageStart::Folded, UsageStart::Day),
+            })
+        })
+    }
+
     /// The removed servers whose rows are still kept.
     pub fn read_removed_servers(&self) -> Result<Vec<RemovedServerUsage>, StateError> {
         let datastore = self.datastore();
@@ -1279,6 +1320,18 @@ impl Database {
                 .collect()
         })
     }
+}
+
+/// Where the kept rows of one kind start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UsageStart {
+    /// No row is kept.
+    Empty,
+    /// Rows past retention are folded into one, so the first day they
+    /// count is no longer known.
+    Folded,
+    /// The first day a row is kept for.
+    Day(NaiveDate),
 }
 
 /// What a span's finished jobs posted as recovery and fetched of it.

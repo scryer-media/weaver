@@ -397,13 +397,21 @@ pub struct RequestPeersStream {
 }
 
 impl RequestPeersStream {
-    fn new(dht: Arc<DhtState>, info_hash: Id20, announce_port: Option<u16>) -> Self {
+    /// Searches over both families, each announcing the port given for
+    /// it, as each of libtorrent's DHT nodes announces the port of its own
+    /// listen socket (kademlia/node.cpp:449-453, `get_listen_port`).
+    fn new(
+        dht: Arc<DhtState>,
+        info_hash: Id20,
+        port_v4: Option<u16>,
+        port_v6: Option<u16>,
+    ) -> Self {
         let (peer_tx, peer_rx) = unbounded_channel();
         let make = |is_v4: bool, dht: Arc<DhtState>, peer_tx: UnboundedSender<SocketAddr>| {
             Arc::new(RecursiveRequest::get_peers(
                 dht,
                 info_hash,
-                announce_port,
+                if is_v4 { port_v4 } else { port_v6 },
                 peer_tx,
             ))
             .request_peers_forever(is_v4)
@@ -1649,7 +1657,18 @@ impl DhtState {
         info_hash: Id20,
         announce_port: Option<u16>,
     ) -> RequestPeersStream {
-        RequestPeersStream::new(self.clone(), info_hash, announce_port)
+        RequestPeersStream::new(self.clone(), info_hash, announce_port, announce_port)
+    }
+
+    /// [`Self::get_peers`], announcing `port_v4` to IPv4 nodes and
+    /// `port_v6` to IPv6 ones.
+    pub fn get_peers_announcing(
+        self: &Arc<Self>,
+        info_hash: Id20,
+        port_v4: Option<u16>,
+        port_v6: Option<u16>,
+    ) -> RequestPeersStream {
+        RequestPeersStream::new(self.clone(), info_hash, port_v4, port_v6)
     }
 
     pub fn listen_addr(&self) -> SocketAddr {

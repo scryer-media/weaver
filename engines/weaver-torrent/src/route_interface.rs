@@ -97,27 +97,77 @@ fn source_toward(clients: &dyn HttpClients, to: SocketAddr) -> anyhow::Result<Ip
     }
 }
 
-/// The interface a session's IPv6 traffic leaves through, holding the
-/// global IPv6 address a PCP mapper asks from: `listen` itself when the
-/// session is held to it; else, on `device`, the global address traffic
+/// Each interface address a session's IPv6 port is mapped from over PCP,
+/// the one whose mapping the session announces first: `listen` itself when
+/// the session is held to it; else, on `device`, the global address traffic
 /// toward a public IPv6 address leaves from, or the device's first global
-/// address. `None` when there is none to map: an address only the local
+/// address. A session on `[::]` bound to no device maps from every global
+/// IPv6 address of every interface that is up, as libtorrent opens one
+/// listen socket per interface address in place of an unspecified one
+/// (`expand_unspecified_address`, session_impl.cpp:256-310) and starts a
+/// PCP mapper on each IPv6 one that is not local (`start_natpmp`,
+/// session_impl.cpp:5912-5919); the one public IPv6 traffic leaves from is
+/// announced. Empty when there is none to map: an address only the local
 /// network reaches, link-local or unique local, is never mapped
-/// (libtorrent `session_impl::start_natpmp` maps no local IPv6 address,
-/// and `get_gateway` finds no gateway for one). A session bound to no
-/// device and held to no IPv6 address maps none.
-pub fn ipv6_route_interface(
+/// (libtorrent `is_local`, and `get_gateway` finds no gateway for one).
+pub fn ipv6_route_interfaces(
     listen: Ipv6Addr,
     device: Option<&str>,
     clients: &dyn HttpClients,
-) -> anyhow::Result<Option<RouteInterface>> {
-    if listen.is_unspecified() && device.is_none() {
-        return Ok(None);
-    }
+) -> anyhow::Result<Vec<RouteInterface>> {
     let addresses = interface_addresses().context("error listing network interfaces")?;
-    pick_v6(addresses, listen, device, || {
-        clients.egress(PUBLIC_PROBE_V6)
-    })
+    let egress = || clients.egress(PUBLIC_PROBE_V6);
+    if listen.is_unspecified() && device.is_none() {
+        return Ok(pick_v6_each(addresses, egress));
+    }
+    Ok(pick_v6(addresses, listen, device, egress)?
+        .into_iter()
+        .collect())
+}
+
+/// An IPv6 address no gateway forwards a port to from the internet: a
+/// local network one, a site-local one, or a multicast one (libtorrent
+/// `is_local`, ip_helpers.cpp:61-79).
+fn unmapped_ipv6(ip: Ipv6Addr) -> bool {
+    local_network_address(ip.into())
+        || ip.is_multicast()
+        // fec0::/10, site local, deprecated and not routed.
+        || (ip.segments()[0] & 0xffc0) == 0xfec0
+}
+
+/// Every global IPv6 address of an interface that is up, each its own
+/// interface address, the one `egress` says public traffic leaves from
+/// first, the rest in the order the system lists them. A loopback
+/// interface's address is never one (libtorrent marks it `local_network`).
+fn pick_v6_each(
+    addresses: Vec<InterfaceAddress>,
+    egress: impl FnOnce() -> Egress,
+) -> Vec<RouteInterface> {
+    let mut each: Vec<RouteInterface> = Vec::new();
+    for a in addresses {
+        let IpAddr::V6(ip) = a.ip else { continue };
+        if !a.up || a.loopback || ip.is_unspecified() || unmapped_ipv6(ip) {
+            continue;
+        }
+        if each.iter().any(|i| i.ip == a.ip) {
+            continue;
+        }
+        each.push(RouteInterface {
+            name: a.name,
+            ip: a.ip,
+            point_to_point: a.point_to_point,
+        });
+    }
+    if each.is_empty() {
+        return each;
+    }
+    if let Egress::From(source) = egress()
+        && let Some(at) = each.iter().position(|i| i.ip == source)
+    {
+        let announced = each.remove(at);
+        each.insert(0, announced);
+    }
+    each
 }
 
 fn pick_v6(
@@ -190,10 +240,15 @@ fn ipv4_interfaces() -> io::Result<Vec<RouteInterface>> {
 }
 
 /// One address of one interface, of either family.
+#[derive(Clone)]
 struct InterfaceAddress {
     name: String,
     ip: IpAddr,
     point_to_point: bool,
+    /// The interface is up.
+    up: bool,
+    /// The interface is a loopback one.
+    loopback: bool,
 }
 
 #[cfg(unix)]
@@ -233,6 +288,8 @@ fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
             name: name.to_string_lossy().into_owned(),
             ip,
             point_to_point: ifa.ifa_flags & libc::IFF_POINTOPOINT as u32 != 0,
+            up: ifa.ifa_flags & libc::IFF_UP as u32 != 0,
+            loopback: ifa.ifa_flags & libc::IFF_LOOPBACK as u32 != 0,
         });
     }
     // SAFETY: the head getifaddrs returned, freed once.
@@ -240,7 +297,9 @@ fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
     Ok(addresses)
 }
 
-/// The adapter list does not say which links are point-to-point.
+/// The adapter list does not say which links are point-to-point, up, or
+/// loopback ones: each is taken as up, and only its address marks a
+/// loopback one.
 #[cfg(not(unix))]
 fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
     use network_interface::{Addr, NetworkInterface, NetworkInterfaceConfig};
@@ -255,6 +314,8 @@ fn interface_addresses() -> io::Result<Vec<InterfaceAddress>> {
                     Addr::V6(a) => a.ip.into(),
                 },
                 point_to_point: false,
+                up: true,
+                loopback: false,
             })
         })
         .collect())
@@ -266,7 +327,10 @@ mod tests {
 
     use std::net::{IpAddr, SocketAddr};
 
-    use super::{InterfaceAddress, RouteInterface, ipv4_interfaces, pick, pick_v6, source_toward};
+    use super::{
+        InterfaceAddress, RouteInterface, ipv4_interfaces, pick, pick_v6, pick_v6_each,
+        source_toward,
+    };
     use crate::{ClientShape, Egress, HttpClients, HttpTarget};
 
     // A route on which every request leaves from `0`.
@@ -398,6 +462,8 @@ mod tests {
             name: name.into(),
             ip: ip.parse().unwrap(),
             point_to_point: false,
+            up: true,
+            loopback: false,
         }
     }
 
@@ -462,6 +528,71 @@ mod tests {
             None
         );
         assert_eq!(pick_v6(host(), any, None, unprobed).unwrap(), None);
+    }
+
+    // A session on `[::]` bound to no device maps from every global IPv6
+    // address of every interface that is up, the one public traffic leaves
+    // from first; local, site-local, loopback and down ones are not mapped,
+    // and an address listed twice is mapped once.
+    #[test]
+    fn a_session_on_any_ipv6_address_maps_from_each_global_one() {
+        let mut addresses = host();
+        addresses.extend([
+            address("en1", "2001:db8:1::9"),
+            address("en0", "2001:db8::5"),
+            address("en2", "fec0::4"),
+            address("lo0", "::1"),
+            InterfaceAddress {
+                loopback: true,
+                ..address("lo0", "2001:db8:2::1")
+            },
+            InterfaceAddress {
+                up: false,
+                ..address("en3", "2001:db8:3::1")
+            },
+            InterfaceAddress {
+                point_to_point: true,
+                ..address("utun4", "2001:db8:4::1")
+            },
+        ]);
+        let ips = |each: Vec<RouteInterface>| -> Vec<(String, String)> {
+            each.into_iter()
+                .map(|i| (i.name, i.ip.to_string()))
+                .collect()
+        };
+        let pair = |name: &str, ip: &str| (name.to_string(), ip.to_string());
+        let leaving = |ip: &str| {
+            let ip: IpAddr = ip.parse().unwrap();
+            move || Egress::From(ip)
+        };
+        assert_eq!(
+            ips(pick_v6_each(addresses.clone(), leaving("2001:db8:1::9"))),
+            vec![
+                pair("en1", "2001:db8:1::9"),
+                pair("en0", "2001:db8::5"),
+                pair("en0", "2001:db8::6"),
+                pair("utun4", "2001:db8:4::1"),
+            ]
+        );
+        // Traffic that leaves from no address of the list, or through a
+        // proxy, keeps the system's order.
+        for egress in [
+            Egress::NoRoute,
+            Egress::Proxied,
+            Egress::From("fe80::5".parse().unwrap()),
+        ] {
+            assert_eq!(
+                ips(pick_v6_each(addresses.clone(), move || egress))[0],
+                pair("en0", "2001:db8::5")
+            );
+        }
+        assert_eq!(
+            pick_v6_each(
+                vec![address("en0", "fe80::5"), address("en0", "fd00::5")],
+                unprobed
+            ),
+            vec![]
+        );
     }
 
     #[test]

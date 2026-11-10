@@ -5668,6 +5668,68 @@ async fn the_extended_handshake_carries_listen_ports_and_no_claimed_address() {
     );
 }
 
+// libtorrent `bt_peer_connection::write_extensions` takes `p` from
+// `session_impl::listen_port(ssl, local_endpoint().address())`
+// (bt_peer_connection.cpp:2459-2463, session_impl.cpp:5859-5873): the
+// external port of the listen socket of the connection's family. A port PCP
+// got over IPv6 goes to IPv6 peers only, and one NAT-PMP got over IPv4 to
+// IPv4 peers only.
+#[tokio::test]
+async fn the_extended_handshake_carries_the_port_mapped_for_the_peers_family() {
+    use crate::upnp::{PortMapped, PortmapProtocol, PortmapTransport};
+    let opts = SessionOptions {
+        listen: Some(crate::ListenerOptions {
+            mode: crate::ListenerMode::TcpOnly,
+            listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            announce_port: Some(51413),
+            ..Default::default()
+        }),
+        ..isolated_session_opts(false)
+    };
+    let h = Harness::build_on(
+        "extended_handshake_family_ports",
+        0x00,
+        opts,
+        MemoryStorageFactory::default().clone_box(),
+    )
+    .await;
+    let outgoing = |addr: &str| {
+        let (mut peer, rx) = h.new_peer(addr);
+        peer.incoming = false;
+        (peer, rx)
+    };
+    let (v4, _v4_rx) = outgoing("127.0.0.2:6881");
+    let (mapped_v4, _mapped_v4_rx) = outgoing("[::ffff:127.0.0.3]:6881");
+    let (v6, _v6_rx) = outgoing("[2001:db8::2]:6881");
+    let ours = |peer: &PeerHandler| {
+        let mut hs = ExtendedHandshake::new();
+        peer.update_my_extended_handshake(&mut hs).unwrap();
+        hs.p
+    };
+    let listen = h._session.listen_addr().map(|addr| u32::from(addr.port()));
+    let mapped = |transport, external_port| PortMapped {
+        transport,
+        protocol: PortmapProtocol::Tcp,
+        local_port: h._session.listen_addr().unwrap().port(),
+        external_port: Some(external_port),
+        external_ip: None,
+        error: None,
+    };
+
+    h._session
+        .port_mapped(&mapped(PortmapTransport::PcpIpv6, 2002));
+    assert_eq!(
+        (ours(&v4), ours(&mapped_v4), ours(&v6)),
+        (listen, listen, Some(2002))
+    );
+    h._session
+        .port_mapped(&mapped(PortmapTransport::NatPmp, 2000));
+    assert_eq!(
+        (ours(&v4), ours(&mapped_v4), ours(&v6)),
+        (Some(2000), Some(2000), Some(2002))
+    );
+}
+
 // libtorrent `bt_peer_connection::on_extended_handshake`: a peer's `yourip`
 // is its vote on our external address (`session_impl::set_external_address`),
 // one address to a family.
@@ -6212,7 +6274,7 @@ async fn a_checked_torrent_keeps_its_peer_list_until_its_state_changes() {
         _ => panic!("the added torrent is not being checked"),
     });
 
-    let paused = init.check().await.unwrap();
+    let paused = init.check(&|| {}).await.unwrap();
     assert_eq!(handle.resume_peers().unwrap(), saved);
     drop(paused);
 }
