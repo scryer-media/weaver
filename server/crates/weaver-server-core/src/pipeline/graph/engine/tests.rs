@@ -1769,6 +1769,7 @@ fn an_inner_run_reserved_first_never_holds_back_the_outer_run_it_waits_on() {
 // ceiling from a scratch file, and reserves what a run inside its grant
 // reserves: the lent window is not in RAM. A scratch file refused for any reason puts the
 // window in RAM.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_lending_run_is_lent_a_scratch_window_and_falls_back_to_ram_when_refused() {
     use crate::pipeline::graph::window::Windows;
@@ -1800,6 +1801,37 @@ fn a_lending_run_is_lent_a_scratch_window_and_falls_back_to_ram_when_refused() {
     }
 }
 
+// Where no window can be mapped, a lending run over its grant is placed in
+// RAM above the ceiling, reserved whole, and no scratch file is made.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[test]
+fn where_no_window_can_be_mapped_a_lending_run_is_placed_in_ram_above_the_ceiling() {
+    use crate::pipeline::graph::window::Windows;
+    let dir = tempfile::tempdir().unwrap();
+    let windows = Arc::new(Windows::new(
+        dir.path().to_path_buf(),
+        CapacityReader::unknown(),
+        holds(u64::MAX),
+        WIDE,
+    ));
+    let pool = profile_pool();
+    let mut runs = Runs::new(1, 1, RunMail::default().sender(), Arc::clone(&pool))
+        .on(over_limit(crate::runtime::OverLimit::ScratchThenRam))
+        .lending(Arc::clone(&windows));
+    let node = NodeId(1);
+    assert_eq!(runs.ask(node, 1), vec![node]);
+    assert_eq!(
+        runs.reserve_for(node, WIDE, Some(Lent(Some(WIDE)))),
+        Reservation::Granted
+    );
+    assert_eq!(runs.reserved(node), WIDE + RUN_OVERHEAD);
+    assert_eq!(pool.room().above, WIDE + RUN_OVERHEAD);
+    assert_eq!(windows.live(), (0, 0));
+    assert!(!dir.path().join(weaver_graph::names::INTERNAL_DIR).exists());
+    runs.ended(node, 0, 1);
+    assert_eq!(pool.room().above, 0);
+}
+
 // What a run's decoder found in its budget: whether it was handed a
 // lender, and the window it was lent for `asked` bytes, with the scratch
 // windows the job held while it held it.
@@ -1825,6 +1857,7 @@ impl Extraction for Borrows {
 // made, and the run reserves what it may keep on its own heap. Within it, the window is
 // the decoder's own in RAM, reserved as declared, and the decoder is still
 // handed the lender for a later window over its grant.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn a_lending_run_takes_the_window_lent_before_it_started() {
     use crate::pipeline::graph::window::Windows;
@@ -1977,6 +2010,7 @@ fn scratch_with_room(
 // too large for it: the scratch refused it, not its grant. It starts again
 // with the window it was placed with in RAM, above the ceiling, and makes no
 // second scratch file; refused again in RAM, its refusal stands.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[tokio::test]
 async fn a_run_the_scratch_refuses_during_decode_starts_again_in_ram() {
     let dir = tempfile::tempdir().unwrap();
@@ -2073,6 +2107,7 @@ async fn under_the_fail_policy_a_refusal_within_the_window_stands() {
 // covers what its decoder may keep on its own heap and the workers a grant
 // whose memory is wider than its window admits side by side. The lent
 // window itself is scratch and not counted.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 #[test]
 fn a_run_placed_on_scratch_reserves_what_a_run_in_its_grant_reserves() {
     use crate::pipeline::graph::window::Windows;
