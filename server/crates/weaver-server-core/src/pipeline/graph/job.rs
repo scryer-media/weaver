@@ -110,7 +110,10 @@ pub(crate) struct Storage {
     pub(crate) metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
     // Weaver's data folder and the free space of its disk: where a decode
     // window goes when the working directory cannot hold it.
-    pub(crate) data_dir: Option<(PathBuf, CapacityReader)>,
+    pub(crate) data_dir: Option<(PathBuf, CapacityReader, super::window::ScratchLedger)>,
+    // What decode windows took from the working directory's disk, for
+    // every job that lends on it.
+    pub(crate) window_ledger: super::window::ScratchLedger,
 }
 
 impl Storage {
@@ -121,11 +124,14 @@ impl Storage {
         let windows = super::window::Windows::new(
             self.working_dir.clone(),
             self.free_disk.clone(),
+            self.window_ledger.clone(),
             Arc::clone(&self.accountant),
             super::window::WINDOW_CEILING_BYTES,
         );
         Arc::new(match &self.data_dir {
-            Some((dir, free_disk)) => windows.or_spare(dir.clone(), scope, free_disk.clone()),
+            Some((dir, free_disk, ledger)) => {
+                windows.or_spare(dir.clone(), scope, free_disk.clone(), ledger.clone())
+            }
             None => windows,
         })
     }

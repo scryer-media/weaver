@@ -1123,8 +1123,8 @@ fn lent_run(
 
 // A run handed a lender borrows the dictionary its grant cannot hold, and
 // decodes through it what it decodes with the dictionary on its own heap,
-// although every lent byte held garbage first. It asks for the window the
-// stream said before the run it would ask for, once, and gives it back.
+// although every lent byte held garbage first. It asks once, for a window
+// over the grant and no wider than the 1 MiB dictionary, and gives it back.
 #[test]
 fn an_xz_dictionary_over_the_grant_is_lent_and_given_back() {
     use crate::lent::testing::TestLender;
@@ -1134,11 +1134,10 @@ fn an_xz_dictionary_over_the_grant_is_lent_and_given_back() {
         lent_run(&bytes, 1, Some(&lender)),
         decoded("a", lent_plain())
     );
-    let said = weaver_graph::Engine::lent(&fronted_within::<Xz>("a.xz", &bytes, LENT_GRANT));
     let asked = lender.asked();
     assert_eq!(asked.len(), 1, "{asked:?}");
     assert!(asked[0] as u64 > LENT_GRANT, "{asked:?}");
-    assert_eq!(said, Some(asked[0] as u64));
+    assert!(asked[0] as u64 <= MIB, "{asked:?}");
     assert_eq!(lender.live(), 0);
 
     // On the decoder's own heap, with room for the dictionary.
@@ -1189,8 +1188,8 @@ fn an_xz_window_the_lender_refuses_says_why() {
 
 // A closed xz of several blocks, each wider than the grant, is read from
 // the front by a run handed a lender, whatever its threads: side by side,
-// each worker would borrow a block of its own. Every window it borrowed it
-// gives back.
+// each worker would borrow a block of its own. It asks one window per
+// block, each the same width, holds one at a time, and gives every one back.
 #[test]
 fn a_multiblock_xz_wider_than_the_grant_borrows_one_window_at_a_time() {
     use crate::lent::testing::TestLender;
@@ -1201,12 +1200,9 @@ fn a_multiblock_xz_wider_than_the_grant_borrows_one_window_at_a_time() {
     let lender = TestLender::new();
     assert_eq!(lent_run(&bytes, 4, Some(&lender)), decoded("a", plain));
     let asked = lender.asked();
-    let said = weaver_graph::Engine::lent(&fronted_within::<Xz>("a.xz", &bytes, LENT_GRANT));
     assert!(asked.len() > 1, "{asked:?}");
-    assert!(
-        asked.iter().all(|asked| Some(*asked as u64) == said),
-        "{asked:?} {said:?}"
-    );
+    assert!(asked[0] as u64 > LENT_GRANT, "{asked:?}");
+    assert!(asked.iter().all(|width| *width == asked[0]), "{asked:?}");
     assert_eq!(lender.peak(), 1, "one window at a time");
     assert_eq!(lender.live(), 0);
 }

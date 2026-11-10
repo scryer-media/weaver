@@ -53,12 +53,6 @@ pub trait Decoder: Send + Sync + 'static {
     // `Budget::lender`: `Engine::lends`.
     const LENDS: bool = false;
 
-    // The widest window the decoder asks its lender for, as the stream's
-    // first bytes declare it: `Engine::lent`.
-    fn lent(_first: &[u8]) -> Option<u64> {
-        None
-    }
-
     // The bytes a run of this stream holds resident, as the stream's first
     // bytes declare them, or the format's largest while they do not say. A
     // decoder whose window the format lets grow holds it to the memory
@@ -291,13 +285,6 @@ impl<D: Decoder> Engine for Stream<D> {
 
     fn lends(&self) -> bool {
         D::LENDS
-    }
-
-    fn lent(&self) -> Option<u64> {
-        if !D::LENDS || !(self.closed || self.first.len() >= FIRST) {
-            return None;
-        }
-        D::lent(&self.first)
     }
 }
 

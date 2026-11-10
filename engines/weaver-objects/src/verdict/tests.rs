@@ -131,6 +131,47 @@ fn a_7z_failure_that_names_no_damage_is_terminal() {
     }
 }
 
+// A window the run's lender refused is what its kind says, bare, inside a
+// block, or carried in a read; a window over the lender's ceiling is too
+// large against the ceiling.
+#[test]
+fn a_7z_window_the_lender_refuses_or_cannot_lend_says_why() {
+    let refused = |kind| Error::WindowAllocatorFailed {
+        bytes: 3 << 20,
+        error: io::Error::new(kind, "refused"),
+    };
+    let full = Emit::Refuse(Why::TooLarge {
+        needed: Some(3 << 20),
+        allowed: None,
+    });
+    for error in [
+        refused(io::ErrorKind::StorageFull),
+        block(refused(io::ErrorKind::StorageFull)),
+    ] {
+        assert_eq!(sevenz(&error), full, "{error}");
+    }
+    assert_eq!(
+        io(&io::Error::other(refused(io::ErrorKind::StorageFull))),
+        full
+    );
+    assert_eq!(
+        sevenz(&refused(io::ErrorKind::PermissionDenied)),
+        Emit::Refuse(Why::Unsupported)
+    );
+    let over = Error::LimitExceeded {
+        what: sevenz_turbo::Limit::LentWindowBytes,
+        limit: 2 << 20,
+        requested: 3 << 20,
+    };
+    assert_eq!(
+        sevenz(&over),
+        Emit::Refuse(Why::TooLarge {
+            needed: Some(3 << 20),
+            allowed: Some(2 << 20),
+        })
+    );
+}
+
 #[test]
 fn an_invalid_zip_is_not_an_unsupported_posted_file() {
     assert_eq!(

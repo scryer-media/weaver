@@ -441,6 +441,7 @@ impl Pipeline {
             unanchored_requeues: HashMap::new(),
             pending_unanchored_release: Vec::new(),
             storage_capacity,
+            window_ledgers: Default::default(),
             extraction_limits,
             process_memory_budget,
             job_article_memory: HashMap::new(),

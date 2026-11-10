@@ -11,7 +11,10 @@ use weaver_graph::WindowMemory;
 use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 use weaver_graph::names::INTERNAL_DIR;
 
-use super::{Refused, SPARE_DIR, Step, Tried, Why, Windows, spare_name, sweep_spare, window_name};
+use super::{
+    Refused, SPARE_DIR, ScratchLedger, Step, Tried, Why, Windows, spare_name, sweep_spare,
+    window_name,
+};
 use crate::operations::{Capacity, CapacityReader, CapacityReading};
 
 const MIB: u64 = 1 << 20;
@@ -41,6 +44,7 @@ fn windows(dir: &Path) -> Arc<Windows> {
     Arc::new(Windows::new(
         dir.to_path_buf(),
         CapacityReader::unknown(),
+        ScratchLedger::default(),
         accountant(0),
         super::WINDOW_CEILING_BYTES,
     ))
@@ -148,7 +152,7 @@ fn two_windows_at_once_are_independent() {
 fn a_run_borrows_its_windows_through_the_lender() {
     let dir = tempfile::tempdir().unwrap();
     let windows = windows(dir.path());
-    let lender = windows.for_node(NodeId(9));
+    let (lender, _) = windows.for_node(NodeId(9));
     assert_eq!(lender.ceiling(), super::WINDOW_CEILING_BYTES);
     let mut lent = lender.lend(MIB as usize).unwrap();
     assert_eq!(lent.len(), MIB as usize);
@@ -160,32 +164,253 @@ fn a_run_borrows_its_windows_through_the_lender() {
     assert_eq!(windows.live(), (0, 0));
 }
 
-// A window made before the run started goes to the borrow of its length
-// alone: a smaller borrow before it is lent a file of its own, the borrow
-// it was made for takes it with no file made, and one after is lent anew.
+// A lender keeps the widest window a node's run asked for under its start,
+// lent or refused for want of room, once one was refused so, and nothing
+// else: a window over the ceiling is no window the run can hold, another
+// node's is its own, and a run handed a lender again starts with none on
+// record.
 #[test]
-fn a_window_made_before_the_run_goes_to_the_borrow_it_was_made_for() {
+fn a_lender_keeps_the_widest_window_asked_once_it_had_no_room() {
     let dir = tempfile::tempdir().unwrap();
-    let windows = windows(dir.path());
-    let made = windows.allocate(NodeId(4), 2 * MIB as usize).unwrap();
-    let made_path = made.path().to_path_buf();
-    let lender = windows.prelent(NodeId(4), made);
+    let windows = Arc::new(Windows::new(
+        dir.path().to_path_buf(),
+        free(10 * MIB),
+        ScratchLedger::default(),
+        accountant(7 * MIB),
+        4 * MIB,
+    ));
+    let (lender, start) = windows.for_node(NodeId(4));
+    assert_eq!(windows.refused(NodeId(4), start), None);
+    let held = lender.lend(2 * MIB as usize).unwrap();
+    assert_eq!(windows.refused(NodeId(4), start), None, "lent");
+
+    let Err(error) = lender.lend(5 * MIB as usize) else {
+        panic!("lent over the ceiling");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{error}");
+    assert_eq!(windows.refused(NodeId(4), start), None, "over the ceiling");
+
+    for (asked, widest) in [(2 * MIB, 2 * MIB), (3 * MIB, 3 * MIB), (2 * MIB, 3 * MIB)] {
+        let Err(error) = lender.lend(asked as usize) else {
+            panic!("lent {asked} bytes");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull, "{error}");
+        assert_eq!(windows.refused(NodeId(4), start), Some(widest));
+    }
+    let (_, other) = windows.for_node(NodeId(5));
+    assert_eq!(windows.refused(NodeId(5), other), None);
     assert_eq!(windows.live(), (1, 2 * MIB));
 
-    let small = lender.lend(MIB as usize).unwrap();
-    assert_eq!(small.len(), MIB as usize);
-    assert_eq!(windows.live(), (2, 3 * MIB), "a file of its own");
-
-    let exact = lender.lend(2 * MIB as usize).unwrap();
-    assert_eq!(exact.len(), 2 * MIB as usize);
-    assert_eq!(windows.live(), (2, 3 * MIB), "no file made for it");
-    assert!(made_path.exists());
-    let after = lender.lend(2 * MIB as usize).unwrap();
-    assert_eq!(windows.live(), (3, 5 * MIB), "lent anew");
-
-    drop((small, exact, after, lender));
-    assert!(left(dir.path()).is_empty());
+    drop((held, lender));
+    assert_eq!(
+        windows.refused(NodeId(4), start),
+        Some(3 * MIB),
+        "kept past the run"
+    );
+    let (_again, restarted) = windows.for_node(NodeId(4));
+    assert_eq!(windows.refused(NodeId(4), restarted), None);
+    assert_eq!(windows.refused(NodeId(4), start), None);
     assert_eq!(windows.live(), (0, 0));
+}
+
+// A lender handed for an earlier start of a node, still held by a run that
+// was stopped, records nothing once the node was handed a lender again:
+// the new start's record is the new run's alone.
+#[test]
+fn a_lender_from_an_earlier_start_records_nothing_for_the_new_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let windows = Arc::new(Windows::new(
+        dir.path().to_path_buf(),
+        free(2 * MIB),
+        ScratchLedger::default(),
+        accountant(MIB),
+        4 * MIB,
+    ));
+    let (old, first) = windows.for_node(NodeId(4));
+    let (new, second) = windows.for_node(NodeId(4));
+    assert_ne!(first, second);
+    let Err(error) = old.lend(2 * MIB as usize) else {
+        panic!("lent past the reserve");
+    };
+    assert_eq!(error.kind(), io::ErrorKind::StorageFull);
+    assert_eq!(windows.refused(NodeId(4), second), None);
+    assert_eq!(windows.refused(NodeId(4), first), None, "no longer kept");
+    let Err(_) = new.lend(2 * MIB as usize) else {
+        panic!("lent past the reserve");
+    };
+    assert_eq!(windows.refused(NodeId(4), second), Some(2 * MIB));
+}
+
+// The lender says the most room any one folder has now past its reserve,
+// less what is lent; nothing where a reading is unknown or no reserve is
+// kept. The job's folder has 3 MiB, the data folder 2 MiB: 3 MiB, not 5.
+// With 2 MiB lent in the job's folder, it has 1 MiB, and the data folder,
+// which may be the same disk, is counted less the 2 MiB lent beside it.
+#[test]
+fn a_lender_says_the_room_its_folders_have() {
+    let job = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let windows = Arc::new(
+        Windows::new(
+            job.path().to_path_buf(),
+            free(10 * MIB),
+            ScratchLedger::default(),
+            accountant(7 * MIB),
+            super::WINDOW_CEILING_BYTES,
+        )
+        .or_spare(
+            data.path().to_path_buf(),
+            42,
+            free(9 * MIB),
+            ScratchLedger::default(),
+        ),
+    );
+    let (lender, _) = windows.for_node(NodeId(1));
+    assert_eq!(lender.room(), Some(3 * MIB));
+    let held = lender.lend(2 * MIB as usize).unwrap();
+    assert_eq!(lender.room(), Some(MIB));
+    drop(held);
+    assert_eq!(lender.room(), Some(3 * MIB));
+
+    let unknown = Arc::new(
+        Windows::new(
+            job.path().to_path_buf(),
+            free(10 * MIB),
+            ScratchLedger::default(),
+            accountant(7 * MIB),
+            super::WINDOW_CEILING_BYTES,
+        )
+        .or_spare(
+            data.path().to_path_buf(),
+            42,
+            CapacityReader::unknown(),
+            ScratchLedger::default(),
+        ),
+    );
+    assert_eq!(unknown.room(), None);
+    let unkept = Arc::new(Windows::new(
+        job.path().to_path_buf(),
+        free(10 * MIB),
+        ScratchLedger::default(),
+        accountant(0),
+        super::WINDOW_CEILING_BYTES,
+    ));
+    assert_eq!(unkept.room(), None, "no reserve kept");
+}
+
+// The job's folder inside the data folder, one disk read through one
+// reader, each folder on a ledger of its own as the pipeline keeps them:
+// 10 MiB free, 7 MiB kept, is room for 3 MiB, not 6, and once 3 MiB is
+// lent there is none, in either folder.
+#[test]
+fn two_folders_on_one_disk_say_its_room_once() {
+    let data = tempfile::tempdir().unwrap();
+    let job = data.path().join("job");
+    std::fs::create_dir(&job).unwrap();
+    let disk = free(10 * MIB);
+    let windows = Arc::new(
+        Windows::new(
+            job,
+            disk.clone(),
+            ScratchLedger::default(),
+            accountant(7 * MIB),
+            super::WINDOW_CEILING_BYTES,
+        )
+        .or_spare(
+            data.path().to_path_buf(),
+            42,
+            disk,
+            ScratchLedger::default(),
+        ),
+    );
+    let (lender, _) = windows.for_node(NodeId(1));
+    assert_eq!(lender.room(), Some(3 * MIB));
+    let held = lender.lend(3 * MIB as usize).unwrap();
+    assert_eq!(lender.room(), Some(0));
+    drop(held);
+    assert_eq!(lender.room(), Some(3 * MIB));
+}
+
+// A window given back after its disk was read again takes back nothing
+// from the ledger: the newer reading counts its file, and the charge on the
+// ledger now is another job's. On 10 MiB free with 7 MiB kept, the first
+// job lends 2 MiB; the disk then reads 8 MiB free; the second job lends 1
+// MiB. Giving the first back leaves the second's charge: a further 1 MiB is
+// refused until the disk is read again.
+#[test]
+fn a_window_given_back_after_a_new_reading_takes_back_only_its_own_charge() {
+    let (first_job, second_job) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let taken = std::time::Instant::now();
+    let reading = Arc::new(std::sync::Mutex::new((10 * MIB, taken)));
+    let disk = {
+        let reading = Arc::clone(&reading);
+        CapacityReader::from_fn(move || {
+            let (available_bytes, sampled_at) = *reading.lock().unwrap();
+            Capacity::Known(CapacityReading {
+                available_bytes,
+                total_bytes: 100 * MIB,
+                sampled_at,
+                stale: false,
+            })
+        })
+    };
+    let ledger = ScratchLedger::default();
+    let job = |dir: &Path| {
+        Arc::new(Windows::new(
+            dir.to_path_buf(),
+            disk.clone(),
+            ledger.clone(),
+            accountant(7 * MIB),
+            super::WINDOW_CEILING_BYTES,
+        ))
+    };
+    let (first, second) = (job(first_job.path()), job(second_job.path()));
+    let lent = first.allocate(NodeId(1), 2 * MIB as usize).unwrap();
+    *reading.lock().unwrap() = (8 * MIB, taken + std::time::Duration::from_secs(5));
+    let beside = second.allocate(NodeId(1), MIB as usize).unwrap();
+    drop(lent);
+    let error = second.allocate(NodeId(2), MIB as usize).unwrap_err();
+    assert_eq!(tried(&error)[0].step, Step::NoSpace, "{error}");
+    drop(beside);
+    let again = second.allocate(NodeId(2), MIB as usize).unwrap();
+    drop(again);
+}
+
+// Two jobs that lend on one disk charge one ledger: room for one window is
+// lent to one of them, the other is refused, and once the first is given
+// back the other is lent. Each job's own count would have lent both, past
+// the reserve downloads and holds keep.
+#[test]
+fn two_jobs_on_one_disk_never_both_take_the_same_room() {
+    let (first_job, second_job) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let disk = free(10 * MIB);
+    let ledger = ScratchLedger::default();
+    let job = |dir: &Path, ledger: &ScratchLedger| {
+        Arc::new(Windows::new(
+            dir.to_path_buf(),
+            disk.clone(),
+            ledger.clone(),
+            accountant(7 * MIB),
+            super::WINDOW_CEILING_BYTES,
+        ))
+    };
+    let (first, second) = (
+        job(first_job.path(), &ledger),
+        job(second_job.path(), &ledger),
+    );
+    let lent = first.allocate(NodeId(1), 2 * MIB as usize).unwrap();
+    let error = second.allocate(NodeId(1), 2 * MIB as usize).unwrap_err();
+    assert_eq!(tried(&error)[0].step, Step::NoSpace, "{error}");
+    drop(lent);
+    let lent = second.allocate(NodeId(1), 2 * MIB as usize).unwrap();
+    let error = first.allocate(NodeId(1), 2 * MIB as usize).unwrap_err();
+    assert_eq!(tried(&error)[0].step, Step::NoSpace, "{error}");
+    drop(lent);
+
+    let apart = job(second_job.path(), &ScratchLedger::default());
+    let held = first.allocate(NodeId(1), 2 * MIB as usize).unwrap();
+    let beside = apart.allocate(NodeId(1), 2 * MIB as usize).unwrap();
+    drop((held, beside));
 }
 
 // The file is created new: a file already at the name, or a link there,
@@ -246,6 +471,7 @@ fn a_window_never_takes_the_disk_below_its_reserve() {
     let windows = Arc::new(Windows::new(
         dir.path().to_path_buf(),
         free(10 * MIB),
+        ScratchLedger::default(),
         accountant(8 * MIB),
         super::WINDOW_CEILING_BYTES,
     ));
@@ -275,6 +501,7 @@ fn a_window_over_the_ceiling_is_refused() {
     let windows = Arc::new(Windows::new(
         dir.path().to_path_buf(),
         CapacityReader::unknown(),
+        ScratchLedger::default(),
         accountant(0),
         MIB,
     ));
@@ -300,6 +527,7 @@ fn a_failed_step_leaves_no_file() {
     let windows = Arc::new(Windows::new(
         dir.path().to_path_buf(),
         free(u64::MAX / 2),
+        ScratchLedger::default(),
         accountant(MIB),
         u64::MAX,
     ));
@@ -329,10 +557,16 @@ fn the_data_folder_takes_a_window_the_jobs_folder_refuses() {
         Windows::new(
             job.path().to_path_buf(),
             free(10 * MIB),
+            ScratchLedger::default(),
             accountant(8 * MIB),
             super::WINDOW_CEILING_BYTES,
         )
-        .or_spare(data.path().to_path_buf(), 42, free(100 * MIB)),
+        .or_spare(
+            data.path().to_path_buf(),
+            42,
+            free(100 * MIB),
+            ScratchLedger::default(),
+        ),
     );
     let mut window = windows.allocate(NodeId(5), 4 * MIB as usize).unwrap();
     assert_eq!(
@@ -373,10 +607,16 @@ fn a_window_neither_folder_holds_is_refused_with_both_reasons() {
         Windows::new(
             job.path().to_path_buf(),
             CapacityReader::unknown(),
+            ScratchLedger::default(),
             accountant(8 * MIB),
             super::WINDOW_CEILING_BYTES,
         )
-        .or_spare(data.path().to_path_buf(), 42, free(10 * MIB)),
+        .or_spare(
+            data.path().to_path_buf(),
+            42,
+            free(10 * MIB),
+            ScratchLedger::default(),
+        ),
     );
     let error = windows.allocate(NodeId(5), 4 * MIB as usize).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::StorageFull, "{error}");

@@ -643,6 +643,18 @@ fn may_start(
         .then_some(total)
 }
 
+// What member `at` of `archive`, over `volumes`, holds once it decodes beside
+// nothing, if it may.
+#[cfg(test)]
+pub(super) fn may_start_alone(
+    archive: &RarArchive,
+    volumes: &Arc<dyn Volumes>,
+    budget: &Budget,
+    at: usize,
+) -> Option<u64> {
+    may_start(archive, &Input::beside(volumes), budget, at, 0, false)
+}
+
 // The window a member's decoder holds: as large as the dictionary its
 // header names, none for stored bytes.
 fn window(info: &unrar_rs::MemberInfo) -> u64 {

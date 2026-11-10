@@ -182,6 +182,7 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
             hardware: Default::default(),
             metrics: None,
             data_dir: None,
+            window_ledger: Default::default(),
         },
         0,
     )

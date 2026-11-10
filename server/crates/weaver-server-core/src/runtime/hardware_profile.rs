@@ -62,15 +62,18 @@ pub struct ProfileTuning {
     pub over_limit: OverLimit,
 }
 
-// What a decode window wider than the profile's ceiling gets.
+// What a decode window wider than the profile's ceiling gets. Every profile
+// lends it from a scratch file first, so RAM stays at the ceiling; they
+// differ only in what follows when the scratch is refused (no room, a file
+// that cannot be made or mapped, or a platform that maps none).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum OverLimit {
-    // The run is refused and the job ends Failed, with the sizes.
+    // The run is refused and the job ends Failed, with the sizes; a retry
+    // with no memory limit runs it again as `ScratchThenRam`.
     #[default]
-    Fail,
-    // The window is lent from a scratch file, so RAM stays at the ceiling;
-    // where the scratch file is refused, the window goes into RAM above the
-    // ceiling, up to what the machine has.
+    ScratchThenFail,
+    // The run starts again with the window in RAM above the ceiling, up to
+    // what the machine has.
     ScratchThenRam,
 }
 
@@ -126,7 +129,7 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: 256 * MIB,
         },
         direct_store_resident_default_cap_bytes: Some(256 * MIB),
-        over_limit: OverLimit::Fail,
+        over_limit: OverLimit::ScratchThenFail,
     },
     ProfileRow {
         profile: HardwareProfile::Balanced,

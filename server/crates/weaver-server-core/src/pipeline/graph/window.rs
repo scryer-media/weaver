@@ -4,8 +4,10 @@
 // Decode windows on a scratch file. A member whose decoder window (a RAR,
 // LZMA, LZMA2 or xz dictionary, a 7z coder's) is larger than the profile
 // lets a decoder hold in RAM is lent memory that is a mapping of a scratch
-// file, so it decodes instead of being refused. RAM never goes above the
-// profile's ceiling for it: a window no folder can hold is refused.
+// file, so it decodes instead of being refused. No window over the profile's
+// ceiling is lent. A window no folder has room for is refused, and the
+// profile's policy decides what follows: scratch-then-fail fails the job
+// with the sizes, scratch-then-RAM starts the run again in RAM.
 //
 // The file goes first under the job's chunk directory. Where that refuses
 // it (the disk reserve, or a step below fails), it goes under Weaver's own
@@ -29,11 +31,13 @@
 // What none of this can turn into an error: a real I/O error of the disk
 // under a page the decoder touches later raises SIGBUS like any mapped file.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::Instant;
 
 use weaver_graph::holds::HoldsAccountant;
 use weaver_graph::{NodeId, WindowLender, WindowMemory};
@@ -42,6 +46,23 @@ use crate::operations::{CapacityDebits, CapacityReader};
 
 // The largest window lent at all: RAR's format maximum dictionary.
 pub(crate) const WINDOW_CEILING_BYTES: u64 = 64 << 30;
+
+// Whether a window can be mapped here at all. Where none can, no run is
+// lent one: a run whose window is over its grant is placed in RAM from the
+// start, not lent, refused and started again.
+pub(crate) const MAPS: bool = cfg!(any(target_os = "linux", target_os = "macos"));
+
+// What scratch windows took from one disk's free-space reading since it was
+// taken, for every job that lends on that disk: two jobs never both see the
+// same room. One per place jobs share, kept by the pipeline.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ScratchLedger(Arc<Mutex<CapacityDebits>>);
+
+impl ScratchLedger {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CapacityDebits> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 // The data folder's subfolder of window files. Nothing else is put there.
 pub(crate) const SPARE_DIR: &str = ".weaver-windows";
@@ -66,11 +87,12 @@ pub(crate) fn spare_name(job: u64, node: NodeId, serial: u64) -> String {
 impl crate::pipeline::Pipeline {
     // Weaver's data folder, the one holding its database, and the free
     // space of its disk: the second place a decode window may go.
-    pub(crate) fn window_data_dir(&self) -> (PathBuf, CapacityReader) {
+    pub(crate) fn window_data_dir(&self) -> (PathBuf, CapacityReader, ScratchLedger) {
         (
             self.script_data_dir.clone(),
             self.storage_capacity
                 .reader(crate::operations::StorageRoot::Data),
+            self.window_ledgers.data.clone(),
         )
     }
 }
@@ -206,13 +228,24 @@ impl fmt::Display for Step {
     }
 }
 
-// A folder windows may go in: where, how its files are named, and the
-// free space of its disk.
+// The ledgers of the two disks windows go on, which every job shares: the
+// intermediate root's, under each job's folder, and the data folder's.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct WindowLedgers {
+    pub(crate) intermediate: ScratchLedger,
+    pub(crate) data: ScratchLedger,
+}
+
+// A folder windows may go in: where, how its files are named, the free
+// space of its disk, and what windows took from it.
 struct Place {
     root: PathBuf,
     // The job's id, in the names of a folder jobs share.
     job: Option<u64>,
     free_disk: CapacityReader,
+    ledger: ScratchLedger,
+    // The bytes this job has lent here now.
+    lent: AtomicU64,
 }
 
 impl Place {
@@ -240,15 +273,32 @@ pub(crate) struct Windows {
     accountant: Arc<HoldsAccountant>,
     ceiling: u64,
     serial: AtomicU64,
+    // The starts its lenders were handed for, counted.
+    starts: AtomicU64,
     lent: Mutex<Lent>,
 }
 
 #[derive(Default)]
 struct Lent {
-    // Bytes lent against each place's free-space reading.
-    debits: Vec<CapacityDebits>,
     windows: u64,
     bytes: u64,
+    // What each node's run asked for since it was last handed a lender,
+    // under the start it was handed it for.
+    asked: HashMap<NodeId, Asked>,
+}
+
+// One start of a run that was handed a lender: the lender knows it by this,
+// so a run stopped before it, still asking, is not heard as the new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Start(u64);
+
+// What a run asked of its lender under one start.
+struct Asked {
+    start: Start,
+    // The widest window it asked for, lent or refused.
+    widest: u64,
+    // Whether a window was refused because no folder had room for it.
+    refused: bool,
 }
 
 impl fmt::Debug for Windows {
@@ -268,10 +318,12 @@ impl fmt::Debug for Windows {
 
 impl Windows {
     // Windows under `working_dir`, the job's folder, on the disk
-    // `free_disk` reads.
+    // `free_disk` reads, whose windows every job's are charged to in
+    // `ledger`.
     pub(crate) fn new(
         working_dir: PathBuf,
         free_disk: CapacityReader,
+        ledger: ScratchLedger,
         accountant: Arc<HoldsAccountant>,
         ceiling: u64,
     ) -> Self {
@@ -280,14 +332,14 @@ impl Windows {
                 root: working_dir,
                 job: None,
                 free_disk,
+                ledger,
+                lent: AtomicU64::new(0),
             }],
             accountant,
             ceiling,
             serial: AtomicU64::new(0),
-            lent: Mutex::new(Lent {
-                debits: vec![CapacityDebits::default()],
-                ..Lent::default()
-            }),
+            starts: AtomicU64::new(0),
+            lent: Mutex::new(Lent::default()),
         }
     }
 
@@ -298,37 +350,76 @@ impl Windows {
         data_dir: PathBuf,
         job: u64,
         free_disk: CapacityReader,
+        ledger: ScratchLedger,
     ) -> Self {
         self.places.push(Place {
             root: data_dir,
             job: Some(job),
             free_disk,
+            ledger,
+            lent: AtomicU64::new(0),
         });
-        self.lent
-            .get_mut()
-            .unwrap_or_else(PoisonError::into_inner)
-            .debits
-            .push(CapacityDebits::default());
         self
     }
 
-    // What the node's run borrows its windows through.
-    pub(crate) fn for_node(self: &Arc<Self>, node: NodeId) -> Arc<dyn WindowLender> {
-        Arc::new(NodeWindows {
+    // What the node's run borrows its windows through, as its decoder asks
+    // for them, and the start it is handed it for. A run handed it starts
+    // with nothing asked on record; what a run handed one before asks from
+    // here is not recorded.
+    pub(crate) fn for_node(self: &Arc<Self>, node: NodeId) -> (Arc<dyn WindowLender>, Start) {
+        let start = Start(self.starts.fetch_add(1, Ordering::Relaxed));
+        self.lock().asked.insert(
+            node,
+            Asked {
+                start,
+                widest: 0,
+                refused: false,
+            },
+        );
+        let lender = Arc::new(NodeWindows {
             windows: Arc::clone(self),
             node,
-        })
+            start,
+        });
+        (lender, start)
     }
 
-    // What the node's run borrows its windows through, lending `window`,
-    // allocated for it before it started, to the borrow of its length.
-    pub(crate) fn prelent(self: &Arc<Self>, node: NodeId, window: Window) -> Arc<dyn WindowLender> {
-        Arc::new(Prelent {
-            window: Mutex::new(Some(window)),
-            rest: NodeWindows {
-                windows: Arc::clone(self),
-                node,
-            },
+    // The widest window the node's run asked for under `start`, lent or
+    // refused, once one was refused because no folder had room for it
+    // (`io::ErrorKind::StorageFull`): `None` while none was.
+    pub(crate) fn refused(&self, node: NodeId, start: Start) -> Option<u64> {
+        self.lock()
+            .asked
+            .get(&node)
+            .filter(|asked| asked.start == start && asked.refused)
+            .map(|asked| asked.widest)
+    }
+
+    // The most any one folder could take now before its disk reaches the
+    // free space it keeps, less what this job has lent in its other
+    // folders, which may be on the same disk under a ledger of their own:
+    // the folders are never added up, as by default the job's folder is
+    // inside the data folder, on one disk. It may say less than the disks
+    // have, never more. `None` where a reading is unknown or no free space
+    // is kept, as `admit` then judges nothing.
+    pub(crate) fn room(&self) -> Option<u64> {
+        let reserve = self.accountant.budgets().disk_reserve;
+        if reserve == 0 {
+            return None;
+        }
+        let lent: u64 = self
+            .places
+            .iter()
+            .map(|place| place.lent.load(Ordering::Relaxed))
+            .sum();
+        self.places.iter().try_fold(0u64, |room, place| {
+            let free = place
+                .ledger
+                .lock()
+                .apply(place.free_disk.current())
+                .best_available_bytes()?;
+            let elsewhere = lent - place.lent.load(Ordering::Relaxed).min(lent);
+            Some(room.max(free.saturating_sub(reserve).saturating_sub(elsewhere)))
         })
     }
 
@@ -381,7 +472,7 @@ impl Windows {
         len: usize,
     ) -> Result<Window, (Step, String)> {
         let bytes = len as u64;
-        self.admit(at, place, bytes)?;
+        let basis = self.admit(place, bytes)?;
         let path = place
             .root
             .join(place.name(node, self.serial.fetch_add(1, Ordering::Relaxed)));
@@ -391,28 +482,32 @@ impl Windows {
                 lent.windows += 1;
                 lent.bytes += bytes;
                 drop(lent);
+                place.lent.fetch_add(bytes, Ordering::Relaxed);
                 Ok(Window {
                     mapping: Some(mapping),
                     path,
                     place: at,
+                    basis,
                     windows: Arc::clone(self),
                 })
             }
             Err((step, error)) => {
-                self.lock().debits[at].credit(bytes);
+                place.ledger.lock().credit_against(basis, bytes);
                 Err((step, error.to_string()))
             }
         }
     }
 
-    // Charge `bytes` against the place's disk, refused when it would leave
-    // less free than the reserve. An unknown reading has nothing to judge
-    // against, as a page-out has not; the preallocation still fails on a
-    // disk that is really full.
-    fn admit(&self, at: usize, place: &Place, bytes: u64) -> Result<(), (Step, String)> {
+    // Charge `bytes` against the place's disk, for every job that lends on
+    // it, refused when it would leave less free than the reserve. An
+    // unknown reading has nothing to judge against, as a page-out has not;
+    // the preallocation still fails on a disk that is really full. Says
+    // the reading the charge was counted against, so taking it back takes
+    // back only it (`CapacityDebits::credit_against`).
+    fn admit(&self, place: &Place, bytes: u64) -> Result<Option<Instant>, (Step, String)> {
         let reserve = self.accountant.budgets().disk_reserve;
-        let mut lent = self.lock();
-        let free = lent.debits[at]
+        let mut ledger = place.ledger.lock();
+        let free = ledger
             .apply(place.free_disk.current())
             .best_available_bytes();
         if let Some(free) = free
@@ -424,15 +519,18 @@ impl Windows {
                 format!("{free} bytes free, {reserve} must stay free"),
             ));
         }
-        lent.debits[at].debit(bytes);
-        Ok(())
+        ledger.debit(bytes);
+        Ok(ledger.basis())
     }
 
-    fn release(&self, at: usize, bytes: u64) {
+    fn release(&self, at: usize, bytes: u64, basis: Option<Instant>) {
         let mut lent = self.lock();
         lent.windows -= 1;
         lent.bytes -= bytes;
-        lent.debits[at].credit(bytes);
+        drop(lent);
+        let place = &self.places[at];
+        place.lent.fetch_sub(bytes, Ordering::Relaxed);
+        place.ledger.lock().credit_against(basis, bytes);
     }
 }
 
@@ -440,43 +538,46 @@ impl Windows {
 struct NodeWindows {
     windows: Arc<Windows>,
     node: NodeId,
+    start: Start,
+}
+
+impl NodeWindows {
+    // What the run asked, kept under its start alone: a run started again
+    // since was handed a lender of its own.
+    fn record(&self, len: usize, refused: bool) {
+        let mut lent = self.windows.lock();
+        if let Some(asked) = lent
+            .asked
+            .get_mut(&self.node)
+            .filter(|asked| asked.start == self.start)
+        {
+            asked.widest = asked.widest.max(len as u64);
+            asked.refused |= refused;
+        }
+    }
 }
 
 impl WindowLender for NodeWindows {
+    // Every window lent is kept, and every one refused for want of room,
+    // before the decoder hears it, so the owner reads them when the
+    // decoder's refusal reaches it. A window that may not be lent at all
+    // (empty, or over the ceiling) is the decoder's own refusal.
     fn lend(&self, len: usize) -> io::Result<Box<dyn WindowMemory>> {
-        Ok(Box::new(self.windows.allocate(self.node, len)?))
+        let lent = self.windows.allocate(self.node, len);
+        match &lent {
+            Ok(_) => self.record(len, false),
+            Err(error) if error.kind() == io::ErrorKind::StorageFull => self.record(len, true),
+            Err(_) => {}
+        }
+        Ok(Box::new(lent?))
     }
 
     fn ceiling(&self) -> u64 {
         self.windows.ceiling
     }
-}
 
-// A run's lender holding the window allocated for it before it started: the
-// borrow it was made for, of exactly its length, takes it, and every other
-// is lent as `rest` lends. A smaller borrow before it takes a file of its
-// own: a decoder keeps the length it asked for, so one that took the larger
-// file would ask for another of that size when it grows.
-struct Prelent {
-    window: Mutex<Option<Window>>,
-    rest: NodeWindows,
-}
-
-impl WindowLender for Prelent {
-    fn lend(&self, len: usize) -> io::Result<Box<dyn WindowMemory>> {
-        let held = self
-            .window
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take_if(|window| WindowMemory::len(window) == len);
-        match held {
-            Some(window) => Ok(Box::new(window)),
-            None => self.rest.lend(len),
-        }
-    }
-
-    fn ceiling(&self) -> u64 {
-        self.rest.ceiling()
+    fn room(&self) -> Option<u64> {
+        self.windows.room()
     }
 }
 
@@ -485,8 +586,10 @@ impl WindowLender for Prelent {
 pub(crate) struct Window {
     mapping: Option<sys::Mapping>,
     path: PathBuf,
-    // Which of the job's folders it lies in.
+    // Which of the job's folders it lies in, and the reading of that
+    // folder's disk its charge was counted against.
     place: usize,
+    basis: Option<Instant>,
     windows: Arc<Windows>,
 }
 
@@ -522,7 +625,7 @@ impl Drop for Window {
         // Unmapped before its file goes.
         self.mapping = None;
         sys::remove(&self.path);
-        self.windows.release(self.place, len as u64);
+        self.windows.release(self.place, len as u64, self.basis);
     }
 }
 
@@ -821,6 +924,7 @@ fn a_window_is_refused_where_it_is_not_supported() {
     let windows = Arc::new(Windows::new(
         dir.path().to_path_buf(),
         CapacityReader::unknown(),
+        ScratchLedger::default(),
         Arc::new(HoldsAccountant::new(weaver_graph::holds::HoldBudgets {
             resident_limit: u64::MAX,
             scratch_total: u64::MAX,

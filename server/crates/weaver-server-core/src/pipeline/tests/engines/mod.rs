@@ -86,6 +86,7 @@ mod encrypted_hex;
 pub(in crate::pipeline) mod harness;
 mod hold_breach;
 mod lent_handed;
+mod lent_windows;
 mod lifecycle;
 mod lines;
 pub(in crate::pipeline) mod loans;

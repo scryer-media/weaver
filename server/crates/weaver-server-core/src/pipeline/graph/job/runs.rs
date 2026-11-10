@@ -13,7 +13,7 @@ use weaver_graph::tree::Mark;
 use weaver_graph::{Emit, Engine, MemberId, NodeId, Why};
 
 use super::{GraphError, GraphJob};
-use crate::pipeline::graph::engine::{Heard, Lent, Reservation, Said};
+use crate::pipeline::graph::engine::{Heard, Reservation, Said};
 use crate::pipeline::graph::namespace::{Coming, Returned, WriteError};
 use crate::pipeline::graph::status::RepairSlots;
 
@@ -200,6 +200,18 @@ impl GraphJob {
                 return Ok(());
             }
             Heard::Emit(emit) => {
+                // A window the scratch refused a run held to the ceiling is
+                // refused with the window it was held to.
+                let emit = match emit {
+                    Emit::Refuse(Why::TooLarge {
+                        needed,
+                        allowed: None,
+                    }) => Emit::Refuse(Why::TooLarge {
+                        needed,
+                        allowed: self.runs.allowed(node),
+                    }),
+                    emit => emit,
+                };
                 // The tree is told the run is asking, as it is told how far
                 // the run read: the object rules on it when the job is quiet.
                 if emit == Emit::NeedsPassword {
@@ -332,10 +344,9 @@ impl GraphJob {
             return Ok(Vec::new());
         };
         // Whether the decoder borrows a window over its grant from a
-        // scratch file, or is given it in RAM (`Engine::lends`), and the
-        // window it asks for first (`Engine::lent`).
-        let lent = engine.lends().then(|| Lent(engine.lent()));
-        let refused = match self.runs.reserve_for(node, window, lent) {
+        // scratch file as it asks for it, or is given it in RAM
+        // (`Engine::lends`).
+        let refused = match self.runs.reserve_for(node, window, engine.lends()) {
             Reservation::Granted => None,
             Reservation::Starved(admitted) => return Ok(admitted),
             Reservation::Refused { needed, allowed } => Some(Why::TooLarge {

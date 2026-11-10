@@ -49,4 +49,12 @@ pub trait WindowLender: Send + Sync {
     // The largest window lent at all: a decoder sets its own maximum
     // dictionary to this when it has a lender.
     fn ceiling(&self) -> u64;
+
+    // The bytes the lender could lend now, all its windows together: a
+    // decoder that borrows several at once sizes how many to what fits.
+    // `None` where it cannot tell, and nothing then bounds them but each
+    // window's own refusal.
+    fn room(&self) -> Option<u64> {
+        None
+    }
 }

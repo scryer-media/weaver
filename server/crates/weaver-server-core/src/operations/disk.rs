@@ -600,6 +600,20 @@ impl CapacityDebits {
     pub fn credit(&mut self, bytes: u64) {
         self.debited = self.debited.saturating_sub(bytes);
     }
+
+    // The reading the debits count against now.
+    pub fn basis(&self) -> Option<Instant> {
+        self.basis
+    }
+
+    // Undo a `debit` made while the count was against `basis`. A newer
+    // reading started the count again without it, so then nothing is
+    // undone: crediting it would take back another's debit.
+    pub fn credit_against(&mut self, basis: Option<Instant>, bytes: u64) {
+        if self.basis == basis {
+            self.credit(bytes);
+        }
+    }
 }
 
 type SharedProbeFn = Arc<ProbeFn>;
@@ -1499,6 +1513,40 @@ mod tests {
                 .best_available_bytes(),
             Some(900),
             "a newer reading already reflects what was written"
+        );
+    }
+
+    // A debit taken back after the reading was taken again takes back
+    // nothing: the newer reading started the count without it, and what is
+    // counted now is another's. Under the same reading it is taken back.
+    #[test]
+    fn a_credit_takes_back_only_a_debit_of_the_same_reading() {
+        let taken = Instant::now();
+        let reading = |available_bytes, sampled_at| {
+            Capacity::Known(CapacityReading {
+                available_bytes,
+                total_bytes: 10_000,
+                sampled_at,
+                stale: false,
+            })
+        };
+        let mut debits = CapacityDebits::default();
+        debits.apply(reading(1000, taken));
+        debits.debit(300);
+        let first = debits.basis();
+        let next = taken + Duration::from_secs(5);
+        debits.apply(reading(1000, next));
+        debits.debit(200);
+        debits.credit_against(first, 300);
+        assert_eq!(
+            debits.apply(reading(1000, next)).best_available_bytes(),
+            Some(800),
+            "the other's debit stands"
+        );
+        debits.credit_against(debits.basis(), 200);
+        assert_eq!(
+            debits.apply(reading(1000, next)).best_available_bytes(),
+            Some(1000)
         );
     }
 }

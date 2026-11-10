@@ -88,6 +88,7 @@ impl Pipeline {
             ),
             metrics: Some(Arc::clone(&self.metrics)),
             data_dir: Some(data_dir),
+            window_ledger: self.window_ledgers.intermediate.clone(),
         };
         let mut graph = GraphJob::admit(job_id.0, &files, storage);
         let mut queued = std::collections::HashSet::new();

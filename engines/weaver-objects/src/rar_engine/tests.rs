@@ -2169,24 +2169,10 @@ fn lent_run(
     said(&emits)
 }
 
-// What the archive's headers say a run lends before it starts, read as a
-// volume's front is read (`claim::front_facts`, which keeps them only for a
-// volume of a set).
-fn lent_before(archive: &[u8]) -> Option<u64> {
-    let facts = unrar_rs::RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
-        io::Cursor::new(archive.to_vec()),
-        None,
-        Arc::new(KdfCache::new()),
-    )
-    .unwrap()
-    .facts;
-    super::lent(&facts)
-}
-
 // A run handed a lender borrows the dictionary its grant cannot hold, and
 // decodes through it what a run with room for it on the heap decodes,
-// although every lent byte held garbage first. It asks for the window its
-// front said it would, once, and gives it back.
+// although every lent byte held garbage first. It asks for the dictionary
+// once, as it opens the member, and gives it back.
 #[test]
 fn a_rar5_dictionary_over_the_grant_is_lent_and_given_back() {
     use crate::lent::testing::TestLender;
@@ -2196,7 +2182,6 @@ fn a_rar5_dictionary_over_the_grant_is_lent_and_given_back() {
     assert!(said.contains(&Said::Closed(0)), "{said:?}");
     let asked = lender.asked();
     assert_eq!(asked, [256 << 10]);
-    assert_eq!(lent_before(LZ), Some(256 << 10));
     assert_eq!(lender.live(), 0);
 }
 
@@ -2237,8 +2222,8 @@ fn a_rar_window_the_lender_refuses_says_why() {
 }
 
 // A RAR 2.9 PPMd model arena over the grant is lent under the same rule as
-// its dictionary: a solid run of three members borrows the dictionary its
-// front said and one arena, keeps both across the members, decodes what a
+// its dictionary: a solid run of three members borrows the dictionary and
+// one arena, keeps both across the members, decodes what a
 // run with room for both on the heap decodes, and gives both back. Without
 // a lender the member is refused.
 #[test]
@@ -2249,12 +2234,9 @@ fn a_rar3_ppmd_arena_over_the_grant_is_lent_as_a_dictionary_is() {
     let said = lent_run(PPMD, grant, Some(&lender));
     assert_eq!(said, run(&mut RarEngine::new(), vec![PPMD.to_vec()]));
     assert!(said.contains(&Said::Closed(2)), "{said:?}");
-    let asked = lender.asked();
-    let window = lent_before(PPMD).unwrap();
-    assert_eq!(window, MIB);
-    // The dictionary, then the arena its block header declares, `(mem + 1)
-    // << 20` bytes: no front states the arena.
-    assert_eq!(asked, [window as usize, MIB as usize]);
+    // The 1 MiB dictionary its headers declare, then the arena its block
+    // header declares, `(mem + 1) << 20` bytes.
+    assert_eq!(lender.asked(), [MIB as usize, MIB as usize]);
     assert_eq!(lender.live(), 0);
 
     let said = lent_run(PPMD, grant, None);
@@ -2270,6 +2252,33 @@ fn a_rar3_ppmd_arena_over_the_grant_is_lent_as_a_dictionary_is() {
     let said = lent_run(PPMD, MIB, Some(&room));
     assert_eq!(said, run(&mut RarEngine::new(), vec![PPMD.to_vec()]));
     assert_eq!(room.asked(), Vec::<usize>::new());
+}
+
+// A RAR 2.9 member decoding beside others counts its bytes and its
+// dictionary, nothing for a PPMd arena it may never use: it fits a grant
+// of exactly those, lent or not.
+#[test]
+fn a_rar3_member_beside_others_counts_its_bytes_and_dictionary() {
+    use crate::lent::testing::TestLender;
+    let parsed =
+        unrar_rs::RarArchive::open_prefix(io::Cursor::new(PPMD.to_vec()), None, NonZeroUsize::MAX)
+            .unwrap();
+    let info = parsed.member_info(0).unwrap();
+    let bytes = info.unpacked_size.unwrap() + info.compression.dict_size;
+    let volumes = Gate::whole(vec![PPMD.to_vec()]) as Arc<dyn Volumes>;
+    let granted = |memory: u64| weaver_graph::Budget {
+        memory_bytes: Some(memory),
+        window_bytes: Some(memory),
+        threads: 1,
+        ..Default::default()
+    };
+    let alone = |budget: &weaver_graph::Budget| run::may_start_alone(&parsed, &volumes, budget, 0);
+    assert_eq!(alone(&granted(bytes)), Some(bytes));
+    assert_eq!(alone(&granted(bytes - 1)), None);
+    assert_eq!(
+        alone(&TestLender::new().lending(granted(bytes))),
+        Some(bytes)
+    );
 }
 
 // A dictionary over the lender's ceiling is not asked for: the decoder
@@ -2314,4 +2323,27 @@ fn a_rar3_ppmd_arena_the_lender_refuses_says_why_with_its_size() {
     assert_eq!(denied.asked().len(), 2);
     assert!(said.contains(&Said::Refuse(Why::Unsupported)), "{said:?}");
     assert_eq!(denied.live(), 0);
+}
+
+// A lone archive is no volume, so its front places nothing, but its headers
+// still state the window its decode holds: its member's unpacked size where
+// that is under the dictionary, the whole dictionary when it is solid. The
+// owner books that window for the run.
+#[test]
+fn a_lone_archive_states_its_window() {
+    let fixture = |path: &str| {
+        std::fs::read(format!(
+            "{}/../../server/crates/weaver-server-core/tests/fixtures/extraction_profiles/{path}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    };
+    for (path, window) in [
+        ("rar5_lz.rar", 226_943),
+        ("rar4_solid_ppmd_plain.rar", 1 << 20),
+    ] {
+        let bytes = fixture(path);
+        assert!(<Rar as Format>::front(&bytes).is_none(), "{path}");
+        assert_eq!(<Rar as Format>::window(&bytes), Some(window), "{path}");
+    }
 }
