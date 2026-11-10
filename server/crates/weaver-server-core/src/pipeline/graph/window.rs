@@ -159,13 +159,22 @@ pub(crate) struct Tried {
 pub(crate) enum Step {
     // The window would take the disk below the free space it keeps.
     NoSpace,
+    // The steps of making a mapping, only where one can be made.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Directory,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Create,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     PreallocateUnsupported,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Preallocate,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     NotReserved,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     MapUnsupported,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Map,
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     Probe,
     // Only where no window can be mapped.
     #[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
@@ -176,13 +185,21 @@ impl fmt::Display for Step {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::NoSpace => "not enough free space",
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Directory => "the folder is not usable",
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Create => "the file could not be created",
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::PreallocateUnsupported => "preallocation not supported",
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Preallocate => "preallocation failed",
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::NotReserved => "the filesystem did not reserve the space",
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::MapUnsupported => "mapping not supported",
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Map => "mapping failed",
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             Self::Probe => "the mapping did not hold its bytes",
             Self::Unsupported => "scratch windows are not supported on this platform",
         })
@@ -473,7 +490,8 @@ pub(crate) struct Window {
     windows: Arc<Windows>,
 }
 
-#[cfg(test)]
+// For the tests of windows that are mapped.
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 impl Window {
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -501,7 +519,8 @@ impl fmt::Debug for Window {
 impl Drop for Window {
     fn drop(&mut self) {
         let len = self.mapping.as_ref().map_or(0, sys::Mapping::len);
-        drop(self.mapping.take());
+        // Unmapped before its file goes.
+        self.mapping = None;
         sys::remove(&self.path);
         self.windows.release(self.place, len as u64);
     }
