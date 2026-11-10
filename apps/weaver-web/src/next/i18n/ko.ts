@@ -823,6 +823,8 @@ export const nextKo: LocaleDictionary = {
   "next.proxies.resolvedBy": "확인 주체",
   "next.proxies.resolverWeaver": "Weaver",
   "next.proxies.resolverProxy": "프록시",
+  "next.proxies.resolverWeaverHelp": "Weaver가 프록시를 거치지 않고 직접 이름을 확인합니다.",
+  "next.proxies.resolverProxyHelp": "이름은 프록시를 통해 확인됩니다.",
   "next.proxies.using": "방식",
   "next.proxies.mtuHelp": "비워 두면 {{value}}을(를) 사용합니다.",
   "next.proxies.keepalive": "킵얼라이브",

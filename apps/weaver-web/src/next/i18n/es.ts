@@ -823,6 +823,8 @@ export const nextEs: LocaleDictionary = {
   "next.proxies.resolvedBy": "Resuelto por",
   "next.proxies.resolverWeaver": "Weaver",
   "next.proxies.resolverProxy": "Proxy",
+  "next.proxies.resolverWeaverHelp": "Weaver resuelve los nombres por sí mismo, fuera del proxy.",
+  "next.proxies.resolverProxyHelp": "Los nombres se resuelven a través del proxy.",
   "next.proxies.using": "Con",
   "next.proxies.mtuHelp": "En blanco usa {{value}}.",
   "next.proxies.keepalive": "Keepalive",

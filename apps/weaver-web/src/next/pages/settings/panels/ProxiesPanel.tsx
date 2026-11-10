@@ -884,6 +884,7 @@ export function ProxyEditor({
     {
       id: "resolver",
       label: t("next.proxies.resolvedBy"),
+      help: t(form.resolver === "PROXY" ? "next.proxies.resolverProxyHelp" : "next.proxies.resolverWeaverHelp"),
       control: {
         kind: "segmented",
         value: form.resolver,

@@ -823,6 +823,8 @@ export const nextJa: LocaleDictionary = {
   "next.proxies.resolvedBy": "解決するもの",
   "next.proxies.resolverWeaver": "Weaver",
   "next.proxies.resolverProxy": "プロキシ",
+  "next.proxies.resolverWeaverHelp": "Weaver がプロキシを通さずに名前を解決します。",
+  "next.proxies.resolverProxyHelp": "名前はプロキシ経由で解決されます。",
   "next.proxies.using": "方法",
   "next.proxies.mtuHelp": "空欄なら {{value}} を使います。",
   "next.proxies.keepalive": "キープアライブ",

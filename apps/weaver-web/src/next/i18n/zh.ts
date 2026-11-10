@@ -823,6 +823,8 @@ export const nextZh: LocaleDictionary = {
   "next.proxies.resolvedBy": "解析方",
   "next.proxies.resolverWeaver": "Weaver",
   "next.proxies.resolverProxy": "代理",
+  "next.proxies.resolverWeaverHelp": "Weaver 自行解析名称，不经过代理。",
+  "next.proxies.resolverProxyHelp": "名称通过代理解析。",
   "next.proxies.using": "方式",
   "next.proxies.mtuHelp": "留空则使用 {{value}}。",
   "next.proxies.keepalive": "保活",
