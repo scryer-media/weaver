@@ -186,6 +186,12 @@ pub(crate) fn hop_before(host: &str, port: u16, reply: Reply) -> TunnelError {
     TunnelError::Engine(format!("{HOP_BEFORE}{}: {reply}", authority(host, port)))
 }
 
+// Whether `error` says the hop before got no answer from the next.
+pub(crate) fn is_silent_hop_before(error: &TunnelError) -> bool {
+    matches!(error, TunnelError::Engine(detail)
+        if detail.starts_with(HOP_BEFORE) && detail.ends_with(SILENT))
+}
+
 // Whether `error` is a proxy's answer that it could not reach the
 // destination it was asked for.
 pub(crate) fn is_destination_unreachable(error: &TunnelError) -> bool {

@@ -626,6 +626,13 @@ fn wireguard(detail: &str, wait: Duration) -> ProxyFault {
     })
 }
 
+// Whether `error` is the HTTP/3 engine's deadline for a whole dial, which
+// runs out the same way on a proxy that never answers and on a destination
+// the proxy is still waiting for.
+pub(crate) fn is_http3_dial_deadline(error: &TunnelError) -> bool {
+    matches!(error, TunnelError::Http3Connect { detail, .. } if detail == HTTP3_DEADLINE[0])
+}
+
 fn http3(detail: &str, wait: Duration) -> ProxyFault {
     if HTTP3_NO_NAME.contains(&detail) {
         ProxyFault::NameNotResolved
