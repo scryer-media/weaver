@@ -515,6 +515,147 @@ async fn a_session_hop_is_failing_only_while_its_own_path_fails() {
     assert_eq!(hop.failing_hop(), None);
 }
 
+// A destination that keeps quiet through a session that answered lately is
+// the destination's: the hop stays working and its watcher hears nothing.
+// Once the session has not answered for `LIVE_WINDOW`, the same wait is the
+// hop's. A session that fails outright is the hop's at once.
+#[tokio::test(start_paused = true)]
+async fn a_wait_on_a_live_session_is_the_destinations() {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    const UP: u8 = 0;
+    const QUIET: u8 = 1;
+    const DEADLINE: u8 = 2;
+    const BROKEN: u8 = 3;
+    #[derive(Default)]
+    struct Provider(AtomicU8);
+    #[async_trait::async_trait]
+    impl TunnelProvider for Provider {
+        async fn dial(&self, host: &str, port: u16) -> Result<Box<dyn TunnelStream>, TunnelError> {
+            match self.0.load(Ordering::SeqCst) {
+                UP => Ok(Box::new(tokio::io::duplex(64).0)),
+                QUIET => std::future::pending().await,
+                DEADLINE => Err(TunnelError::Http3Connect {
+                    host: host.into(),
+                    port,
+                    detail: "HTTP/3 dial deadline exceeded".into(),
+                }),
+                _ => Err(TunnelError::Configuration("session lost".into())),
+            }
+        }
+        fn describe(&self) -> String {
+            "scripted fixture".into()
+        }
+    }
+    let provider = Arc::new(Provider::default());
+    let turns = Arc::new(Turns::default());
+    let hop = SessionHop {
+        sockets: Default::default(),
+        capacity: Default::default(),
+        activity: Default::default(),
+        id: 3,
+        provider: provider.clone(),
+        inner: bottom(),
+        transport: None,
+        path: DialPath::default(),
+        endpoint: Some("127.0.0.1:22".parse().unwrap()),
+        timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
+        resolver: None,
+        forwarding: Default::default(),
+        failure: HopFailure::watched(turns.clone()),
+    };
+    let target = target("192.0.2.9:119".parse().unwrap());
+    assert!(hop.dial(&target).await.is_ok());
+    assert_eq!(turns.taken(), vec![None]);
+
+    for mode in [QUIET, DEADLINE] {
+        provider.0.store(mode, Ordering::SeqCst);
+        assert!(matches!(
+            hop.dial(&target).await,
+            Err(DialError::Destination(_))
+        ));
+        assert_eq!(hop.failing_hop(), None);
+    }
+    assert_eq!(turns.taken(), vec![]);
+
+    tokio::time::advance(crate::pipe::LIVE_WINDOW).await;
+    provider.0.store(QUIET, Ordering::SeqCst);
+    assert!(matches!(
+        hop.dial(&target).await,
+        Err(DialError::Timeout { .. })
+    ));
+    assert_eq!(hop.failing_hop().map(|hop| hop.proxy), Some(3));
+    assert_eq!(turns.taken().len(), 1);
+
+    provider.0.store(UP, Ordering::SeqCst);
+    assert!(hop.dial(&target).await.is_ok());
+    provider.0.store(BROKEN, Ordering::SeqCst);
+    assert!(matches!(
+        hop.dial(&target).await,
+        Err(DialError::Hop { proxy: 3, .. })
+    ));
+    let told = turns.taken();
+    assert_eq!(told.len(), 2, "{told:?}");
+    assert!(told[1].is_some());
+}
+
+// An HTTP proxy that answered lately and then keeps quiet for a
+// destination is still working; one quiet past `LIVE_WINDOW` is failing.
+// A SOCKS5 proxy that answers its greeting is up, so a quiet CONNECT after
+// it is the destination's even on a first dial.
+#[tokio::test(start_paused = true)]
+async fn a_wait_on_a_live_proxy_is_the_destinations() {
+    let stage = Arc::new(Answered {
+        reply: Mutex::new(b"HTTP/1.1 200 Connection established\r\n\r\n"),
+        far: Default::default(),
+    });
+    let turns = Arc::new(Turns::default());
+    let http = TransportHop {
+        failure: HopFailure::watched(turns.clone()),
+        ..Arc::into_inner(hop(7, "192.0.2.1:8080".parse().unwrap(), stage.clone())).unwrap()
+    };
+    let target = target("192.0.2.9:119".parse().unwrap());
+    assert!(http.dial(&target).await.is_ok());
+    *stage.reply.lock().unwrap() = b"";
+    assert!(matches!(
+        http.dial(&target).await,
+        Err(DialError::Destination(_))
+    ));
+    assert_eq!(http.failing_hop(), None);
+    assert_eq!(turns.taken(), vec![None]);
+    tokio::time::advance(crate::pipe::LIVE_WINDOW).await;
+    assert!(matches!(
+        http.dial(&target).await,
+        Err(DialError::Timeout { .. })
+    ));
+    assert_eq!(http.failing_hop().map(|hop| hop.proxy), Some(7));
+    assert_eq!(turns.taken().len(), 1);
+
+    let greeted = Arc::new(Answered {
+        reply: Mutex::new(&[5, 0]),
+        far: Default::default(),
+    });
+    let socks = TransportHop {
+        id: 9,
+        spec: TransportProxy {
+            kind: crate::transport::TransportKind::Socks5,
+            host: "192.0.2.3".into(),
+            port: 1080,
+            username: None,
+            password: None,
+        },
+        inner: greeted,
+        timeout: Duration::from_secs(30),
+        naming: Naming::Proxy,
+        failure: Default::default(),
+    };
+    assert!(matches!(
+        socks.dial(&target).await,
+        Err(DialError::Destination(_))
+    ));
+    assert_eq!(socks.failing_hop(), None);
+}
+
 struct Failure {
     fatal: bool,
     calls: std::sync::atomic::AtomicUsize,

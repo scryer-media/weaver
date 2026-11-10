@@ -501,6 +501,9 @@ pub struct FailingHop {
 //
 // A watched hop tells its watcher each time it turns: it works after it was
 // untried or failing, or it fails after it was untried or working.
+//
+// A hop that answered within `LIVE_WINDOW` is alive. A wait that runs out on
+// it is then the destination's, and says nothing of the hop.
 #[derive(Default)]
 pub struct HopFailure {
     state: Mutex<HopState>,
@@ -511,8 +514,44 @@ pub struct HopFailure {
 enum HopState {
     #[default]
     Untried,
-    Working,
+    // When the hop last answered, if it has since it last failed.
+    Working(Option<tokio::time::Instant>),
     Failing(ProxyFault),
+}
+
+// How long a hop's last answer keeps it known alive. Two minutes is
+// WireGuard's REKEY_AFTER_TIME, the window in which proxy-tunnels takes a
+// handshake as proof that a tunnel is up. SSH keepalives (30 s, three missed)
+// and QUIC's idle timeout (90 s) find a dead session sooner.
+pub const LIVE_WINDOW: Duration = Duration::from_secs(120);
+
+// Whether `error` is a wait that ran out on the hop, with no answer from it:
+// Weaver's own timeout, or the HTTP/3 engine's deadline for a whole dial.
+fn ran_out(error: &DialError) -> bool {
+    match error {
+        DialError::Timeout { .. } => true,
+        DialError::Hop { source, .. } => fault::is_http3_dial_deadline(source),
+        _ => false,
+    }
+}
+
+// What a wait that ran out on a live hop comes to: the destination did not
+// answer, or, when the destination is the next hop's endpoint, that hop did
+// not.
+fn unanswered(target: &Target, destination: &str, proxy: u32) -> DialError {
+    match target.purpose {
+        Purpose::ProxyEndpoint { proxy: next, .. } => DialError::Hop {
+            proxy: next,
+            source: crate::transport::hop_before(destination, target.port, Reply::Silent),
+        },
+        _ => DialError::Destination(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "{} did not answer in time through proxy {proxy}",
+                fault::authority(destination, target.port)
+            ),
+        )),
+    }
 }
 
 // Told when a watched hop turns. It is called with the hop's state held, so
@@ -557,15 +596,34 @@ impl HopFailure {
         }
         *state = HopState::Failing(fault);
     }
+    // The hop answered.
     fn clear(&self) {
+        self.work(Some(tokio::time::Instant::now()));
+    }
+    // The hop did its part without a word, such as a proxy that took the
+    // request for the next hop and was silent: working, but not heard.
+    fn spare(&self) {
+        self.work(None);
+    }
+    fn work(&self, answered: Option<tokio::time::Instant>) {
         let mut state = self.state.lock().expect("hop failure");
-        if matches!(*state, HopState::Working) {
-            return;
-        }
-        if let Some(watcher) = &self.watcher {
-            watcher.working();
-        }
-        *state = HopState::Working;
+        let heard = match *state {
+            HopState::Working(heard) => heard,
+            _ => {
+                if let Some(watcher) = &self.watcher {
+                    watcher.working();
+                }
+                None
+            }
+        };
+        *state = HopState::Working(answered.or(heard));
+    }
+    // Whether the hop answered within `LIVE_WINDOW`.
+    fn alive(&self) -> bool {
+        matches!(
+            *self.state.lock().expect("hop failure"),
+            HopState::Working(Some(at)) if at.elapsed() < LIVE_WINDOW
+        )
     }
     fn of(&self, proxy: u32) -> Option<FailingHop> {
         match &*self.state.lock().expect("hop failure") {
@@ -898,6 +956,12 @@ impl TransportHop {
                     .destination_unreachable(destination, target.port, reply),
             )),
             (Err(_), Some(proxy)) => Err(unreachable(proxy, Reply::Silent)),
+            // A SOCKS5 proxy that answered its greeting is up, so the
+            // destination is the one that did not answer. An HTTP proxy says
+            // nothing before its reply.
+            (Err(_), None) if matches!(self.spec.kind, crate::transport::TransportKind::Socks5) => {
+                Err(unanswered(target, destination, self.id))
+            }
             (Err(_), None) => Err(timed_out()),
         }
     }
@@ -942,7 +1006,7 @@ impl Dialer for TransportHop {
                 })?;
             // Reserve part of the remaining budget for every other address.
             let remaining = self.timeout.saturating_sub(started.elapsed());
-            let negotiated = self
+            let mut negotiated = self
                 .negotiate(
                     &mut dialed.stream,
                     destination,
@@ -951,11 +1015,27 @@ impl Dialer for TransportHop {
                 )
                 .await;
             crate::metrics::record_stream(self.spec.kind.tunnel_kind(), &negotiated);
+            // A wait on a proxy that answered lately is the destination's,
+            // and says nothing new of the proxy.
+            let waited =
+                matches!(&negotiated, Err(error) if ran_out(error)) && self.failure.alive();
             match &negotiated {
+                _ if waited => {}
                 Ok(()) => self.failure.clear(),
-                // The proxy answered for the next hop, so it is working.
-                Err(DialError::Hop { proxy, .. }) if *proxy != self.id => self.failure.clear(),
+                // The proxy took the request for the next hop, so it is
+                // working. An HTTP proxy that kept quiet for it was not heard.
+                Err(DialError::Hop { proxy, source }) if *proxy != self.id => {
+                    let socks = matches!(self.spec.kind, crate::transport::TransportKind::Socks5);
+                    if socks || !crate::transport::is_silent_hop_before(source) {
+                        self.failure.clear();
+                    } else {
+                        self.failure.spare();
+                    }
+                }
                 Err(error) => self.failure.note(error, self.timeout),
+            }
+            if waited {
+                negotiated = Err(unanswered(target, destination, self.id));
             }
             match negotiated {
                 Ok(()) => {
@@ -1272,7 +1352,9 @@ impl Dialer for SessionHop {
         let socket = self.take_socket(SocketClass::of(&target.purpose))?;
         let outcome = Arc::new(ConnectionOutcome::default());
         let mut connected = Err(DialError::Skipped("no destination".into()));
+        let mut tried = target.host.as_str();
         for (index, destination) in destinations.iter().enumerate() {
+            tried = destination.as_str();
             // Reserve part of the remaining budget for every other address.
             let remaining = self
                 .inner
@@ -1301,20 +1383,29 @@ impl Dialer for SessionHop {
         if let Some(kind) = self.provider.kind() {
             crate::metrics::record_stream(kind, &connected);
         }
+        // A wait on a session that answered lately is the destination's, and
+        // says nothing new of the session.
+        let waited = matches!(&connected, Err(error) if ran_out(error)) && self.failure.alive();
         let stream = match connected {
             Ok(stream) => {
                 self.failure.clear();
                 stream
             }
             Err(error) => {
-                self.failure.note(&error, self.timeout);
+                let error = if waited {
+                    unanswered(target, tried, self.id)
+                } else {
+                    self.failure.note(&error, self.timeout);
+                    error
+                };
                 if unreached(target, &error) {
                     self.naming.forget(&target.host);
                 }
                 drop(capacity);
                 drop(activity);
-                // A destination that refuses says nothing about the tunnel.
-                if error.is_path_evidence() {
+                // A destination that refuses or keeps quiet says nothing
+                // about the tunnel.
+                if !waited && error.is_path_evidence() {
                     self.retire_idle().await;
                 }
                 return Err(error);

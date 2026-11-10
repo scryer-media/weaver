@@ -70,11 +70,13 @@ pub enum QueueEvent {
     JobAdded,
     JobDownloaded,
     JobDeleted,
+    // A route told down is available again.
+    RouteUp,
 }
 
 impl QueueEvent {
     // NZB_NAMED is retained for truthful declarations, but Weaver does not raise it.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::FileDownloaded,
         Self::UrlCompleted,
         Self::NzbMarked,
@@ -95,6 +97,7 @@ impl QueueEvent {
         Self::JobAdded,
         Self::JobDownloaded,
         Self::JobDeleted,
+        Self::RouteUp,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -119,6 +122,7 @@ impl QueueEvent {
             Self::JobAdded => "JOB_ADDED",
             Self::JobDownloaded => "JOB_DOWNLOADED",
             Self::JobDeleted => "JOB_DELETED",
+            Self::RouteUp => "ROUTE_UP",
         }
     }
 
@@ -170,14 +174,14 @@ pub mod vars {
     pub const SEEDING_ACTION: &str = "WEAVER_SEEDING_ACTION";
     // SEEDING_STOPPED: why, `paused`, `removed` or `failed`.
     pub const SEEDING_STOPPED_REASON: &str = "WEAVER_SEEDING_STOPPED_REASON";
-    // QUOTA_* and ROUTE_DOWN: the egress. QUOTA_*: the direction (`download` or `upload`) and the
+    // QUOTA_*, ROUTE_DOWN and ROUTE_UP: the egress. QUOTA_*: the direction (`download` or `upload`) and the
     // state it came to (`normal`, `trickle` or `stopped`).
     pub const EGRESS_ID: &str = "WEAVER_EGRESS_ID";
     pub const QUOTA_DIRECTION: &str = "WEAVER_QUOTA_DIRECTION";
     pub const QUOTA_STATE: &str = "WEAVER_QUOTA_STATE";
-    // ROUTE_DOWN: the route's kind (`interface`, `source_address`,
-    // `http_connect`, `http3_connect`, `socks5`, `ssh` or `wireguard`), its
-    // name, and why it is down.
+    // ROUTE_DOWN and ROUTE_UP: the route's kind (`interface`,
+    // `source_address`, `http_connect`, `http3_connect`, `socks5`, `ssh`,
+    // `wireguard` or `pool`) and its name. ROUTE_DOWN alone: why it is down.
     pub const ROUTE_KIND: &str = "WEAVER_ROUTE_KIND";
     pub const ROUTE_NAME: &str = "WEAVER_ROUTE_NAME";
     pub const ROUTE_REASON: &str = "WEAVER_ROUTE_REASON";
