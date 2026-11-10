@@ -160,6 +160,34 @@ fn a_run_borrows_its_windows_through_the_lender() {
     assert_eq!(windows.live(), (0, 0));
 }
 
+// A window made before the run started goes to the borrow of its length
+// alone: a smaller borrow before it is lent a file of its own, the borrow
+// it was made for takes it with no file made, and one after is lent anew.
+#[test]
+fn a_window_made_before_the_run_goes_to_the_borrow_it_was_made_for() {
+    let dir = tempfile::tempdir().unwrap();
+    let windows = windows(dir.path());
+    let made = windows.allocate(NodeId(4), 2 * MIB as usize).unwrap();
+    let made_path = made.path().to_path_buf();
+    let lender = windows.prelent(NodeId(4), made);
+    assert_eq!(windows.live(), (1, 2 * MIB));
+
+    let small = lender.lend(MIB as usize).unwrap();
+    assert_eq!(small.len(), MIB as usize);
+    assert_eq!(windows.live(), (2, 3 * MIB), "a file of its own");
+
+    let exact = lender.lend(2 * MIB as usize).unwrap();
+    assert_eq!(exact.len(), 2 * MIB as usize);
+    assert_eq!(windows.live(), (2, 3 * MIB), "no file made for it");
+    assert!(made_path.exists());
+    let after = lender.lend(2 * MIB as usize).unwrap();
+    assert_eq!(windows.live(), (3, 5 * MIB), "lent anew");
+
+    drop((small, exact, after, lender));
+    assert!(left(dir.path()).is_empty());
+    assert_eq!(windows.live(), (0, 0));
+}
+
 // The file is created new: a file already at the name, or a link there,
 // refuses the window, and what was there stays as it was.
 #[test]

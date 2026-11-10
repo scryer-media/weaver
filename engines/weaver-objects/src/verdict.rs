@@ -69,8 +69,9 @@ pub(crate) fn sevenz(error: &sevenz_turbo::Error) -> Emit {
 }
 
 // A decode that needs more memory than it may hold, from an I/O error: an
-// LZMA decoder's limit, with the sizes it states, or memory the allocator
-// would not give, which states none.
+// LZMA decoder's limit, with the sizes it states, memory the allocator
+// would not give, which states none, or a window the run's lender would not
+// lend (`crate::lent::refused`).
 pub(crate) fn too_large(error: &io::Error) -> Option<Why> {
     use lzma_turbo::xz::{XzError, XzErrorKind};
     let limit = |error: &lzma_turbo::Error| match *error {
@@ -93,6 +94,11 @@ pub(crate) fn too_large(error: &io::Error) -> Option<Why> {
                 if let Some(why) = limit(error) {
                     return Some(why);
                 }
+            }
+            // A dictionary the run's lender refused: a filesystem's
+            // refusal asks for the window in RAM, any other stands.
+            XzErrorKind::WindowAlloc { needed, kind, .. } => {
+                return Some(crate::lent::refused(*needed, *kind, None));
             }
             _ => {}
         }

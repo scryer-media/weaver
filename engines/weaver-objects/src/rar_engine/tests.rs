@@ -2129,3 +2129,189 @@ fn a_small_member_of_a_wide_dictionary_reserves_its_own_size() {
     assert_eq!(reserved(&six_files(0)[0]), Some(0));
     assert_eq!(reserved(&[]), Some(0));
 }
+
+// RAR5 LZ, one member under a 256 KiB dictionary.
+const LZ: &[u8] = include_bytes!(
+    "../../../../server/crates/weaver-server-core/tests/fixtures/extraction_profiles/rar5_lz.rar"
+);
+// RAR 2.9 solid PPMd: three members, a 1 MiB dictionary and a 1 MiB model
+// arena (`-m5 -mc16:1t+ -md1m`).
+const PPMD: &[u8] = include_bytes!(
+    "../../../../server/crates/weaver-server-core/tests/fixtures/extraction_profiles/rar4_solid_ppmd_plain.rar"
+);
+
+// A run over `archive` granted `grant` of memory and window, handed
+// `lender`.
+fn lent_run(
+    archive: &[u8],
+    grant: u64,
+    lender: Option<&Arc<crate::lent::testing::TestLender>>,
+) -> Vec<Said> {
+    let budget = weaver_graph::Budget {
+        memory_bytes: Some(grant),
+        window_bytes: Some(grant),
+        threads: 1,
+        ..Default::default()
+    };
+    let budget = match lender {
+        Some(lender) => lender.lending(budget),
+        None => budget,
+    };
+    let mut emits = Vec::new();
+    RarEngine::new().start().run(
+        Gate::whole(vec![archive.to_vec()]) as Arc<dyn Volumes>,
+        &mut |emit| {
+            emits.push(emit);
+            true
+        },
+        budget,
+    );
+    said(&emits)
+}
+
+// What the archive's headers say a run lends before it starts, read as a
+// volume's front is read (`claim::front_facts`, which keeps them only for a
+// volume of a set).
+fn lent_before(archive: &[u8]) -> Option<u64> {
+    let facts = unrar_rs::RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+        io::Cursor::new(archive.to_vec()),
+        None,
+        Arc::new(KdfCache::new()),
+    )
+    .unwrap()
+    .facts;
+    super::lent(&facts)
+}
+
+// A run handed a lender borrows the dictionary its grant cannot hold, and
+// decodes through it what a run with room for it on the heap decodes,
+// although every lent byte held garbage first. It asks for the window its
+// front said it would, once, and gives it back.
+#[test]
+fn a_rar5_dictionary_over_the_grant_is_lent_and_given_back() {
+    use crate::lent::testing::TestLender;
+    let lender = TestLender::new();
+    let said = lent_run(LZ, 64 << 10, Some(&lender));
+    assert_eq!(said, run(&mut RarEngine::new(), vec![LZ.to_vec()]));
+    assert!(said.contains(&Said::Closed(0)), "{said:?}");
+    let asked = lender.asked();
+    assert_eq!(asked, [256 << 10]);
+    assert_eq!(lent_before(LZ), Some(256 << 10));
+    assert_eq!(lender.live(), 0);
+}
+
+// Without a lender the same grant refuses the dictionary with its sizes, as
+// it always did.
+#[test]
+fn a_rar5_dictionary_over_the_grant_without_a_lender_is_refused() {
+    let said = lent_run(LZ, 64 << 10, None);
+    assert!(
+        said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(256 << 10),
+            allowed: Some(64 << 10),
+        })),
+        "{said:?}"
+    );
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+}
+
+// A lender's refusal is the member's verdict: a filesystem's refusal asks
+// for the window in RAM, which the owner gives or refuses by its policy;
+// any other refusal stands.
+#[test]
+fn a_rar_window_the_lender_refuses_says_why() {
+    use crate::lent::testing::TestLender;
+    let full = TestLender::refusing(io::ErrorKind::StorageFull);
+    let said = lent_run(LZ, 64 << 10, Some(&full));
+    assert!(
+        said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(256 << 10),
+            allowed: None,
+        })),
+        "{said:?}"
+    );
+    let denied = TestLender::refusing(io::ErrorKind::PermissionDenied);
+    let said = lent_run(LZ, 64 << 10, Some(&denied));
+    assert!(said.contains(&Said::Refuse(Why::Unsupported)), "{said:?}");
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+}
+
+// A RAR 2.9 PPMd model arena over the grant is lent under the same rule as
+// its dictionary: a solid run of three members borrows the dictionary its
+// front said and one arena, keeps both across the members, decodes what a
+// run with room for both on the heap decodes, and gives both back. Without
+// a lender the member is refused.
+#[test]
+fn a_rar3_ppmd_arena_over_the_grant_is_lent_as_a_dictionary_is() {
+    use crate::lent::testing::TestLender;
+    let grant = 512 << 10;
+    let lender = TestLender::new();
+    let said = lent_run(PPMD, grant, Some(&lender));
+    assert_eq!(said, run(&mut RarEngine::new(), vec![PPMD.to_vec()]));
+    assert!(said.contains(&Said::Closed(2)), "{said:?}");
+    let asked = lender.asked();
+    let window = lent_before(PPMD).unwrap();
+    assert_eq!(window, MIB);
+    // The dictionary, then the arena its block header declares, `(mem + 1)
+    // << 20` bytes: no front states the arena.
+    assert_eq!(asked, [window as usize, MIB as usize]);
+    assert_eq!(lender.live(), 0);
+
+    let said = lent_run(PPMD, grant, None);
+    assert!(
+        said.iter()
+            .any(|said| matches!(said, Said::Refuse(Why::TooLarge { .. }))),
+        "{said:?}"
+    );
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+
+    // With room for both on the heap nothing is lent.
+    let room = TestLender::new();
+    let said = lent_run(PPMD, MIB, Some(&room));
+    assert_eq!(said, run(&mut RarEngine::new(), vec![PPMD.to_vec()]));
+    assert_eq!(room.asked(), Vec::<usize>::new());
+}
+
+// A dictionary over the lender's ceiling is not asked for: the decoder
+// refuses it with its size against the ceiling.
+#[test]
+fn a_rar_dictionary_over_the_lenders_ceiling_is_refused_unasked() {
+    use crate::lent::testing::TestLender;
+    let low = TestLender::up_to(128 << 10);
+    let said = lent_run(LZ, 64 << 10, Some(&low));
+    assert!(
+        said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(256 << 10),
+            allowed: Some(128 << 10),
+        })),
+        "{said:?}"
+    );
+    assert_eq!(low.asked(), Vec::<usize>::new());
+}
+
+// A lender that lends the RAR 2.9 dictionary and refuses the PPMd arena
+// after it: the arena's refusal is the member's verdict, with the arena's
+// size, the dictionary it lent is given back, and nothing is said of the
+// member's bytes that the arena never decoded.
+#[test]
+fn a_rar3_ppmd_arena_the_lender_refuses_says_why_with_its_size() {
+    use crate::lent::testing::TestLender;
+    let full = TestLender::refusing_after(1, io::ErrorKind::StorageFull);
+    let said = lent_run(PPMD, 512 << 10, Some(&full));
+    assert_eq!(full.asked(), [MIB as usize, MIB as usize]);
+    assert!(
+        said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(MIB),
+            allowed: None,
+        })),
+        "{said:?}"
+    );
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+    assert_eq!(full.live(), 0);
+
+    let denied = TestLender::refusing_after(1, io::ErrorKind::PermissionDenied);
+    let said = lent_run(PPMD, 512 << 10, Some(&denied));
+    assert_eq!(denied.asked().len(), 2);
+    assert!(said.contains(&Said::Refuse(Why::Unsupported)), "{said:?}");
+    assert_eq!(denied.live(), 0);
+}
