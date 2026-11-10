@@ -285,11 +285,3 @@ lto = "thin"
 # repository: the e2e harness's Weaver image build refuses such a manifest, and
 # any build without that exact checkout cannot compile the workspace. When a
 # rarpar change is needed, publish it and bump the requirement here instead.
-
-# TEMPORARY, NOT TO BE MERGED: sevenz-turbo 0.30.0 and lzma-turbo 0.12.0 are
-# not yet published, so this branch builds against local checkouts of them.
-# Remove this block, and take both from crates.io, before the branch merges.
-# The paths are relative to this branch's worktree under `.worktrees/`.
-[patch.crates-io]
-sevenz-turbo = { path = "../../../sevenz-turbo/.worktrees/lent-decode-memory" }
-lzma-turbo = { path = "../../../lzma-turbo/.worktrees/lzma2-mt-window" }
