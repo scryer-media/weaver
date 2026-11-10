@@ -2750,13 +2750,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         // Where we listen, on a connection we made: a peer that reached us
         // knows it (libtorrent `bt_peer_connection::write_extensions`, the
         // port `session_impl::listen_port` gives: the one mapped on the
-        // gateway, else the one we listen on).
+        // gateway, else the one we listen on, whatever announce port is set).
         if !self.incoming {
             let shared = &self.state.shared;
             handshake.p = shared
                 .session
                 .upgrade()
-                .and_then(|session| session.announce_port_of(shared.ssl.is_some()))
+                .and_then(|session| session.external_port_of(shared.ssl.is_some()))
                 .map(u32::from);
         }
 

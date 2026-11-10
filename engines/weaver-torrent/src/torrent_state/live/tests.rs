@@ -5644,8 +5644,11 @@ async fn the_extended_handshake_carries_listen_ports_and_no_claimed_address() {
         peer.update_my_extended_handshake(&mut hs).unwrap();
         hs.p
     };
+    // The listen port, not the announce port set for trackers and the DHT.
+    let port = h._session.listen_addr().map(|addr| u32::from(addr.port()));
     assert_eq!(ours(&incoming), None);
-    assert_eq!(ours(&outgoing), Some(51413));
+    assert_ne!(port, Some(51413));
+    assert_eq!(ours(&outgoing), port);
 
     let theirs = ExtendedHandshake {
         p: Some(7000),

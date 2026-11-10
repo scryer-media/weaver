@@ -48,7 +48,12 @@ pub(crate) struct ListenResult {
     pub utp_socket: Option<UtpSocket>,
     pub enable_upnp_port_forwarding: bool,
     pub addr: SocketAddr,
+    /// The port told to trackers and the DHT: the one set in the options,
+    /// else the listen port, and none on a loopback address with none set.
     pub announce_port: Option<u16>,
+    /// The announce port was set in the options: a port a gateway maps does
+    /// not replace it (libtorrent `session_impl::queue_tracker_request`).
+    pub announce_port_set: bool,
     pub max_pending_incoming_handshake_checks: usize,
 }
 
@@ -183,6 +188,7 @@ impl ListenerOptions {
             tcp_socket,
             utp_socket,
             announce_port,
+            announce_port_set: self.announce_port.is_some(),
             addr: listen_addr,
             enable_upnp_port_forwarding: self.enable_upnp_port_forwarding,
             max_pending_incoming_handshake_checks: self.max_pending_incoming_handshake_checks,
