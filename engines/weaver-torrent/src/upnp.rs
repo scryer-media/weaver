@@ -48,6 +48,8 @@ impl PortmapProtocol {
 pub enum PortmapTransport {
     NatPmp,
     Upnp,
+    /// PCP from a global IPv6 address, which NAT-PMP cannot carry.
+    PcpIpv6,
 }
 
 /// One mapping a mapper keeps: the gateway forwards `external_port` to
@@ -582,7 +584,10 @@ fn search_from(interface: &RouteInterface) -> Result<Ipv4Addr, String> {
             interface.name
         ));
     }
-    Ok(interface.ip)
+    match interface.ip {
+        IpAddr::V4(ip) => Ok(ip),
+        IpAddr::V6(ip) => Err(format!("SSDP searches over IPv4 only, not from {ip}")),
+    }
 }
 
 impl UpnpPortForwarder {
@@ -1058,7 +1063,7 @@ pub(crate) mod tests {
     fn loopback() -> RouteInterface {
         RouteInterface {
             name: "lo".into(),
-            ip: std::net::Ipv4Addr::LOCALHOST,
+            ip: std::net::Ipv4Addr::LOCALHOST.into(),
             point_to_point: false,
         }
     }
@@ -1859,7 +1864,7 @@ pub(crate) mod tests {
         let _hold = hold_clock();
         let tunnel = RouteInterface {
             name: "utun8".into(),
-            ip: std::net::Ipv4Addr::new(10, 44, 0, 2),
+            ip: std::net::Ipv4Addr::new(10, 44, 0, 2).into(),
             point_to_point: true,
         };
         let forwarder = UpnpPortForwarder::new(
@@ -1927,7 +1932,7 @@ pub(crate) mod tests {
         let clients = Arc::new(NoSearchSocket::default());
         let interface = RouteInterface {
             name: "en7".into(),
-            ip: std::net::Ipv4Addr::new(192, 0, 2, 4),
+            ip: std::net::Ipv4Addr::new(192, 0, 2, 4).into(),
             point_to_point: false,
         };
         let forwarder =

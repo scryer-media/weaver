@@ -180,6 +180,7 @@ struct AnnouncePort {
 struct MappedPorts {
     natpmp: Option<u16>,
     upnp: Option<u16>,
+    pcp_ipv6: Option<u16>,
 }
 
 impl AnnouncePort {
@@ -200,7 +201,8 @@ impl AnnouncePort {
     }
 
     /// libtorrent `session_impl::on_port_mapping`: a mapper's TCP report,
-    /// a failure included, sets that mapper's port.
+    /// a failure included, sets that mapper's port. The session announces
+    /// one port: an IPv4 mapper's before the IPv6 one's.
     fn on_port_mapping(&self, event: &PortMapped) {
         if event.protocol != PortmapProtocol::Tcp {
             return;
@@ -209,11 +211,16 @@ impl AnnouncePort {
         let port = match event.transport {
             PortmapTransport::NatPmp => &mut mapped.natpmp,
             PortmapTransport::Upnp => &mut mapped.upnp,
+            PortmapTransport::PcpIpv6 => &mut mapped.pcp_ipv6,
         };
         *port = event.external_port;
-        let announced = self
-            .configured
-            .map(|configured| mapped.natpmp.or(mapped.upnp).unwrap_or(configured));
+        let announced = self.configured.map(|configured| {
+            mapped
+                .natpmp
+                .or(mapped.upnp)
+                .or(mapped.pcp_ipv6)
+                .unwrap_or(configured)
+        });
         self.port.send_if_modified(|port| {
             let changed = *port != announced;
             *port = announced;
@@ -2149,7 +2156,10 @@ impl Session {
     /// interface the session's traffic leaves through: the bound device, or
     /// the one holding the address the session's clients send public
     /// traffic from. Neither runs on an interface that reaches only the
-    /// local network.
+    /// local network. A session held to a global IPv6 address, or bound to
+    /// a device with one, also maps from that address over PCP (libtorrent
+    /// starts a NAT-PMP / PCP mapper on each IPv6 listen socket that is not
+    /// local); one held to an IPv6 address maps over IPv4 not at all.
     fn start_port_mapping(
         &self,
         requests: Vec<PortMapRequest>,
@@ -2166,6 +2176,32 @@ impl Session {
             info!(%ip, "no port mapping on an address only the local network reaches");
             return;
         }
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        let held_to_ipv6 = listen_ip.is_some_and(|ip| ip.is_ipv6() && !ip.is_unspecified());
+        if held_to_ipv6 {
+            // SSDP and NAT-PMP run over IPv4 alone (libtorrent
+            // `start_upnp`; `natpmp::on_reply` falls back to NAT-PMP only
+            // on an IPv4 socket).
+            info!("no UPnP or IPv4 NAT-PMP on a session held to an IPv6 address");
+        } else {
+            self.map_ipv4(requests.clone(), bind_device_name, events_tx.clone());
+        }
+        if let Some(IpAddr::V6(listen)) = listen_ip
+            && !self.ipv4_only
+        {
+            self.map_ipv6(listen, requests, bind_device_name, events_tx);
+        }
+        self.follow_port_mappings(events, self.ssl_mapped_port(), forward);
+    }
+
+    /// Map `requests` over UPnP and over PCP / NAT-PMP from the IPv4
+    /// interface the session's traffic leaves through.
+    fn map_ipv4(
+        &self,
+        requests: Vec<PortMapRequest>,
+        bind_device_name: Option<&str>,
+        events_tx: PortMapEvents,
+    ) {
         let interface =
             crate::route_interface::route_interface(bind_device_name, self.http_clients.as_ref())
                 .map_err(|e| format!("{e:#}"));
@@ -2183,32 +2219,56 @@ impl Session {
             ?interface,
             "starting UPnP and NAT-PMP / PCP port mapping"
         );
-        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         let upnp_opts = UpnpPortForwarderOptions {
             description: self.identity.user_agent.clone(),
             ..Default::default()
         };
-        // SSDP runs over IPv4 alone: a session held to an IPv6 address
-        // searches for no UPnP gateway (libtorrent `start_upnp`).
-        if listen_ip.is_some_and(|ip| ip.is_ipv6() && !ip.is_unspecified()) {
-            info!("no UPnP on a session held to an IPv6 address");
-        } else {
-            match UpnpPortForwarder::new(
-                requests.clone(),
-                Some(upnp_opts),
-                interface.clone(),
-                self.http_clients.clone(),
-            ) {
-                Ok(upnp) => self.spawn_port_mapper(
-                    "upnp_forward",
-                    upnp.run(self.cancellation_token.clone(), events_tx.clone()),
-                ),
-                Err(e) => warn!("error starting UPnP port mapping: {e:#}"),
-            }
+        match UpnpPortForwarder::new(
+            requests.clone(),
+            Some(upnp_opts),
+            interface.clone(),
+            self.http_clients.clone(),
+        ) {
+            Ok(upnp) => self.spawn_port_mapper(
+                "upnp_forward",
+                upnp.run(self.cancellation_token.clone(), events_tx.clone()),
+            ),
+            Err(e) => warn!("error starting UPnP port mapping: {e:#}"),
         }
         let route = interface.and_then(|i| GatewayRoute::of(&i).map_err(|e| format!("{e:#}")));
         self.map_over(route, requests, events_tx);
-        self.follow_port_mappings(events, self.ssl_mapped_port(), forward);
+    }
+
+    /// Map `requests` over PCP from the session's global IPv6 address:
+    /// `listen` when the session is held to it, else one of its device's.
+    /// A session with no such address maps nothing over IPv6.
+    fn map_ipv6(
+        &self,
+        listen: Ipv6Addr,
+        requests: Vec<PortMapRequest>,
+        bind_device_name: Option<&str>,
+        events_tx: PortMapEvents,
+    ) {
+        let interface = match crate::route_interface::ipv6_route_interface(
+            listen,
+            bind_device_name,
+            self.http_clients.as_ref(),
+        ) {
+            Ok(None) => {
+                debug!("no global IPv6 address to map over PCP");
+                return;
+            }
+            Ok(Some(interface)) => Ok(interface),
+            Err(e) => Err(format!("{e:#}")),
+        };
+        info!(?requests, ?interface, "starting PCP port mapping over IPv6");
+        let route = interface.and_then(|i| GatewayRoute::of(&i).map_err(|e| format!("{e:#}")));
+        self.spawn_port_mapper(
+            "pcp_ipv6_forward",
+            NatPmpMapper::new(route, requests, None, self.http_clients.clone())
+                .ipv6()
+                .run(self.cancellation_token.clone(), events_tx),
+        );
     }
 
     /// Run a NAT-PMP / PCP mapper for `requests` over `route`, through the
@@ -4192,6 +4252,84 @@ mod tests {
             .unwrap();
         assert_eq!(session.announce_port_of(true), Some(50001));
         assert_eq!(session.announce_port_of(false), Some(50000));
+        session.stop().await;
+    }
+
+    // A session mapping from an IPv6 address asks its gateway over PCP for
+    // its listen port and announces the port the gateway grants.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_ipv6_mapping_over_pcp_moves_the_announced_port() {
+        use crate::{natpmp::GatewayRoute, upnp::PortMapRequest, upnp::PortmapProtocol};
+        use std::net::Ipv6Addr;
+
+        let dir = TempDir::new().unwrap();
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: None,
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (Ipv6Addr::UNSPECIFIED, 0).into(),
+                    ..Default::default()
+                }),
+                ..crate::test_support::session_options()
+            },
+        )
+        .await
+        .unwrap();
+        let port = session.listen_addr().unwrap().port();
+        assert_eq!(session.announce_port(), Some(port));
+
+        // A PCP gateway on the IPv6 loopback that grants 50002 for the
+        // first MAP it hears, and hands the request back.
+        let gateway = crate::test_support::udp((Ipv6Addr::LOCALHOST, 0)).await;
+        let gateway_addr = gateway.bind_addr();
+        let heard = tokio::spawn(async move {
+            let mut buf = [0u8; 1100];
+            let (n, from) = gateway.recv_from(&mut buf).await.unwrap();
+            let request = buf[..n].to_vec();
+            let mut answer = vec![2, 0x80 | 1, 0, 0];
+            answer.extend_from_slice(&7200u32.to_be_bytes());
+            answer.extend_from_slice(&1000u32.to_be_bytes());
+            answer.extend_from_slice(&[0; 12]);
+            answer.extend_from_slice(&request[24..42]);
+            answer.extend_from_slice(&50002u16.to_be_bytes());
+            answer.extend_from_slice(&"2001:db8::5".parse::<Ipv6Addr>().unwrap().octets());
+            gateway.send_to(&answer, from).await.unwrap();
+            request
+        });
+
+        let mut announced = session.announce_port_changes();
+        let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
+        session.map_over(
+            Ok(GatewayRoute {
+                local_ip: Ipv6Addr::LOCALHOST.into(),
+                gateway: gateway_addr,
+                interface_addresses: vec![Ipv6Addr::LOCALHOST.into()],
+            }),
+            vec![PortMapRequest {
+                protocol: PortmapProtocol::Tcp,
+                local_port: port,
+                external_port: port,
+            }],
+            events_tx,
+        );
+        session.follow_port_mappings(events, None, None);
+
+        let request = heard.await.unwrap();
+        assert_eq!(request[0], 2, "PCP");
+        assert_eq!(&request[8..24], &Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(
+            &request[40..44],
+            &[port.to_be_bytes(), port.to_be_bytes()].concat()[..]
+        );
+        announced
+            .wait_for(|announced| *announced == Some(50002))
+            .await
+            .unwrap();
         session.stop().await;
     }
 

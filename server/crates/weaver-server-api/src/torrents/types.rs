@@ -206,6 +206,8 @@ impl From<(TorrentScope, Option<String>)> for TorrentRouteUseGql {
 pub enum PortMapperGql {
     Upnp,
     NatPmp,
+    /// PCP from a global IPv6 address.
+    PcpIpv6,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Enum)]
@@ -236,6 +238,7 @@ impl From<PortMapped> for TorrentPortMappingGql {
             mapper: match mapped.transport {
                 PortmapTransport::Upnp => PortMapperGql::Upnp,
                 PortmapTransport::NatPmp => PortMapperGql::NatPmp,
+                PortmapTransport::PcpIpv6 => PortMapperGql::PcpIpv6,
             },
             protocol: match mapped.protocol {
                 PortmapProtocol::Tcp => PortMapProtocolGql::Tcp,

@@ -2,11 +2,12 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 //! Port mapping through the default gateway over PCP (RFC 6887), falling
-//! back to NAT-PMP (RFC 6886), after libtorrent's `natpmp.cpp`.
+//! back to NAT-PMP (RFC 6886) on IPv4, after libtorrent's `natpmp.cpp`. A
+//! mapper asking from an IPv6 address asks its IPv6 gateway over PCP only.
 
 use std::{
     io,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
     sync::Arc,
     time::Duration,
 };
@@ -490,31 +491,69 @@ pub struct GatewayRoute {
 }
 
 impl GatewayRoute {
-    /// The default gateway on `interface`, the route's interface.
+    /// The default gateway on `interface`, the route's interface, of the
+    /// family of its address.
     pub fn of(interface: &RouteInterface) -> anyhow::Result<Self> {
-        let routes = routes().context("error reading the routing table")?;
         let addresses = route_interface::addresses_of(&interface.name)
             .with_context(|| format!("error listing the addresses of {}", interface.name))?;
-        gateway_route(&routes, interface, addresses)
+        match interface.ip {
+            IpAddr::V4(_) => {
+                let routes = routes().context("error reading the routing table")?;
+                gateway_route(&routes, interface, addresses)
+            }
+            IpAddr::V6(_) => {
+                let routes = routes_v6().context("error reading the IPv6 routing table")?;
+                gateway_route_v6(&routes, interface, addresses)
+            }
+        }
     }
 }
 
 fn gateway_route(
     routes: &[Route],
     interface: &RouteInterface,
-    mut interface_addresses: Vec<IpAddr>,
+    interface_addresses: Vec<IpAddr>,
 ) -> anyhow::Result<GatewayRoute> {
     let gateway = default_gateway_of(routes, &interface.name)
         .with_context(|| format!("no gateway on the route's interface {}", interface.name))?;
-    let local_ip = IpAddr::V4(interface.ip);
+    Ok(asking_from(
+        interface,
+        (gateway, NATPMP_PORT).into(),
+        interface_addresses,
+    ))
+}
+
+/// The IPv6 gateway on `interface`, which holds a global IPv6 address
+/// (libtorrent `get_gateway`: the default route of the address's family on
+/// the interface).
+fn gateway_route_v6(
+    routes: &[Route6],
+    interface: &RouteInterface,
+    interface_addresses: Vec<IpAddr>,
+) -> anyhow::Result<GatewayRoute> {
+    let gateway = default_gateway_v6_of(routes, &interface.name).with_context(|| {
+        format!(
+            "no IPv6 gateway on the route's interface {}",
+            interface.name
+        )
+    })?;
+    Ok(asking_from(interface, gateway.into(), interface_addresses))
+}
+
+fn asking_from(
+    interface: &RouteInterface,
+    gateway: SocketAddr,
+    mut interface_addresses: Vec<IpAddr>,
+) -> GatewayRoute {
+    let local_ip = interface.ip;
     if !interface_addresses.contains(&local_ip) {
         interface_addresses.push(local_ip);
     }
-    Ok(GatewayRoute {
+    GatewayRoute {
         local_ip,
-        gateway: (gateway, NATPMP_PORT).into(),
+        gateway,
         interface_addresses,
-    })
+    }
 }
 
 /// The socket a mapper asks the gateway over: what it sends goes to the
@@ -532,7 +571,8 @@ impl GatewaySocket {
     async fn recv(&self, buf: &mut [u8]) -> io::Result<usize> {
         loop {
             let (n, from) = self.socket.recv_from(buf).await?;
-            if from == self.gateway {
+            // A link-local gateway's answer may carry its scope or not.
+            if from.ip() == self.gateway.ip() && from.port() == self.gateway.port() {
                 return Ok(n);
             }
             trace!(%from, "ignoring a datagram not from the gateway");
@@ -550,6 +590,8 @@ pub struct NatPmpMapper {
     /// The session's clients, whose route reaches the gateway and gives the
     /// socket to ask it over.
     clients: Arc<dyn HttpClients>,
+    /// It maps from an IPv6 address, over PCP alone.
+    ipv6: bool,
 }
 
 impl NatPmpMapper {
@@ -566,7 +608,15 @@ impl NatPmpMapper {
             mappings,
             opts: opts.unwrap_or_default(),
             clients,
+            ipv6: false,
         }
+    }
+
+    /// A mapper for an IPv6 address: it reports as [`PortmapTransport::PcpIpv6`],
+    /// even when it has no route to ask over.
+    pub fn ipv6(mut self) -> Self {
+        self.ipv6 = true;
+        self
     }
 
     /// The socket the mapper asks the gateway over, from which only the
@@ -615,7 +665,13 @@ impl NatPmpMapper {
     /// mapper with no gateway to ask fails every mapping, as one the gateway
     /// never answers does.
     pub async fn run(self, cancel: CancellationToken, events: PortMapEvents) -> anyhow::Result<()> {
-        let reports = PortMapReports::new(PortmapTransport::NatPmp, events);
+        let ipv6 = self.ipv6 || self.route.as_ref().is_ok_and(|r| r.local_ip.is_ipv6());
+        let transport = if ipv6 {
+            PortmapTransport::PcpIpv6
+        } else {
+            PortmapTransport::NatPmp
+        };
+        let reports = PortMapReports::new(transport, events);
         let (socket, local_ip) = match Self::open_gateway(self.route, self.clients.as_ref()).await {
             Ok(connected) => connected,
             Err(e) => {
@@ -686,6 +742,84 @@ fn default_gateway_of(routes: &[Route], interface: &str) -> Option<Ipv4Addr> {
         .map(|(_, gateway)| gateway)
 }
 
+/// One IPv6 route (libtorrent `ip_route`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Route6 {
+    prefix_len: u8,
+    /// The router the route goes through; `None` for a route straight out
+    /// of the interface.
+    gateway: Option<Ipv6Addr>,
+    interface: String,
+    /// The scope a link-local gateway on the interface is reached in.
+    interface_index: u32,
+    /// Lower wins.
+    metric: u32,
+}
+
+/// Where to ask the gateway of the default IPv6 route on `interface`
+/// (libtorrent `get_gateway`). An IPv6 router is most often a link-local
+/// address, reached within the interface's scope (libtorrent
+/// `enum_routes` gives such a gateway the interface's index). A route over
+/// half the address space or more is a default, as for IPv4.
+fn default_gateway_v6_of(routes: &[Route6], interface: &str) -> Option<SocketAddrV6> {
+    routes
+        .iter()
+        .filter(|r| r.interface == interface && r.prefix_len <= 1)
+        .filter_map(|r| {
+            let gateway = r.gateway.filter(|g| !g.is_unspecified())?;
+            Some((r.metric, gateway, r.interface_index))
+        })
+        .min_by_key(|(metric, ..)| *metric)
+        .map(|(_, gateway, index)| {
+            let scope = if gateway.is_unicast_link_local() {
+                index
+            } else {
+                0
+            };
+            SocketAddrV6::new(gateway, NATPMP_PORT, 0, scope)
+        })
+}
+
+/// `/proc/net/ipv6_route`: each address is 32 hex digits in network order,
+/// and `index_of` gives an interface's index.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+fn parse_proc_net_ipv6_route(text: &str, index_of: impl Fn(&str) -> u32) -> Vec<Route6> {
+    const RTF_UP: u32 = 0x1;
+    const RTF_GATEWAY: u32 = 0x2;
+    let hex = |s: &str| u32::from_str_radix(s, 16).ok();
+    let address = |s: &str| Some(Ipv6Addr::from(u128::from_str_radix(s, 16).ok()?));
+    text.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 10 {
+                return None;
+            }
+            let flags = hex(f[8])?;
+            if flags & RTF_UP == 0 {
+                return None;
+            }
+            let gateway = address(f[4])?;
+            Some(Route6 {
+                prefix_len: u8::from_str_radix(f[1], 16).ok()?,
+                gateway: (flags & RTF_GATEWAY != 0).then_some(gateway),
+                interface: f[9].to_owned(),
+                interface_index: index_of(f[9]),
+                metric: hex(f[5])?,
+            })
+        })
+        .collect()
+}
+
+/// The index of the interface `name`; 0 for none.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn interface_index(name: &str) -> u32 {
+    let Ok(name) = std::ffi::CString::new(name) else {
+        return 0;
+    };
+    // SAFETY: a NUL-terminated name, read for the length of the call.
+    unsafe { nix::libc::if_nametoindex(name.as_ptr()) }
+}
+
 /// `/proc/net/route`: every address is the kernel's network-order word
 /// printed as a native integer.
 #[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
@@ -720,40 +854,27 @@ fn routes() -> io::Result<Vec<Route>> {
     )?))
 }
 
-/// Parse a `NET_RT_DUMP` sysctl buffer (libtorrent `enum_routes` /
-/// `parse_route`). `interface_name` names an interface index.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn routes_v6() -> io::Result<Vec<Route6>> {
+    Ok(parse_proc_net_ipv6_route(
+        &std::fs::read_to_string("/proc/net/ipv6_route")?,
+        interface_index,
+    ))
+}
+
+/// Each route message of a `NET_RT_DUMP` sysctl buffer, with its addresses
+/// by `RTAX_` index (libtorrent `enum_routes` / `parse_route`).
 #[cfg(target_vendor = "apple")]
-fn parse_route_dump(buf: &[u8], interface_name: impl Fn(u16) -> String) -> Vec<Route> {
+fn route_messages<'a>(
+    buf: &'a [u8],
+    mut each: impl FnMut(&nix::libc::rt_msghdr, &[Option<&'a [u8]>]),
+) {
     use nix::libc;
     // Apple pads each address to four bytes.
     fn padded(len: usize) -> usize {
         if len == 0 { 4 } else { 1 + ((len - 1) | 3) }
     }
-    // A `sockaddr_in`; a zero-length address is all zeroes.
-    fn ipv4(sa: &[u8]) -> Option<Ipv4Addr> {
-        if sa.is_empty() {
-            return Some(Ipv4Addr::UNSPECIFIED);
-        }
-        if sa.len() < 8 || i32::from(sa[1]) != libc::AF_INET {
-            return None;
-        }
-        Some(Ipv4Addr::new(sa[4], sa[5], sa[6], sa[7]))
-    }
-    // A netmask is cut after its last non-zero byte, whatever its family;
-    // a route without one is a host route.
-    fn mask(sa: Option<&[u8]>) -> Ipv4Addr {
-        let Some(sa) = sa else {
-            return Ipv4Addr::BROADCAST;
-        };
-        let mut octets = [0u8; 4];
-        for (o, b) in octets.iter_mut().zip(sa.iter().skip(4)) {
-            *o = *b;
-        }
-        octets.into()
-    }
-
     let header = std::mem::size_of::<libc::rt_msghdr>();
-    let mut routes = Vec::new();
     let mut at = 0;
     while at + header <= buf.len() {
         // SAFETY: `rt_msghdr` is plain data and `header` bytes lie in bounds.
@@ -781,8 +902,42 @@ fn parse_route_dump(buf: &[u8], interface_name: impl Fn(u16) -> String) -> Vec<R
             *addr = msg.get(p..p + sa_len);
             p += padded(sa_len);
         }
+        each(&rtm, &addrs);
+    }
+}
+
+/// The IPv4 routes of a `NET_RT_DUMP` sysctl buffer. `interface_name`
+/// names an interface index.
+#[cfg(target_vendor = "apple")]
+fn parse_route_dump(buf: &[u8], interface_name: impl Fn(u16) -> String) -> Vec<Route> {
+    use nix::libc;
+    // A `sockaddr_in`; a zero-length address is all zeroes.
+    fn ipv4(sa: &[u8]) -> Option<Ipv4Addr> {
+        if sa.is_empty() {
+            return Some(Ipv4Addr::UNSPECIFIED);
+        }
+        if sa.len() < 8 || i32::from(sa[1]) != libc::AF_INET {
+            return None;
+        }
+        Some(Ipv4Addr::new(sa[4], sa[5], sa[6], sa[7]))
+    }
+    // A netmask is cut after its last non-zero byte, whatever its family;
+    // a route without one is a host route.
+    fn mask(sa: Option<&[u8]>) -> Ipv4Addr {
+        let Some(sa) = sa else {
+            return Ipv4Addr::BROADCAST;
+        };
+        let mut octets = [0u8; 4];
+        for (o, b) in octets.iter_mut().zip(sa.iter().skip(4)) {
+            *o = *b;
+        }
+        octets.into()
+    }
+
+    let mut routes = Vec::new();
+    route_messages(buf, |rtm, addrs| {
         let Some(destination) = addrs[libc::RTAX_DST as usize].and_then(ipv4) else {
-            continue;
+            return;
         };
         // A gateway that is a link, as a tunnel's is, is no router.
         let gateway = addrs[libc::RTAX_GATEWAY as usize]
@@ -796,18 +951,93 @@ fn parse_route_dump(buf: &[u8], interface_name: impl Fn(u16) -> String) -> Vec<R
             // The primary default route is the one not scoped to an interface.
             metric: u32::from(rtm.rtm_flags & libc::RTF_IFSCOPE != 0),
         });
+    });
+    routes
+}
+
+/// The IPv6 routes of a `NET_RT_DUMP` sysctl buffer. `interface_name`
+/// names an interface index.
+#[cfg(target_vendor = "apple")]
+fn parse_route_dump_v6(buf: &[u8], interface_name: impl Fn(u16) -> String) -> Vec<Route6> {
+    use nix::libc;
+    // A `sockaddr_in6`, its address at bytes 8 to 24; a zero-length address
+    // is all zeroes. The kernel writes a link-local address's scope into
+    // its third and fourth bytes, which the route's interface gives anyway.
+    fn ipv6(sa: &[u8]) -> Option<Ipv6Addr> {
+        if sa.is_empty() {
+            return Some(Ipv6Addr::UNSPECIFIED);
+        }
+        if sa.len() < 24 || i32::from(sa[1]) != libc::AF_INET6 {
+            return None;
+        }
+        let mut octets: [u8; 16] = sa[8..24].try_into().ok()?;
+        if Ipv6Addr::from(octets).is_unicast_link_local() {
+            octets[2] = 0;
+            octets[3] = 0;
+        }
+        Some(octets.into())
     }
+    // A netmask is cut after its last non-zero byte; a route without one
+    // is a host route.
+    fn prefix_len(sa: Option<&[u8]>) -> u8 {
+        let Some(sa) = sa else {
+            return 128;
+        };
+        let mut bits = 0u32;
+        for b in sa.iter().skip(8).take(16) {
+            bits += b.leading_ones();
+            if *b != 0xff {
+                break;
+            }
+        }
+        u8::try_from(bits).unwrap_or(128)
+    }
+
+    let mut routes = Vec::new();
+    route_messages(buf, |rtm, addrs| {
+        if addrs[libc::RTAX_DST as usize].and_then(ipv6).is_none() {
+            return;
+        }
+        let gateway = addrs[libc::RTAX_GATEWAY as usize]
+            .filter(|_| rtm.rtm_flags & libc::RTF_GATEWAY != 0)
+            .and_then(ipv6);
+        routes.push(Route6 {
+            prefix_len: prefix_len(addrs[libc::RTAX_NETMASK as usize]),
+            gateway,
+            interface: interface_name(rtm.rtm_index),
+            interface_index: u32::from(rtm.rtm_index),
+            metric: u32::from(rtm.rtm_flags & libc::RTF_IFSCOPE != 0),
+        });
+    });
     routes
 }
 
 #[cfg(target_vendor = "apple")]
 fn routes() -> io::Result<Vec<Route>> {
+    Ok(parse_route_dump(
+        &route_dump(nix::libc::AF_INET)?,
+        interface_name,
+    ))
+}
+
+#[cfg(target_vendor = "apple")]
+fn routes_v6() -> io::Result<Vec<Route6>> {
+    Ok(parse_route_dump_v6(
+        &route_dump(nix::libc::AF_INET6)?,
+        interface_name,
+    ))
+}
+
+/// The routing table's routes of `family`, as the `NET_RT_DUMP` sysctl
+/// gives them.
+#[cfg(target_vendor = "apple")]
+fn route_dump(family: i32) -> io::Result<Vec<u8>> {
     use nix::libc;
     let mut mib = [
         libc::CTL_NET,
         libc::PF_ROUTE,
         0,
-        libc::AF_INET,
+        family,
         libc::NET_RT_DUMP,
         0,
     ];
@@ -844,18 +1074,23 @@ fn routes() -> io::Result<Vec<Route>> {
         return Err(io::Error::last_os_error());
     }
     buf.truncate(needed);
-    Ok(parse_route_dump(&buf, |index| {
-        let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
-        // SAFETY: `name` has the IF_NAMESIZE bytes if_indextoname writes.
-        let named = unsafe { libc::if_indextoname(u32::from(index), name.as_mut_ptr()) };
-        if named.is_null() {
-            return String::new();
-        }
-        // SAFETY: if_indextoname wrote a NUL-terminated name into `name`.
-        unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
-            .to_string_lossy()
-            .into_owned()
-    }))
+    Ok(buf)
+}
+
+/// The name of the interface of `index`; empty for none.
+#[cfg(target_vendor = "apple")]
+fn interface_name(index: u16) -> String {
+    use nix::libc;
+    let mut name = [0 as libc::c_char; libc::IF_NAMESIZE];
+    // SAFETY: `name` has the IF_NAMESIZE bytes if_indextoname writes.
+    let named = unsafe { libc::if_indextoname(u32::from(index), name.as_mut_ptr()) };
+    if named.is_null() {
+        return String::new();
+    }
+    // SAFETY: if_indextoname wrote a NUL-terminated name into `name`.
+    unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
 }
 
 #[cfg(windows)]
@@ -917,10 +1152,18 @@ fn routes() -> io::Result<Vec<Route>> {
     ))
 }
 
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn routes_v6() -> io::Result<Vec<Route6>> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "no IPv6 routing table reader on this platform",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
-        net::{IpAddr, Ipv4Addr, SocketAddr},
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
         time::Duration,
     };
 
@@ -930,13 +1173,14 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        GatewayRoute, NATPMP_PORT, NatPmpMapper, Route, default_gateway_of, gateway_route,
+        GatewayRoute, NATPMP_PORT, NatPmpMapper, Route, Route6, default_gateway_of,
+        default_gateway_v6_of, gateway_route, gateway_route_v6, parse_proc_net_ipv6_route,
         parse_proc_net_route,
     };
     use crate::{
         core::net::{DatagramSocket, Egress, HttpClients},
         route_interface::RouteInterface,
-        test_support::{loopback, loopback_udp},
+        test_support::{loopback, loopback_udp, udp},
         upnp::{PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport, tests::hold_clock},
     };
 
@@ -950,6 +1194,13 @@ mod tests {
         async fn new() -> Self {
             Self {
                 socket: loopback_udp().await,
+                mapper: None,
+            }
+        }
+
+        async fn new_v6() -> Self {
+            Self {
+                socket: udp((Ipv6Addr::LOCALHOST, 0)).await,
                 mapper: None,
             }
         }
@@ -1287,7 +1538,7 @@ mod tests {
         let routes = [route([0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], "utun8", 0)];
         let tunnel = RouteInterface {
             name: "utun8".into(),
-            ip: Ipv4Addr::new(10, 44, 0, 2),
+            ip: Ipv4Addr::new(10, 44, 0, 2).into(),
             point_to_point: true,
         };
         let route = gateway_route(&routes, &tunnel, Vec::new()).map_err(|e| format!("{e:#}"));
@@ -1454,6 +1705,218 @@ mod tests {
         running.task.await.unwrap().unwrap();
     }
 
+    /// A mapper asking from the IPv6 loopback address over `gateway`.
+    fn run_mapper_v6(gateway: &Gateway, protocols: &[PortmapProtocol]) -> Running {
+        run_mapper_over(
+            Ok(GatewayRoute {
+                local_ip: Ipv6Addr::LOCALHOST.into(),
+                gateway: gateway.socket.bind_addr(),
+                interface_addresses: vec![Ipv6Addr::LOCALHOST.into()],
+            }),
+            protocols,
+        )
+    }
+
+    const EXTERNAL_V6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 5);
+
+    // A mapper on an IPv6 address asks over PCP with that address as its
+    // own (libtorrent `send_map_request` carries an IPv6 address as is),
+    // and reports the port and address the gateway grants as PCP over
+    // IPv6. The loopback address is a local one: it suggests no external
+    // address.
+    #[tokio::test(start_paused = true)]
+    async fn an_ipv6_mapper_asks_over_pcp_and_reports_the_granted_port() {
+        let _hold = hold_clock();
+        let mut gateway = Gateway::new_v6().await;
+        let mut running = run_mapper_v6(&gateway, &[PortmapProtocol::Tcp]);
+
+        let request = gateway.recv().await;
+        assert_eq!(request.len(), 60);
+        assert_eq!(&request[..4], &[2, 1, 0, 0]);
+        assert_eq!(&request[4..8], &3600u32.to_be_bytes());
+        assert_eq!(&request[8..24], &Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(request[36], 6);
+        assert_eq!(&request[40..42], &6881u16.to_be_bytes());
+        assert_eq!(&request[42..44], &6881u16.to_be_bytes());
+        assert_eq!(&request[44..60], &Ipv6Addr::UNSPECIFIED.octets());
+
+        let mut answer = vec![2, 0x80 | 1, 0, 0];
+        answer.extend_from_slice(&7200u32.to_be_bytes());
+        answer.extend_from_slice(&1000u32.to_be_bytes());
+        answer.extend_from_slice(&[0; 12]);
+        answer.extend_from_slice(&request[24..42]);
+        answer.extend_from_slice(&51413u16.to_be_bytes());
+        answer.extend_from_slice(&EXTERNAL_V6.octets());
+        gateway.send(&answer).await;
+        assert_eq!(
+            running.events.recv().await.unwrap(),
+            PortMapped {
+                transport: PortmapTransport::PcpIpv6,
+                protocol: PortmapProtocol::Tcp,
+                local_port: 6881,
+                external_port: Some(51413),
+                external_ip: Some(EXTERNAL_V6.into()),
+                error: None,
+            }
+        );
+
+        running.cancel.cancel();
+        let delete = gateway.recv().await;
+        assert_eq!(&delete[4..8], &0u32.to_be_bytes());
+        assert_eq!(&delete[44..60], &EXTERNAL_V6.octets());
+        running.task.await.unwrap().unwrap();
+    }
+
+    // NAT-PMP carries no IPv6: a gateway that speaks only NAT-PMP is asked
+    // again over PCP, never over NAT-PMP (libtorrent `on_reply` falls back
+    // only on an IPv4 socket).
+    #[tokio::test(start_paused = true)]
+    async fn an_ipv6_mapper_never_falls_back_to_nat_pmp() {
+        let _hold = hold_clock();
+        let mut gateway = Gateway::new_v6().await;
+        let running = run_mapper_v6(&gateway, &[PortmapProtocol::Tcp]);
+
+        let first = gateway.recv().await;
+        let mut refusal = vec![0, 0x80 | 1, 0, 1];
+        refusal.extend_from_slice(&1000u32.to_be_bytes());
+        gateway.send(&refusal).await;
+        tokio::time::advance(Duration::from_millis(250)).await;
+        assert_eq!(gateway.recv().await, first);
+
+        running.cancel.cancel();
+        running.task.await.unwrap().unwrap();
+    }
+
+    // A mapper for an IPv6 address with no gateway to ask fails each
+    // mapping as PCP over IPv6.
+    #[tokio::test(start_paused = true)]
+    async fn an_ipv6_mapper_without_a_gateway_reports_as_pcp_over_ipv6() {
+        let mapper = NatPmpMapper::new(
+            Err("no IPv6 gateway on the route's interface en0".into()),
+            vec![PortMapRequest {
+                protocol: PortmapProtocol::Tcp,
+                local_port: 6881,
+                external_port: 6881,
+            }],
+            None,
+            loopback(),
+        )
+        .ipv6();
+        let (events_tx, mut events) = unbounded_channel();
+        mapper
+            .run(CancellationToken::new(), events_tx)
+            .await
+            .unwrap();
+        assert_eq!(
+            events.recv().await.unwrap(),
+            PortMapped {
+                transport: PortmapTransport::PcpIpv6,
+                ..failed(
+                    PortmapProtocol::Tcp,
+                    "no IPv6 gateway on the route's interface en0"
+                )
+            }
+        );
+    }
+
+    fn route6(prefix_len: u8, gateway: &str, interface: &str, metric: u32) -> Route6 {
+        let gateway: Ipv6Addr = gateway.parse().unwrap();
+        Route6 {
+            prefix_len,
+            gateway: (!gateway.is_unspecified()).then_some(gateway),
+            interface: interface.into(),
+            interface_index: if interface == "en0" { 4 } else { 9 },
+            metric,
+        }
+    }
+
+    // The IPv6 gateway is the cheapest default route's router on the
+    // interface; a link-local router is asked within the interface's scope.
+    #[test]
+    fn the_ipv6_gateway_is_the_default_routes_router_in_the_interfaces_scope() {
+        let routes = [
+            route6(0, "::", "utun8", 0),
+            route6(64, "::", "en0", 0),
+            route6(0, "fe80::1", "en0", 1),
+            route6(0, "fe80::2", "en0", 5),
+            route6(1, "2001:db8::1", "wg0", 0),
+        ];
+        assert_eq!(
+            default_gateway_v6_of(&routes, "en0"),
+            Some(SocketAddrV6::new(
+                "fe80::1".parse().unwrap(),
+                NATPMP_PORT,
+                0,
+                4
+            ))
+        );
+        assert_eq!(
+            default_gateway_v6_of(&routes, "wg0"),
+            Some(SocketAddrV6::new(
+                "2001:db8::1".parse().unwrap(),
+                NATPMP_PORT,
+                0,
+                0
+            ))
+        );
+        assert_eq!(default_gateway_v6_of(&routes, "utun8"), None);
+
+        let en0 = RouteInterface {
+            name: "en0".into(),
+            ip: "2001:db8::5".parse().unwrap(),
+            point_to_point: false,
+        };
+        assert_eq!(
+            gateway_route_v6(&routes, &en0, Vec::new()).unwrap(),
+            GatewayRoute {
+                local_ip: "2001:db8::5".parse().unwrap(),
+                gateway: SocketAddrV6::new("fe80::1".parse().unwrap(), NATPMP_PORT, 0, 4).into(),
+                interface_addresses: vec!["2001:db8::5".parse().unwrap()],
+            }
+        );
+        // An interface with no IPv6 default route has no gateway to ask.
+        let en1 = RouteInterface {
+            name: "en1".into(),
+            ..en0
+        };
+        assert_eq!(
+            format!(
+                "{:#}",
+                gateway_route_v6(&routes, &en1, Vec::new()).unwrap_err()
+            ),
+            "no IPv6 gateway on the route's interface en1"
+        );
+    }
+
+    #[test]
+    fn proc_net_ipv6_route_lists_routes_that_are_up() {
+        let text = "\
+            00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000001 00000400 00000001 00000000 00000003 eth0\n\
+            20010db8000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0\n\
+            00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200 lo\n\
+            00000000000000000000000000000000 00 00000000000000000000000000000000 00 fe800000000000000000000000000002 00000400 00000001 00000000 00000002 eth1\n";
+        let index = |name: &str| if name == "eth0" { 2 } else { 1 };
+        assert_eq!(
+            parse_proc_net_ipv6_route(text, index),
+            vec![
+                Route6 {
+                    prefix_len: 0,
+                    gateway: Some("fe80::1".parse().unwrap()),
+                    interface: "eth0".into(),
+                    interface_index: 2,
+                    metric: 0x400,
+                },
+                Route6 {
+                    prefix_len: 64,
+                    gateway: None,
+                    interface: "eth0".into(),
+                    interface_index: 2,
+                    metric: 0x100,
+                },
+            ]
+        );
+    }
+
     /// A route; a gateway of 0.0.0.0 is a route straight out of the
     /// interface.
     fn route(
@@ -1506,7 +1969,7 @@ mod tests {
 
         let en0 = RouteInterface {
             name: "en0".into(),
-            ip: Ipv4Addr::new(172, 16, 5, 85),
+            ip: Ipv4Addr::new(172, 16, 5, 85).into(),
             point_to_point: false,
         };
         // The route holds every address of the interface, its own among
@@ -1522,7 +1985,7 @@ mod tests {
         );
         let utun8 = RouteInterface {
             name: "utun8".into(),
-            ip: Ipv4Addr::new(10, 44, 0, 2),
+            ip: Ipv4Addr::new(10, 44, 0, 2).into(),
             point_to_point: true,
         };
         assert_eq!(
@@ -1664,5 +2127,93 @@ mod tests {
             Some(Ipv4Addr::new(192, 168, 1, 1))
         );
         assert_eq!(default_gateway_of(&routes, "if9"), None);
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn a_route_dump_yields_its_ipv6_routes() {
+        use nix::libc;
+
+        fn message(flags: i32, index: u16, addrs: &[&[u8]]) -> Vec<u8> {
+            let header = std::mem::size_of::<libc::rt_msghdr>();
+            let mut body = Vec::new();
+            for a in addrs {
+                body.extend_from_slice(a);
+                body.resize(body.len().div_ceil(4) * 4, 0);
+            }
+            // SAFETY: an all-zero rt_msghdr is valid.
+            let mut rtm: libc::rt_msghdr = unsafe { std::mem::zeroed() };
+            rtm.rtm_msglen = u16::try_from(header + body.len()).unwrap();
+            rtm.rtm_version = u8::try_from(libc::RTM_VERSION).unwrap();
+            rtm.rtm_type = u8::try_from(libc::RTM_GET).unwrap();
+            rtm.rtm_index = index;
+            rtm.rtm_flags = flags;
+            rtm.rtm_addrs = libc::RTA_DST | libc::RTA_GATEWAY | libc::RTA_NETMASK;
+            // SAFETY: viewing a plain-data struct as its bytes.
+            let mut m = unsafe {
+                std::slice::from_raw_parts((&rtm as *const libc::rt_msghdr).cast::<u8>(), header)
+            }
+            .to_vec();
+            m.extend_from_slice(&body);
+            m
+        }
+        fn sin6(octets: [u8; 16]) -> Vec<u8> {
+            let mut sa = vec![28, u8::try_from(libc::AF_INET6).unwrap(), 0, 0, 0, 0, 0, 0];
+            sa.extend_from_slice(&octets);
+            sa.resize(28, 0);
+            sa
+        }
+        let ip = |s: &str| s.parse::<Ipv6Addr>().unwrap().octets();
+        // The kernel writes a link-local gateway's scope, index 4, into its
+        // third and fourth bytes.
+        let mut scoped = ip("fe80::1");
+        scoped[3] = 4;
+        let mut dump = message(
+            libc::RTF_GATEWAY,
+            4,
+            &[&sin6(ip("::")), &sin6(scoped), &[0, 0, 0, 0]],
+        );
+        // A /64 on the link, its mask cut after its last non-zero byte.
+        let mut mask = vec![16, 0, 0, 0, 0, 0, 0, 0];
+        mask.extend_from_slice(&[0xff; 8]);
+        dump.extend(message(
+            0,
+            4,
+            &[&sin6(ip("2001:db8::")), &sin6(ip("::")), &mask],
+        ));
+        // An IPv4 route is not one of them.
+        let mut sin = vec![16, u8::try_from(libc::AF_INET).unwrap(), 0, 0, 0, 0, 0, 0];
+        sin.resize(16, 0);
+        dump.extend(message(libc::RTF_GATEWAY, 4, &[&sin, &sin, &[0, 0, 0, 0]]));
+
+        let routes = super::parse_route_dump_v6(&dump, |index| format!("if{index}"));
+        assert_eq!(
+            routes,
+            vec![
+                Route6 {
+                    prefix_len: 0,
+                    gateway: Some("fe80::1".parse().unwrap()),
+                    interface: "if4".into(),
+                    interface_index: 4,
+                    metric: 0,
+                },
+                Route6 {
+                    prefix_len: 64,
+                    gateway: None,
+                    interface: "if4".into(),
+                    interface_index: 4,
+                    metric: 0,
+                },
+            ]
+        );
+        assert_eq!(
+            default_gateway_v6_of(&routes, "if4"),
+            Some(SocketAddrV6::new(
+                "fe80::1".parse().unwrap(),
+                NATPMP_PORT,
+                0,
+                4
+            ))
+        );
     }
 }
