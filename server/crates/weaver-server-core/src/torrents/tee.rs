@@ -418,13 +418,18 @@ impl Tee {
 
     // A step reached the job. Its checkpoint is taken once the write it
     // joins is due, by the bytes taken since the last or their age, or at
-    // once while a move waits on a commit, as a job of the pipeline's is;
-    // until then nothing is read of the job.
+    // once while a move waits on a commit, as a job of the pipeline's is,
+    // or while one that found an object out for its work is owed: the step
+    // that takes the object back takes it, and work goes out again. Until
+    // then nothing is read of the job.
     fn stepped(&self, job: &mut GraphJob) {
         if job.pending().control().cancelled() {
             return;
         }
-        if job.awaits_commit() || job.pending().stepped(self.job_id, &self.mail) {
+        if job.awaits_commit()
+            || job.owes_checkpoint()
+            || job.pending().stepped(self.job_id, &self.mail)
+        {
             self.checkpointed(job, false);
         }
     }
@@ -686,6 +691,29 @@ impl Tee {
         #[cfg(test)]
         self.asked.send_modify(|asked| *asked += 1);
         self.checkpoint_locked(&mut self.locked(), force)
+    }
+
+    // A stop's checkpoint, its change queued at once, on a thread that may
+    // block. Every object of the job out for its work is waited on until
+    // it is back first, as the pipeline's stop hears each back before its
+    // last checkpoint, so the checkpoint holds what the work came to. The
+    // checkpoint is owed meanwhile, so nothing more goes out.
+    pub(crate) fn checkpoint_stopped(&self) -> Result<(), WriteError> {
+        let _job = JobScope::enter(self.job_id);
+        #[cfg(test)]
+        self.asked.send_modify(|asked| *asked += 1);
+        let mut heard = self.heard.subscribe();
+        loop {
+            let mut job = self.locked();
+            if !job.working() {
+                return self.checkpoint_locked(&mut job, true);
+            }
+            job.owe_checkpoint();
+            drop(job);
+            // The word that takes the object back moves the count; the tee
+            // holds its sender, so the wait never ends on a closed one.
+            let _ = tokio::runtime::Handle::current().block_on(heard.changed());
+        }
     }
 
     // A checkpoint write of the job's that cannot succeed. As a job of the

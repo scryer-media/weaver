@@ -962,13 +962,6 @@ impl Pipeline {
             if graph.pending().control().cancelled() {
                 return;
             }
-            // The steps stay unread until the object out for its work is
-            // back. Nothing more goes out until a checkpoint is recorded, so
-            // the step that takes it back takes them.
-            if graph.working() {
-                graph.owe_checkpoint();
-                return;
-            }
             let feed_verdict = self.post_probes.verdicts.get(&job_id);
             match checkpoint_job(graph, job_id, &self.db, &mail, held, feed_verdict, false) {
                 Ok(true) => {}
@@ -1045,6 +1038,12 @@ impl Pipeline {
 // queued to carry it. The change is queued for the database once its write
 // is due, or at once when `force`. Every job checkpoints through here, the
 // pipeline's and the ones outside it alike.
+//
+// While an object is out for its work none is taken: its facts as it left
+// hold the work undone, which a restart cannot always do without the tree.
+// The steps stay unread and the checkpoint is owed, so nothing more goes
+// out until one is recorded, and the step that takes the object back takes
+// it. A forced one still queues at once what earlier checkpoints recorded.
 pub(crate) fn checkpoint_job(
     graph: &mut GraphJob,
     job_id: JobId,
@@ -1055,6 +1054,13 @@ pub(crate) fn checkpoint_job(
     force: bool,
 ) -> Result<bool, crate::pipeline::graph::namespace::WriteError> {
     let pending = graph.pending().clone();
+    if graph.working() {
+        graph.owe_checkpoint();
+        if force {
+            pending.queue(db, job_id, mail, true);
+        }
+        return Ok(false);
+    }
     pending.put_with_feed(graph, held, feed_verdict);
     graph.recorded(pending.stamp());
     let mut moved = false;
