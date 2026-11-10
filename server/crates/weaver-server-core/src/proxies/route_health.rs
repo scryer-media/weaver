@@ -9,8 +9,14 @@
 //
 // A proxy used on an egress only as a pool member tells nothing of its own:
 // its pool does. A chain is not a route of its own: each of its proxies
-// tells as itself. While an egress is down, nothing on it tells, and once it
-// is down every proxy and pool on it starts again as never seen up.
+// tells as itself. A proxy reached by more than one hop, such as alone and
+// at the top of a chain, is up while any of its hops works, and down once
+// every one is failing.
+//
+// While an egress is down, nothing on it tells, and every proxy and pool on
+// it starts again as never seen up. Once it is back, each proxy on it is
+// seen as its hops last said, but a hop that failed while the egress was
+// down says nothing until it turns again: its failure may be the egress's.
 //
 // A route goes down only after it was seen up. Once one is told down, no
 // other down is told for it until `QUIET_PERIOD` has passed: a down inside
@@ -110,6 +116,19 @@ impl RouteKey {
     }
 }
 
+// One hop of a proxy: the proxy on an egress, above the proxies beneath it.
+// The chain ends with the proxy itself.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct HopKey {
+    egress: u32,
+    chain: Vec<u32>,
+}
+impl HopKey {
+    fn proxy(&self) -> u32 {
+        *self.chain.last().expect("a hop names its proxy")
+    }
+}
+
 #[derive(Default)]
 struct Seen {
     // Whether the route was last seen up. None: never seen.
@@ -132,6 +151,9 @@ struct State {
     // Each egress and enabled pool used on it.
     pooled: HashSet<(u32, u32)>,
     seen: HashMap<RouteKey, Seen>,
+    // Whether each hop last said it works. A hop that has said nothing, or
+    // that failed while its egress was down, has no entry.
+    hops: HashMap<HopKey, bool>,
     listeners: Vec<mpsc::UnboundedSender<RouteEvent>>,
 }
 
@@ -241,6 +263,54 @@ impl State {
         for (key, event) in turns {
             waits |= self.turn(key, event, now);
         }
+        waits
+    }
+    // What the hops of proxy `proxy` on `egress` last said: up while any
+    // works, down once every one that said is failing, None while none has.
+    fn hops_say(&self, egress: u32, proxy: u32) -> Option<bool> {
+        let mut said = None;
+        for (hop, works) in &self.hops {
+            if hop.egress == egress && hop.proxy() == proxy {
+                if *works {
+                    return Some(true);
+                }
+                said = Some(false);
+            }
+        }
+        said
+    }
+    // Proxy `proxy` on `egress` as its hops now say, and each pool with it
+    // in, telling what turned. A down gives `fault` as its reason. Returns
+    // true when a down now waits for the quiet period to end.
+    fn turn_proxy(&mut self, egress: u32, proxy: u32, fault: Option<&str>, now: Instant) -> bool {
+        let Some(up) = self.hops_say(egress, proxy) else {
+            return false;
+        };
+        let Some(profile) = self.profiles.get(&proxy) else {
+            return false;
+        };
+        let (kind, name) = (RouteKind::of_proxy(profile.kind), profile.name.clone());
+        let fault = fault.unwrap_or_default();
+        let event = RouteEvent {
+            change: if up {
+                RouteChange::Up
+            } else {
+                RouteChange::Down
+            },
+            egress_id: egress,
+            kind,
+            name: name.clone(),
+            reason: if up { String::new() } else { fault.to_string() },
+        };
+        let key = RouteKey::Proxy { egress, proxy };
+        let mut waits = false;
+        if self.tells_alone(egress, proxy) {
+            waits |= self.turn(key, event, now);
+        } else {
+            self.seen.entry(key).or_default().up = Some(up);
+        }
+        let reason = format!("{name}: {fault}");
+        waits |= self.turn_pools(egress, proxy, (!up).then_some(reason.as_str()), now);
         waits
     }
 }
@@ -376,8 +446,17 @@ impl RouteHealth {
             profiles: before_profiles,
             pools: before_pools,
             seen,
+            hops,
             ..
         } = &mut *state;
+        // A hop goes with an edit to its egress or to any proxy of its chain.
+        hops.retain(|hop, _| {
+            same_egress(before_egresses.get(&hop.egress), egresses.get(&hop.egress))
+                && hop
+                    .chain
+                    .iter()
+                    .all(|id| same_profile(before_profiles.get(id), profiles.get(id)))
+        });
         seen.retain(|key, _| {
             let egress = key.egress();
             same_egress(before_egresses.get(&egress), egresses.get(&egress))
@@ -400,7 +479,8 @@ impl RouteHealth {
     // Egress `id` as the interface check found it. An egress on the
     // system's own routing is always up, and one whose health is unknown
     // keeps what was last seen. An egress going down takes every proxy and
-    // pool on it back to never seen.
+    // pool on it back to never seen; back up, each proxy on it is seen as
+    // its hops last said.
     pub(super) fn egress(&self, id: u32, health: &EgressHealth) {
         let now = self.clock.now();
         let mut state = self.state.lock().expect("route health");
@@ -424,7 +504,8 @@ impl RouteHealth {
             name: egress.name.clone(),
             reason,
         };
-        if change == RouteChange::Down && !state.egress_down(id) {
+        let was_down = state.egress_down(id);
+        if change == RouteChange::Down && !was_down {
             for (key, seen) in &mut state.seen {
                 if !matches!(key, RouteKey::Egress(_)) && key.egress() == id {
                     seen.up = None;
@@ -432,99 +513,93 @@ impl RouteHealth {
                 }
             }
         }
-        let waits = state.turn(RouteKey::Egress(id), event, now);
+        let mut waits = state.turn(RouteKey::Egress(id), event, now);
+        if change == RouteChange::Up && was_down {
+            let mut proxies: Vec<_> = state
+                .hops
+                .keys()
+                .filter(|hop| hop.egress == id)
+                .map(HopKey::proxy)
+                .collect();
+            proxies.sort_unstable();
+            proxies.dedup();
+            for proxy in proxies {
+                waits |= state.turn_proxy(id, proxy, None, now);
+            }
+        }
         drop(state);
         if waits {
             self.rearm.notify_one();
         }
     }
-    // Proxy `proxy` at `revision` on egress `egress` works, or fails with
-    // `fault`. A hop built from another revision, for a proxy or egress no
-    // longer enabled, or on an egress that is down, says nothing; nor does a
-    // fault that is the egress's own.
-    fn proxy(&self, egress: u32, proxy: u32, revision: u64, fault: Option<&ProxyFault>) {
-        if matches!(
-            fault,
-            Some(ProxyFault::NoRouteVia { .. } | ProxyFault::EgressUnusable { .. })
-        ) {
+    // Hop `hop`, built from its proxy's `revision`, works, or fails with
+    // `fault`. A hop built from another revision, or for a proxy or egress
+    // no longer enabled, says nothing; nor does a fault that is the
+    // egress's own. While the egress is down the hop's word is kept, not
+    // told, and a failure then says nothing: it may be the egress's.
+    fn proxy(&self, hop: &HopKey, revision: u64, fault: Option<&ProxyFault>) {
+        if fault.is_some_and(ProxyFault::is_egress_own) {
             return;
         }
         let now = self.clock.now();
         let mut state = self.state.lock().expect("route health");
-        if state.egress(egress).is_none() || state.egress_down(egress) {
+        let (egress, proxy) = (hop.egress, hop.proxy());
+        if state.egress(egress).is_none()
+            || !state
+                .profiles
+                .get(&proxy)
+                .is_some_and(|profile| profile.enabled && profile.revision == revision)
+        {
             return;
         }
-        let Some(profile) = state
-            .profiles
-            .get(&proxy)
-            .filter(|profile| profile.enabled && profile.revision == revision)
-        else {
+        if state.egress_down(egress) {
+            match fault {
+                None => state.hops.insert(hop.clone(), true),
+                Some(_) => state.hops.remove(hop),
+            };
             return;
-        };
+        }
+        state.hops.insert(hop.clone(), fault.is_none());
         let reason = fault.map(ToString::to_string);
-        let event = RouteEvent {
-            change: match fault {
-                Some(_) => RouteChange::Down,
-                None => RouteChange::Up,
-            },
-            egress_id: egress,
-            kind: RouteKind::of_proxy(profile.kind),
-            name: profile.name.clone(),
-            reason: reason.clone().unwrap_or_default(),
-        };
-        let key = RouteKey::Proxy { egress, proxy };
-        let mut waits = false;
-        if state.tells_alone(egress, proxy) {
-            waits |= state.turn(key, event, now);
-        } else {
-            state.seen.entry(key).or_default().up = Some(fault.is_none());
-        }
-        let reason = reason.map(|reason| format!("{}: {reason}", profile_name(&state, proxy)));
-        waits |= state.turn_pools(egress, proxy, reason.as_deref(), now);
+        let waits = state.turn_proxy(egress, proxy, reason.as_deref(), now);
         drop(state);
         if waits {
             self.rearm.notify_one();
         }
     }
-    // What a hop for proxy `proxy` at `revision` on egress `egress` tells.
+    // What a hop for proxy `proxy` at `revision` on egress `egress` tells,
+    // above the proxies `beneath` it, nearest the egress first.
     pub(super) fn watcher(
         self: &Arc<Self>,
         egress: u32,
+        beneath: &[u32],
         proxy: u32,
         revision: u64,
     ) -> Arc<dyn HopWatcher> {
+        let mut chain = beneath.to_vec();
+        chain.push(proxy);
         Arc::new(ProxyWatcher {
             health: Arc::downgrade(self),
-            egress,
-            proxy,
+            hop: HopKey { egress, chain },
             revision,
         })
     }
 }
 
-fn profile_name(state: &State, proxy: u32) -> String {
-    state
-        .profiles
-        .get(&proxy)
-        .map(|profile| profile.name.clone())
-        .unwrap_or_default()
-}
-
 struct ProxyWatcher {
     health: Weak<RouteHealth>,
-    egress: u32,
-    proxy: u32,
+    hop: HopKey,
     revision: u64,
 }
 impl HopWatcher for ProxyWatcher {
     fn working(&self) {
         if let Some(health) = self.health.upgrade() {
-            health.proxy(self.egress, self.proxy, self.revision, None);
+            health.proxy(&self.hop, self.revision, None);
         }
     }
     fn failing(&self, fault: &ProxyFault) {
         if let Some(health) = self.health.upgrade() {
-            health.proxy(self.egress, self.proxy, self.revision, Some(fault));
+            health.proxy(&self.hop, self.revision, Some(fault));
         }
     }
 }

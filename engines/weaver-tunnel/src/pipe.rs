@@ -500,7 +500,8 @@ pub struct FailingHop {
 // `wait` is the hop's own timeout, which a fault that ran out of time names.
 //
 // A watched hop tells its watcher each time it turns: it works after it was
-// untried or failing, or it fails after it was untried or working.
+// untried or failing, or it fails after it was untried or working. Failing
+// for its egress and failing for itself count as two turns.
 //
 // A hop that answered within `LIVE_WINDOW` is alive. A wait that runs out on
 // it is then the destination's, and says nothing of the hop.
@@ -590,7 +591,12 @@ impl HopFailure {
     }
     fn record(&self, fault: ProxyFault) {
         let mut state = self.state.lock().expect("hop failure");
-        let turned = !matches!(*state, HopState::Failing(_));
+        // Failing for the egress and failing for the hop itself are two
+        // turns: the egress's fault says nothing of the proxy beyond it.
+        let turned = match &*state {
+            HopState::Failing(before) => before.is_egress_own() != fault.is_egress_own(),
+            _ => true,
+        };
         if turned && let Some(watcher) = &self.watcher {
             watcher.failing(&fault);
         }
@@ -1016,16 +1022,21 @@ impl Dialer for TransportHop {
                 .await;
             crate::metrics::record_stream(self.spec.kind.tunnel_kind(), &negotiated);
             // A wait on a proxy that answered lately is the destination's,
-            // and says nothing new of the proxy.
-            let waited =
-                matches!(&negotiated, Err(error) if ran_out(error)) && self.failure.alive();
+            // and says nothing new of the proxy. A SOCKS5 proxy's own wait is
+            // the exception: `negotiate` turns its quiet CONNECT into the
+            // destination's error, so the only timeout it returns for a SOCKS5
+            // hop is the proxy silent at its own greeting.
+            let socks = matches!(self.spec.kind, crate::transport::TransportKind::Socks5);
+            let silent_greeting = socks && matches!(negotiated, Err(DialError::Timeout { .. }));
+            let waited = matches!(&negotiated, Err(error) if ran_out(error))
+                && !silent_greeting
+                && self.failure.alive();
             match &negotiated {
                 _ if waited => {}
                 Ok(()) => self.failure.clear(),
                 // The proxy took the request for the next hop, so it is
                 // working. An HTTP proxy that kept quiet for it was not heard.
                 Err(DialError::Hop { proxy, source }) if *proxy != self.id => {
-                    let socks = matches!(self.spec.kind, crate::transport::TransportKind::Socks5);
                     if socks || !crate::transport::is_silent_hop_before(source) {
                         self.failure.clear();
                     } else {

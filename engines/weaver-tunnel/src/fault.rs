@@ -88,6 +88,11 @@ pub enum ProxyFault {
 }
 
 impl ProxyFault {
+    // Whether the fault is the egress's own: no route leaves by it, or it
+    // cannot be used at all, so the proxy beyond it was never tried.
+    pub fn is_egress_own(&self) -> bool {
+        matches!(self, Self::NoRouteVia { .. } | Self::EgressUnusable { .. })
+    }
     pub fn code(&self) -> &'static str {
         match self {
             Self::NameNotResolved => "NAME_NOT_RESOLVED",
