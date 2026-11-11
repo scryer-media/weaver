@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+# Every function of the bench, and of the kernel it includes by path, starts
+# on a 64-byte boundary (LLVM's -align-all-functions takes log2). The
+# padding sits between functions and never runs. A tier's loops then keep
+# the same offset within a 64-byte line whatever code is linked before them,
+# so the bench gives the same answer for the same kernel source. rapidyenc's
+# side is pinned the same way (rapidyenc_encode_build.rs, pin_functions).
+[target.'cfg(target_arch = "x86_64")']
+rustflags = ["-C", "llvm-args=-align-all-functions=6"]

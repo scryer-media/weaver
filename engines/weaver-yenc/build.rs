@@ -2,13 +2,15 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Optional: when `WEAVER_RAPIDYENC_SRC` points at a rapidyenc checkout, compile
-// its decode sources + a tiny extern-"C" shim via `cc` and link them, and emit
+// its decode and encode sources + small extern-"C" shims via `cc` and link them, and emit
 // `cfg(rapidyenc_linked)` so the timing harness can A/B against the real
 // library in-process. When the env var is unset (normal builds, CI, everyone
 // else) this is a complete no-op — no rapidyenc dependency, no behavior change.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+include!("rapidyenc_encode_build.rs");
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(rapidyenc_linked)");
@@ -16,6 +18,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=WEAVER_RAPIDYENC_SRC");
     println!("cargo:rerun-if-env-changed=WEAVER_YENC_RAW_ASM");
     println!("cargo:rerun-if-changed=rapidyenc_shim.cc");
+    println!("cargo:rerun-if-changed=rapidyenc_encode_shim.cc");
+    println!("cargo:rerun-if-changed=rapidyenc_encode_build.rs");
 
     // The oracle-model `asm!` decode kernel (`avx2_raw_kernel_oracle`) is the
     // DEFAULT raw path on x86_64, with and without end detection: measured on Alder Lake and
@@ -77,6 +81,9 @@ fn main() {
             .flag_if_supported("-march=armv8-a+crypto+crc")
             .file(src.join("crc_arm_pmull.cc"))
             .compile("rapidyenc_crc_arm_pmull");
+
+        // Encoder sources + encode shim (platform.cc is already linked above).
+        compile_rapidyenc_encoder(&root, Path::new("rapidyenc_encode_shim.cc"), false);
 
         println!("cargo:rustc-cfg=rapidyenc_linked");
         return;
@@ -154,6 +161,9 @@ fn main() {
         let name = file.trim_end_matches(".cc");
         b.compile(&format!("rapidyenc_{name}"));
     }
+
+    // Encoder sources + encode shim (platform.cc is already linked above).
+    compile_rapidyenc_encoder(&root, Path::new("rapidyenc_encode_shim.cc"), false);
 
     println!("cargo:rustc-cfg=rapidyenc_linked");
 }
