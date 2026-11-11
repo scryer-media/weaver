@@ -1984,3 +1984,41 @@ async fn a_tracker_file_that_cannot_be_read_is_refused_plainly() {
         assert!(!message.contains("upload-secret-word"), "{message}");
     }
 }
+
+// `torrents` pages as the whole list does: 100 when `first` is not given,
+// at most 500, each page the torrents after its cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_torrents_list_pages_with_a_default_and_a_most() {
+    let rig = rig().await;
+    for index in 0..505 {
+        let response = rig
+            .execute(&submit(&metainfo(&format!("{index}.bin"), 2000, false), ""))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+    }
+    let ids = |response: Response| -> Vec<u64> {
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()["torrents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|torrent| torrent["id"].as_u64().unwrap())
+            .collect()
+    };
+    let every: Vec<u64> = rig.torrents.job_ids().await.iter().map(|id| id.0).collect();
+    assert_eq!(every.len(), 505);
+    assert_eq!(ids(rig.execute("{ torrents { id } }").await), every[..100]);
+    assert_eq!(
+        ids(rig.execute("{ torrents(first: 1000) { id tags } }").await),
+        every[..500]
+    );
+    let cursor = weaver_server_api::jobs::types::encode_offset_cursor(480);
+    assert_eq!(
+        ids(rig
+            .execute(&format!(
+                r#"{{ torrents(first: 50, after: "{cursor}") {{ id name trackers {{ url }} }} }}"#
+            ))
+            .await),
+        every[480..]
+    );
+}

@@ -84,6 +84,8 @@ use crate::torrents::{
 };
 
 pub mod fingerprint;
+pub mod listing;
+use listing::{CategoryPick, Pick, Shown};
 mod scripts;
 use scripts::Ending;
 pub use scripts::ScriptDirs;
@@ -6528,6 +6530,34 @@ impl TorrentService {
         files: bool,
         now: i64,
     ) -> Vec<(TorrentView, TorrentSeries)> {
+        let shown = if files { Shown::WHOLE } else { Shown::LISTED };
+        let pick = Pick {
+            category: category.map(CategoryPick::Named),
+            ..Pick::default()
+        };
+        self.listed_by(shown, true, now, |settings, live| pick.ids(settings, live))
+            .await
+            .into_iter()
+            .map(|(view, series)| (view, series.expect("asked for")))
+            .collect()
+    }
+
+    // The torrents `pick` names, in the order it names them, each with what
+    // `shown` asks for, and with its figures as the exporter reads them when
+    // `series` asks for those: both from one reading of its session. Only
+    // the torrents picked are read.
+    async fn listed_by(
+        &self,
+        shown: Shown,
+        series: bool,
+        now: i64,
+        pick: impl FnOnce(&TorrentSettings, &BTreeMap<JobId, Live>) -> Vec<JobId>,
+    ) -> Vec<(TorrentView, Option<TorrentSeries>)> {
+        // A torrent's figures name its trackers.
+        let shown = Shown {
+            trackers: shown.trackers || series,
+            ..shown
+        };
         let settings = self.settings();
         // Under the lock, each torrent's files are only taken by reference
         // with its levels: the list is built after the lock is let go.
@@ -6537,34 +6567,36 @@ impl TorrentService {
         type Listed = (
             TorrentView,
             Vec<TrackerAnnounce>,
-            Unviewed,
+            Option<Unviewed>,
             Files,
             Option<u32>,
-            Arc<[TrackerEntry]>,
+            Option<Arc<[TrackerEntry]>>,
         );
         let mut views: Vec<Listed> = {
             let live = self.inner.live.lock().await;
-            live.values()
+            pick(&settings, &live)
+                .iter()
+                .filter_map(|job_id| live.get(job_id))
                 .map(|torrent| {
                     let reading = torrent.reading(now);
-                    let unviewed = self.unviewed(&settings, torrent, &reading, now);
+                    let unviewed =
+                        series.then(|| self.unviewed(&settings, torrent, &reading, now));
                     let view = self.view_of(&settings, torrent, reading, now);
-                    let files = files.then(|| (torrent.layout.clone(), torrent.levels.clone()));
+                    let files = shown
+                        .files
+                        .then(|| (torrent.layout.clone(), torrent.levels.clone()));
                     (
                         view,
-                        torrent.announces(),
+                        if shown.trackers {
+                            torrent.announces()
+                        } else {
+                            Vec::new()
+                        },
                         unviewed,
                         files,
                         torrent.record.pool_member,
-                        torrent.trackers.clone(),
+                        shown.trackers.then(|| torrent.trackers.clone()),
                     )
-                })
-                .filter(|(view, ..)| {
-                    category.is_none_or(|name| {
-                        view.category
-                            .as_deref()
-                            .is_some_and(|category| category.eq_ignore_ascii_case(name))
-                    })
                 })
                 .collect()
         };
@@ -6573,18 +6605,20 @@ impl TorrentService {
             if let Some((layout, levels)) = files.take() {
                 view.files = files_of(layout.as_deref(), &levels);
             }
-            self.track(view, *pinned, listed, announces, &mut names);
+            if let Some(listed) = listed {
+                self.track(view, *pinned, listed, announces, &mut names);
+            }
         }
-        self.tag(&mut views.iter_mut().map(|(view, ..)| view).collect::<Vec<_>>());
-        let mut views: Vec<(TorrentView, TorrentSeries)> = views
+        if shown.tags {
+            self.tag(&mut views.iter_mut().map(|(view, ..)| view).collect::<Vec<_>>());
+        }
+        views
             .into_iter()
             .map(|(view, announces, unviewed, ..)| {
-                let series = unviewed.series(&view, &announces);
+                let series = unviewed.map(|unviewed| unviewed.series(&view, &announces));
                 (view, series)
             })
-            .collect();
-        views.sort_by_key(|(view, _)| (view.added_at_ms, view.job_id));
-        views
+            .collect()
     }
 
     // What the exporter reads of `torrent` that its view does not carry,
