@@ -4,7 +4,9 @@
 use std::path::PathBuf;
 
 use crate::StateError;
-use crate::history::model::{HistoryFilter, HistoryRows};
+use crate::history::model::{
+    HistoryFilter, HistoryKeyRow, HistoryOrder, HistoryOrderKey, HistoryRows,
+};
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, max_rows_for_engine};
@@ -165,9 +167,7 @@ impl Database {
                         };
                         page.extend(fetch_history_rows(&datastore, &filter, rows).await?);
                     }
-                    page.sort_by(|a, b| {
-                        (b.completed_at, b.job_id).cmp(&(a.completed_at, a.job_id))
-                    });
+                    page.sort_by(|a, b| history_order_cmp(base.order, a, b));
                     page
                 }
                 HistoryIdSplit::NotIn(excluded, _) => {
@@ -229,6 +229,52 @@ impl Database {
                 .filter(|(_, count)| *count > 0)
                 .map(|(category, count)| (category, count as u32))
                 .collect())
+        })
+    }
+
+    // The match-and-order columns of every history row `rows` shows, in no
+    // particular order. `with_titles` adds the name and metadata a title is
+    // built from; without it both come back empty.
+    pub fn list_job_history_keys(
+        &self,
+        rows: HistoryRows,
+        with_titles: bool,
+    ) -> Result<Vec<HistoryKeyRow>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let mut sql = String::from(if with_titles {
+                "SELECT h.job_id, h.name, h.status, h.total_bytes, h.health, h.category,
+                        h.completed_at, h.metadata
+                   FROM job_history h WHERE 1=1"
+            } else {
+                "SELECT h.job_id, h.status, h.total_bytes, h.health, h.category, h.completed_at
+                   FROM job_history h WHERE 1=1"
+            });
+            append_history_visibility(&mut sql, rows);
+            let found = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
+            found
+                .into_iter()
+                .map(|row| {
+                    Ok(HistoryKeyRow {
+                        job_id: row.i64("job_id")? as u64,
+                        name: if with_titles {
+                            row.text("name")?
+                        } else {
+                            String::new()
+                        },
+                        status: row.text("status")?,
+                        total_bytes: row.i64("total_bytes")? as u64,
+                        health: row.i32("health")? as u32,
+                        category: row.opt_text("category")?,
+                        completed_at: row.i64("completed_at")?,
+                        metadata: if with_titles {
+                            row.opt_text("metadata")?
+                        } else {
+                            None
+                        },
+                    })
+                })
+                .collect()
         })
     }
 
@@ -427,6 +473,49 @@ fn append_history_row_filter_predicates(
         sql.push_str(" AND h.category = {}");
         args.push(SqlArg::Text(category.clone()));
     }
+    if let Some(categories) = &filter.categories_any {
+        append_in_i64_or_text_filter(
+            sql,
+            args,
+            "COALESCE(h.category, '')",
+            categories.iter().cloned().map(SqlArg::Text).collect(),
+        );
+    }
+}
+
+// The ORDER BY clause of `order`, served by the history index on its column.
+fn history_order_sql(order: HistoryOrder) -> &'static str {
+    match (order.key, order.descending) {
+        (HistoryOrderKey::CompletedAt, true) => " ORDER BY h.completed_at DESC, h.job_id DESC",
+        (HistoryOrderKey::CompletedAt, false) => " ORDER BY h.completed_at ASC, h.job_id ASC",
+        (HistoryOrderKey::TotalBytes, true) => " ORDER BY h.total_bytes DESC, h.job_id DESC",
+        (HistoryOrderKey::TotalBytes, false) => " ORDER BY h.total_bytes ASC, h.job_id ASC",
+        (HistoryOrderKey::Health, true) => " ORDER BY h.health DESC, h.job_id DESC",
+        (HistoryOrderKey::Health, false) => " ORDER BY h.health ASC, h.job_id ASC",
+    }
+}
+
+// Two rows in `order`, comparing the stored column values the way the
+// database orders them.
+fn history_order_cmp(
+    order: HistoryOrder,
+    a: &JobHistoryRow,
+    b: &JobHistoryRow,
+) -> std::cmp::Ordering {
+    let key = |row: &JobHistoryRow| {
+        let value = match order.key {
+            HistoryOrderKey::CompletedAt => row.completed_at,
+            HistoryOrderKey::TotalBytes => row.total_bytes as i64,
+            HistoryOrderKey::Health => i64::from(row.health as i32),
+        };
+        (value, row.job_id as i64)
+    };
+    let ascending = key(a).cmp(&key(b));
+    if order.descending {
+        ascending.reverse()
+    } else {
+        ascending
+    }
 }
 
 fn append_in_i64_or_text_filter(
@@ -551,7 +640,7 @@ async fn fetch_history_rows(
     append_history_from_clause(&mut sql, &mut args, filter);
     append_history_row_filter_predicates(&mut sql, &mut args, filter);
     append_history_visibility(&mut sql, rows);
-    sql.push_str(" ORDER BY h.completed_at DESC, h.job_id DESC");
+    sql.push_str(history_order_sql(filter.order));
 
     append_history_pagination(&mut sql, &mut args, filter);
 

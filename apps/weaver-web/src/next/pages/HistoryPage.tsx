@@ -27,7 +27,8 @@ import { GridHeader, GridRow } from "../components/rows";
 import { StorageMounts, storageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useStartOfToday } from "../data/clock";
-import { NEXT_HISTORY_PAGE_QUERY } from "../data/queries";
+import { NEXT_HISTORY_PAGE_QUERY, NEXT_HISTORY_SAMPLE_QUERY } from "../data/queries";
+import { useDebouncedValue } from "../data/timers";
 import {
   EM_DASH,
   formatClock,
@@ -82,6 +83,8 @@ const COLUMNS = {
 const PAGE_SIZES = [25, 50, 100] as const;
 /** Deep enough to cover a busy day, cheap enough to ask for on every visit. */
 const SAMPLE_SIZE = 200;
+/** Typing is one search once the keys stop, not one per key. */
+const SEARCH_SETTLE_MS = 300;
 const NO_COUNTS = { all: 0, success: 0, failure: 0 };
 const NO_VOLUMES: StorageVolume[] = [];
 
@@ -132,6 +135,15 @@ interface HistoryPageResponse {
   };
 }
 
+type HistorySampleRow = Pick<
+  HistoryRow,
+  "id" | "totalBytes" | "downloadedBytes" | "createdAt" | "completedAt"
+>;
+
+interface HistorySampleResponse {
+  historyPage: { items: HistorySampleRow[] };
+}
+
 interface DayGroup {
   key: number;
   label: string;
@@ -144,7 +156,7 @@ function millis(value: string | number | null): number | null {
 }
 
 /** How long the job took, start to finish, or null when either end is missing. */
-function elapsedMs(row: HistoryRow): number | null {
+function elapsedMs(row: Pick<HistoryRow, "createdAt" | "completedAt">): number | null {
   const started = millis(row.createdAt);
   const finished = millis(row.completedAt);
   if (started === null || finished === null || finished < started) {
@@ -199,6 +211,13 @@ export function HistoryPage() {
   const [busy, setBusy] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const midnight = useStartOfToday();
+  const search = useDebouncedValue(query.trim(), SEARCH_SETTLE_MS);
+  // A new search starts from its first page, once it is the search in force.
+  const [searchedFor, setSearchedFor] = useState(search);
+  if (searchedFor !== search) {
+    setSearchedFor(search);
+    setPageIndex(0);
+  }
 
   const sortOption = SORT_OPTIONS.find((option) => option.value === sort)!;
   const categories = useMemo(() => facetsToCategories(facets), [facets]);
@@ -206,13 +225,13 @@ export function HistoryPage() {
     () => ({
       pageIndex,
       pageSize,
-      search: query.trim() === "" ? undefined : query.trim(),
+      search: search === "" ? undefined : search,
       status: TAB_STATUS[tab],
       categories,
       sortField: sortOption.field,
       sortDirection: sortOption.direction,
     }),
-    [categories, pageIndex, pageSize, query, sortOption.direction, sortOption.field, tab],
+    [categories, pageIndex, pageSize, search, sortOption.direction, sortOption.field, tab],
   );
 
   const [{ data, fetching }, reexecute] = useQuery<HistoryPageResponse>({
@@ -222,8 +241,8 @@ export function HistoryPage() {
   // The strip's own numbers — today's jobs and what they averaged — need rows
   // the current page may not hold, so they come from a shallow newest-first
   // window rather than from whatever happens to be on screen.
-  const [{ data: sampleData }, reexecuteSample] = useQuery<HistoryPageResponse>({
-    query: NEXT_HISTORY_PAGE_QUERY,
+  const [{ data: sampleData }, reexecuteSample] = useQuery<HistorySampleResponse>({
+    query: NEXT_HISTORY_SAMPLE_QUERY,
     variables: {
       input: {
         pageIndex: 0,
@@ -483,7 +502,7 @@ export function HistoryPage() {
             placeholder={t("next.completed.filterPlaceholder")}
             mono={false}
             value={query}
-            onChange={(next) => reset(() => setQuery(next))}
+            onChange={setQuery}
             className="w-[118px] min-w-[80px] sm:w-[172px] sm:min-w-[96px]"
           />
           <SecondaryButton icon="downloadFile" onClick={exportList} disabled={rows.length === 0}>

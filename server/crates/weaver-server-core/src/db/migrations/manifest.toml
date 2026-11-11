@@ -985,3 +985,20 @@ kind = "sql"
 file = "migrations/0080_graph_holds_on_file/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 81
+description = "index the history page's size, integrity and category reads"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0081_history_page_sort_indexes/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0081_history_page_sort_indexes/postgres.sql"
+engine = "postgres"
+scope = "all"
