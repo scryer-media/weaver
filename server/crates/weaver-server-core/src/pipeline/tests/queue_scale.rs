@@ -292,7 +292,7 @@ async fn restarted_long_queue_with(temp: &tempfile::TempDir, unoutlined: bool) -
     // No list is read ahead, so every parse counted is the restart's.
     pipeline.next_up.depth = 0;
     if unoutlined {
-        sql(&pipeline.db, "DELETE FROM active_job_nzb_files").await;
+        sql(&pipeline.db, "DELETE FROM active_job_outlines").await;
         sql(
             &pipeline.db,
             "UPDATE active_jobs SET nzb_title = NULL, nzb_password = NULL, nzb_files = NULL",
@@ -1207,7 +1207,7 @@ async fn a_restart_fails_the_jobs_stored_without_an_outline_whose_nzb_cannot_be_
 
     let (mut pipeline, intermediate, _) = new_direct_pipeline(&temp).await;
     pipeline.next_up.depth = 0;
-    sql(&pipeline.db, "DELETE FROM active_job_nzb_files").await;
+    sql(&pipeline.db, "DELETE FROM active_job_outlines").await;
     sql(
         &pipeline.db,
         "UPDATE active_jobs SET nzb_title = NULL, nzb_password = NULL, nzb_files = NULL",
@@ -1215,12 +1215,12 @@ async fn a_restart_fails_the_jobs_stored_without_an_outline_whose_nzb_cannot_be_
     .await;
     sql(
         &pipeline.db,
-        "UPDATE active_jobs SET nzb_zstd = x'' WHERE job_id = 1",
+        "UPDATE active_job_nzbs SET nzb_zstd = x'' WHERE job_id = 1",
     )
     .await;
     sql(
         &pipeline.db,
-        "UPDATE active_jobs SET nzb_zstd = x'01020304' WHERE job_id = 2",
+        "UPDATE active_job_nzbs SET nzb_zstd = x'01020304' WHERE job_id = 2",
     )
     .await;
     let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());

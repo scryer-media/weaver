@@ -16,7 +16,8 @@ pub struct OrphanActiveStateCounts {
     pub active_file_identities: usize,
     pub active_extracted: usize,
     pub active_detected_archives: usize,
-    pub active_job_nzb_files: usize,
+    pub active_job_nzbs: usize,
+    pub active_job_outlines: usize,
     // Every graph checkpoint table together.
     pub graph_checkpoint: usize,
 }
@@ -28,18 +29,20 @@ impl OrphanActiveStateCounts {
             + self.active_file_identities
             + self.active_extracted
             + self.active_detected_archives
-            + self.active_job_nzb_files
+            + self.active_job_nzbs
+            + self.active_job_outlines
             + self.graph_checkpoint
     }
 }
 
-const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
+const ACTIVE_JOB_CHILD_TABLES: [&str; 16] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
     "active_extracted",
     "active_detected_archives",
-    "active_job_nzb_files",
+    "active_job_nzbs",
+    "active_job_outlines",
     "graph_nodes",
     "graph_members",
     "graph_coverage",
@@ -201,7 +204,7 @@ async fn archive_job_sql(
                  VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
                          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                          COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
-                         (SELECT nzb_zstd FROM active_jobs WHERE job_id = {}),
+                         (SELECT nzb_zstd FROM active_job_nzbs WHERE job_id = {}),
                          {}, {}, {},
                          COALESCE((SELECT post_processing_summary FROM active_jobs WHERE job_id = {}), 'not_run'),
                          (SELECT script_results_json FROM active_jobs WHERE job_id = {}),
@@ -323,13 +326,14 @@ impl Database {
         &self,
         below: JobId,
     ) -> Result<OrphanActiveStateCounts, StateError> {
-        const ACTIVE_TABLES: [&str; 6] = [
+        const ACTIVE_TABLES: [&str; 7] = [
             "active_file_progress",
             "active_files",
             "active_file_identities",
             "active_extracted",
             "active_detected_archives",
-            "active_job_nzb_files",
+            "active_job_nzbs",
+            "active_job_outlines",
         ];
         let below = i64::try_from(below.0).unwrap_or(i64::MAX);
         let mut orphans = std::collections::BTreeSet::new();
@@ -377,8 +381,9 @@ impl Database {
             counts.active_file_identities += removed[2];
             counts.active_extracted += removed[3];
             counts.active_detected_archives += removed[4];
-            counts.active_job_nzb_files += removed[5];
-            counts.graph_checkpoint += removed[6..].iter().sum::<usize>();
+            counts.active_job_nzbs += removed[5];
+            counts.active_job_outlines += removed[6];
+            counts.graph_checkpoint += removed[7..].iter().sum::<usize>();
         }
         Ok(counts)
     }
