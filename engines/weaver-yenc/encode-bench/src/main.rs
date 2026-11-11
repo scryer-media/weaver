@@ -9,7 +9,8 @@
 //
 // For every fixture and every rapidyenc kernel this CPU runs, the output of
 // both sides is first checked byte for byte (and length and final column);
-// then both are timed, A,B,A,B..., each sample a calibrated batch of calls.
+// then both are timed, A,B,B,A,A,B..., each sample a calibrated batch of
+// calls, and a stream fixture gives each side its own copy of its pool.
 // `ratio` is rapidyenc time / weaver time: above 1 means weaver is faster.
 // A row whose weaver tier is not implemented yet times rapidyenc alone: that
 // is the number the tier has to beat.
@@ -425,7 +426,8 @@ fn kernel_name(id: i32) -> String {
         .unwrap_or_else(|| format!("{id:#x}"))
 }
 
-// Interleaved samples, weaver first; rapidyenc alone when weaver has no tier.
+// Interleaved samples, each pair swapping which side runs first; rapidyenc
+// alone when weaver has no tier.
 fn time_sides(
     weaver: bool,
     n_samples: usize,
@@ -438,9 +440,14 @@ fn time_sides(
     let mut w_ns = Vec::with_capacity(n_samples);
     if weaver {
         let w_iters = calibrate(target_ns, &mut *run_w);
-        for _ in 0..n_samples {
-            w_ns.push(sample(w_iters, run_w));
-            r_ns.push(sample(r_iters, run_r));
+        for s in 0..n_samples {
+            if s % 2 == 0 {
+                w_ns.push(sample(w_iters, run_w));
+                r_ns.push(sample(r_iters, run_r));
+            } else {
+                r_ns.push(sample(r_iters, run_r));
+                w_ns.push(sample(w_iters, run_w));
+            }
         }
     } else {
         for _ in 0..n_samples {
@@ -516,28 +523,39 @@ fn main() {
         .iter()
         .map(|&(n, m)| (n, Some(m), (0, 0)))
         .chain(STREAMS.iter().map(|&(n, l, k)| (n, None, (l, k))));
-    let mut pool_buf: [Option<Paged>; 2] = [None, None];
+    // Per pool kind: weaver's copy and rapidyenc's copy.
+    let mut pool_buf: [Option<(Paged, Paged)>; 2] = [None, None];
     for (fname, make, (slen, kind)) in names {
         if opts.fixture.as_deref().is_some_and(|f| f != fname) {
             continue;
         }
         let mut src_buf: Paged;
         // `n` articles of `len` bytes, `stride` apart; a fixed fixture is one.
-        let (pool, len, stride, n): (&[u8], usize, usize, usize) = match make {
+        // A stream gives each side its own copy of the pool (same bytes, same
+        // page offset): walking one pool in step, the side sampled second
+        // would read articles the first had just pulled into the cache.
+        let (pool, pool_r, len, stride, n): (&[u8], &[u8], usize, usize, usize) = match make {
             Some(make) => {
                 let data = make();
                 src_buf = Paged::new(data.len(), 0);
                 src_buf.bytes().copy_from_slice(&data);
-                (src_buf.bytes(), data.len(), data.len(), 1)
+                let p: &[u8] = src_buf.bytes();
+                (p, p, data.len(), data.len(), 1)
             }
             None => {
                 let st = stream_stride(slen);
-                let pool = pool_buf[kind].get_or_insert_with(|| stream_pool(kind));
-                (pool.bytes(), slen, st, STREAM_POOL / st)
+                let (pw, pr) = pool_buf[kind].get_or_insert_with(|| {
+                    let mut pw = stream_pool(kind);
+                    let mut pr = Paged::new(STREAM_POOL, 0);
+                    pr.bytes().copy_from_slice(pw.bytes());
+                    (pw, pr)
+                });
+                (&*pw.bytes(), &*pr.bytes(), slen, st, STREAM_POOL / st)
             }
         };
         let src: &[u8] = &pool[..len];
         let art = |k: usize| &pool[k * stride..k * stride + len];
+        let art_r = |k: usize| &pool_r[k * stride..k * stride + len];
         let wcap = encode_max_len(src.len(), LINE_SIZE);
         let mut wdst_buf = Paged::new(wcap, DST_PAGE_OFFSET);
         let wdst = wdst_buf.uninit();
@@ -579,11 +597,10 @@ fn main() {
             if let Some(side) = opts.perf.as_deref() {
                 let iters = (4usize << 30) / src.len();
                 for i in 0..iters {
-                    let a = art(i % n);
                     if side == "weaver" {
-                        black_box(weaver_once(tier, black_box(a), wdst));
+                        black_box(weaver_once(tier, black_box(art(i % n)), wdst));
                     } else if side == "rapidyenc" {
-                        black_box(rapidyenc_once(black_box(a), rdst));
+                        black_box(rapidyenc_once(black_box(art_r(i % n)), rdst));
                     }
                 }
                 println!("PERF\t{side}\t{fname}\t{}\t{iters}\t{}", tier.as_str(), src.len());
@@ -598,15 +615,15 @@ fn main() {
                 };
                 time_sides(weaver, n_samples, target_ns, &mut run_w, &mut run_r)
             } else {
-                // Each side walks the stream from article 0, one article per
-                // call, wrapping only after the whole pool.
+                // Each side walks its own copy of the stream from article 0,
+                // one article per call, wrapping only after the whole pool.
                 let (mut kw, mut kr) = (0usize, 0usize);
                 let mut run_w = || {
                     black_box(weaver_once(tier, black_box(art(kw)), wdst));
                     kw = if kw + 1 == n { 0 } else { kw + 1 };
                 };
                 let mut run_r = || {
-                    black_box(rapidyenc_once(black_box(art(kr)), rdst));
+                    black_box(rapidyenc_once(black_box(art_r(kr)), rdst));
                     kr = if kr + 1 == n { 0 } else { kr + 1 };
                 };
                 time_sides(weaver, n_samples, target_ns, &mut run_w, &mut run_r)
