@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crossbeam_queue::ArrayQueue;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 // Size tiers for buffer allocation.
 //
@@ -150,12 +150,18 @@ pub struct BufferPoolMetrics {
     pub wait_count: usize,
 }
 
-// A tiered, slab-backed buffer pool with backpressure.
+// A tiered buffer pool with backpressure.
 //
-// Buffers are pre-allocated at startup and reused via lock-free queues.
-// When all buffers of a tier are in use, [`acquire`](BufferPool::acquire)
-// awaits until one is returned — this is the primary backpressure mechanism
-// in the pipeline.
+// Each tier holds at most its configured count. A buffer is allocated the
+// first time a tier needs one more than it holds, and is then reused through
+// a lock-free queue, so a busy pool allocates only while it grows to its
+// working set and never per article after that. When all buffers of a tier
+// are in use, [`acquire`](BufferPool::acquire) awaits until one is returned —
+// this is the primary backpressure mechanism in the pipeline.
+//
+// An idle pool holds nothing it is not using: the pipeline calls
+// [`release_idle`](BufferPool::release_idle) when its work stops, which frees
+// every buffer sitting in the queues.
 pub struct BufferPool {
     small: TierPool,
     medium: TierPool,
@@ -164,12 +170,15 @@ pub struct BufferPool {
 }
 
 struct TierPool {
+    // Allocated buffers not in use. Never more than `total`, so a return
+    // always fits.
     slots: ArrayQueue<BufferSlot>,
     semaphore: Arc<Semaphore>,
-    #[allow(dead_code)]
     tier: BufferTier,
     total: usize,
     in_use: AtomicUsize,
+    // Buffers currently allocated: the ones in use plus the ones queued.
+    allocated: AtomicUsize,
 }
 
 #[derive(Debug)]
@@ -180,7 +189,7 @@ struct BufferSlot {
 impl BufferPool {
     // Create a new buffer pool with the given configuration.
     //
-    // All buffers are allocated upfront.
+    // Nothing is allocated here: each buffer is allocated on first need.
     pub fn new(config: BufferPoolConfig) -> Arc<Self> {
         Arc::new(Self {
             small: TierPool::new(BufferTier::Small, config.small_count),
@@ -200,17 +209,7 @@ impl BufferPool {
 
         // Try to acquire without waiting first.
         if let Ok(permit) = tier_pool.semaphore.clone().try_acquire_owned() {
-            let slot = tier_pool.slots.pop().expect("semaphore/queue mismatch");
-            tier_pool.in_use.fetch_add(1, Ordering::Relaxed);
-            return BufferHandle {
-                inner: Arc::new(BufferInner {
-                    slot,
-                    len: AtomicUsize::new(0),
-                    tier,
-                    pool: Arc::clone(self),
-                    _permit: permit,
-                }),
-            };
+            return self.handle(tier, permit);
         }
 
         // Must wait — record the wait for metrics.
@@ -221,9 +220,50 @@ impl BufferPool {
             .acquire_owned()
             .await
             .expect("semaphore closed");
-        let slot = tier_pool.slots.pop().expect("semaphore/queue mismatch");
-        tier_pool.in_use.fetch_add(1, Ordering::Relaxed);
+        self.handle(tier, permit)
+    }
 
+    // Try to acquire a buffer without waiting. Returns `None` if all
+    // buffers of the requested tier are in use.
+    pub fn try_acquire(self: &Arc<Self>, tier: BufferTier) -> Option<BufferHandle> {
+        let tier_pool = self.tier_pool(tier);
+        let permit = tier_pool.semaphore.clone().try_acquire_owned().ok()?;
+        Some(self.handle(tier, permit))
+    }
+
+    // Free every buffer that is allocated and not in use.
+    //
+    // Called when the pipeline's work stops, so an idle service holds none of
+    // the pool. Buffers still in use are kept and return to the queue as
+    // usual; the next call frees them if they are still idle then. A busy
+    // pool never reaches this, so its buffers are reused as before.
+    pub(crate) fn release_idle(&self) {
+        for tier_pool in [&self.small, &self.medium, &self.large] {
+            while let Some(slot) = tier_pool.slots.pop() {
+                tier_pool.allocated.fetch_sub(1, Ordering::Relaxed);
+                drop(slot);
+            }
+        }
+    }
+
+    // Buffers of a tier that are allocated, in use or queued.
+    #[cfg(test)]
+    pub(crate) fn allocated(&self, tier: BufferTier) -> usize {
+        self.tier_pool(tier).allocated.load(Ordering::Relaxed)
+    }
+
+    // A handle for a permit already taken: a queued buffer when there is one,
+    // else a new one. The permit bounds the tier, so a new buffer never takes
+    // it past its count.
+    fn handle(self: &Arc<Self>, tier: BufferTier, permit: OwnedSemaphorePermit) -> BufferHandle {
+        let tier_pool = self.tier_pool(tier);
+        let slot = tier_pool.slots.pop().unwrap_or_else(|| {
+            tier_pool.allocated.fetch_add(1, Ordering::Relaxed);
+            BufferSlot {
+                data: vec![0u8; tier_pool.tier.size_bytes()],
+            }
+        });
+        tier_pool.in_use.fetch_add(1, Ordering::Relaxed);
         BufferHandle {
             inner: Arc::new(BufferInner {
                 slot,
@@ -233,25 +273,6 @@ impl BufferPool {
                 _permit: permit,
             }),
         }
-    }
-
-    // Try to acquire a buffer without waiting. Returns `None` if all
-    // buffers of the requested tier are in use.
-    pub fn try_acquire(self: &Arc<Self>, tier: BufferTier) -> Option<BufferHandle> {
-        let tier_pool = self.tier_pool(tier);
-        let permit = tier_pool.semaphore.clone().try_acquire_owned().ok()?;
-        let slot = tier_pool.slots.pop().expect("semaphore/queue mismatch");
-        tier_pool.in_use.fetch_add(1, Ordering::Relaxed);
-
-        Some(BufferHandle {
-            inner: Arc::new(BufferInner {
-                slot,
-                len: AtomicUsize::new(0),
-                tier,
-                pool: Arc::clone(self),
-                _permit: permit,
-            }),
-        })
     }
 
     // Current pool metrics.
@@ -295,20 +316,13 @@ impl BufferPool {
 
 impl TierPool {
     fn new(tier: BufferTier, count: usize) -> Self {
-        let slots = ArrayQueue::new(count.max(1));
-        for _ in 0..count {
-            slots
-                .push(BufferSlot {
-                    data: vec![0u8; tier.size_bytes()],
-                })
-                .expect("queue overflow during init");
-        }
         Self {
-            slots,
+            slots: ArrayQueue::new(count.max(1)),
             semaphore: Arc::new(Semaphore::new(count)),
             tier,
             total: count,
             in_use: AtomicUsize::new(0),
+            allocated: AtomicUsize::new(0),
         }
     }
 }
@@ -326,7 +340,7 @@ struct BufferInner {
     len: AtomicUsize,
     tier: BufferTier,
     pool: Arc<BufferPool>,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: OwnedSemaphorePermit,
 }
 
 impl BufferHandle {

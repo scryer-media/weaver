@@ -917,6 +917,12 @@ impl Pipeline {
             })
     }
 
+    // Give back the memory a pipeline with no work is holding for work that
+    // has stopped: the idle article buffers in the pool.
+    pub(in crate::pipeline) fn release_idle_memory(&self) {
+        self.buffers.release_idle();
+    }
+
     // Leave the gauges the parked drivers would publish saying what the
     // pipeline holds now, since no tick will refresh them.
     fn settle_parked_gauges(&mut self) {
@@ -1363,6 +1369,12 @@ impl Pipeline {
                 }
                 if driving || turn_active || !self.reports_due.is_empty() {
                     self.settle_parked_gauges();
+                }
+                // Once per turn that did something and left the pipeline
+                // with no work, never on an idle tick and never while work
+                // is moving.
+                if driving || turn_active {
+                    self.release_idle_memory();
                 }
             }
             driving = now_driving;
