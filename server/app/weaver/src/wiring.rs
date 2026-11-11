@@ -10,14 +10,13 @@ use weaver_nntp::client::NntpClient;
 use weaver_server_core::Database;
 use weaver_server_core::events::model::PipelineEvent;
 use weaver_server_core::events::publish::should_record_job_event;
-use weaver_server_core::runtime::buffers::{BufferPool, BufferPoolConfig};
+use weaver_server_core::runtime::backlog_sizing::BacklogSizing;
 use weaver_server_core::runtime::system_profile::SystemProfile;
 use weaver_server_core::settings::Config;
 
 pub(crate) struct RuntimeContext {
     pub profile: SystemProfile,
-    pub buffers: Arc<BufferPool>,
-    pub write_buf_max: usize,
+    pub backlog: BacklogSizing,
 }
 
 pub(crate) fn build_runtime_context(profile: SystemProfile) -> RuntimeContext {
@@ -29,35 +28,27 @@ pub(crate) fn build_runtime_context(profile: SystemProfile) -> RuntimeContext {
         "system profile"
     );
 
-    let buffer_sizing_memory = BufferPoolConfig::runtime_sizing_memory_bytes(
+    let sizing_memory = BacklogSizing::sizing_memory_bytes(
         profile.memory.available_bytes,
         profile.memory.cgroup_limit,
     );
-    let buf_config = BufferPoolConfig::for_runtime_memory(
+    let backlog = BacklogSizing::for_runtime_memory(
         profile.memory.available_bytes,
         profile.memory.cgroup_limit,
     );
-    let write_buf_max = buf_config.write_buffer_max_pending();
     info!(
         available_mb = profile.memory.available_bytes / (1024 * 1024),
         cgroup_limit_mb = profile
             .memory
             .cgroup_limit
             .map(|value| value / (1024 * 1024)),
-        sizing_mb = buffer_sizing_memory / (1024 * 1024),
-        total_mb = buf_config.total_bytes() / (1024 * 1024),
-        small = buf_config.small_count,
-        medium = buf_config.medium_count,
-        large = buf_config.large_count,
-        write_buf_max,
-        "buffer pool initialized (memory-adaptive)"
+        sizing_mb = sizing_memory / (1024 * 1024),
+        backlog_base_mb = backlog.base_bytes / (1024 * 1024),
+        pending_writes_per_file = backlog.pending_writes_per_file,
+        "backlog limits sized from memory"
     );
 
-    RuntimeContext {
-        profile,
-        buffers: BufferPool::new(buf_config),
-        write_buf_max,
-    }
+    RuntimeContext { profile, backlog }
 }
 
 pub(crate) fn build_nntp_client(

@@ -118,7 +118,6 @@ impl TestHarness {
             data_dir: tempdir.path().to_string_lossy().to_string(),
             intermediate_dir: None,
             complete_dir: None,
-            buffer_pool: None,
             servers: vec![],
             categories: vec![],
             retry: None,

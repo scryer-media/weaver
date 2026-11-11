@@ -339,11 +339,15 @@ impl Pipeline {
         &self,
         job_id: JobId,
     ) -> DownloadPipelineBacklog {
+        // Only tests queue undecoded bodies.
+        #[cfg(test)]
         let pending_decodes = self
             .pending_decode
             .iter()
             .filter(|work| work.segment_id.file_id.job_id == job_id)
             .count();
+        #[cfg(not(test))]
+        let pending_decodes = 0;
         DownloadPipelineBacklog {
             active_downloads: self
                 .active_downloads_by_job

@@ -82,12 +82,9 @@ async fn restart_paused(
 ) -> Pipeline {
     let working_dir = pipeline.jobs[&JOB].working_dir.clone();
     retire_pipeline_database(pipeline).await;
-    let buffers = crate::runtime::buffers::BufferPoolConfig {
-        small_count: 8,
-        medium_count: 4,
-        large_count: 2,
-    };
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(temp_dir, buffers, 1).await;
+    let backlog_base_bytes = 16 * 1024 * 1024;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(temp_dir, backlog_base_bytes, 1).await;
     scenario.prepare(&mut pipeline);
     pipeline
         .restore_job(crate::RestoreJobRequest {

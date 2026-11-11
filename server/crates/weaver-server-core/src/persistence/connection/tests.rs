@@ -13,7 +13,7 @@ use crate::persistence::database_target::DatabaseTarget;
 use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, StoreDatastore};
 use crate::rss::{RssFeedRow, RssRuleAction, RssRuleRow, RssSeenItemRow};
 use crate::servers::ServerConfig;
-use crate::settings::{BufferPoolOverrides, Config, RetryOverrides};
+use crate::settings::{Config, RetryOverrides};
 
 fn fetch_i64(db: &Database, sql: &'static str, args: Vec<SqlArg>) -> i64 {
     let datastore = db.datastore();
@@ -2371,11 +2371,6 @@ async fn postgres_runtime_smoke_when_configured() {
         hardware_profile: None,
         intermediate_dir: Some("/tmp/weaver-pg/intermediate".to_string()),
         complete_dir: Some("/tmp/weaver-pg/complete".to_string()),
-        buffer_pool: Some(BufferPoolOverrides {
-            small_count: Some(4),
-            medium_count: Some(3),
-            large_count: Some(2),
-        }),
         servers: vec![ServerConfig {
             id: 7,
             host: "news.example.com".to_string(),

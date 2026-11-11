@@ -395,7 +395,6 @@ mod tests {
             hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
-            buffer_pool: None,
             servers: Vec::new(),
             categories: Vec::new(),
             retry: None,

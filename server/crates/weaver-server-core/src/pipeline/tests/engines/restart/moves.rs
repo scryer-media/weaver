@@ -126,7 +126,7 @@ fn delivered(restarted: &Restarted) -> Vec<&str> {
 async fn run_stopping(scenario: &Scenario, stop: Stop) -> (Restarted, GraphCheckpoint) {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
 

@@ -1138,7 +1138,6 @@ mod tests {
             hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
-            buffer_pool: None,
             servers: vec![existing_server()],
             categories: vec![CategoryConfig {
                 id: 1,

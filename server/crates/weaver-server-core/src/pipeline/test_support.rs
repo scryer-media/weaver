@@ -9,7 +9,6 @@ pub async fn idle_pipeline(
     db: crate::Database,
     config: crate::settings::SharedConfig,
 ) -> (Pipeline, crate::SchedulerHandle, crate::SharedPipelineState) {
-    use crate::runtime::buffers::BufferPoolConfig;
     use crate::runtime::system_profile::{
         CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
     };
@@ -36,11 +35,7 @@ pub async fn idle_pipeline(
             max_retries_per_server: 1,
             soft_timeout: Duration::from_secs(15),
         }),
-        BufferPool::new(BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        }),
+        16 * 1024 * 1024,
         SystemProfile {
             cpu: CpuProfile {
                 physical_cores: 4,
@@ -149,7 +144,6 @@ pub(crate) fn admission_resources(
             hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
-            buffer_pool: None,
             servers: vec![],
             categories: vec![],
             retry: None,

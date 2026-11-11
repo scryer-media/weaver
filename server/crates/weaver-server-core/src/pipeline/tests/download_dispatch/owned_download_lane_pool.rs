@@ -8,31 +8,15 @@ use super::*;
 #[tokio::test]
 async fn owned_download_lane_pool_respects_configured_connection_count_at_startup() {
     let low_temp_dir = tempfile::tempdir().unwrap();
-    let (low_pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &low_temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        3,
-    )
-    .await;
+    let (low_pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&low_temp_dir, 16 * 1024 * 1024, 3).await;
 
     assert_eq!(low_pipeline.owned_download_lane_pool.worker_count(), 3);
     assert_eq!(low_pipeline.tuner.params().max_concurrent_downloads, 3);
 
     let high_temp_dir = tempfile::tempdir().unwrap();
-    let (high_pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &high_temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        24,
-    )
-    .await;
+    let (high_pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&high_temp_dir, 16 * 1024 * 1024, 24).await;
 
     assert_eq!(high_pipeline.owned_download_lane_pool.worker_count(), 24);
     assert_eq!(high_pipeline.tuner.params().max_concurrent_downloads, 24);
@@ -199,16 +183,8 @@ async fn a_refill_handout_is_two_ring_turns_deep() {
 #[tokio::test]
 async fn a_handout_is_bounded_by_the_want_not_by_the_queue() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        8,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 8).await;
 
     let job_id = JobId(40143);
     let files = many_standalone_files("lane-tail", 33);
@@ -3293,16 +3269,8 @@ async fn egress_quota_refusal_parks_when_no_server_has_a_leg_in_quota() {
 async fn recovery_metadata_bootstrap_holds_graph_payload_until_indexes_settle() {
     for par3 in [false, true] {
         let temp_dir = tempfile::tempdir().unwrap();
-        let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-            &temp_dir,
-            BufferPoolConfig {
-                small_count: 8,
-                medium_count: 4,
-                large_count: 2,
-            },
-            4,
-        )
-        .await;
+        let (mut pipeline, _, _) =
+            new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 4).await;
         let job_id = JobId(40146);
         let payload = (0..(7 * 128))
             .map(|index| (index % 251) as u8)

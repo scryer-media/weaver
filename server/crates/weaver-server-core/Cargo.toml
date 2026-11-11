@@ -1,6 +1,6 @@
 [package]
 name = "weaver-server-core"
-description = "Shared types, errors, config, and buffer pool primitives for Weaver"
+description = "Shared types, errors, config, and runtime primitives for Weaver"
 version.workspace = true
 edition.workspace = true
 license-file.workspace = true

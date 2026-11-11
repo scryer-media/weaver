@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 pub mod affinity;
-pub mod buffers;
+pub mod backlog_sizing;
 pub mod environment;
 pub(crate) mod file_cache;
 pub(crate) mod fs;

@@ -12,13 +12,14 @@ async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf)
     (pipeline, intermediate_dir, complete_dir)
 }
 
-async fn new_direct_pipeline_with_buffers(
+async fn new_direct_pipeline_with_backlog(
     temp_dir: &TempDir,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
 ) -> (Pipeline, PathBuf, PathBuf) {
     let (mut pipeline, intermediate_dir, complete_dir) =
-        super::new_direct_pipeline_with_buffers(temp_dir, buffer_config, total_connections).await;
+        super::new_direct_pipeline_with_backlog(temp_dir, backlog_base_bytes, total_connections)
+            .await;
     pipeline.audit_lane_holdings = true;
     (pipeline, intermediate_dir, complete_dir)
 }
