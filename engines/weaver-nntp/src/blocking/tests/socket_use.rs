@@ -15,6 +15,8 @@
 // - `WEAVER_SOCKET_USE_DEPTH`: BODY requests in flight per lane (default 2).
 // - `WEAVER_SOCKET_USE_USER` / `WEAVER_SOCKET_USE_PASS`: credentials.
 // - `WEAVER_SOCKET_USE_BACKEND`: `rustls` or `s2n` for a TLS server.
+// - `WEAVER_SOCKET_USE_READ_KIB`: socket read size in KiB; the read buffer is
+//   twice it. Unset, the profile is the one an 8 GiB host gets.
 
 use super::*;
 use std::sync::atomic::AtomicUsize;
@@ -102,8 +104,18 @@ fn measure_read_buffer_use() {
             }
         })
         .collect();
-    // The ordinary case: a host with plenty of memory.
-    let profile = NntpBufferProfile::adaptive(8 << 30, connections);
+    // The ordinary case, a host with plenty of memory, unless a socket read
+    // size is given to compare sizes.
+    let profile = match env("WEAVER_SOCKET_USE_READ_KIB") {
+        Some(kib) => {
+            let socket_read_size = kib.parse::<usize>().unwrap() * 1024;
+            NntpBufferProfile {
+                read_buf_capacity: 2 * socket_read_size,
+                socket_read_size,
+            }
+        }
+        None => NntpBufferProfile::adaptive(8 << 30, connections),
+    };
     let config = ServerConfig {
         dialer: crate::route_dialer::RouteDialer::direct_for_tests(),
         host: host.to_string(),

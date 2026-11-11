@@ -213,8 +213,10 @@ pub struct NntpBufferProfile {
     pub socket_read_size: usize,
 }
 
-// The largest socket read, taken whenever memory allows.
-const SOCKET_READ_MAX: usize = 256 * 1024;
+// The largest socket read, taken whenever memory allows. Reads from a real
+// provider rarely pass 64 KiB; on loopback, where reads arrive in bursts,
+// 64 KiB cost a plain or rustls lane about 4% more CPU and 128 KiB nothing.
+const SOCKET_READ_MAX: usize = 128 * 1024;
 // The smallest: two TLS records.
 const SOCKET_READ_FLOOR: usize = 32 * 1024;
 // All connections together keep their read buffers within this share of
@@ -244,6 +246,7 @@ impl NntpBufferProfile {
     }
 
     // The most read buffer memory one connection holds.
+    #[cfg(test)]
     pub(crate) fn per_connection_bytes(&self) -> usize {
         self.read_buf_capacity + self.socket_read_size
     }

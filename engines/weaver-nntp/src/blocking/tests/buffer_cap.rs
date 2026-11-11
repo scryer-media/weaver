@@ -245,13 +245,13 @@ fn budget(available: u64) -> usize {
 
 #[test]
 fn ordinary_connection_counts_keep_the_full_sizes() {
-    for available in [8 * GIB, 16 * GIB, 64 * GIB] {
+    for available in [2 * GIB, 8 * GIB, 16 * GIB, 64 * GIB] {
         for connections in 1..=100 {
             assert_eq!(
                 NntpBufferProfile::adaptive(available, connections),
                 NntpBufferProfile {
-                    read_buf_capacity: 512 * KIB,
-                    socket_read_size: 256 * KIB,
+                    read_buf_capacity: 256 * KIB,
+                    socket_read_size: 128 * KIB,
                 },
                 "{connections} connections on {} GiB",
                 available / GIB
