@@ -1036,3 +1036,30 @@ kind = "sql"
 file = "migrations/0083_active_job_nzb_outline/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 84
+description = "active job NZB and outline tables"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0084_active_job_nzb_tables/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0084_active_job_nzb_tables/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 85
+description = "active job NZBs and outlines move to their tables"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "move_nzbs_and_outlines_v85"
+scope = "all"
