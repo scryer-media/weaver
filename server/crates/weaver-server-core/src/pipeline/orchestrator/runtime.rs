@@ -277,6 +277,7 @@ impl Pipeline {
             nzb_admitted,
             nzb_seen: HashSet::new(),
             nzb_retired_busy: HashSet::new(),
+            pending_renames: HashMap::new(),
             nzb_pause_releases,
             nzb_reprocess_pending: HashSet::new(),
             nzb_admitting: HashSet::new(),
@@ -1112,6 +1113,11 @@ impl Pipeline {
                 tokio::time::sleep_until(infrastructure_retry_deadline.unwrap_or_else(|| {
                     tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
                 }));
+            // A failed folder rename is tried again at this instant.
+            let rename_retry_at = self.next_rename_retry_at();
+            let rename_retry_sleep = tokio::time::sleep_until(rename_retry_at.unwrap_or_else(|| {
+                tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+            }));
             // A held server admits work again on its own at this instant.
             let connection_hold_deadline = self.nntp.pool().next_connection_hold_deadline();
             let connection_hold_sleep =
@@ -1269,6 +1275,8 @@ impl Pipeline {
                                 turn_timer.resume();
                                 self.download_dispatch_wake = true;
                             }
+                            // The next turn's queue pass retries the rename.
+                            _ = rename_retry_sleep, if rename_retry_at.is_some() => { turn_timer.resume(); }
                             _ = tune_interval.tick(), if drive => {
                                 turn_timer.resume();
                                 idle_tick = true;
