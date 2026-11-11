@@ -316,8 +316,9 @@ pub async fn recover_server_state(
     // server answers. A job with no outline yet, one admitted before
     // outlines were stored, restores under its row's name with no file, and
     // its install reads its stored NZB once, off the pipeline thread, and
-    // stores the outline it reads. A read that fails stops the start, as
-    // the read of every row did.
+    // stores the outline it reads; a stored NZB that is missing or does not
+    // parse fails the job there, which archives it and lets its slot go. A
+    // read that fails stops the start, as the read of every row did.
     // A job's work that panicked would panic again as the job is restored,
     // so the markers the panic left are read before any job is.
     let restoring: HashSet<crate::jobs::ids::JobId> =
@@ -378,6 +379,10 @@ pub async fn recover_server_state(
         crate::HistoryRows::All,
     ) {
         Ok(history_rows) => {
+            // The jobs already held, built once: a job recovered from its
+            // active row is not listed again from its history row.
+            let mut held: HashSet<crate::jobs::ids::JobId> =
+                initial_history.iter().map(|job| job.job_id).collect();
             for row in history_rows {
                 if let Some(output_dir) = row.output_dir.as_ref() {
                     let output_dir = PathBuf::from(output_dir);
@@ -387,7 +392,7 @@ pub async fn recover_server_state(
                 }
                 let job_id = crate::jobs::ids::JobId(row.job_id);
                 // Skip if we already have this job from active_jobs recovery.
-                if initial_history.iter().any(|job| job.job_id == job_id) {
+                if !held.insert(job_id) {
                     continue;
                 }
                 let status =
@@ -724,8 +729,8 @@ mod tests {
 
     // A job with no stored outline restores before its NZB is read, under
     // its row's name and holding no file, keeping its slot. An unreadable
-    // NZB is found as it installs, which reads the NZB once: the job then
-    // waits, blocked, with the reason the start once archived it with.
+    // NZB is found as it installs, which reads the NZB once and fails the
+    // job with the reason the start once archived it with.
     #[tokio::test]
     async fn recovery_reads_no_nzb_and_an_unreadable_one_is_found_at_install() {
         let temp = TempDir::new().unwrap();
@@ -1149,11 +1154,14 @@ mod tests {
         // the next startup.
         assert_eq!(count_rows(&db, "active_jobs", 11), 0);
         assert_eq!(recovered.to_restore.len(), 0);
-        assert!(
+        // Listed once: its history row does not list it again.
+        assert_eq!(
             recovered
                 .initial_history
                 .iter()
-                .any(|job| job.job_id == JobId(11))
+                .filter(|job| job.job_id == JobId(11))
+                .count(),
+            1
         );
     }
 

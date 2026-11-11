@@ -1186,3 +1186,101 @@ async fn a_restart_fills_the_outlines_of_jobs_stored_without_one() {
         assert_eq!(files, summaries, "job {}", id.0);
     }
 }
+
+// A job stored before outlines were whose stored NZB is gone, or does not
+// parse, restores with no NZB read before the server answers, and fails as
+// it installs: it goes to history with the reason, and its active rows and
+// its slot go. A readable job stored the same way installs beside it.
+#[tokio::test]
+async fn a_restart_fails_the_jobs_stored_without_an_outline_whose_nzb_cannot_be_read() {
+    let temp = tempfile::tempdir().unwrap();
+    let slots = std::num::NonZeroU32::new(3).unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle.set_max_concurrent_nzbs(slots).await.unwrap();
+    for id in 1..=3 {
+        enqueue(&mut pipeline, id).await;
+    }
+    pipeline.apply_queue_intents().await;
+    assert_eq!(pipeline.nzb_admitted.len(), 3);
+    retire_pipeline_database(pipeline).await;
+
+    let (mut pipeline, intermediate, _) = new_direct_pipeline(&temp).await;
+    pipeline.next_up.depth = 0;
+    sql(&pipeline.db, "DELETE FROM active_job_nzb_files").await;
+    sql(
+        &pipeline.db,
+        "UPDATE active_jobs SET nzb_title = NULL, nzb_password = NULL, nzb_files = NULL",
+    )
+    .await;
+    sql(
+        &pipeline.db,
+        "UPDATE active_jobs SET nzb_zstd = x'' WHERE job_id = 1",
+    )
+    .await;
+    sql(
+        &pipeline.db,
+        "UPDATE active_jobs SET nzb_zstd = x'01020304' WHERE job_id = 2",
+    )
+    .await;
+    let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
+    handle.set_max_concurrent_nzbs(slots).await.unwrap();
+    let parses = nzb_parses();
+    let recovered = crate::operations::recover_server_state(
+        &pipeline.db,
+        &temp.path().join("data"),
+        &intermediate,
+    )
+    .await
+    .unwrap();
+    assert_eq!(nzb_parses(), parses);
+    assert_eq!(recovered.to_restore.len(), 3);
+    for candidate in recovered.to_restore {
+        handle.restore_job(candidate.request).await.unwrap();
+    }
+    settle_window(&mut pipeline).await;
+    settle_failed_releases(&mut pipeline).await;
+    // Each failed job's archive lands with the job's queued writes, and its
+    // row leaves the queue then; the turn after lets its slot go, and hears
+    // the slot's write.
+    let failed = [JobId(1), JobId(2)];
+    pipeline.db.flush_write_queue().await.unwrap();
+    pipeline.shared_state.queue.read(|inner| {
+        for id in failed {
+            assert!(!inner.contains_job(id), "job {}", id.0);
+        }
+    });
+    pipeline.apply_queue_intents().await;
+    pipeline.db.flush_write_queue().await.unwrap();
+
+    let active = pipeline.db.load_active_jobs().unwrap();
+    let admitted = pipeline.db.load_nzb_admissions().unwrap();
+    for id in failed {
+        let history = pipeline
+            .db
+            .get_job_history(id.0)
+            .unwrap()
+            .expect("history row");
+        assert_eq!(history.status, "failed", "job {}", id.0);
+        assert!(
+            history
+                .error_message
+                .as_deref()
+                .is_some_and(|error| error.starts_with("Cannot recover persisted NZB: ")),
+            "job {}: {:?}",
+            id.0,
+            history.error_message
+        );
+        assert!(!active.contains_key(&id), "job {}", id.0);
+        assert!(!admitted.contains(&id), "job {}", id.0);
+        assert!(!pipeline.nzb_admitted.contains(&id), "job {}", id.0);
+        assert!(!pipeline.jobs.contains_key(&id), "job {}", id.0);
+    }
+    let readable = JobId(3);
+    assert!(active.contains_key(&readable));
+    assert!(pipeline.db.get_job_history(readable.0).unwrap().is_none());
+    let state = &pipeline.jobs[&readable];
+    assert!(!state.spec.files.is_empty());
+    assert!(state.failure_error.is_none());
+    assert!(!pipeline.blocked_restores.contains_key(&readable));
+}

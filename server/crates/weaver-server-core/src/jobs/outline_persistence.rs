@@ -13,7 +13,9 @@ use crate::StateError;
 use crate::ingest::outline::{NzbOutline, OutlineFile};
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, db_err, max_rows_for_tx};
+use crate::persistence::sql_runtime::{
+    SqlArg, SqlRuntime, SqlTx, db_err, max_rows_for_engine, max_rows_for_tx,
+};
 
 // The outline's columns on the active row, the password sealed.
 #[derive(Clone)]
@@ -141,83 +143,102 @@ impl Database {
         })
     }
 
-    // The stored outline of every active job that has one, or of the one job
-    // named. An outline whose file rows do not match its count is not one.
+    // The stored outline of every active job that has one, or of each of the
+    // jobs named, those read in bind-safe chunks. An outline whose file rows
+    // do not match its count is not one.
     pub(crate) fn load_job_outlines(
         &self,
-        only: Option<JobId>,
+        only: Option<&[JobId]>,
     ) -> Result<HashMap<JobId, NzbOutline>, StateError> {
         let datastore = self.datastore();
         let key = self.encryption_key().cloned();
+        let chunks: Vec<Vec<i64>> = match only {
+            None => vec![Vec::new()],
+            Some(ids) => {
+                let mut ids: Vec<i64> = ids.iter().map(|id| id.0 as i64).collect();
+                ids.sort_unstable();
+                ids.dedup();
+                let size = max_rows_for_engine(datastore.engine(), 1);
+                ids.chunks(size).map(<[i64]>::to_vec).collect()
+            }
+        };
+        let filtered = only.is_some();
         self.run_sql_blocking_read(async move {
-            let (filter, args) = match only {
-                Some(job_id) => (" AND job_id = {}", vec![SqlArg::I64(job_id.0 as i64)]),
-                None => ("", Vec::new()),
-            };
-            let heads = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                &format!(
-                    "SELECT job_id, nzb_title, nzb_password, nzb_files FROM active_jobs
-                     WHERE nzb_files IS NOT NULL{filter}"
-                ),
-                &args,
-            )
-            .await?;
-            let mut outlines = HashMap::with_capacity(heads.len());
-            let mut counts = HashMap::with_capacity(heads.len());
-            for row in heads {
-                let job_id = JobId(row.i64("job_id")? as u64);
-                let password = super::persistence::decrypt_archive_password(
-                    key.as_ref(),
-                    row.opt_text("nzb_password")?,
-                )?;
-                let files = row.i64("nzb_files")?;
-                counts.insert(job_id, usize::try_from(files).unwrap_or(usize::MAX));
-                outlines.insert(
-                    job_id,
-                    NzbOutline {
-                        title: row.opt_text("nzb_title")?,
-                        password,
-                        files: Vec::with_capacity(usize::try_from(files).unwrap_or(0)),
-                    },
-                );
-            }
-            if outlines.is_empty() {
-                return Ok(outlines);
-            }
-            let filter = match only {
-                Some(_) => " WHERE job_id = {}",
-                None => "",
-            };
-            let rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                &format!(
-                    "SELECT job_id, file_index, full_name, groups, posted_at, articles, bytes
-                     FROM active_job_nzb_files{filter} ORDER BY job_id, file_index"
-                ),
-                &args,
-            )
-            .await?;
-            for row in rows {
-                let job_id = JobId(row.i64("job_id")? as u64);
-                let Some(outline) = outlines.get_mut(&job_id) else {
-                    continue;
-                };
-                // A row out of place leaves the outline short, so it is
-                // dropped below.
-                if row.i64("file_index")? != outline.files.len() as i64 {
+            let mut outlines = HashMap::new();
+            let mut counts = HashMap::new();
+            for chunk in chunks {
+                if filtered && chunk.is_empty() {
                     continue;
                 }
-                let groups = serde_json::from_str(&row.text("groups")?).map_err(|error| {
-                    StateError::Database(format!("invalid NZB file groups: {error}"))
-                })?;
-                outline.files.push(OutlineFile {
-                    full_name: row.text("full_name")?,
-                    groups,
-                    date: row.i64("posted_at")? as u64,
-                    articles: u32::try_from(row.i64("articles")?).unwrap_or(u32::MAX),
-                    bytes: row.i64("bytes")? as u64,
-                });
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let (head_filter, file_filter) = if filtered {
+                    (
+                        format!(" AND job_id IN ({placeholders})"),
+                        format!(" WHERE job_id IN ({placeholders})"),
+                    )
+                } else {
+                    (String::new(), String::new())
+                };
+                let args: Vec<SqlArg> = chunk.iter().copied().map(SqlArg::I64).collect();
+                let heads = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, nzb_title, nzb_password, nzb_files FROM active_jobs
+                         WHERE nzb_files IS NOT NULL{head_filter}"
+                    ),
+                    &args,
+                )
+                .await?;
+                if heads.is_empty() {
+                    continue;
+                }
+                for row in heads {
+                    let job_id = JobId(row.i64("job_id")? as u64);
+                    let password = super::persistence::decrypt_archive_password(
+                        key.as_ref(),
+                        row.opt_text("nzb_password")?,
+                    )?;
+                    let files = row.i64("nzb_files")?;
+                    counts.insert(job_id, usize::try_from(files).unwrap_or(usize::MAX));
+                    outlines.insert(
+                        job_id,
+                        NzbOutline {
+                            title: row.opt_text("nzb_title")?,
+                            password,
+                            files: Vec::with_capacity(usize::try_from(files).unwrap_or(0)),
+                        },
+                    );
+                }
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &format!(
+                        "SELECT job_id, file_index, full_name, groups, posted_at, articles, bytes
+                         FROM active_job_nzb_files{file_filter} ORDER BY job_id, file_index"
+                    ),
+                    &args,
+                )
+                .await?;
+                for row in rows {
+                    let job_id = JobId(row.i64("job_id")? as u64);
+                    let Some(outline) = outlines.get_mut(&job_id) else {
+                        continue;
+                    };
+                    // A row out of place leaves the outline short, so it is
+                    // dropped below.
+                    if row.i64("file_index")? != outline.files.len() as i64 {
+                        continue;
+                    }
+                    let groups = serde_json::from_str(&row.text("groups")?).map_err(|error| {
+                        StateError::Database(format!("invalid NZB file groups: {error}"))
+                    })?;
+                    outline.files.push(OutlineFile {
+                        full_name: row.text("full_name")?,
+                        groups,
+                        date: row.i64("posted_at")? as u64,
+                        articles: u32::try_from(row.i64("articles")?).unwrap_or(u32::MAX),
+                        bytes: row.i64("bytes")? as u64,
+                    });
+                }
             }
             outlines.retain(|job_id, outline| counts.get(job_id) == Some(&outline.files.len()));
             Ok(outlines)
@@ -313,10 +334,37 @@ mod tests {
         assert_eq!(outlines.len(), 2);
         assert_eq!(outlines[&JobId(1)], large);
         assert_eq!(outlines[&JobId(2)], small);
-        let one = db.load_job_outlines(Some(JobId(2))).unwrap();
+        let one = db.load_job_outlines(Some(&[JobId(2), JobId(3)])).unwrap();
         assert_eq!(one.len(), 1);
         assert_eq!(one[&JobId(2)], small);
         assert_eq!(file_rows(&db), 6_002);
+    }
+
+    // The outlines of more jobs than one statement can bind read back in one
+    // call, each job's own, and a job named twice or with none is read once
+    // or not at all.
+    #[test]
+    fn the_outlines_of_a_long_id_list_read_back_whole() {
+        let db = Database::open_in_memory().unwrap();
+        let jobs = max_rows_for_engine(db.datastore().engine(), 1) as u64 + 50;
+        for id in 1..=jobs {
+            db.create_active_job(&active_job(id)).unwrap();
+            db.write_job_outline(JobId(id), &outline(id as usize % 3 + 1))
+                .unwrap();
+        }
+        let mut wanted: Vec<JobId> = (1..=jobs).map(JobId).collect();
+        wanted.push(JobId(1));
+        wanted.push(JobId(jobs + 1));
+        let outlines = db.load_job_outlines(Some(&wanted)).unwrap();
+        assert_eq!(outlines, db.load_job_outlines(None).unwrap());
+        assert_eq!(outlines.len(), jobs as usize);
+        for id in 1..=jobs {
+            assert_eq!(
+                outlines[&JobId(id)],
+                outline(id as usize % 3 + 1),
+                "job {id}"
+            );
+        }
     }
 
     // The outline goes with the job's active rows, archived or deleted.
