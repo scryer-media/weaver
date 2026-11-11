@@ -497,6 +497,8 @@ pub struct Session {
     persistence: Option<Arc<dyn SessionPersistenceStore>>,
     trackers: HashSet<url::Url>,
 
+    /// Local discovery, unless disabled; it may not have joined its groups
+    /// yet (see [`Session::rejoin_local_discovery`]).
     lsd: Option<LocalServiceDiscovery>,
 
     // Limits and throttling
@@ -1203,6 +1205,11 @@ pub struct SessionOptions {
     #[cfg(test)]
     pub(crate) lsd_socket: Option<Box<dyn crate::lsd::Socket>>,
 
+    /// A test's way to join the LSD's groups in place of the multicast
+    /// one; before `lsd_socket`.
+    #[cfg(test)]
+    pub(crate) lsd_join: Option<crate::lsd::Join>,
+
     /// Leave peer exchange (ut_pex) out: it is not advertised to peers, and
     /// none is sent or read, as in libtorrent without the ut_pex plugin.
     pub disable_pex: bool,
@@ -1285,6 +1292,8 @@ impl SessionOptions {
             disable_local_service_discovery: false,
             #[cfg(test)]
             lsd_socket: None,
+            #[cfg(test)]
+            lsd_join: None,
             disable_pex: false,
             ipv4_only: false,
             socket_factory,
@@ -1844,23 +1853,30 @@ impl Session {
                 UdpTrackerClient::new_with_socket(token.clone(), socket, Some(resolver.clone()))
             };
 
-            let lsd = {
-                if opts.disable_local_service_discovery {
-                    None
-                } else {
-                    LocalServiceDiscovery::new(LocalServiceDiscoveryOptions {
-                        cancel_token: swarm.clone(),
-                        egress: lsd_egress,
-                        tasks: Some(swarm_tasks.clone()),
-                        #[cfg(test)]
-                        socket: opts.lsd_socket.take(),
-                        ..Default::default()
-                    })
-                    .await
-                    .inspect_err(|e| warn!("error starting local service discovery: {e:#}"))
-                    .ok()
+            // Local discovery runs unless disabled, from the start, whether
+            // or not its groups can be joined yet: one that cannot is
+            // joined by the first rejoin that can, and its torrents are
+            // announced from then on.
+            let lsd = (!opts.disable_local_service_discovery).then(|| {
+                let lsd = LocalServiceDiscovery::new(LocalServiceDiscoveryOptions {
+                    cancel_token: swarm.clone(),
+                    egress: lsd_egress,
+                    tasks: Some(swarm_tasks.clone()),
+                    #[cfg(test)]
+                    join: opts.lsd_join.take().or_else(|| {
+                        opts.lsd_socket.take().map(|socket| {
+                            crate::lsd::scripted_join(Arc::new(std::sync::Mutex::new(
+                                [Ok(socket)].into(),
+                            )))
+                        })
+                    }),
+                    ..Default::default()
+                });
+                if let Err(e) = lsd.join() {
+                    warn!("error starting local service discovery: {e:#}");
                 }
-            };
+                lsd
+            });
 
             let external_ips = Arc::new(ExternalIps::new(tokio::time::Instant::now()));
             let session = Arc::new(Self {
@@ -2561,13 +2577,15 @@ impl Session {
         self.dht.as_ref()
     }
 
-    /// Joins local service discovery's groups again on the interfaces up
-    /// now, for a caller that saw them change. Nothing to do when the
-    /// session runs no local service discovery; on failure the groups
-    /// joined before stay.
+    /// Joins local service discovery's groups on the interfaces up now, for
+    /// a caller that saw them change: again, or for the first time when no
+    /// join has succeeded since the session opened, which starts its
+    /// announces and its listening. Nothing to do when the session runs no
+    /// local service discovery; on failure it stays as it was, on the
+    /// groups joined before or on none.
     pub fn rejoin_local_discovery(&self) -> anyhow::Result<()> {
         match &self.lsd {
-            Some(lsd) => lsd.rejoin(),
+            Some(lsd) => lsd.join(),
             None => Ok(()),
         }
     }
@@ -7302,6 +7320,223 @@ mod tests {
             announce.contains(&handle.info_hash().as_string()),
             "{announce}"
         );
+        assert_eq!(listening.load(Ordering::SeqCst), 1);
+
+        session.stop().await;
+        assert_eq!(
+            listening.load(Ordering::SeqCst),
+            0,
+            "the local discovery still listens after stop returned"
+        );
+        while sent.try_recv().is_ok() {}
+        tokio::time::advance(std::time::Duration::from_secs(3600)).await;
+        assert!(
+            sent.try_recv().is_err(),
+            "the local discovery announced after stop returned"
+        );
+        Ok(())
+    }
+
+    /// Joins that take `outcomes` in turn, and the script they take them
+    /// from, to see what is left of it.
+    fn scripted_joins(
+        outcomes: Vec<anyhow::Result<Box<dyn crate::lsd::Socket>>>,
+    ) -> (crate::lsd::JoinScript, crate::lsd::Join) {
+        let script: crate::lsd::JoinScript = Arc::new(std::sync::Mutex::new(outcomes.into()));
+        (script.clone(), crate::lsd::scripted_join(script))
+    }
+
+    /// A session whose local discovery joins as `joins` say, listening on
+    /// loopback so that its torrents announce a port.
+    async fn lsd_session(
+        out: &TempDir,
+        disabled: bool,
+        joins: crate::lsd::Join,
+    ) -> anyhow::Result<Arc<Session>> {
+        Session::new_with_opts(
+            out.path().into(),
+            SessionOptions {
+                disable_local_service_discovery: disabled,
+                lsd_join: Some(joins),
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpOnly,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    announce_port: Some(6881),
+                    ..Default::default()
+                }),
+                ..crate::tests::embedder_util::isolated_session_opts(false)
+            },
+        )
+        .await
+    }
+
+    /// A torrent downloads from a seeder it hears of on the local network
+    /// alone. With `joins_at_open` false, the session opens offline: its
+    /// local discovery cannot join until the rejoin made after the torrent
+    /// is added.
+    async fn download_from_a_local_peer(name: &str, joins_at_open: bool) -> anyhow::Result<()> {
+        use crate::{
+            lsd::InjectedSocket,
+            storage::StorageFactory,
+            tests::embedder_util::{MemoryStorageFactory, TestTorrent},
+        };
+        use anyhow::Context;
+
+        let t = TestTorrent::new(name, 4 * 16384, 16384).await?;
+        let (_seeder, seeder) = t.seed().await?;
+        let (sent_tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let (incoming, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        let socket: Box<dyn crate::lsd::Socket> = Box::new(InjectedSocket {
+            sent: sent_tx,
+            incoming: tokio::sync::Mutex::new(incoming_rx),
+        });
+        let outcomes = if joins_at_open {
+            vec![Ok(socket)]
+        } else {
+            vec![Err(anyhow::anyhow!("no interface up")), Ok(socket)]
+        };
+        let (_, joins) = scripted_joins(outcomes);
+        let out = TempDir::with_prefix(name)?;
+        let session = lsd_session(&out, false, joins).await?;
+        let lsd = session.lsd.clone().context("no LSD")?;
+        assert_eq!(lsd.joined(), joins_at_open);
+
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(t.torrent.clone()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        let info_hash = handle.info_hash();
+        if !joins_at_open {
+            session.rejoin_local_discovery()?;
+            assert!(lsd.joined());
+        }
+
+        // Its first announce shows the torrent listens; a seeder on the
+        // host's network then announces it.
+        let announce = sent.recv().await.context("no announce")?;
+        assert!(announce.contains(&info_hash.as_string()), "{announce}");
+        incoming.send((
+            format!(
+                "BT-SEARCH * HTTP/1.1\r\nHost: 239.192.152.143:6771\r\nPort: {}\r\nInfohash: {}\r\n\r\n\r\n",
+                seeder.port(),
+                info_hash.as_string()
+            ),
+            (std::net::Ipv4Addr::LOCALHOST, 6771).into(),
+        ))?;
+        handle.wait_until_completed().await?;
+        session.stop().await;
+        Ok(())
+    }
+
+    // A session that opens offline joins local discovery on the first
+    // rejoin that can, and from then on does what one that joined at open
+    // does: the torrent added meanwhile announces, and a seeder announced on
+    // the local network reaches it and serves it whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn local_discovery_joined_on_a_rejoin_works_as_one_joined_at_open() -> anyhow::Result<()>
+    {
+        download_from_a_local_peer("test_lsd_joined_at_open", true).await?;
+        download_from_a_local_peer("test_lsd_joined_on_rejoin", false).await
+    }
+
+    // A session with local discovery disabled starts none on a rejoin, and
+    // does not try to join.
+    #[tokio::test]
+    async fn a_rejoin_starts_no_local_discovery_where_it_is_disabled() -> anyhow::Result<()> {
+        use crate::lsd::RecordingSocket;
+
+        let (sent_tx, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let (script, joins) = scripted_joins(vec![Ok(Box::new(RecordingSocket(sent_tx)))]);
+        let out = TempDir::with_prefix("test_lsd_disabled_rejoin")?;
+        let session = lsd_session(&out, true, joins).await?;
+        session.rejoin_local_discovery()?;
+        assert!(session.lsd.is_none());
+        assert_eq!(script.lock().unwrap().len(), 1, "a join was tried");
+        session.stop().await;
+        Ok(())
+    }
+
+    // A rejoin whose join fails reports it and leaves local discovery
+    // unjoined, as it was; the next rejoin that can join it does.
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_rejoin_leaves_local_discovery_for_the_next() -> anyhow::Result<()> {
+        use crate::lsd::RecordingSocket;
+        use anyhow::Context;
+
+        let (sent_tx, _sent) = tokio::sync::mpsc::unbounded_channel();
+        let (_, joins) = scripted_joins(vec![
+            Err(anyhow::anyhow!("no interface up")),
+            Err(anyhow::anyhow!("still none up")),
+            Ok(Box::new(RecordingSocket(sent_tx))),
+        ]);
+        let out = TempDir::with_prefix("test_lsd_failed_rejoin")?;
+        let session = lsd_session(&out, false, joins).await?;
+        let lsd = session.lsd.clone().context("no LSD")?;
+        assert!(!lsd.joined());
+        let error = session
+            .rejoin_local_discovery()
+            .expect_err("the join failed");
+        assert!(format!("{error:#}").contains("still none up"), "{error:#}");
+        assert!(!lsd.joined());
+        session.rejoin_local_discovery()?;
+        assert!(lsd.joined());
+        session.stop().await;
+        Ok(())
+    }
+
+    // Local discovery joined on a rejoin is part of the swarm a stopping
+    // session leaves, as one joined at open is: once stop returns it
+    // listens no more and announces nothing again.
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_session_is_done_with_local_discovery_joined_late() -> anyhow::Result<()> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::{
+            lsd::ListeningSocket,
+            storage::StorageFactory,
+            tests::embedder_util::{MemoryStorageFactory, TestTorrent},
+        };
+        use anyhow::Context;
+
+        let t = TestTorrent::new("test_lsd_late_stop", 2 * 16384, 16384).await?;
+        let (sent_tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let listening = Arc::new(AtomicUsize::new(0));
+        let (_, joins) = scripted_joins(vec![
+            Err(anyhow::anyhow!("no interface up")),
+            Ok(Box::new(ListeningSocket {
+                sent: sent_tx,
+                listening: listening.clone(),
+            })),
+        ]);
+        let out = TempDir::with_prefix("test_lsd_late_stop_out")?;
+        let session = lsd_session(&out, false, joins).await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(t.torrent.clone()),
+                Some(AddTorrentOptions {
+                    storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                    ..Default::default()
+                }),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        session.rejoin_local_discovery()?;
+        let announce = sent.recv().await.context("no announce")?;
+        assert!(
+            announce.contains(&handle.info_hash().as_string()),
+            "{announce}"
+        );
+        while listening.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
         assert_eq!(listening.load(Ordering::SeqCst), 1);
 
         session.stop().await;
