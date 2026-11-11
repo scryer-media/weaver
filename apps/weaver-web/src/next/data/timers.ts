@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useEffect, useState, useSyncExternalStore } from "react";
+import { useEffect, useRef, useState, useSyncExternalStore } from "react";
 
 /** The timer functions the helpers below schedule with; tests pass their own. */
 export interface Timers {
@@ -80,4 +80,65 @@ export const documentVisibility: PageVisibility = {
 /** True while the page is showing; false while its tab is in the background. */
 export function usePageVisible(): boolean {
   return useSyncExternalStore(documentVisibility.subscribe, documentVisibility.visible, () => true);
+}
+
+/**
+ * Calls `run` every `periodMs` while the page is showing. A hidden page is not
+ * polled; when it shows again `run` is called once and the period starts over.
+ * Returns a function that stops it.
+ */
+export function createVisibleInterval(
+  run: () => void,
+  periodMs: number,
+  visibility: PageVisibility = documentVisibility,
+  timers: Timers = browserTimers,
+): () => void {
+  let pending: unknown = null;
+  let wasVisible = visibility.visible();
+  const clear = () => {
+    if (pending !== null) {
+      timers.clearTimeout(pending);
+      pending = null;
+    }
+  };
+  const schedule = () => {
+    clear();
+    pending = timers.setTimeout(() => {
+      pending = null;
+      run();
+      schedule();
+    }, periodMs);
+  };
+  const unsubscribe = visibility.subscribe(() => {
+    const visible = visibility.visible();
+    if (visible === wasVisible) {
+      return;
+    }
+    wasVisible = visible;
+    if (visible) {
+      run();
+      schedule();
+    } else {
+      clear();
+    }
+  });
+  if (wasVisible) {
+    schedule();
+  }
+  return () => {
+    unsubscribe();
+    clear();
+  };
+}
+
+/** `createVisibleInterval` for a component; `periodMs` of null stops it. */
+export function useVisibleInterval(run: () => void, periodMs: number | null): void {
+  const latest = useRef(run);
+  latest.current = run;
+  useEffect(() => {
+    if (periodMs === null) {
+      return;
+    }
+    return createVisibleInterval(() => latest.current(), periodMs);
+  }, [periodMs]);
 }

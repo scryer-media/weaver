@@ -3,7 +3,12 @@
 
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createDebouncer, type Timers } from "../src/next/data/timers.ts";
+import {
+  createDebouncer,
+  createVisibleInterval,
+  type PageVisibility,
+  type Timers,
+} from "../src/next/data/timers.ts";
 
 /** Timers that run only when the test moves the clock. */
 function fakeTimers() {
@@ -59,4 +64,83 @@ test("a cancelled debouncer settles nothing", () => {
   debouncer.cancel();
   clock.advance(1_000);
   assert.deepEqual(settled, []);
+});
+
+/** A page whose visibility the test flips. */
+function fakeVisibility(initiallyVisible: boolean) {
+  let visible = initiallyVisible;
+  const listeners = new Set<() => void>();
+  const visibility: PageVisibility = {
+    visible: () => visible,
+    subscribe(onChange) {
+      listeners.add(onChange);
+      return () => listeners.delete(onChange);
+    },
+  };
+  const show = (next: boolean) => {
+    visible = next;
+    for (const listener of [...listeners]) listener();
+  };
+  return { visibility, show, listenerCount: () => listeners.size };
+}
+
+test("a visible interval runs each period while the page shows", () => {
+  const clock = fakeTimers();
+  const page = fakeVisibility(true);
+  let runs = 0;
+  createVisibleInterval(() => runs++, 1_000, page.visibility, clock.timers);
+
+  clock.advance(999);
+  assert.equal(runs, 0);
+  clock.advance(1);
+  assert.equal(runs, 1);
+  clock.advance(1_000);
+  assert.equal(runs, 2);
+});
+
+test("a hidden page is not polled, and is refreshed once when it shows", () => {
+  const clock = fakeTimers();
+  const page = fakeVisibility(true);
+  let runs = 0;
+  createVisibleInterval(() => runs++, 1_000, page.visibility, clock.timers);
+
+  clock.advance(500);
+  page.show(false);
+  assert.equal(clock.pendingCount(), 0);
+  clock.advance(60_000);
+  assert.equal(runs, 0);
+
+  page.show(true);
+  assert.equal(runs, 1);
+  clock.advance(999);
+  assert.equal(runs, 1);
+  clock.advance(1);
+  assert.equal(runs, 2);
+});
+
+test("an interval started in a hidden page waits for it to show", () => {
+  const clock = fakeTimers();
+  const page = fakeVisibility(false);
+  let runs = 0;
+  createVisibleInterval(() => runs++, 1_000, page.visibility, clock.timers);
+
+  clock.advance(10_000);
+  assert.equal(runs, 0);
+  page.show(true);
+  assert.equal(runs, 1);
+});
+
+test("a stopped interval runs no more and stops listening", () => {
+  const clock = fakeTimers();
+  const page = fakeVisibility(true);
+  let runs = 0;
+  const stop = createVisibleInterval(() => runs++, 1_000, page.visibility, clock.timers);
+
+  stop();
+  clock.advance(5_000);
+  page.show(false);
+  page.show(true);
+  assert.equal(runs, 0);
+  assert.equal(page.listenerCount(), 0);
+  assert.equal(clock.pendingCount(), 0);
 });
