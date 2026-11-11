@@ -123,7 +123,7 @@ pub fn build_job_support_report(
         },
     };
     let mut job = job;
-    job.apply_events(&db.get_job_events(job_id)?);
+    job.apply_event_kind_counts(&db.get_job_event_kind_counts(job_id)?);
     job.apply_support_facts(&db.load_job_support_facts(JobId(job_id))?, now_epoch_secs);
 
     let (path, compressed) = stored.ok_or(SupportReportError::NzbUnavailable(job_id))?;
@@ -650,26 +650,45 @@ impl JobSection {
     // kinds are read; their messages can name files.
     pub fn apply_events(&mut self, events: &[JobEvent]) {
         for event in events {
-            match event.kind.as_str() {
-                "JobVerificationComplete" | "Par3VerificationComplete" => {
-                    self.verification_runs += 1;
-                }
-                "RepairStarted" => self.repair = advance(self.repair, StageOutcome::Started),
-                "RepairComplete" => self.repair = advance(self.repair, StageOutcome::Complete),
-                "RepairFailed" => self.repair = advance(self.repair, StageOutcome::Failed),
-                "ExtractionReady" | "ExtractionMemberStarted" => {
-                    self.extraction = advance(self.extraction, StageOutcome::Started);
-                }
-                "ExtractionComplete" => {
-                    self.extraction = advance(self.extraction, StageOutcome::Complete);
-                }
-                "ExtractionFailed" => {
-                    self.extraction = advance(self.extraction, StageOutcome::Failed);
-                }
-                "ExtractionMemberFailed" => self.extraction_member_failures += 1,
-                "FileMissing" => self.files_reported_missing += 1,
-                _ => {}
+            self.apply_event_kind(&event.kind, 1);
+        }
+    }
+
+    // The same as applying the events counted, given each kind's count in
+    // the order of each kind's newest event: every outcome a stage takes is
+    // its newest event's, and the rest are counts.
+    pub fn apply_event_kind_counts(&mut self, counts: &[(String, u64, u64)]) {
+        for (kind, count, _) in counts {
+            self.apply_event_kind(kind, *count);
+        }
+    }
+
+    fn apply_event_kind(&mut self, kind: &str, count: u64) {
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        match kind {
+            "JobVerificationComplete" | "Par3VerificationComplete" => {
+                self.verification_runs = self.verification_runs.saturating_add(count);
             }
+            "RepairStarted" => self.repair = advance(self.repair, StageOutcome::Started),
+            "RepairComplete" => self.repair = advance(self.repair, StageOutcome::Complete),
+            "RepairFailed" => self.repair = advance(self.repair, StageOutcome::Failed),
+            "ExtractionReady" | "ExtractionMemberStarted" => {
+                self.extraction = advance(self.extraction, StageOutcome::Started);
+            }
+            "ExtractionComplete" => {
+                self.extraction = advance(self.extraction, StageOutcome::Complete);
+            }
+            "ExtractionFailed" => {
+                self.extraction = advance(self.extraction, StageOutcome::Failed);
+            }
+            "ExtractionMemberFailed" => {
+                self.extraction_member_failures =
+                    self.extraction_member_failures.saturating_add(count);
+            }
+            "FileMissing" => {
+                self.files_reported_missing = self.files_reported_missing.saturating_add(count);
+            }
+            _ => {}
         }
     }
 

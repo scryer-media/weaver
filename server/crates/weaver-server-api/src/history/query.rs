@@ -230,7 +230,7 @@ impl HistoryQuery {
         let live_only = live_job.is_some();
 
         let (events, history) = tokio::task::spawn_blocking(move || {
-            let events = db.get_job_events(job_id)?;
+            let events = db.get_job_events_latest(job_id, JOB_DETAIL_EVENT_CAP)?;
             let history = if live_only {
                 None
             } else {
@@ -249,10 +249,23 @@ impl HistoryQuery {
         Ok(Some(build_job_timeline(&job, history.as_ref(), &events)))
     }
     /// Get the event log for a specific job.
-    async fn job_events(&self, ctx: &Context<'_>, job_id: u64) -> Result<Vec<JobEvent>> {
+    async fn job_events(
+        &self,
+        ctx: &Context<'_>,
+        job_id: u64,
+        limit: Option<u32>,
+        offset: Option<u32>,
+    ) -> Result<Vec<JobEvent>> {
         let db = ctx.data::<weaver_server_core::Database>()?;
         let db = db.clone();
-        let events = tokio::task::spawn_blocking(move || db.get_job_events(job_id))
+        // The newest events, oldest-first: `offset` counts back from the
+        // newest, and a page is at most the window the detail snapshot reads.
+        let limit = limit
+            .unwrap_or(JOB_DETAIL_EVENT_CAP)
+            .min(JOB_DETAIL_EVENT_CAP);
+        let offset = offset.unwrap_or(0);
+        let events =
+            tokio::task::spawn_blocking(move || db.get_job_events_window(job_id, limit, offset))
             .await
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;

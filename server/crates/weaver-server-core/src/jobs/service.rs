@@ -33,6 +33,17 @@ fn restore_blocked(error: impl std::fmt::Display) -> String {
 }
 
 impl Pipeline {
+    // The kinds that open or close a job's download finalization. Only the
+    // newest of them decides it, so a restore reads that one event.
+    pub(crate) const DOWNLOAD_FINALIZATION_KINDS: &'static [&'static str] = &[
+        "JobCreated",
+        "JobCompleted",
+        "JobFailed",
+        "JobCancelled",
+        "DownloadFinished",
+        "DownloadPipelineDrained",
+    ];
+
     // Whether the job's events leave its download finalization open.
     pub(crate) fn download_finalization_open(
         job_id: JobId,
@@ -1782,7 +1793,15 @@ async fn read_restored(
     };
     let finalization_open = Pipeline::download_finalization_open(
         job_id,
-        off_thread(db, move |db| db.get_job_events(job_id.0)).await,
+        off_thread(db, move |db| {
+            db.get_last_job_event_of_kinds(
+                job_id.0,
+                Pipeline::DOWNLOAD_FINALIZATION_KINDS,
+                JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER,
+            )
+            .map(|event| event.into_iter().collect())
+        })
+        .await,
     );
     // A delivery that had begun keeps what its graph ruled, read back from
     // its row.
