@@ -673,7 +673,7 @@ async fn a_tracker_rule_keeps_the_client_its_torrents_name_themselves_as() {
     let id = saved["saveTrackerRule"][0]["id"].as_u64().unwrap();
 
     for (client, read) in [
-        ("TRANSMISSION", serde_json::json!("TRANSMISSION")),
+        ("WEAVER", serde_json::json!("WEAVER")),
         ("null", serde_json::Value::Null),
     ] {
         let response = rig.execute(&save(&format!("id: {id},"), client)).await;
@@ -687,6 +687,12 @@ async fn a_tracker_rule_keeps_the_client_its_torrents_name_themselves_as() {
         );
     }
     assert!(!rig.execute(&save("", "DELUGE")).await.errors.is_empty());
+    assert!(
+        !rig.execute(&save("", "TRANSMISSION"))
+            .await
+            .errors
+            .is_empty()
+    );
 }
 
 // A tracker rule keeps its torrents' DHT, PEX and LSD, each on its own,

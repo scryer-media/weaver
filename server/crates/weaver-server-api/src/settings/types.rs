@@ -1592,7 +1592,6 @@ pub enum TorrentClientGql {
     Weaver,
     #[graphql(name = "QBITTORRENT")]
     QBittorrent,
-    Transmission,
 }
 
 impl From<weaver_server_core::settings::Client> for TorrentClientGql {
@@ -1601,7 +1600,6 @@ impl From<weaver_server_core::settings::Client> for TorrentClientGql {
         match value {
             Client::Weaver => Self::Weaver,
             Client::QBittorrent => Self::QBittorrent,
-            Client::Transmission => Self::Transmission,
         }
     }
 }
@@ -1611,7 +1609,6 @@ impl From<TorrentClientGql> for weaver_server_core::settings::Client {
         match value {
             TorrentClientGql::Weaver => Self::Weaver,
             TorrentClientGql::QBittorrent => Self::QBittorrent,
-            TorrentClientGql::Transmission => Self::Transmission,
         }
     }
 }

@@ -15,7 +15,7 @@ use crate::runtime::hardware_profile::HardwareProfile;
 use crate::servers::ServerConfig;
 pub use crate::settings::levels::{Leaf, Level, Levels};
 use crate::torrents::identity::{ClientIdentity, IDENTITY};
-use weaver_torrent::tracker::{AnnounceShape, qbittorrent};
+use weaver_torrent::tracker::qbittorrent;
 use crate::watch_folder::WatchFolderConfig;
 
 // The NZB admission limit when none is saved, for new and upgraded installations.
@@ -674,21 +674,24 @@ pub struct CertificateSummary {
 pub enum Client {
     Weaver,
     QBittorrent,
-    Transmission,
 }
 
 impl Client {
-    pub const ALL: [Self; 3] = [Self::Weaver, Self::QBittorrent, Self::Transmission];
+    pub const ALL: [Self; 2] = [Self::Weaver, Self::QBittorrent];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Weaver => "weaver",
             Self::QBittorrent => "qbittorrent",
-            Self::Transmission => "transmission",
         }
     }
 
+    // A kept `transmission` names no client a torrent may go as, and reads
+    // as Weaver.
     pub fn parse(value: &str) -> Option<Self> {
+        if value == "transmission" {
+            return Some(Self::Weaver);
+        }
         Self::ALL
             .into_iter()
             .find(|client| client.as_str() == value)
@@ -703,14 +706,6 @@ impl Client {
                 qbittorrent::USER_AGENT,
                 qbittorrent::VERSION,
                 &qbittorrent::SHAPE,
-            ),
-            // Major, minor and patch in base 62, then `0` for a stable
-            // release.
-            Self::Transmission => ClientIdentity::new(
-                *b"-TR4100-",
-                "Transmission/4.1.0",
-                "Transmission 4.1.0",
-                &AnnounceShape::WEAVER,
             ),
         }
     }
@@ -1413,8 +1408,6 @@ mod tests {
                 b'-',
             ]
         }
-        const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-
         let qb = Client::QBittorrent.name();
         assert_eq!(
             qb.prefix(),
@@ -1426,26 +1419,19 @@ mod tests {
         assert_eq!(&libtorrent(b"qB", &[5, 1, 2]), b"-qB5120-");
         assert_eq!(&libtorrent(b"qB", &[5, 10, 0]), b"-qB5A00-");
 
-        let tr = Client::Transmission.name();
-        let parts = version(tr.user_agent(), '/');
-        assert_eq!(parts, version(tr.version(), ' '));
-        assert!(tr.version().starts_with("Transmission "));
-        let mut prefix = *b"-TR...0-";
-        for (at, part) in parts.iter().enumerate() {
-            prefix[3 + at] = BASE62[*part as usize];
-        }
-        assert_eq!(tr.prefix(), &prefix);
-        assert_eq!(tr.prefix(), b"-TR4100-");
-
         let weaver = Client::Weaver.name();
         assert_eq!(weaver, IDENTITY);
         assert_eq!(weaver.version(), weaver.user_agent());
-        assert_eq!(weaver.identity().shape, &AnnounceShape::WEAVER);
+        assert_eq!(
+            weaver.identity().shape,
+            &weaver_torrent::tracker::AnnounceShape::WEAVER
+        );
 
         for client in Client::ALL {
             assert_eq!(Client::parse(client.as_str()), Some(client));
         }
         assert_eq!(Client::parse("deluge"), None);
+        assert_eq!(Client::parse("transmission"), Some(Client::Weaver));
     }
 
     #[test]
