@@ -4,7 +4,7 @@
 use crate::StateError;
 use crate::persistence::sql_runtime::{
     POSTGRES_BATCH_BIND_LIMIT, SqlArg, SqlEngine, SqlRuntime, SqlTx, StoreDatastore,
-    max_rows_for_tx,
+    max_rows_for_engine, max_rows_for_tx,
 };
 use crate::persistence::{Database, DatabaseWriterExecutor};
 use sqlx::{Postgres, QueryBuilder, Sqlite};
@@ -400,35 +400,39 @@ impl Database {
         if job_ids.is_empty() || kinds.is_empty() {
             return Ok(std::collections::HashMap::new());
         }
-        let ids = job_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        // Kinds are compile-time constants from callers; quote defensively
-        // anyway so a stray quote cannot break the statement.
-        let kinds = kinds
-            .iter()
-            .map(|kind| format!("'{}'", kind.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(",");
-        let sql = format!(
-            "SELECT job_id, kind, MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts
-               FROM job_events
-              WHERE job_id IN ({ids}) AND kind IN ({kinds})
-              GROUP BY job_id, kind"
-        );
+        // Each job's ids sit in one chunk, so no job's groups are split.
+        let mut job_ids = job_ids.to_vec();
+        job_ids.sort_unstable();
+        job_ids.dedup();
+        let kinds: Vec<String> = kinds.iter().map(|kind| kind.to_string()).collect();
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
+            let chunk_size = max_rows_for_engine(datastore.engine(), 1)
+                .saturating_sub(kinds.len())
+                .max(1);
+            let kind_placeholders = vec!["{}"; kinds.len()].join(", ");
             let mut bounds: std::collections::HashMap<u64, Vec<(String, i64, i64)>> =
                 std::collections::HashMap::new();
-            for row in rows {
-                bounds.entry(row.i64("job_id")? as u64).or_default().push((
-                    row.text("kind")?,
-                    row.i64("first_ts")?,
-                    row.i64("last_ts")?,
-                ));
+            for chunk in job_ids.chunks(chunk_size) {
+                let id_placeholders = vec!["{}"; chunk.len()].join(", ");
+                let sql = format!(
+                    "SELECT job_id, kind, MIN(timestamp) AS first_ts, MAX(timestamp) AS last_ts
+                       FROM job_events
+                      WHERE job_id IN ({id_placeholders}) AND kind IN ({kind_placeholders})
+                      GROUP BY job_id, kind"
+                );
+                let args: Vec<SqlArg> = chunk
+                    .iter()
+                    .map(|id| SqlArg::I64(*id as i64))
+                    .chain(kinds.iter().cloned().map(SqlArg::Text))
+                    .collect();
+                for row in SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await? {
+                    bounds.entry(row.i64("job_id")? as u64).or_default().push((
+                        row.text("kind")?,
+                        row.i64("first_ts")?,
+                        row.i64("last_ts")?,
+                    ));
+                }
             }
             Ok(bounds)
         })
@@ -449,27 +453,35 @@ impl Database {
         if job_ids.is_empty() {
             return Ok(Vec::new());
         }
-        // Trusted internal u64 job ids, inlined as decimal integers exactly
-        // like `get_job_event_stage_bounds` — never user-supplied strings.
-        let ids = job_ids
-            .iter()
-            .map(|id| id.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        let min_id = min_id.min(i64::MAX as u64);
-        let sql = format!(
-            "SELECT id, job_id, timestamp, kind, message, file_id
-               FROM job_events
-              WHERE job_id IN ({ids}) AND id >= {min_id}
-              ORDER BY id DESC
-              LIMIT {limit}"
-        );
+        let mut job_ids = job_ids.to_vec();
+        job_ids.sort_unstable();
+        job_ids.dedup();
+        let min_id = min_id.min(i64::MAX as u64) as i64;
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
-            rows.into_iter()
-                .map(|row| {
-                    Ok(JobEventRecord {
+            // Each chunk gives its newest `limit`, and the newest `limit` of
+            // those is the newest `limit` over every listed job.
+            let chunk_size = max_rows_for_engine(datastore.engine(), 1)
+                .saturating_sub(1)
+                .max(1);
+            let chunks: Vec<&[u64]> = job_ids.chunks(chunk_size).collect();
+            let mut events = Vec::new();
+            for chunk in &chunks {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let sql = format!(
+                    "SELECT id, job_id, timestamp, kind, message, file_id
+                       FROM job_events
+                      WHERE job_id IN ({placeholders}) AND id >= {{}}
+                      ORDER BY id DESC
+                      LIMIT {limit}"
+                );
+                let args: Vec<SqlArg> = chunk
+                    .iter()
+                    .map(|id| SqlArg::I64(*id as i64))
+                    .chain(std::iter::once(SqlArg::I64(min_id)))
+                    .collect();
+                for row in SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await? {
+                    events.push(JobEventRecord {
                         id: row.i64("id")? as u64,
                         event: JobEvent {
                             job_id: row.i64("job_id")? as u64,
@@ -478,9 +490,14 @@ impl Database {
                             message: row.text("message")?,
                             file_id: row.opt_text("file_id")?,
                         },
-                    })
-                })
-                .collect()
+                    });
+                }
+            }
+            if chunks.len() > 1 {
+                events.sort_by_key(|event| std::cmp::Reverse(event.id));
+                events.truncate(limit);
+            }
+            Ok(events)
         })
     }
 
@@ -537,7 +554,8 @@ mod event_window_tests {
     fn a_window_counts_back_from_the_newest_event() {
         let db = Database::open_in_memory().unwrap();
         for at in 0..10 {
-            db.insert_job_event(1, at, &format!("K{at}"), "", None).unwrap();
+            db.insert_job_event(1, at, &format!("K{at}"), "", None)
+                .unwrap();
             db.insert_job_event(2, at, "OTHER", "", None).unwrap();
         }
         let window = db.get_job_events_window(1, 3, 0).unwrap();
@@ -551,6 +569,57 @@ mod event_window_tests {
         let window = db.get_job_events_window(1, 5, 8).unwrap();
         assert_eq!(kinds(&window), ["K0", "K1"]);
         assert!(db.get_job_events_window(1, 5, 10).unwrap().is_empty());
+    }
+
+    // An id list past one statement's bind budget reads the same rows as a
+    // list that fits.
+    #[test]
+    fn a_long_job_list_reads_what_a_short_one_reads() {
+        let db = Database::open_in_memory().unwrap();
+        let far = 39_999u64;
+        for at in 0..6 {
+            db.insert_job_event(3, 100 + at, "JobCreated", &format!("near {at}"), None)
+                .unwrap();
+            db.insert_job_event(far, 200 + at, "JobCompleted", &format!("far {at}"), None)
+                .unwrap();
+        }
+        let short = [3, far];
+        let long: Vec<u64> = (1..=40_000).collect();
+        assert!(long.len() > max_rows_for_engine(db.datastore().engine(), 1));
+
+        let ids =
+            |events: Vec<JobEventRecord>| events.iter().map(|event| event.id).collect::<Vec<_>>();
+        for (min_id, limit) in [(0, 4), (0, 100), (5, 3)] {
+            assert_eq!(
+                ids(db
+                    .get_recent_job_events_multi(&long, min_id, limit)
+                    .unwrap()),
+                ids(db
+                    .get_recent_job_events_multi(&short, min_id, limit)
+                    .unwrap()),
+                "min_id {min_id}, limit {limit}"
+            );
+        }
+
+        let kinds = ["JobCreated", "JobCompleted"];
+        let sorted = |mut bounds: JobEventStageBounds| {
+            bounds.values_mut().for_each(|entries| entries.sort());
+            let mut bounds: Vec<_> = bounds.into_iter().collect();
+            bounds.sort();
+            bounds
+        };
+        let long_bounds = sorted(db.get_job_event_stage_bounds(&long, &kinds).unwrap());
+        assert_eq!(
+            long_bounds,
+            sorted(db.get_job_event_stage_bounds(&short, &kinds).unwrap())
+        );
+        assert_eq!(
+            long_bounds,
+            vec![
+                (3, vec![("JobCreated".to_string(), 100, 105)]),
+                (far, vec![("JobCompleted".to_string(), 200, 205)]),
+            ]
+        );
     }
 
     // Reading only the newest finalization event decides a restore exactly
@@ -567,7 +636,10 @@ mod event_window_tests {
                 ("DownloadFinished", None),
                 ("FileComplete", None),
             ],
-            &[("DownloadFinished", marker), ("DownloadPipelineDrained", None)],
+            &[
+                ("DownloadFinished", marker),
+                ("DownloadPipelineDrained", None),
+            ],
             &[
                 ("DownloadFinished", marker),
                 ("JobFailed", None),
