@@ -356,14 +356,15 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
 
 struct RecursiveRequestCallbacksFindNodes {}
 impl RecursiveRequestCallbacks for RecursiveRequestCallbacksFindNodes {
+    // A node a search is told of enters the table only once it answers
+    // (libtorrent routing_table.cpp:816-822, 1085-1099, v2.0.15: a node not
+    // yet pinged never takes a place in a bucket). One the table holds
+    // already is marked as asked.
     fn on_request_start(&self, req: &RecursiveRequest<Self>, target_node: Id20, addr: SocketAddr) {
-        let mut rt = req.dht.get_table_for_addr(addr).write();
-        match rt.add_node(target_node, addr) {
-            InsertResult::WasExisting | InsertResult::ReplacedBad(_) | InsertResult::Added => {
-                rt.mark_outgoing_request(&target_node, now());
-            }
-            InsertResult::Ignored => {}
-        }
+        req.dht
+            .get_table_for_addr(addr)
+            .write()
+            .mark_outgoing_request(&target_node, now());
     }
 
     fn on_request_end(
@@ -374,8 +375,14 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksFindNodes {
         resp: &crate::dht::Result<ResponseOrError>,
     ) {
         let mut table = req.dht.get_table_for_addr(addr).write();
-        if resp.is_ok() {
-            table.mark_response(&target_node, now());
+        if let Ok(answer) = resp {
+            // The node enters under the id it answered with.
+            let id = match answer {
+                ResponseOrError::Response(response) => response.id,
+                ResponseOrError::Error(_) => target_node,
+            };
+            table.add_node(id, addr);
+            table.mark_response(&id, now());
         } else {
             table.mark_error(&target_node);
         }
@@ -2495,6 +2502,65 @@ mod tests {
             }
             assert_eq!(asked, want, "{nodes} nodes");
         }
+    }
+
+    // libtorrent routing_table.cpp:816-822, 1085-1099: a node a search is
+    // told of takes a place in the table once it answers, never on being
+    // asked; one that never answers never enters it.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_node_enters_the_table_only_once_it_answers() {
+        use crate::core::hash_id::Id20;
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::task::Poll;
+
+        let (dht, mut sent) = fixture_dht();
+        let answers = (Id20::new([0x21; 20]), SocketAddr::from(([10, 0, 1, 1], 6881)));
+        let silent = (Id20::new([0x23; 20]), SocketAddr::from(([10, 0, 2, 1], 6881)));
+        let in_table = |id: Id20| dht.routing_table_v4.read().iter().any(|n| n.id() == id);
+        let target = Id20::new([0x22; 20]);
+        let req = super::RecursiveRequest {
+            info_hash: target,
+            request: super::Request::FindNode(target),
+            dht: dht.clone(),
+            peer_tx: tokio::sync::mpsc::unbounded_channel().0,
+            callbacks: super::RecursiveRequestCallbacksFindNodes {},
+        };
+        let mut refresh = std::pin::pin!(req.search(
+            true,
+            [(Some(answers.0), answers.1), (Some(silent.0), silent.1)].into_iter(),
+        ));
+        assert!(futures::poll!(refresh.as_mut()).is_pending());
+        let mut asked = Vec::new();
+        while let Ok(request) = sent.try_recv() {
+            asked.push(request);
+        }
+        assert_eq!(asked.len(), 2);
+        assert!(!in_table(answers.0) && !in_table(silent.0), "asked is not answered");
+
+        let request = asked.iter().find(|r| r.addr == answers.1).unwrap();
+        dht.on_received_message(
+            bprotocol::Message {
+                transaction_id: request.message.transaction_id.clone(),
+                version: None,
+                ip: None,
+                kind: MessageKind::Response(bprotocol::Response {
+                    id: answers.0,
+                    ..Default::default()
+                }),
+            },
+            answers.1,
+        )
+        .unwrap();
+        let outcome = loop {
+            if let Poll::Ready(outcome) = futures::poll!(refresh.as_mut()) {
+                break outcome;
+            }
+            assert!(in_table(answers.0) || sent.try_recv().is_err());
+            tokio::time::advance(RESPONSE_TIMEOUT).await;
+        };
+        let _ = outcome;
+        assert!(in_table(answers.0), "the node that answered is in the table");
+        assert!(!in_table(silent.0), "the silent node entered the table");
     }
 
     // libtorrent `node::bootstrap` starts its traversal from the nodes it is
