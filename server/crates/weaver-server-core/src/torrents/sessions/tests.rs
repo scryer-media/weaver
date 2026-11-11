@@ -904,6 +904,90 @@ async fn a_session_that_cannot_open_is_logged_once_for_each_cause() {
     sessions.stop_all().await;
 }
 
+// A route whose session is being built reads as opening at once: its build
+// waits on its leg, and no reader of the sessions waits with it. A second
+// opener of the route waits for that build and is handed its session; one
+// leg is opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_reads_as_opening_while_its_leg_has_not_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let sessions = Arc::new(Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    ));
+    sessions.set_config(any_port());
+    let plan = routes.plan(TorrentScope::Default);
+    routes.unanswered.send_replace(true);
+    let mut asked = routes.asked.subscribe();
+    let opening = |sessions: Arc<Sessions>, plan: RoutePlan| {
+        tokio::spawn(async move { sessions.session(&plan, &IDENTITY.identity()).await })
+    };
+    let first = opening(Arc::clone(&sessions), plan.clone());
+    asked.wait_for(|asked| *asked == 1).await.unwrap();
+
+    let views = polled(std::pin::pin!(sessions.views()))
+        .expect("the sessions read while a route's leg has not answered");
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].held, Some(OPENING));
+    let view = polled(std::pin::pin!(sessions.view(&plan.key))).unwrap();
+    assert_eq!(
+        view.unwrap().held.map(|held| held.reason),
+        Some(TorrentRouteReason::Opening)
+    );
+    let read = Mutex::new(Vec::new());
+    assert_eq!(
+        polled(std::pin::pin!(sessions.read_into(&read))),
+        Some(()),
+        "the exporter reads while a route's leg has not answered"
+    );
+    assert_eq!(read.lock().unwrap().len(), 1);
+
+    let second = opening(Arc::clone(&sessions), plan.clone());
+    routes.unanswered.send_replace(false);
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(routes.opened.load(Ordering::SeqCst), 1);
+    assert_eq!(sessions.view(&plan.key).await.unwrap().held, None);
+    sessions.stop_all().await;
+}
+
+// A route whose session is being built when torrents are turned off holds
+// no session: the one built stops, and its opener is told why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_built_after_torrents_were_turned_off_is_not_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let sessions = Arc::new(Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    ));
+    sessions.set_config(any_port());
+    let plan = routes.plan(TorrentScope::Default);
+    routes.unanswered.send_replace(true);
+    let mut asked = routes.asked.subscribe();
+    let opener = {
+        let (sessions, plan) = (Arc::clone(&sessions), plan.clone());
+        tokio::spawn(async move { sessions.session(&plan, &IDENTITY.identity()).await })
+    };
+    asked.wait_for(|asked| *asked == 1).await.unwrap();
+    sessions.turn(false).await;
+    routes.unanswered.send_replace(false);
+
+    assert_eq!(
+        opener.await.unwrap().err(),
+        Some(SessionError::RouteDown(
+            TorrentRouteReason::TorrentsDisabled.into()
+        ))
+    );
+    assert!(sessions.views().await.is_empty());
+    assert!(sessions.running().await.is_empty());
+    sessions.stop_all().await;
+}
+
 // The SSL port chosen while the settings name none is chosen once, above
 // the listen ports and below the ephemeral range, and kept.
 #[test]

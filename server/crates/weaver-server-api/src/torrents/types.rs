@@ -330,6 +330,7 @@ pub enum TorrentRouteReasonGql {
     SessionBuildFailed,
     BlocklistFailed,
     SessionLimit,
+    Opening,
 }
 
 impl From<TorrentRouteReason> for TorrentRouteReasonGql {
@@ -354,6 +355,7 @@ impl From<TorrentRouteReason> for TorrentRouteReasonGql {
             TorrentRouteReason::SessionBuildFailed => Self::SessionBuildFailed,
             TorrentRouteReason::BlocklistFailed => Self::BlocklistFailed,
             TorrentRouteReason::SessionLimit => Self::SessionLimit,
+            TorrentRouteReason::Opening => Self::Opening,
         }
     }
 }

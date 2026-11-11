@@ -68,6 +68,8 @@ pub enum TorrentRouteReason {
     BlocklistFailed,
     /// Every session there can be is in use by other routes.
     SessionLimit,
+    /// Its session is being opened now.
+    Opening,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -125,6 +127,7 @@ impl RouteFailure {
             TorrentRouteReason::SessionBuildFailed => "the session could not be opened",
             TorrentRouteReason::BlocklistFailed => "the blocklist could not be loaded",
             TorrentRouteReason::SessionLimit => "every session is in use by other routes",
+            TorrentRouteReason::Opening => "the route's session is opening",
         }
         .to_owned()
     }
@@ -874,9 +877,29 @@ enum Slot {
         reason: RouteFailure,
         kind: LegKind,
     },
+    // Its session is being built, off the slots' lock: `done` closes once
+    // that build ends, whether it opened or not. `last` is why the route
+    // held closed before, which a build that fails for the same says once.
+    Opening {
+        kind: LegKind,
+        done: tokio::sync::watch::Receiver<()>,
+        last: Option<RouteFailure>,
+    },
 }
 
+/// Why a route whose session is being built has none yet.
+const OPENING: RouteFailure = RouteFailure {
+    reason: TorrentRouteReason::Opening,
+    detail: None,
+};
+
 impl Slot {
+    // Whether the slot's session is being built now: a build whose opener
+    // went away before it ended left the slot to the next one.
+    fn building(&self) -> bool {
+        matches!(self, Self::Opening { done, .. } if done.has_changed().is_ok())
+    }
+
     // The slot's session, while it runs.
     fn running(&self) -> Option<&Arc<Session>> {
         match self {
@@ -889,16 +912,22 @@ impl Slot {
     fn kind(&self) -> &LegKind {
         match self {
             Self::Open { plan, .. } => &plan.kind,
-            Self::Held { kind, .. } => kind,
+            Self::Held { kind, .. } | Self::Opening { kind, .. } => kind,
         }
     }
 
-    // Why the slot's session does not run, when it does not: it is held
-    // closed, the leg it opened on has been revoked under it, or the pool
-    // member that leg holds went from under it or is blocked.
+    // Why the slot's session does not run, when it does not: it is being
+    // built, it is held closed, the leg it opened on has been revoked under
+    // it, or the pool member that leg holds went from under it or is
+    // blocked.
     fn held(&self) -> Option<RouteFailure> {
         match self {
             Self::Held { reason, .. } => Some(reason.clone()),
+            Self::Opening { .. } if self.building() => Some(OPENING),
+            Self::Opening { last, .. } => Some(
+                last.clone()
+                    .unwrap_or_else(|| TorrentRouteReason::NotAskedToOpen.into()),
+            ),
             Self::Open { leg: Some(leg), .. } => match leg.member_down() {
                 Some(reason) if leg.stage.is_revoked() => Some(RouteFailure::with_detail(
                     TorrentRouteReason::LegRevoked,
@@ -1216,11 +1245,29 @@ impl Sessions {
 
     /// Let sessions open, or close every one and open none until turned on.
     pub async fn turn(&self, on: bool) {
-        let mut slots = self.slots.lock().await;
-        self.on.store(on, Ordering::Release);
-        if !on {
-            close_all(std::mem::take(&mut *slots)).await;
-            self.closing.all_stopped().await;
+        {
+            let mut slots = self.slots.lock().await;
+            self.on.store(on, Ordering::Release);
+            if on {
+                return;
+            }
+            self.close_all(std::mem::take(&mut *slots));
+        }
+        self.closing.all_stopped().await;
+    }
+
+    // Close every session of `slots` off the open path: each stops with no
+    // lock held, as its trackers hear `stopped`, and holds its ports until
+    // it has.
+    fn close_all(&self, slots: BTreeMap<RouteKey, Slot>) {
+        for (key, slot) in slots {
+            if let Slot::Open {
+                session, leg, maps, ..
+            } = slot
+            {
+                let ports = held_ports(&session, maps);
+                self.closing.stop(&key, session, leg, ports);
+            }
         }
     }
 
@@ -1264,40 +1311,85 @@ impl Sessions {
             return Ok(session);
         }
         let port_slot = self.port_slot(&plan.key).await;
-        let mut slots = self.slots.lock().await;
-        if let Some(off) = self.off() {
-            return Err(SessionError::RouteDown(off));
-        }
-        if let Some(session) = slots.get(&plan.key).and_then(Slot::running) {
-            self.joined(plan);
-            return Ok(Arc::clone(session));
-        }
-        if !slots.contains_key(&plan.key) && slots.len() >= MAX_SESSIONS {
-            return Err(SessionError::Cap);
-        }
-        // A session whose leg was revoked under it stops before its route
-        // opens again.
-        if matches!(slots.get(&plan.key), Some(Slot::Open { .. }))
-            && let Some(Slot::Open {
-                session, leg, maps, ..
-            }) = slots.remove(&plan.key)
-        {
-            self.closing.close(&plan.key, session, leg, maps);
-        }
-        if let Some(reason) = &plan.down {
+        // The slot is marked as opening and the lock let go while the
+        // session is built: a build waits on its leg, which may take as long
+        // as a tunnel's handshake, and no reader of the sessions waits on
+        // that. An opener that finds the route opening waits for that build
+        // and takes what it left.
+        let (building, last) = loop {
+            let mut slots = self.slots.lock().await;
+            if let Some(off) = self.off() {
+                return Err(SessionError::RouteDown(off));
+            }
+            if let Some(session) = slots.get(&plan.key).and_then(Slot::running) {
+                self.joined(plan);
+                return Ok(Arc::clone(session));
+            }
+            if let Some(Slot::Opening { done, .. }) = slots.get(&plan.key)
+                && done.has_changed().is_ok()
+            {
+                let mut done = done.clone();
+                drop(slots);
+                let _ = done.changed().await;
+                continue;
+            }
+            if !slots.contains_key(&plan.key) && slots.len() >= MAX_SESSIONS {
+                return Err(SessionError::Cap);
+            }
+            // A session whose leg was revoked under it stops before its route
+            // opens again.
+            let last = match slots.remove(&plan.key) {
+                Some(Slot::Open {
+                    session, leg, maps, ..
+                }) => {
+                    self.closing.close(&plan.key, session, leg, maps);
+                    None
+                }
+                Some(Slot::Held { reason, .. }) => Some(reason),
+                Some(Slot::Opening { last, .. }) => last,
+                None => None,
+            };
+            if let Some(reason) = &plan.down {
+                slots.insert(
+                    plan.key.clone(),
+                    Slot::Held {
+                        reason: reason.clone(),
+                        kind: plan.kind.clone(),
+                    },
+                );
+                return Err(SessionError::RouteDown(reason.clone()));
+            }
+            let (building, done) = tokio::sync::watch::channel(());
             slots.insert(
                 plan.key.clone(),
-                Slot::Held {
-                    reason: reason.clone(),
+                Slot::Opening {
                     kind: plan.kind.clone(),
+                    done,
+                    last: last.clone(),
                 },
             );
-            return Err(SessionError::RouteDown(reason.clone()));
-        }
+            break (building, last);
+        };
         // The peer limit is each torrent's, whatever else is open.
         let peers = self.config().max_peers_total as usize;
         let mappings = PortMappings::default();
-        match self.build(plan, opener, port_slot, peers, &mappings).await {
+        let built = self.build(plan, opener, port_slot, peers, &mappings).await;
+        let mut slots = self.slots.lock().await;
+        // The slot may have changed while the session was built: torrents
+        // turned off, the route held or dropped. What stands now wins, and
+        // a session built for a slot no longer this build's stops unused.
+        let ours = matches!(
+            slots.get(&plan.key),
+            Some(Slot::Opening { done, .. }) if done.same_channel(&building.subscribe())
+        );
+        if !ours {
+            let now = self.off().or_else(|| slots.get(&plan.key).and_then(Slot::held));
+            if let Ok((session, leg, _, maps, _)) = built {
+                self.closing.close(&plan.key, session, leg, maps);
+            }
+            return Err(SessionError::RouteDown(now.unwrap_or(REVOKED)));
+        }
+        match built {
             Ok((session, leg, port, maps, opening)) => {
                 self.rates.add(
                     &session,
@@ -1325,13 +1417,9 @@ impl Sessions {
             }
             Err(error) => {
                 // Logged once for each failure that differs from the one
-                // the route is held for already: a route retried for the
+                // the route was held for before: a route retried for the
                 // same cause says nothing more.
-                let repeated = matches!(
-                    slots.get(&plan.key),
-                    Some(Slot::Held { reason, .. }) if *reason == error
-                );
-                if !repeated {
+                if last.as_ref() != Some(&error) {
                     tracing::warn!(
                         route = plan.key.as_str(),
                         reason = %error.message(),
@@ -1483,7 +1571,7 @@ impl Sessions {
     fn silenced(&self, slot: &Slot) -> Option<RouteFailure> {
         match slot {
             Slot::Open { plan, .. } => slot.held().or_else(|| self.routes.leg_down(plan)),
-            Slot::Held { reason, .. } => Some(reason.clone()),
+            Slot::Held { .. } | Slot::Opening { .. } => slot.held(),
         }
     }
 
@@ -1545,7 +1633,7 @@ impl Sessions {
                 self.closing.close(key, session, leg, maps);
                 plan.kind
             }
-            Slot::Held { kind, .. } => kind,
+            Slot::Held { kind, .. } | Slot::Opening { kind, .. } => kind,
         };
         slots.insert(key.clone(), Slot::Held { reason, kind });
     }
@@ -1595,8 +1683,8 @@ impl Sessions {
     }
 
     pub async fn stop_all(&self) {
-        let mut slots = self.slots.lock().await;
-        close_all(std::mem::take(&mut *slots)).await;
+        let slots = std::mem::take(&mut *self.slots.lock().await);
+        self.close_all(slots);
         self.closing.all_stopped().await;
     }
 }
@@ -1804,16 +1892,6 @@ async fn refilter(
     applied.send_modify(|applied| *applied = given.max(*applied));
 }
 
-async fn close_all(slots: BTreeMap<RouteKey, Slot>) {
-    let mut closing = tokio::task::JoinSet::new();
-    for (key, slot) in slots {
-        if let Slot::Open { session, leg, .. } = slot {
-            closing.spawn(async move { close(&key, session, leg).await });
-        }
-    }
-    closing.join_all().await;
-}
-
 fn view(key: &RouteKey, slot: &Slot) -> SessionView {
     match (slot, slot.held()) {
         (
@@ -1883,6 +1961,17 @@ async fn close(key: &RouteKey, session: Arc<Session>, leg: Option<Arc<TorrentLeg
 #[derive(Clone, Default)]
 struct Closing(Arc<Mutex<Vec<Stopping>>>);
 
+// The ports `session` listens on, and the external port whose mapping it
+// removes as it stops, `maps`: a gateway knows a mapping by that port alone.
+fn held_ports(session: &Session, maps: Option<u16>) -> Vec<u16> {
+    [session.listen_addr(), session.ssl_listen_addr()]
+        .into_iter()
+        .flatten()
+        .map(|addr| addr.port())
+        .chain(maps)
+        .collect()
+}
+
 struct Stopping {
     route: RouteKey,
     ports: Vec<u16>,
@@ -1898,19 +1987,24 @@ impl Closing {
         leg: Option<Arc<TorrentLeg>>,
         maps: Option<u16>,
     ) {
-        // The ports it listens on, and the external port whose mapping it
-        // removes as it stops: a gateway knows a mapping by that port alone.
-        let ports: Vec<u16> = [session.listen_addr(), session.ssl_listen_addr()]
-            .into_iter()
-            .flatten()
-            .map(|addr| addr.port())
-            .chain(maps)
-            .collect();
+        let ports = held_ports(&session, maps);
         tracing::info!(
             route = key.as_str(),
             ?ports,
             "a route's session closes off the open path; the route may open again at once"
         );
+        self.stop(key, session, leg, ports);
+    }
+
+    // Stop `session`, which holds `ports`, in the background: each of them
+    // is held until it has stopped.
+    fn stop(
+        &self,
+        key: &RouteKey,
+        session: Arc<Session>,
+        leg: Option<Arc<TorrentLeg>>,
+        ports: Vec<u16>,
+    ) {
         let (stopped, waiting) = tokio::sync::watch::channel(false);
         self.lock().push(Stopping {
             route: key.clone(),

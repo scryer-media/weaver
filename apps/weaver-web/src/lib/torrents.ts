@@ -338,6 +338,7 @@ export const TORRENT_ROUTE_REASONS = [
   "SESSION_BUILD_FAILED",
   "BLOCKLIST_FAILED",
   "SESSION_LIMIT",
+  "OPENING",
 ] as const;
 
 export type TorrentRouteReason = (typeof TORRENT_ROUTE_REASONS)[number];
