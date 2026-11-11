@@ -4855,6 +4855,39 @@ async fn a_connection_we_asked_to_close_counts_no_failure() {
     assert_eq!(failcounts, [(0, 0), (1, 1)]);
 }
 
+// A connect our own uTP socket turned away never reached the peer: it counts
+// no failure. One the peer left unanswered does.
+#[tokio::test]
+async fn a_connect_refused_on_our_side_counts_no_failure() {
+    let h = Harness::new("refused_locally").await;
+    let mut failcounts = Vec::new();
+    for (addr, error) in [
+        (
+            "127.0.0.1:6881",
+            crate::Error::UtpConnect(weaver_utp::Error::ConnectionIdsExhausted),
+        ),
+        (
+            "127.0.0.2:6881",
+            crate::Error::UtpConnect(weaver_utp::Error::DispatcherDead),
+        ),
+        ("127.0.0.3:6881", crate::Error::UtpDisabled),
+        (
+            "127.0.0.4:6881",
+            crate::Error::UtpConnect(weaver_utp::Error::ConnectTimedOut),
+        ),
+    ] {
+        let (peer, _rx) = h.peer(addr);
+        let counters = peer.counters.clone();
+        peer.on_peer_died(Some(error)).unwrap();
+        let failcount = h
+            .peers
+            .with_peer(sock(addr), |p| p.connect_rank().1)
+            .unwrap();
+        failcounts.push((failcount, counters.errors.load(Ordering::Relaxed)));
+    }
+    assert_eq!(failcounts, [(0, 0), (0, 0), (0, 0), (1, 1)]);
+}
+
 // libtorrent `peer_list::is_connect_candidate`: once we only upload, a peer
 // whose connection showed it to be a seed is no connect candidate, and any
 // other still is (`settings_pack::seeding_outgoing_connections`, on by

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-10.
 
 /// The user-facing writer side for uTP stream (UtpStreamWriteHalf).
 /// The user calls AsyncWrite on it to write the data to the stream.
@@ -85,6 +85,13 @@ impl UserTx {
             });
         }
         Ok(())
+    }
+
+    /// Drops every byte past the first `keep`, the newest first.
+    pub fn keep_front(&self, keep: usize) {
+        let mut ring = self.ring.lock();
+        let len = ring.len();
+        ring.truncate_back(len.saturating_sub(keep));
     }
 
     /// Grow a ring buffer 2x up to max capacity.

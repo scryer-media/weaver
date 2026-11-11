@@ -454,45 +454,153 @@ async fn a_canceled_queued_request_cannot_emit_a_syn_before_the_next_request() {
     assert_eq!(network.control.active_syn.load(Ordering::Relaxed), 0);
 }
 
+// One address takes as many connects as the socket admits, each under its
+// own connection id; the next waits for a permit rather than being refused.
 #[tokio::test(start_paused = true)]
-async fn per_endpoint_admission_counts_both_sending_and_waiting_for_ack() {
+async fn one_endpoint_takes_every_admitted_connect() {
     let (socket, network) = network();
     let mut attempts = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..32 {
         let mut attempt = Box::pin(socket.connect(remote(100)));
         assert!(attempt.as_mut().now_or_never().is_none());
         attempts.push(attempt);
     }
-    network.sent(Type::Syn, remote(100), 4).await;
-    assert!(matches!(
-        socket.connect(remote(100)).await,
-        Err(Error::TooManyPendingConnections)
-    ));
-    network.control.syn_completion.add_permits(1);
-    loop {
-        let changed = network.control.changed.notified();
-        tokio::pin!(changed);
-        changed.as_mut().enable();
-        if network.control.active_syn.load(Ordering::Relaxed) == 3 {
-            break;
+    let mut next = Box::pin(socket.connect(remote(100)));
+    assert!(next.as_mut().now_or_never().is_none());
+    {
+        let any_ended = futures::future::select_all(attempts.iter_mut().map(|a| a.as_mut()));
+        tokio::select! {
+            (result, index, _) = any_ended => {
+                panic!("connect {index} ended before its SYN: {:?}", result.err())
+            }
+            _ = network.sent(Type::Syn, remote(100), 32) => {}
         }
-        changed.await;
     }
-    assert!(matches!(
-        socket.connect(remote(100)).await,
-        Err(Error::TooManyPendingConnections)
-    ));
-    assert_eq!(
-        network
-            .control
-            .sent
-            .lock()
-            .iter()
-            .filter(|packet| packet.header.htype == Type::Syn)
-            .count(),
-        4
+    assert_eq!(network.control.active_syn.load(Ordering::Relaxed), 32);
+    let syns: Vec<UtpHeader> = network
+        .control
+        .sent
+        .lock()
+        .iter()
+        .filter(|packet| packet.header.htype == Type::Syn)
+        .map(|packet| packet.header)
+        .collect();
+    assert_eq!(syns.len(), 32);
+    let ids: std::collections::BTreeSet<u16> = syns.iter().map(|h| h.connection_id.0).collect();
+    assert_eq!(ids.len(), 32, "each connect has its own connection id");
+
+    // The remote answers the last SYN: that connect completes and frees the
+    // permit the waiting one needs.
+    network.control.syn_completion.add_permits(33);
+    let last = syns[31];
+    network.deliver(
+        remote(100),
+        UtpHeader {
+            htype: Type::State,
+            connection_id: last.connection_id,
+            ack_nr: last.seq_nr,
+            seq_nr: 7.into(),
+            wnd_size: 65535,
+            ..Default::default()
+        },
+        &[],
     );
+    let answered = attempts.pop().unwrap().await.unwrap();
+    let observed = async {
+        network.sent(Type::Syn, remote(100), 33).await;
+    };
+    tokio::select! {
+        r = next.as_mut() => panic!("the waiting connect ended without a SYN: {:?}", r.err()),
+        _ = observed => {}
+    }
+    drop(answered);
     drop(attempts);
+    drop(next);
+    socket.shutdown().await.unwrap();
+}
+
+// A remote that will not take the connect answers the SYN with a FIN (as
+// libtorrent does) or a RESET. That ends the connect with the refusal, not a
+// timeout; a FIN acknowledging some other sequence number is ignored.
+#[tokio::test(start_paused = true)]
+async fn a_fin_or_reset_answering_the_syn_ends_the_connect() {
+    let (socket, network) = network();
+    network.control.syn_completion.add_permits(3);
+    for (index, htype, matching, expected) in [
+        (0u16, Type::Fin, true, "refused"),
+        (1, Type::Reset, true, "reset"),
+        (2, Type::Fin, false, "timeout"),
+    ] {
+        let target = remote(100 + index);
+        let mut connect = Box::pin(socket.connect(target));
+        assert!(connect.as_mut().now_or_never().is_none());
+        let syn = network.sent(Type::Syn, target, 1).await;
+        let ack_nr = if matching { syn.seq_nr } else { syn.seq_nr - 1 };
+        network.deliver(
+            target,
+            UtpHeader {
+                htype,
+                connection_id: syn.connection_id,
+                ack_nr,
+                seq_nr: 7.into(),
+                wnd_size: 65535,
+                ..Default::default()
+            },
+            &[],
+        );
+        let got = match connect.await {
+            Err(Error::ConnectRefused) => "refused",
+            Err(Error::StResetReceived) => "reset",
+            Err(Error::ConnectTimedOut) => "timeout",
+            other => panic!("unexpected connect result: {:?}", other.err()),
+        };
+        assert_eq!(got, expected, "{htype:?} matching={matching}");
+    }
+    socket.shutdown().await.unwrap();
+    assert_eq!(network.control.active_syn.load(Ordering::Relaxed), 0);
+}
+
+// An accept dropped after the dispatcher handed it a SYN, as a select over
+// accept and other work does, keeps that connection for the next accept,
+// which answers the SYN.
+#[tokio::test(start_paused = true)]
+async fn a_dropped_accept_keeps_the_connection_it_was_handed() {
+    let (socket, network) = network();
+    let mut dropped = Box::pin(socket.accept());
+    assert!(dropped.as_mut().now_or_never().is_none());
+    network.deliver(
+        ADDR_2,
+        UtpHeader {
+            htype: Type::Syn,
+            connection_id: 50.into(),
+            seq_nr: 1.into(),
+            ..Default::default()
+        },
+        &[],
+    );
+    // The dispatcher takes packets in order: once it reads the second, it
+    // has handed the SYN to the waiting accept.
+    network.deliver(
+        remote(200),
+        UtpHeader {
+            htype: Type::State,
+            connection_id: 9.into(),
+            ..Default::default()
+        },
+        &[],
+    );
+    network.received(2).await;
+    drop(dropped);
+
+    let stream = socket
+        .accept()
+        .now_or_never()
+        .expect("the handed connection waits for the next accept")
+        .unwrap();
+    let syn_ack = network.sent(Type::State, ADDR_2, 1).await;
+    assert_eq!(syn_ack.connection_id, 50.into());
+    assert_eq!(syn_ack.ack_nr, 1.into());
+    drop(stream);
     socket.shutdown().await.unwrap();
 }
 

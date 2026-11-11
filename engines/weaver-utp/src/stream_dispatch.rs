@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-10.
 
 #[cfg(test)]
 mod tests;
@@ -173,6 +173,15 @@ struct VirtualSocket<T, Env> {
 
     // How many consecutive RTO retransmissions happened.
     rto_retransmissions: usize,
+
+    // No segment before this one is resent by recovery again: each packet is
+    // fast-resent at most once, and the head the retransmission timer
+    // resends is not fast-resent after it (libtorrent v2.0.15
+    // utp_stream.cpp m_fast_resend_seq_nr: 1235, 1355, 2815-2827 and
+    // 3550-3551). The
+    // timer path alone may send a packet again after that, and gives up
+    // once a packet went out `num_resends` times.
+    fast_resend_seq_nr: SeqNr,
 
     // The remote has sent a packet other than its SYN: it is there, not a
     // spoofed address. A stream that is not fails on its first timeout.
@@ -421,6 +430,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     restrict(&self.socket, seg.payload_size());
                     return Err(Error::MaxRetransmissionsReached);
                 }
+                if self.fast_resend_seq_nr == seg.seq_nr() {
+                    self.fast_resend_seq_nr += 1;
+                }
                 if send_data!(self, cx, header, seg)? {
                     trace!(
                         %header.seq_nr,
@@ -537,13 +549,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             let high_rxt = rec.high_rxt;
             let recovery_point = rec.recovery_point();
             let sack_depth = self.user_tx_segments.sack_depth();
+            let fast_resend_seq_nr = self.fast_resend_seq_nr;
             let mut it = self
                 .user_tx_segments
                 .iter_mut_for_sending(None)
                 .take(sack_depth + 1)
                 .skip_while(|seg| seg.seq_nr().is_at_or_before(high_rxt))
                 .take_while(|seg| seg.seq_nr().is_at_or_before(recovery_point))
-                .filter(|s| !s.is_delivered());
+                .filter(|s| !s.is_delivered())
+                .filter(move |s| s.seq_nr().is_at_or_after(fast_resend_seq_nr));
 
             let mut cwnd = rec.cwnd();
             let mut sent = 0;
@@ -587,6 +601,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "RECOVERY: sent ST_DATA"
                     );
                     rec.high_rxt = seg.seq_nr();
+                    self.fast_resend_seq_nr = seg.seq_nr() + 1;
                     rec.increment_total_transmitted_segments();
                     self.socket
                         .stats
@@ -670,8 +685,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 break;
             }
 
+            let go_back = item.send_count() > 0;
             match send_data!(self, cx, header, item) {
                 Ok(true) => {
+                    // The timer's go-back walks the fast-resend mark along, so
+                    // a SACK does not send the same packet again (libtorrent
+                    // v1.2.20 utp_stream.cpp:1800-1802).
+                    if go_back && self.fast_resend_seq_nr == item.seq_nr() {
+                        self.fast_resend_seq_nr += 1;
+                    }
                     trace!(
                         %header.seq_nr,
                         %header.ack_nr,
@@ -1067,6 +1089,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // Exit RTO mode.
             self.rto_retransmissions = 0;
 
+            // The watermark never falls behind the first unacknowledged
+            // packet (libtorrent v2.0.15 utp_stream.cpp:2750-2751).
+            let snd_una = self.user_tx_segments.next_seq_nr()
+                - self.user_tx_segments.total_len_packets() as u16;
+            if self.fast_resend_seq_nr.is_before(snd_una) {
+                self.fast_resend_seq_nr = snd_una;
+            }
+
             // Reset retransmit timer.
             if self.user_tx_segments.is_empty() && self.state.our_fin_if_unacked().is_none() {
                 // If all outstanding data ACKed, turn off the timer.
@@ -1434,7 +1464,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             self.consumed_but_unacked_bytes.saturating_add(bytes);
                         trace!(self.consumed_but_unacked_bytes);
                     }
-                    AssemblerAddRemoveResult::Unavailable(_) => {
+                    AssemblerAddRemoveResult::Unavailable => {
                         debug_every_ms!(500, header=%hdr.short_repr(), offset,
                             ?self.last_consumed_remote_seq_nr, "cannot reassemble message, ignoring it");
                     }
@@ -1598,6 +1628,23 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         });
     }
 
+    /// Once nothing holds the stream, the data it never sent goes, and the
+    /// FIN follows what is already in flight. libtorrent v2.0.15
+    /// utp_stream.cpp:955-993: destroy() closes, which sends the FIN now
+    /// unless a packet waits to go (938-952), then clears the write buffer;
+    /// packets already sent stay to be acknowledged or time out.
+    fn drop_unsent_data(&mut self) {
+        let dropped = self.user_tx_segments.drop_unsent();
+        let unsegmented = self.this_poll.unsegmented_data;
+        self.user_tx
+            .keep_front(self.user_tx_segments.total_len_bytes());
+        self.this_poll.unsegmented_data = 0;
+        if dropped > 0 || unsegmented > 0 {
+            debug!(dropped, unsegmented, "stream released: unsent data dropped");
+        }
+        self.seq_nr = self.user_tx_segments.next_seq_nr();
+    }
+
     fn unsent_data_exists(&mut self) -> bool {
         // either unsegmented data exists, or unsent data exists or both
         self.this_poll.unsegmented_data > 0
@@ -1683,8 +1730,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // (Re)send tx queue.
             pending_if_cannot_send!(self.send_tx_queue(cx));
 
-            if ((self.user_rx.is_reader_dropped() && self.user_tx.is_writer_dropped())
-                || self.user_tx.is_writer_shutdown())
+            let released = self.user_rx.is_reader_dropped() && self.user_tx.is_writer_dropped();
+            if released && !self.state.is_local_fin_or_later() {
+                self.drop_unsent_data();
+            }
+            if (released || self.user_tx.is_writer_shutdown())
                 && !self.unsent_data_exists()
                 && !self.state.is_local_fin_or_later()
             {
@@ -1962,6 +2012,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
             rto_retransmissions: 0,
+            fast_resend_seq_nr: seq_nr,
             confirmed: !matches!(
                 state,
                 VirtualSocketState::SynReceived | VirtualSocketState::SynAckSent { .. }

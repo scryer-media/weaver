@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-10.
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -10,9 +10,6 @@ pub enum Error {
 
     #[error("all connection IDs for this endpoint and parity are reserved")]
     ConnectionIdsExhausted,
-
-    #[error("too many pending connections to this endpoint")]
-    TooManyPendingConnections,
 
     #[error("task cancelled")]
     TaskCancelled,
@@ -84,9 +81,22 @@ pub enum Error {
     TimedOut,
     #[error("the remote did not answer the connect")]
     ConnectTimedOut,
+    #[error("the remote closed the connection in answer to the connect")]
+    ConnectRefused,
 
     #[error("dispatcher dead")]
     DispatcherDead,
+}
+
+impl Error {
+    /// The local socket turned the connect away before anything reached the
+    /// remote: the remote is not at fault.
+    pub fn is_local_refusal(&self) -> bool {
+        matches!(
+            self,
+            Error::ConnectionIdsExhausted | Error::TaskCancelled | Error::DispatcherDead
+        )
+    }
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

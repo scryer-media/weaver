@@ -66,6 +66,17 @@ impl ByteRing {
         count
     }
 
+    // Drops up to `count` bytes from the back, the newest; returns how many
+    // it dropped.
+    pub fn truncate_back(&mut self, count: usize) -> usize {
+        let count = count.min(self.len);
+        self.len -= count;
+        if self.len == 0 {
+            self.head = 0;
+        }
+        count
+    }
+
     // A ring of `capacity` holding the same bytes; None when they would not
     // fit.
     pub fn resized(&self, capacity: NonZeroUsize) -> Option<Self> {

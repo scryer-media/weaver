@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
+// Modified by the Weaver authors, 2026-11-10.
 
 use std::time::Duration;
 
@@ -10,7 +11,7 @@ use tracing::trace;
 
 use crate::{
     SocketOpts,
-    raw::{Type::*, UtpHeader},
+    raw::{Type::*, UtpHeader, selective_ack::SelectiveAck},
     stream_dispatch::tests::{calc_mtu_for_mss, make_test_vsock},
     test_util::setup_test_logging,
 };
@@ -209,4 +210,145 @@ async fn test_duplicate_ack_counted_only_on_st_state() {
     t.send_msg(header, "");
     t.poll_once_assert_ready().await.unwrap();
     shutdown.await.unwrap();
+}
+
+// A packet the retransmission timer resent is not fast-resent after it, as
+// in libtorrent: a SACK that then marks it lost resends the packets after it
+// instead, and only the timer sends the head again.
+#[tokio::test]
+async fn a_packet_the_timer_resent_is_not_fast_resent() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(5)),
+            ..Default::default()
+        },
+        false,
+    );
+    let rto = Duration::from_secs(1);
+    t.vsock.rtte.force_timeout(rto);
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 0.into(),
+            ack_nr: 100.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(b"aaaaabbbbbcccccdddddeeeeefffff")
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    let first: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    assert_eq!(first, vec![101, 102, 103, 104, 105, 106]);
+
+    // The timer resends the head.
+    t.env.increment_now(rto);
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(Data, seq_nr = 101, payload = "aaaaa")]
+    );
+
+    // 103 to 106 arrive, 101 and 102 do not: more than three packets past
+    // both are SACKed.
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 0.into(),
+            ack_nr: 100.into(),
+            wnd_size: 1024,
+            extensions: crate::raw::Extensions {
+                selective_ack: SelectiveAck::new_test([1, 2, 3, 4]),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    let resent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    assert!(resent.contains(&102), "{resent:?}");
+    assert!(!resent.contains(&101), "{resent:?}");
+    let head = t
+        .vsock
+        .user_tx_segments
+        .iter_mut_for_sending(None)
+        .next()
+        .unwrap()
+        .send_count();
+    assert_eq!(head, 2);
+}
+
+// A packet the timer's go-back resent is not fast-resent by the next SACK,
+// as in libtorrent: the go-back walks the fast-resend mark along with it.
+#[tokio::test]
+async fn a_packet_the_go_back_resent_is_not_fast_resent() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(5)),
+            ..Default::default()
+        },
+        false,
+    );
+    let rto = Duration::from_secs(1);
+    t.vsock.rtte.force_timeout(rto);
+    let ack = |ack_nr: u16, sacked: &[usize]| UtpHeader {
+        htype: State,
+        seq_nr: 0.into(),
+        ack_nr: ack_nr.into(),
+        wnd_size: 1024,
+        extensions: crate::raw::Extensions {
+            selective_ack: SelectiveAck::new_test(sacked.iter().copied()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    t.send_msg(ack(100, &[]), "");
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(b"aaaaabbbbbcccccdddddeeeeefffffggggghhhhh")
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    let first: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    assert_eq!(first, vec![101, 102, 103, 104, 105, 106, 107, 108]);
+
+    // The timer resends the head, and its ACK lets the go-back resume.
+    t.env.increment_now(rto);
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(Data, seq_nr = 101, payload = "aaaaa")]
+    );
+    t.send_msg(ack(101, &[]), "");
+    t.poll_once_assert_pending().await;
+    let go_back: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    assert_eq!(go_back.first(), Some(&102), "{go_back:?}");
+
+    // 105 to 108 arrive, everything the go-back resent is still missing.
+    t.send_msg(ack(101, &[2, 3, 4, 5]), "");
+    t.poll_once_assert_pending().await;
+    let resent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    for seq in &go_back {
+        assert!(
+            !resent.contains(seq),
+            "go-back {go_back:?} resent {resent:?}"
+        );
+    }
+    let most = t
+        .vsock
+        .user_tx_segments
+        .iter_mut_for_sending(None)
+        .map(|s| s.send_count())
+        .max()
+        .unwrap();
+    assert_eq!(most, 2, "go-back {go_back:?} resent {resent:?}");
 }

@@ -2966,10 +2966,11 @@ impl PeerHandler {
             }
         };
         // A connection we asked to close did not fail (libtorrent
-        // `peer_connection::failed`).
+        // `peer_connection::failed`), nor did a connect our own side turned
+        // away before it reached the peer.
         let failed = error
             .as_ref()
-            .is_some_and(|e| !matches!(e, crate::Error::Disconnect));
+            .is_some_and(|e| !matches!(e, crate::Error::Disconnect) && !e.is_local_refusal());
         // A connection to a peer that speaks the holepunch extension failed,
         // and no holepunch asked for it: a peer that can introduce us is
         // asked to (libtorrent `peer_connection::connect_failed`).

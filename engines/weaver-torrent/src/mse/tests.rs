@@ -293,6 +293,116 @@ async fn test_disabled_responder_reads_nothing() {
     assert_eq!(h.peer_id, Id20::new([1; 20]));
 }
 
+/// Two connected uTP streams on loopback, split into the halves a peer
+/// connection reads and writes.
+async fn utp_pipe() -> (
+    (BoxAsyncReadVectored, BoxAsyncWrite),
+    (BoxAsyncReadVectored, BoxAsyncWrite),
+    [crate::network::UtpSocket; 2],
+) {
+    let f = crate::test_support::socket_factory();
+    let bind = || {
+        crate::listen::bind_utp(
+            f.as_ref(),
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+            crate::udp_options::STREAM_WINDOW,
+            None,
+        )
+    };
+    let (a, b) = (bind().await.unwrap(), bind().await.unwrap());
+    let (accepted, dialled) = tokio::join!(a.accept(), b.connect(a.bind_addr()));
+    let (ar, aw) = dialled.unwrap().split();
+    let (br, bw) = accepted.unwrap().split();
+    (
+        (Box::new(ar), Box::new(aw)),
+        (Box::new(br), Box::new(bw)),
+        [a, b],
+    )
+}
+
+/// Reads exactly `len` bytes through vectored reads into two slices at a
+/// time, as the peer connection reads its ring buffer.
+async fn read_vectored_exact(r: &mut BoxAsyncReadVectored, len: usize) -> Vec<u8> {
+    use crate::vectored_traits::AsyncReadVectoredExt;
+    let mut got = Vec::with_capacity(len);
+    let mut a = vec![0u8; 1000];
+    let mut b = vec![0u8; 3000];
+    while got.len() < len {
+        let want = len - got.len();
+        let (a_len, b_len) = (want.min(a.len()), want.saturating_sub(a.len()).min(b.len()));
+        let n = r
+            .read_vectored(&mut [
+                std::io::IoSliceMut::new(&mut a[..a_len]),
+                std::io::IoSliceMut::new(&mut b[..b_len]),
+            ])
+            .await
+            .unwrap();
+        assert_ne!(n, 0, "stream closed after {} of {len} bytes", got.len());
+        got.extend_from_slice(&a[..n.min(a_len)]);
+        if n > a_len {
+            got.extend_from_slice(&b[..n - a_len]);
+        }
+    }
+    got
+}
+
+/// The encrypted handshake and then a stream larger than one read, both ways,
+/// over uTP, read with vectored reads: what the peer connection does.
+async fn mse_over_utp(offer_policy: EncryptionPolicy, responder_policy: EncryptionPolicy) {
+    let ih = Id20::new([7; 20]);
+    let ((ar, aw), (br, bw), _sockets) = utp_pipe().await;
+    let ia = bt_handshake(ih, 1);
+    let mut reader = br;
+    let torrents = by_obfuscated(&[ih], responder_policy);
+    let (a, b) = tokio::join!(
+        initiate(ar, aw, &ih, outgoing_offer(offer_policy), &ia),
+        upgrade_incoming(
+            incoming(responder_policy),
+            &mut reader,
+            bw,
+            Duration::MAX,
+            |o| torrents.get(o).copied()
+        ),
+    );
+    let (encryption, writer, _) = b.unwrap();
+    let mut a = a.unwrap();
+    assert_eq!(encryption, Encryption::Rc4);
+    assert_eq!(a.encryption, Encryption::Rc4);
+    let mut b = Established {
+        reader,
+        writer,
+        encryption,
+    };
+    let got = read_vectored_exact(&mut b.reader, 68).await;
+    assert_eq!(Handshake::deserialize(&got).unwrap().0.info_hash, ih);
+
+    let data: Vec<u8> = (0..300_000u32)
+        .map(|i| u8::try_from(i % 241).unwrap())
+        .collect();
+    let (mut out_a, mut out_b) = (data.clone(), data.clone());
+    let (sent_a, sent_b, got_a, got_b) = tokio::join!(
+        a.writer.write_all(&mut out_a),
+        b.writer.write_all(&mut out_b),
+        read_vectored_exact(&mut a.reader, data.len()),
+        read_vectored_exact(&mut b.reader, data.len()),
+    );
+    sent_a.unwrap();
+    sent_b.unwrap();
+    assert!(got_a == data, "initiator decrypted different bytes");
+    assert!(got_b == data, "responder decrypted different bytes");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rc4_over_utp_moves_data_under_require() {
+    mse_over_utp(EncryptionPolicy::Require, EncryptionPolicy::Require).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rc4_over_utp_moves_data_under_prefer() {
+    mse_over_utp(EncryptionPolicy::Prefer, EncryptionPolicy::Prefer).await;
+}
+
 #[tokio::test]
 async fn test_prefer_and_require_responders_accept_encrypted() {
     for policy in [EncryptionPolicy::Prefer, EncryptionPolicy::Require] {

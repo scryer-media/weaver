@@ -129,4 +129,17 @@ pub enum Error {
     Core(#[from] crate::core::Error),
 }
 
+impl Error {
+    /// Our own side turned the connect away before the peer had a say: no
+    /// transport was enabled, or each that was refused locally. Such an
+    /// error does not count against the peer.
+    pub fn is_local_refusal(&self) -> bool {
+        match self {
+            Error::ConnectDisabled | Error::UtpDisabled | Error::TcpDisabled => true,
+            Error::UtpConnect(utp) => utp.is_local_refusal(),
+            _ => false,
+        }
+    }
+}
+
 pub type Result<T> = core::result::Result<T, Error>;

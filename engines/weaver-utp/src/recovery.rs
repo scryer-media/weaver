@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-10.
 
 // NewReno fast recovery, counting duplicates from SACKs.
 use std::time::Duration;
@@ -79,46 +79,43 @@ struct LastAck {
     ack_nr: SeqNr,
 }
 
+// Mirrors libtorrent v2.0.15 utp_stream.cpp. A SACK that names more than
+// `SACK_DUP_THRESH` packets past the first missing one marks it lost at once
+// (parse_sack, 1286-1320: "dups > dup_ack_limit"). Otherwise a STATE packet
+// that repeats the cumulative ACK while data is outstanding counts as one
+// duplicate, and `SACK_DUP_THRESH` of them mark it lost (2723-2728, 2814).
+// An ACK that moves the cumulative ACK forward, or a DATA packet, is no
+// duplicate.
 fn count_sack_duplicates(
     header: &UtpHeader,
-    _on_ack_result: &OnAckResult,
+    on_ack_result: &OnAckResult,
     prev_dup_acks: u8,
     stats: &UtpStats,
 ) -> u8 {
-    match &header.extensions.selective_ack {
-        Some(sack) => {
-            // If we received at least 3 segments above high_ack, we need to enter recovery
-            // right away.
-            let segments_past_first = sack.as_bitslice().count_ones();
-            if segments_past_first >= SACK_DUP_THRESH as usize {
-                event!(
-                    RECOVERY_TRACING_LOG_LEVEL,
-                    prev_dup_acks,
-                    segments_past_first,
-                    ?header.ack_nr,
-                    "too many segments past first ACKed"
-                );
-                stats.duplicate_acks_received.increment(1);
-                return SACK_DUP_THRESH;
-            }
-
-            // ONLY if the SACK carries new data we +1 the counter. I.e.
-            // "a segment that arrives carrying a SACK block that
-            // identifies previously unacknowledged and un-SACKed octets between
-            // HighACK and HighData".
-            //
-            // However, uTP cannot convey any information past the SACK size limit
-            // (usually 64 segments). So we assume it is trying to do that here, and
-            // ignore actually looking at how many segments were ACKed.
-            stats.duplicate_acks_received.increment(1);
-            prev_dup_acks + 1
-        }
-        None => {
-            // If the incoming ACK is a cumulative acknowledgment, the TCP MUST
-            // reset DupAcks to zero.
-            0
-        }
+    if on_ack_result.acked_segments_count > 0 {
+        return 0;
     }
+    let sacked = header
+        .extensions
+        .selective_ack
+        .as_ref()
+        .map_or(0, |sack| sack.as_bitslice().count_ones());
+    if sacked > SACK_DUP_THRESH as usize {
+        event!(
+            RECOVERY_TRACING_LOG_LEVEL,
+            prev_dup_acks,
+            sacked,
+            ?header.ack_nr,
+            "more than the threshold of segments past the first SACKed"
+        );
+        stats.duplicate_acks_received.increment(1);
+        return SACK_DUP_THRESH;
+    }
+    if header.htype == Type::State {
+        stats.duplicate_acks_received.increment(1);
+        return prev_dup_acks.saturating_add(1);
+    }
+    prev_dup_acks
 }
 
 fn count_non_sack_duplicates(
@@ -346,6 +343,87 @@ mod tests {
             );
         }
         (before, cc.window(), recovery.is_recovering())
+    }
+
+    // One SACK that names `sacked` packets past the missing first one.
+    fn one_sack_past_the_first(sacked: usize) -> bool {
+        let stats = UtpStats::default();
+        let now = Instant::now();
+        let mut segs = Segments::new(10.into());
+        for _ in 0..8 {
+            assert!(segs.enqueue(500, false));
+        }
+        for mut item in segs.iter_mut_for_sending(None) {
+            item.on_sent(now, &stats);
+        }
+        let header = UtpHeader {
+            htype: Type::State,
+            ack_nr: 9.into(),
+            wnd_size: 1 << 20,
+            extensions: crate::raw::Extensions {
+                selective_ack: crate::raw::selective_ack::SelectiveAck::new_test(0..sacked),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = segs.remove_up_to_ack(now, &header);
+        let mut cc = Ledbat::new(500, LedbatParams::default());
+        cc.set_remote_window(usize::MAX);
+        let mut recovery = Recovery::new();
+        recovery.on_ack(
+            &header,
+            &result,
+            &mut segs,
+            &mut cc,
+            super::AckContext {
+                last_sent_seq_nr: 17.into(),
+                next_seq_nr: 18.into(),
+                now,
+                rtt: Duration::from_millis(50),
+                stats: &stats,
+            },
+        );
+        recovery.is_recovering()
+    }
+
+    // libtorrent v2.0.15 utp_stream.cpp:1314: three SACKed packets past a
+    // hole are reordering; a fourth makes it a loss.
+    #[test]
+    fn a_hole_is_lost_only_with_more_than_three_sacked_after_it() {
+        assert!(!one_sack_past_the_first(3));
+        assert!(one_sack_past_the_first(4));
+    }
+
+    // A DATA packet, or an ACK that moves forward, repeats nothing.
+    #[test]
+    fn only_a_repeated_state_ack_counts_as_a_duplicate() {
+        let stats = UtpStats::default();
+        let header = |htype| UtpHeader {
+            htype,
+            ack_nr: 9.into(),
+            extensions: crate::raw::Extensions {
+                selective_ack: crate::raw::selective_ack::SelectiveAck::new_test([0]),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let none = OnAckResult::default();
+        let advanced = OnAckResult {
+            acked_segments_count: 1,
+            ..Default::default()
+        };
+        assert_eq!(
+            super::count_sack_duplicates(&header(Type::State), &none, 1, &stats),
+            2
+        );
+        assert_eq!(
+            super::count_sack_duplicates(&header(Type::Data), &none, 1, &stats),
+            1
+        );
+        assert_eq!(
+            super::count_sack_duplicates(&header(Type::State), &advanced, 2, &stats),
+            0
+        );
     }
 
     #[test]

@@ -2265,6 +2265,10 @@ impl Session {
                                     .instrument(span)
                             );
                         }
+                        Err(e) if A::is_closed(&e) => {
+                            debug!("listener closed: {e:#}");
+                            return Ok(());
+                        }
                         Err(e) => {
                             warn!("error accepting: {e:#}");
                             backoff.as_mut().reset(tokio::time::Instant::now() + ACCEPT_BACKOFF);

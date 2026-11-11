@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-10.
 
 /// The receiving side of uTP stream abstraction.
 ///
@@ -137,19 +137,28 @@ pub struct UtpStreamReadHalf {
 }
 
 impl UtpStreamReadHalf {
+    /// Fills `bufs` in order and returns how many bytes it wrote. The slices
+    /// themselves are left as they came, describing the same memory, as a
+    /// socket's readv leaves them: a caller (a decrypting wrapper, say) finds
+    /// the bytes read in the first `n` bytes of `bufs` taken in order.
     pub fn poll_read_vectored(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-        mut bufs: &mut [IoSliceMut<'_>],
+        bufs: &mut [IoSliceMut<'_>],
     ) -> Poll<std::io::Result<usize>> {
         let mut written = 0usize;
         let mut dispatcher_dead = false;
+        // The slice being filled, and how far into it.
+        let mut buf_idx = 0usize;
+        let mut buf_pos = 0usize;
 
-        while let Some(current_buf) = bufs.first_mut() {
-            if current_buf.is_empty() {
-                bufs = &mut bufs[1..];
+        while let Some(current_buf) = bufs.get_mut(buf_idx) {
+            if buf_pos == current_buf.len() {
+                buf_idx += 1;
+                buf_pos = 0;
                 continue;
             }
+            let current_buf = &mut current_buf[buf_pos..];
             // If there was a previous message we haven't read till the end, do it.
             if let Some(current) = self.current.as_mut() {
                 let payload = &current.payload[current.offset..];
@@ -161,7 +170,7 @@ impl UtpStreamReadHalf {
 
                 let len = current_buf.len().min(payload.len());
                 current_buf[..len].copy_from_slice(&payload[..len]);
-                current_buf.advance(len);
+                buf_pos += len;
 
                 written += len;
                 current.offset += len;
@@ -470,7 +479,7 @@ impl UserRx {
             .window()
             .saturating_sub(self.ooq.stored_bytes());
         if msg.payload().len() > remaining {
-            return Ok(AssemblerAddRemoveResult::Unavailable(msg));
+            return Ok(AssemblerAddRemoveResult::Unavailable);
         }
         match self.ooq.add_remove(msg, offset)? {
             res @ AssemblerAddRemoveResult::Consumed {
@@ -534,7 +543,7 @@ pub enum AssemblerAddRemoveResult {
         bytes: usize,
     },
     AlreadyPresent,
-    Unavailable(UtpMessage),
+    Unavailable,
 }
 
 fn ooq_slot_is_default(slot: &OoqMessage) -> bool {
@@ -669,7 +678,7 @@ impl OutOfOrderQueue {
     ) -> crate::Result<AssemblerAddRemoveResult> {
         if self.is_full() {
             debug!(offset, "assembler buffer full");
-            return Ok(AssemblerAddRemoveResult::Unavailable(msg));
+            return Ok(AssemblerAddRemoveResult::Unavailable);
         }
 
         let effective_offset = offset + self.filled_front;
@@ -679,7 +688,7 @@ impl OutOfOrderQueue {
                 offset,
                 self.filled_front, effective_offset, "message is past assembler's window"
             );
-            return Ok(AssemblerAddRemoveResult::Unavailable(msg));
+            return Ok(AssemblerAddRemoveResult::Unavailable);
         }
 
         let msg = match msg.header.htype {
@@ -760,7 +769,7 @@ mod tests {
         ));
         assert!(matches!(
             rx.add_remove_test(msg(17, b"a"), 16).await.unwrap(),
-            AssemblerAddRemoveResult::Unavailable(_)
+            AssemblerAddRemoveResult::Unavailable
         ));
 
         // 1 MiB holds 953.
@@ -774,7 +783,7 @@ mod tests {
         ));
         assert!(matches!(
             rx.add_remove_test(msg(954, b"a"), 953).await.unwrap(),
-            AssemblerAddRemoveResult::Unavailable(_)
+            AssemblerAddRemoveResult::Unavailable
         ));
     }
 
@@ -783,6 +792,51 @@ mod tests {
             NonZeroUsize::new(capacity_bytes).unwrap(),
             NonZeroUsize::new(1500).unwrap(),
         )
+    }
+
+    /// A vectored read writes the first `n` bytes of the slices in order and
+    /// leaves the slices themselves describing the memory they came with, as
+    /// a socket's readv does: a wrapper that post-processes `bufs[..n]` (the
+    /// stream cipher) must find the bytes there.
+    #[tokio::test]
+    async fn a_vectored_read_leaves_the_callers_slices_as_they_came() {
+        setup_test_logging();
+        let (user_rx, mut read) = user_rx(64);
+        user_rx.enqueue_test(UserRxMessage::Payload(b"abcde".to_vec()));
+        user_rx.enqueue_test(UserRxMessage::Payload(b"fghij".to_vec()));
+
+        let mut a = [0u8; 3];
+        let mut b = [0u8; 4];
+        let mut c = [0u8; 8];
+        let n = {
+            let mut slices = [
+                std::io::IoSliceMut::new(&mut a),
+                std::io::IoSliceMut::new(&mut []),
+                std::io::IoSliceMut::new(&mut b),
+                std::io::IoSliceMut::new(&mut c),
+            ];
+            let n = poll_fn(|cx| std::pin::Pin::new(&mut read).poll_read_vectored(cx, &mut slices))
+                .await
+                .unwrap();
+            // Every slice still has its own length and start.
+            assert_eq!(
+                slices.iter().map(|s| s.len()).collect::<Vec<_>>(),
+                [3, 0, 4, 8]
+            );
+            let mut seen = Vec::new();
+            let mut left = n;
+            for s in &slices {
+                let k = s.len().min(left);
+                seen.extend_from_slice(&s[..k]);
+                left -= k;
+            }
+            assert_eq!(seen, b"abcdefghij");
+            n
+        };
+        assert_eq!(n, 10);
+        assert_eq!(&a, b"abc");
+        assert_eq!(&b, b"defg");
+        assert_eq!(&c[..3], b"hij");
     }
 
     #[test]
@@ -828,7 +882,7 @@ mod tests {
 
         assert_eq!(
             user_rx.add_remove_test(msg.clone(), 0).await.unwrap(),
-            AssemblerAddRemoveResult::Unavailable(msg.clone())
+            AssemblerAddRemoveResult::Unavailable
         );
         assert_eq!(user_rx.ooq.stored_packets(), 0);
         assert_eq!(user_rx.ooq.stored_bytes(), 0);
@@ -878,7 +932,7 @@ mod tests {
 
         assert_eq!(
             user_rx.add_remove_test(missing.clone(), 0).await.unwrap(),
-            AssemblerAddRemoveResult::Unavailable(missing.clone())
+            AssemblerAddRemoveResult::Unavailable
         );
         assert_eq!(user_rx.ooq.stored_packets(), 1);
         assert_eq!(user_rx.ooq.filled_front(), 0);
@@ -1029,7 +1083,7 @@ mod tests {
         // A message that is out of bounds of the assembler should be dropped.
         assert_eq!(
             asm.add_remove(msg_3.clone(), 3).unwrap(),
-            AssemblerAddRemoveResult::Unavailable(msg_3)
+            AssemblerAddRemoveResult::Unavailable
         );
         trace!(asm=%asm.debug_string(true));
         assert_eq!(asm.stored_packets(), 1);

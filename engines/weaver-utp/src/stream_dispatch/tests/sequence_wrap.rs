@@ -212,9 +212,11 @@ async fn a_full_reservation_window_resumes_after_ack_before_sending_fin() {
         env,
     );
     t.vsock.congestion_controller.set_window(2);
-    let mut stream = t.stream.take().unwrap();
-    stream.write_all(&payload).await.unwrap();
-    drop(stream);
+    // Only the writer is closed: a released stream drops what it has not sent
+    // yet, while a stream whose reader lives delivers everything first.
+    let (reader, mut writer) = t.stream.take().unwrap().split();
+    writer.write_all(&payload).await.unwrap();
+    drop(writer);
 
     t.poll_once_assert_pending().await;
     let mut sent = t.take_sent();
@@ -238,8 +240,8 @@ async fn a_full_reservation_window_resumes_after_ack_before_sending_fin() {
     t.poll_once_assert_pending().await;
     sent.extend(t.take_sent());
     assert_eq!(t.vsock.this_poll.unsegmented_data, 0);
-    assert_eq!(sent.len(), total + 1);
-    for (index, packet) in sent[..total].iter().enumerate() {
+    assert_eq!(sent.len(), total);
+    for (index, packet) in sent.iter().enumerate() {
         assert_eq!(packet.header.htype, Data);
         assert_eq!(
             packet.header.seq_nr,
@@ -247,7 +249,13 @@ async fn a_full_reservation_window_resumes_after_ack_before_sending_fin() {
         );
         assert_eq!(packet.payload(), &payload[index..index + 1]);
     }
-    let fin = sent.last().unwrap();
+
+    // With everything sent, releasing the reader sends the FIN behind it.
+    drop(reader);
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1);
+    let fin = &sent[0];
     assert_eq!(fin.header.htype, Fin);
     assert_eq!(fin.header.seq_nr, FIRST.wrapping_add(total as u16).into());
     assert!(fin.payload().is_empty());
