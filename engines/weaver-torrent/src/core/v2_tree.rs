@@ -226,22 +226,110 @@ struct Leaf<'a> {
 /// nothing, replaced by `_`, and a name cut at 240 bytes, keeping an
 /// extension of up to nine bytes.
 pub fn sanitize_component(raw: &[u8]) -> String {
-    sanitize_element(raw).unwrap_or_else(|| "_".to_owned())
+    sanitize_component_with(raw, NameRules::PORTABLE)
+}
+
+/// [`sanitize_component`] under `rules`.
+pub fn sanitize_component_with(raw: &[u8], rules: NameRules) -> String {
+    sanitize_element(raw, rules).unwrap_or_else(|| "_".to_owned())
+}
+
+/// A path element that is not forced, as libtorrent stores the torrent's
+/// `name` (`extract_single_file` with `top_level`): `None` where it drops
+/// the element whole.
+pub fn sanitize_name_with(raw: &[u8], rules: NameRules) -> Option<String> {
+    sanitize_element(raw, rules)
 }
 
 /// The name libtorrent knows a torrent by (`torrent_info::name`):
 /// `name.utf-8`, or else `name`, sanitized as a path element that is not
 /// forced. What that drops whole, a name of nothing but up to two dots once
 /// sanitized, gives way to `fallback`, the hex v1 info hash in libtorrent,
-/// as does a torrent with neither name.
+/// as does a torrent with neither name. It is the same name on every
+/// platform.
 pub fn torrent_name(raw: Option<&[u8]>, fallback: impl FnOnce() -> String) -> String {
-    raw.and_then(sanitize_element).unwrap_or_else(fallback)
+    raw.and_then(|raw| sanitize_element(raw, NameRules::PORTABLE))
+        .unwrap_or_else(fallback)
 }
 
-/// [`sanitize_component`], `None` where libtorrent drops an element it does
-/// not force: one of nothing but up to two dots once sanitized. An empty
-/// element is `_` either way.
-fn sanitize_element(raw: &[u8]) -> Option<String> {
+/// The rules a path element is cleaned under beyond the ones every
+/// platform shares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NameRules {
+    /// Windows' own: `?<>"|*:` replaced by `_`, trailing spaces and dots
+    /// stripped, and a device name (CON, NUL, COM1, ...) made a plain one
+    /// (libtorrent torrent_info.cpp:95-98 and :323-342, v2.0.15).
+    pub windows: bool,
+}
+
+impl NameRules {
+    /// The rules every platform shares.
+    pub const PORTABLE: Self = Self { windows: false };
+    /// The rules of the platform Weaver runs on, which name its files on
+    /// disk.
+    pub const HOST: Self = Self {
+        windows: cfg!(windows),
+    };
+}
+
+/// Names Windows opens as a device rather than a file wherever they stand
+/// in a path, alone or before any extension (libtorrent
+/// torrent_info.cpp:205-211, v2.0.15, plus the console's own `CONIN$` and
+/// `CONOUT$`).
+const WINDOWS_DEVICE_NAMES: [&str; 27] = [
+    "con", "prn", "aux", "clock$", "nul", "conin$", "conout$", "com0", "com1", "com2", "com3",
+    "com4", "com5", "com6", "com7", "com8", "com9", "lpt0", "lpt1", "lpt2", "lpt3", "lpt4", "lpt5",
+    "lpt6", "lpt7", "lpt8", "lpt9",
+];
+
+/// Whether Windows takes `element` for a device: its part before the first
+/// dot, trailing spaces dropped, is a device name, matched without regard
+/// to case. libtorrent looks only before the last dot, and only where it
+/// opens files without `\\?\` paths (torrent_info.cpp:199-226, v2.0.15);
+/// Weaver opens plain paths, where `CON.tar.gz` is the console as much as
+/// `CON` is.
+fn is_windows_device(element: &str) -> bool {
+    let stem = element.split('.').next().unwrap_or(element);
+    let stem = stem.trim_end_matches(' ');
+    WINDOWS_DEVICE_NAMES
+        .iter()
+        .any(|device| stem.eq_ignore_ascii_case(device))
+}
+
+/// Characters Windows refuses in a name, replaced by `_` (libtorrent
+/// `valid_path_character`, torrent_info.cpp:95-98, v2.0.15; backspace is
+/// a control character, replaced on every platform).
+fn is_windows_invalid(c: char) -> bool {
+    matches!(c, '?' | '<' | '>' | '"' | '|' | '*' | ':')
+}
+
+/// [`sanitize_component_with`], `None` where libtorrent drops an element it
+/// does not force: one of nothing but up to two dots once sanitized, or,
+/// under Windows rules, of nothing once its trailing spaces and dots are
+/// stripped. An empty element is `_` either way.
+fn sanitize_element(raw: &[u8], rules: NameRules) -> Option<String> {
+    let mut out = sanitize_portable(raw)?;
+    if rules.windows {
+        // libtorrent torrent_info.cpp:323-342, v2.0.15.
+        if out.contains(is_windows_invalid) {
+            out = out
+                .chars()
+                .map(|c| if is_windows_invalid(c) { '_' } else { c })
+                .collect();
+        }
+        let kept = out.trim_end_matches([' ', '.']).len();
+        out.truncate(kept);
+        if out.is_empty() {
+            return None;
+        }
+        if is_windows_device(&out) {
+            out.insert(0, '_');
+        }
+    }
+    Some(out)
+}
+
+fn sanitize_portable(raw: &[u8]) -> Option<String> {
     if raw.is_empty() {
         return Some("_".to_owned());
     }
@@ -421,6 +509,50 @@ mod tests {
         assert_eq!(name(Some(b"")), "_");
         assert_eq!(name(None), "hash");
         assert_eq!(name(Some("caf\u{e9}.mkv".as_bytes())), "caf\u{e9}.mkv");
+    }
+
+    #[test]
+    fn names_are_cleaned_under_windows_rules_on_every_platform() {
+        const WINDOWS: NameRules = NameRules { windows: true };
+        let forced = |raw: &[u8]| sanitize_component_with(raw, WINDOWS);
+        let name = |raw: &[u8]| sanitize_name_with(raw, WINDOWS);
+        // libtorrent `valid_path_character` on Windows.
+        assert_eq!(forced(b"a?b<c>d\"e|f*g:h"), "a_b_c_d_e_f_g_h");
+        assert_eq!(forced(b"a\x08b"), "a_b");
+        // test_torrent_info.cpp `sanitize_path_trailing_dots`, Windows.
+        assert_eq!(forced(b"abc..."), "abc");
+        assert_eq!(forced(b"abc. . "), "abc");
+        assert_eq!(forced(b"... "), "_");
+        assert_eq!(name(b"... "), None);
+        // Shared rules still hold.
+        assert_eq!(forced("\u{202e}gpj.exe\0".as_bytes()), "gpj.exe");
+        assert_eq!(forced(b"a\x01b"), "a_b");
+        // A device name never stays one, before any extension and in any
+        // case; a name that only starts like one is left alone.
+        for device in [
+            &b"CON"[..],
+            b"con.txt",
+            b"Con.tar.gz",
+            b"NUL",
+            b"com1.log",
+            b"LPT9",
+            b"aux ",
+            b"CONOUT$",
+            b"clock$.x",
+        ] {
+            let cleaned = forced(device);
+            assert!(cleaned.starts_with('_'), "{device:?} -> {cleaned}");
+            assert!(!is_windows_device(&cleaned), "{device:?} -> {cleaned}");
+        }
+        assert_eq!(forced(b"CON"), "_CON");
+        assert_eq!(forced(b"con.txt"), "_con.txt");
+        assert_eq!(forced(b"console.txt"), "console.txt");
+        assert_eq!(forced(b"com10"), "com10");
+        assert_eq!(forced(b"xnul"), "xnul");
+        // The portable rules keep all of these.
+        assert_eq!(sanitize_component(b"CON"), "CON");
+        assert_eq!(sanitize_component(b"a?b:"), "a?b:");
+        assert_eq!(sanitize_component(b"abc. "), "abc. ");
     }
 
     #[test]

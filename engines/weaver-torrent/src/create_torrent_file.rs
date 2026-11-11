@@ -145,6 +145,7 @@ async fn create_torrent_raw<'a>(
                 output_files.push(TorrentMetaV1File {
                     length,
                     path,
+                    path_utf8: None,
                     attr: None,
                     sha1: None,
                     symlink_path: None,
