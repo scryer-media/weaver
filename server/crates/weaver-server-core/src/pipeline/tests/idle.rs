@@ -176,6 +176,35 @@ async fn idle_pipeline_records_production_turn_histogram() {
     );
 }
 
+// A turn that leaves the pipeline with no work frees the idle article
+// buffers, so an idle service holds none of the pool.
+#[tokio::test(start_paused = true)]
+async fn a_turn_that_leaves_the_pipeline_idle_frees_the_idle_buffers() {
+    use crate::runtime::buffers::BufferTier;
+
+    let mut pool = None;
+    let pipeline = idle_pipeline(0, Vec::new(), |pipeline| {
+        pool = Some(Arc::clone(&pipeline.buffers));
+    })
+    .await;
+    let pool = pool.unwrap();
+    // An article buffer that was used and given back, as a finished decode
+    // leaves it.
+    drop(pool.acquire(BufferTier::Small).await);
+    drop(pool.acquire(BufferTier::Large).await);
+    assert_eq!(pool.allocated(BufferTier::Small), 1);
+    assert_eq!(pool.allocated(BufferTier::Large), 1);
+
+    let mut events = pipeline.handle.subscribe_events();
+    pipeline.handle.pause_all().await.unwrap();
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::GlobalPaused) {}
+    // The release runs at the end of that turn.
+    while pool.allocated(BufferTier::Small) + pool.allocated(BufferTier::Large) != 0 {
+        tokio::task::yield_now().await;
+    }
+    pipeline.shutdown().await;
+}
+
 #[tokio::test]
 async fn idle_footprint_tick_tracks_queue_edits_while_globally_paused() {
     let temp = tempfile::tempdir().unwrap();
