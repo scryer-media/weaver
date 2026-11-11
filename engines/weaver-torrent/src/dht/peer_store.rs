@@ -28,6 +28,12 @@ use crate::sha1w::{ISha1, Sha1};
 pub(crate) const PEER_LIFETIME: Duration = Duration::from_secs(45 * 60);
 // The peers kept for one info-hash: libtorrent's `dht_max_peers`.
 pub(crate) const MAX_PEERS_PER_INFO_HASH: usize = 500;
+// The most IPv4 peers one get_peers reply carries: libtorrent's
+// `dht_max_peers_reply` (settings_pack.cpp:389, v2.0.15).
+pub(crate) const MAX_PEERS_REPLY: usize = 100;
+// The most IPv6 peers one reply carries: a quarter, an IPv6 address being
+// four times the size (dht_storage.cpp:254-259, v2.0.15).
+pub(crate) const MAX_PEERS_REPLY_V6: usize = MAX_PEERS_REPLY / 4;
 // The info-hashes kept: libtorrent's `dht_max_torrents`.
 pub(crate) const MAX_INFO_HASHES: usize = 2000;
 // How often expired peers are swept out: libtorrent ticks its store every two
@@ -188,24 +194,33 @@ impl PeerStore {
         true
     }
 
+    /// The peers a get_peers reply carries: of the stored live peers of
+    /// each family `want` asks for, a uniform random sample of at most
+    /// [`MAX_PEERS_REPLY`] IPv4 and [`MAX_PEERS_REPLY_V6`] IPv6 (libtorrent
+    /// `dht_default_storage::get_peers`, dht_storage.cpp:223-283, v2.0.15).
     pub fn get_for_info_hash(&self, info_hash: Id20, want: Want) -> Vec<CompactSocketAddr> {
+        use rand::seq::IteratorRandom;
         let now = Instant::now();
         let swarms = self.swarms.read();
         let Some(peers) = swarms.get(&info_hash) else {
             return Vec::new();
         };
-        peers
-            .iter()
-            .filter(|p| p.is_live(now))
-            .filter(|p| {
-                matches!(
-                    (p.addr, want),
-                    (SocketAddr::V6(..), Want::V6 | Want::Both)
-                        | (SocketAddr::V4(..), Want::V4 | Want::Both)
-                )
-            })
-            .map(|p| p.addr.into())
-            .collect()
+        let mut rng = rand::rng();
+        let mut family = |v6: bool, most: usize| {
+            peers
+                .iter()
+                .filter(|p| p.is_live(now) && p.addr.is_ipv6() == v6)
+                .map(|p| CompactSocketAddr::from(p.addr))
+                .sample(&mut rng, most)
+        };
+        let mut out = Vec::new();
+        if matches!(want, Want::V4 | Want::Both) {
+            out.extend(family(false, MAX_PEERS_REPLY));
+        }
+        if matches!(want, Want::V6 | Want::Both) {
+            out.extend(family(true, MAX_PEERS_REPLY_V6));
+        }
+        out
     }
 
     // Drop every peer past its lifetime, and every info-hash left with none.
@@ -259,12 +274,66 @@ mod tests {
         )
     }
 
+    // Every live peer the store holds for `info_hash`.
     fn stored(store: &PeerStore, info_hash: Id20) -> HashSet<SocketAddr> {
+        let now = tokio::time::Instant::now();
         store
-            .get_for_info_hash(info_hash, Want::V4)
+            .swarms
+            .read()
+            .get(&info_hash)
             .into_iter()
-            .map(|addr| addr.0)
+            .flatten()
+            .filter(|p| p.is_live(now))
+            .map(|p| p.addr)
             .collect()
+    }
+
+    // libtorrent `dht_default_storage::get_peers`: a reply carries at most
+    // 100 IPv4 and 25 IPv6 peers, each a random pick of the live ones.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_reply_carries_a_random_sample_of_at_most_100_peers() {
+        use super::{MAX_PEERS_REPLY, MAX_PEERS_REPLY_V6};
+        let store = store();
+        let info_hash = near_info_hash(7);
+        for n in 0..300 {
+            assert!(announce(&store, info_hash, source(n)));
+            let v6 = SocketAddr::from(([0xfd00, 0, 0, 0, 0, 0, 0, n as u16 + 1], 6881));
+            assert!(announce(&store, info_hash, v6));
+        }
+        let all = stored(&store, info_hash);
+        assert_eq!(all.len(), 500);
+        let reply = |want| -> Vec<SocketAddr> {
+            store
+                .get_for_info_hash(info_hash, want)
+                .into_iter()
+                .map(|addr| addr.0)
+                .collect()
+        };
+        let v4 = reply(Want::V4);
+        assert_eq!(v4.len(), MAX_PEERS_REPLY);
+        assert!(v4.iter().all(|a| a.is_ipv4() && all.contains(a)));
+        assert_eq!(v4.iter().collect::<HashSet<_>>().len(), v4.len());
+        let v6 = reply(Want::V6);
+        assert_eq!(v6.len(), MAX_PEERS_REPLY_V6);
+        assert!(v6.iter().all(|a| a.is_ipv6() && all.contains(a)));
+        let both = reply(Want::Both);
+        assert_eq!(both.len(), MAX_PEERS_REPLY + MAX_PEERS_REPLY_V6);
+        // The sample is drawn anew each time: over many replies every
+        // stored IPv4 peer is handed out, not the first hundred alone.
+        let mut seen = HashSet::new();
+        while seen.len() < all.iter().filter(|a| a.is_ipv4()).count() {
+            seen.extend(reply(Want::V4));
+        }
+        // A swarm smaller than the cap is handed out whole.
+        let small = near_info_hash(8);
+        for n in 0..5 {
+            assert!(announce(&store, small, source(n)));
+        }
+        assert_eq!(reply_len(&store, small), 5);
+    }
+
+    fn reply_len(store: &PeerStore, info_hash: Id20) -> usize {
+        store.get_for_info_hash(info_hash, Want::V4).len()
     }
 
     #[tokio::test(start_paused = true)]

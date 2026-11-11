@@ -26,6 +26,7 @@ use crate::dht::{
     peer_store::{PEER_PURGE_INTERVAL, PeerStore},
     query_limiter::QueryLimiter,
     routing_table::{InsertResult, NodeStatus, RoutingTable},
+    send_quota::{DHT_UPLOAD_RATE_LIMIT, SendQuota},
 };
 use backon::{ExponentialBuilder, Retryable};
 use dashmap::DashMap;
@@ -736,6 +737,10 @@ pub struct DhtState {
     // Which sources have sent too many queries to be answered.
     query_limiter: parking_lot::Mutex<QueryLimiter>,
 
+    // The bytes the DHT may send: every packet spends it, and a query that
+    // arrives while it is spent goes unanswered.
+    send_quota: parking_lot::Mutex<SendQuota>,
+
     // BEP 5 "v": sent with every outgoing message when set.
     client_version: Option<ByteBufOwned>,
 
@@ -775,6 +780,10 @@ impl DhtState {
             rate_limiter: make_rate_limiter(),
             peer_store: PeerStore::new(id),
             query_limiter: parking_lot::Mutex::new(QueryLimiter::new()),
+            send_quota: parking_lot::Mutex::new(SendQuota::new(
+                DHT_UPLOAD_RATE_LIMIT,
+                tokio::time::Instant::now(),
+            )),
             cancellation_token,
             client_version,
             walks: tokio::sync::Semaphore::new(WALKS_AT_ONCE),
@@ -979,6 +988,16 @@ impl DhtState {
             .admit(addr.ip(), tokio::time::Instant::now())
         {
             trace!("ignoring a query from {addr}: it sends too many");
+            return Ok(());
+        }
+
+        // libtorrent node.cpp:324-328, v2.0.15: no budget, no answer.
+        if !self
+            .send_quota
+            .lock()
+            .has_quota(tokio::time::Instant::now())
+        {
+            trace!("dropping a query from {addr}: the DHT's send budget is spent");
             return Ok(());
         }
 
@@ -1396,6 +1415,7 @@ impl DhtWorker {
                     message.kind,
                 )
                 .unwrap();
+                self.dht.send_quota.lock().spend(buf.len());
                 if let Err(e) = socket.send_to(&buf, addr).await {
                     debug!("error sending to {addr}: {e:#}");
                     if let Some(tid) = our_tid {
