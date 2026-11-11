@@ -17,11 +17,12 @@ use weaver_torrent::{
 };
 
 use super::{PieceStorage, PieceStorageFactory, Pieces};
-use crate::torrents::files::Files;
+use crate::torrents::files::{self, Files};
 use crate::torrents::intake::Holds;
 use crate::torrents::layout::{PieceFile, PieceLayout, layout_of};
 use crate::torrents::relocate::Existing;
-use crate::torrents::service::{delete_written, move_listed};
+use crate::torrents::model::Adopted;
+use crate::torrents::service::{delete_written, deletion, move_listed};
 use crate::torrents::store::{Kept, TorrentStore};
 use weaver_torrent::storage::{
     BoxStorageFactory, StorageFactory, StorageFactoryExt, TorrentStorage,
@@ -85,8 +86,11 @@ struct Shim {
 }
 
 fn shim(piece_length: u64, files: Vec<PieceFile>) -> Shim {
+    shim_in(tempfile::tempdir().unwrap(), piece_length, files)
+}
+
+fn shim_in(dir: tempfile::TempDir, piece_length: u64, files: Vec<PieceFile>) -> Shim {
     let layout = Arc::new(PieceLayout::new(piece_length, files).unwrap());
-    let dir = tempfile::tempdir().unwrap();
     let store = store_in(&layout, dir.path(), None);
     let storage = PieceStorage::new(
         Arc::clone(&layout),
@@ -341,9 +345,13 @@ fn deleting_a_torrents_files_removes_them_and_its_output_and_nothing_else() {
     std::fs::write(dir.join("notes.txt"), b"mine").unwrap();
     shim.store.forget();
 
-    let mut written = shim.store.paths();
-    written.push(dir.join("out/member.txt"));
-    delete_written(&dir, &written);
+    let written = deletion(
+        shim.store.files(),
+        &Adopted::default(),
+        &["out/member.txt".to_owned()],
+        None,
+    );
+    delete_written(&written);
     let left: Vec<_> = std::fs::read_dir(&dir)
         .unwrap()
         .map(|entry| entry.unwrap().file_name())
@@ -351,8 +359,67 @@ fn deleting_a_torrents_files_removes_them_and_its_output_and_nothing_else() {
     assert_eq!(left, ["notes.txt"]);
 
     std::fs::remove_file(dir.join("notes.txt")).unwrap();
-    delete_written(&dir, &written);
+    delete_written(&written);
     assert!(!dir.exists());
+}
+
+// A file that was where the torrent's files go before Weaver opened it is
+// never deleted with them, nor is a folder that was there: only what Weaver
+// made goes, and each folder it made that this leaves empty.
+#[test]
+fn deleting_a_torrents_files_leaves_what_was_there_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("kept")).unwrap();
+    std::fs::write(dir.path().join("kept/a.bin"), b"the operator's").unwrap();
+    std::fs::create_dir_all(dir.path().join("empty")).unwrap();
+    let names = [
+        "kept/a.bin".to_owned(),
+        "kept/b.bin".to_owned(),
+        "made/c.bin".to_owned(),
+        "empty/d.bin".to_owned(),
+    ];
+    let adopted = files::adopted(dir.path(), &names);
+    assert_eq!(adopted.files, ["kept/a.bin"]);
+    assert!(!adopted.all_files);
+
+    let shim = shim_in(
+        dir,
+        1024,
+        names.iter().map(|name| file(name, 600)).collect(),
+    );
+    let torrent = noise(2400, 5);
+    for piece in 0..3 {
+        shim.complete(piece, &torrent);
+    }
+    let dir = shim.dir.path().to_path_buf();
+    shim.store.forget();
+    delete_written(&deletion(shim.store.files(), &adopted, &[], None));
+
+    let mut left: Vec<_> = walkdir(&dir);
+    left.sort();
+    assert_eq!(left, ["empty", "kept", "kept/a.bin"]);
+    assert!(dir.exists());
+}
+
+// Every path under the directory, relative to it.
+fn walkdir(dir: &Path) -> Vec<String> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(at) = stack.pop() {
+        for entry in std::fs::read_dir(&at).unwrap() {
+            let path = entry.unwrap().path();
+            found.push(
+                path.strip_prefix(dir)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    found
 }
 
 // libtorrent `torrent::on_piece_hashed`: a piece the check found on disk is

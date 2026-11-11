@@ -100,6 +100,14 @@ fn stored(value: u64) -> Result<i64, StateError> {
         .map_err(|_| StateError::Database(format!("{value} exceeds the database range")))
 }
 
+// What was on disk before a torrent's files, as JSON; NULL when nothing.
+fn adopted_text(adopted: &super::model::Adopted) -> Result<Option<String>, StateError> {
+    (!adopted.is_empty())
+        .then(|| serde_json::to_string(adopted))
+        .transpose()
+        .map_err(|error| StateError::Database(error.to_string()))
+}
+
 // A list as a JSON array of its strings; NULL when empty.
 fn stored_list<T: serde::Serialize>(items: &[T]) -> Result<Option<String>, StateError> {
     (!items.is_empty())
@@ -173,6 +181,18 @@ impl Database {
         torrent: &TorrentRecord,
         trackers: &[TrackerEntry],
     ) -> Result<TorrentInsert, StateError> {
+        self.insert_placed_torrent(torrent, trackers, &super::model::Adopted::default())
+    }
+
+    // [`Self::insert_torrent`], with what was already on disk where its
+    // files go, in the same transaction.
+    pub(crate) fn insert_placed_torrent(
+        &self,
+        torrent: &TorrentRecord,
+        trackers: &[TrackerEntry],
+        adopted: &super::model::Adopted,
+    ) -> Result<TorrentInsert, StateError> {
+        let adopted = adopted_text(adopted)?;
         let infohashes = torrent.infohashes();
         if infohashes.is_empty() {
             return Err(StateError::Database(
@@ -189,6 +209,7 @@ impl Database {
                 let infohashes = infohashes.clone();
                 let torrent_args = torrent_args.clone();
                 let trackers = trackers.clone();
+                let adopted = adopted.clone();
                 Box::pin(async move {
                     if let Some(existing) = torrent_by_infohash_tx(tx, &infohashes).await? {
                         return Ok(TorrentInsert::Duplicate(existing.job_id));
@@ -202,6 +223,13 @@ impl Database {
                     )
                     .await?;
                     insert_trackers(tx, id, &trackers).await?;
+                    if let Some(adopted) = adopted.clone() {
+                        tx.execute(
+                            "UPDATE torrents SET adopted = {} WHERE job_id = {}",
+                            &[SqlArg::Text(adopted), SqlArg::I64(id)],
+                        )
+                        .await?;
+                    }
                     tx.execute(
                         "INSERT INTO torrent_counters (job_id) VALUES ({})",
                         &[SqlArg::I64(job_id.0 as i64)],
@@ -441,6 +469,45 @@ impl Database {
                 .flatten()
             else {
                 return Ok(Vec::new());
+            };
+            serde_json::from_str(&text).map_err(|error| StateError::Database(error.to_string()))
+        })
+    }
+
+    // What was on disk where the torrent's files go before Weaver wrote
+    // them; nothing kept is nothing adopted.
+    pub(crate) fn set_torrent_adopted(
+        &self,
+        job_id: JobId,
+        adopted: &super::model::Adopted,
+    ) -> Result<bool, StateError> {
+        let args = vec![
+            SqlArg::OptText(adopted_text(adopted)?),
+            SqlArg::I64(stored(job_id.0)?),
+        ];
+        self.set_torrent_column("adopted", args)
+    }
+
+    // What [`Self::set_torrent_adopted`] kept.
+    pub(crate) fn torrent_adopted(
+        &self,
+        job_id: JobId,
+    ) -> Result<super::model::Adopted, StateError> {
+        let id = stored(job_id.0)?;
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT adopted FROM torrents WHERE job_id = {}",
+                &[SqlArg::I64(id)],
+            )
+            .await?;
+            let Some(text) = row
+                .map(|row| row.opt_text("adopted"))
+                .transpose()?
+                .flatten()
+            else {
+                return Ok(super::model::Adopted::default());
             };
             serde_json::from_str(&text).map_err(|error| StateError::Database(error.to_string()))
         })

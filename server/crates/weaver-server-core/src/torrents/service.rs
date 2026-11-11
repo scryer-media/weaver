@@ -59,7 +59,7 @@ use crate::settings::{
     SeedingPolicy, TorrentConfig, TorrentEncryption,
 };
 use crate::torrents::admission::{self, Manifest, Refusal};
-use crate::torrents::files::Files;
+use crate::torrents::files::{self, Files};
 use crate::torrents::identity::{ClientIdentity, TorrentIdentity};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
 use crate::torrents::layout::{PieceLayout, layout_of};
@@ -77,6 +77,7 @@ use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces};
 use crate::torrents::store::{Kept, Replayed, TorrentStore};
 use crate::torrents::tee::{Parts, Plan, Tee, plan_outputs};
+use crate::torrents::model::Adopted;
 use crate::torrents::{
     ContentLayout, FilePriority, Infohash, NamedBy, PeerInfo, TorrentCounters, TorrentFile,
     TorrentInsert, TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker,
@@ -3682,7 +3683,7 @@ impl TorrentService {
                     TorrentSource::Metainfo,
                     Some(bytes),
                 );
-                let (dir, files_dir) = self
+                let (dir, files_dir, adopted) = self
                     .place(
                         &settings,
                         category.as_ref(),
@@ -3694,7 +3695,7 @@ impl TorrentService {
                 record.storage_dir = Some(dir.clone());
                 record.files_dir = files_dir;
                 record.seed_mode = request.placement.seed_mode;
-                let mut torrent = match self.insert(record, &parsed.trackers) {
+                let mut torrent = match self.insert(record, &parsed.trackers, &adopted) {
                     Ok(torrent) => torrent,
                     Err(error) => {
                         give_back(&dir).await;
@@ -3762,7 +3763,7 @@ impl TorrentService {
                     None,
                 );
                 record.pool_member = pin;
-                let mut torrent = self.insert(record, &trackers)?;
+                let mut torrent = self.insert(record, &trackers, &Adopted::default())?;
                 self.tag_added(job_id, &request.tags);
                 let identity = identity_of(torrent.rule(&rules), &torrent.identity);
                 let terms = PeerTerms::of(&self.settings(), torrent.rule(&rules));
@@ -3899,7 +3900,9 @@ impl TorrentService {
     // (`SessionImpl::addTorrent_impl`), the metainfo's layout unless asked
     // otherwise, into whatever is there already. Files with no folder of
     // their own sit straight in the directory they go to, and the job
-    // writes in a folder of its own claimed as weaver claims one.
+    // writes in a folder of its own claimed as weaver claims one. With it,
+    // what was already in the directory the files go to before anything is
+    // made there: nothing in a folder Weaver claims.
     async fn place(
         &self,
         settings: &TorrentSettings,
@@ -3907,7 +3910,15 @@ impl TorrentService {
         record: &TorrentRecord,
         manifest: &Manifest,
         job_id: JobId,
-    ) -> Result<(String, Option<String>), AddError> {
+    ) -> Result<(String, Option<String>, Adopted), AddError> {
+        let found = |dir: PathBuf| {
+            let names = manifest.paths.clone();
+            async move {
+                tokio::task::spawn_blocking(move || files::adopted(&dir, &names))
+                    .await
+                    .map_err(|error| AddError::State(error.to_string()))
+            }
+        };
         let layout = record.content_layout;
         let category_parent = || {
             completion_parent(
@@ -3930,23 +3941,27 @@ impl TorrentService {
         match parent {
             Some(parent) if foldered => {
                 let dir = parent.join(admission::output_name(manifest));
+                let adopted = found(dir.clone()).await?;
                 made(&dir)?;
-                Ok((dir.to_string_lossy().into_owned(), None))
+                Ok((dir.to_string_lossy().into_owned(), None, adopted))
             }
             Some(parent) => {
+                let adopted = found(parent.clone()).await?;
                 made(&parent)?;
                 let dir = self.claim_dir(settings, category, manifest, job_id).await?;
-                Ok((dir, Some(parent.to_string_lossy().into_owned())))
+                Ok((dir, Some(parent.to_string_lossy().into_owned()), adopted))
             }
             None if layout.is_none_or(|layout| layout.foldered(manifest.single_file)) => Ok((
                 self.claim_dir(settings, category, manifest, job_id).await?,
                 None,
+                Adopted::default(),
             )),
             None => {
                 let parent = category_parent()?;
+                let adopted = found(parent.clone()).await?;
                 made(&parent)?;
                 let dir = self.claim_dir(settings, category, manifest, job_id).await?;
-                Ok((dir, Some(parent.to_string_lossy().into_owned())))
+                Ok((dir, Some(parent.to_string_lossy().into_owned()), adopted))
             }
         }
     }
@@ -4016,12 +4031,13 @@ impl TorrentService {
         &self,
         mut record: TorrentRecord,
         trackers: &[TrackerEntry],
+        adopted: &Adopted,
     ) -> Result<Live, AddError> {
         let rules = self.rules();
         let rule = tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
         record.forced |= rule.is_some_and(|rule| rule.forced);
         let rule_id = rule.map(|rule| rule.id);
-        match self.inner.db.insert_torrent(&record, trackers) {
+        match self.inner.db.insert_placed_torrent(&record, trackers, adopted) {
             Ok(TorrentInsert::Inserted) => {
                 let now = self.inner.clock.now_ms();
                 let mut torrent = Live::new(
@@ -4204,7 +4220,7 @@ impl TorrentService {
             v2: parsed.hashes.v2.filter(|_| known.v2.is_none()),
         })?;
         let category = settings.category(record.category_id).cloned();
-        let (dir, files_dir) = self
+        let (dir, files_dir, adopted) = self
             .place(
                 &settings,
                 category.as_ref(),
@@ -4249,6 +4265,10 @@ impl TorrentService {
         self.inner
             .db
             .set_torrent_files_dir(job_id, files_dir.as_deref())
+            .map_err(|error| AddError::State(state_error(error)))?;
+        self.inner
+            .db
+            .set_torrent_adopted(job_id, &adopted)
             .map_err(|error| AddError::State(state_error(error)))?;
         let made = self.give_metainfo(torrent, &parsed);
         drop(live);
@@ -4783,9 +4803,8 @@ impl TorrentService {
         if let Some(store) = &torrent.store {
             store.forget();
         }
-        if delete_files && let Some(dir) = torrent.record.storage_dir.clone() {
-            let deleted =
-                tokio::task::spawn_blocking(move || delete_written(Path::new(&dir), &written));
+        if delete_files {
+            let deleted = tokio::task::spawn_blocking(move || delete_written(&written));
             if let Err(error) = deleted.await {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not delete a torrent's files");
             }
@@ -4803,27 +4822,40 @@ impl TorrentService {
     }
 
     // What a deletion of the torrent's files removes (libtorrent
-    // `storage_utils::delete_files`): its listed files, what unpacking
-    // placed beside them, and its tee's directory, nothing else.
-    fn written_paths(&self, torrent: &Live) -> Vec<PathBuf> {
+    // `storage_utils::delete_files`): its listed files Weaver made, what
+    // unpacking placed beside them, and its tee's directory, nothing else.
+    // A file that was there before the torrent stays; so does a folder
+    // that was. On a failed read of what was there, every listed file is.
+    fn written_paths(&self, torrent: &Live) -> Deletion {
+        let job_id = torrent.record.job_id;
         let Some(store) = &torrent.store else {
-            return Vec::new();
+            return Deletion::default();
         };
-        let mut paths = store.paths();
-        let dir = store.files().dir();
-        let outputs = self
-            .inner
-            .db
-            .torrent_outputs(torrent.record.job_id)
-            .unwrap_or_else(|error| {
-                tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not read what a torrent unpacked");
-                Vec::new()
-            });
-        paths.extend(outputs.iter().map(|output| dir.join(output)));
+        let adopted = self.inner.db.torrent_adopted(job_id).unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not read what was on disk before a torrent");
+            Adopted {
+                all_files: true,
+                dirs: vec![String::new()],
+                ..Adopted::default()
+            }
+        });
+        let outputs = self.inner.db.torrent_outputs(job_id).unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent unpacked");
+            Vec::new()
+        });
+        // A torrent placed in a shared folder has a folder of its own
+        // claimed beside it, and the shared one is never its to remove.
+        let claimed = torrent
+            .record
+            .files_dir
+            .as_ref()
+            .and(torrent.record.storage_dir.as_deref())
+            .map(PathBuf::from);
+        let mut deletion = deletion(store.files(), &adopted, &outputs, claimed);
         if let Some(tee) = store.tee() {
-            paths.push(tee.work().to_path_buf());
+            deletion.paths.push(tee.work().to_path_buf());
         }
-        paths
+        deletion
     }
 
     async fn with_torrent<T>(
@@ -7030,9 +7062,6 @@ fn files_dir(torrent: &Live) -> PathBuf {
     )
 }
 
-// libtorrent `storage_utils::delete_files`: the torrent's files go, here
-// with what its job made of them, and then every directory that leaves
-// empty. Whatever else is in its directory stays.
 // The torrent's listed files and what unpacking put beside them, moved to
 // `to` under the lock no read or write gets past, and read and written
 // there from then on; where they went, and whether a file already there
@@ -7059,8 +7088,58 @@ pub(super) fn move_listed(
     })
 }
 
-pub(super) fn delete_written(dir: &Path, written: &[PathBuf]) {
-    for path in written {
+// What a deletion of a torrent's files removes: see `written_paths`.
+#[derive(Debug, Default)]
+pub(super) struct Deletion {
+    // The files and folders Weaver made, removed whole.
+    pub(super) paths: Vec<PathBuf>,
+    // The directory the files are in.
+    pub(super) dir: PathBuf,
+    // Whether that directory is the torrent's own, to go once empty.
+    pub(super) own: bool,
+    // The folders that were there before the torrent, which stay.
+    pub(super) kept_dirs: HashSet<PathBuf>,
+    // The folder claimed for the torrent beside a shared one, to go once
+    // empty.
+    pub(super) claimed: Option<PathBuf>,
+}
+
+// What a deletion of the files takes: each listed file not among those
+// adopted, and each of `outputs`, in the directory the files are in. With a
+// folder `claimed` beside it, that directory is a shared one, and stays.
+pub(super) fn deletion(
+    files: &Files,
+    adopted: &Adopted,
+    outputs: &[String],
+    claimed: Option<PathBuf>,
+) -> Deletion {
+    let dir = files.dir();
+    let kept = files::adopted_paths(adopted);
+    let listed = files
+        .names()
+        .flatten()
+        .filter(|name| !adopted.all_files && !kept.contains(*name))
+        .map(|name| dir.join(name));
+    let paths = listed
+        .chain(outputs.iter().map(|output| dir.join(output)))
+        .collect();
+    let kept_dirs = adopted.dirs.iter().map(|folder| dir.join(folder)).collect();
+    Deletion {
+        paths,
+        own: claimed.is_none(),
+        dir,
+        kept_dirs,
+        claimed,
+    }
+}
+
+// libtorrent `storage_utils::delete_files`: the torrent's files go, here
+// with what its job made of them, and then each folder above them, up to
+// its directory, that this leaves empty and that was not there before the
+// torrent. Whatever else is in its directory stays.
+pub(super) fn delete_written(deletion: &Deletion) {
+    let mut folders = BTreeSet::new();
+    for path in &deletion.paths {
         let removed = match std::fs::symlink_metadata(path) {
             Ok(found) if found.is_dir() => std::fs::remove_dir_all(path),
             Ok(_) => std::fs::remove_file(path),
@@ -7073,21 +7152,32 @@ pub(super) fn delete_written(dir: &Path, written: &[PathBuf]) {
                 tracing::warn!(file = %path.display(), error = %error, "could not delete a torrent's file");
             }
         }
-    }
-    remove_empty(dir);
-}
-
-// The directory, once every directory under it that is empty went first,
-// if it is empty then.
-fn remove_empty(dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                remove_empty(&entry.path());
+        for folder in path.ancestors().skip(1) {
+            if !folder.starts_with(&deletion.dir) {
+                break;
+            }
+            if folder == deletion.dir && !deletion.own {
+                break;
+            }
+            // The folders above one already taken were taken with it.
+            if !folders.insert((folder.components().count(), folder.to_path_buf())) {
+                break;
             }
         }
     }
-    let _ = std::fs::remove_dir(dir);
+    folders.extend(
+        deletion
+            .claimed
+            .iter()
+            .map(|folder| (folder.components().count(), folder.clone())),
+    );
+    // Deepest first, so a folder emptied by the one below it goes too; one
+    // that is not empty stays, as `remove_dir` leaves it.
+    for (_, folder) in folders.iter().rev() {
+        if !deletion.kept_dirs.contains(folder) {
+            let _ = std::fs::remove_dir(folder);
+        }
+    }
 }
 
 // Whether the torrent's job unpacks, as its metainfo fixed it.

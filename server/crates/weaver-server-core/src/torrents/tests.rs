@@ -102,6 +102,35 @@ fn a_torrent_round_trips_with_its_files_trackers_and_ledger() {
     assert_eq!(db.get_torrent(JobId(8)).unwrap(), None);
 }
 
+// What was on disk before a torrent's files is kept with its row, from the
+// add and from a magnet's metadata, and reads back as nothing for a torrent
+// that found nothing.
+#[test]
+fn what_was_on_disk_before_a_torrent_is_kept_with_it() {
+    use crate::torrents::model::Adopted;
+    let db = Database::open_in_memory().unwrap();
+    let found = Adopted {
+        all_files: false,
+        files: vec!["kept/a.bin".to_owned()],
+        dirs: vec![String::new(), "kept".to_owned()],
+    };
+    db.insert_placed_torrent(&torrent(5, Some([5; 20]), None), &[], &found)
+        .unwrap();
+    assert_eq!(db.torrent_adopted(JobId(5)).unwrap(), found);
+
+    db.insert_torrent(&torrent(6, Some([6; 20]), None), &[])
+        .unwrap();
+    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), Adopted::default());
+    let all = Adopted {
+        all_files: true,
+        ..Adopted::default()
+    };
+    db.set_torrent_adopted(JobId(6), &all).unwrap();
+    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), all);
+    db.set_torrent_adopted(JobId(6), &Adopted::default()).unwrap();
+    assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), Adopted::default());
+}
+
 #[test]
 fn rate_limits_update_in_place() {
     let db = Database::open_in_memory().unwrap();

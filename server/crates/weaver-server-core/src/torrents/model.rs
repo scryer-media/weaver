@@ -171,6 +171,28 @@ impl TorrentIntent {
     }
 }
 
+/// What was already on disk where a torrent's files go, before Weaver wrote
+/// any of them: a deletion of the torrent's files never removes these. Files
+/// are named as the metainfo names them; folders are relative to the
+/// directory the files sit in, `""` for that directory itself. Kept on the
+/// torrent's row, and gone with it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Adopted {
+    /// Every file was there, as in seed mode: `files` stays empty.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub all_files: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirs: Vec<String>,
+}
+
+impl Adopted {
+    pub fn is_empty(&self) -> bool {
+        !self.all_files && self.files.is_empty() && self.dirs.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TorrentRecord {
     pub job_id: JobId,
