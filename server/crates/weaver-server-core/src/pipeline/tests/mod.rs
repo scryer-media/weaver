@@ -452,8 +452,9 @@ fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, n
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
             datastore.write_exec(),
-            "UPDATE job_history SET nzb_zstd = {} WHERE job_id = {}",
-            &[SqlArg::Bytes(nzb_zstd), SqlArg::I64(job_id)],
+            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES ({}, {})
+             ON CONFLICT(job_id) DO UPDATE SET nzb_zstd = excluded.nzb_zstd",
+            &[SqlArg::I64(job_id), SqlArg::Bytes(nzb_zstd)],
         )
         .await?;
         Ok(())

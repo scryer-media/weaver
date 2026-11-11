@@ -1,17 +1,26 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Migration 85: each active job's stored NZB moves from
-// `active_jobs.nzb_zstd` to `active_job_nzbs`, each job's outline rows in
-// `active_job_nzb_files` become one compressed `active_job_outlines` row, and
-// the old column and table go. Migration 84 made the two tables.
+// Migration 85: each job's stored NZB moves to `job_nzbs`, from
+// `active_jobs.nzb_zstd` for a job in the queue and from `job_history.nzb_zstd`
+// for a finished one, each job's outline rows in `active_job_nzb_files` become
+// one compressed `active_job_outlines` row, and the two old columns and the
+// old table go. Migration 84 made the two tables.
 //
 // The NZBs are most of a database, so on SQLite they move before the
 // migration's own transaction, a few jobs at a time, each batch copied and
-// cleared on the active row and then committed. The pages a batch frees hold
-// the next batch's copy, the write-ahead log never holds more than one batch,
-// and an upgrade that is cut short carries on from the jobs still to move.
-// The transaction that follows finds none left; on Postgres it moves them all.
+// cleared on its old row and then committed: first every active job's, then
+// every finished job's. The pages a batch frees hold the next batch's copy,
+// the write-ahead log never holds more than one batch, and an upgrade that is
+// cut short carries on from the jobs still to move: a batch only takes rows
+// that still hold their NZB, and the history move starts again only once no
+// active row holds one. The transaction that follows finds none left and drops
+// the columns; on Postgres it moves them all.
+//
+// A job id is in both tables only when a build that restarted a finished job
+// stopped between writing its active row and deleting its history row. Both
+// rows then held the same bytes, read from the history row, and the active
+// row's are kept.
 //
 // An outline is read as the build below 85 read it: a job's rows in file
 // order, from index 0, stopping at the first one out of place; only jobs
@@ -35,31 +44,71 @@ const NZB_BATCH: i64 = 32;
 // Jobs whose outlines are compressed in one batch, two binds each.
 const OUTLINE_BATCH: i64 = 256;
 
+// The rows a stored NZB moves from, in the order they move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NzbSource {
+    Active,
+    History,
+}
+
+impl NzbSource {
+    const ALL: [Self; 2] = [Self::Active, Self::History];
+
+    fn table(self) -> &'static str {
+        match self {
+            Self::Active => "active_jobs",
+            Self::History => "job_history",
+        }
+    }
+
+    // A job in both tables keeps its active row's NZB, which moves first.
+    fn on_conflict(self) -> &'static str {
+        match self {
+            Self::Active => "",
+            Self::History => " ON CONFLICT (job_id) DO NOTHING",
+        }
+    }
+}
+
 // Run the step on a connection that is already inside the transaction it
 // belongs to.
 pub(crate) async fn move_nzbs_and_outlines(conn: &mut SqlConn<'_>) -> Result<(), StateError> {
-    move_nzbs(conn).await?;
+    for source in NzbSource::ALL {
+        move_nzbs(conn, source).await?;
+    }
     compress_outlines(conn).await?;
     conn.execute("DROP TABLE active_job_nzb_files", &[]).await?;
     conn.execute("ALTER TABLE active_jobs DROP COLUMN nzb_zstd", &[])
+        .await?;
+    conn.execute("ALTER TABLE job_history DROP COLUMN nzb_zstd", &[])
         .await?;
     Ok(())
 }
 
 // Move the NZBs before the migration's transaction, one committed batch at a
 // time. Alone at startup, on the migration's one connection.
+pub(crate) async fn move_nzbs_in_committed_batches(pool: &SqlitePool) -> Result<(), StateError> {
+    for source in NzbSource::ALL {
+        move_source_in_committed_batches(pool, source).await?;
+    }
+    Ok(())
+}
+
 #[expect(
     clippy::disallowed_methods,
     reason = "writer gate: the migration run, alone at startup before the gate exists"
 )]
-pub(crate) async fn move_nzbs_in_committed_batches(pool: &SqlitePool) -> Result<(), StateError> {
+async fn move_source_in_committed_batches(
+    pool: &SqlitePool,
+    source: NzbSource,
+) -> Result<(), StateError> {
     let mut after = i64::MIN;
     loop {
         let mut tx = pool
             .begin()
             .await
             .map_err(|error| StateError::Database(error.to_string()))?;
-        let moved = move_nzb_batch(&mut SqlConn::Sqlite(&mut tx), after).await?;
+        let moved = move_nzb_batch(&mut SqlConn::Sqlite(&mut tx), source, after).await?;
         tx.commit()
             .await
             .map_err(|error| StateError::Database(error.to_string()))?;
@@ -70,21 +119,29 @@ pub(crate) async fn move_nzbs_in_committed_batches(pool: &SqlitePool) -> Result<
     }
 }
 
-async fn move_nzbs(conn: &mut SqlConn<'_>) -> Result<(), StateError> {
+async fn move_nzbs(conn: &mut SqlConn<'_>, source: NzbSource) -> Result<(), StateError> {
     let mut after = i64::MIN;
-    while let Some(last) = move_nzb_batch(conn, after).await? {
+    while let Some(last) = move_nzb_batch(conn, source, after).await? {
         after = last;
     }
     Ok(())
 }
 
-// Move the next jobs after `after` that still hold their NZB on the active
-// row, and give the last of them; None once no job holds one.
-async fn move_nzb_batch(conn: &mut SqlConn<'_>, after: i64) -> Result<Option<i64>, StateError> {
+// Move the NZBs of the next jobs after `after` whose row in `source` still
+// holds one, and give the last of them; None once no row holds one. The
+// batch is read along the table's job id key from `after` on.
+async fn move_nzb_batch(
+    conn: &mut SqlConn<'_>,
+    source: NzbSource,
+    after: i64,
+) -> Result<Option<i64>, StateError> {
+    let table = source.table();
     let ids = conn
         .fetch_all(
-            "SELECT job_id FROM active_jobs
-              WHERE job_id > {} AND nzb_zstd IS NOT NULL ORDER BY job_id LIMIT {}",
+            &format!(
+                "SELECT job_id FROM {table}
+                  WHERE job_id > {{}} AND nzb_zstd IS NOT NULL ORDER BY job_id LIMIT {{}}"
+            ),
             &[SqlArg::I64(after), SqlArg::I64(NZB_BATCH)],
         )
         .await?;
@@ -93,15 +150,20 @@ async fn move_nzb_batch(conn: &mut SqlConn<'_>, after: i64) -> Result<Option<i64
     };
     let range = [SqlArg::I64(after), SqlArg::I64(last)];
     conn.execute(
-        "INSERT INTO active_job_nzbs (job_id, nzb_zstd)
-         SELECT job_id, nzb_zstd FROM active_jobs
-          WHERE job_id > {} AND job_id <= {} AND nzb_zstd IS NOT NULL",
+        &format!(
+            "INSERT INTO job_nzbs (job_id, nzb_zstd)
+             SELECT job_id, nzb_zstd FROM {table}
+              WHERE job_id > {{}} AND job_id <= {{}} AND nzb_zstd IS NOT NULL{}",
+            source.on_conflict()
+        ),
         &range,
     )
     .await?;
     conn.execute(
-        "UPDATE active_jobs SET nzb_zstd = NULL
-          WHERE job_id > {} AND job_id <= {} AND nzb_zstd IS NOT NULL",
+        &format!(
+            "UPDATE {table} SET nzb_zstd = NULL
+              WHERE job_id > {{}} AND job_id <= {{}} AND nzb_zstd IS NOT NULL"
+        ),
         &range,
     )
     .await?;
@@ -205,7 +267,7 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
     use super::super::{embedded_catalog, embedded_payload_bytes, replay_catalog_into_fresh_db};
-    use super::{NZB_BATCH, OUTLINE_BATCH, SqlitePool, move_nzb_batch};
+    use super::{NZB_BATCH, NzbSource, OUTLINE_BATCH, SqlitePool, move_nzb_batch};
     use crate::ingest::outline::{NzbOutline, OutlineFile};
     use crate::jobs::ids::JobId;
     use crate::persistence::Database;
@@ -398,16 +460,87 @@ mod tests {
         .unwrap()
     }
 
-    // Every stored NZB moves byte for byte, every outline reads back as the
-    // build below 85 read it, every other column of the active row reads the
-    // same, and the old column and table are gone. More jobs than one batch
-    // of either kind.
+    // A finished job's row as a build below 85 wrote it, its stored NZB on
+    // the row, every other column given a value that differs per job.
+    async fn add_history(pool: &SqlitePool, job: i64, nzb: Option<Vec<u8>>) {
+        sqlx::query(
+            "INSERT INTO job_history (job_id, job_hash, name, status, error_message, total_bytes,
+                 downloaded_bytes, failed_bytes, health, category, output_dir, nzb_path,
+                 nzb_zstd, created_at, completed_at, metadata, failure_kind)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(job)
+        .bind(vec![job as u8; 32])
+        .bind(format!("History {job}"))
+        .bind(if job % 3 == 0 { "failed" } else { "complete" })
+        .bind((job % 3 == 0).then(|| format!("error {job}")))
+        .bind(job * 1_000)
+        .bind(job * 900)
+        .bind(job * 3)
+        .bind(1_000 - job % 100)
+        .bind((job % 2 == 0).then_some("tv"))
+        .bind(format!("/done/job-{job}"))
+        .bind(format!("/nzbs/history-{job}.nzb"))
+        .bind(nzb)
+        .bind(1_600_000_000 + job)
+        .bind(1_600_100_000 + job)
+        .bind(format!(r#"[["h","{job}"]]"#))
+        .bind((job % 3 == 0).then_some("download"))
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    // Every history column but the stored NZB, each job's rendered as text.
+    async fn history_without_nzbs(pool: &SqlitePool) -> Vec<(i64, String)> {
+        let columns: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM pragma_table_info('job_history')
+              WHERE name != 'nzb_zstd' ORDER BY cid",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        assert!(columns.len() > 20);
+        let rendered = columns
+            .iter()
+            .map(|column| format!("quote({column})"))
+            .collect::<Vec<_>>()
+            .join(" || '|' || ");
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "SELECT job_id, {rendered} FROM job_history ORDER BY job_id"
+        )))
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    async fn count(pool: &SqlitePool, sql: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_string()))
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    async fn has_column(pool: &SqlitePool, table: &str, column: &str) -> bool {
+        count(
+            pool,
+            &format!("SELECT COUNT(*) FROM pragma_table_info('{table}') WHERE name = '{column}'"),
+        )
+        .await
+            == 1
+    }
+
+    // Every stored NZB, active and finished, moves byte for byte and reads
+    // back through the job's own read; every outline reads back as the build
+    // below 85 read it; every other column of the active and history rows
+    // reads the same; and the old columns and table are gone. More jobs than
+    // one batch of each kind.
     #[test]
     fn the_upgrade_carries_every_nzb_and_outline_over() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("weaver.db");
         let rt = runtime();
-        let (nzbs, before, narrow_before) = rt.block_on(async {
+        let (nzbs, history, before, narrow_before, history_before) = rt.block_on(async {
             let pool = pool(&path).await;
             replay_catalog_into_fresh_db(
                 &pool,
@@ -460,9 +593,36 @@ mod tests {
             add_job(&pool, 5, None, Some((&bad, 2))).await;
             add_rows(&pool, 5, &[(0, &bad.files[0])]).await;
             add_row(&pool, 5, 1, &bad.files[1], "not json").await;
+
+            // Finished jobs past three batches, every seventh without a
+            // stored NZB.
+            let mut history: HashMap<i64, Option<Vec<u8>>> = HashMap::new();
+            for job in 20_000..20_000 + 3 * NZB_BATCH + 5 {
+                let nzb =
+                    (job % 7 != 0).then(|| nzb_bytes(job as u64, 1_500 + job as usize % 11 * 700));
+                add_history(&pool, job, nzb.clone()).await;
+                history.insert(job, nzb);
+            }
+            // One finished job's NZB of several MB, one empty, and one that
+            // has none.
+            let big = nzb_bytes(30_001, 6 << 20);
+            add_history(&pool, 30_001, Some(big.clone())).await;
+            history.insert(30_001, Some(big));
+            add_history(&pool, 30_002, Some(Vec::new())).await;
+            history.insert(30_002, Some(Vec::new()));
+            add_history(&pool, 30_003, None).await;
+            history.insert(30_003, None);
+            // A restart a build cut short between writing the active row and
+            // deleting the history row: one id in both, the same bytes.
+            let shared = nzb_bytes(7, 9_000);
+            add_job(&pool, 7, Some(shared.clone()), None).await;
+            nzbs.insert(7, shared.clone());
+            add_history(&pool, 7, Some(shared)).await;
+
             let narrow_before = narrow(&pool).await;
+            let history_before = history_without_nzbs(&pool).await;
             pool.close().await;
-            (nzbs, before, narrow_before)
+            (nzbs, history, before, narrow_before, history_before)
         });
         assert!(before.contains_key(&JobId(2)));
         assert!(!before.contains_key(&JobId(4)));
@@ -482,43 +642,61 @@ mod tests {
         }
         let (_, missing) = db.load_active_job_persisted_nzb(JobId(2)).unwrap().unwrap();
         assert_eq!(missing, None);
+        for (job, nzb) in &history {
+            let (path, stored) = db
+                .load_history_job_persisted_nzb(*job as u64)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                path.to_str(),
+                Some(format!("/nzbs/history-{job}.nzb").as_str())
+            );
+            assert_eq!(stored, *nzb, "history job {job}");
+        }
+        let (_, shared) = db.load_history_job_persisted_nzb(7).unwrap().unwrap();
+        assert_eq!(shared.as_deref(), Some(nzbs[&7].as_slice()));
         drop(db);
 
         rt.block_on(async {
             let pool = pool(&path).await;
             assert_eq!(narrow(&pool).await, narrow_before);
-            let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_job_nzbs")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            assert_eq!(stored, nzbs.len() as i64);
-            let column: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM pragma_table_info('active_jobs') WHERE name = 'nzb_zstd'",
-            )
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert_eq!(column, 0);
-            let table: i64 = sqlx::query_scalar(
+            assert_eq!(history_without_nzbs(&pool).await, history_before);
+            let stored_history = history.values().filter(|nzb| nzb.is_some()).count();
+            assert_eq!(
+                count(&pool, "SELECT COUNT(*) FROM job_nzbs").await,
+                (nzbs.len() + stored_history) as i64
+            );
+            assert!(!has_column(&pool, "active_jobs", "nzb_zstd").await);
+            assert!(!has_column(&pool, "job_history", "nzb_zstd").await);
+            let table = count(
+                &pool,
                 "SELECT COUNT(*) FROM sqlite_master WHERE name = 'active_job_nzb_files'",
             )
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+            .await;
             assert_eq!(table, 0);
             pool.close().await;
         });
     }
 
+    // How far an upgrade got before it was cut short.
+    #[derive(Clone, Copy, Debug)]
+    enum Cut {
+        // Some active batches committed.
+        InActiveMove,
+        // Every active NZB moved, no finished job's yet.
+        BetweenMoves,
+        // Every active NZB and some finished jobs' moved.
+        InHistoryMove,
+    }
+
     // An upgrade cut short after some committed batches leaves every NZB in
     // exactly one place, and the next start moves the rest.
-    #[test]
-    fn an_upgrade_cut_short_carries_on_from_the_jobs_still_to_move() {
+    fn cut_short_upgrade(cut: Cut) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("weaver.db");
         let rt = runtime();
         let jobs = 3 * NZB_BATCH + 5;
-        let nzbs = rt.block_on(async {
+        let (nzbs, history) = rt.block_on(async {
             let pool = pool(&path).await;
             replay_catalog_into_fresh_db(
                 &pool,
@@ -535,34 +713,77 @@ mod tests {
                 add_job(&pool, job, Some(nzb.clone()), None).await;
                 nzbs.insert(job, nzb);
             }
-            // Two batches commit, then the upgrade stops.
-            let mut after = i64::MIN;
-            for _ in 0..2 {
+            let mut history: HashMap<i64, Option<Vec<u8>>> = HashMap::new();
+            for job in 1_000..1_000 + jobs {
+                let nzb =
+                    (job % 5 != 0).then(|| nzb_bytes(job as u64, 2_500 + job as usize % 3 * 400));
+                add_history(&pool, job, nzb.clone()).await;
+                history.insert(job, nzb);
+            }
+            let with_nzb = history.values().filter(|nzb| nzb.is_some()).count() as i64;
+
+            let batch = async |source, after| {
                 let mut tx = pool.begin().await.unwrap();
-                after = move_nzb_batch(&mut SqlConn::Sqlite(&mut tx), after)
+                let last = move_nzb_batch(&mut SqlConn::Sqlite(&mut tx), source, after)
                     .await
-                    .unwrap()
                     .unwrap();
                 tx.commit().await.unwrap();
+                last
+            };
+            let (active_batches, history_batches) = match cut {
+                Cut::InActiveMove => (2, 0),
+                Cut::BetweenMoves => (usize::MAX, 0),
+                Cut::InHistoryMove => (usize::MAX, 2),
+            };
+            for (source, batches) in [
+                (NzbSource::Active, active_batches),
+                (NzbSource::History, history_batches),
+            ] {
+                let mut after = i64::MIN;
+                for _ in 0..batches {
+                    match batch(source, after).await {
+                        Some(last) => after = last,
+                        None => break,
+                    }
+                }
             }
-            let moved: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_job_nzbs")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            assert_eq!(moved, 2 * NZB_BATCH);
-            // Each job's NZB is in the new table or on its active row, never
+            let (active_moved, history_moved) = match cut {
+                Cut::InActiveMove => (2 * NZB_BATCH, 0),
+                Cut::BetweenMoves => (jobs, 0),
+                Cut::InHistoryMove => (jobs, 2 * NZB_BATCH),
+            };
+            assert!(history_moved < with_nzb);
+            assert_eq!(
+                count(&pool, "SELECT COUNT(*) FROM job_nzbs").await,
+                active_moved + history_moved,
+                "{cut:?}"
+            );
+            // Each job's NZB is in the new table or on its old row, never
             // both and never neither.
-            let both_or_neither: i64 = sqlx::query_scalar(
+            let active_both_or_neither = count(
+                &pool,
                 "SELECT COUNT(*) FROM active_jobs AS a
-                  LEFT JOIN active_job_nzbs AS n ON n.job_id = a.job_id
+                  LEFT JOIN job_nzbs AS n ON n.job_id = a.job_id
                   WHERE (a.nzb_zstd IS NULL) = (n.job_id IS NULL)",
             )
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-            assert_eq!(both_or_neither, 0);
+            .await;
+            assert_eq!(active_both_or_neither, 0, "{cut:?}");
+            let history_both = count(
+                &pool,
+                "SELECT COUNT(*) FROM job_history AS h
+                   JOIN job_nzbs AS n ON n.job_id = h.job_id
+                  WHERE h.nzb_zstd IS NOT NULL",
+            )
+            .await;
+            assert_eq!(history_both, 0, "{cut:?}");
+            let history_on_rows = count(
+                &pool,
+                "SELECT COUNT(*) FROM job_history WHERE nzb_zstd IS NOT NULL",
+            )
+            .await;
+            assert_eq!(history_on_rows, with_nzb - history_moved, "{cut:?}");
             pool.close().await;
-            nzbs
+            (nzbs, history)
         });
 
         // The next start runs the upgrade from where it stopped.
@@ -574,14 +795,92 @@ mod tests {
                 .unwrap();
             assert_eq!(stored.1.as_deref(), Some(nzb.as_slice()), "job {job}");
         }
+        for (job, nzb) in &history {
+            let (_, stored) = db
+                .load_history_job_persisted_nzb(*job as u64)
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored, *nzb, "history job {job}");
+        }
         drop(db);
         rt.block_on(async {
             let pool = pool(&path).await;
-            let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM active_job_nzbs")
-                .fetch_one(&pool)
-                .await
-                .unwrap();
-            assert_eq!(stored, jobs);
+            let stored_history = history.values().filter(|nzb| nzb.is_some()).count() as i64;
+            assert_eq!(
+                count(&pool, "SELECT COUNT(*) FROM job_nzbs").await,
+                jobs + stored_history
+            );
+            assert!(!has_column(&pool, "job_history", "nzb_zstd").await);
+            pool.close().await;
+        });
+    }
+
+    #[test]
+    fn an_upgrade_cut_short_carries_on_from_the_jobs_still_to_move() {
+        cut_short_upgrade(Cut::InActiveMove);
+    }
+
+    #[test]
+    fn an_upgrade_cut_short_between_the_moves_carries_on_with_the_history() {
+        cut_short_upgrade(Cut::BetweenMoves);
+    }
+
+    #[test]
+    fn an_upgrade_cut_short_in_the_history_move_carries_on_from_the_jobs_still_to_move() {
+        cut_short_upgrade(Cut::InHistoryMove);
+    }
+
+    // Each batch reads and writes along the job id key from where the last
+    // one stopped, so a history of any size costs one pass, not a scan per
+    // batch.
+    #[test]
+    fn a_batch_reads_along_the_job_id_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("weaver.db");
+        runtime().block_on(async {
+            let pool = pool(&path).await;
+            replay_catalog_into_fresh_db(
+                &pool,
+                &embedded_catalog().unwrap(),
+                &embedded_payload_bytes().unwrap(),
+                Some(BELOW),
+                true,
+            )
+            .await
+            .unwrap();
+            for source in NzbSource::ALL {
+                let table = source.table();
+                for sql in [
+                    format!(
+                        "SELECT job_id FROM {table}
+                          WHERE job_id > 1 AND nzb_zstd IS NOT NULL ORDER BY job_id LIMIT 32"
+                    ),
+                    format!(
+                        "SELECT job_id, nzb_zstd FROM {table}
+                          WHERE job_id > 1 AND job_id <= 40 AND nzb_zstd IS NOT NULL"
+                    ),
+                    format!(
+                        "UPDATE {table} SET nzb_zstd = NULL
+                          WHERE job_id > 1 AND job_id <= 40 AND nzb_zstd IS NOT NULL"
+                    ),
+                ] {
+                    let plan: Vec<(i64, i64, i64, String)> =
+                        sqlx::query_as(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {sql}")))
+                            .fetch_all(&pool)
+                            .await
+                            .unwrap();
+                    let detail = plan
+                        .iter()
+                        .map(|row| row.3.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    assert!(
+                        detail.contains(&format!("SEARCH {table} USING INTEGER PRIMARY KEY")),
+                        "{sql}: {detail}"
+                    );
+                    assert!(!detail.contains("TEMP B-TREE"), "{sql}: {detail}");
+                }
+            }
             pool.close().await;
         });
     }

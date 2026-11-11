@@ -383,7 +383,7 @@ impl Database {
                 datastore.read_exec(),
                 "SELECT a.nzb_path, n.nzb_zstd
                  FROM active_jobs AS a
-                 LEFT JOIN active_job_nzbs AS n ON n.job_id = a.job_id
+                 LEFT JOIN job_nzbs AS n ON n.job_id = a.job_id
                  WHERE a.job_id = {}
                  LIMIT 1",
                 &[SqlArg::I64(job_id.0 as i64)],
@@ -421,7 +421,7 @@ impl Database {
                     datastore.read_exec(),
                     "SELECT a.nzb_path, n.nzb_zstd, a.password_candidates
                      FROM active_jobs AS a
-                     LEFT JOIN active_job_nzbs AS n ON n.job_id = a.job_id
+                     LEFT JOIN job_nzbs AS n ON n.job_id = a.job_id
                      WHERE a.job_id = {}
                      LIMIT 1",
                     &[SqlArg::I64(job_id.0 as i64)],

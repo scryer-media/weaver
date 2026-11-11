@@ -576,7 +576,7 @@ fn classify_sql(template: &str) -> String {
         "active_extracted",
         "active_detected_archives",
         "active_files",
-        "active_job_nzbs",
+        "job_nzbs",
         "active_job_outlines",
         "active_jobs",
         "job_events",
