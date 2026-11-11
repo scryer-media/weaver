@@ -211,10 +211,8 @@ impl TorrentIndex {
     ) {
         for hash in hashes.ids20() {
             self.by_hash.insert(hash, id);
-            self.by_obfuscated.insert(
-                crate::mse::obfuscated_hash(&hash),
-                (hash, id, encryption),
-            );
+            self.by_obfuscated
+                .insert(crate::mse::obfuscated_hash(&hash), (hash, id, encryption));
         }
         if let Some(policy) = encryption {
             self.overrides[Self::slot(policy)] += 1;
@@ -6670,7 +6668,11 @@ mod tests {
     // Connects to the session, keys an encrypted stream to `skey` and sends
     // a handshake for `greeted` in it; returns what came back of the
     // session's handshake, nothing when the connection was closed.
-    async fn greet_encrypted(session: &Session, skey: super::Id20, greeted: super::Id20) -> Vec<u8> {
+    async fn greet_encrypted(
+        session: &Session,
+        skey: super::Id20,
+        greeted: super::Id20,
+    ) -> Vec<u8> {
         use tokio::io::AsyncReadExt;
         let (read, write) = crate::test_support::tcp(session.listen_addr().unwrap())
             .await

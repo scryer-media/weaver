@@ -815,9 +815,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     }
                     let out = &mut buf[filled..];
                     let framed = match req {
-                        WriterRequest::Message(msg) => {
-                            addressed(msg.serialize(out, ext_msg_ids))?
-                        }
+                        WriterRequest::Message(msg) => addressed(msg.serialize(out, ext_msg_ids))?,
                         WriterRequest::UtMetadata(utm) => addressed(
                             Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
                                 .serialize(out, ext_msg_ids),
@@ -1546,9 +1544,8 @@ mod tests {
             // after them.
             let mut sent = Vec::new();
             let mut rejects = Vec::new();
-            let word = |body: &[u8], at: usize| {
-                u32::from_be_bytes(body[at..at + 4].try_into().unwrap())
-            };
+            let word =
+                |body: &[u8], at: usize| u32::from_be_bytes(body[at..at + 4].try_into().unwrap());
             loop {
                 let mut body = vec![0; theirs.read_u32().await.unwrap() as usize];
                 theirs.read_exact(&mut body).await.unwrap();

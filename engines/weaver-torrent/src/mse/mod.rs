@@ -483,8 +483,7 @@ pub(crate) async fn respond(
     let req3 = hash(&[b"req3", &s]);
     let mut masked = [0u8; 20];
     masked.copy_from_slice(&wire.buf[pos..pos + 20]);
-    let (skey, policy) =
-        find(&Id20::new(xor20(masked, req3))).ok_or(MseError::UnknownInfoHash)?;
+    let (skey, policy) = find(&Id20::new(xor20(masked, req3))).ok_or(MseError::UnknownInfoHash)?;
     let allowed = policy.methods();
     pos += 20;
 
