@@ -3838,6 +3838,23 @@ async fn a_connection_starts_one_pex_sender_however_many_handshakes_name_ut_pex(
     assert_eq!(peer.tx.strong_count(), senders + 1);
 }
 
+// A PEX tick taken late puts the next a full minute after it: a peer held
+// up past two ticks is not sent the missed ones back to back.
+#[tokio::test]
+async fn a_late_pex_tick_puts_the_next_a_full_interval_after_it() {
+    use futures::FutureExt;
+    tokio::time::pause();
+    let period = Duration::from_secs(60);
+    let mut interval = super::pex_interval(period);
+    interval.tick().await;
+    tokio::time::advance(Duration::from_secs(150)).await;
+    interval.tick().await;
+    let late = tokio::time::Instant::now();
+    assert!(interval.tick().now_or_never().is_none());
+    tokio::time::advance(period).await;
+    assert_eq!(interval.tick().await, late + period);
+}
+
 // BEP 27: a private torrent added with the DHT, local discovery and peer
 // exchange all left on still takes peers from its trackers alone: it
 // advertises no peer exchange, reads none, and looks on neither the DHT nor

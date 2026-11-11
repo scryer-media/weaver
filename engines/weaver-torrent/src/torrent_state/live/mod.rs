@@ -2147,7 +2147,7 @@ impl TorrentStateLive {
         // Wait 10 seconds before sending the first message to assure that peer will stay with us
         tokio::time::sleep(Duration::from_secs(10)).await;
 
-        let mut interval = tokio::time::interval(PEX_MESSAGE_INTERVAL);
+        let mut interval = pex_interval(PEX_MESSAGE_INTERVAL);
 
         loop {
             interval.tick().await;
@@ -2165,6 +2165,16 @@ impl TorrentStateLive {
             }
         }
     }
+}
+
+// The ticks a peer's PEX messages go out on. A tick missed while the task
+// was held up is taken late and the next comes a full `period` after it, so
+// two messages never go out back to back (libtorrent
+// `ut_pex_peer_plugin::tick`, ut_pex.cpp:92: a minute from the last message).
+fn pex_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
 }
 
 // libtorrent `ut_pex_peer_plugin::on_extended`: the longest PEX message a
