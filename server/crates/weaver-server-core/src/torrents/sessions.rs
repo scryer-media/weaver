@@ -31,8 +31,8 @@ use crate::bandwidth::TorrentRates;
 use crate::persistence::Database;
 use crate::proxies::{
     Consumer, EgressBinding, EgressHealth, EgressInterface, EgressLimitChanges, FetchOptions,
-    LegPath, NetworkRuntime, ProxyRuntime, ResolvedBy, Route, RoutingPolicy, Rung,
-    SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope, pool_of, routed_fetch,
+    LegPath, MulticastInterfaces, NetworkRuntime, ProxyRuntime, ResolvedBy, Route, RoutingPolicy,
+    Rung, SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope, pool_of, routed_fetch,
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::IDENTITY;
@@ -388,6 +388,11 @@ pub trait Routes: Send + Sync {
     fn egress_limit_changes(&self) -> Option<EgressLimitChanges> {
         None
     }
+    /// What rings as the host's interfaces change as multicast sees them;
+    /// none when nothing watches them.
+    fn interface_changes(&self) -> Option<tokio::sync::watch::Receiver<MulticastInterfaces>> {
+        None
+    }
 }
 
 /// Routes as the network runtime resolves them.
@@ -523,6 +528,10 @@ impl Routes for NetworkRoutes {
 
     fn egress_limit_changes(&self) -> Option<EgressLimitChanges> {
         self.network().egress_limit_changes()
+    }
+
+    fn interface_changes(&self) -> Option<tokio::sync::watch::Receiver<MulticastInterfaces>> {
+        Some(self.network().interface_changes())
     }
 
     // Fetched once for every route, so on Default outbound, which carries
@@ -748,13 +757,81 @@ pub fn session_options(
             torrent.stop_tracker_timeout_secs.into(),
         )),
         ip_filter,
-        disable_local_service_discovery: !shape.own_sockets,
+        disable_local_service_discovery: !runs_local_discovery(shape),
         resolver: Some(Arc::clone(&leg.names)),
         http_client: Some(leg.http.clone()),
         ..SessionOptions::new(Arc::clone(&leg.factory))
     };
     apply_encryption(&mut options, torrent.encryption);
     options
+}
+
+/// Whether a session on a leg of `shape` runs local service discovery: only
+/// one whose sockets are its own. Its groups are on the local network,
+/// which a proxy or a tunnel does not reach.
+pub(crate) const fn runs_local_discovery(shape: Shape) -> bool {
+    shape.own_sockets
+}
+
+/// A session whose local service discovery can join its groups again.
+pub(crate) trait LocalDiscovery: Send + Sync + 'static {
+    fn rejoin_local_discovery(&self) -> anyhow::Result<()>;
+}
+
+impl LocalDiscovery for Session {
+    fn rejoin_local_discovery(&self) -> anyhow::Result<()> {
+        Session::rejoin_local_discovery(self)
+    }
+}
+
+/// Joins local service discovery's groups again on the interfaces up now,
+/// for each of the `open` sessions, by route and leg shape, that runs it;
+/// the others are left alone. The joins run together off the async
+/// threads. One that fails is logged, and that session keeps the groups it
+/// joined before.
+pub(crate) async fn rejoin_local_discovery<S: LocalDiscovery>(
+    open: Vec<(RouteKey, Shape, Arc<S>)>,
+) {
+    let rejoining: Vec<_> = open
+        .into_iter()
+        .filter(|(_, shape, _)| runs_local_discovery(*shape))
+        .map(|(key, _, session)| (key, session))
+        .collect();
+    if rejoining.is_empty() {
+        return;
+    }
+    let joined = tokio::task::spawn_blocking(move || {
+        for (key, session) in rejoining {
+            match session.rejoin_local_discovery() {
+                Ok(()) => tracing::debug!(
+                    route = key.as_str(),
+                    "local service discovery joined again on the interfaces up now"
+                ),
+                Err(error) => tracing::warn!(
+                    route = key.as_str(),
+                    error = format!("{error:#}"),
+                    "local service discovery could not join again; it keeps the interfaces it had"
+                ),
+            }
+        }
+    })
+    .await;
+    if let Err(error) = joined {
+        tracing::warn!(%error, "local service discovery's rejoin did not finish");
+    }
+}
+
+/// Runs `run` once for each time `changes` rings, until its sender goes:
+/// every change that rang since the last run is taken by the next one.
+pub(crate) async fn each_change<T, F, Run>(mut changes: tokio::sync::watch::Receiver<T>, mut run: F)
+where
+    F: FnMut() -> Run,
+    Run: std::future::Future<Output = ()>,
+{
+    while changes.changed().await.is_ok() {
+        changes.borrow_and_update();
+        run().await;
+    }
 }
 
 /// Why a session could not be had.
@@ -1397,6 +1474,35 @@ impl Sessions {
             .iter()
             .filter_map(|(key, slot)| Some((key.clone(), Arc::clone(slot.running()?))))
             .collect()
+    }
+
+    /// Joins local service discovery's groups again on every running
+    /// session that runs it, on the interfaces up now.
+    pub async fn rejoin_local_discovery(&self) {
+        let open: Vec<_> = {
+            let slots = self.slots.lock().await;
+            slots
+                .iter()
+                .filter_map(|(key, slot)| {
+                    let session = slot.running()?;
+                    let Slot::Open { opening, .. } = slot else {
+                        return None;
+                    };
+                    Some((key.clone(), opening.shape, Arc::clone(session)))
+                })
+                .collect()
+        };
+        rejoin_local_discovery(open).await;
+    }
+
+    /// Joins local service discovery again each time `changes` rings, until
+    /// its sender goes. Changes that ring while a rejoin runs are taken by
+    /// one more, on the interfaces up then.
+    pub async fn follow_interfaces(
+        &self,
+        changes: tokio::sync::watch::Receiver<MulticastInterfaces>,
+    ) {
+        each_change(changes, || self.rejoin_local_discovery()).await;
     }
 
     /// Close `key`'s session and hold it closed for `reason`, its route
