@@ -200,33 +200,69 @@ pub enum ConnectionState {
 // Minimum allowed timeout value (1 second).
 const MIN_TIMEOUT: Duration = Duration::from_secs(1);
 
-// Internal NNTP buffer sizing profile.
+// The read buffer sizes of one NNTP connection, and the only source of them.
+//
+// A connection holds at most `read_buf_capacity` plus `socket_read_size`
+// bytes of read buffers: the read buffer the decoder reads from, and, on a
+// rustls connection, the ciphertext buffer each socket read fills. A plain
+// connection reads the socket straight into the read buffer and holds only
+// that; s2n buffers records itself and reads `socket_read_size` per call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NntpBufferProfile {
     pub read_buf_capacity: usize,
     pub socket_read_size: usize,
 }
 
+// The largest socket read, taken whenever memory allows.
+const SOCKET_READ_MAX: usize = 256 * 1024;
+// The smallest: two TLS records.
+const SOCKET_READ_FLOOR: usize = 32 * 1024;
+// All connections together keep their read buffers within this share of
+// memory, and within `READ_BUFFER_BUDGET_MAX`, unless the floor needs more.
+const READ_BUFFER_MEMORY_SHARE: u64 = 32;
+const READ_BUFFER_BUDGET_MAX: u64 = 256 * 1024 * 1024;
+
 impl NntpBufferProfile {
+    // Sizes for one of `total_connections` connections on a host with
+    // `available_bytes` of memory. Every connection's buffers fit the shared
+    // budget until the floor stops them shrinking.
     pub fn adaptive(available_bytes: u64, total_connections: usize) -> Self {
-        let total_budget = (available_bytes / 32).min(256 * 1024 * 1024) as usize;
-        let per_connection = total_budget
-            .checked_div(total_connections)
-            .unwrap_or(128 * 1024)
-            .clamp(128 * 1024, 512 * 1024);
+        let total_budget =
+            (available_bytes / READ_BUFFER_MEMORY_SHARE).min(READ_BUFFER_BUDGET_MAX) as usize;
+        let per_connection = total_budget / total_connections.max(1);
+        // The read buffer is two socket reads: one read, what the last read
+        // left of a line, and room for the records a TLS read decrypts.
+        Self::with_socket_read(allocation_size_at_most(per_connection / 3))
+    }
+
+    fn with_socket_read(socket_read_size: usize) -> Self {
+        let socket_read_size = socket_read_size.clamp(SOCKET_READ_FLOOR, SOCKET_READ_MAX);
         Self {
-            read_buf_capacity: per_connection,
-            socket_read_size: per_connection.min(256 * 1024),
+            read_buf_capacity: 2 * socket_read_size,
+            socket_read_size,
         }
+    }
+
+    // The most read buffer memory one connection holds.
+    pub(crate) fn per_connection_bytes(&self) -> usize {
+        self.read_buf_capacity + self.socket_read_size
     }
 }
 
+// The largest allocator size class at or below `bytes`. Classes come four to
+// each doubling, so a buffer of this size is never rounded up past its share.
+fn allocation_size_at_most(bytes: usize) -> usize {
+    if bytes < 16 * 1024 {
+        return bytes;
+    }
+    let step = (1usize << bytes.ilog2()) / 4;
+    bytes / step * step
+}
+
+// A connection outside the download pool: the smallest sizes.
 impl Default for NntpBufferProfile {
     fn default() -> Self {
-        Self {
-            read_buf_capacity: 64 * 1024,
-            socket_read_size: 64 * 1024,
-        }
+        Self::with_socket_read(SOCKET_READ_FLOOR)
     }
 }
 
@@ -449,7 +485,7 @@ impl NntpConnection {
 
         let now = Instant::now();
         let remote_addr = transport.remote_addr();
-        let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
+        let read_buf_capacity = config.buffer_profile.read_buf_capacity;
         let mut conn = NntpConnection {
             egress_control: route_path.as_ref().map(|path| {
                 config
@@ -1996,8 +2032,7 @@ impl NntpConnection {
         let target = self
             .buffer_profile
             .read_buf_capacity
-            .max(self.read_buf.len())
-            .max(64 * 1024);
+            .max(self.read_buf.len());
         if self.read_buf.capacity() > target.saturating_mul(2) {
             let mut trimmed = BytesMut::with_capacity(target);
             trimmed.extend_from_slice(&self.read_buf);
@@ -2006,7 +2041,7 @@ impl NntpConnection {
     }
 
     async fn read_into_buffer(&mut self) -> Result<usize> {
-        let socket_read_size = self.buffer_profile.socket_read_size.max(64 * 1024);
+        let socket_read_size = self.buffer_profile.socket_read_size;
         self.read_buf.reserve(socket_read_size);
         let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
         let n = transport
@@ -2034,7 +2069,7 @@ impl NntpConnection {
     }
 
     async fn read_into_buffer_with_stats(&mut self) -> Result<(usize, TransportReadStats)> {
-        let socket_read_size = self.buffer_profile.socket_read_size.max(64 * 1024);
+        let socket_read_size = self.buffer_profile.socket_read_size;
         self.read_buf.reserve(socket_read_size);
         let transport = self.transport.as_mut().ok_or(NntpError::ConnectionClosed)?;
         let read = transport

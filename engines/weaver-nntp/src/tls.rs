@@ -177,7 +177,6 @@ pin_project_lite::pin_project! {
     }
 }
 
-pub(crate) const TLS_READ_BUFFER: usize = 256 * 1024;
 pub(crate) const TLS_READ_TURN_LIMIT: usize = 1024 * 1024;
 // The most plaintext one TLS record carries.
 pub(crate) const TLS_RECORD_PLAINTEXT: usize = 16 * 1024;
@@ -558,7 +557,9 @@ impl ManualTlsStream {
         let mut stream = Self {
             tcp: tcp.into(),
             session,
-            read_buffer: vec![0u8; TLS_READ_BUFFER],
+            // One record's worth for the handshake; the first read sizes it
+            // to the connection's profile.
+            read_buffer: vec![0u8; TLS_RECORD_PLAINTEXT],
         };
         stream.complete_handshake().await.map_err(NntpError::Io)?;
         Ok(stream)
@@ -622,7 +623,7 @@ impl ManualTlsStream {
             return Ok(drained);
         }
 
-        let read_size = target_read_size.clamp(TLS_READ_BUFFER, TLS_READ_TURN_LIMIT);
+        let read_size = target_read_size.clamp(1, TLS_READ_TURN_LIMIT);
         if self.read_buffer.len() < read_size {
             self.read_buffer.resize(read_size, 0);
         }

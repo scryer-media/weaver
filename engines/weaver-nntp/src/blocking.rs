@@ -41,8 +41,7 @@ use crate::fused_yenc::{
 use crate::pool::{BlockingConnectionPermit, ServerId};
 use crate::response::parse_response;
 use crate::tls::{
-    NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TLS_RECORD_PLAINTEXT, TlsCipherPreference,
-    TransportReadStats,
+    NntpTlsBackend, RustlsSession, TLS_RECORD_PLAINTEXT, TlsCipherPreference, TransportReadStats,
     build_tls_config_with_name_mismatch_certificate, make_server_name,
     selected_blocking_tls_backend, tls_backend_for_preference,
 };
@@ -1287,7 +1286,7 @@ impl BlockingNntpConnection {
             BlockingTransport::Plain(tcp)
         };
 
-        let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
+        let read_buf_capacity = config.buffer_profile.read_buf_capacity;
         let mut conn = Self {
             route_path: None,
             egress_control: None,
@@ -2451,9 +2450,9 @@ impl BlockingNntpConnection {
         // before the first read rather than growing into it.
         if self.read_buf.capacity() == 0 {
             self.read_buf
-                .reserve(self.buffer_profile.read_buf_capacity.max(64 * 1024));
+                .reserve(self.buffer_profile.read_buf_capacity);
         }
-        let socket_read_size = self.buffer_profile.socket_read_size.max(64 * 1024);
+        let socket_read_size = self.buffer_profile.socket_read_size;
         let (n, stats) = self
             .transport
             .read_into_buf(&mut self.read_buf, socket_read_size, timeout)
@@ -2511,7 +2510,7 @@ impl BlockingTransport {
                 // An idle lane may have freed its read buffer; a zero-length
                 // read would look like the peer closing.
                 if inner.read_buffer.is_empty() {
-                    inner.read_buffer.resize(16 * 1024, 0);
+                    inner.read_buffer.resize(TLS_RECORD_PLAINTEXT, 0);
                 }
                 let closed = loop {
                     if inner.session.idle_terminal() {
@@ -2656,7 +2655,9 @@ impl BlockingManualTlsStream {
         let mut stream = Self {
             tcp,
             session,
-            read_buffer: vec![0u8; TLS_READ_BUFFER],
+            // One record's worth for the handshake; the first read sizes it
+            // to the profile.
+            read_buffer: vec![0u8; TLS_RECORD_PLAINTEXT],
             stats: BlockingLaneStats::default(),
         };
         stream.complete_handshake().map_err(NntpError::Io)?;
@@ -2707,7 +2708,7 @@ impl BlockingManualTlsStream {
         }
 
         self.tcp.set_read_timeout(Some(timeout))?;
-        let read_size = target_read_size.max(TLS_READ_BUFFER);
+        let read_size = target_read_size.max(1);
         if self.read_buffer.len() < read_size {
             self.read_buffer.resize(read_size, 0);
         }

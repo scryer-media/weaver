@@ -212,3 +212,106 @@ fn an_s2n_lane_keeps_its_read_buffer_at_the_ordinary_size() {
     let _guard = s2n_test_guard();
     tls_lane_stays_within(ordinary(), NntpTlsBackend::S2n);
 }
+
+// The profile at the most connections any host gives: every buffer at its
+// floor.
+fn crowded() -> NntpBufferProfile {
+    NntpBufferProfile::adaptive(2 << 30, 5000)
+}
+
+#[test]
+fn a_plain_lane_keeps_its_read_buffer_at_the_floor() {
+    plain_lane_stays_within(crowded());
+}
+
+#[test]
+fn a_rustls_lane_keeps_its_read_buffers_at_the_floor() {
+    tls_lane_stays_within(crowded(), NntpTlsBackend::ManualRustls);
+}
+
+#[cfg(not(windows))]
+#[test]
+fn an_s2n_lane_keeps_its_read_buffer_at_the_floor() {
+    let _guard = s2n_test_guard();
+    tls_lane_stays_within(crowded(), NntpTlsBackend::S2n);
+}
+
+const GIB: u64 = 1 << 30;
+const KIB: usize = 1024;
+
+fn budget(available: u64) -> usize {
+    (available / 32).min(256 << 20) as usize
+}
+
+#[test]
+fn ordinary_connection_counts_keep_the_full_sizes() {
+    for available in [8 * GIB, 16 * GIB, 64 * GIB] {
+        for connections in 1..=100 {
+            assert_eq!(
+                NntpBufferProfile::adaptive(available, connections),
+                NntpBufferProfile {
+                    read_buf_capacity: 512 * KIB,
+                    socket_read_size: 256 * KIB,
+                },
+                "{connections} connections on {} GiB",
+                available / GIB
+            );
+        }
+    }
+}
+
+#[test]
+fn every_connection_count_fits_the_budget_or_sits_at_the_floor() {
+    let floor = NntpBufferProfile::default();
+    assert_eq!(floor.socket_read_size, 32 * KIB);
+    assert_eq!(floor.read_buf_capacity, 64 * KIB);
+    for available in [GIB, 2 * GIB, 4 * GIB, 8 * GIB, 64 * GIB, 512 * GIB] {
+        let mut last = usize::MAX;
+        for connections in (1..=20_000).step_by(7) {
+            let profile = NntpBufferProfile::adaptive(available, connections);
+            assert_eq!(profile.read_buf_capacity, 2 * profile.socket_read_size);
+            assert!(
+                profile.per_connection_bytes() <= last,
+                "more connections never get more memory each"
+            );
+            last = profile.per_connection_bytes();
+            assert!(
+                profile == floor
+                    || profile.per_connection_bytes() * connections <= budget(available),
+                "{connections} connections on {available} bytes: {profile:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn zero_connections_get_the_whole_budget() {
+    assert_eq!(
+        NntpBufferProfile::adaptive(8 * GIB, 0),
+        NntpBufferProfile::adaptive(8 * GIB, 1)
+    );
+}
+
+// The size table, printed for the record: run with `--no-capture`.
+#[test]
+fn buffer_size_table() {
+    eprintln!("BUFFER_TABLE host connections read_buf socket_read tls_total_mib plain_total_mib budget_mib");
+    for available in [2 * GIB, 8 * GIB, 64 * GIB] {
+        for connections in [20, 50, 100, 500, 1000, 2000, 5000] {
+            let profile = NntpBufferProfile::adaptive(available, connections);
+            let mib = |bytes: usize| bytes as f64 / (1 << 20) as f64;
+            let tls_total = profile.per_connection_bytes() * connections;
+            let plain_total = profile.read_buf_capacity * connections;
+            eprintln!(
+                "BUFFER_TABLE {}GiB {connections} {}K {}K {:.1} {:.1} {:.0}",
+                available / GIB,
+                profile.read_buf_capacity / KIB,
+                profile.socket_read_size / KIB,
+                mib(tls_total),
+                mib(plain_total),
+                mib(budget(available)),
+            );
+            assert!(tls_total <= budget(available) || profile == NntpBufferProfile::default());
+        }
+    }
+}
