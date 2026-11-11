@@ -474,6 +474,10 @@ impl Pipeline {
     }
 
     pub(crate) fn nzb_work_in_flight(&self, id: JobId) -> bool {
+        #[cfg(test)]
+        if self.job_has_queued_decode(id) {
+            return true;
+        }
         self.download_lane_owners.values().any(|lane| {
             lane.outstanding
                 .keys()
@@ -482,10 +486,6 @@ impl Pipeline {
             .active_decodes_by_job
             .get(&id)
             .is_some_and(|count| *count > 0)
-            || self
-                .pending_decode
-                .iter()
-                .any(|work| work.segment_id.file_id.job_id == id)
             || self
                 .pending_released_download_results_by_job
                 .get(&id)

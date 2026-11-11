@@ -11,7 +11,6 @@ use crate::Database;
 use crate::ingest::submit_nzb_bytes;
 use crate::jobs::ids::MessageId;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-use crate::runtime::buffers::{BufferPool, BufferPoolConfig};
 use crate::runtime::system_profile::{
     CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
     SystemProfile,
@@ -152,7 +151,6 @@ impl TestHarness {
             hardware_profile: None,
             intermediate_dir: Some(intermediate_dir.display().to_string()),
             complete_dir: Some(complete_dir.display().to_string()),
-            buffer_pool: None,
             servers: vec![],
             categories: vec![],
             retry: None,
@@ -205,16 +203,10 @@ impl TestHarness {
                 same_filesystem: true,
             },
         };
-        let buffers = BufferPool::new(BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        });
-
         let mut pipeline = Pipeline::new(
             event_tx,
             nntp,
-            buffers,
+            16 * 1024 * 1024,
             profile,
             data_dir.clone(),
             intermediate_dir,
@@ -530,15 +522,15 @@ async fn settle_lane_dials(pipeline: &mut Pipeline) {
     }
 }
 
-pub(crate) async fn new_direct_pipeline_with_buffers(
+pub(crate) async fn new_direct_pipeline_with_backlog(
     temp_dir: &TempDir,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
 ) -> (Pipeline, PathBuf, PathBuf) {
-    new_direct_pipeline_with(temp_dir, buffer_config, total_connections, None).await
+    new_direct_pipeline_with(temp_dir, backlog_base_bytes, total_connections, None).await
 }
 
-// [`new_direct_pipeline_with_buffers`], plus the `[direct_store]` config table.
+// [`new_direct_pipeline_with_backlog`], plus the `[direct_store]` config table.
 //
 // Everything else in this module reaches for `set_gate`, which bypasses
 // configuration entirely. The tests that exist to prove the *config* is the
@@ -546,7 +538,7 @@ pub(crate) async fn new_direct_pipeline_with_buffers(
 // here instead.
 async fn new_direct_pipeline_with(
     temp_dir: &TempDir,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
 ) -> (Pipeline, PathBuf, PathBuf) {
@@ -555,7 +547,7 @@ async fn new_direct_pipeline_with(
         temp_dir.path().join("intermediate"),
         temp_dir.path().join("complete"),
         temp_dir.path().join("weaver.db"),
-        buffer_config,
+        backlog_base_bytes,
         total_connections,
         direct_store,
     )
@@ -575,7 +567,7 @@ async fn new_direct_pipeline_at_roots(
     intermediate_dir: PathBuf,
     complete_dir: PathBuf,
     db_path: PathBuf,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
 ) -> (Pipeline, PathBuf, PathBuf) {
@@ -584,7 +576,7 @@ async fn new_direct_pipeline_at_roots(
         intermediate_dir,
         complete_dir,
         db_path,
-        buffer_config,
+        backlog_base_bytes,
         total_connections,
         direct_store,
         SystemProfile {
@@ -620,7 +612,7 @@ async fn new_direct_pipeline_on_machine(
     intermediate_dir: PathBuf,
     complete_dir: PathBuf,
     db_path: PathBuf,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
     profile: SystemProfile,
@@ -638,7 +630,6 @@ async fn new_direct_pipeline_on_machine(
         hardware_profile: None,
         intermediate_dir: Some(intermediate_dir.display().to_string()),
         complete_dir: Some(complete_dir.display().to_string()),
-        buffer_pool: None,
         servers: vec![],
         categories: vec![],
         retry: None,
@@ -686,12 +677,10 @@ async fn new_direct_pipeline_on_machine(
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     });
-    let buffers = BufferPool::new(buffer_config);
-
     let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
-        buffers,
+        backlog_base_bytes,
         profile,
         data_dir,
         intermediate_dir.clone(),
@@ -731,16 +720,7 @@ async fn new_scheduler_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathB
 }
 
 pub(crate) async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
-    new_direct_pipeline_with_buffers(
-        temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        0,
-    )
-    .await
+    new_direct_pipeline_with_backlog(temp_dir, 16 * 1024 * 1024, 0).await
 }
 
 // End a pipeline incarnation before the next one opens its database.

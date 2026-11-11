@@ -18,6 +18,7 @@ pub mod graph;
 mod health;
 pub(crate) mod held;
 mod infrastructure_retry;
+mod next_up;
 mod nzb_admission;
 mod orchestrator;
 mod post_health;
@@ -52,7 +53,6 @@ use crate::jobs::assembly::JobAssembly;
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::{ArchivePasswordCandidate, ArchivePasswordSource};
 use crate::jobs::{JobPhase, PhaseCounters};
-use crate::runtime::buffers::{BufferHandle, BufferPool};
 use crate::runtime::system_profile::SystemProfile;
 use crate::{
     DownloadPressureReason, DownloadPressureState, DownloadQueue, DownloadWork, JobInfo, JobSpec,
@@ -119,8 +119,7 @@ pub(crate) fn persisted_nzb_password_candidates(
     nzb_path: &std::path::Path,
     nzb_zstd: &[u8],
 ) -> Result<Vec<ArchivePasswordCandidate>, crate::ingest::PersistedNzbError> {
-    let nzb = crate::ingest::parse_persisted_nzb_bytes(nzb_zstd)?;
-    Ok(crate::ingest::nzb_password_candidates(&nzb, nzb_path, None))
+    crate::ingest::outline::read_stored_outline(nzb_zstd, nzb_path).map(|read| read.passwords)
 }
 
 // The candidates a job carries, as `JobState::nzb_password_candidates` holds
@@ -782,7 +781,9 @@ pub(super) fn download_outcome_keeps_connection(
     }
 }
 
-// Successful download payload waiting for decode scheduling.
+// An undecoded article body waiting for a decode slot. Test-only: see
+// [`DownloadPayload::Raw`].
+#[cfg(test)]
 pub(super) struct PendingDecodeWork {
     pub(super) segment_id: SegmentId,
     pub(super) raw: Bytes,
@@ -1122,7 +1123,9 @@ pub(super) struct SegmentSource {
 }
 
 // Completion of a decode task, including explicit failures so backlog
-// accounting is always drained.
+// accounting is always drained. Only the test-only buffer-decode path sends
+// these; production decodes inline in the download lanes.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) enum DecodeDone {
     Success {
         result: DecodeResult,
@@ -1141,11 +1144,6 @@ pub(super) enum DecodedChunk {
     Contiguous(Bytes),
     Batches { chunks: Vec<Bytes>, len: usize },
     Shared(Arc<download::repeated::SharedArticle>),
-    // Decoded straight into a pool slot and carried to the writer as-is, so
-    // the article never needs a second heap allocation for its decoded
-    // bytes. Dropping it returns the slot to the pool instead of freeing on
-    // whichever thread finished with it.
-    Pooled(BufferHandle),
 }
 
 impl DecodedChunk {
@@ -1154,22 +1152,18 @@ impl DecodedChunk {
             Self::Contiguous(bytes) => bytes.len(),
             Self::Batches { len, .. } => *len,
             Self::Shared(body) => body.data.len_bytes(),
-            Self::Pooled(buffer) => buffer.len(),
         }
     }
 
     // The decoded bytes as one view, adopting a single buffer rather than
-    // copying it: a pooled slot goes back to its pool when the last view of
-    // it drops, and a shared body stays shared. Only output the decoder left
+    // copying it, and a shared body stays shared. Only output the decoder left
     // in several batches is joined, and a part that declares its length is
     // never left in several.
     pub(super) fn into_bytes(self) -> Bytes {
         match self {
             Self::Contiguous(bytes) => bytes,
-            Self::Pooled(buffer) => Bytes::from_owner(buffer),
             Self::Shared(body) => match &body.data {
                 Self::Contiguous(bytes) => bytes.clone(),
-                Self::Pooled(buffer) => Bytes::from_owner(buffer.clone()),
                 data => data.joined(),
             },
             data @ Self::Batches { .. } => data.joined(),
@@ -1188,7 +1182,6 @@ impl DecodedChunk {
     {
         match self {
             Self::Contiguous(bytes) => f(bytes),
-            Self::Pooled(buffer) => f(buffer.as_slice()),
             Self::Shared(body) => body.data.for_each_slice(f),
             Self::Batches { chunks, .. } => {
                 for chunk in chunks {
@@ -1204,7 +1197,6 @@ impl DecodedChunk {
     {
         match self {
             Self::Contiguous(bytes) => writer.write_all(bytes),
-            Self::Pooled(buffer) => writer.write_all(buffer.as_slice()),
             Self::Shared(body) => body.data.write_to(writer),
             Self::Batches { chunks, .. } => {
                 for chunk in chunks {
@@ -1325,8 +1317,6 @@ pub struct Pipeline {
     pub(super) event_tx: broadcast::Sender<PipelineEvent>,
     // NNTP client for fetching articles.
     pub(super) nntp: Arc<NntpClient>,
-    // Buffer pool used as decode scratch space only.
-    pub(super) buffers: Arc<BufferPool>,
     // Runtime tuner for adaptive concurrency.
     pub(super) tuner: RuntimeTuner,
     // The operator's hardware profile, or the recommendation standing in
@@ -1525,7 +1515,9 @@ pub struct Pipeline {
     // environment variable while other tests are running.
     #[cfg(test)]
     pub(super) par2_ignore_extensions_override: Option<Vec<String>>,
-    // Downloaded article bodies waiting for decode scheduling.
+    // Undecoded article bodies waiting for a decode slot. Only tests hand
+    // the pipeline an undecoded body; the download lanes decode inline.
+    #[cfg(test)]
     pub(super) pending_decode: VecDeque<PendingDecodeWork>,
     // Jobs that should re-enter completion/post-processing on the next loop pass.
     pub(super) pending_completion_checks: VecDeque<JobId>,
@@ -1547,6 +1539,9 @@ pub struct Pipeline {
     pub(super) owned_download_lane_event_tx: mpsc::Sender<OwnedDownloadLaneEvent>,
     pub(super) owned_download_lane_event_rx: mpsc::Receiver<OwnedDownloadLaneEvent>,
     pub(super) owned_download_lane_pool: download::owned_lane::OwnedDownloadLanePool,
+    // Only the test-only decode of an undecoded body sends here. Production
+    // holds the sender so the receiver stays open and never yields.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) decode_done_tx: mpsc::Sender<DecodeDone>,
     pub(super) decode_done_rx: mpsc::Receiver<DecodeDone>,
     // Channel through which due retries re-enter the pipeline loop.
@@ -1853,6 +1848,8 @@ pub struct Pipeline {
     pub(super) job_article_memory: HashMap<JobId, ProcessMemoryPermit>,
     // The number the next read of a job's articles is told by.
     pub(super) next_activation: u64,
+    // The jobs next up, their article lists read ahead: see [`next_up`].
+    pub(super) next_up: next_up::NextUp,
     // Paused jobs still holding their articles while what was out for them
     // on a connection or in the decoder comes back.
     pub(super) parking_jobs: HashSet<JobId>,

@@ -92,7 +92,6 @@ fn config_roundtrip() {
         hardware_profile: None,
         intermediate_dir: Some("/tmp/intermediate".to_string()),
         complete_dir: Some("/tmp/complete".to_string()),
-        buffer_pool: None,
         servers: vec![ServerConfig {
             id: 1,
             host: "news.test.com".to_string(),

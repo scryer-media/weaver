@@ -570,14 +570,6 @@ metric_families! {
     DB_OP_DURATION = ("weaver_db_op_duration_seconds", Histogram, ["engine"],
         "Database operation latency, measured around the executor round-trip.");
 
-    // ---- buffer pool -----------------------------------------------------------------------
-    BUFFER_POOL_IN_USE_BYTES = ("weaver_runtime_buffer_pool_in_use_bytes", Gauge, ["tier"],
-        "Pre-allocated article buffer bytes currently checked out, by tier.");
-    BUFFER_POOL_TOTAL_BYTES = ("weaver_runtime_buffer_pool_total_bytes", Gauge, ["tier"],
-        "Pre-allocated article buffer bytes the pool owns, by tier.");
-    BUFFER_POOL_WAITS = ("weaver_runtime_buffer_pool_waits_total", Counter, [],
-        "Buffer acquisitions that had to wait for a buffer to come back.");
-
     // ---- process ---------------------------------------------------------------------------
     // Standard process collector names, deliberately unprefixed so the usual
     // dashboards and recording rules work unchanged. Every one is conditional:

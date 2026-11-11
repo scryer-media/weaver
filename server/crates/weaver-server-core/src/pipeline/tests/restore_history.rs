@@ -1416,18 +1416,22 @@ async fn a_restart_finds_the_staging_directory_the_job_chose() {
             temp_dir.path().join("weaver.db"),
         )
     };
-    let buffers = || BufferPoolConfig {
-        small_count: 8,
-        medium_count: 4,
-        large_count: 2,
-    };
+    let backlog_base_bytes = || 16 * 1024 * 1024;
     let movies = temp_dir.path().join("movies");
     let (data, intermediate, complete, db) = roots();
     crate::runtime::fs::test_devices::assign(&intermediate, 1);
     crate::runtime::fs::test_devices::assign(&complete, 2);
     crate::runtime::fs::test_devices::assign(&movies, 3);
-    let (mut pipeline, _, _) =
-        new_direct_pipeline_at_roots(data, intermediate, complete, db, buffers(), 0, None).await;
+    let (mut pipeline, _, _) = new_direct_pipeline_at_roots(
+        data,
+        intermediate,
+        complete,
+        db,
+        backlog_base_bytes(),
+        0,
+        None,
+    )
+    .await;
     pipeline.config.write().await.categories = vec![crate::categories::CategoryConfig {
         id: 0,
         name: "movies".to_string(),
@@ -1458,8 +1462,16 @@ async fn a_restart_finds_the_staging_directory_the_job_chose() {
     retire_pipeline_database(pipeline).await;
 
     let (data, intermediate, complete, db) = roots();
-    let (mut pipeline, _, _) =
-        new_direct_pipeline_at_roots(data, intermediate, complete, db, buffers(), 0, None).await;
+    let (mut pipeline, _, _) = new_direct_pipeline_at_roots(
+        data,
+        intermediate,
+        complete,
+        db,
+        backlog_base_bytes(),
+        0,
+        None,
+    )
+    .await;
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,

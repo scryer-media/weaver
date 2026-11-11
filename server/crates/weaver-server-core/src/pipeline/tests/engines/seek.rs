@@ -22,7 +22,7 @@ use crate::jobs::model::JobStatus;
 use crate::pipeline::Pipeline;
 use crate::pipeline::tests::direct_store::{multi_member_store_set, obfuscate_volumes};
 use crate::pipeline::tests::{
-    insert_active_job, new_direct_pipeline_with_buffers, pump_pipeline_runtime_queues,
+    insert_active_job, new_direct_pipeline_with_backlog, pump_pipeline_runtime_queues,
     retire_pipeline_database,
 };
 
@@ -655,7 +655,8 @@ async fn run_restarting_once(
     BTreeMap<(u32, u32), usize>,
 ) {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(&temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes(), 1).await;
     // Admitted as the whole run's job is: its queues built as admission
     // builds a graph job's.
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
@@ -719,12 +720,8 @@ async fn run_restarting_once(
     (status, order, requests)
 }
 
-fn buffers() -> crate::runtime::buffers::BufferPoolConfig {
-    crate::runtime::buffers::BufferPoolConfig {
-        small_count: 8,
-        medium_count: 4,
-        large_count: 2,
-    }
+fn backlog_base_bytes() -> usize {
+    16 * 1024 * 1024
 }
 
 // The pipeline goes down as `stop` says and a new one restores the job from
@@ -743,7 +740,8 @@ async fn restart(
     let db = pipeline.db.clone();
     retire_pipeline_database(pipeline).await;
     drop(db);
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(temp_dir, buffers(), 1).await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(temp_dir, backlog_base_bytes(), 1).await;
     pipeline
         .restore_job(crate::RestoreJobRequest {
             job_id: JOB,

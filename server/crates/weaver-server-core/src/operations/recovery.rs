@@ -1,10 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use rayon::prelude::*;
 use tracing::{error, info, warn};
 
 use crate::Database;
@@ -72,40 +71,80 @@ impl AfterBoot {
     }
 }
 
-// A job's files from its stored NZB, read and parsed once, with the
-// summaries of the article lists let go. A read that fails is the outer
-// error; a missing or unreadable NZB is the inner one.
+// A job's files as a job waiting its turn holds them, with the summaries of
+// its article lists: from its stored outline when it has one, else from one
+// streamed read of its stored NZB, which keeps no article list and writes the
+// outline it read, so the job's next read needs no NZB. A read that fails is
+// the outer error; a missing or unreadable NZB is the inner one.
 pub(crate) fn read_stored_files(
     db: &Database,
     job_id: crate::jobs::ids::JobId,
     recovered: &crate::RecoveredJob,
+    outline: Option<ingest::outline::NzbOutline>,
 ) -> Result<
     Result<(crate::JobSpec, crate::jobs::model::FileSummaries), ingest::PersistedNzbError>,
     crate::StateError,
 > {
+    let spec = |outline: &ingest::outline::NzbOutline| {
+        outline.spec(
+            &recovered.nzb_path,
+            recovered.category.clone(),
+            recovered.metadata.clone(),
+        )
+    };
+    if let Some(outline) = outline {
+        return Ok(Ok(spec(&outline)));
+    }
     let missing = || {
         ingest::PersistedNzbError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("persisted NZB missing from database for job {}", job_id.0),
         ))
     };
-    Ok(db
+    let read = db
         .load_active_job_persisted_nzb(job_id)?
         .and_then(|(_, nzb_zstd)| nzb_zstd)
         .filter(|nzb_zstd| !nzb_zstd.is_empty())
         .ok_or_else(missing)
-        .and_then(|nzb_zstd| ingest::parse_persisted_nzb_bytes(&nzb_zstd))
-        .map(|nzb| {
-            let mut spec = ingest::nzb_to_spec(
-                &nzb,
-                &recovered.nzb_path,
-                recovered.category.clone(),
-                recovered.metadata.clone(),
-            );
-            drop(nzb);
-            let summaries = spec.drop_article_lists();
-            (spec, summaries)
-        }))
+        .and_then(|nzb_zstd| ingest::outline::read_stored_outline(&nzb_zstd, &recovered.nzb_path));
+    let read = match read {
+        Ok(read) => read,
+        Err(error) => return Ok(Err(error)),
+    };
+    if let Err(error) = db.write_job_outline(job_id, &read.outline) {
+        warn!(job_id = job_id.0, %error, "could not store the job's NZB outline; its next read parses the NZB again");
+    }
+    Ok(Ok(spec(&read.outline)))
+}
+
+// The job a restart restores before its outline is read: its row's name for
+// it, and no file. Its install reads its stored NZB, once, and stores the
+// outline it reads.
+fn unread_spec(recovered: &crate::RecoveredJob) -> crate::JobSpec {
+    let stem = recovered
+        .nzb_path
+        .file_stem()
+        .and_then(|stem| stem.to_str());
+    crate::JobSpec {
+        name: ingest::renamed_title(&recovered.metadata)
+            .map(str::to_string)
+            .unwrap_or_else(|| ingest::derive_release_name(stem, None)),
+        password: None,
+        files: Vec::new(),
+        total_bytes: 0,
+        category: recovered.category.clone(),
+        metadata: recovered.metadata.clone(),
+    }
+}
+
+// A persisted password override on top of the NZB-derived password ('' =
+// explicitly none).
+pub(crate) fn apply_password_override(spec: &mut crate::JobSpec, password_override: Option<&str>) {
+    match password_override {
+        None => {}
+        Some("") => spec.password = None,
+        Some(password) => spec.password = Some(password.to_string()),
+    }
 }
 
 // The restore of a job from its active row and the files of its stored NZB.
@@ -116,13 +155,7 @@ pub(crate) fn restore_request(
     summaries: crate::jobs::model::FileSummaries,
 ) -> RestoreJobRequest {
     let runtime = crate::pipeline::StoredRuntimeValues::of(&recovered);
-    // Apply a persisted password override on top of the NZB-derived
-    // password ('' = explicitly none).
-    match recovered.password_override.as_deref() {
-        None => {}
-        Some("") => spec.password = None,
-        Some(password) => spec.password = Some(password.to_string()),
-    }
+    apply_password_override(&mut spec, recovered.password_override.as_deref());
     let status = job_status_from_persisted_str(&recovered.status, recovered.error.as_deref());
     let download_state = recovered
         .download_state
@@ -163,6 +196,7 @@ pub(crate) fn restore_request(
             summaries,
             created_at_epoch_ms: recovered.created_at as f64 * 1000.0,
             reentry: false,
+            outline_pending: false,
         }),
     }
 }
@@ -277,49 +311,63 @@ pub async fn recover_server_state(
         });
     }
 
-    // In-progress jobs: each NZB is read and parsed on its own, so a worker
-    // holds one job's article lists at a time, and only the job's files are
-    // kept. The jobs are spread over the cores, as the parse is most of a
-    // start. The install reads the lists back from the same stored NZB, and
-    // a job waiting its turn lets them go again. A read that fails stops the
-    // start, as the read of every row did; only a missing or unreadable NZB
-    // archives the job.
+    // In-progress jobs: each is rebuilt from its stored NZB outline, read
+    // for every job in two queries, and no stored NZB is read before the
+    // server answers. A job with no outline yet, one admitted before
+    // outlines were stored, restores under its row's name with no file, and
+    // its install reads its stored NZB once, off the pipeline thread, and
+    // stores the outline it reads; a stored NZB that is missing or does not
+    // parse fails the job there, which archives it and lets its slot go. A
+    // read that fails stops the start, as the read of every row did.
     // A job's work that panicked would panic again as the job is restored,
     // so the markers the panic left are read before any job is.
     let restoring: HashSet<crate::jobs::ids::JobId> =
         in_progress.iter().map(|(job_id, _)| *job_id).collect();
     let crashed = crate::runtime::panic_trap::boot_marks(data_dir, |job| restoring.contains(&job));
 
-    let parsed = in_progress
-        .par_iter()
-        .map(|(job_id, recovered)| read_stored_files(db, *job_id, recovered))
-        .collect::<Vec<Result<_, crate::StateError>>>();
-
-    for ((job_id, recovered), parsed) in in_progress.into_iter().zip(parsed) {
-        match parsed? {
-            Ok((spec, summaries)) => {
-                to_restore.push(RestoreCandidate {
+    let mut outlines = if in_progress.is_empty() {
+        HashMap::new()
+    } else {
+        db.load_job_outlines(None)?
+    };
+    let mut unread = 0usize;
+    for (job_id, recovered) in in_progress {
+        let queue_position = recovered.queue_position;
+        let request = match outlines.remove(&job_id) {
+            Some(outline) => {
+                let (spec, summaries) = outline.spec(
+                    &recovered.nzb_path,
+                    recovered.category.clone(),
+                    recovered.metadata.clone(),
+                );
+                restore_request(job_id, recovered, spec, summaries)
+            }
+            None => {
+                unread += 1;
+                let spec = unread_spec(&recovered);
+                let mut request = restore_request(
                     job_id,
-                    queue_position: recovered.queue_position,
-                    request: restore_request(job_id, recovered, spec, summaries),
-                });
+                    recovered,
+                    spec,
+                    crate::jobs::model::FileSummaries::default(),
+                );
+                if let Some(read) = request.restart.as_mut() {
+                    read.outline_pending = true;
+                }
+                request
             }
-            Err(error) => {
-                // A skipped owner would never enter the runtime queue and
-                // could therefore never release its admission, so archive
-                // it before dispatch starts. An archive that fails leaves
-                // the row active, and the next start tries it again.
-                let name = recovered
-                    .nzb_path
-                    .file_stem()
-                    .and_then(|name| name.to_str())
-                    .unwrap_or("Unknown");
-                let status = JobStatus::Failed {
-                    error: format!("Cannot recover persisted NZB: {error}"),
-                };
-                archive_unfinished_terminal_job(db, job_id, &recovered, name, &status);
-            }
-        }
+        };
+        to_restore.push(RestoreCandidate {
+            job_id,
+            queue_position,
+            request,
+        });
+    }
+    if unread > 0 {
+        info!(
+            jobs = unread,
+            "jobs with no stored NZB outline read their NZB as they install"
+        );
     }
 
     // Also load archived job history from SQLite so the UI can show completed/failed jobs.
@@ -331,6 +379,10 @@ pub async fn recover_server_state(
         crate::HistoryRows::All,
     ) {
         Ok(history_rows) => {
+            // The jobs already held, built once: a job recovered from its
+            // active row is not listed again from its history row.
+            let mut held: HashSet<crate::jobs::ids::JobId> =
+                initial_history.iter().map(|job| job.job_id).collect();
             for row in history_rows {
                 if let Some(output_dir) = row.output_dir.as_ref() {
                     let output_dir = PathBuf::from(output_dir);
@@ -340,7 +392,7 @@ pub async fn recover_server_state(
                 }
                 let job_id = crate::jobs::ids::JobId(row.job_id);
                 // Skip if we already have this job from active_jobs recovery.
-                if initial_history.iter().any(|job| job.job_id == job_id) {
+                if !held.insert(job_id) {
                     continue;
                 }
                 let status =
@@ -675,8 +727,12 @@ mod tests {
         assert!(recovered.crashed.is_empty());
     }
 
+    // A job with no stored outline restores before its NZB is read, under
+    // its row's name and holding no file, keeping its slot. An unreadable
+    // NZB is found as it installs, which reads the NZB once and fails the
+    // job with the reason the start once archived it with.
     #[tokio::test]
-    async fn recovery_archives_unreadable_nzb_owners_before_dispatch() {
+    async fn recovery_reads_no_nzb_and_an_unreadable_one_is_found_at_install() {
         let temp = TempDir::new().unwrap();
         let db = Database::open_in_memory().unwrap();
         for (id, bytes) in [(1, Vec::new()), (2, vec![1, 2, 3])] {
@@ -689,42 +745,37 @@ mod tests {
             db.create_active_job(&job).unwrap();
             db.set_nzb_admitted(JobId(id), true).unwrap();
         }
+        let parses = crate::ingest::NZB_PARSES.load(std::sync::atomic::Ordering::Relaxed);
         let recovered = recover_server_state(&db, temp.path(), &temp.path().join("intermediate"))
             .await
             .unwrap();
-        assert!(recovered.to_restore.is_empty());
-        assert_eq!(recovered.initial_history.len(), 2);
-        for id in [JobId(1), JobId(2)] {
-            assert!(recovered.initial_history.iter().any(|job| {
-                job.job_id == id && matches!(job.status, crate::JobStatus::Failed { .. })
-            }));
+        assert_eq!(
+            crate::ingest::NZB_PARSES.load(std::sync::atomic::Ordering::Relaxed),
+            parses
+        );
+        assert!(recovered.initial_history.is_empty());
+        assert_eq!(recovered.to_restore.len(), 2);
+        for candidate in &recovered.to_restore {
+            let request = &candidate.request;
+            assert_eq!(request.spec.name, format!("job-{}", candidate.job_id.0));
+            assert!(request.spec.files.is_empty());
+            assert!(request.restart.as_ref().unwrap().outline_pending);
+            let row = db.load_active_job_row(candidate.job_id).unwrap().unwrap();
+            let read = super::read_stored_files(&db, candidate.job_id, &row, None).unwrap();
+            assert!(read.is_err(), "job {}", candidate.job_id.0);
         }
-        assert!(db.load_nzb_admissions().unwrap().is_empty());
-        assert!(db.load_active_jobs().unwrap().is_empty());
-        for id in [1, 2] {
-            let history = db.get_job_history(id).unwrap().unwrap();
-            assert_eq!(history.status, "failed");
-            assert!(
-                history
-                    .error_message
-                    .unwrap()
-                    .contains("Cannot recover persisted NZB")
-            );
-        }
+        assert_eq!(db.load_nzb_admissions().unwrap().len(), 2);
+        assert_eq!(db.load_active_jobs().unwrap().len(), 2);
     }
 
     #[tokio::test]
     async fn recovery_archive_failure_keeps_starting_and_retries_next_start() {
-        for terminal in [false, true] {
+        {
             let temp = TempDir::new().unwrap();
             let db = Database::open_in_memory().unwrap();
             let mut job =
                 sample_active_job(1, temp.path().join("job.nzb"), temp.path().join("job"));
-            if terminal {
-                job.status = "complete";
-            } else {
-                job.nzb_zstd.clear();
-            }
+            job.status = "complete";
             db.create_active_job(&job).unwrap();
             db.set_nzb_admitted(JobId(1), true).unwrap();
             execute_sql(
@@ -947,9 +998,9 @@ mod tests {
         assert_eq!(count_rows(&db, "active_jobs", 2), 1);
     }
 
-    // Recovery reads a job's row and NZB, never its file rows: those are
-    // read as the job installs. The queue's rows come back whole and in
-    // order, with the names and sizes their NZBs give.
+    // Recovery reads a job's row and stored outline, never its file rows or
+    // its NZB: those are read as the job installs. The queue's rows come back
+    // whole and in order, with the names and sizes their NZBs give.
     #[tokio::test]
     async fn recovery_reads_no_file_rows() {
         let temp = TempDir::new().unwrap();
@@ -965,6 +1016,9 @@ mod tests {
                 job.download_state = "downloading";
             }
             db.create_active_job(&job).unwrap();
+            let read =
+                crate::ingest::outline::read_stored_outline(&job.nzb_zstd, &job.nzb_path).unwrap();
+            db.write_job_outline(JobId(id), &read.outline).unwrap();
             db.save_file_identities(
                 JobId(id),
                 &[crate::jobs::ActiveFileIdentity {
@@ -1100,11 +1154,14 @@ mod tests {
         // the next startup.
         assert_eq!(count_rows(&db, "active_jobs", 11), 0);
         assert_eq!(recovered.to_restore.len(), 0);
-        assert!(
+        // Listed once: its history row does not list it again.
+        assert_eq!(
             recovered
                 .initial_history
                 .iter()
-                .any(|job| job.job_id == JobId(11))
+                .filter(|job| job.job_id == JobId(11))
+                .count(),
+            1
         );
     }
 

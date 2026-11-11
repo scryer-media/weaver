@@ -185,16 +185,8 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
 #[tokio::test]
 async fn dispatch_downloads_shares_a_small_hot_job_across_both_lanes_before_the_next_job() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 2).await;
 
     let hot_job_id = JobId(20023);
     let secondary_job_id = JobId(20024);
@@ -267,16 +259,8 @@ async fn dispatch_downloads_shares_a_small_hot_job_across_both_lanes_before_the_
 #[tokio::test]
 async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 2).await;
     pipeline.decode_backlog_budget_bytes = 1000;
     pipeline
         .metrics
@@ -408,16 +392,8 @@ async fn dispatch_downloads_throttles_hot_job_under_soft_byte_pressure() {
 #[tokio::test]
 async fn dispatch_downloads_suppresses_the_spill_under_soft_byte_pressure() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 2).await;
     pipeline.decode_backlog_budget_bytes = 1000;
     pipeline
         .metrics
@@ -489,16 +465,8 @@ async fn dispatch_downloads_suppresses_the_spill_under_soft_byte_pressure() {
 #[tokio::test]
 async fn dispatch_downloads_reorders_after_priority_metadata_change() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 1).await;
 
     let leading_job_id = JobId(20021);
     let promoted_job_id = JobId(20022);
@@ -623,16 +591,8 @@ async fn dispatch_downloads_reorders_after_priority_metadata_change() {
 #[tokio::test]
 async fn list_jobs_projects_downloading_while_extracting_with_active_download_work() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 2).await;
     let job_id = JobId(20008);
     insert_active_job(
         &mut pipeline,
@@ -682,16 +642,8 @@ async fn list_jobs_projects_downloading_while_extracting_with_active_download_wo
 #[tokio::test]
 async fn lane_less_download_stays_downloading_and_resumes_on_the_gauge_window() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 2).await;
     let job_id = JobId(20009);
     insert_active_job(
         &mut pipeline,
@@ -776,16 +728,8 @@ async fn lane_less_download_stays_downloading_and_resumes_on_the_gauge_window() 
 #[tokio::test]
 async fn a_started_download_with_only_queued_work_lists_as_downloading() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 2).await;
     let job_id = JobId(20010);
     insert_active_job(
         &mut pipeline,
@@ -825,16 +769,8 @@ async fn a_started_download_with_only_queued_work_lists_as_downloading() {
 #[tokio::test]
 async fn download_phase_rate_matches_the_global_speed_gauge() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 2).await;
     let job_id = JobId(20010);
     insert_active_job(
         &mut pipeline,
@@ -989,16 +925,8 @@ fn assert_rates_sum_to_gauge(rates: &[(JobId, u64)], gauge: u64, tick: u32) {
 #[tokio::test]
 async fn downloading_rows_rates_sum_to_the_global_speed_gauge() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 2).await;
     let first = JobId(20040);
     let second = JobId(20041);
     insert_active_job(
@@ -1251,16 +1179,7 @@ async fn queued_work_behind_quota_blocked_fills_shows_the_server_quota_block() {
 #[tokio::test]
 async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 1,
-            medium_count: 1,
-            large_count: 1,
-        },
-        2,
-    )
-    .await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_backlog(&temp_dir, 5632 * 1024, 2).await;
     let job_id = JobId(20996);
     let spec = standalone_job_spec("Server Quota Gate", &[("queued.bin".to_string(), 512u32)]);
     insert_active_job(&mut pipeline, job_id, spec).await;
@@ -1309,16 +1228,7 @@ async fn server_quota_ui_state_does_not_globally_stop_unrelated_dispatch() {
 #[tokio::test]
 async fn download_block_refresh_preserves_scheduled_speed_limit() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 1,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_backlog(&temp_dir, 5632 * 1024, 1).await;
 
     pipeline.scheduled_rate_limit = Some(131_072);
     pipeline.rate_limiter.set_rate(131_072);
@@ -1809,16 +1719,8 @@ async fn restore_paused_postprocessing_target_normalizes_to_downloading() {
 #[tokio::test]
 async fn active_rate_limit_does_not_prelease_multiple_bodies() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 4,
-            medium_count: 2,
-            large_count: 1,
-        },
-        4,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 8 * 1024 * 1024, 4).await;
     let job_id = JobId(31232);
     let files = (0..4)
         .map(|index| (format!("rate-limit-{index}.bin"), 512 * 1024))
@@ -2251,16 +2153,8 @@ async fn a_freshly_posted_job_defers_until_its_articles_have_propagated() {
 #[tokio::test]
 async fn changing_propagation_delay_updates_the_hold_and_zero_dispatches_immediately() {
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 1).await;
     pipeline.propagation_delay = Duration::from_secs(600);
     let mut events = pipeline.event_tx.subscribe();
     let job_id = JobId(20220);
@@ -2374,16 +2268,8 @@ async fn a_deferred_job_issues_nothing_until_it_is_eligible() {
     // are synchronous, and only the spawned fetch needs a server, exactly as
     // the surrounding hot-dispatch tests rely on.
     let temp_dir = tempfile::tempdir().unwrap();
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        &temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        new_direct_pipeline_with_backlog(&temp_dir, 6 * 1024 * 1024, 1).await;
     pipeline.propagation_delay_forced = Some(Duration::from_millis(150));
 
     let job_id = JobId(20209);

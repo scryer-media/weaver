@@ -16,6 +16,7 @@ pub struct OrphanActiveStateCounts {
     pub active_file_identities: usize,
     pub active_extracted: usize,
     pub active_detected_archives: usize,
+    pub active_job_nzb_files: usize,
     // Every graph checkpoint table together.
     pub graph_checkpoint: usize,
 }
@@ -27,16 +28,18 @@ impl OrphanActiveStateCounts {
             + self.active_file_identities
             + self.active_extracted
             + self.active_detected_archives
+            + self.active_job_nzb_files
             + self.graph_checkpoint
     }
 }
 
-const ACTIVE_JOB_CHILD_TABLES: [&str; 14] = [
+const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
     "active_extracted",
     "active_detected_archives",
+    "active_job_nzb_files",
     "graph_nodes",
     "graph_members",
     "graph_coverage",
@@ -320,12 +323,13 @@ impl Database {
         &self,
         below: JobId,
     ) -> Result<OrphanActiveStateCounts, StateError> {
-        const ACTIVE_TABLES: [&str; 5] = [
+        const ACTIVE_TABLES: [&str; 6] = [
             "active_file_progress",
             "active_files",
             "active_file_identities",
             "active_extracted",
             "active_detected_archives",
+            "active_job_nzb_files",
         ];
         let below = i64::try_from(below.0).unwrap_or(i64::MAX);
         let mut orphans = std::collections::BTreeSet::new();
@@ -373,7 +377,8 @@ impl Database {
             counts.active_file_identities += removed[2];
             counts.active_extracted += removed[3];
             counts.active_detected_archives += removed[4];
-            counts.graph_checkpoint += removed[5..].iter().sum::<usize>();
+            counts.active_job_nzb_files += removed[5];
+            counts.graph_checkpoint += removed[6..].iter().sum::<usize>();
         }
         Ok(counts)
     }

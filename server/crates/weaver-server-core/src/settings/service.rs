@@ -7,8 +7,8 @@ use crate::persistence::Database;
 use crate::runtime::hardware_profile::HardwareProfile;
 use crate::settings::record::SettingRecord;
 use crate::settings::{
-    BufferPoolOverrides, Config, DeliveryNamingOverrides, DirectStoreOverrides, MetricsConfig,
-    PerJobSeries, RetryOverrides,
+    Config, DeliveryNamingOverrides, DirectStoreOverrides, MetricsConfig, PerJobSeries,
+    RetryOverrides,
 };
 use crate::watch_folder::{WatchFolderConfig, WatchFolderMode};
 
@@ -23,6 +23,9 @@ pub(crate) const RETIRED_SETTING_KEYS: &[&str] = &[
     "ip_replacement_trial_extra_connections",
     "direct_store.enabled",
     "direct_unpack.enabled",
+    "buffer_pool.small_count",
+    "buffer_pool.medium_count",
+    "buffer_pool.large_count",
 ];
 
 impl Database {
@@ -81,26 +84,6 @@ impl Database {
                 .get("watch_folder.scanning_paused")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(false),
-        };
-        let buffer_pool = {
-            let small = settings
-                .get("buffer_pool.small_count")
-                .and_then(|v| v.parse().ok());
-            let medium = settings
-                .get("buffer_pool.medium_count")
-                .and_then(|v| v.parse().ok());
-            let large = settings
-                .get("buffer_pool.large_count")
-                .and_then(|v| v.parse().ok());
-            if small.is_some() || medium.is_some() || large.is_some() {
-                Some(BufferPoolOverrides {
-                    small_count: small,
-                    medium_count: medium,
-                    large_count: large,
-                })
-            } else {
-                None
-            }
         };
 
         let retry = {
@@ -216,7 +199,6 @@ impl Database {
             data_dir,
             intermediate_dir,
             complete_dir,
-            buffer_pool,
             servers,
             categories,
             retry,
@@ -312,18 +294,6 @@ impl Database {
             "duplicate_policy.normalized_name",
             config.duplicate_policy.normalized_name.as_str(),
         )?;
-        if let Some(ref bp) = config.buffer_pool {
-            if let Some(v) = bp.small_count {
-                self.set_setting("buffer_pool.small_count", &v.to_string())?;
-            }
-            if let Some(v) = bp.medium_count {
-                self.set_setting("buffer_pool.medium_count", &v.to_string())?;
-            }
-            if let Some(v) = bp.large_count {
-                self.set_setting("buffer_pool.large_count", &v.to_string())?;
-            }
-        }
-
         if let Some(ref direct_store) = config.direct_store {
             for (key, bytes) in [
                 (

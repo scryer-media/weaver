@@ -1019,3 +1019,20 @@ kind = "sql"
 file = "migrations/0082_active_job_staging_dir/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 83
+description = "active job NZB outline"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0083_active_job_nzb_outline/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0083_active_job_nzb_outline/postgres.sql"
+engine = "postgres"
+scope = "all"

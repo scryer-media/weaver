@@ -434,6 +434,7 @@ impl Queue {
         self.history.read().expect("history lock poisoned").clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn job_counters(&self, id: JobId) -> Option<Arc<JobCounters>> {
         self.read(|inner| inner.job(id).map(|row| row.counters.clone()))
     }

@@ -40,11 +40,8 @@ pub(crate) async fn run(
     let nzb_bytes = std::fs::read(nzb_path)?;
     info!(path = %nzb_path.display(), force, "starting standalone NZB submission");
 
-    let wiring::RuntimeContext {
-        profile,
-        buffers,
-        write_buf_max,
-    } = wiring::build_runtime_context(weaver_server_core::runtime::detect_system_profile(data_dir));
+    let wiring::RuntimeContext { profile, backlog } =
+        wiring::build_runtime_context(weaver_server_core::runtime::detect_system_profile(data_dir));
 
     // Build the NNTP client from capability values validated when servers were saved.
     let policy_db = db.clone();
@@ -134,13 +131,13 @@ pub(crate) async fn run(
     let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
-        buffers,
+        backlog.base_bytes,
         profile,
         data_dir.to_path_buf(),
         effective_intermediate_dir.to_path_buf(),
         complete_dir.to_path_buf(),
         total_connections,
-        write_buf_max,
+        backlog.pending_writes_per_file,
         vec![],
         initial_global_paused,
         shared_state,

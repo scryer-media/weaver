@@ -10,7 +10,7 @@ use weaver_graph::{ByteRange, MemberId, NodeId};
 use weaver_nntp::client::{DecodedBody, DecodedBodyTrace};
 
 use super::super::{
-    checkpoint_plan, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
+    checkpoint_plan, insert_active_job, job_status_for_assert, new_direct_pipeline_with_backlog,
     pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use super::harness::{self, JOB, Post, Scenario, par2_volumes_sliced};
@@ -63,12 +63,9 @@ async fn periodic_copy7z_repair_preserves_archive_before_extraction() {
     assert_eq!(spec.files[0].segments.len(), 4);
     assert_eq!(spec.files[1].segments.len(), 1);
     let temp = tempfile::tempdir().unwrap();
-    let buffers = crate::runtime::buffers::BufferPoolConfig {
-        small_count: 8,
-        medium_count: 4,
-        large_count: 2,
-    };
-    let (mut pipeline, _, complete) = new_direct_pipeline_with_buffers(&temp, buffers, 1).await;
+    let backlog_base_bytes = 16 * 1024 * 1024;
+    let (mut pipeline, _, complete) =
+        new_direct_pipeline_with_backlog(&temp, backlog_base_bytes, 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, spec).await;
     let mut observed = false;

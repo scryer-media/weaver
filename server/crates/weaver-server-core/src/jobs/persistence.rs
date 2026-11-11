@@ -528,6 +528,7 @@ impl Database {
     // SCORE caller supplies the generation it received at admission; parking
     // or superseding that candidate invalidates the generation before any
     // stale request can create scheduler work.
+    #[cfg(test)]
     pub(crate) fn materialize_admission(
         &self,
         job: &ActiveJob,
@@ -536,9 +537,36 @@ impl Database {
         semantic_promotion_generation: Option<i64>,
         restart: bool,
     ) -> Result<bool, StateError> {
+        self.materialize_admission_with_outline(
+            job,
+            identities,
+            None,
+            semantic_materialization_generation,
+            semantic_promotion_generation,
+            restart,
+        )
+    }
+
+    // As `materialize_admission`, writing the job's NZB outline in the same
+    // transaction when it was read.
+    pub(crate) fn materialize_admission_with_outline(
+        &self,
+        job: &ActiveJob,
+        identities: &[ActiveFileIdentity],
+        outline: Option<&crate::ingest::outline::NzbOutline>,
+        semantic_materialization_generation: Option<i64>,
+        semantic_promotion_generation: Option<i64>,
+        restart: bool,
+    ) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let job_id = job.job_id;
         let identities = identities.to_vec();
+        let outline = outline
+            .map(|outline| {
+                super::outline_persistence::OutlineHead::of(self.encryption_key(), outline)
+                    .map(|head| (head, outline.files.clone()))
+            })
+            .transpose()?;
         let now = (crate::jobs::epoch_ms_now() / 1_000.0) as i64;
         let args = vec![
             SqlArg::I64(job.job_id.0 as i64),
@@ -572,6 +600,7 @@ impl Database {
                 |tx| {
                     let args = args.clone();
                     let identities = identities.clone();
+                    let outline = outline.clone();
                     Box::pin(async move {
                         if restart {
                             let deleted = crate::history::persistence::delete_job_history_bundles_tx(tx, &[job_id]).await?;
@@ -692,6 +721,10 @@ impl Database {
                         )
                         .await?;
                         bulk_upsert_file_identities_tx(tx, job_id, &identities).await?;
+                        if let Some((head, files)) = &outline {
+                            super::outline_persistence::write_outline_tx(tx, job_id, head, files)
+                                .await?;
+                        }
                         Ok(true)
                     })
                 },

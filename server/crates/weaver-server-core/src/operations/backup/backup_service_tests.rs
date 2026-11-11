@@ -144,7 +144,6 @@ fn sample_config() -> Config {
         hardware_profile: None,
         intermediate_dir: Some("/old/data/intermediate".into()),
         complete_dir: Some("/old/data/complete".into()),
-        buffer_pool: None,
         servers: vec![],
         categories: vec![
             CategoryConfig {
@@ -1179,7 +1178,6 @@ async fn restore_requires_category_remap_for_external_paths() {
             hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
-            buffer_pool: None,
             servers: vec![],
             categories: vec![],
             retry: None,
@@ -1204,7 +1202,6 @@ async fn restore_requires_category_remap_for_external_paths() {
             hardware_profile: None,
             intermediate_dir: None,
             complete_dir: None,
-            buffer_pool: None,
             servers: vec![],
             categories: vec![],
             retry: None,

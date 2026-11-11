@@ -156,7 +156,6 @@ fn config(data: &Path) -> SharedConfig {
         data_dir: data.to_string_lossy().into_owned(),
         intermediate_dir: None,
         complete_dir: None,
-        buffer_pool: None,
         servers: vec![],
         categories: vec![],
         retry: None,

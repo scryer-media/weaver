@@ -53,7 +53,7 @@ impl Pipeline {
     }
 
     // Mark a job as failed and purge its queued segments.
-    pub(super) fn fail_job(&mut self, job_id: JobId, error: String) {
+    pub(crate) fn fail_job(&mut self, job_id: JobId, error: String) {
         self.fail_job_with_rejection(job_id, error, false);
     }
 

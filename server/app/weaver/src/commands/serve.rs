@@ -129,13 +129,9 @@ pub(crate) async fn run(
         base_url
     };
 
-    let wiring::RuntimeContext {
-        profile,
-        buffers,
-        write_buf_max,
-    } = wiring::build_runtime_context(weaver_server_core::runtime::detect_startup_profile(
-        &data_dir,
-    ));
+    let wiring::RuntimeContext { profile, backlog } = wiring::build_runtime_context(
+        weaver_server_core::runtime::detect_startup_profile(&data_dir),
+    );
     let system_profile = Arc::new(std::sync::RwLock::new(profile.clone()));
 
     // Build the NNTP client from capability values validated when servers were saved.
@@ -266,13 +262,13 @@ pub(crate) async fn run(
     let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
-        Arc::clone(&buffers),
+        backlog.base_bytes,
         profile,
         data_dir,
         intermediate_dir,
         complete_dir,
         total_connections,
-        write_buf_max,
+        backlog.pending_writes_per_file,
         initial_history,
         initial_global_paused,
         shared_state,
@@ -449,7 +445,6 @@ pub(crate) async fn run(
         nntp_pool,
         Arc::clone(&server_transfer_policy),
         shared_config.clone(),
-        buffers,
     )
     .with_schedules(shared_schedules);
 

@@ -10,7 +10,7 @@ use super::harness::{self, JOB, Post, Scenario};
 use crate::jobs::model::JobStatus;
 use crate::pipeline::tests::direct_store::single_member_store_set;
 use crate::pipeline::tests::{
-    checkpoint_plan, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
+    checkpoint_plan, insert_active_job, job_status_for_assert, new_direct_pipeline_with_backlog,
     pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use crate::pipeline::{DecodeDone, DownloadPayload, Pipeline, SegmentSource};
@@ -117,12 +117,9 @@ async fn split_metadata_repairs_missing_rar_with_a_staged_short_footer_donor() {
         file.segments = data.segments;
     }
     let temp = tempfile::tempdir().unwrap();
-    let buffers = crate::runtime::buffers::BufferPoolConfig {
-        small_count: 8,
-        medium_count: 4,
-        large_count: 2,
-    };
-    let (mut pipeline, _, complete) = new_direct_pipeline_with_buffers(&temp, buffers, 1).await;
+    let backlog_base_bytes = 16 * 1024 * 1024;
+    let (mut pipeline, _, complete) =
+        new_direct_pipeline_with_backlog(&temp, backlog_base_bytes, 1).await;
     scenario.prepare(&mut pipeline);
     insert_active_job(&mut pipeline, JOB, spec).await;
     loop {
