@@ -7,7 +7,7 @@
 
 use std::{
     cmp::Reverse,
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
@@ -62,6 +62,47 @@ const PEERLIST_LOW_WATERMARK: usize = MAX_PEERLIST_SIZE * 95 / 100;
 // peer list holds.
 pub(crate) const MAX_PAUSED_PEERLIST_SIZE: usize = 1000;
 
+// The most addresses the session keeps banned for bad data: about a
+// megabyte at most.
+pub(crate) const MAX_SESSION_BANS: usize = 16_384;
+
+/// The addresses a torrent of the session banned for sending bad data,
+/// banned on every torrent of the session for as long as it runs, and kept
+/// nowhere. One host is one address, so a ban covers every port, as each
+/// torrent's own ban does. Past [`MAX_SESSION_BANS`] the oldest is
+/// forgotten here; the torrent that banned it keeps its own ban.
+#[derive(Default)]
+pub(crate) struct SessionBans(RwLock<SessionBanList>);
+
+#[derive(Default)]
+struct SessionBanList {
+    banned: HashSet<IpAddr>,
+    // The order they were banned in, oldest first.
+    order: VecDeque<IpAddr>,
+}
+
+impl SessionBans {
+    /// Whether `ip` is banned.
+    pub(crate) fn contains(&self, ip: IpAddr) -> bool {
+        self.0.read().banned.contains(&ip)
+    }
+
+    /// Bans `ip`; true when it was not banned before.
+    pub(crate) fn insert(&self, ip: IpAddr) -> bool {
+        let mut list = self.0.write();
+        if !list.banned.insert(ip) {
+            return false;
+        }
+        list.order.push_back(ip);
+        if list.order.len() > MAX_SESSION_BANS
+            && let Some(oldest) = list.order.pop_front()
+        {
+            list.banned.remove(&oldest);
+        }
+        true
+    }
+}
+
 /// Where a peer stands when the list must forget one; the lowest goes first
 /// (libtorrent `peer_list::is_erase_candidate`, then `compare_peer_erase`):
 /// an erase candidate, a peer with no connection that is no connect
@@ -101,6 +142,9 @@ pub(crate) struct PeerStates {
     // (`allow_multiple_connections_per_ip` off): a ban covers every port.
     // Taken last, after any other lock.
     banned: RwLock<HashSet<IpAddr>>,
+    // The addresses the session bans for bad data sent to any of its
+    // torrents. Taken after `banned`.
+    session_bans: Arc<SessionBans>,
     // Wakes the connect loop when a connect candidate appears or may come due
     // sooner.
     candidates_changed: Notify,
@@ -380,6 +424,7 @@ impl PeerStates {
             total_pieces,
             admission: Mutex::new(()),
             banned: RwLock::new(list.banned),
+            session_bans: Default::default(),
             candidates_changed: Notify::new(),
             went_live: Arc::new(Notify::new()),
             super_seeding: Mutex::new(()),
@@ -404,6 +449,13 @@ impl PeerStates {
     /// holds from the next.
     pub fn allowing_multiple_connections_per_ip(mut self, allow: Arc<AtomicBool>) -> Self {
         self.allow_multiple_connections_per_ip = allow;
+        self
+    }
+
+    /// The list, refusing the addresses `bans` holds as it refuses its own
+    /// banned ones.
+    pub fn sharing_session_bans(mut self, bans: Arc<SessionBans>) -> Self {
+        self.session_bans = bans;
         self
     }
 
@@ -486,9 +538,31 @@ impl PeerStates {
         ResumePeers::of(entries.into_iter(), &self.banned.read())
     }
 
-    /// Whether peers at `ip` are banned.
+    /// Whether peers at `ip` are banned: by this torrent, or by the session
+    /// for bad data sent to another.
     pub fn is_banned(&self, ip: IpAddr) -> bool {
-        self.banned.read().contains(&ip)
+        self.banned.read().contains(&ip) || self.session_bans.contains(ip)
+    }
+
+    /// Bans `ip` for sending bad data: here, as [`Self::ban`] does, and on
+    /// every torrent of the session for as long as it runs. True when the
+    /// session had not banned it before.
+    pub fn ban_for_bad_data(&self, ip: IpAddr) -> bool {
+        self.ban(ip);
+        self.session_bans.insert(ip)
+    }
+
+    /// The session banned `ip` for bad data another torrent was sent: every
+    /// peer at it here has its connection closed and is no connect
+    /// candidate, as [`Self::ban`] leaves it, while this torrent's own bans,
+    /// which a restart keeps, stay as they are.
+    pub fn close_session_banned(&self, ip: IpAddr) {
+        let _admission = self.admission.lock();
+        for mut peer in self.states.iter_mut() {
+            if peer.key().ip() == ip {
+                peer.value_mut().ban(self);
+            }
+        }
     }
 
     /// Bans `ip`: no peer at it joins the list again, and every one there

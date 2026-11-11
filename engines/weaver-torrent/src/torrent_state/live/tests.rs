@@ -905,6 +905,74 @@ async fn a_timed_out_peer_keeps_its_requests_and_is_asked_for_no_more() {
     );
 }
 
+// libtorrent `request_a_block` passes over a block already in the peer's
+// queues (request_blocks.cpp:238-256), and `snub_peer` asks for a new block
+// before it times one out so as not to pick that block again
+// (peer_connection.cpp:5217-5233). A slow peer whose piece went back at a
+// snub, and that then catches up, is not handed that piece again while its
+// requests for it stand: the piece stays free for other peers, the peer is
+// asked for the other piece, and no block is asked of it twice.
+#[tokio::test]
+async fn a_peer_is_not_handed_back_a_piece_it_gave_up_while_its_requests_for_it_stand() {
+    let h = Harness::new("a_given_up_piece_is_not_taken_back").await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    tokio::time::pause();
+    let mut task: Task<'_> = Box::pin(peer.task_peer_chunk_requester());
+    peer.on_i_am_unchoked();
+    let first = next_requests(&mut task, &mut rx, CHUNKS_PER_PIECE as usize).await;
+    let (piece, _) = *first.first().unwrap();
+    let other = 1 - piece;
+
+    // No block arrives: the peer is snubbed and its piece goes back, its
+    // four requests outstanding still.
+    h.until_released(&mut task).await;
+    assert_eq!(h.queued_pieces(), vec![0, 1]);
+
+    // The peer catches up: a block past its timeout, then two at once, the
+    // first of which lifts the snub. One of its requests for the piece
+    // stands.
+    let timeout = h
+        .peers
+        .with_live(peer.addr, |live| live.request_timeout())
+        .unwrap();
+    tokio::time::advance(timeout).await;
+    for chunk in 0..3 {
+        h.deliver(&peer, (piece, chunk * CHUNK_SIZE)).await;
+    }
+    assert!(!h.snubbed(&peer));
+    assert_eq!(h.inflight_count(&peer), 1);
+
+    // Its next pick is the other piece: the one it gave up, the started
+    // one, has nothing left to ask it, and stays queued for other peers.
+    // The requester asks for it, and asks for no block of the given-up
+    // piece again.
+    let depth = h
+        .peers
+        .with_live(peer.addr, |live| live.desired_queue_size(usize::MAX))
+        .unwrap();
+    let room = u32::try_from(depth - 1).unwrap().min(CHUNKS_PER_PIECE);
+    assert!(room > 0);
+    assert_eq!(
+        next_requests(&mut task, &mut rx, room as usize).await,
+        chunks(other, 0..room)
+    );
+    drop(task);
+    assert!(h.owns(&peer, other));
+    assert!(!h.owns(&peer, piece));
+    assert!(h.queued_pieces().contains(&piece));
+    assert_eq!(h.stats.asked_already.load(Ordering::Relaxed), 0);
+
+    // Its standing request completes the piece, every byte used.
+    h.deliver(&peer, (piece, 3 * CHUNK_SIZE)).await;
+    assert!(
+        h.lock_read("test")
+            .get_chunks()
+            .unwrap()
+            .is_piece_have(h.piece(piece))
+    );
+    assert_eq!(h.get_redundant_bytes(), 0);
+}
+
 #[tokio::test]
 async fn a_snubbed_peer_takes_no_piece_from_another_peer() {
     let h = Harness::new("a_snubbed_peer_does_not_steal").await;

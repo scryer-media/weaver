@@ -507,6 +507,10 @@ pub struct Session {
     // Read by every torrent's peer list at each judgment; changed by
     // `set_allow_multiple_connections_per_ip`.
     pub(crate) allow_multiple_connections_per_ip: Arc<AtomicBool>,
+    // The addresses banned for bad data sent to any torrent, refused by
+    // every torrent's peer list and at every incoming connection while the
+    // session runs.
+    pub(crate) bad_data_bans: Arc<crate::torrent_state::live::peers::SessionBans>,
     pub ratelimits: Limits,
 
     // Read wherever an address is judged; changed by `set_ip_filter`.
@@ -1973,6 +1977,7 @@ impl Session {
                 allow_multiple_connections_per_ip: Arc::new(AtomicBool::new(
                     opts.allow_multiple_connections_per_ip,
                 )),
+                bad_data_bans: Default::default(),
                 ip_filter: RwLock::new(opts.ip_filter),
                 allowlist,
                 lsd,
@@ -2089,6 +2094,11 @@ impl Session {
                     .fetch_add(1, Ordering::Relaxed);
             }
             bail!("incoming connection refused: {} is {why}", addr.ip());
+        }
+        // An address banned for bad data sent to any torrent is refused
+        // before a byte is read, whichever torrent it greets.
+        if self.bad_data_bans.contains(addr.ip()) {
+            bail!("incoming connection refused: {} is banned", addr.ip());
         }
         // No peer on a privileged port is kept, whichever way it connects
         // (libtorrent `torrent::privileged_port_updated` disconnects one).
@@ -2904,7 +2914,7 @@ impl Session {
 
     // The torrents that are live, so whose peers the session uploads to and
     // turns over.
-    fn live_torrents(&self) -> Vec<Arc<TorrentStateLive>> {
+    pub(crate) fn live_torrents(&self) -> Vec<Arc<TorrentStateLive>> {
         self.with_torrents(|torrents| torrents.filter_map(|(_, t)| t.live()).collect())
     }
 
@@ -7725,6 +7735,105 @@ mod tests {
 
         assert_eq!(check_once(&session, "192.0.2.1:6881"), None);
         session.stop().await;
+    }
+
+    // An address one torrent banned for bad data is banned on every torrent
+    // of the session, by address whatever its port, as libtorrent bans one
+    // peer per address (peer_list.cpp:446-459 `ban_peer`, found by address
+    // in `add_peer` with `allow_multiple_connections_per_ip` off,
+    // peer_list.cpp:654-664, and refused in `new_connection`,
+    // peer_list.cpp:700-703). libtorrent bans it on the one torrent
+    // (torrent.cpp:11531-11542); here the session refuses it everywhere
+    // while it runs.
+    #[tokio::test]
+    async fn an_address_banned_for_bad_data_on_one_torrent_is_banned_on_every_torrent() {
+        let (dir, session, a) = seeding_with(10, 0, crate::limits::LimitKind::Unlimited).await;
+        let b = crate::create_torrent(
+            dir.path(),
+            crate::CreateTorrentOptions {
+                piece_length: Some(32768),
+                ..Default::default()
+            },
+            &crate::spawn_utils::BlockingSpawner::new(1),
+        )
+        .await
+        .unwrap()
+        .as_bytes()
+        .unwrap();
+        let b = session
+            .add_torrent(
+                AddTorrent::from_bytes(b),
+                Some(AddTorrentOptions {
+                    output_folder: Some(dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        b.wait_until_completed().await.unwrap();
+        let (a, b) = (a.live().unwrap(), b.live().unwrap());
+        let state = |torrent: &crate::torrent_state::TorrentStateLive, addr: &str| {
+            torrent
+                .per_peer_stats_snapshot(
+                    crate::torrent_state::peer::stats::snapshot::PeerStatsFilter {
+                        state:
+                            crate::torrent_state::peer::stats::snapshot::PeerStatsFilterState::All,
+                    },
+                )
+                .peers
+                .get(addr)
+                .map(|peer| peer.state)
+        };
+
+        // B knows the liar at one port before A bans it.
+        b.add_peer(
+            "127.0.0.7:6881".parse().unwrap(),
+            crate::type_aliases::PeerSourceFlag::Tracker,
+        );
+        assert_eq!(state(&b, "127.0.0.7:6881"), Some("queued"));
+
+        a.ban_for_bad_data("127.0.0.7".parse().unwrap());
+
+        // Nothing below awaits, so no connection is attempted meanwhile.
+        // On B the peer it knew is no connect candidate, and the address at
+        // another port joins B's list no more, so it is never dialled.
+        assert_eq!(state(&b, "127.0.0.7:6881"), Some("dead"));
+        b.add_peer(
+            "127.0.0.7:7000".parse().unwrap(),
+            crate::type_aliases::PeerSourceFlag::Tracker,
+        );
+        assert_eq!(state(&b, "127.0.0.7:7000"), None);
+        // An incoming connection from it, at any port, is refused unread.
+        let refusal = check_once(&session, "127.0.0.7:7000").expect("refused unread");
+        assert!(refusal.contains("is banned"), "{refusal}");
+        // Another address is untouched.
+        b.add_peer(
+            "127.0.0.8:6881".parse().unwrap(),
+            crate::type_aliases::PeerSourceFlag::Tracker,
+        );
+        assert_eq!(state(&b, "127.0.0.8:6881"), Some("queued"));
+        assert_eq!(check_once(&session, "127.0.0.8:6881"), None);
+        session.stop().await;
+    }
+
+    // At its bound the session forgets its oldest ban for bad data.
+    #[test]
+    fn the_session_forgets_its_oldest_ban_for_bad_data_at_its_bound() {
+        use crate::torrent_state::live::peers::{MAX_SESSION_BANS, SessionBans};
+        let bans = SessionBans::default();
+        let ip = |n: usize| std::net::IpAddr::from(u32::try_from(n).unwrap().to_be_bytes());
+        for n in 0..MAX_SESSION_BANS {
+            assert!(bans.insert(ip(n)));
+        }
+        assert!(!bans.insert(ip(0)));
+        assert!(bans.contains(ip(0)));
+        assert!(bans.insert(ip(MAX_SESSION_BANS)));
+        assert!(!bans.contains(ip(0)));
+        assert!(bans.contains(ip(1)));
+        assert!(bans.contains(ip(MAX_SESSION_BANS)));
     }
 
     // libtorrent `session_impl::set_ip_filter` and `update_privileged_ports`

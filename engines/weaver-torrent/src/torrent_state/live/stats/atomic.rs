@@ -28,4 +28,7 @@ pub struct AtomicStats {
     /// The part of `redundant_bytes` that is blocks cut short as their
     /// connection closed: received, but never counted in `fetched_bytes`.
     pub cut_short_bytes: AtomicU64,
+    /// Blocks of a piece a peer was handed that were asked of it already,
+    /// and so were not asked again.
+    pub(crate) asked_already: AtomicU64,
 }
