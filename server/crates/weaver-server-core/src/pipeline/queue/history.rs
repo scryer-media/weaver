@@ -53,7 +53,7 @@ pub(crate) async fn clear_restart_artifacts(
         }
     }
     clear_left_working_dirs(&resources.intermediate_dir, id, working_dir).await?;
-    remove_job_staging(&resources.complete_dir, id).await
+    remove_job_staging(&resources.staging_roots().await, id).await
 }
 
 // A working directory that kept the job's marker for what its move could
@@ -79,13 +79,19 @@ pub(crate) async fn clear_left_working_dirs(
     Ok(())
 }
 
-// The job's staging directory under the complete directory, whatever it
-// still holds. A symbolic link in its place is never followed.
+// The job's staging directories under each of `roots`, whatever they still
+// hold. A symbolic link in the place of one is never followed.
 pub(crate) async fn remove_job_staging(
-    complete_dir: &std::path::Path,
+    roots: &[std::path::PathBuf],
     id: JobId,
 ) -> Result<(), SchedulerError> {
-    let staging = super::staging_dir_for(complete_dir, id);
+    for root in roots {
+        remove_staging_dir(super::staging_dir_for(root, id)).await?;
+    }
+    Ok(())
+}
+
+async fn remove_staging_dir(staging: std::path::PathBuf) -> Result<(), SchedulerError> {
     match tokio::fs::symlink_metadata(&staging).await {
         Ok(meta) if meta.file_type().is_symlink() => Err(SchedulerError::Conflict(
             "the job's staging directory is a symbolic link".into(),
@@ -430,7 +436,7 @@ impl Queue {
             if let Err(error) = crate::history::delete_files::sweep_failed_job_files(
                 &resources.db,
                 &resources.intermediate_dir,
-                &resources.complete_dir,
+                &resources.staging_roots().await,
                 id,
                 recorded.map(std::path::PathBuf::from),
                 marked.remove(&id).unwrap_or_default(),
@@ -594,7 +600,7 @@ impl Queue {
             let (removed, result) = crate::history::delete_files::delete_history_rows(
                 &resources.db,
                 &resources.intermediate_dir,
-                &resources.complete_dir,
+                &resources.staging_roots().await,
                 accepted,
                 delete_files,
             )

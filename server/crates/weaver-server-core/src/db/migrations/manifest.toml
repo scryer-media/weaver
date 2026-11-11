@@ -1002,3 +1002,20 @@ kind = "sql"
 file = "migrations/0081_history_page_sort_indexes/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 82
+description = "active job staging directory"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0082_active_job_staging_dir/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0082_active_job_staging_dir/postgres.sql"
+engine = "postgres"
+scope = "all"

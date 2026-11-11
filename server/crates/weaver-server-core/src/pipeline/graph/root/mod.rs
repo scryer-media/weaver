@@ -142,7 +142,12 @@ impl ArticleRoot {
                 });
             }
         }
-        let drawn = self.window.draw(queued);
+        let leading = &self.leading;
+        let drawn = self.window.draw(
+            queued,
+            |volume| leading.rank_of(volume),
+            |bid| leading.ready(bid),
+        );
         let mut applied = BTreeSet::new();
         let answers = asks
             .iter()

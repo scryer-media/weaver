@@ -771,3 +771,219 @@ fn a_failed_return_still_releases_the_working_directory_and_keeps_the_rest_stage
         &working
     ));
 }
+
+fn staging_category(name: &str, dest_dir: Option<&Path>) -> crate::categories::CategoryConfig {
+    crate::categories::CategoryConfig {
+        id: 0,
+        name: name.to_string(),
+        dest_dir: dest_dir.map(|dir| dir.display().to_string()),
+        aliases: String::new(),
+    }
+}
+
+// Add a job in a category and start it, so it chooses where it stages.
+async fn add_and_start(pipeline: &mut Pipeline, job_id: JobId, category: Option<&str>) {
+    let mut spec = crate::pipeline::tests::segmented_job_spec(
+        &format!("staged {}", job_id.0),
+        "payload.bin",
+        &[100],
+    );
+    spec.category = category.map(str::to_string);
+    let nzb_zstd = crate::pipeline::tests::nzb_zstd_for(&spec);
+    pipeline
+        .add_job(
+            job_id,
+            spec,
+            PathBuf::from(format!("staged-{}.nzb", job_id.0)),
+            nzb_zstd,
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+    crate::pipeline::tests::activate_job(pipeline, job_id).await;
+}
+
+// Deliver one file from where the job delivers into the destination it
+// claims for the category, and return that destination.
+async fn deliver_one_file(pipeline: &Pipeline, job_id: JobId, category: Option<&str>) -> PathBuf {
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    let working = state.working_dir.clone();
+    let staging = state.staging_dir.clone();
+    let source = staging.clone().unwrap_or_else(|| working.clone());
+    tokio::fs::create_dir_all(&source).await.unwrap();
+    std::fs::write(source.join("movie.mkv"), b"movie").unwrap();
+    let dest = pipeline
+        .claim_complete_destination(job_id, &format!("Staged {}", job_id.0), category)
+        .await
+        .unwrap();
+    run_move_to_complete(
+        job_id,
+        working,
+        staging.clone(),
+        dest.clone(),
+        Arc::new(PhaseCounters::default()),
+        None,
+        DeliveryPolicySource::Fixed(PostProcessingSettings::default()),
+        HashSet::new(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(std::fs::read(dest.join("movie.mkv")).unwrap(), b"movie");
+    if let Some(staging) = staging {
+        assert!(!staging.exists(), "{job_id:?}");
+    }
+    dest
+}
+
+// A job stages on the device of the folder it delivers to: its category's
+// folder when the category has one, else the complete folder. Its staging
+// directory is recorded for a restart, and its final move is on one device.
+// Devices: intermediate 1, complete 2, the movies folder 3, the beside
+// folder 1.
+#[tokio::test]
+async fn a_job_stages_on_the_device_its_category_delivers_to() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate, complete) =
+        crate::pipeline::tests::new_direct_pipeline(&temp).await;
+    let movies = temp.path().join("movies");
+    let beside = temp.path().join("beside");
+    crate::runtime::fs::test_devices::assign(&intermediate, 1);
+    crate::runtime::fs::test_devices::assign(&complete, 2);
+    crate::runtime::fs::test_devices::assign(&movies, 3);
+    crate::runtime::fs::test_devices::assign(&beside, 1);
+    pipeline.config.write().await.categories = vec![
+        staging_category("movies", Some(&movies)),
+        staging_category("beside", Some(&beside)),
+        staging_category("tv", None),
+    ];
+
+    let cases = [
+        (
+            JobId(41001),
+            Some("movies"),
+            Some(movies.clone()),
+            movies.clone(),
+        ),
+        (
+            JobId(41002),
+            Some("tv"),
+            Some(complete.join("tv")),
+            complete.join("tv"),
+        ),
+        (JobId(41003), None, Some(complete.clone()), complete.clone()),
+        // On the intermediate folder's device the job stages nothing and
+        // delivers from its working directory.
+        (JobId(41004), Some("beside"), None, beside.clone()),
+    ];
+    for (job_id, category, staging_root, dest_parent) in cases {
+        add_and_start(&mut pipeline, job_id, category).await;
+        let expected = staging_root
+            .as_deref()
+            .map(|root| crate::pipeline::queue::staging_dir_for(root, job_id));
+        let staging = pipeline.jobs.get(&job_id).unwrap().staging_dir.clone();
+        assert_eq!(staging, expected, "{job_id:?}");
+        pipeline.db.flush_write_queue().await.unwrap();
+        assert_eq!(
+            pipeline.db.load_active_job_staging_dir(job_id).unwrap(),
+            expected,
+            "{job_id:?}"
+        );
+        let source = staging
+            .clone()
+            .unwrap_or_else(|| pipeline.jobs.get(&job_id).unwrap().working_dir.clone());
+        assert!(
+            crate::runtime::fs::same_device(&source, &dest_parent),
+            "{job_id:?}"
+        );
+        let dest = deliver_one_file(&pipeline, job_id, category).await;
+        assert_eq!(dest.parent(), Some(dest_parent.as_path()), "{job_id:?}");
+    }
+    // The movies folder is on another device from the complete folder, so a
+    // job staged under the complete folder would have been copied there.
+    assert!(!crate::runtime::fs::same_device(&complete, &movies));
+}
+
+// A category changed while the job waits stages the job on the new folder's
+// device. One changed after the job began staging keeps its staging
+// directory, and the final move still delivers into the new folder, by a
+// copy when the devices differ. Devices: intermediate 1, complete 2, movies
+// 3, shows 4.
+#[tokio::test]
+async fn a_category_change_still_delivers_into_the_new_folder() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate, complete) =
+        crate::pipeline::tests::new_direct_pipeline(&temp).await;
+    let movies = temp.path().join("movies");
+    let shows = temp.path().join("shows");
+    crate::runtime::fs::test_devices::assign(&intermediate, 1);
+    crate::runtime::fs::test_devices::assign(&complete, 2);
+    crate::runtime::fs::test_devices::assign(&movies, 3);
+    crate::runtime::fs::test_devices::assign(&shows, 4);
+    pipeline.config.write().await.categories = vec![
+        staging_category("movies", Some(&movies)),
+        staging_category("shows", Some(&shows)),
+    ];
+    let to_shows = || crate::jobs::model::JobUpdate {
+        category: crate::jobs::model::FieldUpdate::Set("shows".to_string()),
+        ..Default::default()
+    };
+
+    // Changed while queued: it stages on the shows device.
+    let queued = JobId(41011);
+    let mut spec = crate::pipeline::tests::segmented_job_spec("queued", "payload.bin", &[100]);
+    spec.category = Some("movies".to_string());
+    let nzb_zstd = crate::pipeline::tests::nzb_zstd_for(&spec);
+    pipeline
+        .add_job(
+            queued,
+            spec,
+            PathBuf::from("queued.nzb"),
+            nzb_zstd,
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+    pipeline
+        .shared_state
+        .queue
+        .update_job(queued, to_shows())
+        .unwrap();
+    pipeline.apply_queue_intents().await;
+    crate::pipeline::tests::activate_job(&mut pipeline, queued).await;
+    assert_eq!(
+        pipeline.jobs.get(&queued).unwrap().staging_dir,
+        Some(crate::pipeline::queue::staging_dir_for(&shows, queued))
+    );
+    let dest = deliver_one_file(&pipeline, queued, Some("shows")).await;
+    assert_eq!(dest.parent(), Some(shows.as_path()));
+
+    // Changed after it began staging: it keeps its staging directory and
+    // still delivers into the shows folder.
+    let started = JobId(41012);
+    add_and_start(&mut pipeline, started, Some("movies")).await;
+    let staging = crate::pipeline::queue::staging_dir_for(&movies, started);
+    assert_eq!(
+        pipeline.jobs.get(&started).unwrap().staging_dir,
+        Some(staging.clone())
+    );
+    pipeline
+        .shared_state
+        .queue
+        .update_job(started, to_shows())
+        .unwrap();
+    pipeline.apply_queue_intents().await;
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&started)
+            .unwrap()
+            .spec
+            .category
+            .as_deref(),
+        Some("shows")
+    );
+    assert!(!crate::runtime::fs::same_device(&staging, &shows));
+    let dest = deliver_one_file(&pipeline, started, Some("shows")).await;
+    assert_eq!(dest.parent(), Some(shows.as_path()));
+    assert!(!staging.exists());
+}

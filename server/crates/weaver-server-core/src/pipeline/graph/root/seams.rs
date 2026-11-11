@@ -599,7 +599,10 @@ impl Pipeline {
             )
         };
         match round {
-            Ok(moves) => apply_moves(state, &moves),
+            Ok(moves) => {
+                apply_moves(state, &moves);
+                rank_volumes(state, &graph.take_volume_ranks());
+            }
             Err(error) => warn!(job_id = job_id.0, error = %error, "graph seek round failed"),
         }
         self.wake_repair_waiters();
@@ -688,6 +691,28 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
                 _ => None,
             },
         ));
+}
+
+// Rank the ordinary articles of each volume whose place in its set is now
+// known, so the volumes past the window are fetched by place. Only the
+// articles at the neutral priority move: a window volume, a first article
+// and anything raised or parked keep their place. Each volume's own
+// articles are found by its file, not by a walk of the queue.
+pub(super) fn rank_volumes(state: &mut JobState, ranks: &[(VolumeIndex, u32)]) {
+    if ranks.is_empty() {
+        return;
+    }
+    let job_id = state.job_id;
+    let Some(state) = state.articles.active_mut() else {
+        return;
+    };
+    for &(volume, rank) in ranks {
+        state.download_queue.rank_ordinary_file(
+            file(job_id, volume),
+            crate::pipeline::graph::NEUTRAL_PRIORITY,
+            rank,
+        );
+    }
 }
 
 // The moves applied by walks of the whole queue, which `apply_moves` must

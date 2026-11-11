@@ -417,6 +417,32 @@ fn rename_equivalent_path(_src: &Path, _dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Devices a test gives the directories it makes, so one machine's disk
+// reads as several: a path reads as the device of the longest directory it
+// lies under. Each test names only its own temporary directories, so tests
+// running together never read each other's.
+#[cfg(test)]
+pub(crate) mod test_devices {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    static DEVICES: Mutex<Vec<(PathBuf, u64)>> = Mutex::new(Vec::new());
+
+    pub(crate) fn assign(dir: &Path, device: u64) {
+        DEVICES.lock().unwrap().push((dir.to_path_buf(), device));
+    }
+
+    pub(super) fn of(path: &Path) -> Option<u64> {
+        DEVICES
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(dir, _)| path.starts_with(dir))
+            .max_by_key(|(dir, _)| dir.components().count())
+            .map(|(_, device)| *device)
+    }
+}
+
 // Whether two directories lie on one device, each read at the nearest of
 // its ancestors that exists, as one not yet made will be made there. A
 // device that cannot be read, or a platform with no device to read, counts
@@ -429,6 +455,10 @@ pub(crate) fn same_device(a: &Path, b: &Path) -> bool {
 }
 
 fn nearest_device(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    if let Some(device) = test_devices::of(path) {
+        return Some(device);
+    }
     let existing = path
         .ancestors()
         .find(|at| std::fs::metadata(at).is_ok_and(|meta| meta.is_dir()))?;

@@ -971,6 +971,29 @@ impl Database {
         )
     }
 
+    // Where the job stages the files it delivers; None when it stages
+    // nothing apart from its working directory.
+    pub(crate) fn set_active_job_staging_dir(
+        &self,
+        job_id: JobId,
+        staging_dir: Option<&std::path::Path>,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let args = vec![
+            SqlArg::OptText(staging_dir.map(|dir| dir.to_string_lossy().into_owned())),
+            SqlArg::I64(job_id.0 as i64),
+        ];
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE active_jobs SET staging_dir = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
     #[expect(
         clippy::too_many_arguments,
         reason = "active job runtime is persisted as one atomic SQL update"

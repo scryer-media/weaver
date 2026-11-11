@@ -1579,7 +1579,11 @@ pub(super) fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_siz
     stream
 }
 
-fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobSpec {
+pub(in crate::pipeline) fn segmented_job_spec(
+    name: &str,
+    filename: &str,
+    segment_sizes: &[u32],
+) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
