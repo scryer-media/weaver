@@ -39,3 +39,9 @@ pub use submission::{
     submit_uploaded_nzb_reader, submit_uploaded_nzb_reader_with_options,
 };
 pub use xz::{XZ_DECODER_MEMORY_LIMIT_BYTES, xz_multistream_decoder};
+
+// Opens a decoder for bzip2 input that reads every stream in it, as SABnzbd's
+// `BZ2File` does for an `.nzb.bz2`.
+pub fn bzip2_multistream_decoder<R: std::io::Read>(reader: R) -> bzip2::read::MultiBzDecoder<R> {
+    bzip2::read::MultiBzDecoder::new(reader)
+}
