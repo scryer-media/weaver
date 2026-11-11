@@ -57,6 +57,8 @@ fn priority_edit(priority: &str) -> crate::jobs::JobUpdate {
 async fn seeded() -> (tempfile::TempDir, Pipeline, SchedulerHandle) {
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    // A ring deep enough for the pending edits below to reach it.
+    pipeline.next_up.depth = 10;
     let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
     handle
         .set_max_concurrent_nzbs(std::num::NonZeroU32::new(SLOTS).unwrap())
@@ -233,7 +235,7 @@ fn sorted(mut ids: Vec<JobId>) -> Vec<JobId> {
 
 #[tokio::test]
 async fn every_consumer_ranks_as_it_did_before_the_shared_order() {
-    let (_temp, mut pipeline, _handle) = seeded().await;
+    let (_temp, pipeline, _handle) = seeded().await;
     assert_eq!(pipeline.nzb_admitted.len(), SLOTS as usize);
 
     let window = pipeline

@@ -57,7 +57,7 @@ impl QueueWalkMark {
 
 impl Pipeline {
     // Whether the row's job counts as paused for its slot.
-    fn admission_paused(&self, row: &crate::pipeline::queue::JobRow) -> bool {
+    pub(in crate::pipeline) fn admission_paused(&self, row: &crate::pipeline::queue::JobRow) -> bool {
         row.intents.paused.unwrap_or_else(|| {
             row.admission
                 .as_ref()
