@@ -26,6 +26,7 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         .download_queue
         .pop()
         .unwrap();
+    let work = pipeline.dispatched(work);
     let segment_id = work.segment_id;
     pipeline.hold_test_lane_works(vec![work.clone()], false);
     let lease = DownloadBatchLease {
@@ -84,6 +85,7 @@ async fn owned_download_lane_capacity_failure_requeues_without_failing_the_artic
         .download_queue
         .pop()
         .unwrap();
+    let restored = pipeline.dispatched(restored);
     assert_eq!(restored.segment_id, segment_id);
     assert_eq!(restored.retry_count, 0);
 }
@@ -113,6 +115,7 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         .download_queue
         .pop()
         .unwrap();
+    let work = pipeline.dispatched(work);
     let segment_id = work.segment_id;
     pipeline.hold_test_lane_works(vec![work.clone()], false);
     let lease = DownloadBatchLease {
@@ -175,6 +178,7 @@ async fn owned_download_lane_selection_contention_requeues_without_failing_the_a
         .download_queue
         .pop()
         .unwrap();
+    let restored = pipeline.dispatched(restored);
     assert_eq!(restored.segment_id, segment_id);
     assert_eq!(
         restored.retry_count, 0,

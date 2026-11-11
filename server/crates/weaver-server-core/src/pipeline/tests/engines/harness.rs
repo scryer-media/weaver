@@ -1419,36 +1419,36 @@ fn handed_out(
     {
         return None;
     }
-    let queue = &mut pipeline
-        .jobs
-        .get_mut(&JOB)?
-        .articles
-        .active_mut()
-        .unwrap()
-        .download_queue;
+    let crate::jobs::model::JobState { articles, spec, .. } = pipeline.jobs.get_mut(&JOB)?;
+    let queue = &mut articles.active_mut().unwrap().download_queue;
     let all = scenario.backwards || !scenario.together.is_empty();
     let mut batch = Vec::new();
     if scenario.batch > 0 {
         while batch.len() < scenario.batch
             && let Some(work) = queue.pop()
         {
-            batch.push(work);
+            batch.push(work.dispatched(spec));
         }
         return (!batch.is_empty()).then_some((batch, None));
     }
     while let Some(work) = queue.pop() {
-        batch.push(work);
+        batch.push(work.dispatched(spec));
         if !all {
             break;
         }
     }
-    let reversed = |work: &DownloadWork| {
-        scenario
-            .reversed
-            .contains(&work.segment_id.file_id.file_index)
-    };
-    if !all && batch.first().is_some_and(reversed) {
-        batch.extend(queue.extract_matching(reversed));
+    let reversed = |file_index: u32| scenario.reversed.contains(&file_index);
+    if !all
+        && batch
+            .first()
+            .is_some_and(|work| reversed(work.segment_id.file_id.file_index))
+    {
+        batch.extend(
+            queue
+                .extract_matching(|work| reversed(work.segment_id.file_id.file_index))
+                .into_iter()
+                .map(|item| item.dispatched(spec)),
+        );
         batch.sort_by_key(|work| {
             std::cmp::Reverse((
                 work.segment_id.segment_number,
@@ -1925,11 +1925,10 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
         out: &mut Vec<DownloadWork>,
     ) {
         loop {
-            while let Some(work) = pipeline
-                .jobs
-                .get_mut(&JOB)
-                .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
-            {
+            while let Some(work) = pipeline.jobs.get_mut(&JOB).and_then(|state| {
+                let item = state.articles.active_mut().unwrap().download_queue.pop()?;
+                Some(item.dispatched(&state.spec))
+            }) {
                 let article = (
                     work.segment_id.file_id.file_index,
                     work.segment_id.segment_number,

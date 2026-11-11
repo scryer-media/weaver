@@ -191,6 +191,7 @@ async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
             .download_queue
             .pop()
             .unwrap();
+        let work = pipeline.dispatched(work);
         let segment_id = work.segment_id;
         pipeline
             .jobs

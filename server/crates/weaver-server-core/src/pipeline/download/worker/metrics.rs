@@ -393,7 +393,7 @@ impl Pipeline {
             };
             let queued = active.download_queue.extract_matching(|_| true);
             for work in &queued {
-                self.book_unservable_work(work);
+                self.book_unservable_segment(work.segment_id, &work.exclude_servers);
             }
             self.update_queue_metrics();
             self.maybe_finish_download_pass(job_id);

@@ -267,19 +267,14 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
 // whose turn comes first, a turn of each named post at a time; the rest stay
 // queued.
 fn next_work(pipeline: &mut Pipeline, scenario: &Scenario) -> Option<DownloadWork> {
-    let queue = &mut pipeline
-        .jobs
-        .get_mut(&JOB)?
-        .articles
-        .active_mut()
-        .unwrap()
-        .download_queue;
+    let crate::jobs::model::JobState { articles, spec, .. } = pipeline.jobs.get_mut(&JOB)?;
+    let queue = &mut articles.active_mut().unwrap().download_queue;
     if scenario.together.is_empty() && scenario.first.is_empty() {
-        return queue.pop();
+        return queue.pop().map(|item| item.dispatched(spec));
     }
     let mut queued = Vec::new();
     while let Some(work) = queue.pop() {
-        queued.push(work);
+        queued.push(work.dispatched(spec));
     }
     let article = |work: &DownloadWork| {
         (
@@ -1060,10 +1055,13 @@ async fn a_restored_graph_job_advances_its_durable_floor_with_its_checkpoints() 
     let limit = Pipeline::restart_durable_lead_limit_bytes();
     pipeline.jobs.get_mut(&JOB).unwrap().downloaded_bytes = floor + limit - 2 * estimate;
     let admission = pipeline.checkpoint_admission(JOB);
-    assert_eq!(admission.decision(&work, &[]).as_str(), "within_limit");
+    assert_eq!(
+        admission.decision(&work.view(), &[]).as_str(),
+        "within_limit"
+    );
     assert_eq!(
         admission
-            .decision(&work, std::slice::from_ref(&work))
+            .decision(&work.view(), std::slice::from_ref(&work))
             .as_str(),
         "within_limit",
         "a restored graph job must not drop to one article at a time"

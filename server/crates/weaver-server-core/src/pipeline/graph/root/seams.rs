@@ -19,7 +19,7 @@ use super::intake::Decoded;
 use super::source::{Class, Move};
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{JobState, JobStatus};
-use crate::pipeline::download::queue::DownloadWork;
+use crate::pipeline::download::queue::{DownloadWork, QueueItem};
 use crate::pipeline::graph::engine::{Heard, Said};
 use crate::pipeline::graph::job::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::limits;
@@ -636,8 +636,7 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
         .iter()
         .map(|found| ((found.volume.0, found.ordinal), found.class))
         .collect();
-    let class_of = |work: &DownloadWork| {
-        let id = work.segment_id;
+    let class_of = |id: SegmentId| {
         (id.file_id.job_id == job_id)
             .then(|| classes.get(&(id.file_id.file_index, id.segment_number)))
             .flatten()
@@ -672,10 +671,10 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
     taken.extend(state.download_queue.extract_segments(picked(|class| {
         class < Class::Ordinary && !matches!(class, Class::Window(_))
     })));
-    taken.sort_by_key(|work| class_of(work));
+    taken.sort_by_key(|work| class_of(work.segment_id));
     for mut work in taken {
-        if let Some(class) = class_of(&work) {
-            classify(&mut work, class);
+        if let Some(class) = class_of(work.segment_id) {
+            classify_item(&mut work, class);
         }
         state.download_queue.push(work);
     }
@@ -730,8 +729,7 @@ pub(super) fn apply_moves_by_walk(state: &mut JobState, moves: &[Move]) {
         .iter()
         .map(|found| ((found.volume.0, found.ordinal), found.class))
         .collect();
-    let class_of = |work: &DownloadWork| {
-        let id = work.segment_id;
+    let class_of = |id: SegmentId| {
         (id.file_id.job_id == job_id)
             .then(|| classes.get(&(id.file_id.file_index, id.segment_number)))
             .flatten()
@@ -745,34 +743,36 @@ pub(super) fn apply_moves_by_walk(state: &mut JobState, moves: &[Move]) {
                 .note_first_article(segment(job_id, VolumeIndex(volume), ordinal));
         }
     }
-    let parked = |work: &DownloadWork| class_of(work) == Some(Class::Parked);
+    let parked = |work: &crate::pipeline::download::QueuedWork<'_>| {
+        class_of(work.segment_id) == Some(Class::Parked)
+    };
     if any(|class| class == Class::Parked) {
         for work in state.download_queue.extract_matching(parked) {
             state.recovery_queue.push(work);
         }
     }
-    let mut taken = state
-        .recovery_queue
-        .extract_matching(|work| class_of(work).is_some_and(|class| class != Class::Parked));
+    let mut taken = state.recovery_queue.extract_matching(|work| {
+        class_of(work.segment_id).is_some_and(|class| class != Class::Parked)
+    });
     let raised = |class: Class| class < Class::Ordinary && !matches!(class, Class::Window(_));
     if any(raised) {
         taken.extend(
             state
                 .download_queue
-                .extract_matching(|work| class_of(work).is_some_and(raised)),
+                .extract_matching(|work| class_of(work.segment_id).is_some_and(raised)),
         );
     }
-    taken.sort_by_key(|work| class_of(work));
+    taken.sort_by_key(|work| class_of(work.segment_id));
     for mut work in taken {
-        if let Some(class) = class_of(&work) {
-            classify(&mut work, class);
+        if let Some(class) = class_of(work.segment_id) {
+            classify_item(&mut work, class);
         }
         state.download_queue.push(work);
     }
     if any(|class| matches!(class, Class::Window(_))) {
         state
             .download_queue
-            .reprioritize_matching_with_rank(|work| match class_of(work) {
+            .reprioritize_matching_with_rank(|work| match class_of(work.segment_id) {
                 Some(Class::Window(rank)) => Some((WINDOW_PRIORITY, Some(rank))),
                 _ => None,
             });
@@ -782,9 +782,33 @@ pub(super) fn apply_moves_by_walk(state: &mut JobState, moves: &[Move]) {
 // The queue flags a class is fetched under, and its priority: a window
 // volume's, or the one neutral priority every other article holds.
 fn classify(work: &mut DownloadWork, class: Class) {
-    work.completion_critical |= class.waited_on();
-    work.is_recovery |= class == Class::Recovery;
-    work.priority = match class {
+    classify_flags(
+        &mut work.completion_critical,
+        &mut work.is_recovery,
+        &mut work.priority,
+        class,
+    );
+}
+
+// [`classify`] for an item taken off a queue.
+fn classify_item(work: &mut QueueItem, class: Class) {
+    classify_flags(
+        &mut work.completion_critical,
+        &mut work.is_recovery,
+        &mut work.priority,
+        class,
+    );
+}
+
+fn classify_flags(
+    completion_critical: &mut bool,
+    is_recovery: &mut bool,
+    priority: &mut u32,
+    class: Class,
+) {
+    *completion_critical |= class.waited_on();
+    *is_recovery |= class == Class::Recovery;
+    *priority = match class {
         Class::Window(_) => WINDOW_PRIORITY,
         _ => crate::pipeline::graph::NEUTRAL_PRIORITY,
     };

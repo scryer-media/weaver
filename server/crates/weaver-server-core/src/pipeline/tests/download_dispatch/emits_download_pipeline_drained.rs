@@ -468,6 +468,7 @@ async fn capped_uu_spool_keeps_unrelated_yenc_ordinals_eligible() {
             .download_queue
             .pop()
             .unwrap();
+        let first = pipeline.dispatched(first);
         assert_eq!(first.segment_id.segment_number, 0);
     }
     pipeline.uu_files.insert(
@@ -808,6 +809,7 @@ async fn dispatch_downloads_prefers_new_higher_priority_job_after_inflight_segme
             .download_queue
             .pop()
             .expect("low-priority job should have an in-flight segment to drain");
+        let in_flight = pipeline.dispatched(in_flight);
         pipeline.hold_test_lane_works(vec![in_flight], true);
     }
     pipeline.active_download_connections = 1;
@@ -1849,6 +1851,7 @@ async fn owned_download_lane_requeues_unrequested_tail_without_retry_result() {
         .download_queue
         .pop()
         .unwrap();
+    let tail_work = pipeline.dispatched(tail_work);
     pipeline.hold_test_lane_works(vec![tail_work.clone()], false);
 
     let (ack, ack_rx) = std::sync::mpsc::sync_channel(1);
