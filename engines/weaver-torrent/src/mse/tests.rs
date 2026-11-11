@@ -5,6 +5,8 @@
 // licensed under the Apache License 2.0 (see LICENSE-APACHE). Modified by the
 // Weaver authors from 2026-10-20 onward.
 
+use std::collections::HashMap;
+
 use crate::core::hash_id::Id20;
 use crate::peer_protocol::Handshake;
 use crate::sha1w::{ISha1, Sha1};
@@ -98,23 +100,43 @@ struct Pair {
     responder: Result<Established, MseError>,
 }
 
+fn by_obfuscated(
+    hashes: &[Id20],
+    policy: EncryptionPolicy,
+) -> HashMap<Id20, (Id20, EncryptionPolicy)> {
+    hashes
+        .iter()
+        .map(|ih| (obfuscated_hash(ih), (*ih, policy)))
+        .collect()
+}
+
+/// What a session whose policy and every torrent's is `policy` takes.
+fn incoming(policy: EncryptionPolicy) -> Incoming {
+    Incoming {
+        encrypted: policy != EncryptionPolicy::Disabled,
+        plaintext: policy != EncryptionPolicy::Require,
+    }
+}
+
 async fn run_pair(
     initiator_hash: Id20,
     offer: u32,
     session_hashes: Vec<Id20>,
     policy: EncryptionPolicy,
 ) -> Pair {
-    let policies: Vec<(Id20, EncryptionPolicy)> =
-        session_hashes.into_iter().map(|ih| (ih, policy)).collect();
+    let torrents = by_obfuscated(&session_hashes, policy);
     let ((ar, aw), (br, bw)) = pipe();
     let ia = bt_handshake(initiator_hash, 1);
     let (initiator, responder) = tokio::join!(
         initiate(ar, aw, &initiator_hash, offer, &ia),
-        respond(br, bw, true, &policies),
+        respond(br, bw, true, |o| torrents.get(o).copied()),
     );
+    if let Ok((_, skey)) = &responder {
+        assert_eq!(*skey, Some(initiator_hash));
+    }
     Pair {
         initiator,
-        responder,
+        responder: responder.map(|(established, _)| established),
     }
 }
 
@@ -237,9 +259,15 @@ async fn plaintext_against(
     let ih = Id20::new([7; 20]);
     let ((ar, mut aw), (mut reader, writer)) = pipe();
     aw.write_all(&bt_handshake(ih, 1)).await.unwrap();
-    let res = upgrade_incoming(policy, &mut reader, writer, Duration::MAX, &[(ih, policy)])
-        .await
-        .map(|(encryption, _)| encryption);
+    let torrents = by_obfuscated(&[ih], policy);
+    let res = upgrade_incoming(incoming(policy), &mut reader, writer, Duration::MAX, |o| {
+        torrents.get(o).copied()
+    })
+    .await
+    .map(|(encryption, _, skey)| {
+        assert_eq!(skey, None);
+        encryption
+    });
     (res, reader, (ar, aw))
 }
 
@@ -272,13 +300,16 @@ async fn test_prefer_and_require_responders_accept_encrypted() {
         let ((ar, aw), (br, bw)) = pipe();
         let ia = bt_handshake(ih, 1);
         let mut reader = br;
-        let policies = [(ih, policy)];
+        let torrents = by_obfuscated(&[ih], policy);
         let (a, b) = tokio::join!(
             initiate(ar, aw, &ih, outgoing_offer(EncryptionPolicy::Require), &ia),
-            upgrade_incoming(policy, &mut reader, bw, Duration::MAX, &policies),
+            upgrade_incoming(incoming(policy), &mut reader, bw, Duration::MAX, |o| {
+                torrents.get(o).copied()
+            }),
         );
-        let (encryption, writer) = b.unwrap();
+        let (encryption, writer, skey) = b.unwrap();
         assert_eq!(encryption, Encryption::Rc4);
+        assert_eq!(skey, Some(ih));
         let b = Established {
             reader,
             writer,

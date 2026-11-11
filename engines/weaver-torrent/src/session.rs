@@ -153,6 +153,7 @@ fn torrent_from_bytes(bytes: Bytes) -> anyhow::Result<ParsedTorrentFile> {
 #[derive(Default)]
 pub struct SessionDatabase {
     torrents: HashMap<TorrentId, ManagedTorrentHandle>,
+    index: TorrentIndex,
     // Rings as a torrent is added: a magnet's torrent enters the session
     // once its metadata is received.
     added: Arc<Notify>,
@@ -160,8 +161,110 @@ pub struct SessionDatabase {
 
 impl SessionDatabase {
     fn add_torrent(&mut self, torrent: ManagedTorrentHandle, id: TorrentId) {
+        self.index
+            .insert(id, torrent.info_hashes(), torrent.encryption());
         self.torrents.insert(id, torrent);
         self.added.notify_waiters();
+    }
+
+    fn remove_torrent(&mut self, id: TorrentId) -> Option<ManagedTorrentHandle> {
+        let removed = self.torrents.remove(&id)?;
+        self.index
+            .remove(id, removed.info_hashes(), removed.encryption());
+        Some(removed)
+    }
+
+    /// The torrent that answers to `hash`, one of its 20-byte ids.
+    fn by_hash(&self, hash: Id20) -> Option<(TorrentId, &ManagedTorrentHandle)> {
+        let id = self.index.by_hash(hash)?;
+        Some((id, self.torrents.get(&id)?))
+    }
+}
+
+/// Each torrent's 20-byte ids, and `HASH('req2', id)` an encryption
+/// handshake names each by, so an accepted connection finds its torrent
+/// in one lookup (libtorrent `torrent_list::find_obfuscated`); and how many
+/// torrents set each encryption policy over the session's.
+#[derive(Default)]
+struct TorrentIndex {
+    by_hash: HashMap<Id20, TorrentId>,
+    /// The id and the policy its torrent sets over the session's.
+    by_obfuscated: HashMap<Id20, (Id20, TorrentId, Option<crate::mse::EncryptionPolicy>)>,
+    /// Torrents setting `Disabled`, `Prefer` and `Require`.
+    overrides: [usize; 3],
+}
+
+impl TorrentIndex {
+    fn slot(policy: crate::mse::EncryptionPolicy) -> usize {
+        match policy {
+            crate::mse::EncryptionPolicy::Disabled => 0,
+            crate::mse::EncryptionPolicy::Prefer => 1,
+            crate::mse::EncryptionPolicy::Require => 2,
+        }
+    }
+
+    fn insert(
+        &mut self,
+        id: TorrentId,
+        hashes: InfoHashes,
+        encryption: Option<crate::mse::EncryptionPolicy>,
+    ) {
+        for hash in hashes.ids20() {
+            self.by_hash.insert(hash, id);
+            self.by_obfuscated
+                .insert(crate::mse::obfuscated_hash(&hash), (hash, id, encryption));
+        }
+        if let Some(policy) = encryption {
+            self.overrides[Self::slot(policy)] += 1;
+        }
+    }
+
+    fn remove(
+        &mut self,
+        id: TorrentId,
+        hashes: InfoHashes,
+        encryption: Option<crate::mse::EncryptionPolicy>,
+    ) {
+        for hash in hashes.ids20() {
+            if self.by_hash.get(&hash) == Some(&id) {
+                self.by_hash.remove(&hash);
+            }
+            let obfuscated = crate::mse::obfuscated_hash(&hash);
+            if self.by_obfuscated.get(&obfuscated).map(|(_, t, _)| *t) == Some(id) {
+                self.by_obfuscated.remove(&obfuscated);
+            }
+        }
+        if let Some(policy) = encryption {
+            let count = &mut self.overrides[Self::slot(policy)];
+            *count = count.saturating_sub(1);
+        }
+    }
+
+    fn by_hash(&self, hash: Id20) -> Option<TorrentId> {
+        self.by_hash.get(&hash).copied()
+    }
+
+    /// The id an encryption handshake named by `HASH('req2', id)`, its
+    /// torrent, and the torrent's policy under the session's `session`.
+    fn by_obfuscated(
+        &self,
+        obfuscated: &Id20,
+        session: crate::mse::EncryptionPolicy,
+    ) -> Option<(Id20, TorrentId, crate::mse::EncryptionPolicy)> {
+        let (hash, id, encryption) = *self.by_obfuscated.get(obfuscated)?;
+        Some((hash, id, encryption.unwrap_or(session)))
+    }
+
+    /// What an accepted connection may be taken as under the session's
+    /// `session` and every torrent's policy. A torrent with none of its own
+    /// keeps `session`, which already counts.
+    fn incoming(&self, session: crate::mse::EncryptionPolicy) -> crate::mse::Incoming {
+        use crate::mse::EncryptionPolicy::{Disabled, Prefer, Require};
+        let any = |policy| self.overrides[Self::slot(policy)] > 0;
+        crate::mse::Incoming {
+            encrypted: session != Disabled || any(Prefer) || any(Require),
+            plaintext: session != Require || any(Disabled) || any(Prefer),
+        }
     }
 }
 
@@ -1956,7 +2059,7 @@ impl Session {
         // the torrent its SNI names: that torrent's CA checks the peer's
         // chain and our identity under it answers. No encryption handshake
         // runs inside it.
-        let (encryption, writer, named) = if tls {
+        let (encryption, writer, named, skey_named) = if tls {
             let (r, w, named) = tokio::time::timeout(handshake_timeout, async {
                 let incoming = crate::ssl::Incoming::start(reader, writer)
                     .await
@@ -1982,7 +2085,7 @@ impl Session {
             .await
             .context("TLS handshake timed out")??;
             reader = r;
-            (crate::mse::Encryption::None, w.into(), Some(named))
+            (crate::mse::Encryption::None, w.into(), Some(named), None)
         } else {
             // With encryption enabled, an encrypted connection is unwrapped here
             // and a plaintext one passed through (or refused); with it disabled
@@ -1992,30 +2095,24 @@ impl Session {
             // encrypted one names its torrent in the encryption handshake, a
             // plaintext one only in its BitTorrent handshake.
             let session_policy = self.connector.encryption();
-            let policies: Vec<(Id20, crate::mse::EncryptionPolicy)> = self
-                .db
-                .read()
-                .torrents
-                .values()
-                .flat_map(|t| {
-                    let policy = t
-                        .shared()
-                        .options
-                        .peer_opts
-                        .encryption_under(session_policy);
-                    t.info_hashes().ids20().map(move |hash| (hash, policy))
-                })
-                .collect();
-            let (encryption, writer) = crate::mse::upgrade_incoming(
-                session_policy,
+            let incoming = self.db.read().index.incoming(session_policy);
+            let (encryption, writer, skey) = crate::mse::upgrade_incoming(
+                incoming,
                 &mut reader,
                 writer,
                 handshake_timeout,
-                &policies,
+                |obfuscated| {
+                    let (hash, _, policy) = self
+                        .db
+                        .read()
+                        .index
+                        .by_obfuscated(obfuscated, session_policy)?;
+                    Some((hash, policy))
+                },
             )
             .await
             .context("error in the encryption handshake")?;
-            (encryption, writer, None)
+            (encryption, writer, None, skey)
         };
 
         let mut read_buf = ReadBuf::new();
@@ -2028,11 +2125,20 @@ impl Session {
         let (id, torrent) = self
             .db
             .read()
-            .torrents
-            .iter()
-            .find(|(_, t)| t.info_hashes().answers_to(h.info_hash))
-            .map(|(id, t)| (*id, t.clone()))
+            .by_hash(h.info_hash)
+            .map(|(id, t)| (id, t.clone()))
             .with_context(|| format!("didn't find a matching torrent {:?}", h.info_hash))?;
+        // The encryption handshake keyed the stream to one torrent; the
+        // BitTorrent handshake must greet that torrent, by either of a
+        // hybrid's ids (libtorrent `bt_peer_connection::on_receive`, "verify
+        // info hash" once attached by `find_encrypted_torrent`).
+        if let Some(skey) = skey_named
+            && !torrent.info_hashes().answers_to(skey)
+        {
+            bail!(
+                "the encryption handshake named {skey:?} and the BitTorrent handshake greets torrent {id}"
+            );
+        }
         if h.peer_id == torrent.shared().peer_id {
             bail!("seems like we are connecting to ourselves, ignoring");
         }
@@ -3235,14 +3341,12 @@ impl Session {
 
         let (managed_torrent, metadata) = {
             let mut g = self.db.write();
-            if let Some((id, handle)) = g.torrents.iter().find_map(|(eid, t)| {
-                if t.info_hashes().overlaps(&info_hashes) || *eid == id {
-                    Some((*eid, t.clone()))
-                } else {
-                    None
-                }
-            }) {
-                return Ok(AddTorrentResponse::AlreadyManaged(id, handle));
+            if let Some((id, handle)) = info_hashes
+                .ids20()
+                .find_map(|hash| g.by_hash(hash))
+                .or_else(|| g.torrents.get(&id).map(|t| (id, t)))
+            {
+                return Ok(AddTorrentResponse::AlreadyManaged(id, handle.clone()));
             }
 
             let span = debug_span!(parent: self.rs(), "torrent", id);
@@ -3329,7 +3433,7 @@ impl Session {
         if let Some(p) = self.persistence.as_ref()
             && let Err(e) = p.store(id, &managed_torrent).await
         {
-            self.db.write().torrents.remove(&id);
+            self.db.write().remove_torrent(id);
             return Err(e);
         }
 
@@ -3349,13 +3453,7 @@ impl Session {
     pub fn get(&self, id: TorrentIdOrHash) -> Option<ManagedTorrentHandle> {
         match id {
             TorrentIdOrHash::Id(id) => self.db.read().torrents.get(&id).cloned(),
-            TorrentIdOrHash::Hash(id) => self.db.read().torrents.iter().find_map(|(_, v)| {
-                if v.info_hashes().answers_to(id) {
-                    Some(v.clone())
-                } else {
-                    None
-                }
-            }),
+            TorrentIdOrHash::Hash(id) => self.db.read().by_hash(id).map(|(_, t)| t.clone()),
         }
     }
 
@@ -3365,22 +3463,14 @@ impl Session {
             TorrentIdOrHash::Hash(h) => self
                 .db
                 .read()
-                .torrents
-                .values()
-                .find_map(|v| {
-                    if v.info_hashes().answers_to(h) {
-                        Some(v.id())
-                    } else {
-                        None
-                    }
-                })
+                .by_hash(h)
+                .map(|(id, _)| id)
                 .context("no such torrent in db")?,
         };
         let removed = self
             .db
             .write()
-            .torrents
-            .remove(&id)
+            .remove_torrent(id)
             .with_context(|| format!("torrent with id {id} did not exist"))?;
 
         if let Err(e) = removed.pause() {
@@ -4208,6 +4298,99 @@ mod tests {
 
     fn bstr(s: &str) -> String {
         format!("{}:{s}", s.len())
+    }
+
+    // The torrent index answers each lookup of an accepted connection as a
+    // scan over every torrent does, over a seeded set with a v1, a hybrid
+    // and a v2 torrent, a torrent added and removed, and an unknown hash.
+    #[test]
+    fn the_torrent_index_finds_what_a_scan_of_every_torrent_finds() {
+        use super::{Id20, InfoHashes, TorrentIndex};
+        use crate::core::hash_id::Id32;
+        use crate::mse::{EncryptionPolicy, Incoming, obfuscated_hash};
+        let policies = [
+            EncryptionPolicy::Disabled,
+            EncryptionPolicy::Prefer,
+            EncryptionPolicy::Require,
+        ];
+        let v1 = |b| InfoHashes {
+            v1: Some(Id20::new([b; 20])),
+            v2: None,
+        };
+        let seeded: Vec<(usize, InfoHashes, Option<EncryptionPolicy>)> = vec![
+            (0, v1(1), None),
+            (
+                1,
+                InfoHashes {
+                    v1: Some(Id20::new([2; 20])),
+                    v2: Some(Id32::new([3; 32])),
+                },
+                Some(EncryptionPolicy::Require),
+            ),
+            (
+                2,
+                InfoHashes {
+                    v1: None,
+                    v2: Some(Id32::new([4; 32])),
+                },
+                Some(EncryptionPolicy::Disabled),
+            ),
+            (3, v1(5), Some(EncryptionPolicy::Prefer)),
+            (4, v1(6), None),
+        ];
+        let removed = (5, v1(7), Some(EncryptionPolicy::Prefer));
+        let unknown = Id20::new([8; 20]);
+
+        // Every subset of the torrents, as a session may hold.
+        for subset in 0..1u32 << seeded.len() {
+            let held: Vec<_> = seeded
+                .iter()
+                .filter(|(id, _, _)| subset & (1 << id) != 0)
+                .copied()
+                .collect();
+            let mut index = TorrentIndex::default();
+            for &(id, hashes, encryption) in &held {
+                index.insert(id, hashes, encryption);
+            }
+            index.insert(removed.0, removed.1, removed.2);
+            index.remove(removed.0, removed.1, removed.2);
+
+            let candidates: Vec<Id20> = seeded
+                .iter()
+                .chain([&removed])
+                .flat_map(|(_, h, _)| h.ids20())
+                .chain([unknown])
+                .collect();
+            for session in policies {
+                let every = || {
+                    std::iter::once(session)
+                        .chain(held.iter().map(|(_, _, p)| p.unwrap_or(session)))
+                };
+                assert_eq!(
+                    index.incoming(session),
+                    Incoming {
+                        encrypted: !every().all(|p| p == EncryptionPolicy::Disabled),
+                        plaintext: every().any(|p| p != EncryptionPolicy::Require),
+                    },
+                    "{subset:#b} {session:?}"
+                );
+                for &hash in &candidates {
+                    let obfuscated = obfuscated_hash(&hash);
+                    let scanned = held.iter().find_map(|(id, hashes, p)| {
+                        hashes
+                            .ids20()
+                            .find(|ih| obfuscated_hash(ih) == obfuscated)
+                            .map(|ih| (ih, *id, p.unwrap_or(session)))
+                    });
+                    assert_eq!(index.by_obfuscated(&obfuscated, session), scanned);
+                    let scanned = held
+                        .iter()
+                        .find(|(_, hashes, _)| hashes.answers_to(hash))
+                        .map(|(id, _, _)| *id);
+                    assert_eq!(index.by_hash(hash), scanned);
+                }
+            }
+        }
     }
 
     #[test]
@@ -6349,6 +6532,18 @@ mod tests {
         std::sync::Arc<Session>,
         super::ManagedTorrentHandle,
     ) {
+        seeding_v2_under(torrent, crate::mse::EncryptionPolicy::default()).await
+    }
+
+    // As [`seeding_v2`], the session's connections under `encryption`.
+    async fn seeding_v2_under(
+        torrent: &crate::core::v2_test_torrent::TestTorrent,
+        encryption: crate::mse::EncryptionPolicy,
+    ) -> (
+        TempDir,
+        std::sync::Arc<Session>,
+        super::ManagedTorrentHandle,
+    ) {
         let dir = TempDir::with_prefix("v2_identity").unwrap();
         for (name, data) in &torrent.files {
             std::fs::write(dir.path().join(name), data).unwrap();
@@ -6367,6 +6562,7 @@ mod tests {
                 }),
                 // A test greets the seed from this host more than once.
                 allow_multiple_connections_per_ip: true,
+                encryption,
                 ..crate::test_support::session_options()
             },
         )
@@ -6431,6 +6627,88 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(again, AddTorrentResponse::AlreadyManaged(id, _) if id == handle.id()));
+
+        session.stop().await;
+    }
+
+    // Connects to the session, keys an encrypted stream to `skey` and sends
+    // a handshake for `greeted` in it; returns what came back of the
+    // session's handshake, nothing when the connection was closed.
+    async fn greet_encrypted(
+        session: &Session,
+        skey: super::Id20,
+        greeted: super::Id20,
+    ) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let (read, write) = crate::test_support::tcp(session.listen_addr().unwrap())
+            .await
+            .unwrap();
+        let mut handshake = [0u8; 68];
+        let len = crate::peer_protocol::Handshake::new(greeted, super::Id20::new([7; 20]))
+            .serialize_unchecked_len(&mut handshake);
+        let mut established = crate::mse::initiate(
+            read,
+            write,
+            &skey,
+            crate::mse::outgoing_offer(crate::mse::EncryptionPolicy::Require),
+            &handshake[..len],
+        )
+        .await
+        .unwrap();
+        let mut answer = Vec::new();
+        let _ = (&mut established.reader)
+            .take(68)
+            .read_to_end(&mut answer)
+            .await;
+        answer
+    }
+
+    #[tokio::test]
+    async fn an_encrypted_connection_greets_only_the_torrent_its_stream_was_keyed_to() {
+        // libtorrent bt_peer_connection::on_receive: the stream key attaches
+        // the connection to its torrent, and a handshake for another torrent
+        // disconnects with invalid_info_hash. A hybrid's two ids name one
+        // torrent.
+        let (_dir, session, hybrid) =
+            seeding_v2_under(&v2_torrent(true), crate::mse::EncryptionPolicy::Prefer).await;
+        let other_torrent = v2_torrent(false);
+        let other_dir = TempDir::with_prefix("v2_other").unwrap();
+        for (name, data) in &other_torrent.files {
+            std::fs::write(other_dir.path().join(name), data).unwrap();
+        }
+        let other = session
+            .add_torrent(
+                AddTorrent::from_bytes(other_torrent.torrent_bytes()),
+                Some(AddTorrentOptions {
+                    output_folder: Some(other_dir.path().to_str().unwrap().to_owned()),
+                    overwrite: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap()
+            .into_handle()
+            .unwrap();
+        other.wait_until_completed().await.unwrap();
+        let v1 = hybrid.info_hashes().v1.unwrap();
+        let v2 = hybrid.info_hashes().v2.unwrap().truncate_for_dht();
+        let other = other.info_hash();
+
+        for (skey, greeted, kept) in [
+            (v1, v1, true),
+            (v1, v2, true),
+            (v2, v1, true),
+            (other, other, true),
+            (v1, other, false),
+            (other, v2, false),
+        ] {
+            let answer = greet_encrypted(&session, skey, greeted).await;
+            assert_eq!(
+                answered_hash(&answer),
+                kept.then_some(greeted),
+                "{skey:?} {greeted:?}"
+            );
+        }
 
         session.stop().await;
     }

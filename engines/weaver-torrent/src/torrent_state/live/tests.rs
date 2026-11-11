@@ -235,6 +235,7 @@ impl Harness {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),
             tx,
@@ -3211,6 +3212,46 @@ async fn a_request_we_cannot_serve_is_dropped_and_the_peer_kept() {
     assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
 }
 
+// libtorrent `peer_connection::incoming_request`: on a fast connection each
+// request we cannot serve is answered with a Reject (`write_reject_request`),
+// once, and the peer kept.
+#[tokio::test]
+async fn a_request_we_cannot_serve_is_rejected_on_a_fast_connection() {
+    let h = Harness::build(
+        "unservable_is_rejected",
+        0x80,
+        choker::DEFAULT_UNCHOKE_SLOTS_LIMIT,
+    )
+    .await;
+    let (peer, mut rx) = h.peer("127.0.0.1:6881");
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    h.speak_fast(peer);
+
+    for n in 0..5 {
+        let asked = unservable(n);
+        peer.on_received_message(Message::Request(asked))
+            .await
+            .unwrap();
+        match rx.try_recv() {
+            Ok(WriterRequest::Message(Message::Reject(r))) => {
+                assert_eq!(
+                    (r.index, r.begin, r.length),
+                    (asked.index, asked.begin, asked.length)
+                );
+            }
+            other => panic!("expected a Reject for {asked:?}, got {other:?}"),
+        }
+        assert!(rx.is_empty());
+    }
+
+    peer.on_received_message(Message::Request(request(0, 0)))
+        .await
+        .unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Block(0, 0));
+}
+
 impl Harness {
     /// The peer sends `count` requests we cannot serve, each kept.
     async fn ask_unservable(&self, peer: &PeerHandler, count: u32) {
@@ -3836,6 +3877,40 @@ async fn a_torrent_added_without_pex_neither_advertises_sends_nor_reads_it() {
     assert!(!off.knows("10.0.0.1:6881"));
 }
 
+// libtorrent `ut_pex_peer_plugin`: a connection has one PEX sender, however
+// many extended handshakes name ut_pex. Each sender holds the connection's
+// queue, so the senders of the queue count them.
+#[tokio::test]
+async fn a_connection_starts_one_pex_sender_however_many_handshakes_name_ut_pex() {
+    let h = Harness::seeding("pex_sender_once").await;
+    let (peer, _rx) = h.peer("203.0.113.2:50002");
+    assert!(h.advertised(&peer).ut_pex.is_some());
+    let senders = peer.tx.strong_count();
+    let mut hs = ExtendedHandshake::new();
+    hs.m.ut_pex = Some(1);
+    for _ in 0..3 {
+        (&peer).on_extended_handshake(&hs).unwrap();
+    }
+    assert_eq!(peer.tx.strong_count(), senders + 1);
+}
+
+// A PEX tick taken late puts the next a full minute after it: a peer held
+// up past two ticks is not sent the missed ones back to back.
+#[tokio::test]
+async fn a_late_pex_tick_puts_the_next_a_full_interval_after_it() {
+    use futures::FutureExt;
+    tokio::time::pause();
+    let period = Duration::from_secs(60);
+    let mut interval = super::pex_interval(period);
+    interval.tick().await;
+    tokio::time::advance(Duration::from_secs(150)).await;
+    interval.tick().await;
+    let late = tokio::time::Instant::now();
+    assert!(interval.tick().now_or_never().is_none());
+    tokio::time::advance(period).await;
+    assert_eq!(interval.tick().await, late + period);
+}
+
 // BEP 27: a private torrent added with the DHT, local discovery and peer
 // exchange all left on still takes peers from its trackers alone: it
 // advertises no peer exchange, reads none, and looks on neither the DHT nor
@@ -4238,6 +4313,26 @@ async fn a_super_seeded_peer_is_served_only_the_pieces_it_was_handed() {
         assert_eq!(next_sent(&mut rx).await, Sent::Block(piece, 0));
         assert!(peer.claim_upload(&h.chunk(piece, 0)));
     }
+}
+
+// libtorrent `peer_connection::incoming_request`: while super-seeding, a fast
+// peer's request for a piece it was not handed is answered with a Reject.
+#[tokio::test]
+async fn a_super_seeded_fast_peer_is_rejected_a_piece_it_was_not_handed() {
+    let h = Harness::super_seeding("super_seed_rejects", 3, 0xe0).await;
+    let (peer, mut rx) = h.peer_with("127.0.0.1:6881", &[]).await;
+    let handed = told_have(&mut rx);
+    let other = (0..3).find(|p| !handed.contains(p)).unwrap();
+    let peer = &peer;
+    peer.on_received_message(Message::Interested).await.unwrap();
+    assert_eq!(next_sent(&mut rx).await, Sent::Unchoke);
+    h.speak_fast(peer);
+
+    peer.on_received_message(Message::Request(request(other, 0)))
+        .await
+        .unwrap();
+    assert_eq!(rx.try_recv().ok().map(sent), Some(Sent::Reject(other, 0)));
+    assert!(rx.is_empty());
 }
 
 // libtorrent `peer_connection::incoming_have` without
@@ -6043,6 +6138,7 @@ impl Harness {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),
             tx,

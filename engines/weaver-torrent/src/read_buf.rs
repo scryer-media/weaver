@@ -622,6 +622,29 @@ mod tests {
         assert_eq!(rb.buf.len(), BUFLEN);
     }
 
+    // libtorrent `bt_peer_connection::on_extended`: an extended frame too
+    // short to hold its extended message id is malformed, and ends the
+    // connection; the bytes behind it are not waited for.
+    #[tokio::test(start_paused = true)]
+    async fn an_extended_frame_without_its_id_is_refused_not_waited_on() {
+        let mut wire = vec![0, 0, 0, 1, 20];
+        wire.extend_from_slice(&[0, 0, 0, 5, 4, 0, 0, 0, 7]);
+        let mut reader = reader_of(&wire).await;
+        let mut rb = ReadBuf::new();
+        let res = rb
+            .read_message(&mut reader, Duration::from_secs(10), None, &mut Unlimited)
+            .await;
+        assert!(
+            matches!(
+                res,
+                Err(crate::Error::Deserialize(
+                    MessageDeserializeError::IncorrectMsgLen { .. }
+                ))
+            ),
+            "{res:?}"
+        );
+    }
+
     // Admits `each` bytes a read, and counts the reads.
     struct Drip {
         each: usize,

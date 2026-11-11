@@ -43,18 +43,40 @@ pub const MY_EXTENDED_UPLOAD_ONLY: u8 = 2;
 pub const MY_EXTENDED_LT_DONTHAVE: u8 = 7;
 
 // An extension we do not speak has no entry in `m` (libtorrent
-// `bt_peer_connection::write_handshake` lists the loaded plugins only).
+// `bt_peer_connection::write_handshake` lists the loaded plugins only). An
+// id that is not one, an integer past a byte or of another type, is taken as
+// not named.
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct PeerExtendedMessageIds {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "handshake::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ut_metadata: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "handshake::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ut_pex: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "handshake::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ut_holepunch: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "handshake::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub upload_only: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "handshake::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub lt_donthave: Option<u8>,
 }
 
@@ -66,6 +88,30 @@ impl PeerExtendedMessageIds {
             ut_holepunch: None,
             upload_only: Some(MY_EXTENDED_UPLOAD_ONLY),
             lt_donthave: Some(MY_EXTENDED_LT_DONTHAVE),
+        }
+    }
+
+    /// The ids the peer names once its extended handshake's `m` is taken
+    /// over these, the ones it named before (BEP 10): an id it names
+    /// replaces the one held, an id of 0 says it does not, or no longer
+    /// does, speak that extension, and an extension it does not mention
+    /// keeps the id held. No id held is ever 0 (libtorrent treats an id of
+    /// 0 as no support, `bt_peer_connection::on_holepunch`,
+    /// `write_upload_only`, `ut_metadata_peer_plugin::write_metadata_packet`).
+    pub fn updated_by(self, m: Self) -> Self {
+        fn take(held: Option<u8>, named: Option<u8>) -> Option<u8> {
+            match named {
+                Some(0) => None,
+                Some(id) => Some(id),
+                None => held,
+            }
+        }
+        Self {
+            ut_metadata: take(self.ut_metadata, m.ut_metadata),
+            ut_pex: take(self.ut_pex, m.ut_pex),
+            ut_holepunch: take(self.ut_holepunch, m.ut_holepunch),
+            upload_only: take(self.upload_only, m.upload_only),
+            lt_donthave: take(self.lt_donthave, m.lt_donthave),
         }
     }
 }
@@ -82,6 +128,10 @@ pub enum ExtendedMessage<ByteBuf: ByteBufT> {
     /// The sender no longer has the piece of this index: four bytes, big
     /// endian (libtorrent `bt_peer_connection::write_dont_have`).
     DontHave(u32),
+    /// A message under our id for upload_only or lt_donthave whose size is
+    /// not that message's: it says nothing, and is ignored (libtorrent
+    /// `bt_peer_connection::on_extended` logs it and reads on).
+    WrongSize(u8),
     Dyn(u8, BencodeValue<ByteBuf>),
 }
 
@@ -136,15 +186,23 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 out.write_u8(emsg_id)?;
                 out.write_u32::<BE>(*index)?;
             }
+            // The id alone, which reads back as of the wrong size.
+            ExtendedMessage::WrongSize(msg_id) => out.write_u8(*msg_id)?,
         }
         Ok(usize::try_from(out.position()).expect("the cursor stays within its buffer"))
     }
 
+    /// The extended message whose payload, whole, is `buf`. A payload with
+    /// no extended message id is not one.
     pub fn deserialize(mut buf: DoubleBufHelper<'a>) -> Result<Self, MessageDeserializeError> {
         let msg_id = crate::peer_protocol::MsgIdDebug(MSGID_EXTENDED);
         let emsg_id = buf
             .read_u8()
-            .ok_or(MessageDeserializeError::NotEnoughData(1, Some(msg_id)))?;
+            .ok_or(MessageDeserializeError::IncorrectMsgLen {
+                received: 0,
+                expected: 1,
+                msg_id,
+            })?;
 
         fn from_bytes_contig<'a, T>(buf: &DoubleBufHelper<'a>) -> Result<T, MessageDeserializeError>
         where
@@ -168,31 +226,21 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
             MY_EXTENDED_UT_HOLEPUNCH => {
                 Ok(ExtendedMessage::UtHolepunch(UtHolepunch::deserialize(buf)?))
             }
-            // One byte, nonzero when the peer only uploads (libtorrent
-            // `bt_peer_connection::on_extended`, `upload_only_msg`).
-            MY_EXTENDED_UPLOAD_ONLY => match buf.get_contiguous(buf.len()) {
-                Some(&[byte]) => Ok(ExtendedMessage::UploadOnly(byte != 0)),
-                _ => Err(MessageDeserializeError::IncorrectMsgLen {
-                    received: u32::try_from(buf.len())
-                        .unwrap_or(u32::MAX)
-                        .saturating_add(1),
-                    expected: 2,
-                    msg_id,
-                }),
+            // One byte, nonzero when the peer only uploads; one of another
+            // size is ignored (libtorrent `bt_peer_connection::on_extended`,
+            // `upload_only_msg`, a packet of 3 bytes).
+            MY_EXTENDED_UPLOAD_ONLY => match buf.len() {
+                1 => Ok(ExtendedMessage::UploadOnly(buf.read_u8().unwrap() != 0)),
+                _ => Ok(ExtendedMessage::WrongSize(emsg_id)),
             },
-            // A piece index, four bytes (libtorrent
-            // `bt_peer_connection::on_extended`, `dont_have_msg`).
-            MY_EXTENDED_LT_DONTHAVE => match buf.get_contiguous(buf.len()) {
-                Some(&[a, b, c, d]) => {
-                    Ok(ExtendedMessage::DontHave(u32::from_be_bytes([a, b, c, d])))
+            // A piece index, four bytes; one of another size is ignored
+            // (libtorrent `bt_peer_connection::on_extended`, `dont_have_msg`,
+            // a packet of 6 bytes).
+            MY_EXTENDED_LT_DONTHAVE => match buf.consume::<4>() {
+                Ok(index) if buf.is_empty() => {
+                    Ok(ExtendedMessage::DontHave(u32::from_be_bytes(index)))
                 }
-                _ => Err(MessageDeserializeError::IncorrectMsgLen {
-                    received: u32::try_from(buf.len())
-                        .unwrap_or(u32::MAX)
-                        .saturating_add(1),
-                    expected: 5,
-                    msg_id,
-                }),
+                _ => Ok(ExtendedMessage::WrongSize(emsg_id)),
             },
             _ => Ok(ExtendedMessage::Dyn(emsg_id, from_bytes_contig(&buf)?)),
         }
@@ -262,6 +310,54 @@ mod tests {
         assert_eq!(hs.m, PeerExtendedMessageIds::default());
         assert_eq!(hs.p, Some(100));
         assert_eq!(hs.reqq, Some(250));
+    }
+
+    // libtorrent `bt_peer_connection::on_extended_handshake` reads each field
+    // on its own and skips one of the wrong type or length: the handshake
+    // still counts, with that field absent. One that is not a dictionary is
+    // refused.
+    #[test]
+    fn a_malformed_optional_handshake_field_is_taken_as_absent() {
+        // `yourip` of 6 bytes, `reqq` a string, `metadata_size` a list,
+        // `upload_only` past u32, `ut_pex` a string and `ut_holepunch` past
+        // a byte; `p`, `v` and `ut_metadata` as they should be.
+        const PAYLOAD: &[u8] = b"\x00d1:md12:ut_holepunchi300e11:ut_metadatai3e6:ut_pex1:xe\
+            13:metadata_sizeli1ee1:pi6881e4:reqq3:abc11:upload_onlyi99999999999e\
+            1:v4:test6:yourip6:abcdefe";
+        let hs = match ExtendedMessage::deserialize(DoubleBufHelper::new(PAYLOAD, &[])).unwrap() {
+            ExtendedMessage::Handshake(hs) => hs,
+            other => panic!("expected handshake, got {other:?}"),
+        };
+        assert_eq!(
+            hs.m,
+            PeerExtendedMessageIds {
+                ut_metadata: Some(3),
+                ..Default::default()
+            }
+        );
+        assert_eq!(hs.p, Some(6881));
+        assert_eq!(hs.v, Some(ByteBuf(b"test")));
+        assert_eq!(hs.yourip, None);
+        assert_eq!(hs.reqq, None);
+        assert_eq!(hs.metadata_size, None);
+        assert_eq!(hs.upload_only, None);
+
+        // `m` that is not a dictionary names no ids.
+        const NOT_A_DICT_M: &[u8] = b"\x00d1:mi1e1:pi1ee";
+        match ExtendedMessage::deserialize(DoubleBufHelper::new(NOT_A_DICT_M, &[])).unwrap() {
+            ExtendedMessage::Handshake(hs) => {
+                assert_eq!(hs.m, PeerExtendedMessageIds::default());
+                assert_eq!(hs.p, Some(1));
+            }
+            other => panic!("expected handshake, got {other:?}"),
+        }
+
+        for not_a_dict in [&b"\x00i1e"[..], b"\x00l1:pe", b"\x004:spam"] {
+            assert!(matches!(
+                ExtendedMessage::deserialize(DoubleBufHelper::new(not_a_dict, &[])),
+                Err(MessageDeserializeError::Bencode(..))
+            ));
+        }
     }
 
     #[test]
@@ -338,17 +434,20 @@ mod tests {
             ExtendedMessage::deserialize(DoubleBufHelper::new(&[2, 7], &[])).unwrap(),
             ExtendedMessage::UploadOnly(true)
         );
+        // libtorrent `bt_peer_connection::on_extended` ignores one of
+        // another size, and the connection stays.
         for bad in [&[2][..], &[2, 1, 1]] {
-            assert!(matches!(
-                ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])),
-                Err(MessageDeserializeError::IncorrectMsgLen { .. })
-            ));
+            assert_eq!(
+                ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])).unwrap(),
+                ExtendedMessage::WrongSize(2)
+            );
         }
     }
 
     // libtorrent `bt_peer_connection::write_dont_have` and `on_extended`:
     // the id the peer named for lt_donthave, then the piece index in four
-    // bytes; read under our id, a message of another size is not one.
+    // bytes; read under our id, a message of another size is not one, and
+    // is ignored.
     #[test]
     fn dont_have_is_a_piece_index_under_the_peers_id() {
         let mut buf = [0u8; 8];
@@ -370,12 +469,55 @@ mod tests {
             .unwrap();
         let de = ExtendedMessage::deserialize(DoubleBufHelper::new(&buf[..sz], &[])).unwrap();
         assert_eq!(de, msg);
-        for bad in [&[7, 1, 2, 3][..], &[7, 1, 2, 3, 4, 5]] {
-            assert!(matches!(
-                ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])),
-                Err(MessageDeserializeError::IncorrectMsgLen { .. })
-            ));
+        // One of another size is ignored, split or not.
+        for bad in [&[7, 1, 2, 3][..], &[7, 1, 2, 3, 4, 5], &[7]] {
+            assert_eq!(
+                ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])).unwrap(),
+                ExtendedMessage::WrongSize(7)
+            );
         }
+        assert_eq!(
+            ExtendedMessage::deserialize(DoubleBufHelper::new(&[7, 1, 2], &[3, 4])).unwrap(),
+            ExtendedMessage::DontHave(0x0102_0304)
+        );
+    }
+
+    // BEP 10: a first handshake's id of 0 names no support; a later one
+    // replaces the ids it names, takes away those it names 0, and leaves
+    // the rest.
+    #[test]
+    fn a_handshake_updates_only_the_ids_it_names_and_zero_names_none() {
+        let first = PeerExtendedMessageIds::default().updated_by(PeerExtendedMessageIds {
+            ut_metadata: Some(0),
+            ut_pex: Some(1),
+            ut_holepunch: Some(0),
+            upload_only: Some(3),
+            lt_donthave: Some(7),
+        });
+        assert_eq!(
+            first,
+            PeerExtendedMessageIds {
+                ut_pex: Some(1),
+                upload_only: Some(3),
+                lt_donthave: Some(7),
+                ..Default::default()
+            }
+        );
+        let later = first.updated_by(PeerExtendedMessageIds {
+            ut_metadata: Some(2),
+            ut_pex: Some(9),
+            lt_donthave: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(
+            later,
+            PeerExtendedMessageIds {
+                ut_metadata: Some(2),
+                ut_pex: Some(9),
+                upload_only: Some(3),
+                ..Default::default()
+            }
+        );
     }
 
     #[test]

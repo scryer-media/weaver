@@ -172,6 +172,21 @@ fn xor20(a: [u8; 20], b: [u8; 20]) -> [u8; 20] {
     std::array::from_fn(|i| a[i] ^ b[i])
 }
 
+/// `HASH('req2', info_hash)`: the name an encryption handshake gives a
+/// torrent, masked on the wire with `HASH('req3', S)`.
+pub(crate) fn obfuscated_hash(info_hash: &Id20) -> Id20 {
+    Id20::new(hash(&[b"req2", &info_hash.0]))
+}
+
+/// What an accepted connection may be taken as, over the session's policy
+/// and every torrent's: encrypted while any of them is not `Disabled`,
+/// plaintext while any is not `Require`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Incoming {
+    pub encrypted: bool,
+    pub plaintext: bool,
+}
+
 /// The values both sides derive from the shared secret and the info hash.
 pub(crate) struct Keys {
     pub req1: [u8; 20],
@@ -410,15 +425,16 @@ pub(crate) async fn initiate(
 
 /// Run the handshake as the side that accepted the connection. A plaintext
 /// BitTorrent handshake is passed through when `allow_plaintext_handshake`;
-/// anything else is taken as the start of the key exchange. `allowed` is the
-/// crypto methods we may select; `info_hashes` lists the torrents a peer may
-/// ask for.
+/// anything else is taken as the start of the key exchange. `find` names
+/// the torrent whose `HASH('req2', info_hash)` it is given, with that
+/// torrent's policy, which sets the crypto methods we may select. An
+/// encrypted connection comes back with the info hash it named (SKEY).
 pub(crate) async fn respond(
     mut reader: BoxAsyncReadVectored,
     mut writer: BoxAsyncWrite,
     allow_plaintext_handshake: bool,
-    policies: &[(Id20, EncryptionPolicy)],
-) -> Result<Established, MseError> {
+    find: impl Fn(&Id20) -> Option<(Id20, EncryptionPolicy)>,
+) -> Result<(Established, Option<Id20>), MseError> {
     let mut wire = Wire {
         r: &mut reader,
         buf: Vec::new(),
@@ -430,11 +446,12 @@ pub(crate) async fn respond(
             return Err(MseError::PlaintextRefused);
         }
         let prefix = std::mem::take(&mut wire.buf);
-        return Ok(Established {
+        let established = Established {
             reader: DecryptingReader::new(prefix, reader, None).into_boxed(),
             writer: writer.into(),
             encryption: Encryption::None,
-        });
+        };
+        return Ok((established, None));
     }
 
     wire.fill(dh::KEY_LEN, "reading the peer's public key")
@@ -461,12 +478,12 @@ pub(crate) async fn respond(
         )
         .await?;
     wire.fill(pos + 20, "reading the torrent hash").await?;
+    // libtorrent `session_impl::find_encrypted_torrent`: unmask once and
+    // look the torrent up by its obfuscated hash.
     let req3 = hash(&[b"req3", &s]);
-    let (skey, policy) = policies
-        .iter()
-        .copied()
-        .find(|(ih, _)| xor20(hash(&[b"req2", &ih.0]), req3)[..] == wire.buf[pos..pos + 20])
-        .ok_or(MseError::UnknownInfoHash)?;
+    let mut masked = [0u8; 20];
+    masked.copy_from_slice(&wire.buf[pos..pos + 20]);
+    let (skey, policy) = find(&Id20::new(xor20(masked, req3))).ok_or(MseError::UnknownInfoHash)?;
     let allowed = policy.methods();
     pos += 20;
 
@@ -510,34 +527,37 @@ pub(crate) async fn respond(
         .map_err(|e| io_error("sending our crypto selection", e))?;
 
     let rest = wire.buf.split_off(pos);
-    Ok(establish(reader, writer, ia, rest, selected, dec, enc))
+    Ok((
+        establish(reader, writer, ia, rest, selected, dec, enc),
+        Some(skey),
+    ))
 }
 
-/// Upgrade an accepted connection under the session's `policy`
-/// and `policies`, each torrent's hash with its own: an encrypted handshake
-/// selects a method its torrent's policy allows, and a plaintext one passes
-/// while any of them takes plaintext, to be judged by its torrent once its
-/// BitTorrent handshake names it. The reader is replaced in place and the
-/// writer comes back with the cipher it writes under. When every one is
-/// `Disabled` no byte is read and the writer comes back as it was.
+/// Upgrade an accepted connection as `incoming` allows: an encrypted
+/// handshake selects a method its torrent's policy allows, the torrent
+/// found by `find` as [`respond`] does, and a plaintext one passes while
+/// `incoming.plaintext`, to be judged by its torrent once its BitTorrent
+/// handshake names it. The reader is replaced in place and the writer
+/// comes back with the cipher it writes under, and with the info hash an
+/// encrypted handshake named. When nothing is taken encrypted no byte is
+/// read and the writer comes back as it was.
 pub(crate) async fn upgrade_incoming(
-    policy: EncryptionPolicy,
+    incoming: Incoming,
     reader: &mut BoxAsyncReadVectored,
     writer: BoxAsyncWrite,
     timeout: Duration,
-    policies: &[(Id20, EncryptionPolicy)],
-) -> Result<(Encryption, Outbound), MseError> {
-    let every = || std::iter::once(policy).chain(policies.iter().map(|(_, p)| *p));
-    if every().all(|p| p == EncryptionPolicy::Disabled) {
-        return Ok((Encryption::None, writer.into()));
+    find: impl Fn(&Id20) -> Option<(Id20, EncryptionPolicy)>,
+) -> Result<(Encryption, Outbound, Option<Id20>), MseError> {
+    if !incoming.encrypted {
+        return Ok((Encryption::None, writer.into(), None));
     }
     let r = std::mem::replace(reader, Box::new(tokio::io::empty().into_vectored_compat()));
-    let allow_plaintext = every().any(|p| p != EncryptionPolicy::Require);
-    let established = tokio::time::timeout(timeout, respond(r, writer, allow_plaintext, policies))
-        .await
-        .map_err(|_| MseError::Timeout)??;
+    let (established, skey) =
+        tokio::time::timeout(timeout, respond(r, writer, incoming.plaintext, find))
+            .await
+            .map_err(|_| MseError::Timeout)??;
     *reader = established.reader;
-    Ok((established.encryption, established.writer))
+    Ok((established.encryption, established.writer, skey))
 }
 
 /// The crypto_provide bitmask an outgoing connection offers under `policy`.

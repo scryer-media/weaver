@@ -86,7 +86,7 @@ const PSTR_BT1: &str = "BitTorrent protocol";
 const V2_UPGRADE_BIT: u8 = 0x10;
 // libtorrent `bt_peer_connection::write_handshake`: "we support FAST
 // extension" (BEP 6), in the last reserved byte.
-const FAST_BIT: u8 = 0x04;
+pub(crate) const FAST_BIT: u8 = 0x04;
 
 // libtorrent `bt_peer_connection::write_handshake`: "we support DHT
 // messages", the low bit of the last reserved byte (BEP 5).
@@ -501,6 +501,21 @@ pub enum SerializeError {
     FrameTooLong,
 }
 
+impl SerializeError {
+    /// The message is for an extension the peer names no id for, or no
+    /// longer does: it cannot be addressed to the peer.
+    pub fn is_unaddressed(&self) -> bool {
+        matches!(
+            self,
+            Self::NeedUtMetadata
+                | Self::NeedPex
+                | Self::NeedHolepunch
+                | Self::NeedUploadOnly
+                | Self::NeedDontHave
+        )
+    }
+}
+
 impl From<std::io::Error> for SerializeError {
     fn from(_: std::io::Error) -> Self {
         Self::NoSpaceInBuffer
@@ -655,7 +670,9 @@ impl Message<'_> {
             MSGID_REQUEST | MSGID_CANCEL | MSGID_REJECT => (INTEGER_LEN * 3, INTEGER_LEN * 3),
             // At most a block (`on_piece`: `packet_size() - 9 > block_size()`).
             MSGID_PIECE => (INTEGER_LEN * 2 + 1, INTEGER_LEN * 2 + CHUNK_SIZE as usize),
-            MSGID_EXTENDED => (0, ANY),
+            // The extended message id at least (`on_extended`:
+            // `packet_size() < 2` disconnects).
+            MSGID_EXTENDED => (1, ANY),
             MSGID_HASH_REQUEST | MSGID_HASH_REJECT => (HASH_REQUEST_LEN, HASH_REQUEST_LEN),
             // The exact length follows from the request it repeats (`on_hashes`).
             MSGID_HASHES => (HASH_REQUEST_LEN, ANY),
@@ -1540,6 +1557,11 @@ mod tests {
         assert!(matches!(
             refused(5, 99),
             Some(MessageDeserializeError::UnsupportedMessageId(99))
+        ));
+        // An extended frame with no extended message id in it.
+        assert!(matches!(
+            refused(1, MSGID_EXTENDED),
+            Some(MessageDeserializeError::IncorrectMsgLen { .. })
         ));
     }
 

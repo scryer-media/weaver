@@ -750,6 +750,7 @@ impl TorrentStateLive {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
             tx,
@@ -902,6 +903,7 @@ impl TorrentStateLive {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
             tx,
@@ -1018,6 +1020,7 @@ impl TorrentStateLive {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(state.max_request_window())),
             state: state.clone(),
             tx,
@@ -2147,7 +2150,7 @@ impl TorrentStateLive {
         // Wait 10 seconds before sending the first message to assure that peer will stay with us
         tokio::time::sleep(Duration::from_secs(10)).await;
 
-        let mut interval = tokio::time::interval(PEX_MESSAGE_INTERVAL);
+        let mut interval = pex_interval(PEX_MESSAGE_INTERVAL);
 
         loop {
             interval.tick().await;
@@ -2165,6 +2168,16 @@ impl TorrentStateLive {
             }
         }
     }
+}
+
+// The ticks a peer's PEX messages go out on. A tick missed while the task
+// was held up is taken late and the next comes a full `period` after it, so
+// two messages never go out back to back (libtorrent
+// `ut_pex_peer_plugin::tick`, ut_pex.cpp:92: a minute from the last message).
+fn pex_interval(period: Duration) -> tokio::time::Interval {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    interval
 }
 
 // libtorrent `ut_pex_peer_plugin::on_extended`: the longest PEX message a
@@ -2234,6 +2247,10 @@ struct PeerHandler {
 
     // Our DHT port went to the peer on this connection (BEP 5 PORT).
     sent_dht_port: AtomicBool,
+
+    // The connection's PEX sender is started (BEP 11): once, at the first
+    // extended handshake that names ut_pex.
+    pex_started: AtomicBool,
 
     addr: SocketAddr,
     incoming: bool,
@@ -2374,6 +2391,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 self.on_upload_only(upload_only)
             }
             Message::Extended(ExtendedMessage::DontHave(index)) => self.on_dont_have(index),
+            Message::Extended(ExtendedMessage::WrongSize(id)) => {
+                trace!(id, "ignoring an extended message of the wrong size");
+            }
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
                 if self.state.pex {
                     self.on_pex_message(pex)?;
@@ -2660,7 +2680,13 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             }
         }
 
-        if self.state.pex && hs.m.ut_pex.is_some() {
+        // A later handshake that names ut_pex again starts no second sender;
+        // once one names it 0, the writer drops what the sender queues
+        // (libtorrent `ut_pex_peer_plugin`, one per connection).
+        if self.state.pex
+            && hs.m.ut_pex.is_some()
+            && !self.pex_started.swap(true, Ordering::Relaxed)
+        {
             spawn_with_cancel(
                 debug_span!(
                     parent: self.state.shared.span.clone(),
@@ -3147,9 +3173,10 @@ impl PeerHandler {
         }
 
         // A request for a block that is not one, or of a piece we do not
-        // have, is dropped (libtorrent `peer_connection::incoming_request`).
-        // While we super-seed, so is one for a piece other than the one
-        // the peer was handed (libtorrent `peer_connection::incoming_request`).
+        // have, is refused; while we super-seed, so is one for a piece other
+        // than the ones the peer was handed (libtorrent
+        // `peer_connection::incoming_request`, which answers each with
+        // `write_reject_request`).
         let chunk_info = match self.requested_chunk(&request) {
             Some(chunk)
                 if !self.state.super_seeding
@@ -3213,20 +3240,21 @@ impl PeerHandler {
         }
     }
 
-    /// The peer asked for what we cannot serve. The request is dropped: with
-    /// no fast extension there is no Reject to send.
+    /// The peer asked for what we cannot serve. The request is dropped, with
+    /// a Reject on a fast connection; a plain one has no word for it
+    /// (libtorrent `peer_connection::incoming_request`).
     fn on_invalid_request(&self, request: Request) -> anyhow::Result<()> {
         let peer_chokes_us = self.choked_by_peer();
         let keep = self
             .state
             .peers
             .with_live_mut(self.addr, "invalid_request", |live| {
-                live.invalid_request(peer_chokes_us)
+                live.invalid_request(request, peer_chokes_us)
             });
         if keep == Some(false) {
             anyhow::bail!("too many invalid requests while choked, the last {request:?}");
         }
-        trace!(?request, "dropping a request we cannot serve");
+        trace!(?request, "refusing a request we cannot serve");
         Ok(())
     }
 

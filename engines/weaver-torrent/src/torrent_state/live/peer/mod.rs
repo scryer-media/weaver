@@ -1682,12 +1682,14 @@ impl LivePeerState {
         Some(chunk)
     }
 
-    /// The peer sent a request we cannot serve, which is dropped; with
-    /// `peer_chokes_us` when it chokes us. Every tenth while it is not
-    /// interested and we choke it, it is told again that we do; past 300 so,
-    /// while it does not choke us, it is to be disconnected: false then
-    /// (libtorrent `peer_connection::incoming_request`).
-    pub fn invalid_request(&mut self, peer_chokes_us: bool) -> bool {
+    /// The peer sent `request`, which we cannot serve: it is dropped, with a
+    /// Reject on a fast connection; with `peer_chokes_us` when it chokes us.
+    /// Every tenth while it is not interested and we choke it, it is told
+    /// again that we do; past 300 so, while it does not choke us, it is to
+    /// be disconnected: false then (libtorrent
+    /// `peer_connection::incoming_request`).
+    pub fn invalid_request(&mut self, request: Request, peer_chokes_us: bool) -> bool {
+        self.reject_request(request);
         self.invalid_requests = self.invalid_requests.saturating_add(1);
         if self.peer_interested || !self.is_choked() || !self.invalid_requests.is_multiple_of(10) {
             return true;
@@ -1801,10 +1803,15 @@ impl LivePeerState {
     /// connection has no word for it (libtorrent
     /// `bt_peer_connection::write_reject_request`).
     fn reject(&self, chunk: &ChunkInfo) {
+        self.reject_request(wire_request(chunk));
+    }
+
+    /// Tells a fast peer we will not answer `request`, as it named it.
+    fn reject_request(&self, request: Request) {
         if self.fast {
             let _ = self
                 .tx
-                .send(WriterRequest::Message(Message::Reject(wire_request(chunk))));
+                .send(WriterRequest::Message(Message::Reject(request)));
         }
     }
 

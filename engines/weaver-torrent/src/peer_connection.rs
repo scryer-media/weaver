@@ -19,7 +19,7 @@ use crate::core::{
 };
 use crate::peer_protocol::{
     Handshake, Hashes, Message, PIECE_MESSAGE_DEFAULT_LEN, PIECE_MESSAGE_PREAMBLE_LEN,
-    PartialBlock,
+    PartialBlock, Request, SerializeError,
     extended::{
         ExtendedMessage, PeerExtendedMessageIds, handshake::ExtendedHandshake,
         ut_metadata::UtMetadata, ut_pex::UtPex,
@@ -68,6 +68,11 @@ pub trait PeerConnectionHandler {
         ckind: ConnectionKind,
         speaks_v2: bool,
     ) -> anyhow::Result<()>;
+    /// The peer sent an extended handshake, the first or a later one (BEP
+    /// 10). Its `m` holds the ids the peer names on the connection after
+    /// it, every handshake so far taken together
+    /// ([`PeerExtendedMessageIds::updated_by`]); its other fields are as
+    /// this one sent them.
     fn on_extended_handshake(
         &self,
         extended_handshake: &ExtendedHandshake<ByteBuf>,
@@ -386,6 +391,21 @@ struct Framed {
     len: usize,
     chunk: Option<ChunkInfo>,
     read: bool,
+}
+
+/// The frame of a message serialized, or none for one the peer cannot be
+/// sent: an extension message under an extension it names no id for, or
+/// no longer does, is dropped and the connection kept (libtorrent sends
+/// nothing to a peer whose id is 0, `bt_peer_connection::write_upload_only`).
+fn addressed(serialized: std::result::Result<usize, SerializeError>) -> Result<Option<Framed>> {
+    match serialized {
+        Ok(len) => Ok(Some(Framed::message(len))),
+        Err(e) if e.is_unaddressed() => {
+            trace!("dropping a message the peer cannot be sent: {e}");
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 impl Framed {
@@ -795,17 +815,15 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     }
                     let out = &mut buf[filled..];
                     let framed = match req {
-                        WriterRequest::Message(msg) => {
-                            Some(Framed::message(msg.serialize(out, ext_msg_ids)?))
-                        }
-                        WriterRequest::UtMetadata(utm) => Some(Framed::message(
+                        WriterRequest::Message(msg) => addressed(msg.serialize(out, ext_msg_ids))?,
+                        WriterRequest::UtMetadata(utm) => addressed(
                             Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
-                                .serialize(out, ext_msg_ids)?,
-                        )),
-                        WriterRequest::UtPex(ut_pex) => Some(Framed::message(
+                                .serialize(out, ext_msg_ids),
+                        )?,
+                        WriterRequest::UtPex(ut_pex) => addressed(
                             Message::Extended(ExtendedMessage::UtPex(ut_pex.as_borrowed()))
-                                .serialize(out, ext_msg_ids)?,
-                        )),
+                                .serialize(out, ext_msg_ids),
+                        )?,
                         WriterRequest::Hashes(hashes) => Some(Framed::message(
                             Message::Hashes(hashes.as_borrowed()).serialize(out, ext_msg_ids)?,
                         )),
@@ -819,9 +837,22 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                 .await
                                 .map_err(Error::ReadChunk)?
                             {
+                                // The block is refused, with a Reject on a
+                                // fast connection (libtorrent
+                                // `peer_connection::fill_send_buffer`, a
+                                // piece we turn out not to have).
                                 trace!(?chunk, "upload not served");
                                 self.handler.upload_done(&chunk);
-                                None
+                                supports_fast
+                                    .then(|| {
+                                        let reject = Message::Reject(Request {
+                                            index: chunk.piece_index.get(),
+                                            begin: chunk.offset,
+                                            length: chunk.size,
+                                        });
+                                        reject.serialize(out, ext_msg_ids).map(Framed::message)
+                                    })
+                                    .transpose()?
                             } else {
                                 #[allow(unused_mut)]
                                 let mut read = true;
@@ -986,16 +1017,24 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 // share, not after every message.
                 tokio::task::coop::consume_budget().await;
 
-                if let Message::Extended(ExtendedMessage::Handshake(h)) = &message {
-                    *extended_handshake_ref.write() = Some(h.peer_extended_messages());
-                    self.handler
-                        .on_extended_handshake(h)
-                        .map_err(Error::Anyhow)?;
-                } else {
-                    self.handler
-                        .on_received_message(message)
-                        .await
-                        .map_err(Error::Anyhow)?;
+                match message {
+                    Message::Extended(ExtendedMessage::Handshake(mut h)) => {
+                        h.m = {
+                            let mut held = extended_handshake_ref.write();
+                            let ids = held.unwrap_or_default().updated_by(h.m);
+                            *held = Some(ids);
+                            ids
+                        };
+                        self.handler
+                            .on_extended_handshake(&h)
+                            .map_err(Error::Anyhow)?;
+                    }
+                    message => {
+                        self.handler
+                            .on_received_message(message)
+                            .await
+                            .map_err(Error::Anyhow)?;
+                    }
                 }
                 self.handler.on_protocol_bytes(
                     Channel::Download,
@@ -1439,9 +1478,19 @@ mod tests {
 
     // libtorrent `peer_connection::on_seed_mode_hashed`: a piece that fails
     // its seed-mode check is not sent, and the connection is not ended for
-    // it. The block asked for after it is sent on the same connection.
+    // it. The block asked for after it is sent on the same connection. A
+    // fast peer is sent a Reject for the block in its place
+    // (`peer_connection::fill_send_buffer`), a plain one nothing.
     #[tokio::test(start_paused = true)]
     async fn a_block_not_served_is_dropped_and_the_connection_kept() {
+        assert_eq!(serve_picky(true).await, (vec![1], vec![(0, 0, 16384)]));
+        assert_eq!(serve_picky(false).await, (vec![1], vec![]));
+    }
+
+    /// Serves blocks 0 and 1 to a peer that sets the fast bit when `fast`:
+    /// the pieces of the blocks sent, and the Rejects, by piece, offset and
+    /// length.
+    async fn serve_picky(fast: bool) -> (Vec<u32>, Vec<(u32, u32, u32)>) {
         use tokio::io::AsyncReadExt;
         const BLOCK: u32 = 16384;
         let picky = Picky;
@@ -1464,7 +1513,13 @@ mod tests {
             reader,
             writer: writer.into(),
             read_buf: ReadBuf::new(),
-            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            handshake: {
+                let mut handshake = Handshake::new(Id20::new(HASH), Id20::new([2; 20]));
+                if !fast {
+                    handshake.reserved &= !u64::from(crate::peer_protocol::FAST_BIT);
+                }
+                handshake
+            },
             encryption: crate::mse::Encryption::None,
             meter,
         };
@@ -1485,26 +1540,34 @@ mod tests {
         let peer = async {
             let mut handshake = [0; 68];
             theirs.read_exact(&mut handshake).await.unwrap();
-            // The pieces of the blocks sent, until the have after them.
+            // The pieces of the blocks sent and the Rejects, until the have
+            // after them.
             let mut sent = Vec::new();
+            let mut rejects = Vec::new();
+            let word =
+                |body: &[u8], at: usize| u32::from_be_bytes(body[at..at + 4].try_into().unwrap());
             loop {
                 let mut body = vec![0; theirs.read_u32().await.unwrap() as usize];
                 theirs.read_exact(&mut body).await.unwrap();
                 if body == [4, 0, 0, 0, 3] {
                     break;
                 }
-                if body.first() == Some(&7) {
-                    sent.push(u32::from_be_bytes(body[1..5].try_into().unwrap()));
-                    assert!(body[9..].iter().all(|byte| *byte == 0xab));
+                match body.first() {
+                    Some(&7) => {
+                        sent.push(word(&body, 1));
+                        assert!(body[9..].iter().all(|byte| *byte == 0xab));
+                    }
+                    Some(&16) => rejects.push((word(&body, 1), word(&body, 5), word(&body, 9))),
+                    _ => {}
                 }
             }
             drop(tx);
-            sent
+            (sent, rejects)
         };
-        let (result, sent) = tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
-        assert_eq!(sent, [1]);
+        let (result, told) = tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
         // The connection ended only when its torrent let go of it.
         assert!(matches!(result, Err(Error::TorrentIsNotLive)), "{result:?}");
+        told
     }
 
     /// Records the blocks cut short it is told of; reads under the download
@@ -2326,5 +2389,160 @@ mod tests {
         let told = recorder.told.lock().clone();
         assert!(told.contains(&Told::Done(0)));
         assert!(!told.contains(&Told::Done(1)));
+    }
+
+    /// Records the extension ids each extended handshake leaves the
+    /// connection with; after the `n`th, queues a PEX message and then a
+    /// Have of `n`.
+    #[derive(Default)]
+    struct Shook {
+        seen: parking_lot::Mutex<Vec<crate::peer_protocol::extended::PeerExtendedMessageIds>>,
+        tx: parking_lot::Mutex<Option<mpsc::UnboundedSender<WriterRequest>>>,
+    }
+
+    impl PeerConnectionHandler for &Shook {
+        fn should_send_bitfield(&self) -> bool {
+            false
+        }
+        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_extended_handshake(&self, h: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+            let mut seen = self.seen.lock();
+            seen.push(h.m);
+            let tx = self.tx.lock();
+            let tx = tx.as_ref().unwrap();
+            let pex = crate::peer_protocol::extended::ut_pex::UtPex::from_peers(
+                std::iter::once(crate::peer_protocol::extended::ut_pex::PexPeerInfo {
+                    flags: 0,
+                    addr: "10.0.0.1:6881".parse().unwrap(),
+                }),
+                std::iter::empty(),
+            );
+            tx.send(WriterRequest::UtPex(pex)).unwrap();
+            let n = u32::try_from(seen.len()).unwrap();
+            tx.send(WriterRequest::Message(Message::Have(n))).unwrap();
+            Ok(())
+        }
+        async fn on_received_message(&self, _: Message<'_>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_uploaded_bytes(&self, _: u32) {}
+        fn read_chunk(&self, _: &ChunkInfo, _: &mut [u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // BEP 10: a later extended handshake adds or changes the ids it names,
+    // an id of 0 takes one away, and an extension it does not mention keeps
+    // its id. A message for an extension the peer no longer names is
+    // dropped and the connection kept.
+    #[tokio::test(start_paused = true)]
+    async fn a_later_extended_handshake_updates_the_ids_and_unaddressed_messages_are_dropped() {
+        use crate::peer_protocol::extended::{ExtendedMessage, PeerExtendedMessageIds};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let shook = Shook::default();
+        let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        let connection = PeerConnection::new(
+            connection.addr,
+            connection.info_hashes,
+            connection.peer_id,
+            &shook,
+            Some(connection.options),
+            BlockingSpawner::new(1),
+            connection.connector,
+        );
+        let (ours, mut theirs) = tokio::io::duplex(1 << 18);
+        let (reader, writer) = halves(ours);
+        let (meter, reader, writer) = Meter::wrap(reader, writer);
+        let incoming = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            reader,
+            writer: writer.into(),
+            read_buf: ReadBuf::new(),
+            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encryption: crate::mse::Encryption::None,
+            meter,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        *shook.tx.lock() = Some(tx);
+
+        let handshake = |m: PeerExtendedMessageIds| {
+            let hs = ExtendedHandshake {
+                m,
+                ..Default::default()
+            };
+            let mut buf = [0u8; 256];
+            let len = Message::Extended(ExtendedMessage::Handshake(hs))
+                .serialize(&mut buf, &PeerExtendedMessageIds::default)
+                .unwrap();
+            buf[..len].to_vec()
+        };
+        let first = handshake(PeerExtendedMessageIds {
+            ut_pex: Some(5),
+            upload_only: Some(3),
+            lt_donthave: Some(0),
+            ..Default::default()
+        });
+        let second = handshake(PeerExtendedMessageIds {
+            ut_pex: Some(0),
+            ut_holepunch: Some(4),
+            ..Default::default()
+        });
+        let peer = async {
+            let mut opening = [0; 68];
+            theirs.read_exact(&mut opening).await.unwrap();
+            // The extended message ids of the frames after our handshake,
+            // each with how many Haves came before it, and the Haves: the
+            // second handshake goes once the Have after the first is in.
+            let mut extended = Vec::new();
+            let mut haves = Vec::new();
+            let mut ours_seen = false;
+            for (n, hs) in [first, second].into_iter().enumerate() {
+                theirs.write_all(&hs).await.unwrap();
+                while haves.len() <= n {
+                    let mut body = vec![0; theirs.read_u32().await.unwrap() as usize];
+                    theirs.read_exact(&mut body).await.unwrap();
+                    match body.as_slice() {
+                        [20, 0, ..] if !ours_seen => ours_seen = true,
+                        [20, id, ..] => extended.push((haves.len(), *id)),
+                        [4, have @ ..] => {
+                            haves.push(u32::from_be_bytes(have.try_into().unwrap()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            shook.tx.lock().take();
+            (extended, haves)
+        };
+        let (result, (extended, haves)) =
+            tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
+        assert!(matches!(result, Err(Error::TorrentIsNotLive)), "{result:?}");
+
+        // The PEX message went out under id 5 after the first handshake,
+        // and not after the second.
+        assert_eq!(extended, [(0, 5)]);
+        assert_eq!(haves, [1, 2]);
+        let seen = shook.seen.lock().clone();
+        assert_eq!(
+            seen,
+            [
+                PeerExtendedMessageIds {
+                    ut_pex: Some(5),
+                    upload_only: Some(3),
+                    ..Default::default()
+                },
+                PeerExtendedMessageIds {
+                    ut_holepunch: Some(4),
+                    upload_only: Some(3),
+                    ..Default::default()
+                },
+            ]
+        );
     }
 }
