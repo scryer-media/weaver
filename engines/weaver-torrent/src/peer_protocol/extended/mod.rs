@@ -43,18 +43,40 @@ pub const MY_EXTENDED_UPLOAD_ONLY: u8 = 2;
 pub const MY_EXTENDED_LT_DONTHAVE: u8 = 7;
 
 // An extension we do not speak has no entry in `m` (libtorrent
-// `bt_peer_connection::write_handshake` lists the loaded plugins only).
+// `bt_peer_connection::write_handshake` lists the loaded plugins only). An
+// id that is not one, an integer past a byte or of another type, is taken as
+// not named.
 #[derive(Debug, Default, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 pub struct PeerExtendedMessageIds {
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "handshake::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ut_metadata: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "handshake::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ut_pex: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "handshake::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub ut_holepunch: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "handshake::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub upload_only: Option<u8>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "handshake::lenient",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub lt_donthave: Option<u8>,
 }
 
@@ -292,6 +314,54 @@ mod tests {
         assert_eq!(hs.m, PeerExtendedMessageIds::default());
         assert_eq!(hs.p, Some(100));
         assert_eq!(hs.reqq, Some(250));
+    }
+
+    // libtorrent `bt_peer_connection::on_extended_handshake` reads each field
+    // on its own and skips one of the wrong type or length: the handshake
+    // still counts, with that field absent. One that is not a dictionary is
+    // refused.
+    #[test]
+    fn a_malformed_optional_handshake_field_is_taken_as_absent() {
+        // `yourip` of 6 bytes, `reqq` a string, `metadata_size` a list,
+        // `upload_only` past u32, `ut_pex` a string and `ut_holepunch` past
+        // a byte; `p`, `v` and `ut_metadata` as they should be.
+        const PAYLOAD: &[u8] = b"\x00d1:md12:ut_holepunchi300e11:ut_metadatai3e6:ut_pex1:xe\
+            13:metadata_sizeli1ee1:pi6881e4:reqq3:abc11:upload_onlyi99999999999e\
+            1:v4:test6:yourip6:abcdefe";
+        let hs = match ExtendedMessage::deserialize(DoubleBufHelper::new(PAYLOAD, &[])).unwrap() {
+            ExtendedMessage::Handshake(hs) => hs,
+            other => panic!("expected handshake, got {other:?}"),
+        };
+        assert_eq!(
+            hs.m,
+            PeerExtendedMessageIds {
+                ut_metadata: Some(3),
+                ..Default::default()
+            }
+        );
+        assert_eq!(hs.p, Some(6881));
+        assert_eq!(hs.v, Some(ByteBuf(b"test")));
+        assert_eq!(hs.yourip, None);
+        assert_eq!(hs.reqq, None);
+        assert_eq!(hs.metadata_size, None);
+        assert_eq!(hs.upload_only, None);
+
+        // `m` that is not a dictionary names no ids.
+        const NOT_A_DICT_M: &[u8] = b"\x00d1:mi1e1:pi1ee";
+        match ExtendedMessage::deserialize(DoubleBufHelper::new(NOT_A_DICT_M, &[])).unwrap() {
+            ExtendedMessage::Handshake(hs) => {
+                assert_eq!(hs.m, PeerExtendedMessageIds::default());
+                assert_eq!(hs.p, Some(1));
+            }
+            other => panic!("expected handshake, got {other:?}"),
+        }
+
+        for not_a_dict in [&b"\x00i1e"[..], b"\x00l1:pe", b"\x004:spam"] {
+            assert!(matches!(
+                ExtendedMessage::deserialize(DoubleBufHelper::new(not_a_dict, &[])),
+                Err(MessageDeserializeError::Bencode(..))
+            ));
+        }
     }
 
     #[test]
