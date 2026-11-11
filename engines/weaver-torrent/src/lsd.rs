@@ -250,17 +250,20 @@ impl Registry {
     }
 }
 
-/// Joins the LSD's groups afresh, on the interfaces up now.
-type Rejoin = Box<dyn Fn() -> anyhow::Result<Box<dyn Socket>> + Send + Sync>;
+/// Joins the LSD's groups on the interfaces up now.
+pub(crate) type Join = Box<dyn Fn() -> anyhow::Result<Box<dyn Socket>> + Send + Sync>;
 
 struct LocalServiceDiscoveryInner {
-    /// The socket sent on and received from; replaced whole by a rejoin.
-    socket: RwLock<Arc<dyn Socket>>,
-    /// How to join again, when the LSD can.
-    rejoin: Option<Rejoin>,
-    /// Rung once a rejoin replaced the socket: a receive waiting on the old
-    /// one moves to the new.
-    rejoined: Notify,
+    /// The socket sent on and received from, once a join made one; each
+    /// later join replaces it whole. None until a join succeeds: the LSD
+    /// keeps its torrents' registrations meanwhile and sends nothing.
+    socket: RwLock<Option<Arc<dyn Socket>>>,
+    /// How to join, when the LSD can.
+    join: Option<Join>,
+    /// Rung once a join put a socket in place: a receive waiting on the old
+    /// one, or on none, moves to the new, and a schedule waiting for the
+    /// first join starts.
+    joined: Notify,
     cookie: u32,
     registry: Mutex<Registry>,
     /// Wakes the schedule when it moves earlier.
@@ -282,57 +285,54 @@ pub struct LocalServiceDiscoveryOptions {
     /// once the tracker is empty after cancellation, nothing is sent or
     /// received on it again.
     pub tasks: Option<TaskTracker>,
-    /// A test's socket in place of the multicast one.
+    /// A test's way to join in place of the multicast one.
     #[cfg(test)]
-    pub(crate) socket: Option<Box<dyn Socket>>,
+    pub(crate) join: Option<Join>,
 }
 
 impl LocalServiceDiscovery {
-    pub async fn new(opts: LocalServiceDiscoveryOptions) -> anyhow::Result<Self> {
+    /// Starts the LSD's tasks, joined to nothing yet: [`Self::join`] joins
+    /// its groups. Must be called within a Tokio runtime.
+    pub fn new(opts: LocalServiceDiscoveryOptions) -> Self {
         let tasks = opts.tasks.unwrap_or_default();
-        #[cfg(test)]
-        if let Some(socket) = opts.socket {
-            return Ok(Self::with_socket(
-                socket,
-                None,
-                opts.cookie.unwrap_or_else(rand::random),
-                opts.cancel_token,
-                tasks,
-            ));
-        }
         let egress = opts.egress;
-        let join: Rejoin = Box::new(move || {
-            #[expect(
-                clippy::disallowed_methods,
-                reason = "the LSD's groups are on the local network alone, never a route"
-            )]
-            let socket = egress
-                .join_multicast(LSD_IPV4, LSD_IPV6)
-                .context("error binding LSD socket")?;
-            Ok(Box::new(socket) as Box<dyn Socket>)
-        });
-        let socket = join()?;
-        Ok(Self::with_socket(
-            socket,
+        let multicast = move || -> Join {
+            Box::new(move || {
+                #[expect(
+                    clippy::disallowed_methods,
+                    reason = "the LSD's groups are on the local network alone, never a route"
+                )]
+                let socket = egress
+                    .join_multicast(LSD_IPV4, LSD_IPV6)
+                    .context("error binding LSD socket")?;
+                Ok(Box::new(socket) as Box<dyn Socket>)
+            })
+        };
+        #[cfg(test)]
+        let join = opts.join.unwrap_or_else(multicast);
+        #[cfg(not(test))]
+        let join = multicast();
+        Self::start(
+            None,
             Some(join),
             opts.cookie.unwrap_or_else(rand::random),
             opts.cancel_token,
             tasks,
-        ))
+        )
     }
 
-    fn with_socket(
-        socket: Box<dyn Socket>,
-        rejoin: Option<Rejoin>,
+    fn start(
+        socket: Option<Box<dyn Socket>>,
+        join: Option<Join>,
         cookie: u32,
         cancel_token: CancellationToken,
         tasks: TaskTracker,
     ) -> Self {
         let lsd = Self {
             inner: Arc::new(LocalServiceDiscoveryInner {
-                socket: RwLock::new(Arc::from(socket)),
-                rejoin,
-                rejoined: Notify::new(),
+                socket: RwLock::new(socket.map(Arc::from)),
+                join,
+                joined: Notify::new(),
                 cookie,
                 registry: Mutex::new(Registry::new()),
                 reschedule: Notify::new(),
@@ -355,25 +355,35 @@ impl LocalServiceDiscovery {
         lsd
     }
 
-    /// Joins the LSD's groups again on the interfaces up now, and sends and
-    /// receives on the new socket from here on; the old one closes once the
-    /// receive waiting on it lets it go. A join captures the interfaces it
-    /// was made on, so one that came up since, or an address that changed,
-    /// is reached only after this. Run on an interface change. On failure
-    /// the old socket stays. Must be called within a Tokio runtime.
-    pub fn rejoin(&self) -> anyhow::Result<()> {
+    /// Joins the LSD's groups on the interfaces up now, and sends and
+    /// receives on the new socket from here on; an old one closes once the
+    /// receive waiting on it lets it go. The first join that succeeds starts
+    /// the LSD: the torrents that registered before it are announced on the
+    /// schedule, the first announces they wait for due at once. A join
+    /// captures the interfaces it was made on, so one that came up since, or
+    /// an address that changed, is reached only after another. Run at the
+    /// start and on each interface change. On failure the LSD stays as it
+    /// was: on its old socket, or joined to nothing. Must be called within a
+    /// Tokio runtime.
+    pub fn join(&self) -> anyhow::Result<()> {
         let join = self
             .inner
-            .rejoin
+            .join
             .as_ref()
-            .context("this local service discovery cannot rejoin")?;
+            .context("this local service discovery cannot join")?;
         let socket = join()?;
-        *self.inner.socket.write() = Arc::from(socket);
-        self.inner.rejoined.notify_waiters();
+        *self.inner.socket.write() = Some(Arc::from(socket));
+        self.inner.joined.notify_waiters();
         Ok(())
     }
 
-    fn socket(&self) -> Arc<dyn Socket> {
+    /// Whether a join has succeeded.
+    #[cfg(test)]
+    pub(crate) fn joined(&self) -> bool {
+        self.inner.socket.read().is_some()
+    }
+
+    fn socket(&self) -> Option<Arc<dyn Socket>> {
         self.inner.socket.read().clone()
     }
 
@@ -404,15 +414,18 @@ cookie: {cookie}\r
     async fn recv_and_process_one(&self, buf: &mut [u8]) -> io::Result<()> {
         let mut headers = [httparse::EMPTY_HEADER; 16];
 
-        // Armed before the socket is read, so a rejoin between the two
-        // still moves the receive.
-        let rejoined = self.inner.rejoined.notified();
-        let mut rejoined = std::pin::pin!(rejoined);
-        rejoined.as_mut().enable();
-        let socket = self.socket();
+        // Armed before the socket is read, so a join between the two still
+        // moves the receive.
+        let joined = self.inner.joined.notified();
+        let mut joined = std::pin::pin!(joined);
+        joined.as_mut().enable();
+        let Some(socket) = self.socket() else {
+            joined.await;
+            return Ok(());
+        };
         let received = tokio::select! {
             received = socket.recv_from(buf) => received,
-            () = rejoined => return Ok(()),
+            () = joined => return Ok(()),
         };
         let (sz, addr) = match received {
             Ok(received) => received,
@@ -466,8 +479,16 @@ cookie: {cookie}\r
         }
     }
 
-    /// Sends what the schedule says is due, whenever it is due.
+    /// Sends what the schedule says is due, whenever it is due, once a join
+    /// has succeeded. Until then the schedule stands still, so the first
+    /// announces registered meanwhile are all due when it starts.
     async fn task_announce(self) -> anyhow::Result<()> {
+        let joined = self.inner.joined.notified();
+        let mut joined = std::pin::pin!(joined);
+        joined.as_mut().enable();
+        if self.socket().is_none() {
+            joined.await;
+        }
         loop {
             let wake_at = self.inner.registry.lock().wake_at();
             tokio::select! {
@@ -477,8 +498,10 @@ cookie: {cookie}\r
             }
             let due = self.inner.registry.lock().due(Instant::now());
             for (info_hash, port) in due {
+                // A socket, once in place, is only ever replaced.
+                let Some(socket) = self.socket() else { break };
                 trace!(?info_hash, port, "announcing");
-                self.socket()
+                socket
                     .send_everywhere(&|is_v6| self.gen_announce_msg(info_hash, port, is_v6))
                     .await;
             }
@@ -622,6 +645,59 @@ impl Socket for ListeningSocket {
     fn is_local(&self, _: SocketAddr) -> bool {
         false
     }
+}
+
+/// A socket on a host whose one network is loopback: it hands on each
+/// announce it sends, and receives the packets a test injects.
+#[cfg(test)]
+pub(crate) struct InjectedSocket {
+    pub(crate) sent: UnboundedSender<String>,
+    pub(crate) incoming: tokio::sync::Mutex<UnboundedReceiver<(String, SocketAddr)>>,
+}
+
+#[cfg(test)]
+impl Socket for InjectedSocket {
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+        Box::pin(async move {
+            let Some((packet, from)) = self.incoming.lock().await.recv().await else {
+                return std::future::pending().await;
+            };
+            buf[..packet.len()].copy_from_slice(packet.as_bytes());
+            Ok((packet.len(), from))
+        })
+    }
+
+    fn send_everywhere<'a>(
+        &'a self,
+        msg: &'a (dyn Fn(bool) -> String + Sync),
+    ) -> BoxFuture<'a, ()> {
+        let _ = self.sent.send(msg(false));
+        Box::pin(async {})
+    }
+
+    fn is_local(&self, source: SocketAddr) -> bool {
+        source.ip().is_loopback()
+    }
+}
+
+/// The outcomes a test's joins take in turn, first first; a join past the
+/// last fails.
+#[cfg(test)]
+pub(crate) type JoinScript = Arc<std::sync::Mutex<VecDeque<anyhow::Result<Box<dyn Socket>>>>>;
+
+/// Joins by taking the next outcome of `script`.
+#[cfg(test)]
+pub(crate) fn scripted_join(script: JoinScript) -> Join {
+    Box::new(move || {
+        script
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| Err(anyhow::anyhow!("no join scripted")))
+    })
 }
 
 #[derive(Debug)]
@@ -786,13 +862,13 @@ mod tests {
             Self::rejoining(None)
         }
 
-        fn rejoining(rejoin: Option<super::Rejoin>) -> Self {
+        fn rejoining(join: Option<super::Join>) -> Self {
             let (socket, sent, incoming) = test_socket();
             let tasks = tokio_util::task::TaskTracker::new();
             Self {
-                lsd: LocalServiceDiscovery::with_socket(
-                    Box::new(socket),
-                    rejoin,
+                lsd: LocalServiceDiscovery::start(
+                    Some(Box::new(socket)),
+                    join,
                     1,
                     CancellationToken::new(),
                     tasks.clone(),
@@ -873,7 +949,7 @@ mod tests {
         let a = hash(1);
         let mut peers = h.lsd.announce(a, Some(fixed(PORT)));
         assert_eq!(h.next().await, (a, 0));
-        h.lsd.rejoin().unwrap();
+        h.lsd.join().unwrap();
         h.incoming.closed().await;
         let old = std::mem::replace(&mut h.sent, sent);
         h.incoming = incoming;
@@ -884,6 +960,55 @@ mod tests {
         assert!(old.try_recv().is_err(), "nothing more on the old socket");
     }
 
+    // Joined to nothing, the LSD keeps what registers and its schedule
+    // stands still; a join that fails leaves it so. The first join that
+    // succeeds sends the waiting first announce at once, its resends 2 s and
+    // 6 s on, and takes packets.
+    #[tokio::test(start_paused = true)]
+    async fn the_first_join_starts_what_waited_for_it() {
+        let (socket, mut sent, incoming) = test_socket();
+        let script: super::JoinScript = std::sync::Arc::new(std::sync::Mutex::new(
+            [
+                Err(anyhow::anyhow!("no interface up")),
+                Ok(Box::new(socket) as Box<dyn Socket>),
+            ]
+            .into(),
+        ));
+        let start = Instant::now();
+        let lsd = LocalServiceDiscovery::start(
+            None,
+            Some(super::scripted_join(script)),
+            1,
+            CancellationToken::new(),
+            tokio_util::task::TaskTracker::new(),
+        );
+        let a = hash(1);
+        let mut peers = lsd.announce(a, Some(fixed(PORT)));
+        tokio::time::advance(std::time::Duration::from_secs(600)).await;
+        assert!(lsd.join().is_err());
+        assert!(!lsd.joined());
+
+        lsd.join().unwrap();
+        assert!(lsd.joined());
+        let mut sends = Vec::new();
+        while sends.len() < 3 {
+            let (at, hash, port) = sent.recv().await.unwrap();
+            sends.push((hash, (at - start).as_secs(), port));
+        }
+        assert_eq!(sends, [(a, 600, PORT), (a, 602, PORT), (a, 606, PORT)]);
+        incoming
+            .send(Ok((
+                format!(
+                    "BT-SEARCH * HTTP/1.1\r\nPort: 7001\r\nInfohash: {}\r\ncookie: 2\r\n\r\n\r\n",
+                    a.as_string()
+                )
+                .into_bytes(),
+                "10.0.0.7:6771".parse().unwrap(),
+            )))
+            .unwrap();
+        assert_eq!(peers.next().await, Some("10.0.0.7:7001".parse().unwrap()));
+    }
+
     // With nothing to join again with, a rejoin fails and the socket stays.
     #[tokio::test(start_paused = true)]
     async fn a_rejoin_without_a_way_to_join_keeps_the_socket() {
@@ -891,7 +1016,7 @@ mod tests {
         let a = hash(1);
         let _stream = h.lsd.announce(a, Some(fixed(PORT)));
         assert_eq!(h.next().await, (a, 0));
-        assert!(h.lsd.rejoin().is_err());
+        assert!(h.lsd.join().is_err());
         assert_eq!(h.until(2).await, [(a, 2)]);
     }
 
