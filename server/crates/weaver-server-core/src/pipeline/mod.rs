@@ -18,6 +18,7 @@ pub mod graph;
 mod health;
 pub(crate) mod held;
 mod infrastructure_retry;
+mod next_up;
 mod nzb_admission;
 mod orchestrator;
 mod post_health;
@@ -119,8 +120,7 @@ pub(crate) fn persisted_nzb_password_candidates(
     nzb_path: &std::path::Path,
     nzb_zstd: &[u8],
 ) -> Result<Vec<ArchivePasswordCandidate>, crate::ingest::PersistedNzbError> {
-    let nzb = crate::ingest::parse_persisted_nzb_bytes(nzb_zstd)?;
-    Ok(crate::ingest::nzb_password_candidates(&nzb, nzb_path, None))
+    crate::ingest::outline::read_stored_outline(nzb_zstd, nzb_path).map(|read| read.passwords)
 }
 
 // The candidates a job carries, as `JobState::nzb_password_candidates` holds
@@ -1853,6 +1853,8 @@ pub struct Pipeline {
     pub(super) job_article_memory: HashMap<JobId, ProcessMemoryPermit>,
     // The number the next read of a job's articles is told by.
     pub(super) next_activation: u64,
+    // The jobs next up, their article lists read ahead: see [`next_up`].
+    pub(super) next_up: next_up::NextUp,
     // Paused jobs still holding their articles while what was out for them
     // on a connection or in the decoder comes back.
     pub(super) parking_jobs: HashSet<JobId>,

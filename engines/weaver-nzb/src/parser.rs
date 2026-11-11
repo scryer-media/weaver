@@ -158,6 +158,96 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
     limits: ParserLimits,
     diagnostics: &mut ParseDiagnostics,
 ) -> Result<Nzb, NzbError> {
+    let mut files: Vec<NzbFile> = Vec::new();
+    let meta = visit_nzb_files(reader, limits, diagnostics, &mut |file| {
+        files.push(file);
+        Ok(())
+    })?;
+
+    // Borrow IDs from the completed document: no second copy of every ID and
+    // no bookkeeping on the download path. Placements retain their semantics.
+    if limits.max_message_id_uses < limits.max_segments {
+        let mut uses = HashMap::<&str, usize>::new();
+        let ids = files
+            .iter()
+            .flat_map(|file| &file.segments)
+            .flat_map(|segment| &segment.message_ids);
+        for id in ids {
+            let count = uses.entry(id).or_default();
+            if *count >= limits.max_message_id_uses {
+                return Err(NzbError::ResourceLimit(format!(
+                    "message-ID fan-out exceeds {} placements",
+                    limits.max_message_id_uses
+                )));
+            }
+            *count += 1;
+        }
+    }
+
+    Ok(Nzb { meta, files })
+}
+
+// Parse an NZB incrementally, handing each file to `on_file` as its element
+// closes, and return the document's meta once the whole document is read.
+// The parse keeps nothing of a file it has handed over, so what stays in
+// memory is what `on_file` keeps. A file is handed over only once it has
+// passed every check the whole-document parse makes of it, but a later part
+// of the document can still fail the parse: a caller keeps what it was handed
+// only when this returns `Ok`.
+pub fn parse_nzb_reader_files<R: BufRead>(
+    reader: R,
+    mut on_file: impl FnMut(NzbFile) -> Result<(), NzbError>,
+) -> Result<NzbMeta, NzbError> {
+    let limits = ParserLimits::from_env()?;
+    let read_limit = limits.max_xml_bytes.checked_add(1).ok_or_else(|| {
+        NzbError::ResourceLimit("XML byte cap is too large to enforce".to_string())
+    })?;
+    let mut reader = reader.take(u64::try_from(read_limit).unwrap_or(u64::MAX));
+    // Fan-out is counted only under a cap lowered below the segment cap, as
+    // the whole-document parse counts it, here as each file is handed over.
+    let mut uses =
+        (limits.max_message_id_uses < limits.max_segments).then(HashMap::<String, usize>::new);
+    let result = visit_nzb_files(
+        &mut reader,
+        limits,
+        &mut ParseDiagnostics::default(),
+        &mut |file| {
+            if let Some(uses) = uses.as_mut() {
+                for id in file
+                    .segments
+                    .iter()
+                    .flat_map(|segment| &segment.message_ids)
+                {
+                    let count = uses.entry(id.clone()).or_default();
+                    if *count >= limits.max_message_id_uses {
+                        return Err(NzbError::ResourceLimit(format!(
+                            "message-ID fan-out exceeds {} placements",
+                            limits.max_message_id_uses
+                        )));
+                    }
+                    *count += 1;
+                }
+            }
+            on_file(file)
+        },
+    );
+    if reader.limit() == 0 {
+        return Err(NzbError::ResourceLimit(format!(
+            "XML document exceeds {} bytes",
+            limits.max_xml_bytes
+        )));
+    }
+    result
+}
+
+// The parse itself: each file that survives its checks goes to `on_file` as
+// its element closes; the document's meta is returned at its end.
+fn visit_nzb_files<R: BufRead>(
+    reader: R,
+    limits: ParserLimits,
+    diagnostics: &mut ParseDiagnostics,
+    on_file: &mut dyn FnMut(NzbFile) -> Result<(), NzbError>,
+) -> Result<NzbMeta, NzbError> {
     // Text is taken whole: an element's text arrives as text pieces with an
     // entity reference between each, so the pieces are joined first and the
     // element's text is trimmed once, at its end. A password keeps its
@@ -173,7 +263,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
     let mut meta_tags: Vec<(String, String)> = Vec::new();
 
     // File accumulation
-    let mut files: Vec<NzbFile> = Vec::new();
+    let mut file_count = 0usize;
     let mut current_file: Option<FileBuilder> = None;
     let mut total_segments = 0usize;
     let mut total_declared_bytes = 0u64;
@@ -447,7 +537,7 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                     "skipping file with no segments"
                                 );
                             } else {
-                                if files.len() >= limits.max_files {
+                                if file_count >= limits.max_files {
                                     return Err(NzbError::ResourceLimit(format!(
                                         "NZB has more than {} files",
                                         limits.max_files
@@ -456,13 +546,14 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
                                 let mut segments = f.segments;
                                 segments.sort_by_key(|s| s.number);
                                 diagnostics.files.push(f.notes);
-                                files.push(NzbFile {
+                                on_file(NzbFile {
                                     poster: f.poster,
                                     subject: f.subject,
                                     date: f.date,
                                     groups: f.groups,
                                     segments,
-                                });
+                                })?;
+                                file_count += 1;
                             }
                         }
                     }
@@ -499,38 +590,15 @@ fn parse_nzb_reader_with_limits<R: BufRead>(
     }
     malformed.report();
 
-    if files.is_empty() {
+    if file_count == 0 {
         return Err(NzbError::EmptyNzb);
     }
 
-    // Borrow IDs from the completed document: no second copy of every ID and
-    // no bookkeeping on the download path. Placements retain their semantics.
-    if limits.max_message_id_uses < limits.max_segments {
-        let mut uses = HashMap::<&str, usize>::new();
-        let ids = files
-            .iter()
-            .flat_map(|file| &file.segments)
-            .flat_map(|segment| &segment.message_ids);
-        for id in ids {
-            let count = uses.entry(id).or_default();
-            if *count >= limits.max_message_id_uses {
-                return Err(NzbError::ResourceLimit(format!(
-                    "message-ID fan-out exceeds {} placements",
-                    limits.max_message_id_uses
-                )));
-            }
-            *count += 1;
-        }
-    }
-
-    Ok(Nzb {
-        meta: NzbMeta {
-            title: meta_title,
-            password: meta_password,
-            passwords: meta_passwords,
-            tags: meta_tags,
-        },
-        files,
+    Ok(NzbMeta {
+        title: meta_title,
+        password: meta_password,
+        passwords: meta_passwords,
+        tags: meta_tags,
     })
 }
 
@@ -2151,5 +2219,48 @@ mod tests {
                 "Some.Title.nfo".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn files_reader_hands_over_what_the_whole_parse_holds() {
+        let xml = br#"<?xml version="1.0" encoding="UTF-8"?>
+<nzb xmlns="http://www.newzbin.com/DTD/2003/nzb">
+  <head><meta type="title">T</meta><meta type="password">pw</meta></head>
+  <file poster="p@example.com" date="7" subject="Post - &quot;a.part01.rar&quot; yEnc (1/3)">
+    <groups><group>alt.binaries.test</group><group>alt.binaries.other</group></groups>
+    <segments>
+      <segment bytes="10" number="2">b@example.com</segment>
+      <segment bytes="10" number="1">a@example.com</segment>
+      <segment bytes="10" number="1">a2@example.com</segment>
+      <segment bytes="10" number="3">a@example.com</segment>
+    </segments>
+  </file>
+  <file poster="p@example.com" date="1" subject="empty (1/1)">
+    <segments><segment bytes="x" number="1">bad@example.com</segment></segments>
+  </file>
+  <file poster="p@example.com" date="bad" subject="b.nfo (1/1)">
+    <segments><segment bytes="5" number="1">c@example.com</segment></segments>
+  </file>
+</nzb>"#;
+        let whole = parse_nzb(xml).unwrap();
+        let mut files = Vec::new();
+        let meta = parse_nzb_reader_files(Cursor::new(&xml[..]), |file| {
+            files.push(file);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(meta.title, whole.meta.title);
+        assert_eq!(meta.password, whole.meta.password);
+        assert_eq!(meta.passwords, whole.meta.passwords);
+        assert_eq!(meta.tags, whole.meta.tags);
+        assert_eq!(format!("{files:?}"), format!("{:?}", whole.files));
+        assert_eq!(files.len(), 2);
+
+        let empty =
+            br#"<nzb><file poster="p" date="1" subject="s"><segments></segments></file></nzb>"#;
+        assert!(matches!(
+            parse_nzb_reader_files(Cursor::new(&empty[..]), |_| Ok(())),
+            Err(NzbError::EmptyNzb)
+        ));
     }
 }
