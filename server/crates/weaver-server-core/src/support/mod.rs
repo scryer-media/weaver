@@ -45,6 +45,67 @@ pub enum SupportReportError {
     Task(String),
 }
 
+impl SupportReportError {
+    // The stable snake_case code a reader tells the failures apart by; the
+    // message is for people and can change.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "job_not_found",
+            Self::NzbUnavailable(_) => "nzb_unavailable",
+            Self::Parse(_) => "nzb_unreadable",
+            Self::State(_) => "state_read_failed",
+            Self::Task(_) => "report_task_failed",
+        }
+    }
+}
+
+// Where a queued job stands for the reports the diagnostics package carries.
+// Only jobs Weaver has started work on qualify: a job that is merely queued,
+// waiting on its queue scripts, or paused does not, and neither does one that
+// finished well and is on its way to history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveReportGroup {
+    // Verifying, repairing, extracting, moving or post-processing, or
+    // waiting in line for one of them. Listed first.
+    PostProcessing,
+    // Failed and still in the queue.
+    Failed,
+    // Downloading, or checking article availability before it does.
+    Downloading,
+}
+
+impl ActiveReportGroup {
+    pub fn of(status: &crate::JobStatus) -> Option<Self> {
+        use crate::JobStatus;
+        if status.past_download() {
+            Some(Self::PostProcessing)
+        } else {
+            match status {
+                JobStatus::Failed { .. } => Some(Self::Failed),
+                JobStatus::Downloading | JobStatus::Checking => Some(Self::Downloading),
+                _ => None,
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PostProcessing => "post_processing",
+            Self::Failed => "failed",
+            Self::Downloading => "downloading",
+        }
+    }
+}
+
+// The jobs chosen for reports, in report order, and how many qualified
+// before the cap.
+#[derive(Debug, Clone)]
+pub struct ActiveReportJobs {
+    pub qualified: usize,
+    pub jobs: Vec<(ActiveReportGroup, JobInfo)>,
+}
+
 // Where the report was made. Every field is a fixed name.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ReportEnvironment {
