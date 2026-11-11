@@ -2784,7 +2784,10 @@ mod tests {
         assert!(next.as_mut().poll_unpin_once().is_none());
         drop(first);
         // The turn skipped the waiter that gave up.
-        let second = next.as_mut().poll_unpin_once().expect("the next waiter's turn");
+        let second = next
+            .as_mut()
+            .poll_unpin_once()
+            .expect("the next waiter's turn");
         assert_eq!(announces.out(), 1);
 
         // Sent its turn, then gone before it took it.

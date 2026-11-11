@@ -2853,7 +2853,9 @@ mod v2 {
         // `bt_peer_connection::on_hash_request`).
         let request = ask(tree.root(), 0, 512, 512, 9);
         peer.on_hash_request(request).unwrap();
-        let Ok(WriterRequest::Answer(crate::peer_connection::Answer::Hashes(answer))) = rx.try_recv() else {
+        let Ok(WriterRequest::Answer(crate::peer_connection::Answer::Hashes(answer))) =
+            rx.try_recv()
+        else {
             panic!("expected hashes");
         };
         assert_eq!(answer.request, request);

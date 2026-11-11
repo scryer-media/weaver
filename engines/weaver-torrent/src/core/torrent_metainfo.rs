@@ -26,7 +26,9 @@ use crate::core::{
     hash_id::Id20,
     lengths::{Lengths, MAX_NUM_PIECES, ValidPieceIndex},
     merkle::{self, BLOCK_SIZE},
-    v2_tree::{FileTree, NameRules, sanitize_component, sanitize_component_with, sanitize_name_with},
+    v2_tree::{
+        FileTree, NameRules, sanitize_component, sanitize_component_with, sanitize_name_with,
+    },
 };
 
 pub type TorrentMetaV1Borrowed<'a> = TorrentMetaV1<ByteBuf<'a>>;
@@ -948,13 +950,10 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
                     f.is_pad(),
                 )
             })),
-            None => Either::Right(
-                self.iter_file_details_raw(encoding)?
-                    .map(|d| {
-                        let padding = d.attrs().padding;
-                        (d.filename, d.len, padding)
-                    }),
-            ),
+            None => Either::Right(self.iter_file_details_raw(encoding)?.map(|d| {
+                let padding = d.attrs().padding;
+                (d.filename, d.len, padding)
+            })),
         };
         let mut paths = Vec::new();
         let mut files = Vec::new();
@@ -1232,15 +1231,13 @@ fn clean_path<B: AsRef<[u8]>>(
     rules: NameRules,
 ) -> crate::core::Result<Vec<String>> {
     let utf8 = name.encoding == encoding_rs::UTF_8;
-    let elements = name
-        .iter_components_bytes()
-        .map(|raw| match utf8 {
-            true => Cow::Borrowed(raw),
-            false => match name.encoding.decode(raw).0 {
-                Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
-                Cow::Owned(text) => Cow::Owned(text.into_bytes()),
-            },
-        });
+    let elements = name.iter_components_bytes().map(|raw| match utf8 {
+        true => Cow::Borrowed(raw),
+        false => match name.encoding.decode(raw).0 {
+            Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
+            Cow::Owned(text) => Cow::Owned(text.into_bytes()),
+        },
+    });
     match name.data {
         FileIteratorNameData::Single(Some(_)) => elements
             .map(|raw| sanitize_name_with(&raw, rules).ok_or(Error::BadTorrentFileNoName))
@@ -1563,9 +1560,13 @@ mod tests {
     fn a_real_duplicate_name_is_renamed() {
         // libtorrent test_torrent_info.cpp `resolve_duplicates`: the later
         // file takes the first `.N` free before its extension.
-        let renamed = |files: Vec<TorrentMetaV1File<ByteBufOwned>>| clean_paths(multi_file_info(files));
+        let renamed =
+            |files: Vec<TorrentMetaV1File<ByteBufOwned>>| clean_paths(multi_file_info(files));
         assert_eq!(
-            renamed(vec![file(&["a.bin"], 100, None), file(&["a.bin"], 100, None)]),
+            renamed(vec![
+                file(&["a.bin"], 100, None),
+                file(&["a.bin"], 100, None)
+            ]),
             ["a.bin", "a.1.bin"]
         );
         // A `.pad/` path without the attribute is an ordinary file.
@@ -1674,7 +1675,12 @@ mod tests {
         let validated = single.validate().unwrap();
         assert_eq!(validated.name().as_deref(), Some("utf8.bin"));
         assert_eq!(
-            validated.iter_file_details().next().unwrap().filename.to_vec(),
+            validated
+                .iter_file_details()
+                .next()
+                .unwrap()
+                .filename
+                .to_vec(),
             ["utf8.bin"]
         );
     }
@@ -1697,7 +1703,10 @@ mod tests {
         // A single file's name the cleaning drops leaves it without one.
         let mut single = single_file_info(100, 16384, 20);
         single.name = Some(b"."[..].into());
-        assert!(matches!(single.validate(), Err(Error::BadTorrentFileNoName)));
+        assert!(matches!(
+            single.validate(),
+            Err(Error::BadTorrentFileNoName)
+        ));
     }
 
     /// A single-file v1 info of `length` bytes in pieces of `piece_length`,

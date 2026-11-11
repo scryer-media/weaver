@@ -18,10 +18,11 @@ use crate::core::{
     peer_id::try_decode_peer_id,
 };
 use crate::peer_protocol::{
-    HashRequest, Handshake, Hashes, Message, PIECE_MESSAGE_DEFAULT_LEN,
-    PIECE_MESSAGE_PREAMBLE_LEN, PartialBlock, Request, SerializeError,
+    Handshake, HashRequest, Hashes, Message, PIECE_MESSAGE_DEFAULT_LEN, PIECE_MESSAGE_PREAMBLE_LEN,
+    PartialBlock, Request, SerializeError,
     extended::{
-        ExtendedMessage, PeerExtendedMessageIds, handshake::ExtendedHandshake,
+        ExtendedMessage, PeerExtendedMessageIds,
+        handshake::ExtendedHandshake,
         ut_metadata::{UtMetadata, UtMetadataData},
         ut_pex::UtPex,
     },
@@ -263,9 +264,13 @@ impl Answer {
         match self {
             Self::Reject(request) => Message::Reject(*request).serialize(out, ext_msg_ids),
             Self::HashReject(request) => Message::HashReject(*request).serialize(out, ext_msg_ids),
-            Self::Hashes(hashes) => Message::Hashes(hashes.as_borrowed()).serialize(out, ext_msg_ids),
-            Self::Metadata(utm) => Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
-                .serialize(out, ext_msg_ids),
+            Self::Hashes(hashes) => {
+                Message::Hashes(hashes.as_borrowed()).serialize(out, ext_msg_ids)
+            }
+            Self::Metadata(utm) => {
+                Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
+                    .serialize(out, ext_msg_ids)
+            }
         }
     }
 }
@@ -1667,11 +1672,17 @@ mod tests {
         assert!(result.is_err(), "{result:?}");
 
         let answer_len = 53 + 512 * 32;
-        let received = answering.received.load(Ordering::SeqCst) as usize;
+        let received = usize::try_from(answering.received.load(Ordering::SeqCst)).unwrap();
         // The reader stopped once the backlog reached the limit: past the
         // answers the stream holds, at most one answer more than the limit.
-        assert!(received < SENT as usize, "every request was read: {received}");
-        assert!(received >= super::ANSWER_BACKLOG_LIMIT / answer_len, "{received}");
+        assert!(
+            received < SENT as usize,
+            "every request was read: {received}"
+        );
+        assert!(
+            received >= super::ANSWER_BACKLOG_LIMIT / answer_len,
+            "{received}"
+        );
         assert!(
             received <= (super::ANSWER_BACKLOG_LIMIT + (1 << 16)) / answer_len + 2,
             "{received}"

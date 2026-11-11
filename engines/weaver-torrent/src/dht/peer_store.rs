@@ -297,7 +297,7 @@ mod tests {
         let info_hash = near_info_hash(7);
         for n in 0..300 {
             assert!(announce(&store, info_hash, source(n)));
-            let v6 = SocketAddr::from(([0xfd00, 0, 0, 0, 0, 0, 0, n as u16 + 1], 6881));
+            let v6 = SocketAddr::from(([0xfd00, 0, 0, 0, 0, 0, 0, u16::try_from(n).unwrap() + 1], 6881));
             assert!(announce(&store, info_hash, v6));
         }
         let all = stored(&store, info_hash);

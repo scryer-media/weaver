@@ -2514,8 +2514,14 @@ mod tests {
         use std::task::Poll;
 
         let (dht, mut sent) = fixture_dht();
-        let answers = (Id20::new([0x21; 20]), SocketAddr::from(([10, 0, 1, 1], 6881)));
-        let silent = (Id20::new([0x23; 20]), SocketAddr::from(([10, 0, 2, 1], 6881)));
+        let answers = (
+            Id20::new([0x21; 20]),
+            SocketAddr::from(([10, 0, 1, 1], 6881)),
+        );
+        let silent = (
+            Id20::new([0x23; 20]),
+            SocketAddr::from(([10, 0, 2, 1], 6881)),
+        );
         let in_table = |id: Id20| dht.routing_table_v4.read().iter().any(|n| n.id() == id);
         let target = Id20::new([0x22; 20]);
         let req = super::RecursiveRequest {
@@ -2535,7 +2541,10 @@ mod tests {
             asked.push(request);
         }
         assert_eq!(asked.len(), 2);
-        assert!(!in_table(answers.0) && !in_table(silent.0), "asked is not answered");
+        assert!(
+            !in_table(answers.0) && !in_table(silent.0),
+            "asked is not answered"
+        );
 
         let request = asked.iter().find(|r| r.addr == answers.1).unwrap();
         dht.on_received_message(
@@ -2559,7 +2568,10 @@ mod tests {
             tokio::time::advance(RESPONSE_TIMEOUT).await;
         };
         let _ = outcome;
-        assert!(in_table(answers.0), "the node that answered is in the table");
+        assert!(
+            in_table(answers.0),
+            "the node that answered is in the table"
+        );
         assert!(!in_table(silent.0), "the silent node entered the table");
     }
 

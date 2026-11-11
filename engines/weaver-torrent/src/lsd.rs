@@ -984,7 +984,10 @@ mod tests {
         let mut peers_a = h.lsd.announce(a, None);
         let mut peers_b = h.lsd.announce(b, None);
         let _zero = h.lsd.announce(zero, None);
-        h.receive_headers("10.0.0.9:6771", &format!("Port: 0\r\nInfohash: {}\r\n", a.as_string()));
+        h.receive_headers(
+            "10.0.0.9:6771",
+            &format!("Port: 0\r\nInfohash: {}\r\n", a.as_string()),
+        );
         h.receive_headers(
             "10.0.0.7:6771",
             &format!(
@@ -1005,7 +1008,11 @@ mod tests {
             b.as_string()
         );
         let bts = try_parse_bt_search(packet.as_bytes(), &mut headers).unwrap();
-        assert_eq!(bts.hashes, [b], "no Host header needed, the zero hash passed over");
+        assert_eq!(
+            bts.hashes,
+            [b],
+            "no Host header needed, the zero hash passed over"
+        );
         let packet = "BT-SEARCH * HTTP/1.1\r\nPort: 65535\r\n\r\n";
         assert!(try_parse_bt_search(packet.as_bytes(), &mut [httparse::EMPTY_HEADER; 16]).is_err());
     }

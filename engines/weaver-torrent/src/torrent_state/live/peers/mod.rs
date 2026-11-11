@@ -673,7 +673,12 @@ impl PeerStates {
             .connected
             .lock()
             .get(&addr.ip())
-            .map(|at| at.iter().copied().filter(|other| *other != addr).collect::<Vec<_>>())
+            .map(|at| {
+                at.iter()
+                    .copied()
+                    .filter(|other| *other != addr)
+                    .collect::<Vec<_>>()
+            })
             .unwrap_or_default();
         let Some((other, outgoing)) = others
             .into_iter()
@@ -1011,7 +1016,11 @@ impl PeerStates {
             counter.inc(state);
         }
         if has_connection(addr, state) {
-            self.connected.lock().entry(addr.ip()).or_default().push(addr);
+            self.connected
+                .lock()
+                .entry(addr.ip())
+                .or_default()
+                .push(addr);
         }
         if let PeerState::Live(live) = state {
             self.availability.add(&live.bitfield);
@@ -1621,7 +1630,10 @@ mod tests {
             let peers = make_peer_states().allowing_multiple_connections_per_ip(allowed.clone());
             // Four ports on each of 16 hosts.
             let addr = |i: u64| {
-                SocketAddr::from(([10, 1, 0, u8::try_from(i % 16).unwrap()], 6881 + (i / 16 % 4) as u16))
+                SocketAddr::from((
+                    [10, 1, 0, u8::try_from(i % 16).unwrap()],
+                    6881 + (i / 16 % 4) as u16,
+                ))
             };
             let web_seed = |i: u64| {
                 SocketAddr::from((

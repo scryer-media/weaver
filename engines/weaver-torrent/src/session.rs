@@ -45,8 +45,8 @@ use crate::torrent_state::live::{
     web_seed::WebSeeds,
 };
 use crate::tracker::{
-    HttpAnnounces, ListenPort, Reachable, StoppedAnnounces, ToldPorts, Tracker, TrackerAnnounce, TrackerComms,
-    TrackerHandover, TrackerStatus, TrackerTask, UdpTrackerClient, Unreachable,
+    HttpAnnounces, ListenPort, Reachable, StoppedAnnounces, ToldPorts, Tracker, TrackerAnnounce,
+    TrackerComms, TrackerHandover, TrackerStatus, TrackerTask, UdpTrackerClient, Unreachable,
 };
 use crate::upnp::{
     PortMapEvents, PortMapReceiver, PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport,
