@@ -22,7 +22,7 @@ use super::{
     TorrentAndInfoBytes, read_metainfo_from_peer,
 };
 use crate::{
-    buffers::ByteBuf,
+    buffers::{ByteBuf, ByteBufOwned},
     core::{
         constants::CHUNK_SIZE,
         hash_id::{Id20, InfoHashes},
@@ -474,15 +474,20 @@ fn set_of(handler: &Handler) -> Arc<Mutex<super::PieceSet>> {
 }
 
 #[tokio::test]
-async fn peers_naming_one_metadata_size_fill_one_buffer() {
+async fn every_peer_fills_the_fetchs_one_buffer_whatever_size_it_claims() {
     let fetch = MetadataFetch::new(metadata(10).1, None);
     let (a, _a_writes) = handler(&fetch);
     let (b, _b_writes) = handler(&fetch);
+    let (c, _c_writes) = handler(&fetch);
 
     a.on_extended_handshake(&naming(40_000)).unwrap();
     b.on_extended_handshake(&naming(40_000)).unwrap();
+    c.on_extended_handshake(&naming(80_000)).unwrap();
 
     assert!(Arc::ptr_eq(&set_of(&a), &set_of(&b)));
+    assert!(Arc::ptr_eq(&set_of(&a), &set_of(&c)));
+    // The latest claim sizes it.
+    assert_eq!(set_of(&a).lock().size(), 80_000);
 }
 
 #[tokio::test]
@@ -498,7 +503,7 @@ async fn a_repeated_extended_handshake_asks_for_nothing_again() {
     peer.on_extended_handshake(&naming(80_000)).unwrap();
     assert_eq!(requested(&peer), [] as [u32; 0]);
     assert!(Arc::ptr_eq(&set, &set_of(&peer)));
-    assert_eq!(fetch.sets.lock().len(), 1);
+    assert_eq!(set.lock().size(), 40_000);
 }
 
 #[tokio::test]
@@ -509,26 +514,79 @@ async fn metadata_sizes_past_the_cap_or_zero_are_refused() {
         assert!(peer.on_extended_handshake(&naming(size)).is_err(), "{size}");
         assert!(requested(&peer).is_empty());
     }
-    assert!(fetch.sets.lock().is_empty());
+    assert_eq!(fetch.set.lock().size(), 0);
 
     let (peer, _writes) = handler(&fetch);
     peer.on_extended_handshake(&naming(MAX_METADATA_SIZE))
         .unwrap();
 }
 
-#[tokio::test]
-async fn a_metadata_buffer_goes_with_its_last_peer() {
-    let fetch = MetadataFetch::new(metadata(10).1, None);
-    let (a, _a_writes) = handler(&fetch);
-    let (b, _b_writes) = handler(&fetch);
-    a.on_extended_handshake(&naming(40_000)).unwrap();
-    b.on_extended_handshake(&naming(40_000)).unwrap();
-    let set = Arc::downgrade(&set_of(&a));
+// libtorrent ut_metadata.cpp:146-152 and 537-551: a handshake sizes the
+// buffer only up to 4 MiB. Past that the first piece in sizes it, by its
+// total_size, up to the largest metadata taken in, and only while the
+// buffer has no size; a piece of any other size is ignored.
+#[tokio::test(start_paused = true)]
+async fn a_claim_past_4_mib_leaves_the_size_to_the_first_piece() {
+    // A little over 4 MiB of metadata.
+    let info = info_bytes(4 * 1024 * 1024 / 20 + 100);
+    let size: u32 = info.len().try_into().unwrap();
+    assert!(size > super::HANDSHAKE_METADATA_SIZE_CAP);
+    let (handler, mut sent, result) = reader(&info);
+    let set = set_of(&handler);
+    assert_eq!(set.lock().size(), 0, "the claim does not size the buffer");
+    let (pieces, _) = next_requests(&mut sent).await;
+    assert_eq!(pieces, [0], "asked for the first piece, to learn the size");
 
-    drop(a);
-    assert!(set.upgrade().is_some());
-    drop(b);
-    assert!(set.upgrade().is_none());
+    // A piece claiming metadata larger than any taken in sizes nothing,
+    // and is not counted.
+    let oversized = UtMetadataData::from_bytes(
+        0,
+        MAX_METADATA_SIZE + 1,
+        ByteBufOwned(info.slice(..CHUNK_SIZE as usize)),
+    );
+    handler
+        .on_received_message(Message::Extended(ExtendedMessage::UtMetadata(
+            UtMetadata::Data(oversized).as_borrowed(),
+        )))
+        .await
+        .unwrap();
+    assert_eq!(set.lock().size(), 0);
+
+    // The real first piece sizes it, and the peer is asked for the rest.
+    let (pieces, _) = next_requests(&mut sent).await;
+    assert_eq!(pieces, [0]);
+    answer(&handler, &info, 0).await;
+    assert_eq!(set.lock().size(), size);
+
+    // Each piece is first sent claiming another size, which, once the
+    // buffer has one, is ignored: it neither resizes the buffer nor counts.
+    // Asked again, the piece is sent right.
+    let total = size.div_ceil(CHUNK_SIZE);
+    let mut wrong_sent = std::collections::HashSet::new();
+    let mut right = 1;
+    while right < total {
+        let (pieces, _) = next_requests(&mut sent).await;
+        for piece in pieces {
+            if wrong_sent.insert(piece) {
+                let start = piece as usize * CHUNK_SIZE as usize;
+                let bytes = info.slice(start..info.len().min(start + CHUNK_SIZE as usize));
+                let other = UtMetadataData::from_bytes(piece, size - 1, ByteBufOwned(bytes));
+                handler
+                    .on_received_message(Message::Extended(ExtendedMessage::UtMetadata(
+                        UtMetadata::Data(other).as_borrowed(),
+                    )))
+                    .await
+                    .unwrap();
+                assert_eq!(set.lock().size(), size);
+                assert!(set.lock().missing().any(|missing| missing == piece));
+            } else {
+                answer(&handler, &info, piece).await;
+                right += 1;
+            }
+        }
+    }
+    let (_, info_bytes) = result.await.unwrap().unwrap();
+    assert_eq!(info_bytes.as_ref(), &info[..]);
 }
 
 #[tokio::test(start_paused = true)]

@@ -70,6 +70,11 @@ impl<'a> UtMetadataData<ByteBuf<'a>> {
         self.piece
     }
 
+    /// The size of the whole metadata, as the sender gives it.
+    pub fn total_size(&self) -> u32 {
+        self.total_size
+    }
+
     pub fn len(&self) -> usize {
         self.data_0.as_ref().len() + self.data_1.as_ref().len()
     }
