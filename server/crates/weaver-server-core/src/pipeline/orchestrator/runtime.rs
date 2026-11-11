@@ -947,15 +947,11 @@ impl Pipeline {
             && self.installing.is_empty()
     }
 
-    // Whether to give memory back this turn: as the pipeline settles, and
-    // after each turn that did something while it stays settled. Never on an
-    // idle tick, and never while work moves.
-    pub(in crate::pipeline) fn memory_release_due(
-        was_settled: bool,
-        settled: bool,
-        turn_active: bool,
-    ) -> bool {
-        settled && (!was_settled || turn_active)
+    // Whether to give memory back this turn: once, as the pipeline settles.
+    // Not again while it stays settled, whatever wakes it, and never while
+    // work moves.
+    pub(in crate::pipeline) fn memory_release_due(was_settled: bool, settled: bool) -> bool {
+        settled && !was_settled
     }
 
     // Give back the memory a pipeline with no work is holding for work that
@@ -1420,7 +1416,7 @@ impl Pipeline {
                 }
             }
             let settled = self.memory_settled(now_driving);
-            if Self::memory_release_due(memory_settled, settled, turn_active) {
+            if Self::memory_release_due(memory_settled, settled) {
                 self.release_idle_memory();
             }
             memory_settled = settled;

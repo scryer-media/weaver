@@ -98,27 +98,26 @@ async fn a_paused_queue_settles_once_the_ring_is_read() {
     assert!(pipeline.memory_settled(false));
 }
 
-// The release follows a turn's answers: once on settling, once per turn that
-// did something while settled, never on an idle tick or while unsettled.
+// The release happens once per settling: never while unsettled, and not again
+// on any turn while the pipeline stays settled.
 #[test]
-fn memory_goes_back_once_on_settling_and_after_each_active_turn() {
-    // (settled, turn active, released)
+fn memory_goes_back_once_each_time_the_pipeline_settles() {
+    // (settled, released)
     let turns = [
-        (false, true, false),  // start-up, reads out
-        (false, true, false),  // a read heard, more out
-        (true, true, true),    // the last read heard: settled
-        (true, false, false),  // an idle tick
-        (true, false, false),  // another
-        (true, true, true),    // an intent while settled
-        (false, true, false),  // work starts
-        (false, false, false), // a tick while it moves
-        (true, false, true),   // settled on a tick: the work ran out
-        (true, false, false),  // an idle tick
+        (false, false), // start-up, reads out
+        (false, false), // a read heard, more out
+        (true, true),   // the last read heard: settled
+        (true, false),  // an idle tick
+        (true, false),  // a wake that changes nothing
+        (false, false), // work starts
+        (false, false), // a tick while it moves
+        (true, true),   // the work ran out: settled again
+        (true, false),  // an idle tick
     ];
     let mut was = false;
-    for (index, (settled, active, released)) in turns.into_iter().enumerate() {
+    for (index, (settled, released)) in turns.into_iter().enumerate() {
         assert_eq!(
-            Pipeline::memory_release_due(was, settled, active),
+            Pipeline::memory_release_due(was, settled),
             released,
             "turn {index}"
         );
