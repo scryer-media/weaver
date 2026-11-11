@@ -68,6 +68,8 @@ pub struct TrackerComms {
     poke: tokio::sync::Notify,
     /// Bounds the `stopped` announces this hash sends.
     stopped: StoppedAnnounces,
+    /// The turns its HTTP announces wait for, shared across the session.
+    http_announces: HttpAnnounces,
     /// Hands the task an announce loop for another hash the torrent goes by
     /// (see [`TrackerTask::take_over`]).
     grow: tokio::sync::mpsc::UnboundedSender<Arc<TrackerComms>>,
@@ -1522,6 +1524,108 @@ impl TrackerTask {
     }
 }
 
+/// The HTTP announces that may be out at once, across every torrent
+/// (libtorrent `settings_pack::max_concurrent_http_announces`,
+/// settings_pack.cpp:388).
+pub const MAX_CONCURRENT_HTTP_ANNOUNCES: usize = 50;
+
+/// Holds the HTTP announces out at once to a limit, across every torrent
+/// that shares it. An announce past the limit waits its turn: one that
+/// carries an event (`started`, `completed`, `stopped`) ahead of every
+/// plain re-announce, each kind in the order it came (libtorrent
+/// `tracker_manager::queue_request` and `remove_request`,
+/// tracker_manager.cpp:237-263 and 300-325, puts a high priority request
+/// at the front of its one queue). The wait is not part of the announce's
+/// own time limit, as libtorrent starts a queued request's timer only when
+/// it is started.
+///
+/// Clones share their state: create one per session, or one for every
+/// session that shares limits.
+#[derive(Clone)]
+pub struct HttpAnnounces(Arc<Mutex<HttpQueue>>);
+
+type Waiter = tokio::sync::oneshot::Sender<HttpAnnounceSlot>;
+
+struct HttpQueue {
+    limit: usize,
+    out: usize,
+    events: std::collections::VecDeque<Waiter>,
+    plain: std::collections::VecDeque<Waiter>,
+}
+
+impl Default for HttpAnnounces {
+    fn default() -> Self {
+        Self::new(MAX_CONCURRENT_HTTP_ANNOUNCES)
+    }
+}
+
+impl HttpAnnounces {
+    /// At most `limit` HTTP announces out at once, at least one.
+    pub fn new(limit: usize) -> Self {
+        Self(Arc::new(Mutex::new(HttpQueue {
+            limit: limit.max(1),
+            out: 0,
+            events: Default::default(),
+            plain: Default::default(),
+        })))
+    }
+
+    /// A turn to announce, held until dropped; `event` puts the wait ahead
+    /// of every plain re-announce's.
+    async fn take(&self, event: bool) -> HttpAnnounceSlot {
+        let rx = {
+            let mut queue = self.0.lock();
+            if queue.out < queue.limit {
+                queue.out += 1;
+                return HttpAnnounceSlot(Some(self.clone()));
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            match event {
+                true => queue.events.push_back(tx),
+                false => queue.plain.push_back(tx),
+            }
+            rx
+        };
+        // A waiter's sender stays queued until a turn is sent through it,
+        // and the queue lives in `self`.
+        rx.await.expect("the queue hands every waiter a turn")
+    }
+
+    /// A turn given back: handed to the first waiter still waiting, or
+    /// counted free.
+    fn give_back(&self) {
+        let mut queue = self.0.lock();
+        let queue = &mut *queue;
+        while let Some(next) = queue.events.pop_front().or_else(|| queue.plain.pop_front()) {
+            match next.send(HttpAnnounceSlot(Some(self.clone()))) {
+                Ok(()) => return,
+                // A waiter that gave up dropped its receiver: the turn comes
+                // back unspent and goes to the next.
+                Err(mut unspent) => unspent.0 = None,
+            }
+        }
+        queue.out -= 1;
+    }
+
+    #[cfg(test)]
+    fn out(&self) -> usize {
+        self.0.lock().out
+    }
+}
+
+/// One HTTP announce's turn, handed on once dropped. A turn sent to a
+/// waiter that goes away before taking it is dropped with it, so handed on
+/// too.
+struct HttpAnnounceSlot(Option<HttpAnnounces>);
+
+impl Drop for HttpAnnounceSlot {
+    fn drop(&mut self) {
+        if let Some(announces) = self.0.take() {
+            announces.give_back();
+        }
+    }
+}
+
 /// Bounds the `stopped` announce (BEP 3) a tracker task sends when its peer
 /// stream is dropped, and lets a shutdown wait for those announces.
 ///
@@ -1777,6 +1881,7 @@ impl TrackerComms {
         reachable: Reachable,
         udp_client: UdpTrackerClient,
         stopped: StoppedAnnounces,
+        http_announces: HttpAnnounces,
     ) -> TrackerTask {
         let mut tiers = supported_tiers(tiers);
         for trackers in &mut tiers {
@@ -1816,6 +1921,7 @@ impl TrackerComms {
                     status: status.clone(),
                     poke: tokio::sync::Notify::new(),
                     stopped: stopped.clone(),
+                    http_announces: http_announces.clone(),
                     grow: grow.clone(),
                 })
             })
@@ -1889,6 +1995,7 @@ impl TrackerComms {
             status: self.status.clone(),
             poke: tokio::sync::Notify::new(),
             stopped: self.stopped.clone(),
+            http_announces: self.http_announces.clone(),
             grow: self.grow.clone(),
         });
         if self.grow.send(comms.clone()).is_err() {
@@ -2094,6 +2201,11 @@ impl TrackerComms {
         event: Option<TrackerRequestEvent>,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
+        // An HTTP announce waits for its turn first, outside its time limit.
+        let _turn = match tracker.udp {
+            true => None,
+            false => Some(self.http_announces.take(event.is_some()).await),
+        };
         within_completion_timeout(async {
             if tracker.udp {
                 self.announce_udp(tracker, event, stats)
@@ -2612,6 +2724,92 @@ mod tests {
     const STARTED: Option<TrackerRequestEvent> = Some(TrackerRequestEvent::Started);
     const COMPLETED: Option<TrackerRequestEvent> = Some(TrackerRequestEvent::Completed);
 
+    // Past the limit an announce waits; a turn given back goes to the
+    // announces with an event first, each kind in the order it came.
+    #[tokio::test]
+    async fn http_announces_past_the_limit_wait_their_turn_events_first() {
+        use std::pin::pin;
+        // Fused, as a waiter is polled again once it has its turn.
+        let announces = super::HttpAnnounces::new(1);
+        let first = announces.take(true).await;
+        let mut plain_a = pin!(announces.take(false).fuse());
+        let mut event_b = pin!(announces.take(true).fuse());
+        let mut plain_c = pin!(announces.take(false).fuse());
+        let mut event_d = pin!(announces.take(true).fuse());
+        for waiter in [
+            plain_a.as_mut().poll_unpin_once(),
+            event_b.as_mut().poll_unpin_once(),
+            plain_c.as_mut().poll_unpin_once(),
+            event_d.as_mut().poll_unpin_once(),
+        ] {
+            assert!(waiter.is_none(), "a turn was taken past the limit");
+        }
+        assert_eq!(announces.out(), 1);
+
+        let mut order = Vec::new();
+        let mut held = first;
+        for _ in 0..4 {
+            drop(held);
+            let mut next = None;
+            for (name, waiter) in [
+                ("a", plain_a.as_mut().poll_unpin_once()),
+                ("b", event_b.as_mut().poll_unpin_once()),
+                ("c", plain_c.as_mut().poll_unpin_once()),
+                ("d", event_d.as_mut().poll_unpin_once()),
+            ] {
+                if let Some(turn) = waiter {
+                    assert!(next.is_none(), "two turns out past the limit");
+                    order.push(name);
+                    next = Some(turn);
+                }
+            }
+            held = next.expect("a turn given back goes to a waiter");
+            assert_eq!(announces.out(), 1);
+        }
+        assert_eq!(order, ["b", "d", "a", "c"]);
+        drop(held);
+        assert_eq!(announces.out(), 0);
+    }
+
+    // A waiter that gives up, before or after its turn is sent to it, holds
+    // no turn: the next waiter has it, or it is free again.
+    #[tokio::test]
+    async fn an_http_announce_that_gives_up_waiting_leaves_its_turn() {
+        let announces = super::HttpAnnounces::new(1);
+        let first = announces.take(false).await;
+        let mut gone = Box::pin(announces.take(false));
+        assert!(gone.as_mut().poll_unpin_once().is_none());
+        drop(gone);
+        let mut next = Box::pin(announces.take(false));
+        assert!(next.as_mut().poll_unpin_once().is_none());
+        drop(first);
+        // The turn skipped the waiter that gave up.
+        let second = next.as_mut().poll_unpin_once().expect("the next waiter's turn");
+        assert_eq!(announces.out(), 1);
+
+        // Sent its turn, then gone before it took it.
+        let mut sent = Box::pin(announces.take(true));
+        assert!(sent.as_mut().poll_unpin_once().is_none());
+        drop(second);
+        drop(sent);
+        assert_eq!(announces.out(), 0);
+        let _free = announces.take(false).now_or_never().expect("a free turn");
+        assert_eq!(announces.out(), 1);
+    }
+
+    /// Polls a future once, with a waker that does nothing.
+    trait PollOnce: Future {
+        fn poll_unpin_once(self: std::pin::Pin<&mut Self>) -> Option<Self::Output> {
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            match self.poll(&mut cx) {
+                std::task::Poll::Ready(out) => Some(out),
+                std::task::Poll::Pending => None,
+            }
+        }
+    }
+
+    impl<F: Future + ?Sized> PollOnce for F {}
+
     #[test]
     fn a_failing_tracker_backs_off_as_libtorrent_does() {
         // libtorrent announce_infohash::failed with tracker_backoff 250.
@@ -3109,6 +3307,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         )
         .peers;
         let mut announced = Vec::new();
@@ -3163,6 +3362,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         );
         let (conn, started) = tokio::select! {
             _ = peers.next() => panic!("the tracker sent peers"),
@@ -3242,6 +3442,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         );
         let (conn, started) = tokio::select! {
             _ = peers.next() => panic!("the tracker sent peers"),
@@ -3344,6 +3545,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         )
         .peers;
         let q = answer_with_a_peer(
@@ -3406,6 +3608,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         )
         .peers;
         let q = answer_with_a_peer(
@@ -3538,6 +3741,7 @@ mod tests {
             reach_all(),
             udp_client,
             StoppedAnnounces::default(),
+            Default::default(),
         )
         .peers;
         let first = tokio::select! {
@@ -3587,6 +3791,7 @@ mod tests {
             reach_all(),
             udp_client,
             StoppedAnnounces::default(),
+            Default::default(),
         )
         .peers;
         let first = tokio::select! {
@@ -3643,6 +3848,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         )
         .peers;
 
@@ -3716,6 +3922,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         )
         .peers;
 
@@ -3760,6 +3967,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         )
         .peers;
 
@@ -3818,6 +4026,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         )
         .peers;
 
@@ -3964,6 +4173,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         )
         .peers;
         drop(peers);
@@ -4003,6 +4213,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         );
         (task, token)
     }
@@ -4267,6 +4478,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         )
         .peers;
 
@@ -4528,6 +4740,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         );
 
         for url in &forged {
@@ -4661,6 +4874,7 @@ mod tests {
             reach_all(),
             udp_client,
             StoppedAnnounces::default(),
+            Default::default(),
         )
         .peers;
 
@@ -4790,6 +5004,7 @@ mod tests {
             reach_all(),
             udp_client,
             stopped.clone(),
+            Default::default(),
         )
     }
 
@@ -5391,6 +5606,7 @@ mod tests {
             reach_but(vec![loopback], true),
             udp_client,
             stopped.clone(),
+            Default::default(),
         );
 
         for (url, why) in &refused {
@@ -5446,6 +5662,7 @@ mod tests {
             reach_but(vec![blocked], true),
             udp_client,
             stopped.clone(),
+            Default::default(),
         );
 
         let serve = async {
