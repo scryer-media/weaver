@@ -25,6 +25,103 @@ impl Pipeline {
         self.reports_due = due;
     }
 
+    // Publish the job's report now when its stage, status or wait moved since
+    // the row was written; otherwise only its figures moved, and the snapshot
+    // tick publishes them.
+    pub(crate) fn report_job_soon(&mut self, job_id: JobId) {
+        if self.reported_stage_current(job_id) {
+            self.reports_due.insert(job_id);
+        } else {
+            self.reports_due.remove(&job_id);
+            self.report_job(job_id);
+        }
+    }
+
+    // Whether the job's row already says what a report built now would say of
+    // everything but the job's figures.
+    fn reported_stage_current(&self, job_id: JobId) -> bool {
+        let Some(state) = self.jobs.get(&job_id) else {
+            return false;
+        };
+        if is_terminal_status(&state.status) {
+            return false;
+        }
+        let status = if self.reports_awaiting_queue_scripts(state) {
+            &JobStatus::AwaitingQueueScripts
+        } else {
+            &state.status
+        };
+        let error = self.reported_error(state);
+        let retry_at = self
+            .download_wait_by_job
+            .get(&job_id)
+            .and_then(|wait| wait.retry_at_epoch_ms);
+        let finalizing = self.jobs_finalizing_download.contains(&job_id);
+        let fetching_repair_data = self
+            .graph_jobs
+            .get(&job_id)
+            .is_some_and(|graph| graph.fetching_repair_data());
+        let moving = self.inflight_moves.contains(&job_id);
+        let nzb_admitted = self.nzb_admitted.contains(&job_id);
+        let download_active = self.job_has_current_download_activity(job_id);
+        let download_work_pending = self.job_has_pending_download_pipeline_work(job_id);
+        let propagation_until = self
+            .propagation_ready_at
+            .get(&job_id)
+            .map(|(_, epoch)| *epoch as f64);
+        let cancellable = self.post_processing_cancellable(job_id);
+        self.shared_state.queue.read(|inner| {
+            let Some(row) = inner.job(job_id) else {
+                return false;
+            };
+            let reason = self.stored_wait_reason(row);
+            let download_state = if reason == Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON)
+            {
+                crate::DownloadState::Queued
+            } else {
+                crate::jobs::model::runtime_lanes_from_status_snapshot(status).0
+            };
+            let report = &row.report;
+            let job = &report.job;
+            job.status == *status
+                && job.error.as_deref() == error
+                && job.download_state == download_state
+                && job.download_wait_reason.as_deref() == reason
+                && job.download_retry_at_epoch_ms == retry_at
+                && job.finalizing_download == finalizing
+                && job.fetching_repair_data == fetching_repair_data
+                && report.moving == moving
+                && report.nzb_admitted == nzb_admitted
+                && report.download_active == download_active
+                && report.download_work_pending == download_work_pending
+                && report.propagation_until_epoch_ms == propagation_until
+                && report.post_processing_cancellable == cancellable
+        })
+    }
+
+    fn post_processing_cancellable(&self, job_id: JobId) -> bool {
+        self.terminal_post_processing_cancellations
+            .contains_key(&job_id)
+            || self
+                .terminal_post_processing_executor
+                .has_cancellable_job(job_id.0)
+    }
+
+    // The download is complete; its queue scripts are being admitted.
+    fn reports_awaiting_queue_scripts(&self, state: &JobState) -> bool {
+        self.awaiting_queue_script_barrier(state.job_id) && state.status == JobStatus::Downloading
+    }
+
+    fn reported_error<'a>(&self, state: &'a JobState) -> Option<&'a str> {
+        if let JobStatus::Failed { error } = &state.status {
+            Some(error)
+        } else if self.blocked_restores.contains_key(&state.job_id) {
+            state.failure_error.as_deref()
+        } else {
+            None
+        }
+    }
+
     fn report_job_event(&self, job_id: JobId, event: Option<PipelineEvent>) {
         let report = self.job_report(job_id);
         let moving = self.inflight_moves.contains(&job_id);
@@ -34,13 +131,11 @@ impl Pipeline {
             .propagation_ready_at
             .get(&job_id)
             .map(|(_, epoch)| *epoch as f64);
-        let cancellable = self
-            .terminal_post_processing_cancellations
-            .contains_key(&job_id)
-            || self
-                .terminal_post_processing_executor
-                .has_cancellable_job(job_id.0);
+        let cancellable = self.post_processing_cancellable(job_id);
         self.shared_state.queue.write(|inner| {
+            if report.is_none() && event.is_none() {
+                return Change::unchanged(());
+            }
             if let Some(job) = report {
                 let Some(row) = inner.job_mut(job_id) else {
                     return Change::unchanged(());
@@ -153,10 +248,7 @@ impl Pipeline {
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =
             self.optional_recovery_bytes(state);
         let health = health_milli(total, state.failed_bytes);
-        let status = if self.awaiting_queue_script_barrier(state.job_id)
-            && state.status == JobStatus::Downloading
-        {
-            // The download is complete; its queue scripts are being admitted.
+        let status = if self.reports_awaiting_queue_scripts(state) {
             JobStatus::AwaitingQueueScripts
         } else {
             state.status.clone()
@@ -207,13 +299,7 @@ impl Pipeline {
             job_id: state.job_id,
             job_hash: Some(state.job_hash),
             name: state.spec.name.clone(),
-            error: if let JobStatus::Failed { error } = &state.status {
-                Some(error.clone())
-            } else if self.blocked_restores.contains_key(&state.job_id) {
-                state.failure_error.clone()
-            } else {
-                None
-            },
+            error: self.reported_error(state).map(str::to_owned),
             download_wait_reason: self.dispatch_wait_reason(state.job_id).map(str::to_owned),
             download_retry_at_epoch_ms: download_wait.and_then(|wait| wait.retry_at_epoch_ms),
             status,

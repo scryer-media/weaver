@@ -1238,7 +1238,7 @@ impl Pipeline {
                                 turn_timer.resume();
                                 let reported_job = retry.work.segment_id.file_id.job_id;
                                 self.receive_retry_work(retry);
-                                self.report_job(reported_job);
+                                self.report_job_soon(reported_job);
                             }
                             _ = metrics_snapshot_interval.tick(), if drive => {
                                 turn_timer.resume();
@@ -1351,7 +1351,7 @@ impl Pipeline {
                     // stops, rather than on a tick nobody will take.
                     self.reconcile_candidate_jobs().await;
                 }
-                if driving || turn_active {
+                if driving || turn_active || !self.reports_due.is_empty() {
                     self.settle_parked_gauges();
                 }
             }
@@ -1372,7 +1372,8 @@ impl Pipeline {
         metrics_interval: &mut tokio::time::Interval,
     ) -> usize {
         let mut processed = 0;
-        // One report per job per turn, however many of its results landed.
+        // Each job a result landed for is reported once the turn is done: at
+        // once if its stage moved, else on the snapshot tick.
         let mut reported = BTreeSet::new();
         while processed < Self::DOWNLOAD_RESULTS_PER_TURN {
             let Some(result) = pending.pop_front() else {
@@ -1389,7 +1390,7 @@ impl Pipeline {
             }
         }
         for job_id in reported {
-            self.report_job(job_id);
+            self.report_job_soon(job_id);
         }
         if processed != 0 {
             // A backlog can keep every actor operation immediately ready.
@@ -1517,7 +1518,7 @@ impl Pipeline {
             self.receive_retry_work(retry);
         }
         for job_id in jobs {
-            self.report_job(job_id);
+            self.report_job_soon(job_id);
         }
         count
     }
