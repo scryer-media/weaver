@@ -557,6 +557,10 @@ impl NetworkRuntime {
     pub fn interfaces(&self) -> InterfaceSnapshot {
         self.interfaces.snapshot()
     }
+    /// Rings as the host's interfaces change as multicast sees them.
+    pub fn interface_changes(&self) -> tokio::sync::watch::Receiver<MulticastInterfaces> {
+        self.interfaces.changes()
+    }
     // The saved routes' health, which tells of each route that goes down.
     pub fn route_health(&self) -> Option<Arc<RouteHealth>> {
         self.route_health.clone()

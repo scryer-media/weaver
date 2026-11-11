@@ -2577,3 +2577,92 @@ fn unlimited_connections_leave_room_for_files() {
     assert_eq!(super::connections_within(256), 188);
     assert_eq!(super::connections_within(10), 5);
 }
+
+// A session that counts the times it is asked to join local service
+// discovery again, and fails each one when told to.
+#[derive(Default)]
+struct Rejoining {
+    asked: AtomicUsize,
+    fails: bool,
+}
+
+impl LocalDiscovery for Rejoining {
+    fn rejoin_local_discovery(&self) -> anyhow::Result<()> {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        if self.fails {
+            anyhow::bail!("no interface to join on");
+        }
+        Ok(())
+    }
+}
+
+// Only a session on its own sockets runs local service discovery, as its
+// options say, and only such a session is asked to join again; one whose
+// join fails leaves the others to theirs.
+#[tokio::test]
+async fn only_sessions_that_run_local_discovery_are_asked_to_rejoin() {
+    let address: IpAddr = "192.0.2.4".parse().unwrap();
+    let kinds = [
+        (LegKind::Interface("en1".into()), true),
+        (LegKind::System, false),
+        (LegKind::SourceAddress(address), false),
+        (LegKind::Ladder, false),
+    ];
+    let sessions: Vec<_> = kinds
+        .iter()
+        .map(|(_, fails)| {
+            Arc::new(Rejoining {
+                fails: *fails,
+                ..Rejoining::default()
+            })
+        })
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let open = kinds
+        .iter()
+        .zip(&sessions)
+        .zip(1..)
+        .map(|(((kind, _), session), proxy)| {
+            let shape = kind.shape(None);
+            let options = session_options(
+                &leg(kind.clone()),
+                6881,
+                dir.path(),
+                8,
+                &TorrentConfig::default(),
+                IpFilter::default(),
+                &IDENTITY.identity(),
+            );
+            assert_eq!(
+                runs_local_discovery(shape),
+                !options.disable_local_service_discovery,
+                "{kind:?}"
+            );
+            (proxy_key(proxy), shape, Arc::clone(session))
+        })
+        .collect();
+    rejoin_local_discovery(open).await;
+    let asked: Vec<_> = sessions
+        .iter()
+        .map(|session| session.asked.load(Ordering::SeqCst))
+        .collect();
+    assert_eq!(asked, [1, 1, 0, 0], "interface, system, source, ladder");
+}
+
+// Changes that ring before the follower runs make one rejoin, not one
+// each: three sets, then the sender gone, and the follower runs once.
+#[tokio::test]
+async fn several_interface_changes_before_the_follower_runs_make_one_rejoin() {
+    let (changes, follower) = tokio::sync::watch::channel(0u32);
+    for set in 1..=3 {
+        changes.send_replace(set);
+    }
+    drop(changes);
+    let seen = Mutex::new(Vec::new());
+    each_change(follower.clone(), || {
+        seen.lock().unwrap().push(*follower.borrow());
+        std::future::ready(())
+    })
+    .await;
+    assert_eq!(*seen.lock().unwrap(), [3], "one run, on the last set");
+}

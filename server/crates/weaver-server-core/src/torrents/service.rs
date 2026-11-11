@@ -2592,7 +2592,21 @@ impl TorrentService {
         self.spawn_settle();
         self.spawn_follow_trackers();
         self.spawn_follow_egress_limits();
+        self.spawn_follow_interfaces();
         self.restore().await
+    }
+
+    // A session's local service discovery joins its groups on the
+    // interfaces up as it opens; each time those change, it joins again on
+    // the ones up then.
+    fn spawn_follow_interfaces(&self) {
+        let Some(changes) = self.inner.sessions.routes().interface_changes() else {
+            return;
+        };
+        let service = self.clone();
+        self.keep(tokio::spawn(async move {
+            service.inner.sessions.follow_interfaces(changes).await;
+        }));
     }
 
     // Each egress's caps and quota state reach the open sessions as they

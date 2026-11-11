@@ -131,3 +131,126 @@ async fn injected_interface_changes_are_sampled_by_the_poll_clock() {
     observed.changed().await.unwrap();
     assert_eq!(monitor.snapshot().health(&route, None), EgressHealth::Up);
 }
+
+// A source whose interfaces a test sets, that fails while told to, and
+// counts its reads. A read is answered, compared and published in one turn
+// of the monitor's task, so once the count passes a read, that read's
+// sample is in.
+struct SetSource {
+    interfaces: RwLock<Vec<DiscoveredInterface>>,
+    fail: std::sync::atomic::AtomicBool,
+    calls: tokio::sync::watch::Sender<u32>,
+}
+
+impl InterfaceSource for SetSource {
+    fn interfaces(&self) -> io::Result<Vec<DiscoveredInterface>> {
+        self.calls.send_modify(|n| *n += 1);
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::other("enumeration failed"));
+        }
+        Ok(self.interfaces.read().unwrap().clone())
+    }
+}
+
+fn set_source() -> (Arc<SetSource>, tokio::sync::watch::Receiver<u32>) {
+    let (calls, observed) = tokio::sync::watch::channel(0);
+    let source = Arc::new(SetSource {
+        interfaces: RwLock::new(snapshot().interfaces),
+        fail: std::sync::atomic::AtomicBool::new(false),
+        calls,
+    });
+    (source, observed)
+}
+
+// Waits until a read begun after this call has been sampled whole: the
+// read after the last one begun so far, which the source answered from
+// what the test set before calling this.
+async fn sampled(observed: &mut tokio::sync::watch::Receiver<u32>) {
+    let begun = *observed.borrow();
+    observed.wait_for(|n| *n >= begun + 2).await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_change_signal_rings_only_when_the_multicast_set_differs() {
+    let (source, mut observed) = set_source();
+    let monitor = InterfaceMonitor::start(source.clone(), &tokio::runtime::Handle::current());
+    let mut changes = monitor.changes();
+    assert_eq!(
+        *changes.borrow_and_update(),
+        multicast_view(&snapshot().interfaces)
+    );
+
+    // The same set again.
+    sampled(&mut observed).await;
+    assert!(!changes.has_changed().unwrap(), "the same set");
+
+    // An address's lifetime flags are not where multicast joins.
+    source.interfaces.write().unwrap()[0].addresses[1].tentative = true;
+    sampled(&mut observed).await;
+    assert!(!changes.has_changed().unwrap(), "a flag flipped");
+
+    // A read that fails says nothing of the set; one that reads the same
+    // set after it is no change either.
+    source.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+    sampled(&mut observed).await;
+    assert!(!changes.has_changed().unwrap(), "a failed read");
+    source
+        .fail
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    sampled(&mut observed).await;
+    assert!(
+        !changes.has_changed().unwrap(),
+        "the same set after a failure"
+    );
+
+    // A new address is a change, and the signal holds the new set.
+    source.interfaces.write().unwrap()[0]
+        .addresses
+        .push(address("192.0.2.7"));
+    sampled(&mut observed).await;
+    assert!(changes.has_changed().unwrap(), "an address came");
+    let seen = changes.borrow_and_update().clone();
+    assert_eq!(
+        seen[0].addresses,
+        ["192.0.2.1", "2001:db8::1", "192.0.2.7"]
+            .map(|ip| ip.parse::<IpAddr>().unwrap())
+            .to_vec()
+    );
+
+    // An interface going down, and one coming, are changes too.
+    source.interfaces.write().unwrap()[0].up = false;
+    sampled(&mut observed).await;
+    assert!(changes.has_changed().unwrap(), "an interface went down");
+    assert!(!changes.borrow_and_update()[0].up);
+    source
+        .interfaces
+        .write()
+        .unwrap()
+        .push(DiscoveredInterface {
+            name: "en1".into(),
+            index: Some(2),
+            up: true,
+            addresses: vec![address("10.0.0.2")],
+        });
+    sampled(&mut observed).await;
+    assert!(changes.has_changed().unwrap(), "an interface came");
+}
+
+// Changes found before the receiver looks ring it once, with the last set.
+#[tokio::test(start_paused = true)]
+async fn changes_before_the_receiver_looks_are_taken_together() {
+    let (source, mut observed) = set_source();
+    let monitor = InterfaceMonitor::start(source.clone(), &tokio::runtime::Handle::current());
+    let mut changes = monitor.changes();
+    changes.borrow_and_update();
+    for ip in ["192.0.2.7", "192.0.2.8", "192.0.2.9"] {
+        source.interfaces.write().unwrap()[0].addresses = vec![address(ip)];
+        sampled(&mut observed).await;
+    }
+    changes.changed().await.unwrap();
+    assert_eq!(
+        changes.borrow_and_update()[0].addresses,
+        ["192.0.2.9".parse::<IpAddr>().unwrap()]
+    );
+    assert!(!changes.has_changed().unwrap(), "one ring for the three");
+}

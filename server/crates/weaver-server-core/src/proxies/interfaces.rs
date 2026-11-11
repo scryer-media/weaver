@@ -148,50 +148,100 @@ impl InterfaceSnapshot {
     }
 }
 
+/// What of one interface decides where multicast groups are joined and
+/// sent from: its name and index, whether it is up, and the addresses it
+/// holds. An address's lifetime flags are left out: a join names the
+/// interface by an address or by its index, whatever the flags say.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MulticastInterface {
+    pub name: String,
+    pub index: Option<u32>,
+    pub up: bool,
+    pub addresses: Vec<IpAddr>,
+}
+
+/// The host's interfaces as multicast sees them, in name order.
+pub type MulticastInterfaces = Vec<MulticastInterface>;
+
+fn multicast_view(interfaces: &[DiscoveredInterface]) -> MulticastInterfaces {
+    interfaces
+        .iter()
+        .map(|iface| MulticastInterface {
+            name: iface.name.clone(),
+            index: iface.index,
+            up: iface.up,
+            addresses: iface.addresses.iter().map(|a| a.address).collect(),
+        })
+        .collect()
+}
+
+fn sample(source: &dyn InterfaceSource) -> InterfaceSnapshot {
+    match source.interfaces() {
+        Ok(interfaces) => InterfaceSnapshot {
+            interfaces,
+            error: None,
+        },
+        Err(error) => InterfaceSnapshot {
+            interfaces: Vec::new(),
+            error: Some(error.to_string()),
+        },
+    }
+}
+
 // Owns its polling task; dropping the monitor stops all further enumeration.
 pub struct InterfaceMonitor {
     snapshot: Arc<RwLock<InterfaceSnapshot>>,
+    // The interfaces as multicast last saw them, from the last sample that
+    // read them; changed only when a sample finds them different.
+    changes: tokio::sync::watch::Sender<MulticastInterfaces>,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl InterfaceMonitor {
     pub fn start(source: Arc<dyn InterfaceSource>, handle: &tokio::runtime::Handle) -> Self {
-        let sample = || match source.interfaces() {
-            Ok(interfaces) => InterfaceSnapshot {
-                interfaces,
-                error: None,
-            },
-            Err(error) => InterfaceSnapshot {
-                interfaces: Vec::new(),
-                error: Some(error.to_string()),
-            },
-        };
-        let snapshot = Arc::new(RwLock::new(sample()));
+        let first = sample(&*source);
+        let changes = tokio::sync::watch::Sender::new(multicast_view(&first.interfaces));
+        let snapshot = Arc::new(RwLock::new(first));
         let latest = snapshot.clone();
+        let changed = changes.clone();
         let task = handle.spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(5));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
             loop {
                 interval.tick().await;
-                let next = match source.interfaces() {
-                    Ok(interfaces) => InterfaceSnapshot {
-                        interfaces,
-                        error: None,
-                    },
-                    Err(error) => InterfaceSnapshot {
-                        interfaces: Vec::new(),
-                        error: Some(error.to_string()),
-                    },
-                };
+                let next = sample(&*source);
+                // A sample that could not read the interfaces says nothing
+                // of them: the set it would be compared with stays.
+                if next.error.is_none() {
+                    let view = multicast_view(&next.interfaces);
+                    changed.send_if_modified(|seen| {
+                        let differs = *seen != view;
+                        if differs {
+                            *seen = view;
+                        }
+                        differs
+                    });
+                }
                 *latest.write().expect("interface snapshot") = next;
             }
         });
-        Self { snapshot, task }
+        Self {
+            snapshot,
+            changes,
+            task,
+        }
     }
 
     pub fn snapshot(&self) -> InterfaceSnapshot {
         self.snapshot.read().expect("interface snapshot").clone()
+    }
+
+    /// Rings each time a sample finds the interfaces, as multicast sees
+    /// them, different from the last set it found, and holds that latest
+    /// set. Changes made before the receiver looks are taken together.
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<MulticastInterfaces> {
+        self.changes.subscribe()
     }
 }
 
