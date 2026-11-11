@@ -40,6 +40,80 @@ pub(crate) struct ReadArticles {
     // The job's graph rebuilt from its checkpoint, and the articles that
     // checkpoint has in hand; none for a job never checkpointed.
     restored: Option<GraphRestore>,
+    // The staging directory a job starting afresh delivers into, chosen for
+    // where it delivers now: None when it stages nothing. A job its
+    // checkpoint brings back keeps the one it has.
+    staging: Option<Option<PathBuf>>,
+}
+
+// Where a job delivers as its articles are read, so a job starting afresh
+// stages on its destination's device.
+struct StagingChoice {
+    current: Option<PathBuf>,
+    intermediate_dir: PathBuf,
+    complete_dir: PathBuf,
+    config: crate::settings::SharedConfig,
+    category: Option<String>,
+}
+
+impl StagingChoice {
+    // The staging directory for the job's destination, made and marked the
+    // job's, and the one it had gone when that is another. One that cannot
+    // be made leaves the job delivering from its working directory. A staging
+    // directory that already holds delivered files is kept: the final move
+    // carries them to wherever the job then delivers.
+    fn choose(
+        self,
+        job_id: JobId,
+        categories: &[crate::categories::CategoryConfig],
+    ) -> Option<PathBuf> {
+        if let Some(current) = self.current.as_ref()
+            && std::fs::read_dir(current).is_ok_and(|mut entries| {
+                entries.any(|entry| {
+                    entry.is_ok_and(|entry| {
+                        let name = entry.file_name();
+                        name != crate::jobs::working_dir::WORKING_DIR_MARKER
+                            && name != crate::jobs::working_dir::WORKING_DIR_MARKER_UPGRADE
+                    })
+                })
+            })
+        {
+            return self.current;
+        }
+        let root = crate::pipeline::queue::destination_root(
+            &self.complete_dir,
+            categories,
+            self.category.as_deref(),
+        );
+        let wanted =
+            crate::pipeline::queue::delivery_staging_dir(&self.intermediate_dir, &root, job_id);
+        if let Some(current) = self
+            .current
+            .as_ref()
+            .filter(|dir| Some(*dir) != wanted.as_ref())
+            && let Err(error) = std::fs::remove_dir_all(current)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warn!(job_id = job_id.0, dir = %current.display(), %error, "could not remove a staging directory the job no longer delivers into");
+        }
+        let staging = wanted.filter(|staging| {
+            crate::pipeline::queue::make_staging_dir(staging, job_id)
+                .inspect_err(|error| {
+                    warn!(job_id = job_id.0, dir = %staging.display(), %error, "could not make the staging directory; the job delivers from its working directory");
+                })
+                .is_ok()
+        });
+        let output_root = staging
+            .clone()
+            .unwrap_or_else(|| self.intermediate_dir.clone());
+        info!(
+            job_id = job_id.0,
+            storage = crate::runtime::storage_kind::storage_kind(&output_root).as_str(),
+            split = staging.is_some(),
+            "output storage"
+        );
+        staging
+    }
 }
 
 impl Pipeline {
@@ -76,6 +150,13 @@ impl Pipeline {
         let staging_dir = state.staging_dir.clone();
         let spec_password = state.spec.password.clone();
         let expected = summaries.clone();
+        let staging = StagingChoice {
+            current: staging_dir.clone(),
+            intermediate_dir: self.intermediate_dir.clone(),
+            complete_dir: self.complete_dir.clone(),
+            config: Arc::clone(&self.config),
+            category: category.clone(),
+        };
         state.articles = JobArticles::Activating(summaries, activation);
         let seat = self
             .graph_restore_seat(None, &working_dir)
@@ -98,8 +179,16 @@ impl Pipeline {
         let tx = self.job_activated_tx.clone();
         tokio::spawn(async move {
             let _ = written_rx.await;
+            let categories = staging.config.read().await.categories.clone();
             let result = tokio::task::spawn_blocking(move || {
-                read_job_articles(&db, job_id, category, metadata, &expected, memory, seat)
+                read_job_articles(&db, job_id, category, metadata, &expected, memory, seat).map(
+                    |mut read| {
+                        if read.restored.is_none() {
+                            read.staging = Some(staging.choose(job_id, &categories));
+                        }
+                        read
+                    },
+                )
             })
             .await
             .unwrap_or_else(|error| Err(format!("article read worker failed: {error}")));
@@ -133,6 +222,18 @@ impl Pipeline {
                 if let Some(state) = self.jobs.get_mut(&job_id) {
                     for (file, list) in state.spec.files.iter_mut().zip(read.lists) {
                         file.segments = list;
+                    }
+                    if let Some(staging) = read.staging
+                        && staging != state.staging_dir
+                    {
+                        state.staging_dir = staging.clone();
+                        if let Err(error) = self.db.try_queue_job_write(
+                            job_id,
+                            "set_active_job_staging_dir",
+                            move |db| db.set_active_job_staging_dir(job_id, staging.as_deref()),
+                        ) {
+                            warn!(job_id = job_id.0, error = %error, "could not record the job's staging directory");
+                        }
                     }
                 }
                 let (graph, skip, held) = match read.restored {
@@ -510,5 +611,6 @@ fn read_job_articles(
         lists,
         repeated,
         restored,
+        staging: None,
     })
 }
