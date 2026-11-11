@@ -82,6 +82,10 @@ async fn bulk_insert_integration_events_tx(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+)]
 pub(crate) async fn replace_job_history_attributes_tx(
     tx: &mut SqlTx<'_>,
     entry: &JobHistoryRow,
@@ -93,20 +97,57 @@ pub(crate) async fn replace_job_history_attributes_tx(
     .await?;
 
     let metadata = parse_history_metadata(entry.metadata.as_deref());
-    for (key, value) in public_history_attributes(&metadata) {
-        tx.execute(
-            "INSERT INTO job_history_attributes (job_id, key, value, completed_at)
-             VALUES ({}, {}, {}, {})
-             ON CONFLICT(job_id, key, value) DO UPDATE SET
-                completed_at = excluded.completed_at",
-            &[
-                SqlArg::I64(entry.job_id as i64),
-                SqlArg::Text(key),
-                SqlArg::Text(value),
-                SqlArg::I64(entry.completed_at),
-            ],
-        )
-        .await?;
+    // One row per pair: a statement may not update the same row twice.
+    let attributes: Vec<(String, String)> = public_history_attributes(&metadata)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if attributes.is_empty() {
+        return Ok(());
+    }
+
+    const INSERT: &str = "INSERT INTO job_history_attributes (job_id, key, value, completed_at) ";
+    const ON_CONFLICT: &str = " ON CONFLICT(job_id, key, value) DO UPDATE SET
+                completed_at = excluded.completed_at";
+    let job_id = entry.job_id as i64;
+    let completed_at = entry.completed_at;
+    let chunk_size = max_rows_for_tx(tx, 4);
+    match tx {
+        SqlTx::Sqlite(tx) => {
+            for chunk in attributes.chunks(chunk_size) {
+                let mut builder = QueryBuilder::<Sqlite>::new(INSERT);
+                builder.push_values(chunk, |mut row, (key, value)| {
+                    row.push_bind(job_id)
+                        .push_bind(key)
+                        .push_bind(value)
+                        .push_bind(completed_at);
+                });
+                builder.push(ON_CONFLICT);
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+        SqlTx::Postgres(tx) => {
+            for chunk in attributes.chunks(chunk_size) {
+                let mut builder = QueryBuilder::<Postgres>::new(INSERT);
+                builder.push_values(chunk, |mut row, (key, value)| {
+                    row.push_bind(job_id)
+                        .push_bind(key)
+                        .push_bind(value)
+                        .push_bind(completed_at);
+                });
+                builder.push(ON_CONFLICT);
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
     }
 
     Ok(())

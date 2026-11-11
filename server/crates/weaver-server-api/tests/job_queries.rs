@@ -358,6 +358,39 @@ async fn duplicate_summary_projections_chunk_more_than_256_jobs() {
     assert_duplicate_summaries_for_ids(data["historyPage"]["items"].as_array().unwrap(), &job_ids);
 }
 
+#[tokio::test]
+async fn history_items_is_bounded_by_default_and_at_most() {
+    let h = TestHarness::new().await;
+    for index in 0..1_005u64 {
+        h.insert_history_row(&sample_history_row(
+            10_000 + index,
+            &format!("bounded-history-{index:04}"),
+            "complete",
+            1_800_000_000 + index as i64,
+        ));
+    }
+    let resp = h
+        .execute(
+            r#"{
+              unnamed: historyItems { id }
+              large: historyItems(first: 5000) { id }
+              small: historyItems(first: 3) { id }
+            }"#,
+        )
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(data["unnamed"].as_array().unwrap().len(), 1_000);
+    assert_eq!(data["large"].as_array().unwrap().len(), 1_000);
+    let small: Vec<u64> = data["small"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|item| item["id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(small, vec![11_004, 11_003, 11_002]);
+}
+
 fn assert_duplicate_summaries_for_ids(items: &[serde_json::Value], expected_ids: &[u64]) {
     assert_eq!(items.len(), expected_ids.len());
     for job_id in expected_ids {

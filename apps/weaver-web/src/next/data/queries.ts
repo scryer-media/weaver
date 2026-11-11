@@ -49,3 +49,18 @@ export const NEXT_HISTORY_PAGE_QUERY = gql`
     }
   }
 `;
+
+/** The newest rows the History strip's numbers are taken from, and nothing else. */
+export const NEXT_HISTORY_SAMPLE_QUERY = gql`
+  query NextHistorySample($input: HistoryPageInput!) {
+    historyPage(input: $input) {
+      items {
+        id
+        totalBytes
+        downloadedBytes
+        createdAt
+        completedAt
+      }
+    }
+  }
+`;

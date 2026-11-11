@@ -17,7 +17,7 @@ use super::model::{
     PostProcessingFacts, PostProcessingResume, PostProcessingSettings, PostProcessingSummary,
     ScriptResult, StartedScript,
 };
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
+use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx, max_rows_for_engine};
 use crate::persistence::{Database, StateError};
 
 pub(crate) const SETTINGS_KEY: &str = "post_processing.settings.v2";
@@ -363,6 +363,54 @@ impl Database {
         })
     }
 
+    // The script results of each of `job_ids` that has any recorded, the same
+    // results `job_post_processing_results` returns for it: a live row's
+    // results win over its history row's. A job with none is left out.
+    pub fn job_post_processing_results_many(
+        &self,
+        job_ids: &[u64],
+    ) -> Result<std::collections::HashMap<u64, Vec<ScriptResult>>, StateError> {
+        let mut wanted = job_ids
+            .iter()
+            .map(|job_id| job_id_i64(*job_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        wanted.sort_unstable();
+        wanted.dedup();
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let chunk_size = max_rows_for_engine(datastore.engine(), 1);
+            let mut found = std::collections::HashMap::new();
+            for table in ["active_jobs", "job_history"] {
+                let unresolved: Vec<i64> = wanted
+                    .iter()
+                    .copied()
+                    .filter(|job_id| !found.contains_key(&(*job_id as u64)))
+                    .collect();
+                for chunk in unresolved.chunks(chunk_size) {
+                    let placeholders = vec!["{}"; chunk.len()].join(", ");
+                    let rows = SqlRuntime::fetch_all(
+                        datastore.read_exec(),
+                        &format!(
+                            "SELECT job_id, script_results_json FROM {table}
+                              WHERE job_id IN ({placeholders})
+                                AND script_results_json IS NOT NULL"
+                        ),
+                        &chunk.iter().copied().map(SqlArg::I64).collect::<Vec<_>>(),
+                    )
+                    .await?;
+                    for row in rows {
+                        let job_id = row.i64("job_id")? as u64;
+                        if let Some(json) = row.opt_text("script_results_json")? {
+                            found.insert(job_id, from_json::<Vec<ScriptResult>>(&json)?);
+                        }
+                    }
+                }
+            }
+            found.retain(|_, results: &mut Vec<ScriptResult>| !results.is_empty());
+            Ok(found)
+        })
+    }
+
     // Record that a job's scripts have started, so a crash is recoverable.
     pub fn mark_job_post_processing_running(&self, job_id: u64) -> Result<(), StateError> {
         self.mark_job_post_processing_resumed(job_id, &PostProcessingResume::default())
@@ -613,6 +661,128 @@ fn state_err(error: impl std::fmt::Display) -> StateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn script_result(exit_code: i32) -> ScriptResult {
+        ScriptResult {
+            script: crate::post_processing::model::ScriptName::new("notify.sh").unwrap(),
+            instance_id: None,
+            instance_name: None,
+            event: Default::default(),
+            adapter: crate::post_processing::model::ScriptAdapter::Nzbget,
+            status: crate::post_processing::model::ScriptStatus::Succeeded,
+            exit_code: Some(exit_code),
+            duration_ms: 5,
+            output_tail: String::new(),
+            output_id: None,
+            background: false,
+            output_truncated: false,
+            error_message: None,
+            finished_at_epoch_ms: 3,
+        }
+    }
+
+    fn history_row(job_id: u64) -> crate::JobHistoryRow {
+        crate::JobHistoryRow {
+            job_id,
+            job_hash: None,
+            name: format!("Invented.Release.{job_id}"),
+            status: "complete".to_string(),
+            error_message: None,
+            total_bytes: 1,
+            downloaded_bytes: 1,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1_000,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 1,
+            completed_at: 2,
+            metadata: None,
+            server_attribution: None,
+        }
+    }
+
+    fn active_job(job_id: u64) -> crate::ActiveJob {
+        crate::ActiveJob {
+            job_id: crate::JobId(job_id),
+            nzb_hash: [0xBC; 32],
+            nzb_path: PathBuf::from(format!("/invented/job-{job_id}.nzb")),
+            nzb_zstd: Vec::new(),
+            output_dir: PathBuf::from(format!("/invented/job-{job_id}")),
+            created_at: 1_700_000_000,
+            category: None,
+            metadata: Vec::new(),
+            status: "queued",
+            download_state: "queued",
+            post_state: "idle",
+            run_state: "active",
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            password_override: None,
+            supplied_password_candidates: Vec::new(),
+        }
+    }
+
+    fn set_results_json(db: &Database, table: &'static str, job_id: u64, json: Option<&str>) {
+        let datastore = db.datastore();
+        let json = json.map(str::to_string);
+        db.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                &format!("UPDATE {table} SET script_results_json = {{}} WHERE job_id = {{}}"),
+                &[SqlArg::OptText(json), SqlArg::I64(job_id as i64)],
+            )
+            .await?;
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    // The batched read gives every job what the one-job read gives it,
+    // including a live row winning over its history row and an empty live
+    // result hiding a non-empty history one.
+    #[test]
+    fn batched_script_results_match_the_one_job_read() {
+        let db = Database::open_in_memory().unwrap();
+        let live_results = vec![script_result(1)];
+        let history_results = vec![script_result(2), script_result(3)];
+        let live_json = to_json(&live_results).unwrap();
+        let history_json = to_json(&history_results).unwrap();
+
+        // 1: live row only. 2: history row only. 3: both, both set.
+        // 4: both, live unset. 5: both, live set to an empty list.
+        // 6: neither row. 7: history row with nothing recorded.
+        db.create_active_job(&active_job(1)).unwrap();
+        set_results_json(&db, "active_jobs", 1, Some(&live_json));
+        db.insert_job_history(&history_row(2)).unwrap();
+        set_results_json(&db, "job_history", 2, Some(&history_json));
+        for job_id in [3, 4, 5] {
+            db.create_active_job(&active_job(job_id)).unwrap();
+            db.insert_job_history(&history_row(job_id)).unwrap();
+            set_results_json(&db, "job_history", job_id, Some(&history_json));
+        }
+        set_results_json(&db, "active_jobs", 3, Some(&live_json));
+        set_results_json(&db, "active_jobs", 5, Some("[]"));
+        db.insert_job_history(&history_row(7)).unwrap();
+
+        let ids = [1, 2, 3, 4, 5, 6, 7, 3, 2];
+        let batched = db.job_post_processing_results_many(&ids).unwrap();
+        let mut one_by_one = std::collections::HashMap::new();
+        for job_id in ids {
+            let results = db.job_post_processing_results(job_id).unwrap();
+            if !results.is_empty() {
+                one_by_one.insert(job_id, results);
+            }
+        }
+        assert_eq!(batched, one_by_one);
+        assert_eq!(batched.get(&3), Some(&live_results));
+        assert_eq!(batched.get(&4), Some(&history_results));
+        assert!(!batched.contains_key(&5));
+        assert!(db.job_post_processing_results_many(&[]).unwrap().is_empty());
+    }
 
     #[test]
     fn stored_settings_from_earlier_shapes_still_load() {

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use super::*;
 use crate::jobs::types::{
     DuplicateSummaryInfo, PreparedQueueFilter, load_duplicate_summaries_chunked,
-    matches_queue_event_filter_prepared, matches_queue_filter_prepared,
+    matches_queue_event_filter_prepared,
 };
 
 #[derive(Default)]
@@ -91,14 +91,15 @@ impl JobsSubscription {
                         }
                         memo.last = Some((state.clone(), max_download_speed));
                     }
-                    let mut items: Vec<QueueItem> =
-                        crate::jobs::paging::read_listing(&state_handle)
-                            .iter()
-                            .map(queue_item_from_job)
-                            .filter(|item| {
-                                matches_queue_filter_prepared(item, prepared_filter.as_ref())
-                            })
-                            .collect();
+                    let mut items: Vec<QueueItem> = crate::jobs::paging::read_listing(
+                        &state_handle,
+                        prepared_filter.as_ref(),
+                        0,
+                        usize::MAX,
+                    )
+                    .iter()
+                    .map(queue_item_from_job)
+                    .collect();
                     let cached = {
                         let memo = memo.lock().expect("queue snapshot memo poisoned");
                         memo.summaries

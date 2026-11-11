@@ -250,3 +250,61 @@ async fn script_job_events_keep_their_own_kind() {
         assert_eq!(kinds, stored.to_vec(), "{query}");
     }
 }
+
+#[tokio::test]
+async fn job_events_return_the_newest_window_and_page_back_from_it() {
+    let h = TestHarness::new().await;
+    let job_id = 4_242;
+    let events: Vec<weaver_server_core::JobEvent> = (0..2_005)
+        .map(|n| weaver_server_core::JobEvent {
+            job_id,
+            timestamp: 1_000 + n,
+            kind: "JobCreated".to_string(),
+            message: format!("event {n}"),
+            file_id: None,
+        })
+        .collect();
+    h.db.insert_job_events(&events).unwrap();
+
+    let messages = |query: String| {
+        let h = &h;
+        async move {
+            let resp = h.execute(&query).await;
+            assert_no_errors(&resp);
+            response_data(&resp)["jobEvents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|event| event["message"].as_str().unwrap().to_string())
+                .collect::<Vec<_>>()
+        }
+    };
+    let expected =
+        |from: i64, to: i64| (from..to).map(|n| format!("event {n}")).collect::<Vec<_>>();
+
+    let latest = messages(format!("{{ jobEvents(jobId: {job_id}) {{ message }} }}")).await;
+    assert_eq!(latest, expected(5, 2_005));
+
+    let page = messages(format!(
+        "{{ jobEvents(jobId: {job_id}, limit: 3, offset: 2) {{ message }} }}"
+    ))
+    .await;
+    assert_eq!(page, expected(2_000, 2_003));
+
+    let oldest = messages(format!(
+        "{{ jobEvents(jobId: {job_id}, limit: 10, offset: 2000) {{ message }} }}"
+    ))
+    .await;
+    assert_eq!(oldest, expected(0, 5));
+
+    let capped = messages(format!(
+        "{{ jobEvents(jobId: {job_id}, limit: 5000) {{ message }} }}"
+    ))
+    .await;
+    assert_eq!(capped, expected(5, 2_005));
+
+    let resp = h
+        .execute(&format!("{{ jobTimeline(jobId: {job_id}) {{ outcome }} }}"))
+        .await;
+    assert_no_errors(&resp);
+}

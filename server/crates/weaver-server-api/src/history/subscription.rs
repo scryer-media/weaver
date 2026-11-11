@@ -80,35 +80,39 @@ impl HistorySubscription {
             tokio::pin!(triggers);
             let mut terminal_settled = false;
             let mut last_terminal_reload = tokio::time::Instant::now();
-            let mut last_revision: Option<u64> = None;
+            let mut gate = JobDetailReloadGate::default();
 
             while let Some(trigger) = triggers.next().await {
+                let heartbeat = matches!(trigger, JobDetailTrigger::Heartbeat);
                 // A terminal (archived) job's event log and history are
                 // immutable, so the fast per-tab heartbeat need not re-read the
                 // database. But DB-only changes that emit no pipeline event
                 // (e.g. a background history-delete) must still surface, so a
-                // terminal job is polled at a slow cadence instead of having its
-                // heartbeats suppressed outright.
-                if matches!(trigger, JobDetailTrigger::Heartbeat)
-                    && terminal_settled
-                    && last_terminal_reload.elapsed() < JOB_DETAIL_TERMINAL_HEARTBEAT
-                {
+                // terminal job is checked at a slow cadence, and rebuilt only
+                // when its history row or delete state moved.
+                if heartbeat && terminal_settled {
+                    if last_terminal_reload.elapsed() < JOB_DETAIL_TERMINAL_HEARTBEAT {
+                        continue;
+                    }
+                    last_terminal_reload = tokio::time::Instant::now();
+                    match terminal_mark(db.clone(), job_id).await {
+                        Ok(mark) => {
+                            if !gate.terminal_moved(mark) {
+                                continue;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(job_id, error = ?error, "failed to check job detail history");
+                        }
+                    }
+                }
+                // A live job's heartbeat rebuilds only when this job's own
+                // queue row changed: its status, phases, counters or files.
+                // Another job's progress leaves this snapshot as it was sent.
+                let live = live_fingerprint(&handle, job_id);
+                if heartbeat && !terminal_settled && !gate.live_moved(live) {
                     continue;
                 }
-                // A live job's heartbeat reloads only when the job list was
-                // republished or bytes are moving. Every progress change,
-                // including post-download phase progress, republishes the job
-                // list, so an unchanged revision with no download activity
-                // means the database read would return what was last sent.
-                let revision = handle.job_revision();
-                if matches!(trigger, JobDetailTrigger::Heartbeat)
-                    && !terminal_settled
-                    && last_revision == Some(revision)
-                    && handle.get_metrics().current_download_speed == 0
-                {
-                    continue;
-                }
-                last_revision = Some(revision);
                 if matches!(trigger, JobDetailTrigger::Event) {
                     tokio::time::sleep(JOB_DETAIL_SETTLE_DELAY).await;
                 }
@@ -143,6 +147,64 @@ impl HistorySubscription {
             }
         })
     }
+}
+
+// What a job detail heartbeat compares to decide whether a rebuild could
+// differ from the last snapshot sent.
+#[derive(Default)]
+struct JobDetailReloadGate {
+    live: Option<Vec<u8>>,
+    terminal: Option<TerminalMark>,
+}
+
+impl JobDetailReloadGate {
+    // Records `live` and answers whether it differs from the last one. A job
+    // the queue no longer holds always counts as moved.
+    fn live_moved(&mut self, live: Option<Vec<u8>>) -> bool {
+        let moved = live.is_none() || live != self.live;
+        self.live = live;
+        moved
+    }
+
+    // Records `mark` and answers whether it differs from the last one.
+    fn terminal_moved(&mut self, mark: TerminalMark) -> bool {
+        let moved = self.terminal.as_ref() != Some(&mark);
+        self.terminal = Some(mark);
+        moved
+    }
+}
+
+// This job's queue row, serialized, or `None` when the queue holds no row
+// for it. Read from the queue's shared rows; copies this one row alone.
+fn live_fingerprint(handle: &SchedulerHandle, job_id: u64) -> Option<Vec<u8>> {
+    let info = handle.get_job(JobId(job_id)).ok()?;
+    serde_json::to_vec(&info).ok()
+}
+
+// What a terminal job's snapshot can still change by: whether its history row
+// exists, and its delete state.
+#[derive(Debug, PartialEq, Eq)]
+struct TerminalMark {
+    archived: bool,
+    delete_state: Option<weaver_server_core::HistoryDeleteRowState>,
+}
+
+async fn terminal_mark(
+    db: Database,
+    job_id: u64,
+) -> Result<TerminalMark, weaver_server_core::StateError> {
+    tokio::task::spawn_blocking(move || {
+        let archived = !db.job_history_ids_among(&[job_id])?.is_empty();
+        let delete_state = db
+            .list_history_delete_row_states(&[job_id])?
+            .remove(&job_id);
+        Ok(TerminalMark {
+            archived,
+            delete_state,
+        })
+    })
+    .await
+    .map_err(|error| weaver_server_core::StateError::Database(error.to_string()))?
 }
 
 fn raw_pipeline_event_stream(handle: SchedulerHandle) -> impl Stream<Item = PipelineEventGql> {
@@ -187,5 +249,84 @@ where
             last = tokio::time::Instant::now();
             yield item;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handle_with(jobs: Vec<weaver_server_core::JobInfo>) -> SchedulerHandle {
+        let (event_tx, _event_rx) = tokio::sync::broadcast::channel(1);
+        SchedulerHandle::new(
+            event_tx,
+            weaver_server_core::jobs::handle::SharedPipelineState::new(
+                weaver_server_core::operations::metrics::PipelineMetrics::new(),
+                jobs,
+            ),
+        )
+    }
+
+    fn history_row(job_id: u64) -> weaver_server_core::JobHistoryRow {
+        weaver_server_core::JobHistoryRow {
+            job_id,
+            job_hash: None,
+            name: format!("job-{job_id}"),
+            status: "complete".to_string(),
+            error_message: None,
+            total_bytes: 1_000,
+            downloaded_bytes: 1_000,
+            optional_recovery_bytes: 0,
+            optional_recovery_downloaded_bytes: 0,
+            failed_bytes: 0,
+            health: 1_000,
+            category: None,
+            output_dir: None,
+            nzb_path: None,
+            created_at: 100,
+            completed_at: 200,
+            metadata: None,
+            server_attribution: None,
+        }
+    }
+
+    fn job(job_id: u64, downloaded_bytes: u64) -> weaver_server_core::JobInfo {
+        let row = history_row(job_id);
+        let mut info = crate::schema::history_query::job_info_from_history_row(&row);
+        info.status = weaver_server_core::JobStatus::Downloading;
+        info.downloaded_bytes = downloaded_bytes;
+        info
+    }
+
+    #[test]
+    fn a_heartbeat_rebuilds_only_when_this_jobs_row_moved() {
+        let mut gate = JobDetailReloadGate::default();
+        let before = handle_with(vec![job(1, 10), job(2, 10)]);
+        assert!(gate.live_moved(live_fingerprint(&before, 1)));
+
+        let other_moved = handle_with(vec![job(1, 10), job(2, 99)]);
+        assert!(!gate.live_moved(live_fingerprint(&other_moved, 1)));
+
+        let this_moved = handle_with(vec![job(1, 11), job(2, 99)]);
+        assert!(gate.live_moved(live_fingerprint(&this_moved, 1)));
+        assert!(!gate.live_moved(live_fingerprint(&this_moved, 1)));
+
+        let gone = handle_with(vec![job(2, 99)]);
+        assert!(gate.live_moved(live_fingerprint(&gone, 1)));
+    }
+
+    #[tokio::test]
+    async fn a_terminal_job_rebuilds_only_when_its_history_moved() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_history(&history_row(7)).unwrap();
+        let mut gate = JobDetailReloadGate::default();
+        assert!(gate.terminal_moved(terminal_mark(db.clone(), 7).await.unwrap()));
+        assert!(!gate.terminal_moved(terminal_mark(db.clone(), 7).await.unwrap()));
+
+        db.delete_job_history(7).unwrap();
+        let gone = terminal_mark(db.clone(), 7).await.unwrap();
+        assert!(!gone.archived);
+        assert!(gate.terminal_moved(gone));
+        assert!(!gate.terminal_moved(terminal_mark(db, 7).await.unwrap()));
     }
 }

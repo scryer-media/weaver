@@ -16,9 +16,9 @@ use weaver_server_core::pipeline::queue::paging::JobView;
 use weaver_server_core::{JobId, JobInfo, SharedPipelineState};
 
 use super::types::{
-    QueueCategoryCount, QueueEtaBytes, QueueItemState, QueuePageInput, QueuePriority,
-    QueueSelectionInput, QueueSortDirection, QueueSortField, QueueStateCount, QueueStateFacts,
-    QueueSummary, queue_item_state,
+    PreparedQueueFilter, QueueCategoryCount, QueueEtaBytes, QueueItemState, QueuePageInput,
+    QueuePriority, QueueSelectionInput, QueueSortDirection, QueueSortField, QueueStateCount,
+    QueueStateFacts, QueueSummary, matches_view_filter_prepared, queue_item_state,
 };
 
 pub(crate) const MAX_QUEUE_PAGE_SIZE: usize = 500;
@@ -837,14 +837,25 @@ impl PageRead {
     }
 }
 
-/// Copies every queued row in queue order, as a listing shows it: no per-file
-/// bytes, server attribution or discards.
-pub(crate) fn read_listing(state: &SharedPipelineState) -> Vec<JobInfo> {
+/// Copies the queued rows `filter` keeps, in queue order, as a listing shows
+/// them: no per-file bytes, server attribution or discards. The first `skip`
+/// kept rows are passed over and at most `take` are copied; the rest are
+/// matched in place.
+pub(crate) fn read_listing(
+    state: &SharedPipelineState,
+    filter: Option<&PreparedQueueFilter>,
+    skip: usize,
+    take: usize,
+) -> Vec<JobInfo> {
     state.read_queue(|inner| {
         inner
             .jobs
             .iter()
-            .map(|row| row.view(&inner.globals).list_info())
+            .map(|row| row.view(&inner.globals))
+            .filter(|view| matches_view_filter_prepared(view, filter))
+            .skip(skip)
+            .take(take)
+            .map(|view| view.list_info())
             .collect()
     })
 }
@@ -976,6 +987,100 @@ mod tests {
             categories: None,
             sort_field: None,
             sort_direction: None,
+        }
+    }
+
+    // The listing keeps, skips and takes exactly the rows that filtering the
+    // queue items of every row would, in the same order.
+    #[test]
+    fn a_filtered_listing_matches_filtering_every_queue_item() {
+        use super::super::types::{
+            AttributeInput, QueueFilterInput, matches_queue_filter_prepared, queue_item_from_job,
+        };
+        let statuses = [
+            JobStatus::Queued,
+            JobStatus::Downloading,
+            JobStatus::Paused,
+            JobStatus::Extracting,
+            JobStatus::Failed {
+                error: "invented".to_string(),
+            },
+        ];
+        let categories = [None, Some("tv"), Some("movies")];
+        let jobs: Vec<JobInfo> = (1..=90)
+            .map(|id| {
+                let mut info = job(
+                    id,
+                    statuses[(id % 5) as usize].clone(),
+                    categories[(id % 3) as usize],
+                    10,
+                );
+                if id % 4 == 0 {
+                    info.metadata = vec![("tvdbId".to_string(), format!("{}", id % 8))];
+                }
+                if id % 7 == 0 {
+                    info.metadata.push((
+                        weaver_server_core::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+                        format!("request-{id}"),
+                    ));
+                }
+                info
+            })
+            .collect();
+        let state = SharedPipelineState::new(PipelineMetrics::new(), jobs);
+        let filters = [
+            None,
+            Some(QueueFilterInput::default()),
+            Some(QueueFilterInput {
+                states: Some(vec![QueueItemState::Downloading, QueueItemState::Paused]),
+                ..Default::default()
+            }),
+            Some(QueueFilterInput {
+                category: Some("tv".to_string()),
+                item_ids: Some((1..=60).collect()),
+                ..Default::default()
+            }),
+            Some(QueueFilterInput {
+                has_attribute_key: Some("tvdbId".to_string()),
+                ..Default::default()
+            }),
+            Some(QueueFilterInput {
+                attribute_equals: Some(AttributeInput {
+                    key: "tvdbId".to_string(),
+                    value: "4".to_string(),
+                }),
+                ..Default::default()
+            }),
+            Some(QueueFilterInput {
+                has_attribute_key: Some(
+                    weaver_server_core::CLIENT_REQUEST_ID_ATTRIBUTE_KEY.to_string(),
+                ),
+                ..Default::default()
+            }),
+        ];
+        let every_item: Vec<_> = state.read_queue(|inner| {
+            inner
+                .jobs
+                .iter()
+                .map(|row| queue_item_from_job(&row.view(&inner.globals).list_info()))
+                .collect()
+        });
+        for filter in &filters {
+            let prepared = PreparedQueueFilter::new(filter.as_ref());
+            for (skip, take) in [(0, usize::MAX), (0, 5), (7, 3), (200, 5)] {
+                let expected: Vec<_> = every_item
+                    .iter()
+                    .filter(|item| matches_queue_filter_prepared(item, prepared.as_ref()))
+                    .skip(skip)
+                    .take(take)
+                    .cloned()
+                    .collect();
+                let listed: Vec<_> = read_listing(&state, prepared.as_ref(), skip, take)
+                    .iter()
+                    .map(queue_item_from_job)
+                    .collect();
+                assert_eq!(listed, expected, "{filter:?} skip={skip} take={take}");
+            }
         }
     }
 

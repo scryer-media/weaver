@@ -726,7 +726,12 @@ fn attention_for_history_row(row: &JobHistoryRow, state: QueueItemState) -> Opti
 }
 
 fn history_state_from_row(row: &JobHistoryRow) -> QueueItemState {
-    match row.status.to_ascii_lowercase().as_str() {
+    history_state_from_status(&row.status)
+}
+
+// The public state of a history row with persisted `status`.
+pub(crate) fn history_state_from_status(status: &str) -> QueueItemState {
+    match status.to_ascii_lowercase().as_str() {
         "complete" => QueueItemState::Completed,
         "cancelled" | "failed" | "partial" => QueueItemState::Failed,
         "paused" => QueueItemState::Paused,
