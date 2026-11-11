@@ -15,8 +15,8 @@ use crate::runtime::hardware_profile::HardwareProfile;
 use crate::servers::ServerConfig;
 pub use crate::settings::levels::{Leaf, Level, Levels};
 use crate::torrents::identity::{ClientIdentity, IDENTITY};
-use weaver_torrent::tracker::qbittorrent;
 use crate::watch_folder::WatchFolderConfig;
+use weaver_torrent::tracker::qbittorrent;
 
 // The NZB admission limit when none is saved, for new and upgraded installations.
 pub const DEFAULT_MAX_CONCURRENT_NZBS: std::num::NonZeroU32 =

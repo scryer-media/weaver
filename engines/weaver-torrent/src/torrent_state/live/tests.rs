@@ -2473,8 +2473,8 @@ async fn a_torrent_paused_mid_piece_announces_the_payload_it_received() {
     let h = Harness::new("announced_mid_piece").await;
     let (peer, _rx) = h.peer("127.0.0.1:6881");
     let chunk = CHUNK_SIZE as usize;
-    for (begin, block) in [(0, 0..chunk), (chunk, chunk..2 * chunk), (0, 0..chunk)] {
-        peer.on_received_piece(Piece::from_data(0, begin as u32, &h.content[block]))
+    for (begin, block) in [(0, 0..chunk), (CHUNK_SIZE, chunk..2 * chunk), (0, 0..chunk)] {
+        peer.on_received_piece(Piece::from_data(0, begin, &h.content[block]))
             .await
             .unwrap();
     }

@@ -79,11 +79,6 @@ pub struct AnnounceFields {
 /// The URL data option's type (BEP 41).
 const OPTION_URL_DATA: u8 = 2;
 
-/// The most bytes of URL data one announce carries: one option's length is
-/// a byte, and libtorrent sends no more than this, in one option
-/// (`udp_tracker_connection::send_udp_announce`).
-const MAX_URL_DATA: usize = 255;
-
 /// The URL data of an announce to `url`: its path and query, as libtorrent
 /// takes them from the URL (`udp_tracker_connection::send_udp_announce`).
 pub(crate) fn url_data(url: &url::Url) -> String {
@@ -147,10 +142,13 @@ impl Request {
                 w.extend_from_slice(&fields.num_want.to_be_bytes())?;
                 w.extend_from_slice(&fields.port.to_be_bytes())?;
                 let data = fields.url_data.as_bytes();
-                let data = &data[..data.len().min(MAX_URL_DATA)];
-                if !data.is_empty() {
-                    w.extend_from_slice(&[OPTION_URL_DATA, data.len() as u8])?;
-                    w.extend_from_slice(data)?;
+                // One option's length is a byte: libtorrent sends no more
+                // than 255 bytes, in one option
+                // (`udp_tracker_connection::send_udp_announce`).
+                let len = u8::try_from(data.len()).unwrap_or(u8::MAX);
+                if len > 0 {
+                    w.extend_from_slice(&[OPTION_URL_DATA, len])?;
+                    w.extend_from_slice(&data[..usize::from(len)])?;
                 }
             }
             Request::Scrape(connection_id, info_hash) => {

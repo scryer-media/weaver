@@ -2844,7 +2844,8 @@ mod tests {
     #[test]
     fn as_qbittorrent_a_finished_torrent_says_paused_before_started() {
         let t0 = Instant::now();
-        let mut list = TrackerList::new(&[vec![http("a")]], t0, &crate::tracker::qbittorrent::SHAPE);
+        let mut list =
+            TrackerList::new(&[vec![http("a")]], t0, &crate::tracker::qbittorrent::SHAPE);
         let selection_done = TrackerCommsStats {
             finished: true,
             ..live(60, 30, false)

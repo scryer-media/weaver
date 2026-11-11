@@ -938,10 +938,18 @@ mod tests {
         if let Some(id) = r.trackerid {
             s += &format!("&trackerid={}", esc(id));
         }
-        for ip in r.own_addrs.iter().filter(|ip| Family::of(**ip) == Family::V4) {
+        for ip in r
+            .own_addrs
+            .iter()
+            .filter(|ip| Family::of(**ip) == Family::V4)
+        {
             s += &format!("&ipv4={}", esc(ip.to_string().as_bytes()));
         }
-        for ip in r.own_addrs.iter().filter(|ip| Family::of(**ip) == Family::V6) {
+        for ip in r
+            .own_addrs
+            .iter()
+            .filter(|ip| Family::of(**ip) == Family::V6)
+        {
             s += &format!("&ipv6={}", esc(ip.to_string().as_bytes()));
         }
         s

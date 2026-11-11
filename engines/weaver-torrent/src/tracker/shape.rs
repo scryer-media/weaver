@@ -195,9 +195,7 @@ impl AnnounceShape {
             Field::Corrupt => number(s, "corrupt", r.corrupt),
             Field::Redundant => number(s, "redundant", r.redundant),
             Field::Compact { always } => number(s, "compact", u8::from(always || r.compact)),
-            Field::NoPeerId { always } => {
-                number(s, "no_peer_id", u8::from(always || r.no_peer_id))
-            }
+            Field::NoPeerId { always } => number(s, "no_peer_id", u8::from(always || r.no_peer_id)),
             Field::Numwant => number(s, "numwant", r.numwant),
             Field::Crypto { require } => {
                 if r.encryption != EncryptionPolicy::Disabled {
