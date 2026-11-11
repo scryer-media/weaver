@@ -25,15 +25,21 @@ pub(super) const CHUNK: usize = 64 << 10;
 pub(super) struct Run<D> {
     decoder: PhantomData<fn() -> D>,
     name: String,
+    // The window the stream's front sized against the grant it was built
+    // with.
     window: u64,
+    // The stream's front, which sizes the window again against the grant
+    // the run is given, where that is wider.
+    first: Vec<u8>,
 }
 
 impl<D: Decoder> Run<D> {
-    pub(super) fn new(name: String, window: u64) -> Self {
+    pub(super) fn new(name: String, window: u64, first: Vec<u8>) -> Self {
         Self {
             decoder: PhantomData,
             name,
             window,
+            first,
         }
     }
 }
@@ -53,6 +59,19 @@ impl<D: Decoder> Extraction for Run<D> {
         // Asked before anything is read, so a volume still growing is
         // never waited on for its tail.
         let closed = volumes.len(weaver_graph::VolumeIndex(0)).is_some();
+        // The window the stream was built to, or the run's grant's where
+        // that is wider: an owner that lets a window go above its ceiling
+        // grants the run the wider one. An owner that reserved the whole
+        // grant for the run gives the decoder all of it, since a later
+        // block or frame may need more than the first declares.
+        let window = if budget.window_reserved {
+            budget.window_or(self.window).max(self.window)
+        } else {
+            self.window.max(D::window(&self.first, &budget))
+        };
+        // What the front declares the decoder needs, where the decoder's
+        // own refusal does not say.
+        let declared = D::declared(&self.first);
         let input = Front::new(Arc::clone(&volumes));
         let failed = input.failure();
         let announced = sink(Emit::Member {
@@ -63,7 +82,7 @@ impl<D: Decoder> Extraction for Run<D> {
         if !announced {
             return;
         }
-        let pumped = D::open_with(input, self.window, budget, closed)
+        let pumped = D::open_with(input, window, budget, closed)
             .and_then(|mut reader| pump(&mut *reader, sink));
         let error = match pumped {
             Ok(Ended::Whole) => {
@@ -77,7 +96,7 @@ impl<D: Decoder> Extraction for Run<D> {
         if failed.load(Ordering::Acquire) || !sink(Emit::Retract(MEMBER)) {
             return;
         }
-        sink(Emit::Refuse(why(&error)));
+        sink(Emit::Refuse(why(&error, window, declared)));
     }
 }
 
@@ -129,12 +148,31 @@ fn fill<R: Read + ?Sized>(reader: &mut R, buffer: &mut [u8]) -> (usize, Option<i
     (filled, None)
 }
 
-// A stream that asks for more than its reservation, or for something its
+// A stream that asks for more memory than its window, or for something its
 // decoder does not implement, is not damage; everything else a decoder
-// fails on is, and nothing here can repair the decoder's input.
-fn why(error: &io::Error) -> Why {
+// fails on is, and nothing here can repair the decoder's input. A decoder
+// that states the sizes it refused says them. zstd states none: it was held
+// to the run's window, and needs what its front declares when that is more.
+fn why(error: &io::Error, window: u64, declared: Option<u64>) -> Why {
+    if let Some(why) = crate::verdict::too_large(error) {
+        return why;
+    }
+    if zstd_0_13_frame_too_wide(&error.to_string()) {
+        return Why::TooLarge {
+            needed: declared.filter(|declared| *declared > window),
+            allowed: Some(window),
+        };
+    }
     match error.kind() {
-        io::ErrorKind::Unsupported | io::ErrorKind::OutOfMemory => Why::Unsupported,
+        io::ErrorKind::Unsupported => Why::Unsupported,
         _ => Why::Unrepairable,
     }
+}
+
+// zstd 0.13 (libzstd 1.5.7): a frame whose window is wider than the
+// decoder's limit is an `io::Error` carrying `ZSTD_getErrorName`'s text for
+// `frameParameter_windowTooLarge`. zstd exposes no typed error code through
+// its `Read` adapters.
+fn zstd_0_13_frame_too_wide(text: &str) -> bool {
+    text.contains("Frame requires too much memory for decoding")
 }

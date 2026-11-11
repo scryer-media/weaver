@@ -449,6 +449,34 @@ async fn a_deflate_zip_damaged_beside_par2_is_repaired_with_no_refetch() {
     );
 }
 
+// One article of a ZipCrypto member damaged beside PAR2: the repair writes
+// the ciphertext back and its keys run over it, with no refetch, whether the
+// damaged article came while the zip was lent out for its keys or not.
+#[tokio::test]
+async fn a_zipcrypto_zip_damaged_beside_par2_is_repaired_with_no_refetch() {
+    use ::zip::unstable::write::FileOptionsExt;
+    let secret = "lantern-zipcrypto-secret";
+    let bytes = archive(
+        stored()
+            .with_deprecated_encryption(secret.as_bytes())
+            .unwrap(),
+    );
+    for damaged in [1, 3] {
+        let mut posts = vec![Post::plain("lantern.zip", bytes.clone())];
+        posts.extend(par2_set("lantern", &[("lantern.zip", &bytes)], 2));
+        let scenario = Scenario::new(posts).damaged(0, damaged).password(secret);
+        let graph = run(&scenario).await;
+        assert_members(&graph);
+        assert!(kinds(&graph).contains(&"par2"), "{:?}", kinds(&graph));
+        assert!(graph.reads > 0, "the repair read its slices");
+        assert!(
+            graph.refetched().is_empty(),
+            "graph: {:?}",
+            graph.refetched()
+        );
+    }
+}
+
 // A zip from before names could be flagged UTF-8: its entry named in code
 // page 437, where 0x82 is é. The name is written as ASCII and its bytes are
 // then swapped in the local header and the directory, so no flag is set.

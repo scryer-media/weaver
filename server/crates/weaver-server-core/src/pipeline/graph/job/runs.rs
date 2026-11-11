@@ -38,6 +38,14 @@ impl GraphJob {
             Heard::Verified(_) => {
                 self.loans.returned(said.node, said.generation);
             }
+            Heard::Worked(_) => {
+                self.works.returned(said.node, said.generation);
+            }
+            Heard::Rewalked(_) => {
+                if self.works.rewalk_returned(said.node, said.generation) {
+                    self.tree.rewalk_dropped(said.node);
+                }
+            }
             Heard::Written { stamp, control } => {
                 if self.pending.control().same(&control) {
                     self.acknowledge_checkpoint(stamp.unwrap_or(said.generation));
@@ -97,6 +105,75 @@ impl GraphJob {
                 self.step_runs(Vec::new(), limit)?;
                 return self.lend(slots, limit);
             }
+            Heard::Worked(worked) => {
+                if !self.works.returned(node, said.generation) {
+                    return Ok(());
+                }
+                let super::Worked { object, said } = *worked;
+                let mut effects = Vec::new();
+                self.tree.take_back_worked(
+                    node,
+                    object,
+                    said,
+                    &mut self.writer.placing(&mut *self.builder),
+                    &mut effects,
+                );
+                self.settle_worked(effects)?;
+                self.step_runs(Vec::new(), limit)?;
+                return self.lend(slots, limit);
+            }
+            Heard::Rewalked(rewalked) => {
+                // Its reader goes on before anything here can fail: a job
+                // failing on this piece drains the rest, and the reader stops.
+                self.works.rewalk_heard(node);
+                let mut effects = Vec::new();
+                let mut placing = self.writer.placing(&mut *self.builder);
+                match rewalked.piece {
+                    Some((volume, piece)) => {
+                        if !self.works.rewalking(node, said.generation) {
+                            return Ok(());
+                        }
+                        match piece {
+                            Ok(posted) => {
+                                self.tree.rewalked(
+                                    node,
+                                    volume,
+                                    posted,
+                                    &mut placing,
+                                    &mut effects,
+                                );
+                            }
+                            Err(range) => {
+                                self.unread(node, volume, range, limit)?;
+                            }
+                        }
+                    }
+                    None => {
+                        if !self.works.rewalk_returned(node, said.generation) {
+                            return Ok(());
+                        }
+                        // A reading cut short leaves the object owing: it
+                        // hears no close and rules on nothing it has not
+                        // heard all of, and the next restore asks again.
+                        // Cut short with no shutdown, the job's working
+                        // directory went, and the job fails as its next
+                        // write would.
+                        if rewalked.whole {
+                            self.tree.rewalk_done(node, &mut placing, &mut effects);
+                        } else if self.works.admit_rewalk() {
+                            return Err(WriteError::from(self.writer.gone()).into());
+                        }
+                    }
+                }
+                // A commit held while this read waits for the checkpoint
+                // taken after it, which commits once nothing reads.
+                self.settle_worked(effects)?;
+                self.step_runs(Vec::new(), limit)?;
+                // The end of one rewalk lends the next, as the job's install
+                // lent the first, whether or not the job may run.
+                self.lend_rewalks()?;
+                return self.lend(slots, limit);
+            }
             Heard::Written { stamp, control } => {
                 return if self.pending.control().same(&control) {
                     self.written(stamp, said.generation)
@@ -106,7 +183,35 @@ impl GraphJob {
             }
             Heard::CheckpointBlocked { .. } | Heard::CheckpointDue { .. } => return Ok(()),
             _ if !self.runs.current(node, said.generation) => return Ok(()),
+            // A run widened is ending, to start again at the wider window.
+            Heard::Emit(_) if self.runs.rerunning(node) => return Ok(()),
+            // A wider window than the run had, which the grant lets it have:
+            // what it built is retracted, and it starts again once it ends,
+            // its window reserved whole. A decoder that cannot say what it
+            // needs is given the widest its format has.
+            Heard::Emit(Emit::Refuse(Why::TooLarge { needed, .. }))
+                if self.runs.widen(
+                    node,
+                    needed,
+                    self.tree.engine(node).and_then(Engine::widest),
+                ) =>
+            {
+                self.retract_run(node)?;
+                return Ok(());
+            }
             Heard::Emit(emit) => {
+                // A window the scratch refused a run held to the ceiling is
+                // refused with the window it was held to.
+                let emit = match emit {
+                    Emit::Refuse(Why::TooLarge {
+                        needed,
+                        allowed: None,
+                    }) => Emit::Refuse(Why::TooLarge {
+                        needed,
+                        allowed: self.runs.allowed(node),
+                    }),
+                    emit => emit,
+                };
                 // The tree is told the run is asking, as it is told how far
                 // the run read: the object rules on it when the job is quiet.
                 if emit == Emit::NeedsPassword {
@@ -232,23 +337,34 @@ impl GraphJob {
     // can never fit is refused to the tree as a run's own refusal is; one
     // that does not fit now hands back the nodes its slot admitted.
     fn start_run(&mut self, node: NodeId) -> Result<Vec<NodeId>, GraphError> {
-        let Some(window) = self.tree.engine(node).and_then(Engine::reserve) else {
+        let Some(engine) = self.tree.engine(node) else {
             return Ok(Vec::new());
         };
-        match self.runs.reserve(node, window) {
-            Reservation::Granted => {}
+        let Some(window) = engine.reserve() else {
+            return Ok(Vec::new());
+        };
+        // Whether the decoder borrows a window over its grant from a
+        // scratch file as it asks for it, or is given it in RAM
+        // (`Engine::lends`).
+        let refused = match self.runs.reserve_for(node, window, engine.lends()) {
+            Reservation::Granted => None,
             Reservation::Starved(admitted) => return Ok(admitted),
-            Reservation::Refused => {
-                let mut effects = Vec::new();
-                self.tree.emitted(
-                    node,
-                    vec![Emit::Refuse(Why::Unsupported)],
-                    &mut self.writer.placing(&mut *self.builder),
-                    &mut effects,
-                );
-                self.settle(effects)?;
-                return Ok(Vec::new());
-            }
+            Reservation::Refused { needed, allowed } => Some(Why::TooLarge {
+                needed: Some(needed),
+                allowed: Some(allowed),
+            }),
+            Reservation::Beyond { needed, memory } => Some(Why::OverMachine { needed, memory }),
+        };
+        if let Some(why) = refused {
+            let mut effects = Vec::new();
+            self.tree.emitted(
+                node,
+                vec![Emit::Refuse(why)],
+                &mut self.writer.placing(&mut *self.builder),
+                &mut effects,
+            );
+            self.settle(effects)?;
+            return Ok(Vec::new());
         }
         if let Some(extraction) = self.tree.start(node) {
             let shelf = self.writer.shelf(node);

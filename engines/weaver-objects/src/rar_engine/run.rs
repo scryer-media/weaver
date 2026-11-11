@@ -56,13 +56,12 @@ impl Run {
     }
 }
 
-fn limits(budget: &Budget) -> unrar_rs::Limits {
-    let mut limits = unrar_rs::Limits::default();
-    if let Some(memory) = budget.memory_bytes {
-        limits.max_dict_size = limits.max_dict_size.min(memory);
-        limits.max_ppmd_arena_size = limits.max_ppmd_arena_size.min(memory);
-    }
-    limits
+// A member's dictionary is held to the window the run was granted, or the
+// decoder's own limit when none was. A RAR3 PPMd arena keeps the format's
+// own ceiling, narrowed by the window too. A run handed a lender borrows a
+// dictionary or an arena over that window: `crate::lent::rar`.
+pub(super) fn limits(budget: &Budget) -> unrar_rs::Limits {
+    crate::lent::rar(budget)
 }
 
 impl Extraction for Run {
@@ -644,6 +643,18 @@ fn may_start(
         .then_some(total)
 }
 
+// What member `at` of `archive`, over `volumes`, holds once it decodes beside
+// nothing, if it may.
+#[cfg(test)]
+pub(super) fn may_start_alone(
+    archive: &RarArchive,
+    volumes: &Arc<dyn Volumes>,
+    budget: &Budget,
+    at: usize,
+) -> Option<u64> {
+    may_start(archive, &Input::beside(volumes), budget, at, 0, false)
+}
+
 // The window a member's decoder holds: as large as the dictionary its
 // header names, none for stored bytes.
 fn window(info: &unrar_rs::MemberInfo) -> u64 {
@@ -864,11 +875,45 @@ fn terminal(error: &RarError, encrypted: bool) -> Emit {
         | RarError::UnsupportedEncryption { .. }
         | RarError::UnsupportedEncryptionKdf { .. }
         | RarError::UnsupportedFilter { .. }
-        | RarError::DictionaryTooLarge { .. }
         | RarError::ResourceLimit { .. }
         | RarError::VolumeProviderRequired { .. }
-        | RarError::SolidOrderViolation { .. } => Emit::Refuse(Why::Unsupported),
-        _ => Emit::Refuse(Why::Unrepairable),
+        | RarError::SolidOrderViolation { .. } => {
+            Emit::Refuse(too_large(error).unwrap_or(Why::Unsupported))
+        }
+        _ => Emit::Refuse(too_large(error).unwrap_or(Why::Unrepairable)),
+    }
+}
+
+// A member whose decode needs more memory than the run may hold: a
+// dictionary or a PPMd model over its limit, or memory the allocator or the
+// run's lender would not give. A dictionary of no size names no limit either: the decoder
+// refused a window it could not build.
+fn too_large(error: &RarError) -> Option<Why> {
+    let known = |size: u64| (size > 0).then_some(size);
+    match error {
+        RarError::DictionaryTooLarge { size, max } => Some(Why::TooLarge {
+            needed: known(*size),
+            allowed: known(*max),
+        }),
+        RarError::ResourceLimit {
+            kind: unrar_rs::LimitKind::PpmdArena,
+            requested,
+            max,
+            ..
+        } => Some(Why::TooLarge {
+            needed: Some(*requested),
+            allowed: Some(*max),
+        }),
+        RarError::AllocationFailed { bytes } => Some(Why::TooLarge {
+            needed: known(*bytes),
+            allowed: None,
+        }),
+        // A window or arena the run's lender refused.
+        RarError::WindowAllocatorFailed { bytes, error } => {
+            Some(crate::lent::refused(*bytes, error.kind(), None))
+        }
+        RarError::Io(error) => too_large(error.get_ref()?.downcast_ref::<RarError>()?),
+        _ => None,
     }
 }
 

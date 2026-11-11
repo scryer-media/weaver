@@ -75,7 +75,8 @@ impl Segments for Posted {
 
 // What a job does with what the writer passes on: an object that asks for a
 // password is offered the one the set was written under, once, and what it
-// says back is applied.
+// says back is applied. Work an object holds, such as deriving a file key,
+// is done on the loop and taken back, as a job does it when it lends none.
 fn answer(
     tree: &mut Tree,
     writer: &mut NamespaceWriter,
@@ -94,6 +95,21 @@ fn answer(
                 tree.offer_password(node, PASSWORD, &mut writer.placing(objects), &mut effects);
                 any = true;
             }
+        }
+        for node in tree.working() {
+            let Some(mut object) = tree.lend_work(node) else {
+                continue;
+            };
+            let mut said = Vec::new();
+            object.work(&mut said);
+            tree.take_back_worked(
+                node,
+                object,
+                said,
+                &mut writer.placing(objects),
+                &mut effects,
+            );
+            any = true;
         }
         if !any {
             return;

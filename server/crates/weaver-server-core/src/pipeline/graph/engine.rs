@@ -10,14 +10,15 @@
 //
 // A run has one life: queued for a slot, running, ended, or stopped where it
 // stands when the job goes down. Before it starts it reserves the resident
-// bytes it will hold, against the limit every job shares; one that does not
-// fit gives its slot back and waits for memory instead. A repair behind what
-// it read moves its shelf's generation on, which stops it where it stands;
-// its owner then retracts what it built and starts it again, under the slot
-// it already holds. Whatever a stopped run still says carries the old
+// bytes it will hold, from the decode pool every job shares and the holds do
+// not; one that does not fit gives its slot back and waits for memory
+// instead. A repair behind what it read moves its shelf's generation on,
+// which stops it where it stands; its owner then retracts what it built and
+// starts it again, under the slot it already holds. Whatever a stopped run still says carries the old
 // generation, and is not heard: a run stopped as the job goes down keeps its
 // generation, so no run starts under it again.
 
+mod pool;
 mod volumes;
 
 #[cfg(test)]
@@ -25,18 +26,20 @@ pub(crate) mod echo;
 #[cfg(test)]
 mod tests;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use tokio::sync::mpsc;
-use weaver_graph::holds::{HoldsAccountant, HoldsNamespace, Reserve};
 use weaver_graph::slots::{Admissions, Asked, AskerId, Slots, Ticket};
 use weaver_graph::{Emit, Extraction, Marks, NodeId, Why};
 
+pub(crate) use self::pool::DecodePool;
 use self::volumes::RunVolumes;
+use super::decoding::DecodeClock;
 use super::envelope::Shelf;
 use super::hardware::Hardware;
 use super::namespace::Returned;
+use crate::runtime::OverLimit;
 
 // How many things a run may have said before it waits for the pipeline to
 // hear them: a bound on the bytes in flight, not on the run.
@@ -70,6 +73,13 @@ pub(crate) enum Heard {
     Repaired(Box<Returned>),
     Replayed(Box<super::namespace::Replayed>),
     Verified(Box<super::namespace::Verified>),
+    // An object lent off the loop for the work it held came back with what
+    // it said: addressed to its node, under the loan's number.
+    Worked(Box<super::job::Worked>),
+    // A restored recovery object walked what of its volumes arrived again,
+    // off the loop, and came back with what it said: addressed to its
+    // node, under the loan's number.
+    Rewalked(Box<super::namespace::Rewalked>),
     // The job's checkpoints committed through this stamp, or a write of
     // them failed (`None`), while a member's file waited on them to move.
     // Addressed to the root, under no run's generation.
@@ -154,10 +164,10 @@ impl RunMail {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Life {
     Queued,
-    // Its reservation did not fit beside what is resident. It holds no
-    // slot, and asks for one again once fewer resident bytes are held than
-    // when it was turned away.
-    Starved { resident: u64 },
+    // Its reservation did not fit beside what the decode pool holds. It
+    // holds no slot, and asks for one again once the pool was given room
+    // back since it was turned away, or its limit rose.
+    Starved { freed: u64, limit: u64 },
     Running { generation: u64 },
     Ended { generation: u64 },
     // Stopped where it stood because the job is going down, under the
@@ -174,9 +184,66 @@ struct Run {
     ticket: Option<Ticket>,
     // The reader the run is out with, through which its owner stops it.
     volumes: Option<Arc<RunVolumes>>,
-    // The resident bytes reserved for the run, held from before it starts
-    // until it ends or is forgotten; zero while none is taken.
+    // The bytes reserved for the run in the decode pool, held from before
+    // it starts until it ends or is forgotten; zero while none is taken.
     reserved: u64,
+    // The window the run decodes at past what its object declared: above
+    // the grant's ceiling where the policy lets it go above, or within it,
+    // the widest its object or its decoder named.
+    wide: Option<u64>,
+    // The window the run was given when it was reserved.
+    window: u64,
+    // Whether its reservation is held above the ceiling, apart from the
+    // pool.
+    above: bool,
+    // Where that window is: within the grant, or past it in RAM.
+    placed: Placed,
+    // Its decoder is handed the job's lender, to borrow every window over
+    // its grant as it asks for it: it borrows (`Engine::lends`), the policy
+    // lets a window go over the ceiling, and the scratch has not refused it.
+    lends: bool,
+    // The start its lender was handed for, while it is lent: what the
+    // lender heard under any other is not this run's.
+    lent: Option<super::window::Start>,
+    // The scratch refused it once: from here it is not lent, and its window
+    // is placed in RAM.
+    in_ram: bool,
+    // The run refused a window its policy lets it have: it starts again,
+    // wider, once it ends, and what it says before then is not heard.
+    rerun: bool,
+    // Whether it is counted among the runs waiting above the ceiling.
+    whole: bool,
+}
+
+impl Run {
+    fn queued() -> Self {
+        Self {
+            life: Life::Queued,
+            ticket: None,
+            volumes: None,
+            reserved: 0,
+            wide: None,
+            window: 0,
+            above: false,
+            placed: Placed::Grant,
+            lends: false,
+            lent: None,
+            in_ram: false,
+            rerun: false,
+            whole: false,
+        }
+    }
+}
+
+// Where a run's decode window is. A window a lending run borrows is on a
+// scratch file, asked for as its decoder asks, and is no part of either.
+#[derive(Clone, Copy, Debug)]
+enum Placed {
+    // Within the grant, in RAM.
+    Grant,
+    // Past what its object declared, in RAM, reserved whole: this many
+    // bytes of it.
+    Ram(u64),
 }
 
 // The e2e hook for a job that is extracting, on the run's own thread: with
@@ -193,11 +260,15 @@ fn extracting_hook(volumes: &RunVolumes) {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Reservation {
     Granted,
-    // It does not fit beside what is resident now: its slot went to the
-    // nodes named, which may start now.
+    // It does not fit beside what the decode pool holds now: its slot went
+    // to the nodes named, which may start now.
     Starved(Vec<NodeId>),
-    // It is larger than the resident limit itself, so it can never fit.
-    Refused,
+    // It is larger than the decode pool itself, so it can never fit:
+    // `needed` bytes against the `allowed` pool.
+    Refused { needed: u64, allowed: u64 },
+    // Its window may go above the ceiling, but it needs more RAM than the
+    // machine's `memory` leaves a run: `needed` bytes of window.
+    Beyond { needed: u64, memory: u64 },
 }
 
 // A run's last word, said when the run's thread lets it go, however the run
@@ -215,13 +286,14 @@ impl Drop for Ends {
     }
 }
 
-// One job's runs, the slots they take, and the resident bytes they reserve.
+// One job's runs, the slots they take, and the bytes they reserve in the
+// decode pool.
 #[derive(Debug)]
 pub(crate) struct Runs {
     scope: u64,
     mail: mpsc::Sender<Said>,
     slots: Slots,
-    accountant: Arc<HoldsAccountant>,
+    pool: Arc<DecodePool>,
     runs: BTreeMap<NodeId, Run>,
     // The nodes whose run came, went, or moved on in its life, each under
     // the generation of its latest change: a step reads again only the
@@ -229,6 +301,17 @@ pub(crate) struct Runs {
     marks: Marks<NodeId>,
     // What a run is granted as it starts, and the job's repairs too.
     hardware: Hardware,
+    // Where the runs keep the time their decoders spend executing.
+    clock: DecodeClock,
+    // The scratch-file windows a run's decoders may borrow, when the job
+    // lends any.
+    windows: Option<Arc<super::window::Windows>>,
+    // The nodes whose decoder's refusal stands only because the policy
+    // holds runs to the ceiling: a job lifted of its memory limit would be
+    // given the window refused, within what the machine leaves a run. A
+    // refused node's run is forgotten, so this outlives it; a node that
+    // runs again leaves it.
+    held_back: BTreeSet<NodeId>,
 }
 
 impl Runs {
@@ -236,23 +319,42 @@ impl Runs {
         scope: u64,
         slots: usize,
         mail: mpsc::Sender<Said>,
-        accountant: Arc<HoldsAccountant>,
+        pool: Arc<DecodePool>,
     ) -> Self {
         Self {
             scope,
             mail,
             slots: Slots::new(slots),
-            accountant,
+            pool,
             runs: BTreeMap::new(),
             marks: Marks::default(),
             hardware: Hardware::default(),
+            clock: DecodeClock::default(),
+            windows: None,
+            held_back: BTreeSet::new(),
         }
+    }
+
+    // The runs, lending their decoders windows from `windows`.
+    pub(crate) fn lending(mut self, windows: Arc<super::window::Windows>) -> Self {
+        self.windows = Some(windows);
+        self
     }
 
     // The runs, granted what `hardware` grants as each starts.
     pub(crate) fn on(mut self, hardware: Hardware) -> Self {
         self.hardware = hardware;
         self
+    }
+
+    // The runs, keeping the time they decode on `clock`.
+    pub(crate) fn timed(mut self, clock: DecodeClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    pub(crate) fn clock(&self) -> DecodeClock {
+        self.clock.clone()
     }
 
     pub(crate) fn hardware(&self) -> Hardware {
@@ -295,7 +397,7 @@ impl Runs {
             .is_some_and(|run| !matches!(run.life, Life::Ended { .. }))
     }
 
-    // The resident bytes reserved for the node's run.
+    // The bytes reserved for the node's run.
     #[cfg(test)]
     pub(crate) fn reserved(&self, node: NodeId) -> u64 {
         self.runs.get(&node).map_or(0, |run| run.reserved)
@@ -354,12 +456,7 @@ impl Runs {
         let mut admitted = self.follow(limit);
         admitted.extend(self.wake());
         self.marks.mark(node);
-        let run = self.runs.entry(node).or_insert(Run {
-            life: Life::Queued,
-            ticket: None,
-            volumes: None,
-            reserved: 0,
-        });
+        let run = self.runs.entry(node).or_insert_with(Run::queued);
         if run.ticket.is_some() {
             if !admitted.contains(&node) {
                 admitted.push(node);
@@ -370,29 +467,115 @@ impl Runs {
         admitted
     }
 
-    // Reserve what the node's run holds resident before it starts: the
-    // window its object declares and the run's fixed overhead. A
-    // reservation is taken once and kept across restarts; a window only
-    // narrows as the object's first bytes say more, so a restarted run
-    // never needs more than the first.
+    // Reserve what the node's run holds resident before it starts, from the
+    // decode pool: the window its object declares, no more than the
+    // hardware lets one decoder hold, and the run's fixed overhead. A window
+    // wider than that is the decoder's to refuse, with the sizes its headers
+    // state. A reservation is taken once and kept across restarts; a window
+    // only narrows as the object's first bytes say more, so a restarted run
+    // never needs more than the first. It is bookkeeping: nothing is
+    // allocated for it.
+    #[cfg(test)]
     pub(crate) fn reserve(&mut self, node: NodeId, window: u64) -> Reservation {
-        let namespace = self.namespace(node);
+        self.reserve_for(node, window, false)
+    }
+
+    // As `reserve`, for a run whose decoder borrows a window over its grant
+    // from its lender (`Engine::lends`) when `lends` says so.
+    //
+    // Under every policy such a run is handed the job's lender and borrows
+    // every window over its grant as its decoder asks for it: nothing is
+    // lent before it starts. It reserves the window its object declares, to
+    // the grant's window (`Grant::held`), and its overhead: what its decoder
+    // keeps in RAM, for a lent window is scratch, not RAM. On efficient a
+    // RAR naming a 4 GiB dictionary reserves 256 MiB and the overhead, not
+    // the whole pool. A run the scratch refused (`widen`) is not lent
+    // again: it is placed in RAM where the policy lets a run go above the
+    // ceiling, and its refusal stands where it does not.
+    //
+    // Any other run whose window is over the ceiling, as its object
+    // declares or as its decoder refused (`widen`), is placed in RAM above
+    // the ceiling where the policy lets it go above, reserved whole apart
+    // from the pool. It is admitted once it, every other run above the
+    // ceiling, and the whole pool fit under what the machine leaves a run.
+    // A window its decoder refused within the ceiling is reserved whole from
+    // the pool. Under a policy that holds runs to the ceiling, a window a
+    // run was widened to above it is dropped: the run is held to the
+    // ceiling, and its decoder refuses with the sizes.
+    //
+    // Where no window can be mapped (`window::MAPS`), no run is lent: one
+    // whose window is over the ceiling is placed in RAM from the start where
+    // the policy lets it go above, and is refused where it does not.
+    pub(crate) fn reserve_for(&mut self, node: NodeId, window: u64, lends: bool) -> Reservation {
+        let grant = self.hardware.grant();
+        self.held_back.remove(&node);
         let Some(run) = self.runs.get_mut(&node) else {
             return Reservation::Granted;
         };
         if run.reserved > 0 {
             return Reservation::Granted;
         }
-        let len = window.saturating_add(RUN_OVERHEAD);
-        if len > self.accountant.budgets().resident_limit {
-            return Reservation::Refused;
+        let ceiling = grant.ceiling();
+        let above = grant.over_limit == OverLimit::ScratchThenRam;
+        run.lends = lends && !run.in_ram && self.windows.is_some() && super::window::MAPS;
+        if above && !run.lends && window > ceiling {
+            run.wide = run.wide.max(Some(window));
         }
-        if self.accountant.reserve_resident(namespace, len) == Reserve::Granted {
-            run.reserved = len;
-            return Reservation::Granted;
+        if !above {
+            run.wide = run.wide.filter(|wide| *wide <= grant.held());
         }
+        // The window a run had, which a refusal must pass to ask for more.
+        // A lending run's decoder lends a window wider than its grant's, so
+        // that is the most it had: a refusal over it was never held in RAM.
+        let most = if run.lends { grant.held() } else { ceiling };
+        run.window = run.wide.unwrap_or(window.min(most));
+        let len = match run.wide {
+            // What a run inside its grant reserves: the window it was
+            // given, to the ceiling, and its overhead. That is the window
+            // its object declares, or for a lending run no more than the
+            // grant's window, which is all of it the run keeps in RAM.
+            None => {
+                run.placed = Placed::Grant;
+                run.window.min(ceiling).saturating_add(RUN_OVERHEAD)
+            }
+            Some(wide) => {
+                run.placed = Placed::Ram(wide);
+                wide.saturating_add(RUN_OVERHEAD)
+            }
+        };
+        let room = self.pool.room();
+        let taken = if len <= room.limit {
+            self.pool.stop_waiting(&mut run.whole);
+            self.pool.take(len)
+        } else if let Some(wide) = run.wide {
+            let stop = grant.above_ceiling();
+            if !self.pool.could_fit_above(len, stop) {
+                self.pool.stop_waiting(&mut run.whole);
+                run.placed = Placed::Grant;
+                return Reservation::Beyond {
+                    needed: wide,
+                    memory: grant.machine_bytes.unwrap_or(u64::MAX),
+                };
+            }
+            self.pool
+                .take_above(len, stop, &mut run.whole)
+                .map(|()| run.above = true)
+        } else {
+            return Reservation::Refused {
+                needed: len,
+                allowed: room.limit,
+            };
+        };
+        let room = match taken {
+            Ok(()) => {
+                run.reserved = len;
+                return Reservation::Granted;
+            }
+            Err(room) => room,
+        };
         run.life = Life::Starved {
-            resident: self.accountant.usage().resident,
+            freed: room.freed,
+            limit: room.limit,
         };
         self.marks.mark(node);
         let admissions = run
@@ -419,8 +602,27 @@ impl Runs {
         self.marks.mark(node);
         let volumes = Arc::new(RunVolumes::new(shelf, generation));
         run.volumes = Some(Arc::clone(&volumes));
-        let budget = self.hardware.grant().run;
-        let (scope, mail) = (self.scope, self.mail.clone());
+        let grant = self.hardware.grant();
+        let mut budget = grant.run.clone();
+        // Only a decoder that borrows, and that the scratch has not refused,
+        // is handed the lender, and borrows every window as it asks for it:
+        // every other is held to its grant and refuses a window over it with
+        // the sizes.
+        let lending = self
+            .windows
+            .as_ref()
+            .filter(|_| run.lends)
+            .map(|windows| windows.for_node(node));
+        run.lent = lending.as_ref().map(|(_, start)| *start);
+        budget.lender = lending.map(|(lender, _)| lender);
+        // The decoder may hold the window in RAM: what was reserved, the
+        // whole of it, whatever its first bytes declare.
+        if let Placed::Ram(wide) = run.placed {
+            budget.memory_bytes = budget.memory_bytes.max(Some(wide));
+            budget.window_bytes = Some(wide);
+            budget.window_reserved = true;
+        }
+        let (scope, mail, clock) = (self.scope, self.mail.clone(), self.clock.clone());
         let said = move |heard| Said {
             scope,
             node,
@@ -438,11 +640,16 @@ impl Runs {
                 mail: mail.clone(),
                 said: Some(said(Heard::Ended)),
             };
+            // The decoder executes from here until it returns, but while it
+            // waits on its volumes or on the job to hear it.
+            let decoding = Arc::new(clock.decoding());
+            volumes.decoding(Arc::downgrade(&decoding));
             let reader = Arc::clone(&volumes);
             let mut sink = |emit: Emit| {
                 if matches!(emit, Emit::Member { .. }) {
                     crate::e2e_failpoint::fire(crate::e2e_failpoint::EXTRACT_MEMBER_START);
                 }
+                let _waiting = decoding.wait();
                 extracting_hook(&volumes);
                 volumes.current() && mail.blocking_send(said(Heard::Emit(emit))).is_ok()
             };
@@ -454,6 +661,7 @@ impl Runs {
             if volumes.lost() {
                 sink(Emit::Refuse(Why::Unrepairable));
             }
+            drop(decoding);
             extracting_hook(&volumes);
         });
     }
@@ -462,6 +670,23 @@ impl Runs {
     // returns the nodes that may start now.
     pub(crate) fn ended(&mut self, node: NodeId, generation: u64, limit: usize) -> Vec<NodeId> {
         let mut admitted = self.follow(limit);
+        if let Some(run) = self.runs.get_mut(&node)
+            && std::mem::take(&mut run.rerun)
+        {
+            // Widened: it gives back what it reserved at the narrower
+            // window and starts again under the slot it holds, reserving
+            // the wider one.
+            run.life = Life::Queued;
+            run.volumes = None;
+            run.placed = Placed::Grant;
+            give_back(&self.pool, run);
+            self.marks.mark(node);
+            if run.ticket.is_some() {
+                admitted.push(node);
+            }
+            admitted.extend(self.wake());
+            return admitted;
+        }
         if let Some(run) = self.runs.get_mut(&node) {
             run.life = Life::Ended { generation };
             self.marks.mark(node);
@@ -469,6 +694,115 @@ impl Runs {
         }
         admitted.extend(self.wake());
         admitted
+    }
+
+    // The node's run refused a window of `needed` bytes, wider than the
+    // one it was given, that the grant lets it have: within the window the
+    // grant holds one decoder to, or above it where the policy lets a run go
+    // above. A decoder that does not say what it needs is given the grant's
+    // window first, then the `widest` its format has where the policy lets
+    // it go above. The run is stopped
+    // where it stands, what it says from here is not heard, and once it
+    // ends it starts again at that window. `false` when the grant holds it
+    // narrower, or it already had that window: its refusal stands. Each
+    // widening is wider than the last, so a run that refuses again with
+    // nothing wider to ask for stands refused.
+    pub(crate) fn widen(&mut self, node: NodeId, needed: Option<u64>, widest: Option<u64>) -> bool {
+        let grant = self.hardware.grant();
+        self.held_back.remove(&node);
+        let Some(run) = self.runs.get_mut(&node) else {
+            return false;
+        };
+        let held = grant.held();
+        let running = matches!(run.life, Life::Running { .. });
+        // A lending run whose lender found no folder with room for a window
+        // it asked for was refused by the scratch, not by its grant: it
+        // starts again, not lent, with the widest of every window it asked
+        // for, lent or refused, what its decoder said it needs and the
+        // window it had, in RAM under the machine's hard stop. Once only: a
+        // run in RAM is lent nothing, so the scratch cannot refuse it again,
+        // and what its decoder refuses from there is weighed as any run's
+        // refusal is. Only what its lender heard under this start counts.
+        // Where the policy lets nothing go above the ceiling, the scratch's
+        // refusal stands, with the sizes, as a decoder's refusal over the
+        // ceiling does.
+        let refused = self
+            .windows
+            .as_ref()
+            .zip(run.lent)
+            .filter(|_| run.lends && !run.in_ram)
+            .filter(|_| grant.over_limit == OverLimit::ScratchThenRam)
+            .and_then(|(windows, start)| windows.refused(node, start));
+        if let Some(refused) = refused
+            && running
+        {
+            run.in_ram = true;
+            run.wide = Some(run.window.max(refused).max(needed.unwrap_or(0)));
+            run.rerun = true;
+            if let Some(volumes) = &run.volumes {
+                volumes.stop();
+            }
+            return true;
+        }
+        let most = match grant.over_limit {
+            OverLimit::ScratchThenRam => u64::MAX,
+            OverLimit::ScratchThenFail => held,
+        };
+        // What a run lifted of its memory limit would be given.
+        let lifted = needed.or(widest);
+        let Some(needed) = needed.or_else(|| {
+            widest.map(|widest| match widest.min(held) {
+                within if within > run.window => within,
+                _ => widest.min(most),
+            })
+        }) else {
+            return false;
+        };
+        let wider = needed <= most && needed > run.window && running;
+        let held_back = !wider
+            && grant.over_limit == OverLimit::ScratchThenFail
+            && lifted.is_some_and(|lifted| {
+                lifted > run.window.max(held)
+                    && self
+                        .pool
+                        .could_fit_above(lifted.saturating_add(RUN_OVERHEAD), grant.above_ceiling())
+            });
+        if held_back {
+            self.held_back.insert(node);
+        }
+        if wider {
+            run.wide = Some(needed);
+            run.rerun = true;
+            if let Some(volumes) = &run.volumes {
+                volumes.stop();
+            }
+        }
+        wider
+    }
+
+    // What the node's run was allowed, when it is lent under a policy that
+    // holds runs to the ceiling and the scratch refused it a window for want
+    // of room: that refusal names no limit, and the run was held to the
+    // grant's window. Any other refusal naming no limit is left so.
+    pub(crate) fn allowed(&self, node: NodeId) -> Option<u64> {
+        let grant = self.hardware.grant();
+        let run = self
+            .runs
+            .get(&node)
+            .filter(|run| run.lends && grant.over_limit == OverLimit::ScratchThenFail)?;
+        let (windows, start) = self.windows.as_ref().zip(run.lent)?;
+        windows.refused(node, start).map(|_| grant.held())
+    }
+
+    // Whether a refusal stands in the job only because the policy holds runs
+    // to the ceiling, so a reprocess with no memory limit could finish it.
+    pub(crate) fn held_to_ceiling(&self) -> bool {
+        !self.held_back.is_empty()
+    }
+
+    // Whether the node's run was widened and is ending, to start again.
+    pub(crate) fn rerunning(&self, node: NodeId) -> bool {
+        self.runs.get(&node).is_some_and(|run| run.rerun)
     }
 
     // Stop every run where it stands: the job is going down. What a run read
@@ -539,16 +873,22 @@ impl Runs {
         self.admit(admissions)
     }
 
-    // Starved runs ask for a slot again once resident bytes were released
-    // since they were turned away, in the order they first asked.
+    // Whether a run turned away for memory may ask again: the decode pool
+    // was given bytes back since, by this job or any other, or it grew.
+    pub(crate) fn wakeable(&self) -> bool {
+        let room = self.pool.room();
+        self.runs.values().any(|run| woken(run.life, room))
+    }
+
+    // Starved runs ask for a slot again once the decode pool was given
+    // bytes back since they were turned away, or it grew, in the order
+    // they first asked.
     fn wake(&mut self) -> Vec<NodeId> {
-        let resident = self.accountant.usage().resident;
+        let room = self.pool.room();
         let woken: Vec<NodeId> = self
             .runs
             .iter()
-            .filter(
-                |(_, run)| matches!(run.life, Life::Starved { resident: then } if resident < then),
-            )
+            .filter(|(_, run)| woken(run.life, room))
             .map(|(node, _)| *node)
             .collect();
         woken
@@ -573,27 +913,22 @@ impl Runs {
 
     // Give back the node's reservation and its slot.
     fn free(&mut self, node: NodeId) -> Vec<NodeId> {
-        let namespace = self.namespace(node);
         let Some(run) = self.runs.get_mut(&node) else {
             return Vec::new();
         };
-        let reserved = std::mem::take(&mut run.reserved);
-        if reserved > 0 {
-            self.accountant.release_resident(namespace, reserved);
-        }
+        give_back(&self.pool, run);
+        self.pool.stop_waiting(&mut run.whole);
+        run.placed = Placed::Grant;
+        run.lends = false;
+        run.lent = None;
+        run.in_ram = false;
+        run.rerun = false;
         let admissions = run
             .ticket
             .take()
             .map(|ticket| self.slots.release(ticket))
             .unwrap_or_default();
         self.admit(admissions)
-    }
-
-    fn namespace(&self, node: NodeId) -> HoldsNamespace {
-        HoldsNamespace {
-            scope: self.scope,
-            node,
-        }
     }
 
     fn admit(&mut self, admissions: Admissions) -> Vec<NodeId> {
@@ -609,16 +944,29 @@ impl Runs {
 }
 
 // A job that goes away gives back what its runs reserved, or every other
-// job would count it against the resident limit for good.
+// job would count it against the decode pool for good.
 impl Drop for Runs {
     fn drop(&mut self) {
-        for (node, run) in &self.runs {
-            if run.reserved > 0 {
-                self.accountant
-                    .release_resident(self.namespace(*node), run.reserved);
-            }
+        for run in self.runs.values_mut() {
+            give_back(&self.pool, run);
+            self.pool.stop_waiting(&mut run.whole);
         }
     }
+}
+
+// Give back what the run reserved, to the pool or above the ceiling where it
+// was taken, once.
+fn give_back(pool: &DecodePool, run: &mut Run) {
+    let len = std::mem::take(&mut run.reserved);
+    if std::mem::take(&mut run.above) {
+        pool.release_above(len);
+    } else {
+        pool.release(len);
+    }
+}
+
+fn woken(life: Life, room: pool::Room) -> bool {
+    matches!(life, Life::Starved { freed, limit } if room.freed > freed || room.limit > limit)
 }
 
 fn asker(node: NodeId) -> AskerId {

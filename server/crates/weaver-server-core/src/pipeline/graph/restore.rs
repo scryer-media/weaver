@@ -14,6 +14,8 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use weaver_graph::holds::HoldsAccountant;
 
+use super::engine::DecodePool;
+
 use super::checkpoint::{self, CheckpointError};
 use super::engine::Said;
 use super::hardware::Hardware;
@@ -103,7 +105,12 @@ pub(crate) static RESTORES: std::sync::atomic::AtomicUsize = std::sync::atomic::
 pub(crate) struct RestoreSeat {
     db: crate::Database,
     working_dir: PathBuf,
+    // The job's staging directory on the complete device, when its
+    // delivered files lie there, and the free space of that device.
+    output: Option<(PathBuf, CapacityReader)>,
+    output_free_disk: CapacityReader,
     accountant: Arc<HoldsAccountant>,
+    decode: Arc<DecodePool>,
     free_disk: CapacityReader,
     slots: usize,
     mail: mpsc::Sender<Said>,
@@ -111,6 +118,8 @@ pub(crate) struct RestoreSeat {
     metrics: Arc<PipelineMetrics>,
     extraction_limits: Arc<ExtractionLimits>,
     spec_password: Option<String>,
+    data_dir: Option<(PathBuf, CapacityReader, super::window::ScratchLedger)>,
+    window_ledger: super::window::ScratchLedger,
 }
 
 impl Pipeline {
@@ -122,7 +131,12 @@ impl Pipeline {
         RestoreSeat {
             db: self.db.clone(),
             working_dir: working_dir.to_path_buf(),
+            output: None,
+            output_free_disk: self
+                .storage_capacity
+                .reader(crate::operations::StorageRoot::Complete),
             accountant: Arc::clone(&self.graph_holds),
+            decode: Arc::clone(&self.graph_decode),
             free_disk: self
                 .storage_capacity
                 .reader(crate::operations::StorageRoot::Intermediate),
@@ -135,6 +149,8 @@ impl Pipeline {
             metrics: Arc::clone(&self.metrics),
             extraction_limits: Arc::clone(&self.extraction_limits),
             spec_password,
+            data_dir: Some(self.window_data_dir()),
+            window_ledger: self.window_ledgers.intermediate.clone(),
         }
     }
 }
@@ -155,11 +171,28 @@ pub(crate) fn root_files(spec: &JobSpec) -> Vec<RootFile> {
 }
 
 impl RestoreSeat {
-    // The seat for one job: its password, and its working directory as its
-    // install found it.
-    pub(crate) fn for_job(mut self, spec_password: Option<String>, working_dir: &Path) -> Self {
+    // The seat for one job: its password, its working directory as its
+    // install found it, and its staging directory when one was found: then
+    // the files it delivers lie there.
+    pub(crate) fn for_job(
+        mut self,
+        spec_password: Option<String>,
+        working_dir: &Path,
+        staging_dir: Option<&Path>,
+    ) -> Self {
         self.spec_password = spec_password;
         self.working_dir = working_dir.to_path_buf();
+        self.output = staging_dir.map(|dir| (dir.to_path_buf(), self.output_free_disk.clone()));
+        self
+    }
+
+    // The seat for a job whose metadata asks for no memory limit: its runs
+    // are granted a window over the ceiling, as the reprocess that set it
+    // granted them.
+    pub(crate) fn lifted(mut self, metadata: &[(String, String)]) -> Self {
+        self.hardware = self
+            .hardware
+            .lifted(crate::history::attributes::no_memory_limit(metadata));
         self
     }
 
@@ -172,6 +205,9 @@ impl RestoreSeat {
     // and fetches every article, and its first checkpoint replaces the old
     // rows whole. Blocks: called off the pipeline thread. A job whose work
     // crashed the daemon never reaches here: its install is given no seat.
+    // A job that starts afresh finds its directories as its last run left
+    // them, which may have stopped before its first checkpoint committed:
+    // no row names anything there as the job's, so all of it goes first.
     pub(crate) fn restore(
         self,
         job_id: JobId,
@@ -181,8 +217,11 @@ impl RestoreSeat {
         RESTORES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A restore replays the job's own facts: a panic in it is the job's.
         let _job = crate::runtime::panic_trap::JobScope::enter(job_id);
+        let roots: Vec<PathBuf> = std::iter::once(self.working_dir.clone())
+            .chain(self.output.as_ref().map(|(dir, _)| dir.clone()))
+            .collect();
         let loaded = self.db.load_graph_checkpoint(job_id);
-        loaded
+        let restored = loaded
             .map_err(GraphRestoreError::from)
             .and_then(|rows| rows.ok_or(GraphRestoreError::NoCheckpoint(job_id.0)))
             .and_then(|rows| self.rebuild(job_id, files, rows))
@@ -196,7 +235,13 @@ impl RestoreSeat {
                     "graph job checkpoint is not one this build restores; the job starts afresh"
                 );
                 GraphRestoreError::NoCheckpoint(job_id.0)
-            })
+            });
+        if matches!(restored, Err(GraphRestoreError::NoCheckpoint(_))) {
+            for root in &roots {
+                sweep_all(root);
+            }
+        }
+        restored
     }
 
     fn rebuild(
@@ -207,18 +252,25 @@ impl RestoreSeat {
     ) -> Result<GraphRestore, GraphRestoreError> {
         let snapshot = checkpoint::snapshot(&rows)?;
         sweep_unnamed(&self.working_dir, &snapshot, &rows.held_parts)?;
+        if let Some((output_dir, _)) = &self.output {
+            sweep_unnamed(output_dir, &snapshot, &rows.held_parts)?;
+        }
         let held = held_parts_from_rows(job_id, &self.working_dir, &rows.held_parts);
         let storage = Storage {
             passwords: restore_passwords(&self.db, job_id, self.spec_password.as_deref())?,
             caps: caps_for(&self.db, &self.extraction_limits, &files),
             working_dir: self.working_dir,
+            output: self.output,
             accountant: self.accountant,
+            decode: self.decode,
             free_disk: self.free_disk,
             slots: self.slots,
             mail: self.mail,
             nesting: super::limits::NESTING,
             hardware: self.hardware,
             metrics: Some(self.metrics),
+            data_dir: self.data_dir,
+            window_ledger: self.window_ledger,
         };
         let limit = storage.slots;
         let Restored {
@@ -262,7 +314,7 @@ impl RestoreSeat {
 // before the job is rebuilt, so no file the job opens again meets bytes it
 // never recorded and no file it never recorded is delivered. The checkpoint
 // names each member's file at the one place the restore opens it, every
-// envelope, every holds scratch and every spooled part. The
+// envelope, every holds scratch and spill file and every spooled part. The
 // directory's own marker and the run's cache are the directory's, never the
 // job's, and stay. A file that cannot be removed stays; the job does not
 // read it.
@@ -289,10 +341,13 @@ pub(super) fn sweep_unnamed(
             .clone()
             .unwrap_or_else(|| super::envelope::envelope_name(kept.node, kept.envelope))
     });
-    let holds = snapshot
-        .holds
-        .iter()
-        .map(|hold| super::namespace::scratch_name(hold.node));
+    let holds = snapshot.holds.iter().map(|hold| {
+        if hold.on_file {
+            super::namespace::spill_name(hold.node, weaver_graph::MemberId(hold.held.volume.0))
+        } else {
+            super::namespace::scratch_name(hold.node)
+        }
+    });
     let spooled = held_parts.iter().map(|part| part.spool_path.clone());
     // Each name as the path it takes on disk, the key the name ledger and
     // the writer compare names by: a directory "Folder/" and a file
@@ -315,6 +370,14 @@ pub(super) fn sweep_unnamed(
     }
     sweep_within(working_dir, Path::new(""), &named, &within);
     Ok(())
+}
+
+// A job with no checkpoint to come back to has nothing in its directory:
+// every file a step wrote goes, as `sweep_unnamed` takes what no
+// checkpoint names. The directory's own marker and the run's cache stay.
+fn sweep_all(dir: &Path) {
+    let within = HashSet::from([key(INTERNAL_DIR)]);
+    sweep_within(dir, Path::new(""), &HashSet::new(), &within);
 }
 
 fn sweep_within(dir: &Path, at: &Path, named: &HashSet<String>, within: &HashSet<String>) {

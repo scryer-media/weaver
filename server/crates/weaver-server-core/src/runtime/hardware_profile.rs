@@ -23,6 +23,10 @@ pub struct ProfileTuning {
     // extraction ceiling still bounds it; this only stops one archive from
     // taking the whole allowance.
     pub sevenz_decode_memory_bytes: u64,
+    // The largest window one decoder of a run may hold in memory: a RAR
+    // dictionary, an xz or zstd window. A member that asks for more is
+    // refused. Never more than the run's memory above.
+    pub decode_window_bytes: u64,
     // The extraction memory ceiling, before the `[64 MiB, 64 GiB]` clamp and
     // before an explicit environment override replaces it.
     pub extraction_memory_bytes: u64,
@@ -53,6 +57,24 @@ pub struct ProfileTuning {
     // machine's memory. It never touches a configured limit. `None` leaves
     // the derived value alone.
     pub direct_store_resident_default_cap_bytes: Option<u64>,
+    // What a run whose decode window is wider than the profile's ceiling
+    // gets.
+    pub over_limit: OverLimit,
+}
+
+// What a decode window wider than the profile's ceiling gets. Every profile
+// lends it from a scratch file first, so RAM stays at the ceiling; they
+// differ only in what follows when the scratch is refused (no room, a file
+// that cannot be made or mapped, or a platform that maps none).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OverLimit {
+    // The run is refused and the job ends Failed, with the sizes; a retry
+    // with no memory limit runs it again as `ScratchThenRam`.
+    #[default]
+    ScratchThenFail,
+    // The run starts again with the window in RAM above the ceiling, up to
+    // what the machine has.
+    ScratchThenRam,
 }
 
 // A share of the machine's memory: a fraction of it, up to a ceiling.
@@ -80,12 +102,14 @@ struct ProfileRow {
     // Physical cores, after any cgroup limit, the machine must have.
     min_cores: usize,
     sevenz_decode_memory_bytes: u64,
+    decode_window_bytes: u64,
     // The share of the machine's memory extraction may reserve.
     extraction_memory_divisor: u64,
     max_concurrent_downloads_cap: Option<usize>,
     max_concurrent_extractions: usize,
     par3_memory: MemoryShare,
     direct_store_resident_default_cap_bytes: Option<u64>,
+    over_limit: OverLimit,
 }
 
 // Ordered from the least demanding to the most: `available` preserves this
@@ -96,6 +120,7 @@ const TABLE: [ProfileRow; 3] = [
         min_memory_bytes: 0,
         min_cores: 0,
         sevenz_decode_memory_bytes: 512 * MIB,
+        decode_window_bytes: 256 * MIB,
         extraction_memory_divisor: 4,
         max_concurrent_downloads_cap: Some(10),
         max_concurrent_extractions: 2,
@@ -104,12 +129,14 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: 256 * MIB,
         },
         direct_store_resident_default_cap_bytes: Some(256 * MIB),
+        over_limit: OverLimit::ScratchThenFail,
     },
     ProfileRow {
         profile: HardwareProfile::Balanced,
         min_memory_bytes: 4 * GIB,
         min_cores: 4,
         sevenz_decode_memory_bytes: GIB,
+        decode_window_bytes: GIB,
         extraction_memory_divisor: 2,
         max_concurrent_downloads_cap: None,
         max_concurrent_extractions: 4,
@@ -118,12 +145,14 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: GIB,
         },
         direct_store_resident_default_cap_bytes: None,
+        over_limit: OverLimit::ScratchThenRam,
     },
     ProfileRow {
         profile: HardwareProfile::Performance,
         min_memory_bytes: 16 * GIB,
         min_cores: 8,
         sevenz_decode_memory_bytes: 4 * GIB,
+        decode_window_bytes: 4 * GIB,
         extraction_memory_divisor: 2,
         max_concurrent_downloads_cap: None,
         max_concurrent_extractions: 6,
@@ -132,6 +161,7 @@ const TABLE: [ProfileRow; 3] = [
             cap_bytes: 2 * GIB,
         },
         direct_store_resident_default_cap_bytes: None,
+        over_limit: OverLimit::ScratchThenRam,
     },
 ];
 
@@ -263,6 +293,7 @@ impl HardwareProfile {
         };
         ProfileTuning {
             sevenz_decode_memory_bytes: row.sevenz_decode_memory_bytes,
+            decode_window_bytes: row.decode_window_bytes,
             extraction_memory_bytes: memory / row.extraction_memory_divisor,
             decode_threads: match self {
                 Self::Efficient => 2,
@@ -278,6 +309,7 @@ impl HardwareProfile {
                 Self::Performance => None,
             },
             direct_store_resident_default_cap_bytes: row.direct_store_resident_default_cap_bytes,
+            over_limit: row.over_limit,
         }
     }
 

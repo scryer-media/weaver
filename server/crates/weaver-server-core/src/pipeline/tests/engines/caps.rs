@@ -6,10 +6,11 @@
 // word, at the extraction stage; a name the operator's policy refuses fails
 // it with the policy's sentence. The depth limit is no breach: the tree
 // never builds an object past it, the member is delivered as the container
-// it is, and the job goes on. The deadline has no row: it is a wall clock,
-// and no row here races one.
+// it is, and the job goes on. The deadline has no row: it counts the time
+// decoders execute, which a row here cannot hold still, so it is pinned
+// beside the clock and the namespace instead.
 
-use super::harness::{ARTICLE, Post, Scenario, assert_fetched_once, payload, run};
+use super::harness::{ARTICLE, Post, Scenario, assert_fetched_once, payload, run, run_then};
 use super::restart::run_restarting;
 use super::streams::{gzip, tar, xz};
 use crate::history::HistoryFailureKind;
@@ -134,6 +135,37 @@ async fn a_member_declaring_past_its_byte_cap_fails_naming_member_bytes() {
             .is_some_and(|failure| failure.contains(&declared)),
         "{:?}",
         graph.failure
+    );
+}
+
+#[tokio::test]
+async fn a_stored_member_split_over_volumes_bound_one_by_one_stays_under_the_ratio() {
+    // The member's file takes its whole length at its first write, while
+    // only the first of the eight volumes is bound. The ratio is taken over
+    // every volume posted, not only the ones bound so far: twice one volume
+    // is under the member, twice the eight is over it. Each article holds a
+    // whole front, as a 750 KB article of a 100 MiB volume does, so the
+    // first volume is founded, and its member written, on its first article.
+    let front = weaver_graph::member::FIRST_BYTES;
+    let body = payload(8 * 2 * front, 81);
+    let posts = single_member_store_set("beacon.bin", &body, 8)
+        .into_iter()
+        .map(|(name, bytes)| Post::plain(&name, bytes))
+        .collect();
+    let scenario = Scenario::new(posts).framed(front).limits(limits(|limits| {
+        limits.max_ratio = 2;
+        limits.ratio_floor_bytes = 1024;
+    }));
+    let graph = run(&scenario).await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    let delivered = graph
+        .files
+        .iter()
+        .find(|(path, _)| path.rsplit('/').next() == Some("beacon.bin"));
+    assert!(
+        delivered.is_some_and(|(_, delivered)| *delivered == body),
+        "{:?}",
+        graph.files.keys()
     );
 }
 
@@ -275,6 +307,117 @@ async fn a_member_the_policy_allows_is_untouched() {
             graph.files.keys()
         );
     }
+}
+
+// A stored policy that does not parse is no reason to hold a job: the job is
+// judged by the default unacceptable extensions, not the operator's list,
+// and the stored value is left as it is.
+#[tokio::test]
+async fn a_job_whose_policy_does_not_parse_is_judged_by_the_default() {
+    let refused = vec![
+        vec![Post::plain("beacon.exe", payload(ARTICLE, 75))],
+        vec![Post::plain(
+            "lantern.tar",
+            tar(&[("beacon.exe", payload(2 * ARTICLE + 3, 75))]),
+        )],
+    ];
+    for posts in refused {
+        let scenario = Scenario::new(posts).unacceptable(&["iso"]).policy_corrupt();
+        let graph = run(&scenario).await;
+        assert_eq!(
+            graph.failure.as_deref(),
+            Some("unwanted extension '.exe' in 'beacon.exe'"),
+            "{:?}",
+            graph.status
+        );
+        assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Unpack));
+        assert!(graph.files.is_empty(), "{:?}", graph.files.keys());
+    }
+
+    // The operator's list would refuse it; the default does not.
+    let body = payload(2 * ARTICLE + 3, 76);
+    let scenario = Scenario::new(vec![Post::plain(
+        "lantern.tar",
+        tar(&[("disc.iso", body.clone())]),
+    )])
+    .unacceptable(&["iso"])
+    .policy_corrupt();
+    let mut stored = None;
+    let graph = run_then(&scenario, async |pipeline, _| {
+        stored = pipeline
+            .db
+            .get_setting(crate::post_processing::settings::SETTINGS_KEY)
+            .unwrap();
+    })
+    .await;
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    assert!(
+        graph
+            .files
+            .iter()
+            .any(|(path, bytes)| path.ends_with("disc.iso") && *bytes == body),
+        "{:?}",
+        graph.files.keys()
+    );
+    assert_eq!(stored.as_deref(), Some(super::harness::CORRUPT_POLICY));
+}
+
+// A restored job is judged as one built fresh: a stored policy that does not
+// parse is the default there too. The refused name comes out of the archive
+// only after the run has restarted.
+#[tokio::test]
+async fn a_restored_job_whose_policy_does_not_parse_is_judged_by_the_default() {
+    let scenario = Scenario::new(vec![Post::plain(
+        "lantern.tar",
+        tar(&[
+            ("lantern.bin", payload(4 * ARTICLE, 74)),
+            ("beacon.exe", payload(ARTICLE, 75)),
+        ]),
+    )])
+    .unacceptable(&["iso"])
+    .policy_corrupt();
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert!(restarted.restarts > 0, "the run restarted");
+    assert_eq!(
+        restarted.status,
+        Some(JobStatus::Failed {
+            error: "unwanted extension '.exe' in 'beacon.exe'".into()
+        })
+    );
+    assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
+}
+
+// A pipeline starts on stored settings that do not parse, and its scripts are
+// admitted as under the defaults. The value stays as stored.
+#[tokio::test]
+async fn a_pipeline_starts_on_stored_settings_that_do_not_parse() {
+    use crate::pipeline::tests::{new_direct_pipeline, retire_pipeline_database};
+    use crate::post_processing::events::refresh_admission_hint;
+    use crate::post_processing::settings::SETTINGS_KEY;
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let refused_by_default = refresh_admission_hint(&pipeline.db).unwrap();
+    pipeline
+        .db
+        .set_setting(SETTINGS_KEY, super::harness::CORRUPT_POLICY)
+        .unwrap();
+    retire_pipeline_database(pipeline).await;
+
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    assert_eq!(
+        refresh_admission_hint(&pipeline.db).unwrap(),
+        refused_by_default
+    );
+    assert_eq!(
+        pipeline.db.post_processing_settings().unwrap(),
+        Default::default()
+    );
+    assert_eq!(
+        pipeline.db.get_setting(SETTINGS_KEY).unwrap().as_deref(),
+        Some(super::harness::CORRUPT_POLICY)
+    );
+    retire_pipeline_database(pipeline).await;
 }
 
 #[tokio::test]

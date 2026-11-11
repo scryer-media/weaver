@@ -7,7 +7,8 @@
 // directory order, each decoded straight into the sink with its CRC checked
 // as it goes. Reads wait for bytes still on their way, so the run inflates
 // as the download brings each entry, never ahead of it. A verdict waits for
-// the volumes to close: the lengths it rests on are final only then.
+// the volumes to close, as the lengths it rests on are final only then;
+// an ask for a password does not.
 
 use std::io::{self, Write};
 use std::sync::Arc;
@@ -67,7 +68,13 @@ impl Extraction for Run {
         };
         // An owner that failed a read already knows why too, as it does
         // when a volume closed at another length than the run read.
-        if failed.load(Ordering::Acquire) || !disks.settled() {
+        if failed.load(Ordering::Acquire) {
+            return;
+        }
+        // An ask for a password rests on no volume's length, and the tree
+        // rules on it only once the job is quiet, so it is said at once: the
+        // run the offer starts then decrypts alongside the download.
+        if verdict != Emit::NeedsPassword && !disks.settled() {
             return;
         }
         // A member left open was built on bytes the run cannot vouch for.

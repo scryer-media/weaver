@@ -595,12 +595,6 @@ async fn a_split_7z_with_encrypted_headers_whose_last_volume_came_first_opens_on
     ))
     .password(SECRET);
     let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
-    while pipeline
-        .jobs
-        .get_mut(&JOB)
-        .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
-        .is_some()
-    {}
     serve_posts(&mut pipeline, &scenario, 2..3).await;
     serve_posts(&mut pipeline, &scenario, 0..1).await;
     serve_posts(&mut pipeline, &scenario, 1..2).await;

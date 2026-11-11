@@ -2,7 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // Holds are bytes that arrived before the headers that say where they go.
-// They wait in RAM, and on a namespace's scratch file when RAM runs short.
+// They wait in RAM, on a namespace's scratch file when RAM runs short, and
+// past the budgets in a file of the member's own, at their own offsets.
 //
 // Two types share the work. The `HoldsAccountant` is one per process and
 // only counts: it never sees a byte, so every namespace can ask it under one
@@ -11,8 +12,10 @@
 // write and where, and the caller reports free space, so both stay
 // deterministic and testable.
 //
-// A breach is never a pause. It is a decision handed to the caller, which
-// refuses the member to a leaf (`Why::HoldsBreached`) and keeps downloading.
+// A breach is never a pause and never a refusal. Bytes the budgets cannot
+// take are spilled: the caller writes them to the member's spill file at
+// their offsets, and the ledger keeps them held there, counted by no budget,
+// since they are the job's own download, which its admission sized.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
@@ -49,7 +52,7 @@ pub struct HoldBudgets {
 }
 
 // The ceiling a reservation would have crossed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Budget {
     ResidentLimit,
     ScratchTotal,
@@ -168,6 +171,24 @@ impl HoldsAccountant {
         self.lock().budgets = budgets;
     }
 
+    // How far a budget stands, as (held, limit): what a spill past it
+    // reports. The disk reserve stands as the free space against it.
+    pub fn standing(
+        &self,
+        namespace: HoldsNamespace,
+        budget: Budget,
+        free_disk: u64,
+    ) -> (u64, u64) {
+        let accounts = self.lock();
+        let budgets = accounts.budgets;
+        match budget {
+            Budget::ResidentLimit => (accounts.resident, budgets.resident_limit),
+            Budget::ScratchTotal => (accounts.scratch, budgets.scratch_total),
+            Budget::ScratchCeiling => (accounts.usage(namespace).scratch, budgets.scratch_ceiling),
+            Budget::DiskReserve => (free_disk, budgets.disk_reserve),
+        }
+    }
+
     pub fn usage(&self) -> HoldsUsage {
         let accounts = self.lock();
         HoldsUsage {
@@ -231,6 +252,17 @@ impl HoldsAccountant {
         Reserve::Granted
     }
 
+    // Room `len` new bytes of RAM past the resident limit, for bytes no
+    // file may take yet: they are counted, and the next holds page out
+    // around them.
+    pub fn reserve_resident_past_limit(&self, namespace: HoldsNamespace, len: u64) {
+        let mut accounts = self.lock();
+        let mut usage = accounts.usage(namespace);
+        usage.resident += len;
+        accounts.resident += len;
+        accounts.store(namespace, usage);
+    }
+
     pub fn release_resident(&self, namespace: HoldsNamespace, len: u64) {
         let mut accounts = self.lock();
         let mut usage = accounts.usage(namespace);
@@ -264,6 +296,8 @@ pub enum Location {
     Ram(Bytes),
     // A span of this namespace's scratch file.
     Scratch { offset: u64, len: u64 },
+    // The member's spill file, at the hold's own offsets.
+    Spilled,
 }
 
 // Resident bytes the caller must write to the scratch file at
@@ -292,10 +326,19 @@ pub enum Placed {
     Ram,
     // Straight to scratch; their write is the last `PageOut`.
     Scratch,
-    // Not held. Page-outs made before the breach stand and must still be
-    // written; whatever the new bytes overlapped is no longer held either,
-    // since a re-hold replaces it.
-    Breached(Budget),
+    // Past the budget named: held in the member's spill file, which the
+    // caller writes the bytes to before it reads that range back.
+    // Page-outs made before it stand and must still be written.
+    Spilled(Budget),
+}
+
+// Resident bytes the caller must write to the member's spill file at their
+// own offsets. The ledger already holds them there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Spill {
+    pub volume: VolumeIndex,
+    pub range: ByteRange,
+    pub bytes: Bytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -328,10 +371,6 @@ struct Hold {
 }
 
 impl Hold {
-    fn is_resident(&self) -> bool {
-        matches!(self.location, Location::Ram(_))
-    }
-
     // The location of `piece`, which lies inside this hold.
     fn slice(&self, piece: ByteRange) -> Location {
         let skip = piece.start - self.range.start;
@@ -343,6 +382,7 @@ impl Hold {
                 offset: offset + skip,
                 len: piece.len(),
             },
+            Location::Spilled => Location::Spilled,
         }
     }
 
@@ -370,7 +410,7 @@ impl Hold {
     fn keep(&self, piece: ByteRange) -> Location {
         match self.slice(piece) {
             Location::Ram(bytes) => Location::Ram(Bytes::copy_from_slice(&bytes)),
-            scratch @ Location::Scratch { .. } => scratch,
+            kept @ (Location::Scratch { .. } | Location::Spilled) => kept,
         }
     }
 }
@@ -387,9 +427,11 @@ fn byte_len(bytes: &Bytes) -> u64 {
 
 // The holds of one namespace.
 //
-// Scratch space is a bump allocator: offsets grow and are not reused while
-// anything lives on scratch, and start again at zero once nothing does. The
-// file can therefore be larger than what is live; the accountant counts the
+// Scratch space is a bump allocator: offsets grow and are never reused until
+// the owner rewinds it, which it does only once nothing lives on scratch and
+// a checkpoint naming none of the file has committed: until then the one the
+// database holds may name any byte below the extent. The file can therefore
+// be larger than what is live; the accountant counts the
 // live bytes, and the disk reserve sees the real file through the free space
 // the caller reports.
 // It shares the accountant it reports to, so dropping it releases whatever
@@ -407,6 +449,15 @@ pub struct HoldLedger {
     scratch_end: u64,
     resident: u64,
     scratch: u64,
+    spilled: u64,
+    // Bytes held in each volume's spill file, so whether a member still
+    // holds anything there is one lookup, asked on every take.
+    spilled_in: BTreeMap<VolumeIndex, u64>,
+    // Each volume whose spill file no new bytes may enter below the offset
+    // given, as the owner says: a checkpoint the database holds may name
+    // the bytes there, and new bytes would pair them with state they were
+    // never part of. Bytes that would spill there stay in RAM instead.
+    off_file: BTreeMap<VolumeIndex, u64>,
 }
 
 impl HoldLedger {
@@ -420,6 +471,9 @@ impl HoldLedger {
             scratch_end: 0,
             resident: 0,
             scratch: 0,
+            spilled: 0,
+            spilled_in: BTreeMap::new(),
+            off_file: BTreeMap::new(),
         }
     }
 
@@ -491,7 +545,7 @@ impl HoldLedger {
                     }
                     Some(Err(budget)) => {
                         return HoldOutcome {
-                            placed: Placed::Breached(budget),
+                            placed: self.past_budgets(volume, range, bytes, evidence, budget),
                             page_outs,
                         };
                     }
@@ -525,10 +579,49 @@ impl HoldLedger {
                 }
             }
             Reserve::Breached(budget) => HoldOutcome {
-                placed: Placed::Breached(budget),
+                placed: self.past_budgets(volume, range, bytes, evidence, budget),
                 page_outs,
             },
         }
+    }
+
+    // Bytes past the budget named go to their spill file, unless the owner
+    // keeps that part of the file off limits: then they stay in RAM past the
+    // limit until it lifts that, and are never written there meanwhile.
+    fn past_budgets(
+        &mut self,
+        volume: VolumeIndex,
+        range: ByteRange,
+        bytes: Bytes,
+        evidence: Vec<Evidence>,
+        budget: Budget,
+    ) -> Placed {
+        if self.off_file(volume, range) {
+            self.accountant
+                .reserve_resident_past_limit(self.namespace, range.len());
+            self.insert(volume, range, Location::Ram(bytes), evidence);
+            return Placed::Ram;
+        }
+        self.insert(volume, range, Location::Spilled, evidence);
+        Placed::Spilled(budget)
+    }
+
+    fn off_file(&self, volume: VolumeIndex, range: ByteRange) -> bool {
+        self.off_file
+            .get(&volume)
+            .is_some_and(|&below| range.start < below)
+    }
+
+    // No new bytes of `volume` enter its spill file below `below` until
+    // `allow_file`: a checkpoint the database holds may name what is there.
+    pub fn keep_off_file(&mut self, volume: VolumeIndex, below: u64) {
+        let kept = self.off_file.entry(volume).or_default();
+        *kept = (*kept).max(below);
+    }
+
+    // The volume's spill file takes new bytes anywhere again.
+    pub fn allow_file(&mut self, volume: VolumeIndex) {
+        self.off_file.remove(&volume);
     }
 
     // Release the held parts of `range`, which now have a home, in offset
@@ -577,6 +670,9 @@ impl HoldLedger {
         self.resident_by_age.clear();
         self.resident = 0;
         self.scratch = 0;
+        self.spilled = 0;
+        self.spilled_in.clear();
+        self.off_file.clear();
         self.scratch_end = 0;
     }
 
@@ -616,7 +712,30 @@ impl HoldLedger {
     }
 
     pub fn total_held(&self) -> u64 {
-        self.resident + self.scratch
+        self.resident + self.scratch + self.spilled
+    }
+
+    pub fn spilled_bytes(&self) -> u64 {
+        self.spilled
+    }
+
+    // Whether anything of `volume` is held in its spill file.
+    pub fn spills(&self, volume: VolumeIndex) -> bool {
+        self.spilled_in.contains_key(&volume)
+    }
+
+    // Every hold in a spill file, in volume and offset order: what a
+    // checkpoint records beside the scratch holds.
+    pub fn spilled_holds(&self) -> Vec<(VolumeIndex, ByteRange)> {
+        self.volumes
+            .iter()
+            .flat_map(|(volume, holds)| {
+                holds
+                    .values()
+                    .filter(|hold| hold.location == Location::Spilled)
+                    .map(move |hold| (*volume, hold.range))
+            })
+            .collect()
     }
 
     pub fn resident_bytes(&self) -> u64 {
@@ -629,9 +748,25 @@ impl HoldLedger {
 
     // Where the next scratch allocation starts, which is how long the
     // scratch file needs to be.
-    #[cfg(test)]
     pub fn scratch_extent(&self) -> u64 {
         self.scratch_end
+    }
+
+    // Allocate nothing below `end`: a checkpoint the database holds names
+    // scratch bytes up to it, whether or not their holds came back.
+    pub fn keep_scratch_to(&mut self, end: u64) {
+        self.scratch_end = self.scratch_end.max(end);
+    }
+
+    // Start scratch offsets over at zero, once nothing lives on scratch and
+    // the owner knows no checkpoint the database holds names any of it.
+    // False, and nothing changes, while anything lives there.
+    pub fn rewind_scratch(&mut self) -> bool {
+        if self.scratch != 0 {
+            return false;
+        }
+        self.scratch_end = 0;
+        true
     }
 
     // Every hold on scratch, in volume and offset order: what a checkpoint
@@ -646,7 +781,7 @@ impl HoldLedger {
                         range: hold.range,
                         scratch_offset: offset,
                     }),
-                    Location::Ram(_) => None,
+                    Location::Ram(_) | Location::Spilled => None,
                 })
             })
             .collect()
@@ -654,15 +789,61 @@ impl HoldLedger {
 
     // Page every resident hold to scratch, oldest first, under the same
     // budgets as any page-out: a graceful stop keeps what scratch can take.
-    // The first breach stops it, and what is left stays resident.
-    pub fn page_out_all(&mut self, free_disk: u64) -> Vec<PageOut> {
+    // The first breach stops it, and what is left spills, oldest first, as
+    // far as the disk reserve leaves room: a stop never takes the disk below
+    // it, since the checkpoint written after it must still land. What is
+    // left after that, and what is kept off its spill file, stays resident,
+    // unrecorded, and is fetched again.
+    pub fn page_out_all(&mut self, free_disk: u64) -> (Vec<PageOut>, Vec<Spill>) {
         let mut free_disk = free_disk;
         let mut page_outs = Vec::new();
         while let Some(Ok(page_out)) = self.page_out_oldest(free_disk) {
             free_disk = free_disk.saturating_sub(page_out.range.len());
             page_outs.push(page_out);
         }
-        page_outs
+        let reserve = self.accountant.budgets().disk_reserve;
+        let mut spills = Vec::new();
+        while let Some((volume, start, len)) = self.oldest_to_spill() {
+            let room = reserve == 0
+                || reserve
+                    .checked_add(len)
+                    .is_some_and(|needed| needed <= free_disk);
+            if !room {
+                break;
+            }
+            free_disk = free_disk.saturating_sub(len);
+            let Some(hold) = self.unplace(volume, start) else {
+                break;
+            };
+            let Location::Ram(bytes) = hold.location else {
+                unreachable!("a hold indexed as resident lives on scratch");
+            };
+            self.accountant
+                .release_resident(self.namespace, hold.range.len());
+            spills.push(Spill {
+                volume,
+                range: hold.range,
+                bytes,
+            });
+            self.place(
+                volume,
+                Hold {
+                    location: Location::Spilled,
+                    ..hold
+                },
+            );
+        }
+        (page_outs, spills)
+    }
+
+    // The oldest resident hold its spill file may take, as (volume, start,
+    // len): one kept off the file stays resident, as one the disk reserve
+    // has no room for does.
+    fn oldest_to_spill(&self) -> Option<(VolumeIndex, u64, u64)> {
+        self.resident_by_age.iter().find_map(|&(_, volume, start)| {
+            let range = self.volumes.get(&volume)?.get(&start)?.range;
+            (!self.off_file(volume, range)).then_some((volume, start, range.len()))
+        })
     }
 
     // A hold a checkpoint recorded on scratch, put back where it was. The
@@ -694,6 +875,18 @@ impl HoldLedger {
         reserve
     }
 
+    // A hold a checkpoint recorded in the member's spill file, or one the
+    // caller has just written there: held where it lies, counted by no
+    // budget.
+    pub fn restore_spilled(&mut self, volume: VolumeIndex, range: ByteRange) {
+        if range.is_empty() {
+            return;
+        }
+        self.cut(volume, range);
+        // A checkpoint records where the bytes are, not what proved them.
+        self.insert(volume, range, Location::Spilled, Vec::new());
+    }
+
     fn allocate(&mut self, len: u64) -> u64 {
         let offset = self.scratch_end;
         self.scratch_end += len;
@@ -722,12 +915,17 @@ impl HoldLedger {
 
     fn place(&mut self, volume: VolumeIndex, hold: Hold) {
         let len = hold.range.len();
-        if hold.is_resident() {
-            self.resident += len;
-            self.resident_by_age
-                .insert((hold.age, volume, hold.range.start));
-        } else {
-            self.scratch += len;
+        match hold.location {
+            Location::Ram(_) => {
+                self.resident += len;
+                self.resident_by_age
+                    .insert((hold.age, volume, hold.range.start));
+            }
+            Location::Scratch { .. } => self.scratch += len,
+            Location::Spilled => {
+                self.spilled += len;
+                *self.spilled_in.entry(volume).or_default() += len;
+            }
         }
         self.volumes
             .entry(volume)
@@ -745,11 +943,21 @@ impl HoldLedger {
             self.volumes.remove(&volume);
         }
         let len = hold.range.len();
-        if hold.is_resident() {
-            self.resident -= len;
-            self.resident_by_age.remove(&(hold.age, volume, start));
-        } else {
-            self.scratch -= len;
+        match hold.location {
+            Location::Ram(_) => {
+                self.resident -= len;
+                self.resident_by_age.remove(&(hold.age, volume, start));
+            }
+            Location::Scratch { .. } => self.scratch -= len,
+            Location::Spilled => {
+                self.spilled -= len;
+                if let Some(held) = self.spilled_in.get_mut(&volume) {
+                    *held -= len;
+                    if *held == 0 {
+                        self.spilled_in.remove(&volume);
+                    }
+                }
+            }
         }
         Some(hold)
     }
@@ -773,12 +981,14 @@ impl HoldLedger {
             let Some(inside) = hold.range.intersect(range) else {
                 continue;
             };
-            if hold.is_resident() {
-                self.accountant
-                    .release_resident(self.namespace, inside.len());
-            } else {
-                self.accountant
-                    .release_scratch(self.namespace, inside.len());
+            match hold.location {
+                Location::Ram(_) => self
+                    .accountant
+                    .release_resident(self.namespace, inside.len()),
+                Location::Scratch { .. } => self
+                    .accountant
+                    .release_scratch(self.namespace, inside.len()),
+                Location::Spilled => {}
             }
             let left = ByteRange::new(hold.range.start, inside.start);
             let right = ByteRange::new(inside.end, hold.range.end);
@@ -802,9 +1012,6 @@ impl HoldLedger {
                 location: hold.slice(inside),
                 evidence: hold.evidence_of(inside),
             });
-        }
-        if self.scratch == 0 {
-            self.scratch_end = 0;
         }
         taken
     }
@@ -1107,7 +1314,7 @@ mod tests {
     }
 
     #[test]
-    fn each_scratch_budget_is_named_when_it_breaches() {
+    fn each_scratch_budget_is_named_when_the_bytes_spill() {
         let cases = [
             (
                 HoldBudgets {
@@ -1138,7 +1345,14 @@ mod tests {
             let accountant = Arc::new(HoldsAccountant::new(budgets));
             let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
             let outcome = ledger.hold(VolumeIndex(0), 0, bytes(1, 4), free_disk);
-            assert_eq!(outcome.placed, Placed::Breached(budget));
+            assert_eq!(outcome.placed, Placed::Spilled(budget));
+            // Held still, in the spill file, and counted by no budget.
+            assert_eq!(ledger.spilled_bytes(), 4);
+            assert_eq!(ledger.total_held(), 4);
+            assert!(ledger.spills(VolumeIndex(0)));
+            assert_idle(&accountant);
+            let taken = ledger.take(VolumeIndex(0), ByteRange::new(0, 4));
+            assert_eq!(taken[0].location, Location::Spilled);
             assert_eq!(ledger.total_held(), 0);
             assert_idle(&accountant);
         }
@@ -1155,9 +1369,13 @@ mod tests {
         ledger.hold(VolumeIndex(1), 0, bytes(2, 4), PLENTY);
         // Room for one page-out of 4 above the reserve, not two.
         let outcome = ledger.hold(VolumeIndex(2), 0, bytes(3, 8), 15);
-        assert_eq!(outcome.placed, Placed::Breached(Budget::DiskReserve));
+        assert_eq!(outcome.placed, Placed::Spilled(Budget::DiskReserve));
         assert_eq!(outcome.page_outs.len(), 1);
         assert_eq!(outcome.page_outs[0].volume, VolumeIndex(0));
+        assert_eq!(
+            ledger.spilled_holds(),
+            vec![(VolumeIndex(2), ByteRange::new(0, 8))]
+        );
         ledger.discard();
         assert_idle(&accountant);
     }
@@ -1222,15 +1440,22 @@ mod tests {
     }
 
     #[test]
-    fn scratch_offsets_start_over_once_nothing_lives_there() {
+    fn scratch_offsets_start_over_only_when_rewound_with_nothing_there() {
         let accountant = Arc::new(HoldsAccountant::new(budgets(0)));
         let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
         ledger.hold(VolumeIndex(0), 0, bytes(1, 4), PLENTY);
         ledger.hold(VolumeIndex(0), 4, bytes(1, 4), PLENTY);
         assert_eq!(ledger.scratch_extent(), 8);
         ledger.take(VolumeIndex(0), ByteRange::new(0, 4));
+        assert!(!ledger.rewind_scratch());
         assert_eq!(ledger.scratch_extent(), 8);
         ledger.take(VolumeIndex(0), ByteRange::new(4, 8));
+        // Emptied, scratch still allocates past what a checkpoint may name.
+        assert_eq!(ledger.scratch_extent(), 8);
+        let outcome = ledger.hold(VolumeIndex(0), 0, bytes(1, 4), PLENTY);
+        assert_eq!(outcome.page_outs[0].scratch_offset, 8);
+        ledger.take(VolumeIndex(0), ByteRange::new(0, 4));
+        assert!(ledger.rewind_scratch());
         assert_eq!(ledger.scratch_extent(), 0);
         let outcome = ledger.hold(VolumeIndex(0), 0, bytes(1, 4), PLENTY);
         assert_eq!(outcome.page_outs[0].scratch_offset, 0);
@@ -1249,8 +1474,9 @@ mod tests {
         });
         assert_eq!(ledger.resident_bytes(), 50);
         let outcome = ledger.hold(VolumeIndex(1), 0, bytes(2, 10), PLENTY);
-        assert_eq!(outcome.placed, Placed::Breached(Budget::ScratchCeiling));
+        assert_eq!(outcome.placed, Placed::Spilled(Budget::ScratchCeiling));
         assert!(outcome.page_outs.is_empty());
+        assert_eq!(ledger.resident_bytes(), 50);
         ledger.discard();
         assert_idle(&accountant);
     }
@@ -1286,7 +1512,7 @@ mod tests {
     }
 
     #[test]
-    fn paging_out_all_goes_oldest_first_and_stops_at_the_first_breach() {
+    fn paging_out_all_goes_oldest_first_and_spills_what_scratch_cannot_take() {
         let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
             resident_limit: 100,
             scratch_total: 1_000,
@@ -1298,7 +1524,7 @@ mod tests {
         ledger.hold(VolumeIndex(0), 0, bytes(2, 4), PLENTY);
         ledger.hold(VolumeIndex(1), 0, bytes(3, 4), PLENTY);
 
-        let page_outs = ledger.page_out_all(PLENTY);
+        let (page_outs, spills) = ledger.page_out_all(PLENTY);
         assert_eq!(
             page_outs,
             vec![PageOut {
@@ -1308,13 +1534,31 @@ mod tests {
                 bytes: bytes(1, 4),
             }]
         );
+        // The rest spills, oldest first, and leaves RAM.
+        assert_eq!(
+            spills,
+            vec![
+                Spill {
+                    volume: VolumeIndex(0),
+                    range: ByteRange::new(0, 4),
+                    bytes: bytes(2, 4),
+                },
+                Spill {
+                    volume: VolumeIndex(1),
+                    range: ByteRange::new(0, 4),
+                    bytes: bytes(3, 4),
+                },
+            ]
+        );
         assert_eq!(
             accountant.namespace_usage(NS),
             NamespaceUsage {
-                resident: 8,
+                resident: 0,
                 scratch: 4
             }
         );
+        assert_eq!(ledger.resident_bytes(), 0);
+        assert_eq!(ledger.spilled_bytes(), 8);
         assert_eq!(
             ledger.scratch_holds(),
             vec![ScratchHold {
@@ -1324,7 +1568,65 @@ mod tests {
             }]
         );
         let left = ledger.take(VolumeIndex(0), ByteRange::new(0, 4));
-        assert_eq!(left[0].location, Location::Ram(bytes(2, 4)));
+        assert_eq!(left[0].location, Location::Spilled);
+    }
+
+    // A stop spills what scratch cannot take only as far as the disk
+    // reserve leaves room: the first hold that would take the disk below it
+    // stops the spill, and it and what is younger stay resident, unrecorded.
+    #[test]
+    fn paging_out_all_spills_no_further_than_the_disk_reserve() {
+        let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: 100,
+            scratch_total: 1_000,
+            scratch_ceiling: 0,
+            disk_reserve: 10,
+        }));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.hold(VolumeIndex(0), 0, bytes(1, 4), PLENTY);
+        ledger.hold(VolumeIndex(1), 0, bytes(2, 4), PLENTY);
+        ledger.hold(VolumeIndex(2), 0, bytes(3, 2), PLENTY);
+
+        // Room for the reserve and five bytes: the oldest hold spills, the
+        // next would cross the reserve, and the spill stops there.
+        let (page_outs, spills) = ledger.page_out_all(15);
+        assert!(page_outs.is_empty());
+        assert_eq!(
+            spills,
+            vec![Spill {
+                volume: VolumeIndex(0),
+                range: ByteRange::new(0, 4),
+                bytes: bytes(1, 4),
+            }]
+        );
+        assert_eq!(
+            ledger.spilled_holds(),
+            vec![(VolumeIndex(0), ByteRange::new(0, 4))]
+        );
+        assert_eq!(ledger.resident_bytes(), 6);
+        assert_eq!(
+            accountant.namespace_usage(NS),
+            NamespaceUsage {
+                resident: 6,
+                scratch: 0
+            }
+        );
+
+        // Already below the reserve, nothing spills at all.
+        let mut below = HoldLedger::new(
+            HoldsNamespace {
+                scope: 2,
+                node: NodeId(0),
+            },
+            Arc::clone(&accountant),
+        );
+        below.hold(VolumeIndex(0), 0, bytes(4, 4), PLENTY);
+        let (page_outs, spills) = below.page_out_all(9);
+        assert!(page_outs.is_empty() && spills.is_empty());
+        assert_eq!(below.resident_bytes(), 4);
+        ledger.discard();
+        below.discard();
+        assert_idle(&accountant);
     }
 
     #[test]
@@ -1333,7 +1635,8 @@ mod tests {
         let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
         ledger.hold(VolumeIndex(0), 10, bytes(1, 4), PLENTY);
         ledger.hold(VolumeIndex(1), 0, bytes(2, 3), PLENTY);
-        let page_outs = ledger.page_out_all(PLENTY);
+        let (page_outs, spills) = ledger.page_out_all(PLENTY);
+        assert!(spills.is_empty());
         let offsets: Vec<(VolumeIndex, u64)> = page_outs
             .iter()
             .map(|page_out| (page_out.volume, page_out.scratch_offset))
@@ -1376,10 +1679,50 @@ mod tests {
         // A new spill goes past what was restored.
         let outcome = ledger.hold(VolumeIndex(2), 0, bytes(5, 2), PLENTY);
         assert_eq!(outcome.placed, Placed::Ram);
-        assert_eq!(ledger.page_out_all(PLENTY)[0].scratch_offset, 14);
+        assert_eq!(ledger.page_out_all(PLENTY).0[0].scratch_offset, 14);
 
         let taken = ledger.take(VolumeIndex(1), ByteRange::new(22, 25));
         assert_eq!(taken[0].location, Location::Scratch { offset: 11, len: 3 });
+        drop(ledger);
+        assert_idle(&accountant);
+    }
+
+    // Past every budget, bytes kept off their spill file stay in RAM past
+    // the limit, at a stop as on arrival, and spill again once allowed;
+    // bytes past the part kept off spill as ever.
+    #[test]
+    fn bytes_kept_off_their_spill_file_stay_resident_until_allowed() {
+        let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
+            resident_limit: 0,
+            scratch_total: 0,
+            scratch_ceiling: 0,
+            disk_reserve: 0,
+        }));
+        let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+        ledger.keep_off_file(VolumeIndex(0), 10);
+        let kept = ledger.hold(VolumeIndex(0), 4, bytes(1, 4), PLENTY);
+        assert_eq!(kept.placed, Placed::Ram);
+        let past = ledger.hold(VolumeIndex(0), 10, bytes(2, 4), PLENTY);
+        assert_eq!(past.placed, Placed::Spilled(Budget::ScratchCeiling));
+        assert_eq!(ledger.resident_bytes(), 4);
+        assert_eq!(accountant.usage().resident, 4);
+        assert_eq!(ledger.page_out_all(PLENTY), (Vec::new(), Vec::new()));
+        assert_eq!(ledger.resident_bytes(), 4);
+
+        ledger.allow_file(VolumeIndex(0));
+        let (_, spills) = ledger.page_out_all(PLENTY);
+        assert_eq!(
+            spills,
+            vec![Spill {
+                volume: VolumeIndex(0),
+                range: ByteRange::new(4, 8),
+                bytes: bytes(1, 4),
+            }]
+        );
+        assert_eq!(
+            ledger.hold(VolumeIndex(0), 0, bytes(3, 2), PLENTY).placed,
+            Placed::Spilled(Budget::ScratchCeiling)
+        );
         drop(ledger);
         assert_idle(&accountant);
     }

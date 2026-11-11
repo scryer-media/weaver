@@ -221,6 +221,9 @@ fn decode<D: Decoder>(
 ) -> Vec<Said> {
     let gate = Gate::new(bytes);
     let extraction = stream.start();
+    // The run is granted what the stream was built with, as its owner
+    // grants both from the one profile.
+    let granted = stream.budget.clone();
     let runner = {
         let gate = Arc::clone(&gate);
         thread::spawn(move || {
@@ -232,7 +235,7 @@ fn decode<D: Decoder>(
                     emits.push(emit);
                     true
                 },
-                weaver_graph::Budget::default(),
+                granted,
             );
             gate.finish();
             emits
@@ -485,7 +488,8 @@ fn each_stream_reserves_the_window_its_first_bytes_declare() {
     // 1 MiB is dictionary property 16, 4 MiB property 20.
     assert_eq!(reserve::<Xz>(&xz_at(&plain, 1 << 20)), lzma2(16));
     assert_eq!(reserve::<Xz>(&xz_at(&plain, 4 << 20)), lzma2(20));
-    // A zstd frame reserves the decoder's own limit, whatever it declares.
+    // A zstd frame no wider than the decoder's own limit reserves that
+    // limit, so a wider frame after it still fits.
     assert_eq!(reserve::<Zstd>(&zstd_at(&plain, 20)), 1 << 27);
     assert_eq!(reserve::<Zstd>(&zstd_at(&plain, 23)), 1 << 27);
     assert_eq!(reserve::<Brotli>(&brotli_at(&plain, 18)), 1 << 18);
@@ -512,16 +516,302 @@ fn zstd_window(log: u8) -> Vec<u8> {
     frame
 }
 
+// A run over `bytes` whose front the stream was handed first, as its owner
+// hands it before a run starts.
+fn fronted<D: Decoder>(stream: &mut Stream<D>, bytes: Vec<u8>) -> Vec<Said> {
+    stream.deliver(
+        Delivery {
+            volume: VolumeIndex(0),
+            offset: 0,
+            bytes: &weaver_graph::Evidenced::from(bytes.clone()),
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut Vec::new(),
+    );
+    whole(stream, bytes)
+}
+
+// Refused as needing more decode memory than it was allowed.
+fn too_large(said: &[Said], needed: Option<u64>, allowed: Option<u64>) {
+    assert_eq!(
+        ending(said),
+        [
+            Said::Retract,
+            Said::Refuse(Why::TooLarge { needed, allowed })
+        ],
+        "{said:?}"
+    );
+}
+
 // The decoder keeps its default window limit: a frame that asks for more is
-// refused, however little it holds.
+// refused as too large, however little it holds, with the window its header
+// declares against the one it was held to.
 #[test]
 fn a_zstd_frame_wider_than_the_decoders_limit_is_refused() {
-    let mut stream = stream::<Zstd>("a.zst");
+    let mut frames = stream::<Zstd>("a.zst");
     assert_eq!(
-        whole(&mut stream, zstd_window(27)),
+        fronted(&mut frames, zstd_window(27)),
         decoded("a", b"z".to_vec())
     );
-    refused(&whole(&mut stream, zstd_window(28)));
+    too_large(
+        &fronted(&mut frames, zstd_window(28)),
+        Some(1 << 28),
+        Some(1 << 27),
+    );
+    // A run whose front never reached the stream knows only the window.
+    too_large(
+        &whole(&mut stream::<Zstd>("a.zst"), zstd_window(28)),
+        None,
+        Some(1 << 27),
+    );
+}
+
+const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
+
+// A run as each hardware profile grants it: its memory and the window one
+// decoder may hold, Efficient, Balanced and Performance in turn.
+fn profiles() -> [weaver_graph::Budget; 3] {
+    [(512 * MIB, 256 * MIB), (GIB, GIB), (4 * GIB, 4 * GIB)].map(|(memory, window)| {
+        weaver_graph::Budget {
+            memory_bytes: Some(memory),
+            window_bytes: Some(window),
+            threads: 1,
+            ..Default::default()
+        }
+    })
+}
+
+// An xz stream whose first block names dictionary property `property`.
+// Only the header says so: the block was written with a 1 MiB dictionary.
+fn xz_declaring(property: u8) -> Vec<u8> {
+    declaring(xz_at(&first_payload(), 1 << 20), property)
+}
+
+// `bytes`, an xz stream written with a 1 MiB dictionary, whose first block
+// names dictionary property `property` instead.
+fn declaring(mut bytes: Vec<u8>, property: u8) -> Vec<u8> {
+    let end = 12 + (usize::from(bytes[12]) + 1) * 4;
+    let at = 12
+        + bytes[12..end]
+            .windows(3)
+            .position(|filter| filter == [0x21, 0x01, 16])
+            .unwrap()
+        + 2;
+    bytes[at] = property;
+    let check = crate::grid::crc32(&bytes[12..end - 4]);
+    bytes[end - 4..end].copy_from_slice(&check.to_le_bytes());
+    bytes
+}
+
+// The xz decoder holds its limit against a block's dictionary. A 1 GiB
+// dictionary, property 36, fits the window Balanced and Performance hand
+// the decoder and not Efficient's 256 MiB. A stream whose front says
+// nothing reserves the decoder's own 128 MiB, never the whole grant.
+#[test]
+fn each_profiles_window_reaches_the_xz_decoder() {
+    let declared = xz_declaring(36);
+    let [efficient, balanced, performance] = profiles();
+    assert_eq!(Xz::window(&declared, &efficient), 256 * MIB);
+    assert_eq!(Xz::window(&declared, &balanced), GIB);
+    assert_eq!(Xz::window(&declared, &performance), {
+        lzma_turbo::Lzma2Reader::<io::Empty>::memory_required(36).unwrap()
+    });
+    let fits = profiles().map(|budget| Xz::window(&declared, &budget) >= GIB);
+    assert_eq!(fits, [false, true, true]);
+    for budget in profiles() {
+        assert_eq!(Xz::window(&[], &budget), 128 * MIB);
+    }
+}
+
+// A zstd frame header naming a window of 1 << log, with no content size, so
+// nothing but the window says how much its decoder must hold.
+fn zstd_header(log: u8) -> Vec<u8> {
+    vec![0x28, 0xB5, 0x2F, 0xFD, 0x00, (log - 10) << 3]
+}
+
+// The window a zstd decoder is held to is the profile's, up to libzstd's
+// own 2 GiB: a 1 GiB window fits Balanced and Performance and not
+// Efficient. A frame at or below the decoder's own 128 MiB reserves that.
+#[test]
+fn each_profiles_window_reaches_the_zstd_decoder() {
+    let window = |log, budget: &weaver_graph::Budget| Zstd::window(&zstd_header(log), budget);
+    let [efficient, balanced, performance] = profiles();
+    assert_eq!(window(30, &efficient), 256 * MIB);
+    assert_eq!(window(30, &balanced), GIB);
+    assert_eq!(window(30, &performance), GIB);
+    let fits = profiles().map(|budget| window(30, &budget) >= GIB);
+    assert_eq!(fits, [false, true, true]);
+    assert_eq!(window(31, &performance), 2 * GIB);
+    for budget in profiles() {
+        assert_eq!(Zstd::window(&[], &budget), 128 * MIB);
+    }
+    assert_eq!(window(20, &performance), 128 * MIB);
+    assert_eq!(window(28, &balanced), 256 * MIB);
+}
+
+// The grant's window is the one libzstd holds the decoder to: a frame that
+// fits it decodes, one a step wider is refused before its window is held.
+// Under Efficient a 512 MiB window is refused.
+#[test]
+fn a_zstd_frame_wider_than_the_granted_window_is_refused() {
+    let granted = weaver_graph::Budget {
+        memory_bytes: Some(GIB),
+        window_bytes: Some(MIB),
+        threads: 1,
+        ..Default::default()
+    };
+    let mut narrow = stream::<Zstd>("a.zst").within(granted);
+    assert_eq!(
+        whole(&mut narrow, zstd_window(20)),
+        decoded("a", b"z".to_vec())
+    );
+    too_large(
+        &fronted(&mut narrow, zstd_window(21)),
+        Some(2 * MIB),
+        Some(MIB),
+    );
+
+    let [efficient, ..] = profiles();
+    let mut held = stream::<Zstd>("a.zst").within(efficient);
+    too_large(
+        &fronted(&mut held, zstd_window(29)),
+        Some(512 * MIB),
+        Some(256 * MIB),
+    );
+}
+
+// A run granted a wider window than the stream was built with, as an owner
+// grants a run whose window it lets go above its ceiling, decodes a frame
+// the build's grant refused; it never holds less than the build's window.
+#[test]
+fn a_run_granted_a_wider_window_than_the_build_decodes_the_wider_frame() {
+    let built = weaver_graph::Budget {
+        memory_bytes: Some(GIB),
+        window_bytes: Some(MIB),
+        threads: 1,
+        ..Default::default()
+    };
+    let mut stream = stream::<Zstd>("a.zst").within(built);
+    let bytes = zstd_window(21);
+    stream.deliver(
+        Delivery {
+            volume: VolumeIndex(0),
+            offset: 0,
+            bytes: &weaver_graph::Evidenced::from(bytes.clone()),
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut Vec::new(),
+    );
+    let wider = weaver_graph::Budget {
+        memory_bytes: Some(2 * MIB),
+        window_bytes: Some(2 * MIB),
+        threads: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        closed_run(&mut stream, bytes.clone(), wider),
+        decoded("a", b"z".to_vec())
+    );
+    let narrower = weaver_graph::Budget {
+        memory_bytes: Some(1 << 10),
+        window_bytes: Some(1 << 10),
+        threads: 1,
+        ..Default::default()
+    };
+    too_large(
+        &closed_run(&mut stream, bytes, narrower),
+        Some(2 * MIB),
+        Some(MIB),
+    );
+}
+
+// A stream handed its front, so its window is sized from the first block or
+// frame, built within `window`.
+fn fronted_within<D: Decoder>(name: &str, bytes: &[u8], window: u64) -> Stream<D> {
+    let mut stream = stream::<D>(name).within(weaver_graph::Budget {
+        memory_bytes: Some(window),
+        window_bytes: Some(window),
+        threads: 1,
+        ..Default::default()
+    });
+    stream.deliver(
+        Delivery {
+            volume: VolumeIndex(0),
+            offset: 0,
+            bytes: &weaver_graph::Evidenced::from(bytes.to_vec()),
+            provenance: Provenance::Fresh,
+        },
+        &mut |_, _| false,
+        &mut Vec::new(),
+    );
+    stream
+}
+
+// A run granted `window`, reserved whole for it or not.
+fn granted(window: u64, reserved: bool) -> weaver_graph::Budget {
+    weaver_graph::Budget {
+        memory_bytes: Some(window),
+        window_bytes: Some(window),
+        window_reserved: reserved,
+        threads: 1,
+        ..Default::default()
+    }
+}
+
+fn refused_too_large(said: &[Said]) {
+    assert!(
+        matches!(
+            ending(said),
+            [Said::Retract, Said::Refuse(Why::TooLarge { .. })]
+        ),
+        "{said:?}"
+    );
+}
+
+// An xz whose later stream's dictionary is wider than the first's: a run
+// granted a wider window sizes its decoder from the first block and is
+// refused at the later one. A run whose owner reserved the whole wider
+// window for it gives the decoder all of it and decodes whole.
+#[test]
+fn a_later_xz_block_wider_than_the_first_decodes_within_a_window_reserved_whole() {
+    // The decoder holds no more dictionary than a block's content, so the
+    // later block's content is larger than the first's dictionary.
+    let later = payload(2, 3_000).repeat(1_500);
+    let mut bytes = xz_at(&first_payload(), 1 << 20);
+    bytes.extend(xz_at(&later, 8 << 20));
+    let plain = [first_payload(), later].concat();
+    let mut stream = fronted_within::<Xz>("a.xz", &bytes, 2 * MIB);
+    refused_too_large(&closed_run(
+        &mut stream,
+        bytes.clone(),
+        granted(16 * MIB, false),
+    ));
+    assert_eq!(
+        closed_run(&mut stream, bytes, granted(16 * MIB, true)),
+        decoded("a", plain)
+    );
+}
+
+// The same for zstd, past the decoder's own 128 MiB: a later frame of
+// 256 MiB is refused unless the run's window was reserved whole for it. Its
+// refusal cannot say what the later frame needs.
+#[test]
+fn a_later_zstd_frame_wider_than_the_first_decodes_within_a_window_reserved_whole() {
+    let mut bytes = zstd_window(20);
+    bytes.extend(zstd_window(28));
+    let mut stream = fronted_within::<Zstd>("a.zst", &bytes, MIB);
+    too_large(
+        &closed_run(&mut stream, bytes.clone(), granted(512 * MIB, false)),
+        None,
+        Some(128 * MIB),
+    );
+    assert_eq!(
+        closed_run(&mut stream, bytes, granted(512 * MIB, true)),
+        decoded("a", b"zz".to_vec())
+    );
 }
 
 #[test]
@@ -730,18 +1020,17 @@ fn a_closed_multiblock_xz_decodes_its_blocks_side_by_side_within_the_budget() {
         bytes.clone(),
         budget(1, 4),
     );
-    assert_eq!(
-        ending(&held),
-        [Said::Retract, Said::Refuse(Why::Unsupported)]
-    );
+    // The decoder states the sizes it refused: the stream's index, 28
+    // bytes, against the one byte granted.
+    too_large(&held, Some(28), Some(1));
     let sequential = closed_run(&mut stream::<Xz>("ember.bin.xz"), bytes, budget(1, 1));
     assert_eq!(sequential, decoded("ember.bin", plain));
 }
 
 // A run granted less than the 128 MiB an xz decoder may hold sizes its
 // window to the grant, whether the first bytes declare more or say nothing
-// yet; one granted more still holds to the 128 MiB. A dictionary the grant
-// cannot hold is refused rather than decoded past it.
+// yet; one granted more and no window still holds to the 128 MiB. A
+// dictionary the grant cannot hold is refused rather than decoded past it.
 #[test]
 fn an_xz_window_is_no_larger_than_the_memory_granted() {
     let window = |bytes: &[u8], granted: u64| Xz::window(bytes, &budget(granted, 1));
@@ -800,4 +1089,142 @@ fn a_growing_multiblock_xz_is_read_from_the_front() {
     gate.release(bytes.len());
     gate.close();
     assert_eq!(said(&runner.join().unwrap()), decoded("ember.bin", plain));
+}
+
+// An xz of a 1 MiB dictionary whose block is wider than a 64 KiB grant.
+const LENT_GRANT: u64 = 64 << 10;
+
+fn lent_plain() -> Vec<u8> {
+    payload(5, 4096).repeat(80)
+}
+
+fn lent_xz() -> Vec<u8> {
+    xz_at(&lent_plain(), 1 << 20)
+}
+
+// A run of the stream built within `LENT_GRANT`, granted it and handed
+// `lender`, over `bytes`.
+fn lent_run(
+    bytes: &[u8],
+    threads: usize,
+    lender: Option<&Arc<crate::lent::testing::TestLender>>,
+) -> Vec<Said> {
+    let mut stream = fronted_within::<Xz>("a.xz", bytes, LENT_GRANT);
+    let granted = weaver_graph::Budget {
+        threads,
+        ..granted(LENT_GRANT, false)
+    };
+    let granted = match lender {
+        Some(lender) => lender.lending(granted),
+        None => granted,
+    };
+    closed_run(&mut stream, bytes.to_vec(), granted)
+}
+
+// A run handed a lender borrows the dictionary its grant cannot hold, and
+// decodes through it what it decodes with the dictionary on its own heap,
+// although every lent byte held garbage first. It asks once, for a window
+// over the grant and no wider than the 1 MiB dictionary, and gives it back.
+#[test]
+fn an_xz_dictionary_over_the_grant_is_lent_and_given_back() {
+    use crate::lent::testing::TestLender;
+    let bytes = lent_xz();
+    let lender = TestLender::new();
+    assert_eq!(
+        lent_run(&bytes, 1, Some(&lender)),
+        decoded("a", lent_plain())
+    );
+    let asked = lender.asked();
+    assert_eq!(asked.len(), 1, "{asked:?}");
+    assert!(asked[0] as u64 > LENT_GRANT, "{asked:?}");
+    assert!(asked[0] as u64 <= MIB, "{asked:?}");
+    assert_eq!(lender.live(), 0);
+
+    // On the decoder's own heap, with room for the dictionary.
+    let room = 2 * MIB;
+    let mut own = fronted_within::<Xz>("a.xz", &bytes, room);
+    assert_eq!(
+        closed_run(&mut own, bytes.clone(), granted(room, false)),
+        decoded("a", lent_plain())
+    );
+}
+
+// Without a lender the same grant refuses the dictionary, as it always did,
+// with the sizes it refused.
+#[test]
+fn an_xz_dictionary_over_the_grant_without_a_lender_is_refused() {
+    let said = lent_run(&lent_xz(), 1, None);
+    let [
+        Said::Retract,
+        Said::Refuse(Why::TooLarge { needed, allowed }),
+    ] = ending(&said)
+    else {
+        panic!("{said:?}");
+    };
+    assert!(needed.is_some_and(|needed| needed > LENT_GRANT), "{said:?}");
+    assert_eq!(*allowed, Some(LENT_GRANT));
+}
+
+// A lender's refusal is the member's verdict: a filesystem's refusal asks
+// for the window it states in RAM, which the owner gives or refuses by its
+// policy; any other refusal stands.
+#[test]
+fn an_xz_window_the_lender_refuses_says_why() {
+    use crate::lent::testing::TestLender;
+    let bytes = lent_xz();
+    let full = TestLender::refusing(io::ErrorKind::StorageFull);
+    let said = lent_run(&bytes, 1, Some(&full));
+    let asked = full.asked()[0] as u64;
+    too_large(&said, Some(asked), None);
+
+    let denied = TestLender::refusing(io::ErrorKind::PermissionDenied);
+    let said = lent_run(&bytes, 1, Some(&denied));
+    assert_eq!(
+        ending(&said),
+        [Said::Retract, Said::Refuse(Why::Unsupported)],
+        "{said:?}"
+    );
+}
+
+// A closed xz of several blocks, each wider than the grant, is read from
+// the front by a run handed a lender, whatever its threads: side by side,
+// each worker would borrow a block of its own. It asks one window per
+// block, each the same width, holds one at a time, and gives every one back.
+#[test]
+fn a_multiblock_xz_wider_than_the_grant_borrows_one_window_at_a_time() {
+    use crate::lent::testing::TestLender;
+    let plain: Vec<u8> = (0..(1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let bytes = xz_multiblock(&plain);
+    let lender = TestLender::new();
+    assert_eq!(lent_run(&bytes, 4, Some(&lender)), decoded("a", plain));
+    let asked = lender.asked();
+    assert!(asked.len() > 1, "{asked:?}");
+    assert!(asked[0] as u64 > LENT_GRANT, "{asked:?}");
+    assert!(asked.iter().all(|width| *width == asked[0]), "{asked:?}");
+    assert_eq!(lender.peak(), 1, "one window at a time");
+    assert_eq!(lender.live(), 0);
+}
+
+// A dictionary over the lender's ceiling is not asked for: the decoder
+// refuses it with its size against the ceiling, as a run with no lender
+// refuses one over its grant.
+#[test]
+fn an_xz_dictionary_over_the_lenders_ceiling_is_refused_unasked() {
+    use crate::lent::testing::TestLender;
+    let bytes = lent_xz();
+    let ceiling = 128 << 10;
+    let low = TestLender::up_to(ceiling);
+    let said = lent_run(&bytes, 1, Some(&low));
+    let [
+        Said::Retract,
+        Said::Refuse(Why::TooLarge { needed, allowed }),
+    ] = ending(&said)
+    else {
+        panic!("{said:?}");
+    };
+    assert!(needed.is_some_and(|needed| needed > ceiling), "{said:?}");
+    assert_eq!(*allowed, Some(ceiling));
+    assert_eq!(low.asked(), Vec::<usize>::new());
 }

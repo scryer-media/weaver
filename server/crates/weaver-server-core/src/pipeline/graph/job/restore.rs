@@ -1,37 +1,35 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// A graph job back from its checkpoint. The promise is no refetch: what the
-// checkpoint says is on disk is read back and delivered down the tree again,
-// and only what is not there is fetched. In the plan's order:
+// A graph job back from its checkpoint. The promise is no refetch and no
+// second pass over the data: what the checkpoint says is on disk is taken
+// as there, and only what is not there is fetched. In the plan's order:
 //
 //   2. every node is rebuilt from its facts, and each node that was offered
-//      a candidate is offered it again, so its keys are derived anew
-//   3. every article the root had in hand is read back through the inverse
-//      map and checked against the decoder's checksums; one that reads but
-//      does not match is damaged, one that does not read is fetched again
-//   4. each article read is delivered down the tree before the next is
-//      read, as it first came, so every object is where it was and a stream
-//      replays from its start
+//      a candidate is offered it again, so its keys are derived anew; a
+//      member's file folds its check from the decoder's checksums
+//   3. every article the root had in hand is judged on the records and the
+//      files' lengths, never read: one whose bytes are not where they say
+//      is fetched again
+//   4. each member's front, which no record keeps, is read again alone, as
+//      far as it came; an object whose facts leave out what it read of its
+//      volumes asks for those bytes again itself, and an engine's run reads
+//      its volumes from its files as it decodes them
 //   5. the engines' runs are asked again for their slots; holds the
-//      checkpoint recorded on scratch were adopted before step 3, so they
-//      read back as bytes on disk do, and holds that were in memory are
-//      fetched again
+//      checkpoint recorded on scratch were adopted before step 3, and holds
+//      that were in memory are fetched again
 //   6. what the root still waits on is what the queue fetches
 //
 // Step 1, refusing a graph job with no checkpoint, is the caller's.
 
-use std::sync::Arc;
-
-use bytes::Bytes;
-use weaver_graph::{ByteRange, MemberId, NodeId, Provenance, RestoreError, Tree, VolumeIndex};
+use weaver_graph::{MemberId, NodeId, RestoreError, Tree, VolumeIndex};
 
 use super::loans::Loans;
 use super::passwords::Passwords;
 use super::{GraphError, GraphJob, RootFile, Storage};
 use crate::pipeline::graph::checkpoint::{Pending, Snapshot};
 use crate::pipeline::graph::engine::Runs;
-use crate::pipeline::graph::namespace::{Arrival, NamespaceWriter, WriteError};
+use crate::pipeline::graph::namespace::{NamespaceWriter, WriteError};
 use crate::pipeline::graph::root::ArticleRoot;
 use crate::pipeline::graph::root::facts::RootFactsError;
 
@@ -57,12 +55,6 @@ pub(crate) struct Restored {
     pub(crate) refetched: Vec<(VolumeIndex, u32)>,
 }
 
-// An article read back, and how each of its pieces is delivered again.
-struct ReadBack {
-    volume: VolumeIndex,
-    pieces: Vec<(ByteRange, Bytes, Provenance)>,
-}
-
 impl GraphJob {
     pub(crate) fn restore(
         snapshot: &Snapshot,
@@ -75,19 +67,17 @@ impl GraphJob {
         tree.nest_at_most(storage.nesting);
         let root = ArticleRoot::restore(files, &snapshot.root)?;
         same_post(&tree, files)?;
-        let runs = Runs::new(
-            scope,
-            storage.slots,
-            storage.mail,
-            Arc::clone(&storage.accountant),
-        )
-        .on(storage.hardware);
+        let windows = storage.windows(scope);
+        let runs = Runs::new(scope, storage.slots, storage.mail, storage.decode)
+            .on(storage.hardware)
+            .lending(windows);
         let mut writer = NamespaceWriter::new(
             scope,
             storage.working_dir,
             storage.accountant,
             storage.free_disk,
         )
+        .delivering(storage.output)
         .capped(storage.caps)
         .metered(storage.metrics);
         writer.restore_verifications(&snapshot.root.pending_verifications);
@@ -100,7 +90,7 @@ impl GraphJob {
             {
                 continue;
             }
-            writer.restore_file(&tree, *node, *member, state)?;
+            writer.restore_file(&tree, *node, *member, state, &root)?;
         }
         // A file that still sits at a name it is moving off keeps that name
         // from every other member until it has moved.
@@ -115,17 +105,23 @@ impl GraphJob {
             writer.restore_kept(kept)?;
         }
         writer.restore_holds(&tree, &snapshot.holds)?;
+        // The deadline counts the time the runs and the loans decode. What
+        // a run before spent is not in the checkpoint: it counts again.
+        let runs = runs.timed(writer.decode_clock());
         let mut job = Self {
             tree,
             root,
             builder: Box::new(runs.hardware()),
             writer,
             loans: Loans::new(runs.scope(), runs.mail(), runs.hardware()),
+            works: super::works::Works::new(runs.scope(), runs.mail(), runs.hardware())
+                .timed(runs.clock()),
             runs,
             passwords: Passwords::new(storage.passwords),
             reported: snapshot.root.reported,
             pending: Pending::default(),
             mail_owed: None,
+            commit_held: None,
             notes: Vec::new(),
             fed: super::runs::Fed::default(),
             sealed_at: None,
@@ -137,13 +133,20 @@ impl GraphJob {
             NodeId::ROOT,
             job.namespace().members().map(|member| member.id),
         );
-        let refetched = job.read_back()?;
+        let refetched = job.reach()?;
+        job.fronts_again()?;
+        let mut effects = Vec::new();
+        job.tree
+            .restored(&mut job.writer.placing(&mut *job.builder), &mut effects);
+        job.settle(effects)?;
+        job.lift_hold_refusals()?;
         job.writer.queue_rechecks(rejected);
         job.mark_damage()?;
         let mut effects = Vec::new();
         job.tree
             .close_again(&mut job.writer.placing(&mut *job.builder), &mut effects);
         job.settle(effects)?;
+        job.bind_again()?;
         for volume in 0..job.root.map.volume_count() {
             job.after_member(VolumeIndex(volume as u32))?;
         }
@@ -159,6 +162,52 @@ impl GraphJob {
             refetched,
             job,
         })
+    }
+
+    // The restored sets bind over their namespaces, now every front that
+    // came is in hand again and every close was told again, and before the
+    // job first rules them.
+    fn bind_again(&mut self) -> Result<(), GraphError> {
+        let mut out = Vec::new();
+        self.writer
+            .bind_restored(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
+        self.heard(out)
+    }
+
+    // Refusals an older build gave when holds ran past their budgets are
+    // taken back, and their sets read their volumes again from their files.
+    fn lift_hold_refusals(&mut self) -> Result<(), GraphError> {
+        let mut out = Vec::new();
+        self.writer
+            .lift_hold_refusals(&mut self.tree, &mut *self.builder, &self.root, &mut out)?;
+        self.heard(out)
+    }
+
+    // What an older build left when a member's holds ran past their
+    // budgets: the object bound over the first root member that has one
+    // refuses it for its holds, as that build's object said.
+    #[cfg(test)]
+    pub(crate) fn refuse_for_holds(&mut self) -> Result<NodeId, GraphError> {
+        let node = self
+            .tree
+            .namespace(NodeId::ROOT)
+            .and_then(|root| {
+                root.records()
+                    .find_map(|record| self.tree.child_of(NodeId::ROOT, record.id))
+            })
+            .map(|(node, _)| node)
+            .expect("an object bound over a root member");
+        let mut out = Vec::new();
+        self.writer.said(
+            &mut self.tree,
+            &mut *self.builder,
+            &self.root,
+            node,
+            weaver_graph::Emit::Refuse(weaver_graph::Why::HoldsBreached),
+            &mut out,
+        )?;
+        self.heard(out)?;
+        Ok(node)
     }
 
     // The node was offered this candidate last: it is offered again, so the
@@ -177,40 +226,32 @@ impl GraphJob {
         self.settle(effects)
     }
 
-    // Every article the root had in hand, read back and delivered before the
-    // next is read: an object's inverse map for a later article can lean on
-    // what the earlier ones rebuilt, as a cipher's chain does. What does not
-    // read is the root's to fetch again: the article waits, and the bytes
-    // it covered are no longer covered, or said at any depth they reached.
-    // A restore starts with the holds the checkpoint recorded on scratch,
-    // read through as any bytes on disk are; any others it reads through are
-    // bytes an earlier article's delivery moved there from disk, as a member
-    // bound by its bytes moves its file.
-    fn read_back(&mut self) -> Result<Vec<(VolumeIndex, u32)>, GraphError> {
+    // Every article the root had in hand is where the checkpoint says, as
+    // far as the records and the files' lengths tell: nothing is read, and
+    // nothing is delivered again. What does not reach is the root's to fetch
+    // again: the article waits, and the bytes it covered are no longer
+    // covered, or said at any depth they reached. A file cut shorter than
+    // its record says loses what it no longer holds this way. Holds the
+    // checkpoint recorded on scratch reach as files do; holds that were in
+    // memory are on no disk, and their articles are fetched again.
+    fn reach(&mut self) -> Result<Vec<(VolumeIndex, u32)>, GraphError> {
         let mut missing = Vec::new();
-        let mut bytes = Vec::new();
+        let mut scratch = Vec::new();
+        let access = self.writer.access(&self.tree);
         for index in 0..self.root.map.volume_count() {
             let volume = VolumeIndex(index as u32);
             let member = MemberId(volume.0);
             for (ordinal, range) in self.root.map.arrived_ranges(volume) {
-                bytes.clear();
-                if !self
-                    .writer
-                    .access(&self.tree)
-                    .read_at(NodeId::ROOT, member, range, &mut bytes)
-                {
+                if !access.reaches(NodeId::ROOT, member, range, &mut scratch) {
                     missing.push((volume, ordinal));
-                    continue;
                 }
-                let read = Bytes::copy_from_slice(&bytes);
-                let pieces = self.pieces(volume, range, &read);
-                self.deliver_again(ReadBack { volume, pieces })?;
             }
         }
         missing.extend(self.root.map.unseen());
         let mut refetched = Vec::with_capacity(missing.len());
+        // Nothing is lent inside a restore: the job lends once installed.
         for (volume, ordinal) in missing {
-            self.unarrive(volume, ordinal)?;
+            self.unarrive(volume, ordinal, 0)?;
             if let Some(found) = self
                 .tree
                 .namespace_mut(NodeId::ROOT)
@@ -223,38 +264,38 @@ impl GraphJob {
         Ok(refetched)
     }
 
-    // The article's bytes cut at its coverage runs, each with the
-    // provenance it arrived with. A fresh piece that no longer matches the
-    // decoder's checksums is damaged: it is repaired, not fetched.
-    fn pieces(
-        &self,
-        volume: VolumeIndex,
-        range: ByteRange,
-        bytes: &Bytes,
-    ) -> Vec<(ByteRange, Bytes, Provenance)> {
-        let Some(member) = self
-            .tree
-            .namespace(NodeId::ROOT)
-            .and_then(|namespace| namespace.get(MemberId(volume.0)))
-        else {
-            return Vec::new();
-        };
-        member
-            .coverage
-            .overlapping(range)
-            .filter_map(|run| {
-                let piece = run.range.intersect(range)?;
-                let from = (piece.start - range.start) as usize;
-                let slice = bytes.slice(from..from + piece.len() as usize);
-                let provenance = match run.provenance {
-                    Provenance::Fresh if !self.root.matches(volume, piece, &slice) => {
-                        Provenance::Damaged
-                    }
-                    provenance => provenance,
-                };
-                Some((piece, slice, provenance))
-            })
-            .collect()
+    // Each member's front that came and is not in hand, read alone from
+    // where its bytes went, the runs that arrived inside its first
+    // FIRST_BYTES, and handed to the tree, which judges it as a front that
+    // came. A run that does not read is left away, as its bytes are fetched
+    // again.
+    fn fronts_again(&mut self) -> Result<(), GraphError> {
+        for (node, member, runs) in self.tree.fronts_away() {
+            let access = self.writer.access(&self.tree);
+            let pieces: Vec<(u64, Vec<u8>)> = runs
+                .into_iter()
+                .filter_map(|run| {
+                    let mut bytes = Vec::new();
+                    access
+                        .read_at(node, member, run, &mut bytes)
+                        .then_some((run.start, bytes))
+                })
+                .collect();
+            if pieces.is_empty() {
+                continue;
+            }
+            let mut effects = Vec::new();
+            self.tree.front_again(
+                node,
+                member,
+                &pieces,
+                &mut self.writer.placing(&mut *self.builder),
+                &mut effects,
+            );
+            self.writer.admit_front(&self.tree, node, member)?;
+            self.settle(effects)?;
+        }
+        Ok(())
     }
 
     // The articles a crash now would cost, so a restore fetches them again:
@@ -294,41 +335,45 @@ impl GraphJob {
     }
 
     // Each article the root has in hand, and whether its bytes read back
-    // from disk.
+    // from disk, in the root's order. Every checkpoint asks this of every
+    // article, so articles that lie end to end are read back
+    // as one run, and only a run that does not read back is halved until
+    // each article in it is answered alone.
     #[cfg(test)]
     fn arrived(&self, mut each: impl FnMut((u32, u32), bool)) {
         let mut bytes = Vec::new();
         for index in 0..self.root.map.volume_count() {
             let volume = VolumeIndex(index as u32);
-            for (ordinal, range) in self.root.map.arrived_ranges(volume) {
-                bytes.clear();
-                let on_disk =
-                    self.writer
-                        .read_posted(&self.tree, MemberId(volume.0), range, &mut bytes);
-                each((volume.0, ordinal), on_disk);
+            let articles = self.root.map.arrived_ranges(volume);
+            for run in articles.chunk_by(|(_, a), (_, b)| a.end == b.start) {
+                self.reads_back(volume, run, &mut bytes, &mut each);
             }
         }
     }
 
-    fn deliver_again(&mut self, read: ReadBack) -> Result<(), GraphError> {
-        for (range, bytes, provenance) in read.pieces {
-            let mut out = Vec::new();
-            self.writer.deliver_again(
-                &mut self.tree,
-                &mut *self.builder,
-                &self.root,
-                Arrival {
-                    node: NodeId::ROOT,
-                    member: MemberId(read.volume.0),
-                    offset: range.start,
-                    bytes: bytes.into(),
-                    provenance,
-                },
-                &mut out,
-            )?;
-            self.heard(out)?;
+    // Whether each article of `run`, which lie end to end, reads back.
+    #[cfg(test)]
+    fn reads_back(
+        &self,
+        volume: VolumeIndex,
+        run: &[(u32, weaver_graph::ByteRange)],
+        bytes: &mut Vec<u8>,
+        each: &mut impl FnMut((u32, u32), bool),
+    ) {
+        let whole = weaver_graph::ByteRange::new(run[0].1.start, run[run.len() - 1].1.end);
+        bytes.clear();
+        let read = self
+            .writer
+            .read_posted(&self.tree, MemberId(volume.0), whole, bytes);
+        if read || run.len() == 1 {
+            for (ordinal, _) in run {
+                each((volume.0, *ordinal), read);
+            }
+            return;
         }
-        Ok(())
+        let (front, back) = run.split_at(run.len() / 2);
+        self.reads_back(volume, front, bytes, each);
+        self.reads_back(volume, back, bytes, each);
     }
 }
 

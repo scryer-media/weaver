@@ -31,13 +31,92 @@ impl GraphJob {
     // when the job holds none. The slot goes back once nothing is out. A
     // step lends after its runs are stepped, so `reading` counts the runs
     // the step started: a namespace one of them is about to read may still
-    // announce members, and no set over it is due yet.
+    // announce members, and no set over it is due yet. Work goes first, as
+    // the walk waits for it, and again after, for what the walk's rulings
+    // made due. Under no slot, as for a job paused, held or retiring,
+    // nothing goes out and no work is done: the job lends once it runs.
     pub(crate) fn lend(&mut self, slots: &mut RepairSlots, limit: usize) -> Result<(), GraphError> {
+        if limit > 0 {
+            self.lend_rewalks()?;
+        }
+        self.lend_work(limit)?;
         let walked = self.walk(Some((&mut *slots, limit)));
         if let Some(ticket) = self.loans.give_back() {
             slots.release(ticket);
         }
-        walked
+        walked?;
+        self.lend_work(limit)
+    }
+
+    // Lend out every object that holds work too slow for the loop. Once
+    // the pipeline is shutting down, or while a checkpoint that found a
+    // loan out is owed, nothing goes out: the work is done here, so the
+    // checkpoint finds none of it out. Work done here can make more due:
+    // what it said lets the writer drop the next bytes it held, and the
+    // object holds them in turn. It goes on until no object is due, or a
+    // round's work said nothing, which moved nothing. It needs no repair
+    // slot, so the gate lends it too before it rules. While a repair, a
+    // replay or a check is out, no object goes out for its work: what that
+    // loan comes to is read back through the objects its set covers, so
+    // they stay home until it returns, and its return lends them. Under no
+    // slot nothing is lent or done.
+    pub(crate) fn lend_work(&mut self, limit: usize) -> Result<(), GraphError> {
+        let admit = self.works.admit();
+        if limit == 0 || (admit && self.loans.out()) {
+            return Ok(());
+        }
+        loop {
+            let mut moved = false;
+            for node in self.tree.working() {
+                let Some(mut object) = self.tree.lend_work(node) else {
+                    continue;
+                };
+                if admit {
+                    self.works.lend(node, object);
+                    continue;
+                }
+                let mut said = Vec::new();
+                {
+                    let _decoding = self.works.decoding();
+                    object.work(&mut said);
+                }
+                moved |= !said.is_empty();
+                let mut effects = Vec::new();
+                self.tree.take_back_worked(
+                    node,
+                    object,
+                    said,
+                    &mut self.writer.placing(&mut *self.builder),
+                    &mut effects,
+                );
+                self.settle_worked(effects)?;
+            }
+            if admit || !moved {
+                return Ok(());
+            }
+        }
+    }
+
+    // What each restored recovery object asked again goes out once the job
+    // is installed, never inside its restore, whether or not it may run:
+    // the job fetches nothing until each is heard. One reads at a time, so
+    // a job holds one thread and reads one file at once; the end of each
+    // lends the next.
+    pub(crate) fn lend_rewalks(&mut self) -> Result<(), GraphError> {
+        if !self.works.admit_rewalk() || self.works.rewalks_out() {
+            return Ok(());
+        }
+        for node in self.tree.rewalks() {
+            if let Some(loan) = self
+                .writer
+                .lend_rewalk(&mut self.tree, node)
+                .map_err(WriteError::from)?
+            {
+                self.works.lend_rewalk(loan);
+                break;
+            }
+        }
+        Ok(())
     }
 
     // A retiring job releases an idle slot. An outstanding repair keeps
@@ -54,6 +133,14 @@ impl GraphJob {
     // changes, applied, takes back the rulings it touches (an uncovered
     // input), and the set rules again through the same walk.
     fn walk(&mut self, mut slots: Option<(&mut RepairSlots, usize)>) -> Result<(), GraphError> {
+        // An object out for its work is not there to read a set's inputs
+        // back through, and one with work due has not yet said what it
+        // holds: the walk waits for it, and its return walks again. A
+        // recovery object yet to hear all that arrived of it again, asked,
+        // being read or cut short, knows too little to rule on.
+        if self.works.out() || self.tree.work_due() || self.tree.rewalks_owed() {
+            return Ok(());
+        }
         let mut walked = None;
         while let Some(node) = self.tree.next_recovery_home(walked) {
             walked = Some(node);
@@ -206,11 +293,17 @@ impl GraphJob {
         Ok(changed)
     }
 
-    // The payload is in, no run is reading, no repair is out, and every
-    // namespace's sets have ruled on something other than waiting, none
+    // The payload is in, no run is reading, no repair is out, no recovery
+    // object owes a rewalk, and every namespace's sets have ruled on something other than waiting, none
     // with a volume of its own still arriving.
     fn quiet(&self) -> bool {
-        if self.runs.live() || self.loans.out() || self.writer.rechecks_waiting() {
+        if self.runs.live()
+            || self.loans.out()
+            || self.works.out()
+            || self.tree.rewalks_owed()
+            || self.tree.work_due()
+            || self.writer.rechecks_waiting()
+        {
             return false;
         }
         let coming = self.coming();

@@ -214,6 +214,8 @@ impl Open {
     ) -> Option<Decrypted> {
         let mut passed = Vec::new();
         let before = self.walk(offset, coverage, read, &mut passed)?;
+        #[cfg(any(test, feature = "test-support"))]
+        super::counting::deciphered(cipher.len());
         let mut state = before.clone();
         state.provenance = crate::crypt::worse(state.provenance, provenance);
         let mut plain = Vec::with_capacity(cipher.len());
@@ -469,6 +471,37 @@ impl Cipher {
 }
 
 impl super::Zip {
+    // A delivery's bytes in the archive's coordinates, with each repair a
+    // cipher member holds for its replay laid over them: a replay reads
+    // the member's old suffix back through plaintext the old bytes made,
+    // so what it brings over a repair is the bytes the repair replaced,
+    // and what the object keeps of the archive is the repair.
+    pub(super) fn under_pending<'a>(
+        &self,
+        range: ByteRange,
+        bytes: &'a [u8],
+    ) -> std::borrow::Cow<'a, [u8]> {
+        let mut bytes = std::borrow::Cow::Borrowed(bytes);
+        let Some(map) = &self.map else {
+            return bytes;
+        };
+        for entry in &map.entries {
+            let (Some(data), Some(cipher)) = (entry.data, &entry.cipher) else {
+                continue;
+            };
+            for (wanted, replacement, _) in &cipher.pending {
+                let Some(part) = wanted.shift(data as i64).intersect(range) else {
+                    continue;
+                };
+                let from = (part.start - range.start) as usize;
+                let at = (part.start - data - wanted.start) as usize;
+                bytes.to_mut()[from..from + part.len() as usize]
+                    .copy_from_slice(&replacement[at..at + part.len() as usize]);
+            }
+        }
+        bytes
+    }
+
     pub(super) fn posted_over(&self, ranges: &[(weaver_graph::VolumeIndex, ByteRange)]) -> Posted {
         use weaver_graph::{Placement, Placements};
         let placed = Placements::take(ranges, |volume, range, out: &mut Vec<Placement>| {
@@ -682,11 +715,39 @@ impl super::Zip {
         }
     }
 
+    // Whether some member's keys are proved and stand where ciphertext the
+    // object kept starts: it can be deciphered with nothing read.
+    pub(super) fn kept_due(&self) -> bool {
+        self.map.as_ref().is_some_and(|map| {
+            map.entries.iter().any(|entry| {
+                let (Some(member), Some(data), Some(cipher)) =
+                    (entry.member, entry.data, &entry.cipher)
+                else {
+                    return false;
+                };
+                cipher.open.as_ref().is_some_and(|open| {
+                    let at = open.reaches();
+                    open.checked
+                        && !cipher.retry
+                        && at < entry.length
+                        && !self.kept.from(data + at).is_empty()
+                        && !self.members[member.0 as usize]
+                            .coverage
+                            .covered(ByteRange::at(at, 1))
+                })
+            })
+        })
+    }
+
     pub(super) fn emit_kept_encrypted(
         &mut self,
         read: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<weaver_graph::Emit>,
     ) {
+        // A member whose keys could not go on, away from the tree an
+        // unchecked one, is passed over, so another's ciphertext the keys
+        // reach is still said, and the pass ends.
+        let mut stuck = Vec::new();
         loop {
             let next = self.map.as_ref().and_then(|map| {
                 map.entries.iter().find_map(|entry| {
@@ -695,6 +756,9 @@ impl super::Zip {
                     else {
                         return None;
                     };
+                    if stuck.contains(&member) {
+                        return None;
+                    }
                     let open = cipher.open.as_ref()?;
                     if cipher.retry || open.reaches() >= entry.length {
                         return None;
@@ -705,12 +769,9 @@ impl super::Zip {
                     if len == 0 {
                         return None;
                     }
-                    let range = ByteRange::at(start, len);
-                    let provenance = if self.kept.verified(range) {
-                        Provenance::Fresh
-                    } else {
-                        Provenance::Damaged
-                    };
+                    // Said as the run arrived: a replay saying it again
+                    // as it arrived says nothing new.
+                    let provenance = self.kept.provenance_at(start)?;
                     Some((
                         member,
                         offset,
@@ -731,7 +792,7 @@ impl super::Zip {
                 .and_then(|cipher| cipher.open.as_ref())
                 .map_or(offset, |open| open.reaches());
             if reached <= offset {
-                return;
+                stuck.push(member);
             }
         }
     }
@@ -744,16 +805,16 @@ impl super::Zip {
         provenance: Provenance,
         read: &mut dyn FnMut(&weaver_graph::Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<weaver_graph::Emit>,
-    ) {
+    ) -> bool {
         use weaver_graph::{Emit, Evidenced, Placement};
         let Some(map) = &mut self.map else {
-            return;
+            return false;
         };
         let index = map.members[member.0 as usize];
         let entry = &mut map.entries[index];
         let Some(mut cipher) = entry.cipher.take() else {
             self.record(member, offset, bytes, provenance, out);
-            return;
+            return true;
         };
         let coverage = &self.members[member.0 as usize].coverage;
         let mut plain =
@@ -787,7 +848,7 @@ impl super::Zip {
             let mut expected = Vec::new();
             if said > 0 && !plain(proof, &mut expected) {
                 entry.cipher = Some(cipher);
-                return;
+                return false;
             }
             if said == 0 || open.proves(&expected, &cipher.proof[..said as usize]) {
                 Arc::make_mut(cipher.open.as_mut().unwrap()).checked = true;
@@ -804,17 +865,18 @@ impl super::Zip {
         let Some(open) = &cipher.open else {
             entry.cipher = Some(cipher);
             if disproved {
-                return self.disown(member, out);
+                self.disown(member, out);
+                return true;
             }
             if !self.asked {
                 self.asked = true;
                 out.push(Emit::NeedsPassword);
             }
-            return;
+            return false;
         };
         if cipher.retry {
             entry.cipher = Some(cipher);
-            return;
+            return false;
         }
         let mut input = std::borrow::Cow::Borrowed(&bytes[..]);
         let range = ByteRange::at(offset, input.len() as u64);
@@ -844,7 +906,7 @@ impl super::Zip {
         let source = provenance;
         let Some(decrypted) = open.trial(offset, &input, provenance, coverage, &mut plain) else {
             entry.cipher = Some(cipher);
-            return;
+            return false;
         };
         // Capture the old suffix before replacing its prefix. Every byte
         // after a changed ciphertext byte needs the new feedback state.
@@ -859,7 +921,7 @@ impl super::Zip {
                 let again = ByteRange::new(data + range.start, data + entry.length);
                 entry.cipher = Some(cipher);
                 if replay_from.is_some_and(|from| from <= range.start) {
-                    return;
+                    return true;
                 }
                 // The replay says everything from the change again; the
                 // prefix's checksum, from the keys' state at the change,
@@ -881,7 +943,7 @@ impl super::Zip {
                         .into_iter()
                         .map(|(volume, range)| Emit::Again { volume, range }),
                 );
-                return;
+                return true;
             }
         }
         if offset <= cipher.proof.len() as u64 && offset < 32 {
@@ -917,6 +979,7 @@ impl super::Zip {
             .collect();
         entry.cipher = Some(cipher);
         self.record(member, offset, Evidenced::from(bytes), provenance, out);
+        true
     }
 }
 

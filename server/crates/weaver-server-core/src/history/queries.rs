@@ -107,6 +107,31 @@ impl Database {
         })
     }
 
+    // Every failed job whose record says it finished at or before
+    // `finished_by`, in epoch seconds, with the output directory it records.
+    pub(crate) fn failed_job_history_finished_by(
+        &self,
+        finished_by: i64,
+    ) -> Result<std::collections::BTreeMap<crate::JobId, Option<String>>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id, output_dir FROM job_history WHERE status = 'failed' AND completed_at <= {}",
+                &[SqlArg::I64(finished_by)],
+            )
+            .await?;
+            let mut dirs = std::collections::BTreeMap::new();
+            for row in rows {
+                dirs.insert(
+                    crate::JobId(row.i64("job_id")? as u64),
+                    row.opt_text("output_dir")?,
+                );
+            }
+            Ok(dirs)
+        })
+    }
+
     // The visibility predicate is applied in SQL, before pagination.
     pub fn list_job_history(
         &self,

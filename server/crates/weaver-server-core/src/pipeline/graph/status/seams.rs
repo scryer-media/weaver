@@ -35,8 +35,20 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     };
     // A pause, a failure or anything after the tree is done belongs to
     // whoever set it, and the queues still owe bytes while they hold work.
-    if !RootPhase::may_replace(&state.status)
-        || pipeline.job_has_pending_download_pipeline_work(job_id)
+    if !RootPhase::may_replace(&state.status) {
+        return;
+    }
+    // Names placed while the content policy could not be read are judged
+    // as soon as a read of it succeeds; one that fails is tried again at the
+    // next check, and the job never delivers before it succeeds.
+    let unread = pipeline
+        .graph_jobs
+        .get_mut(&job_id)
+        .map_or(Ok(()), GraphJob::learn_policy);
+    if pipeline.fail_graph_job_on_breach(job_id) {
+        return;
+    }
+    if pipeline.job_has_pending_download_pipeline_work(job_id)
         || pipeline.queue_script_completion_gate(job_id, true)
     {
         return;
@@ -60,6 +72,13 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     let Some(job) = pipeline.graph_jobs.get_mut(&job_id) else {
         return;
     };
+    // Work an object holds goes out before the verdict, which then waits
+    // for it: an object holding ciphertext it has keys for is not short.
+    // Work done here that could not write fails the job as any step does.
+    if let Err(error) = job.lend_work(limit) {
+        pipeline.after_graph_result(job_id, Err(error));
+        return;
+    }
     let step = drive(
         job,
         &mut pipeline.graph_status.repairs,
@@ -69,6 +88,16 @@ pub(in crate::pipeline) async fn advance(pipeline: &mut Pipeline, job_id: JobId)
     pipeline.report_graph_phase(job_id);
     for woken in pipeline.graph_status.repairs.take_woken() {
         pipeline.schedule_job_completion_check(JobId(woken.0));
+    }
+    // Nothing is delivered while a name waits to be judged: the job holds
+    // its files and waits for the operator, as an unwritable checkpoint
+    // does, and its resume reads the policy again.
+    if let (Step::Deliver, Err(error)) = (&step, unread) {
+        pipeline.hold_graph_job_on_host_error(
+            job_id,
+            format!("{error}. Resolve the database error and resume to retry; files are retained."),
+        );
+        return;
     }
     settle(pipeline, job_id, step).await;
 }
@@ -98,6 +127,7 @@ pub(super) async fn settle(pipeline: &mut Pipeline, job_id: JobId, step: Step) {
                 // broke, whatever the root showed.
                 let stage = pipeline.graph_shortfall(job_id).map(|(stage, _)| stage);
                 pipeline.enter_short_stage(job_id, stage);
+                pipeline.mark_failed_for_memory(job_id);
                 if pipeline.graph_failure_is_health(job_id) {
                     pipeline.fail_job_on_health(job_id, error);
                 } else {
@@ -585,6 +615,33 @@ impl Pipeline {
             })
     }
 
+    // Record with a failing graph job that what it withheld was refused
+    // only because the policy holds runs to the profile's ceiling, so its
+    // history offers a reprocess with no memory limit. A window over the
+    // machine, or any other refusal, records nothing.
+    fn mark_failed_for_memory(&mut self, job_id: JobId) {
+        use crate::history::attributes::{FAILED_FOR_MEMORY_ATTRIBUTE_KEY, failed_for_memory};
+        let too_large = self.graph_ruling(job_id).is_some_and(|(delivery, _)| {
+            delivery
+                .withheld
+                .iter()
+                .any(|(_, why)| matches!(why, weaver_graph::Why::TooLarge { .. }))
+        });
+        let held = self
+            .graph_jobs
+            .get(&job_id)
+            .is_some_and(GraphJob::held_to_ceiling);
+        let Some(state) = self.jobs.get_mut(&job_id) else {
+            return;
+        };
+        if too_large && held && !failed_for_memory(&state.spec.metadata) {
+            state
+                .spec
+                .metadata
+                .push((FAILED_FOR_MEMORY_ATTRIBUTE_KEY.to_string(), "1".to_string()));
+        }
+    }
+
     // Whether a graph job's failure is the feed's: no set failed and the
     // feed gave the post up.
     fn graph_failure_from_feed(&self, job_id: JobId) -> bool {
@@ -792,6 +849,17 @@ impl Pipeline {
                         reason: crate::pipeline::graph::checkpoint::why_name(given_back.why)
                             .to_owned(),
                     });
+                }
+                // The queue fetches it again as first dispatched.
+                Note::Unread(volume, ordinal) => {
+                    let segment_id = crate::jobs::ids::SegmentId {
+                        file_id: NzbFileId {
+                            job_id,
+                            file_index: volume.0,
+                        },
+                        segment_number: ordinal,
+                    };
+                    self.push_requeued_segment(segment_id);
                 }
             }
         }

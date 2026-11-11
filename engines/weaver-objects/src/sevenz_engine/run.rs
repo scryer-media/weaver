@@ -20,8 +20,10 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
-use sevenz_turbo::{ArchiveEntry, ArchiveReader, Error, Password, ReadAt, UnorderedEntry};
-use weaver_graph::{Budget, Emit, Extraction, MemberId, Provenance, Sink, Volumes};
+use sevenz_turbo::{
+    Archive, ArchiveEntry, ArchiveReader, Error, Password, ReadAt, ReadAtCursor, UnorderedEntry,
+};
+use weaver_graph::{Budget, Emit, Extraction, MemberId, Provenance, Sink, Volumes, Why};
 
 use crate::engine::Joined;
 use crate::verdict;
@@ -38,7 +40,7 @@ impl Run {
 
 impl Extraction for Run {
     fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, sink: &mut Sink<'_>, budget: Budget) {
-        let input = Joined::new(volumes);
+        let input = Arc::new(Joined::new(volumes));
         let failed = input.failure();
         let password = self
             .password
@@ -53,13 +55,9 @@ impl Extraction for Run {
             closed: 0,
             stopped: false,
         };
-        // The decoder holds no more than the run was granted, and decodes on
-        // as many threads.
-        let limits = crate::sevenz_store::limits(&budget);
-        let threads = u32::try_from(budget.threads()).unwrap_or(u32::MAX);
-        let walked = ArchiveReader::from_read_at(input, password, limits).and_then(|mut reader| {
+        let mut in_ram = None;
+        let walked = open(&input, password, &budget, &mut in_ram).and_then(|mut reader| {
             reader.set_verify_checksums(true);
-            reader.set_threads(threads);
             walk.number(&reader);
             reader.for_each_entries_unordered(|event| walk.event(event))
         });
@@ -77,7 +75,21 @@ impl Extraction for Run {
                 return;
             }
         }
-        (walk.sink)(verdict::sevenz(&error));
+        // A window the scratch had no room for asks for the decode in RAM:
+        // all of what it holds there on one thread, so one start in RAM is
+        // enough, not just the window refused. What it was allowed there is
+        // the run's memory, which it keeps in RAM what fits.
+        let said = match verdict::sevenz(&error) {
+            Emit::Refuse(Why::TooLarge {
+                needed: Some(needed),
+                allowed: None,
+            }) => Emit::Refuse(Why::TooLarge {
+                needed: Some(needed.max(in_ram.unwrap_or(0))),
+                allowed: budget.memory_bytes,
+            }),
+            said => said,
+        };
+        (walk.sink)(said);
     }
 }
 
@@ -86,6 +98,36 @@ struct Named {
     name: String,
     length: u64,
     crc32: Option<u32>,
+}
+
+// The reader over the run's input. The decoder holds no more than the run
+// was granted, and decodes on as many threads. With a lender, what the run's
+// memory holds stays in RAM (`crate::lent::sevenz_of`), and the decode runs
+// on fewer threads where what they would borrow at once is more than the
+// lender has room for. `in_ram` is then what a decode holds in RAM on one
+// thread with nothing lent.
+fn open(
+    input: &Arc<Joined>,
+    password: Password,
+    budget: &Budget,
+    in_ram: &mut Option<u64>,
+) -> Result<ArchiveReader<ReadAtCursor<Joined>>, Error> {
+    let limits = crate::sevenz_store::limits(budget);
+    let most = u32::try_from(budget.threads()).unwrap_or(u32::MAX);
+    let mut cursor = ReadAtCursor::new(Arc::clone(input));
+    let archive = Archive::read_with_limits(&mut cursor, &password, &limits)?;
+    let (limits, threads) = if budget.lender.is_some() {
+        let limits = crate::lent::sevenz_of(&archive, budget);
+        *in_ram = crate::lent::sevenz_in_ram(&archive, &limits);
+        let threads = crate::lent::sevenz_threads(&archive, &limits, budget, most);
+        (limits, threads)
+    } else {
+        (limits, most)
+    };
+    let mut reader = ArchiveReader::from_archive_with_limits(archive, cursor, password, limits)?;
+    reader.set_positional_source(Arc::clone(input));
+    reader.set_threads(threads);
+    Ok(reader)
 }
 
 struct Walk<'s, 'a> {

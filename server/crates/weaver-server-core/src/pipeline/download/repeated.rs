@@ -47,48 +47,25 @@ impl Template {
     }
 }
 
-// The cache's directory. A job rename moves it with the working directory,
-// so the live path is held here, behind one lock, rather than in a
-// `tempfile::TempDir`: those paths are immutable, and a stale one would
-// both miss the moved files and, on drop, remove whatever later took the
-// old path. Every cached body names its file relative to this root, so a
-// relocation is the one rewrite below and no entry has to be visited.
+// The cache's directory, removed once the cache and every body cut from it
+// are gone. Every cached body names its file relative to this root.
 struct CacheRoot {
-    path: std::sync::RwLock<PathBuf>,
+    path: PathBuf,
 }
 
 impl CacheRoot {
     fn new(path: PathBuf) -> Arc<Self> {
-        Arc::new(Self {
-            path: std::sync::RwLock::new(path),
-        })
+        Arc::new(Self { path })
     }
 
-    fn path(&self) -> PathBuf {
-        self.path
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
-    }
-
-    fn relocate(&self, old: &Path, new: &Path) {
-        let mut path = self
-            .path
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Ok(relative) = path.strip_prefix(old) {
-            *path = new.join(relative);
-        }
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
 impl Drop for CacheRoot {
     fn drop(&mut self) {
-        let path = self
-            .path
-            .get_mut()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ = std::fs::remove_dir_all(path);
+        let _ = std::fs::remove_dir_all(&self.path);
     }
 }
 
@@ -307,13 +284,6 @@ impl RepeatedArticles {
             memory,
             _index_memory: index_memory,
         })))
-    }
-
-    // The job's working directory moved from `old` to `new` with this cache
-    // inside it. The caller has proven the job idle, so no read or store is
-    // between resolving a path and using it.
-    pub(crate) fn relocate_working_dir(&self, old: &Path, new: &Path) {
-        self.root.relocate(old, new);
     }
 
     #[cfg(test)]
@@ -716,54 +686,6 @@ mod tests {
         assert_eq!(memory.reserved_bytes(), bytes.len() as u64);
         drop(restored);
         assert_eq!(memory.reserved_bytes(), 0);
-    }
-
-    // A rename of an idle job moves its working directory, the cache with
-    // it. The bodies already cached must read back from the new place and
-    // the next store must land there too; nothing may still name the old
-    // directory, and dropping the cache cleans the new one up.
-    #[test]
-    fn a_renamed_working_dir_carries_the_cache_and_every_cached_body() {
-        let base = tempfile::tempdir().unwrap();
-        let old = base.path().join("old name");
-        let new = base.path().join("new name");
-        let dir = old
-            .join(weaver_graph::names::CACHE_DIR)
-            .join("article-cache-test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let memory = Arc::new(ProcessMemoryBudget::new(1 << 20));
-        let cache = RepeatedArticles {
-            entries: HashMap::new(),
-            root: CacheRoot::new(dir),
-            _index_memory: memory.try_reserve_retained(0).unwrap(),
-            memory: memory.clone(),
-        };
-        let id = work().segment_id;
-        let (mut body, first) =
-            CachedBody::store(decoded(id, b"before"), Some(0), &cache.root, &memory, 7).unwrap();
-        drop(first);
-
-        std::fs::rename(&old, &new).unwrap();
-        cache.relocate_working_dir(&old, &new);
-
-        let moved = new
-            .join(weaver_graph::names::CACHE_DIR)
-            .join("article-cache-test");
-        assert_eq!(cache.root.path(), moved);
-        assert_eq!(body.path().parent(), Some(moved.as_path()));
-        let restored = body.read(id, &memory).unwrap();
-        let mut actual = Vec::new();
-        restored.data.write_to(&mut actual).unwrap();
-        assert_eq!(actual, b"before");
-        let (after, _replayed) =
-            CachedBody::store(decoded(id, b"after"), Some(0), &cache.root, &memory, 7).unwrap();
-        assert_eq!(after.path().parent(), Some(moved.as_path()));
-        assert_eq!(std::fs::read(after.path()).unwrap(), b"after");
-
-        drop((body, after, restored, _replayed));
-        drop(cache);
-        assert!(!moved.exists());
-        assert!(!old.exists());
     }
 
     #[test]

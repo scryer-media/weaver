@@ -7,10 +7,10 @@
 // the same limits here.
 
 use std::collections::BTreeMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::time::Instant;
 use tracing::warn;
 use weaver_graph::holds::HoldBudgets;
 use weaver_graph::{MemberId, NodeId, Tree};
@@ -19,6 +19,7 @@ use crate::RuntimeTuner;
 use crate::operations::disk::{Capacity, CapacityDebits};
 use crate::pipeline::completion::finalize::MAX_GRAPH_NESTING_DEPTH;
 use crate::pipeline::extraction::{ExtractionFailure, ExtractionLimits, ExtractionRejectionReason};
+use crate::pipeline::graph::decoding::DecodeClock;
 use crate::pipeline::graph::job::RootFile;
 use crate::pipeline::graph::leaf::Leaf;
 use crate::post_processing::model::{PostProcessingSettings, unwanted_extension_reason};
@@ -206,25 +207,33 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //   entries            members of the live namespaces objects produced
 //   resident           what those namespaces keep in memory for their
 //                      members, against the memory limit
-//   deadline           the wall clock since the first member an object
-//                      produced reached its namespace, less the time the
-//                      job spent paused; the posts' own writes are not
-//                      under it
+//   deadline           the time the job's decoders spent executing, less
+//                      what they spent while the job was paused; waiting
+//                      for articles, a slot, memory or a thread is not
+//                      under it, nor are the posts' own writes
 //   disk reserve       the free space a write would leave, against the
 //                      reading the holds already take
 //   content policy     the operator's unacceptable extensions, on every
-//                      name a namespace places
+//                      name a namespace places; a name placed while the
+//                      database could not be read waits, and is judged when
+//                      a read succeeds, before the job delivers; a stored
+//                      setting that does not parse is the default
 pub(crate) struct Caps {
     limits: Arc<ExtractionLimits>,
-    policy: Result<Arc<PostProcessingSettings>, String>,
+    read_policy: PolicyRead,
+    policy: Policy,
+    // Names placed and not judged yet: placed while the policy was unread,
+    // or brought back by a restore.
+    waiting: Vec<String>,
     // The bytes posted for each root member, by member id.
     declared: Vec<u64>,
-    // When extraction began: the first time an object's namespace was
-    // charged. A job queued or paused before then has spent none of it.
-    started: Option<Instant>,
-    // When the job paused, while it is paused: the clock stands still
-    // until it resumes.
-    paused: Option<Instant>,
+    // The time the job's decoders spent executing, which its runs and
+    // loans keep.
+    decoding: DecodeClock,
+    // What of it was spent while the job was paused, and what it stood at
+    // when the job paused, while it is paused.
+    excused: Duration,
+    paused: Option<Duration>,
     debits: CapacityDebits,
     // How far each member an object produced is written.
     extents: BTreeMap<(NodeId, MemberId), u64>,
@@ -237,6 +246,29 @@ pub(crate) struct Caps {
     refusal: Option<ExtractionFailure>,
 }
 
+// A read of the operator's settings, answering with them or with why the
+// database could not be read. A failed read is the host's, never the
+// post's: it is tried again when the policy is next needed. A stored value
+// that does not parse is no failed read: it answers with the default.
+pub(crate) type PolicyRead =
+    Arc<dyn Fn() -> Result<Arc<PostProcessingSettings>, String> + Send + Sync>;
+
+// What a failed read of the policy is said as: the setting, never the post.
+const POLICY_UNREAD: &str = "The Unacceptable extensions setting could not be read";
+
+// A read that always answers with these settings.
+pub(crate) fn known_policy(settings: PostProcessingSettings) -> PolicyRead {
+    let settings = Arc::new(settings);
+    Arc::new(move || Ok(Arc::clone(&settings)))
+}
+
+// The unacceptable extensions as the job knows them: read, or not yet,
+// with why the last read failed.
+enum Policy {
+    Known(Arc<PostProcessingSettings>),
+    Unknown(String),
+}
+
 // One namespace's charge: how many members it held, and what it kept
 // resident for each record it was charged for.
 #[derive(Default)]
@@ -246,16 +278,27 @@ struct Account {
 }
 
 impl Caps {
+    // The policy is read once here; a read that fails is tried again.
     pub(crate) fn new(
         limits: Arc<ExtractionLimits>,
-        policy: Result<Arc<PostProcessingSettings>, String>,
+        read_policy: PolicyRead,
         declared: Vec<u64>,
     ) -> Self {
+        let policy = match read_policy() {
+            Ok(settings) => Policy::Known(settings),
+            Err(error) => {
+                warn!(%error, "{POLICY_UNREAD}; names wait to be judged until a read succeeds");
+                Policy::Unknown(error)
+            }
+        };
         Self {
             limits,
+            read_policy,
             policy,
+            waiting: Vec::new(),
             declared,
-            started: None,
+            decoding: DecodeClock::default(),
+            excused: Duration::ZERO,
             paused: None,
             debits: CapacityDebits::default(),
             extents: BTreeMap::new(),
@@ -283,7 +326,7 @@ impl Caps {
             unacceptable_extensions: Vec::new(),
             ..PostProcessingSettings::default()
         };
-        Self::new(Arc::new(limits), Ok(Arc::new(policy)), Vec::new())
+        Self::new(Arc::new(limits), known_policy(policy), Vec::new())
     }
 
     // The breach the job stopped on, if it did.
@@ -300,17 +343,16 @@ impl Caps {
     }
 
     // A member of `node` changed. What an object produced is extraction:
-    // the first such change starts the clock, and every one after it is
-    // refused once the deadline has passed. The posts are not under it.
+    // every such change is refused once the job's decoders have spent the
+    // deadline. The posts are not under it.
     fn extracting(&mut self, tree: &Tree, node: NodeId) -> Result<(), ExtractionFailure> {
         if !produced(tree, node) {
             return Ok(());
         }
-        let started = *self.started.get_or_insert_with(Instant::now);
-        let spent = match self.paused {
-            Some(paused) => paused.saturating_duration_since(started),
-            None => started.elapsed(),
-        };
+        let spent = self
+            .paused
+            .unwrap_or_else(|| self.decoding.spent())
+            .saturating_sub(self.excused);
         if spent > Duration::from_secs(self.limits.max_seconds) {
             let detail = format!(
                 "extraction exceeded the {} second deadline",
@@ -321,21 +363,22 @@ impl Caps {
         Ok(())
     }
 
-    // The job paused or resumed. The time it spends paused is not
-    // extraction: on resume the clock moves on by the pause, so the
-    // deadline counts only the time the job ran.
+    // The job paused or resumed. What its decoders spend while it is
+    // paused is not counted: on resume it is excused.
     pub(crate) fn hold_clock(&mut self, paused: bool) {
-        let now = Instant::now();
         match (paused, self.paused) {
-            (true, None) => self.paused = Some(now),
+            (true, None) => self.paused = Some(self.decoding.spent()),
             (false, Some(at)) => {
                 self.paused = None;
-                if let Some(started) = self.started.as_mut() {
-                    *started = now - at.saturating_duration_since(*started);
-                }
+                self.excused += self.decoding.spent().saturating_sub(at);
             }
             _ => {}
         }
+    }
+
+    // Where the job's runs and loans keep the time they spend decoding.
+    pub(crate) fn decode_clock(&self) -> DecodeClock {
+        self.decoding.clone()
     }
 
     #[cfg(test)]
@@ -344,21 +387,47 @@ impl Caps {
     }
 
     // A namespace places `name`. A directory carries no extension.
+    // While the policy is unread the name waits to be judged.
     pub(crate) fn admit_name(&mut self, name: &str) -> Result<(), ExtractionFailure> {
         self.check()?;
         if Leaf::is_directory(name) {
             return Ok(());
         }
-        let rejected = match &self.policy {
-            Ok(policy) => policy
-                .unacceptable_extension_match(name)
-                .map(|_| unwanted_extension_reason(name)),
-            Err(error) => Some(error.clone()),
+        let policy = match &mut self.policy {
+            Policy::Known(policy) => Arc::clone(policy),
+            Policy::Unknown(_) => {
+                self.waiting.push(name.to_owned());
+                return Ok(());
+            }
         };
-        match rejected {
-            Some(detail) => Err(self.breach(ExtractionRejectionReason::ContentPolicy, detail)),
+        match policy.unacceptable_extension_match(name) {
+            Some(_) => Err(self.breach(
+                ExtractionRejectionReason::ContentPolicy,
+                unwanted_extension_reason(name),
+            )),
             None => Ok(()),
         }
+    }
+
+    // Read the policy again if it is still unread, and judge every name
+    // that waited for it. The error, worded for the operator, while the
+    // read still fails; a name the policy refuses stands as the breach.
+    pub(crate) fn learn_policy(&mut self) -> Result<(), String> {
+        if let Policy::Unknown(error) = &mut self.policy {
+            match (self.read_policy)() {
+                Ok(settings) => self.policy = Policy::Known(settings),
+                Err(failed) => {
+                    *error = failed;
+                    return Err(format!("{POLICY_UNREAD}: {error}"));
+                }
+            }
+        }
+        for name in std::mem::take(&mut self.waiting) {
+            if self.admit_name(&name).is_err() {
+                break;
+            }
+        }
+        Ok(())
     }
 
     // A namespace announced a member, or bytes of one reached it: the
@@ -436,13 +505,14 @@ impl Caps {
     }
 
     // Bytes up to `end` of a member of `node`, against the disk reading the
-    // holds take. Only what an object produced counts.
+    // holds take of the filesystem under `folder`. Only what an object
+    // produced counts.
     pub(crate) fn admit_write(
         &mut self,
         tree: &Tree,
         (node, member): (NodeId, MemberId),
         end: u64,
-        capacity: Capacity,
+        (folder, capacity): (&Path, Capacity),
     ) -> Result<(), ExtractionFailure> {
         self.check()?;
         self.extracting(tree, node)?;
@@ -475,9 +545,11 @@ impl Caps {
         if let Some(reading) = self.debits.apply(capacity).reading() {
             let remaining = reading.available_bytes.saturating_sub(grown);
             if remaining < self.limits.min_free_bytes && !reading.stale {
-                let detail = format!(
-                    "writing {grown} bytes would leave {remaining} bytes free, reserve is {}",
-                    self.limits.min_free_bytes
+                let detail = disk_full(
+                    folder,
+                    reading.available_bytes,
+                    grown,
+                    self.limits.min_free_bytes,
                 );
                 return Err(self.breach(ExtractionRejectionReason::DiskReserve, detail));
             }
@@ -521,31 +593,38 @@ impl Caps {
     }
 
     // The restored tree's members, each charged as the tree holds it: what
-    // a checkpoint brings back is counted from the tree, never stored.
+    // a checkpoint brings back is counted from the tree, never stored. No
+    // checkpoint says which names a run before judged, so each waits to be
+    // judged again before the job delivers: a refusal here would stop the
+    // restore itself, and the job would never be failed for it.
     pub(crate) fn restore_members(&mut self, tree: &Tree) {
         for node in tree.live() {
-            let records: Vec<MemberId> = tree
+            let records: Vec<(MemberId, String)> = tree
                 .namespace(node)
-                .map(|namespace| namespace.records().map(|record| record.id).collect())
+                .map(|namespace| {
+                    namespace
+                        .records()
+                        .map(|record| (record.id, record.output_name.clone()))
+                        .collect()
+                })
                 .unwrap_or_default();
-            for member in records {
+            for (member, name) in records {
+                if !Leaf::is_directory(&name) {
+                    self.waiting.push(name);
+                }
                 self.charge(tree, node, member);
             }
         }
     }
 
-    // The bytes posted for the root members an object other than a
-    // recovery object owns, or gave up: the archives the output came from.
+    // The bytes posted for every root member but recovery data. A member
+    // no object holds yet counts: an archive's member takes its whole
+    // length at its first write, before its later volumes are bound.
     fn declared(&self, tree: &Tree) -> u64 {
         self.declared
             .iter()
             .zip(0u32..)
-            .filter(|(_, index)| {
-                let member = MemberId(*index);
-                tree.child_of(NodeId::ROOT, member)
-                    .or_else(|| tree.retired(NodeId::ROOT, member))
-                    .is_some_and(|(object, _)| !tree.recovers(object))
-            })
+            .filter(|(_, index)| !recovery_post(tree, MemberId(*index)))
             .map(|(bytes, _)| *bytes)
             .fold(0u64, u64::saturating_add)
     }
@@ -557,6 +636,35 @@ impl Caps {
                 ExtractionFailure::new(reason, detail)
             })
             .clone()
+    }
+}
+
+// A disk reserve breach as the operator reads it: the disk is out of space,
+// where, and by how much.
+fn disk_full(folder: &Path, free: u64, writing: u64, reserve: u64) -> String {
+    use crate::support::human_bytes;
+    format!(
+        "out of disk space: the disk holding {} has {} free, writing {} more would leave {}, and {} must stay free",
+        folder.display(),
+        human_bytes(free),
+        human_bytes(writing),
+        human_bytes(free.saturating_sub(writing)),
+        human_bytes(reserve),
+    )
+}
+
+// Whether a post is recovery data: a recovery object holds it or gave it
+// up, or, held by none, its posted name says so.
+fn recovery_post(tree: &Tree, member: MemberId) -> bool {
+    match tree
+        .child_of(NodeId::ROOT, member)
+        .or_else(|| tree.retired(NodeId::ROOT, member))
+    {
+        Some((object, _)) => tree.recovers(object),
+        None => tree
+            .namespace(NodeId::ROOT)
+            .and_then(|namespace| namespace.get(member))
+            .is_some_and(|record| weaver_graph::names_recovery(&record.name)),
     }
 }
 
@@ -581,10 +689,14 @@ pub(in crate::pipeline::graph) fn caps_for(
     extraction_limits: &Arc<ExtractionLimits>,
     files: &[RootFile],
 ) -> Caps {
-    let policy = db
-        .post_processing_settings()
-        .map(Arc::new)
-        .map_err(|error| format!("could not load unacceptable extension policy: {error}"));
+    let db = db.clone();
+    // A stored value that does not parse reads as the default policy; only
+    // a failed read leaves the policy unknown.
+    let policy: PolicyRead = Arc::new(move || {
+        db.post_processing_settings()
+            .map(Arc::new)
+            .map_err(|error| error.to_string())
+    });
     let declared = files
         .iter()
         .map(|file| {

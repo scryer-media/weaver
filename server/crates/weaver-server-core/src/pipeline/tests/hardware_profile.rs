@@ -24,6 +24,7 @@ fn twelve_core_machine() -> SystemProfile {
             total_bytes: 8 * 1024 * 1024 * 1024,
             available_bytes: 8 * 1024 * 1024 * 1024,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Ssd,
@@ -86,10 +87,20 @@ fn assert_limits_of(pipeline: &Pipeline, profile: HardwareProfile) {
     );
     let grant = pipeline.graph_hardware.grant();
     assert_eq!(pool_size(&grant), tuning.extract_threads);
+    // The decode pool fits one run at the profile's ceiling, and its
+    // overhead.
+    assert_eq!(
+        pipeline.graph_decode.room().limit,
+        tuning
+            .sevenz_decode_memory_bytes
+            .max(tuning.decode_window_bytes)
+            + crate::pipeline::graph::engine::RUN_OVERHEAD
+    );
     assert_eq!(
         lent(&grant.run),
         (
             Some(tuning.sevenz_decode_memory_bytes),
+            Some(tuning.decode_window_bytes),
             tuning.extract_threads,
             true
         )
@@ -152,6 +163,32 @@ async fn a_chosen_profile_is_in_force_for_the_next_activity() {
         pipeline.graph_hardware.grant().pool.as_ref().unwrap()
     ));
     assert_eq!(pool_size(&running), 6);
+}
+
+// The holds keep exactly what their settings resolve to under every profile:
+// the decode pool is apart from them and never raises their limit.
+#[tokio::test]
+async fn the_holds_keep_their_settings_on_every_profile() {
+    use crate::pipeline::graph::limits::{HoldSettings, HostFacts};
+
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut pipeline = pipeline_on_twelve_cores(&temp_dir).await;
+    let settings = HoldSettings::resolve(
+        &*pipeline.config.read().await,
+        HostFacts::probe(
+            &temp_dir.path().join("intermediate"),
+            HardwareProfile::Balanced
+                .tuning(pipeline.tuner.system_profile())
+                .direct_store_resident_default_cap_bytes,
+        ),
+    )
+    .budgets();
+    assert_eq!(pipeline.graph_holds.budgets(), settings);
+    for profile in [HardwareProfile::Efficient, HardwareProfile::Balanced] {
+        choose(&mut pipeline, profile).await;
+        assert_limits_of(&pipeline, profile);
+        assert_eq!(pipeline.graph_holds.budgets(), settings);
+    }
 }
 
 #[tokio::test]
@@ -238,9 +275,15 @@ async fn a_scheduled_profile_the_machine_cannot_honour_is_skipped() {
     assert_limits_of(&pipeline, HardwareProfile::Efficient);
 }
 
-// A run's grant as its memory, its threads, and whether the pool is lent.
-fn lent(budget: &Budget) -> (Option<u64>, usize, bool) {
-    (budget.memory_bytes, budget.threads, budget.pool.is_some())
+// A run's grant as its memory, its window, its threads, and whether the
+// pool is lent.
+fn lent(budget: &Budget) -> (Option<u64>, Option<u64>, usize, bool) {
+    (
+        budget.memory_bytes,
+        budget.window_bytes,
+        budget.threads,
+        budget.pool.is_some(),
+    )
 }
 
 fn pool_size(grant: &Grant) -> usize {
@@ -273,22 +316,16 @@ impl weaver_graph::Extraction for Told {
 // run after the change starts on the new profile's.
 #[tokio::test]
 async fn a_profile_change_reaches_the_next_run_and_not_the_running_one() {
-    use crate::pipeline::graph::engine::{RunMail, Runs};
+    use crate::pipeline::graph::engine::{DecodePool, RunMail, Runs};
     use crate::pipeline::graph::envelope::Envelopes;
     use weaver_graph::NodeId;
-    use weaver_graph::holds::{HoldBudgets, HoldsAccountant};
 
     let temp_dir = tempfile::tempdir().unwrap();
     let mut pipeline = pipeline_on_twelve_cores(&temp_dir).await;
     let mut envelopes = Envelopes::new(temp_dir.path().join("envelopes"));
     let mut mail = RunMail::default();
-    let accountant = Arc::new(HoldsAccountant::new(HoldBudgets {
-        resident_limit: u64::MAX,
-        scratch_total: u64::MAX,
-        scratch_ceiling: u64::MAX,
-        disk_reserve: 0,
-    }));
-    let mut runs = Runs::new(1, 2, mail.sender(), accountant).on(pipeline.graph_hardware.clone());
+    let pool = Arc::new(DecodePool::new(u64::MAX));
+    let mut runs = Runs::new(1, 2, mail.sender(), pool).on(pipeline.graph_hardware.clone());
     let (first, second) = (NodeId(1), NodeId(2));
     let (told, heard) = std::sync::mpsc::channel();
 
@@ -326,6 +363,7 @@ async fn a_profile_change_reaches_the_next_run_and_not_the_running_one() {
         lent(&first_budget),
         (
             Some(balanced.sevenz_decode_memory_bytes),
+            Some(balanced.decode_window_bytes),
             balanced.extract_threads,
             true
         )
@@ -334,6 +372,7 @@ async fn a_profile_change_reaches_the_next_run_and_not_the_running_one() {
         lent(&second_budget),
         (
             Some(efficient.sevenz_decode_memory_bytes),
+            Some(efficient.decode_window_bytes),
             efficient.extract_threads,
             true
         )
@@ -358,8 +397,11 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
         balanced.repair,
         Budget {
             memory_bytes: Some(1024 * 1024 * 1024),
+            window_bytes: None,
+            window_reserved: false,
             threads: 6,
             pool: None,
+            lender: None,
         }
     );
 
@@ -373,10 +415,53 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
         grant.repair,
         Budget {
             memory_bytes: Some(256 * 1024 * 1024),
+            window_bytes: None,
+            window_reserved: false,
             threads: 4,
             pool: None,
+            lender: None,
         }
     );
     assert_eq!(grant.install(rayon::current_num_threads), 4);
     assert_eq!(balanced.install(rayon::current_num_threads), 6);
+}
+
+// Only memory read from the machine is a hard stop for a run above the
+// ceiling. Where it could not be read, the sizes the profile works from are
+// a default, and nothing bounds the run: no hard stop, and no "this machine
+// has" to say.
+#[tokio::test]
+async fn a_hard_stop_holds_only_to_memory_read_from_the_machine() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let pipeline = pipeline_on_twelve_cores(&temp_dir).await;
+    let grant = pipeline.graph_hardware.grant();
+    assert_eq!(grant.machine_bytes, Some(8 * 1024 * 1024 * 1024));
+    assert_eq!(grant.above_ceiling(), 6 * 1024 * 1024 * 1024);
+
+    let mut guessed = twelve_core_machine();
+    guessed.memory.guessed = true;
+    let other = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline_on_machine(
+        other.path().join("data"),
+        other.path().join("intermediate"),
+        other.path().join("complete"),
+        other.path().join("weaver.db"),
+        BufferPoolConfig {
+            small_count: 8,
+            medium_count: 4,
+            large_count: 2,
+        },
+        20,
+        None,
+        guessed,
+    )
+    .await;
+    let grant = pipeline.graph_hardware.grant();
+    assert_eq!(grant.machine_bytes, None);
+    assert_eq!(grant.above_ceiling(), u64::MAX);
+    // What the guessed size feeds elsewhere is as before.
+    assert_eq!(
+        pipeline.tuner.profile_tuning(),
+        HardwareProfile::Balanced.tuning(&twelve_core_machine())
+    );
 }

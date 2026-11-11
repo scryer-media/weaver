@@ -2415,6 +2415,7 @@ async fn postgres_runtime_smoke_when_configured() {
         }),
         max_download_speed: Some(12_345),
         cleanup_after_extract: Some(false),
+        delete_failed_job_files: None,
         propagation_delay_secs: Some(0),
         max_concurrent_nzbs: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
@@ -2927,4 +2928,24 @@ async fn execute_schema_ddl(pool: &sqlx::PgPool, sql: String) {
 fn postgres_url_for_schema(base_url: &str, schema: &str) -> String {
     let separator = if base_url.contains('?') { '&' } else { '?' };
     format!("{base_url}{separator}options=-csearch_path%3D{schema}")
+}
+
+// sqlx hands a dropped connection back to the pool from a spawned task. The
+// sync writer used to run on a current-thread runtime that only ran that
+// task inside its next job, so a write left its connection checked out
+// until another write came, and a one-connection pool timed out on the
+// read after it. Every connection now returns with no further job.
+#[test]
+fn a_sync_write_returns_its_connection_without_another_job() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = Database::open(&temp.path().join("weaver.db")).unwrap();
+    db.set_setting("returns", "1").unwrap();
+
+    let DatabaseServices::Sqlite(services) = &db.sql_services else {
+        unreachable!("a path opens SQLite");
+    };
+    let pool = services.pool();
+    while pool.num_idle() < pool.size() as usize {
+        std::thread::yield_now();
+    }
 }

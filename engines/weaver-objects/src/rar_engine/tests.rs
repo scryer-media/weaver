@@ -1091,8 +1091,11 @@ fn on_budget(volumes: Vec<Vec<u8>>, memory_bytes: Option<u64>, threads: usize) -
         &mut sink,
         weaver_graph::Budget {
             memory_bytes,
+            window_bytes: None,
             threads,
             pool: Some(Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>),
+            lender: None,
+            ..Default::default()
         },
     );
     let reads = std::mem::take(&mut *counted.reads.lock().unwrap());
@@ -1118,9 +1121,12 @@ fn a_compressed_member_larger_than_the_run_memory_budget_is_refused() {
     );
     let result = on_budget(vec![archive.to_vec()], Some(1), 1);
     assert!(
-        result.said.contains(&Said::Refuse(Why::Unsupported)),
-        "{} events",
-        result.said.len()
+        result.said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(256 << 10),
+            allowed: Some(1),
+        })),
+        "{:?}",
+        result.said
     );
     assert!(
         !result
@@ -1128,6 +1134,93 @@ fn a_compressed_member_larger_than_the_run_memory_budget_is_refused() {
             .iter()
             .any(|said| matches!(said, Said::Bytes(_, _)))
     );
+}
+
+const MIB: u64 = 1 << 20;
+const GIB: u64 = 1 << 30;
+
+// A run as each hardware profile grants it: its memory and the window one
+// decoder may hold, Efficient, Balanced and Performance in turn.
+fn profiles() -> [weaver_graph::Budget; 3] {
+    [(512 * MIB, 256 * MIB), (GIB, GIB), (4 * GIB, 4 * GIB)].map(|(memory, window)| {
+        weaver_graph::Budget {
+            memory_bytes: Some(memory),
+            window_bytes: Some(window),
+            threads: 1,
+            ..Default::default()
+        }
+    })
+}
+
+// The dictionary limit is the window the profile grants. A RAR3 PPMd arena
+// keeps the format's 256 MiB ceiling on every profile. A run granted no
+// window keeps the decoder's own 256 MiB, narrowed by the memory granted.
+#[test]
+fn each_profiles_window_is_the_rar_dictionary_limit() {
+    let [efficient, balanced, performance] = profiles().map(|budget| run::limits(&budget));
+    assert_eq!(efficient.max_dict_size, 256 * MIB);
+    assert_eq!(balanced.max_dict_size, GIB);
+    assert_eq!(performance.max_dict_size, 4 * GIB);
+    for limits in [&efficient, &balanced, &performance] {
+        assert_eq!(limits.max_ppmd_arena_size, 256 * MIB);
+    }
+    let own = run::limits(&weaver_graph::Budget::default());
+    assert_eq!(own.max_dict_size, 256 * MIB);
+    let narrow = run::limits(&weaver_graph::Budget {
+        memory_bytes: Some(64 * MIB),
+        window_bytes: Some(GIB),
+        ..Default::default()
+    });
+    assert_eq!(narrow.max_dict_size, 64 * MIB);
+    assert_eq!(narrow.max_ppmd_arena_size, 64 * MIB);
+}
+
+// A compressed member whose header names a 1 GiB dictionary: RAR5 method 1,
+// dictionary 128 KiB << 13. Its data is never decoded.
+fn one_gib_dictionary() -> Vec<u8> {
+    [
+        rar5::start(None),
+        rar5::file_as("wide.bin", 0, &[0; 64], MIB, None, (1 << 7) | (13 << 10)),
+        rar5::end(false),
+    ]
+    .concat()
+}
+
+// The header's dictionary fits the Balanced and Performance limits and not
+// the Efficient one, and an Efficient run refuses the member before it
+// holds any window.
+#[test]
+fn a_one_gib_rar_dictionary_is_refused_only_under_efficient() {
+    let archive = unrar_rs::RarArchive::open_prefix(
+        io::Cursor::new(one_gib_dictionary()),
+        None,
+        NonZeroUsize::MIN,
+    )
+    .unwrap();
+    let dictionary = archive.member_info(0).unwrap().compression.dict_size;
+    assert_eq!(dictionary, GIB);
+    let fits = profiles().map(|budget| dictionary <= run::limits(&budget).max_dict_size);
+    assert_eq!(fits, [false, true, true]);
+
+    let [efficient, ..] = profiles();
+    let mut emits = Vec::new();
+    RarEngine::new().start().run(
+        Gate::whole(vec![one_gib_dictionary()]) as Arc<dyn Volumes>,
+        &mut |emit| {
+            emits.push(emit);
+            true
+        },
+        efficient,
+    );
+    let said = said(&emits);
+    assert!(
+        said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(GIB),
+            allowed: Some(256 * MIB),
+        })),
+        "{said:?}"
+    );
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(_, _))));
 }
 
 #[test]
@@ -1263,8 +1356,11 @@ fn a_volume_whose_bytes_are_not_all_in_decodes_one_by_one() {
         &mut sink,
         weaver_graph::Budget {
             memory_bytes: None,
+            window_bytes: None,
             threads: 4,
             pool: Some(Arc::clone(&lent) as Arc<dyn weaver_graph::Pool>),
+            lender: None,
+            ..Default::default()
         },
     );
     assert_eq!(said(&emits), on_threads(six_files(0), 1).said);
@@ -1537,8 +1633,11 @@ fn arriving_on(
                 &mut sink,
                 weaver_graph::Budget {
                     memory_bytes: None,
+                    window_bytes: None,
                     threads,
                     pool: Some(pool),
+                    lender: None,
+                    ..Default::default()
                 },
             );
             emits
@@ -1699,8 +1798,11 @@ fn a_run_stopped_while_files_decode_beside_it_joins_them_and_the_next_says_all()
                 &mut sink,
                 weaver_graph::Budget {
                     memory_bytes: None,
+                    window_bytes: None,
                     threads: 4,
                     pool: Some(Arc::clone(&held) as Arc<dyn weaver_graph::Pool>),
+                    lender: None,
+                    ..Default::default()
                 },
             );
             held.returned()
@@ -1786,8 +1888,11 @@ fn arrived(
         &mut sink,
         weaver_graph::Budget {
             memory_bytes: None,
+            window_bytes: None,
             threads,
             pool: Some(lent as Arc<dyn weaver_graph::Pool>),
+            lender: None,
+            ..Default::default()
         },
     );
     (said(&emits), checksums(&emits))
@@ -1982,5 +2087,263 @@ fn a_compressed_member_is_said_in_megabyte_pieces() {
                 "{lengths:?}"
             );
         }
+    }
+}
+
+// A volume whose one compressed member names a 1 GiB dictionary, RAR5
+// method 1, and unpacks to 64 KiB; `flags` are the archive's.
+fn wide_dictionary_small_member(flags: u64) -> Vec<u8> {
+    [
+        rar5::start_flagged(flags, 0),
+        rar5::file_as(
+            "small.bin",
+            0,
+            &[0; 64],
+            64 << 10,
+            None,
+            (1 << 7) | (13 << 10),
+        ),
+        rar5::end(true),
+    ]
+    .concat()
+}
+
+fn reserved(front: &[u8]) -> Option<u64> {
+    let mut engine = RarEngine::new();
+    engine.bound(VolumeIndex(0), "lantern.part1.rar", front, None);
+    engine.reserve()
+}
+
+// A run reserves what its decode will hold: the dictionary the header
+// declares or the member's whole unpacked size, the less. A solid archive
+// keeps one window across members no front sums, so it holds the whole
+// dictionary. A front that states no compressed member reserves nothing
+// past the format's own.
+#[test]
+fn a_small_member_of_a_wide_dictionary_reserves_its_own_size() {
+    assert_eq!(reserved(&wide_dictionary_small_member(0)), Some(64 << 10));
+    assert_eq!(
+        reserved(&wide_dictionary_small_member(rar5::SOLID)),
+        Some(GIB)
+    );
+    assert_eq!(reserved(&six_files(0)[0]), Some(0));
+    assert_eq!(reserved(&[]), Some(0));
+}
+
+// RAR5 LZ, one member under a 256 KiB dictionary.
+const LZ: &[u8] = include_bytes!(
+    "../../../../server/crates/weaver-server-core/tests/fixtures/extraction_profiles/rar5_lz.rar"
+);
+// RAR 2.9 solid PPMd: three members, a 1 MiB dictionary and a 1 MiB model
+// arena (`-m5 -mc16:1t+ -md1m`).
+const PPMD: &[u8] = include_bytes!(
+    "../../../../server/crates/weaver-server-core/tests/fixtures/extraction_profiles/rar4_solid_ppmd_plain.rar"
+);
+
+// A run over `archive` granted `grant` of memory and window, handed
+// `lender`.
+fn lent_run(
+    archive: &[u8],
+    grant: u64,
+    lender: Option<&Arc<crate::lent::testing::TestLender>>,
+) -> Vec<Said> {
+    let budget = weaver_graph::Budget {
+        memory_bytes: Some(grant),
+        window_bytes: Some(grant),
+        threads: 1,
+        ..Default::default()
+    };
+    let budget = match lender {
+        Some(lender) => lender.lending(budget),
+        None => budget,
+    };
+    let mut emits = Vec::new();
+    RarEngine::new().start().run(
+        Gate::whole(vec![archive.to_vec()]) as Arc<dyn Volumes>,
+        &mut |emit| {
+            emits.push(emit);
+            true
+        },
+        budget,
+    );
+    said(&emits)
+}
+
+// A run handed a lender borrows the dictionary its grant cannot hold, and
+// decodes through it what a run with room for it on the heap decodes,
+// although every lent byte held garbage first. It asks for the dictionary
+// once, as it opens the member, and gives it back.
+#[test]
+fn a_rar5_dictionary_over_the_grant_is_lent_and_given_back() {
+    use crate::lent::testing::TestLender;
+    let lender = TestLender::new();
+    let said = lent_run(LZ, 64 << 10, Some(&lender));
+    assert_eq!(said, run(&mut RarEngine::new(), vec![LZ.to_vec()]));
+    assert!(said.contains(&Said::Closed(0)), "{said:?}");
+    let asked = lender.asked();
+    assert_eq!(asked, [256 << 10]);
+    assert_eq!(lender.live(), 0);
+}
+
+// Without a lender the same grant refuses the dictionary with its sizes, as
+// it always did.
+#[test]
+fn a_rar5_dictionary_over_the_grant_without_a_lender_is_refused() {
+    let said = lent_run(LZ, 64 << 10, None);
+    assert!(
+        said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(256 << 10),
+            allowed: Some(64 << 10),
+        })),
+        "{said:?}"
+    );
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+}
+
+// A lender's refusal is the member's verdict: a filesystem's refusal asks
+// for the window in RAM, which the owner gives or refuses by its policy;
+// any other refusal stands.
+#[test]
+fn a_rar_window_the_lender_refuses_says_why() {
+    use crate::lent::testing::TestLender;
+    let full = TestLender::refusing(io::ErrorKind::StorageFull);
+    let said = lent_run(LZ, 64 << 10, Some(&full));
+    assert!(
+        said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(256 << 10),
+            allowed: None,
+        })),
+        "{said:?}"
+    );
+    let denied = TestLender::refusing(io::ErrorKind::PermissionDenied);
+    let said = lent_run(LZ, 64 << 10, Some(&denied));
+    assert!(said.contains(&Said::Refuse(Why::Unsupported)), "{said:?}");
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+}
+
+// A RAR 2.9 PPMd model arena over the grant is lent under the same rule as
+// its dictionary: a solid run of three members borrows the dictionary and
+// one arena, keeps both across the members, decodes what a
+// run with room for both on the heap decodes, and gives both back. Without
+// a lender the member is refused.
+#[test]
+fn a_rar3_ppmd_arena_over_the_grant_is_lent_as_a_dictionary_is() {
+    use crate::lent::testing::TestLender;
+    let grant = 512 << 10;
+    let lender = TestLender::new();
+    let said = lent_run(PPMD, grant, Some(&lender));
+    assert_eq!(said, run(&mut RarEngine::new(), vec![PPMD.to_vec()]));
+    assert!(said.contains(&Said::Closed(2)), "{said:?}");
+    // The 1 MiB dictionary its headers declare, then the arena its block
+    // header declares, `(mem + 1) << 20` bytes.
+    assert_eq!(lender.asked(), [MIB as usize, MIB as usize]);
+    assert_eq!(lender.live(), 0);
+
+    let said = lent_run(PPMD, grant, None);
+    assert!(
+        said.iter()
+            .any(|said| matches!(said, Said::Refuse(Why::TooLarge { .. }))),
+        "{said:?}"
+    );
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+
+    // With room for both on the heap nothing is lent.
+    let room = TestLender::new();
+    let said = lent_run(PPMD, MIB, Some(&room));
+    assert_eq!(said, run(&mut RarEngine::new(), vec![PPMD.to_vec()]));
+    assert_eq!(room.asked(), Vec::<usize>::new());
+}
+
+// A RAR 2.9 member decoding beside others counts its bytes and its
+// dictionary, nothing for a PPMd arena it may never use: it fits a grant
+// of exactly those, lent or not.
+#[test]
+fn a_rar3_member_beside_others_counts_its_bytes_and_dictionary() {
+    use crate::lent::testing::TestLender;
+    let parsed =
+        unrar_rs::RarArchive::open_prefix(io::Cursor::new(PPMD.to_vec()), None, NonZeroUsize::MAX)
+            .unwrap();
+    let info = parsed.member_info(0).unwrap();
+    let bytes = info.unpacked_size.unwrap() + info.compression.dict_size;
+    let volumes = Gate::whole(vec![PPMD.to_vec()]) as Arc<dyn Volumes>;
+    let granted = |memory: u64| weaver_graph::Budget {
+        memory_bytes: Some(memory),
+        window_bytes: Some(memory),
+        threads: 1,
+        ..Default::default()
+    };
+    let alone = |budget: &weaver_graph::Budget| run::may_start_alone(&parsed, &volumes, budget, 0);
+    assert_eq!(alone(&granted(bytes)), Some(bytes));
+    assert_eq!(alone(&granted(bytes - 1)), None);
+    assert_eq!(
+        alone(&TestLender::new().lending(granted(bytes))),
+        Some(bytes)
+    );
+}
+
+// A dictionary over the lender's ceiling is not asked for: the decoder
+// refuses it with its size against the ceiling.
+#[test]
+fn a_rar_dictionary_over_the_lenders_ceiling_is_refused_unasked() {
+    use crate::lent::testing::TestLender;
+    let low = TestLender::up_to(128 << 10);
+    let said = lent_run(LZ, 64 << 10, Some(&low));
+    assert!(
+        said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(256 << 10),
+            allowed: Some(128 << 10),
+        })),
+        "{said:?}"
+    );
+    assert_eq!(low.asked(), Vec::<usize>::new());
+}
+
+// A lender that lends the RAR 2.9 dictionary and refuses the PPMd arena
+// after it: the arena's refusal is the member's verdict, with the arena's
+// size, the dictionary it lent is given back, and nothing is said of the
+// member's bytes that the arena never decoded.
+#[test]
+fn a_rar3_ppmd_arena_the_lender_refuses_says_why_with_its_size() {
+    use crate::lent::testing::TestLender;
+    let full = TestLender::refusing_after(1, io::ErrorKind::StorageFull);
+    let said = lent_run(PPMD, 512 << 10, Some(&full));
+    assert_eq!(full.asked(), [MIB as usize, MIB as usize]);
+    assert!(
+        said.contains(&Said::Refuse(Why::TooLarge {
+            needed: Some(MIB),
+            allowed: None,
+        })),
+        "{said:?}"
+    );
+    assert!(!said.iter().any(|said| matches!(said, Said::Bytes(..))));
+    assert_eq!(full.live(), 0);
+
+    let denied = TestLender::refusing_after(1, io::ErrorKind::PermissionDenied);
+    let said = lent_run(PPMD, 512 << 10, Some(&denied));
+    assert_eq!(denied.asked().len(), 2);
+    assert!(said.contains(&Said::Refuse(Why::Unsupported)), "{said:?}");
+    assert_eq!(denied.live(), 0);
+}
+
+// A lone archive is no volume, so its front places nothing, but its headers
+// still state the window its decode holds: its member's unpacked size where
+// that is under the dictionary, the whole dictionary when it is solid. The
+// owner books that window for the run.
+#[test]
+fn a_lone_archive_states_its_window() {
+    let fixture = |path: &str| {
+        std::fs::read(format!(
+            "{}/../../server/crates/weaver-server-core/tests/fixtures/extraction_profiles/{path}",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap()
+    };
+    for (path, window) in [
+        ("rar5_lz.rar", 226_943),
+        ("rar4_solid_ppmd_plain.rar", 1 << 20),
+    ] {
+        let bytes = fixture(path);
+        assert!(<Rar as Format>::front(&bytes).is_none(), "{path}");
+        assert_eq!(<Rar as Format>::window(&bytes), Some(window), "{path}");
     }
 }

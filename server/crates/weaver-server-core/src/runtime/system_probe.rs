@@ -233,6 +233,7 @@ fn memory_profile_from_facts(facts: &ProcessMemoryFacts) -> MemoryProfile {
         total_bytes: total,
         available_bytes: available,
         cgroup_limit: facts.cgroup_limit,
+        guessed: facts.memory_bytes.is_none(),
     }
 }
 

@@ -158,10 +158,15 @@ pub(in crate::pipeline::graph) fn job_with(
     let writer = NamespaceWriter::new(
         1,
         dir.path().to_path_buf(),
-        Arc::clone(&accountant),
+        accountant,
         CapacityReader::unknown(),
     );
-    let runs = Runs::new(1, 1, RunMail::default().sender(), accountant);
+    let runs = Runs::new(
+        1,
+        1,
+        RunMail::default().sender(),
+        crate::pipeline::graph::engine::DecodePool::unbounded(),
+    );
     let job = GraphJob::new(files, Box::new(builder), writer, runs, u32::MAX);
     (job, dir, answers)
 }

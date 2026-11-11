@@ -39,6 +39,8 @@ struct Backing {
     path: Option<PathBuf>,
     leaf: Option<(u64, u64)>,
     scratch: Option<(u64, u64)>,
+    // The member's spill file: any write or emptying of it moves this.
+    spill: Option<(u64, u64)>,
     coverage: Coverage,
     length: Option<u64>,
 }
@@ -126,6 +128,7 @@ impl Replay {
                     path: taken.path.clone(),
                     leaf: taken.revision,
                     scratch: taken.scratch_revision,
+                    spill: taken.spill_revision,
                     coverage: taken.coverage.clone(),
                     length: taken.length,
                 })
@@ -262,6 +265,9 @@ impl NamespaceWriter {
             let scratch = files
                 .and_then(|files| files.scratch.as_ref())
                 .map(Leaf::revision);
+            let spill = files
+                .and_then(|files| files.spills.get(&backing.member))
+                .map(Leaf::revision);
             let bound = tree
                 .child_of(backing.node, backing.member)
                 .filter(|(child, _)| !tree.recovers(*child));
@@ -274,6 +280,7 @@ impl NamespaceWriter {
             leaf != backing.leaf
                 || path != backing.path.as_deref()
                 || scratch != backing.scratch
+                || spill != backing.spill
                 || bound != backing.bound
                 || verdict_changed
         });
@@ -282,7 +289,11 @@ impl NamespaceWriter {
             .shelves
             .iter()
             .any(|(shelf, generation)| shelf.generation() != *generation);
-        if replayed.read.stopped || changed || moved {
+        // An object out for its work cannot say the cipher tail its window
+        // forgets, so nothing would read it back: the window is checked
+        // again once the object is home.
+        let lent = tree.lent(replayed.node);
+        if replayed.read.stopped || changed || moved || lent {
             if !replayed.read.stopped {
                 self.queue_rechecks(vec![(replayed.node, replayed.ranges.clone())]);
             }

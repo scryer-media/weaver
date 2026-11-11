@@ -235,3 +235,81 @@ async fn history_item_exposes_full_file_names_but_not_as_an_attribute() {
         item.full_file_names_record
     );
 }
+
+// A failed job whose failure recorded a decode window over the profile's
+// ceiling is failed for memory, and offers a reprocess with no limit. An
+// error that only reads like one, a failure over the machine, or a job that
+// did not fail does not.
+#[tokio::test]
+async fn history_item_says_whether_it_failed_for_memory() {
+    let row = |status: &str, error: Option<&str>, marked: bool| JobHistoryRow {
+        job_id: 80,
+        job_hash: None,
+        name: "Wide".to_string(),
+        status: status.to_string(),
+        error_message: error.map(str::to_string),
+        total_bytes: 2_000,
+        downloaded_bytes: 2_000,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1_700_000_000,
+        completed_at: 1_700_000_100,
+        metadata: marked.then(|| {
+            serde_json::to_string(&[(
+                weaver_server_core::history::attributes::FAILED_FOR_MEMORY_ATTRIBUTE_KEY,
+                "1",
+            )])
+            .unwrap()
+        }),
+        server_attribution: None,
+    };
+
+    struct Query(HistoryItem);
+    #[async_graphql::Object]
+    impl Query {
+        async fn item(&self) -> HistoryItem {
+            self.0.clone()
+        }
+    }
+
+    for (status, error, marked, expected) in [
+        (
+            "failed",
+            Some("lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed"),
+            true,
+            true,
+        ),
+        (
+            "failed",
+            Some("lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed"),
+            false,
+            false,
+        ),
+        (
+            "failed",
+            Some("lantern.mkv.zst needs 2.0 TiB of decode memory, this machine has 8.0 GiB"),
+            false,
+            false,
+        ),
+        ("failed", Some("extract failed"), false, false),
+        ("complete", None, true, false),
+    ] {
+        let schema = async_graphql::Schema::new(
+            Query(history_item_from_row(&row(status, error, marked), None)),
+            async_graphql::EmptyMutation,
+            async_graphql::EmptySubscription,
+        );
+        let response = schema.execute("{ item { failedForMemory } }").await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        assert_eq!(
+            response.data.into_json().unwrap(),
+            serde_json::json!({ "item": { "failedForMemory": expected } }),
+            "{status} {error:?} {marked}"
+        );
+    }
+}

@@ -297,6 +297,101 @@ async fn archive_password_override_is_durable_for_history_reprocess_and_redownlo
     }
 }
 
+// A reprocess with no memory limit keeps the flag with the job, so a
+// restart restores it; a later plain reprocess of a row that carried it
+// drops it, so it never reaches the next run unasked. Either reprocess drops
+// the mark that the job failed for memory: the retry is offered again only
+// if the new run fails the same way.
+#[tokio::test]
+async fn the_no_memory_limit_flag_is_kept_with_the_job_and_dropped_by_a_plain_reprocess() {
+    use crate::history::attributes::{
+        FAILED_FOR_MEMORY_ATTRIBUTE_KEY, NO_MEMORY_LIMIT_ATTRIBUTE_KEY, failed_for_memory,
+        no_memory_limit,
+    };
+    for lifted in [true, false] {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+        let job_id = JobId(30903);
+        let mut row = history_row_with_output_dir(
+            job_id,
+            "Wide Fixture",
+            "failed",
+            temp_dir.path().join("unused-output"),
+        );
+        row.output_dir = None;
+        row.error_message =
+            Some("lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed".into());
+        // A row from a run that already carried the flag.
+        row.metadata = Some(
+            serde_json::to_string(&vec![
+                (NO_MEMORY_LIMIT_ATTRIBUTE_KEY, "1"),
+                (FAILED_FOR_MEMORY_ATTRIBUTE_KEY, "1"),
+            ])
+            .unwrap(),
+        );
+        insert_history_row_with_nzb_zstd(&pipeline.db, &row, &sample_nzb_zstd());
+        if lifted {
+            pipeline
+                .reprocess_job_with_no_memory_limit(job_id, None)
+                .await
+                .unwrap();
+        } else {
+            pipeline.reprocess_job(job_id).await.unwrap();
+        }
+        let metadata = &pipeline.jobs.get(&job_id).unwrap().spec.metadata;
+        assert_eq!(no_memory_limit(metadata), lifted);
+        assert_eq!(
+            metadata
+                .iter()
+                .filter(|(key, _)| key == NO_MEMORY_LIMIT_ATTRIBUTE_KEY)
+                .count(),
+            usize::from(lifted),
+            "{metadata:?}"
+        );
+        assert!(!failed_for_memory(metadata), "{metadata:?}");
+        let restored = pipeline.db.load_active_jobs().unwrap();
+        assert_eq!(no_memory_limit(&restored[&job_id].metadata), lifted);
+        assert!(!failed_for_memory(&restored[&job_id].metadata));
+    }
+}
+
+// A passworded job retried with no memory limit is told its password as a
+// plain reprocess is, and keeps it beside the lifted limit, through a
+// restart too.
+#[tokio::test]
+async fn a_passworded_job_retried_with_no_memory_limit_keeps_its_password() {
+    use crate::history::attributes::no_memory_limit;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30904);
+    let mut row = history_row_with_output_dir(
+        job_id,
+        "Wide Password Fixture",
+        "failed",
+        temp_dir.path().join("unused-output"),
+    );
+    row.output_dir = None;
+    row.error_message = Some("lantern.7z needs 4.0 GiB of decode memory, 512.0 MiB allowed".into());
+    insert_history_row_with_nzb_zstd(&pipeline.db, &row, &sample_nzb_zstd());
+    pipeline
+        .reprocess_job_with_no_memory_limit(job_id, Some("lantern-key".into()))
+        .await
+        .unwrap();
+    let state = pipeline.jobs.get(&job_id).unwrap();
+    assert_eq!(state.spec.password.as_deref(), Some("lantern-key"));
+    assert!(no_memory_limit(&state.spec.metadata));
+    assert_eq!(
+        pipeline.archive_password_candidates_for_job(job_id)[0].value(),
+        "lantern-key"
+    );
+    let restored = pipeline.db.load_active_jobs().unwrap();
+    assert_eq!(
+        restored[&job_id].password_override.as_deref(),
+        Some("lantern-key")
+    );
+    assert!(no_memory_limit(&restored[&job_id].metadata));
+}
+
 // A reprocess over nothing on disk fetches the job again: its spec is
 // rebuilt from the history row's persisted NZB, and its articles are queued.
 async fn reprocess_rebuilds_from_history(job_id: JobId, name: &str, status: &str) {

@@ -417,6 +417,37 @@ fn rename_equivalent_path(_src: &Path, _dst: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// Whether two directories lie on one device, each read at the nearest of
+// its ancestors that exists, as one not yet made will be made there. A
+// device that cannot be read, or a platform with no device to read, counts
+// as one device: nothing changes for it.
+pub(crate) fn same_device(a: &Path, b: &Path) -> bool {
+    match (nearest_device(a), nearest_device(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => true,
+    }
+}
+
+fn nearest_device(path: &Path) -> Option<u64> {
+    let existing = path
+        .ancestors()
+        .find(|at| std::fs::metadata(at).is_ok_and(|meta| meta.is_dir()))?;
+    let fingerprint = directory_fingerprint_from_path(existing).ok()?;
+    #[cfg(unix)]
+    {
+        Some(fingerprint.dev)
+    }
+    #[cfg(windows)]
+    {
+        Some(u64::from(fingerprint.volume_serial_number))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = fingerprint;
+        None
+    }
+}
+
 fn directory_fingerprint_from_path(path: &Path) -> io::Result<DirectoryFingerprint> {
     let metadata = std::fs::metadata(path)?;
     if !metadata.is_dir() {
@@ -617,6 +648,31 @@ fn current_umask() -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn two_directories_on_one_device_are_one_device_even_before_they_exist() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let made = root.path().join("made");
+        std::fs::create_dir(&made).expect("dir");
+        assert!(super::same_device(&made, &root.path().join("not/yet/made")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directories_on_two_devices_are_told_apart() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let ours = std::fs::metadata(root.path()).expect("meta");
+        // `/dev` is its own filesystem wherever the tests run; when it is not,
+        // there is nothing to tell apart and the case says nothing.
+        use std::os::unix::fs::MetadataExt;
+        let dev = std::fs::metadata("/dev").expect("meta");
+        if dev.dev() != ours.dev() {
+            assert!(!super::same_device(
+                root.path(),
+                std::path::Path::new("/dev")
+            ));
+        }
+    }
+
     use super::*;
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

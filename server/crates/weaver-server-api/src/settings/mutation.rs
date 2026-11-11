@@ -150,6 +150,7 @@ impl SettingsMutation {
         let normalized_intermediate_dir = normalize_settings_path_update(&input.intermediate_dir);
         let normalized_complete_dir = normalize_settings_path_update(&input.complete_dir);
         let cleanup_after_extract = input.cleanup_after_extract;
+        let delete_failed_job_files = input.delete_failed_job_files;
         let max_download_speed = input.max_download_speed;
         let max_retries = input.max_retries;
         let propagation_delay_secs = input.propagation_delay_secs;
@@ -186,6 +187,7 @@ impl SettingsMutation {
             enable_srrdb_lookup,
             propagation_delay_secs,
             max_concurrent_nzbs,
+            delete_failed_job_files,
         );
         let settings_persist = {
             let db = db.clone();
@@ -293,6 +295,9 @@ impl SettingsMutation {
                                 &enabled.to_string(),
                             )?;
                         }
+                        if let Some(delete) = persist_input.10 {
+                            db.set_setting("delete_failed_job_files", &delete.to_string())?;
+                        }
                         Ok(())
                     },
                 )
@@ -321,6 +326,9 @@ impl SettingsMutation {
                 }
                 if let Some(cleanup) = cleanup_after_extract {
                     cfg.cleanup_after_extract = Some(cleanup);
+                }
+                if let Some(delete) = delete_failed_job_files {
+                    cfg.delete_failed_job_files = Some(delete);
                 }
                 if let Some(speed) = max_download_speed {
                     cfg.max_download_speed = Some(speed);
@@ -365,6 +373,7 @@ impl SettingsMutation {
                     intermediate_dir: cfg.intermediate_dir(),
                     complete_dir: cfg.complete_dir(),
                     cleanup_after_extract: cfg.cleanup_after_extract(),
+                    delete_failed_job_files: cfg.delete_failed_job_files(),
                     max_download_speed: cfg.max_download_speed.unwrap_or(0),
                     propagation_delay_secs: cfg.propagation_delay_secs(),
                     max_concurrent_nzbs: cfg.max_concurrent_nzbs(),
@@ -693,6 +702,7 @@ mod tests {
             retry: None,
             max_download_speed: None,
             cleanup_after_extract: None,
+            delete_failed_job_files: None,
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),

@@ -32,7 +32,7 @@ fn pending() -> (GraphJob, tempfile::TempDir, RunMail, Vec<RootFile>) {
     let state = job.writer.file_state(NodeId::ROOT, MemberId(0));
     job.writer.restore_verifications(&[(0, 0)]);
     job.writer
-        .restore_file(&job.tree, NodeId::ROOT, MemberId(0), &state)
+        .restore_file(&job.tree, NodeId::ROOT, MemberId(0), &state, &job.root)
         .unwrap();
     let mail = RunMail::default();
     job.loans = Loans::new(1, mail.sender(), job.runs.hardware());
@@ -165,12 +165,14 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
         2,
         Storage {
             working_dir: dir.path().to_owned(),
+            output: None,
             accountant: Arc::new(HoldsAccountant::new(weaver_graph::holds::HoldBudgets {
                 resident_limit: u64::MAX,
                 scratch_total: u64::MAX,
                 scratch_ceiling: u64::MAX,
                 disk_reserve: 0,
             })),
+            decode: crate::pipeline::graph::engine::DecodePool::unbounded(),
             free_disk: CapacityReader::unknown(),
             slots: 1,
             mail: mail.sender(),
@@ -179,6 +181,8 @@ async fn a_checkpoint_before_verification_cannot_restore_an_unchecked_crc_as_pas
             nesting: u32::MAX,
             hardware: Default::default(),
             metrics: None,
+            data_dir: None,
+            window_ledger: Default::default(),
         },
         0,
     )

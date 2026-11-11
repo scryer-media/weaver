@@ -38,11 +38,16 @@ fn echo_job(count: u32, size: u32) -> (GraphJob, NodeId, Arc<Shelf>, tempfile::T
     let writer = NamespaceWriter::new(
         1,
         directory.path().to_owned(),
-        Arc::clone(&accountant),
+        accountant,
         CapacityReader::unknown(),
     );
     let mail = RunMail::default();
-    let runs = Runs::new(1, 0, mail.sender(), accountant);
+    let runs = Runs::new(
+        1,
+        0,
+        mail.sender(),
+        crate::pipeline::graph::engine::DecodePool::unbounded(),
+    );
     let mut job = GraphJob::new(
         &files,
         Box::new(Echoes {

@@ -53,6 +53,7 @@ interface GeneralSettings {
   intermediateDir: string;
   completeDir: string;
   cleanupAfterExtract: boolean;
+  deleteFailedJobFiles: boolean;
   maxRetries: number;
   propagationDelaySecs: number;
   maxConcurrentNzbs: number;
@@ -70,6 +71,7 @@ interface Form extends DuplicatePolicy {
   intermediateDir: string;
   completeDir: string;
   cleanupAfterExtract: boolean;
+  deleteFailedJobFiles: boolean;
   maxRetries: number;
   propagationDelaySecs: number;
   maxConcurrentNzbs: number;
@@ -228,6 +230,7 @@ export function GeneralPanel() {
             intermediateDir: settings.intermediateDir,
             completeDir: settings.completeDir,
             cleanupAfterExtract: settings.cleanupAfterExtract,
+            deleteFailedJobFiles: settings.deleteFailedJobFiles,
             maxRetries: settings.maxRetries,
             propagationDelaySecs: settings.propagationDelaySecs,
             maxConcurrentNzbs: settings.maxConcurrentNzbs,
@@ -596,6 +599,16 @@ export function GeneralPanel() {
                 kind: "toggle",
                 value: values.cleanupAfterExtract,
                 onChange: (next) => commit("cleanupAfterExtract", next),
+              },
+            },
+            {
+              id: "deleteFailedJobFiles",
+              label: t("next.general.deleteFailedJobFiles"),
+              keywords: "delete failed incomplete housekeeping",
+              control: {
+                kind: "toggle",
+                value: values.deleteFailedJobFiles,
+                onChange: (next) => commit("deleteFailedJobFiles", next),
               },
             },
           ],

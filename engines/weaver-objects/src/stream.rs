@@ -44,11 +44,27 @@ pub use front::Front;
 pub trait Decoder: Send + Sync + 'static {
     const KIND: Kind;
 
+    // The widest window the decoder can be held to, for a decoder whose
+    // refusal of a window too wide does not say how wide: `None` where
+    // every refusal says.
+    const WIDEST: Option<u64> = None;
+
+    // Whether the decoder borrows a window over the run's grant from
+    // `Budget::lender`: `Engine::lends`.
+    const LENDS: bool = false;
+
     // The bytes a run of this stream holds resident, as the stream's first
     // bytes declare them, or the format's largest while they do not say. A
     // decoder whose window the format lets grow holds it to the memory
     // `budget` grants.
     fn window(first: &[u8], budget: &Budget) -> u64;
+
+    // The memory the first bytes declare the decoder needs, unbounded by any
+    // grant, for a decoder whose refusal does not say it: `None` where the
+    // front does not say or the decoder says for itself.
+    fn declared(_first: &[u8]) -> Option<u64> {
+        None
+    }
 
     // The decoded bytes of the stream read from `input`, holding no more
     // than `window` resident.
@@ -252,6 +268,7 @@ impl<D: Decoder> Engine for Stream<D> {
         Box::new(run::Run::<D>::new(
             D::member(&self.name),
             D::window(&self.first, &self.budget),
+            self.first.clone(),
         ))
     }
 
@@ -260,6 +277,14 @@ impl<D: Decoder> Engine for Stream<D> {
     // at a time.
     fn reserve(&self) -> Option<u64> {
         (self.closed || self.first.len() >= FIRST).then(|| D::window(&self.first, &self.budget))
+    }
+
+    fn widest(&self) -> Option<u64> {
+        D::WIDEST
+    }
+
+    fn lends(&self) -> bool {
+        D::LENDS
     }
 }
 
