@@ -670,7 +670,9 @@ impl Message<'_> {
             MSGID_REQUEST | MSGID_CANCEL | MSGID_REJECT => (INTEGER_LEN * 3, INTEGER_LEN * 3),
             // At most a block (`on_piece`: `packet_size() - 9 > block_size()`).
             MSGID_PIECE => (INTEGER_LEN * 2 + 1, INTEGER_LEN * 2 + CHUNK_SIZE as usize),
-            MSGID_EXTENDED => (0, ANY),
+            // The extended message id at least (`on_extended`:
+            // `packet_size() < 2` disconnects).
+            MSGID_EXTENDED => (1, ANY),
             MSGID_HASH_REQUEST | MSGID_HASH_REJECT => (HASH_REQUEST_LEN, HASH_REQUEST_LEN),
             // The exact length follows from the request it repeats (`on_hashes`).
             MSGID_HASHES => (HASH_REQUEST_LEN, ANY),
@@ -1555,6 +1557,11 @@ mod tests {
         assert!(matches!(
             refused(5, 99),
             Some(MessageDeserializeError::UnsupportedMessageId(99))
+        ));
+        // An extended frame with no extended message id in it.
+        assert!(matches!(
+            refused(1, MSGID_EXTENDED),
+            Some(MessageDeserializeError::IncorrectMsgLen { .. })
         ));
     }
 

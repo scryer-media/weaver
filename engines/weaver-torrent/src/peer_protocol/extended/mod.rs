@@ -164,11 +164,17 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
         Ok(usize::try_from(out.position()).expect("the cursor stays within its buffer"))
     }
 
+    /// The extended message whose payload, whole, is `buf`. A payload with
+    /// no extended message id is not one.
     pub fn deserialize(mut buf: DoubleBufHelper<'a>) -> Result<Self, MessageDeserializeError> {
         let msg_id = crate::peer_protocol::MsgIdDebug(MSGID_EXTENDED);
         let emsg_id = buf
             .read_u8()
-            .ok_or(MessageDeserializeError::NotEnoughData(1, Some(msg_id)))?;
+            .ok_or(MessageDeserializeError::IncorrectMsgLen {
+                received: 0,
+                expected: 1,
+                msg_id,
+            })?;
 
         fn from_bytes_contig<'a, T>(buf: &DoubleBufHelper<'a>) -> Result<T, MessageDeserializeError>
         where
