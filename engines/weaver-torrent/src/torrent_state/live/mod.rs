@@ -3848,7 +3848,10 @@ impl PeerHandler {
                         // before the piece came back to the queue and to it
                         // (libtorrent `request_a_block` passes over a block
                         // in the peer's queues, request_blocks.cpp:238-256).
-                        self.state.stats.asked_already.fetch_add(1, Ordering::Relaxed);
+                        self.state
+                            .stats
+                            .asked_already
+                            .fetch_add(1, Ordering::Relaxed);
                         debug!(?chunk, "asked of the peer already");
                         continue;
                     }

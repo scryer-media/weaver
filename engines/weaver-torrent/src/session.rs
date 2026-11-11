@@ -7685,16 +7685,22 @@ mod tests {
         let (a, b) = (a.live().unwrap(), b.live().unwrap());
         let state = |torrent: &crate::torrent_state::TorrentStateLive, addr: &str| {
             torrent
-                .per_peer_stats_snapshot(crate::torrent_state::peer::stats::snapshot::PeerStatsFilter {
-                    state: crate::torrent_state::peer::stats::snapshot::PeerStatsFilterState::All,
-                })
+                .per_peer_stats_snapshot(
+                    crate::torrent_state::peer::stats::snapshot::PeerStatsFilter {
+                        state:
+                            crate::torrent_state::peer::stats::snapshot::PeerStatsFilterState::All,
+                    },
+                )
                 .peers
                 .get(addr)
                 .map(|peer| peer.state)
         };
 
         // B knows the liar at one port before A bans it.
-        b.add_peer("127.0.0.7:6881".parse().unwrap(), crate::type_aliases::PeerSourceFlag::Tracker);
+        b.add_peer(
+            "127.0.0.7:6881".parse().unwrap(),
+            crate::type_aliases::PeerSourceFlag::Tracker,
+        );
         assert_eq!(state(&b, "127.0.0.7:6881"), Some("queued"));
 
         a.ban_for_bad_data("127.0.0.7".parse().unwrap());
@@ -7703,13 +7709,19 @@ mod tests {
         // On B the peer it knew is no connect candidate, and the address at
         // another port joins B's list no more, so it is never dialled.
         assert_eq!(state(&b, "127.0.0.7:6881"), Some("dead"));
-        b.add_peer("127.0.0.7:7000".parse().unwrap(), crate::type_aliases::PeerSourceFlag::Tracker);
+        b.add_peer(
+            "127.0.0.7:7000".parse().unwrap(),
+            crate::type_aliases::PeerSourceFlag::Tracker,
+        );
         assert_eq!(state(&b, "127.0.0.7:7000"), None);
         // An incoming connection from it, at any port, is refused unread.
         let refusal = check_once(&session, "127.0.0.7:7000").expect("refused unread");
         assert!(refusal.contains("is banned"), "{refusal}");
         // Another address is untouched.
-        b.add_peer("127.0.0.8:6881".parse().unwrap(), crate::type_aliases::PeerSourceFlag::Tracker);
+        b.add_peer(
+            "127.0.0.8:6881".parse().unwrap(),
+            crate::type_aliases::PeerSourceFlag::Tracker,
+        );
         assert_eq!(state(&b, "127.0.0.8:6881"), Some("queued"));
         assert_eq!(check_once(&session, "127.0.0.8:6881"), None);
         session.stop().await;
