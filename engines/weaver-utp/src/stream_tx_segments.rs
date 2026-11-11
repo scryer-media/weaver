@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-10.
 
 // uTP doesn't resegment, so we pre-segment TX once.
 // We also store the delivered state of the segments here.
@@ -28,7 +28,7 @@ use tokio::time::Instant;
 use tracing::trace;
 
 use crate::{
-    constants::{MAX_RESERVED_DATA_PACKETS, calc_pipe_expiry},
+    constants::{MAX_RESERVED_DATA_PACKETS, SACK_DUP_THRESH, calc_pipe_expiry},
     raw::UtpHeader,
     seq_nr::SeqNr,
     stats::{Counter, UtpStats},
@@ -279,6 +279,27 @@ impl Segments {
         } else {
             Some(self.snd_una)
         }
+    }
+
+    /// The sequence number the next new segment would take.
+    pub fn next_seq_nr(&self) -> SeqNr {
+        self.snd_una + self.segments.len() as u16
+    }
+
+    /// Drops the segments never sent, all at the back, and returns how many
+    /// bytes they held. Sent segments stay until acknowledged.
+    pub fn drop_unsent(&mut self) -> usize {
+        let mut dropped = 0;
+        while let Some(segment) = self.segments.back() {
+            if segment.send_count() > 0 {
+                break;
+            }
+            dropped += segment.payload_size;
+            self.segments.pop_back();
+        }
+        self.offset -= dropped as u64;
+        self.len_bytes -= dropped;
+        dropped
     }
 
     pub fn first_is_mtu_probe(&self) -> bool {
@@ -546,16 +567,18 @@ impl Segments {
 
             segment.is_expired = now - last_sent >= expiry_threshold;
 
-            // If a segment is past sack depth limit, we don't know anything about it.
-            segment.is_lost = if offset > self.sack_depth + 1 {
-                segment.is_expired
-            } else {
-                // Segments past the SACK's reach are unknown, so be conservative
-                // here.
-                delivered_segs >= 3 || segment.is_expired
-            };
+            // A segment is lost only when more than `SACK_DUP_THRESH`
+            // segments after it were SACKed (libtorrent v2.0.15
+            // utp_stream.cpp:1286-1320). Time in flight alone is no loss: a
+            // late segment is reordering until the SACKs or the
+            // retransmission timer say otherwise. Past the SACK's reach
+            // nothing is known, so nothing is lost there.
+            segment.is_lost =
+                offset <= self.sack_depth + 1 && delivered_segs > SACK_DUP_THRESH as usize;
 
-            if !segment.is_lost {
+            // A segment in flight past the expiry has likely left the
+            // network, so it no longer counts against the pipe.
+            if !segment.is_lost && !segment.is_expired {
                 pipe += segment.payload_size;
             }
 
@@ -669,6 +692,72 @@ mod tests {
             assert!(segments.enqueue(1, false));
         }
         assert!(!segments.enqueue(1, false));
+    }
+
+    // A segment long in flight with fewer than four SACKed after it is late,
+    // not lost: it leaves the pipe but is not resent.
+    #[test]
+    fn time_in_flight_alone_does_not_lose_a_segment() {
+        let sent = Instant::now();
+        let stats = UtpStats::default();
+        let mut segments = make_segments(10, 8);
+        for mut item in segments.iter_mut_for_sending(None) {
+            item.on_sent(sent, &stats);
+        }
+        segments.remove_up_to_ack(sent, &make_sack_header(9, [0, 1, 2]));
+        let rtt = Duration::from_millis(100);
+        let pipe = segments.calc_pipe(9.into(), 17.into(), rtt, sent + rtt * 10);
+        let head = segments.iter_mut_for_sending(None).next().unwrap();
+        assert_eq!(head.seq_nr(), 10.into());
+        assert!(head.is_expired());
+        assert!(!head.is_lost());
+        assert_eq!(pipe.pipe, 0);
+
+        segments.remove_up_to_ack(sent, &make_sack_header(9, [0, 1, 2, 3]));
+        segments.calc_pipe(9.into(), 17.into(), rtt, sent + rtt * 10);
+        assert!(
+            segments
+                .iter_mut_for_sending(None)
+                .next()
+                .unwrap()
+                .is_lost()
+        );
+    }
+
+    // libtorrent sends a SACK as long as its receive buffer, often far past
+    // 64 packets: every bit of it marks a packet delivered.
+    #[test]
+    fn a_sack_longer_than_ours_marks_every_packet_it_names() {
+        let now = Instant::now();
+        let stats = UtpStats::default();
+        let mut segments = make_segments(1000, 400);
+        for mut item in segments.iter_mut_for_sending(None) {
+            item.on_sent(now, &stats);
+        }
+        // ack_nr 999: packet 1000 is missing; bit i names packet 1001 + i.
+        let sacked = [0usize, 1, 2, 100, 150, 300];
+        let mut sack = [0u8; 40];
+        for i in sacked {
+            sack[i / 8] |= 1 << (i % 8);
+        }
+        let mut wire = vec![0x21, 1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 7];
+        wire.extend_from_slice(&999u16.to_be_bytes());
+        wire.extend_from_slice(&[0, sack.len() as u8]);
+        wire.extend_from_slice(&sack);
+        let (header, _) = UtpHeader::deserialize(&wire).unwrap();
+
+        let result = segments.remove_up_to_ack(now, &header);
+        assert_eq!(result.newly_sacked_segment_count, sacked.len());
+        assert_eq!(segments.count_delivered_test(), sacked.len());
+        assert_eq!(segments.sack_depth(), 320);
+        let delivered: Vec<u16> = segments
+            .segments
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.is_delivered)
+            .map(|(i, _)| 1000 + i as u16)
+            .collect();
+        assert_eq!(delivered, vec![1001, 1002, 1003, 1101, 1151, 1301]);
     }
 
     #[test]

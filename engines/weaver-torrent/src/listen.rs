@@ -291,6 +291,12 @@ pub(crate) async fn bind_utp(
 pub(crate) trait Accept {
     const KIND: ConnectionKind;
 
+    /// Whether `error` says the listener is gone for good, so no later
+    /// accept can succeed.
+    fn is_closed(_error: &anyhow::Error) -> bool {
+        false
+    }
+
     async fn accept(
         &self,
     ) -> anyhow::Result<(
@@ -322,6 +328,14 @@ impl Accept for Box<dyn StreamListener + '_> {
 
 impl Accept for UtpSocket {
     const KIND: ConnectionKind = ConnectionKind::Utp;
+
+    // The socket's dispatcher ended: the socket was shut down, or died.
+    fn is_closed(error: &anyhow::Error) -> bool {
+        matches!(
+            error.downcast_ref::<weaver_utp::Error>(),
+            Some(weaver_utp::Error::DispatcherDead | weaver_utp::Error::TaskCancelled)
+        )
+    }
     async fn accept(
         &self,
     ) -> anyhow::Result<(
@@ -335,5 +349,35 @@ impl Accept for UtpSocket {
         let addr = stream.remote_addr();
         let (read, write) = stream.split();
         Ok((addr, (read, write)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    // A uTP socket that shut down tells its accept loop it is gone, which
+    // then ends instead of retrying; any other accept error is retried.
+    #[tokio::test]
+    async fn an_accept_on_a_shut_down_utp_socket_reports_the_listener_closed() {
+        let sock = bind_utp(
+            crate::test_support::socket_factory().as_ref(),
+            (Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+            crate::udp_options::STREAM_WINDOW,
+            None,
+        )
+        .await
+        .unwrap();
+        sock.shutdown().await.unwrap();
+        let Err(error) = Accept::accept(&sock).await else {
+            panic!("accepted on a shut down socket");
+        };
+        assert!(<UtpSocket as Accept>::is_closed(&error), "{error:#}");
+        assert!(!<UtpSocket as Accept>::is_closed(&anyhow::anyhow!(
+            "too many open files"
+        )));
     }
 }

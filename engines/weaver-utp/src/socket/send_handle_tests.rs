@@ -38,7 +38,7 @@ enum Event {
     },
     Sent {
         handle: Option<usize>,
-        message: UtpMessage,
+        message: Box<UtpMessage>,
     },
 }
 
@@ -88,7 +88,7 @@ impl Control {
         }
         self.waiter.lock().take();
         let bytes: Vec<_> = bufs.iter().flat_map(|buf| buf.iter().copied()).collect();
-        let message = UtpMessage::deserialize(&bytes, Instant::now()).unwrap();
+        let message = Box::new(UtpMessage::deserialize(&bytes, Instant::now()).unwrap());
         self.events.send(Event::Sent { handle, message }).unwrap();
         Poll::Ready(Ok(bytes.len()))
     }
@@ -253,7 +253,7 @@ async fn sent(
         Event::Sent { handle, message } => {
             assert_eq!(handle, owner);
             assert_eq!(message.header.htype, htype);
-            message
+            *message
         }
         event => panic!("expected sent packet, got {event:?}"),
     }

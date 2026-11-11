@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-10.
 
 use std::{task::Poll, time::Duration};
 
@@ -188,6 +188,9 @@ async fn test_resource_cleanup_both_sides_dropped_abruptly() {
     );
 }
 
+// Released with data the window held back: the unsent data goes, the FIN
+// follows the packet already in flight at once, and that packet is resent
+// until acknowledged (libtorrent v2.0.15 utp_stream.cpp:938-993).
 #[tokio::test]
 async fn test_resource_cleanup_with_pending_data() {
     setup_test_logging();
@@ -216,47 +219,34 @@ async fn test_resource_cleanup_with_pending_data() {
     drop(writer);
     drop(reader);
 
-    // First poll should send the pending data
+    // The first poll sends what the window allows, drops the rest and sends
+    // the FIN behind it.
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hel"),]
+        vec![
+            cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hel"),
+            cmphead!(Fin, seq_nr = 102, ack_nr = 0)
+        ]
     );
+    assert_eq!(t.vsock.user_tx.ring.lock().len(), 3);
 
     // Nothing else should be sent before ACK.
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
 
-    // Data should be retransmitted
+    // What is in flight is retransmitted, the FIN with it.
     t.env.increment_now(rto);
     t.poll_once_assert_pending().await;
     assert_eq!(
         t.take_sent(),
-        vec![cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hel"),]
-    );
-
-    // Send ACK for DATA
-    t.send_msg(
-        UtpHeader {
-            htype: State,
-            seq_nr: 0.into(),
-            ack_nr: 101.into(),
-            wnd_size: 1024,
-            ..Default::default()
-        },
-        "",
-    );
-
-    t.poll_once_assert_pending().await;
-    assert_eq!(
-        t.take_sent(),
         vec![
-            cmphead!(Data, seq_nr = 102, ack_nr = 0, payload = "lo"),
-            cmphead!(Fin, seq_nr = 103, ack_nr = 0)
+            cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hel"),
+            cmphead!(Fin, seq_nr = 102, ack_nr = 0)
         ]
     );
 
-    // Send ACK for DATA
+    // The remote acknowledges the data and the FIN: nothing more goes out.
     t.send_msg(
         UtpHeader {
             htype: State,
@@ -267,24 +257,9 @@ async fn test_resource_cleanup_with_pending_data() {
         },
         "",
     );
-
-    tracing::trace!("waiting for FIN retransmission");
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
-    t.env.increment_now(rto);
-    t.poll_once_assert_pending().await;
-    // Should retransmit FIN
-    assert_eq!(
-        t.take_sent(),
-        vec![cmphead!(Fin, seq_nr = 103, ack_nr = 0)],
-        "should retransmit FIN"
-    );
-    assert_eq!(
-        t.vsock.state,
-        VirtualSocketState::FinWait1 {
-            our_fin: 103.into()
-        }
-    );
+    assert!(t.vsock.user_tx.ring.lock().is_empty());
 
     // We should die in ~1 second now
     t.env.increment_now(Duration::from_secs(1));
@@ -293,6 +268,97 @@ async fn test_resource_cleanup_with_pending_data() {
     assert!(
         err.to_string().contains("inactive"),
         "Error should mention inactivity: {err}"
+    );
+}
+
+// A remote that keeps its window shut cannot hold a released stream: its
+// data goes and the FIN is sent at once, with no window probe.
+#[tokio::test]
+async fn a_released_stream_facing_a_shut_window_sends_its_fin_at_once() {
+    setup_test_logging();
+    let mut t = make_test_vsock(Default::default(), false);
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 0.into(),
+            ack_nr: 100.into(),
+            wnd_size: 0,
+            ..Default::default()
+        },
+        "",
+    );
+    let (reader, mut writer) = t.stream.take().unwrap().split();
+    writer.write_all(b"hello").await.unwrap();
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+
+    drop(writer);
+    drop(reader);
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent(), vec![cmphead!(Fin, seq_nr = 101, ack_nr = 0)]);
+    assert!(t.vsock.user_tx.ring.lock().is_empty());
+    assert_eq!(
+        t.vsock.state,
+        VirtualSocketState::FinWait1 {
+            our_fin: 101.into()
+        }
+    );
+
+    // The remote acknowledges the FIN; the stream ends after its last chance.
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 0.into(),
+            ack_nr: 101.into(),
+            wnd_size: 0,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+    t.env.increment_now(Duration::from_secs(1));
+    let err = t.poll_once_assert_ready().await.unwrap_err();
+    assert!(err.to_string().contains("inactive"), "{err}");
+}
+
+// A dropped writer with the reader still held is a half close: it all goes.
+#[tokio::test]
+async fn a_dropped_writer_with_a_live_reader_still_delivers_everything() {
+    setup_test_logging();
+    let mut t = make_test_vsock(Default::default(), false);
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 0.into(),
+            ack_nr: 100.into(),
+            wnd_size: 3,
+            ..Default::default()
+        },
+        "",
+    );
+    let (_reader, mut writer) = t.stream.take().unwrap().split();
+    writer.write_all(b"hello").await.unwrap();
+    drop(writer);
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(Data, seq_nr = 101, ack_nr = 0, payload = "hel")]
+    );
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 0.into(),
+            ack_nr: 101.into(),
+            wnd_size: 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    assert_eq!(
+        t.take_sent(),
+        vec![cmphead!(Data, seq_nr = 102, ack_nr = 0, payload = "lo")]
     );
 }
 

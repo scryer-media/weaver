@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-10.
 
 use std::{
     collections::{BTreeMap, VecDeque, btree_map::Entry},
@@ -229,6 +229,25 @@ pub(crate) struct RequestWithSpan<V> {
 type ConnectRequest = RequestWithSpan<crate::Result<UtpStream>>;
 type Acceptor<T, E> = RequestWithSpan<UtpStreamStarter<T, E>>;
 
+// An accept's answer channel. Dropped while still waiting, it closes the
+// channel, so the dispatcher hands any later SYN to the next acceptor, and
+// keeps a stream the dispatcher already sent for the next accept.
+struct HandBackOnDrop<'a, T, E> {
+    rx: Option<oneshot::Receiver<UtpStreamStarter<T, E>>>,
+    handed_back: &'a Mutex<VecDeque<UtpStreamStarter<T, E>>>,
+}
+
+impl<T, E> Drop for HandBackOnDrop<'_, T, E> {
+    fn drop(&mut self) {
+        if let Some(mut rx) = self.rx.take() {
+            rx.close();
+            if let Ok(stream) = rx.try_recv() {
+                self.handed_back.lock().push_back(stream);
+            }
+        }
+    }
+}
+
 impl<V> RequestWithSpan<V> {
     fn new(tx: oneshot::Sender<V>) -> Self {
         Self {
@@ -294,7 +313,7 @@ impl PendingSend {
 }
 
 enum SendCompletion {
-    Syn(SocketAddr, Arc<RetirementFlag>),
+    Syn(SocketAddr, SeqNr, Arc<RetirementFlag>),
     Response(usize),
 }
 
@@ -313,53 +332,55 @@ struct Connecting {
     requester: ConnectRequest,
 }
 
-const MAX_CONNECTING_PER_ADDR: usize = 4;
-
+// The connects waiting on one remote address, by connection id. Nothing
+// caps them per address: libtorrent opens as many uTP connections to one
+// endpoint as it is asked to (v2.0.15 utp_socket_manager.cpp:323-342). Every
+// entry holds a permit of the socket's connect admission, which bounds them
+// all together.
 #[derive(Default)]
 struct ConnectingPerAddr {
-    slots: [Option<Connecting>; MAX_CONNECTING_PER_ADDR],
-    len: usize,
+    by_id: BTreeMap<u16, Connecting>,
 }
 
 impl ConnectingPerAddr {
     fn is_empty(&self) -> bool {
-        self.len == 0
+        self.by_id.is_empty()
     }
 
     fn insert(&mut self, c: Connecting) -> bool {
-        for slot in self.slots.iter_mut() {
-            if slot.is_none() {
-                *slot = Some(c);
-                self.len += 1;
-                return true;
+        match self.by_id.entry(c.connection_id.0) {
+            Entry::Vacant(slot) => {
+                slot.insert(c);
+                true
             }
+            Entry::Occupied(_) => false,
         }
-        false
+    }
+
+    fn contains(&self, connection_id: u16) -> bool {
+        self.by_id.contains_key(&connection_id)
+    }
+
+    fn get_mut(&mut self, connection_id: SeqNr, seq_nr: SeqNr) -> Option<&mut Connecting> {
+        self.by_id
+            .get_mut(&connection_id.0)
+            .filter(|c| c.seq_nr == seq_nr)
     }
 
     fn pop(&mut self, connection_id: SeqNr, seq_nr: SeqNr) -> Option<Connecting> {
-        for slot in self.slots.iter_mut() {
-            if let Some(c) = slot
-                && c.connection_id == connection_id
-                && c.seq_nr == seq_nr
-            {
-                self.len -= 1;
-                return slot.take();
-            }
-        }
-        None
+        self.get_mut(connection_id, seq_nr)?;
+        self.by_id.remove(&connection_id.0)
     }
 
-    fn pop_by_flag(&mut self, flag: &Arc<RetirementFlag>) -> Option<Connecting> {
-        for slot in self.slots.iter_mut() {
-            if let Some(c) = slot
-                && Arc::ptr_eq(&c.retired, flag)
-            {
-                self.len -= 1;
-                return slot.take();
-            }
+    fn pop_by_flag(
+        &mut self,
+        connection_id: SeqNr,
+        flag: &Arc<RetirementFlag>,
+    ) -> Option<Connecting> {
+        if !Arc::ptr_eq(&self.by_id.get(&connection_id.0)?.retired, flag) {
+            return None;
         }
-        None
+        self.by_id.remove(&connection_id.0)
     }
 }
 
@@ -381,7 +402,8 @@ struct Syn {
 enum MatchSynWithAccept<T, E> {
     Matched,
     SynInvalid(Acceptor<T, E>),
-    ReceiverDead(Syn),
+    // Boxed: a header carries a SACK of up to 255 bytes.
+    ReceiverDead(Box<Syn>),
 }
 
 struct AcceptQueue<T, E> {
@@ -432,7 +454,7 @@ fn poll_control_sends(
     cx: &mut std::task::Context<'_>,
 ) -> Poll<SendCompletion> {
     for (remote, pending) in connecting {
-        for connect in pending.slots.iter_mut().flatten() {
+        for connect in pending.by_id.values_mut() {
             let ready = if connect.retired.is_retired() || connect.requester.tx.is_closed() {
                 true
             } else {
@@ -442,7 +464,11 @@ fn poll_control_sends(
                 }
             };
             if ready {
-                return Poll::Ready(SendCompletion::Syn(*remote, Arc::clone(&connect.retired)));
+                return Poll::Ready(SendCompletion::Syn(
+                    *remote,
+                    connect.connection_id,
+                    Arc::clone(&connect.retired),
+                ));
             }
         }
     }
@@ -473,11 +499,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     debug!(%error, "error sending ST_RESET");
                 }
             }
-            SendCompletion::Syn(remote, flag) => {
+            SendCompletion::Syn(remote, connection_id, flag) => {
                 let Some(mut entry) = self
                     .connecting
                     .get_mut(&remote)
-                    .and_then(|pending| pending.pop_by_flag(&flag))
+                    .and_then(|pending| pending.pop_by_flag(connection_id, &flag))
                 else {
                     return Ok(());
                 };
@@ -542,9 +568,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 });
                 if self.connecting.values().any(|pending| {
                     pending
-                        .slots
-                        .iter()
-                        .flatten()
+                        .by_id
+                        .values()
                         .any(|connect| matches!(connect.send, SynSend::Sending(_)))
                 }) {
                     let completion = poll_fn(|cx| {
@@ -657,7 +682,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     self.accept_queue.next_available_acceptor = Some(sender);
                 }
                 MatchSynWithAccept::ReceiverDead(syn) => {
-                    self.accept_queue.syns.push_front(syn);
+                    self.accept_queue.syns.push_front(*syn);
                 }
             }
         }
@@ -678,13 +703,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
     fn key_reserved(&self, key: StreamRecvKey) -> bool {
         self.streams.contains_key(&key)
-            || self.connecting.get(&key.0).is_some_and(|pending| {
-                pending
-                    .slots
-                    .iter()
-                    .flatten()
-                    .any(|connect| connect.connection_id.0 == key.1)
-            })
+            || self
+                .connecting
+                .get(&key.0)
+                .is_some_and(|pending| pending.contains(key.1))
             || self
                 .accept_queue
                 .syns
@@ -698,14 +720,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 .retain(|_, stream| !stream.retired.is_retired());
         }
         self.connecting.retain(|_, pending| {
-            for slot in &mut pending.slots {
-                if slot.as_ref().is_some_and(|connect| {
-                    connect.retired.is_retired() || connect.requester.tx.is_closed()
-                }) {
-                    slot.take();
-                    pending.len -= 1;
-                }
-            }
+            pending.by_id.retain(|_, connect| {
+                !connect.retired.is_retired() && !connect.requester.tx.is_closed()
+            });
             !pending.is_empty()
         });
     }
@@ -722,14 +739,6 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             || sender.tx.is_closed()
             || self.socket.cancellation_token.is_cancelled()
         {
-            return;
-        }
-        if self
-            .connecting
-            .get(&addr)
-            .is_some_and(|pending| pending.len == MAX_CONNECTING_PER_ADDR)
-        {
-            let _ = sender.tx.send(Err(Error::TooManyPendingConnections));
             return;
         }
         let conn_id = match self.get_next_free_conn_id(addr) {
@@ -780,9 +789,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             }
         };
 
-        if let Some(connect) = occ.get_mut().slots.iter_mut().flatten().find(|connect| {
-            connect.connection_id == msg.header.connection_id && connect.seq_nr == msg.header.ack_nr
-        }) && matches!(connect.send, SynSend::Sending(_))
+        if let Some(connect) = occ
+            .get_mut()
+            .get_mut(msg.header.connection_id, msg.header.ack_nr)
+            && matches!(connect.send, SynSend::Sending(_))
         {
             if connect.early_ack.is_none() {
                 connect.early_ack = Some(msg);
@@ -807,6 +817,36 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         };
 
         self.promote_connect(addr, conn, msg)
+    }
+
+    /// A FIN or RESET that acknowledges a pending SYN ends that connect at
+    /// once. libtorrent v2.0.15 answers a SYN it will not take with a FIN, and
+    /// its own connecting socket treats a FIN or RESET that acknowledges the SYN
+    /// as the end of the connection (utp_stream.cpp:2680-2693 for RESET,
+    /// 2947-2990 for a FIN in syn_sent). Waiting for the connect timeout
+    /// instead holds the attempt open for nothing.
+    fn on_maybe_connect_refused(&mut self, addr: SocketAddr, msg: UtpMessage) {
+        let Some(pending) = self.connecting.get_mut(&addr) else {
+            trace!(?msg, ?addr, "dropping packet");
+            return;
+        };
+        let Some(conn) = pending.pop(msg.header.connection_id, msg.header.ack_nr) else {
+            trace!(
+                ?msg,
+                ?addr,
+                "dropping packet, it answers no pending connect"
+            );
+            return;
+        };
+        if pending.is_empty() {
+            self.connecting.remove(&addr);
+        }
+        let error = match msg.header.get_type() {
+            Type::Reset => Error::StResetReceived,
+            _ => Error::ConnectRefused,
+        };
+        debug!(?addr, %error, "connect refused by the remote");
+        let _ = conn.requester.tx.send(Err(error));
     }
 
     fn promote_connect(
@@ -873,7 +913,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             Err(starter) => {
                 starter.disarm();
                 self.streams.remove(&recv_key);
-                MatchSynWithAccept::ReceiverDead(syn)
+                MatchSynWithAccept::ReceiverDead(Box::new(syn))
             }
         }
     }
@@ -938,7 +978,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     self.accept_queue.next_available_acceptor = Some(sender);
                     return Ok(());
                 }
-                MatchSynWithAccept::ReceiverDead(s) => syn = s,
+                MatchSynWithAccept::ReceiverDead(s) => syn = *s,
             }
         }
         match self.accept_queue.try_cache_syn(syn) {
@@ -976,6 +1016,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             Type::Syn => {
                 self.on_syn(addr, message).await?;
             }
+            Type::Fin | Type::Reset => {
+                self.on_maybe_connect_refused(addr, message);
+            }
             _ => {
                 trace!(?message, ?addr, "dropping packet");
             }
@@ -987,6 +1030,11 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 pub struct UtpSocket<T: Transport, E> {
     pub(crate) state: Arc<SocketState<T, E>>,
     runtime: Arc<Runtime<T>>,
+    // Incoming connections handed to an accept that was dropped before it
+    // took them. The next accept takes them first, so dropping an accept
+    // never leaves a remote's SYN unanswered. Held here rather than in the
+    // shared state, which every stream refers to.
+    handed_back: Mutex<VecDeque<UtpStreamStarter<T, E>>>,
 }
 
 impl<T: Transport, E> Drop for UtpSocket<T, E> {
@@ -1126,6 +1174,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let sock = Arc::new(Self {
             state: state.clone(),
             runtime,
+            handed_back: Mutex::default(),
         });
         let dispatcher = Dispatcher {
             streams: BTreeMap::default(),
@@ -1178,8 +1227,9 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         &self.state.stats
     }
 
+    /// Cancel-safe: dropping the future loses no incoming connection.
     pub async fn accept(self: &Arc<Self>) -> crate::Result<UtpStream> {
-        self.state.accept().await
+        self.state.accept(&self.handed_back).await
     }
 
     pub async fn connect(self: &Arc<Self>, remote: SocketAddr) -> crate::Result<UtpStream> {
@@ -1231,8 +1281,26 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
         &self.opts
     }
 
-    pub async fn accept(self: &Arc<Self>) -> crate::Result<UtpStream> {
+    async fn accept(
+        self: &Arc<Self>,
+        handed_back: &Mutex<VecDeque<UtpStreamStarter<T, Env>>>,
+    ) -> crate::Result<UtpStream> {
+        if self.cancellation_token.is_cancelled() {
+            return Err(Error::DispatcherDead);
+        }
+        let waiting = handed_back.lock().pop_front();
+        if let Some(stream) = waiting {
+            let stream = stream.start()?;
+            self.stats.accepts.increment(1);
+            trace!("accepted");
+            return Ok(stream);
+        }
+
         let (tx, rx) = oneshot::channel();
+        let mut rx = HandBackOnDrop {
+            rx: Some(rx),
+            handed_back,
+        };
 
         self.stats.accepting.increment(1);
         let _accepting_guard = FnDropGuard::new(|| self.stats.accepting.decrement(1));
@@ -1242,11 +1310,13 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
             _ = self.cancellation_token.cancelled() => return Err(Error::DispatcherDead),
             sent = self.accept_requests.send(RequestWithSpan::new(tx)) => sent.map_err(|_| Error::DispatcherDead)?,
         }
+        let receiver = rx.rx.as_mut().ok_or(Error::BugUnreachable)?;
         let stream = tokio::select! {
             biased;
             _ = self.cancellation_token.cancelled() => return Err(Error::DispatcherDead),
-            received = rx => received.map_err(|_| Error::DispatcherDead)?,
+            received = receiver => received.map_err(|_| Error::DispatcherDead)?,
         };
+        rx.rx = None;
         let stream = stream.start()?;
         self.stats.accepts.increment(1);
         trace!("accepted");

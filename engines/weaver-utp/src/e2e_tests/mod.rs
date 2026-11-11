@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-10.
 
 // Two sockets joined by an in-memory link, run on tokio's paused clock: a
 // connect, an accept and a counter echoed both ways, clean and with loss.
@@ -237,6 +237,9 @@ async fn echo(
         for counter in 0..=MAX_COUNTER {
             writer.write_u64(counter).await.context("error writing")?;
         }
+        // A released stream drops what it has not sent, so the echo holds
+        // its writer until the remote has acknowledged everything.
+        writer.flush().await.context("error flushing")?;
         Ok::<_, anyhow::Error>(())
     };
 
