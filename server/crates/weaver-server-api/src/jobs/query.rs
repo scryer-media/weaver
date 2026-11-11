@@ -7,9 +7,12 @@ use super::*;
 use crate::jobs::paging::{PageRead, PageWants, read_row};
 use crate::jobs::types::{
     DuplicateIdentitySnapshotInfo, DuplicateSummaryInfo, PreparedQueueFilter,
-    load_duplicate_summaries_chunked, matches_queue_filter_prepared, queue_table_item_from_job,
+    load_duplicate_summaries_chunked, queue_table_item_from_job,
 };
 use crate::observability::with_timed_config_read;
+
+// The most rows `queueItems` and `jobs` return when the caller names a size.
+const QUEUE_LIST_MAX_FIRST: usize = 10_000;
 
 #[derive(Default)]
 pub(crate) struct JobsQuery;
@@ -48,19 +51,25 @@ impl JobsQuery {
     ) -> Result<Vec<QueueItem>> {
         let offset = decode_offset_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
-        let limit = first.unwrap_or(u32::MAX) as usize;
+        // A caller that names no size gets every matching row, as it always
+        // has; one that does is held to the largest page.
+        let limit = first.map_or(usize::MAX, |first| {
+            (first as usize).min(QUEUE_LIST_MAX_FIRST)
+        });
         let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
         let mut items: Vec<QueueItem> = crate::jobs::paging::read_listing(
             ctx.data::<weaver_server_core::SharedPipelineState>()?,
+            prepared_filter.as_ref(),
+            offset,
+            limit,
         )
         .iter()
         .map(queue_item_from_job)
-        .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
-        .skip(offset)
-        .take(limit)
         .collect();
-        attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
+        if ctx.look_ahead().field("duplicateSummary").exists() {
+            attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
+        }
         Ok(items)
     }
     /// Server-paginated queue rows for the interactive queue table.
@@ -113,12 +122,21 @@ impl JobsQuery {
 
         let mut items: Vec<QueueItem> = crate::jobs::paging::read_listing(
             ctx.data::<weaver_server_core::SharedPipelineState>()?,
+            prepared_filter.as_ref(),
+            0,
+            usize::MAX,
         )
         .iter()
         .map(queue_item_from_job)
-        .filter(|item| matches_queue_filter_prepared(item, prepared_filter.as_ref()))
         .collect();
-        attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
+        if ctx
+            .look_ahead()
+            .field("items")
+            .field("duplicateSummary")
+            .exists()
+        {
+            attach_duplicate_summaries(ctx.data::<Database>()?.clone(), &mut items).await?;
+        }
         let metrics = handle.get_metrics();
         let latest_cursor = replay.latest_cursor().await;
         let max_download_speed = with_timed_config_read(
@@ -182,7 +200,9 @@ impl JobsQuery {
             has_metadata_key,
         };
         let offset = offset.unwrap_or(0) as usize;
-        let limit = limit.map_or(usize::MAX, |limit| limit as usize);
+        let limit = limit.map_or(usize::MAX, |limit| {
+            (limit as usize).min(QUEUE_LIST_MAX_FIRST)
+        });
         let history = state.history_rows();
         // Only the jobs on the page are copied; the rest are matched in place.
         let (mut infos, queued_matches) = state.read_queue(|inner| {

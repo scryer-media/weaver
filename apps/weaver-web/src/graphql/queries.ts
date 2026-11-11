@@ -646,26 +646,6 @@ const RSS_SEEN_ITEM_FIELDS = `
   }
 `;
 
-export const JOBS_PAGE_QUERY = gql`
-  query JobsPage {
-    queueSnapshot {
-      items {
-        ...FacadeQueueItemFields
-      }
-      latestCursor
-      globalState {
-        isPaused
-        downloadBlock {
-          ...DownloadBlockFields
-        }
-      }
-    }
-  }
-  ${PARSED_RELEASE_FIELDS}
-  ${FACADE_QUEUE_ITEM_FIELDS}
-  ${DOWNLOAD_BLOCK_FIELDS}
-`;
-
 const QUEUE_PAGE_FIELDS = `
   fragment QueuePageFields on QueuePage {
     items {
@@ -1290,16 +1270,6 @@ export const SERVICE_LOG_LINES_SUBSCRIPTION = gql`
   subscription ServiceLogLines {
     serviceLogLines
   }
-`;
-
-export const HISTORY_JOBS_QUERY = gql`
-  query HistoryJobs($first: Int, $after: String, $filter: QueueFilterInput) {
-    historyItems(first: $first, after: $after, filter: $filter) {
-      ...FacadeHistoryItemFields
-    }
-  }
-  ${PARSED_RELEASE_FIELDS}
-  ${FACADE_HISTORY_ITEM_FIELDS}
 `;
 
 export const HISTORY_PAGE_QUERY = gql`

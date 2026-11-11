@@ -23,6 +23,10 @@ enum HistoryQueryPlan {
 // capping the per-poll cost. Only the detail-view read is bounded; callers that
 // must see the full log use `get_job_events`.
 const JOB_DETAIL_EVENT_CAP: u32 = 2000;
+// The page `historyItems` returns when the caller names no size, and the
+// largest it returns when one does.
+const HISTORY_ITEMS_DEFAULT_FIRST: u32 = 1000;
+const HISTORY_ITEMS_MAX_FIRST: u32 = 1000;
 
 #[derive(Default)]
 pub(crate) struct HistoryQuery;
@@ -42,19 +46,24 @@ impl HistoryQuery {
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
         let db = ctx.data::<Database>()?.clone();
         let live_jobs = live_job_ids(ctx.data::<SchedulerHandle>()?);
-        let plan = history_query_plan(filter.as_ref(), first, Some(offset));
-        let HistoryQueryPlan::Query(history_filter) = plan else {
+        let first = first
+            .unwrap_or(HISTORY_ITEMS_DEFAULT_FIRST)
+            .min(HISTORY_ITEMS_MAX_FIRST);
+        let plan = history_query_plan(filter.as_ref(), Some(first), Some(offset));
+        let HistoryQueryPlan::Query(mut history_filter) = plan else {
             return Ok(Vec::new());
         };
         let items = tokio::task::spawn_blocking(move || {
-            // The live exclusion is applied after the query's LIMIT/OFFSET, so a
-            // page that contains a live job's row comes back short by that many
-            // rows rather than pulling the next row forward. The cursor stays a
-            // plain row offset, which is what the next page is decoded against.
-            let rows = exclude_live_rows(
-                db.list_job_history(&history_filter, HistoryRows::Shown)?,
-                &live_jobs,
-            );
+            // Live rows are left out in SQL, before the page is cut, so a page
+            // comes back full and the cursor's offset counts only rows that are
+            // history.
+            let live_in_history = live_jobs_in_history(&db, &live_jobs)?;
+            if !live_in_history.is_empty() {
+                let mut ids: Vec<u64> = live_in_history.into_iter().collect();
+                ids.sort_unstable();
+                history_filter.item_ids_not_in = Some(ids);
+            }
+            let rows = db.list_job_history(&history_filter, HistoryRows::Shown)?;
             let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
             let duplicate_summaries = load_duplicate_summaries_chunked(
                 &db,
@@ -1850,20 +1859,29 @@ mod tests {
         assert_eq!(page.counts.all, 7);
     }
 
+    // `historyItems` leaves live rows out before the page is cut, so a page
+    // holding a live job's row is filled from the next row on, and the next
+    // page starts where this one ended.
     #[test]
-    fn a_limited_list_page_is_short_by_its_live_rows() {
-        // `historyItems` applies the exclusion after the query's LIMIT, so a
-        // page holding a live job's row comes back short rather than pulling the
-        // next row forward onto it.
-        let rows = vec![
-            history_row(1, "complete", 1_000),
-            history_row(2, "complete", 1_100),
-        ];
-        let live = HashSet::from([2]);
-        let kept: Vec<u64> = exclude_live_rows(rows, &live)
-            .iter()
-            .map(|row| row.job_id)
-            .collect();
-        assert_eq!(kept, vec![1]);
+    fn a_limited_list_page_is_full_without_its_live_rows() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        let live = HashSet::from([6, 4]);
+        let live_in_history = live_jobs_in_history(&db, &live).unwrap();
+        let page = |offset: u32| {
+            let HistoryQueryPlan::Query(mut filter) =
+                history_query_plan(None, Some(3), Some(offset as usize))
+            else {
+                panic!("an unfiltered plan reads");
+            };
+            filter.item_ids_not_in = Some(live_in_history.iter().copied().collect());
+            db.list_job_history(&filter, HistoryRows::Shown)
+                .unwrap()
+                .into_iter()
+                .map(|row| row.job_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(page(0), vec![7, 5, 3]);
+        assert_eq!(page(3), vec![2, 1]);
     }
 }
