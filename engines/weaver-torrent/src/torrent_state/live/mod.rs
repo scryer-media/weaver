@@ -3109,6 +3109,26 @@ impl PeerHandler {
                     .retain(|p| !pieces.chunks().is_piece_have(*p));
                 live.suggested
                     .retain(|p| !pieces.chunks().is_piece_have(*p));
+                // A queued piece whose every missing block is asked of the
+                // peer already holds nothing to ask it: the peer gave it back
+                // when it was snubbed, for other peers to fetch, and is not
+                // handed it again while those requests stand (libtorrent
+                // `request_a_block` passes over a block in the peer's queues,
+                // request_blocks.cpp:238-256, and `snub_peer` asks for a new
+                // block before it times one out so as not to pick that block
+                // again, peer_connection.cpp:5217-5233).
+                let mut asked_whole: Vec<ValidPieceIndex> = Vec::new();
+                for request in live.inflight_requests() {
+                    let piece = request.piece_index;
+                    if !pieces.is_inflight(piece)
+                        && !asked_whole.contains(&piece)
+                        && pieces
+                            .missing_chunks(piece)
+                            .all(|chunk| live.has_inflight_request(&chunk))
+                    {
+                        asked_whole.push(piece);
+                    }
+                }
                 let bf = &live.bitfield;
                 let allowed_fast = &live.allowed_fast_from_peer;
                 let was_end_game = pieces.chunks().every_queued_piece_started();
@@ -3128,6 +3148,7 @@ impl PeerHandler {
                             bf.get(p.get() as usize).map(|v| *v) == Some(true)
                                 && self.state.metadata.can_verify(p)
                                 && (!choked || allowed_fast.contains(&p))
+                                && !asked_whole.contains(&p)
                         },
                         availability: |p| self.state.peers.availability.ranked(p),
                         moved: self.state.peers.availability.take_moved(),
@@ -3803,19 +3824,13 @@ impl PeerHandler {
                     // Stolen or released: the piece is no longer ours to request.
                     Some(None) => break,
                     Some(Some(false)) => {
-                        // This request was already in-flight for this peer for this chunk.
-                        // This might happen in theory, but not very likely.
-                        //
-                        // Example:
-                        // someone stole a piece from us, and then died, the piece became "needed" again, and we reserved it
-                        // all before the piece request was processed by us.
-                        warn!(
-                            id = self.state.shared.id,
-                            info_hash = ?self.state.shared.info_hash,
-                            addr = ?self.addr,
-                            "we already requested {:?} previously",
-                            chunk
-                        );
+                        // The block is asked of the peer already, and is not
+                        // asked again: the peer doubled it in the end game
+                        // before the piece came back to the queue and to it
+                        // (libtorrent `request_a_block` passes over a block
+                        // in the peer's queues, request_blocks.cpp:238-256).
+                        self.state.stats.asked_already.fetch_add(1, Ordering::Relaxed);
+                        debug!(?chunk, "asked of the peer already");
                         continue;
                     }
                     // peer died
