@@ -97,6 +97,82 @@ async fn backpressure_blocks_then_unblocks() {
 }
 
 #[tokio::test]
+async fn a_new_pool_allocates_nothing_until_a_buffer_is_wanted() {
+    let pool = test_pool();
+    for tier in [BufferTier::Small, BufferTier::Medium, BufferTier::Large] {
+        assert_eq!(pool.allocated(tier), 0);
+        assert_eq!(pool.available(tier), pool.tier_pool(tier).total);
+    }
+
+    let buf = pool.acquire(BufferTier::Medium).await;
+    assert_eq!(buf.capacity(), 1024 * 1024);
+    assert_eq!(pool.allocated(BufferTier::Medium), 1);
+    assert_eq!(pool.allocated(BufferTier::Small), 0);
+    assert_eq!(pool.allocated(BufferTier::Large), 0);
+}
+
+#[tokio::test]
+async fn a_busy_pool_reuses_its_buffers_instead_of_allocating_per_use() {
+    let pool = test_pool();
+    // Two in flight at a time, many times over: the pool grows to two and
+    // then only reuses them.
+    for round in 0..100u8 {
+        let mut a = pool.acquire(BufferTier::Small).await;
+        let b = pool.try_acquire(BufferTier::Small).unwrap();
+        a.as_mut_slice().unwrap()[0] = round;
+        a.set_len(1);
+        drop(a);
+        drop(b);
+        assert_eq!(pool.allocated(BufferTier::Small), 2);
+    }
+}
+
+#[tokio::test]
+async fn allocation_stops_at_the_tier_count() {
+    let pool = test_pool();
+    let held: Vec<_> = (0..4)
+        .map(|_| pool.try_acquire(BufferTier::Small).unwrap())
+        .collect();
+    assert!(pool.try_acquire(BufferTier::Small).is_none());
+    assert_eq!(pool.allocated(BufferTier::Small), 4);
+    drop(held);
+    assert_eq!(pool.allocated(BufferTier::Small), 4);
+    assert_eq!(pool.available(BufferTier::Small), 4);
+}
+
+#[tokio::test]
+async fn release_idle_frees_queued_buffers_and_keeps_the_ones_in_use() {
+    let pool = test_pool();
+    let in_use = pool.acquire(BufferTier::Small).await;
+    let idle = pool.acquire(BufferTier::Small).await;
+    let large = pool.acquire(BufferTier::Large).await;
+    drop(idle);
+    drop(large);
+    assert_eq!(pool.allocated(BufferTier::Small), 2);
+    assert_eq!(pool.allocated(BufferTier::Large), 1);
+
+    pool.release_idle();
+    assert_eq!(pool.allocated(BufferTier::Small), 1);
+    assert_eq!(pool.allocated(BufferTier::Large), 0);
+    assert_eq!(in_use.capacity(), 512 * 1024);
+
+    // A buffer returned after the release goes back to the queue as usual,
+    // and the next release frees it.
+    drop(in_use);
+    assert_eq!(pool.allocated(BufferTier::Small), 1);
+    assert_eq!(pool.available(BufferTier::Small), 4);
+    pool.release_idle();
+    assert_eq!(pool.allocated(BufferTier::Small), 0);
+
+    // The pool still serves its full count afterwards.
+    let again: Vec<_> = (0..4)
+        .map(|_| pool.try_acquire(BufferTier::Small).unwrap())
+        .collect();
+    assert_eq!(pool.allocated(BufferTier::Small), 4);
+    drop(again);
+}
+
+#[tokio::test]
 async fn tier_for_size() {
     assert_eq!(BufferTier::for_size(100), BufferTier::Small);
     assert_eq!(BufferTier::for_size(512 * 1024), BufferTier::Small);

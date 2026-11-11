@@ -465,6 +465,16 @@ impl BlockingBodyLane {
         !self.conn.read_buf.is_empty() || self.conn.transport.idle_terminal()
     }
 
+    // Free the read buffers of a lane that is waiting for work, keeping the
+    // connection open. The next read allocates them again at their normal
+    // size. Does nothing while a response is owed or unread bytes are held.
+    pub fn release_idle_buffers(&mut self) {
+        if !self.ring.outstanding.is_empty() || self.conn.bodies_outstanding() {
+            return;
+        }
+        self.conn.release_idle_buffers();
+    }
+
     pub fn socket_id(&self) -> u64 {
         self._permit.socket_slot.id()
     }
@@ -1285,7 +1295,8 @@ impl BlockingNntpConnection {
             transport,
             codec: NntpCodec::new(),
             read_buf: BytesMut::with_capacity(read_buf_capacity),
-            read_scratch: vec![0; config.buffer_profile.socket_read_size.max(64 * 1024)],
+            // Only a plain socket reads through it; sized by its first read.
+            read_scratch: Vec::new(),
             buffer_profile: config.buffer_profile,
             capabilities: match config.pipelining {
                 crate::connection::PipeliningCapability::Probe => Capabilities::default(),
@@ -2422,12 +2433,34 @@ impl BlockingNntpConnection {
         self.read_into_buffer_with_stats_timeout(self.command_timeout)
     }
 
+    // Free the read buffers while nothing is waiting in them. A buffer
+    // holding unread bytes is kept.
+    fn release_idle_buffers(&mut self) {
+        if !self.read_buf.is_empty() {
+            return;
+        }
+        self.read_buf = BytesMut::new();
+        self.read_scratch = Vec::new();
+        if let BlockingTransport::Rustls(inner) = &mut self.transport {
+            inner.read_buffer = Vec::new();
+        }
+    }
+
     fn read_into_buffer_with_stats_timeout(
         &mut self,
         timeout: Duration,
     ) -> Result<(usize, TransportReadStats)> {
+        // Freed while the lane waited for work: take the normal size back
+        // before the first read rather than growing into it.
+        if self.read_buf.capacity() == 0 {
+            self.read_buf
+                .reserve(self.buffer_profile.read_buf_capacity.max(64 * 1024));
+        }
         let socket_read_size = self.buffer_profile.socket_read_size.max(64 * 1024);
-        if self.read_scratch.len() < socket_read_size {
+        // A TLS transport reads into its own buffer and never touches this.
+        if matches!(self.transport, BlockingTransport::Plain(_))
+            && self.read_scratch.len() < socket_read_size
+        {
             self.read_scratch.resize(socket_read_size, 0);
         }
         let (n, stats) = self
@@ -2487,6 +2520,11 @@ impl BlockingTransport {
                 }
                 let mut plaintext = BytesMut::new();
                 let mut remaining = 64 * 1024;
+                // An idle lane may have freed its read buffer; a zero-length
+                // read would look like the peer closing.
+                if inner.read_buffer.is_empty() {
+                    inner.read_buffer.resize(16 * 1024, 0);
+                }
                 let closed = loop {
                     if inner.session.idle_terminal() {
                         break true;
