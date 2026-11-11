@@ -2065,6 +2065,34 @@ export const SET_TORRENT_FIRST_LAST_PIECE_FIRST_MUTATION = gql`
   }
 `;
 
+/** Check every piece of the torrent again. */
+export const RECHECK_TORRENT_MUTATION = gql`
+  mutation RecheckTorrent($id: Int!) {
+    recheckTorrent(id: $id)
+  }
+`;
+
+/** Move the torrent's directory under `path`. */
+export const SET_TORRENT_LOCATION_MUTATION = gql`
+  mutation SetTorrentLocation($id: Int!, $path: String!) {
+    setTorrentLocation(id: $id, path: $path)
+  }
+`;
+
+/** Put the torrent in a category; null takes it out of its own. */
+export const SET_TORRENT_CATEGORY_MUTATION = gql`
+  mutation SetTorrentCategory($id: Int!, $category: String) {
+    setTorrentCategory(id: $id, category: $category)
+  }
+`;
+
+/** Look the torrent up on the DHT now. */
+export const DHT_ANNOUNCE_TORRENT_MUTATION = gql`
+  mutation DhtAnnounceTorrent($id: Int!) {
+    dhtAnnounceTorrent(id: $id)
+  }
+`;
+
 // --- Hardware profile ---
 
 const HARDWARE_PROFILE_FIELDS = gql`

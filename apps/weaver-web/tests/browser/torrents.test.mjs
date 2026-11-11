@@ -238,6 +238,22 @@ async function sentAs(page, name, count) {
 }
 const publish = (page) => page.evaluate(() => window.torrentsFixture.publish());
 
+test("a public torrent announces on the DHT from its trackers, and a private one offers no DHT announce", async () => {
+  const { page, errors } = await open("trackers");
+  await page.getByTitle("http://a.test/announce", { exact: true }).waitFor();
+  await page.getByRole("button", { name: "DHT announce", exact: true }).click();
+  assert.deepEqual(await sentAs(page, "DhtAnnounceTorrent", 1), [{ id: 5 }]);
+  assert.equal(errors.length, 0, errors.join("\n"));
+  await page.close();
+
+  const closed = await open("privateTrackers");
+  await closed.page.getByTitle("http://a.test/announce", { exact: true }).waitFor();
+  await closed.page.getByRole("button", { name: "Reannounce", exact: true }).waitFor();
+  assert.equal(await closed.page.getByRole("button", { name: "DHT announce", exact: true }).count(), 0);
+  assert.equal(closed.errors.length, 0, closed.errors.join("\n"));
+  await closed.page.close();
+});
+
 test("a file's priority set on its row is sent for that file alone, and shown once the torrent pushes it", async () => {
   const { page, errors } = await open("files");
   const files = page.getByRole("region", { name: "Files", exact: true });
