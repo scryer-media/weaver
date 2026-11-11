@@ -17,6 +17,7 @@ use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
 mod group_discovery;
 mod idle;
+mod socket_use;
 
 enum TestArticle {
     Body(Vec<u8>),

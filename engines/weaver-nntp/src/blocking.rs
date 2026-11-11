@@ -203,7 +203,6 @@ pub struct BlockingNntpConnection {
     transport: BlockingTransport,
     codec: NntpCodec,
     read_buf: BytesMut,
-    read_scratch: Vec<u8>,
     buffer_profile: NntpBufferProfile,
     capabilities: Capabilities,
     // The configured endpoint, kept so a requirement learned here is
@@ -1295,8 +1294,6 @@ impl BlockingNntpConnection {
             transport,
             codec: NntpCodec::new(),
             read_buf: BytesMut::with_capacity(read_buf_capacity),
-            // Only a plain socket reads through it; sized by its first read.
-            read_scratch: Vec::new(),
             buffer_profile: config.buffer_profile,
             capabilities: match config.pipelining {
                 crate::connection::PipeliningCapability::Probe => Capabilities::default(),
@@ -2440,7 +2437,6 @@ impl BlockingNntpConnection {
             return;
         }
         self.read_buf = BytesMut::new();
-        self.read_scratch = Vec::new();
         if let BlockingTransport::Rustls(inner) = &mut self.transport {
             inner.read_buffer = Vec::new();
         }
@@ -2457,20 +2453,9 @@ impl BlockingNntpConnection {
                 .reserve(self.buffer_profile.read_buf_capacity.max(64 * 1024));
         }
         let socket_read_size = self.buffer_profile.socket_read_size.max(64 * 1024);
-        // A TLS transport reads into its own buffer and never touches this.
-        if matches!(self.transport, BlockingTransport::Plain(_))
-            && self.read_scratch.len() < socket_read_size
-        {
-            self.read_scratch.resize(socket_read_size, 0);
-        }
         let (n, stats) = self
             .transport
-            .read_into_buf(
-                &mut self.read_buf,
-                &mut self.read_scratch,
-                socket_read_size,
-                timeout,
-            )
+            .read_into_buf(&mut self.read_buf, socket_read_size, timeout)
             .map_err(|error| {
                 if let Some(outcome) = &self.route_outcome {
                     outcome.failed();
@@ -2479,6 +2464,8 @@ impl BlockingNntpConnection {
                 self.current_group = None;
                 NntpError::Io(error)
             })?;
+        #[cfg(test)]
+        read_probe::transport_read(n, self.read_buf.len(), self.read_buf.capacity());
         if n == 0 {
             if let Some(outcome) = &self.route_outcome {
                 outcome.failed();
@@ -2581,16 +2568,16 @@ impl BlockingTransport {
     fn read_into_buf(
         &mut self,
         dst: &mut BytesMut,
-        scratch: &mut [u8],
         target_read_size: usize,
         timeout: Duration,
     ) -> io::Result<(usize, TransportReadStats)> {
         match self {
             BlockingTransport::Plain(tcp) => {
                 tcp.set_read_timeout(Some(timeout))?;
-                let read_size = target_read_size.min(scratch.len()).max(1);
-                let n = tcp.read(&mut scratch[..read_size])?;
-                dst.extend_from_slice(&scratch[..n]);
+                // Straight into the connection's buffer: no staging copy.
+                let n = tcp.read_into(dst, target_read_size)?;
+                #[cfg(test)]
+                read_probe::socket_read(n, 0);
                 Ok((
                     n,
                     TransportReadStats {
@@ -2727,6 +2714,8 @@ impl BlockingManualTlsStream {
         let started = Instant::now();
         loop {
             let n = self.tcp.read(&mut self.read_buffer[..read_size])?;
+            #[cfg(test)]
+            read_probe::socket_read(n, self.read_buffer.len());
             self.stats.socket_reads += 1;
             stats.try_read_calls += 1;
             if n == 0 {
@@ -2955,6 +2944,10 @@ impl BlockingS2nStream {
             };
             if n > 0 {
                 let n = n as usize;
+                // s2n reads the socket itself; this is what one receive
+                // call handed back.
+                #[cfg(test)]
+                read_probe::socket_read(n, 0);
                 unsafe { dst.advance_mut(n) };
                 total += n;
                 self.stats.tls_recv_calls += 1;
@@ -3384,6 +3377,63 @@ fn is_connection_error(err: &NntpError) -> bool {
             | NntpError::AccessDenied
             | NntpError::SoftTimeout(_)
     )
+}
+
+// Test-only record of how a connection uses its read buffers, for the
+// measurement in `tests::socket_use`. Off unless a test turns it on, and kept
+// per thread so recording never contends between lanes.
+#[cfg(test)]
+pub(crate) mod read_probe {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub(crate) static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    #[derive(Debug, Default, Clone)]
+    pub(crate) struct Samples {
+        // Bytes each transport read added to `read_buf`.
+        pub(crate) added: Vec<u32>,
+        // Bytes each socket read returned, where this crate makes the read.
+        pub(crate) socket: Vec<u32>,
+        pub(crate) read_buf_len_max: usize,
+        pub(crate) read_buf_capacity_max: usize,
+        pub(crate) transport_buffer_max: usize,
+    }
+
+    thread_local! {
+        static SAMPLES: RefCell<Samples> = RefCell::new(Samples::default());
+    }
+
+    fn enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn transport_read(added: usize, read_buf_len: usize, read_buf_capacity: usize) {
+        if !enabled() {
+            return;
+        }
+        SAMPLES.with(|samples| {
+            let mut samples = samples.borrow_mut();
+            samples.added.push(added as u32);
+            samples.read_buf_len_max = samples.read_buf_len_max.max(read_buf_len);
+            samples.read_buf_capacity_max = samples.read_buf_capacity_max.max(read_buf_capacity);
+        });
+    }
+
+    pub(crate) fn socket_read(bytes: usize, transport_buffer: usize) {
+        if !enabled() {
+            return;
+        }
+        SAMPLES.with(|samples| {
+            let mut samples = samples.borrow_mut();
+            samples.socket.push(bytes as u32);
+            samples.transport_buffer_max = samples.transport_buffer_max.max(transport_buffer);
+        });
+    }
+
+    pub(crate) fn take() -> Samples {
+        SAMPLES.with(|samples| std::mem::take(&mut *samples.borrow_mut()))
+    }
 }
 
 #[cfg(test)]

@@ -230,6 +230,38 @@ impl BlockingSocket {
             _ => Err(io::Error::other("tunnel adapter requires blocking calls")),
         }
     }
+
+    // One read of at most `max` bytes, appended straight to `dst` without a
+    // staging copy. `dst` gains room for `max` first if it lacks it.
+    pub(crate) fn read_into(&mut self, dst: &mut bytes::BytesMut, max: usize) -> io::Result<usize> {
+        use bytes::BufMut;
+        let max = max.max(1);
+        dst.reserve(max);
+        match self {
+            Self::Tcp(tcp) => {
+                let len = dst.len();
+                let spare = dst.spare_capacity_mut();
+                let limit = spare.len().min(max);
+                let n = socket2::SockRef::from(&*tcp).recv(&mut spare[..limit])?;
+                // SAFETY: `recv` initialised the first `n` bytes of the spare
+                // capacity and reports exactly that count.
+                unsafe { dst.set_len(len + n) };
+                Ok(n)
+            }
+            Self::Tunnel {
+                stream,
+                runtime,
+                read_timeout,
+                ..
+            } => {
+                let mut limited = dst.limit(max);
+                runtime.block_on(deadline(
+                    read_timeout.get(),
+                    stream.read_buf(&mut limited),
+                ))
+            }
+        }
+    }
 }
 impl Drop for BlockingSocket {
     fn drop(&mut self) {

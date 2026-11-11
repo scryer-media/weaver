@@ -198,8 +198,8 @@ fn rustls_idle_inspection_after_the_read_buffer_is_freed_tells_open_from_closed(
     std::fs::remove_file(fixture.ca).unwrap();
 }
 
-// A TLS connection frees all three read buffers between articles and reads
-// the next article as before. It never allocates the plain-socket scratch.
+// A TLS connection frees both read buffers between articles and reads the
+// next article as before.
 #[test]
 fn a_rustls_connection_frees_its_read_buffers_between_articles_and_reads_on() {
     let (config, handle, ca_path) = spawn_tls_nntp_server(vec![
@@ -213,11 +213,6 @@ fn a_rustls_connection_frees_its_read_buffers_between_articles_and_reads_on() {
             .unwrap()
             .into_data(),
         vec![0x41; 300 * 1024]
-    );
-    assert_eq!(
-        conn.read_scratch.capacity(),
-        0,
-        "TLS never reads through the scratch"
     );
 
     conn.release_idle_buffers();
@@ -233,7 +228,6 @@ fn a_rustls_connection_frees_its_read_buffers_between_articles_and_reads_on() {
             .into_data(),
         vec![0x42; 300 * 1024]
     );
-    assert_eq!(conn.read_scratch.capacity(), 0);
     conn.quit().unwrap();
     handle.join().unwrap();
     let _ = std::fs::remove_file(ca_path);
@@ -288,7 +282,6 @@ fn an_idle_plain_lane_frees_its_read_buffers_and_reads_the_next_article() {
     let second = vec![0x62; 300 * 1024];
     let (config, server) = spawn_plain_body_server(vec![first.clone(), second.clone()]);
     let mut lane = test_body_lane(&config);
-    let socket_read_size = lane.conn.buffer_profile.socket_read_size.max(64 * 1024);
 
     assert!(matches!(
         lane.ring_issue("<first@test>", 300 * 1024, 1),
@@ -301,11 +294,9 @@ fn an_idle_plain_lane_frees_its_read_buffers_and_reads_the_next_article() {
     );
     let (trace, _) = lane.ring_read_next().unwrap();
     assert_eq!(ring_payload(&trace), first);
-    assert_eq!(lane.conn.read_scratch.len(), socket_read_size);
 
     lane.release_idle_buffers();
     assert_eq!(lane.conn.read_buf.capacity(), 0);
-    assert_eq!(lane.conn.read_scratch.capacity(), 0);
     assert!(!lane.peer_closed(), "freeing the buffers keeps the session");
 
     assert!(matches!(
@@ -314,7 +305,6 @@ fn an_idle_plain_lane_frees_its_read_buffers_and_reads_the_next_article() {
     ));
     let (trace, _) = lane.ring_read_next().unwrap();
     assert_eq!(ring_payload(&trace), second);
-    assert_eq!(lane.conn.read_scratch.len(), socket_read_size);
     lane.park();
     server.join().unwrap();
 }
