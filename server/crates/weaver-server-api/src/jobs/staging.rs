@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use std::collections::HashMap;
-use std::io::{Error, ErrorKind, Read, Result as IoResult};
+use std::io::{Chain, Cursor, Error, ErrorKind, Read, Result as IoResult, Take};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -13,8 +13,8 @@ use crate::auth::CallerIdentity;
 use weaver_server_core::auth::generate_api_key;
 use weaver_server_core::ingest::{
     PreparedPersistedNzb, StagedSubmissionPreparation, SubmitNzbError,
-    XZ_DECODER_MEMORY_LIMIT_BYTES, nzb_to_submission_spec, parse_and_hash_persisted_nzb_bytes,
-    persist_decoded_nzb_reader_to_zstd, xz_multistream_decoder,
+    XZ_DECODER_MEMORY_LIMIT_BYTES, bzip2_multistream_decoder, nzb_to_submission_spec,
+    parse_and_hash_persisted_nzb_bytes, persist_decoded_nzb_reader_to_zstd, xz_multistream_decoder,
 };
 use weaver_server_core::jobs::FingerprintEvidence;
 use weaver_server_core::security::RuntimeSecurityConfig;
@@ -319,6 +319,54 @@ enum UploadEncoding {
     Brotli,
     Deflate,
     Xz,
+    Bzip2,
+}
+
+// The longest magic number looked for, xz's.
+const UPLOAD_MAGIC_LEN: usize = 6;
+
+// The compression the first bytes of an NZB announce. An NZB is XML, so none
+// of these can open a plain one. Brotli and raw deflate have no magic number.
+fn encoding_from_magic(bytes: &[u8]) -> UploadEncoding {
+    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
+    const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
+    const XZ_MAGIC: &[u8] = &[0xfd, b'7', b'z', b'X', b'Z', 0x00];
+    const BZIP2_MAGIC: &[u8] = b"BZh";
+
+    if bytes.starts_with(GZIP_MAGIC) {
+        UploadEncoding::Gzip
+    } else if bytes.starts_with(ZSTD_MAGIC) {
+        UploadEncoding::Zstd
+    } else if bytes.starts_with(XZ_MAGIC) {
+        UploadEncoding::Xz
+    } else if bytes.starts_with(BZIP2_MAGIC) {
+        UploadEncoding::Bzip2
+    } else {
+        UploadEncoding::Plain
+    }
+}
+
+// An upload whose first bytes were read and are put back in front of it.
+type Sniffed<R> = Chain<Take<Cursor<[u8; UPLOAD_MAGIC_LEN]>>, R>;
+
+// Reads the first bytes of an upload to learn its compression, and hands back
+// a reader that still starts at the first byte.
+fn sniff_upload_encoding<R: Read>(mut source: R) -> IoResult<(UploadEncoding, Sniffed<R>)> {
+    let mut prefix = [0_u8; UPLOAD_MAGIC_LEN];
+    let mut filled = 0;
+    while filled < prefix.len() {
+        match source.read(&mut prefix[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let encoding = encoding_from_magic(&prefix[..filled]);
+    Ok((
+        encoding,
+        Cursor::new(prefix).take(filled as u64).chain(source),
+    ))
 }
 
 fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
@@ -337,6 +385,9 @@ fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
     }
     if filename.ends_with(".xz") {
         return UploadEncoding::Xz;
+    }
+    if filename.ends_with(".bz2") {
+        return UploadEncoding::Bzip2;
     }
 
     let Some(content_type) = upload.content_type.as_deref() else {
@@ -357,6 +408,9 @@ fn detect_upload_encoding(upload: &UploadValue) -> UploadEncoding {
             UploadEncoding::Deflate
         }
         "application/x-xz" | "application/xz" | "application/octet-stream+xz" => UploadEncoding::Xz,
+        "application/x-bzip2" | "application/x-bzip" | "application/octet-stream+bzip2" => {
+            UploadEncoding::Bzip2
+        }
         _ => UploadEncoding::Plain,
     }
 }
@@ -403,12 +457,21 @@ pub(crate) fn normalize_uploaded_nzb_reader(
     upload: UploadValue,
 ) -> Result<Box<dyn Read + Send>, SubmitNzbError> {
     let limits = RuntimeSecurityConfig::from_env_or_default_for_tests();
-    let encoding = detect_upload_encoding(&upload);
+    let named = detect_upload_encoding(&upload);
     let source = LimitedReader::new(
         upload.into_read(),
         limits.nzb_upload_limit_bytes,
         "NZB upload",
     );
+    // A compressed NZB under a plain name, SABnzbd's "gzip in disguise", is
+    // known by its first bytes. A name or content type that names an encoding
+    // is taken at its word.
+    let (sniffed, source) = sniff_upload_encoding(source).map_err(SubmitNzbError::Upload)?;
+    let encoding = if named == UploadEncoding::Plain {
+        sniffed
+    } else {
+        named
+    };
 
     let decoded: Box<dyn Read + Send> = match encoding {
         UploadEncoding::Plain => Box::new(source),
@@ -424,6 +487,7 @@ pub(crate) fn normalize_uploaded_nzb_reader(
             xz_multistream_decoder(source, XZ_DECODER_MEMORY_LIMIT_BYTES)
                 .map_err(SubmitNzbError::Upload)?,
         ),
+        UploadEncoding::Bzip2 => Box::new(bzip2_multistream_decoder(source)),
     };
 
     Ok(Box::new(LimitedReader::new(
@@ -453,13 +517,9 @@ fn base64_len_within(encoded_len: usize, limit: u64) -> bool {
 }
 
 // Read NZB bytes that arrived inline, decompressing them when their magic
-// says gzip, zstd or xz. Inline bytes carry no filename or content type, so
+// says gzip, zstd, xz or bzip2. Inline bytes carry no filename or content type, so
 // the bytes themselves are the only evidence; the upload limits still apply.
 pub(crate) fn read_inline_nzb_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, SubmitNzbError> {
-    const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
-    const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
-    const XZ_MAGIC: &[u8] = &[0xfd, b'7', b'z', b'X', b'Z', 0x00];
-
     let limits = RuntimeSecurityConfig::from_env_or_default_for_tests();
     if bytes.len() as u64 > limits.nzb_upload_limit_bytes {
         return Err(SubmitNzbError::Upload(Error::new(
@@ -467,19 +527,21 @@ pub(crate) fn read_inline_nzb_bytes(bytes: Vec<u8>) -> Result<Vec<u8>, SubmitNzb
             format!("NZB upload exceeds {} bytes", limits.nzb_upload_limit_bytes),
         )));
     }
-    let source = std::io::Cursor::new(bytes);
-    let magic = source.get_ref().as_slice();
-    let decoded: Box<dyn Read + Send> = if magic.starts_with(GZIP_MAGIC) {
-        Box::new(flate2::read::GzDecoder::new(source))
-    } else if magic.starts_with(ZSTD_MAGIC) {
-        Box::new(zstd::stream::read::Decoder::new(source).map_err(SubmitNzbError::Upload)?)
-    } else if magic.starts_with(XZ_MAGIC) {
-        Box::new(
+    let encoding = encoding_from_magic(&bytes);
+    let source = Cursor::new(bytes);
+    let decoded: Box<dyn Read + Send> = match encoding {
+        UploadEncoding::Gzip => Box::new(flate2::read::GzDecoder::new(source)),
+        UploadEncoding::Zstd => {
+            Box::new(zstd::stream::read::Decoder::new(source).map_err(SubmitNzbError::Upload)?)
+        }
+        UploadEncoding::Xz => Box::new(
             xz_multistream_decoder(source, XZ_DECODER_MEMORY_LIMIT_BYTES)
                 .map_err(SubmitNzbError::Upload)?,
-        )
-    } else {
-        Box::new(source)
+        ),
+        UploadEncoding::Bzip2 => Box::new(bzip2_multistream_decoder(source)),
+        UploadEncoding::Plain | UploadEncoding::Brotli | UploadEncoding::Deflate => {
+            Box::new(source)
+        }
     };
     let mut xml = Vec::new();
     LimitedReader::new(
@@ -618,6 +680,103 @@ mod tests {
                 .unwrap();
             assert_eq!(staged.filename, filename);
             assert_eq!(staged.total_files, Some(1));
+        }
+    }
+
+    // `minimal_nzb("bz2-upload")` as two bzip2 streams, one after the other.
+    #[rustfmt::skip]
+    const BZIP2_NZB: &[u8] = &[
+        0x42, 0x5a, 0x68, 0x39, 0x31, 0x41, 0x59, 0x26, 0x53, 0x59, 0x3a, 0xb4, 0xe5, 0x35, 0x00, 0x00,
+        0x1d, 0x5f, 0x80, 0x00, 0x10, 0x51, 0x03, 0xff, 0xff, 0xc5, 0x00, 0x06, 0x00, 0x3f, 0xf7, 0xff,
+        0xd0, 0x20, 0x00, 0x84, 0x1a, 0xa9, 0xfa, 0x93, 0xda, 0x93, 0x40, 0x7a, 0x47, 0xa9, 0xe8, 0x6a,
+        0x3d, 0x32, 0x41, 0xea, 0x7a, 0x8d, 0x0d, 0x32, 0x60, 0xd5, 0x4f, 0x6a, 0x9e, 0xa3, 0x4c, 0x65,
+        0x34, 0xf4, 0xf5, 0x4f, 0x42, 0x68, 0xd1, 0x90, 0xc2, 0x06, 0x65, 0x31, 0x60, 0x8d, 0xe8, 0x31,
+        0x61, 0x78, 0xb2, 0x3b, 0x47, 0x21, 0x9e, 0x89, 0x00, 0x9b, 0xe1, 0x3d, 0x4a, 0xba, 0xdc, 0x13,
+        0x5f, 0x54, 0xb1, 0x8c, 0x76, 0xc5, 0x2c, 0x63, 0x2a, 0x50, 0x73, 0x36, 0xb7, 0x73, 0x7b, 0x2e,
+        0xa0, 0x54, 0xea, 0xa9, 0xb4, 0xef, 0x6a, 0xe0, 0x50, 0x38, 0xd2, 0x4d, 0xf3, 0x2f, 0xed, 0x30,
+        0x6e, 0x6c, 0x0e, 0x77, 0x8d, 0xfe, 0xf8, 0xea, 0x88, 0x9e, 0xf4, 0x49, 0xfc, 0x84, 0x27, 0xf4,
+        0x95, 0x90, 0xf8, 0xca, 0x0a, 0xf7, 0x84, 0x55, 0xc0, 0x66, 0x12, 0x47, 0xc7, 0x59, 0xc9, 0xcc,
+        0x9f, 0xa9, 0x30, 0xce, 0x0d, 0x0d, 0x70, 0xa1, 0x4a, 0x43, 0x69, 0x21, 0x24, 0x06, 0x41, 0x65,
+        0xb9, 0x0f, 0x9d, 0x7f, 0xd3, 0x98, 0xba, 0x27, 0x06, 0xaf, 0xc2, 0x69, 0x60, 0xdb, 0xa0, 0xbb,
+        0x92, 0x29, 0xc2, 0x84, 0x81, 0xd5, 0xa7, 0x29, 0xa8, 0x42, 0x5a, 0x68, 0x39, 0x31, 0x41, 0x59,
+        0x26, 0x53, 0x59, 0x3d, 0xfe, 0x19, 0x72, 0x00, 0x00, 0x19, 0x5d, 0x80, 0x60, 0x10, 0x50, 0x63,
+        0xf2, 0x0f, 0x42, 0x00, 0x3f, 0xa7, 0xde, 0x30, 0x20, 0x00, 0x80, 0x34, 0x29, 0x94, 0xf4, 0x69,
+        0xa1, 0x89, 0x90, 0x83, 0x20, 0xcc, 0xa1, 0x83, 0x4d, 0x1a, 0x69, 0x84, 0xc4, 0xc9, 0x80, 0x81,
+        0xa6, 0x58, 0x1b, 0x00, 0x10, 0x12, 0xcb, 0x44, 0xe6, 0xd8, 0x5d, 0x98, 0x73, 0xd8, 0x7b, 0x46,
+        0xe1, 0xca, 0xa6, 0x0b, 0x22, 0x9e, 0x13, 0xcf, 0xd5, 0x55, 0x2c, 0x5c, 0x92, 0xf8, 0x83, 0x43,
+        0x3e, 0x9f, 0x69, 0x8e, 0x38, 0xe9, 0xaa, 0x08, 0xbc, 0xeb, 0x4b, 0xe8, 0xfc, 0x7d, 0xc1, 0x6b,
+        0xb3, 0xf5, 0x30, 0x20, 0xc0, 0x32, 0xa3, 0xcb, 0x58, 0x90, 0x3f, 0x06, 0x72, 0xa3, 0x19, 0x37,
+        0x46, 0xbd, 0xc0, 0x5d, 0x5c, 0x04, 0xb0, 0x87, 0x58, 0x81, 0x71, 0x0e, 0xd7, 0xb4, 0x04, 0x0e,
+        0x79, 0x9d, 0x21, 0x78, 0x35, 0x89, 0xba, 0x41, 0x36, 0xae, 0xb6, 0x14, 0x83, 0x4c, 0x46, 0x61,
+        0x5f, 0xc5, 0xdc, 0x91, 0x4e, 0x14, 0x24, 0x0f, 0x7f, 0x86, 0x5c, 0x80,
+    ];
+
+    fn decoded_upload(filename: &str, content_type: &str, content: Vec<u8>) -> String {
+        let upload = UploadValue {
+            filename: filename.to_string(),
+            content_type: Some(content_type.to_string()),
+            content: content.into(),
+        };
+        let mut xml = String::new();
+        normalize_uploaded_nzb_reader(upload)
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+        xml
+    }
+
+    #[test]
+    fn bzip2_uploads_decode_by_name_mime_type_or_magic() {
+        for (filename, content_type) in [
+            ("named.nzb.bz2", "application/octet-stream"),
+            ("mime.nzb", "application/x-bzip2"),
+            ("disguised.nzb", "application/x-nzb"),
+        ] {
+            assert_eq!(
+                decoded_upload(filename, content_type, BZIP2_NZB.to_vec()),
+                minimal_nzb("bz2-upload"),
+                "{filename}"
+            );
+        }
+        assert_eq!(
+            read_inline_nzb_bytes(BZIP2_NZB.to_vec()).unwrap(),
+            minimal_nzb("bz2-upload").into_bytes()
+        );
+    }
+
+    // SABnzbd's "gzip in disguise": compressed bytes under a plain `.nzb` name.
+    #[test]
+    fn compressed_uploads_under_a_plain_name_decode_by_magic() {
+        let nzb = minimal_nzb("disguised");
+
+        let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        gzip.write_all(nzb.as_bytes()).unwrap();
+        let gzip = gzip.finish().unwrap();
+        let zstd = zstd::stream::encode_all(nzb.as_bytes(), 1).unwrap();
+        let xz = make_xz_upload("x.nzb", "application/x-nzb", "disguised")
+            .content
+            .to_vec();
+
+        for content in [gzip, zstd, xz] {
+            assert_eq!(
+                decoded_upload("plain.nzb", "application/x-nzb", content),
+                nzb
+            );
+        }
+    }
+
+    #[test]
+    fn plain_and_short_uploads_pass_through_the_magic_check() {
+        let nzb = minimal_nzb("plain");
+        assert_eq!(
+            decoded_upload("plain.nzb", "application/x-nzb", nzb.clone().into_bytes()),
+            nzb
+        );
+        for short in ["", "<", "<nzb/"] {
+            assert_eq!(
+                decoded_upload("short.nzb", "application/x-nzb", short.as_bytes().to_vec()),
+                short
+            );
         }
     }
 
