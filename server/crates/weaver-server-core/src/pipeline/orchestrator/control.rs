@@ -73,6 +73,7 @@ impl Pipeline {
         self.queue_walk_mark = Some(mark);
         if !self.reconcile_nzb_admission(walk) {
             self.settle_reprocess_pending().await;
+            self.retry_pending_renames().await;
             return;
         }
         crate::pipeline::queue::count_walk();
@@ -398,27 +399,75 @@ impl Pipeline {
             inner
                 .jobs
                 .iter()
-                .filter(|row| row.intents.cancelled.is_none())
-                .filter_map(|row| row.intents.rename_to.clone().map(|name| (row.id, name)))
+                .filter(|row| row.intents.cancelled.is_none() && row.intents.rename_to.is_some())
+                .map(|row| row.id)
                 .collect::<Vec<_>>()
         });
-        for (id, name) in renames {
-            if self.rename_working_dir_when_quiet(id, &name).await {
-                self.shared_state.queue.write(|inner| {
-                    if let Some(row) = inner.job_mut(id)
-                        && row.intents.rename_to.as_ref() == Some(&name)
-                    {
-                        row.intents.rename_to = None;
-                    }
-                    Change::changed(())
-                });
-                self.report_job(id);
-            } else {
-                // Renamed once the job is quiet; the next turn looks again.
-                self.queue_walk_due = true;
-            }
+        for id in renames {
+            self.pending_renames.entry(id).or_default();
         }
+        self.retry_pending_renames().await;
         self.evict_outside_window(&ranked);
+    }
+
+    // Each job whose row asks for a rename has its folder renamed once the
+    // job is quiet; a turn looks at these jobs alone. A rename that failed
+    // waits out its backoff first. A row gone, cancelled or no longer asking
+    // drops its job.
+    pub(crate) async fn retry_pending_renames(&mut self) {
+        if self.pending_renames.is_empty() {
+            return;
+        }
+        let mut ids: Vec<JobId> = self.pending_renames.keys().copied().collect();
+        ids.sort_unstable();
+        let names: Vec<(JobId, Option<String>)> = self.shared_state.queue.read(|inner| {
+            ids.iter()
+                .map(|id| {
+                    let name = inner
+                        .job(*id)
+                        .filter(|row| row.intents.cancelled.is_none())
+                        .and_then(|row| row.intents.rename_to.clone());
+                    (*id, name)
+                })
+                .collect()
+        });
+        let now = tokio::time::Instant::now();
+        for (id, name) in names {
+            let Some(name) = name else {
+                self.pending_renames.remove(&id);
+                continue;
+            };
+            let Some(retry) = self.pending_renames.get_mut(&id) else {
+                continue;
+            };
+            if retry.retry_at.is_some_and(|at| at > now) {
+                continue;
+            }
+            // A backoff that ran out is spent; a rename that fails again
+            // sets the next.
+            retry.retry_at = None;
+            if !self.rename_working_dir_when_quiet(id, &name).await {
+                continue;
+            }
+            self.pending_renames.remove(&id);
+            self.shared_state.queue.write(|inner| {
+                if let Some(row) = inner.job_mut(id)
+                    && row.intents.rename_to.as_ref() == Some(&name)
+                {
+                    row.intents.rename_to = None;
+                }
+                Change::changed(())
+            });
+            self.report_job(id);
+        }
+    }
+
+    // When the first rename waiting out a backoff is due.
+    pub(crate) fn next_rename_retry_at(&self) -> Option<tokio::time::Instant> {
+        self.pending_renames
+            .values()
+            .filter_map(|retry| retry.retry_at)
+            .min()
     }
 
     // The job's interrupted-pause marker, written on its lane behind every

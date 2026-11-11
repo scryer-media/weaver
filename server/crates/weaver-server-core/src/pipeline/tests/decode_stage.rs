@@ -533,6 +533,52 @@ async fn a_decoded_article_leaves_its_jobs_report_to_the_tick_until_the_last() {
     assert_eq!(published(&pipeline), before + 9);
 }
 
+// A result or retry that only moves a job's figures leaves its report to the
+// tick; one that moves its stage publishes at once. A job with no report
+// writes nothing.
+#[tokio::test]
+async fn a_report_soon_defers_figures_and_publishes_a_stage_at_once() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20032);
+    let files = vec![("one.bin".to_string(), 64u32)];
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Report Soon", &files),
+    )
+    .await;
+    pipeline.report_job(job_id);
+    let published = |pipeline: &Pipeline| {
+        pipeline.shared_state.queue.read(|inner| {
+            inner
+                .job(job_id)
+                .map(|row| {
+                    (
+                        row.report.job.failed_bytes,
+                        row.report.job.finalizing_download,
+                    )
+                })
+                .expect("the job's row")
+        })
+    };
+    let (before, _) = published(&pipeline);
+
+    pipeline.jobs.get_mut(&job_id).unwrap().failed_bytes = before + 5;
+    pipeline.report_job_soon(job_id);
+    assert!(pipeline.reports_due.contains(&job_id));
+    assert_eq!(published(&pipeline), (before, false));
+
+    pipeline.jobs_finalizing_download.insert(job_id);
+    pipeline.report_job_soon(job_id);
+    assert!(pipeline.reports_due.is_empty());
+    assert_eq!(published(&pipeline), (before + 5, true));
+
+    let revision = pipeline.shared_state.queue.revision();
+    pipeline.report_job(JobId(20033));
+    assert_eq!(pipeline.shared_state.queue.revision(), revision);
+}
+
 #[tokio::test]
 async fn streamed_decode_failure_retries_excluding_actual_source_server() {
     let temp_dir = tempfile::tempdir().unwrap();

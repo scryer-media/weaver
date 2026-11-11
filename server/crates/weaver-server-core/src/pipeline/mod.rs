@@ -3,7 +3,9 @@
 
 mod activation;
 pub(crate) use activation::read_stored_spec_and_passwords;
-pub(crate) use completion::finalize::{ActiveRuntimeValues, StoredRuntimeValues};
+pub(crate) use completion::finalize::{
+    ActiveRuntimeValues, RestoredPostProcessing, StoredRuntimeValues,
+};
 pub mod archive;
 mod capacity;
 mod completion;
@@ -1294,6 +1296,27 @@ pub(in crate::pipeline) struct TerminalReconciliation {
     pub(in crate::pipeline) discards: Vec<crate::jobs::model::TerminalDiscard>,
 }
 
+// A rename a job's row asks for. After a failure it waits until `retry_at`,
+// longer for each failure in a row.
+#[derive(Default)]
+pub(crate) struct RenameRetry {
+    pub(crate) failures: u32,
+    pub(crate) retry_at: Option<tokio::time::Instant>,
+}
+
+impl RenameRetry {
+    const FIRST_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+    const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(300);
+
+    pub(crate) fn failed(&mut self, now: tokio::time::Instant) {
+        self.failures = self.failures.saturating_add(1);
+        let backoff = Self::FIRST_BACKOFF
+            .saturating_mul(1 << (self.failures - 1).min(16))
+            .min(Self::MAX_BACKOFF);
+        self.retry_at = Some(now + backoff);
+    }
+}
+
 // The pipeline engine. Owns the scheduler loop and drives work through
 // download → decode → commit → verify → repair → extract stages.
 pub struct Pipeline {
@@ -1340,6 +1363,13 @@ pub struct Pipeline {
     pub(super) post_probes: post_health::Probes,
     pub(crate) nzb_admitted: HashSet<JobId>,
     pub(crate) nzb_seen: HashSet<JobId>,
+    // The jobs whose rows ask for their folder to be renamed, each with its
+    // backoff after a failed rename.
+    pub(crate) pending_renames: HashMap<JobId, RenameRetry>,
+    // The ids a walk found gone from the queue while their work was still
+    // in flight. Each turn looks at these alone, and forgets each once its
+    // work drains.
+    pub(crate) nzb_retired_busy: HashSet<JobId>,
     pub(crate) nzb_pause_releases: HashSet<JobId>,
     pub(crate) nzb_reprocess_pending: HashSet<JobId>,
     // The slots whose take or release is out on the writer, not yet

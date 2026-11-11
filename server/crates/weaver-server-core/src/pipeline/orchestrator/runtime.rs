@@ -276,6 +276,8 @@ impl Pipeline {
             post_probes: Default::default(),
             nzb_admitted,
             nzb_seen: HashSet::new(),
+            nzb_retired_busy: HashSet::new(),
+            pending_renames: HashMap::new(),
             nzb_pause_releases,
             nzb_reprocess_pending: HashSet::new(),
             nzb_admitting: HashSet::new(),
@@ -1111,6 +1113,12 @@ impl Pipeline {
                 tokio::time::sleep_until(infrastructure_retry_deadline.unwrap_or_else(|| {
                     tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
                 }));
+            // A failed folder rename is tried again at this instant.
+            let rename_retry_at = self.next_rename_retry_at();
+            let rename_retry_sleep =
+                tokio::time::sleep_until(rename_retry_at.unwrap_or_else(|| {
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+                }));
             // A held server admits work again on its own at this instant.
             let connection_hold_deadline = self.nntp.pool().next_connection_hold_deadline();
             let connection_hold_sleep =
@@ -1238,7 +1246,7 @@ impl Pipeline {
                                 turn_timer.resume();
                                 let reported_job = retry.work.segment_id.file_id.job_id;
                                 self.receive_retry_work(retry);
-                                self.report_job(reported_job);
+                                self.report_job_soon(reported_job);
                             }
                             _ = metrics_snapshot_interval.tick(), if drive => {
                                 turn_timer.resume();
@@ -1268,6 +1276,8 @@ impl Pipeline {
                                 turn_timer.resume();
                                 self.download_dispatch_wake = true;
                             }
+                            // The next turn's queue pass retries the rename.
+                            _ = rename_retry_sleep, if rename_retry_at.is_some() => { turn_timer.resume(); }
                             _ = tune_interval.tick(), if drive => {
                                 turn_timer.resume();
                                 idle_tick = true;
@@ -1351,7 +1361,7 @@ impl Pipeline {
                     // stops, rather than on a tick nobody will take.
                     self.reconcile_candidate_jobs().await;
                 }
-                if driving || turn_active {
+                if driving || turn_active || !self.reports_due.is_empty() {
                     self.settle_parked_gauges();
                 }
             }
@@ -1372,7 +1382,8 @@ impl Pipeline {
         metrics_interval: &mut tokio::time::Interval,
     ) -> usize {
         let mut processed = 0;
-        // One report per job per turn, however many of its results landed.
+        // Each job a result landed for is reported once the turn is done: at
+        // once if its stage moved, else on the snapshot tick.
         let mut reported = BTreeSet::new();
         while processed < Self::DOWNLOAD_RESULTS_PER_TURN {
             let Some(result) = pending.pop_front() else {
@@ -1389,7 +1400,7 @@ impl Pipeline {
             }
         }
         for job_id in reported {
-            self.report_job(job_id);
+            self.report_job_soon(job_id);
         }
         if processed != 0 {
             // A backlog can keep every actor operation immediately ready.
@@ -1517,7 +1528,7 @@ impl Pipeline {
             self.receive_retry_work(retry);
         }
         for job_id in jobs {
-            self.report_job(job_id);
+            self.report_job_soon(job_id);
         }
         count
     }

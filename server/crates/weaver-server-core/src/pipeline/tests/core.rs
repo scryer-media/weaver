@@ -604,6 +604,94 @@ async fn rename_preserves_an_existing_working_directory_collision() {
     ));
 }
 
+// Each failure in a row doubles the wait before the next try, up to a cap.
+#[test]
+fn a_rename_backoff_doubles_up_to_its_cap() {
+    let now = tokio::time::Instant::now();
+    let mut retry = crate::pipeline::RenameRetry::default();
+    let mut waits = Vec::new();
+    for _ in 0..12 {
+        retry.failed(now);
+        waits.push((retry.retry_at.unwrap() - now).as_secs());
+    }
+    assert_eq!(waits, [1, 2, 4, 8, 16, 32, 64, 128, 256, 300, 300, 300]);
+}
+
+// A rename that fails is not tried again until its backoff runs out, and a
+// job busy with a move is renamed by the first turn after the move ends.
+// Neither leaves a walk over the queue due.
+#[tokio::test]
+async fn a_failed_rename_waits_out_its_backoff_and_a_busy_one_needs_no_walk() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(10068);
+    let old_dir = intermediate_dir.join("original");
+    std::fs::create_dir(&old_dir).unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_working_dir(&intermediate_dir, &old_dir, job_id)
+        .unwrap();
+    let mut state = minimal_job_state(job_id, "renamed", old_dir.clone());
+    state.download_state = crate::jobs::model::DownloadState::Queued;
+    pipeline.jobs.insert(job_id, state);
+    pipeline.shared_state.queue.write(|inner| {
+        let mut row = crate::pipeline::queue::JobRow::new(finished_job_info(job_id));
+        row.intents.rename_to = Some("renamed".to_string());
+        inner.push_job(row);
+        crate::pipeline::queue::Change::changed(())
+    });
+    std::fs::create_dir(intermediate_dir.join("renamed")).unwrap();
+    let collision = intermediate_dir.join("renamed.#10068");
+    std::fs::create_dir(&collision).unwrap();
+
+    let before = tokio::time::Instant::now();
+    pipeline.pending_renames.entry(job_id).or_default();
+    pipeline.retry_pending_renames().await;
+    let retry = &pipeline.pending_renames[&job_id];
+    assert_eq!(retry.failures, 1);
+    let retry_at = retry.retry_at.expect("a backoff after the failure");
+    assert!(retry_at >= before + std::time::Duration::from_secs(1));
+    assert_eq!(pipeline.next_rename_retry_at(), Some(retry_at));
+    assert!(!pipeline.queue_walk_due);
+
+    // Inside the backoff nothing is tried.
+    let far = tokio::time::Instant::now() + std::time::Duration::from_secs(3600);
+    pipeline.pending_renames.get_mut(&job_id).unwrap().retry_at = Some(far);
+    pipeline.retry_pending_renames().await;
+    assert_eq!(pipeline.pending_renames[&job_id].failures, 1);
+    assert_eq!(pipeline.pending_renames[&job_id].retry_at, Some(far));
+
+    // Once it runs out the rename is tried, and fails again.
+    pipeline.pending_renames.get_mut(&job_id).unwrap().retry_at = Some(tokio::time::Instant::now());
+    pipeline.retry_pending_renames().await;
+    assert_eq!(pipeline.pending_renames[&job_id].failures, 2);
+
+    // A move holds the folder: the turn passes without a try or a walk.
+    std::fs::remove_dir(intermediate_dir.join("renamed")).unwrap();
+    std::fs::remove_dir(&collision).unwrap();
+    pipeline.pending_renames.get_mut(&job_id).unwrap().retry_at = Some(tokio::time::Instant::now());
+    pipeline.inflight_moves.insert(job_id);
+    pipeline.retry_pending_renames().await;
+    assert_eq!(pipeline.pending_renames[&job_id].failures, 2);
+    assert_eq!(pipeline.pending_renames[&job_id].retry_at, None);
+    assert_eq!(pipeline.next_rename_retry_at(), None);
+    assert!(!pipeline.queue_walk_due);
+    assert_eq!(pipeline.jobs[&job_id].working_dir, old_dir);
+
+    pipeline.inflight_moves.remove(&job_id);
+    pipeline.retry_pending_renames().await;
+    assert!(pipeline.pending_renames.is_empty());
+    assert_eq!(
+        pipeline.jobs[&job_id].working_dir,
+        intermediate_dir.join("renamed")
+    );
+    let asked = pipeline.shared_state.queue.read(|inner| {
+        inner
+            .job(job_id)
+            .map(|row| row.intents.rename_to.clone())
+            .expect("the job's row")
+    });
+    assert_eq!(asked, None);
+}
+
 #[tokio::test]
 async fn move_to_complete_uses_unique_destination_for_duplicate_job_names() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -971,7 +1059,14 @@ async fn restored_post_processing_is_interrupted_without_rerunning_scripts() {
     );
     pipeline.schedule_job_completion_check(job_id);
 
-    assert!(pipeline.recover_restored_terminal_post_processing(job_id));
+    assert!(pipeline.recover_restored_terminal_post_processing(
+        job_id,
+        Some(crate::pipeline::RestoredPostProcessing::read(
+            &pipeline.db,
+            job_id,
+            None
+        ))
+    ));
     settle_failed_releases(&mut pipeline).await;
 
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
@@ -1016,7 +1111,14 @@ async fn restored_post_processing_that_already_finished_archives_as_complete() {
     );
     pipeline.schedule_job_completion_check(job_id);
 
-    assert!(pipeline.recover_restored_terminal_post_processing(job_id));
+    assert!(pipeline.recover_restored_terminal_post_processing(
+        job_id,
+        Some(crate::pipeline::RestoredPostProcessing::read(
+            &pipeline.db,
+            job_id,
+            None
+        ))
+    ));
 
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
     assert!(!pipeline.jobs.contains_key(&job_id));

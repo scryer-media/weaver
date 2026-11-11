@@ -287,13 +287,22 @@ impl PostProcessingExecutor {
         &self,
         category: Option<&str>,
     ) -> Result<Option<PostProcessingJobAdmission>, StateError> {
-        let (settings, script_directory) = self.db.post_processing_script_admission()?;
+        Self::admit_job_scripts_from(&self.db, category)
+    }
+
+    // The same admission, read from `db` alone, so it can be taken off the
+    // pipeline thread.
+    pub(crate) fn admit_job_scripts_from(
+        db: &Database,
+        category: Option<&str>,
+    ) -> Result<Option<PostProcessingJobAdmission>, StateError> {
+        let (settings, script_directory) = db.post_processing_script_admission()?;
         if !settings.execution_enabled {
             return Ok(None);
         }
         Ok(Some(PostProcessingJobAdmission {
             scripts_directory: script_directory,
-            scripts: self.resolve_job_scripts(category)?,
+            scripts: db.script_instances_for(&ScriptEventLabel::PostProcessing, category)?,
         }))
     }
 

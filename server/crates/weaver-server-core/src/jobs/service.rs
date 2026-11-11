@@ -1167,6 +1167,7 @@ impl Pipeline {
             finalization_open,
             delivered,
             delivery_left_behind,
+            post_processing,
         } = restored;
         if self.jobs.contains_key(&job_id) {
             return Err(crate::SchedulerError::JobExists(job_id));
@@ -1445,7 +1446,7 @@ impl Pipeline {
             self.moves_to_resume.push(job_id);
         }
         let restored_terminal_post_processing =
-            self.recover_restored_terminal_post_processing(job_id);
+            self.recover_restored_terminal_post_processing(job_id, post_processing);
 
         if self
             .jobs
@@ -1535,6 +1536,15 @@ impl InstallRead {
     pub(crate) fn job_id(&self) -> JobId {
         self.request.job_id
     }
+
+    // Whether the read carries what a job restored in post-processing is
+    // finished or resumed from.
+    #[cfg(test)]
+    pub(crate) fn carries_post_processing(&self) -> bool {
+        self.restored
+            .as_ref()
+            .is_ok_and(|restored| restored.post_processing.is_some())
+    }
 }
 
 pub(crate) struct RestoredFacts {
@@ -1551,6 +1561,8 @@ pub(crate) struct RestoredFacts {
     delivered: Option<crate::post_processing::model::DeliveredVerdict>,
     // What that delivery's move was told to leave in the working directory.
     delivery_left_behind: Vec<PathBuf>,
+    // What a job restored in post-processing is finished or resumed from.
+    post_processing: Option<crate::pipeline::RestoredPostProcessing>,
 }
 
 // One job of a batch a walk installs: a restart's restore, or a job entering
@@ -1799,6 +1811,20 @@ async fn read_restored(
     } else {
         (None, Vec::new())
     };
+    let post_processing = if matches!(
+        request.status,
+        JobStatus::QueuedPostProcessing | JobStatus::PostProcessing
+    ) {
+        let category = spec.category.clone();
+        Some(
+            off_thread(db, move |db| {
+                crate::pipeline::RestoredPostProcessing::read(db, job_id, category.as_deref())
+            })
+            .await,
+        )
+    } else {
+        None
+    };
     Ok(RestoredFacts {
         spec,
         waiting_summaries,
@@ -1808,6 +1834,7 @@ async fn read_restored(
         finalization_open,
         delivered,
         delivery_left_behind,
+        post_processing,
     })
 }
 

@@ -14,9 +14,9 @@ pub(crate) mod deobfuscate;
 mod output;
 #[cfg(test)]
 pub(in crate::pipeline) use output::member_crc32_by_path;
-pub(crate) use output::release_failed_delivery;
 #[cfg(test)]
 pub(in crate::pipeline) use output::{BEFORE_FIRST_MOVE, BEFORE_SPENT_REMOVAL};
+pub(crate) use output::{RestoredPostProcessing, release_failed_delivery};
 mod status;
 #[cfg(test)]
 pub(crate) use status::RUNTIME_WRITES;

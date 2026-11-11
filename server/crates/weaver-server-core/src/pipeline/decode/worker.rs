@@ -295,10 +295,7 @@ impl Pipeline {
         if let Some(state) = self.jobs.get(&job_id) {
             let file_idx = segment_id.file_id.file_index as usize;
             if let Some(file_spec) = state.spec.files.get(file_idx)
-                && let Some(seg_spec) = file_spec
-                    .segments
-                    .iter()
-                    .find(|s| s.ordinal == segment_id.segment_number)
+                && let Some(seg_spec) = file_spec.segment(segment_id.segment_number)
             {
                 let work = DownloadWork {
                     counters: None,

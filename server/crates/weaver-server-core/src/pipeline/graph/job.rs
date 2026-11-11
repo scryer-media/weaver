@@ -1057,7 +1057,12 @@ impl GraphJob {
     ) -> Result<Vec<Move>, GraphError> {
         let from = self.root.map.moves_pending();
         sample::indexes(&self.root.indexes, &self.root.map, &mut self.root.window);
-        sample::bootstrap(&self.tree, &self.root.map, &mut self.root.window);
+        sample::bootstrap(
+            &self.tree,
+            &mut self.root.map,
+            &mut self.root.leading,
+            &mut self.root.window,
+        );
         sample::fronts(&self.tree, &mut self.root.map);
         let mut wants = Vec::new();
         self.tree.collect_wants(&mut wants);

@@ -316,9 +316,7 @@ impl Pipeline {
                     .get(segment_id.file_id.file_index as usize)?;
                 file_spec.role.counts_toward_health().then(|| {
                     file_spec
-                        .segments
-                        .iter()
-                        .find(|segment| segment.ordinal == segment_id.segment_number)
+                        .segment(segment_id.segment_number)
                         .map_or(0, |segment| segment.bytes as u64)
                 })
             })

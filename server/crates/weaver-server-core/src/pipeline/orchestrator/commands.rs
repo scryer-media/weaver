@@ -135,6 +135,10 @@ impl Pipeline {
             Ok(path) => path,
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, %error, "working directory rename remains pending");
+                self.pending_renames
+                    .entry(job_id)
+                    .or_default()
+                    .failed(tokio::time::Instant::now());
                 return false;
             }
         };
