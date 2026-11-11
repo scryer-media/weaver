@@ -302,6 +302,7 @@ impl Files {
     }
 
     // Where the file is now; none for padding.
+    #[cfg(test)]
     pub(crate) fn path(&self, file: usize) -> Option<PathBuf> {
         let name = self.names.get(file)?.as_ref()?;
         Some(self.at().dir.join(name))

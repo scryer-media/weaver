@@ -368,7 +368,7 @@ impl Database {
         })
     }
 
-    // Why unpacking refused each torrent its history keeps as failed, by
+    // Why unpacking left each torrent short, as its history keeps it failed or partial, by
     // torrent, in one read: what [`Self::get_job_history`] gives a torrent's
     // restore, for all of them.
     pub(crate) fn failed_torrent_histories(
@@ -381,7 +381,7 @@ impl Database {
                 datastore.read_exec(),
                 "SELECT h.job_id, h.error_message FROM job_history h \
                    JOIN torrents t ON t.job_id = h.job_id \
-                  WHERE h.status = 'failed' AND h.error_message IS NOT NULL",
+                  WHERE h.status IN ('failed', 'partial') AND h.error_message IS NOT NULL",
                 &[],
             )
             .await?;

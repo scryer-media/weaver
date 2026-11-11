@@ -77,6 +77,7 @@ use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces};
 use crate::torrents::store::{Kept, Replayed, TorrentStore};
 use crate::torrents::tee::{Parts, Plan, Tee, plan_outputs};
+use crate::pipeline::post_health::names_a_piece;
 use crate::torrents::model::Adopted;
 use crate::torrents::{
     ContentLayout, FilePriority, Infohash, NamedBy, PeerInfo, TorrentCounters, TorrentFile,
@@ -2690,7 +2691,13 @@ impl TorrentService {
                         Ok(())
                     }),
                 );
-                self.refused(job_id, error).await;
+                // With every file it wants, the torrent is done downloading
+                // whatever its unpacking came to.
+                if whole {
+                    self.short(job_id, &store, error, &[]).await;
+                } else {
+                    self.refused(job_id, error).await;
+                }
                 continue;
             }
             if tee.with(|job| job.awaits_commit() || job.moves_waiting()) {
@@ -4700,6 +4707,35 @@ impl TorrentService {
         self.finish(report, "failed", hash, now).await;
     }
 
+    // Unpacking ended short of what it would deliver, on a torrent with
+    // every file it wants: the torrent completes and seeds on to its goal,
+    // saying `why`, and its job goes to history as what it delivered says
+    // (`short_status`): its files it has whole and the unpacked files
+    // `placed` beside them.
+    async fn short(&self, job_id: JobId, store: &TorrentStore, why: String, placed: &[String]) {
+        self.completed(job_id).await;
+        let mut delivered = store.whole_names();
+        delivered.extend(placed.iter().cloned());
+        let status = short_status(&delivered, &why);
+        let settings = self.settings();
+        let now = self.inner.clock.now_ms();
+        let (report, hash) = {
+            let mut live = self.inner.live.lock().await;
+            let Some(torrent) = live.get_mut(&job_id) else {
+                return;
+            };
+            torrent.failed = Some(why.clone());
+            let mut report = report(self.view(&settings, torrent, now), status.clone(), now);
+            report.shortfall = Some(why);
+            (report, hashes_of(&torrent.record).best())
+        };
+        if matches!(status, JobStatus::Failed { .. }) {
+            self.inner.counters.event(TorrentEvent::Failed);
+        }
+        self.finish(report, status.persisted_status(), hash, now)
+            .await;
+    }
+
     // A torrent that left the live ones goes to history: its row, then out
     // of the torrents and into the finished jobs.
     async fn retire(&self, torrent: Live, status: &str, error: Option<String>) {
@@ -4710,11 +4746,12 @@ impl TorrentService {
         }
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
-        let report = report(
+        let mut report = report(
             self.view(&settings, &torrent, now),
             job_status_from_persisted_str(status, error.as_deref()),
             now,
         );
+        report.shortfall = error;
         if let Err(error) = self.inner.db.delete_torrent(job_id) {
             tracing::warn!(job_id = job_id.0, error = %error, "could not remove a torrent");
         }
@@ -4809,9 +4846,23 @@ impl TorrentService {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not delete a torrent's files");
             }
         }
-        // The job's outcome: complete, refused by unpacking, or cut short.
+        // The job's outcome: complete, short of what unpacking would
+        // deliver, refused by unpacking, or cut short.
         let (status, error) = match (torrent.complete(), torrent.refusal()) {
-            (true, _) => ("complete", None),
+            (true, None) => ("complete", None),
+            (true, Some(why)) => {
+                let mut delivered = torrent
+                    .store
+                    .as_ref()
+                    .map(|store| store.whole_names())
+                    .unwrap_or_default();
+                delivered.extend(self.inner.db.torrent_outputs(job_id).unwrap_or_else(|error| {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent unpacked");
+                    Vec::new()
+                }));
+                let status = short_status(&delivered, &why);
+                (status.persisted_status(), Some(why))
+            }
             (false, Some(refusal)) => ("failed", Some(refusal)),
             (false, None) => ("cancelled", None),
         };
@@ -7180,6 +7231,25 @@ pub(super) fn delete_written(deletion: &Deletion) {
     }
 }
 
+// How a torrent's job ends when unpacking left it short of what it would
+// deliver, from the files it `delivered` whole (AGENTS.md, "Job status:
+// Partial"): partial when one of them is a file people open, read as a
+// graph job's delivery reads one (`Delivery::status`), and failed for `why`
+// when none is. An archive volume, a split part and recovery data are never
+// usable files, whole or not.
+fn short_status(delivered: &[String], why: &str) -> JobStatus {
+    let usable = delivered
+        .iter()
+        .any(|name| !names_a_piece(name) && weaver_graph::known_type(name));
+    if usable {
+        JobStatus::Partial
+    } else {
+        JobStatus::Failed {
+            error: why.to_owned(),
+        }
+    }
+}
+
 // Whether the torrent's job unpacks, as its metainfo fixed it.
 fn unpacks(torrent: &Live) -> bool {
     torrent.record.unpack_in_force.unwrap_or_default()
@@ -7244,5 +7314,6 @@ fn report(view: TorrentView, status: JobStatus, now_ms: i64) -> JobReport {
         wait_reason: view.detail,
         created_at_ms: view.added_at_ms,
         metadata: view.metadata,
+        shortfall: None,
     }
 }

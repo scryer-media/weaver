@@ -19,7 +19,7 @@ pub(crate) mod held;
 mod infrastructure_retry;
 mod nzb_admission;
 mod orchestrator;
-mod post_health;
+pub(crate) mod post_health;
 mod progress;
 pub mod queue;
 mod queue_window;

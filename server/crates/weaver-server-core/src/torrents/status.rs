@@ -244,8 +244,9 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
         Engine::Absent => (TorrentState::Queued, None),
         Engine::Starting => (TorrentState::CheckingResumeData, None),
         Engine::Checking => (TorrentState::CheckingFiles, None),
+        // A torrent whose unpacking came up short seeds on, and says why.
         Engine::Live { .. } | Engine::Paused { .. } if seen.seeding() => {
-            (TorrentState::Seeding, None)
+            (TorrentState::Seeding, seen.failed.clone().map(Why::Said))
         }
         Engine::Live {
             upload_mode: true, ..
@@ -938,14 +939,17 @@ mod tests {
                 Some("x.exe has an unwanted extension".into())
             )
         );
-        // A refusal the operator resumed past seeds again.
+        // A refusal the operator resumed past seeds again, and says why.
         assert_eq!(
             project(&Observed {
                 complete: true,
                 failed: Some("x.exe has an unwanted extension".into()),
                 ..seen(live.clone())
             }),
-            (TorrentState::Seeding, None)
+            (
+                TorrentState::Seeding,
+                Some("x.exe has an unwanted extension".into())
+            )
         );
         assert_eq!(
             project(&Observed {

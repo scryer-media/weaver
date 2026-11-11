@@ -1871,8 +1871,9 @@ async fn the_ledger_is_written_at_each_tick_it_changed() {
 }
 
 // A member with an extension the operator does not want, found inside an
-// archive the torrent carries, fails the job into history. The torrent
-// stays, stopped with its data, and may be resumed to seed.
+// archive the torrent carries while it is short of a piece, fails the job
+// into history. The torrent stays, stopped with its data, and may be
+// resumed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_torrent() {
     let archive = include_bytes!(concat!(
@@ -1912,7 +1913,8 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
         layout.piece_length() as u32,
     )
     .unwrap();
-    for piece in 0..layout.piece_count() {
+    // The last piece never comes: the torrent is short when it is refused.
+    for piece in 0..layout.piece_count() - 1 {
         let range = layout.piece_range(piece);
         let index = lengths.try_validate_piece_index(piece).unwrap();
         assert!(storage.reserve_piece(index, &Arc::default()));
@@ -2068,11 +2070,55 @@ async fn unpacks_beside_and_seeds(name: &str, archive: &[u8]) {
     }
 }
 
-// After a restart, before the tick restores its job, a torrent unpacking
-// refused reads as failed, as its history keeps it, and a removal then
-// goes to history as failed, as it would once the job is back.
+// Every piece of the torrent written through its intake, as a session
+// that fetched them would: `whole` is its files' bytes end to end. The
+// torrents are held meanwhile, so nothing the service settles sees the
+// torrent short of every piece.
+async fn fetch_every_piece(service: &TorrentService, job_id: JobId, whole: &[u8]) {
+    let live = service.inner.live.lock().await;
+    let (layout, intake) = {
+        let torrent = &live[&job_id];
+        (
+            torrent.layout.clone().unwrap(),
+            torrent.intake.clone().unwrap(),
+        )
+    };
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        intake as Arc<dyn Pieces>,
+        service.resident(job_id),
+    );
+    let lengths = Lengths::new(
+        layout.files().map(|file| file.length).sum(),
+        layout.piece_length() as u32,
+    )
+    .unwrap();
+    for piece in 0..layout.piece_count() {
+        let range = layout.piece_range(piece);
+        let index = lengths.try_validate_piece_index(piece).unwrap();
+        assert!(storage.reserve_piece(index, &Arc::default()));
+        for span in layout.spans(piece) {
+            let at = (range.start + span.at) as usize;
+            storage
+                .pwrite_all(
+                    span.file,
+                    span.range.start,
+                    &whole[at..at + span.range.len() as usize],
+                )
+                .unwrap();
+        }
+        storage.on_piece_completed(index).unwrap();
+    }
+    drop(live);
+}
+
+// A torrent with every file it wants whose unpacking refused its output
+// is done downloading: it completes and seeds on, saying why, and its job
+// goes to history as failed when nothing it delivered is a usable file, an
+// archive volume being none. After a restart, before the tick restores its
+// job, a removal goes to history as failed for the same reason.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_refused_torrent_reads_and_is_removed_as_failed_before_its_job_is_back() {
+async fn a_finished_torrent_unpacking_refused_seeds_on_and_fails_with_no_usable_file() {
     let archive = include_bytes!(concat!(
         std::env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/rar5/rar5_store.rar"
@@ -2091,56 +2137,73 @@ async fn a_refused_torrent_reads_and_is_removed_as_failed_before_its_job_is_back
         .add(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
-    let (layout, intake) = {
-        let live = rig.service.inner.live.lock().await;
-        let torrent = &live[&job_id];
-        (
-            torrent.layout.clone().unwrap(),
-            torrent.intake.clone().unwrap(),
-        )
-    };
     let mut retired = rig.service.retired();
-    let storage = PieceStorage::new(
-        Arc::clone(&layout),
-        intake as Arc<dyn Pieces>,
-        rig.service.resident(job_id),
-    );
-    let lengths = Lengths::new(
-        layout.files().map(|file| file.length).sum(),
-        layout.piece_length() as u32,
-    )
-    .unwrap();
-    for piece in 0..layout.piece_count() {
-        let range = layout.piece_range(piece);
-        let index = lengths.try_validate_piece_index(piece).unwrap();
-        assert!(storage.reserve_piece(index, &Arc::default()));
-        for span in layout.spans(piece) {
-            let at = (range.start + span.at) as usize;
-            storage
-                .pwrite_all(
-                    span.file,
-                    span.range.start,
-                    &archive[at..at + span.range.len() as usize],
-                )
-                .unwrap();
-        }
-        let _ = storage.on_piece_completed(index);
-    }
+    fetch_every_piece(&rig.service, job_id, archive).await;
     retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "failed");
+    assert!(history.error_message.unwrap().contains("txt"));
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert!(view.completed_at_ms.is_some());
+    assert_ne!(view.state, TorrentState::Stopped);
     rig.service.stop().await;
     rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     again.open().await.unwrap();
     let view = again.torrent(job_id).await.unwrap();
-    assert_eq!(view.state, TorrentState::Stopped);
-    assert!(view.detail.unwrap().contains("txt"));
+    assert!(view.completed_at_ms.is_some());
+    assert_ne!(view.state, TorrentState::Stopped);
 
     again.remove(job_id, false, false).await.unwrap();
     let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
     assert_eq!(history.status, "failed");
     assert!(history.error_message.unwrap().contains("txt"));
     again.stop().await;
+}
+
+// AGENTS.md "Job status: Partial": a finished torrent whose unpacking
+// refused its archive, beside a file people open that it delivered whole,
+// ends partial, with the refusal kept as why, and seeds on; its removal
+// keeps it partial.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_finished_torrent_unpacking_refused_beside_a_usable_file_is_partial() {
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.db
+        .save_post_processing_settings(&PostProcessingSettings {
+            unacceptable_extensions: vec!["txt".into()],
+            ..PostProcessingSettings::default()
+        })
+        .unwrap();
+    let sample = vec![0x5a_u8; 300];
+    let files: [(&str, &[u8]); 2] = [("set.rar", archive), ("sample.mkv", &sample)];
+    let bytes = metainfo("set", &files, 128, false);
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let mut retired = rig.service.retired();
+    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+    fetch_every_piece(&rig.service, job_id, &whole).await;
+    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "partial");
+    assert!(history.error_message.unwrap().contains("txt"));
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert!(view.completed_at_ms.is_some());
+    assert_ne!(view.state, TorrentState::Stopped);
+
+    rig.service.remove(job_id, false, false).await.unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "partial");
+    assert!(history.error_message.unwrap().contains("txt"));
+    rig.service.stop().await;
 }
 
 // The metainfo's own word on who made it, when, and why stays with the
