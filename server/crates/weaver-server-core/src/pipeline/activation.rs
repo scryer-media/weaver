@@ -151,14 +151,11 @@ impl Pipeline {
         let spec_password = state.spec.password.clone();
         let expected = summaries.clone();
         // Lists read ahead are taken with the job's files, to be checked
-        // as any read is.
-        let ahead = self.next_up.take(job_id).map(|lists| {
-            let mut spec = state.spec.clone();
-            for (file, list) in spec.files.iter_mut().zip(lists) {
-                file.segments = list;
-            }
-            spec
-        });
+        // as any read is. They are unpacked on the read's blocking thread.
+        let ahead = self
+            .next_up
+            .take(job_id)
+            .map(|held| (state.spec.clone(), held));
         let staging = StagingChoice {
             current: staging_dir.clone(),
             intermediate_dir: self.intermediate_dir.clone(),
@@ -605,7 +602,7 @@ fn read_job_articles(
     category: Option<String>,
     metadata: Vec<(String, String)>,
     expected: &FileSummaries,
-    ahead: Option<JobSpec>,
+    ahead: Option<(JobSpec, crate::pipeline::next_up::HeldLists)>,
     memory: Arc<ProcessMemoryBudget>,
     seat: RestoreSeat,
 ) -> Result<ReadArticles, String> {
@@ -617,6 +614,12 @@ fn read_job_articles(
                 .zip(&expected.0)
                 .all(|(file, expected)| FileSummary::of(file).same_list(expected))
     };
+    let ahead = ahead.map(|(mut spec, held)| {
+        for (file, list) in spec.files.iter_mut().zip(held.unpack()) {
+            file.segments = list;
+        }
+        spec
+    });
     // Lists read ahead that no longer match are read again.
     let spec = match ahead.filter(|spec| matches(spec)) {
         Some(spec) => spec,

@@ -476,3 +476,53 @@ fn event_kind_counts_give_what_every_event_gives() {
         assert_eq!(format!("{counted:?}"), format!("{every:?}"), "{kinds:?}");
     }
 }
+
+// Jobs Weaver has started work on qualify, post-processing first, then
+// failed, then downloading, each in queue order; queued, paused, waiting on
+// queue scripts and finished jobs do not.
+#[test]
+fn active_report_jobs_choose_started_work_in_report_order() {
+    let at = |id: u64, status: JobStatus| JobInfo {
+        status,
+        ..live_info(id)
+    };
+    let state = crate::SharedPipelineState::new(crate::PipelineMetrics::new(), Vec::new());
+    state.publish_jobs(vec![
+        at(1, JobStatus::Downloading),
+        at(2, JobStatus::Queued),
+        at(
+            3,
+            JobStatus::Failed {
+                error: "repair failed".to_string(),
+            },
+        ),
+        at(4, JobStatus::Paused),
+        at(5, JobStatus::QueuedRepair),
+        at(6, JobStatus::Complete),
+        at(7, JobStatus::Checking),
+        at(8, JobStatus::AwaitingQueueScripts),
+        at(9, JobStatus::Extracting),
+    ]);
+
+    let chosen = state.active_report_jobs(25);
+    let order: Vec<(u64, ActiveReportGroup)> = chosen
+        .jobs
+        .iter()
+        .map(|(group, job)| (job.job_id.0, *group))
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            (5, ActiveReportGroup::PostProcessing),
+            (9, ActiveReportGroup::PostProcessing),
+            (3, ActiveReportGroup::Failed),
+            (1, ActiveReportGroup::Downloading),
+            (7, ActiveReportGroup::Downloading),
+        ]
+    );
+    assert_eq!(chosen.qualified, 5);
+
+    let capped = state.active_report_jobs(2);
+    assert_eq!(capped.qualified, 5);
+    assert_eq!(capped.jobs.len(), 2);
+}

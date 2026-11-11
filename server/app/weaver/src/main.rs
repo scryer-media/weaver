@@ -67,6 +67,10 @@ const DOTENV_FILE: &str = ".env";
 static GLOBAL_ALLOC: allocator::ProcessAllocator = allocator::PROCESS_ALLOCATOR;
 
 fn main() {
+    // SQLite takes its allocator only before it is first used.
+    #[cfg(target_os = "macos")]
+    allocator::route_sqlite_allocations();
+
     // The Windows upgrade helper is this binary run with `--upgrade-helper`: it
     // replaces the installation the server it was copied from is still holding
     // open. Checked before anything else, because a helper must never start a

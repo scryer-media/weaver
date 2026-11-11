@@ -581,3 +581,263 @@ async fn file_identity_and_graph_member_names_go_through_the_filter() {
          INFO member job-9/file-4.mkv wrote job-9/file-5.mkv\n"
     );
 }
+
+// A queued job as the queue's shared rows hold it.
+fn queued_info(id: u64, status: weaver_server_core::JobStatus) -> weaver_server_core::JobInfo {
+    use weaver_server_core::{DownloadState, JobId, JobStatus, PostState, RunState};
+    let (download_state, post_state, run_state) = match &status {
+        JobStatus::Downloading => (
+            DownloadState::Downloading,
+            PostState::Idle,
+            RunState::Active,
+        ),
+        JobStatus::Repairing => (
+            DownloadState::Complete,
+            PostState::Repairing,
+            RunState::Active,
+        ),
+        JobStatus::Extracting => (
+            DownloadState::Complete,
+            PostState::Extracting,
+            RunState::Active,
+        ),
+        JobStatus::Paused => (DownloadState::Queued, PostState::Idle, RunState::Paused),
+        _ => (DownloadState::Queued, PostState::Idle, RunState::Active),
+    };
+    weaver_server_core::JobInfo {
+        job_id: JobId(id),
+        job_hash: None,
+        name: format!("Synthetic.Job.{id}"),
+        error: None,
+        download_wait_reason: None,
+        download_retry_at_epoch_ms: None,
+        status,
+        download_state,
+        finalizing_download: false,
+        fetching_repair_data: false,
+        post_state,
+        run_state,
+        progress: 0.0,
+        total_bytes: 10,
+        downloaded_bytes: 0,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        phase_progress: Vec::new(),
+        failed_bytes: 0,
+        health: 1000,
+        terminal_discards: Vec::new(),
+        total_files: 1,
+        completed_files: 0,
+        remaining_par_files: 0,
+        file_remaining_bytes: Vec::new(),
+        file_parked_bytes: Vec::new(),
+        remaining_bytes: 10,
+        wanted_bytes: 10,
+        password: None,
+        category: None,
+        metadata: Vec::new(),
+        output_dir: None,
+        created_at_epoch_ms: 0.0,
+        server_attribution: Vec::new(),
+    }
+}
+
+// A handle over a queue holding `jobs`, with no pipeline behind it: the
+// reports must be made without one answering.
+fn queue_handle(jobs: Vec<weaver_server_core::JobInfo>) -> SchedulerHandle {
+    use weaver_server_core::{PipelineMetrics, SharedPipelineState};
+    let (event_tx, _) = tokio::sync::broadcast::channel(4);
+    let state = SharedPipelineState::new(PipelineMetrics::new(), Vec::new());
+    state.publish_jobs(jobs);
+    SchedulerHandle::new(event_tx, state)
+}
+
+// Seeds an active job row whose stored NZB names the synthetic fixture.
+fn seed_report_job(db: &Database, id: u64) {
+    db.create_active_job(&seeded_job(
+        id,
+        &format!("/srv/synthetic-nzbs/Synthetic.Job.{id}.nzb"),
+        seeded_nzb(
+            &format!("Synthetic Job {id}"),
+            &format!("Synthetic.File.{id}.mkv"),
+        ),
+        &format!("/srv/synthetic-complete/Synthetic.Job.{id}"),
+        None,
+        Vec::new(),
+    ))
+    .expect("active job");
+}
+
+const REPORT_NOW: u64 = 1_767_225_600;
+
+// Far past any real run: the budget is not what these tests exercise.
+const UNBOUNDED: Duration = Duration::from_secs(365 * 24 * 3_600);
+
+fn nzb_reports_json(component: &Component) -> serde_json::Value {
+    assert_eq!(component.name, nzb_reports::FILE);
+    let data = component.outcome.as_ref().expect("the reports are written");
+    serde_json::from_slice(data).expect("the reports are JSON")
+}
+
+fn entry_ids(reports: &serde_json::Value) -> Vec<u64> {
+    reports["jobs"]
+        .as_array()
+        .expect("jobs")
+        .iter()
+        .map(|entry| entry["job_id"].as_u64().expect("job id"))
+        .collect()
+}
+
+// Only jobs Weaver has started work on get a report, post-processing first,
+// each keyed by the id queue.json lists it under, and each report is the
+// support report the report code makes for that job.
+#[tokio::test]
+async fn nzb_reports_cover_exactly_the_active_jobs() {
+    use weaver_server_core::JobStatus;
+    use weaver_server_core::support::{ReportEnvironment, build_job_support_report};
+
+    let db = Database::open_in_memory().expect("database");
+    for id in 1..=7 {
+        seed_report_job(&db, id);
+    }
+    let jobs = vec![
+        queued_info(1, JobStatus::Queued),
+        queued_info(2, JobStatus::Downloading),
+        queued_info(3, JobStatus::Paused),
+        queued_info(4, JobStatus::Repairing),
+        queued_info(5, JobStatus::Queued),
+        queued_info(6, JobStatus::Paused),
+        queued_info(7, JobStatus::AwaitingQueueScripts),
+    ];
+    let handle = queue_handle(jobs.clone());
+
+    let component =
+        nzb_reports::collect_nzb_reports_within(&db, &handle, 25, UNBOUNDED, REPORT_NOW).await;
+    let reports = nzb_reports_json(&component);
+    assert_eq!(entry_ids(&reports), vec![4, 2], "{reports:#}");
+    assert_eq!(reports["qualified"], 2);
+    assert_eq!(reports["written"], 2);
+    assert_eq!(reports["failed"], 0);
+    assert!(reports["cut_short"].is_null());
+
+    let environment = ReportEnvironment::current(&db, &handle);
+    for (entry, (id, group, status)) in reports["jobs"].as_array().expect("jobs").iter().zip([
+        (4, "post_processing", "repairing"),
+        (2, "downloading", "downloading"),
+    ]) {
+        assert_eq!(entry["job"], format!("job-{id}"));
+        assert_eq!(entry["group"], group);
+        assert_eq!(entry["status"], status);
+        let info = jobs[usize::try_from(id - 1).expect("index")].clone();
+        let expected = build_job_support_report(&db, Some(info), id, &environment, REPORT_NOW)
+            .expect("the report code reports the job");
+        let expected: serde_json::Value =
+            serde_json::from_str(&expected.json).expect("report JSON");
+        assert_eq!(entry["report"], expected, "job {id}");
+    }
+}
+
+// The cap keeps the first reports in report order and the file says how many
+// qualified, so a cut set is visible.
+#[tokio::test]
+async fn nzb_reports_stop_at_the_cap_and_count_what_qualified() {
+    use weaver_server_core::JobStatus;
+
+    let db = Database::open_in_memory().expect("database");
+    for id in 1..=6 {
+        seed_report_job(&db, id);
+    }
+    let handle = queue_handle(vec![
+        queued_info(1, JobStatus::Downloading),
+        queued_info(2, JobStatus::Downloading),
+        queued_info(3, JobStatus::Extracting),
+        queued_info(4, JobStatus::Downloading),
+        queued_info(5, JobStatus::Repairing),
+        queued_info(6, JobStatus::Queued),
+    ]);
+
+    let component =
+        nzb_reports::collect_nzb_reports_within(&db, &handle, 3, UNBOUNDED, REPORT_NOW).await;
+    let reports = nzb_reports_json(&component);
+    assert_eq!(entry_ids(&reports), vec![3, 5, 1], "{reports:#}");
+    assert_eq!(reports["qualified"], 5);
+    assert_eq!(reports["limit"], 3);
+    assert_eq!(reports["written"], 3);
+}
+
+// A job whose NZB cannot be read gets an entry with a stable reason, the
+// other jobs keep their reports, and the package still builds, even though
+// the stand-in table refuses the same NZB.
+#[tokio::test]
+async fn an_unreadable_nzb_gets_an_entry_and_the_package_still_builds() {
+    use weaver_server_core::JobStatus;
+
+    let db = Database::open_in_memory().expect("database");
+    seed_report_job(&db, 1);
+    let mut broken = vec![0x28, 0xB5, 0x2F, 0xFD];
+    broken.extend_from_slice(b"not a zstd frame at all");
+    db.create_active_job(&seeded_job(
+        2,
+        "/srv/synthetic-nzbs/Synthetic.Broken.nzb",
+        broken,
+        "/srv/synthetic-complete/Synthetic.Broken",
+        None,
+        Vec::new(),
+    ))
+    .expect("broken job");
+    let handle = queue_handle(vec![
+        queued_info(1, JobStatus::Downloading),
+        queued_info(2, JobStatus::Repairing),
+    ]);
+
+    let component =
+        nzb_reports::collect_nzb_reports_within(&db, &handle, 25, UNBOUNDED, REPORT_NOW).await;
+    let reports = nzb_reports_json(&component);
+    assert_eq!(entry_ids(&reports), vec![2, 1], "{reports:#}");
+    assert_eq!(reports["written"], 2);
+    assert_eq!(reports["failed"], 1);
+    let broken = &reports["jobs"][0];
+    assert_eq!(broken["error"]["reason"], "nzb_unreadable", "{broken:#}");
+    assert!(broken.get("report").is_none(), "{broken:#}");
+    assert!(reports["jobs"][1]["report"].is_object());
+
+    let archive = archive::build_archive(
+        vec![component],
+        "0.0.0-test",
+        "2000-01-01T00:00:00Z",
+        archive::ManifestSanitized {
+            stand_ins: 0,
+            history_jobs_total: None,
+            note: String::new(),
+        },
+    )
+    .expect("archive builds");
+    let members = unpack_package(&archive);
+    let manifest: archive::Manifest =
+        serde_json::from_str(&member_text(&members, archive::MANIFEST_NAME))
+            .expect("manifest parses");
+    assert!(manifest.errors.is_empty(), "{:?}", manifest.errors);
+    assert!(
+        manifest
+            .files
+            .iter()
+            .any(|file| file.name == nzb_reports::FILE)
+    );
+}
+
+// A spent budget writes what was made and says the set was cut short.
+#[tokio::test]
+async fn a_spent_budget_writes_what_was_made_and_says_so() {
+    use weaver_server_core::JobStatus;
+
+    let db = Database::open_in_memory().expect("database");
+    seed_report_job(&db, 1);
+    let handle = queue_handle(vec![queued_info(1, JobStatus::Downloading)]);
+
+    let component =
+        nzb_reports::collect_nzb_reports_within(&db, &handle, 25, Duration::ZERO, REPORT_NOW).await;
+    let reports = nzb_reports_json(&component);
+    assert_eq!(reports["qualified"], 1);
+    assert_eq!(reports["written"], 0);
+    assert_eq!(reports["cut_short"], "time_budget_spent");
+}

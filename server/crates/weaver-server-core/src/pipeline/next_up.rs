@@ -10,12 +10,15 @@
 // without starting drops its lists. The lists read ahead are checked against
 // the job's files as any read is, and a job whose lists do not match, or did
 // not read, reads them again as it activates.
+//
+// The ring holds each job's lists packed (see `HeldLists`), and they are
+// unpacked as the job activates, on the blocking thread that checks them.
 
 use super::*;
-use crate::jobs::model::{JobArticles, SegmentSpec};
+use crate::jobs::model::{JobArticles, MessageIds, SegmentSpec};
 
 // How many jobs past the slots have their lists read ahead.
-pub(crate) const NEXT_UP_DEPTH: usize = 10;
+pub(crate) const NEXT_UP_DEPTH: usize = 3;
 
 pub(crate) struct NextUp {
     pub(crate) depth: usize,
@@ -26,7 +29,7 @@ pub(crate) struct NextUp {
 enum Entry {
     // A read is out, told by its number.
     Reading(u64),
-    Read(Vec<Vec<SegmentSpec>>),
+    Read(HeldLists),
     // The read failed: the job reads its lists as it activates.
     Unread,
 }
@@ -43,7 +46,7 @@ impl Default for NextUp {
 
 impl NextUp {
     // The lists read ahead for the job, taken.
-    pub(crate) fn take(&mut self, job_id: JobId) -> Option<Vec<Vec<SegmentSpec>>> {
+    pub(crate) fn take(&mut self, job_id: JobId) -> Option<HeldLists> {
         match self.entries.remove(&job_id)? {
             Entry::Read(lists) => Some(lists),
             Entry::Reading(_) | Entry::Unread => None,
@@ -62,18 +65,145 @@ impl NextUp {
         held
     }
 
-    #[cfg(test)]
+    // Whether a read ahead is out.
     pub(crate) fn reading(&self) -> bool {
         self.entries
             .values()
             .any(|entry| matches!(entry, Entry::Reading(_)))
+    }
+
+    // Every job the ring tracks, read or not.
+    #[cfg(test)]
+    pub(crate) fn ids(&self) -> Vec<JobId> {
+        let mut ids: Vec<JobId> = self.entries.keys().copied().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    // The number of the last read sent out.
+    #[cfg(test)]
+    pub(crate) fn last_read(&self) -> u64 {
+        self.next_read
+    }
+}
+
+// One job's article lists as the ring holds them: every message-id of the
+// job end to end in one block, and each part a fixed record that names where
+// its ids end. A part costs its record and its ids' bytes, with no string or
+// list of its own. The lists come back, in order and whole, as the job
+// activates, off the pipeline thread.
+pub(crate) struct HeldLists {
+    ids: Box<str>,
+    // Where each id ends in `ids`.
+    id_ends: Box<[u32]>,
+    // Every part of every file, in order.
+    parts: Box<[HeldPart]>,
+    // Where each file's parts end in `parts`.
+    file_ends: Box<[u32]>,
+}
+
+struct HeldPart {
+    ordinal: u32,
+    article_number: u32,
+    bytes: u32,
+    // Where the part's ids end in `id_ends`.
+    ids_end: u32,
+}
+
+impl HeldLists {
+    // The lists packed, or None when they cannot be held this way: a part
+    // whose fetch has moved past its first id, or a job too large for the
+    // offsets. Such a job reads its lists as it activates.
+    pub(crate) fn pack(lists: &[Vec<SegmentSpec>]) -> Option<Self> {
+        let mut id_count = 0usize;
+        let mut id_bytes = 0usize;
+        let mut part_count = 0usize;
+        for list in lists {
+            part_count += list.len();
+            for part in list {
+                let all = part.message_ids.all();
+                if !std::ptr::eq(part.message_ids.in_use(), all[0].as_str()) {
+                    return None;
+                }
+                id_count += all.len();
+                id_bytes += all.iter().map(String::len).sum::<usize>();
+            }
+        }
+        u32::try_from(id_bytes).ok()?;
+        u32::try_from(id_count).ok()?;
+        u32::try_from(part_count).ok()?;
+        let mut ids = String::with_capacity(id_bytes);
+        let mut id_ends = Vec::with_capacity(id_count);
+        let mut parts = Vec::with_capacity(part_count);
+        let mut file_ends = Vec::with_capacity(lists.len());
+        for list in lists {
+            for part in list {
+                for id in part.message_ids.all() {
+                    ids.push_str(id);
+                    id_ends.push(ids.len() as u32);
+                }
+                parts.push(HeldPart {
+                    ordinal: part.ordinal,
+                    article_number: part.article_number,
+                    bytes: part.bytes,
+                    ids_end: id_ends.len() as u32,
+                });
+            }
+            file_ends.push(parts.len() as u32);
+        }
+        Some(Self {
+            ids: ids.into_boxed_str(),
+            id_ends: id_ends.into_boxed_slice(),
+            parts: parts.into_boxed_slice(),
+            file_ends: file_ends.into_boxed_slice(),
+        })
+    }
+
+    // The lists as they were packed.
+    pub(crate) fn unpack(&self) -> Vec<Vec<SegmentSpec>> {
+        let mut lists = Vec::with_capacity(self.file_ends.len());
+        let mut part_start = 0usize;
+        let mut id_start = 0usize;
+        let mut byte_start = 0usize;
+        for &part_end in &self.file_ends {
+            let part_end = part_end as usize;
+            let mut list = Vec::with_capacity(part_end - part_start);
+            for part in &self.parts[part_start..part_end] {
+                let id_end = part.ids_end as usize;
+                let mut ids = Vec::with_capacity(id_end - id_start);
+                for &byte_end in &self.id_ends[id_start..id_end] {
+                    let byte_end = byte_end as usize;
+                    ids.push(self.ids[byte_start..byte_end].to_string());
+                    byte_start = byte_end;
+                }
+                id_start = id_end;
+                list.push(SegmentSpec {
+                    ordinal: part.ordinal,
+                    article_number: part.article_number,
+                    bytes: part.bytes,
+                    message_ids: MessageIds::new(ids),
+                });
+            }
+            part_start = part_end;
+            lists.push(list);
+        }
+        lists
+    }
+
+    // The bytes the lists hold on the heap.
+    #[cfg(test)]
+    pub(crate) fn heap_bytes(&self) -> usize {
+        self.ids.len()
+            + std::mem::size_of_val(&*self.id_ends)
+            + std::mem::size_of_val(&*self.parts)
+            + std::mem::size_of_val(&*self.file_ends)
     }
 }
 
 impl Pipeline {
     // The jobs next up: installed jobs that never started, waiting for a
     // slot, not paused, in dispatch order, as many as the depth.
-    fn next_up_jobs(&self) -> Vec<JobId> {
+    pub(in crate::pipeline) fn next_up_jobs(&self) -> Vec<JobId> {
         let depth = self.next_up.depth;
         if depth == 0 {
             return Vec::new();
@@ -82,35 +212,21 @@ impl Pipeline {
             if inner.globals.shutting_down {
                 return Vec::new();
             }
-            let mut waiting: Vec<(u8, usize, JobId)> = inner
-                .jobs
-                .iter()
-                .enumerate()
-                .filter(|(_, row)| {
-                    row.intents.cancelled.is_none()
-                        && !row.report.retiring
-                        && !self.nzb_admitted.contains(&row.id)
-                })
-                .filter(|(_, row)| {
-                    self.jobs.get(&row.id).is_some_and(|state| {
+            // Paused as the admission pass counts it: a pause asked for is in
+            // force at once, and a job resumed while it waits for its slot,
+            // still paused until it takes one, is next up.
+            let mut waiting = inner.dispatch_keys(|row| {
+                row.intents.cancelled.is_none()
+                    && !row.report.retiring
+                    && !self.nzb_admitted.contains(&row.id)
+                    && !self.admission_paused(row)
+                    && self.jobs.get(&row.id).is_some_and(|state| {
                         matches!(state.articles, JobArticles::Queued(_))
-                            && state.status == JobStatus::Queued
-                            && state.run_state != crate::jobs::model::RunState::Paused
+                            && matches!(state.status, JobStatus::Queued | JobStatus::Paused)
                     })
-                })
-                .map(|(position, row)| {
-                    (
-                        crate::pipeline::nzb_admission::metadata_priority(&row.report.job.metadata),
-                        position,
-                        row.id,
-                    )
-                })
-                .collect();
-            if waiting.len() > depth {
-                waiting.select_nth_unstable(depth - 1);
-                waiting.truncate(depth);
-            }
-            waiting.into_iter().map(|(_, _, id)| id).collect()
+            });
+            crate::pipeline::queue::order::keep_first(&mut waiting, depth);
+            waiting.into_iter().map(|key| key.job_id()).collect()
         })
     }
 
@@ -151,7 +267,9 @@ impl Pipeline {
             tokio::spawn(async move {
                 let _ = written_rx.await;
                 let lists = tokio::task::spawn_blocking(move || {
-                    super::activation::read_stored_lists(&db, job_id).map(|(_, read)| read.lists)
+                    let (_, read) = super::activation::read_stored_lists(&db, job_id)?;
+                    HeldLists::pack(&read.lists)
+                        .ok_or_else(|| "the lists cannot be held packed".to_string())
                 })
                 .await
                 .unwrap_or_else(|error| Err(format!("read ahead worker failed: {error}")));
@@ -169,7 +287,7 @@ impl Pipeline {
         &mut self,
         job_id: JobId,
         read: u64,
-        lists: Result<Vec<Vec<SegmentSpec>>, String>,
+        lists: Result<HeldLists, String>,
     ) {
         let Some(entry) = self.next_up.entries.get_mut(&job_id) else {
             return;

@@ -32,15 +32,6 @@ pub(crate) fn waits_its_turn(status: &JobStatus, paused_resume_status: Option<&J
     }
 }
 
-// The row's priority in dispatch order, with an edit not yet applied in force.
-fn row_priority(row: &JobRow, globals: &crate::pipeline::queue::Globals) -> u8 {
-    if row.intents.update.is_some() {
-        crate::pipeline::nzb_admission::metadata_priority(&row.info(globals).metadata)
-    } else {
-        crate::pipeline::nzb_admission::metadata_priority(&row.report.job.metadata)
-    }
-}
-
 // What a window install reads of a job that is not installed: its active row
 // and its stored NZB outline, as a restart reads it.
 pub(crate) struct ParkedLoads {
@@ -156,23 +147,14 @@ impl Pipeline {
                 .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
                 .get() as usize,
         );
-        let mut ranked: Vec<(u8, usize, JobId)> = inner
-            .jobs
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                row.intents.cancelled.is_none()
-                    && !row.report.retiring
-                    && !self.blocked_restores.contains_key(&row.id)
-                    && !self.window_unreadable.contains(&row.id)
-            })
-            .map(|(position, row)| (row_priority(row, globals), position, row.id))
-            .collect();
-        if ranked.len() > size {
-            ranked.select_nth_unstable(size - 1);
-            ranked.truncate(size);
-        }
-        ranked.into_iter().map(|(_, _, id)| id).collect()
+        let mut ranked = inner.dispatch_keys(|row| {
+            row.intents.cancelled.is_none()
+                && !row.report.retiring
+                && !self.blocked_restores.contains_key(&row.id)
+                && !self.window_unreadable.contains(&row.id)
+        });
+        crate::pipeline::queue::order::keep_first(&mut ranked, size);
+        ranked.into_iter().map(|key| key.job_id()).collect()
     }
 
     // Whether the row's job does something its row cannot carry: it holds a
