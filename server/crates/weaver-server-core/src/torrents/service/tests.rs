@@ -558,8 +558,12 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
     assert!(paused.phase_progress.is_empty());
 }
 
+// A file with an extension the operator does not want is left out of the
+// download, its level kept as `Ignored`, and the torrent completes on the
+// files it wants. One that leaves no file wanted is refused, and so is one
+// named after an executable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn admission_refuses_unwanted_extensions_and_executables() {
+async fn admission_leaves_out_unwanted_files_and_refuses_nothing_wanted_and_executables() {
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     rig.db
@@ -568,12 +572,39 @@ async fn admission_refuses_unwanted_extensions_and_executables() {
             ..PostProcessingSettings::default()
         })
         .unwrap();
-    let unwanted = metainfo(
-        "set",
-        &[("set/a.bin", &[1; 100]), ("set/b.nfo", &[2; 10])],
-        64,
-        false,
+    let files: [(&str, &[u8]); 2] = [("a.bin", &[1; 128]), ("b.nfo", &[2; 64])];
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo("set", &files, 64, false))))
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.db.torrent_file_priorities(job_id).unwrap(),
+        [FilePriority::Normal, FilePriority::Ignored]
     );
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.wanted_bytes, 128);
+
+    // Only the wanted file's pieces come, and it completes.
+    let mut published = rig.service.inner.published.subscribe();
+    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+    fetch_pieces(&rig.service, job_id, &whole, Some(&[0, 1])).await;
+    published
+        .wait_for(|_| {
+            rig.db
+                .get_torrent(job_id)
+                .unwrap()
+                .unwrap()
+                .completed_at_ms
+                .is_some()
+        })
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert!(view.completed_at_ms.is_some());
+    assert_eq!(view.wanted_bytes, 128);
+
+    let unwanted = metainfo("set", &[("set/b.nfo", &[2; 10])], 64, false);
     assert_eq!(
         rig.service
             .add(request(AddSource::Metainfo(unwanted)))
@@ -590,7 +621,8 @@ async fn admission_refuses_unwanted_extensions_and_executables() {
             .await,
         Err(AddError::Refused(Refusal::Executable("setup.exe".into())))
     );
-    assert!(rig.db.list_torrents().unwrap().is_empty());
+    assert_eq!(rig.db.list_torrents().unwrap().len(), 1);
+    rig.service.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2075,6 +2107,11 @@ async fn unpacks_beside_and_seeds(name: &str, archive: &[u8]) {
 // torrents are held meanwhile, so nothing the service settles sees the
 // torrent short of every piece.
 async fn fetch_every_piece(service: &TorrentService, job_id: JobId, whole: &[u8]) {
+    fetch_pieces(service, job_id, whole, None).await;
+}
+
+// `fetch_every_piece`, or only the pieces `only` names.
+async fn fetch_pieces(service: &TorrentService, job_id: JobId, whole: &[u8], only: Option<&[u32]>) {
     let live = service.inner.live.lock().await;
     let (layout, intake) = {
         let torrent = &live[&job_id];
@@ -2094,6 +2131,9 @@ async fn fetch_every_piece(service: &TorrentService, job_id: JobId, whole: &[u8]
     )
     .unwrap();
     for piece in 0..layout.piece_count() {
+        if only.is_some_and(|only| !only.contains(&piece)) {
+            continue;
+        }
         let range = layout.piece_range(piece);
         let index = lengths.try_validate_piece_index(piece).unwrap();
         assert!(storage.reserve_piece(index, &Arc::default()));

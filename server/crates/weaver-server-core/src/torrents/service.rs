@@ -3373,13 +3373,39 @@ impl TorrentService {
     }
 
     // The torrent's metainfo and its store over it, at once. A store that
-    // cannot be made fails the torrent.
-    fn give_metainfo(&self, torrent: &mut Live, parsed: &Parsed) -> Result<(), String> {
+    // cannot be made fails the torrent. The files `left_out`, by their
+    // index among the manifest's paths, are not downloaded: their level is
+    // `Ignored`, kept as the operator's own would be.
+    fn give_metainfo(
+        &self,
+        torrent: &mut Live,
+        parsed: &Parsed,
+        left_out: &[usize],
+    ) -> Result<(), String> {
         let job_id = torrent.record.job_id;
-        let stored = self.inner.db.torrent_file_priorities(job_id).unwrap_or_else(|error| {
+        let mut stored = self.inner.db.torrent_file_priorities(job_id).unwrap_or_else(|error| {
             tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
             Vec::new()
         });
+        if !left_out.is_empty() {
+            let left_out: HashSet<usize> = left_out.iter().copied().collect();
+            stored.resize(parsed.layout.file_count(), FilePriority::Normal);
+            let listed = parsed
+                .layout
+                .files()
+                .enumerate()
+                .filter(|(_, file)| !file.padding)
+                .map(|(index, _)| index);
+            for (path, index) in listed.enumerate() {
+                if left_out.contains(&path) {
+                    stored[index] = FilePriority::Ignored;
+                }
+            }
+            self.inner
+                .db
+                .set_torrent_file_priorities(job_id, &stored)
+                .map_err(state_error)?;
+        }
         self.describe(torrent, parsed, stored);
         let Some(made) = self.making(torrent, &self.global_passwords()) else {
             return Ok(());
@@ -3678,7 +3704,7 @@ impl TorrentService {
             AddSource::Metainfo(bytes) => {
                 let bytes = Bytes::from(bytes);
                 let parsed = parse(&bytes)?;
-                self.admit(&parsed.manifest)?;
+                let left_out = self.admit(&parsed.manifest)?;
                 self.duplicate(parsed.hashes)?;
                 let job_id = self.reserve()?;
                 let mut record = self.record(
@@ -3710,7 +3736,7 @@ impl TorrentService {
                     }
                 };
                 self.tag_added(job_id, &request.tags);
-                let made = self.give_metainfo(&mut torrent, &parsed);
+                let made = self.give_metainfo(&mut torrent, &parsed, &left_out);
                 // Raised for an add, never for a restore (qBittorrent emits
                 // `torrentAdded` from `addTorrent_impl` alone).
                 self.raise_script_event(&torrent, QueueEvent::TorrentAdded, &[]);
@@ -3847,7 +3873,8 @@ impl TorrentService {
         }
     }
 
-    fn admit(&self, manifest: &Manifest) -> Result<(), AddError> {
+    // The files of `manifest.paths`, by index, that admission leaves out.
+    fn admit(&self, manifest: &Manifest) -> Result<Vec<usize>, AddError> {
         let policy = self
             .inner
             .db
@@ -4207,7 +4234,7 @@ impl TorrentService {
         fetched: Option<Fetched>,
     ) -> Result<(), AddError> {
         let parsed = parse(&bytes)?;
-        self.admit(&parsed.manifest)?;
+        let left_out = self.admit(&parsed.manifest)?;
         let settings = self.settings();
         let Some(record) = self
             .inner
@@ -4277,7 +4304,7 @@ impl TorrentService {
             .db
             .set_torrent_adopted(job_id, &adopted)
             .map_err(|error| AddError::State(state_error(error)))?;
-        let made = self.give_metainfo(torrent, &parsed);
+        let made = self.give_metainfo(torrent, &parsed, &left_out);
         drop(live);
         if let Err(error) = made {
             self.fail(job_id, error).await;
