@@ -29,13 +29,16 @@
 //    package allocated, so a reader knows the names are not real, and how
 //    many finished jobs the history holds: names are read for the 2,000 most
 //    recent. A table source that cannot be read leaves every component out.
-//    There is no way to turn this off.
+//    There is no way to turn this off. The one file that skips the pass is
+//    `nzb-reports.json`: the support reports in it are built from fixed
+//    names and generated tokens only, and join the package as written.
 // 3. **A failed component never fails the package.** Each piece records
 //    either its bytes or its error, and the error is written into the manifest.
 //    A report that is missing one section is still a report; a 500 is not.
 
 mod archive;
 mod graphql;
+mod nzb_reports;
 mod redact;
 mod sanitize;
 
@@ -208,6 +211,9 @@ async fn collect_components(
 
     components.extend(collect_graphql_components(schema, &caller).await);
     components.push(collect_pipeline_internals(handle).await);
+    // The support reports name nothing to begin with, so they join the
+    // package as their report code wrote them, after the stand-in pass.
+    let nzb_reports = nzb_reports::collect_nzb_reports(db, handle).await;
 
     let (data_dir, intermediate_dir, complete_dir, watch_dir) = {
         let config = config.read().await;
@@ -265,7 +271,9 @@ async fn collect_components(
                 ))
             })
     };
-    sanitize_components(components, stored, local).await
+    let (mut components, sanitized) = sanitize_components(components, stored, local).await;
+    components.push(nzb_reports);
+    (components, sanitized)
 }
 
 // The one sanitizing pass over a collected package. A table source that
