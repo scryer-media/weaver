@@ -1349,8 +1349,10 @@ impl TorrentStateLive {
         let mut moved = self.shared.moved.lock();
         if self.run_counted.load(Ordering::Relaxed) {
             moved.redundant_bytes += len;
+            moved.cut_short_bytes += len;
         } else {
             self.add_redundant_bytes(len);
+            self.stats.cut_short_bytes.fetch_add(len, Ordering::Relaxed);
         }
     }
 
@@ -1510,6 +1512,7 @@ impl TorrentStateLive {
             uploaded_protocol_bytes: self.stats.uploaded_protocol_bytes.load(Relaxed),
             failed_bytes: self.get_failed_bytes(),
             redundant_bytes: self.get_redundant_bytes(),
+            cut_short_bytes: self.stats.cut_short_bytes.load(Relaxed),
             total_piece_download_ms: self.stats.total_piece_download_ms.load(Relaxed),
             peer_stats: self.peers.stats(),
         }

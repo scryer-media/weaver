@@ -514,7 +514,7 @@ fn tracker_rules_crud() {
         seeding: None,
         never_pause: false,
         unpack: Some(true),
-        client: Some(Client::Transmission),
+        client: Some(Client::Weaver),
         torrent_route: false,
         dht: None,
         pex: Some(false),
@@ -528,6 +528,57 @@ fn tracker_rules_crud() {
     assert!(db.delete_tracker_rule(second.id).unwrap());
     assert!(!db.delete_tracker_rule(second.id).unwrap());
     assert_eq!(db.list_tracker_rules().unwrap(), [changed]);
+}
+
+// A rule kept naming `transmission` reads as one naming Weaver.
+#[test]
+fn a_kept_transmission_client_reads_as_weaver() {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    use crate::settings::model::TrackerRule;
+
+    let db = Database::open_in_memory().unwrap();
+    let kept = db
+        .insert_tracker_rule(
+            &TrackerRule {
+                archive_passwords: Default::default(),
+                bound: None,
+                id: 0,
+                host_pattern: "tracker.example".into(),
+                seeding: None,
+                never_pause: false,
+                unpack: None,
+                client: Some(Client::QBittorrent),
+                torrent_route: false,
+                dht: None,
+                pex: None,
+                lsd: None,
+                encryption: None,
+                upload_cap: Leaf::Inherit,
+                forced: false,
+                ssl: None,
+            },
+            1,
+        )
+        .unwrap();
+    let datastore = db.datastore();
+    let args = vec![SqlArg::I64(i64::from(kept.id))];
+    db.run_sql_blocking(async move {
+        SqlRuntime::execute(
+            datastore.write_exec(),
+            "UPDATE tracker_rules SET client = 'transmission' WHERE id = {}",
+            &args,
+        )
+        .await?;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        db.list_tracker_rules().unwrap(),
+        [TrackerRule {
+            client: Some(Client::Weaver),
+            ..kept
+        }]
+    );
 }
 
 // A rule's certificate comes back as it was kept, its private key sealed in

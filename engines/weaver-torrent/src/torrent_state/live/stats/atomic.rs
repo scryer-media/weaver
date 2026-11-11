@@ -25,4 +25,7 @@ pub struct AtomicStats {
     /// Bytes of blocks received and not used (libtorrent
     /// `torrent::m_total_redundant_bytes`).
     pub redundant_bytes: AtomicU64,
+    /// The part of `redundant_bytes` that is blocks cut short as their
+    /// connection closed: received, but never counted in `fetched_bytes`.
+    pub cut_short_bytes: AtomicU64,
 }

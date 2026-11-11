@@ -55,6 +55,7 @@ async fn test_a_web_seed_is_asked_as_the_client_the_torrent_names_itself_as() ->
         version: "qBittorrent/5.2.3".into(),
         user_agent: "qBittorrent/5.2.3".into(),
         tracker_ids: Default::default(),
+        shape: &crate::tracker::qbittorrent::SHAPE,
     };
     for (identity, expected) in [
         (Some(emulated), "qBittorrent/5.2.3"),

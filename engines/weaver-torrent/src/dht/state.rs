@@ -35,10 +35,9 @@ use crate::core::{
     compact_ip::{CompactSerialize, CompactSerializeFixedLen},
     hash_id::Id20,
     net::{DatagramSocket, NoNames, Resolved, Resolver},
-    peer_id::generate_azereus_style,
+    peer_id::try_decode_peer_id,
     spawn_utils::{spawn, spawn_with_cancel},
 };
-use crate::crate_version;
 use crate::network::SocketFactory;
 use governor::{
     Quota, clock::Clock, middleware::NoOpMiddleware, nanos::Nanos, state::InMemoryState,
@@ -1523,6 +1522,10 @@ impl DhtWorker {
 
 #[derive(Default)]
 pub struct DhtConfig {
+    /// Our node id, as restored or given. It is kept unless it reads as a
+    /// BEP 20 peer id; otherwise, and when none is given, the id is
+    /// entirely random (BEP 5), and routing tables built around another id
+    /// are dropped.
     pub peer_id: Option<Id20>,
     pub bootstrap_addrs: Option<Vec<String>>,
     pub routing_table: Option<RoutingTable>,
@@ -1539,14 +1542,6 @@ pub struct DhtConfig {
     /// Look up bootstrap hostnames through this resolver; with none, only
     /// bootstrap addresses are asked.
     pub resolver: Option<Arc<dyn Resolver>>,
-    /// The leading bytes of our node id, the rest being random (BEP 5 node ids
-    /// are otherwise random). A client puts its BEP 20 peer id fingerprint here
-    /// so that one identity covers the peer wire, trackers and the DHT. An
-    /// explicit or restored `peer_id` is kept only if it starts with these bytes;
-    /// otherwise a new id is made, and the routing tables, which are built
-    /// around the old one, are dropped. At most 20 bytes are used.
-    /// Defaults to rqbit's own fingerprint.
-    pub node_id_prefix: Option<Vec<u8>>,
     /// The BEP 5 client version ("v"): by convention the two BEP 20 client
     /// letters followed by two version bytes. Sent with every outgoing message
     /// when set; when not, no "v" is sent.
@@ -1556,13 +1551,11 @@ pub struct DhtConfig {
     pub tasks: Option<TaskTracker>,
 }
 
-// A node id starting with `prefix` (at most 20 bytes of it), the rest random.
-fn generate_node_id(prefix: &[u8]) -> Id20 {
+// An entirely random node id.
+fn random_node_id() -> Id20 {
     use rand::Rng as _;
     let mut id = [0u8; 20];
-    let len = prefix.len().min(20);
-    id[..len].copy_from_slice(&prefix[..len]);
-    rand::rng().fill_bytes(&mut id[len..]);
+    rand::rng().fill_bytes(&mut id);
     Id20::new(id)
 }
 
@@ -1592,18 +1585,11 @@ impl DhtState {
             let listen_addr = socket.bind_addr();
             info!("DHT listening on {:?}", listen_addr);
 
-            let peer_id = match config.node_id_prefix.as_deref() {
-                None => config
-                    .peer_id
-                    .unwrap_or_else(|| generate_azereus_style(*b"WV", crate_version!())),
-                Some(prefix) => {
-                    let prefix = &prefix[..prefix.len().min(20)];
-                    config
-                        .peer_id
-                        .filter(|id| id.0.starts_with(prefix))
-                        .unwrap_or_else(|| generate_node_id(prefix))
-                }
-            };
+            // A node id carries no client's fingerprint.
+            let peer_id = config
+                .peer_id
+                .filter(|id| try_decode_peer_id(*id).is_none())
+                .unwrap_or_else(random_node_id);
             info!("starting up DHT with peer id {:?}", peer_id);
             // A routing table is laid out by distance from its own node's id: it
             // does not carry over to another id.
@@ -2031,40 +2017,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_node_id_prefix() {
+    async fn test_node_id_carries_no_fingerprint() {
         use crate::core::hash_id::Id20;
+        use crate::core::peer_id::generate_azereus_style;
         use crate::dht::routing_table::RoutingTable;
 
         let bootstrap = crate::test_support::loopback_udp().await;
+        let weaver = generate_azereus_style(*b"WV", crate::crate_version!());
 
-        // By default: rqbit's own fingerprint.
+        // By default: an entirely random id, not Weaver's fingerprint.
         let dht = start_dht_with(&bootstrap, DhtConfig::default()).await;
-        assert!(dht.stats().id.0.starts_with(b"-WV"));
+        assert!(!dht.stats().id.0.starts_with(&weaver.0[..8]));
         dht.cancellation_token().cancel();
 
-        // A prefix replaces it.
-        let prefix = b"-XY1234-".to_vec();
-        let dht = start_dht_with(
-            &bootstrap,
-            DhtConfig {
-                node_id_prefix: Some(prefix.clone()),
-                ..Default::default()
-            },
-        )
-        .await;
-        assert!(dht.stats().id.0.starts_with(&prefix));
-        dht.cancellation_token().cancel();
-
-        // A restored id that already carries the prefix is kept, with its table.
-        let mut kept = [7u8; 20];
-        kept[..8].copy_from_slice(&prefix);
-        let kept = Id20::new(kept);
+        // A restored id is kept, with its table.
+        let kept = Id20::new([7u8; 20]);
         let dht = start_dht_with(
             &bootstrap,
             DhtConfig {
                 peer_id: Some(kept),
                 routing_table: Some(RoutingTable::new(kept, None)),
-                node_id_prefix: Some(prefix.clone()),
                 ..Default::default()
             },
         )
@@ -2072,43 +2044,27 @@ mod tests {
         assert_eq!(dht.stats().id, kept);
         dht.cancellation_token().cancel();
 
-        // One made under another identity is replaced, and so is the table built
-        // around it.
-        let other = Id20::new([9u8; 20]);
+        // One that reads as a BEP 20 peer id is replaced, and so is the table
+        // built around it.
+        let mut fingerprinted = [9u8; 20];
+        fingerprinted[..8].copy_from_slice(b"-XY1234-");
+        let fingerprinted = Id20::new(fingerprinted);
         let dht = start_dht_with(
             &bootstrap,
             DhtConfig {
-                peer_id: Some(other),
-                routing_table: Some(RoutingTable::new(other, None)),
-                node_id_prefix: Some(prefix.clone()),
+                peer_id: Some(fingerprinted),
+                routing_table: Some(RoutingTable::new(fingerprinted, None)),
                 ..Default::default()
             },
         )
         .await;
         let id = dht.stats().id;
-        assert!(id.0.starts_with(&prefix));
+        assert!(!id.0.starts_with(b"-XY1234-"));
         dht.with_routing_tables(|v4, v6| {
             assert_eq!(v4.id(), id);
             assert_eq!(v6.id(), id);
         });
         dht.cancellation_token().cancel();
-
-        // An empty prefix: an entirely random id, not rqbit's fingerprint.
-        let ids: Vec<Id20> = futures::future::join_all((0..4).map(|_| async {
-            let dht = start_dht_with(
-                &bootstrap,
-                DhtConfig {
-                    node_id_prefix: Some(Vec::new()),
-                    ..Default::default()
-                },
-            )
-            .await;
-            let id = dht.stats().id;
-            dht.cancellation_token().cancel();
-            id
-        }))
-        .await;
-        assert!(ids.iter().any(|id| !id.0.starts_with(b"-WV")));
     }
 
     // A DHT whose outgoing datagrams land in the returned receiver instead of on

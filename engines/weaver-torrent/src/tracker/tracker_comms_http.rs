@@ -12,12 +12,11 @@ use crate::core::net::{
     ClientShape, ClientUse, HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_public,
 };
 use crate::tracker::ScrapeOk;
+use crate::tracker::shape::AnnounceShape;
 use crate::tracker::tracker_comms::{Reachable, only_reachable};
 use anyhow::Context;
 use either::Either;
 use futures::StreamExt;
-use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
-use reqwest::header::{self, HeaderMap, HeaderValue};
 use serde::Deserializer;
 use serde_derive::Deserialize;
 use std::{
@@ -67,8 +66,8 @@ pub struct TrackerRequest<'a> {
     pub encryption: EncryptionPolicy,
     /// The public addresses this session announces from, which libtorrent
     /// lists for a private torrent as `ipv4` and `ipv6`
-    /// (`torrent::announce_with_tracker`). Only the libtorrent shape says
-    /// them.
+    /// (`torrent::announce_with_tracker`). Only a shape whose fields name
+    /// them says them.
     pub own_addrs: &'a [IpAddr],
 }
 
@@ -270,49 +269,8 @@ impl TrackerResponse<'_> {
     }
 }
 
-// Every byte but RFC 3986's unreserved characters is escaped.
-const QUERY_VALUE: &AsciiSet = &NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
-
-/// How a GET to a tracker is written: as Weaver writes it, or as libtorrent
-/// does for the clients built on it, so a tracker sees the request the
-/// client the torrent goes as would send.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Shape {
-    Weaver,
-    Libtorrent,
-}
-
-impl Shape {
-    /// The shape of the client `peer_id` names by its code: qBittorrent,
-    /// Deluge and libtorrent announce through libtorrent.
-    pub(crate) fn of(peer_id: &Id20) -> Self {
-        match &peer_id.0[..3] {
-            b"-qB" | b"-DE" | b"-LT" => Self::Libtorrent,
-            _ => Self::Weaver,
-        }
-    }
-}
-
-/// `bytes` escaped as libtorrent's `escape_string` does: alphanumerics and
-/// `-_!.~*()` as they are, every other byte as `%` and two lowercase hex
-/// digits.
-fn libtorrent_escape(bytes: &[u8], s: &mut String) {
-    use std::fmt::Write;
-    for &b in bytes {
-        if b.is_ascii_alphanumeric() || b"-_!.~*()".contains(&b) {
-            s.push(char::from(b));
-        } else {
-            write!(s, "%{b:02x}").unwrap();
-        }
-    }
-}
-
 impl TrackerRequestEvent {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Started => "started",
             Self::Stopped => "stopped",
@@ -323,95 +281,9 @@ impl TrackerRequestEvent {
 }
 
 impl TrackerRequest<'_> {
-    /// The query of this announce, in the shape of the client its peer id
-    /// names.
-    pub fn as_querystring(&self) -> String {
-        match Shape::of(self.peer_id) {
-            Shape::Weaver => self.weaver_query(),
-            Shape::Libtorrent => self.libtorrent_query(),
-        }
-    }
-
-    // libtorrent `http_tracker_connection::start`: its order and escaping,
-    // the key as eight hex digits, compact and no peer id always asked for,
-    // encryption only ever said to be supported, and the redundant bytes
-    // after it.
-    fn libtorrent_query(&self) -> String {
-        use std::fmt::Write;
-        let mut s = String::from("info_hash=");
-        libtorrent_escape(&self.info_hash.0, &mut s);
-        s.push_str("&peer_id=");
-        libtorrent_escape(&self.peer_id.0, &mut s);
-        write!(
-            s,
-            "&port={}&uploaded={}&downloaded={}&left={}&corrupt={}",
-            self.port, self.uploaded, self.downloaded, self.left, self.corrupt
-        )
-        .unwrap();
-        if let Some(key) = self.key {
-            write!(s, "&key={key:08X}").unwrap();
-        }
-        if let Some(event) = self.event {
-            write!(s, "&event={}", event.as_str()).unwrap();
-        }
-        write!(s, "&numwant={}&compact=1&no_peer_id=1", self.numwant).unwrap();
-        if self.encryption != EncryptionPolicy::Disabled {
-            s.push_str("&supportcrypto=1");
-        }
-        write!(s, "&redundant={}", self.redundant).unwrap();
-        if let Some(trackerid) = self.trackerid {
-            s.push_str("&trackerid=");
-            libtorrent_escape(trackerid, &mut s);
-        }
-        for family in [Family::V4, Family::V6] {
-            for ip in self
-                .own_addrs
-                .iter()
-                .filter(|ip| Family::of(**ip) == family)
-            {
-                let name = match family {
-                    Family::V4 => "ipv4",
-                    Family::V6 => "ipv6",
-                };
-                write!(s, "&{name}=").unwrap();
-                libtorrent_escape(ip.to_string().as_bytes(), &mut s);
-            }
-        }
-        s
-    }
-
-    fn weaver_query(&self) -> String {
-        use std::fmt::Write;
-        let mut s = String::new();
-        s.push_str("info_hash=");
-        s.extend(percent_encode(&self.info_hash.0, QUERY_VALUE));
-        s.push_str("&peer_id=");
-        s.extend(percent_encode(&self.peer_id.0, QUERY_VALUE));
-        if let Some(event) = self.event {
-            write!(s, "&event={}", event.as_str()).unwrap();
-        }
-        write!(s, "&port={}", self.port).unwrap();
-        write!(s, "&uploaded={}", self.uploaded).unwrap();
-        write!(s, "&downloaded={}", self.downloaded).unwrap();
-        write!(s, "&left={}", self.left).unwrap();
-        write!(s, "&corrupt={}", self.corrupt).unwrap();
-        write!(s, "&redundant={}", self.redundant).unwrap();
-        write!(s, "&compact={}", if self.compact { 1 } else { 0 }).unwrap();
-        write!(s, "&no_peer_id={}", if self.no_peer_id { 1 } else { 0 }).unwrap();
-        write!(s, "&numwant={}", self.numwant).unwrap();
-        match self.encryption {
-            EncryptionPolicy::Disabled => {}
-            EncryptionPolicy::Prefer => s.push_str("&supportcrypto=1"),
-            EncryptionPolicy::Require => s.push_str("&supportcrypto=1&requirecrypto=1"),
-        }
-        if let Some(key) = &self.key {
-            write!(s, "&key={key}").unwrap();
-        }
-        if let Some(trackerid) = self.trackerid {
-            s.push_str("&trackerid=");
-            s.extend(percent_encode(trackerid, QUERY_VALUE));
-        }
-        s
+    /// The query of this announce, in `shape`.
+    pub fn as_querystring(&self, shape: &AnnounceShape) -> String {
+        shape.query(self)
     }
 }
 
@@ -527,8 +399,7 @@ pub(crate) async fn addresses(
 /// address the client may pick, so it judges the addresses the client is
 /// handed, after the filter. A name the session's network resolves where it
 /// exits has no address here: nothing is checked, and the client hands the
-/// name on. A client for the libtorrent shape writes header names as
-/// libtorrent does, each word capitalised.
+/// name on. Its header names are written in `shape`'s case.
 #[allow(clippy::too_many_arguments)]
 async fn reach(
     clients: &dyn HttpClients,
@@ -538,7 +409,7 @@ async fn reach(
     family: Option<Family>,
     resolver: &dyn Resolver,
     reachable: &Reachable,
-    shape: Shape,
+    shape: &AnnounceShape,
 ) -> anyhow::Result<(reqwest::Client, Vec<IpAddr>)> {
     let (host, mut found) = addresses(url, resolver).await?;
     if let Some(family) = family
@@ -559,29 +430,10 @@ async fn reach(
     let client = clients.client(
         Some(target),
         &ClientShape::of(ClientUse::Tracker {
-            title_case: shape == Shape::Libtorrent,
+            title_case: shape.title_case,
         }),
     )?;
     Ok((client, addrs))
-}
-
-/// The headers libtorrent's `http_connection` sends, in its order: the host
-/// as the URL names it, its port left out when it is the scheme's own, the
-/// user agent, gzip as the only encoding, and the connection closed after.
-fn libtorrent_headers(url: &url::Url, user_agent: &str) -> anyhow::Result<HeaderMap> {
-    let mut host = url
-        .host_str()
-        .context("the tracker URL has no host")?
-        .to_owned();
-    if let Some(port) = url.port() {
-        host.push_str(&format!(":{port}"));
-    }
-    let mut headers = HeaderMap::new();
-    headers.insert(header::HOST, HeaderValue::from_str(&host)?);
-    headers.insert(header::USER_AGENT, HeaderValue::from_str(user_agent)?);
-    headers.insert(header::ACCEPT_ENCODING, HeaderValue::from_static("gzip"));
-    headers.insert(header::CONNECTION, HeaderValue::from_static("close"));
-    Ok(headers)
 }
 
 /// The most redirects one GET follows.
@@ -598,8 +450,8 @@ const MAX_REDIRECTS: usize = 5;
 /// first. The answer fails when the tracker sends nothing for
 /// [`RECEIVE_TIMEOUT`], the status is not a success, or the body passes
 /// [`MAX_RESPONSE_LENGTH`]. The bounds are the engine's own, so they hold
-/// whatever client is used. In the libtorrent shape the URL's own query
-/// comes first and the headers are libtorrent's ([`libtorrent_headers`]).
+/// whatever client is used. `shape` places the URL's own query and names
+/// the headers set.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn get(
     clients: &dyn HttpClients,
@@ -611,31 +463,22 @@ pub(crate) async fn get(
     family: Option<Family>,
     query: &str,
     user_agent: &str,
-    shape: Shape,
+    shape: &AnnounceShape,
 ) -> anyhow::Result<Answer> {
     let mut url = tracker.clone();
-    match (tracker.query(), shape) {
-        (Some(own), _) if has_tracker_query(own) => {
-            anyhow::bail!("SSRF mitigation: the tracker URL's query names an announce argument")
-        }
-        (Some(own), Shape::Weaver) => url.set_query(Some(&format!("{query}&{own}"))),
-        (Some(own), Shape::Libtorrent) => url.set_query(Some(&format!("{own}&{query}"))),
-        (None, _) => url.set_query(Some(query)),
+    if tracker.query().is_some_and(has_tracker_query) {
+        anyhow::bail!("SSRF mitigation: the tracker URL's query names an announce argument")
     }
+    shape.place_query(&mut url, tracker.query(), query);
     let mut redirects = 0;
     let response = loop {
         let (client, addrs) = reach(
             clients, &url, named_by, ask, family, resolver, reachable, shape,
         )
         .await?;
-        let request = match shape {
-            Shape::Weaver => client
-                .get(url.clone())
-                .header(header::USER_AGENT, user_agent),
-            Shape::Libtorrent => client
-                .get(url.clone())
-                .headers(libtorrent_headers(&url, user_agent)?),
-        };
+        let request = client
+            .get(url.clone())
+            .headers(shape.headers(&url, user_agent)?);
         let response = tokio::time::timeout(RECEIVE_TIMEOUT, request.send())
             .await
             .map_err(|_| anyhow::anyhow!("the tracker sent nothing for {RECEIVE_TIMEOUT:?}"))??;
@@ -707,17 +550,6 @@ pub(crate) fn scrape_url(announce: &url::Url) -> Option<url::Url> {
     let mut url = announce.clone();
     url.set_path(&format!("{dir}/scrape{rest}"));
     Some(url)
-}
-
-/// The query of a scrape for `info_hash`, escaped as an announce of `shape`
-/// is.
-pub(crate) fn scrape_querystring(info_hash: &Id20, shape: Shape) -> String {
-    let mut s = String::from("info_hash=");
-    match shape {
-        Shape::Weaver => s.extend(percent_encode(&info_hash.0, QUERY_VALUE)),
-        Shape::Libtorrent => libtorrent_escape(&info_hash.0, &mut s),
-    }
-    s
 }
 
 /// The counts a scrape reply gives for `info_hash`: the `files` entry keyed
@@ -832,7 +664,7 @@ mod tests {
                 None,
                 &resolver,
                 &reachable,
-                Shape::Weaver,
+                &AnnounceShape::WEAVER,
             )
             .await
             .unwrap();
@@ -879,7 +711,7 @@ mod tests {
                     None,
                     &at(ip),
                     &reachable,
-                    Shape::Weaver,
+                    &AnnounceShape::WEAVER,
                 )
                 .await
                 .err()
@@ -904,7 +736,7 @@ mod tests {
             None,
             &at("127.0.0.1"),
             &reachable,
-            Shape::Weaver,
+            &AnnounceShape::WEAVER,
         )
         .await
         .unwrap();
@@ -924,7 +756,7 @@ mod tests {
                 None,
                 &at_exit,
                 &reachable,
-                Shape::Weaver,
+                &AnnounceShape::WEAVER,
             )
             .await
             .unwrap();
@@ -959,7 +791,7 @@ mod tests {
                     None,
                     &at,
                     &reachable,
-                    Shape::Weaver,
+                    &AnnounceShape::WEAVER,
                 )
                 .await;
                 let built = !clients.0.lock().unwrap().is_empty();
@@ -988,163 +820,231 @@ mod tests {
         }
     }
 
-    // The started announce of a qBittorrent 5.3.0 seed, as a tracker
-    // recorded it.
-    const QBITTORRENT_ANNOUNCE: &str = "info_hash=F%b6%7by!%3eC%9a%97%8b%bce%a3uu%a5H%07%8b%a2&peer_id=-qB5300-CDwwoycKIZ6y&port=19681&uploaded=34340864&downloaded=0&left=0&corrupt=0&key=AEB9ABBF&event=started&numwant=200&compact=1&no_peer_id=1&supportcrypto=1&redundant=0";
+    use crate::tracker::qbittorrent::{self, CAPTURED_ANNOUNCE, CAPTURED_HASH, captured_request};
 
-    const QBITTORRENT_HASH: [u8; 20] = [
-        b'F', 0xb6, 0x7b, b'y', b'!', 0x3e, b'C', 0x9a, 0x97, 0x8b, 0xbc, b'e', 0xa3, b'u', b'u',
-        0xa5, b'H', 0x07, 0x8b, 0xa2,
-    ];
-
-    fn qbittorrent_request<'a>(
-        info_hash: &'a Id20,
-        peer_id: &'a Id20,
-        encryption: EncryptionPolicy,
-    ) -> TrackerRequest<'a> {
-        TrackerRequest {
-            info_hash,
-            peer_id,
-            port: 19681,
-            uploaded: 34340864,
-            downloaded: 0,
-            left: 0,
-            corrupt: 0,
-            redundant: 0,
-            compact: true,
-            no_peer_id: false,
-            event: Some(TrackerRequestEvent::Started),
-            numwant: 200,
-            key: Some(0xAEB9ABBF),
-            trackerid: None,
-            encryption,
-            own_addrs: &[],
-        }
-    }
-
-    // An announce under a qBittorrent peer id is the one qBittorrent sends,
-    // byte for byte. Requiring encryption says only that it is supported,
-    // turning it off says nothing, and a tracker id follows the redundant
-    // bytes, escaped as libtorrent escapes.
-    #[test]
-    fn a_qbittorrent_announce_is_libtorrents() {
-        let info_hash = Id20::new(QBITTORRENT_HASH);
-        let peer_id = Id20::new(*b"-qB5300-CDwwoycKIZ6y");
-        for encryption in [EncryptionPolicy::Prefer, EncryptionPolicy::Require] {
-            assert_eq!(
-                qbittorrent_request(&info_hash, &peer_id, encryption).as_querystring(),
-                QBITTORRENT_ANNOUNCE
-            );
-        }
-        let plain = qbittorrent_request(&info_hash, &peer_id, EncryptionPolicy::Disabled);
-        assert_eq!(
-            plain.as_querystring(),
-            QBITTORRENT_ANNOUNCE.replace("&supportcrypto=1", "")
-        );
-        let request = TrackerRequest {
-            event: None,
-            trackerid: Some(b"a b&!"),
-            ..plain
-        };
-        assert!(
-            request.as_querystring().ends_with(
-                "&key=AEB9ABBF&numwant=200&compact=1&no_peer_id=1&redundant=0&trackerid=a%20b%26!"
-            ),
-            "{}",
-            request.as_querystring()
-        );
-    }
-
-    // `paused` goes where libtorrent puts any event, in either shape.
+    // `paused` goes where any event goes, in either shape.
     #[test]
     fn a_paused_announce_says_so() {
-        let info_hash = Id20::new(QBITTORRENT_HASH);
-        for peer_id in [*b"-qB5300-CDwwoycKIZ6y", *b"-WV0170-CDwwoycKIZ6y"] {
-            let peer_id = Id20::new(peer_id);
+        let info_hash = Id20::new(CAPTURED_HASH);
+        let peer_id = Id20::new(*b"-WV0170-CDwwoycKIZ6y");
+        for shape in [&AnnounceShape::WEAVER, &qbittorrent::SHAPE] {
             let request = TrackerRequest {
                 event: Some(TrackerRequestEvent::Paused),
-                ..qbittorrent_request(&info_hash, &peer_id, EncryptionPolicy::Disabled)
+                ..captured_request(&info_hash, &peer_id, EncryptionPolicy::Disabled)
             };
-            let query = request.as_querystring();
+            let query = request.as_querystring(shape);
             assert!(query.contains("&event=paused&"), "{query}");
         }
     }
 
-    // libtorrent lists a private torrent's own addresses after the tracker
-    // id, IPv4 then IPv6, each escaped (http_tracker_connection.cpp); the
-    // Weaver shape lists none.
+    // Weaver's own announces list none of the session's addresses.
     #[test]
-    fn own_addresses_follow_the_tracker_id_in_libtorrents_shape() {
-        let info_hash = Id20::new(QBITTORRENT_HASH);
+    fn a_weaver_announce_lists_no_own_address() {
+        let info_hash = Id20::new(CAPTURED_HASH);
         let own: [IpAddr; 2] = ["2001:db8::1".parse().unwrap(), [198, 51, 100, 1].into()];
-        let peer_id = Id20::new(*b"-qB5300-CDwwoycKIZ6y");
-        let request = TrackerRequest {
-            trackerid: Some(b"t"),
-            own_addrs: &own,
-            ..qbittorrent_request(&info_hash, &peer_id, EncryptionPolicy::Disabled)
-        };
-        let query = request.as_querystring();
-        assert!(
-            query.ends_with("&trackerid=t&ipv4=198.51.100.1&ipv6=2001%3adb8%3a%3a1"),
-            "{query}"
-        );
         let peer_id = Id20::new(*b"-WV0170-CDwwoycKIZ6y");
         let request = TrackerRequest {
             own_addrs: &own,
-            ..qbittorrent_request(&info_hash, &peer_id, EncryptionPolicy::Disabled)
+            ..captured_request(&info_hash, &peer_id, EncryptionPolicy::Disabled)
         };
-        let query = request.as_querystring();
+        let query = request.as_querystring(&AnnounceShape::WEAVER);
         assert!(
             !query.contains("ipv4") && !query.contains("ipv6"),
             "{query}"
         );
     }
 
-    // libtorrent leaves alphanumerics and `-_!.~*()` as they are and
-    // escapes every other byte in lowercase hex; a scrape in its shape
-    // escapes the hash the same way.
-    #[test]
-    fn libtorrent_escapes_all_but_its_unreserved_bytes() {
-        let all: Vec<u8> = (0..=255).collect();
-        for chunk in all.chunks(20) {
-            let mut hash = [0u8; 20];
-            hash[..chunk.len()].copy_from_slice(chunk);
-            let escaped: String = hash
-                .iter()
-                .map(|&b| match b {
-                    b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' => char::from(b).to_string(),
-                    b'-' | b'_' | b'!' | b'.' | b'~' | b'*' | b'(' | b')' => {
-                        char::from(b).to_string()
-                    }
-                    _ => format!("%{b:02x}"),
-                })
-                .collect();
-            assert_eq!(
-                scrape_querystring(&Id20::new(hash), Shape::Libtorrent),
-                format!("info_hash={escaped}")
-            );
+    // Weaver's query written out field by field: RFC 3986 escaping, the
+    // request's own compact and no peer id, both crypto flags under a
+    // policy that only encrypts, the key in decimal.
+    fn weaver_by_hand(r: &TrackerRequest<'_>) -> String {
+        use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_encode};
+        const SET: &AsciiSet = &NON_ALPHANUMERIC
+            .remove(b'-')
+            .remove(b'.')
+            .remove(b'_')
+            .remove(b'~');
+        let set = SET;
+        let mut s = format!(
+            "info_hash={}&peer_id={}",
+            percent_encode(&r.info_hash.0, set),
+            percent_encode(&r.peer_id.0, set)
+        );
+        if let Some(event) = r.event {
+            s += &format!("&event={}", event.as_str());
         }
+        s += &format!(
+            "&port={}&uploaded={}&downloaded={}&left={}&corrupt={}&redundant={}&compact={}&no_peer_id={}&numwant={}",
+            r.port,
+            r.uploaded,
+            r.downloaded,
+            r.left,
+            r.corrupt,
+            r.redundant,
+            u8::from(r.compact),
+            u8::from(r.no_peer_id),
+            r.numwant
+        );
+        s += match r.encryption {
+            EncryptionPolicy::Disabled => "",
+            EncryptionPolicy::Prefer => "&supportcrypto=1",
+            EncryptionPolicy::Require => "&supportcrypto=1&requirecrypto=1",
+        };
+        if let Some(key) = r.key {
+            s += &format!("&key={key}");
+        }
+        if let Some(id) = r.trackerid {
+            s += &format!("&trackerid={}", percent_encode(id, set));
+        }
+        s
     }
 
+    // libtorrent's query written out field by field, as
+    // `http_tracker_connection::start` writes it.
+    fn libtorrent_by_hand(r: &TrackerRequest<'_>) -> String {
+        let esc = |bytes: &[u8]| -> String {
+            bytes
+                .iter()
+                .map(|&b| {
+                    if b.is_ascii_alphanumeric() || b"-_!.~*()".contains(&b) {
+                        char::from(b).to_string()
+                    } else {
+                        format!("%{b:02x}")
+                    }
+                })
+                .collect()
+        };
+        let mut s = format!(
+            "info_hash={}&peer_id={}&port={}&uploaded={}&downloaded={}&left={}&corrupt={}",
+            esc(&r.info_hash.0),
+            esc(&r.peer_id.0),
+            r.port,
+            r.uploaded,
+            r.downloaded,
+            r.left,
+            r.corrupt
+        );
+        if let Some(key) = r.key {
+            s += &format!("&key={key:08X}");
+        }
+        if let Some(event) = r.event {
+            s += &format!("&event={}", event.as_str());
+        }
+        s += &format!("&numwant={}&compact=1&no_peer_id=1", r.numwant);
+        if r.encryption != EncryptionPolicy::Disabled {
+            s += "&supportcrypto=1";
+        }
+        s += &format!("&redundant={}", r.redundant);
+        if let Some(id) = r.trackerid {
+            s += &format!("&trackerid={}", esc(id));
+        }
+        for ip in r
+            .own_addrs
+            .iter()
+            .filter(|ip| Family::of(**ip) == Family::V4)
+        {
+            s += &format!("&ipv4={}", esc(ip.to_string().as_bytes()));
+        }
+        for ip in r
+            .own_addrs
+            .iter()
+            .filter(|ip| Family::of(**ip) == Family::V6)
+        {
+            s += &format!("&ipv6={}", esc(ip.to_string().as_bytes()));
+        }
+        s
+    }
+
+    // Each row writes exactly the query its fields name, over every event,
+    // policy, flag, key, tracker id and own address list, and a hash and
+    // peer id that take in every byte.
     #[test]
-    fn a_peer_id_names_its_clients_shape() {
-        for (prefix, shape) in [
-            (b"-qB5300-", Shape::Libtorrent),
-            (b"-DE2110-", Shape::Libtorrent),
-            (b"-LT2120-", Shape::Libtorrent),
-            (b"-WV0170-", Shape::Weaver),
-            (b"-TR4100-", Shape::Weaver),
-        ] {
-            let mut id = [b'x'; 20];
-            id[..8].copy_from_slice(prefix);
-            assert_eq!(Shape::of(&Id20::new(id)), shape, "{prefix:?}");
+    fn each_row_writes_its_query_field_by_field() {
+        let own: [IpAddr; 3] = [
+            "2001:db8::1".parse().unwrap(),
+            [198, 51, 100, 1].into(),
+            [203, 0, 113, 9].into(),
+        ];
+        let all: Vec<u8> = (0..=255).collect();
+        let mut checked = 0;
+        for chunk in all.chunks(20) {
+            let mut bytes = [0u8; 20];
+            bytes[..chunk.len()].copy_from_slice(chunk);
+            let id = Id20::new(bytes);
+            for event in [
+                None,
+                Some(TrackerRequestEvent::Started),
+                Some(TrackerRequestEvent::Stopped),
+                Some(TrackerRequestEvent::Completed),
+                Some(TrackerRequestEvent::Paused),
+            ] {
+                for encryption in [
+                    EncryptionPolicy::Disabled,
+                    EncryptionPolicy::Prefer,
+                    EncryptionPolicy::Require,
+                ] {
+                    for (compact, no_peer_id) in [(true, false), (false, true)] {
+                        for key in [None, Some(0), Some(0xAEB9ABBF)] {
+                            for trackerid in [None, Some(&b"a b&!*~"[..])] {
+                                for own_addrs in [&own[..0], &own[..]] {
+                                    let request = TrackerRequest {
+                                        info_hash: &id,
+                                        peer_id: &id,
+                                        event,
+                                        port: 6881,
+                                        uploaded: 1 << 40,
+                                        downloaded: 7,
+                                        left: u64::MAX,
+                                        corrupt: 3,
+                                        redundant: 5,
+                                        compact,
+                                        no_peer_id,
+                                        numwant: 200,
+                                        key,
+                                        trackerid,
+                                        encryption,
+                                        own_addrs,
+                                    };
+                                    assert_eq!(
+                                        request.as_querystring(&AnnounceShape::WEAVER),
+                                        weaver_by_hand(&request)
+                                    );
+                                    assert_eq!(
+                                        request.as_querystring(&qbittorrent::SHAPE),
+                                        libtorrent_by_hand(&request)
+                                    );
+                                    checked += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(checked, 13 * 5 * 3 * 2 * 3 * 2 * 2);
+    }
+
+    // A scrape escapes the hash as the row's announces do.
+    #[test]
+    fn a_scrape_escapes_as_its_rows_announces() {
+        let id = Id20::new(CAPTURED_HASH);
+        let request = captured_request(&id, &id, EncryptionPolicy::Disabled);
+        for shape in [&AnnounceShape::WEAVER, &qbittorrent::SHAPE] {
+            let announce = request.as_querystring(shape);
+            let scrape = shape.scrape_query(&id);
+            assert!(announce.starts_with(&format!("{scrape}&")), "{scrape}");
         }
     }
 
     // The request a tracker reads off the wire for a GET of `tracker` in
     // `shape`, the tracker answering an empty announce, and the port it
     // listened on, which `tracker` names as `PORT`.
-    async fn sent(tracker: &str, shape: Shape, query: &str, user_agent: &str) -> (String, u16) {
+    async fn sent(
+        tracker: &str,
+        shape: &AnnounceShape,
+        query: &str,
+        user_agent: &str,
+    ) -> (String, u16) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1191,15 +1091,15 @@ mod tests {
     async fn a_libtorrent_get_carries_libtorrents_headers() {
         let (head, port) = sent(
             "http://127.0.0.1:PORT/announce?passkey=abc",
-            Shape::Libtorrent,
-            QBITTORRENT_ANNOUNCE,
+            &qbittorrent::SHAPE,
+            CAPTURED_ANNOUNCE,
             "qBittorrent/5.3.0",
         )
         .await;
         assert_eq!(
             head,
             format!(
-                "GET /announce?passkey=abc&{QBITTORRENT_ANNOUNCE} HTTP/1.1\r\n\
+                "GET /announce?passkey=abc&{CAPTURED_ANNOUNCE} HTTP/1.1\r\n\
                  Host: 127.0.0.1:{port}\r\n\
                  User-Agent: qBittorrent/5.3.0\r\n\
                  Accept-Encoding: gzip\r\n\
@@ -1209,23 +1109,27 @@ mod tests {
         );
     }
 
-    // Weaver's own GET puts its query ahead of the URL's and names itself
-    // only by its user agent.
+    // Weaver's own GET puts its query ahead of the URL's and sets only its
+    // user agent; reqwest adds the rest after it.
     #[tokio::test]
     async fn a_weaver_get_keeps_its_own_shape() {
-        let (head, _) = sent(
+        let (head, port) = sent(
             "http://127.0.0.1:PORT/announce?passkey=abc",
-            Shape::Weaver,
+            &AnnounceShape::WEAVER,
             "info_hash=x",
             "Weaver/0.17.0",
         )
         .await;
-        assert!(
-            head.starts_with("GET /announce?info_hash=x&passkey=abc HTTP/1.1\r\n"),
-            "{head}"
+        assert_eq!(
+            head,
+            format!(
+                "GET /announce?info_hash=x&passkey=abc HTTP/1.1\r\n\
+                 user-agent: Weaver/0.17.0\r\n\
+                 accept: */*\r\n\
+                 accept-encoding: zstd,gzip,deflate,br\r\n\
+                 host: 127.0.0.1:{port}\r\n\r\n"
+            )
         );
-        assert!(head.contains("user-agent: Weaver/0.17.0\r\n"), "{head}");
-        assert!(!head.contains("Connection: close"), "{head}");
     }
 
     #[test]
@@ -1252,7 +1156,7 @@ mod tests {
             encryption: EncryptionPolicy::Disabled,
             own_addrs: &[],
         };
-        dbg!(request.as_querystring());
+        dbg!(request.as_querystring(&AnnounceShape::WEAVER));
     }
 
     #[test]
@@ -1290,7 +1194,7 @@ mod tests {
                     })
                     .collect();
             assert_eq!(
-                request.as_querystring(),
+                request.as_querystring(&AnnounceShape::WEAVER),
                 format!(
                     "info_hash={e}&peer_id={e}&port=1&uploaded=0&downloaded=0&left=0&corrupt=0&redundant=0&compact=1&no_peer_id=0&numwant=50"
                 )
@@ -1435,10 +1339,10 @@ mod tests {
         };
         assert!(
             request
-                .as_querystring()
+                .as_querystring(&AnnounceShape::WEAVER)
                 .ends_with("&numwant=200&trackerid=a%20b%26"),
             "{}",
-            request.as_querystring()
+            request.as_querystring(&AnnounceShape::WEAVER)
         );
     }
 

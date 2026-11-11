@@ -71,6 +71,23 @@ pub struct AnnounceFields {
     /// How many peers to ask for.
     pub num_want: u32,
     pub port: u16,
+    /// The tracker URL's path and query, sent as the URL data option
+    /// (BEP 41); none when empty.
+    pub url_data: String,
+}
+
+/// The URL data option's type (BEP 41).
+const OPTION_URL_DATA: u8 = 2;
+
+/// The URL data of an announce to `url`: its path and query, as libtorrent
+/// takes them from the URL (`udp_tracker_connection::send_udp_announce`).
+pub(crate) fn url_data(url: &url::Url) -> String {
+    let mut data = url.path().to_owned();
+    if let Some(query) = url.query() {
+        data.push('?');
+        data.push_str(query);
+    }
+    data
 }
 
 #[derive(Debug)]
@@ -124,6 +141,15 @@ impl Request {
                 w.extend_from_slice(&fields.key.to_be_bytes())?;
                 w.extend_from_slice(&fields.num_want.to_be_bytes())?;
                 w.extend_from_slice(&fields.port.to_be_bytes())?;
+                let data = fields.url_data.as_bytes();
+                // One option's length is a byte: libtorrent sends no more
+                // than 255 bytes, in one option
+                // (`udp_tracker_connection::send_udp_announce`).
+                let len = u8::try_from(data.len()).unwrap_or(u8::MAX);
+                if len > 0 {
+                    w.extend_from_slice(&[OPTION_URL_DATA, len])?;
+                    w.extend_from_slice(&data[..usize::from(len)])?;
+                }
             }
             Request::Scrape(connection_id, info_hash) => {
                 w.extend_from_slice(&connection_id.to_be_bytes())?;
@@ -590,6 +616,7 @@ mod tests {
                     key: 0,
                     num_want: 7,
                     port: 6881,
+                    url_data: String::new(),
                 },
             );
             let mut buf = [0u8; 128];
@@ -601,6 +628,59 @@ mod tests {
             // Then ip, key, num_want and port.
             assert_eq!(buf[92..96], 7u32.to_be_bytes());
         }
+    }
+
+    fn announce_with(url_data: &str) -> (usize, [u8; 512]) {
+        let request = Request::Announce(
+            1,
+            AnnounceFields {
+                info_hash: Id20::new([1; 20]),
+                peer_id: Id20::new([2; 20]),
+                downloaded: 0,
+                left: 0,
+                uploaded: 0,
+                event: 0,
+                key: 0,
+                num_want: 7,
+                port: 6881,
+                url_data: url_data.to_owned(),
+            },
+        );
+        let mut buf = [0u8; 512];
+        let len = request.serialize(0, &mut buf).unwrap();
+        (len, buf)
+    }
+
+    // The URL data option follows the port: type 2, its length in a byte,
+    // then the path and query as the URL gives them (BEP 41; libtorrent
+    // `udp_tracker_connection::send_udp_announce`). None goes with none.
+    #[test]
+    fn an_announce_carries_the_trackers_path_and_query() {
+        let url = url::Url::parse("udp://tracker.test:6969/announce/k3y?passkey=a%20b").unwrap();
+        let data = super::url_data(&url);
+        assert_eq!(data, "/announce/k3y?passkey=a%20b");
+        let (len, buf) = announce_with(&data);
+        assert_eq!(len, 98 + 2 + data.len());
+        assert_eq!(buf[98], 2);
+        assert_eq!(usize::from(buf[99]), data.len());
+        assert_eq!(&buf[100..len], data.as_bytes());
+
+        let bare = url::Url::parse("udp://tracker.test:6969").unwrap();
+        assert_eq!(super::url_data(&bare), "");
+        assert_eq!(announce_with("").0, 98);
+    }
+
+    // URL data past 255 bytes is cut to 255, in one option.
+    #[test]
+    fn url_data_is_cut_to_255_bytes() {
+        let long = format!("/{}", "a".repeat(300));
+        let (len, buf) = announce_with(&long);
+        assert_eq!(len, 98 + 2 + 255);
+        assert_eq!(buf[98..100], [2, 255]);
+        assert_eq!(&buf[100..len], &long.as_bytes()[..255]);
+        let (len, buf) = announce_with(&long[..255]);
+        assert_eq!(len, 98 + 2 + 255);
+        assert_eq!(buf[99], 255);
     }
 
     #[test]
@@ -870,6 +950,7 @@ mod tests {
             key: 0,
             num_want: 200,
             port: 6881,
+            url_data: String::new(),
         };
         let r = client.announce(v4_tracker, fields()).await.unwrap();
         assert_eq!(r.addrs, vec![v4_peer]);

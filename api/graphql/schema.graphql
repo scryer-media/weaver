@@ -5543,7 +5543,6 @@ A client a torrent may name itself as to its peers and trackers.
 enum TorrentClient {
 	WEAVER
 	QBITTORRENT
-	TRANSMISSION
 }
 
 enum TorrentEncryption {

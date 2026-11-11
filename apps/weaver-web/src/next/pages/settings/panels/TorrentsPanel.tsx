@@ -109,12 +109,11 @@ interface TrackerFilePreview {
   fingerprint: string;
 }
 
-type TorrentClient = "WEAVER" | "QBITTORRENT" | "TRANSMISSION";
+type TorrentClient = "WEAVER" | "QBITTORRENT";
 
 const TORRENT_CLIENTS: readonly { value: TorrentClient; label: string }[] = [
   { value: "WEAVER", label: "Weaver" },
   { value: "QBITTORRENT", label: "qBittorrent" },
-  { value: "TRANSMISSION", label: "Transmission" },
 ];
 
 interface TrackerRuleForm {

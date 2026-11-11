@@ -2460,6 +2460,62 @@ async fn the_end_of_a_run_waits_for_its_connections_to_count_the_block_they_were
     drop(theirs);
 }
 
+// libtorrent tells a tracker the payload received less the corrupt and
+// redundant bytes (`torrent::announce_with_tracker`), not the pieces that
+// passed their check: a torrent paused part way through a piece announces
+// the blocks of it that it took, and neither the copy it already had nor
+// the block a closing connection cut short.
+#[tokio::test]
+async fn a_torrent_paused_mid_piece_announces_the_payload_it_received() {
+    use tokio::io::AsyncWriteExt;
+    const RECEIVED: usize = 1000;
+
+    let h = Harness::new("announced_mid_piece").await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    let chunk = CHUNK_SIZE as usize;
+    for (begin, block) in [(0, 0..chunk), (CHUNK_SIZE, chunk..2 * chunk), (0, 0..chunk)] {
+        peer.on_received_piece(Piece::from_data(0, begin, &h.content[block]))
+            .await
+            .unwrap();
+    }
+
+    let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+    let (reader, writer, mut taken) = crate::peer_info_reader::tests::watched_halves(ours);
+    let checked = CheckedIncomingConnection {
+        kind: ConnectionKind::Tcp,
+        addr: sock("192.0.2.1:6881"),
+        reader,
+        writer: writer.into(),
+        read_buf: crate::read_buf::ReadBuf::new(),
+        handshake: Handshake::new(h.shared.info_hash, Id20::new([7; 20])),
+        encryption: crate::mse::Encryption::None,
+        meter: Default::default(),
+    };
+    let slot = h._session.connection_slots.try_accept().unwrap();
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(added, AddIncomingPeerResult::Added));
+    let mut frame = (9 + CHUNK_SIZE).to_be_bytes().to_vec();
+    frame.push(7);
+    frame.extend(0u32.to_be_bytes());
+    frame.extend((2 * CHUNK_SIZE).to_be_bytes());
+    frame.extend(vec![0xab; RECEIVED]);
+    theirs.write_all(&frame).await.unwrap();
+    taken.wait_for(|n| *n == frame.len()).await.unwrap();
+
+    let _paused = h.live.pause().unwrap();
+    let ending = h.shared.ending_run.lock().clone().expect("the run's tasks");
+    ending.wait().await;
+    let totals = *h.shared.moved.lock();
+    assert_eq!(totals.downloaded_bytes, 0);
+    assert_eq!(totals.fetched_bytes, 3 * u64::from(CHUNK_SIZE));
+    assert_eq!(
+        totals.redundant_bytes,
+        u64::from(CHUNK_SIZE) + RECEIVED as u64
+    );
+    assert_eq!(totals.announced_downloaded(), 2 * u64::from(CHUNK_SIZE));
+    drop(theirs);
+}
+
 #[tokio::test]
 async fn a_peer_in_four_failed_pieces_is_banned_and_a_passed_piece_earns_a_point() {
     let h = Harness::new("trust_floor_ban").await;

@@ -6,12 +6,15 @@
 // Weaver authors from 2026-10-20 onward.
 
 mod handover;
+pub mod qbittorrent;
+mod shape;
 mod tiers;
 mod tracker_comms;
 mod tracker_comms_http;
 mod tracker_comms_udp;
 
 pub use handover::TrackerHandover;
+pub use shape::AnnounceShape;
 pub use tiers::{Tracker, added_tiers, tidy_tiers, without_trackers};
 pub use tracker_comms::*;
 pub use tracker_comms_udp::UdpTrackerClient;

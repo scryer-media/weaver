@@ -11,6 +11,7 @@ use crate::core::{
     peer_id::{generate_azereus_style, url_random},
 };
 use crate::crate_version;
+use crate::tracker::AnnounceShape;
 
 /// How a torrent names itself to its peers and trackers. A torrent keeps one
 /// for as long as it is kept: every run, session and tracker task of it goes
@@ -29,6 +30,8 @@ pub struct Identity {
     pub user_agent: String,
     /// What each HTTP tracker gave it to be known by.
     pub tracker_ids: TrackerIds,
+    /// How its announces are written.
+    pub shape: &'static AnnounceShape,
 }
 
 /// The `tracker id` each HTTP tracker last gave a torrent, sent back on every
@@ -69,7 +72,8 @@ impl std::fmt::Debug for TrackerIds {
 
 impl Identity {
     /// The same client under a fresh peer id and tracker key: the eight
-    /// bytes that name the client are kept, the rest drawn anew.
+    /// bytes that name the client and the shape of its announces are kept,
+    /// the rest drawn anew.
     pub fn same_client(&self) -> Self {
         let mut peer_id = [0u8; 20];
         peer_id[..8].copy_from_slice(&self.peer_id.0[..8]);
@@ -80,6 +84,7 @@ impl Identity {
             version: self.version.clone(),
             user_agent: self.user_agent.clone(),
             tracker_ids: TrackerIds::default(),
+            shape: self.shape,
         }
     }
 }
@@ -93,6 +98,7 @@ impl Default for Identity {
             version: crate::client_name_and_version().to_owned(),
             user_agent: crate::client_name_and_version().to_owned(),
             tracker_ids: TrackerIds::default(),
+            shape: &AnnounceShape::WEAVER,
         }
     }
 }
@@ -109,10 +115,12 @@ mod tests {
             version: "qBittorrent/5.2.3".into(),
             user_agent: "qBittorrent/5.2.3".into(),
             tracker_ids: TrackerIds::default(),
+            shape: &crate::tracker::qbittorrent::SHAPE,
         };
         let same = identity.same_client();
         assert_eq!(&same.peer_id.0[..8], b"-qB5230-");
         assert_ne!(same.peer_id, identity.peer_id);
+        assert_eq!(same.shape, identity.shape);
         assert_eq!(
             (same.version.as_str(), same.user_agent.as_str()),
             ("qBittorrent/5.2.3", "qBittorrent/5.2.3")
