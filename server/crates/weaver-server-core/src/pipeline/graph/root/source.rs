@@ -103,6 +103,9 @@ struct Open {
     lost: BTreeMap<VolumeIndex, BTreeSet<usize>>,
     // The volumes holding a lost article or a short tail not yet told.
     untold: BTreeSet<VolumeIndex>,
+    // The volumes that began or stopped being waited on since the bootstrap
+    // last read them.
+    reopened: BTreeSet<VolumeIndex>,
     // The volumes and articles the readers looked at, for the tests that
     // hold them to the ones still open.
     #[cfg(test)]
@@ -111,7 +114,9 @@ struct Open {
 
 impl Open {
     fn file(&mut self, volume: VolumeIndex, index: usize, state: State) {
-        file_in(&mut self.waiting, volume, index, state == State::Waiting);
+        if file_in(&mut self.waiting, volume, index, state == State::Waiting) {
+            self.reopened.insert(volume);
+        }
         file_in(
             &mut self.lost,
             volume,
@@ -133,26 +138,32 @@ impl Open {
     }
 }
 
+// File the article in or out of its volume's entry. True when the volume
+// gained or lost its entry.
 fn file_in(
     sets: &mut BTreeMap<VolumeIndex, BTreeSet<usize>>,
     volume: VolumeIndex,
     index: usize,
     held: bool,
-) {
+) -> bool {
     match (sets.entry(volume), held) {
         (Entry::Vacant(entry), true) => {
             entry.insert(BTreeSet::from([index]));
+            true
         }
         (Entry::Occupied(mut entry), true) => {
             entry.get_mut().insert(index);
+            false
         }
         (Entry::Occupied(mut entry), false) => {
             entry.get_mut().remove(&index);
             if entry.get().is_empty() {
                 entry.remove();
+                return true;
             }
+            false
         }
-        (Entry::Vacant(_), false) => {}
+        (Entry::Vacant(_), false) => false,
     }
 }
 
@@ -963,6 +974,18 @@ impl ArticleMap {
             .keys()
             .inspect(|_| self.open.visit(1, 0))
             .copied()
+    }
+
+    // The volumes that began or stopped being waited on since the last call.
+    pub(crate) fn take_reopened(&mut self) -> BTreeSet<VolumeIndex> {
+        std::mem::take(&mut self.open.reopened)
+    }
+
+    // The volumes still waited on, read without counting a visit, for the
+    // tests that check a reader against a walk of them all.
+    #[cfg(test)]
+    pub(crate) fn waiting_volumes_unseen(&self) -> Vec<VolumeIndex> {
+        self.open.waiting.keys().copied().collect()
     }
 
     // Parked articles are waiting ones, so the volume has one to come
