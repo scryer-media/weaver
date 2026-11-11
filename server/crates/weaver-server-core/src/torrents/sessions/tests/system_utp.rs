@@ -165,7 +165,10 @@ async fn a_system_leg_session_with_both_transports_builds_and_moves_data_over_ut
     assert!(view.utp && view.held.is_none(), "{view:?}");
     assert_eq!(view.port, Some(seed_port));
     assert_eq!(
-        seed.get_dht().context("the seed runs no DHT")?.listen_addr().port(),
+        seed.get_dht()
+            .context("the seed runs no DHT")?
+            .listen_addr()
+            .port(),
         seed_port
     );
     // One datagram socket on the peer port, which uTP and the DHT share.

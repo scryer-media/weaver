@@ -200,7 +200,9 @@ impl DhtTap {
         let Some(inbox) = self.inbox.get() else {
             return false;
         };
-        if !(datagram.len() > 20 && datagram.first() == Some(&b'd') && datagram.last() == Some(&b'e'))
+        if !(datagram.len() > 20
+            && datagram.first() == Some(&b'd')
+            && datagram.last() == Some(&b'e'))
         {
             return false;
         }
@@ -320,17 +322,12 @@ impl Transport for DatagramTransport {
         self.0.shutdown()
     }
 
-    fn recv_from<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send + Sync + 'a {
-        async move {
-            loop {
-                let (len, from) = self.0.recv_from(buf).await?;
-                match &self.1 {
-                    Some(tap) if tap.take(&buf[..len.min(buf.len())], from) => {}
-                    _ => return Ok((len, from)),
-                }
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        loop {
+            let (len, from) = self.0.recv_from(buf).await?;
+            match &self.1 {
+                Some(tap) if tap.take(&buf[..len.min(buf.len())], from) => {}
+                _ => return Ok((len, from)),
             }
         }
     }

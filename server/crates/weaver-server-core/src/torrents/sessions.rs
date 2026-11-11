@@ -868,7 +868,7 @@ enum Slot {
         // The route plan it opened under, whose leg it runs on.
         plan: RoutePlan,
         mappings: PortMappings,
-        opening: Opening,
+        opening: Box<Opening>,
     },
     Held {
         reason: RouteFailure,
@@ -1318,7 +1318,7 @@ impl Sessions {
                         maps,
                         plan: plan.clone(),
                         mappings,
-                        opening,
+                        opening: Box::new(opening),
                     },
                 );
                 Ok(session)
@@ -1472,7 +1472,7 @@ impl Sessions {
                     withhold(key, session, &reason);
                 }
                 (slot.held().is_some()
-                    || *opening != Opening::of(&self.env, &torrent, opening.shape))
+                    || **opening != Opening::of(&self.env, &torrent, opening.shape))
                 .then(|| key.clone())
             })
             .collect()

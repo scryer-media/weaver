@@ -5296,10 +5296,9 @@ mod tests {
                 break len;
             }
         };
-        let reply = crate::dht::bprotocol::deserialize_message::<crate::bencode::ByteBufOwned>(
-            &buf[..len],
-        )
-        .unwrap();
+        let reply =
+            crate::dht::bprotocol::deserialize_message::<crate::bencode::ByteBufOwned>(&buf[..len])
+                .unwrap();
         assert!(matches!(
             reply.kind,
             crate::dht::bprotocol::MessageKind::Response(_)

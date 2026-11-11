@@ -880,8 +880,7 @@ async fn a_session_that_cannot_open_is_logged_once_for_each_cause() {
     let plan = routes.plan(TorrentScope::Default);
     let mut first = None;
     for _ in 0..3 {
-        let Err(SessionError::Build(failure)) =
-            sessions.session(&plan, &IDENTITY.identity()).await
+        let Err(SessionError::Build(failure)) = sessions.session(&plan, &IDENTITY.identity()).await
         else {
             panic!("a leg with no datagram socket builds no session");
         };

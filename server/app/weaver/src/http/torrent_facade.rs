@@ -1284,9 +1284,7 @@ fn when(ms: Option<i64>) -> i64 {
 // :1181-1185; served in torrents/info, serialize_torrent.cpp:130, and in
 // torrents/properties, torrentscontroller.cpp:873).
 fn progress(view: &TorrentView) -> f64 {
-    view.check_progress
-        .unwrap_or(view.progress)
-        .clamp(0.0, 1.0)
+    view.check_progress.unwrap_or(view.progress).clamp(0.0, 1.0)
 }
 
 fn wanted_and_left(view: &TorrentView) -> (u64, u64) {
@@ -1830,7 +1828,7 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         ("download_path", json!("")),
         ("comment", json!(view.comment.clone().unwrap_or_default())),
         ("has_metadata", json!(has_metadata)),
-        ("progress", json!(progress(view))),
+        ("progress", json!(progress(&view))),
     ]);
     // The properties read no limit as -1, where the list reads it as 0.
     let fields = with_limits(

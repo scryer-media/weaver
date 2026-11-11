@@ -476,6 +476,7 @@ impl StreamConnector {
     }
 
     /// Connect to the peer at `addr` over `transports`.
+    #[cfg(test)]
     pub async fn connect(
         &self,
         addr: SocketAddr,
@@ -1213,7 +1214,13 @@ mod tests {
             .await;
         assert!(sent.is_err());
         let v4 = connector.stats().tcp.snapshot().v4;
-        [v4.attempts, v4.successes, v4.refused, v4.timeouts, v4.errors]
+        [
+            v4.attempts,
+            v4.successes,
+            v4.refused,
+            v4.timeouts,
+            v4.errors,
+        ]
     }
 
     // Every attempt ends in exactly one counted end: one whose connect

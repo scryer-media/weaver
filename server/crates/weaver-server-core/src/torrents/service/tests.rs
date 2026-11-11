@@ -825,7 +825,7 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
     assert_eq!(view.state, TorrentState::Stalled);
     assert_eq!(
         (view.detail.as_deref(), view.route_reason),
-        (None, Some(TorrentRouteReason::LegDown))
+        (Some("tunnel gone"), Some(TorrentRouteReason::LegDown))
     );
     let held = rig.service.inner.sessions.views().await;
     assert_eq!(held.len(), 1);
@@ -1778,7 +1778,10 @@ async fn a_session_that_cannot_be_built_says_why() {
     assert_eq!(view.state, TorrentState::Stalled);
     assert_eq!(
         (view.detail.as_deref(), view.route_reason),
-        (None, Some(TorrentRouteReason::LegOpenFailed))
+        (
+            Some("no listening port"),
+            Some(TorrentRouteReason::LegOpenFailed)
+        )
     );
 }
 
