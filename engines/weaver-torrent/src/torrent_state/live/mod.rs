@@ -619,11 +619,9 @@ impl TorrentStateLive {
             .add_snapshot(stats.fetched_bytes, Some(remaining), now);
         self.up_speed_estimator
             .add_snapshot(stats.uploaded_bytes, None, now);
-        for peer in self.peers.states.iter() {
-            if let Some(live) = peer.value().get_live() {
-                live.sample_rates(&peer.value().stats.counters, now);
-            }
-        }
+        self.peers.for_each_live(|_, peer, live| {
+            live.sample_rates(&peer.stats.counters, now);
+        });
         if self.down_speed_estimator.bps() > 0 || self.up_speed_estimator.bps() > 0 {
             return true;
         }
@@ -1381,12 +1379,10 @@ impl TorrentStateLive {
     /// `m_swarm_last_seen_complete`). For status only, never sent.
     pub fn swarm_complete_ago(&self) -> Option<Duration> {
         let now = tokio::time::Instant::now();
-        let theirs = self
-            .peers
-            .states
-            .iter()
-            .filter_map(|e| e.value().get_live()?.last_seen_complete)
-            .max();
+        let mut theirs = None;
+        self.peers.for_each_live(|_, _, live| {
+            theirs = theirs.max(live.last_seen_complete);
+        });
         self.last_seen_complete(now)
             .max(theirs)
             .map(|last| now.saturating_duration_since(last))
@@ -1456,14 +1452,14 @@ impl TorrentStateLive {
     /// want (libtorrent `torrent::piece_passed` updates the interest of each
     /// interesting peer that has the piece).
     fn update_interest_of_holders(&self, piece: ValidPieceIndex) {
-        for mut entry in self.peers.states.iter_mut() {
-            if let Some(live) = entry.value_mut().get_live_mut()
+        self.peers.for_each_live_mut(|_, peer| {
+            if let Some(live) = peer.get_live_mut()
                 && live.is_interesting()
                 && live.bitfield.get(piece.get_usize()).is_some_and(|b| *b)
             {
                 self.update_interest(live);
             }
-        }
+        });
     }
 
     /// `source` named `addr` (libtorrent `torrent::add_peer`). A mapped
@@ -1749,15 +1745,14 @@ impl TorrentStateLive {
         }
         debug!(id = self.shared.id, on, "upload mode");
         if on {
-            for mut entry in self.peers.states.iter_mut() {
-                let addr = *entry.key();
-                if let Some(live) = entry.value_mut().get_live_mut() {
+            self.peers.for_each_live_mut(|addr, peer| {
+                if let Some(live) = peer.get_live_mut() {
                     if let Ok(pieces) = self.lock_write("set_upload_mode").get_pieces_mut() {
                         pieces.release_pieces_owned_by(addr);
                     }
                     live.cancel_all_requests();
                 }
-            }
+            });
         }
         self.new_pieces_notify.notify_waiters();
         self.update_upload_only();
@@ -2114,29 +2109,7 @@ impl TorrentStateLive {
         to: SocketAddr,
         told: &mut HashSet<SocketAddr>,
     ) -> Option<UtPex<ByteBufOwned>> {
-        // BEP 11: at most 50 added and 50 dropped peers in one message.
-        const MAX_SENT_PEERS: usize = 50;
-        let listed = self.peers.pex_listed();
-        let shown = |addr: &SocketAddr| is_local(to.ip()) || !is_local(addr.ip());
-        let added: Vec<PexPeerInfo> = listed
-            .iter()
-            .filter(|(addr, _)| shown(addr) && !told.contains(*addr))
-            .take(MAX_SENT_PEERS)
-            .map(|(&addr, &flags)| PexPeerInfo { flags, addr })
-            .collect();
-        let dropped: Vec<SocketAddr> = told
-            .iter()
-            .filter(|addr| !listed.contains_key(addr))
-            .take(MAX_SENT_PEERS)
-            .copied()
-            .collect();
-        if added.is_empty() && dropped.is_empty() {
-            return None;
-        }
-        for addr in &dropped {
-            told.remove(addr);
-        }
-        told.extend(added.iter().map(|p| p.addr));
+        let (added, dropped) = pex_diff(&self.peers.pex_listed(), to, told)?;
         Some(UtPex::from_peers(added.into_iter(), dropped.into_iter()))
     }
 
@@ -2171,6 +2144,41 @@ impl TorrentStateLive {
             }
         }
     }
+}
+
+// BEP 11: at most 50 added and 50 dropped peers in one message.
+pub(crate) const MAX_SENT_PEX_PEERS: usize = 50;
+
+// The peers the next PEX message to `to` adds and drops, given the peers we
+// list and those our earlier messages to `to` told of in `told`, and `told`
+// brought up to it; None when nothing changed. See
+// [`TorrentStateLive::next_pex_message`].
+pub(crate) fn pex_diff(
+    listed: &HashMap<SocketAddr, u8>,
+    to: SocketAddr,
+    told: &mut HashSet<SocketAddr>,
+) -> Option<(Vec<PexPeerInfo>, Vec<SocketAddr>)> {
+    let shown = |addr: &SocketAddr| is_local(to.ip()) || !is_local(addr.ip());
+    let added: Vec<PexPeerInfo> = listed
+        .iter()
+        .filter(|(addr, _)| shown(addr) && !told.contains(*addr))
+        .take(MAX_SENT_PEX_PEERS)
+        .map(|(&addr, &flags)| PexPeerInfo { flags, addr })
+        .collect();
+    let dropped: Vec<SocketAddr> = told
+        .iter()
+        .filter(|addr| !listed.contains_key(*addr))
+        .take(MAX_SENT_PEX_PEERS)
+        .copied()
+        .collect();
+    if added.is_empty() && dropped.is_empty() {
+        return None;
+    }
+    for addr in &dropped {
+        told.remove(addr);
+    }
+    told.extend(added.iter().map(|p| p.addr));
+    Some((added, dropped))
 }
 
 // The ticks a peer's PEX messages go out on. A tick missed while the task
@@ -2644,7 +2652,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state
             .peers
             .with_live_mut(self.addr, "update peer holepunch support", |live| {
-                live.supports_holepunch = hs.m.ut_holepunch.is_some();
+                let holepunch = hs.m.ut_holepunch.is_some();
+                if live.supports_holepunch != holepunch {
+                    live.supports_holepunch = holepunch;
+                    self.state.peers.pex_changed();
+                }
                 live.supports_upload_only = hs.m.upload_only.is_some();
             });
         // A nonzero `upload_only` says the peer only uploads; zero or none
@@ -2733,7 +2745,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             self.state
                 .peers
                 .with_peer_mut(self.addr, "update outgoing addr", |peer| {
-                    peer.outgoing_address = Some(listen)
+                    peer.listens_at(listen, &self.state.peers)
                 });
         }
 

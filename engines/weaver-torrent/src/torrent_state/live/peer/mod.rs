@@ -585,13 +585,23 @@ impl Peer {
     /// way round). One we made makes the next we make try that method again
     /// (`init_bt_handshake` and `on_receive_impl` write `pe_support` only
     /// when `is_outgoing()`).
-    pub(crate) fn handshake_encryption(&mut self, encryption: Encryption) {
+    pub(crate) fn handshake_encryption(&mut self, encryption: Encryption, peers: &PeerStates) {
         if self.connected_out() == Some(true) {
             self.encrypt = encryption.is_encrypted();
             self.fast_reconnect = false;
         }
         if let Some(live) = self.get_live_mut() {
             live.encryption = encryption;
+            peers.pex_changed();
+        }
+    }
+
+    /// The live peer said it listens at `listen`: our PEX messages list it
+    /// there (libtorrent `peer_list::update_peer_port`).
+    pub(crate) fn listens_at(&mut self, listen: SocketAddr, peers: &PeerStates) {
+        if self.outgoing_address != Some(listen) {
+            self.outgoing_address = Some(listen);
+            peers.pex_changed();
         }
     }
 

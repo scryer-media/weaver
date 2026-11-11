@@ -2557,6 +2557,17 @@ impl Session {
         self.dht.as_ref()
     }
 
+    /// Joins local service discovery's groups again on the interfaces up
+    /// now, for a caller that saw them change. Nothing to do when the
+    /// session runs no local service discovery; on failure the groups
+    /// joined before stay.
+    pub fn rejoin_local_discovery(&self) -> anyhow::Result<()> {
+        match &self.lsd {
+            Some(lsd) => lsd.rejoin(),
+            None => Ok(()),
+        }
+    }
+
     /// The limits the session holds to now.
     pub fn limits(&self) -> SessionLimits {
         SessionLimits {

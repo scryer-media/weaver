@@ -286,12 +286,11 @@ impl Choker {
         let mut unchoked = Held::default();
         for (at, torrent) in torrents.iter().enumerate() {
             let piece_length = u64::from(torrent.lengths.default_piece_length());
-            for mut entry in torrent.peers.states.iter_mut() {
-                let key = (torrent.shared.id, *entry.key());
-                let peer = entry.value_mut();
+            torrent.peers.for_each_live_mut(|addr, peer| {
+                let key = (torrent.shared.id, addr);
                 let totals = Transfer::of(&peer.stats.counters);
                 let Some(live) = peer.get_live_mut() else {
-                    continue;
+                    return;
                 };
                 let round = live.end_round(totals);
                 unchoked.record(key, torrent, !live.is_choked());
@@ -305,9 +304,8 @@ impl Choker {
                     let rank = rank(live, round, totals.uploaded, piece_length, now);
                     ranked.push((rank, key, at));
                 }
-            }
+            });
         }
-        ranked.sort_unstable();
         // A slot is held by a connection of a live torrent: one whose
         // torrent stopped, so whose peers went without a word, holds none.
         unchoked.optimistic = held_optimistic;
@@ -319,6 +317,7 @@ impl Choker {
             optimistic => optimistic,
         };
         let regular = self.slots().saturating_sub(reserved);
+        top_first(&mut ranked, regular);
         for (place, (_, key, at)) in ranked.into_iter().enumerate() {
             let holds_optimistic = held.optimistic.contains(&key);
             if place < regular && holds_optimistic {
@@ -352,12 +351,8 @@ impl Choker {
         let previous = std::mem::take(&mut held.optimistic);
         let mut candidates = Vec::new();
         for (at, torrent) in torrents.iter().enumerate() {
-            for entry in torrent.peers.states.iter() {
-                let key = (torrent.shared.id, *entry.key());
-                let peer = entry.value();
-                let Some(live) = peer.get_live() else {
-                    continue;
-                };
+            torrent.peers.for_each_live(|addr, peer, live| {
+                let key = (torrent.shared.id, addr);
                 if live.peer_interested && (live.is_choked() || previous.contains(&key)) {
                     let rank = OptimisticRank {
                         last_optimistic_unchoke: peer.last_optimistic_unchoke,
@@ -365,10 +360,12 @@ impl Choker {
                     };
                     candidates.push((rank, key, at));
                 }
-            }
+            });
         }
+        let slots = self.optimistic_slots();
+        top_first(&mut candidates, slots);
+        candidates.truncate(slots);
         candidates.sort_unstable();
-        candidates.truncate(self.optimistic_slots());
         let chosen: Vec<Key> = candidates.iter().map(|(_, key, _)| *key).collect();
 
         for (_, key, at) in candidates.iter().filter(|(_, k, _)| !previous.contains(k)) {
@@ -403,6 +400,19 @@ impl Choker {
     }
 }
 
+// Puts the `top` lowest of `ranked` first, in no order, the rest after
+// them: a round needs only which peers hold the slots, not how all the
+// others rank (libtorrent v2.0.15 `unchoke_sort` takes the regular slots
+// with `std::nth_element`, choker.cpp:279, and
+// `session_impl::recalculate_optimistic_unchoke_slots` the optimistic ones
+// with `std::partial_sort`, session_impl.cpp:4224). Visits each entry a
+// constant number of times on average, against a full sort's log factor.
+fn top_first<T: Ord>(ranked: &mut [T], top: usize) {
+    if top > 0 && top < ranked.len() {
+        ranked.select_nth_unstable(top - 1);
+    }
+}
+
 // Where `live` ranks at `now` for a regular slot (libtorrent `choker.cpp`
 // `unchoke_compare_rr`). `round` is what moved in the round that ended;
 // `uploaded` is all we uploaded to the peer; `piece_length` is its torrent's.
@@ -427,7 +437,38 @@ fn rank(
 
 #[cfg(test)]
 mod tests {
-    use super::Choker;
+    use super::{Choker, top_first};
+
+    // The slots a round hands out after only partly ranking the peers are
+    // those a full sort hands out, the same peers in each place given, over
+    // seeded rankings with ties, at every slot count.
+    #[test]
+    fn a_partial_ranking_hands_the_slots_to_the_peers_a_full_sort_does() {
+        let mut rng = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for len in 0..40usize {
+            // A rank with ties, then the peer's unique key, as in a round.
+            let ranked: Vec<(u64, usize)> = (0..len).map(|key| (next() % 5, key)).collect();
+            let mut sorted = ranked.clone();
+            sorted.sort_unstable();
+            for top in 0..=len + 1 {
+                let mut partial = ranked.clone();
+                top_first(&mut partial, top);
+                let n = top.min(len);
+                let mut held = partial[..n].to_vec();
+                held.sort_unstable();
+                assert_eq!(held, sorted[..n], "len {len} top {top}");
+                let mut rest = partial[n..].to_vec();
+                rest.sort_unstable();
+                assert_eq!(rest, sorted[n..], "len {len} top {top}");
+            }
+        }
+    }
 
     // libtorrent session_impl::update_unchoke_limit: a changed limit is
     // handed out by a round that begins at once.

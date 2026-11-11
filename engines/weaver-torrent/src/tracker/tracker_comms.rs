@@ -6,6 +6,7 @@
 // Weaver authors from 2026-10-20 onward.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
@@ -432,9 +433,10 @@ impl TrackerList {
     /// `tracker_list::add_tracker`).
     fn new(tiers: &[Vec<SupportedTracker>], now: Instant, shape: &'static AnnounceShape) -> Self {
         let mut entries: Vec<Entry> = Vec::new();
+        let mut named = HashSet::new();
         for (tier, trackers) in tiers.iter().enumerate() {
             for tracker in trackers {
-                if entries.iter().any(|e| &e.tracker == tracker) {
+                if !named.insert(tracker) {
                     continue;
                 }
                 entries.push(Entry::new(tracker.clone(), tier, now));
@@ -455,28 +457,36 @@ impl TrackerList {
     /// `started` again nor let off its back-off; libtorrent starts every
     /// entry afresh. A tracker that is gone is forgotten; those of them that
     /// accepted `started` are returned.
+    // Each tracker is looked up once in sets built for the pass, so a pass
+    // costs the trackers named and kept, not their product.
     fn replace(&mut self, tiers: &[Vec<SupportedTracker>], now: Instant) -> Vec<SupportedTracker> {
-        let mut old = std::mem::take(&mut self.entries);
+        let old = std::mem::take(&mut self.entries);
+        let at: HashMap<SupportedTracker, usize> = old
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (e.tracker.clone(), i))
+            .collect();
+        let mut old: Vec<Option<Entry>> = old.into_iter().map(Some).collect();
+        let mut named = HashSet::new();
         for (tier, trackers) in tiers.iter().enumerate() {
             for tracker in trackers {
-                if self.position(tracker).is_some() {
+                if !named.insert(tracker) {
                     continue;
                 }
-                let entry = match old.iter().position(|e| &e.tracker == tracker) {
-                    Some(i) => Entry {
+                let entry = match at.get(tracker).and_then(|&i| old[i].take()) {
+                    Some(kept) => Entry {
                         tracker: tracker.clone(),
                         tier,
-                        ..old.remove(i)
+                        ..kept
                     },
                     None => Entry::new(tracker.clone(), tier, now),
                 };
                 self.entries.push(entry);
             }
         }
-        let entries = &self.entries;
-        self.forced
-            .retain(|t| entries.iter().any(|e| &e.tracker == t));
+        self.forced.retain(|t| named.contains(t));
         old.into_iter()
+            .flatten()
             .filter(|e| e.start_sent)
             .map(|e| e.tracker)
             .collect()
@@ -560,13 +570,26 @@ impl TrackerList {
         // A tracker forced alone goes now if it may, else the walk and the
         // timer reach it (libtorrent `torrent::announce_tracker_now`); one
         // waiting for an answer is not asked twice.
-        let forced = std::mem::take(&mut self.forced)
-            .into_iter()
-            .filter_map(|t| self.position(&t))
-            .filter(|&i| self.entries[i].can_announce(now, seed, port));
-        let mut picked: Vec<usize> = forced.collect();
+        let forced = std::mem::take(&mut self.forced);
+        let at: HashMap<&SupportedTracker, usize> = if forced.is_empty() {
+            HashMap::new()
+        } else {
+            self.entries
+                .iter()
+                .enumerate()
+                .rev()
+                .map(|(i, e)| (&e.tracker, i))
+                .collect()
+        };
+        let mut picked: Vec<usize> = forced
+            .iter()
+            .filter_map(|t| at.get(t).copied())
+            .filter(|&i| self.entries[i].can_announce(now, seed, port))
+            .collect();
+        drop(at);
+        let mut seen: HashSet<usize> = picked.iter().copied().collect();
         for i in self.walk(|_| true, |e| e.can_announce(now, seed, port)) {
-            if !picked.contains(&i) {
+            if seen.insert(i) {
                 picked.push(i);
             }
         }
@@ -1133,13 +1156,12 @@ fn supported_tiers(tiers: Vec<Vec<Tracker>>) -> Vec<Vec<SupportedTracker>> {
 }
 
 fn unique<'a>(trackers: impl IntoIterator<Item = &'a SupportedTracker>) -> Vec<SupportedTracker> {
-    let mut unique: Vec<SupportedTracker> = Vec::new();
-    for tracker in trackers {
-        if !unique.contains(tracker) {
-            unique.push(tracker.clone());
-        }
-    }
-    unique
+    let mut seen = HashSet::new();
+    trackers
+        .into_iter()
+        .filter(|tracker| seen.insert(*tracker))
+        .cloned()
+        .collect()
 }
 
 /// `instant` on the wall clock.
@@ -2084,8 +2106,18 @@ impl TrackerComms {
         // Ends the announce to a tracker that has been removed.
         let mut aborts: HashMap<SupportedTracker, futures::future::AbortHandle> = HashMap::new();
         loop {
+            let listed: HashSet<SupportedTracker> = if aborts.is_empty() {
+                HashSet::new()
+            } else {
+                self.list
+                    .lock()
+                    .entries
+                    .iter()
+                    .map(|e| e.tracker.clone())
+                    .collect()
+            };
             aborts.retain(|tracker, abort| {
-                let kept = self.list.lock().position(tracker).is_some();
+                let kept = listed.contains(tracker);
                 if !kept {
                     abort.abort();
                 }
@@ -2507,6 +2539,7 @@ mod tests {
         TrackerTask, UdpTrackerResolveResult, Unreachable, may_complete, read_answer, retry_delay,
         udp_tracker_to_socket_addrs,
     };
+    use super::{Entry, unique};
     use crate::Identity;
     use crate::tracker::tracker_comms_http::{MAX_INTERVAL, TrackerRequestEvent};
     use crate::tracker::tracker_comms_udp::{
@@ -5731,6 +5764,181 @@ mod tests {
             matches!(found, UdpTrackerResolveResult::Two(a, b) if SocketAddr::from(a) == v4 && SocketAddr::from(b) == v6),
             "{found:?}"
         );
+    }
+
+    // The list's upkeep as it walked the list for each tracker, before it
+    // built a set per pass: the reference the test below compares with.
+    fn listed_new(tiers: &[Vec<SupportedTracker>], now: Instant) -> TrackerList {
+        let mut entries: Vec<Entry> = Vec::new();
+        for (tier, trackers) in tiers.iter().enumerate() {
+            for tracker in trackers {
+                if entries.iter().any(|e| &e.tracker == tracker) {
+                    continue;
+                }
+                entries.push(Entry::new(tracker.clone(), tier, now));
+            }
+        }
+        TrackerList {
+            entries,
+            complete_sent: false,
+            forced: Vec::new(),
+            announcing: true,
+            shape: &crate::tracker::AnnounceShape::WEAVER,
+        }
+    }
+
+    fn listed_replace(
+        list: &mut TrackerList,
+        tiers: &[Vec<SupportedTracker>],
+        now: Instant,
+    ) -> Vec<SupportedTracker> {
+        let mut old = std::mem::take(&mut list.entries);
+        for (tier, trackers) in tiers.iter().enumerate() {
+            for tracker in trackers {
+                if list.position(tracker).is_some() {
+                    continue;
+                }
+                let entry = match old.iter().position(|e| &e.tracker == tracker) {
+                    Some(i) => Entry {
+                        tracker: tracker.clone(),
+                        tier,
+                        ..old.remove(i)
+                    },
+                    None => Entry::new(tracker.clone(), tier, now),
+                };
+                list.entries.push(entry);
+            }
+        }
+        let entries = &list.entries;
+        list.forced
+            .retain(|t| entries.iter().any(|e| &e.tracker == t));
+        old.into_iter()
+            .filter(|e| e.start_sent)
+            .map(|e| e.tracker)
+            .collect()
+    }
+
+    fn listed_start_due(
+        list: &mut TrackerList,
+        now: Instant,
+        stats: &TrackerCommsStats,
+    ) -> Vec<(SupportedTracker, Option<TrackerRequestEvent>)> {
+        let seed = stats.completed_during_run;
+        let port = ToldPorts::default();
+        let forced = std::mem::take(&mut list.forced)
+            .into_iter()
+            .filter_map(|t| list.position(&t))
+            .filter(|&i| list.entries[i].can_announce(now, seed, port));
+        let mut picked: Vec<usize> = forced.collect();
+        for i in list.walk(|_| true, |e| e.can_announce(now, seed, port)) {
+            if !picked.contains(&i) {
+                picked.push(i);
+            }
+        }
+        picked
+            .into_iter()
+            .map(|i| {
+                let event = list.event(&list.entries[i], stats);
+                let entry = &mut list.entries[i];
+                entry.updating = true;
+                entry.port = port;
+                (entry.tracker.clone(), event)
+            })
+            .collect()
+    }
+
+    fn listed_unique<'a>(
+        trackers: impl IntoIterator<Item = &'a SupportedTracker>,
+    ) -> Vec<SupportedTracker> {
+        let mut unique: Vec<SupportedTracker> = Vec::new();
+        for tracker in trackers {
+            if !unique.contains(tracker) {
+                unique.push(tracker.clone());
+            }
+        }
+        unique
+    }
+
+    // The list kept with a set per pass holds the trackers, tiers, state,
+    // forced trackers and order the list walked per tracker held, and
+    // returns the same gone trackers, announces and unique trackers, over
+    // seeded runs of replaces with repeats, forces, answers, failures and
+    // due announces.
+    #[test]
+    fn tracker_upkeep_by_sets_matches_the_list_walked_per_tracker() {
+        let mut rng = 0x510e_527f_ade6_82d1u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let names: Vec<String> = (0..14).map(|i| format!("t{i}")).collect();
+        let tiers = |next: &mut dyn FnMut() -> u64| -> Vec<Vec<SupportedTracker>> {
+            (0..1 + next() % 4)
+                .map(|_| {
+                    (0..next() % 6)
+                        .map(|_| http(&names[(next() % 14) as usize]))
+                        .collect()
+                })
+                .collect()
+        };
+        let stats = live(0, 90, false);
+        for run in 0..30 {
+            let mut now = Instant::now();
+            let first = tiers(&mut next);
+            let mut sets = TrackerList::new(&first, now, &crate::tracker::AnnounceShape::WEAVER);
+            let mut walked = listed_new(&first, now);
+            assert_eq!(format!("{sets:?}"), format!("{walked:?}"), "run {run}");
+            for step in 0..300 {
+                let r = next();
+                let tracker = http(&names[(r >> 8) as usize % 14]);
+                match r % 6 {
+                    0 => {
+                        let to = tiers(&mut next);
+                        assert_eq!(
+                            sets.replace(&to, now),
+                            listed_replace(&mut walked, &to, now),
+                            "run {run} step {step}"
+                        );
+                        let flat: Vec<&SupportedTracker> = to.iter().flatten().collect();
+                        assert_eq!(
+                            unique(flat.iter().copied()),
+                            listed_unique(flat.iter().copied())
+                        );
+                    }
+                    1 => {
+                        let ignore = r & 0x100 != 0;
+                        let named = (r & 0x200 != 0).then_some(&tracker);
+                        assert_eq!(
+                            sets.force(now, named, ignore),
+                            walked.force(now, named, ignore)
+                        );
+                    }
+                    2 => {
+                        sets.on_success(&tracker, STARTED, now, &ANSWERED);
+                        walked.on_success(&tracker, STARTED, now, &ANSWERED);
+                    }
+                    3 => {
+                        sets.on_failure(&tracker, now, Duration::from_secs(5));
+                        walked.on_failure(&tracker, now, Duration::from_secs(5));
+                    }
+                    4 => {
+                        assert_eq!(
+                            sets.start_due(now, ToldPorts::default(), &stats),
+                            listed_start_due(&mut walked, now, &stats),
+                            "run {run} step {step}"
+                        );
+                    }
+                    _ => now += Duration::from_secs(next() % 120),
+                }
+                assert_eq!(
+                    format!("{sets:?}"),
+                    format!("{walked:?}"),
+                    "run {run} step {step}"
+                );
+            }
+        }
     }
 
     #[test]

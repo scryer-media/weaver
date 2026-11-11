@@ -11,12 +11,13 @@ use std::{
     net::{IpAddr, SocketAddr},
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
 
 use crate::core::{hash_id::Id20, lengths::ValidPieceIndex};
 use dashmap::DashMap;
+use indexmap::IndexSet;
 use parking_lot::{Mutex, RwLock};
 use tokio::{
     sync::{Notify, mpsc::unbounded_channel},
@@ -134,7 +135,27 @@ pub(crate) struct PeerStates {
     // judgment does not walk the list for them. Taken while an entry of
     // `states` is held, never the other way.
     connected: Mutex<HashMap<IpAddr, Vec<SocketAddr>>>,
+    // The peers in `states` that are live, web seeds too: kept as each peer
+    // is counted in and out, so the work done for every connection each
+    // tick, piece or round visits the connections alone, as libtorrent's
+    // tick walks `torrent::m_connections`, not its peer list
+    // (`torrent::second_tick`). Taken while an entry of `states` is held,
+    // never the other way.
+    live: Mutex<IndexSet<PeerHandle>>,
+    // Bumped by every change that can alter what [`Self::pex_listed`]
+    // returns: a peer going live or leaving it, and a live peer's listen
+    // address or advertised PEX flags changing. Each bump comes while the
+    // changed entry of `states` is held, or after the change.
+    pex_version: AtomicU64,
+    // The peers our PEX messages list, built at the version it holds, and
+    // shared by every connection's message until the version moves on.
+    // Never taken while an entry of `states` is held.
+    pex_cache: Mutex<Option<(u64, PexListed)>>,
 }
+
+/// The peers our PEX messages list, each where it listens, with what the
+/// message says of it; see [`PeerStates::pex_listed`].
+pub(crate) type PexListed = Arc<HashMap<SocketAddr, u8>>;
 
 /// The peer list as a pause leaves it: every peer on it, idle, the banned
 /// addresses, and the smart-ban records of its peers. The next run's list
@@ -316,6 +337,19 @@ pub(crate) enum IncomingRefused {
     Banned,
 }
 
+// The `n` lowest of `ranked`, in no order: the first `n` a full sort would
+// put first. Each entry holds a peer's address, so no two are equal and the
+// `n` lowest are one set, whichever way ties of rank fall.
+fn lowest<T: Ord>(mut ranked: Vec<T>, n: usize) -> Vec<T> {
+    if n == 0 {
+        ranked.clear();
+    } else if n < ranked.len() {
+        ranked.select_nth_unstable(n - 1);
+        ranked.truncate(n);
+    }
+    ranked
+}
+
 // Whether a peer at `addr` in `state` counts among the connected
 // addresses: it has a connection, open or opening, and is no web seed.
 fn has_connection(addr: PeerHandle, state: &PeerState) -> bool {
@@ -354,6 +388,9 @@ impl PeerStates {
             finished: AtomicBool::new(false),
             smart_ban: Mutex::new(list.smart_ban),
             connected: Default::default(),
+            live: Default::default(),
+            pex_version: AtomicU64::new(0),
+            pex_cache: Mutex::new(None),
         };
         for mut peer in list.peers {
             peer.rejoin(&peers);
@@ -546,7 +583,7 @@ impl PeerStates {
     /// [`Peer::handshake_encryption`].
     pub fn handshake_encryption(&self, addr: SocketAddr, encryption: Encryption) {
         self.with_peer_mut(addr, "handshake_encryption", |peer| {
-            peer.handshake_encryption(encryption)
+            peer.handshake_encryption(encryption, self)
         });
     }
 
@@ -807,15 +844,14 @@ impl PeerStates {
         if excess == 0 {
             return true;
         }
-        let mut ranked = self
+        let ranked = self
             .states
             .iter()
             .filter(|e| !is_web_seed(*e.key()) && e.value().connected_out().is_none())
             .map(|e| (erase_rank(e.value()), *e.key()))
             .filter(|(rank, _)| displace.allows(rank))
             .collect::<Vec<_>>();
-        ranked.sort_unstable();
-        for (_, addr) in ranked.into_iter().take(excess) {
+        for (_, addr) in lowest(ranked, excess) {
             if let Some((_, peer)) = self
                 .states
                 .remove_if(&addr, |_, peer| peer.connected_out().is_none())
@@ -987,11 +1023,94 @@ impl PeerStates {
             .flatten()
     }
 
+    // The live peers as they stand now. The set's lock is let go before any
+    // entry of `states` is taken.
+    fn live_handles(&self) -> Vec<PeerHandle> {
+        self.live.lock().iter().copied().collect()
+    }
+
+    /// Runs `f` on every live peer, web seeds too, one entry held at a
+    /// time. Visits the live peers alone, not the whole list.
+    pub(crate) fn for_each_live(&self, mut f: impl FnMut(PeerHandle, &Peer, &LivePeerState)) {
+        for handle in self.live_handles() {
+            if let Some(e) = self.states.get(&handle)
+                && let Some(live) = e.value().get_live()
+            {
+                f(handle, e.value(), live);
+            }
+        }
+    }
+
+    /// [`Self::for_each_live`], with the peer to change.
+    pub(crate) fn for_each_live_mut(&self, mut f: impl FnMut(PeerHandle, &mut Peer)) {
+        for handle in self.live_handles() {
+            if let Some(mut e) = self.states.get_mut(&handle)
+                && e.value().get_live().is_some()
+            {
+                f(handle, e.value_mut());
+            }
+        }
+    }
+
+    // The live peers read off the whole list, as before the running set;
+    // the test that the set keeps them compares the two.
+    #[cfg(test)]
+    pub(crate) fn live_walked(&self) -> HashSet<PeerHandle> {
+        self.states
+            .iter()
+            .filter(|e| e.value().get_live().is_some())
+            .map(|e| *e.key())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_counted(&self) -> HashSet<PeerHandle> {
+        self.live.lock().iter().copied().collect()
+    }
+
     /// The peers our PEX messages list, each where it listens, with what
     /// the message says of it (libtorrent `ut_pex_plugin::tick`,
     /// `send_peer`): every connected peer whose listening address we know,
-    /// as we connected to it there or it told us; never a web seed.
-    pub fn pex_listed(&self) -> HashMap<SocketAddr, u8> {
+    /// as we connected to it there or it told us; never a web seed. Built
+    /// once and shared by every connection's message until a change that
+    /// can alter it ([`Self::pex_changed`]).
+    pub fn pex_listed(&self) -> PexListed {
+        let mut cache = self.pex_cache.lock();
+        // Read before the build: a change during it moves the version on,
+        // so the next call builds again.
+        let version = self.pex_version.load(Ordering::Acquire);
+        if let Some((built_at, listed)) = &*cache
+            && *built_at == version
+        {
+            return listed.clone();
+        }
+        let listed = Arc::new(self.pex_listed_now());
+        *cache = Some((version, listed.clone()));
+        listed
+    }
+
+    /// Something [`Self::pex_listed`] returns may have changed: a peer went
+    /// live or left it, or a live peer's listen address or advertised PEX
+    /// flags changed. Called while the changed entry is held, or after the
+    /// change.
+    pub(crate) fn pex_changed(&self) {
+        self.pex_version.fetch_add(1, Ordering::Release);
+    }
+
+    // [`Self::pex_listed`] built now, from the live peers.
+    fn pex_listed_now(&self) -> HashMap<SocketAddr, u8> {
+        let mut listed = HashMap::new();
+        self.for_each_live(|_, peer, live| {
+            if let Some(addr) = peer.outgoing_address {
+                listed.insert(addr, live.advertised_pex_flags());
+            }
+        });
+        listed
+    }
+
+    // [`Self::pex_listed`] read off the whole list.
+    #[cfg(test)]
+    pub(crate) fn pex_listed_walked(&self) -> HashMap<SocketAddr, u8> {
         self.states
             .iter()
             .filter_map(|e| {
@@ -1023,6 +1142,8 @@ impl PeerStates {
                 .push(addr);
         }
         if let PeerState::Live(live) = state {
+            self.live.lock().insert(addr);
+            self.pex_changed();
             self.availability.add(&live.bitfield);
             self.went_live.notify_one();
         }
@@ -1048,6 +1169,8 @@ impl PeerStates {
             }
         }
         if let PeerState::Live(live) = state {
+            self.live.lock().swap_remove(&addr);
+            self.pex_changed();
             self.availability.remove(&live.bitfield);
         }
     }
@@ -1108,6 +1231,7 @@ impl PeerStates {
             return;
         }
         live.seeder = seeder;
+        self.pex_changed();
         self.stats.seeder_flag_changed(seeder);
         self.session_stats.seeder_flag_changed(seeder);
     }
@@ -1138,29 +1262,25 @@ impl PeerStates {
     /// receives it late but never loses it. A peer that goes live after this
     /// walk reads our have-bitfield afterwards, which holds the piece.
     pub(crate) fn announce_have(&self, piece: ValidPieceIndex) {
-        for peer in self.states.iter() {
-            if let PeerState::Live(live) = peer.value().get_state()
-                && !live.bitfield.get(piece.get_usize()).is_some_and(|has| *has)
-            {
+        self.for_each_live(|_, _, live| {
+            if !live.bitfield.get(piece.get_usize()).is_some_and(|has| *has) {
                 let _ = live
                     .tx
                     .send(WriterRequest::Message(Message::Have(piece.get())));
             }
-        }
+        });
     }
 
     /// Tells every live peer that takes upload_only whether we only upload
     /// now (libtorrent `torrent::send_upload_only`).
     pub(crate) fn send_upload_only(&self, enabled: bool) {
-        for peer in self.states.iter() {
-            if let PeerState::Live(live) = peer.value().get_state()
-                && live.supports_upload_only
-            {
+        self.for_each_live(|_, _, live| {
+            if live.supports_upload_only {
                 let _ = live.tx.send(WriterRequest::Message(Message::Extended(
                     ExtendedMessage::UploadOnly(enabled),
                 )));
             }
-        }
+        });
     }
 }
 
@@ -1650,6 +1770,7 @@ mod tests {
             };
             let mut keep = Vec::new();
             let mut at = Instant::now();
+            let mut pex_listed = 0;
             for step in 0..4000 {
                 let r = next();
                 let a = addr(r >> 8);
@@ -1663,6 +1784,12 @@ mod tests {
                     3 => {
                         if let Ok(rx) = connected_to_us(&peers, a) {
                             keep.push((a, rx, unbounded_channel().0));
+                            // Half tell us the port they listen on.
+                            if r & 2 == 0 {
+                                peers.with_peer_mut(a, "test", |peer| {
+                                    peer.listens_at(a, &peers);
+                                });
+                            }
                         }
                     }
                     4 | 5 => {
@@ -1697,7 +1824,12 @@ mod tests {
                     peers.connected_ips_walked(),
                     "step {step}"
                 );
+                assert_eq!(peers.live_counted(), peers.live_walked(), "step {step}");
+                let listed = peers.pex_listed();
+                assert_eq!(*listed, peers.pex_listed_walked(), "step {step}");
+                pex_listed = pex_listed.max(listed.len());
             }
+            assert!(pex_listed > 0, "the run listed no peer for PEX");
             assert!(
                 allow || !peers.connected_ips_counted().is_empty(),
                 "the run left no connection to compare"
@@ -1711,6 +1843,7 @@ mod tests {
                 });
             }
             assert!(peers.connected.lock().is_empty());
+            assert!(peers.live.lock().is_empty());
         }
     }
 
@@ -2093,6 +2226,306 @@ mod tests {
         assert!(peers.connect_next(t0).is_some());
         assert_eq!(peers.listed(), PEERLIST_LOW_WATERMARK - 1);
         assert_eq!(failed_left(&peers), failed.len() - 51);
+    }
+
+    // A xorshift stream from `seed`, for seeded runs.
+    fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+        let mut rng = seed | 1;
+        move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        }
+    }
+
+    // Whom weeding to `fewer_than` forgets by a full sort of every idle
+    // peer `displace` allows on the list, by erase rank and address: the
+    // rule the partial selection keeps.
+    fn erased_by_full_sort(
+        peers: &PeerStates,
+        displace: Displace,
+        fewer_than: usize,
+    ) -> HashSet<SocketAddr> {
+        let excess = (peers.listed() + 1).saturating_sub(fewer_than);
+        let mut ranked = peers
+            .states
+            .iter()
+            .filter(|e| !is_web_seed(*e.key()) && e.value().connected_out().is_none())
+            .map(|e| (erase_rank(e.value()), *e.key()))
+            .filter(|(rank, _)| displace.allows(rank))
+            .collect::<Vec<_>>();
+        ranked.sort();
+        ranked
+            .into_iter()
+            .take(excess)
+            .map(|(_, addr)| addr)
+            .collect()
+    }
+
+    // A list of `size` peers from `next`: named ones, ones that failed one
+    // to three times and were or were not let go, ones let go that never
+    // failed, live ones, ones whose connection to us closed, failed or
+    // not, and ones refused while the slots were full; some more trusted,
+    // some less. Many share an erase rank, so the address settles who goes.
+    // Returns the receiving ends of the live peers' channels.
+    fn seeded_list(
+        peers: &PeerStates,
+        next: &mut impl FnMut() -> u64,
+        size: usize,
+        t0: Instant,
+    ) -> Vec<PeerRx> {
+        let spaced = reconnect_wait(MAX_FAILCOUNT);
+        let mut keep = Vec::new();
+        for i in 0..size {
+            let r = next();
+            let addr = peer_addr(i);
+            match r % 6 {
+                0 => peers.add_peer(addr, PeerSourceFlag::Tracker),
+                1 => {
+                    peers.add_peer(addr, PeerSourceFlag::Tracker);
+                    let failures = 1 + u32::try_from((r >> 8) % u64::from(MAX_FAILCOUNT)).unwrap();
+                    for k in 0..failures {
+                        fail_at(peers, addr, t0 + spaced * (k + 1));
+                    }
+                    if r & 16 != 0 {
+                        peers.with_peer_mut(addr, "test", |peer| peer.set_not_needed(peers));
+                    }
+                }
+                2 => never_failed(peers, addr),
+                3 => keep.push(connected_to_us(peers, addr).unwrap()),
+                4 => {
+                    let _rx = connected_to_us(peers, addr).unwrap();
+                    peers.with_peer_mut(addr, "test", |peer| {
+                        peers.connection_closed(peer, t0, r & 16 != 0, false);
+                    });
+                }
+                _ => peers.add_refused_incoming(addr, ConnectionKind::Tcp),
+            }
+            peers.with_peer_mut(addr, "test", |peer| {
+                if r & 32 != 0 {
+                    peer.piece_passed();
+                }
+                if r & 64 != 0 {
+                    let _banned = peer.piece_failed(false);
+                }
+            });
+        }
+        keep
+    }
+
+    // The partial selection picks the set a full sort puts first, over
+    // seeded lists with many ties of rank, every count to take.
+    #[test]
+    fn the_lowest_are_the_first_a_full_sort_puts_first() {
+        let mut next = xorshift(0x2545_f491_4f6c_dd1d);
+        for _ in 0..500 {
+            let len = usize::try_from(next() % 64).unwrap();
+            // Few ranks, so most entries tie on rank and differ in address.
+            let ranked: Vec<(u8, u16)> = (0..len)
+                .map(|i| (u8::try_from(next() % 4).unwrap(), u16::try_from(i).unwrap()))
+                .collect();
+            let mut sorted = ranked.clone();
+            sorted.sort();
+            for n in 0..=len + 1 {
+                let mut picked = lowest(ranked.clone(), n);
+                picked.sort();
+                assert_eq!(picked, sorted[..n.min(len)], "{ranked:?} {n}");
+            }
+        }
+    }
+
+    // Weeding forgets the peers a full sort of the list would, over seeded
+    // lists of every kind of peer and a full list, for both kinds of room
+    // made, and says the same of whether the list is under its mark.
+    #[tokio::test(start_paused = true)]
+    async fn weeding_forgets_the_peers_a_full_sort_would() {
+        let t0 = Instant::now();
+        let mut checked = 0;
+        for seed in 0..40u64 {
+            let mut next = xorshift(0x9e37_79b9_7f4a_7c15 ^ seed);
+            let peers = make_peer_states();
+            let size = if seed == 0 {
+                MAX_PEERLIST_SIZE
+            } else {
+                64 + usize::try_from(next() % 400).unwrap()
+            };
+            let _keep = seeded_list(&peers, &mut next, size, t0);
+            for round in 0..4 {
+                let displace = if next() & 1 == 0 {
+                    Displace::EraseCandidates
+                } else {
+                    Displace::AnyIdle
+                };
+                let listed = peers.listed();
+                let fewer_than = if seed == 0 && round == 0 {
+                    PEERLIST_LOW_WATERMARK
+                } else {
+                    1 + usize::try_from(next() % u64::try_from(listed + 1).unwrap()).unwrap()
+                };
+                let expected = erased_by_full_sort(&peers, displace, fewer_than);
+                let before: HashSet<SocketAddr> = peers.states.iter().map(|e| *e.key()).collect();
+                let under = peers.erase_to(displace, fewer_than);
+                let after: HashSet<SocketAddr> = peers.states.iter().map(|e| *e.key()).collect();
+                let erased: HashSet<SocketAddr> = before.difference(&after).copied().collect();
+                assert_eq!(erased, expected, "seed {seed} round {round}");
+                assert_eq!(under, listed - expected.len() < fewer_than);
+                checked += expected.len();
+            }
+        }
+        assert!(checked > 0, "no run forgot a peer");
+    }
+
+    // Each connection's PEX message from the one shared map is one the
+    // map built afresh for it gives: over a seeded run of peers going live
+    // (connecting to us, or we to them over TCP or uTP), telling us where
+    // they listen, closing, leaving, their handshakes encrypted or not and
+    // their pieces whole or not, the shared map equals a fresh walk at
+    // every round and is shared by the round's connections; and every
+    // connection, local or not, with its own `told`, gets the peers the
+    // fresh map adds and drops for it, at most 50 of each, local peers
+    // hidden from one that is not local. Where more than 50 are new, the
+    // 50 sent are those the map's order gives first, as with a map built
+    // afresh, so the test checks they are 50 of the right ones.
+    #[tokio::test(start_paused = true)]
+    async fn each_pex_message_from_the_shared_map_is_the_one_a_fresh_map_gives() {
+        use crate::torrent_state::live::{MAX_SENT_PEX_PEERS, pex_diff};
+        use holepunch::is_local;
+        let host = |i: u64| -> SocketAddr {
+            let i = u8::try_from(i % 120).unwrap();
+            if i % 3 == 0 {
+                SocketAddr::from(([10, 2, 0, i], 6881))
+            } else {
+                SocketAddr::from(([203, 0, 113, i], 6881))
+            }
+        };
+        let to: Vec<SocketAddr> = vec![
+            "192.168.1.1:6881".parse().unwrap(),
+            "192.168.1.2:6881".parse().unwrap(),
+            "10.9.0.1:6881".parse().unwrap(),
+            "198.51.100.1:6881".parse().unwrap(),
+            "198.51.100.2:6881".parse().unwrap(),
+            "198.51.100.3:6881".parse().unwrap(),
+        ];
+        let (mut capped, mut uncapped, mut hidden, mut dropped_seen) = (0, 0, 0, 0);
+        for seed in 0..8u64 {
+            let mut next = xorshift(0xd1b5_4a32_d192_ed03 ^ seed);
+            let peers = make_peer_states();
+            let mut told: Vec<HashSet<SocketAddr>> = vec![HashSet::new(); to.len()];
+            let mut keep_rx = Vec::new();
+            let mut keep = Vec::new();
+            let mut now = Instant::now();
+            // A burst first, so the first round has more than 50 to add.
+            for i in 0..90 {
+                if let Ok(rx) = connected_to_us(&peers, host(i)) {
+                    peers.with_peer_mut(host(i), "test", |peer| peer.listens_at(host(i), &peers));
+                    keep_rx.push(rx);
+                }
+            }
+            for step in 0..600 {
+                let r = next();
+                let a = host(r >> 8);
+                match r % 8 {
+                    0 => {
+                        if let Ok(rx) = connected_to_us(&peers, a) {
+                            keep_rx.push(rx);
+                            if r & 16 != 0 {
+                                peers.with_peer_mut(a, "test", |peer| peer.listens_at(a, &peers));
+                            }
+                        }
+                    }
+                    1 => {
+                        peers.add_peer(a, PeerSourceFlag::Tracker);
+                        if let Some((handle, rx, tx)) = peers.connect_next(now) {
+                            let kind = if r & 16 != 0 {
+                                ConnectionKind::Utp
+                            } else {
+                                ConnectionKind::Tcp
+                            };
+                            peers.with_peer_mut(handle, "test", |peer| {
+                                peer.connecting_to_live(Id20::default(), &peers, kind);
+                            });
+                            keep.push((rx, tx));
+                        }
+                    }
+                    2 => {
+                        peers.with_peer_mut(a, "test", |peer| {
+                            if peer.connected_out().is_some() {
+                                peers.connection_closed(peer, now, r & 16 != 0, false);
+                            }
+                        });
+                    }
+                    3 => {
+                        peers.drop_peer(a);
+                    }
+                    4 => peers.handshake_encryption(a, handshake(r & 16 != 0)),
+                    5 => {
+                        let bitfield = if r & 16 != 0 {
+                            full_bitfield()
+                        } else {
+                            empty_bitfield()
+                        };
+                        peers.update_bitfield(a, bitfield);
+                    }
+                    _ => {
+                        let mut shared: Option<PexListed> = None;
+                        for (to, told) in to.iter().zip(&mut told) {
+                            let listed = peers.pex_listed();
+                            let fresh = peers.pex_listed_walked();
+                            assert_eq!(*listed, fresh, "seed {seed} step {step}");
+                            if let Some(shared) = &shared {
+                                assert!(Arc::ptr_eq(shared, &listed), "seed {seed} step {step}");
+                            }
+                            shared = Some(listed.clone());
+
+                            let before = told.clone();
+                            let shown =
+                                |addr: &SocketAddr| is_local(to.ip()) || !is_local(addr.ip());
+                            let may_add: HashMap<SocketAddr, u8> = fresh
+                                .iter()
+                                .filter(|(addr, _)| shown(addr) && !before.contains(*addr))
+                                .map(|(&addr, &flags)| (addr, flags))
+                                .collect();
+                            let may_drop: HashSet<SocketAddr> = before
+                                .iter()
+                                .filter(|addr| !fresh.contains_key(*addr))
+                                .copied()
+                                .collect();
+                            hidden += fresh.keys().filter(|addr| !shown(addr)).count();
+                            let (added, dropped) = pex_diff(&listed, *to, told).unwrap_or_default();
+                            assert_eq!(added.len(), may_add.len().min(MAX_SENT_PEX_PEERS));
+                            assert_eq!(dropped.len(), may_drop.len().min(MAX_SENT_PEX_PEERS));
+                            let added_at: HashSet<SocketAddr> =
+                                added.iter().map(|p| p.addr).collect();
+                            assert_eq!(added_at.len(), added.len());
+                            for p in &added {
+                                assert_eq!(may_add.get(&p.addr), Some(&p.flags), "{seed} {step}");
+                            }
+                            for addr in &dropped {
+                                assert!(may_drop.contains(addr), "seed {seed} step {step}");
+                            }
+                            let mut expected_told = before;
+                            for addr in &dropped {
+                                expected_told.remove(addr);
+                            }
+                            expected_told.extend(added_at);
+                            assert_eq!(*told, expected_told, "seed {seed} step {step}");
+                            if may_add.len() > MAX_SENT_PEX_PEERS {
+                                capped += 1;
+                            } else {
+                                uncapped += 1;
+                            }
+                            dropped_seen += dropped.len();
+                        }
+                        now += MIN_RECONNECT_TIME;
+                    }
+                }
+            }
+        }
+        assert!(capped > 0, "no round had more than 50 to add");
+        assert!(uncapped > 0, "no round had 50 or fewer to add");
+        assert!(hidden > 0, "no round hid a local peer");
+        assert!(dropped_seen > 0, "no round dropped a peer");
     }
 
     // libtorrent `torrent::get_peer_list_state`: a paused torrent's list
@@ -2972,7 +3405,7 @@ mod tests {
                 let encrypted = peer.encrypt_outgoing();
                 if let Ends::Completed = ends {
                     peer.connecting_to_live(Id20::default(), peers, ConnectionKind::Tcp);
-                    peer.handshake_encryption(handshake(encrypted));
+                    peer.handshake_encryption(handshake(encrypted), peers);
                 }
                 peers.connection_closed(peer, at, matches!(ends, Ends::Failed), false);
                 encrypted
@@ -3118,7 +3551,7 @@ mod tests {
             peers.with_peer_mut(addr, "test", |peer| {
                 peer.connect_if_due(now, &peers).expect("a due candidate");
                 peer.connecting_to_live(Id20::default(), &peers, ConnectionKind::Tcp);
-                peer.handshake_encryption(handshake(encrypt));
+                peer.handshake_encryption(handshake(encrypt), &peers);
             });
         }
 
