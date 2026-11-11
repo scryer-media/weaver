@@ -1340,6 +1340,10 @@ pub struct Pipeline {
     pub(super) post_probes: post_health::Probes,
     pub(crate) nzb_admitted: HashSet<JobId>,
     pub(crate) nzb_seen: HashSet<JobId>,
+    // The ids a walk found gone from the queue while their work was still
+    // in flight. Each turn looks at these alone, and forgets each once its
+    // work drains.
+    pub(crate) nzb_retired_busy: HashSet<JobId>,
     pub(crate) nzb_pause_releases: HashSet<JobId>,
     pub(crate) nzb_reprocess_pending: HashSet<JobId>,
     // The slots whose take or release is out on the writer, not yet

@@ -126,6 +126,7 @@ impl Pipeline {
     // and restates each row's slot, runs when `walk` asks for it or a slot
     // was released this turn. Returns whether it walked.
     pub(crate) fn reconcile_nzb_admission(&mut self, walk: bool) -> bool {
+        self.recheck_retired_busy();
         // A crash between accepting pause and draining work must not turn
         // the interrupted pause into an automatic resume.
         if !self.nzb_pause_releases.is_empty() {
@@ -223,12 +224,10 @@ impl Pipeline {
         for id in retired {
             if self.nzb_work_in_flight(id) {
                 // Looked at again once its work drains.
-                self.queue_walk_due = true;
+                self.nzb_retired_busy.insert(id);
                 continue;
             }
-            self.nzb_seen.remove(&id);
-            self.nzb_pause_releases.remove(&id);
-            self.nzb_reprocess_pending.remove(&id);
+            self.forget_retired(id);
         }
         // A history retry can replace a canceled, unadmitted paused job
         // before this actor sees the old row disappear.
@@ -313,6 +312,36 @@ impl Pipeline {
             }
         });
         true
+    }
+
+    fn forget_retired(&mut self, id: JobId) {
+        self.nzb_retired_busy.remove(&id);
+        self.nzb_seen.remove(&id);
+        self.nzb_pause_releases.remove(&id);
+        self.nzb_reprocess_pending.remove(&id);
+    }
+
+    // The retired ids whose work was in flight: one that came back to the
+    // queue or took a slot is no longer retired, and one whose work drained
+    // is forgotten, as the walk would have.
+    fn recheck_retired_busy(&mut self) {
+        if self.nzb_retired_busy.is_empty() {
+            return;
+        }
+        let busy: Vec<JobId> = self.nzb_retired_busy.iter().copied().collect();
+        let present: HashSet<JobId> = self.shared_state.queue.read(|inner| {
+            busy.iter()
+                .copied()
+                .filter(|id| inner.contains_job(*id))
+                .collect()
+        });
+        for id in busy {
+            if present.contains(&id) || self.nzb_admitted.contains(&id) {
+                self.nzb_retired_busy.remove(&id);
+            } else if !self.nzb_work_in_flight(id) {
+                self.forget_retired(id);
+            }
+        }
     }
 
     // The wait reason a queue row stores, the one answer every writer of the

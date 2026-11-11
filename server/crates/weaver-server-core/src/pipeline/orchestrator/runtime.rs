@@ -276,6 +276,7 @@ impl Pipeline {
             post_probes: Default::default(),
             nzb_admitted,
             nzb_seen: HashSet::new(),
+            nzb_retired_busy: HashSet::new(),
             nzb_pause_releases,
             nzb_reprocess_pending: HashSet::new(),
             nzb_admitting: HashSet::new(),
