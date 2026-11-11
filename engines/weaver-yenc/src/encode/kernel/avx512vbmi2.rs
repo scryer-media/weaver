@@ -1700,7 +1700,14 @@ unsafe extern "sysv64" {
         is_end: bool,
     ) -> usize;
 }
-unsafe fn encode_asm_zen4(line_size: usize, column: &mut usize, src: *const u8, len: usize, dst: *mut u8, is_end: bool) -> usize {
+unsafe fn encode_asm_zen4(
+    line_size: usize,
+    column: &mut usize,
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+    is_end: bool,
+) -> usize {
     unsafe { weaver_yenc_encode_zen4(line_size, column, src, len, dst, is_end) }
 }
 
@@ -1848,7 +1855,9 @@ mod tests {
                 })
                 .collect()
         };
-        let lens = [0usize, 1, 63, 64, 65, 128, 129, 130, 192, 193, 200, 257, 1000, 4096, 9001];
+        let lens = [
+            0usize, 1, 63, 64, 65, 128, 129, 130, 192, 193, 200, 257, 1000, 4096, 9001,
+        ];
         for kind in 0..7 {
             for &len in &lens {
                 let src = make(kind, len);
@@ -1902,7 +1911,13 @@ mod tests {
                 }
                 for &ls in &[12usize, 64, 100, 128, 129, 997] {
                     for &col0 in &[0usize, 1, ls / 2, ls - 1] {
-                        check(loops, &src, ls, col0, &format!("clean block {b} offset {o}"));
+                        check(
+                            loops,
+                            &src,
+                            ls,
+                            col0,
+                            &format!("clean block {b} offset {o}"),
+                        );
                     }
                 }
             }

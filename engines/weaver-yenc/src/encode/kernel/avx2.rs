@@ -17,7 +17,7 @@
 use std::arch::x86_64::*;
 
 use super::scalar::encode_simd_frame;
-use super::ssse3::{DenseX, ONE, dense32, dense_eq32};
+use super::ssse3::{DenseX, ONE, dense_eq32, dense32};
 use super::x86_common::{Block, Dense, main_loop};
 
 pub(super) struct Avx2;
@@ -213,8 +213,14 @@ pub(super) unsafe fn encode_raw(
     is_end: bool,
 ) -> usize {
     unsafe {
-        encode_simd_frame(line_size, column, src, len, dst, is_end, |ls, col, s, n, d| {
-            main_loop::<Avx2>(ls, col, s, n, d)
-        })
+        encode_simd_frame(
+            line_size,
+            column,
+            src,
+            len,
+            dst,
+            is_end,
+            |ls, col, s, n, d| main_loop::<Avx2>(ls, col, s, n, d),
+        )
     }
 }
