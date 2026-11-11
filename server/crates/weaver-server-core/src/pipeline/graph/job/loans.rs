@@ -167,8 +167,8 @@ impl Lender for Lending<'_> {
             kind: Work::Repair,
         });
         let mail = loans.mail.clone();
-        // The repair runs inside the pool, on the budget in force as it goes
-        // out: a later profile reaches the next repair, not this one.
+        // The repair runs inside the repair pool, on the budget in force as
+        // it goes out: a later profile reaches the next repair, not this one.
         let grant = loans.hardware.grant();
         let shutdown = loans.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
@@ -181,7 +181,7 @@ impl Lender for Lending<'_> {
             );
             crate::e2e_failpoint::maybe_delay(crate::e2e_failpoint::REPAIR_TASK_START);
             crate::e2e_failpoint::maybe_trip(crate::e2e_failpoint::REPAIR_TASK_START);
-            let returned = grant.install(|| loan.run(grant.repair.clone(), &shutdown));
+            let returned = grant.install_repair(|| loan.run(grant.repair.clone(), &shutdown));
             tracing::info!(
                 job_id = scope,
                 node = set.0,

@@ -57,6 +57,10 @@ pub(crate) struct Grant {
     // The post-processing pool, sized to the profile's extract threads.
     // None outside a pipeline: the work runs on the thread it was given.
     pub(crate) pool: Option<Arc<rayon::ThreadPool>>,
+    // The pool a repair runs inside, as wide as the repair's threads: a
+    // PAR2 repair spreads across the pool it runs in. The post-processing
+    // pool when that is as wide. None outside a pipeline.
+    pub(crate) repair_pool: Option<Arc<rayon::ThreadPool>>,
     // An engine run: its decoder's memory and its threads.
     pub(crate) run: Budget,
     // A recovery set's repair: its workspace and its workers.
@@ -102,23 +106,47 @@ impl Grant {
         }
     }
 
-    // What the profile the tuner holds grants, on `pool`.
+    // A repair's `work`, inside the repair pool when there is one.
+    // The pool's thread works for the job this one does.
+    pub(crate) fn install_repair<R: Send>(&self, work: impl FnOnce() -> R + Send) -> R {
+        match &self.repair_pool {
+            Some(pool) => pool.install(crate::runtime::panic_trap::carried(work)),
+            None => work(),
+        }
+    }
+
+    // What the profile the tuner holds grants, on `pool`, its repairs inside
+    // `repairs` when that is as wide as they are granted.
     //
     //   run     the profile's 7z decoder allowance, and the window any one
     //           decoder may hold, on its extract threads, lent from `pool`
     //   repair  the profile's PAR3 share of the machine's memory, which a
     //           PAR2 repair is held to as well, on every core but one, no
     //           more than the profile's repair cap
-    fn of(tuner: &RuntimeTuner, pool: Arc<rayon::ThreadPool>) -> Self {
+    fn of(
+        tuner: &RuntimeTuner,
+        pool: Arc<rayon::ThreadPool>,
+        repairs: Option<&Arc<rayon::ThreadPool>>,
+    ) -> Self {
         let tuning = tuner.profile_tuning();
         let probe = tuner.system_profile();
         let threads = tuner.params().extract_thread_count.max(1);
         let host = HardwareProfile::effective_cores(probe)
             .saturating_sub(1)
             .max(1);
+        let repair_threads = tuning.par3_cpu_cap.map_or(host, |cap| host.min(cap)).max(1);
+        let repair_pool = [Some(&pool), repairs]
+            .into_iter()
+            .flatten()
+            .find(|held| held.current_num_threads() == repair_threads)
+            .cloned()
+            .unwrap_or_else(|| {
+                crate::runtime::postprocess_pool::build_postprocess_pool(repair_threads)
+            });
         let lent: Arc<dyn Pool> = Arc::new(Lent(Arc::clone(&pool)));
         Self {
             pool: Some(pool),
+            repair_pool: Some(repair_pool),
             run: Budget {
                 memory_bytes: Some(tuning.sevenz_decode_memory_bytes),
                 window_bytes: Some(tuning.decode_window_bytes),
@@ -135,7 +163,7 @@ impl Grant {
                 ),
                 window_bytes: None,
                 window_reserved: false,
-                threads: tuning.par3_cpu_cap.map_or(host, |cap| host.min(cap)).max(1),
+                threads: repair_threads,
                 pool: None,
                 lender: None,
             },
@@ -186,7 +214,7 @@ impl Hardware {
             tuner.params().extract_thread_count,
         );
         Self {
-            grant: Arc::new(RwLock::new(Grant::of(tuner, pool))),
+            grant: Arc::new(RwLock::new(Grant::of(tuner, pool, None))),
             shutdown: Shutdown::default(),
             lifted: false,
         }
@@ -232,7 +260,7 @@ impl Hardware {
     }
 
     // The profile the tuner holds now, for the work that starts from here.
-    // The pool is built again only when its size changed; work already
+    // Each pool is built again only when its size changed; work already
     // going keeps the grant it took.
     pub(crate) fn follow(&self, tuner: &RuntimeTuner) {
         let mut grant = self.grant.write().unwrap_or_else(PoisonError::into_inner);
@@ -241,7 +269,7 @@ impl Hardware {
             Some(pool) if pool.current_num_threads() == threads => Arc::clone(pool),
             _ => crate::runtime::postprocess_pool::build_postprocess_pool(threads),
         };
-        *grant = Grant::of(tuner, pool);
+        *grant = Grant::of(tuner, pool, grant.repair_pool.as_ref());
     }
 }
 
