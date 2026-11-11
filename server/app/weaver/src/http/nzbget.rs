@@ -3885,11 +3885,15 @@ fn job_events_to_log_entries(
     entries
 }
 
+// The most entries one `log` call returns.
+const LOG_ENTRIES_MAX_LIMIT: usize = 1000;
+
 // Global message log assembled from the event tails of current queue jobs.
 async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
     let params = positional_params(params)?;
     let id_from = optional_i64_param(&params, 0)?.unwrap_or(0).max(0) as u64;
-    let limit = optional_i64_param(&params, 1)?.unwrap_or(0).max(0) as usize;
+    let limit = (optional_i64_param(&params, 1)?.unwrap_or(0).max(0) as usize)
+        .min(LOG_ENTRIES_MAX_LIMIT);
 
     let history = ctx.queue.history_rows();
     let ids: Vec<u64> = ctx.queue.read_queue(|inner| {
