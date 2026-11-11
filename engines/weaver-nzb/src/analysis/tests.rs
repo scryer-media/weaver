@@ -295,6 +295,51 @@ fn rnn_volumes_continue_into_snn() {
     assert_eq!(set.missing_volumes, 0);
 }
 
+// Volumes named by their first block and the one past their last declare
+// the blocks between, not the sum of the ends, and a set whose stem only
+// adds a dashed suffix is a set of its own.
+#[test]
+fn range_named_par2_volumes_declare_the_blocks_between() {
+    let mut files = vec![file(
+        "\"Invented.Title.2031.mkv\" yEnc (1/1)",
+        segments("main", "example.invalid", 1, 1000),
+    )];
+    let mut post = |name: String| {
+        let id = format!("p{}", files.len());
+        files.push(file(
+            format!("\"{name}\" yEnc (1/1)"),
+            segments(&id, "example.invalid", 1, 100),
+        ));
+    };
+    post("Invented.Title.2031.par2".into());
+    for (start, end) in [
+        (0, 1),
+        (1, 3),
+        (3, 7),
+        (7, 15),
+        (15, 31),
+        (31, 63),
+        (63, 105),
+    ] {
+        post(format!("Invented.Title.2031.vol{start:03}-{end:03}.par2"));
+    }
+    post("Invented.Title.2031-sample.par2".into());
+    for (start, end) in [(0, 1), (1, 3), (3, 7), (7, 15), (15, 31), (31, 58)] {
+        post(format!(
+            "Invented.Title.2031-sample.vol{start:02}-{end:02}.par2"
+        ));
+    }
+    let report = report_of(&nzb_xml(&[], &files));
+    let mut sets: Vec<(u32, u32)> = report
+        .layout
+        .par2_sets
+        .iter()
+        .map(|set| (set.volumes, set.declared_blocks))
+        .collect();
+    sets.sort();
+    assert_eq!(sets, vec![(6, 58), (7, 105)]);
+}
+
 #[test]
 fn hashed_names_without_recovery_are_flagged() {
     let files: Vec<_> = (0..4u32)
