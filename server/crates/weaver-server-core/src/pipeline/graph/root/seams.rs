@@ -678,16 +678,16 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
     }
     state
         .download_queue
-        .reprioritize_segments(classes.iter().filter_map(|(&(volume, ordinal), class)| {
-            match class {
+        .reprioritize_segments(classes.iter().filter_map(
+            |(&(volume, ordinal), class)| match class {
                 Class::Window(rank) => Some((
                     segment(job_id, VolumeIndex(volume), ordinal),
                     WINDOW_PRIORITY,
                     Some(*rank),
                 )),
                 _ => None,
-            }
-        }));
+            },
+        ));
 }
 
 // The moves applied by walks of the whole queue, which `apply_moves` must

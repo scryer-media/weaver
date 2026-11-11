@@ -660,16 +660,14 @@ async fn a_failed_rename_waits_out_its_backoff_and_a_busy_one_needs_no_walk() {
     assert_eq!(pipeline.pending_renames[&job_id].retry_at, Some(far));
 
     // Once it runs out the rename is tried, and fails again.
-    pipeline.pending_renames.get_mut(&job_id).unwrap().retry_at =
-        Some(tokio::time::Instant::now());
+    pipeline.pending_renames.get_mut(&job_id).unwrap().retry_at = Some(tokio::time::Instant::now());
     pipeline.retry_pending_renames().await;
     assert_eq!(pipeline.pending_renames[&job_id].failures, 2);
 
     // A move holds the folder: the turn passes without a try or a walk.
     std::fs::remove_dir(intermediate_dir.join("renamed")).unwrap();
     std::fs::remove_dir(&collision).unwrap();
-    pipeline.pending_renames.get_mut(&job_id).unwrap().retry_at =
-        Some(tokio::time::Instant::now());
+    pipeline.pending_renames.get_mut(&job_id).unwrap().retry_at = Some(tokio::time::Instant::now());
     pipeline.inflight_moves.insert(job_id);
     pipeline.retry_pending_renames().await;
     assert_eq!(pipeline.pending_renames[&job_id].failures, 2);
@@ -1061,7 +1059,14 @@ async fn restored_post_processing_is_interrupted_without_rerunning_scripts() {
     );
     pipeline.schedule_job_completion_check(job_id);
 
-    assert!(pipeline.recover_restored_terminal_post_processing(job_id, Some(crate::pipeline::RestoredPostProcessing::read(&pipeline.db, job_id, None))));
+    assert!(pipeline.recover_restored_terminal_post_processing(
+        job_id,
+        Some(crate::pipeline::RestoredPostProcessing::read(
+            &pipeline.db,
+            job_id,
+            None
+        ))
+    ));
     settle_failed_releases(&mut pipeline).await;
 
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
@@ -1106,7 +1111,14 @@ async fn restored_post_processing_that_already_finished_archives_as_complete() {
     );
     pipeline.schedule_job_completion_check(job_id);
 
-    assert!(pipeline.recover_restored_terminal_post_processing(job_id, Some(crate::pipeline::RestoredPostProcessing::read(&pipeline.db, job_id, None))));
+    assert!(pipeline.recover_restored_terminal_post_processing(
+        job_id,
+        Some(crate::pipeline::RestoredPostProcessing::read(
+            &pipeline.db,
+            job_id,
+            None
+        ))
+    ));
 
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
     assert!(!pipeline.jobs.contains_key(&job_id));

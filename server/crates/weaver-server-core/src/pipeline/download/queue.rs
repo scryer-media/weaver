@@ -300,18 +300,20 @@ impl DownloadQueue {
         [true, false]
             .into_iter()
             .flat_map(|completion_critical| {
-                self.class(completion_critical).iter().map(move |(key, work)| {
-                    (
-                        completion_critical,
-                        key.completion_rank,
-                        key.priority,
-                        key.rank,
-                        key.sequence,
-                        work.segment_id,
-                        work.priority,
-                        work.is_recovery,
-                    )
-                })
+                self.class(completion_critical)
+                    .iter()
+                    .map(move |(key, work)| {
+                        (
+                            completion_critical,
+                            key.completion_rank,
+                            key.priority,
+                            key.rank,
+                            key.sequence,
+                            work.segment_id,
+                            work.priority,
+                            work.is_recovery,
+                        )
+                    })
             })
             .collect()
     }
@@ -461,7 +463,11 @@ impl DownloadQueue {
                 continue;
             };
             let number = segment.segment_number;
-            found.extend(slots.range((number, 0)..=(number, u64::MAX)).map(|(_, slot)| *slot));
+            found.extend(
+                slots
+                    .range((number, 0)..=(number, u64::MAX))
+                    .map(|(_, slot)| *slot),
+            );
         }
         found.sort_by(|one, other| {
             other
@@ -481,7 +487,9 @@ impl DownloadQueue {
         let slots = self.slots_of(segments);
         let mut extracted = Vec::with_capacity(slots.len());
         for slot in slots {
-            if let Some((key, work)) = self.class_mut(slot.completion_critical).remove_entry(&slot.key)
+            if let Some((key, work)) = self
+                .class_mut(slot.completion_critical)
+                .remove_entry(&slot.key)
             {
                 self.note_removed(&key, &work);
                 extracted.push(work);

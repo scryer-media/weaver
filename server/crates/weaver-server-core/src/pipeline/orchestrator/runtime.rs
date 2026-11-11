@@ -1115,9 +1115,10 @@ impl Pipeline {
                 }));
             // A failed folder rename is tried again at this instant.
             let rename_retry_at = self.next_rename_retry_at();
-            let rename_retry_sleep = tokio::time::sleep_until(rename_retry_at.unwrap_or_else(|| {
-                tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
-            }));
+            let rename_retry_sleep =
+                tokio::time::sleep_until(rename_retry_at.unwrap_or_else(|| {
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+                }));
             // A held server admits work again on its own at this instant.
             let connection_hold_deadline = self.nntp.pool().next_connection_hold_deadline();
             let connection_hold_sleep =

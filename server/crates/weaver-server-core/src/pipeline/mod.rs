@@ -3,7 +3,9 @@
 
 mod activation;
 pub(crate) use activation::read_stored_spec_and_passwords;
-pub(crate) use completion::finalize::{ActiveRuntimeValues, RestoredPostProcessing, StoredRuntimeValues};
+pub(crate) use completion::finalize::{
+    ActiveRuntimeValues, RestoredPostProcessing, StoredRuntimeValues,
+};
 pub mod archive;
 mod capacity;
 mod completion;

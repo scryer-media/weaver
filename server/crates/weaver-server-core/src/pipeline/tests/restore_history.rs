@@ -1353,8 +1353,7 @@ async fn an_install_read_carries_the_post_processing_rows_of_a_job_in_post_proce
             working_dir,
             restart: None,
         };
-        let read =
-            crate::jobs::service::read_install(pipeline.install_seat(job_id), request).await;
+        let read = crate::jobs::service::read_install(pipeline.install_seat(job_id), request).await;
         assert_eq!(read.carries_post_processing(), carries, "{job_id:?}");
     }
 }

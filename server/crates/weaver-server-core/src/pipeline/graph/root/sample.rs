@@ -140,7 +140,10 @@ pub(crate) fn bootstrap(
 }
 
 // Each set's bids, set by set, each in place order.
-fn leading_bids(tree: &Tree, sets: &BTreeMap<NodeId, BTreeSet<(VolumeIndex, VolumeIndex)>>) -> Vec<Bid> {
+fn leading_bids(
+    tree: &Tree,
+    sets: &BTreeMap<NodeId, BTreeSet<(VolumeIndex, VolumeIndex)>>,
+) -> Vec<Bid> {
     let mut bids = Vec::new();
     for (set, volumes) in sets {
         let set = *set;

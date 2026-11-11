@@ -1818,11 +1818,7 @@ async fn read_restored(
         let category = spec.category.clone();
         Some(
             off_thread(db, move |db| {
-                crate::pipeline::RestoredPostProcessing::read(
-                    db,
-                    job_id,
-                    category.as_deref(),
-                )
+                crate::pipeline::RestoredPostProcessing::read(db, job_id, category.as_deref())
             })
             .await,
         )

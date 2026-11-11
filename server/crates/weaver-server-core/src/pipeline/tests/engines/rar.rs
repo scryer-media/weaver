@@ -284,12 +284,7 @@ async fn the_bootstrap_bids_what_a_walk_of_every_waiting_volume_bids() {
     ];
     for scenario in shapes {
         let graph = run(&scenario).await;
-        assert!(
-            graph.completed(),
-            "{:?} {:?}",
-            graph.status,
-            graph.failure
-        );
+        assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
     }
 }
 

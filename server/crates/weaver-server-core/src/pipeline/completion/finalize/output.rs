@@ -2507,7 +2507,8 @@ fn queue_events_may_hold_job(db: &crate::Database, job_id: JobId) -> bool {
 // the database. Each read is taken only where the recovery would use it.
 pub(crate) struct RestoredPostProcessing {
     facts: Result<Option<crate::post_processing::model::PostProcessingFacts>, crate::StateError>,
-    summary: Result<Option<crate::post_processing::model::PostProcessingSummary>, crate::StateError>,
+    summary:
+        Result<Option<crate::post_processing::model::PostProcessingSummary>, crate::StateError>,
     results: Result<Vec<crate::post_processing::model::ScriptResult>, crate::StateError>,
     resume: Result<Option<crate::post_processing::model::PostProcessingResume>, crate::StateError>,
     admission: Result<

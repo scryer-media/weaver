@@ -75,12 +75,12 @@ impl Pipeline {
                 return false;
             };
             let reason = self.stored_wait_reason(row);
-            let download_state = if reason == Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON)
-            {
-                crate::DownloadState::Queued
-            } else {
-                crate::jobs::model::runtime_lanes_from_status_snapshot(status).0
-            };
+            let download_state =
+                if reason == Some(crate::pipeline::nzb_admission::NZB_SLOT_WAIT_REASON) {
+                    crate::DownloadState::Queued
+                } else {
+                    crate::jobs::model::runtime_lanes_from_status_snapshot(status).0
+                };
             let report = &row.report;
             let job = &report.job;
             job.status == *status
