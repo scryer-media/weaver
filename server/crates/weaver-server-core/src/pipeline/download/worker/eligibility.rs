@@ -198,6 +198,6 @@ impl Pipeline {
     }
 
     pub(in crate::pipeline::download) fn job_dispatch_priority(state: &JobState) -> u8 {
-        crate::pipeline::nzb_admission::metadata_priority(&state.spec.metadata)
+        crate::pipeline::queue::order::metadata_priority(&state.spec.metadata)
     }
 }

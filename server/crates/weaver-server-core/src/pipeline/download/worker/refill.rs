@@ -90,23 +90,23 @@ impl Pipeline {
             .collect();
         owners.sort_unstable();
         owners.dedup();
-        // The owner standing first in the queue, each found by its index.
-        let chosen: Option<(usize, JobId)> = self.shared_state.queue.read(|inner| {
+        // The owner first in dispatch order, ranked as the hot job is, each
+        // found in the queue by its index.
+        self.shared_state.queue.read(|inner| {
             owners
                 .into_iter()
-                .filter(|job_id| self.jobs.contains_key(job_id))
                 .filter_map(|job_id| {
-                    let index = inner.job_position(job_id).or_else(|| {
-                        self.job_order
-                            .iter()
-                            .position(|id| *id == job_id)
-                            .map(|index| inner.jobs.len() + index)
-                    })?;
-                    Some((index, job_id))
+                    let state = self.jobs.get(&job_id)?;
+                    let position = inner.dispatch_position(job_id, &self.job_order)?;
+                    Some(crate::pipeline::queue::order::DispatchKey::new(
+                        Self::job_dispatch_priority(state),
+                        position,
+                        job_id,
+                    ))
                 })
                 .min()
-        });
-        chosen.map(|(_, job_id)| job_id)
+                .map(|key| key.job_id())
+        })
     }
 
     pub(crate) fn handle_download_lane_refill_request(

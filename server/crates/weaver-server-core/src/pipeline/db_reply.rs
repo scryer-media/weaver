@@ -24,7 +24,7 @@ pub(crate) enum DbReply {
     NextUp {
         job_id: JobId,
         read: u64,
-        lists: Result<Vec<Vec<crate::jobs::model::SegmentSpec>>, String>,
+        lists: Result<crate::pipeline::next_up::HeldLists, String>,
     },
 }
 

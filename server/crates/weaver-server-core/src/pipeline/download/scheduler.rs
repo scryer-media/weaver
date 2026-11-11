@@ -266,20 +266,14 @@ impl Pipeline {
             self.nzb_admitted
                 .iter()
                 .filter_map(|job_id| {
-                    let position = match inner.job_position(*job_id) {
-                        Some(position) => {
-                            let row = &inner.jobs[position];
-                            if row.intents.cancelled.is_some() || row.intents.paused == Some(true) {
-                                return None;
-                            }
-                            position
-                        }
-                        // A job installed without a queue row ranks after
-                        // every row, in install order.
-                        None => {
-                            inner.jobs.len() + self.job_order.iter().position(|id| id == job_id)?
-                        }
-                    };
+                    if let Some(row) = inner.job(*job_id)
+                        && (row.intents.cancelled.is_some() || row.intents.paused == Some(true))
+                    {
+                        return None;
+                    }
+                    // A job installed without a queue row ranks after every
+                    // row, in install order.
+                    let position = inner.dispatch_position(*job_id, &self.job_order)?;
                     Some((*job_id, position))
                 })
                 .collect()
@@ -291,11 +285,15 @@ impl Pipeline {
                 if !Self::has_dispatchable_work(state) || self.held_for_added_scripts(job_id) {
                     return None;
                 }
-                Some((Self::job_dispatch_priority(state), position, job_id))
+                Some(crate::pipeline::queue::order::DispatchKey::new(
+                    Self::job_dispatch_priority(state),
+                    position,
+                    job_id,
+                ))
             })
             .collect::<Vec<_>>();
         eligible.sort_unstable();
-        eligible.into_iter().map(|(_, _, job_id)| job_id).collect()
+        eligible.into_iter().map(|key| key.job_id()).collect()
     }
 
     // How many of one job's articles a single lane may hold at once.
