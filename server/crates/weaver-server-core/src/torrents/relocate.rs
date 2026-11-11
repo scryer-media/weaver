@@ -111,8 +111,10 @@ fn move_files_using(
         }
         return Err(error);
     }
+    // Every file is in: the move is done, and a source that will not go is
+    // only left behind (libtorrent `storage_utils.cpp:314-320`).
     for (source, _) in copied {
-        let _ = std::fs::remove_file(source);
+        left_behind(source, std::fs::remove_file(source));
     }
     for (source, _) in moves {
         let mut dir = source.parent();
@@ -158,7 +160,19 @@ fn move_directory_using(
         let _ = std::fs::create_dir(to);
         return Err(error);
     }
-    std::fs::remove_dir_all(from).map_err(MoveError::at(from))
+    // The copy is whole, so the move is done: a source that will not go is
+    // only left behind (libtorrent `storage_utils.cpp:295-335`).
+    left_behind(from, std::fs::remove_dir_all(from));
+    Ok(())
+}
+
+// A source a finished move could not remove, which stays where it was.
+fn left_behind(path: &Path, removed: io::Result<()>) {
+    if let Err(error) = removed
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        tracing::warn!(path = %path.display(), error = %error, "a moved torrent's files were copied but could not be removed from where they were");
+    }
 }
 
 // Copy the directory at `from`, as it is, to `to`, which need not exist.
@@ -329,6 +343,45 @@ mod tests {
         assert!(!move_files(&from, &moves, Existing::Replace).unwrap());
         assert_eq!(contents(&to), expected);
         assert!(contents(&from).is_empty());
+    }
+
+    // libtorrent `storage_utils::move_storage` (`storage_utils.cpp:295-335`):
+    // once every copy is in, the move is done; a source that will not go
+    // after it is left behind, and the move stands.
+    #[cfg(unix)]
+    #[test]
+    fn a_copied_move_stands_when_its_source_will_not_go() {
+        use std::os::unix::fs::PermissionsExt;
+        let locked = |dir: &Path, mode| {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let across = |_: &Path, _: &Path| Err(io::Error::from(io::ErrorKind::CrossesDevices));
+
+        let root = tempfile::tempdir().unwrap();
+        let (from, to) = (root.path().join("from"), root.path().join("to"));
+        tree(&from);
+        let expected = contents(&from);
+        std::fs::create_dir(&to).unwrap();
+        locked(&from.join("sub"), 0o555);
+        let moved = move_directory_using(&from, &to, across);
+        locked(&from.join("sub"), 0o755);
+        moved.unwrap();
+        assert_eq!(contents(&to), expected);
+        assert!(from.join("sub/b.bin").exists());
+
+        let (from, to) = (root.path().join("files"), root.path().join("moved"));
+        tree(&from);
+        let moves: Vec<(PathBuf, PathBuf)> = expected
+            .iter()
+            .map(|(name, _)| (from.join(name), to.join(name)))
+            .collect();
+        locked(&from.join("sub"), 0o555);
+        let moved = move_files_using(&from, &moves, Existing::Replace, across);
+        locked(&from.join("sub"), 0o755);
+        assert!(!moved.unwrap());
+        assert_eq!(contents(&to), expected);
+        assert!(from.join("sub/b.bin").exists());
+        assert!(!from.join("a.bin").exists());
     }
 
     // A rename that fails for another reason leaves the job as it was: the
