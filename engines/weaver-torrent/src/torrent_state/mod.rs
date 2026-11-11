@@ -1346,6 +1346,17 @@ impl ManagedTorrent {
         {
             let g = self.locked.read();
             match &g.state {
+                // A paused torrent whose check a pause stopped, or that was
+                // paused before its check began, checks nothing: it is
+                // paused, and checks again once it is resumed. libtorrent
+                // holds a paused torrent in `checking_files` with no check
+                // running (`torrent::should_check_files`, torrent.cpp:9740-9747,
+                // v2.0.15), and qBittorrent shows it stopped
+                // (`TorrentImpl::updateState`, torrentimpl.cpp:1316, which
+                // shows a check only for a torrent not stopped).
+                ManagedTorrentState::Initializing(i) if g.paused && !i.is_checking() => {
+                    resp.state = S::Paused;
+                }
                 ManagedTorrentState::Initializing(i) => {
                     resp.state = S::Initializing {
                         paused: g.paused,
