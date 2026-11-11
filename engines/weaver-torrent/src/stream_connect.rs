@@ -9,7 +9,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::Duration,
 };
@@ -136,11 +136,85 @@ impl StreamConnectorArgs {
     }
 }
 
+// Outgoing connection attempts over one transport and family, and how each
+// ended: every attempt ends in exactly one of connected (`successes`),
+// refused by the peer, timed out, or failed otherwise (`errors`), an
+// attempt dropped because the other transport connected first among them.
 gen_stats!(SingleStatAtomic SingleStatSnapshot, [
     attempts u64,
     successes u64,
+    refused u64,
+    timeouts u64,
     errors u64
 ], []);
+
+// How a failed attempt ended, as its error says.
+enum Failure {
+    Refused,
+    TimedOut,
+    Other,
+}
+
+trait Failed {
+    fn failure(&self) -> Failure;
+}
+
+impl Failed for std::io::Error {
+    fn failure(&self) -> Failure {
+        match self.kind() {
+            std::io::ErrorKind::ConnectionRefused => Failure::Refused,
+            std::io::ErrorKind::TimedOut => Failure::TimedOut,
+            _ => Failure::Other,
+        }
+    }
+}
+
+impl Failed for weaver_utp::Error {
+    fn failure(&self) -> Failure {
+        match self {
+            // A peer with no uTP listener answers the SYN with a reset.
+            weaver_utp::Error::StResetReceived => Failure::Refused,
+            weaver_utp::Error::ConnectTimedOut | weaver_utp::Error::TimedOut => Failure::TimedOut,
+            _ => Failure::Other,
+        }
+    }
+}
+
+// Counts the end of one attempt once: as it finished, or, when it is
+// dropped unfinished, as timed out when the dial's time ran out and as
+// failed otherwise.
+struct Attempt<'a> {
+    stat: &'a SingleStatAtomic,
+    expired: &'a AtomicBool,
+    ended: bool,
+}
+
+impl Attempt<'_> {
+    fn end<R, E: Failed>(&mut self, result: &std::result::Result<R, E>) {
+        self.ended = true;
+        match result {
+            Ok(_) => self.stat.successes(1),
+            Err(e) => match e.failure() {
+                Failure::Refused => self.stat.refused(1),
+                Failure::TimedOut => self.stat.timeouts(1),
+                Failure::Other => self.stat.errors(1),
+            },
+        }
+    }
+}
+
+impl Drop for Attempt<'_> {
+    fn drop(&mut self) {
+        if self.ended {
+            return;
+        }
+        if self.expired.load(Ordering::Relaxed) {
+            self.stat.timeouts(1);
+        } else {
+            self.stat.errors(1);
+        }
+    }
+}
 gen_stats!(PerFamilyAtomic PerFamilySnapshot, [], [
     v4 SingleStatAtomic SingleStatSnapshot,
     v6 SingleStatAtomic SingleStatSnapshot
@@ -249,12 +323,21 @@ impl StreamConnector {
         Meter,
         Encryption,
     )> {
-        let (kind, r, w) = with_timeout(
-            "connecting",
-            connect_timeout,
-            self.connect(addr, transports),
-        )
-        .await?;
+        // The attempts still running when the time runs out end as timed
+        // out: the flag is set before the dial, and with it its attempts, is
+        // dropped.
+        let expired = AtomicBool::new(false);
+        let (kind, r, w) = {
+            let dial = self.dial(addr, transports, &expired);
+            tokio::pin!(dial);
+            match tokio::time::timeout(connect_timeout, &mut dial).await {
+                Ok(dialed) => dialed?,
+                Err(_) => {
+                    expired.store(true, Ordering::Relaxed);
+                    return Err(Error::Timeout("connecting"));
+                }
+            }
+        };
         let (meter, r, mut w) = Meter::wrap(r, w);
 
         let policy = match guard {
@@ -327,17 +410,23 @@ impl StreamConnector {
         if is_v6 { &stat.v6 } else { &stat.v4 }
     }
 
-    async fn with_stat<R, E>(
+    async fn with_stat<R, E: Failed>(
         &self,
         kind: ConnectionKind,
         is_v6: bool,
+        expired: &AtomicBool,
         fut: impl Future<Output = std::result::Result<R, E>>,
     ) -> std::result::Result<R, E> {
         let stat = self.get_stat(kind, is_v6);
         stat.attempts(1);
-        fut.await
-            .inspect(|_| stat.successes(1))
-            .inspect_err(|_| stat.errors(1))
+        let mut attempt = Attempt {
+            stat,
+            expired,
+            ended: false,
+        };
+        let result = fut.await;
+        attempt.end(&result);
+        result
     }
 
     pub fn stats(&self) -> &ConnectStatsAtomic {
@@ -392,6 +481,17 @@ impl StreamConnector {
         addr: SocketAddr,
         transports: Transports,
     ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
+        self.dial(addr, transports, &AtomicBool::new(false)).await
+    }
+
+    // Connect as `connect` does. An attempt dropped unfinished counts as
+    // timed out when `expired` is set by then, and as failed otherwise.
+    async fn dial(
+        &self,
+        addr: SocketAddr,
+        transports: Transports,
+        expired: &AtomicBool,
+    ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
         let addr = crate::network::canonical_socket_addr(addr);
         if addr.port() == 0 {
             return Err(Error::Anyhow(anyhow::anyhow!(
@@ -422,6 +522,7 @@ impl StreamConnector {
                 .with_stat(
                     ConnectionKind::Tcp,
                     addr.is_ipv6(),
+                    expired,
                     self.socket_factory.connect_tcp(addr),
                 )
                 .await?;
@@ -452,7 +553,12 @@ impl StreamConnector {
             };
 
             let conn = self
-                .with_stat(ConnectionKind::Utp, addr.is_ipv6(), sock.connect(addr))
+                .with_stat(
+                    ConnectionKind::Utp,
+                    addr.is_ipv6(),
+                    expired,
+                    sock.connect(addr),
+                )
                 .await?;
 
             debug!(?addr, "connected over uTP");
@@ -1037,5 +1143,99 @@ mod tests {
         drop(dialed);
         let sent = send_handshake(&connector, || panic!("asked which handshake")).await;
         assert!(matches!(sent, Err(Error::TcpConnect(_))), "{sent:?}");
+    }
+
+    /// Sockets whose TCP connects end as `answer` says: never, when it is
+    /// `None`, else with an error of that kind.
+    struct Answering {
+        sockets: Arc<dyn SocketFactory>,
+        answer: Option<std::io::ErrorKind>,
+    }
+
+    impl SocketFactory for Answering {
+        fn connect_tcp<'a>(
+            &'a self,
+            _addr: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<(BoxAsyncReadVectored, BoxAsyncWrite)>> {
+            let answer = self.answer;
+            Box::pin(async move {
+                match answer {
+                    Some(kind) => Err(std::io::Error::from(kind)),
+                    None => std::future::pending().await,
+                }
+            })
+        }
+
+        fn listen_tcp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>> {
+            self.sockets.listen_tcp(addr)
+        }
+
+        fn bind_udp<'a>(
+            &'a self,
+            addr: SocketAddr,
+        ) -> BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>> {
+            self.sockets.bind_udp(addr)
+        }
+
+        fn bind_utp<'a>(
+            &'a self,
+            addr: SocketAddr,
+            receive_buffer: usize,
+        ) -> BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>> {
+            self.sockets.bind_utp(addr, receive_buffer)
+        }
+    }
+
+    // The TCP counts, as attempted, connected, refused, timed out and failed
+    // otherwise, after one handshake to a peer whose connect ends as
+    // `answer` says, under a connect timeout of a minute.
+    async fn tcp_ends(answer: Option<std::io::ErrorKind>) -> [u64; 5] {
+        let connector = StreamConnector::new(StreamConnectorArgs::over(Arc::new(Answering {
+            sockets: crate::test_support::socket_factory(),
+            answer,
+        })))
+        .await
+        .unwrap();
+        let sent = connector
+            .connect_and_send_handshake(
+                (Ipv4Addr::LOCALHOST, 6881).into(),
+                Transports::Any,
+                Guard::Mse(EncryptionPolicy::Disabled),
+                &Id20::new([7; 20]),
+                HANDSHAKE,
+                || false,
+                Duration::from_secs(60),
+                Duration::MAX,
+            )
+            .await;
+        assert!(sent.is_err());
+        let v4 = connector.stats().tcp.snapshot().v4;
+        [v4.attempts, v4.successes, v4.refused, v4.timeouts, v4.errors]
+    }
+
+    // Every attempt ends in exactly one counted end: one whose connect
+    // timeout runs out counts as timed out, not as nothing.
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_that_runs_out_of_time_counts_as_timed_out() {
+        assert_eq!(tcp_ends(None).await, [1, 0, 0, 1, 0]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_the_peer_refuses_counts_as_refused() {
+        assert_eq!(
+            tcp_ends(Some(std::io::ErrorKind::ConnectionRefused)).await,
+            [1, 0, 1, 0, 0]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_attempt_that_fails_otherwise_counts_as_failed() {
+        assert_eq!(
+            tcp_ends(Some(std::io::ErrorKind::ConnectionReset)).await,
+            [1, 0, 0, 0, 1]
+        );
     }
 }

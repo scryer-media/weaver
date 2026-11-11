@@ -381,8 +381,9 @@ pub struct SessionSeries {
     /// Its peers across every torrent, by state.
     pub peers: Vec<(&'static str, u32)>,
     /// Outgoing connections by transport and address family: attempted,
-    /// succeeded, failed.
-    pub connects: Vec<(&'static str, &'static str, [u64; 3])>,
+    /// then each attempt's end: connected, refused, timed out, failed
+    /// otherwise.
+    pub connects: Vec<(&'static str, &'static str, [u64; 5])>,
     /// Its DHT, while it runs one: nodes in the v4 and v6 routing tables,
     /// and requests waiting for an answer.
     pub dht: Option<(usize, usize, usize)>,
@@ -408,7 +409,13 @@ impl SessionSeries {
         let connections = &stats.connections;
         macro_rules! family {
             ($single:expr) => {
-                [$single.attempts, $single.successes, $single.errors]
+                [
+                    $single.attempts,
+                    $single.successes,
+                    $single.refused,
+                    $single.timeouts,
+                    $single.errors,
+                ]
             };
         }
         Self {

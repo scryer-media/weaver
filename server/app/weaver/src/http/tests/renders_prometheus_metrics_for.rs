@@ -1161,6 +1161,15 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
             r#"weaver_torrent_session_connect_results_total{{{ROUTE},transport="tcp",family="v4",result="succeeded"}} 20"#
         ),
         format!(
+            r#"weaver_torrent_session_connect_results_total{{{ROUTE},transport="tcp",family="v4",result="refused"}} 3"#
+        ),
+        format!(
+            r#"weaver_torrent_session_connect_results_total{{{ROUTE},transport="tcp",family="v4",result="timed_out"}} 4"#
+        ),
+        format!(
+            r#"weaver_torrent_session_connect_results_total{{{ROUTE},transport="tcp",family="v4",result="failed"}} 2"#
+        ),
+        format!(
             r#"weaver_torrent_session_connect_results_total{{{ROUTE},transport="utp",family="v4",result="failed"}} 5"#
         ),
         format!(r#"weaver_torrent_dht_nodes{{{ROUTE},family="v4"}} 150"#),
