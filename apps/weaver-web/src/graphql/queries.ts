@@ -1308,8 +1308,6 @@ export const HISTORY_DELETE_OPERATIONS_QUERY = gql`
 export const HISTORY_JOBS_COUNT_QUERY = gql`
   query HistoryJobsCount {
     all: historyItemsCount
-    success: historyItemsCount(filter: { states: [COMPLETED] })
-    failure: historyItemsCount(filter: { states: [FAILED] })
   }
 `;
 

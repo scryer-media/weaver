@@ -232,6 +232,28 @@ impl Database {
         })
     }
 
+    // The ids among `job_ids` that have a history row, hidden or not, in no
+    // particular order. Reads only the id column, through the primary key.
+    pub fn job_history_ids_among(&self, job_ids: &[u64]) -> Result<Vec<u64>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let datastore = self.datastore();
+        let job_ids = job_ids.to_vec();
+        self.run_sql_blocking_read(async move {
+            let mut found = Vec::new();
+            for chunk in job_ids.chunks(max_rows_for_engine(datastore.engine(), 1)) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let sql = format!("SELECT job_id FROM job_history WHERE job_id IN ({placeholders})");
+                let args: Vec<SqlArg> = chunk.iter().map(|id| SqlArg::I64(*id as i64)).collect();
+                for row in SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await? {
+                    found.push(row.i64("job_id")? as u64);
+                }
+            }
+            Ok(found)
+        })
+    }
+
     // The match-and-order columns of every history row `rows` shows, in no
     // particular order. `with_titles` adds the name and metadata a title is
     // built from; without it both come back empty.

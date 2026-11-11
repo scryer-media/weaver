@@ -53,6 +53,8 @@ impl HistoryQuery {
         let HistoryQueryPlan::Query(mut history_filter) = plan else {
             return Ok(Vec::new());
         };
+        let want_delete_states = ctx.look_ahead().field("deleteOperation").exists();
+        let want_duplicates = ctx.look_ahead().field("duplicateSummary").exists();
         let items = tokio::task::spawn_blocking(move || {
             // Live rows are left out in SQL, before the page is cut, so a page
             // comes back full and the cursor's offset counts only rows that are
@@ -64,12 +66,20 @@ impl HistoryQuery {
                 history_filter.item_ids_not_in = Some(ids);
             }
             let rows = db.list_job_history(&history_filter, HistoryRows::Shown)?;
-            let delete_states = load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?;
-            let duplicate_summaries = load_duplicate_summaries_chunked(
-                &db,
-                rows.iter()
-                    .map(|row| weaver_server_core::jobs::ids::JobId(row.job_id)),
-            )?;
+            let delete_states = if want_delete_states {
+                load_history_delete_states(&db, rows.iter().map(|row| row.job_id))?
+            } else {
+                HashMap::new()
+            };
+            let duplicate_summaries = if want_duplicates {
+                load_duplicate_summaries_chunked(
+                    &db,
+                    rows.iter()
+                        .map(|row| weaver_server_core::jobs::ids::JobId(row.job_id)),
+                )?
+            } else {
+                Default::default()
+            };
             Ok::<_, weaver_server_core::StateError>(
                 rows.into_iter()
                     .map(|row| {
@@ -100,7 +110,7 @@ impl HistoryQuery {
     ) -> Result<HistoryPage> {
         let db = ctx.data::<Database>()?.clone();
         let live_jobs = live_job_ids(ctx.data::<SchedulerHandle>()?);
-        load_history_page(db, live_jobs, input).await
+        load_history_page(db, live_jobs, input, HistoryPageFields::selected(ctx)).await
     }
     /// Public history facade for one completed or failed item.
     #[graphql(guard = "ReadGuard")]
@@ -399,10 +409,45 @@ pub(crate) async fn load_job_detail_snapshot(
     })
 }
 
+// The parts of a History page a query selected; the rest are left at their
+// defaults without being read.
+#[derive(Debug, Clone, Copy)]
+struct HistoryPageFields {
+    total_count: bool,
+    counts: bool,
+    category_counts: bool,
+    delete_operation: bool,
+    duplicate_summary: bool,
+}
+
+impl HistoryPageFields {
+    #[cfg(test)]
+    const ALL: Self = Self {
+        total_count: true,
+        counts: true,
+        category_counts: true,
+        delete_operation: true,
+        duplicate_summary: true,
+    };
+
+    fn selected(ctx: &Context<'_>) -> Self {
+        let page = ctx.look_ahead();
+        let items = page.field("items");
+        Self {
+            total_count: page.field("totalCount").exists(),
+            counts: page.field("counts").exists(),
+            category_counts: page.field("categoryCounts").exists(),
+            delete_operation: items.field("deleteOperation").exists(),
+            duplicate_summary: items.field("duplicateSummary").exists(),
+        }
+    }
+}
+
 async fn load_history_page(
     db: Database,
     live_jobs: HashSet<u64>,
     input: HistoryPageInput,
+    fields: HistoryPageFields,
 ) -> Result<HistoryPage> {
     tokio::task::spawn_blocking(move || {
         // Rows for jobs the scheduler still owns are not history. They are
@@ -423,11 +468,11 @@ async fn load_history_page(
         // columns a row is matched and ordered by, decides the page in Rust, and
         // reads whole rows for that page alone.
         let page = if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
-            build_history_page_sql(&db, plan, &live_in_history)?
+            build_history_page_sql(&db, plan, &live_in_history, fields)?
         } else {
             build_history_page_from_keys(&db, input, &live_in_history)?
         };
-        attach_history_page_badges(&db, page)
+        attach_history_page_badges(&db, page, fields)
     })
     .await
     .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
@@ -444,14 +489,23 @@ async fn load_history_page(
 fn attach_history_page_badges(
     db: &Database,
     mut page: HistoryPage,
+    fields: HistoryPageFields,
 ) -> Result<HistoryPage, weaver_server_core::StateError> {
-    let delete_states = load_history_delete_states(db, page.items.iter().map(|item| item.id))?;
-    let duplicate_summaries = load_duplicate_summaries_chunked(
-        db,
-        page.items
-            .iter()
-            .map(|item| weaver_server_core::jobs::ids::JobId(item.id)),
-    )?;
+    let delete_states = if fields.delete_operation {
+        load_history_delete_states(db, page.items.iter().map(|item| item.id))?
+    } else {
+        HashMap::new()
+    };
+    let duplicate_summaries = if fields.duplicate_summary {
+        load_duplicate_summaries_chunked(
+            db,
+            page.items
+                .iter()
+                .map(|item| weaver_server_core::jobs::ids::JobId(item.id)),
+        )?
+    } else {
+        Default::default()
+    };
     for item in &mut page.items {
         item.delete_operation = delete_states
             .get(&item.id)
@@ -552,6 +606,7 @@ fn build_history_page_sql(
     db: &Database,
     plan: HistoryPageSqlPlan,
     live_in_history: &HashSet<u64>,
+    fields: HistoryPageFields,
 ) -> Result<HistoryPage, weaver_server_core::StateError> {
     // Every count and the page itself leave out rows of jobs still live.
     let excluding_live = |mut filter: weaver_server_core::HistoryFilter| {
@@ -570,18 +625,32 @@ fn build_history_page_sql(
     };
 
     // Counts are computed over the category-filtered set before the status
-    // filter, just like the key path computes them.
+    // filter, just like the key path computes them. The total is the bucket
+    // count of the requested status, so it is read once for either field.
+    let bucket = |status: HistoryStatusFilter| -> Result<u32, weaver_server_core::StateError> {
+        if !(fields.counts || (fields.total_count && plan.status == status)) {
+            return Ok(0);
+        }
+        let filter = match status {
+            HistoryStatusFilter::All => weaver_server_core::HistoryFilter::default(),
+            HistoryStatusFilter::Success => success_history_filter(),
+            HistoryStatusFilter::Failure => failure_history_filter(),
+        };
+        db.count_job_history(&in_categories(filter), HistoryRows::Shown)
+    };
     let counts = HistoryPageCounts {
-        all: db.count_job_history(
-            &in_categories(weaver_server_core::HistoryFilter::default()),
-            HistoryRows::Shown,
-        )?,
-        success: db.count_job_history(&in_categories(success_history_filter()), HistoryRows::Shown)?,
-        failure: db.count_job_history(&in_categories(failure_history_filter()), HistoryRows::Shown)?,
+        all: bucket(HistoryStatusFilter::All)?,
+        success: bucket(HistoryStatusFilter::Success)?,
+        failure: bucket(HistoryStatusFilter::Failure)?,
+    };
+    let total_count = match plan.status {
+        HistoryStatusFilter::All => counts.all,
+        HistoryStatusFilter::Success => counts.success,
+        HistoryStatusFilter::Failure => counts.failure,
     };
 
-    // The status filter selects which rows are paginated and counted for
-    // total_count. `All` needs no status predicate.
+    // The status filter selects which rows are paginated. `All` needs no
+    // status predicate.
     let mut items_filter = in_categories(match plan.status {
         HistoryStatusFilter::All => weaver_server_core::HistoryFilter::default(),
         HistoryStatusFilter::Success => success_history_filter(),
@@ -590,17 +659,18 @@ fn build_history_page_sql(
 
     // Facet counts describe every category, before the category filter: a
     // facet's count has to survive that facet's rivals being selected.
-    let mut category_counts: Vec<HistoryCategoryCount> = db
-        .count_job_history_by_category(
+    let mut category_counts: Vec<HistoryCategoryCount> = if fields.category_counts {
+        db.count_job_history_by_category(
             &excluding_live(weaver_server_core::HistoryFilter::default()),
             HistoryRows::Shown,
         )?
         .into_iter()
         .map(|(category, count)| HistoryCategoryCount { category, count })
-        .collect();
+        .collect()
+    } else {
+        Vec::new()
+    };
     category_counts.sort_by(|left, right| left.category.cmp(&right.category));
-
-    let total_count = db.count_job_history(&items_filter, HistoryRows::Shown)?;
 
     items_filter.order = plan.order;
     items_filter.limit = Some(plan.page_size as u32);
@@ -811,16 +881,9 @@ fn live_jobs_in_history(
     if live_jobs.is_empty() {
         return Ok(HashSet::new());
     }
-    let filter = weaver_server_core::HistoryFilter {
-        item_ids: Some(live_jobs.iter().copied().collect()),
-        ..Default::default()
-    };
+    let live_jobs: Vec<u64> = live_jobs.iter().copied().collect();
     // An exclusion list: an id that is hidden anyway changes nothing.
-    Ok(db
-        .list_job_history(&filter, HistoryRows::All)?
-        .into_iter()
-        .map(|row| row.job_id)
-        .collect())
+    Ok(db.job_history_ids_among(&live_jobs)?.into_iter().collect())
 }
 
 // How many of the rows `filter` counts belong to jobs the scheduler still
@@ -1327,7 +1390,7 @@ mod tests {
     fn assert_parity_excluding(db: &Database, input: HistoryPageInput, live: &HashSet<u64>) {
         let plan = HistoryPageSqlPlan::for_input(&input)
             .expect("input should be SQL-eligible for this parity check");
-        let sql = build_history_page_sql(db, plan, live).unwrap();
+        let sql = build_history_page_sql(db, plan, live, HistoryPageFields::ALL).unwrap();
         let rust = rust_page(db, input, live);
 
         assert_eq!(
@@ -1448,6 +1511,63 @@ mod tests {
         }
     }
 
+    // A page that selects only some parts reads only those, and the parts it
+    // does select match the whole page.
+    #[test]
+    fn a_page_reads_only_the_parts_it_selects() {
+        let db = Database::open_in_memory().unwrap();
+        seed(&db);
+        let live = HashSet::from([6]);
+        let none = HistoryPageFields {
+            total_count: false,
+            counts: false,
+            category_counts: false,
+            delete_operation: false,
+            duplicate_summary: false,
+        };
+        for status in [
+            HistoryStatusFilter::All,
+            HistoryStatusFilter::Success,
+            HistoryStatusFilter::Failure,
+        ] {
+            let plan = || HistoryPageSqlPlan::for_input(&page_input(0, 3, Some(status))).unwrap();
+            let whole = build_history_page_sql(&db, plan(), &live, HistoryPageFields::ALL).unwrap();
+            let total_only = build_history_page_sql(
+                &db,
+                plan(),
+                &live,
+                HistoryPageFields {
+                    total_count: true,
+                    ..none
+                },
+            )
+            .unwrap();
+            assert_eq!(total_only.total_count, whole.total_count, "{status:?}");
+            assert_eq!(total_only.items, whole.items, "{status:?}");
+            assert!(total_only.category_counts.is_empty());
+
+            let bare = build_history_page_sql(&db, plan(), &live, none).unwrap();
+            assert_eq!(bare.total_count, 0);
+            assert_eq!((bare.counts.all, bare.counts.success, bare.counts.failure), (0, 0, 0));
+            assert_eq!(
+                bare.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+                whole.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            );
+
+            let counts_only = build_history_page_sql(
+                &db,
+                plan(),
+                &live,
+                HistoryPageFields { counts: true, ..none },
+            )
+            .unwrap();
+            assert_eq!(
+                (counts_only.counts.all, counts_only.counts.success, counts_only.counts.failure),
+                (whole.counts.all, whole.counts.success, whole.counts.failure),
+            );
+        }
+    }
+
     // A re-queued job's old row stays on the SQL path: the live ids are
     // excluded in SQL, and the page, its total and every bucket count match
     // the Rust path over the same rows with those ids removed.
@@ -1468,7 +1588,7 @@ mod tests {
         }
 
         let plan = HistoryPageSqlPlan::for_input(&page_input(0, 25, None)).unwrap();
-        let page = build_history_page_sql(&db, plan, &live).unwrap();
+        let page = build_history_page_sql(&db, plan, &live, HistoryPageFields::ALL).unwrap();
         assert_eq!(page.total_count, 5);
         assert!(page.items.iter().all(|item| !live.contains(&item.id)));
     }
@@ -1709,7 +1829,7 @@ mod tests {
                                             .unwrap();
                                     assert_pages_equal(&label, &keyed, &whole);
                                     if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
-                                        let sql = build_history_page_sql(&db, plan, live).unwrap();
+                                        let sql = build_history_page_sql(&db, plan, live, HistoryPageFields::ALL).unwrap();
                                         assert_pages_equal(&label, &sql, &whole);
                                         sql_checked += 1;
                                     }
@@ -1758,7 +1878,7 @@ mod tests {
         let live = live_job_ids(&handle);
         assert!(live.contains(&3));
 
-        let page = load_history_page(db.clone(), live.clone(), page_input(0, 25, None))
+        let page = load_history_page(db.clone(), live.clone(), page_input(0, 25, None), HistoryPageFields::ALL)
             .await
             .unwrap();
         let ids: Vec<u64> = page.items.iter().map(|item| item.id).collect();
@@ -1807,7 +1927,7 @@ mod tests {
         )]);
         let live = live_job_ids(&handle);
         assert!(live.contains(&3));
-        let page = load_history_page(db.clone(), live, page_input(0, 25, None))
+        let page = load_history_page(db.clone(), live, page_input(0, 25, None), HistoryPageFields::ALL)
             .await
             .unwrap();
         assert!(!page.items.iter().any(|item| item.id == 3));
@@ -1816,7 +1936,7 @@ mod tests {
         let handle = scheduler_with_jobs(vec![]);
         let live = live_job_ids(&handle);
         assert!(live.is_empty());
-        let page = load_history_page(db, live, page_input(0, 25, None))
+        let page = load_history_page(db, live, page_input(0, 25, None), HistoryPageFields::ALL)
             .await
             .unwrap();
         let ids: Vec<u64> = page.items.iter().map(|item| item.id).collect();
@@ -1842,7 +1962,7 @@ mod tests {
         assert!(handle.list_jobs().iter().any(|job| job.job_id.0 == 3));
         let live = live_job_ids(&handle);
         assert!(live.contains(&3));
-        let page = load_history_page(db, live, page_input(0, 25, None))
+        let page = load_history_page(db, live, page_input(0, 25, None), HistoryPageFields::ALL)
             .await
             .unwrap();
         assert!(!page.items.iter().any(|item| item.id == 3));
@@ -1863,7 +1983,7 @@ mod tests {
         let live = live_job_ids(&handle);
         assert_eq!(live.len(), 1);
 
-        let page = load_history_page(db, live, page_input(0, 25, None))
+        let page = load_history_page(db, live, page_input(0, 25, None), HistoryPageFields::ALL)
             .await
             .unwrap();
         let ids: Vec<u64> = page.items.iter().map(|item| item.id).collect();
