@@ -947,6 +947,14 @@ impl ManagedTorrent {
                                     paused.peers = checked.take_peers();
                                     g.state = ManagedTorrentState::Paused(Box::new(paused));
                                     t.state_change_notify.notify_waiters();
+                                    // The checked torrent goes live only if it
+                                    // is still asked to run: a pause or start
+                                    // made during the check overrides the one
+                                    // the check began with (libtorrent
+                                    // torrent.cpp:9739-9746 and :2371, v2.0.15,
+                                    // gate every step on `m_paused` as it is
+                                    // now).
+                                    let start_paused = g.paused;
                                     _start(&t, peer_rx, start_paused, session, Some(g), token)
                                 }
                                 Err(err) => {
