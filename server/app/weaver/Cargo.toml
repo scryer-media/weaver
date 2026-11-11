@@ -87,6 +87,13 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = ["c
 tikv-jemallocator = { version = "0.7", default-features = false }
 tikv-jemalloc-sys = { version = "0.7", default-features = false }
 
+# On glibc Linux only, build jemalloc so its background purge thread can be
+# switched on; `allocator_jemalloc` switches it on. The crate marks musl as
+# unsupported, and Mach-O has no background thread, so every other target
+# keeps the build above unchanged.
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+tikv-jemalloc-sys = { version = "0.7", default-features = false, features = ["background_threads_runtime_support"] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 # Windows has no jemalloc, and its system heap serializes threaded allocation
 # badly, so it keeps the tuned mimalloc; see `allocator_mimalloc`.
