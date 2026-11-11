@@ -105,6 +105,12 @@ pub(crate) async fn read_metainfo_from_peer(
 /// `ut_metadata_plugin::received_metadata`).
 pub(crate) const MAX_METADATA_SIZE: u32 = 30 * 1024 * 1024;
 
+/// The largest metadata size a peer's extended handshake may size the
+/// buffer to (libtorrent `ut_metadata_plugin::metadata_size`,
+/// ut_metadata.cpp:146-152, v2.0.15). Larger metadata is sized by the
+/// `total_size` of the first piece that comes in.
+const HANDSHAKE_METADATA_SIZE_CAP: u32 = 4 * 1024 * 1024;
+
 /// How long a peer that rejected a metadata request is left alone
 /// (libtorrent `ut_metadata_peer_plugin::on_extended`, `dont_have`).
 const REJECTED_WAIT: Duration = Duration::from_secs(60);
@@ -119,13 +125,12 @@ const MAX_OUTSTANDING: usize = 2;
 /// longest `peer_connection::request_timeout`).
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// One torrent's metadata as its peers send it in. The buffer belongs to
-/// the fetch, not to a peer (libtorrent `ut_metadata_plugin::m_metadata`):
-/// every peer that names the same size fills the one buffer of that size,
-/// which lives while a peer filling it does.
+/// One torrent's metadata as its peers send it in. The fetch has one
+/// buffer, whatever sizes its peers claim (libtorrent
+/// `ut_metadata_plugin::m_metadata`).
 pub(crate) struct MetadataFetch {
     info_hashes: InfoHashes,
-    sets: Mutex<HashMap<u32, Weak<Mutex<PieceSet>>>>,
+    set: Arc<Mutex<PieceSet>>,
     /// The DHT the fetch looks for peers on, when it may.
     dht: Option<FetchDht>,
 }
@@ -151,7 +156,7 @@ impl MetadataFetch {
     pub(crate) fn new(info_hashes: InfoHashes, dht: Option<FetchDht>) -> Arc<Self> {
         Arc::new(Self {
             info_hashes,
-            sets: Default::default(),
+            set: Arc::new(Mutex::new(PieceSet::new())),
             dht,
         })
     }
@@ -164,29 +169,28 @@ impl MetadataFetch {
         (*fetch.phase.borrow() == FetchPhase::Discovery).then_some(&fetch.dht)
     }
 
-    /// The buffer of the metadata size a peer names, made when no peer
-    /// filling one of that size is left.
+    /// The fetch's buffer, for a peer whose extended handshake names
+    /// `metadata_size`, which the buffer takes as libtorrent's
+    /// `metadata_size` does: only up to [`HANDSHAKE_METADATA_SIZE_CAP`].
     fn join(&self, metadata_size: u32) -> anyhow::Result<Arc<Mutex<PieceSet>>> {
         anyhow::ensure!(
             metadata_size > 0 && metadata_size <= MAX_METADATA_SIZE,
             "metadata size {metadata_size} is out of range"
         );
-        let mut sets = self.sets.lock();
-        sets.retain(|_, set| set.strong_count() > 0);
-        if let Some(set) = sets.get(&metadata_size).and_then(Weak::upgrade) {
-            return Ok(set);
-        }
-        let set = Arc::new(Mutex::new(PieceSet::new(metadata_size)));
-        sets.insert(metadata_size, Arc::downgrade(&set));
-        Ok(set)
+        self.set.lock().claim(metadata_size);
+        Ok(self.set.clone())
     }
 }
 
-/// The pieces of metadata of one size: how often each was asked for, and
+/// The pieces of a torrent's metadata: how often each was asked for, and
 /// the peer that sent it (libtorrent `ut_metadata_plugin::
 /// m_requested_metadata`).
 struct PieceSet {
+    /// The metadata, empty until its size is known.
     buffer: Vec<u8>,
+    /// One for each piece of the buffer; while its size is unknown, one for
+    /// the first piece, which a peer is asked for to learn the size
+    /// (libtorrent `metadata_request` with no pieces yet).
     pieces: Vec<MetadataPiece>,
     /// The peers filling the set, woken when every piece is missing again.
     peers: Vec<Weak<Requests>>,
@@ -213,13 +217,41 @@ enum Recorded {
 }
 
 impl PieceSet {
-    fn new(metadata_size: u32) -> Self {
-        let total_pieces = metadata_size.div_ceil(CHUNK_SIZE) as usize;
+    fn new() -> Self {
         Self {
-            buffer: vec![0u8; metadata_size as usize],
-            pieces: vec![MetadataPiece::default(); total_pieces],
+            buffer: Vec::new(),
+            pieces: vec![MetadataPiece::default()],
             peers: Vec::new(),
         }
+    }
+
+    fn size(&self) -> u32 {
+        u32::try_from(self.buffer.len()).expect("metadata sizes fit in u32")
+    }
+
+    /// The buffer is `metadata_size` long from now on, every piece missing
+    /// and unasked, and every peer filling it is woken to ask for them.
+    fn resize(&mut self, metadata_size: u32) {
+        self.buffer = vec![0u8; metadata_size as usize];
+        self.pieces = vec![MetadataPiece::default(); metadata_size.div_ceil(CHUNK_SIZE) as usize];
+        for peer in self.peers.iter().filter_map(Weak::upgrade) {
+            peer.changed.notify_one();
+        }
+    }
+
+    /// A peer's extended handshake claims `metadata_size`. A claim of at
+    /// most [`HANDSHAKE_METADATA_SIZE_CAP`] sizes the buffer, as the latest
+    /// claim does in libtorrent, so one false size does not hold the fetch;
+    /// a new size starts the buffer over, where libtorrent keeps the pieces
+    /// it counted in even when they no longer fit.
+    fn claim(&mut self, metadata_size: u32) {
+        if metadata_size == 0
+            || metadata_size > HANDSHAKE_METADATA_SIZE_CAP
+            || metadata_size == self.size()
+        {
+            return;
+        }
+        self.resize(metadata_size);
     }
 
     fn total_pieces(&self) -> u32 {
@@ -255,7 +287,11 @@ impl PieceSet {
 
     /// Records piece `d` as sent by `source`, and gives the whole metadata
     /// once its last piece is in and it hashes to the torrent. A piece
-    /// another peer sent first is not written again. Metadata that does not
+    /// another peer sent first is not written again. Its `total_size` sizes
+    /// a buffer of no size yet, when it is at most [`MAX_METADATA_SIZE`];
+    /// a piece whose `total_size` is not the buffer's is ignored
+    /// (libtorrent `ut_metadata_plugin::received_metadata`,
+    /// ut_metadata.cpp:537-571). Metadata that does not
     /// hash right leaves every piece missing and unasked again, wakes every
     /// peer filling the set and names the peers that sent the pieces
     /// (libtorrent `ut_metadata_plugin::received_metadata` clears every
@@ -266,6 +302,18 @@ impl PieceSet {
         source: &Arc<Requests>,
         info_hashes: &InfoHashes,
     ) -> anyhow::Result<Recorded> {
+        let total_size = d.total_size();
+        if self.buffer.is_empty() && total_size > 0 && total_size <= MAX_METADATA_SIZE {
+            self.resize(total_size);
+        }
+        if total_size != self.size() {
+            trace!(
+                total_size,
+                size = self.size(),
+                "a metadata piece of another size"
+            );
+            return Ok(Recorded::Incomplete);
+        }
         let piece = d.piece();
         match self.pieces.get(piece as usize) {
             None => anyhow::bail!("metadata piece {piece} is past the end"),

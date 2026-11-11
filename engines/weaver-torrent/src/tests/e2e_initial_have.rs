@@ -159,3 +159,46 @@ async fn test_initial_have_of_the_wrong_length_is_refused() -> anyhow::Result<()
     );
     Ok(())
 }
+
+// A pause asked for while the torrent is still being checked holds once the
+// check ends: the torrent ends paused, not live. The test holds the check at
+// its last step, so the pause lands while the torrent is initializing.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_pause_during_the_check_ends_paused() -> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new(
+        "test_pause_during_check",
+        PIECES * PIECE_LENGTH as usize,
+        PIECE_LENGTH,
+    )
+    .await?;
+    let out = TempDir::with_prefix("test_pause_during_check_out")?;
+    let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
+    let storage = MemoryStorageFactory::default();
+    let release = storage.log.hold_file_lengths();
+
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(storage.clone_box()),
+                checkpoint: Some(crate::Checkpoint::pieces(have_all_but(&[]))),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    assert!(handle.with_state(|s| matches!(s, ManagedTorrentState::Initializing(_))));
+    session.pause(&handle).await?;
+    drop(release);
+
+    handle.wait_until_initialized().await?;
+    assert!(
+        handle.with_state(|s| matches!(s, ManagedTorrentState::Paused(_))),
+        "a torrent paused during its check went live"
+    );
+    assert!(handle.is_paused());
+    Ok(())
+}

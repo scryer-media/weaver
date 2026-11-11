@@ -219,6 +219,9 @@ impl SocketEgress {
 
 impl MulticastSocket {
     /// The next datagram on either family's socket, and where it came from.
+    /// An error of kind [`io::ErrorKind::NotConnected`] means the sockets can
+    /// receive nothing more, as when the runtime's I/O driver has shut down;
+    /// any other is about one datagram.
     pub async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         loop {
             let group = tokio::select! {
@@ -256,7 +259,13 @@ impl MulticastSocket {
 
 async fn readable(group: Option<&Group>) -> io::Result<&Group> {
     match group {
-        Some(group) => group.socket.readable().await.map(|()| group),
+        // Readiness fails only once the I/O driver is gone, for good.
+        Some(group) => group
+            .socket
+            .readable()
+            .await
+            .map(|()| group)
+            .map_err(|error| io::Error::new(io::ErrorKind::NotConnected, error)),
         None => std::future::pending().await,
     }
 }

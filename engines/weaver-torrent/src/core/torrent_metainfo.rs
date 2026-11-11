@@ -15,7 +15,7 @@ use encoding_rs::Encoding;
 use serde_derive::{Deserialize, Serialize};
 use std::{
     borrow::Cow,
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet},
     iter::once,
     path::PathBuf,
 };
@@ -26,7 +26,9 @@ use crate::core::{
     hash_id::Id20,
     lengths::{Lengths, MAX_NUM_PIECES, ValidPieceIndex},
     merkle::{self, BLOCK_SIZE},
-    v2_tree::{FileTree, sanitize_component},
+    v2_tree::{
+        FileTree, NameRules, sanitize_component, sanitize_component_with, sanitize_name_with,
+    },
 };
 
 pub type TorrentMetaV1Borrowed<'a> = TorrentMetaV1<ByteBuf<'a>>;
@@ -478,8 +480,8 @@ pub struct FileIteratorName<'a, BufType> {
 pub enum FileIteratorNameData<'a, BufType> {
     Single(Option<&'a BufType>),
     Tree(&'a [BufType]),
-    /// A v2 path, its components sanitized at validation.
-    V2(&'a [String]),
+    /// A path whose components were cleaned at validation.
+    Clean(&'a [String]),
 }
 
 impl<BufType> std::fmt::Debug for FileIteratorName<'_, BufType>
@@ -552,7 +554,7 @@ where
             FileIteratorNameData::Tree(t) => {
                 Either::Left(Either::Right(t.iter().map(|bb| bb.as_ref())))
             }
-            FileIteratorNameData::V2(t) => Either::Right(t.iter().map(|c| c.as_bytes())),
+            FileIteratorNameData::Clean(t) => Either::Right(t.iter().map(|c| c.as_bytes())),
         };
         Either::Right(it)
     }
@@ -688,15 +690,23 @@ pub struct ValidatedTorrentMetaV1Info<BufType> {
     info: TorrentMetaV1Info<BufType>,
     /// The v2 layout, pads included, when the torrent is v2 or hybrid.
     v2: Option<Vec<V2File>>,
+    /// The torrent's name as a path element on this platform:
+    /// `name.utf-8`, else `name`, cleaned; none when it has neither or the
+    /// cleaning drops it.
+    name: Option<String>,
+    /// Every file's path on this platform, in the order of
+    /// [`Self::iter_file_details`]: each component cleaned, and a file whose
+    /// path another file or directory already has, compared without regard
+    /// to case, renamed. Names only: the info hash and the files' place in
+    /// the pieces come from the info dict as written.
+    paths: Vec<Vec<String>>,
 }
 
 impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
+    /// The torrent's name: `name.utf-8` over `name`, as libtorrent prefers
+    /// it (torrent_info.cpp:500-503, v2.0.15), cleaned as a path element.
     pub fn name(&self) -> Option<Cow<'_, str>> {
-        self.info
-            .name
-            .as_ref()
-            .map(|n| self.encoding.decode(n.as_ref()).0)
-            .filter(|n| !n.is_empty())
+        self.name.as_deref().map(Cow::Borrowed)
     }
 
     pub fn info(&self) -> &TorrentMetaV1Info<BufType> {
@@ -748,11 +758,12 @@ impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
 
     /// Guaranteed to produce at least one file.
     pub fn iter_file_details(&self) -> impl Iterator<Item = FileDetails<'_, BufType>> {
-        match &self.v2 {
+        let paths = self.paths.iter();
+        let listing = match &self.v2 {
             Some(files) => Either::Left(files.iter().map(|f| FileDetails {
                 filename: FileIteratorName {
                     encoding: encoding_rs::UTF_8,
-                    data: FileIteratorNameData::V2(&f.path),
+                    data: FileIteratorNameData::Clean(&f.path),
                 },
                 len: f.length,
                 attr: Some(&f.attr[..]).filter(|a| !a.is_empty()),
@@ -762,7 +773,14 @@ impl<BufType: AsRef<[u8]>> ValidatedTorrentMetaV1Info<BufType> {
             })),
             // .unwrap is ok here() as we checked errors at creation time.
             None => Either::Right(self.info.iter_file_details_raw(self.encoding).unwrap()),
-        }
+        };
+        listing.zip(paths).map(|(details, path)| FileDetails {
+            filename: FileIteratorName {
+                encoding: encoding_rs::UTF_8,
+                data: FileIteratorNameData::Clean(path),
+            },
+            ..details
+        })
     }
 
     pub fn iter_file_lengths(&self) -> impl Iterator<Item = u64> + '_ {
@@ -917,23 +935,31 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
                 return Err(Error::InvalidPieceHashes { expected, got });
             }
         }
-        let validated = ValidatedTorrentMetaV1Info {
-            encoding,
-            lengths,
-            info: self,
-            v2,
-        };
-
         // Ensure:
         // - there's at least one file
         // - each filename has at least one path component
         // - there's no path traversal
-        // - all filenames are unique
-        let mut seen_files = 0;
-        for file in validated.iter_file_details() {
-            seen_files += 1;
+        let listing = match &v2 {
+            Some(files) => Either::Left(files.iter().map(|f| {
+                (
+                    FileIteratorName::<BufType> {
+                        encoding: encoding_rs::UTF_8,
+                        data: FileIteratorNameData::Clean(&f.path),
+                    },
+                    f.length,
+                    f.is_pad(),
+                )
+            })),
+            None => Either::Right(self.iter_file_details_raw(encoding)?.map(|d| {
+                let padding = d.attrs().padding;
+                (d.filename, d.len, padding)
+            })),
+        };
+        let mut paths = Vec::new();
+        let mut files = Vec::new();
+        for (filename, len, padding) in listing {
             let mut seen_a_bit = false;
-            for bit in file.filename.iter_components_bytes() {
+            for bit in filename.iter_components_bytes() {
                 seen_a_bit = true;
                 if bit == b".." {
                     return Err(Error::BadTorrentPathTraversal);
@@ -946,29 +972,37 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
             if !seen_a_bit {
                 return Err(Error::BadTorrentFileNoName);
             }
+            paths.push(clean_path(&filename, NameRules::HOST)?);
+            files.push((len, padding));
         }
-        if seen_files == 0 {
+        if paths.is_empty() {
             return Err(Error::BadTorrentNoFiles);
         }
+        rename_duplicates(&mut paths, &files);
 
-        // Every file has a name of its own, except that a padding file, which
-        // is never written, may share its name with another padding file of
-        // the same length. Hybrid v1+v2 torrents repeat `.pad/N` that way.
-        let mut filenames = HashMap::<PathBuf, (u64, bool)>::new();
-        for fd in validated.iter_file_details() {
-            let pb = fd.filename.to_pathbuf();
-            if pb.as_os_str().is_empty() {
-                return Err(Error::BadTorrentFileNoName);
-            }
-            let this = (fd.len, fd.attrs().padding);
-            match filenames.entry(pb) {
-                Entry::Vacant(name) => {
-                    name.insert(this);
-                }
-                Entry::Occupied(name) if *name.get() == this && this.1 => {}
-                Entry::Occupied(_) => return Err(Error::BadTorrentDuplicateFilenames),
-            }
-        }
+        let name = self
+            .name_utf8
+            .as_ref()
+            .map(|name| Cow::Borrowed(name.as_ref()))
+            .or_else(|| {
+                self.name
+                    .as_ref()
+                    .map(|name| match encoding.decode(name.as_ref()).0 {
+                        Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
+                        Cow::Owned(text) => Cow::Owned(text.into_bytes()),
+                    })
+            })
+            .filter(|name| !name.is_empty())
+            .and_then(|name| sanitize_name_with(&name, NameRules::HOST));
+
+        let validated = ValidatedTorrentMetaV1Info {
+            encoding,
+            lengths,
+            info: self,
+            v2,
+            name,
+            paths,
+        };
 
         Ok(validated)
     }
@@ -1007,9 +1041,17 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
         match (self.length, self.files.as_ref()) {
             // Single-file
             (Some(length), None) => Ok(Either::Left(once(FileDetails {
-                filename: FileIteratorName {
-                    encoding,
-                    data: FileIteratorNameData::Single(self.name.as_ref()),
+                // libtorrent prefers `name.utf-8` (torrent_info.cpp:500-503,
+                // v2.0.15).
+                filename: match &self.name_utf8 {
+                    Some(name) => FileIteratorName {
+                        encoding: encoding_rs::UTF_8,
+                        data: FileIteratorNameData::Single(Some(name)),
+                    },
+                    None => FileIteratorName {
+                        encoding,
+                        data: FileIteratorNameData::Single(self.name.as_ref()),
+                    },
                 },
                 len: length,
                 attr: self.attr.as_ref().map(|a| a.as_ref()),
@@ -1024,9 +1066,17 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
                     return Err(Error::BadTorrentMultiFileEmpty);
                 }
                 Ok(Either::Right(files.iter().map(move |f| FileDetails {
-                    filename: FileIteratorName {
-                        encoding,
-                        data: FileIteratorNameData::Tree(&f.path),
+                    // libtorrent prefers `path.utf-8` (torrent_info.cpp:522-523,
+                    // v2.0.15).
+                    filename: match f.path_utf8.as_deref().filter(|p| !p.is_empty()) {
+                        Some(path) => FileIteratorName {
+                            encoding: encoding_rs::UTF_8,
+                            data: FileIteratorNameData::Tree(path),
+                        },
+                        None => FileIteratorName {
+                            encoding,
+                            data: FileIteratorNameData::Tree(&f.path),
+                        },
                     },
                     len: f.length,
                     attr: f.attr.as_ref().map(|a| a.as_ref()),
@@ -1169,6 +1219,107 @@ fn reconcile_hybrid<'a, B: AsRef<[u8]> + 'a>(
     Ok(v2)
 }
 
+/// A file's path cleaned under `rules` (libtorrent
+/// `sanitize_append_path_element`, torrent_info.cpp:183-345, v2.0.15):
+/// every element of a listed path is forced, so it is never dropped; the
+/// name of a single-file torrent is not, and one it drops leaves the file
+/// without a name (`extract_single_file`, :505-510). A name in UTF-8 is
+/// cleaned from its bytes, so an invalid sequence becomes `_`; one in
+/// another encoding from its decoded text.
+fn clean_path<B: AsRef<[u8]>>(
+    name: &FileIteratorName<'_, B>,
+    rules: NameRules,
+) -> crate::core::Result<Vec<String>> {
+    let utf8 = name.encoding == encoding_rs::UTF_8;
+    let elements = name.iter_components_bytes().map(|raw| match utf8 {
+        true => Cow::Borrowed(raw),
+        false => match name.encoding.decode(raw).0 {
+            Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
+            Cow::Owned(text) => Cow::Owned(text.into_bytes()),
+        },
+    });
+    match name.data {
+        FileIteratorNameData::Single(Some(_)) => elements
+            .map(|raw| sanitize_name_with(&raw, rules).ok_or(Error::BadTorrentFileNoName))
+            .collect(),
+        _ => Ok(elements
+            .map(|raw| sanitize_component_with(&raw, rules))
+            .collect()),
+    }
+}
+
+/// Renames each file whose path a directory of the torrent or an earlier
+/// file already has, compared without regard to case: `name.ext` becomes
+/// `name.1.ext`, else `name.2.ext`, and so on, the first one free. A
+/// padding file may share its path with another of the same length
+/// (libtorrent `torrent_info::resolve_duplicate_filenames_slow`,
+/// torrent_info.cpp:806-905, v2.0.15). `files` holds each file's length and
+/// whether it is padding. libtorrent folds ASCII case alone; this folds
+/// every letter, as the case-insensitive filesystems of Windows and macOS
+/// do. Each path keeps the next number to try, so many files of one name
+/// are renamed in linear time: a number below it is taken already.
+fn rename_duplicates(paths: &mut [Vec<String>], files: &[(u64, bool)]) {
+    fn key(parts: &[String]) -> String {
+        parts.join("/").to_lowercase()
+    }
+    // A path and the file that has it, or none for a directory.
+    let mut taken = HashMap::<String, Option<usize>>::new();
+    let mut directories = HashSet::<String>::new();
+    for path in paths.iter() {
+        let mut directory = String::new();
+        for part in path.iter().take(path.len().saturating_sub(1)) {
+            if !directory.is_empty() {
+                directory.push('/');
+            }
+            directory.push_str(&part.to_lowercase());
+            if directories.insert(directory.clone()) {
+                taken.insert(directory.clone(), None);
+            }
+        }
+    }
+    drop(directories);
+    let mut next = HashMap::<String, u32>::new();
+    for index in 0..paths.len() {
+        let path_key = key(&paths[index]);
+        match taken.get(&path_key) {
+            None => {
+                taken.insert(path_key, Some(index));
+                continue;
+            }
+            Some(Some(other))
+                if files[index].1 && files[*other].1 && files[index].0 == files[*other].0 =>
+            {
+                continue;
+            }
+            Some(_) => {}
+        }
+        let path = &mut paths[index];
+        let Some((last, parents)) = path.split_last_mut() else {
+            continue;
+        };
+        let (base, extension) = match last.rfind('.') {
+            Some(dot) => last.split_at(dot),
+            None => (last.as_str(), ""),
+        };
+        let prefix = match parents.is_empty() {
+            true => String::new(),
+            false => format!("{}/", key(parents)),
+        };
+        let mut number = next.get(&path_key).copied().unwrap_or(1);
+        let renamed = loop {
+            let candidate = format!("{base}.{number}{extension}");
+            number += 1;
+            let candidate_key = format!("{prefix}{}", candidate.to_lowercase());
+            if let std::collections::hash_map::Entry::Vacant(free) = taken.entry(candidate_key) {
+                free.insert(Some(index));
+                break candidate;
+            }
+        };
+        *last = renamed;
+        next.insert(path_key, number);
+    }
+}
+
 const fn none<T>() -> Option<T> {
     None
 }
@@ -1177,6 +1328,14 @@ const fn none<T>() -> Option<T> {
 pub struct TorrentMetaV1File<BufType> {
     pub length: u64,
     pub path: Vec<BufType>,
+    /// The path in UTF-8, which libtorrent takes over `path` where both
+    /// are given.
+    #[serde(
+        rename = "path.utf-8",
+        default = "none",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub path_utf8: Option<Vec<BufType>>,
 
     #[serde(default = "none", skip_serializing_if = "Option::is_none")]
     pub attr: Option<BufType>,
@@ -1200,6 +1359,7 @@ where
         TorrentMetaV1File {
             length: self.length,
             path: self.path.clone_to_owned(within_buffer),
+            path_utf8: self.path_utf8.clone_to_owned(within_buffer),
             attr: self.attr.clone_to_owned(within_buffer),
             sha1: self.sha1.clone_to_owned(within_buffer),
             symlink_path: self.symlink_path.clone_to_owned(within_buffer),
@@ -1335,6 +1495,7 @@ mod tests {
         TorrentMetaV1File {
             length,
             path: path.iter().map(|c| c.as_bytes().into()).collect(),
+            path_utf8: None,
             attr: attr.map(|a| a.as_bytes().into()),
             sha1: None,
             symlink_path: None,
@@ -1387,28 +1548,165 @@ mod tests {
         assert_eq!(padding, vec![false, true, false]);
     }
 
+    fn clean_paths(info: TorrentMetaV1Info<ByteBufOwned>) -> Vec<String> {
+        info.validate()
+            .unwrap()
+            .iter_file_details()
+            .map(|d| d.filename.to_vec().join("/"))
+            .collect()
+    }
+
     #[test]
-    fn a_real_duplicate_name_is_refused() {
-        for files in [
-            vec![file(&["a.bin"], 100, None), file(&["a.bin"], 100, None)],
-            // A `.pad/` path without the attribute is an ordinary file.
-            vec![
+    fn a_real_duplicate_name_is_renamed() {
+        // libtorrent test_torrent_info.cpp `resolve_duplicates`: the later
+        // file takes the first `.N` free before its extension.
+        let renamed =
+            |files: Vec<TorrentMetaV1File<ByteBufOwned>>| clean_paths(multi_file_info(files));
+        assert_eq!(
+            renamed(vec![
+                file(&["a.bin"], 100, None),
+                file(&["a.bin"], 100, None)
+            ]),
+            ["a.bin", "a.1.bin"]
+        );
+        // A `.pad/` path without the attribute is an ordinary file.
+        assert_eq!(
+            renamed(vec![
                 file(&[".pad", "123"], 123, None),
                 file(&[".pad", "123"], 123, None),
-            ],
-            // A pad file never shares a name with a file that is written.
-            vec![file(&["x"], 7, Some("p")), file(&["x"], 7, None)],
-            // Nor with a pad file of another length.
-            vec![
+            ]),
+            [".pad/123", ".pad/123.1"]
+        );
+        // A pad file never shares a name with a file that is written.
+        assert_eq!(
+            renamed(vec![file(&["x"], 7, Some("p")), file(&["x"], 7, None)]),
+            ["x", "x.1"]
+        );
+        // Nor with a pad file of another length.
+        assert_eq!(
+            renamed(vec![
                 file(&[".pad", "7"], 7, Some("p")),
                 file(&[".pad", "7"], 8, Some("p")),
-            ],
-        ] {
-            assert!(matches!(
-                multi_file_info(files).validate(),
-                Err(Error::BadTorrentDuplicateFilenames)
-            ));
+            ]),
+            [".pad/7", ".pad/7.1"]
+        );
+    }
+
+    #[test]
+    fn names_that_differ_only_by_case_are_renamed_without_moving_a_byte() {
+        let files = vec![
+            file(&["Movie.mkv"], 100, None),
+            file(&["movie.MKV"], 200, None),
+            file(&["MOVIE.mkv"], 300, None),
+            // A name a rename took is taken.
+            file(&["movie.1.mkv"], 50, None),
+            // A file never takes a directory's name, in any case.
+            file(&["Extras", "a.txt"], 10, None),
+            file(&["extras"], 10, None),
+            file(&["EXTRAS", "A.TXT"], 10, None),
+            // Directories that differ only by case are one directory.
+            file(&["EXTRAS", "b.txt"], 10, None),
+            // Unicode letters fold too.
+            file(&["\u{c9}t\u{e9}.txt"], 1, None),
+            file(&["\u{e9}t\u{e9}.txt"], 1, None),
+        ];
+        let info = multi_file_info(files);
+        let before = info.clone().validate().unwrap();
+        let offsets: Vec<_> = before
+            .iter_file_details_ext()
+            .map(|f| (f.offset, f.details.len, f.pieces.clone()))
+            .collect();
+        assert_eq!(
+            clean_paths(info.clone()),
+            [
+                "Movie.mkv",
+                "movie.1.MKV",
+                "MOVIE.2.mkv",
+                "movie.1.1.mkv",
+                "Extras/a.txt",
+                "extras.1",
+                "EXTRAS/A.1.TXT",
+                "EXTRAS/b.txt",
+                "\u{c9}t\u{e9}.txt",
+                "\u{e9}t\u{e9}.1.txt",
+            ]
+        );
+        // Only the names change: every file keeps its place in the pieces,
+        // and the info dict as written is untouched.
+        let validated = info.clone().validate().unwrap();
+        let after: Vec<_> = validated
+            .iter_file_details_ext()
+            .map(|f| (f.offset, f.details.len, f.pieces.clone()))
+            .collect();
+        assert_eq!(offsets, after);
+        assert_eq!(validated.info(), &info);
+    }
+
+    #[test]
+    fn many_files_of_one_name_are_each_renamed_once() {
+        let files = (0..2000).map(|_| file(&["same.bin"], 1, None)).collect();
+        let names = clean_paths(multi_file_info(files));
+        assert_eq!(names[0], "same.bin");
+        for (index, name) in names.iter().enumerate().skip(1) {
+            assert_eq!(name, &format!("same.{index}.bin"));
         }
+    }
+
+    #[test]
+    fn utf8_names_and_paths_are_preferred() {
+        // libtorrent torrent_info.cpp:500-503 and :522-523, v2.0.15.
+        let mut listed = file(&["raw"], 100, None);
+        listed.path = vec![b"\x82\xa0.txt"[..].into()];
+        listed.path_utf8 = Some(vec!["\u{3042}.txt".as_bytes().into()]);
+        let mut info = multi_file_info(vec![listed, file(&["plain.txt"], 100, None)]);
+        info.name = Some(b"raw name"[..].into());
+        info.name_utf8 = Some("utf8 \u{3042}".as_bytes().into());
+        let validated = info.validate().unwrap();
+        assert_eq!(validated.name().as_deref(), Some("utf8 \u{3042}"));
+        let names: Vec<_> = validated
+            .iter_file_details()
+            .map(|d| d.filename.to_vec().join("/"))
+            .collect();
+        assert_eq!(names, ["\u{3042}.txt", "plain.txt"]);
+
+        let mut single = single_file_info(100, 16384, 20);
+        single.name = Some(b"raw.bin"[..].into());
+        single.name_utf8 = Some("utf8.bin".as_bytes().into());
+        let validated = single.validate().unwrap();
+        assert_eq!(validated.name().as_deref(), Some("utf8.bin"));
+        assert_eq!(
+            validated
+                .iter_file_details()
+                .next()
+                .unwrap()
+                .filename
+                .to_vec(),
+            ["utf8.bin"]
+        );
+    }
+
+    #[test]
+    fn listed_names_are_cleaned() {
+        let mut info = multi_file_info(vec![
+            file(&["a\x01b", "\u{202e}gpj.exe"], 100, None),
+            file(&["."], 100, None),
+            file(&["c\0d"], 100, None),
+        ]);
+        info.name = Some("\u{202e}top\x07".as_bytes().into());
+        let validated = info.validate().unwrap();
+        assert_eq!(validated.name().as_deref(), Some("top_"));
+        let names: Vec<_> = validated
+            .iter_file_details()
+            .map(|d| d.filename.to_vec().join("/"))
+            .collect();
+        assert_eq!(names, ["a_b/gpj.exe", "_", "cd"]);
+        // A single file's name the cleaning drops leaves it without one.
+        let mut single = single_file_info(100, 16384, 20);
+        single.name = Some(b"."[..].into());
+        assert!(matches!(
+            single.validate(),
+            Err(Error::BadTorrentFileNoName)
+        ));
     }
 
     /// A single-file v1 info of `length` bytes in pieces of `piece_length`,

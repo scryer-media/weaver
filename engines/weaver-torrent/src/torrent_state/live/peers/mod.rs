@@ -129,6 +129,11 @@ pub(crate) struct PeerStates {
     // (`on_clear_peers`), and crosses a pause with it in [`PeerList`]. Never
     // taken while an entry of `states` is held.
     smart_ban: Mutex<SmartBan>,
+    // The peers on the list with a connection, open or opening, web seeds
+    // aside, by host: kept as each peer is counted in and out, so a connect
+    // judgment does not walk the list for them. Taken while an entry of
+    // `states` is held, never the other way.
+    connected: Mutex<HashMap<IpAddr, Vec<SocketAddr>>>,
 }
 
 /// The peer list as a pause leaves it: every peer on it, idle, the banned
@@ -311,6 +316,12 @@ pub(crate) enum IncomingRefused {
     Banned,
 }
 
+// Whether a peer at `addr` in `state` counts among the connected
+// addresses: it has a connection, open or opening, and is no web seed.
+fn has_connection(addr: PeerHandle, state: &PeerState) -> bool {
+    !is_web_seed(addr) && matches!(state, PeerState::Connecting(_) | PeerState::Live(_))
+}
+
 impl Drop for PeerStates {
     fn drop(&mut self) {
         for (_, p) in std::mem::take(&mut self.states).into_iter() {
@@ -342,6 +353,7 @@ impl PeerStates {
             allow_multiple_connections_per_ip: Default::default(),
             finished: AtomicBool::new(false),
             smart_ban: Mutex::new(list.smart_ban),
+            connected: Default::default(),
         };
         for mut peer in list.peers {
             peer.rejoin(&peers);
@@ -634,7 +646,7 @@ impl PeerStates {
         if !self.erase_to(displace, MAX_PEERLIST_SIZE) {
             return Admitted::Refused;
         }
-        self.count_in(peer.get_state());
+        self.count_in(addr, peer.get_state());
         for counter in [&*self.session_stats, &*self.stats] {
             atomic_inc(&counter.seen);
         }
@@ -651,11 +663,27 @@ impl PeerStates {
     // listen port, so both drop the same one; a tie is settled by chance.
     // The connection that loses is closed, which is no failure.
     fn keeps_incoming(&self, addr: SocketAddr, our_port: u16) -> bool {
-        let other = self
-            .connections()
+        if self
+            .allow_multiple_connections_per_ip
+            .load(Ordering::Relaxed)
+        {
+            return true;
+        }
+        let others = self
+            .connected
+            .lock()
+            .get(&addr.ip())
+            .map(|at| {
+                at.iter()
+                    .copied()
+                    .filter(|other| *other != addr)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let Some((other, outgoing)) = others
             .into_iter()
-            .find(|(other, _)| other.ip() == addr.ip() && *other != addr);
-        let Some((other, outgoing)) = other else {
+            .find_map(|other| Some((other, self.with_peer(other, Peer::connected_out)??)))
+        else {
             return true;
         };
         let keep = outgoing
@@ -674,28 +702,39 @@ impl PeerStates {
     // at. No other peer there is connected to (libtorrent's peer list holds
     // one entry per address, and an entry with a connection is no connect
     // candidate).
+    // The addresses of the peers on the list with a connection, open or
+    // opening, web seeds aside. None when peers at one address may each have
+    // one: no connection then stands in another's way.
     fn connected_ips(&self) -> HashSet<IpAddr> {
-        self.connections()
-            .into_iter()
-            .map(|(addr, _)| addr.ip())
-            .collect()
-    }
-
-    // The peers on the list with a connection, open or opening, each with
-    // whether we made it. None when peers at one address may each have one:
-    // no connection then stands in another's way.
-    fn connections(&self) -> Vec<(SocketAddr, bool)> {
         if self
             .allow_multiple_connections_per_ip
             .load(Ordering::Relaxed)
         {
-            return Vec::new();
+            return HashSet::new();
+        }
+        self.connected.lock().keys().copied().collect()
+    }
+
+    // `connected_ips` read off the whole list, as it was before the running
+    // count; the test that the count keeps it compares the two.
+    #[cfg(test)]
+    pub(crate) fn connected_ips_walked(&self) -> HashSet<IpAddr> {
+        if self
+            .allow_multiple_connections_per_ip
+            .load(Ordering::Relaxed)
+        {
+            return HashSet::new();
         }
         self.states
             .iter()
             .filter(|e| !is_web_seed(*e.key()))
-            .filter_map(|e| Some((*e.key(), e.value().connected_out()?)))
+            .filter_map(|e| e.value().connected_out().map(|_| e.key().ip()))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connected_ips_counted(&self) -> HashSet<IpAddr> {
+        self.connected_ips()
     }
 
     /// How many peers we could connect to (libtorrent
@@ -752,7 +791,7 @@ impl PeerStates {
         // Not where it listens: a web seed is never a connect candidate.
         let mut peer = Peer::new_with_outgoing_address(handle, Default::default());
         peer.outgoing_address = None;
-        self.count_in(peer.get_state());
+        self.count_in(handle, peer.get_state());
         peer.set_state(PeerState::Connecting(tx.clone()), self);
         self.web_seeds.fetch_add(1, Ordering::Relaxed);
         self.states.insert(handle, peer);
@@ -793,7 +832,7 @@ impl PeerStates {
         if is_web_seed(handle) {
             self.web_seeds.fetch_sub(1, Ordering::Relaxed);
         }
-        self.count_out(peer.get_state());
+        self.count_out(handle, peer.get_state());
         self.smart_ban.lock().forget(handle);
     }
 
@@ -969,11 +1008,19 @@ impl PeerStates {
         Some(p)
     }
 
-    /// Counts a peer in `state` into the torrent and session peer stats and,
-    /// when it is live, its bitfield into the piece availability.
-    pub(super) fn count_in(&self, state: &PeerState) {
+    /// Counts a peer at `addr` in `state` into the torrent and session peer
+    /// stats, its address into the connected ones when it has a connection,
+    /// and, when it is live, its bitfield into the piece availability.
+    pub(super) fn count_in(&self, addr: PeerHandle, state: &PeerState) {
         for counter in [&*self.session_stats, &*self.stats] {
             counter.inc(state);
+        }
+        if has_connection(addr, state) {
+            self.connected
+                .lock()
+                .entry(addr.ip())
+                .or_default()
+                .push(addr);
         }
         if let PeerState::Live(live) = state {
             self.availability.add(&live.bitfield);
@@ -984,9 +1031,21 @@ impl PeerStates {
     /// Takes back what [`Self::count_in`] counted for a peer leaving `state`.
     /// Every way a connection ends passes here once, through
     /// [`Peer::set_state`] or the peer leaving the list.
-    pub(super) fn count_out(&self, state: &PeerState) {
+    pub(super) fn count_out(&self, addr: PeerHandle, state: &PeerState) {
         for counter in [&*self.session_stats, &*self.stats] {
             counter.dec(state);
+        }
+        if has_connection(addr, state) {
+            let mut connected = self.connected.lock();
+            if let std::collections::hash_map::Entry::Occupied(mut at) = connected.entry(addr.ip())
+            {
+                if let Some(i) = at.get().iter().position(|held| *held == addr) {
+                    at.get_mut().swap_remove(i);
+                }
+                if at.get().is_empty() {
+                    at.remove();
+                }
+            }
         }
         if let PeerState::Live(live) = state {
             self.availability.remove(&live.bitfield);
@@ -1556,6 +1615,103 @@ mod tests {
             fail_at(peers, addr, at);
         }
         at
+    }
+
+    // The connected addresses kept as peers are counted in and out are the
+    // ones a walk of the whole list finds, after every step of a seeded run
+    // of names, connects, incoming connections, closes, failures, peers let
+    // go and dropped, and web seeds, some peers sharing a host; and so is
+    // what connect_next picks, with peers at one host each allowed a
+    // connection or not.
+    #[test]
+    fn the_connected_addresses_kept_are_those_a_walk_of_the_list_finds() {
+        for allow in [false, true] {
+            let allowed = Arc::new(AtomicBool::new(allow));
+            let peers = make_peer_states().allowing_multiple_connections_per_ip(allowed.clone());
+            // Four ports on each of 16 hosts.
+            let addr = |i: u64| {
+                SocketAddr::from((
+                    [10, 1, 0, u8::try_from(i % 16).unwrap()],
+                    6881 + (i / 16 % 4) as u16,
+                ))
+            };
+            let web_seed = |i: u64| {
+                SocketAddr::from((
+                    std::net::Ipv6Addr::new(0x100, 0, 0, 0, 0, 0, 0, u16::try_from(i % 3).unwrap()),
+                    0,
+                ))
+            };
+            let mut rng = 0x9e37_79b9_7f4a_7c15u64;
+            let mut next = || {
+                rng ^= rng << 13;
+                rng ^= rng >> 7;
+                rng ^= rng << 17;
+                rng
+            };
+            let mut keep = Vec::new();
+            let mut at = Instant::now();
+            for step in 0..4000 {
+                let r = next();
+                let a = addr(r >> 8);
+                match r % 9 {
+                    0 | 1 => peers.add_peer(a, PeerSourceFlag::Tracker),
+                    2 => {
+                        if let Some((handle, rx, tx)) = peers.connect_next(at) {
+                            keep.push((handle, rx, tx));
+                        }
+                    }
+                    3 => {
+                        if let Ok(rx) = connected_to_us(&peers, a) {
+                            keep.push((a, rx, unbounded_channel().0));
+                        }
+                    }
+                    4 | 5 => {
+                        peers.with_peer_mut(a, "test", |peer| {
+                            if peer.connected_out().is_some() {
+                                peers.connection_closed(peer, at, r & 1 == 0, false);
+                            }
+                        });
+                    }
+                    6 => {
+                        peers.with_peer_mut(a, "test", |peer| peer.set_not_needed(&peers));
+                    }
+                    7 => {
+                        if r & 3 == 0 {
+                            peers.drop_peer(a);
+                        } else if let Some((rx, tx)) = peers.admit_web_seed(web_seed(r >> 8)) {
+                            keep.push((web_seed(r >> 8), rx, tx));
+                        }
+                    }
+                    _ => {
+                        let seed = web_seed(r >> 8);
+                        peers.with_peer_mut(seed, "test", |peer| {
+                            if peer.connected_out().is_some() {
+                                peers.connection_closed(peer, at, false, false);
+                            }
+                        });
+                        at += MIN_RECONNECT_TIME;
+                    }
+                }
+                assert_eq!(
+                    peers.connected_ips_counted(),
+                    peers.connected_ips_walked(),
+                    "step {step}"
+                );
+            }
+            assert!(
+                allow || !peers.connected_ips_counted().is_empty(),
+                "the run left no connection to compare"
+            );
+            // Every connection closed, the count is empty again.
+            for (handle, ..) in &keep {
+                peers.with_peer_mut(*handle, "test", |peer| {
+                    if peer.connected_out().is_some() {
+                        peers.connection_closed(peer, at, false, false);
+                    }
+                });
+            }
+            assert!(peers.connected.lock().is_empty());
+        }
     }
 
     #[test]

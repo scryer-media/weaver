@@ -9,7 +9,7 @@ use std::{
     collections::{HashMap, VecDeque},
     io,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6},
-    str::{FromStr, from_utf8},
+    str::from_utf8,
     sync::Arc,
     time::Duration,
 };
@@ -26,7 +26,7 @@ use tokio::{
     time::Instant,
 };
 use tokio_util::{sync::CancellationToken, task::TaskTracker};
-use tracing::{debug_span, trace};
+use tracing::{debug, debug_span, trace};
 use weaver_tunnel::egress::{MulticastSocket, SocketEgress};
 
 const LSD_PORT: u16 = 6771;
@@ -55,6 +55,9 @@ const RESEND_STEP: Duration = Duration::from_secs(2);
 /// What the LSD sends on and receives from: the multicast socket, or a
 /// test's.
 pub(crate) trait Socket: Send + Sync + 'static {
+    /// The next datagram. An error of kind [`io::ErrorKind::NotConnected`]
+    /// means the socket is closed and nothing more arrives; any other is
+    /// about one datagram, and the socket goes on receiving.
     fn recv_from<'a>(&'a self, buf: &'a mut [u8])
     -> BoxFuture<'a, io::Result<(usize, SocketAddr)>>;
 
@@ -355,12 +358,20 @@ cookie: {cookie}\r
     }
 
     /// Takes one packet: an announce from the local network names a peer of
-    /// the torrent it announces, and is never answered (libtorrent
-    /// `lsd::process_packet`).
-    async fn recv_and_process_one(&self, buf: &mut [u8]) -> anyhow::Result<()> {
+    /// each torrent it announces, and is never answered (libtorrent
+    /// `lsd::on_announce`, lsd.cpp:215-330, v2.0.15). Fails only once the
+    /// socket is closed.
+    async fn recv_and_process_one(&self, buf: &mut [u8]) -> io::Result<()> {
         let mut headers = [httparse::EMPTY_HEADER; 16];
 
-        let (sz, addr) = self.inner.socket.recv_from(buf).await?;
+        let (sz, addr) = match self.inner.socket.recv_from(buf).await {
+            Ok(received) => received,
+            Err(error) if error.kind() == io::ErrorKind::NotConnected => return Err(error),
+            Err(error) => {
+                debug!(%error, "LSD receive error");
+                return Ok(());
+            }
+        };
         if !self.inner.socket.is_local(addr) {
             trace!(?addr, "ignoring a packet from outside the local network");
             return Ok(());
@@ -384,17 +395,24 @@ cookie: {cookie}\r
 
         let mut addr = addr;
         addr.set_port(bts.port);
-        if let Some(announce) = self.inner.registry.lock().receivers.get(&bts.hash) {
-            let _ = announce.tx.send(addr);
+        let registry = self.inner.registry.lock();
+        for hash in bts.hashes {
+            if let Some(announce) = registry.receivers.get(&hash) {
+                let _ = announce.tx.send(addr);
+            }
         }
         Ok(())
     }
 
+    /// Receives until the socket is closed. A receive error ends nothing
+    /// else: the error is about one datagram.
     async fn task_monitor_recv(self) -> anyhow::Result<()> {
         let mut buf = [0u8; 4096];
 
         loop {
-            self.recv_and_process_one(&mut buf).await?;
+            self.recv_and_process_one(&mut buf)
+                .await
+                .context("the LSD socket is closed")?;
         }
     }
 
@@ -559,13 +577,16 @@ impl Socket for ListeningSocket {
 
 #[derive(Debug)]
 struct BtSearchAnnounceMessage {
-    hash: Id20,
+    /// Every torrent the packet announces, in its order.
+    hashes: Vec<Id20>,
     our_cookie: Option<u32>,
-    #[allow(unused)]
-    host: SocketAddr,
     port: u16,
 }
 
+/// Reads a BT-SEARCH as libtorrent does (lsd.cpp:248-330, v2.0.15): it
+/// needs a port in 1..=65534; every `Infohash` header names a torrent, one
+/// that is not 40 hex digits or is all zeros is passed over; the `Host`
+/// header is not read.
 fn try_parse_bt_search<'a: 'h, 'h>(
     buf: &'a [u8],
     headers: &'a mut [httparse::Header<'h>],
@@ -573,44 +594,41 @@ fn try_parse_bt_search<'a: 'h, 'h>(
     let mut req = httparse::Request::new(headers);
     req.parse(buf).context("error parsing request")?;
 
-    match req.method {
-        Some("BT-SEARCH") => {
-            let mut host = None;
-            let mut port = None;
-            let mut infohash = None;
-            let mut our_cookie = None;
+    if !req
+        .method
+        .is_some_and(|method| method.eq_ignore_ascii_case("BT-SEARCH"))
+    {
+        anyhow::bail!("expecting BT-SEARCH");
+    }
+    let mut port = None;
+    let mut hashes = Vec::new();
+    let mut our_cookie = None;
 
-            for header in req.headers.iter() {
-                if header.name.eq_ignore_ascii_case("host") {
-                    host = Some(
-                        from_utf8(header.value)
-                            .context("invalid utf-8 in host header")?
-                            .parse()
-                            .context("invalid IP in host header")?,
-                    );
-                } else if header.name.eq_ignore_ascii_case("port") {
-                    port = Some(atoi::atoi::<u16>(header.value).context("port is not a number")?)
-                } else if header.name.eq_ignore_ascii_case("infohash") {
-                    infohash = Some(
-                        Id20::from_str(from_utf8(header.value).context("infohash isn't utf-8")?)
-                            .context("invalid infohash header")?,
-                    );
-                } else if header.name.eq_ignore_ascii_case("cookie") {
-                    our_cookie = atoi::atoi::<u32>(header.value);
-                }
+    for header in req.headers.iter() {
+        if header.name.eq_ignore_ascii_case("port") {
+            port = Some(atoi::atoi::<u16>(header.value).context("port is not a number")?)
+        } else if header.name.eq_ignore_ascii_case("infohash") {
+            let hash = (header.value.len() == 40)
+                .then(|| from_utf8(header.value).ok()?.parse::<Id20>().ok())
+                .flatten();
+            match hash {
+                Some(hash) if hash != Id20::default() => hashes.push(hash),
+                Some(_) => {}
+                None => trace!(value = ?bstr::BStr::new(header.value), "invalid infohash header"),
             }
-
-            match (host, port, infohash) {
-                (Some(host), Some(port), Some(hash)) => Ok(BtSearchAnnounceMessage {
-                    hash,
-                    our_cookie,
-                    host,
-                    port,
-                }),
-                _ => anyhow::bail!("not all of host, man and st are set"),
-            }
+        } else if header.name.eq_ignore_ascii_case("cookie") {
+            our_cookie = atoi::atoi::<u32>(header.value);
         }
-        _ => anyhow::bail!("expecting BT-SEARCH"),
+    }
+
+    match port {
+        Some(port) if port > 0 && port < u16::MAX => Ok(BtSearchAnnounceMessage {
+            hashes,
+            our_cookie,
+            port,
+        }),
+        Some(port) => anyhow::bail!("invalid port {port}"),
+        None => anyhow::bail!("no port"),
     }
 }
 
@@ -635,10 +653,13 @@ mod tests {
         std::sync::Arc::new(move || Some(port))
     }
 
-    /// A socket that records what the LSD sends and hands it the packets a
-    /// test injects.
+    /// A packet, or a receive error of this kind.
+    type Incoming = Result<(Vec<u8>, SocketAddr), std::io::ErrorKind>;
+
+    /// A socket that records what the LSD sends and hands it the packets and
+    /// errors a test injects.
     struct TestSocket {
-        incoming: tokio::sync::Mutex<UnboundedReceiver<(Vec<u8>, SocketAddr)>>,
+        incoming: tokio::sync::Mutex<UnboundedReceiver<Incoming>>,
         sent: UnboundedSender<(Instant, Id20, u16)>,
         nics: Vec<NetworkInterface>,
     }
@@ -647,7 +668,7 @@ mod tests {
         fn record(&self, payload: &str) {
             let mut headers = [httparse::EMPTY_HEADER; 16];
             let bts = try_parse_bt_search(payload.as_bytes(), &mut headers).unwrap();
-            let _ = self.sent.send((Instant::now(), bts.hash, bts.port));
+            let _ = self.sent.send((Instant::now(), bts.hashes[0], bts.port));
         }
     }
 
@@ -657,9 +678,10 @@ mod tests {
             buf: &'a mut [u8],
         ) -> BoxFuture<'a, std::io::Result<(usize, SocketAddr)>> {
             Box::pin(async move {
-                let Some((packet, from)) = self.incoming.lock().await.recv().await else {
+                let Some(incoming) = self.incoming.lock().await.recv().await else {
                     return std::future::pending().await;
                 };
+                let (packet, from) = incoming.map_err(std::io::Error::from)?;
                 buf[..packet.len()].copy_from_slice(&packet);
                 Ok((packet.len(), from))
             })
@@ -681,7 +703,8 @@ mod tests {
     struct Harness {
         lsd: LocalServiceDiscovery,
         sent: UnboundedReceiver<(Instant, Id20, u16)>,
-        incoming: UnboundedSender<(Vec<u8>, SocketAddr)>,
+        incoming: UnboundedSender<Incoming>,
+        tasks: tokio_util::task::TaskTracker,
         start: Instant,
     }
 
@@ -702,15 +725,17 @@ mod tests {
                     false,
                 )],
             };
+            let tasks = tokio_util::task::TaskTracker::new();
             Self {
                 lsd: LocalServiceDiscovery::with_socket(
                     Box::new(socket),
                     1,
                     CancellationToken::new(),
-                    tokio_util::task::TaskTracker::new(),
+                    tasks.clone(),
                 ),
                 sent,
                 incoming,
+                tasks,
                 start: Instant::now(),
             }
         }
@@ -732,14 +757,25 @@ mod tests {
 
         /// A peer at `from` announces `info_hash` on `port`.
         fn receive(&self, from: &str, info_hash: Id20, port: u16) {
+            self.receive_headers(
+                from,
+                &format!("Port: {port}\r\nInfohash: {}\r\n", info_hash.as_string()),
+            );
+        }
+
+        /// A peer at `from` sends a BT-SEARCH with these header lines.
+        fn receive_headers(&self, from: &str, lines: &str) {
             let msg = format!(
-                "BT-SEARCH * HTTP/1.1\r\nHost: 239.192.152.143:6771\r\nPort: {port}\r\n\
-                 Infohash: {}\r\ncookie: 2\r\n\r\n\r\n",
-                info_hash.as_string()
+                "BT-SEARCH * HTTP/1.1\r\nHost: 239.192.152.143:6771\r\n{lines}cookie: 2\r\n\r\n\r\n"
             );
             self.incoming
-                .send((msg.into_bytes(), from.parse().unwrap()))
+                .send(Ok((msg.into_bytes(), from.parse().unwrap())))
                 .unwrap();
+        }
+
+        /// The next receive fails with `kind`.
+        fn fail(&self, kind: std::io::ErrorKind) {
+            self.incoming.send(Err(kind)).unwrap();
         }
 
         /// The sends up to and including the first at or after `secs`.
@@ -911,5 +947,73 @@ mod tests {
         h.receive("10.0.0.7:6771", a, 7001);
         assert_eq!(peers.next().await, Some("10.0.0.7:7001".parse().unwrap()));
         assert_eq!(h.until(2).await, [(a, 0), (a, 2)]);
+    }
+
+    // A receive error is about one datagram: the LSD goes on receiving.
+    // Only a closed socket ends the receive task.
+    #[tokio::test(start_paused = true)]
+    async fn a_receive_error_ends_nothing_but_a_closed_socket_ends_the_receives() {
+        let h = Harness::new();
+        let a = hash(1);
+        let mut peers = h.lsd.announce(a, None);
+        h.fail(std::io::ErrorKind::ConnectionReset);
+        h.fail(std::io::ErrorKind::Other);
+        h.receive("10.0.0.7:6771", a, 7001);
+        assert_eq!(peers.next().await, Some("10.0.0.7:7001".parse().unwrap()));
+
+        h.fail(std::io::ErrorKind::NotConnected);
+        h.receive("10.0.0.8:6771", a, 7002);
+        // Of the two tasks the announcer alone is left.
+        h.tasks.close();
+        let announcer_only = async {
+            while h.tasks.len() > 1 {
+                tokio::task::yield_now().await;
+            }
+        };
+        announcer_only.await;
+        assert!(h.lsd.registered(a));
+    }
+
+    // libtorrent `lsd::on_announce` (lsd.cpp:303-330): every Infohash header
+    // names a peer of that torrent; one that is malformed or all zeros is
+    // passed over, and a packet without a usable port names nobody.
+    #[tokio::test(start_paused = true)]
+    async fn every_infohash_in_a_packet_is_read() {
+        let h = Harness::new();
+        let (a, b, zero) = (hash(1), hash(2), Id20::default());
+        let mut peers_a = h.lsd.announce(a, None);
+        let mut peers_b = h.lsd.announce(b, None);
+        let _zero = h.lsd.announce(zero, None);
+        h.receive_headers(
+            "10.0.0.9:6771",
+            &format!("Port: 0\r\nInfohash: {}\r\n", a.as_string()),
+        );
+        h.receive_headers(
+            "10.0.0.7:6771",
+            &format!(
+                "Port: 7001\r\nInfohash: {}\r\nInfohash: nothex\r\nInfohash: {}\r\nInfohash: {}\r\n",
+                a.as_string(),
+                zero.as_string(),
+                b.as_string()
+            ),
+        );
+        let peer: SocketAddr = "10.0.0.7:7001".parse().unwrap();
+        assert_eq!(peers_a.next().await, Some(peer));
+        assert_eq!(peers_b.next().await, Some(peer));
+
+        let mut headers = [httparse::EMPTY_HEADER; 16];
+        let packet = format!(
+            "BT-SEARCH * HTTP/1.1\r\nPort: 7001\r\nInfohash: {}\r\nInfohash: {}\r\n\r\n",
+            zero.as_string(),
+            b.as_string()
+        );
+        let bts = try_parse_bt_search(packet.as_bytes(), &mut headers).unwrap();
+        assert_eq!(
+            bts.hashes,
+            [b],
+            "no Host header needed, the zero hash passed over"
+        );
+        let packet = "BT-SEARCH * HTTP/1.1\r\nPort: 65535\r\n\r\n";
+        assert!(try_parse_bt_search(packet.as_bytes(), &mut [httparse::EMPTY_HEADER; 16]).is_err());
     }
 }

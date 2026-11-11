@@ -722,7 +722,7 @@ impl Peer {
     /// An idle peer joins the list of a new run: a connect candidate or
     /// not, as the list says now.
     pub(crate) fn rejoin(&mut self, peers: &PeerStates) {
-        peers.count_in(&self.state);
+        peers.count_in(self.addr, &self.state);
         self.set_state(self.idle_state(peers), peers);
     }
 
@@ -819,12 +819,12 @@ impl Peer {
     }
 
     pub fn destroy(self, counters: &PeerStates) {
-        counters.count_out(&self.state);
+        counters.count_out(self.addr, &self.state);
     }
 
     pub fn set_state(&mut self, new: PeerState, counters: &PeerStates) -> PeerState {
-        counters.count_out(&self.state);
-        counters.count_in(&new);
+        counters.count_out(self.addr, &self.state);
+        counters.count_in(self.addr, &new);
         std::mem::replace(&mut self.state, new)
     }
 
@@ -1688,8 +1688,16 @@ impl LivePeerState {
     /// again that we do; past 300 so, while it does not choke us, it is to
     /// be disconnected: false then (libtorrent
     /// `peer_connection::incoming_request`).
-    pub fn invalid_request(&mut self, request: Request, peer_chokes_us: bool) -> bool {
-        self.reject_request(request);
+    /// `reject` sends a fast peer its Reject.
+    pub fn invalid_request(
+        &mut self,
+        request: Request,
+        peer_chokes_us: bool,
+        reject: impl FnOnce(Request),
+    ) -> bool {
+        if self.fast {
+            reject(request);
+        }
         self.invalid_requests = self.invalid_requests.saturating_add(1);
         if self.peer_interested || !self.is_choked() || !self.invalid_requests.is_multiple_of(10) {
             return true;

@@ -239,6 +239,7 @@ impl Harness {
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),
             tx,
+            answers: Default::default(),
             counters,
             first_message_received: AtomicBool::new(false),
             cancel_token: self.live.cancellation_token.child_token(),
@@ -1246,7 +1247,10 @@ fn sent(request: WriterRequest) -> Sent {
     match request {
         WriterRequest::Message(Message::Choke) => Sent::Choke,
         WriterRequest::Message(Message::Unchoke) => Sent::Unchoke,
-        WriterRequest::Message(Message::Reject(r)) => Sent::Reject(r.index, r.begin),
+        WriterRequest::Message(Message::Reject(r))
+        | WriterRequest::Answer(crate::peer_connection::Answer::Reject(r)) => {
+            Sent::Reject(r.index, r.begin)
+        }
         WriterRequest::Message(Message::AllowedFast(piece)) => Sent::AllowedFast(piece),
         WriterRequest::ReadChunkRequest(c) => Sent::Block(c.piece_index.get(), c.offset),
         other => panic!("unexpected writer request {other:?}"),
@@ -2849,7 +2853,9 @@ mod v2 {
         // `bt_peer_connection::on_hash_request`).
         let request = ask(tree.root(), 0, 512, 512, 9);
         peer.on_hash_request(request).unwrap();
-        let Ok(WriterRequest::Hashes(answer)) = rx.try_recv() else {
+        let Ok(WriterRequest::Answer(crate::peer_connection::Answer::Hashes(answer))) =
+            rx.try_recv()
+        else {
             panic!("expected hashes");
         };
         assert_eq!(answer.request, request);
@@ -2873,7 +2879,7 @@ mod v2 {
         ] {
             peer.on_hash_request(bad).unwrap();
             assert!(
-                matches!(rx.try_recv(), Ok(WriterRequest::Message(Message::HashReject(r))) if r == bad),
+                matches!(rx.try_recv(), Ok(WriterRequest::Answer(crate::peer_connection::Answer::HashReject(r))) if r == bad),
                 "{bad:?}"
             );
         }
@@ -3235,7 +3241,7 @@ async fn a_request_we_cannot_serve_is_rejected_on_a_fast_connection() {
             .await
             .unwrap();
         match rx.try_recv() {
-            Ok(WriterRequest::Message(Message::Reject(r))) => {
+            Ok(WriterRequest::Answer(crate::peer_connection::Answer::Reject(r))) => {
                 assert_eq!(
                     (r.index, r.begin, r.length),
                     (asked.index, asked.begin, asked.length)
@@ -6142,6 +6148,7 @@ impl Harness {
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),
             tx,
+            answers: Default::default(),
             counters,
             first_message_received: AtomicBool::new(true),
             cancel_token: self.live.cancellation_token.child_token(),

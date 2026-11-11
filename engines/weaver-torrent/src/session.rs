@@ -45,8 +45,8 @@ use crate::torrent_state::live::{
     web_seed::WebSeeds,
 };
 use crate::tracker::{
-    ListenPort, Reachable, StoppedAnnounces, ToldPorts, Tracker, TrackerAnnounce, TrackerComms,
-    TrackerHandover, TrackerStatus, TrackerTask, UdpTrackerClient, Unreachable,
+    HttpAnnounces, ListenPort, Reachable, StoppedAnnounces, ToldPorts, Tracker, TrackerAnnounce,
+    TrackerComms, TrackerHandover, TrackerStatus, TrackerTask, UdpTrackerClient, Unreachable,
 };
 use crate::upnp::{
     PortMapEvents, PortMapReceiver, PortMapRequest, PortMapped, PortmapProtocol, PortmapTransport,
@@ -473,6 +473,9 @@ pub struct Session {
     udp_tracker_client: UdpTrackerClient,
     disable_trackers: bool,
     stopped_announces: StoppedAnnounces,
+    // The turns HTTP announces take, shared with every session that shares
+    // limits.
+    http_announces: HttpAnnounces,
     // Rung as an announce table or a metadata fetch's phase changes.
     trackers_changed: Option<Arc<Notify>>,
 
@@ -1023,6 +1026,7 @@ pub struct SessionLimits {
 pub struct SharedLimits {
     slots: Arc<ConnectionSlots>,
     checks: Arc<tokio::sync::Semaphore>,
+    http_announces: HttpAnnounces,
 }
 
 impl SharedLimits {
@@ -1037,6 +1041,7 @@ impl SharedLimits {
                 limits.connection_speed,
             )),
             checks: Arc::new(tokio::sync::Semaphore::new(concurrent_checks.max(1))),
+            http_announces: HttpAnnounces::default(),
         }
     }
 }
@@ -1917,6 +1922,10 @@ impl Session {
                 trackers: opts.trackers,
                 disable_trackers: opts.disable_trackers,
                 trackers_changed: opts.trackers_changed.clone(),
+                http_announces: match &opts.shared_limits {
+                    Some(shared) => shared.http_announces.clone(),
+                    None => HttpAnnounces::default(),
+                },
                 stopped_announces: StoppedAnnounces::new(
                     opts.tracker_stopped_timeout
                         .unwrap_or(StoppedAnnounces::DEFAULT_TIMEOUT),
@@ -3667,6 +3676,7 @@ impl Session {
             self.reachable(),
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
+            self.http_announces.clone(),
         );
         // The table rings the session's watcher at each change, until the
         // table is gone.

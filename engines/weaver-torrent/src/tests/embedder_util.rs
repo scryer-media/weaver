@@ -115,6 +115,10 @@ pub struct StorageLog {
     completed_files: Mutex<Vec<usize>>,
     // Per-file contents, created on the first create() from the torrent's file sizes.
     files: RwLock<Vec<Arc<RwLock<Vec<u8>>>>>,
+    // While set, the next `ensure_file_length` waits for a message on it:
+    // the check that sets the file lengths, its last step, cannot end until
+    // the test lets it.
+    lengths_gate: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
 }
 
 impl StorageLog {
@@ -136,6 +140,14 @@ impl StorageLog {
 
     pub fn file_contents(&self, file_id: usize) -> Vec<u8> {
         self.files.read()[file_id].read().clone()
+    }
+
+    /// Holds the next `ensure_file_length` until the returned sender sends
+    /// or is dropped.
+    pub fn hold_file_lengths(&self) -> std::sync::mpsc::Sender<()> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        *self.lengths_gate.lock() = Some(rx);
+        tx
     }
 }
 
@@ -254,6 +266,10 @@ impl TorrentStorage for MemoryStorage {
     }
 
     fn ensure_file_length(&self, _file_id: usize, _length: u64) -> anyhow::Result<()> {
+        let gate = self.log.lengths_gate.lock().take();
+        if let Some(gate) = gate {
+            let _ = gate.recv();
+        }
         Ok(())
     }
 

@@ -338,8 +338,9 @@ struct ConnectionIdMeta {
 struct ClientLocked {
     connections: HashMap<SocketAddr, ConnectionIdMeta>,
     // Each request's raw reply goes back to it to parse, as only the request
-    // knows the tracker address that fixes the reply's peer format.
-    transactions: HashMap<TransactionId, tokio::sync::oneshot::Sender<Vec<u8>>>,
+    // knows the tracker address that fixes the reply's peer format. The
+    // address is the tracker's, which the reply must come from.
+    transactions: HashMap<TransactionId, (SocketAddr, tokio::sync::oneshot::Sender<Vec<u8>>)>,
 }
 
 struct ClientShared {
@@ -363,6 +364,12 @@ impl Drop for TransactionIdGuard<'_> {
         let mut g = self.state.locked.write();
         g.transactions.remove(&self.tid);
     }
+}
+
+// Whether `from` is `tracker`, an IPv4 address and its IPv4-mapped IPv6 form
+// being one: a dual-stack socket reports either.
+fn same_endpoint(tracker: SocketAddr, from: SocketAddr) -> bool {
+    tracker.port() == from.port() && tracker.ip().to_canonical() == from.ip().to_canonical()
 }
 
 impl UdpTrackerClient {
@@ -427,7 +434,24 @@ impl UdpTrackerClient {
 
             trace!(?tid, len, ?addr, "received");
 
-            let t = self.state.locked.write().transactions.remove(&tid);
+            // A reply counts only from the tracker the request went to
+            // (libtorrent udp_tracker_connection.cpp:356-370, v2.0.15); one
+            // from anywhere else is dropped and the request still waits.
+            // libtorrent skips the check only for a request a proxy resolved,
+            // and Weaver resolves every tracker itself.
+            let t = {
+                let mut g = self.state.locked.write();
+                match g.transactions.entry(tid) {
+                    Entry::Occupied(waiting) if same_endpoint(waiting.get().0, addr) => {
+                        Some(waiting.remove().1)
+                    }
+                    Entry::Occupied(waiting) => {
+                        debug!(tid, ?addr, tracker = ?waiting.get().0, "reply from an address the request did not go to");
+                        continue;
+                    }
+                    Entry::Vacant(_) => None,
+                }
+            };
             match t {
                 Some(tx) => match tx.send(buf[..len].to_vec()) {
                     Ok(_) => {}
@@ -467,7 +491,7 @@ impl UdpTrackerClient {
 
     async fn request(&self, addr: SocketAddr, request: Request) -> anyhow::Result<Response> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let tid_g = self.reserve_transaction_id(tx)?;
+        let tid_g = self.reserve_transaction_id(addr, tx)?;
 
         let mut write_buf = [0u8; 1024];
         let len = request.serialize(tid_g.tid, &mut write_buf)?;
@@ -497,6 +521,7 @@ impl UdpTrackerClient {
 
     fn reserve_transaction_id(
         &self,
+        tracker: SocketAddr,
         tx: tokio::sync::oneshot::Sender<Vec<u8>>,
     ) -> anyhow::Result<TransactionIdGuard<'_>> {
         let mut g = self.state.locked.write();
@@ -505,7 +530,7 @@ impl UdpTrackerClient {
             match g.transactions.entry(t) {
                 Entry::Occupied(_) => continue,
                 Entry::Vacant(vac) => {
-                    vac.insert(tx);
+                    vac.insert((tracker, tx));
                     return Ok(TransactionIdGuard {
                         tid: t,
                         state: &self.state,
@@ -957,6 +982,76 @@ mod tests {
         let r = client.announce(v6_tracker, fields()).await.unwrap();
         assert_eq!(r.addrs, vec![v6_peer]);
 
+        token.cancel();
+        drop(client);
+        tracker.abort();
+    }
+
+    #[tokio::test]
+    async fn a_reply_from_an_address_the_request_did_not_go_to_is_ignored() {
+        let tracker_addr: SocketAddr = "192.0.2.1:6969".parse().unwrap();
+        let elsewhere = [
+            "192.0.2.9:6969".parse::<SocketAddr>().unwrap(),
+            "192.0.2.1:6970".parse().unwrap(),
+        ];
+        let (sent_tx, mut sent_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (reply_tx, reply_rx) = tokio::sync::mpsc::unbounded_channel();
+        let token = CancellationToken::new();
+        let client = UdpTrackerClient::new_with_socket(
+            token.clone(),
+            Arc::new(FakeSocket {
+                sent: sent_tx,
+                replies: parking_lot::Mutex::new(reply_rx),
+            }),
+            None,
+        );
+
+        // Every request is answered first from another host and from another
+        // port of the tracker's host, each with the request's transaction id
+        // and other counts, then by the tracker itself. The client reads one
+        // packet at a time, so the forged replies reach it first.
+        let tracker = async move {
+            while let Some((request, to)) = sent_rx.recv().await {
+                let tid = &request[12..16];
+                let action = u32::from_be_bytes(request[8..12].try_into().unwrap());
+                let connect = |id: u64| {
+                    let mut b = ACTION_CONNECT.to_be_bytes().to_vec();
+                    b.extend_from_slice(tid);
+                    b.extend_from_slice(&id.to_be_bytes());
+                    b
+                };
+                for from in elsewhere {
+                    let forged = if action == ACTION_CONNECT {
+                        connect(99)
+                    } else {
+                        scrape_reply(tid, [100, 100, 100])
+                    };
+                    reply_tx.send((forged, from)).unwrap();
+                }
+                let reply = if action == ACTION_CONNECT {
+                    connect(7)
+                } else {
+                    // The connection id the tracker gave, not a forged one.
+                    assert_eq!(request[..8], 7u64.to_be_bytes());
+                    scrape_reply(tid, [3, 8, 2])
+                };
+                reply_tx.send((reply, to)).unwrap();
+            }
+        };
+        let tracker = tokio::spawn(tracker);
+
+        let r = client
+            .scrape(tracker_addr, Id20::new([1; 20]))
+            .await
+            .unwrap();
+        assert_eq!(
+            r,
+            ScrapeResponse {
+                complete: 3,
+                downloaded: 8,
+                incomplete: 2,
+            }
+        );
         token.cancel();
         drop(client);
         tracker.abort();
