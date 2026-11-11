@@ -9,8 +9,8 @@ pub(crate) const NZB_SLOT_WAIT_REASON: &str = "nzb_slot";
 // One queue row as the admission pass sees it, copied out under the read lock.
 struct AdmissionRow {
     id: JobId,
-    position: usize,
-    priority: u8,
+    // Where the row stands in dispatch order.
+    key: crate::pipeline::queue::order::DispatchKey,
     paused: bool,
     // The row still carries an intake, a restore or a resume for the actor,
     // or its job is installed and waits for a slot to download.
@@ -54,21 +54,6 @@ impl QueueWalkMark {
     }
 }
 
-// A job's priority from its metadata: high 0, normal 1, low 2.
-pub(crate) fn metadata_priority(metadata: &[(String, String)]) -> u8 {
-    metadata
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case("priority"))
-        .map_or(1, |(_, value)| {
-            if value.eq_ignore_ascii_case("high") {
-                0
-            } else if value.eq_ignore_ascii_case("low") {
-                2
-            } else {
-                1
-            }
-        })
-}
 
 impl Pipeline {
     // Whether the row's job counts as paused for its slot.
@@ -101,16 +86,9 @@ impl Pipeline {
             || row.intents.paused == Some(false)
             || self.jobs.contains_key(&row.id)
             || self.window_parked(row.id);
-        // Only a pending edit can move the priority off the reported metadata.
-        let priority = if row.intents.update.is_some() {
-            metadata_priority(&row.info(globals).metadata)
-        } else {
-            metadata_priority(&row.report.job.metadata)
-        };
         AdmissionRow {
             id: row.id,
-            position,
-            priority,
+            key: crate::pipeline::queue::order::DispatchKey::of_row(row, position, globals),
             paused: self.admission_paused(row),
             pending,
             cancelled_or_retiring: row.intents.cancelled.is_some() || row.report.retiring,
@@ -250,13 +228,13 @@ impl Pipeline {
                     && !self.nzb_admitted.contains(&row.id)
                     && !self.nzb_admitting.contains(&row.id)
             })
-            .map(|row| (row.priority, row.position, row.id))
+            .map(|row| row.key)
             .collect();
         drop(rows);
         candidates.sort_unstable();
         let propagating: HashSet<_> = candidates
             .iter()
-            .filter_map(|(_, _, id)| self.propagation_hold_until(*id).map(|_| *id))
+            .filter_map(|key| self.propagation_hold_until(key.job_id()).map(|_| key.job_id()))
             .collect();
         // A hold that ran out on a job that is not a candidate, such as a
         // paused one, holds nothing. It goes once seen, so it never calls for
@@ -271,7 +249,7 @@ impl Pipeline {
         for id in expired {
             self.propagation_hold_until(id);
         }
-        for (_, _, id) in candidates {
+        for id in candidates.into_iter().map(|key| key.job_id()) {
             // A settings edit or global hold can arrive while the previous
             // acquisition awaits its durable commit. Re-read before admitting
             // the next job rather than using the pass's earlier snapshot.

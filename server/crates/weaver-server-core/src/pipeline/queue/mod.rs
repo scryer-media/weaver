@@ -14,6 +14,7 @@ mod admission;
 mod counters;
 mod history;
 mod intents;
+pub(crate) mod order;
 pub mod paging;
 pub(crate) use admission::{
     AdmissionResources, PreparedAdd, RestartAdmission, delivery_staging_dir, destination_root,

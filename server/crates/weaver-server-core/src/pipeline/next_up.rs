@@ -73,7 +73,7 @@ impl NextUp {
 impl Pipeline {
     // The jobs next up: installed jobs that never started, waiting for a
     // slot, not paused, in dispatch order, as many as the depth.
-    fn next_up_jobs(&self) -> Vec<JobId> {
+    pub(in crate::pipeline) fn next_up_jobs(&self) -> Vec<JobId> {
         let depth = self.next_up.depth;
         if depth == 0 {
             return Vec::new();
@@ -82,35 +82,18 @@ impl Pipeline {
             if inner.globals.shutting_down {
                 return Vec::new();
             }
-            let mut waiting: Vec<(u8, usize, JobId)> = inner
-                .jobs
-                .iter()
-                .enumerate()
-                .filter(|(_, row)| {
-                    row.intents.cancelled.is_none()
-                        && !row.report.retiring
-                        && !self.nzb_admitted.contains(&row.id)
-                })
-                .filter(|(_, row)| {
-                    self.jobs.get(&row.id).is_some_and(|state| {
+            let mut waiting = inner.dispatch_keys(|row| {
+                row.intents.cancelled.is_none()
+                    && !row.report.retiring
+                    && !self.nzb_admitted.contains(&row.id)
+                    && self.jobs.get(&row.id).is_some_and(|state| {
                         matches!(state.articles, JobArticles::Queued(_))
                             && state.status == JobStatus::Queued
                             && state.run_state != crate::jobs::model::RunState::Paused
                     })
-                })
-                .map(|(position, row)| {
-                    (
-                        crate::pipeline::nzb_admission::metadata_priority(&row.report.job.metadata),
-                        position,
-                        row.id,
-                    )
-                })
-                .collect();
-            if waiting.len() > depth {
-                waiting.select_nth_unstable(depth - 1);
-                waiting.truncate(depth);
-            }
-            waiting.into_iter().map(|(_, _, id)| id).collect()
+            });
+            crate::pipeline::queue::order::keep_first(&mut waiting, depth);
+            waiting.into_iter().map(|key| key.job_id()).collect()
         })
     }
 
