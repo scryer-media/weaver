@@ -640,6 +640,78 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
             .flatten()
             .copied()
     };
+    // The moved segments whose class `pick` takes, each found by its file
+    // and number in the queue rather than by a walk of it.
+    let picked = |pick: fn(Class) -> bool| {
+        classes
+            .iter()
+            .filter(move |(_, class)| pick(**class))
+            .map(move |(&(volume, ordinal), _)| segment(job_id, VolumeIndex(volume), ordinal))
+    };
+    for (&(volume, ordinal), class) in &classes {
+        if *class == Class::FirstArticle {
+            state
+                .download_queue
+                .note_first_article(segment(job_id, VolumeIndex(volume), ordinal));
+        }
+    }
+    for work in state
+        .download_queue
+        .extract_segments(picked(|class| class == Class::Parked))
+    {
+        state.recovery_queue.push(work);
+    }
+    let mut taken = state
+        .recovery_queue
+        .extract_segments(picked(|class| class != Class::Parked));
+    // An ordinary move only brings parked work back: queued work keeps its
+    // place. A window move re-keys in place below.
+    taken.extend(state.download_queue.extract_segments(picked(|class| {
+        class < Class::Ordinary && !matches!(class, Class::Window(_))
+    })));
+    taken.sort_by_key(|work| class_of(work));
+    for mut work in taken {
+        if let Some(class) = class_of(&work) {
+            classify(&mut work, class);
+        }
+        state.download_queue.push(work);
+    }
+    state
+        .download_queue
+        .reprioritize_segments(classes.iter().filter_map(|(&(volume, ordinal), class)| {
+            match class {
+                Class::Window(rank) => Some((
+                    segment(job_id, VolumeIndex(volume), ordinal),
+                    WINDOW_PRIORITY,
+                    Some(*rank),
+                )),
+                _ => None,
+            }
+        }));
+}
+
+// The moves applied by walks of the whole queue, which `apply_moves` must
+// match on every state.
+#[cfg(test)]
+pub(super) fn apply_moves_by_walk(state: &mut JobState, moves: &[Move]) {
+    if moves.is_empty() {
+        return;
+    }
+    let job_id = state.job_id;
+    let Some(state) = state.articles.active_mut() else {
+        return;
+    };
+    let classes: BTreeMap<(u32, u32), Class> = moves
+        .iter()
+        .map(|found| ((found.volume.0, found.ordinal), found.class))
+        .collect();
+    let class_of = |work: &DownloadWork| {
+        let id = work.segment_id;
+        (id.file_id.job_id == job_id)
+            .then(|| classes.get(&(id.file_id.file_index, id.segment_number)))
+            .flatten()
+            .copied()
+    };
     let any = |pick: fn(Class) -> bool| classes.values().any(|class| pick(*class));
     for (&(volume, ordinal), class) in &classes {
         if *class == Class::FirstArticle {
@@ -657,8 +729,6 @@ pub(super) fn apply_moves(state: &mut JobState, moves: &[Move]) {
     let mut taken = state
         .recovery_queue
         .extract_matching(|work| class_of(work).is_some_and(|class| class != Class::Parked));
-    // An ordinary move only brings parked work back: queued work keeps its
-    // place. A window move re-keys in place below.
     let raised = |class: Class| class < Class::Ordinary && !matches!(class, Class::Window(_));
     if any(raised) {
         taken.extend(

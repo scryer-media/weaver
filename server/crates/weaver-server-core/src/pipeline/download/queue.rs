@@ -130,6 +130,16 @@ impl Ord for QueueKey {
 // pop and re-push of everything ahead of the match.
 type ClassMap = BTreeMap<QueueKey, DownloadWork>;
 
+// Where one queued item sits: the class map that holds it and its key there.
+#[derive(Clone, Copy)]
+struct Slot {
+    completion_critical: bool,
+    key: QueueKey,
+}
+
+// The slots of one file's queued items, by segment number and sequence.
+type FileSlots = BTreeMap<(u32, u64), Slot>;
+
 // Priority queue for download work items.
 pub struct DownloadQueue {
     completion_critical_work: ClassMap,
@@ -142,11 +152,11 @@ pub struct DownloadQueue {
     // Queued recovery items, which the restart checkpoint never holds back.
     // Maintained on push/pop; recounted on the bulk-removal paths.
     recovery_work: usize,
-    // Queued items per file, maintained on every push and removal. The RAR
-    // unlock planner asks "does this file still have queued work" once per
-    // volume; answering that by scanning the queue made every replan cost
-    // files times queued segments.
-    queued_by_file: HashMap<NzbFileId, u32>,
+    // Where each file's queued items sit, maintained on every push, removal
+    // and re-key. Its length is the file's queued count, and a caller that
+    // names the segments it moves finds them here, not by a walk of the
+    // queue.
+    queued_by_file: HashMap<NzbFileId, FileSlots>,
     // One article per file — the lowest ordinal each file has. Held here
     // rather than on the work item so that every path that puts an article
     // back, including a requeue after a lane gave one up, lands it in the
@@ -187,10 +197,6 @@ impl DownloadQueue {
             self.excluded_work += 1;
         }
         self.recovery_work += usize::from(work.is_recovery);
-        *self
-            .queued_by_file
-            .entry(work.segment_id.file_id)
-            .or_default() += 1;
         let completion_critical = work.completion_critical;
         let first_article = self.first_articles.contains(&work.segment_id);
         let key = QueueKey {
@@ -199,6 +205,16 @@ impl DownloadQueue {
             rank: None,
             sequence,
         };
+        self.queued_by_file
+            .entry(work.segment_id.file_id)
+            .or_default()
+            .insert(
+                (work.segment_id.segment_number, sequence),
+                Slot {
+                    completion_critical,
+                    key,
+                },
+            );
         self.class_mut(completion_critical).insert(key, work);
     }
 
@@ -211,14 +227,9 @@ impl DownloadQueue {
     }
 
     fn pop_from_class(&mut self, completion_critical: bool) -> Option<DownloadWork> {
-        let work = self
-            .class_mut(completion_critical)
-            .pop_first()
-            .map(|(_, work)| work);
-        if let Some(work) = &work {
-            self.note_removed(work);
-        }
-        work
+        let (key, work) = self.class_mut(completion_critical).pop_first()?;
+        self.note_removed(&key, &work);
+        Some(work)
     }
 
     // Number of queued recovery items, in O(1).
@@ -274,19 +285,62 @@ impl DownloadQueue {
         cleared
     }
 
-    fn recount_derived_counts(&mut self) {
-        self.excluded_work = self.iter().filter(|work| work.is_steered()).count();
-        self.recovery_work = self.iter().filter(|work| work.is_recovery).count();
-        let mut queued_by_file = HashMap::new();
-        for work in self.iter() {
-            *queued_by_file.entry(work.segment_id.file_id).or_default() += 1;
-        }
-        self.queued_by_file = queued_by_file;
-    }
-
     // Queued items for one file, in O(1).
     pub fn queued_count_for_file(&self, file_id: NzbFileId) -> u32 {
-        self.queued_by_file.get(&file_id).copied().unwrap_or(0)
+        self.queued_by_file
+            .get(&file_id)
+            .map_or(0, |slots| slots.len() as u32)
+    }
+
+    // Every queued item in dispatch order, with its key and the fields its
+    // class sets, for the tests that compare two queues.
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn snapshot(&self) -> Vec<(bool, u8, u32, Option<u32>, u64, SegmentId, u32, bool)> {
+        [true, false]
+            .into_iter()
+            .flat_map(|completion_critical| {
+                self.class(completion_critical).iter().map(move |(key, work)| {
+                    (
+                        completion_critical,
+                        key.completion_rank,
+                        key.priority,
+                        key.rank,
+                        key.sequence,
+                        work.segment_id,
+                        work.priority,
+                        work.is_recovery,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    // The derived counts as a walk of every queued item finds them, for the
+    // tests that hold the maintained ones to it.
+    #[cfg(test)]
+    pub(crate) fn counts_match_a_walk(&self) -> bool {
+        let mut by_file: HashMap<NzbFileId, u32> = HashMap::new();
+        for work in self.iter() {
+            *by_file.entry(work.segment_id.file_id).or_default() += 1;
+        }
+        let slots_match = [true, false].into_iter().all(|completion_critical| {
+            self.class(completion_critical).iter().all(|(key, work)| {
+                self.queued_by_file
+                    .get(&work.segment_id.file_id)
+                    .and_then(|slots| slots.get(&(work.segment_id.segment_number, key.sequence)))
+                    .is_some_and(|slot| {
+                        slot.completion_critical == completion_critical && slot.key == *key
+                    })
+            })
+        });
+        slots_match
+            && self.excluded_work == self.iter().filter(|work| work.is_steered()).count()
+            && self.recovery_work == self.iter().filter(|work| work.is_recovery).count()
+            && by_file.len() == self.queued_by_file.len()
+            && by_file
+                .iter()
+                .all(|(file, count)| self.queued_count_for_file(*file) == *count)
     }
 
     #[cfg(test)]
@@ -347,14 +401,15 @@ impl DownloadQueue {
         &mut self,
         mut matches: impl FnMut(&DownloadWork) -> bool,
     ) -> Option<DownloadWork> {
-        if let Some(work) =
+        if let Some((key, work)) =
             Self::remove_first_matching_from_class(&mut self.completion_critical_work, &mut matches)
         {
-            self.note_removed(&work);
+            self.note_removed(&key, &work);
             return Some(work);
         }
-        let work = Self::remove_first_matching_from_class(&mut self.ordinary_work, &mut matches)?;
-        self.note_removed(&work);
+        let (key, work) =
+            Self::remove_first_matching_from_class(&mut self.ordinary_work, &mut matches)?;
+        self.note_removed(&key, &work);
         Some(work)
     }
 
@@ -363,36 +418,119 @@ impl DownloadQueue {
         completion_critical: bool,
         mut matches: impl FnMut(&DownloadWork) -> bool,
     ) -> Option<DownloadWork> {
-        let work = Self::remove_first_matching_from_class(
+        let (key, work) = Self::remove_first_matching_from_class(
             self.class_mut(completion_critical),
             &mut matches,
         )?;
-        self.note_removed(&work);
+        self.note_removed(&key, &work);
         Some(work)
     }
 
     fn remove_first_matching_from_class(
         class: &mut ClassMap,
         matches: &mut impl FnMut(&DownloadWork) -> bool,
-    ) -> Option<DownloadWork> {
+    ) -> Option<(QueueKey, DownloadWork)> {
         let key = class
             .iter()
             .find_map(|(key, work)| matches(work).then_some(*key))?;
-        class.remove(&key)
+        class.remove_entry(&key)
     }
 
-    fn note_removed(&mut self, work: &DownloadWork) {
+    fn note_removed(&mut self, key: &QueueKey, work: &DownloadWork) {
         if work.is_steered() {
             self.excluded_work = self.excluded_work.saturating_sub(1);
         }
         self.recovery_work = self
             .recovery_work
             .saturating_sub(usize::from(work.is_recovery));
-        if let Some(count) = self.queued_by_file.get_mut(&work.segment_id.file_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                self.queued_by_file.remove(&work.segment_id.file_id);
+        let file = work.segment_id.file_id;
+        if let Some(slots) = self.queued_by_file.get_mut(&file) {
+            slots.remove(&(work.segment_id.segment_number, key.sequence));
+            if slots.is_empty() {
+                self.queued_by_file.remove(&file);
             }
+        }
+    }
+
+    // The slots of every queued item of the segments, in dispatch order:
+    // the completion-critical class first, each class in key order.
+    fn slots_of(&self, segments: impl IntoIterator<Item = SegmentId>) -> Vec<Slot> {
+        let mut found = Vec::new();
+        for segment in segments {
+            let Some(slots) = self.queued_by_file.get(&segment.file_id) else {
+                continue;
+            };
+            let number = segment.segment_number;
+            found.extend(slots.range((number, 0)..=(number, u64::MAX)).map(|(_, slot)| *slot));
+        }
+        found.sort_by(|one, other| {
+            other
+                .completion_critical
+                .cmp(&one.completion_critical)
+                .then(one.key.cmp(&other.key))
+        });
+        found
+    }
+
+    // Removes and returns every queued item of the segments, in the order
+    // `extract_matching` returns them, leaving the rest queued in place.
+    pub fn extract_segments(
+        &mut self,
+        segments: impl IntoIterator<Item = SegmentId>,
+    ) -> Vec<DownloadWork> {
+        let slots = self.slots_of(segments);
+        let mut extracted = Vec::with_capacity(slots.len());
+        for slot in slots {
+            if let Some((key, work)) = self.class_mut(slot.completion_critical).remove_entry(&slot.key)
+            {
+                self.note_removed(&key, &work);
+                extracted.push(work);
+            }
+        }
+        extracted
+    }
+
+    // Sets the priority and rank of every queued item of each segment, as
+    // `reprioritize_matching_with_rank` does for the items it matches.
+    // Returns how many items moved.
+    pub fn reprioritize_segments(
+        &mut self,
+        segments: impl IntoIterator<Item = (SegmentId, u32, Option<u32>)>,
+    ) -> usize {
+        let mut changed = 0;
+        for (segment, priority, rank) in segments {
+            for slot in self.slots_of([segment]) {
+                if slot.key.priority == priority && slot.key.rank == rank {
+                    continue;
+                }
+                let key = QueueKey {
+                    priority,
+                    rank,
+                    ..slot.key
+                };
+                self.rekey(slot, key);
+                changed += 1;
+            }
+        }
+        changed
+    }
+
+    // Moves one queued item to a new key in its class, and its slot with it.
+    fn rekey(&mut self, slot: Slot, key: QueueKey) {
+        let class = self.class_mut(slot.completion_critical);
+        let Some(mut work) = class.remove(&slot.key) else {
+            return;
+        };
+        work.priority = key.priority;
+        let file = work.segment_id.file_id;
+        let number = work.segment_id.segment_number;
+        class.insert(key, work);
+        if let Some(found) = self
+            .queued_by_file
+            .get_mut(&file)
+            .and_then(|slots| slots.get_mut(&(number, key.sequence)))
+        {
+            found.key = key;
         }
     }
 
@@ -468,16 +606,12 @@ impl DownloadQueue {
     ) -> Vec<DownloadWork> {
         let mut extracted = Vec::new();
         for class in [&mut self.completion_critical_work, &mut self.ordinary_work] {
-            extracted.extend(
-                class
-                    .extract_if(.., |_, work| predicate(work))
-                    .map(|(_, work)| work),
-            );
+            extracted.extend(class.extract_if(.., |_, work| predicate(work)));
         }
-        if !extracted.is_empty() {
-            self.recount_derived_counts();
+        for (key, work) in &extracted {
+            self.note_removed(key, work);
         }
-        extracted
+        extracted.into_iter().map(|(_, work)| work).collect()
     }
 
     // Adds every queued segment id to `out`.
@@ -495,31 +629,32 @@ impl DownloadQueue {
         &mut self,
         mut priority_for: impl FnMut(&DownloadWork) -> Option<(u32, Option<u32>)>,
     ) -> usize {
-        let mut changed = 0;
-        for class in [&mut self.completion_critical_work, &mut self.ordinary_work] {
+        let mut rekeyed = Vec::new();
+        for completion_critical in [true, false] {
             // Only the items whose key changes move; each keeps its sequence,
             // so equal keys still serve in insertion order.
-            let rekeyed: Vec<_> = class
-                .iter()
-                .filter_map(|(key, work)| {
-                    let (priority, rank) = priority_for(work)?;
-                    (key.priority != priority || key.rank != rank).then_some((
-                        *key,
-                        QueueKey {
-                            priority,
-                            rank,
-                            ..*key
-                        },
-                    ))
-                })
-                .collect();
-            changed += rekeyed.len();
-            for (old, new) in rekeyed {
-                if let Some(mut work) = class.remove(&old) {
-                    work.priority = new.priority;
-                    class.insert(new, work);
-                }
-            }
+            rekeyed.extend(
+                self.class(completion_critical)
+                    .iter()
+                    .filter_map(|(key, work)| {
+                        let (priority, rank) = priority_for(work)?;
+                        (key.priority != priority || key.rank != rank).then_some((
+                            Slot {
+                                completion_critical,
+                                key: *key,
+                            },
+                            QueueKey {
+                                priority,
+                                rank,
+                                ..*key
+                            },
+                        ))
+                    }),
+            );
+        }
+        let changed = rekeyed.len();
+        for (slot, key) in rekeyed {
+            self.rekey(slot, key);
         }
         changed
     }
