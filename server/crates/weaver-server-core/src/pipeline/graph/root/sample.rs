@@ -16,7 +16,12 @@
 // Once a recovery object has said what the members are called, the sets they
 // form are known before any of their objects has asked for anything, so the
 // first volumes of each set are bid into the window at once. The payload
-// follows in posted order.
+// follows in posted order, except that a set's volumes are fetched by their
+// place in the set once it is known: from their names, their headers or a
+// recovery object's names, whichever says it first. Sets keep the order they
+// were first known in, and a volume whose place is not known yet stays where
+// it was posted, after them. A set's own bid for a volume waits for the places
+// before it the same way, so the window too is drawn in place order.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
@@ -69,14 +74,33 @@ pub(crate) struct Leading {
     // The root namespace's generation the files are up to date with, once
     // they are built.
     at: Option<u64>,
+    // Each set's turn in the fetch order: the order the sets were first
+    // filed in.
+    turns: HashMap<NodeId, u32>,
+    // The volumes filed at a new place since the queue last took them, each
+    // with the rank its articles are fetched at.
+    ranked: Vec<(VolumeIndex, u32)>,
+    // Each set's first place no member is bound at, as of the last round.
+    unbound: HashMap<NodeId, VolumeIndex>,
+    // Some member of the post had not yet said what it is, as of the last
+    // round, so a place still unbound may yet be.
+    undecided: bool,
 }
+
+// A volume's rank is its set's turn, then its place in the set.
+const PLACE_BITS: u32 = 20;
+const MAX_PLACE: u32 = (1 << PLACE_BITS) - 1;
+const MAX_TURN: u32 = (1 << (32 - PLACE_BITS)) - 1;
 
 impl Leading {
     // File the volume afresh: out of where it was, and into its set at its
     // place when it waits and its member is a set's volume. A further
-    // posting of a member is the member's, not a volume of its own.
+    // posting of a member is the member's, not a volume of its own. A
+    // volume filed at a place it was not filed at is ranked by it, unless
+    // its set recovers: a recovery volume is fetched only when asked.
     fn refile(&mut self, tree: &Tree, root: &Namespace, volume: VolumeIndex, waiting: bool) {
-        if let Some((set, place)) = self.filed.remove(&volume)
+        let was = self.filed.remove(&volume);
+        if let Some((set, place)) = was
             && let Some(volumes) = self.sets.get_mut(&set)
         {
             volumes.remove(&(place, volume));
@@ -96,6 +120,42 @@ impl Leading {
         };
         self.sets.entry(set).or_default().insert((place, volume));
         self.filed.insert(volume, (set, place));
+        if was != Some((set, place)) && !tree.recovers(set) {
+            let next = self.turns.len() as u32;
+            self.turns.entry(set).or_insert(next);
+            if let Some(rank) = self.rank_of(volume) {
+                self.ranked.push((volume, rank));
+            }
+        }
+    }
+
+    // The rank of a waiting volume whose place in its set is known.
+    pub(crate) fn rank_of(&self, volume: VolumeIndex) -> Option<u32> {
+        let (set, place) = self.filed.get(&volume)?;
+        let turn = self.turns.get(set)?;
+        Some((turn.min(&MAX_TURN) << PLACE_BITS) | place.0.min(MAX_PLACE))
+    }
+
+    // The volumes ranked since the last call, each with its rank.
+    pub(crate) fn take_ranked(&mut self) -> Vec<(VolumeIndex, u32)> {
+        std::mem::take(&mut self.ranked)
+    }
+
+    // Whether a set's bid for one of its own volumes may take a place in the
+    // window: once every place before the volume's is bound, or every member
+    // of the post has said what it is, so no further place will be. The
+    // window is then drawn in place order however the set was posted. A bid
+    // for anything else is ready.
+    pub(crate) fn ready(&self, bid: &Bid) -> bool {
+        if !self.undecided {
+            return true;
+        }
+        match self.filed.get(&bid.volume) {
+            Some((set, place)) if *set == bid.bidder => {
+                self.unbound.get(set).is_none_or(|unbound| place < unbound)
+            }
+            _ => true,
+        }
     }
 }
 
@@ -131,7 +191,8 @@ pub(crate) fn bootstrap(
         }
     }
     leading.at = Some(root.generation());
-    let bids = leading_bids(tree, &leading.sets);
+    leading.undecided = tree.undecided(NodeId::ROOT).next().is_some();
+    let bids = leading_bids(tree, &leading.sets, &mut leading.unbound);
     #[cfg(test)]
     assert_eq!(bids, reference_bids(tree, map), "the bootstrap's bids");
     for bid in bids {
@@ -139,11 +200,14 @@ pub(crate) fn bootstrap(
     }
 }
 
-// Each set's bids, set by set, each in place order.
+// Each set's bids, set by set, each in place order, noting each set's first
+// unbound place.
 fn leading_bids(
     tree: &Tree,
     sets: &BTreeMap<NodeId, BTreeSet<(VolumeIndex, VolumeIndex)>>,
+    unbounds: &mut HashMap<NodeId, VolumeIndex>,
 ) -> Vec<Bid> {
+    unbounds.clear();
     let mut bids = Vec::new();
     for (set, volumes) in sets {
         let set = *set;
@@ -151,6 +215,7 @@ fn leading_bids(
             continue;
         }
         let unbound = first_unbound(tree, set);
+        unbounds.insert(set, unbound);
         for (_, volume) in volumes
             .iter()
             .take_while(|(place, _)| *place < unbound)

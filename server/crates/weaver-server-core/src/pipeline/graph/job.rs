@@ -1103,6 +1103,12 @@ impl GraphJob {
         Ok(self.root.map.take_moves())
     }
 
+    // The volumes whose place in their set the rounds learned since the last
+    // call, each with the rank its articles are fetched at.
+    pub(crate) fn take_volume_ranks(&mut self) -> Vec<(VolumeIndex, u32)> {
+        self.root.leading.take_ranked()
+    }
+
     // The phase, when it changed since the last call.
     pub(crate) fn phase_change(&mut self) -> Option<RootPhase> {
         let phase = self.phase();

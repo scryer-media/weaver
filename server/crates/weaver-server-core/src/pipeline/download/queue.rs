@@ -523,6 +523,34 @@ impl DownloadQueue {
         changed
     }
 
+    // Sets the rank of the file's ordinary queued items at `priority`: its
+    // first articles and its items in any other class or at any other
+    // priority keep their keys. Only the file's own slots are read. Returns
+    // how many items moved.
+    pub fn rank_ordinary_file(&mut self, file_id: NzbFileId, priority: u32, rank: u32) -> usize {
+        let Some(slots) = self.queued_by_file.get(&file_id) else {
+            return 0;
+        };
+        let moving: Vec<Slot> = slots
+            .values()
+            .filter(|slot| {
+                !slot.completion_critical
+                    && slot.key.completion_rank == COMPLETION_RANK_ORDINARY
+                    && slot.key.priority == priority
+                    && slot.key.rank != Some(rank)
+            })
+            .copied()
+            .collect();
+        for slot in &moving {
+            let key = QueueKey {
+                rank: Some(rank),
+                ..slot.key
+            };
+            self.rekey(*slot, key);
+        }
+        moving.len()
+    }
+
     // Moves one queued item to a new key in its class, and its slot with it.
     fn rekey(&mut self, slot: Slot, key: QueueKey) {
         let class = self.class_mut(slot.completion_critical);

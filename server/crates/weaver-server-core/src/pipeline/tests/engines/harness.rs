@@ -559,6 +559,10 @@ pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) article: usize,
     // Every batch the download queue hands out is served last article first.
     pub(in crate::pipeline::tests) backwards: bool,
+    // Every handout is this many articles at once, served in the order the
+    // queue handed them out, as that many workers fetching side by side
+    // land; none is one at a time.
+    pub(in crate::pipeline::tests) batch: usize,
     // Every batch the download queue hands out is served as workers fetching
     // these posts at once: one article of each in turn, in this order.
     pub(in crate::pipeline::tests) together: Vec<u32>,
@@ -615,6 +619,7 @@ impl Scenario {
             global_passwords: Vec::new(),
             article: ARTICLE,
             backwards: false,
+            batch: 0,
             together: Vec::new(),
             reversed: Vec::new(),
             first: Vec::new(),
@@ -760,6 +765,13 @@ impl Scenario {
     // Whatever the download queue hands out at once arrives in reverse.
     pub(in crate::pipeline::tests) fn backwards(mut self) -> Self {
         self.backwards = true;
+        self
+    }
+
+    // The queue hands out `articles` at a time, served in the order handed
+    // out.
+    pub(in crate::pipeline::tests) fn batched(mut self, articles: usize) -> Self {
+        self.batch = articles;
         self
     }
 
@@ -1385,8 +1397,9 @@ pub(in crate::pipeline::tests) async fn run_unprompted(
     (outcomes, moved)
 }
 
-// The next articles the download queue hands out: one, or with `backwards`
-// every one it holds, last first, or with `together` every one it holds, a
+// The next articles the download queue hands out: one, or with `batched`
+// that many in the order handed out, or with `backwards` every one it
+// holds, last first, or with `together` every one it holds, a
 // turn of each named post at a time, or with `leased` the batch a lane
 // leases, last first, with the slice sizes it was leased under. `None` once
 // it is dry.
@@ -1419,6 +1432,14 @@ fn handed_out(
         .download_queue;
     let all = scenario.backwards || !scenario.together.is_empty();
     let mut batch = Vec::new();
+    if scenario.batch > 0 {
+        while batch.len() < scenario.batch
+            && let Some(work) = queue.pop()
+        {
+            batch.push(work);
+        }
+        return (!batch.is_empty()).then_some((batch, None));
+    }
     while let Some(work) = queue.pop() {
         batch.push(work);
         if !all {
