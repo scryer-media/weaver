@@ -320,9 +320,7 @@ pub(crate) async fn load_job_detail_snapshot(
         // The detail view is a read-only, high-frequency poll (heartbeat + event
         // triggers, up to a few Hz per open tab). Large RAR jobs write thousands
         // of event rows, so read only the newest slice instead of scanning the
-        // whole log. This is the ONLY detail-snapshot event read switched to the
-        // capped variant; the pipeline restore path still uses get_job_events so
-        // it can scan the full log for its finalization marker.
+        // whole log.
         let events = db.get_job_events_latest(job_id, JOB_DETAIL_EVENT_CAP)?;
         let history = if live_only {
             None
@@ -1245,7 +1243,7 @@ fn history_state_key(state: QueueItemState) -> &'static str {
     }
 }
 
-fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
+pub(crate) fn job_info_from_history_row(row: &JobHistoryRow) -> JobInfo {
     let metadata = row
         .metadata
         .as_deref()

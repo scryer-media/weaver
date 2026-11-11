@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore } from "react";
 
 /** The timer functions the helpers below schedule with; tests pass their own. */
 export interface Timers {
@@ -58,4 +58,26 @@ export function useDebouncedValue<T>(value: T, delayMs: number): T {
     return debouncer.cancel;
   }, [delayMs, settled, value]);
   return settled;
+}
+
+/** Whether the page is showing, and a way to hear when that changes. */
+export interface PageVisibility {
+  visible(): boolean;
+  subscribe(onChange: () => void): () => void;
+}
+
+export const documentVisibility: PageVisibility = {
+  visible: () => typeof document === "undefined" || document.visibilityState !== "hidden",
+  subscribe(onChange) {
+    if (typeof document === "undefined") {
+      return () => {};
+    }
+    document.addEventListener("visibilitychange", onChange);
+    return () => document.removeEventListener("visibilitychange", onChange);
+  },
+};
+
+/** True while the page is showing; false while its tab is in the background. */
+export function usePageVisible(): boolean {
+  return useSyncExternalStore(documentVisibility.subscribe, documentVisibility.visible, () => true);
 }
