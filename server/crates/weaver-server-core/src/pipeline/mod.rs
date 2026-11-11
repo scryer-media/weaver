@@ -1486,6 +1486,9 @@ pub struct Pipeline {
     pub(super) dirty_server_attribution: HashSet<JobId>,
     // Jobs whose support facts changed since the last checkpoint.
     pub(super) dirty_support_facts: HashSet<JobId>,
+    // Jobs an article decoded for since their report was last published.
+    // The snapshot tick publishes each once, however many articles decoded.
+    pub(super) reports_due: HashSet<JobId>,
     pub(super) server_attribution_checkpoint_at: Instant,
     // Forces the PAR2 ignore-extension list for a test, so the "override
     // disables it" case can be exercised without mutating a process-global

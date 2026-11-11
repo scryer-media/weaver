@@ -342,6 +342,7 @@ impl Pipeline {
             uu_spool_available_bytes_for_test: None,
             dirty_server_attribution: HashSet::new(),
             dirty_support_facts: HashSet::new(),
+            reports_due: HashSet::new(),
             server_attribution_checkpoint_at: Instant::now(),
             #[cfg(test)]
             par2_ignore_extensions_override: None,
@@ -702,6 +703,7 @@ impl Pipeline {
     pub(crate) fn clear_job_progress_floor_runtime(&mut self, job_id: JobId) {
         self.dirty_server_attribution.remove(&job_id);
         self.dirty_support_facts.remove(&job_id);
+        self.reports_due.remove(&job_id);
         self.blocked_restores.remove(&job_id);
         self.download_restart_durable_lead_retry_after
             .remove(&job_id);
@@ -1408,6 +1410,7 @@ impl Pipeline {
 
     pub(in crate::pipeline) fn refresh_periodic_snapshot(&mut self) {
         self.checkpoint_server_attribution_if_due();
+        self.report_due_jobs();
         // Queue edits can change eligibility while the data plane is idle.
         // The existing active/idle tick cadence bounds these small walks.
         self.publish_download_footprint_metrics();

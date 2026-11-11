@@ -462,6 +462,77 @@ async fn decode_failure_retries_excluding_actual_source_server() {
     assert_eq!(work.exclude_servers, vec![0]);
 }
 
+// A decoded article does not build its job's report: the job is marked, and
+// the snapshot tick publishes the report once. The job's last decode
+// publishes at once.
+#[tokio::test]
+async fn a_decoded_article_leaves_its_jobs_report_to_the_tick_until_the_last() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20031);
+    let files = vec![
+        ("one.bin".to_string(), 64u32),
+        ("two.bin".to_string(), 64u32),
+    ];
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        standalone_job_spec("Report Per Tick", &files),
+    )
+    .await;
+
+    for file_index in 0..2 {
+        let segment_id = SegmentId {
+            file_id: NzbFileId { job_id, file_index },
+            segment_number: 0,
+        };
+        pipeline.active_downloads += 1;
+        pipeline
+            .handle_download_done(DownloadResult {
+                lane_id: 0,
+                job_id,
+                runtime_generation: 0,
+                segment_id,
+                data: Ok(DownloadPayload::Raw(Bytes::from_static(
+                    b"not a yenc article",
+                ))),
+                attempts: Vec::new(),
+                lane_observation: None,
+                source_server_idx: Some(0),
+                origin: DownloadResultOrigin::NormalPrimary,
+                retry_count: 0,
+                exclude_servers: Vec::new(),
+                release_connection_slot: true,
+            })
+            .await;
+    }
+    let first = pipeline.decode_done_rx.recv().await.expect("first decode");
+    let last = pipeline.decode_done_rx.recv().await.expect("last decode");
+    let published = |pipeline: &Pipeline| {
+        pipeline.shared_state.queue.read(|inner| {
+            inner
+                .job(job_id)
+                .map(|row| row.report.job.failed_bytes)
+                .expect("the job's row")
+        })
+    };
+
+    pipeline.handle_decode_done(first).await;
+    assert!(pipeline.reports_due.contains(&job_id));
+    // The figure moves; the row says what it said until the tick.
+    let before = published(&pipeline);
+    pipeline.jobs.get_mut(&job_id).unwrap().failed_bytes = before + 7;
+    assert_eq!(published(&pipeline), before);
+    pipeline.refresh_periodic_snapshot();
+    assert!(pipeline.reports_due.is_empty());
+    assert_eq!(published(&pipeline), before + 7);
+
+    pipeline.jobs.get_mut(&job_id).unwrap().failed_bytes = before + 9;
+    pipeline.handle_decode_done(last).await;
+    assert!(pipeline.reports_due.is_empty());
+    assert_eq!(published(&pipeline), before + 9);
+}
+
 #[tokio::test]
 async fn streamed_decode_failure_retries_excluding_actual_source_server() {
     let temp_dir = tempfile::tempdir().unwrap();

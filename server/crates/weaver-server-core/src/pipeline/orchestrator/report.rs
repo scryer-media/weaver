@@ -9,6 +9,22 @@ impl Pipeline {
         self.report_job_event(job_id, None);
     }
 
+    // Publish the report of each job an article decoded for since the last
+    // tick: once per job a tick, however many of its articles decoded. With
+    // none due this writes nothing.
+    pub(crate) fn report_due_jobs(&mut self) {
+        if self.reports_due.is_empty() {
+            return;
+        }
+        let mut due = std::mem::take(&mut self.reports_due);
+        for job_id in due.drain() {
+            if self.jobs.contains_key(&job_id) {
+                self.report_job(job_id);
+            }
+        }
+        self.reports_due = due;
+    }
+
     fn report_job_event(&self, job_id: JobId, event: Option<PipelineEvent>) {
         let report = self.job_report(job_id);
         let moving = self.inflight_moves.contains(&job_id);

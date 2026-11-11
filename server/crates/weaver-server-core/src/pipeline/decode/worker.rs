@@ -174,10 +174,19 @@ impl Pipeline {
         // `active_download_passes`), and its own `in_flight == 0 && no queued
         // work` gate makes this a no-op for every decode that is not the last.
         let job_id = segment_id.file_id.job_id;
-        if self.jobs.contains_key(&job_id) && self.job_decode_stage_drained(job_id) {
-            self.maybe_finish_download_pass(job_id);
+        if !self.jobs.contains_key(&job_id) {
+            return;
         }
-        self.report_job(job_id);
+        // A job's report walks its files, so it is not built for each
+        // article. The job's last decode changes what the report says of its
+        // stage and is published now; any other only moves its figures, which
+        // the snapshot tick publishes once for all that decoded since.
+        if self.job_decode_stage_drained(job_id) {
+            self.maybe_finish_download_pass(job_id);
+            self.report_job(job_id);
+        } else {
+            self.reports_due.insert(job_id);
+        }
     }
 
     // Whether a body that failed to decode is fetched again: the job still
