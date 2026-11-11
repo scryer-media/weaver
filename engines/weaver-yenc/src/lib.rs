@@ -43,7 +43,10 @@ pub use decode::{
     decode_rapidyenc, decode_rapidyenc_ex, decode_rapidyenc_incremental, decode_with_options,
     finish_streaming_article, finish_streaming_result, max_decoded_len,
 };
-pub use encode::{encode, encode_part};
+pub use encode::{
+    EncodeError, EncoderTier, encode, encode_body, encode_body_append, encode_body_with_tier,
+    encode_max_len, encode_part,
+};
 pub use error::YencError;
 pub use header::extract_filename_from_subject;
 pub use segment::{
