@@ -18,11 +18,12 @@ use crate::core::{
     peer_id::try_decode_peer_id,
 };
 use crate::peer_protocol::{
-    Handshake, Hashes, Message, PIECE_MESSAGE_DEFAULT_LEN, PIECE_MESSAGE_PREAMBLE_LEN,
-    PartialBlock, Request, SerializeError,
+    HashRequest, Handshake, Hashes, Message, PIECE_MESSAGE_DEFAULT_LEN,
+    PIECE_MESSAGE_PREAMBLE_LEN, PartialBlock, Request, SerializeError,
     extended::{
         ExtendedMessage, PeerExtendedMessageIds, handshake::ExtendedHandshake,
-        ut_metadata::UtMetadata, ut_pex::UtPex,
+        ut_metadata::{UtMetadata, UtMetadataData},
+        ut_pex::UtPex,
     },
     max_frame_len, serialize_piece_preamble,
 };
@@ -161,14 +162,127 @@ pub trait PeerConnectionHandler {
     fn dht_port(&self) -> Option<u16> {
         None
     }
+    /// The answers to the peer's requests queued and not yet written. While
+    /// they hold [`ANSWER_BACKLOG_LIMIT`] bytes or more, nothing more is read
+    /// from the peer. A handler that answers no requests has none.
+    fn answers(&self) -> Option<&AnswerBacklog> {
+        None
+    }
+}
+
+/// The most bytes of answers to a peer's requests that may wait for the
+/// writer before the connection stops reading from the peer. libtorrent
+/// bounds none of these: a hash request is answered at once whatever its
+/// send buffer holds (bt_peer_connection.cpp:1162-1233, v2.0.15), as is a
+/// Reject, and `can_read` (peer_connection.cpp:6280-6301) looks at the
+/// download quota and the disk, never the send buffer. Its block uploads
+/// alone stop at `send_buffer_watermark` (peer_connection.cpp:5252-5297,
+/// 500 KiB by default, settings_pack.cpp:280); this is that bound, for the
+/// answers. Blocks are not counted: the peer's queue of them is capped
+/// apart, and the writer reads each only as it sends it.
+pub(crate) const ANSWER_BACKLOG_LIMIT: usize = 500 * 1024;
+
+/// A connection's queued answers, in bytes as they go on the wire.
+#[derive(Debug, Default)]
+pub struct AnswerBacklog {
+    bytes: std::sync::atomic::AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+impl AnswerBacklog {
+    /// `answer` is queued for the writer.
+    pub(crate) fn queued(&self, answer: &Answer) {
+        self.bytes
+            .fetch_add(answer.wire_len(), std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// Answers of `bytes` in all left the queue, written or dropped.
+    fn written(&self, bytes: usize) {
+        if bytes == 0 {
+            return;
+        }
+        let _ = self.bytes.fetch_update(
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+            |held| Some(held.saturating_sub(bytes)),
+        );
+        self.drained.notify_waiters();
+    }
+
+    /// The bytes queued now.
+    pub(crate) fn held(&self) -> usize {
+        self.bytes.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Returns once fewer than `limit` bytes are queued.
+    async fn below(&self, limit: usize) {
+        loop {
+            let drained = self.drained.notified();
+            tokio::pin!(drained);
+            drained.as_mut().enable();
+            if self.held() < limit {
+                return;
+            }
+            drained.await;
+        }
+    }
+}
+
+/// An answer to one of the peer's requests, counted in its connection's
+/// [`AnswerBacklog`] while it waits for the writer.
+#[derive(Debug)]
+pub enum Answer {
+    /// A Reject of a block request (BEP 6).
+    Reject(Request),
+    HashReject(HashRequest),
+    Hashes(Hashes<ByteBufOwned>),
+    /// A piece of the metadata (BEP 9).
+    Metadata(UtMetadata<ByteBufOwned>),
+}
+
+impl Answer {
+    /// The bytes the answer takes on the wire, near enough: its frame
+    /// header, fixed fields and payload.
+    pub(crate) fn wire_len(&self) -> usize {
+        match self {
+            Self::Reject(_) => 17,
+            Self::HashReject(_) => 53,
+            Self::Hashes(hashes) => 53 + hashes.hashes.as_ref().len(),
+            Self::Metadata(utm) => match utm.as_borrowed() {
+                UtMetadata::Data(data) => 64 + data.len(),
+                _ => 64,
+            },
+        }
+    }
+
+    fn serialize(
+        &self,
+        out: &mut [u8],
+        ext_msg_ids: &dyn Fn() -> PeerExtendedMessageIds,
+    ) -> std::result::Result<usize, SerializeError> {
+        match self {
+            Self::Reject(request) => Message::Reject(*request).serialize(out, ext_msg_ids),
+            Self::HashReject(request) => Message::HashReject(*request).serialize(out, ext_msg_ids),
+            Self::Hashes(hashes) => Message::Hashes(hashes.as_borrowed()).serialize(out, ext_msg_ids),
+            Self::Metadata(utm) => Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
+                .serialize(out, ext_msg_ids),
+        }
+    }
+}
+
+impl Answer {
+    /// The metadata piece `data`.
+    pub fn metadata(data: UtMetadataData<ByteBufOwned>) -> Self {
+        Self::Metadata(UtMetadata::Data(data))
+    }
 }
 
 #[derive(Debug)]
 pub enum WriterRequest {
     Message(Message<'static>),
-    UtMetadata(UtMetadata<ByteBufOwned>),
     UtPex(UtPex<ByteBufOwned>),
-    Hashes(Hashes<ByteBufOwned>),
+    /// An answer to a request of the peer's; see [`AnswerBacklog`].
+    Answer(Answer),
     ReadChunkRequest(ChunkInfo),
     Disconnect(anyhow::Result<()>),
 }
@@ -798,6 +912,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 };
 
                 let mut filled = 0;
+                let mut answered = 0;
                 let mut ending = None;
                 let mut next = Some(first);
                 while let Some(req) = next.take() {
@@ -816,17 +931,14 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     let out = &mut buf[filled..];
                     let framed = match req {
                         WriterRequest::Message(msg) => addressed(msg.serialize(out, ext_msg_ids))?,
-                        WriterRequest::UtMetadata(utm) => addressed(
-                            Message::Extended(ExtendedMessage::UtMetadata(utm.as_borrowed()))
-                                .serialize(out, ext_msg_ids),
-                        )?,
                         WriterRequest::UtPex(ut_pex) => addressed(
                             Message::Extended(ExtendedMessage::UtPex(ut_pex.as_borrowed()))
                                 .serialize(out, ext_msg_ids),
                         )?,
-                        WriterRequest::Hashes(hashes) => Some(Framed::message(
-                            Message::Hashes(hashes.as_borrowed()).serialize(out, ext_msg_ids)?,
-                        )),
+                        WriterRequest::Answer(answer) => {
+                            answered += answer.wire_len();
+                            addressed(answer.serialize(out, ext_msg_ids))?
+                        }
                         WriterRequest::ReadChunkRequest(chunk) => {
                             if !self.handler.claim_upload(&chunk) {
                                 trace!(?chunk, "upload taken off the queue before it was sent");
@@ -956,6 +1068,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     )
                     .await?;
                 }
+                if let Some(answers) = self.handler.answers() {
+                    answers.written(answered);
+                }
                 if let Some(lent) = lent {
                     return_batch_buf(lent);
                 }
@@ -989,6 +1104,11 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         let reader = async move {
             let num_pieces = self.handler.num_pieces();
             loop {
+                // A peer whose answers pile up, unread, is not read from
+                // until the writer has sent enough of them.
+                if let Some(answers) = self.handler.answers() {
+                    answers.below(ANSWER_BACKLOG_LIMIT).await;
+                }
                 let read_before = reading.consumed();
                 let message = reading
                     .read_message(&mut read, rwtimeout, num_pieces, &mut down)
@@ -1442,6 +1562,121 @@ mod tests {
         assert!(meter.sent() > 68 + 9);
         assert_eq!(load(&ledger.paid[1]), meter.sent());
         assert_eq!(load(&ledger.protocol[1]), meter.sent());
+    }
+
+    /// Answers every Have with 512 hashes, about 16 KiB, as a peer's hash
+    /// requests are answered.
+    struct Answering {
+        tx: mpsc::UnboundedSender<WriterRequest>,
+        answers: super::AnswerBacklog,
+        received: AtomicU64,
+    }
+
+    impl PeerConnectionHandler for &Answering {
+        fn should_send_bitfield(&self) -> bool {
+            false
+        }
+        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()> {
+            if let Message::Have(index) = msg {
+                self.received.fetch_add(1, Ordering::SeqCst);
+                let request = crate::peer_protocol::HashRequest {
+                    root: crate::core::hash_id::Id32::new([1; 32]),
+                    base: 0,
+                    index,
+                    count: 512,
+                    proof_layers: 0,
+                };
+                let hashes = vec![crate::core::hash_id::Id32::new([2; 32]); 512];
+                let answer =
+                    super::Answer::Hashes(crate::peer_protocol::Hashes::new(request, &hashes));
+                self.answers.queued(&answer);
+                let _ = self.tx.send(WriterRequest::Answer(answer));
+            }
+            Ok(())
+        }
+        fn on_uploaded_bytes(&self, _: u32) {}
+        fn read_chunk(&self, _: &ChunkInfo, _: &mut [u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn answers(&self) -> Option<&super::AnswerBacklog> {
+            Some(&self.answers)
+        }
+    }
+
+    // A peer that sends requests and reads none of the answers is read from
+    // only until its answers hold ANSWER_BACKLOG_LIMIT bytes: the rest of
+    // what it sent stays unread, and the connection ends at the write
+    // timeout, its queue bounded.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_reads_no_answers_is_not_read_from_past_the_backlog_limit() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let (tx, rx) = mpsc::unbounded_channel();
+        let answering = Answering {
+            tx,
+            answers: Default::default(),
+            received: AtomicU64::new(0),
+        };
+        let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        let connection = PeerConnection::new(
+            connection.addr,
+            connection.info_hashes,
+            connection.peer_id,
+            &answering,
+            Some(connection.options),
+            BlockingSpawner::new(1),
+            connection.connector,
+        );
+        let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+        let (reader, writer) = halves(ours);
+        let (meter, reader, writer) = Meter::wrap(reader, writer);
+        let incoming = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            reader,
+            writer: writer.into(),
+            read_buf: ReadBuf::new(),
+            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encryption: crate::mse::Encryption::None,
+            meter,
+        };
+        const SENT: u32 = 200;
+        let peer = async {
+            let mut handshake = [0; 68];
+            theirs.read_exact(&mut handshake).await.unwrap();
+            let mut wire = vec![0; 9 * SENT as usize];
+            let mut len = 0;
+            for index in 0..SENT {
+                len += Message::Have(index)
+                    .serialize(&mut wire[len..], &Default::default)
+                    .unwrap();
+            }
+            theirs.write_all(&wire[..len]).await.unwrap();
+            // Nothing more is read: the answers fill the stream and stop.
+            theirs
+        };
+        let (result, _theirs) = tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
+        assert!(result.is_err(), "{result:?}");
+
+        let answer_len = 53 + 512 * 32;
+        let received = answering.received.load(Ordering::SeqCst) as usize;
+        // The reader stopped once the backlog reached the limit: past the
+        // answers the stream holds, at most one answer more than the limit.
+        assert!(received < SENT as usize, "every request was read: {received}");
+        assert!(received >= super::ANSWER_BACKLOG_LIMIT / answer_len, "{received}");
+        assert!(
+            received <= (super::ANSWER_BACKLOG_LIMIT + (1 << 16)) / answer_len + 2,
+            "{received}"
+        );
+        assert!(answering.answers.held() >= super::ANSWER_BACKLOG_LIMIT - (1 << 16));
     }
 
     /// Serves every block but those of piece 0, whose check failed.

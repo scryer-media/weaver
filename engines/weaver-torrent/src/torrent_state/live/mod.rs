@@ -104,8 +104,8 @@ use crate::{
     file_ops::{FileOps, Verdict, inconsistent_hashes},
     limits::{Channel, LimitKind},
     peer_connection::{
-        DEFAULT_CONNECT_TIMEOUT, PeerConnection, PeerConnectionHandler, PeerConnectionOptions,
-        WriterRequest,
+        Answer, AnswerBacklog, DEFAULT_CONNECT_TIMEOUT, PeerConnection, PeerConnectionHandler,
+        PeerConnectionOptions, WriterRequest,
     },
     piece_priority::{FilePriority, PiecePriority},
     piece_tracker::{AcquireRequest, AcquireResult, Arrival, PickOptions, PieceTracker},
@@ -754,6 +754,7 @@ impl TorrentStateLive {
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
             tx,
+            answers: AnswerBacklog::default(),
             counters,
             first_message_received: AtomicBool::new(false),
             cancel_token: self.cancellation_token.child_token(),
@@ -907,6 +908,7 @@ impl TorrentStateLive {
             flow_control: Mutex::new(PeerFlowControl::new(self.max_request_window())),
             state: self.clone(),
             tx,
+            answers: AnswerBacklog::default(),
             counters,
             first_message_received: AtomicBool::new(false),
             cancel_token: self.cancellation_token.child_token(),
@@ -1024,6 +1026,7 @@ impl TorrentStateLive {
             flow_control: Mutex::new(PeerFlowControl::new(state.max_request_window())),
             state: state.clone(),
             tx,
+            answers: AnswerBacklog::default(),
             counters,
             first_message_received: AtomicBool::new(false),
             cancel_token: state.cancellation_token.child_token(),
@@ -2255,6 +2258,8 @@ struct PeerHandler {
     addr: SocketAddr,
     incoming: bool,
     tx: PeerTx,
+    // The answers to the peer's requests that wait for the writer.
+    answers: AnswerBacklog,
 
     first_message_received: AtomicBool,
 
@@ -2806,9 +2811,20 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     fn dht_port(&self) -> Option<u16> {
         self.dht().map(|dht| dht.listen_addr().port())
     }
+
+    fn answers(&self) -> Option<&AnswerBacklog> {
+        Some(&self.answers)
+    }
 }
 
 impl PeerHandler {
+    /// Queues `answer` for the writer, counted until it is written. False
+    /// once the writer is gone.
+    fn answer(&self, answer: Answer) -> bool {
+        self.answers.queued(&answer);
+        self.tx.send(WriterRequest::Answer(answer)).is_ok()
+    }
+
     /// The DHT a peer of this torrent hears of: none for a private torrent,
     /// which is found through its trackers only. So a private torrent's
     /// handshake offers no DHT, it sends no PORT, and a PORT from its peer
@@ -3249,7 +3265,9 @@ impl PeerHandler {
             .state
             .peers
             .with_live_mut(self.addr, "invalid_request", |live| {
-                live.invalid_request(request, peer_chokes_us)
+                live.invalid_request(request, peer_chokes_us, |request| {
+                    self.answer(Answer::Reject(request));
+                })
             });
         if keep == Some(false) {
             anyhow::bail!("too many invalid requests while choked, the last {request:?}");
@@ -4261,9 +4279,10 @@ impl PeerHandler {
             return Ok(());
         };
         let data = UtMetadataData::piece_of(info, piece_id)?;
-        self.tx
-            .send(WriterRequest::UtMetadata(UtMetadata::Data(data)))
-            .context("error sending UtMetadata: channel closed")?;
+        anyhow::ensure!(
+            self.answer(Answer::metadata(data)),
+            "error sending UtMetadata: channel closed"
+        );
         Ok(())
     }
 

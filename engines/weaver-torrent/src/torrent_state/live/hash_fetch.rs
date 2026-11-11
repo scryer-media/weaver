@@ -25,7 +25,7 @@ use crate::{
         lengths::{Lengths, ValidPieceIndex},
         merkle::{self, BLOCK_SIZE},
     },
-    peer_connection::WriterRequest,
+    peer_connection::{Answer, WriterRequest},
     peer_protocol::{HashRequest, Hashes, MAX_HASHES_IN_REPLY, Message},
     piece_tracker::Senders,
     type_aliases::PeerHandle,
@@ -456,11 +456,11 @@ impl PeerHandler {
             .as_ref()
             .context("a hash request for a v1 torrent")?;
         let reply = match v2.answer(&request) {
-            Some(hashes) => WriterRequest::Hashes(Hashes::new(request, &hashes)),
-            None => WriterRequest::Message(Message::HashReject(request)),
+            Some(hashes) => Answer::Hashes(Hashes::new(request, &hashes)),
+            None => Answer::HashReject(request),
         };
         // A closed writer means the peer is gone.
-        let _ = self.tx.send(reply);
+        let _ = self.answer(reply);
         Ok(())
     }
 
