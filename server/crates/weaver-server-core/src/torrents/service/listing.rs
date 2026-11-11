@@ -57,7 +57,9 @@ pub enum CategoryPick<'a> {
 impl CategoryPick<'_> {
     fn keeps(self, category: Option<&str>) -> bool {
         match self {
-            Self::Named(name) => category.is_some_and(|category| category.eq_ignore_ascii_case(name)),
+            Self::Named(name) => {
+                category.is_some_and(|category| category.eq_ignore_ascii_case(name))
+            }
             Self::WithSubcategories(name) => {
                 let category = category.unwrap_or_default();
                 category.eq_ignore_ascii_case(name)
@@ -94,7 +96,11 @@ fn parsed(hashes: &[&str]) -> HashSet<Id20> {
 impl Pick<'_> {
     // The torrents of `live` it keeps, in the order they were added: the
     // order `TorrentService::torrents` lists them in.
-    pub(super) fn ids(&self, settings: &TorrentSettings, live: &BTreeMap<JobId, Live>) -> Vec<JobId> {
+    pub(super) fn ids(
+        &self,
+        settings: &TorrentSettings,
+        live: &BTreeMap<JobId, Live>,
+    ) -> Vec<JobId> {
         let hashes = self.hashes.map(parsed);
         let mut kept: Vec<(i64, JobId)> = live
             .values()
@@ -103,7 +109,9 @@ impl Pick<'_> {
                 hashes
                     .as_ref()
                     .is_none_or(|hashes| hashes.contains(&hashes_of(record).best()))
-                    && self.private.is_none_or(|private| torrent.private == private)
+                    && self
+                        .private
+                        .is_none_or(|private| torrent.private == private)
                     && self.category.is_none_or(|category| {
                         category.keeps(
                             settings

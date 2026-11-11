@@ -2063,7 +2063,10 @@ async fn torrent_updates_follow_the_torrents_named() {
         format!("id: {}, ids: [{}]", every[0], every[1]),
         format!("ids: {:?}", (1..=501).collect::<Vec<u64>>()),
     ] {
-        let refused = subscribe(arguments.clone()).next().await.expect("an answer");
+        let refused = subscribe(arguments.clone())
+            .next()
+            .await
+            .expect("an answer");
         assert!(!refused.errors.is_empty(), "{arguments}");
     }
 }

@@ -16,9 +16,10 @@ async fn seeded(rig: &Rig, clock: &SetClock) -> Vec<JobId> {
     rig.service.open().await.unwrap();
     let mut jobs = Vec::with_capacity(TORRENTS);
     for at in 0..TORRENTS {
-        clock
-            .0
-            .store(EPOCH_MS + (TORRENTS - at / 2) as i64 * 1000, Ordering::SeqCst);
+        clock.0.store(
+            EPOCH_MS + (TORRENTS - at / 2) as i64 * 1000,
+            Ordering::SeqCst,
+        );
         let name = format!("t{at}");
         let bytes = metainfo(
             &name,
@@ -31,7 +32,11 @@ async fn seeded(rig: &Rig, clock: &SetClock) -> Vec<JobId> {
             .add(AddRequest {
                 paused: true,
                 category: (at % 2 == 0).then(|| "tv".to_owned()),
-                tags: if at % 5 == 0 { vec!["hd".to_owned()] } else { Vec::new() },
+                tags: if at % 5 == 0 {
+                    vec!["hd".to_owned()]
+                } else {
+                    Vec::new()
+                },
                 ..request(AddSource::Metainfo(bytes))
             })
             .await
@@ -85,7 +90,14 @@ async fn a_picked_page_is_the_page_of_every_view() {
     by_id.sort_unstable();
     assert_ne!(ids(&every), by_id);
 
-    for (offset, first) in [(0, 10), (7, 33), (110, 50), (200, 5), (0, 0), (0, usize::MAX)] {
+    for (offset, first) in [
+        (0, 10),
+        (7, 33),
+        (110, 50),
+        (200, 5),
+        (0, 0),
+        (0, usize::MAX),
+    ] {
         let picked = rig
             .service
             .picked(Pick::default(), page(offset, first), Shown::LISTED)
@@ -95,13 +107,14 @@ async fn a_picked_page_is_the_page_of_every_view() {
     }
 
     // A category's torrents, as filtering the views by their category.
-    let tv: Vec<TorrentView> = rig
-        .service
-        .torrents(Some("TV"))
-        .await;
+    let tv: Vec<TorrentView> = rig.service.torrents(Some("TV")).await;
     let old: Vec<TorrentView> = every
         .iter()
-        .filter(|view| view.category.as_deref().is_some_and(|name| name.eq_ignore_ascii_case("tv")))
+        .filter(|view| {
+            view.category
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case("tv"))
+        })
         .cloned()
         .collect();
     assert_eq!(tv.len(), TORRENTS / 2);
@@ -117,7 +130,10 @@ async fn a_picked_page_is_the_page_of_every_view() {
             Shown::LISTED,
         )
         .await;
-    assert_eq!(picked, old.iter().skip(5).take(20).cloned().collect::<Vec<_>>());
+    assert_eq!(
+        picked,
+        old.iter().skip(5).take(20).cloned().collect::<Vec<_>>()
+    );
 
     // Hashes, a category with its subcategories and privacy, as the
     // facade filtered every view with its files.
@@ -185,7 +201,9 @@ async fn a_picked_page_is_the_page_of_every_view() {
     // One torrent by its hash, as `torrent` gives it.
     for view in whole.iter().step_by(11) {
         assert_eq!(
-            rig.service.torrent_by_hash(&format!(" {} ", view.infohash.to_uppercase())).await,
+            rig.service
+                .torrent_by_hash(&format!(" {} ", view.infohash.to_uppercase()))
+                .await,
             rig.service.torrent(view.job_id).await
         );
     }
@@ -231,7 +249,11 @@ async fn a_followed_set_is_given_its_torrents_of_every_torrent() {
     loop {
         let next = some.next().await;
         assert!(!next.full_update);
-        assert!(next.torrents.iter().all(|view| followed.contains(&view.job_id)));
+        assert!(
+            next.torrents
+                .iter()
+                .all(|view| followed.contains(&view.job_id))
+        );
         assert!(next.removed.iter().all(|job_id| *job_id == jobs[4]));
         if !next.removed.is_empty() {
             break;

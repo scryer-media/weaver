@@ -94,7 +94,9 @@ impl TorrentsQuery {
     ) -> Result<Vec<Torrent>> {
         let offset = decode_offset_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
-        let limit = first.map_or(DEFAULT_TORRENT_PAGE, |first| first as usize).min(MAX_TORRENT_PAGE);
+        let limit = first
+            .map_or(DEFAULT_TORRENT_PAGE, |first| first as usize)
+            .min(MAX_TORRENT_PAGE);
         let field = ctx.look_ahead();
         let shown = Shown {
             files: false,

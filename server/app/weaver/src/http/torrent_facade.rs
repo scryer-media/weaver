@@ -44,10 +44,10 @@ use weaver_server_core::settings::{
 use weaver_server_core::tags::{TagSnapshot, split_tags};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::fingerprint::ViewParts;
+use weaver_server_core::torrents::service::listing::{CategoryPick, Pick, Shown};
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, Placement, TorrentService, TorrentSettings, TorrentView,
 };
-use weaver_server_core::torrents::service::listing::{CategoryPick, Pick, Shown};
 use weaver_server_core::torrents::{
     ConnectionKind, ContentLayout, Encryption, FilePriority, NamedBy, PeerInfo, PeerSourceFlag,
     TorrentState, TorrentTracker, TrackerStatus, redacted_tracker_url, status,

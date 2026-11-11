@@ -3819,7 +3819,11 @@ async fn torrents_info_filters_and_pages_as_the_whole_list() {
         }),
     ];
     for (query, old) in cases {
-        let rows = steady(rig.get(&format!("/api/v2/torrents/info?{query}")).await.json());
+        let rows = steady(
+            rig.get(&format!("/api/v2/torrents/info?{query}"))
+                .await
+                .json(),
+        );
         assert_eq!(rows, old, "{query}");
     }
     // The names were given in the order the torrents were added.

@@ -6579,8 +6579,7 @@ impl TorrentService {
                 .filter_map(|job_id| live.get(job_id))
                 .map(|torrent| {
                     let reading = torrent.reading(now);
-                    let unviewed =
-                        series.then(|| self.unviewed(&settings, torrent, &reading, now));
+                    let unviewed = series.then(|| self.unviewed(&settings, torrent, &reading, now));
                     let view = self.view_of(&settings, torrent, reading, now);
                     let files = shown
                         .files
