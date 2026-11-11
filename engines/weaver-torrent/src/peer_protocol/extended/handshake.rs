@@ -45,10 +45,6 @@ impl ExtendedHandshake<ByteBuf<'_>> {
         }
     }
 
-    pub fn peer_extended_messages(&self) -> PeerExtendedMessageIds {
-        self.m
-    }
-
     pub fn port(&self) -> Option<u16> {
         self.p.and_then(|p| u16::try_from(p).ok())
     }

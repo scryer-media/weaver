@@ -235,6 +235,7 @@ impl Harness {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),
             tx,
@@ -3820,6 +3821,23 @@ async fn a_torrent_added_without_pex_neither_advertises_sends_nor_reads_it() {
     assert!(!off.knows("10.0.0.1:6881"));
 }
 
+// libtorrent `ut_pex_peer_plugin`: a connection has one PEX sender, however
+// many extended handshakes name ut_pex. Each sender holds the connection's
+// queue, so the senders of the queue count them.
+#[tokio::test]
+async fn a_connection_starts_one_pex_sender_however_many_handshakes_name_ut_pex() {
+    let h = Harness::seeding("pex_sender_once").await;
+    let (peer, _rx) = h.peer("203.0.113.2:50002");
+    assert!(h.advertised(&peer).ut_pex.is_some());
+    let senders = peer.tx.strong_count();
+    let mut hs = ExtendedHandshake::new();
+    hs.m.ut_pex = Some(1);
+    for _ in 0..3 {
+        (&peer).on_extended_handshake(&hs).unwrap();
+    }
+    assert_eq!(peer.tx.strong_count(), senders + 1);
+}
+
 // BEP 27: a private torrent added with the DHT, local discovery and peer
 // exchange all left on still takes peers from its trackers alone: it
 // advertises no peer exchange, reads none, and looks on neither the DHT nor
@@ -6047,6 +6065,7 @@ impl Harness {
             on_bitfield_notify: Default::default(),
             speaks_v2: AtomicBool::new(false),
             sent_dht_port: AtomicBool::new(false),
+            pex_started: AtomicBool::new(false),
             flow_control: Mutex::new(PeerFlowControl::new(self.live.max_request_window())),
             state: self.live.clone(),
             tx,

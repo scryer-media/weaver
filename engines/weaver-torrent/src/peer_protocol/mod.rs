@@ -501,6 +501,21 @@ pub enum SerializeError {
     FrameTooLong,
 }
 
+impl SerializeError {
+    /// The message is for an extension the peer names no id for, or no
+    /// longer does: it cannot be addressed to the peer.
+    pub fn is_unaddressed(&self) -> bool {
+        matches!(
+            self,
+            Self::NeedUtMetadata
+                | Self::NeedPex
+                | Self::NeedHolepunch
+                | Self::NeedUploadOnly
+                | Self::NeedDontHave
+        )
+    }
+}
+
 impl From<std::io::Error> for SerializeError {
     fn from(_: std::io::Error) -> Self {
         Self::NoSpaceInBuffer

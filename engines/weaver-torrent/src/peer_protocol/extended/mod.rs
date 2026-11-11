@@ -68,6 +68,30 @@ impl PeerExtendedMessageIds {
             lt_donthave: Some(MY_EXTENDED_LT_DONTHAVE),
         }
     }
+
+    /// The ids the peer names once its extended handshake's `m` is taken
+    /// over these, the ones it named before (BEP 10): an id it names
+    /// replaces the one held, an id of 0 says it does not, or no longer
+    /// does, speak that extension, and an extension it does not mention
+    /// keeps the id held. No id held is ever 0 (libtorrent treats an id of
+    /// 0 as no support, `bt_peer_connection::on_holepunch`,
+    /// `write_upload_only`, `ut_metadata_peer_plugin::write_metadata_packet`).
+    pub fn updated_by(self, m: Self) -> Self {
+        fn take(held: Option<u8>, named: Option<u8>) -> Option<u8> {
+            match named {
+                Some(0) => None,
+                Some(id) => Some(id),
+                None => held,
+            }
+        }
+        Self {
+            ut_metadata: take(self.ut_metadata, m.ut_metadata),
+            ut_pex: take(self.ut_pex, m.ut_pex),
+            ut_holepunch: take(self.ut_holepunch, m.ut_holepunch),
+            upload_only: take(self.upload_only, m.upload_only),
+            lt_donthave: take(self.lt_donthave, m.lt_donthave),
+        }
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -376,6 +400,44 @@ mod tests {
                 Err(MessageDeserializeError::IncorrectMsgLen { .. })
             ));
         }
+    }
+
+    // BEP 10: a first handshake's id of 0 names no support; a later one
+    // replaces the ids it names, takes away those it names 0, and leaves
+    // the rest.
+    #[test]
+    fn a_handshake_updates_only_the_ids_it_names_and_zero_names_none() {
+        let first = PeerExtendedMessageIds::default().updated_by(PeerExtendedMessageIds {
+            ut_metadata: Some(0),
+            ut_pex: Some(1),
+            ut_holepunch: Some(0),
+            upload_only: Some(3),
+            lt_donthave: Some(7),
+        });
+        assert_eq!(
+            first,
+            PeerExtendedMessageIds {
+                ut_pex: Some(1),
+                upload_only: Some(3),
+                lt_donthave: Some(7),
+                ..Default::default()
+            }
+        );
+        let later = first.updated_by(PeerExtendedMessageIds {
+            ut_metadata: Some(2),
+            ut_pex: Some(9),
+            lt_donthave: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(
+            later,
+            PeerExtendedMessageIds {
+                ut_metadata: Some(2),
+                ut_pex: Some(9),
+                upload_only: Some(3),
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
