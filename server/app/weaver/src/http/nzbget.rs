@@ -2164,14 +2164,7 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     let db = ctx.db.clone();
     let history_job_ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
     let post_processing_results = tokio::task::spawn_blocking(move || {
-        let mut results = HashMap::new();
-        for job_id in history_job_ids {
-            let scripts = db.job_post_processing_results(job_id)?;
-            if !scripts.is_empty() {
-                results.insert(job_id, scripts);
-            }
-        }
-        Ok::<_, weaver_server_core::StateError>(results)
+        db.job_post_processing_results_many(&history_job_ids)
     })
     .await
     .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
