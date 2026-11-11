@@ -20,6 +20,7 @@ fn lease_to_new_lane(pipeline: &mut Pipeline, job_id: JobId, take: usize) -> Dow
                 .download_queue
                 .pop()
                 .expect("the job has queued work")
+                .dispatched(&state.spec)
         })
         .collect();
     lease_works_to_new_lane(pipeline, job_id, works)
@@ -218,6 +219,7 @@ async fn an_article_the_lane_does_not_hold_is_refused_without_moving_a_gauge() {
         .download_queue
         .pop()
         .unwrap();
+    let stray = pipeline.dispatched(stray);
     let queued_before = queued(&pipeline, job_id);
 
     let mut pending = VecDeque::new();
@@ -259,6 +261,7 @@ async fn a_lease_that_names_an_article_twice_owes_one_result() {
         .download_queue
         .pop()
         .unwrap();
+    let work = pipeline.dispatched(work);
     let segment_id = work.segment_id;
     let lease = lease_works_to_new_lane(&mut pipeline, job_id, vec![work.clone(), work]);
     assert_eq!(in_flight(&pipeline, job_id), 1);
@@ -334,7 +337,7 @@ async fn a_stall_release_takes_back_the_tail_a_lane_carries_for_its_previous_job
     .await;
     let lease = lease_to_new_lane(&mut pipeline, tail_job, 1);
     let tail = lease.works[0].segment_id;
-    let refill: Vec<DownloadWork> = (0..2)
+    let refill = (0..2)
         .map(|_| {
             pipeline
                 .jobs
@@ -347,7 +350,8 @@ async fn a_stall_release_takes_back_the_tail_a_lane_carries_for_its_previous_job
                 .pop()
                 .unwrap()
         })
-        .collect();
+        .collect::<Vec<_>>();
+    let refill: Vec<DownloadWork> = pipeline.dispatched_all(refill);
     pipeline.rebook_download_lane_owner(
         lease.lane_id,
         next_job,

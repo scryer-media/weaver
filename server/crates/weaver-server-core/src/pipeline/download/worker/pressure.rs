@@ -93,7 +93,7 @@ impl CheckpointAdmission {
 
     pub(in crate::pipeline) fn decision(
         self,
-        work: &DownloadWork,
+        work: &QueuedWork<'_>,
         leased: &[DownloadWork],
     ) -> CheckpointDecision {
         self.decision_with_lease(work, CheckpointLease::of(leased))
@@ -102,7 +102,7 @@ impl CheckpointAdmission {
     // [`Self::decision`] against a lease already summed.
     pub(in crate::pipeline) fn decision_with_lease(
         self,
-        work: &DownloadWork,
+        work: &QueuedWork<'_>,
         leased: CheckpointLease,
     ) -> CheckpointDecision {
         if !self.enforced || self.limit == 0 {
@@ -251,7 +251,7 @@ impl Pipeline {
 
     pub(in crate::pipeline::download::worker) fn uu_work_closes_cursor(
         cursors: &HashMap<NzbFileId, u32>,
-        work: &DownloadWork,
+        work: &QueuedWork<'_>,
     ) -> bool {
         // Only identified UU files have a sequential cursor. yEnc and files
         // whose encoding is not yet known retain ordinary dispatch; if an
@@ -417,7 +417,9 @@ impl Pipeline {
         lease: &DownloadBatchLease,
     ) -> Option<SegmentId> {
         let first = lease.works.first()?;
-        (self.checkpoint_admission(lease.job_id).decision(first, &[])
+        (self
+            .checkpoint_admission(lease.job_id)
+            .decision(&first.view(), &[])
             == CheckpointDecision::ProgressArticle)
             .then_some(first.segment_id)
     }
@@ -544,7 +546,7 @@ impl Pipeline {
         work: &DownloadWork,
     ) -> bool {
         self.checkpoint_admission(job_id)
-            .decision(work, &[])
+            .decision(&work.view(), &[])
             .allows()
     }
 

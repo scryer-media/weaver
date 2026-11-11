@@ -240,7 +240,7 @@ impl Pipeline {
                     retries.get(job_id).copied().unwrap_or_default();
                 let group = next.and_then(|work| {
                     provider_policy.as_ref()?.eligible_group(
-                        &work.exclude_servers,
+                        work.exclude_servers,
                         &self.compute_job_retention_excludes(*job_id),
                         Self::bandwidth_reservation_estimate(work.byte_estimate),
                     )
@@ -311,7 +311,7 @@ impl Pipeline {
                     checkpoint_lead_limit_bytes: Some(Self::restart_durable_lead_limit_bytes()),
                     checkpoint_admission: Some(
                         next.map_or("no_queued_primary", |work| {
-                            checkpoint.decision(work, &[]).as_str()
+                            checkpoint.decision(&work, &[]).as_str()
                         })
                         .to_string(),
                     ),

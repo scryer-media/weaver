@@ -25,7 +25,7 @@ pub(crate) use worker::{
     download_stall_recovery_from_env_value,
 };
 
-pub use queue::{DownloadQueue, DownloadWork};
+pub use queue::{DownloadQueue, DownloadWork, QueueItem, QueuedWork};
 pub(super) use transport::{DownloadLaneMode, DownloadLaneRuntimeState, LaneParkReason};
 
 // The NNTP wire arguments for a batch of leased work, in lease order.

@@ -45,7 +45,7 @@ use weaver_nntp::pool::ServerId;
 
 use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSpec, JobSpec};
-use crate::pipeline::download::queue::DownloadWork;
+use crate::pipeline::download::queue::QueuedWork;
 use crate::pipeline::{Pipeline, SegmentTerminalState, health_milli};
 
 mod given_up;
@@ -1087,7 +1087,7 @@ impl Pipeline {
         else {
             return;
         };
-        let lost_file = |work: &DownloadWork| lost.contains(&work.segment_id.file_id.file_index);
+        let lost_file = |work: &QueuedWork<'_>| lost.contains(&work.segment_id.file_id.file_index);
         let mut abandoned = active.download_queue.extract_matching(lost_file);
         abandoned.extend(active.recovery_queue.extract_matching(lost_file));
         for work in abandoned {

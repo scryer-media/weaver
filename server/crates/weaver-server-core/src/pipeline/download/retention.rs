@@ -358,8 +358,8 @@ impl Pipeline {
             return 0;
         }
         let retention = self.job_retention_excludes(job_id);
-        let unservable = |work: &DownloadWork| {
-            Self::unavailable_server_count_from_excludes(&pool, &work.exclude_servers, &retention)
+        let unservable = |work: &QueuedWork<'_>| {
+            Self::unavailable_server_count_from_excludes(&pool, work.exclude_servers, &retention)
                 >= server_count
         };
         let Some(active) = self

@@ -182,6 +182,7 @@ async fn the_last_server_refusing_credentials_fails_the_job() {
         .download_queue
         .pop()
         .unwrap();
+    let work = pipeline.dispatched(work);
     pipeline.hold_test_lane_works(vec![work.clone()], false);
     let effective_exclude_servers = pipeline.effective_exclude_servers(job, &work.exclude_servers);
     let Err(error) = pipeline

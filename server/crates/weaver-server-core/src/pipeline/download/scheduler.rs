@@ -479,11 +479,20 @@ impl Pipeline {
                 .articles
                 .download_queue_mut()
                 .and_then(|queue| queue.pop_first_matching(|work| filter.allows(work)));
-            let Some(work) = popped else {
+            let Some(item) = popped else {
                 self.metrics
                     .download_scheduler_scan_no_match_total
                     .fetch_add(1, Ordering::Relaxed);
                 break;
+            };
+            let segment_id = item.segment_id;
+            let Some(work) = item.into_work(&state.spec) else {
+                // The job's queue only holds parts of its own article list.
+                error!(
+                    segment = %segment_id,
+                    "queued article is not in its job's article list; dropping it"
+                );
+                continue;
             };
             filter.note_taken(&work);
             taken.push(work);

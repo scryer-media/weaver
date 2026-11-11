@@ -80,7 +80,7 @@ pub(in crate::pipeline::download) enum ServableWork<'a> {
 }
 
 impl ServableWorkFilter<'_> {
-    pub(in crate::pipeline::download) fn allows(&self, work: &DownloadWork) -> bool {
+    pub(in crate::pipeline::download) fn allows(&self, work: &QueuedWork<'_>) -> bool {
         let Some(clause) = self.refusal(work) else {
             return true;
         };
@@ -92,7 +92,7 @@ impl ServableWorkFilter<'_> {
     // The first clause that refuses `work`, in a fixed order; the restart
     // checkpoint is asked last and only of an article every other clause
     // admits.
-    fn refusal(&self, work: &DownloadWork) -> Option<SchedulerBlockClause> {
+    fn refusal(&self, work: &QueuedWork<'_>) -> Option<SchedulerBlockClause> {
         let file_index = work.segment_id.file_id.file_index;
         if work.exclude_servers.contains(&self.server_idx)
             || (work.avoid_server == Some(self.server_idx) && self.hint_has_alternative(work))
@@ -103,7 +103,7 @@ impl ServableWorkFilter<'_> {
         let estimate = Pipeline::bandwidth_reservation_estimate(work.byte_estimate);
         match self.provider_policy.eligibility(
             self.server_idx,
-            &work.exclude_servers,
+            work.exclude_servers,
             &self.retention_excludes,
             estimate,
         ) {
@@ -142,7 +142,7 @@ impl ServableWorkFilter<'_> {
 
     // Whether a server other than this one could take `work` now: available,
     // not excluded by the article, not ruled out by the job's retention.
-    fn hint_has_alternative(&self, work: &DownloadWork) -> bool {
+    fn hint_has_alternative(&self, work: &QueuedWork<'_>) -> bool {
         self.hint_alternatives.iter().any(|server| {
             *server != self.server_idx
                 && !work.exclude_servers.contains(server)
@@ -150,7 +150,7 @@ impl ServableWorkFilter<'_> {
                 && matches!(
                     self.provider_policy.eligibility(
                         *server,
-                        &work.exclude_servers,
+                        work.exclude_servers,
                         &self.retention_excludes,
                         Pipeline::bandwidth_reservation_estimate(work.byte_estimate)
                     ),

@@ -188,12 +188,16 @@ fn unblock_checkpoint(pipeline: &mut Pipeline, job_id: JobId) {
 // Rewrite a job's whole queue through `edit`, keeping it in the same queue.
 fn rewrite_queue(pipeline: &mut Pipeline, job_id: JobId, mut edit: impl FnMut(&mut DownloadWork)) {
     let state = pipeline.jobs.get_mut(&job_id).unwrap();
-    let mut works = state
+    let items = state
         .articles
         .active_mut()
         .unwrap()
         .download_queue
         .drain_all();
+    let mut works: Vec<DownloadWork> = items
+        .into_iter()
+        .map(|item| item.dispatched(&state.spec))
+        .collect();
     for work in &mut works {
         edit(work);
     }

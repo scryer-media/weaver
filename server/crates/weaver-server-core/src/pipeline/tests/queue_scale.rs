@@ -1018,6 +1018,7 @@ async fn a_result_turn_and_a_refill_turn_walk_no_row_and_ask_no_database_on_a_lo
         .download_queue
         .pop()
         .unwrap();
+    let work = pipeline.dispatched(work);
     let segment_id = work.segment_id;
     pipeline.hold_test_lane_works(vec![work], false);
 

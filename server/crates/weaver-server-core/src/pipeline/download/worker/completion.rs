@@ -153,13 +153,25 @@ impl Pipeline {
             .jobs
             .get_mut(&segment_id.file_id.job_id)
             .and_then(|state| {
-                state
+                let segment = state
                     .spec
                     .files
-                    .get_mut(segment_id.file_id.file_index as usize)
+                    .get_mut(segment_id.file_id.file_index as usize)?
+                    .segment_mut(segment_id.segment_number)?;
+                // A copy of the article still queued, which reads its id from
+                // the part when it is dispatched, keeps the id it was queued
+                // under.
+                if segment.message_ids.has_next()
+                    && let Some(active) = state.articles.active_mut()
+                {
+                    let in_use = segment.message_ids.in_use();
+                    let pin = || crate::jobs::ids::MessageId::new(in_use);
+                    active.download_queue.pin_message_id(segment_id, pin);
+                    active.recovery_queue.pin_message_id(segment_id, pin);
+                }
+                Some(segment.message_ids.spend())
             })
-            .and_then(|file| file.segment_mut(segment_id.segment_number))
-            .is_some_and(|segment| segment.message_ids.spend());
+            .unwrap_or(false);
         let Some(work) = moved
             .then(|| self.download_retry_work(segment_id, 0, Vec::new()))
             .flatten()
