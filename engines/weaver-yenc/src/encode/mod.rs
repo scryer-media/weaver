@@ -1,8 +1,38 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+// Article-level yEnc encoding (`=ybegin` / `=ypart` / `=yend` around a body)
+// over the body encoder in `kernel`.
+
+pub mod kernel;
+
+pub use kernel::{
+    EncodeError, EncoderTier, MAX_COLUMN, MAX_LINE_SIZE, encode_body, encode_body_append,
+    encode_body_with_tier, encode_max_len,
+};
+
 use crate::crc::Crc32;
 use crate::error::YencError;
+
+impl From<EncodeError> for YencError {
+    fn from(err: EncodeError) -> Self {
+        match err {
+            EncodeError::DestinationTooSmall { needed, available } => {
+                YencError::BufferTooSmall { needed, available }
+            }
+            EncodeError::LineSizeOutOfRange { .. } => YencError::InvalidHeader {
+                field: "line".to_string(),
+                reason: err.to_string(),
+            },
+            EncodeError::ColumnOutOfRange { .. } | EncodeError::TierUnavailable { .. } => {
+                YencError::InvalidHeader {
+                    field: "body".to_string(),
+                    reason: err.to_string(),
+                }
+            }
+        }
+    }
+}
 
 // Encode `input` bytes into a complete single-part yEnc article, appending to `output`.
 //
@@ -13,6 +43,8 @@ pub fn encode(
     line_length: usize,
     filename: &str,
 ) -> Result<(), YencError> {
+    check_line_length(line_length)?;
+
     // Compute CRC32 of the input data.
     let mut crc = Crc32::new();
     crc.update(input);
@@ -28,7 +60,7 @@ pub fn encode(
     output.extend_from_slice(header.as_bytes());
 
     // Encode the data.
-    encode_data(input, output, line_length);
+    encode_data(input, output, line_length)?;
 
     // Write =yend trailer.
     let trailer = format!("\r\n=yend size={} crc32={:08x}\r\n", input.len(), crc_val);
@@ -50,6 +82,8 @@ pub fn encode_part(
     end: u64,
     file_size: u64,
 ) -> Result<(), YencError> {
+    check_line_length(line_length)?;
+
     // Compute CRC32 of this part's data.
     let mut crc = Crc32::new();
     crc.update(input);
@@ -67,7 +101,7 @@ pub fn encode_part(
     output.extend_from_slice(ypart.as_bytes());
 
     // Encode the data.
-    encode_data(input, output, line_length);
+    encode_data(input, output, line_length)?;
 
     // Write =yend trailer.
     let trailer = format!(
@@ -81,43 +115,24 @@ pub fn encode_part(
     Ok(())
 }
 
-// Encode raw data bytes into yEnc format (no headers), appending to `output`.
-// Inserts CRLF line breaks at approximately `line_length` encoded characters.
-fn encode_data(input: &[u8], output: &mut Vec<u8>, line_length: usize) {
-    let mut col = 0usize;
+// Encode raw data bytes into yEnc body lines (no headers), appending to
+// `output`: rapidyenc's body encoding, one call, ending the article.
+fn encode_data(input: &[u8], output: &mut Vec<u8>, line_length: usize) -> Result<(), YencError> {
+    let mut column = 0usize;
+    encode_body_append(line_length, &mut column, input, output, true)?;
+    Ok(())
+}
 
-    for (i, &byte) in input.iter().enumerate() {
-        let encoded = byte.wrapping_add(42);
-
-        let needs_escape = matches!(encoded, 0x00 | 0x0A | 0x0D | 0x3D)
-            || (encoded == b'\t' && (col == 0 || i == input.len() - 1))
-            || (encoded == b' ' && (col == 0 || i == input.len() - 1))
-            || (encoded == b'.' && col == 0);
-
-        if needs_escape {
-            // Check if we need a line break before the 2-byte escape.
-            if col + 2 > line_length && line_length > 0 {
-                output.extend_from_slice(b"\r\n");
-                col = 0;
-            }
-            output.push(b'=');
-            output.push(encoded.wrapping_add(64));
-            col += 2;
-        } else {
-            if col >= line_length && line_length > 0 {
-                output.extend_from_slice(b"\r\n");
-                col = 0;
-                // After line break, check if this byte needs escaping at line start.
-                if encoded == b'.' || encoded == b'\t' || encoded == b' ' {
-                    output.push(b'=');
-                    output.push(encoded.wrapping_add(64));
-                    col += 2;
-                    continue;
-                }
-            }
-            output.push(encoded);
-            col += 1;
+// Refuse a line length the body encoder would refuse, before any header is
+// written.
+fn check_line_length(line_length: usize) -> Result<(), YencError> {
+    if (1..=MAX_LINE_SIZE).contains(&line_length) {
+        Ok(())
+    } else {
+        Err(EncodeError::LineSizeOutOfRange {
+            line_size: line_length,
         }
+        .into())
     }
 }
 
@@ -349,5 +364,31 @@ mod tests {
                 b
             );
         }
+    }
+
+    #[test]
+    fn zero_line_length_is_refused_before_any_output() {
+        let mut output = b"keep".to_vec();
+        assert!(matches!(
+            encode(b"data", &mut output, 0, "x.bin"),
+            Err(YencError::InvalidHeader { .. })
+        ));
+        assert!(encode_part(b"data", &mut output, 0, "x.bin", 1, 1, 1, 4, 4).is_err());
+        assert_eq!(output, b"keep");
+    }
+
+    // The body between header and trailer is exactly the body encoder's
+    // output for one call ending the article.
+    #[test]
+    fn article_body_is_the_body_encoder_output() {
+        let input: Vec<u8> = (0..5000u32).map(|i| (i * 131 + 7) as u8).collect();
+        let mut article = Vec::new();
+        encode(&input, &mut article, 128, "b.bin").unwrap();
+        let mut body = Vec::new();
+        let mut column = 0;
+        encode_body_append(128, &mut column, &input, &mut body, true).unwrap();
+        let header_end = article.windows(2).position(|w| w == b"\r\n").unwrap() + 2;
+        assert_eq!(&article[header_end..header_end + body.len()], &body[..]);
+        assert!(article[header_end + body.len()..].starts_with(b"\r\n=yend "));
     }
 }
