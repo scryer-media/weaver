@@ -234,7 +234,7 @@ fn a_rustls_connection_frees_its_read_buffers_between_articles_and_reads_on() {
 }
 
 // A plain server answering BODY with the given bodies in order.
-fn spawn_plain_body_server(bodies: Vec<Vec<u8>>) -> (ServerConfig, std::thread::JoinHandle<()>) {
+pub(super) fn spawn_plain_body_server(bodies: Vec<Vec<u8>>) -> (ServerConfig, std::thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let config = ServerConfig {
         // Long enough that a loaded machine never trips it.

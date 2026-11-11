@@ -179,7 +179,9 @@ pin_project_lite::pin_project! {
 
 pub(crate) const TLS_READ_BUFFER: usize = 256 * 1024;
 pub(crate) const TLS_READ_TURN_LIMIT: usize = 1024 * 1024;
-const TLS_PLAINTEXT_DRAIN_CHUNK: usize = 16 * 1024;
+// The most plaintext one TLS record carries.
+pub(crate) const TLS_RECORD_PLAINTEXT: usize = 16 * 1024;
+const TLS_PLAINTEXT_DRAIN_CHUNK: usize = TLS_RECORD_PLAINTEXT;
 const TLS_BACKEND_ENV: &str = "WEAVER_NNTP_TLS_BACKEND";
 
 #[inline]

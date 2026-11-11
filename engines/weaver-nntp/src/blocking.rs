@@ -41,7 +41,8 @@ use crate::fused_yenc::{
 use crate::pool::{BlockingConnectionPermit, ServerId};
 use crate::response::parse_response;
 use crate::tls::{
-    NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TlsCipherPreference, TransportReadStats,
+    NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TLS_RECORD_PLAINTEXT, TlsCipherPreference,
+    TransportReadStats,
     build_tls_config_with_name_mismatch_certificate, make_server_name,
     selected_blocking_tls_backend, tls_backend_for_preference,
 };
@@ -2710,6 +2711,11 @@ impl BlockingManualTlsStream {
         if self.read_buffer.len() < read_size {
             self.read_buffer.resize(read_size, 0);
         }
+        // Room for everything one read can decrypt before reading: the read
+        // itself, a record held over from the last read, and one drain chunk
+        // of slack. Without it the drain's chunked reserves meet a nearly full
+        // buffer mid-read and double it.
+        dst.reserve(read_size + 2 * TLS_RECORD_PLAINTEXT);
 
         let started = Instant::now();
         loop {
