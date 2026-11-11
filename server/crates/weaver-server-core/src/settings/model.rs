@@ -15,6 +15,7 @@ use crate::runtime::hardware_profile::HardwareProfile;
 use crate::servers::ServerConfig;
 pub use crate::settings::levels::{Leaf, Level, Levels};
 use crate::torrents::identity::{ClientIdentity, IDENTITY};
+use weaver_torrent::tracker::{AnnounceShape, qbittorrent};
 use crate::watch_folder::WatchFolderConfig;
 
 // The NZB admission limit when none is saved, for new and upgraded installations.
@@ -697,16 +698,20 @@ impl Client {
     pub const fn name(self) -> ClientIdentity {
         match self {
             Self::Weaver => IDENTITY,
-            // libtorrent's fingerprint of `qB` 5.3.0.0; libtorrent sends the
-            // user agent as `v`.
-            Self::QBittorrent => {
-                ClientIdentity::new(*b"-qB5300-", "qBittorrent/5.3.0", "qBittorrent/5.3.0")
-            }
+            Self::QBittorrent => ClientIdentity::new(
+                qbittorrent::PEER_ID_PREFIX,
+                qbittorrent::USER_AGENT,
+                qbittorrent::VERSION,
+                &qbittorrent::SHAPE,
+            ),
             // Major, minor and patch in base 62, then `0` for a stable
             // release.
-            Self::Transmission => {
-                ClientIdentity::new(*b"-TR4100-", "Transmission/4.1.0", "Transmission 4.1.0")
-            }
+            Self::Transmission => ClientIdentity::new(
+                *b"-TR4100-",
+                "Transmission/4.1.0",
+                "Transmission 4.1.0",
+                &AnnounceShape::WEAVER,
+            ),
         }
     }
 }
@@ -1417,6 +1422,7 @@ mod tests {
         );
         assert_eq!(qb.prefix(), b"-qB5300-");
         assert_eq!(qb.version(), qb.user_agent());
+        assert_eq!(qb.identity().shape, &qbittorrent::SHAPE);
         assert_eq!(&libtorrent(b"qB", &[5, 1, 2]), b"-qB5120-");
         assert_eq!(&libtorrent(b"qB", &[5, 10, 0]), b"-qB5A00-");
 
@@ -1434,6 +1440,7 @@ mod tests {
         let weaver = Client::Weaver.name();
         assert_eq!(weaver, IDENTITY);
         assert_eq!(weaver.version(), weaver.user_agent());
+        assert_eq!(weaver.identity().shape, &AnnounceShape::WEAVER);
 
         for client in Client::ALL {
             assert_eq!(Client::parse(client.as_str()), Some(client));

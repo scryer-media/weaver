@@ -34,6 +34,7 @@ use crate::Identity;
 use crate::core::hash_id::{Id20, InfoHashes};
 use crate::core::net::{Egress, HttpClients, NamedBy, Resolved, Resolver, is_public};
 use crate::tracker::Tracker;
+use crate::tracker::shape::AnnounceShape;
 use crate::tracker::tracker_comms_http;
 use crate::tracker::tracker_comms_http::Ask;
 use crate::tracker::tracker_comms_http::Family;
@@ -1002,8 +1003,8 @@ pub struct TrackerScrape {
 struct Scraper {
     info_hashes: Mutex<Vec<Id20>>,
     user_agent: String,
-    /// The shape of the torrent's client's requests.
-    shape: tracker_comms_http::Shape,
+    /// How the torrent's requests are written.
+    shape: &'static AnnounceShape,
     // In table order, one per URL.
     trackers: Mutex<Vec<SupportedTracker>>,
     http_clients: Arc<dyn HttpClients>,
@@ -1063,7 +1064,7 @@ impl Scraper {
             tracker.named_by,
             Ask::Scrape,
             None,
-            &tracker_comms_http::scrape_querystring(&info_hash, self.shape),
+            &self.shape.scrape_query(&info_hash),
             &self.user_agent,
             self.shape,
         )
@@ -1186,7 +1187,7 @@ impl TrackerStatus {
             scraper: Scraper {
                 info_hashes: Mutex::new(info_hashes),
                 user_agent: identity.user_agent.clone(),
-                shape: tracker_comms_http::Shape::of(&identity.peer_id),
+                shape: identity.shape,
                 trackers: Mutex::new(unique),
                 http_clients,
                 reachable,
@@ -2166,7 +2167,7 @@ impl TrackerComms {
         let mut queries = Vec::with_capacity(routes.len());
         for (family, _) in &routes {
             request.port = announced_port(ports.of(*family == Some(Family::V6)));
-            queries.push(request.as_querystring());
+            queries.push(request.as_querystring(self.identity.shape));
         }
 
         // One announce per route, at once; the peers of every answer are
@@ -2183,7 +2184,7 @@ impl TrackerComms {
                     *family,
                     query,
                     &self.identity.user_agent,
-                    tracker_comms_http::Shape::of(&self.identity.peer_id),
+                    self.identity.shape,
                 )
             }))
             .await;
@@ -3404,6 +3405,7 @@ mod tests {
             version: "Test 1.0".into(),
             user_agent: "Test/1.0".into(),
             tracker_ids: Default::default(),
+            shape: &crate::tracker::AnnounceShape::WEAVER,
         }
     }
 

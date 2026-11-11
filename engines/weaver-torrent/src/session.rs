@@ -3308,6 +3308,7 @@ impl Session {
                 client_name_and_version: identity.version.clone(),
                 user_agent: identity.user_agent.clone(),
                 tracker_ids: identity.tracker_ids.clone(),
+                announce_shape: identity.shape,
                 last_run: Default::default(),
                 ending_run: Default::default(),
                 moved: parking_lot::Mutex::new(opts.totals),

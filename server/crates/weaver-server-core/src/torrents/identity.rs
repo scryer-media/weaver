@@ -5,15 +5,18 @@
 
 use weaver_torrent::core::Id20;
 use weaver_torrent::core::peer_id::url_random;
+use weaver_torrent::tracker::AnnounceShape;
 use weaver_torrent::{Identity, TrackerIds};
 
 /// A client's Azureus-style peer-id prefix, the User-Agent of its HTTP
-/// announces and the `v` of its extended handshake.
+/// announces, the `v` of its extended handshake and the shape of its
+/// announces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientIdentity {
     prefix: [u8; 8],
     user_agent: &'static str,
     version: &'static str,
+    shape: &'static AnnounceShape,
 }
 
 /// The identity of this build: `-WV<major><minor:02><patch>-`, `Weaver/<version>`.
@@ -21,6 +24,7 @@ pub const IDENTITY: ClientIdentity = ClientIdentity::new(
     prefix_for(env!("CARGO_PKG_VERSION")),
     concat!("Weaver/", env!("CARGO_PKG_VERSION")),
     concat!("Weaver/", env!("CARGO_PKG_VERSION")),
+    &AnnounceShape::WEAVER,
 );
 
 const DIGITS: &[u8; 64] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz.-";
@@ -57,11 +61,17 @@ const fn prefix_for(version: &str) -> [u8; 8] {
 }
 
 impl ClientIdentity {
-    pub const fn new(prefix: [u8; 8], user_agent: &'static str, version: &'static str) -> Self {
+    pub const fn new(
+        prefix: [u8; 8],
+        user_agent: &'static str,
+        version: &'static str,
+        shape: &'static AnnounceShape,
+    ) -> Self {
         Self {
             prefix,
             user_agent,
             version,
+            shape,
         }
     }
 
@@ -92,6 +102,7 @@ impl ClientIdentity {
             version: self.version.to_owned(),
             user_agent: self.user_agent.to_owned(),
             tracker_ids: own.tracker_ids.clone(),
+            shape: self.shape,
         }
     }
 
