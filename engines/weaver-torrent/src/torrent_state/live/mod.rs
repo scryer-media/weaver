@@ -619,11 +619,9 @@ impl TorrentStateLive {
             .add_snapshot(stats.fetched_bytes, Some(remaining), now);
         self.up_speed_estimator
             .add_snapshot(stats.uploaded_bytes, None, now);
-        for peer in self.peers.states.iter() {
-            if let Some(live) = peer.value().get_live() {
-                live.sample_rates(&peer.value().stats.counters, now);
-            }
-        }
+        self.peers.for_each_live(|_, peer, live| {
+            live.sample_rates(&peer.stats.counters, now);
+        });
         if self.down_speed_estimator.bps() > 0 || self.up_speed_estimator.bps() > 0 {
             return true;
         }
@@ -1381,12 +1379,10 @@ impl TorrentStateLive {
     /// `m_swarm_last_seen_complete`). For status only, never sent.
     pub fn swarm_complete_ago(&self) -> Option<Duration> {
         let now = tokio::time::Instant::now();
-        let theirs = self
-            .peers
-            .states
-            .iter()
-            .filter_map(|e| e.value().get_live()?.last_seen_complete)
-            .max();
+        let mut theirs = None;
+        self.peers.for_each_live(|_, _, live| {
+            theirs = theirs.max(live.last_seen_complete);
+        });
         self.last_seen_complete(now)
             .max(theirs)
             .map(|last| now.saturating_duration_since(last))
@@ -1456,14 +1452,14 @@ impl TorrentStateLive {
     /// want (libtorrent `torrent::piece_passed` updates the interest of each
     /// interesting peer that has the piece).
     fn update_interest_of_holders(&self, piece: ValidPieceIndex) {
-        for mut entry in self.peers.states.iter_mut() {
-            if let Some(live) = entry.value_mut().get_live_mut()
+        self.peers.for_each_live_mut(|_, peer| {
+            if let Some(live) = peer.get_live_mut()
                 && live.is_interesting()
                 && live.bitfield.get(piece.get_usize()).is_some_and(|b| *b)
             {
                 self.update_interest(live);
             }
-        }
+        });
     }
 
     /// `source` named `addr` (libtorrent `torrent::add_peer`). A mapped
@@ -1749,15 +1745,14 @@ impl TorrentStateLive {
         }
         debug!(id = self.shared.id, on, "upload mode");
         if on {
-            for mut entry in self.peers.states.iter_mut() {
-                let addr = *entry.key();
-                if let Some(live) = entry.value_mut().get_live_mut() {
+            self.peers.for_each_live_mut(|addr, peer| {
+                if let Some(live) = peer.get_live_mut() {
                     if let Ok(pieces) = self.lock_write("set_upload_mode").get_pieces_mut() {
                         pieces.release_pieces_owned_by(addr);
                     }
                     live.cancel_all_requests();
                 }
-            }
+            });
         }
         self.new_pieces_notify.notify_waiters();
         self.update_upload_only();

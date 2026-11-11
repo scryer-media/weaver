@@ -73,12 +73,8 @@ impl PeerStates {
         replace: Option<ValidPieceIndex>,
         lengths: &Lengths,
     ) {
-        let handed: HashSet<ValidPieceIndex> = self
-            .states
-            .iter()
-            .filter_map(|p| Some(p.get_live()?.super_seeded_pieces().collect::<Vec<_>>()))
-            .flatten()
-            .collect();
+        let mut handed: HashSet<ValidPieceIndex> = HashSet::new();
+        self.for_each_live(|_, _, live| handed.extend(live.super_seeded_pieces()));
         let Some(has) = self.with_live(handle, |live| live.bitfield.clone()) else {
             return;
         };

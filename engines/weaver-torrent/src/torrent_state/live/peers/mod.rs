@@ -17,6 +17,7 @@ use std::{
 
 use crate::core::{hash_id::Id20, lengths::ValidPieceIndex};
 use dashmap::DashMap;
+use indexmap::IndexSet;
 use parking_lot::{Mutex, RwLock};
 use tokio::{
     sync::{Notify, mpsc::unbounded_channel},
@@ -134,6 +135,13 @@ pub(crate) struct PeerStates {
     // judgment does not walk the list for them. Taken while an entry of
     // `states` is held, never the other way.
     connected: Mutex<HashMap<IpAddr, Vec<SocketAddr>>>,
+    // The peers in `states` that are live, web seeds too: kept as each peer
+    // is counted in and out, so the work done for every connection each
+    // tick, piece or round visits the connections alone, as libtorrent's
+    // tick walks `torrent::m_connections`, not its peer list
+    // (`torrent::second_tick`). Taken while an entry of `states` is held,
+    // never the other way.
+    live: Mutex<IndexSet<PeerHandle>>,
 }
 
 /// The peer list as a pause leaves it: every peer on it, idle, the banned
@@ -354,6 +362,7 @@ impl PeerStates {
             finished: AtomicBool::new(false),
             smart_ban: Mutex::new(list.smart_ban),
             connected: Default::default(),
+            live: Default::default(),
         };
         for mut peer in list.peers {
             peer.rejoin(&peers);
@@ -987,6 +996,51 @@ impl PeerStates {
             .flatten()
     }
 
+    // The live peers as they stand now. The set's lock is let go before any
+    // entry of `states` is taken.
+    fn live_handles(&self) -> Vec<PeerHandle> {
+        self.live.lock().iter().copied().collect()
+    }
+
+    /// Runs `f` on every live peer, web seeds too, one entry held at a
+    /// time. Visits the live peers alone, not the whole list.
+    pub(crate) fn for_each_live(&self, mut f: impl FnMut(PeerHandle, &Peer, &LivePeerState)) {
+        for handle in self.live_handles() {
+            if let Some(e) = self.states.get(&handle)
+                && let Some(live) = e.value().get_live()
+            {
+                f(handle, e.value(), live);
+            }
+        }
+    }
+
+    /// [`Self::for_each_live`], with the peer to change.
+    pub(crate) fn for_each_live_mut(&self, mut f: impl FnMut(PeerHandle, &mut Peer)) {
+        for handle in self.live_handles() {
+            if let Some(mut e) = self.states.get_mut(&handle)
+                && e.value().get_live().is_some()
+            {
+                f(handle, e.value_mut());
+            }
+        }
+    }
+
+    // The live peers read off the whole list, as before the running set;
+    // the test that the set keeps them compares the two.
+    #[cfg(test)]
+    pub(crate) fn live_walked(&self) -> HashSet<PeerHandle> {
+        self.states
+            .iter()
+            .filter(|e| e.value().get_live().is_some())
+            .map(|e| *e.key())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_counted(&self) -> HashSet<PeerHandle> {
+        self.live.lock().iter().copied().collect()
+    }
+
     /// The peers our PEX messages list, each where it listens, with what
     /// the message says of it (libtorrent `ut_pex_plugin::tick`,
     /// `send_peer`): every connected peer whose listening address we know,
@@ -1023,6 +1077,7 @@ impl PeerStates {
                 .push(addr);
         }
         if let PeerState::Live(live) = state {
+            self.live.lock().insert(addr);
             self.availability.add(&live.bitfield);
             self.went_live.notify_one();
         }
@@ -1048,6 +1103,7 @@ impl PeerStates {
             }
         }
         if let PeerState::Live(live) = state {
+            self.live.lock().swap_remove(&addr);
             self.availability.remove(&live.bitfield);
         }
     }
@@ -1138,29 +1194,25 @@ impl PeerStates {
     /// receives it late but never loses it. A peer that goes live after this
     /// walk reads our have-bitfield afterwards, which holds the piece.
     pub(crate) fn announce_have(&self, piece: ValidPieceIndex) {
-        for peer in self.states.iter() {
-            if let PeerState::Live(live) = peer.value().get_state()
-                && !live.bitfield.get(piece.get_usize()).is_some_and(|has| *has)
-            {
+        self.for_each_live(|_, _, live| {
+            if !live.bitfield.get(piece.get_usize()).is_some_and(|has| *has) {
                 let _ = live
                     .tx
                     .send(WriterRequest::Message(Message::Have(piece.get())));
             }
-        }
+        });
     }
 
     /// Tells every live peer that takes upload_only whether we only upload
     /// now (libtorrent `torrent::send_upload_only`).
     pub(crate) fn send_upload_only(&self, enabled: bool) {
-        for peer in self.states.iter() {
-            if let PeerState::Live(live) = peer.value().get_state()
-                && live.supports_upload_only
-            {
+        self.for_each_live(|_, _, live| {
+            if live.supports_upload_only {
                 let _ = live.tx.send(WriterRequest::Message(Message::Extended(
                     ExtendedMessage::UploadOnly(enabled),
                 )));
             }
-        }
+        });
     }
 }
 
@@ -1697,6 +1749,7 @@ mod tests {
                     peers.connected_ips_walked(),
                     "step {step}"
                 );
+                assert_eq!(peers.live_counted(), peers.live_walked(), "step {step}");
             }
             assert!(
                 allow || !peers.connected_ips_counted().is_empty(),
@@ -1711,6 +1764,7 @@ mod tests {
                 });
             }
             assert!(peers.connected.lock().is_empty());
+            assert!(peers.live.lock().is_empty());
         }
     }
 
