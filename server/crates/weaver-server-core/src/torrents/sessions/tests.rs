@@ -2347,6 +2347,49 @@ fn port_mapping_is_what_a_mapping_leg_opens_with() {
     );
 }
 
+// The peer protocol is what a session opens with: a route open with one
+// is outdated once the settings give another, and its next session listens
+// with the new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_peer_protocol_reopens_the_route_with_it() {
+    use crate::settings::TorrentPeerProtocol;
+
+    let dir = tempfile::tempdir().unwrap();
+    let both = TorrentConfig {
+        peer_protocol: TorrentPeerProtocol::Both,
+        ..any_port()
+    };
+    let routes = Arc::new(FakeRoutes::default());
+    routes
+        .no_local_discovery
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    loopback_leg(&routes);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    sessions.set_config(both.clone());
+    let plan = routes.plan(TorrentScope::Default);
+    sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    assert!(sessions.view(&plan.key).await.unwrap().utp);
+    assert!(sessions.outdated().await.is_empty());
+
+    sessions.set_config(TorrentConfig {
+        peer_protocol: TorrentPeerProtocol::Tcp,
+        ..both
+    });
+    assert_eq!(
+        sessions.outdated().await,
+        BTreeSet::from([plan.key.clone()])
+    );
+    sessions.drop_route(&plan.key).await;
+    sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    assert!(!sessions.view(&plan.key).await.unwrap().utp);
+    assert!(sessions.outdated().await.is_empty());
+    sessions.stop_all().await;
+}
+
 // A session directory given while a route is open is where its next
 // session keeps its state.
 #[tokio::test(flavor = "multi_thread")]
