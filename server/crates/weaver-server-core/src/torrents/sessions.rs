@@ -1317,6 +1317,20 @@ impl Sessions {
                 Ok(session)
             }
             Err(error) => {
+                // Logged once for each failure that differs from the one
+                // the route is held for already: a route retried for the
+                // same cause says nothing more.
+                let repeated = matches!(
+                    slots.get(&plan.key),
+                    Some(Slot::Held { reason, .. }) if *reason == error
+                );
+                if !repeated {
+                    tracing::warn!(
+                        route = plan.key.as_str(),
+                        reason = %error.message(),
+                        "a route's session could not be opened"
+                    );
+                }
                 slots.insert(
                     plan.key.clone(),
                     Slot::Held {

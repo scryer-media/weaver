@@ -120,22 +120,37 @@ impl Held {
             Self::SessionLimit => TorrentRouteReason::SessionLimit,
         }
     }
+
+    // The diagnostic behind the hold's reason, when it has one: why the
+    // session could not be built, or why the leg is down. Torrents being
+    // off has none: a stop with words is a failure.
+    fn diagnostic(&self) -> Option<String> {
+        if self.off() {
+            return None;
+        }
+        match self {
+            Self::RouteDown(failure) | Self::Session(failure) => {
+                failure.detail.clone().filter(|detail| !detail.is_empty())
+            }
+            Self::SessionLimit => None,
+        }
+    }
 }
 
 /// Why a torrent is in its state: in words, or, while its route holds it,
-/// by the route's reason.
+/// by the route's reason and the diagnostic behind it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Why {
     Said(String),
-    Route(TorrentRouteReason),
+    Route(TorrentRouteReason, Option<String>),
 }
 
 impl Why {
-    /// The words, and the route's reason, whichever this is.
+    /// The words or the route's diagnostic, and the route's reason.
     pub fn split(why: Option<Self>) -> (Option<String>, Option<TorrentRouteReason>) {
         match why {
             Some(Self::Said(text)) => (Some(text), None),
-            Some(Self::Route(reason)) => (None, Some(reason)),
+            Some(Self::Route(reason, diagnostic)) => (diagnostic, Some(reason)),
             None => (None, None),
         }
     }
@@ -228,7 +243,10 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
         return (TorrentState::Queued, detail(origin.reason()));
     }
     if let Some(held) = &seen.held {
-        return (held.state(), Some(Why::Route(held.reason())));
+        return (
+            held.state(),
+            Some(Why::Route(held.reason(), held.diagnostic())),
+        );
     }
     if !seen.has_metadata {
         return (
@@ -903,7 +921,7 @@ mod tests {
             }),
             (
                 TorrentState::Stalled,
-                Some(Why::Route(TorrentRouteReason::LegDown))
+                Some(Why::Route(TorrentRouteReason::LegDown, None))
             )
         );
         assert_eq!(
@@ -915,7 +933,10 @@ mod tests {
             }),
             (
                 TorrentState::Stalled,
-                Some(Why::Route(TorrentRouteReason::LegDown))
+                Some(Why::Route(
+                    TorrentRouteReason::LegDown,
+                    Some("tunnel gone".into())
+                ))
             )
         );
         // A full disk: the session fetches nothing and keeps seeding.
@@ -1037,7 +1058,7 @@ mod tests {
             }),
             (
                 TorrentState::Stalled,
-                Some(Why::Route(TorrentRouteReason::SessionLimit))
+                Some(Why::Route(TorrentRouteReason::SessionLimit, None))
             )
         );
         assert_eq!(
@@ -1048,7 +1069,7 @@ mod tests {
             }),
             (
                 TorrentState::Stalled,
-                Some(Why::Route(TorrentRouteReason::SessionLimit))
+                Some(Why::Route(TorrentRouteReason::SessionLimit, None))
             )
         );
         assert_eq!(
@@ -1061,7 +1082,10 @@ mod tests {
             }),
             (
                 TorrentState::Stalled,
-                Some(Why::Route(TorrentRouteReason::ListenPortUnavailable))
+                Some(Why::Route(
+                    TorrentRouteReason::ListenPortUnavailable,
+                    Some("no listening port".into())
+                ))
             )
         );
         assert_eq!(
@@ -1072,7 +1096,7 @@ mod tests {
             }),
             (
                 TorrentState::Stopped,
-                Some(Why::Route(TorrentRouteReason::TorrentsDisabled))
+                Some(Why::Route(TorrentRouteReason::TorrentsDisabled, None))
             )
         );
     }

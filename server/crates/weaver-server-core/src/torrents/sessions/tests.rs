@@ -857,6 +857,54 @@ async fn a_route_that_could_not_listen_shows_why() {
     sessions.stop_all().await;
 }
 
+// A session that cannot be opened is logged with its cause once, however
+// often its route is asked to open for that same cause; a different cause is
+// logged again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_session_that_cannot_open_is_logged_once_for_each_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.set_leg(
+        LegKind::SourceAddress("127.0.0.1".parse().unwrap()),
+        Arc::new(NoUdp),
+    );
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    let (lines, _guard) = crate::pipeline::graph::lines::Lines::capture_at(
+        "weaver_server_core::torrents",
+        tracing::Level::WARN,
+    );
+    let plan = routes.plan(TorrentScope::Default);
+    let mut first = None;
+    for _ in 0..3 {
+        let Err(SessionError::Build(failure)) =
+            sessions.session(&plan, &IDENTITY.identity()).await
+        else {
+            panic!("a leg with no datagram socket builds no session");
+        };
+        first.get_or_insert(failure);
+    }
+    let first = first.unwrap();
+    assert_eq!(first.reason, TorrentRouteReason::SessionBuildFailed);
+    let detail = first.detail.clone().expect("the build failure has a cause");
+    let heard = lines.of("a route's session could not be opened");
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(heard[0].contains(&detail), "{heard:?}");
+
+    routes.set_refused(Some("the leg failed to open"));
+    let Err(SessionError::Build(second)) = sessions.session(&plan, &IDENTITY.identity()).await
+    else {
+        panic!("a refused leg builds no session");
+    };
+    assert_eq!(second.reason, TorrentRouteReason::LegOpenFailed);
+    let heard = lines.of("a route's session could not be opened");
+    assert_eq!(heard.len(), 2, "{heard:?}");
+    sessions.stop_all().await;
+}
+
 // The SSL port chosen while the settings name none is chosen once, above
 // the listen ports and below the ephemeral range, and kept.
 #[test]

@@ -301,6 +301,8 @@ pub struct TorrentRouteGql {
     /// Why its session is closed: held closed, its leg down, or not opened
     /// as nothing has asked it to open. None while open.
     pub reason: Option<TorrentRouteReasonGql>,
+    /// The cause behind `reason`, as the server logged it, when there is one.
+    pub detail: Option<String>,
     /// Who resolves the names its sessions look up.
     pub resolved_by: Option<ResolvedBy>,
     /// What its session shows trackers and peers, while open.
@@ -364,6 +366,10 @@ impl From<TorrentRoute> for TorrentRouteGql {
         });
         // A previous session can outlive the route becoming unavailable.
         let session = route.session.filter(|_| reason.is_none());
+        let detail = reason
+            .as_ref()
+            .and_then(|failure| failure.detail.clone())
+            .filter(|detail| !detail.is_empty());
         let reason = reason.map(|failure| failure.reason.into());
         Self {
             key: route.key.as_str().to_owned(),
@@ -386,6 +392,7 @@ impl From<TorrentRoute> for TorrentRouteGql {
                 .map(|session| session.external.iter().map(ToString::to_string).collect())
                 .unwrap_or_default(),
             reason,
+            detail,
             resolved_by: route.names.map(Into::into),
         }
     }
@@ -541,8 +548,8 @@ pub struct Torrent {
     /// Which hashes verify its pieces, once its metainfo is in hand.
     pub version: Option<TorrentVersionGql>,
     pub state: TorrentStateGql,
-    /// Why the torrent is in its state, when there is a reason to give and
-    /// its route does not hold it.
+    /// Why the torrent is in its state, when there is a reason to give. While
+    /// its route holds it, the cause behind `routeReason`, when one is known.
     pub detail: Option<String>,
     /// Why its route holds it, while its state comes from that hold.
     pub route_reason: Option<TorrentRouteReasonGql>,
