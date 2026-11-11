@@ -10,12 +10,12 @@ use tracing::{debug, error, info, warn};
 use crate::events::model::PipelineEvent;
 use crate::history::timeline::JOB_EVENT_DOWNLOAD_FINALIZATION_MARKER;
 use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
-use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
+use crate::jobs::ids::{JobId, NzbFileId, SegmentId};
 use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, JobSpec, JobState, JobStatus};
 use crate::jobs::record::{ActiveFileIdentity, FileIdentitySource};
 use crate::jobs::working_dir::{claim_working_dir, stamp_working_dir};
 use crate::pipeline::Pipeline;
-use crate::{DownloadQueue, DownloadWork, RestoreJobRequest};
+use crate::{DownloadQueue, RestoreJobRequest};
 
 // A row whose delivery began: every article is in hand and the job goes on
 // from its row, never from a checkpoint.
@@ -706,10 +706,14 @@ impl Pipeline {
                 segment_sizes,
             );
 
-            // One shared group list per file; every segment's work item holds
-            // a reference to it rather than its own copy.
+            // One shared group list per file, held once by the queue for all
+            // of the file's articles. A queued article holds no copy of its
+            // message id either: dispatch reads it from this list.
             let groups: std::sync::Arc<[String]> =
                 std::sync::Arc::from(file_spec.groups.as_slice());
+            if let Some(last) = file_spec.segments.iter().map(|seg| seg.ordinal).max() {
+                download_queue.reserve_file(file_id, last.saturating_add(1));
+            }
             for seg in &file_spec.segments {
                 let segment_id = SegmentId {
                     file_id,
@@ -718,19 +722,12 @@ impl Pipeline {
                 if skip.contains(&segment_id) {
                     let _ = file_assembly.commit_segment(seg.ordinal, seg.bytes);
                 } else if !held.contains(&segment_id) {
-                    download_queue.push(DownloadWork {
-                        counters: None,
+                    download_queue.push_article(
                         segment_id,
-                        message_id: MessageId::new(seg.message_ids.in_use()),
-                        groups: std::sync::Arc::clone(&groups),
-                        priority: crate::pipeline::graph::NEUTRAL_PRIORITY,
-                        byte_estimate: seg.bytes,
-                        retry_count: 0,
-                        is_recovery: false,
-                        completion_critical: false,
-                        exclude_servers: vec![],
-                        avoid_server: None,
-                    });
+                        &groups,
+                        crate::pipeline::graph::NEUTRAL_PRIORITY,
+                        seg.bytes,
+                    );
                 }
             }
 

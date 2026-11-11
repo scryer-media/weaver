@@ -1788,6 +1788,7 @@ pub(in crate::pipeline) async fn insert_delivered_job(
         .download_queue
         .pop()
         .unwrap();
+    let work = pipeline.dispatched(work);
     let segment_id = work.segment_id;
     let raw = encode_article_part(filename, payload, 1, 1, 1, payload.len() as u64);
     // Lane 0 holds the article, as a dispatched lease would book it.

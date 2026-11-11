@@ -78,6 +78,7 @@ fn park_indefinite_infrastructure_retry(pipeline: &mut Pipeline, job_id: JobId) 
         .extract_matching(|work| work.segment_id.segment_number == 0)
         .pop()
         .expect("segment 0 is queued");
+    let work = pipeline.dispatched(work);
     pipeline.note_retry_scheduled(work.segment_id);
     let scheduled_pool_generation = pipeline.pool_generation;
     pipeline.schedule_infrastructure_retry(

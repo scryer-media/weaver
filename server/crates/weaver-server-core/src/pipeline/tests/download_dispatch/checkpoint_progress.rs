@@ -443,6 +443,7 @@ fn park_one(pipeline: &mut Pipeline, delay: Option<Duration>) {
         .download_queue
         .pop_first_matching(|_| true)
         .unwrap();
+    let work = pipeline.dispatched(work);
     pipeline.note_retry_scheduled(work.segment_id);
     pipeline.schedule_infrastructure_retry(
         delay,
@@ -512,7 +513,7 @@ async fn checkpoint_progress_keeps_recovery_and_global_pressure_rules() {
     assert!(!pipeline.job_has_dispatchable_work_for_test(HOT));
     // Model promoted recovery behind a blocked critical primary article.
     // Recovery is exempt from the durable-lead gate.
-    let mut recovery = pipeline
+    let recovery = pipeline
         .jobs
         .get_mut(&HOT)
         .unwrap()
@@ -522,6 +523,7 @@ async fn checkpoint_progress_keeps_recovery_and_global_pressure_rules() {
         .download_queue
         .pop_first_matching(|_| true)
         .unwrap();
+    let mut recovery = pipeline.dispatched(recovery);
     recovery.is_recovery = true;
     recovery.completion_critical = true;
     let queue = &mut pipeline

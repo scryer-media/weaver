@@ -6,7 +6,9 @@
 // Migrations run before Weaver can serve anything, so a long upgrade looks,
 // from a browser, exactly like a Weaver that failed to start. Publishing its
 // progress lets the binary put a page up in the meantime. Only an upgrade
-// publishes: a fresh install has nobody waiting on it.
+// publishes: a fresh install has nobody waiting on it. The backup written
+// before an upgrade publishes too: it takes as long as the database is large,
+// and nothing else answers while it runs.
 
 use std::sync::LazyLock;
 
@@ -16,6 +18,8 @@ use tokio::sync::watch;
 pub enum SchemaUpgrade {
     // No upgrade is being applied.
     Idle,
+    // The backup taken before an upgrade is being written.
+    BackingUp,
     // `applied` of the `total` pending migrations are in.
     Running { applied: usize, total: usize },
 }
@@ -65,6 +69,29 @@ impl Drop for UpgradeProgress {
     }
 }
 
+// The backup before an upgrade being published. Dropping it returns the state
+// to idle, whether the backup was written or failed.
+pub(crate) struct UpgradeBackup {
+    sender: &'static watch::Sender<SchemaUpgrade>,
+}
+
+impl UpgradeBackup {
+    pub(crate) fn start() -> Self {
+        Self::start_on(&PROGRESS)
+    }
+
+    fn start_on(sender: &'static watch::Sender<SchemaUpgrade>) -> Self {
+        sender.send_replace(SchemaUpgrade::BackingUp);
+        Self { sender }
+    }
+}
+
+impl Drop for UpgradeBackup {
+    fn drop(&mut self) {
+        self.sender.send_replace(SchemaUpgrade::Idle);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -94,6 +121,16 @@ mod tests {
             }
         );
         drop(progress);
+        assert_eq!(*receiver.borrow(), SchemaUpgrade::Idle);
+    }
+
+    #[test]
+    fn a_backup_is_published_until_it_ends() {
+        let sender = Box::leak(Box::new(watch::Sender::new(SchemaUpgrade::Idle)));
+        let receiver = sender.subscribe();
+        let backup = UpgradeBackup::start_on(sender);
+        assert_eq!(*receiver.borrow(), SchemaUpgrade::BackingUp);
+        drop(backup);
         assert_eq!(*receiver.borrow(), SchemaUpgrade::Idle);
     }
 }

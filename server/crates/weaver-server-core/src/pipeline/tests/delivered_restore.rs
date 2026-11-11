@@ -509,7 +509,7 @@ async fn a_resumed_move_leaves_the_consumed_input_it_was_told_to_leave() {
             .unwrap();
         let mut works = active.download_queue.drain_all();
         works.extend(active.recovery_queue.drain_all());
-        works
+        pipeline.dispatched_all(works)
     };
     assert_eq!(works.len(), posts.len());
     pipeline.hold_test_lane_works(works.clone(), false);

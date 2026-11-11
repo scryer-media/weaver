@@ -293,12 +293,18 @@ async fn an_unreadable_parked_job_is_cancelled_and_frees_its_slot() {
         .run_sql_blocking(async move {
             SqlRuntime::execute(
                 datastore.write_exec(),
-                // With no stored outline, its entry reads the NZB.
-                "UPDATE active_jobs SET nzb_zstd = {}, nzb_files = NULL WHERE job_id = {}",
+                "UPDATE active_job_nzbs SET nzb_zstd = {} WHERE job_id = {}",
                 &[
                     SqlArg::Bytes(b"not an nzb".to_vec()),
                     SqlArg::I64(unreadable.0 as i64),
                 ],
+            )
+            .await?;
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                // With no stored outline, its entry reads the NZB.
+                "UPDATE active_jobs SET nzb_files = NULL WHERE job_id = {}",
+                &[SqlArg::I64(unreadable.0 as i64)],
             )
             .await?;
             Ok(())

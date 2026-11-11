@@ -94,7 +94,8 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("active_extracted", ResetOnRestore, RequireEmpty),
     table!("active_detected_archives", ResetOnRestore, RequireEmpty),
     table!("active_file_identities", ResetOnRestore, RequireEmpty),
-    table!("active_job_nzb_files", ResetOnRestore, RequireEmpty),
+    table!("active_job_nzbs", ResetOnRestore, RequireEmpty),
+    table!("active_job_outlines", ResetOnRestore, RequireEmpty),
     // Direct-store coverage is claimed against working-directory destination
     // files that a database restore does not restore, so the claim must be
     // discarded with every other `active_*` table. `Export`
