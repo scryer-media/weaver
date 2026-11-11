@@ -9,7 +9,6 @@
 // torrent seeds from; nothing else writes them.
 
 use std::io;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bitvec::boxed::BitBox;

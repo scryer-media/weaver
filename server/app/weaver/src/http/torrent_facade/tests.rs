@@ -960,7 +960,14 @@ fn every_time_a_row_carries_is_in_the_clients_unit() {
         ..seeding.clone()
     };
     let clock = clock_fields(&consecutive, now);
-    let field = |name: &str| clock.iter().find(|(key, _)| *key == name).unwrap().1.clone();
+    let field = |name: &str| {
+        clock
+            .iter()
+            .find(|(key, _)| *key == name)
+            .unwrap()
+            .1
+            .clone()
+    };
     assert_eq!(field("seeding_time"), json!(600));
     // MatchAny: the soonest, the ratio already met.
     assert_eq!(field("eta"), json!(0));

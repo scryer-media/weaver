@@ -39,8 +39,7 @@ use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::settings::{
     Leaf, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig,
-    TorrentEncryption,
-    TorrentLimit, TorrentPeerProtocol,
+    TorrentEncryption, TorrentLimit, TorrentPeerProtocol,
 };
 use weaver_server_core::tags::{TagSnapshot, split_tags};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};

@@ -905,15 +905,20 @@ pub(crate) fn plan_outputs(
 }
 
 impl Outputs {
-    // Moved; false when a move failed, which leaves the rest where they were.
-    pub(crate) fn place(&self, work: &Path) -> bool {
-        match super::relocate::move_files(work, &self.moves, super::relocate::Existing::Keep) {
-            Ok(_) => true,
-            Err(error) => {
-                tracing::warn!(error = %error, "a torrent's unpacked files did not move beside it");
-                false
-            }
-        }
+    // Moved, every one or none: a move that failed puts back what it moved.
+    pub(crate) fn place(&self, work: &Path) -> Result<(), super::relocate::MoveError> {
+        super::relocate::move_files(work, &self.moves, super::relocate::Existing::Keep).map(drop)
+    }
+
+    // The names whose file is at its destination: after a failed move, the
+    // ones it could not put back.
+    pub(crate) fn there(&self) -> Vec<String> {
+        self.moves
+            .iter()
+            .zip(&self.names)
+            .filter(|((_, to), _)| std::fs::symlink_metadata(to).is_ok())
+            .map(|(_, name)| name.clone())
+            .collect()
     }
 }
 

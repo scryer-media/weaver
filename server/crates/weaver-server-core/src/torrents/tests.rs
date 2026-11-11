@@ -127,7 +127,8 @@ fn what_was_on_disk_before_a_torrent_is_kept_with_it() {
     };
     db.set_torrent_adopted(JobId(6), &all).unwrap();
     assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), all);
-    db.set_torrent_adopted(JobId(6), &Adopted::default()).unwrap();
+    db.set_torrent_adopted(JobId(6), &Adopted::default())
+        .unwrap();
     assert_eq!(db.torrent_adopted(JobId(6)).unwrap(), Adopted::default());
 }
 

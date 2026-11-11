@@ -377,16 +377,18 @@ impl Database {
 
     // Unpacking is over: the files it placed beside the torrent's own are
     // kept on its row, with those an earlier unpacking that a crash cut
-    // short kept there, and its job's checkpoint goes, in one transaction.
-    // Run on the torrent's own lane, so no write of the job's checkpoint
-    // queued before it lands after.
+    // short kept there, those kept for it that it did not place go from it,
+    // and its job's checkpoint goes, in one transaction. Run on the
+    // torrent's own lane, so no write of the job's checkpoint queued before
+    // it lands after.
     pub(crate) fn finish_torrent_unpack(
         &self,
         job_id: JobId,
         outputs: &[String],
+        unplaced: &[String],
     ) -> Result<(), StateError> {
         let id = stored(job_id.0)?;
-        let outputs = self.outputs_with(job_id, outputs)?;
+        let outputs = self.outputs_with(job_id, outputs, unplaced)?;
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "finish_torrent_unpack", |tx| {
@@ -420,7 +422,7 @@ impl Database {
         outputs: &[String],
     ) -> Result<(), StateError> {
         let id = stored(job_id.0)?;
-        let outputs = self.outputs_with(job_id, outputs)?;
+        let outputs = self.outputs_with(job_id, outputs, &[])?;
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::execute(
@@ -433,15 +435,20 @@ impl Database {
         })
     }
 
-    // The row's outputs with `outputs` added, as the row keeps them.
+    // The row's outputs with `outputs` added and `unplaced` taken out, as
+    // the row keeps them.
     fn outputs_with(
         &self,
         job_id: JobId,
         outputs: &[String],
+        unplaced: &[String],
     ) -> Result<Option<String>, StateError> {
+        let unplaced: std::collections::HashSet<&String> = unplaced.iter().collect();
         let mut kept = self.torrent_outputs(job_id)?;
+        kept.retain(|output| !unplaced.contains(output));
+        let mut seen: std::collections::HashSet<String> = kept.iter().cloned().collect();
         for output in outputs {
-            if !kept.contains(output) {
+            if seen.insert(output.clone()) {
                 kept.push(output.clone());
             }
         }

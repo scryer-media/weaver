@@ -575,7 +575,9 @@ async fn admission_leaves_out_unwanted_files_and_refuses_nothing_wanted_and_exec
     let files: [(&str, &[u8]); 2] = [("a.bin", &[1; 128]), ("b.nfo", &[2; 64])];
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo("set", &files, 64, false))))
+        .add(request(AddSource::Metainfo(metainfo(
+            "set", &files, 64, false,
+        ))))
         .await
         .unwrap();
     assert_eq!(
@@ -588,7 +590,7 @@ async fn admission_leaves_out_unwanted_files_and_refuses_nothing_wanted_and_exec
     // Only the wanted file's pieces come, and it completes.
     let mut published = rig.service.inner.published.subscribe();
     let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
-    fetch_pieces(&rig.service, job_id, &whole, Some(&[0, 1])).await;
+    fetch_pieces(&rig.service, job_id, &whole, Some(&[0, 1]), |_| {}).await;
     published
         .wait_for(|_| {
             rig.db
@@ -2107,11 +2109,18 @@ async fn unpacks_beside_and_seeds(name: &str, archive: &[u8]) {
 // torrents are held meanwhile, so nothing the service settles sees the
 // torrent short of every piece.
 async fn fetch_every_piece(service: &TorrentService, job_id: JobId, whole: &[u8]) {
-    fetch_pieces(service, job_id, whole, None).await;
+    fetch_pieces(service, job_id, whole, None, |_| {}).await;
 }
 
-// `fetch_every_piece`, or only the pieces `only` names.
-async fn fetch_pieces(service: &TorrentService, job_id: JobId, whole: &[u8], only: Option<&[u32]>) {
+// `fetch_every_piece`, or only the pieces `only` names, and `then` done to
+// the torrent before anything the service settles sees them.
+async fn fetch_pieces(
+    service: &TorrentService,
+    job_id: JobId,
+    whole: &[u8],
+    only: Option<&[u32]>,
+    then: impl FnOnce(&Live),
+) {
     let live = service.inner.live.lock().await;
     let (layout, intake) = {
         let torrent = &live[&job_id];
@@ -2149,6 +2158,7 @@ async fn fetch_pieces(service: &TorrentService, job_id: JobId, whole: &[u8], onl
         }
         storage.on_piece_completed(index).unwrap();
     }
+    then(&live[&job_id]);
     drop(live);
 }
 
@@ -2244,6 +2254,69 @@ async fn a_finished_torrent_unpacking_refused_beside_a_usable_file_is_partial() 
     assert_eq!(history.status, "partial");
     assert!(history.error_message.unwrap().contains("txt"));
     rig.service.stop().await;
+}
+
+// Unpacked files that cannot be placed beside the torrent's are never
+// removed for it: they stay in its unpacking directory, the torrent
+// completes and seeds on, and its job ends as what it delivered says,
+// partial beside a file people open, with why and where they are. The
+// directory stays past a restart, and a removal that deletes the
+// torrent's files takes it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unpacked_files_that_cannot_be_placed_are_kept_and_the_job_is_partial() {
+    use std::os::unix::fs::PermissionsExt;
+    let archive = include_bytes!(concat!(
+        std::env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/rar5/rar5_store.rar"
+    ));
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let sample = vec![0x5a_u8; 300];
+    let files: [(&str, &[u8]); 2] = [("set.rar", archive), ("sample.mkv", &sample)];
+    let bytes = metainfo("set", &files, 128, false);
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(bytes)))
+        .await
+        .unwrap();
+    let work = rig.service.unpacking_dir(job_id);
+    let mut retired = rig.service.retired();
+    let whole: Vec<u8> = files.iter().flat_map(|(_, bytes)| bytes.to_vec()).collect();
+    let mut dir = PathBuf::new();
+    fetch_pieces(&rig.service, job_id, &whole, None, |torrent| {
+        dir = torrent.store.as_ref().unwrap().files().dir();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    })
+    .await;
+    retired.wait_for(|retired| *retired >= 1).await.unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "partial");
+    let error = history.error_message.unwrap();
+    assert!(error.contains("could not be placed"), "{error}");
+    assert!(error.contains(&work.display().to_string()), "{error}");
+    assert!(!dir.join("small.txt").exists());
+    assert_eq!(std::fs::read(work.join("small.txt")).unwrap(), SMALL_TXT);
+    assert!(rig.db.torrent_outputs(job_id).unwrap().is_empty());
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert!(view.completed_at_ms.is_some());
+    assert_ne!(view.state, TorrentState::Stopped);
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+
+    // The same unpacking root, as a restart has.
+    let mut env = job_env();
+    env.work = rig.service.inner.env.work.clone();
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, env, set_clock());
+    again.open().await.unwrap();
+    assert_eq!(std::fs::read(work.join("small.txt")).unwrap(), SMALL_TXT);
+    again.remove(job_id, true, false).await.unwrap();
+    assert!(!work.exists());
+    assert!(!dir.join("sample.mkv").exists());
+    let history = rig.db.get_job_history(job_id.0).unwrap().unwrap();
+    assert_eq!(history.status, "partial");
+    again.stop().await;
 }
 
 // The metainfo's own word on who made it, when, and why stays with the
@@ -8680,11 +8753,15 @@ async fn an_unpacking_run_again_keeps_the_files_the_first_one_placed() {
         .await
         .unwrap();
     rig.db
-        .finish_torrent_unpack(job_id, &["small.txt".to_owned()])
+        .finish_torrent_unpack(job_id, &["small.txt".to_owned()], &[])
         .unwrap();
-    rig.db.finish_torrent_unpack(job_id, &[]).unwrap();
+    rig.db.finish_torrent_unpack(job_id, &[], &[]).unwrap();
     rig.db
-        .finish_torrent_unpack(job_id, &["small.txt".to_owned(), "notes.txt".to_owned()])
+        .finish_torrent_unpack(
+            job_id,
+            &["small.txt".to_owned(), "notes.txt".to_owned()],
+            &[],
+        )
         .unwrap();
     assert_eq!(
         rig.db.torrent_outputs(job_id).unwrap(),

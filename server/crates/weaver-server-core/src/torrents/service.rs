@@ -48,6 +48,7 @@ use crate::pipeline::graph::job::Storage;
 use crate::pipeline::graph::limits::{self, Caps};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::graph::window::ScratchLedger;
+use crate::pipeline::post_health::names_a_piece;
 use crate::post_processing::model::{QueueEvent, vars};
 use crate::proxies::{
     Consumer, LegTenancy, LegTenant, NetworkRuntime, ResolvedBy, SessionTraffic, TorrentScope,
@@ -67,6 +68,7 @@ use crate::torrents::metrics::{
     Counters, FetchOutcome, Published, SeedingSeries, SessionSeries, TorrentEvent, TorrentMetrics,
     TorrentSeries,
 };
+use crate::torrents::model::Adopted;
 use crate::torrents::rate::limit_kind;
 use crate::torrents::relocate::{self, Existing, MoveError};
 use crate::torrents::sessions::{
@@ -77,8 +79,6 @@ use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces};
 use crate::torrents::store::{Kept, Replayed, TorrentStore};
 use crate::torrents::tee::{Parts, Plan, Tee, plan_outputs};
-use crate::pipeline::post_health::names_a_piece;
-use crate::torrents::model::Adopted;
 use crate::torrents::{
     ContentLayout, FilePriority, Infohash, NamedBy, PeerInfo, TorrentCounters, TorrentFile,
     TorrentInsert, TorrentIntent, TorrentRecord, TorrentSource, TorrentState, TorrentTracker,
@@ -2703,8 +2703,14 @@ impl TorrentService {
             if tee.with(|job| job.awaits_commit() || job.moves_waiting()) {
                 self.checkpoint_tee(job_id, Arc::clone(tee), false).await;
             }
-            if whole && tee.done() && self.unpacked(job_id, &store, tee).await {
-                self.completed(job_id).await;
+            if whole && tee.done() {
+                match self.unpacked(job_id, &store, tee).await {
+                    Placing::Waits => {}
+                    Placing::Placed => self.completed(job_id).await,
+                    Placing::Short { why, placed } => {
+                        self.short(job_id, &store, why, &placed).await;
+                    }
+                }
             }
         }
         self.save_checkpoints(self.inner.signal.take_due()).await;
@@ -2730,9 +2736,11 @@ impl TorrentService {
     // torrent's files are claimed as a move claims them, so its directory
     // stays where it is with no lock its reads and writes wait on; while a
     // move has them, this waits for the move to end, which marks the
-    // torrent. False until it placed them, and while its job still uses
-    // its storage, so the next settle asks again.
-    async fn unpacked(&self, job_id: JobId, store: &Arc<TorrentStore>, tee: &Arc<Tee>) -> bool {
+    // torrent. It waits while its job still uses its storage, so the next
+    // settle asks again. Files it could not place are never removed for
+    // it: they stay in its directory, which stays, and it ends short with
+    // the ones it did place.
+    async fn unpacked(&self, job_id: JobId, store: &Arc<TorrentStore>, tee: &Arc<Tee>) -> Placing {
         let claimed = self
             .with_torrent(job_id, |torrent| {
                 if torrent.moving.is_some() {
@@ -2743,7 +2751,7 @@ impl TorrentService {
             })
             .await;
         if !matches!(claimed, Ok(true)) {
-            return false;
+            return Placing::Waits;
         }
         let releasing = Arc::clone(tee);
         let spent = match tokio::task::spawn_blocking(move || releasing.spent()).await {
@@ -2755,12 +2763,12 @@ impl TorrentService {
                     "a torrent's unpacked files wait on its job"
                 );
                 self.unclaim_outputs(job_id).await;
-                return false;
+                return Placing::Waits;
             }
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
                 self.unclaim_outputs(job_id).await;
-                return false;
+                return Placing::Waits;
             }
         };
         tee.stop_checkpoints();
@@ -2778,8 +2786,15 @@ impl TorrentService {
             Ok(outputs) => Arc::new(outputs),
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
+                let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
+                    db.finish_torrent_unpack(job_id, &[], &[])
+                });
+                self.recorded(job_id, recorded.await);
                 self.unclaim_outputs(job_id).await;
-                return true;
+                return Placing::Short {
+                    why: unplaced(&work, &error),
+                    placed: Vec::new(),
+                };
             }
         };
         // Kept on the row before they move, so a crash between leaves no
@@ -2792,27 +2807,46 @@ impl TorrentService {
         let (from, moving) = (work.clone(), Arc::clone(&outputs));
         let placed = tokio::task::spawn_blocking(move || {
             let _job = JobScope::enter(job_id);
-            moving.place(&from)
+            moving
+                .place(&from)
+                .map_err(|error| (error.to_string(), Some(moving.there())))
         })
         .await
-        .unwrap_or(false);
-        let names = if placed {
-            outputs.names.clone()
-        } else {
-            Vec::new()
+        .unwrap_or_else(|error| Err((error.to_string(), None)));
+        // A move that failed takes off the row the files it put back; one
+        // whose end is not known leaves every one on it, for its delete.
+        let (names, unplaced_names) = match &placed {
+            Ok(()) | Err((_, None)) => (outputs.names.clone(), Vec::new()),
+            Err((_, Some(there))) => {
+                let there: HashSet<&String> = there.iter().collect();
+                let left = outputs
+                    .names
+                    .iter()
+                    .filter(|name| !there.contains(name))
+                    .cloned()
+                    .collect();
+                (Vec::new(), left)
+            }
         };
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
-            db.finish_torrent_unpack(job_id, &names)
+            db.finish_torrent_unpack(job_id, &names, &unplaced_names)
         });
         self.recorded(job_id, recorded.await);
         self.unclaim_outputs(job_id).await;
+        if let Err((error, there)) = placed {
+            tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files did not move beside it");
+            return Placing::Short {
+                why: unplaced(&work, &error),
+                placed: there.unwrap_or_default(),
+            };
+        }
         let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(work)).await;
         if let Ok(Err(error)) = removed
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(job_id = job_id.0, error = %error, "could not remove a torrent's unpacking directory");
         }
-        true
+        Placing::Placed
     }
 
     fn recorded(
@@ -2832,6 +2866,11 @@ impl TorrentService {
                 );
             }
         }
+    }
+
+    // The directory a torrent's unpacking works in.
+    fn unpacking_dir(&self, job_id: JobId) -> PathBuf {
+        self.inner.env.work.join(format!("torrent-{}", job_id.0))
     }
 
     // The claim `unpacked` took on the torrent's files, given back.
@@ -3276,7 +3315,7 @@ impl TorrentService {
         passwords: Vec<String>,
         hold: Hold<W>,
     ) -> Result<(Arc<Tee>, Option<Note>), Unmade<W>> {
-        let work = self.inner.env.work.join(format!("torrent-{}", job_id.0));
+        let work = self.unpacking_dir(job_id);
         let (rows, mut fresh) = match self.inner.db.load_graph_checkpoint(job_id) {
             Ok(rows) => (rows, None),
             Err(LoadError::Read(error)) => match hold(error.to_string()) {
@@ -4071,7 +4110,11 @@ impl TorrentService {
         let rule = tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
         record.forced |= rule.is_some_and(|rule| rule.forced);
         let rule_id = rule.map(|rule| rule.id);
-        match self.inner.db.insert_placed_torrent(&record, trackers, adopted) {
+        match self
+            .inner
+            .db
+            .insert_placed_torrent(&record, trackers, adopted)
+        {
             Ok(TorrentInsert::Inserted) => {
                 let now = self.inner.clock.now_ms();
                 let mut torrent = Live::new(
@@ -4930,9 +4973,9 @@ impl TorrentService {
             .and(torrent.record.storage_dir.as_deref())
             .map(PathBuf::from);
         let mut deletion = deletion(store.files(), &adopted, &outputs, claimed);
-        if let Some(tee) = store.tee() {
-            deletion.paths.push(tee.work().to_path_buf());
-        }
+        // With or without a tee: one whose unpacked files were not placed
+        // keeps its directory past it.
+        deletion.paths.push(self.unpacking_dir(job_id));
         deletion
     }
 
@@ -7264,6 +7307,26 @@ pub(super) fn delete_written(deletion: &Deletion) {
 // graph job's delivery reads one (`Delivery::status`), and failed for `why`
 // when none is. An archive volume, a split part and recovery data are never
 // usable files, whole or not.
+// What placing a torrent's unpacked files came to.
+enum Placing {
+    // Not yet: the next settle asks again.
+    Waits,
+    // Every one is beside the torrent's files.
+    Placed,
+    // Some or all stay where unpacking made them, for `why`; `placed` are
+    // the ones beside the torrent's files.
+    Short { why: String, placed: Vec<String> },
+}
+
+// Why a torrent's unpacked files are not all beside its own, and where
+// they are.
+fn unplaced(work: &Path, error: &impl std::fmt::Display) -> String {
+    format!(
+        "the unpacked files could not be placed beside the torrent's files ({error}); they are kept in {}",
+        work.display()
+    )
+}
+
 fn short_status(delivered: &[String], why: &str) -> JobStatus {
     let usable = delivered
         .iter()

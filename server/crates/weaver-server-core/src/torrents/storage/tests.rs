@@ -20,8 +20,8 @@ use super::{PieceStorage, PieceStorageFactory, Pieces};
 use crate::torrents::files::{self, Files};
 use crate::torrents::intake::Holds;
 use crate::torrents::layout::{PieceFile, PieceLayout, layout_of};
-use crate::torrents::relocate::Existing;
 use crate::torrents::model::Adopted;
+use crate::torrents::relocate::Existing;
 use crate::torrents::service::{delete_written, deletion, move_listed};
 use crate::torrents::store::{Kept, TorrentStore};
 use weaver_torrent::storage::{
