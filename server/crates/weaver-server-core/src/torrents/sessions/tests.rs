@@ -3,6 +3,7 @@
 
 mod outgoing_utp;
 mod pool_members;
+mod system_utp;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -95,6 +96,9 @@ pub(crate) struct FakeRoutes {
     pub(crate) egress_rates: Mutex<BTreeMap<u32, crate::bandwidth::TorrentRates>>,
     pub(crate) egress_policy: tokio::sync::watch::Sender<u64>,
     pub(crate) egress_capacity: tokio::sync::watch::Sender<u64>,
+    // The legs it opens run no local service discovery, so a session on
+    // the host's own sockets sends nothing past loopback.
+    pub(crate) no_local_discovery: std::sync::atomic::AtomicBool,
 }
 
 // The route of a scope mapped to `proxy`.
@@ -296,7 +300,13 @@ impl Routes for FakeRoutes {
             .transpose()?;
         Ok(OpenLeg {
             kind: plan.kind.clone(),
-            shape: plan.kind.shape(None),
+            shape: {
+                let mut shape = plan.kind.shape(None);
+                if self.no_local_discovery.load(Ordering::SeqCst) {
+                    shape.own_sockets = false;
+                }
+                shape
+            },
             factory,
             names: Arc::new(weaver_torrent::network::NoNames),
             http: tracker_client(

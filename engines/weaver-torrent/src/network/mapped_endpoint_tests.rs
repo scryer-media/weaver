@@ -31,12 +31,12 @@ async fn a_mapped_peer_transfers_both_ways_through_a_same_port_datagram_pair() -
         ..Default::default()
     };
     let ours = UtpSocket::new_with_opts(
-        DatagramTransport(paired),
+        DatagramTransport::alone(paired),
         DefaultUtpEnvironment::default(),
         options(),
     )?;
     let theirs = UtpSocket::new_with_opts(
-        DatagramTransport(peer_transport),
+        DatagramTransport::alone(peer_transport),
         DefaultUtpEnvironment::default(),
         options(),
     )?;
