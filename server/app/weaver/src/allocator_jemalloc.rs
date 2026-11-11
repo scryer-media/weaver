@@ -31,9 +31,13 @@
 //   paid in resident pages. Arenas are created lazily, so the cap costs
 //   nothing on a small host and bounds the caches on a large one.
 //
-// Background purge threads are deliberately not requested: they are not
-// available on every target this binary builds for, and the two collections
-// below already cover the boundaries where a purge matters.
+// On glibc Linux, `background_thread` also asks jemalloc for its purge
+// threads (at most four), so freed pages decay back to the system on their
+// own between the boundaries the two collections below cover, even while no
+// thread is allocating. Every other target runs without them: Mach-O has no
+// background thread, and the allocator crate marks musl as unsupported. The
+// collections stay on every target; they purge at once at the boundary
+// instead of waiting for the decay clock.
 //
 // One build note that does not belong in a comment anywhere else: jemalloc
 // fixes its page size when it is compiled, and a binary built for a smaller
@@ -46,6 +50,13 @@ use std::alloc::{GlobalAlloc, Layout};
 use tikv_jemallocator::Jemalloc;
 
 // Read by jemalloc's constructor, before `main` runs.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: &[u8] =
+    b"dirty_decay_ms:3000,muzzy_decay_ms:0,narenas:16,background_thread:true\0";
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:3000,muzzy_decay_ms:0,narenas:16\0";
@@ -150,6 +161,35 @@ mod tests {
 
         assert_eq!(opt_ms(c"opt.dirty_decay_ms"), 3000);
         assert_eq!(opt_ms(c"opt.muzzy_decay_ms"), 0);
+    }
+
+    // Reads a boolean `mallctl` value.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn read_bool(name: &std::ffi::CStr) -> bool {
+        let mut value = false;
+        let mut len = std::mem::size_of::<bool>();
+        // SAFETY: both names below are documented as `bool`, the output
+        // buffer and its length match that type, and no input is given.
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                name.as_ptr(),
+                std::ptr::from_mut(&mut value).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "mallctl read failed");
+        value
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn glibc_linux_runs_the_background_purge_threads() {
+        // `opt.background_thread` is what the configuration asked for;
+        // `background_thread` is whether jemalloc actually turned it on.
+        assert!(read_bool(c"opt.background_thread"));
+        assert!(read_bool(c"background_thread"));
     }
 
     #[test]
