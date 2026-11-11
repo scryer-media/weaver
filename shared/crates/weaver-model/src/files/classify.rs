@@ -226,12 +226,20 @@ fn remove_duplicate_marker(lower: &str) -> String {
     normalized
 }
 
+// The recovery blocks a PAR2 volume name declares, `None` when it is no
+// volume name. `.vol<start>+<count>` names its count; `.vol<start>-<end>`
+// names its first block and the one past its last, so it declares the
+// blocks between, and none when the end is not past the start. A start
+// that is no number counts from zero.
 fn parse_par2_vol_blocks(lower: &str) -> Option<u32> {
     let vol_pos = lower.rfind(".vol")?;
     let between = &lower[vol_pos + 4..lower.len() - 5];
-    let sep_pos = between.find('+').or_else(|| between.find('-'))?;
-    let count_str = &between[sep_pos + 1..];
-    count_str.parse().ok()
+    if let Some((_, count)) = between.split_once('+') {
+        return count.parse().ok();
+    }
+    let (start, end) = between.split_once('-')?;
+    let end: u32 = end.parse().ok()?;
+    Some(end.saturating_sub(start.parse().unwrap_or(0)))
 }
 
 fn is_par3_volume_name(lower: &str) -> bool {
