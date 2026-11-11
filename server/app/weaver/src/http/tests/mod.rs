@@ -1618,10 +1618,10 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             ("not_needed", 1),
         ],
         connects: vec![
-            ("tcp", "v4", [30, 20, 9]),
-            ("tcp", "v6", [0, 0, 0]),
-            ("utp", "v4", [12, 7, 5]),
-            ("utp", "v6", [0, 0, 0]),
+            ("tcp", "v4", [30, 20, 3, 4, 2]),
+            ("tcp", "v6", [0, 0, 0, 0, 0]),
+            ("utp", "v4", [12, 7, 0, 0, 5]),
+            ("utp", "v6", [0, 0, 0, 0, 0]),
         ],
         dht: Some((150, 20, 6)),
     };

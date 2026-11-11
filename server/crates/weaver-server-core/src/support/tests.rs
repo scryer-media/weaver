@@ -630,6 +630,7 @@ fn held_torrent(
         private: true,
         forced: false,
         progress: 0.25,
+        check_progress: None,
         total_bytes: 3000,
         have_bytes: 1024,
         wanted_bytes: 3000,
@@ -819,7 +820,7 @@ fn published_metrics() -> crate::torrents::metrics::TorrentMetrics {
                 blocked_outgoing: 0,
                 utp: Default::default(),
                 peers: vec![("established", 3), ("connecting", 2)],
-                connects: vec![("tcp", "v4", [5, 3, 2])],
+                connects: vec![("tcp", "v4", [7, 3, 1, 1, 2])],
                 dht: None,
             }],
         }),
@@ -889,7 +890,9 @@ fn a_held_torrent_reports_what_the_service_holds() {
         report.text
     );
     assert!(
-        report.text.contains("    connects tcp/v4 3/5 x2"),
+        report
+            .text
+            .contains("    connects tcp/v4 3/7 refused 1 timed out 1 x2"),
         "{}",
         report.text
     );

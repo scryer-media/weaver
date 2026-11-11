@@ -231,6 +231,11 @@ impl TorrentStateInitializing {
         self.check.store(CHECK_IDLE, Ordering::Release);
     }
 
+    /// Whether a check is under way, in any of its steps.
+    pub(crate) fn is_checking(&self) -> bool {
+        self.check.load(Ordering::Acquire) != CHECK_IDLE
+    }
+
     /// Whether the check reads every piece back now, or is past the saved
     /// state and waits its turn to (libtorrent's torrent waiting for an
     /// `active_checking` slot is in `checking_files` already); one that
@@ -1064,6 +1069,206 @@ mod tests {
             assert!(matches!(handle.stats().state, TorrentStatsState::Paused));
             session.stop().await;
             Ok(())
+        }
+
+        /// A memory storage whose reads all wait while it is shut, the
+        /// first of them saying so on `reading`.
+        #[derive(Clone)]
+        struct ShutStorageFactory {
+            inner: MemoryStorageFactory,
+            door: Arc<Door>,
+        }
+
+        struct Door {
+            open: Mutex<bool>,
+            opened: parking_lot::Condvar,
+            reading: Mutex<Option<UnboundedSender<()>>>,
+        }
+
+        impl Door {
+            fn shut(reading: UnboundedSender<()>) -> Arc<Self> {
+                Arc::new(Self {
+                    open: Mutex::new(false),
+                    opened: parking_lot::Condvar::new(),
+                    reading: Mutex::new(Some(reading)),
+                })
+            }
+
+            fn open(&self) {
+                *self.open.lock() = true;
+                self.opened.notify_all();
+            }
+
+            fn pass(&self) {
+                if let Some(reading) = self.reading.lock().take() {
+                    let _ = reading.send(());
+                }
+                let mut open = self.open.lock();
+                while !*open {
+                    self.opened.wait(&mut open);
+                }
+            }
+        }
+
+        struct ShutStorage {
+            inner: Box<dyn TorrentStorage>,
+            door: Arc<Door>,
+        }
+
+        impl StorageFactory for ShutStorageFactory {
+            type Storage = ShutStorage;
+
+            fn create(
+                &self,
+                shared: &ManagedTorrentShared,
+                metadata: &TorrentMetadata,
+            ) -> anyhow::Result<ShutStorage> {
+                Ok(ShutStorage {
+                    inner: Box::new(self.inner.create(shared, metadata)?),
+                    door: self.door.clone(),
+                })
+            }
+
+            fn clone_box(&self) -> BoxStorageFactory {
+                self.clone().boxed()
+            }
+        }
+
+        impl TorrentStorage for ShutStorage {
+            fn init(
+                &mut self,
+                shared: &ManagedTorrentShared,
+                metadata: &TorrentMetadata,
+            ) -> anyhow::Result<()> {
+                self.inner.init(shared, metadata)
+            }
+
+            fn pread_exact(
+                &self,
+                file_id: usize,
+                offset: u64,
+                buf: &mut [u8],
+            ) -> anyhow::Result<()> {
+                self.door.pass();
+                self.inner.pread_exact(file_id, offset, buf)
+            }
+
+            fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+                self.inner.pwrite_all(file_id, offset, buf)
+            }
+
+            fn remove_file(&self, file_id: usize, filename: &Path) -> anyhow::Result<()> {
+                self.inner.remove_file(file_id, filename)
+            }
+
+            fn remove_directory_if_empty(&self, path: &Path) -> anyhow::Result<()> {
+                self.inner.remove_directory_if_empty(path)
+            }
+
+            fn ensure_file_length(&self, file_id: usize, length: u64) -> anyhow::Result<()> {
+                self.inner.ensure_file_length(file_id, length)
+            }
+
+            fn take(&self) -> anyhow::Result<Box<dyn TorrentStorage>> {
+                Ok(Box::new(ShutStorage {
+                    inner: self.inner.take()?,
+                    door: self.door.clone(),
+                }))
+            }
+
+            fn on_piece_completed(&self, piece: ValidPieceIndex) -> anyhow::Result<()> {
+                self.inner.on_piece_completed(piece)
+            }
+        }
+
+        // More pieces than a check has threads, so a pause stops it short.
+        const PIECES: usize = 512;
+
+        // A pause that stops a check under way leaves the torrent paused,
+        // checking nothing, not reading as a check that never ends; resumed,
+        // it is checked whole and runs. `recheck` pauses a check of every
+        // piece asked for while the torrent runs, else the first check of
+        // a torrent added running.
+        async fn a_check_stopped_by_a_pause_reads_as_paused(
+            name: &str,
+            recheck: bool,
+        ) -> anyhow::Result<()> {
+            let t = TestTorrent::new(name, PIECES * 1024, 1024).await?;
+            let out = TempDir::with_prefix(name)?;
+            let session =
+                Session::new_with_opts(out.path().into(), isolated_session_opts(false)).await?;
+            let (reading_tx, mut reading) = tokio::sync::mpsc::unbounded_channel();
+            let door = Door::shut(reading_tx);
+            if recheck {
+                door.open();
+            }
+            let storage = ShutStorageFactory {
+                inner: MemoryStorageFactory::holding(vec![t.content.clone()]),
+                door: door.clone(),
+            };
+            let handle = session
+                .add_torrent(
+                    AddTorrent::from_bytes(t.torrent.clone()),
+                    Some(AddTorrentOptions {
+                        storage_factory: Some(storage.clone_box()),
+                        ..Default::default()
+                    }),
+                )
+                .await?
+                .into_handle()
+                .context("expected a handle")?;
+            if recheck {
+                handle.wait_until_completed().await?;
+                let (reading_tx, again) = tokio::sync::mpsc::unbounded_channel();
+                reading = again;
+                *door.reading.lock() = Some(reading_tx);
+                *door.open.lock() = false;
+                session.force_recheck(&handle).await?;
+            }
+            reading.recv().await.context("the check read nothing")?;
+            session.pause(&handle).await?;
+            door.open();
+
+            // The check stops at the next piece of each of its threads.
+            loop {
+                let changed = handle.next_state_change();
+                let checking = handle.with_state(|state| {
+                    matches!(state, crate::ManagedTorrentState::Initializing(init) if init.is_checking())
+                });
+                if !checking {
+                    break;
+                }
+                changed.await;
+            }
+            assert!(
+                handle.with_state(|state| matches!(
+                    state,
+                    crate::ManagedTorrentState::Initializing(_)
+                )),
+                "the check ran to its end"
+            );
+            assert!(handle.is_paused());
+            let stats = handle.stats();
+            assert!(
+                matches!(stats.state, TorrentStatsState::Paused),
+                "{:?}",
+                stats.state
+            );
+
+            session.unpause(&handle).await?;
+            handle.wait_until_completed().await?;
+            session.stop().await;
+            Ok(())
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_first_check_stopped_by_a_pause_reads_as_paused() -> anyhow::Result<()> {
+            a_check_stopped_by_a_pause_reads_as_paused("first_check_paused", false).await
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_recheck_stopped_by_a_pause_reads_as_paused() -> anyhow::Result<()> {
+            a_check_stopped_by_a_pause_reads_as_paused("recheck_paused", true).await
         }
     }
 }

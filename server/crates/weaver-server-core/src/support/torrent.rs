@@ -979,8 +979,9 @@ pub struct SessionFigures {
     pub blocked_incoming: u64,
     pub blocked_outgoing: u64,
     pub peers: Vec<(&'static str, u32)>,
-    // Transport, address family, then attempted, succeeded, failed.
-    pub connects: Vec<(&'static str, &'static str, [u64; 3])>,
+    // Transport, address family, then attempted, and each attempt's end:
+    // connected, refused, timed out, failed otherwise.
+    pub connects: Vec<(&'static str, &'static str, [u64; 5])>,
     // Nodes in the v4 and v6 tables, and requests awaiting an answer.
     pub dht: Option<(usize, usize, usize)>,
 }
@@ -1203,8 +1204,11 @@ impl SessionFigures {
         }
         let _ = writeln!(text, "{}", clip(&line));
         let mut line = String::from("    connects");
-        for (transport, family, [tried, ok, failed]) in &self.connects {
-            let _ = write!(line, " {transport}/{family} {ok}/{tried} x{failed}");
+        for (transport, family, [tried, ok, refused, timed_out, failed]) in &self.connects {
+            let _ = write!(
+                line,
+                " {transport}/{family} {ok}/{tried} refused {refused} timed out {timed_out} x{failed}"
+            );
         }
         let _ = writeln!(text, "{}", clip(&line));
         if let Some((v4, v6, waiting)) = self.dht {

@@ -1625,7 +1625,10 @@ impl Session {
                     opts.connection_speed,
                 )),
             };
-            let listen_result = if let Some(mut listen_opts) = opts.listen.take() {
+            // The port the peer listener was asked for: 0 when the factory
+            // chooses it.
+            let asked_listen_port = opts.listen.as_ref().map(|l| l.listen_addr.port());
+            let mut listen_result = if let Some(mut listen_opts) = opts.listen.take() {
                 // uTP drops a SYN once its streams pass twice the limit.
                 let connections_limit = connection_slots.limit();
                 session_utp_opts(
@@ -1716,14 +1719,31 @@ impl Session {
                 .cloned()
                 .collect();
 
+            // The peer listener's uTP socket, which the DHT shares when it
+            // runs on the same port.
+            let dht_share = listen_result
+                .as_mut()
+                .and_then(|listen| listen.dht_share.take());
             let dht = if let Some(dht_config) = opts.dht.take() {
-                // The DHT runs over a datagram socket the factory binds; the
-                // factory decides the real address.
+                // The DHT on the port uTP listens on, or asked for the port
+                // the listener was asked for, shares uTP's socket, as
+                // libtorrent runs uTP and its DHT on one socket per listen
+                // port (session_impl.cpp:2648-2663): a second socket on the
+                // port fails to bind, or takes uTP's datagrams. Elsewhere it
+                // runs over a datagram socket the factory binds; the factory
+                // decides the real address.
                 let dht_socket = Some(
-                    datagram_sockets
-                        .bind_udp(dht_listen_addr(dht_config.port, None, opts.ipv4_only))
-                        .await
-                        .context("error binding DHT socket through socket factory")?,
+                    match dht_share.filter(|share| {
+                        dht_config.port.is_some_and(|port| {
+                            port == share.port() || Some(port) == asked_listen_port
+                        })
+                    }) {
+                        Some(share) => share.dht_socket(),
+                        None => datagram_sockets
+                            .bind_udp(dht_listen_addr(dht_config.port, None, opts.ipv4_only))
+                            .await
+                            .context("error binding DHT socket through socket factory")?,
+                    },
                 );
                 let dht = if let Some(persistence_config) = dht_config.persistence {
                     PersistentDht::create_from_config(
@@ -5224,6 +5244,78 @@ mod tests {
             *sockets.asked.lock().unwrap(),
             [7 * crate::udp_options::STREAM_WINDOW]
         );
+    }
+
+    // The DHT on the port uTP listens on runs over uTP's one socket: the
+    // session binds one datagram socket there, the DHT answers a ping sent
+    // to it, and a uTP peer connects to it.
+    #[tokio::test]
+    async fn the_dht_shares_the_utp_listeners_socket() {
+        let dir = TempDir::new().unwrap();
+        let sockets = Arc::new(NotingAsks {
+            kernel: crate::test_support::socket_factory(),
+            asked: Default::default(),
+        });
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: Some(crate::DhtSessionConfig {
+                    bootstrap_addrs: Some(Vec::new()),
+                    port: Some(0),
+                    persistence: None,
+                }),
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ipv4_only: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpAndUtp,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                ..SessionOptions::new(sockets.clone())
+            },
+        )
+        .await
+        .unwrap();
+        let listening = session.listen_addr().unwrap();
+        assert_eq!(session.get_dht().unwrap().listen_addr(), listening);
+
+        let client = crate::test_support::loopback_udp().await;
+        client
+            .send_to(
+                b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe",
+                listening,
+            )
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1024];
+        let len = loop {
+            let (len, from) = client.recv_from(&mut buf).await.unwrap();
+            if from == listening {
+                break len;
+            }
+        };
+        let reply =
+            crate::dht::bprotocol::deserialize_message::<crate::bencode::ByteBufOwned>(&buf[..len])
+                .unwrap();
+        assert!(matches!(
+            reply.kind,
+            crate::dht::bprotocol::MessageKind::Response(_)
+        ));
+        assert_eq!(reply.transaction_id.as_ref(), b"aa");
+
+        let peer = crate::listen::bind_utp(
+            crate::test_support::socket_factory().as_ref(),
+            (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+            Default::default(),
+            crate::udp_options::STREAM_WINDOW,
+            None,
+        )
+        .await
+        .unwrap();
+        peer.connect(listening).await.unwrap();
+        session.stop().await;
     }
 
     #[tokio::test]

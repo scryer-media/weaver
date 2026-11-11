@@ -196,6 +196,11 @@ impl TorrentStore {
         self.have().file_have.clone()
     }
 
+    // Each file's bytes in the pieces it has, into `into`, reusing its room.
+    pub(crate) fn file_have_into(&self, into: &mut Vec<u64>) {
+        into.clone_from(&self.have().file_have);
+    }
+
     // The pieces to keep for the next run.
     pub(crate) fn kept(&self) -> Kept {
         let have = self.have();

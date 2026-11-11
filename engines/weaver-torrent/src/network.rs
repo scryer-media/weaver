@@ -163,7 +163,144 @@ impl std::fmt::Debug for dyn SocketFactory {
 }
 
 /// Adapts a [`DatagramSocket`] from a [`SocketFactory`] to the uTP transport.
-pub(crate) struct DatagramTransport(pub(crate) Arc<dyn DatagramSocket>);
+/// The socket of a session's peer listener may be shared with the DHT: its
+/// DHT messages then go to the DHT, every other datagram to uTP.
+pub(crate) struct DatagramTransport(
+    pub(crate) Arc<dyn DatagramSocket>,
+    pub(crate) Option<Arc<DhtTap>>,
+);
+
+impl DatagramTransport {
+    /// A transport that keeps every datagram for uTP.
+    #[cfg(test)]
+    pub(crate) fn alone(socket: Arc<dyn DatagramSocket>) -> Self {
+        Self(socket, None)
+    }
+}
+
+/// How many DHT messages wait for the DHT on a shared socket before more are
+/// dropped, as a full socket buffer drops them.
+const DHT_INBOX: usize = 256;
+
+/// Where uTP's receive loop hands the DHT messages it reads on a socket the
+/// two share, once the DHT takes the socket.
+#[derive(Default)]
+pub(crate) struct DhtTap {
+    inbox: std::sync::OnceLock<tokio::sync::mpsc::Sender<(Box<[u8]>, SocketAddr)>>,
+}
+
+impl DhtTap {
+    /// Takes `datagram` for the DHT when the DHT shares the socket and it
+    /// is a DHT message. libtorrent v2.0.15 hands a datagram uTP does not
+    /// take to its DHT when it is longer than 20 bytes and starts with `d`
+    /// and ends with `e` (session_impl.cpp:2648-2663); a uTP header's first
+    /// byte carries version 1, never `d`, so testing for the DHT first takes
+    /// the same datagrams.
+    fn take(&self, datagram: &[u8], from: SocketAddr) -> bool {
+        let Some(inbox) = self.inbox.get() else {
+            return false;
+        };
+        if !(datagram.len() > 20
+            && datagram.first() == Some(&b'd')
+            && datagram.last() == Some(&b'e'))
+        {
+            return false;
+        }
+        // A full inbox drops the message; a DHT that has gone takes none.
+        let _ = inbox.try_send((datagram.into(), from));
+        true
+    }
+}
+
+/// A uTP socket's datagram socket the DHT may share, from the uTP socket of
+/// a session's peer listener.
+pub(crate) struct DhtShare {
+    pub(crate) socket: Arc<dyn DatagramSocket>,
+    pub(crate) tap: Arc<DhtTap>,
+}
+
+impl DhtShare {
+    /// The port the shared socket is bound to.
+    pub(crate) fn port(&self) -> u16 {
+        self.socket.bind_addr().port()
+    }
+
+    /// The DHT's socket: it sends on the shared socket and receives the DHT
+    /// messages uTP's receive loop hands it, until that loop ends.
+    pub(crate) fn dht_socket(self) -> Arc<dyn DatagramSocket> {
+        let (inbox, messages) = tokio::sync::mpsc::channel(DHT_INBOX);
+        // The tap is the DHT's alone: it is set once, here.
+        let _ = self.tap.inbox.set(inbox);
+        drop(self.tap);
+        Arc::new(SharedDhtSocket {
+            socket: self.socket,
+            messages: tokio::sync::Mutex::new(messages),
+        })
+    }
+}
+
+/// The DHT's side of a socket it shares with uTP.
+struct SharedDhtSocket {
+    socket: Arc<dyn DatagramSocket>,
+    messages: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(Box<[u8]>, SocketAddr)>>,
+}
+
+impl DatagramSocket for SharedDhtSocket {
+    fn bind_addr(&self) -> SocketAddr {
+        self.socket.bind_addr()
+    }
+
+    fn recv_from<'a>(
+        &'a self,
+        buf: &'a mut [u8],
+    ) -> BoxFuture<'a, io::Result<(usize, SocketAddr)>> {
+        Box::pin(async move {
+            let Some((message, from)) = self.messages.lock().await.recv().await else {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "the uTP socket the DHT shares has closed",
+                ));
+            };
+            let len = message.len().min(buf.len());
+            buf[..len].copy_from_slice(&message[..len]);
+            Ok((len, from))
+        })
+    }
+
+    fn send_to<'a>(
+        &'a self,
+        buf: &'a [u8],
+        target: SocketAddr,
+    ) -> BoxFuture<'a, io::Result<usize>> {
+        self.socket.send_to(buf, target)
+    }
+
+    fn poll_send_to(
+        &self,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.socket.poll_send_to(cx, buf, target)
+    }
+
+    fn poll_send_to_vectored(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+    ) -> Poll<io::Result<usize>> {
+        self.socket.poll_send_to_vectored(cx, bufs, target)
+    }
+
+    fn link_mtu(&self) -> Option<u16> {
+        self.socket.link_mtu()
+    }
+
+    fn dont_fragment(&self) -> bool {
+        self.socket.dont_fragment()
+    }
+}
 
 impl PollSendToVectored for DatagramTransport {
     fn poll_send_to_vectored(
@@ -185,11 +322,14 @@ impl Transport for DatagramTransport {
         self.0.shutdown()
     }
 
-    fn recv_from<'a>(
-        &'a self,
-        buf: &'a mut [u8],
-    ) -> impl Future<Output = io::Result<(usize, SocketAddr)>> + Send + Sync + 'a {
-        self.0.recv_from(buf)
+    async fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        loop {
+            let (len, from) = self.0.recv_from(buf).await?;
+            match &self.1 {
+                Some(tap) if tap.take(&buf[..len.min(buf.len())], from) => {}
+                _ => return Ok((len, from)),
+            }
+        }
     }
 
     fn send_to<'a>(

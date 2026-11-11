@@ -484,6 +484,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         private: false,
         forced: false,
         progress: 0.25,
+        check_progress: None,
         total_bytes: 4000,
         have_bytes: 1000,
         wanted_bytes: 4000,
@@ -824,7 +825,7 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
     assert_eq!(view.state, TorrentState::Stalled);
     assert_eq!(
         (view.detail.as_deref(), view.route_reason),
-        (None, Some(TorrentRouteReason::LegDown))
+        (Some("tunnel gone"), Some(TorrentRouteReason::LegDown))
     );
     let held = rig.service.inner.sessions.views().await;
     assert_eq!(held.len(), 1);
@@ -1777,7 +1778,10 @@ async fn a_session_that_cannot_be_built_says_why() {
     assert_eq!(view.state, TorrentState::Stalled);
     assert_eq!(
         (view.detail.as_deref(), view.route_reason),
-        (None, Some(TorrentRouteReason::LegOpenFailed))
+        (
+            Some("no listening port"),
+            Some(TorrentRouteReason::LegOpenFailed)
+        )
     );
 }
 
@@ -2726,22 +2730,53 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
     seeding.stop().await;
 }
 
-// While the session checks the files, the bytes in hand are the checkpoint's;
-// once it reports, they are the session's.
+// While the session reports no bytes, as while it checks the files, the
+// bytes in hand are the store's: the pieces the check has found so far, so
+// they move with the pieces counted. Once it reports, they are the
+// session's.
 #[test]
-fn a_checking_torrent_keeps_the_checkpoints_bytes() {
-    let mut have = vec![1000, 2500];
-    take_file_have(&mut have, &Engine::Checking, &[0, 0]);
-    assert_eq!(have, [1000, 2500]);
-    let live = Engine::Live {
-        finished: false,
-        peers: 0,
-        upload_mode: false,
+fn a_checking_torrent_has_the_bytes_of_the_pieces_it_counts() {
+    use crate::torrents::storage::Pieces;
+
+    let layout = Arc::new(
+        crate::torrents::layout::PieceLayout::new(
+            64,
+            vec![
+                crate::torrents::layout::PieceFile {
+                    name: "a.bin".to_owned(),
+                    length: 100,
+                    padding: false,
+                },
+                crate::torrents::layout::PieceFile {
+                    name: "b.bin".to_owned(),
+                    length: 92,
+                    padding: false,
+                },
+            ],
+        )
+        .unwrap(),
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let files = crate::torrents::files::Files::new(&layout, dir.path().to_path_buf()).unwrap();
+    let every = crate::torrents::store::Kept {
+        bits: vec![0b1110_0000],
+        checking: false,
     };
-    take_file_have(&mut have, &live, &[]);
-    assert_eq!(have, [1000, 2500]);
-    take_file_have(&mut have, &live, &[1024, 2500]);
-    assert_eq!(have, [1024, 2500]);
+    let store = crate::torrents::store::TorrentStore::new(layout, files, Some(&every), None);
+    let mut have = Vec::new();
+    take_file_have(&mut have, &[], Some(&store));
+    assert_eq!((store.count(), have.clone()), (3, vec![100, 92]));
+
+    // A recheck: nothing is had until the check finds it.
+    store.checking().unwrap();
+    take_file_have(&mut have, &[], Some(&store));
+    assert_eq!((store.count(), have.clone()), (0, vec![0, 0]));
+    store.found(0).unwrap();
+    take_file_have(&mut have, &[], Some(&store));
+    assert_eq!((store.count(), have.clone()), (1, vec![64, 0]));
+
+    take_file_have(&mut have, &[100, 92], Some(&store));
+    assert_eq!(have, [100, 92]);
 }
 
 // The tee of a torrent whose files unpack.

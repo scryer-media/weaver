@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 
 use crate::{
-    network::{DatagramTransport, SocketFactory, StreamListener, UtpSocket},
+    network::{DatagramTransport, DhtShare, DhtTap, SocketFactory, StreamListener, UtpSocket},
     stream_connect::ConnectionKind,
     vectored_traits::AsyncReadVectored,
 };
@@ -39,6 +39,13 @@ pub(crate) struct Listening {
     pub addr: SocketAddr,
 }
 
+/// A bound listener's sockets, and the datagram socket of its uTP socket the
+/// DHT may share, on the session's peer listener.
+struct Bound {
+    listening: Listening,
+    dht_share: Option<DhtShare>,
+}
+
 pub(crate) struct ListenResult {
     /// The SSL listener: SSL torrents' peers connect to it, TLS from their
     /// first byte.
@@ -46,6 +53,10 @@ pub(crate) struct ListenResult {
     /// The TCP listener the session's `SocketFactory` opened.
     pub tcp_socket: Option<Box<dyn StreamListener>>,
     pub utp_socket: Option<UtpSocket>,
+    /// The datagram socket of the peer listener's uTP socket, for the DHT
+    /// to share when it runs on the same port: one UDP socket on a port,
+    /// never two.
+    pub dht_share: Option<DhtShare>,
     pub enable_upnp_port_forwarding: bool,
     pub addr: SocketAddr,
     /// The port told to trackers and the DHT: the one set in the options,
@@ -153,8 +164,9 @@ impl ListenerOptions {
             connection_slots,
         )
         .await?;
-        let listen_addr = bound.addr;
-        let (tcp_socket, utp_socket) = (bound.tcp_socket, bound.utp_socket);
+        let dht_share = bound.dht_share;
+        let listen_addr = bound.listening.addr;
+        let (tcp_socket, utp_socket) = (bound.listening.tcp_socket, bound.listening.utp_socket);
 
         let ssl = match self.ssl_listen_port {
             Some(port) => Some(
@@ -168,7 +180,8 @@ impl ListenerOptions {
                     connection_slots,
                 )
                 .await
-                .context("error starting the SSL listener")?,
+                .context("error starting the SSL listener")?
+                .listening,
             ),
             None => None,
         };
@@ -187,6 +200,7 @@ impl ListenerOptions {
             ssl,
             tcp_socket,
             utp_socket,
+            dht_share,
             announce_port,
             announce_port_set: self.announce_port.is_some(),
             addr: listen_addr,
@@ -198,8 +212,9 @@ impl ListenerOptions {
 
 // A listener's sockets on `listen_addr`, as `mode` says; a port of 0 takes
 // TCP's free port, and uTP binds the port TCP took. The session's `peers`
-// listener is the one a factory's forwarded port reaches. Its uTP socket
-// asks for a receive buffer of `receive_buffer` bytes.
+// listener is the one a factory's forwarded port reaches, and its uTP
+// socket's datagram socket is kept for the DHT to share. Its uTP socket asks
+// for a receive buffer of `receive_buffer` bytes.
 async fn bind(
     mode: ListenerMode,
     mut listen_addr: SocketAddr,
@@ -208,7 +223,7 @@ async fn bind(
     factory: &Arc<dyn SocketFactory>,
     peers: bool,
     connection_slots: &crate::connection_slots::ConnectionSlots,
-) -> anyhow::Result<Listening> {
+) -> anyhow::Result<Bound> {
     let tcp_socket = if mode.tcp_enabled() {
         let listening = if peers {
             factory.listen_peers_tcp(listen_addr)
@@ -226,39 +241,43 @@ async fn bind(
         None
     };
 
-    let utp_socket = if mode.utp_enabled() {
-        match bind_utp(
+    let (utp_socket, dht_share) = if mode.utp_enabled() {
+        match bind_shared_utp(
             factory.as_ref(),
             listen_addr,
             utp_opts,
             receive_buffer,
             Some(connection_slots),
+            peers,
         )
         .await
         {
-            Ok(sock) => {
+            Ok((sock, share)) => {
                 listen_addr = sock.bind_addr();
                 info!(
                     "Listening on UDP {:?} for incoming uTP peer connections",
                     listen_addr
                 );
-                Some(sock)
+                (Some(sock), share)
             }
             Err(e) if tcp_socket.is_some() => {
                 // If we listen over TCP, it's not a fatal error if we can't listen over uTP.
                 tracing::error!("Error listening on UDP {listen_addr:?}: {e:#}");
-                None
+                (None, None)
             }
             Err(e) => return Err(e),
         }
     } else {
-        None
+        (None, None)
     };
 
-    Ok(Listening {
-        tcp_socket,
-        utp_socket,
-        addr: listen_addr,
+    Ok(Bound {
+        listening: Listening {
+            tcp_socket,
+            utp_socket,
+            addr: listen_addr,
+        },
+        dht_share,
     })
 }
 
@@ -271,12 +290,39 @@ pub(crate) async fn bind_utp(
     receive_buffer: usize,
     connection_slots: Option<&crate::connection_slots::ConnectionSlots>,
 ) -> anyhow::Result<UtpSocket> {
+    bind_shared_utp(
+        factory,
+        listen_addr,
+        utp_opts,
+        receive_buffer,
+        connection_slots,
+        false,
+    )
+    .await
+    .map(|(socket, _)| socket)
+}
+
+// A uTP socket as `bind_utp` binds it, and its datagram socket for the DHT
+// to share when `shared`.
+async fn bind_shared_utp(
+    factory: &dyn SocketFactory,
+    listen_addr: SocketAddr,
+    utp_opts: weaver_utp::SocketOpts,
+    receive_buffer: usize,
+    connection_slots: Option<&crate::connection_slots::ConnectionSlots>,
+    shared: bool,
+) -> anyhow::Result<(UtpSocket, Option<DhtShare>)> {
     let transport = factory
         .bind_utp(listen_addr, receive_buffer)
         .await
         .context("error binding UDP socket")?;
+    let share = shared.then(|| DhtShare {
+        socket: Arc::clone(&transport),
+        tap: Arc::new(DhtTap::default()),
+    });
+    let tap = share.as_ref().map(|share| Arc::clone(&share.tap));
     let sock = weaver_utp::UtpSocket::new_with_opts_and_init(
-        DatagramTransport(transport),
+        DatagramTransport(transport, tap),
         Default::default(),
         utp_opts,
         |socket| {
@@ -285,7 +331,7 @@ pub(crate) async fn bind_utp(
             }
         },
     )?;
-    Ok(UtpSocket(sock))
+    Ok((UtpSocket(sock), share))
 }
 
 pub(crate) trait Accept {

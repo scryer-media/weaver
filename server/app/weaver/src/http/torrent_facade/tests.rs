@@ -411,6 +411,7 @@ fn view(state: TorrentState) -> TorrentView {
         private: false,
         forced: false,
         progress: 0.5,
+        check_progress: None,
         total_bytes: 10,
         have_bytes: 5,
         wanted_bytes: 10,
@@ -696,6 +697,20 @@ fn a_starting_torrent_passes_the_checking_filter() {
     let queued = view(TorrentState::Queued);
     assert_eq!(state(&queued), "queuedDL");
     assert!(!wanted(&queued, "checking"));
+}
+
+// qBittorrent `TorrentImpl::progress` (torrentimpl.cpp:927-947): while a
+// torrent is checked, its progress is how far the check has read, not the
+// pieces in hand; otherwise it is the pieces in hand.
+#[test]
+fn a_checked_torrent_reads_as_far_as_its_check_has_read() {
+    let mut checking = view(TorrentState::CheckingFiles);
+    checking.progress = 1.0;
+    checking.check_progress = Some(0.25);
+    assert_eq!(progress(&checking), 0.25);
+    let mut seeding = view(TorrentState::Seeding);
+    seeding.progress = 1.0;
+    assert_eq!(progress(&seeding), 1.0);
 }
 
 fn file(index: u32, path: &str) -> TorrentFile {

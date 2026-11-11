@@ -3,6 +3,7 @@
 
 mod outgoing_utp;
 mod pool_members;
+mod system_utp;
 
 use std::io;
 use std::net::{IpAddr, SocketAddr};
@@ -95,6 +96,9 @@ pub(crate) struct FakeRoutes {
     pub(crate) egress_rates: Mutex<BTreeMap<u32, crate::bandwidth::TorrentRates>>,
     pub(crate) egress_policy: tokio::sync::watch::Sender<u64>,
     pub(crate) egress_capacity: tokio::sync::watch::Sender<u64>,
+    // The legs it opens run no local service discovery, so a session on
+    // the host's own sockets sends nothing past loopback.
+    pub(crate) no_local_discovery: std::sync::atomic::AtomicBool,
 }
 
 // The route of a scope mapped to `proxy`.
@@ -296,7 +300,13 @@ impl Routes for FakeRoutes {
             .transpose()?;
         Ok(OpenLeg {
             kind: plan.kind.clone(),
-            shape: plan.kind.shape(None),
+            shape: {
+                let mut shape = plan.kind.shape(None);
+                if self.no_local_discovery.load(Ordering::SeqCst) {
+                    shape.own_sockets = false;
+                }
+                shape
+            },
             factory,
             names: Arc::new(weaver_torrent::network::NoNames),
             http: tracker_client(
@@ -844,6 +854,53 @@ async fn a_route_that_could_not_listen_shows_why() {
     assert_eq!(view.listen, None);
     assert!(view.mappings.is_empty());
     assert!(view.external.is_empty());
+    sessions.stop_all().await;
+}
+
+// A session that cannot be opened is logged with its cause once, however
+// often its route is asked to open for that same cause; a different cause is
+// logged again.
+#[tokio::test(flavor = "current_thread")]
+async fn a_session_that_cannot_open_is_logged_once_for_each_cause() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.set_leg(
+        LegKind::SourceAddress("127.0.0.1".parse().unwrap()),
+        Arc::new(NoUdp),
+    );
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    let (lines, _guard) = crate::pipeline::graph::lines::Lines::capture_at(
+        "weaver_server_core::torrents",
+        tracing::Level::WARN,
+    );
+    let plan = routes.plan(TorrentScope::Default);
+    let mut first = None;
+    for _ in 0..3 {
+        let Err(SessionError::Build(failure)) = sessions.session(&plan, &IDENTITY.identity()).await
+        else {
+            panic!("a leg with no datagram socket builds no session");
+        };
+        first.get_or_insert(failure);
+    }
+    let first = first.unwrap();
+    assert_eq!(first.reason, TorrentRouteReason::SessionBuildFailed);
+    let detail = first.detail.clone().expect("the build failure has a cause");
+    let heard = lines.of("a route's session could not be opened");
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(heard[0].contains(&detail), "{heard:?}");
+
+    routes.set_refused(Some("the leg failed to open"));
+    let Err(SessionError::Build(second)) = sessions.session(&plan, &IDENTITY.identity()).await
+    else {
+        panic!("a refused leg builds no session");
+    };
+    assert_eq!(second.reason, TorrentRouteReason::LegOpenFailed);
+    let heard = lines.of("a route's session could not be opened");
+    assert_eq!(heard.len(), 2, "{heard:?}");
     sessions.stop_all().await;
 }
 
@@ -2287,6 +2344,49 @@ fn port_mapping_is_what_a_mapping_leg_opens_with() {
         opening(&off, LegKind::Ladder),
         opening(&on, LegKind::Ladder)
     );
+}
+
+// The peer protocol is what a session opens with: a route open with one
+// is outdated once the settings give another, and its next session listens
+// with the new one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_peer_protocol_reopens_the_route_with_it() {
+    use crate::settings::TorrentPeerProtocol;
+
+    let dir = tempfile::tempdir().unwrap();
+    let both = TorrentConfig {
+        peer_protocol: TorrentPeerProtocol::Both,
+        ..any_port()
+    };
+    let routes = Arc::new(FakeRoutes::default());
+    routes
+        .no_local_discovery
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    loopback_leg(&routes);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    sessions.set_config(both.clone());
+    let plan = routes.plan(TorrentScope::Default);
+    sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    assert!(sessions.view(&plan.key).await.unwrap().utp);
+    assert!(sessions.outdated().await.is_empty());
+
+    sessions.set_config(TorrentConfig {
+        peer_protocol: TorrentPeerProtocol::Tcp,
+        ..both
+    });
+    assert_eq!(
+        sessions.outdated().await,
+        BTreeSet::from([plan.key.clone()])
+    );
+    sessions.drop_route(&plan.key).await;
+    sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    assert!(!sessions.view(&plan.key).await.unwrap().utp);
+    assert!(sessions.outdated().await.is_empty());
+    sessions.stop_all().await;
 }
 
 // A session directory given while a route is open is where its next

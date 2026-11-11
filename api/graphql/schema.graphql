@@ -5414,8 +5414,8 @@ type Torrent {
 	version: TorrentVersion
 	state: TorrentState!
 	"""
-	Why the torrent is in its state, when there is a reason to give and
-	its route does not hold it.
+	Why the torrent is in its state, when there is a reason to give. While
+	its route holds it, the cause behind `routeReason`, when one is known.
 	"""
 	detail: String
 	"""
@@ -5722,6 +5722,10 @@ type TorrentRoute {
 	as nothing has asked it to open. None while open.
 	"""
 	reason: TorrentRouteReason
+	"""
+	The cause behind `reason`, as the server logged it, when there is one.
+	"""
+	detail: String
 	"""
 	Who resolves the names its sessions look up.
 	"""

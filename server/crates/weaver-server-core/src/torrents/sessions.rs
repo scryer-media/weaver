@@ -594,8 +594,8 @@ impl SessionEnv {
 
 /// What a session on a leg of `shape` takes from the settings when it opens
 /// and cannot take while open: where it keeps its state, the port it binds,
-/// the port it announces and whether it maps its port. Settings that now
-/// give another re-open it.
+/// the port it announces, whether it maps its port and the transports it
+/// listens on and dials with. Settings that now give another re-open it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Opening {
     shape: Shape,
@@ -603,6 +603,10 @@ struct Opening {
     base_port: Option<u16>,
     announce_port: Option<u16>,
     upnp: bool,
+    // TCP and uTP as `transports` gives them for the leg: a protocol the
+    // leg cannot carry changes nothing.
+    tcp: bool,
+    utp: bool,
 }
 
 /// The external port a session on a leg of `shape`, listening on `port`
@@ -615,7 +619,10 @@ fn maps(torrent: &TorrentConfig, shape: Shape, port: u16) -> Option<u16> {
 
 impl Opening {
     fn of(env: &SessionEnv, torrent: &TorrentConfig, shape: Shape) -> Self {
+        let (_, tcp, utp) = transports(torrent, shape);
         Self {
+            tcp,
+            utp,
             shape,
             root: env.root_of(torrent),
             base_port: (shape.listen || shape.dht).then_some(torrent.base_port),
@@ -861,7 +868,7 @@ enum Slot {
         // The route plan it opened under, whose leg it runs on.
         plan: RoutePlan,
         mappings: PortMappings,
-        opening: Opening,
+        opening: Box<Opening>,
     },
     Held {
         reason: RouteFailure,
@@ -1311,12 +1318,26 @@ impl Sessions {
                         maps,
                         plan: plan.clone(),
                         mappings,
-                        opening,
+                        opening: Box::new(opening),
                     },
                 );
                 Ok(session)
             }
             Err(error) => {
+                // Logged once for each failure that differs from the one
+                // the route is held for already: a route retried for the
+                // same cause says nothing more.
+                let repeated = matches!(
+                    slots.get(&plan.key),
+                    Some(Slot::Held { reason, .. }) if *reason == error
+                );
+                if !repeated {
+                    tracing::warn!(
+                        route = plan.key.as_str(),
+                        reason = %error.message(),
+                        "a route's session could not be opened"
+                    );
+                }
                 slots.insert(
                     plan.key.clone(),
                     Slot::Held {
@@ -1451,7 +1472,7 @@ impl Sessions {
                     withhold(key, session, &reason);
                 }
                 (slot.held().is_some()
-                    || *opening != Opening::of(&self.env, &torrent, opening.shape))
+                    || **opening != Opening::of(&self.env, &torrent, opening.shape))
                 .then(|| key.clone())
             })
             .collect()
