@@ -6,8 +6,10 @@
 // Migrations finish before the real server binds, so a long upgrade used to
 // look like a Weaver that would not start: the browser got "connection
 // refused" and nothing said why. This watches for an upgrade and, only once
-// one is actually running, answers on Weaver's own address with the turning W
-// and how far the upgrade has got. The page polls, and reloads into Weaver
+// one is actually running or its backup is being written, answers on Weaver's
+// own address with the turning W and how far the upgrade has got. A liveness
+// probe is answered too, so a container manager does not restart a Weaver
+// that is upgrading. The page polls, and reloads into Weaver
 // when something other than this page answers.
 //
 // If Weaver stops answering instead -- an upgrade that failed ends the
@@ -70,7 +72,7 @@ impl UpgradeSplash {
         let task = tokio::spawn(async move {
             let mut progress = schema_upgrade::subscribe();
             loop {
-                if matches!(*progress.borrow_and_update(), SchemaUpgrade::Running { .. }) {
+                if !matches!(*progress.borrow_and_update(), SchemaUpgrade::Idle) {
                     break;
                 }
                 tokio::select! {
@@ -235,6 +237,7 @@ fn splash_resource(state: &SplashState, resource: &str) -> Response {
     match resource {
         "/status" => {
             let body = match *state.progress.borrow() {
+                SchemaUpgrade::BackingUp => serde_json::json!({ "state": "backing_up" }),
                 SchemaUpgrade::Running { applied, total } => serde_json::json!({
                     "state": "upgrading",
                     "applied": applied,
@@ -406,6 +409,9 @@ button:focus-visible { outline: 2px solid #3fb39c; outline-offset: 2px; }
         if (body && body.state === "upgrading") {
           progress.textContent = "Applying change " + Math.min(body.applied + 1, body.total) + " of " + body.total;
           meter.style.width = (body.total ? (body.applied / body.total) * 100 : 0) + "%";
+        } else if (body && body.state === "backing_up") {
+          progress.textContent = "Backing up first";
+          meter.style.width = "0%";
         } else if (body && body.state === "starting") {
           starting();
         } else {
@@ -563,6 +569,26 @@ mod tests {
             get(&app, "/weaver/readyz", "*/*").await.0,
             StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    #[tokio::test]
+    async fn the_backup_before_an_upgrade_is_answered_like_the_upgrade() {
+        let (sender, app) = state(SchemaUpgrade::BackingUp, "");
+        assert_eq!(get(&app, "/healthz", "*/*").await.0, StatusCode::OK);
+        assert_eq!(
+            get(&app, "/readyz", "*/*").await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let (_, _, body) = get(&app, "/__weaver/upgrade/status", "*/*").await;
+        assert_eq!(body, r#"{"state":"backing_up"}"#);
+
+        sender.send_replace(SchemaUpgrade::Running {
+            applied: 0,
+            total: 2,
+        });
+        let (_, _, body) = get(&app, "/__weaver/upgrade/status", "*/*").await;
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["state"], "upgrading");
     }
 
     #[test]
