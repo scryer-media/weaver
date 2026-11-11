@@ -4,17 +4,24 @@
 import { useMemo } from "react";
 import { useSubscription } from "urql";
 import { TORRENT_SUMMARY_UPDATES_SUBSCRIPTION } from "@/graphql/queries";
+import { usePageVisible } from "@/lib/page-visible";
 import { applyTorrentChanges, type TorrentChangesData, type TorrentSummaryData } from "@/lib/torrents";
 import { useNextData } from "@/next/data/next-data";
 
 const NO_TORRENTS: ReadonlyMap<number, TorrentSummaryData> = new Map();
 
 /**
- * Each torrent's seeding figures and force flag, by job id, followed while
- * the queue holds a torrent.
+ * The seeding figures and force flag of the torrents `ids` names, by job
+ * id: the torrents a page shows, followed while it shows any and the tab
+ * is visible. Shown again, the tab reads them afresh.
  */
-export function useTorrentSummaries(active: boolean): ReadonlyMap<number, TorrentSummaryData> {
+export function useTorrentSummaries(ids: readonly number[]): ReadonlyMap<number, TorrentSummaryData> {
   const { connection } = useNextData("connection");
+  const visible = usePageVisible();
+  // The same torrents in another order are the same follow.
+  const key = [...new Set(ids)].sort((a, b) => a - b).join(",");
+  const variables = useMemo(() => ({ ids: key === "" ? [] : key.split(",").map(Number) }), [key]);
+  const active = key !== "";
   // Each push carries only what moved, so the torrents are kept between them.
   const [{ data }] = useSubscription<
     { torrentUpdates: TorrentChangesData<TorrentSummaryData> },
@@ -22,7 +29,8 @@ export function useTorrentSummaries(active: boolean): ReadonlyMap<number, Torren
   >(
     {
       query: TORRENT_SUMMARY_UPDATES_SUBSCRIPTION,
-      pause: !active || connection.isDisconnected,
+      variables,
+      pause: !active || !visible || connection.isDisconnected,
     },
     (held, pushed) => applyTorrentChanges(held, pushed.torrentUpdates),
   );

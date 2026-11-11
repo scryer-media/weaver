@@ -6,6 +6,7 @@
 
 use super::*;
 use crate::torrents::service::listing::{CategoryPick, Pick, Shown, page};
+use crate::torrents::service::updates::Follow;
 
 const TORRENTS: usize = 120;
 
@@ -38,7 +39,32 @@ async fn seeded(rig: &Rig, clock: &SetClock) -> Vec<JobId> {
         jobs.push(job_id);
     }
     clock.0.store(EPOCH_MS + 10_000_000, Ordering::SeqCst);
+    settled(&rig.service, TORRENTS).await;
     jobs
+}
+
+// Once each of `count` torrents is past checking what was saved of it, as
+// a follower of every torrent hears it: a view read before then can say
+// it is checking, and one read after says it is paused.
+async fn settled(service: &TorrentService, count: usize) {
+    let mut updates = service.follow(Follow::Every, std::time::Duration::from_millis(10));
+    let mut states = std::collections::HashMap::new();
+    loop {
+        let changes = updates.next().await;
+        for view in changes.torrents {
+            states.insert(view.job_id, view.state);
+        }
+        for job_id in changes.removed {
+            states.remove(&job_id);
+        }
+        if states.len() == count
+            && states
+                .values()
+                .all(|state| *state != TorrentState::CheckingResumeData)
+        {
+            return;
+        }
+    }
 }
 
 fn ids(views: &[TorrentView]) -> Vec<JobId> {
@@ -165,5 +191,54 @@ async fn a_picked_page_is_the_page_of_every_view() {
     }
     assert_eq!(rig.service.torrent_by_hash("nothex").await, None);
     assert_eq!(rig.service.torrent_by_hash(&"cd".repeat(20)).await, None);
+    rig.service.stop().await;
+}
+
+// A follower of a few torrents is given what every torrent's follower is
+// given of those, and hears nothing of the others.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_followed_set_is_given_its_torrents_of_every_torrent() {
+    use std::collections::BTreeSet;
+    use std::time::Duration;
+
+    let clock = set_clock();
+    let rig = rig(clock.clone());
+    let jobs = seeded(&rig, &clock).await;
+    let followed: BTreeSet<JobId> = jobs
+        .iter()
+        .step_by(4)
+        .copied()
+        .chain([JobId(999_999)])
+        .collect();
+    let beat = Duration::from_millis(10);
+    let every = rig.service.follow(Follow::Every, beat).next().await;
+    let mut some = rig.service.follow(Follow::Some(followed.clone()), beat);
+    let first = some.next().await;
+    assert!(first.full_update);
+    let old: Vec<TorrentView> = every
+        .torrents
+        .into_iter()
+        .filter(|view| followed.contains(&view.job_id))
+        .collect();
+    assert_eq!(old.len(), TORRENTS / 4);
+    assert_eq!(first.torrents, old);
+    assert_eq!(first.torrents, rig.service.torrents_of(&followed).await);
+
+    // A torrent it does not follow goes unheard; one it follows goes as
+    // gone. What a removal moves in the others is told of those it follows.
+    rig.service.remove(jobs[1], false, false).await.unwrap();
+    rig.service.remove(jobs[4], false, false).await.unwrap();
+    loop {
+        let next = some.next().await;
+        assert!(!next.full_update);
+        assert!(next.torrents.iter().all(|view| followed.contains(&view.job_id)));
+        assert!(next.removed.iter().all(|job_id| *job_id == jobs[4]));
+        if !next.removed.is_empty() {
+            break;
+        }
+    }
+    let now = rig.service.torrents_of(&followed).await;
+    assert_eq!(now.len(), TORRENTS / 4 - 1);
+    assert!(now.iter().all(|view| view.job_id != jobs[4]));
     rig.service.stop().await;
 }

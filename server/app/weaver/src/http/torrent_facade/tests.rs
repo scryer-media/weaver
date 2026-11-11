@@ -3744,6 +3744,24 @@ async fn torrents_info_filters_and_pages_as_the_whole_list() {
             })
             .collect()
     };
+    // Each torrent past checking what was saved of it, so that no read
+    // below sees one torrent checking that another read saw stopped.
+    let service = rig.context.inner.torrents.as_ref().unwrap();
+    let mut updates = service.follow(
+        weaver_server_core::torrents::service::updates::Follow::Every,
+        std::time::Duration::from_millis(10),
+    );
+    let mut states = std::collections::HashMap::new();
+    while states.len() != 45
+        || states
+            .values()
+            .any(|state| *state == TorrentState::CheckingResumeData)
+    {
+        let changes = updates.next().await;
+        for view in changes.torrents {
+            states.insert(view.job_id, view.state);
+        }
+    }
     let all = steady(rig.get("/api/v2/torrents/info").await.json());
     assert_eq!(all.len(), 45);
     let hashes: Vec<String> = all

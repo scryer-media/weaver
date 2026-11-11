@@ -331,7 +331,12 @@ export function DownloadsPage() {
     [page.jobs, removedIds],
   );
 
-  const torrents = useTorrentSummaries(jobs.some((job) => job.protocol === "TORRENT"));
+  // Only the torrents on the page are followed.
+  const torrentIds = useMemo(
+    () => jobs.filter((job) => job.protocol === "TORRENT").map((job) => job.id),
+    [jobs],
+  );
+  const torrents = useTorrentSummaries(torrentIds);
   const seedingColumn = [...torrents.values()].some((torrent) => showsSeeding(torrent.state));
   // The row handlers read a job's protocol by id, so they keep their identity while the rows move.
   const jobsRef = useRef(jobs);

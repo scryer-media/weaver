@@ -5,7 +5,7 @@
 //! is built: a page, a category or a few hashes cost the views they show,
 //! not one view per torrent.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ops::Range;
 
 use weaver_torrent::core::Id20;
@@ -146,6 +146,25 @@ impl TorrentService {
             let Range { start, end } = page(ids.len());
             let end = end.min(ids.len());
             ids.get(start.min(end)..end).unwrap_or_default().to_vec()
+        })
+        .await
+        .into_iter()
+        .map(|(view, _)| view)
+        .collect()
+    }
+
+    /// The torrents of `ids` there are, as [`TorrentService::torrents`]
+    /// lists them and in its order. Only their views are built.
+    pub async fn torrents_of(&self, ids: &BTreeSet<JobId>) -> Vec<TorrentView> {
+        let now = self.inner.clock.now_ms();
+        self.listed_by(Shown::LISTED, false, now, |_, live| {
+            let mut kept: Vec<(i64, JobId)> = ids
+                .iter()
+                .filter_map(|job_id| live.get(job_id))
+                .map(|torrent| (torrent.record.added_at_ms, torrent.record.job_id))
+                .collect();
+            kept.sort_unstable();
+            kept.into_iter().map(|(_, job_id)| job_id).collect()
         })
         .await
         .into_iter()

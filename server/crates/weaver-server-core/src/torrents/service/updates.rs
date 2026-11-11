@@ -13,7 +13,7 @@
 //! tells a change, or each beat would carry every running torrent; one
 //! torrent's follower, which shows those seconds, counts them.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::future::{Future, poll_fn};
 use std::task::Poll;
 use std::time::Duration;
@@ -23,13 +23,14 @@ use tokio::time::{Interval, MissedTickBehavior};
 use weaver_torrent::TrackerAnnounce;
 
 use super::fingerprint::ViewParts;
-use super::{TorrentService, TorrentView};
+use super::{Live, TorrentService, TorrentView};
 use crate::jobs::JobId;
 
-/// The torrents' views as they move: one torrent's, or every torrent's.
+/// The torrents' views as they move: one torrent's, a few torrents', or
+/// every torrent's.
 pub struct TorrentUpdates {
     service: TorrentService,
-    job_id: Option<JobId>,
+    follow: Follow,
     beat: Interval,
     queue: Option<watch::Receiver<u64>>,
     // The tags' revision: a view shows its job's tags.
@@ -49,16 +50,33 @@ pub struct TorrentChanges {
     pub removed: Vec<JobId>,
 }
 
+/// Which torrents a follower follows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Follow {
+    /// One torrent, with the fields that move with the clock alone.
+    One(JobId),
+    /// The torrents of a set, as every torrent's follower sees them: a list
+    /// shows a page of the torrents, and follows those alone.
+    Some(BTreeSet<JobId>),
+    Every,
+}
+
 impl TorrentService {
     /// Follow the torrents' views: `job_id`'s alone when one is given, every
     /// torrent's otherwise. Between pushes the views are read again every
     /// `beat`.
     pub fn updates(&self, job_id: Option<JobId>, beat: Duration) -> TorrentUpdates {
+        self.follow(job_id.map_or(Follow::Every, Follow::One), beat)
+    }
+
+    /// Follow the views of the torrents `follow` names. Between pushes the
+    /// views are read again every `beat`.
+    pub fn follow(&self, follow: Follow, beat: Duration) -> TorrentUpdates {
         let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + beat, beat);
         beat.set_missed_tick_behavior(MissedTickBehavior::Delay);
         TorrentUpdates {
             service: self.clone(),
-            job_id,
+            follow,
             beat,
             queue: self
                 .queue()
@@ -71,14 +89,15 @@ impl TorrentService {
     // The announce table of each followed torrent's current run, seen as it
     // is now. A run that starts later brings its own table, taken the next
     // time the views are read.
-    async fn announce_tables(
-        &self,
-        job_id: Option<JobId>,
-    ) -> Vec<watch::Receiver<Vec<TrackerAnnounce>>> {
+    async fn announce_tables(&self, follow: &Follow) -> Vec<watch::Receiver<Vec<TrackerAnnounce>>> {
         let live = self.inner.live.lock().await;
-        live.iter()
-            .filter(|(id, _)| job_id.is_none_or(|job_id| **id == job_id))
-            .filter_map(|(_, torrent)| match &torrent.attached {
+        let followed: Box<dyn Iterator<Item = &Live>> = match follow {
+            Follow::One(job_id) => Box::new(live.get(job_id).into_iter()),
+            Follow::Some(ids) => Box::new(ids.iter().filter_map(|job_id| live.get(job_id))),
+            Follow::Every => Box::new(live.values()),
+        };
+        followed
+            .filter_map(|torrent| match &torrent.attached {
                 Some(attached) => attached.handle.tracker_status(),
                 None => torrent
                     .fetching
@@ -97,7 +116,7 @@ impl TorrentUpdates {
         loop {
             // What is waited on is taken before the views are read, so a
             // move after the read wakes the wait.
-            let mut tables = self.service.announce_tables(self.job_id).await;
+            let mut tables = self.service.announce_tables(&self.follow).await;
             for changes in [&mut self.queue, &mut self.tags].into_iter().flatten() {
                 changes.borrow_and_update();
             }
@@ -118,7 +137,7 @@ impl TorrentUpdates {
     // What a change is told by: one torrent's follower shows its seconds,
     // every torrent's follower reads the list's fields.
     fn parts(&self) -> ViewParts {
-        if self.job_id.is_some() {
+        if matches!(self.follow, Follow::One(_)) {
             ViewParts::Whole
         } else {
             ViewParts::Steady
@@ -126,9 +145,10 @@ impl TorrentUpdates {
     }
 
     async fn read(&self) -> Vec<TorrentView> {
-        match self.job_id {
-            Some(job_id) => self.service.torrent(job_id).await.into_iter().collect(),
-            None => self.service.torrents(None).await,
+        match &self.follow {
+            Follow::One(job_id) => self.service.torrent(*job_id).await.into_iter().collect(),
+            Follow::Some(ids) => self.service.torrents_of(ids).await,
+            Follow::Every => self.service.torrents(None).await,
         }
     }
 }

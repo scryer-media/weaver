@@ -1849,8 +1849,8 @@ export const SCHEDULE_SEEDING_QUERY = gql`
  * every torrent first, then the changed ones and the ids of the gone.
  */
 export const TORRENT_SUMMARY_UPDATES_SUBSCRIPTION = gql`
-  subscription TorrentSummaryUpdates {
-    torrentUpdates {
+  subscription TorrentSummaryUpdates($ids: [Int!]!) {
+    torrentUpdates(ids: $ids) {
       fullUpdate
       removedIds
       torrents {
