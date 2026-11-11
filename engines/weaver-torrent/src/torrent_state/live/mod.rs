@@ -3144,9 +3144,10 @@ impl PeerHandler {
         }
 
         // A request for a block that is not one, or of a piece we do not
-        // have, is dropped (libtorrent `peer_connection::incoming_request`).
-        // While we super-seed, so is one for a piece other than the one
-        // the peer was handed (libtorrent `peer_connection::incoming_request`).
+        // have, is refused; while we super-seed, so is one for a piece other
+        // than the ones the peer was handed (libtorrent
+        // `peer_connection::incoming_request`, which answers each with
+        // `write_reject_request`).
         let chunk_info = match self.requested_chunk(&request) {
             Some(chunk)
                 if !self.state.super_seeding
@@ -3210,20 +3211,21 @@ impl PeerHandler {
         }
     }
 
-    /// The peer asked for what we cannot serve. The request is dropped: with
-    /// no fast extension there is no Reject to send.
+    /// The peer asked for what we cannot serve. The request is dropped, with
+    /// a Reject on a fast connection; a plain one has no word for it
+    /// (libtorrent `peer_connection::incoming_request`).
     fn on_invalid_request(&self, request: Request) -> anyhow::Result<()> {
         let peer_chokes_us = self.choked_by_peer();
         let keep = self
             .state
             .peers
             .with_live_mut(self.addr, "invalid_request", |live| {
-                live.invalid_request(peer_chokes_us)
+                live.invalid_request(request, peer_chokes_us)
             });
         if keep == Some(false) {
             anyhow::bail!("too many invalid requests while choked, the last {request:?}");
         }
-        trace!(?request, "dropping a request we cannot serve");
+        trace!(?request, "refusing a request we cannot serve");
         Ok(())
     }
 

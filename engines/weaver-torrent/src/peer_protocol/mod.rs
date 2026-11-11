@@ -86,7 +86,7 @@ const PSTR_BT1: &str = "BitTorrent protocol";
 const V2_UPGRADE_BIT: u8 = 0x10;
 // libtorrent `bt_peer_connection::write_handshake`: "we support FAST
 // extension" (BEP 6), in the last reserved byte.
-const FAST_BIT: u8 = 0x04;
+pub(crate) const FAST_BIT: u8 = 0x04;
 
 // libtorrent `bt_peer_connection::write_handshake`: "we support DHT
 // messages", the low bit of the last reserved byte (BEP 5).

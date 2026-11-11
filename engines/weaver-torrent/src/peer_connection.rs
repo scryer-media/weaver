@@ -19,7 +19,7 @@ use crate::core::{
 };
 use crate::peer_protocol::{
     Handshake, Hashes, Message, PIECE_MESSAGE_DEFAULT_LEN, PIECE_MESSAGE_PREAMBLE_LEN,
-    PartialBlock,
+    PartialBlock, Request,
     extended::{
         ExtendedMessage, PeerExtendedMessageIds, handshake::ExtendedHandshake,
         ut_metadata::UtMetadata, ut_pex::UtPex,
@@ -819,9 +819,22 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                 .await
                                 .map_err(Error::ReadChunk)?
                             {
+                                // The block is refused, with a Reject on a
+                                // fast connection (libtorrent
+                                // `peer_connection::fill_send_buffer`, a
+                                // piece we turn out not to have).
                                 trace!(?chunk, "upload not served");
                                 self.handler.upload_done(&chunk);
-                                None
+                                supports_fast
+                                    .then(|| {
+                                        let reject = Message::Reject(Request {
+                                            index: chunk.piece_index.get(),
+                                            begin: chunk.offset,
+                                            length: chunk.size,
+                                        });
+                                        reject.serialize(out, ext_msg_ids).map(Framed::message)
+                                    })
+                                    .transpose()?
                             } else {
                                 #[allow(unused_mut)]
                                 let mut read = true;
@@ -1439,9 +1452,19 @@ mod tests {
 
     // libtorrent `peer_connection::on_seed_mode_hashed`: a piece that fails
     // its seed-mode check is not sent, and the connection is not ended for
-    // it. The block asked for after it is sent on the same connection.
+    // it. The block asked for after it is sent on the same connection. A
+    // fast peer is sent a Reject for the block in its place
+    // (`peer_connection::fill_send_buffer`), a plain one nothing.
     #[tokio::test(start_paused = true)]
     async fn a_block_not_served_is_dropped_and_the_connection_kept() {
+        assert_eq!(serve_picky(true).await, (vec![1], vec![(0, 0, 16384)]));
+        assert_eq!(serve_picky(false).await, (vec![1], vec![]));
+    }
+
+    /// Serves blocks 0 and 1 to a peer that sets the fast bit when `fast`:
+    /// the pieces of the blocks sent, and the Rejects, by piece, offset and
+    /// length.
+    async fn serve_picky(fast: bool) -> (Vec<u32>, Vec<(u32, u32, u32)>) {
         use tokio::io::AsyncReadExt;
         const BLOCK: u32 = 16384;
         let picky = Picky;
@@ -1464,7 +1487,13 @@ mod tests {
             reader,
             writer: writer.into(),
             read_buf: ReadBuf::new(),
-            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            handshake: {
+                let mut handshake = Handshake::new(Id20::new(HASH), Id20::new([2; 20]));
+                if !fast {
+                    handshake.reserved &= !u64::from(crate::peer_protocol::FAST_BIT);
+                }
+                handshake
+            },
             encryption: crate::mse::Encryption::None,
             meter,
         };
@@ -1485,26 +1514,35 @@ mod tests {
         let peer = async {
             let mut handshake = [0; 68];
             theirs.read_exact(&mut handshake).await.unwrap();
-            // The pieces of the blocks sent, until the have after them.
+            // The pieces of the blocks sent and the Rejects, until the have
+            // after them.
             let mut sent = Vec::new();
+            let mut rejects = Vec::new();
+            let word = |body: &[u8], at: usize| {
+                u32::from_be_bytes(body[at..at + 4].try_into().unwrap())
+            };
             loop {
                 let mut body = vec![0; theirs.read_u32().await.unwrap() as usize];
                 theirs.read_exact(&mut body).await.unwrap();
                 if body == [4, 0, 0, 0, 3] {
                     break;
                 }
-                if body.first() == Some(&7) {
-                    sent.push(u32::from_be_bytes(body[1..5].try_into().unwrap()));
-                    assert!(body[9..].iter().all(|byte| *byte == 0xab));
+                match body.first() {
+                    Some(&7) => {
+                        sent.push(word(&body, 1));
+                        assert!(body[9..].iter().all(|byte| *byte == 0xab));
+                    }
+                    Some(&16) => rejects.push((word(&body, 1), word(&body, 5), word(&body, 9))),
+                    _ => {}
                 }
             }
             drop(tx);
-            sent
+            (sent, rejects)
         };
-        let (result, sent) = tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
-        assert_eq!(sent, [1]);
+        let (result, told) = tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
         // The connection ended only when its torrent let go of it.
         assert!(matches!(result, Err(Error::TorrentIsNotLive)), "{result:?}");
+        told
     }
 
     /// Records the blocks cut short it is told of; reads under the download
