@@ -1552,6 +1552,19 @@ pub struct DhtConfig {
 }
 
 // An entirely random node id.
+//
+// TODO(BEP 42): tie the node id to the node's external IP. Its first 21
+// bits are then a CRC32C of the masked IP and a small random number kept in
+// the last byte, so a node cannot choose where it sits among the ids.
+// libtorrent keeps a node whose id passes that check over one whose id does
+// not when a routing table slot is contested (`dht_prefer_verified_node_ids`,
+// on by default), and refuses none (`dht_enforce_node_id`, off by default).
+// What it needs here:
+// - the external IP, read from the `ip` of replies once several nodes agree
+//   on it; the DHT stores none today, and the id is made before any reply;
+// - the id built from that IP;
+// - the routing tables rebuilt around the new id when it is first known and
+//   whenever the external IP changes.
 fn random_node_id() -> Id20 {
     use rand::Rng as _;
     let mut id = [0u8; 20];
