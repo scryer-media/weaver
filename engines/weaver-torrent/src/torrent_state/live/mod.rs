@@ -2378,6 +2378,9 @@ impl PeerConnectionHandler for &'_ PeerHandler {
                 self.on_upload_only(upload_only)
             }
             Message::Extended(ExtendedMessage::DontHave(index)) => self.on_dont_have(index),
+            Message::Extended(ExtendedMessage::WrongSize(id)) => {
+                trace!(id, "ignoring an extended message of the wrong size");
+            }
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
                 if self.state.pex {
                     self.on_pex_message(pex)?;

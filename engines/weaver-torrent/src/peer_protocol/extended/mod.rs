@@ -128,6 +128,10 @@ pub enum ExtendedMessage<ByteBuf: ByteBufT> {
     /// The sender no longer has the piece of this index: four bytes, big
     /// endian (libtorrent `bt_peer_connection::write_dont_have`).
     DontHave(u32),
+    /// A message under our id for upload_only or lt_donthave whose size is
+    /// not that message's: it says nothing, and is ignored (libtorrent
+    /// `bt_peer_connection::on_extended` logs it and reads on).
+    WrongSize(u8),
     Dyn(u8, BencodeValue<ByteBuf>),
 }
 
@@ -182,6 +186,8 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 out.write_u8(emsg_id)?;
                 out.write_u32::<BE>(*index)?;
             }
+            // The id alone, which reads back as of the wrong size.
+            ExtendedMessage::WrongSize(msg_id) => out.write_u8(*msg_id)?,
         }
         Ok(usize::try_from(out.position()).expect("the cursor stays within its buffer"))
     }
@@ -220,31 +226,21 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
             MY_EXTENDED_UT_HOLEPUNCH => {
                 Ok(ExtendedMessage::UtHolepunch(UtHolepunch::deserialize(buf)?))
             }
-            // One byte, nonzero when the peer only uploads (libtorrent
-            // `bt_peer_connection::on_extended`, `upload_only_msg`).
-            MY_EXTENDED_UPLOAD_ONLY => match buf.get_contiguous(buf.len()) {
-                Some(&[byte]) => Ok(ExtendedMessage::UploadOnly(byte != 0)),
-                _ => Err(MessageDeserializeError::IncorrectMsgLen {
-                    received: u32::try_from(buf.len())
-                        .unwrap_or(u32::MAX)
-                        .saturating_add(1),
-                    expected: 2,
-                    msg_id,
-                }),
+            // One byte, nonzero when the peer only uploads; one of another
+            // size is ignored (libtorrent `bt_peer_connection::on_extended`,
+            // `upload_only_msg`, a packet of 3 bytes).
+            MY_EXTENDED_UPLOAD_ONLY => match buf.len() {
+                1 => Ok(ExtendedMessage::UploadOnly(buf.read_u8().unwrap() != 0)),
+                _ => Ok(ExtendedMessage::WrongSize(emsg_id)),
             },
-            // A piece index, four bytes (libtorrent
-            // `bt_peer_connection::on_extended`, `dont_have_msg`).
-            MY_EXTENDED_LT_DONTHAVE => match buf.get_contiguous(buf.len()) {
-                Some(&[a, b, c, d]) => {
-                    Ok(ExtendedMessage::DontHave(u32::from_be_bytes([a, b, c, d])))
+            // A piece index, four bytes; one of another size is ignored
+            // (libtorrent `bt_peer_connection::on_extended`, `dont_have_msg`,
+            // a packet of 6 bytes).
+            MY_EXTENDED_LT_DONTHAVE => match buf.consume::<4>() {
+                Ok(index) if buf.is_empty() => {
+                    Ok(ExtendedMessage::DontHave(u32::from_be_bytes(index)))
                 }
-                _ => Err(MessageDeserializeError::IncorrectMsgLen {
-                    received: u32::try_from(buf.len())
-                        .unwrap_or(u32::MAX)
-                        .saturating_add(1),
-                    expected: 5,
-                    msg_id,
-                }),
+                _ => Ok(ExtendedMessage::WrongSize(emsg_id)),
             },
             _ => Ok(ExtendedMessage::Dyn(emsg_id, from_bytes_contig(&buf)?)),
         }
@@ -438,17 +434,20 @@ mod tests {
             ExtendedMessage::deserialize(DoubleBufHelper::new(&[2, 7], &[])).unwrap(),
             ExtendedMessage::UploadOnly(true)
         );
+        // libtorrent `bt_peer_connection::on_extended` ignores one of
+        // another size, and the connection stays.
         for bad in [&[2][..], &[2, 1, 1]] {
-            assert!(matches!(
-                ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])),
-                Err(MessageDeserializeError::IncorrectMsgLen { .. })
-            ));
+            assert_eq!(
+                ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])).unwrap(),
+                ExtendedMessage::WrongSize(2)
+            );
         }
     }
 
     // libtorrent `bt_peer_connection::write_dont_have` and `on_extended`:
     // the id the peer named for lt_donthave, then the piece index in four
-    // bytes; read under our id, a message of another size is not one.
+    // bytes; read under our id, a message of another size is not one, and
+    // is ignored.
     #[test]
     fn dont_have_is_a_piece_index_under_the_peers_id() {
         let mut buf = [0u8; 8];
@@ -470,12 +469,17 @@ mod tests {
             .unwrap();
         let de = ExtendedMessage::deserialize(DoubleBufHelper::new(&buf[..sz], &[])).unwrap();
         assert_eq!(de, msg);
-        for bad in [&[7, 1, 2, 3][..], &[7, 1, 2, 3, 4, 5]] {
-            assert!(matches!(
-                ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])),
-                Err(MessageDeserializeError::IncorrectMsgLen { .. })
-            ));
+        // One of another size is ignored, split or not.
+        for bad in [&[7, 1, 2, 3][..], &[7, 1, 2, 3, 4, 5], &[7]] {
+            assert_eq!(
+                ExtendedMessage::deserialize(DoubleBufHelper::new(bad, &[])).unwrap(),
+                ExtendedMessage::WrongSize(7)
+            );
         }
+        assert_eq!(
+            ExtendedMessage::deserialize(DoubleBufHelper::new(&[7, 1, 2], &[3, 4])).unwrap(),
+            ExtendedMessage::DontHave(0x0102_0304)
+        );
     }
 
     // BEP 10: a first handshake's id of 0 names no support; a later one
