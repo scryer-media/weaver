@@ -540,6 +540,88 @@ fn an_owner_read_failure_is_no_format_refusal() {
     }
 }
 
+fn wide() -> weaver_graph::Budget {
+    weaver_graph::Budget {
+        memory_bytes: Some(1 << 30),
+        threads: 4,
+        ..Default::default()
+    }
+}
+
+fn many() -> (Vec<u8>, Vec<(String, Vec<u8>)>) {
+    let members: Vec<(String, Vec<u8>)> = (0..12u8)
+        .map(|i| {
+            let bytes = payload(u64::from(i) + 20, 3_000 + usize::from(i) * 700).repeat(4);
+            (format!("set/part-{i:02}.bin"), bytes)
+        })
+        .collect();
+    let borrowed: Vec<(&str, &[u8])> = members
+        .iter()
+        .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
+        .collect();
+    (lzma2(&borrowed), members)
+}
+
+// Each member's bytes joined from wherever they came, the order members were
+// announced and closed in, and the checksums said.
+#[derive(Debug, PartialEq, Eq)]
+struct Heard {
+    announced: Vec<(u32, String, Option<u64>)>,
+    closed: Vec<u32>,
+    bytes: std::collections::BTreeMap<u32, Vec<u8>>,
+    checksums: Vec<(u32, u32)>,
+}
+
+fn heard(emits: &[Emit]) -> Heard {
+    let mut heard = Heard {
+        announced: Vec::new(),
+        closed: Vec::new(),
+        bytes: std::collections::BTreeMap::new(),
+        checksums: checksums(emits),
+    };
+    for emit in emits {
+        match emit {
+            Emit::Member {
+                member,
+                name,
+                length,
+            } => heard.announced.push((member.0, name.clone(), *length)),
+            Emit::Bytes {
+                member,
+                offset,
+                bytes,
+                ..
+            } => {
+                assert!(
+                    heard.announced.iter().any(|(id, ..)| *id == member.0),
+                    "bytes of a member not announced"
+                );
+                assert!(!heard.closed.contains(&member.0), "bytes after a close");
+                let joined = heard.bytes.entry(member.0).or_default();
+                assert_eq!(*offset, joined.len() as u64);
+                joined.extend_from_slice(bytes);
+            }
+            Emit::MemberClosed(member) => heard.closed.push(member.0),
+            Emit::Checksum { .. } => {}
+            other => panic!("a clean run does not say {other:?}"),
+        }
+    }
+    heard
+}
+
+fn run_with(volumes: Arc<dyn Volumes>, budget: weaver_graph::Budget) -> Vec<Emit> {
+    let mut emits = Vec::new();
+    SevenZipEngine::new().start().run(
+        volumes,
+        &mut |emit| {
+            emits.push(emit);
+            true
+        },
+        budget,
+    );
+    emits
+}
+
 // The grant the lender tests hold a run to: room in RAM for a folder's
 // input buffer and coder state, none for its dictionary or model.
 const GRANT: u64 = 2 << 20;
@@ -609,7 +691,9 @@ const WORKERS_DICTIONARY: u32 = 12 << 20;
 const WORKERS_RUN: u64 = 47 << 20;
 
 // One LZMA2 folder of two runs of `WORKERS_RUN`, which a threaded decoder
-// decodes side by side; built once.
+// decodes side by side; built once. The folder is the archive's only one:
+// beside another, the folders would be decoded side by side instead, each on
+// its share of the threads and the memory.
 fn lzma2_workers() -> (Vec<u8>, Vec<u8>) {
     static BUILT: std::sync::OnceLock<(Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
     BUILT
@@ -617,11 +701,15 @@ fn lzma2_workers() -> (Vec<u8>, Vec<u8>) {
             let bytes = payload(11, 4_096).repeat(2 * WORKERS_RUN as usize / 4_096);
             let mut options = Lzma2Options::from_level_mt(1, 4, WORKERS_RUN);
             options.set_dictionary_size(WORKERS_DICTIONARY);
-            let archive = archive(
-                vec![EncoderConfiguration::from(options)],
-                &[("big.bin", &bytes)],
-            );
-            (archive, bytes)
+            let mut writer = ArchiveWriter::new(Cursor::new(Vec::new())).unwrap();
+            writer.set_content_methods(vec![EncoderConfiguration::from(options)]);
+            writer
+                .push_archive_entry(
+                    ArchiveEntry::new_file("big.bin"),
+                    Some(Cursor::new(bytes.clone())),
+                )
+                .unwrap();
+            (writer.finish().unwrap().into_inner(), bytes)
         })
         .clone()
 }
@@ -666,6 +754,245 @@ fn lent_run_of(
         budget,
     );
     said(&emits)
+}
+
+#[test]
+fn folders_decoded_side_by_side_say_what_one_by_one_says() {
+    let (archive, members) = many();
+    let one = heard(&run_with(
+        Gate::whole(vec![archive.clone()]),
+        weaver_graph::Budget::default(),
+    ));
+    let wide = heard(&run_with(Gate::whole(vec![archive]), wide()));
+    assert_eq!(wide, one);
+    // Announced and closed in archive order, every member whole.
+    let ids: Vec<u32> = (0..13).collect();
+    assert_eq!(
+        wide.announced
+            .iter()
+            .map(|(id, ..)| *id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+    assert_eq!(wide.closed, ids);
+    for (id, (name, bytes)) in members.iter().enumerate() {
+        assert_eq!(&wide.announced[id].1, name);
+        assert_eq!(&wide.bytes[&(id as u32)], bytes);
+    }
+}
+
+// The archive's bytes, with reads of one folder's packed bytes held until
+// the test lets them go.
+struct Held {
+    bytes: Vec<u8>,
+    held: ByteRange,
+    open: Mutex<bool>,
+    changed: Condvar,
+}
+
+impl Held {
+    fn open(&self) {
+        *self.open.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+}
+
+impl Volumes for Held {
+    fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
+        Ok(after.is_none().then_some(VolumeIndex(0)))
+    }
+
+    fn len(&self, _: VolumeIndex) -> Option<u64> {
+        Some(self.bytes.len() as u64)
+    }
+
+    fn read_at(&self, _: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+        let range = ByteRange::at(offset, into.len() as u64);
+        if range.start < self.held.end && self.held.start < range.end {
+            let mut open = self.open.lock().unwrap();
+            while !*open {
+                open = self.changed.wait(open).unwrap();
+            }
+        }
+        let start = (offset as usize).min(self.bytes.len());
+        let read = into.len().min(self.bytes.len() - start);
+        into[..read].copy_from_slice(&self.bytes[start..start + read]);
+        Ok(read)
+    }
+}
+
+#[test]
+fn a_later_member_decodes_while_an_earlier_one_waits_and_closes_after_it() {
+    // The first member's folder cannot be read until the second member has
+    // arrived whole, which a run decoding them one after another never gets
+    // past; the second still closes only after the first.
+    let first = payload(41, 9_000).repeat(3);
+    let second = payload(42, 7_000).repeat(3);
+    let archive = lzma2(&[("first.bin", &first), ("second.bin", &second)]);
+    let parsed =
+        sevenz_turbo::Archive::read(&mut Cursor::new(&archive), &Password::empty()).unwrap();
+    // The link's body is the first folder; the first member's is the next.
+    let pack = parsed.block_pack_streams(1)[0];
+    let held = Arc::new(Held {
+        bytes: archive,
+        held: ByteRange::at(pack.offset, pack.size),
+        open: Mutex::new(false),
+        changed: Condvar::new(),
+    });
+    let mut emits = Vec::new();
+    let mut second_got = 0usize;
+    let gate = Arc::clone(&held);
+    SevenZipEngine::new().start().run(
+        Arc::clone(&held) as Arc<dyn Volumes>,
+        &mut |emit| {
+            if let Emit::Bytes { member, bytes, .. } = &emit
+                && member.0 == 1
+            {
+                second_got += bytes.len();
+                if second_got == second.len() {
+                    gate.open();
+                }
+            }
+            emits.push(emit);
+            true
+        },
+        wide(),
+    );
+    let said = said(&emits);
+    assert_eq!(
+        said,
+        vec![
+            Said::Member(0, "first.bin".into(), Some(first.len() as u64)),
+            Said::Member(1, "second.bin".into(), Some(second.len() as u64)),
+            Said::Bytes(1, second),
+            Said::Bytes(0, first),
+            Said::Closed(0),
+            Said::Closed(1),
+            Said::Member(2, "deep/".into(), Some(0)),
+            Said::Closed(2),
+        ]
+    );
+}
+
+#[test]
+fn a_failed_folder_retracts_every_member_left_open_and_closes_only_those_before() {
+    let (mut archive, _) = many();
+    let parsed =
+        sevenz_turbo::Archive::read(&mut Cursor::new(&archive), &Password::empty()).unwrap();
+    // The link's body is the first folder, so member 4 is in the sixth.
+    let damaged = 4;
+    let pack = parsed.block_pack_streams(damaged + 1)[0];
+    for at in [pack.offset + 2, pack.offset + pack.size / 2] {
+        archive[at as usize] ^= 0xff;
+    }
+    let one = said(&run_with(
+        Gate::whole(vec![archive.clone()]),
+        weaver_graph::Budget::default(),
+    ));
+    let wide = said(&run_with(Gate::whole(vec![archive]), wide()));
+    let closed = |said: &[Said]| {
+        said.iter()
+            .filter_map(|said| match said {
+                Said::Closed(id) => Some(*id),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    let before: Vec<u32> = (0..damaged as u32).collect();
+    assert_eq!(closed(&one), before);
+    assert_eq!(closed(&wide), before);
+    assert_eq!(wide.last(), Some(&Said::Refuse(Why::Unrepairable)));
+    // Every member announced and not closed is retracted, the damaged one
+    // first, before the verdict.
+    let announced: Vec<u32> = wide
+        .iter()
+        .filter_map(|said| match said {
+            Said::Member(id, ..) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let retracted: Vec<u32> = wide
+        .iter()
+        .filter_map(|said| match said {
+            Said::Retract(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let open: Vec<u32> = announced
+        .into_iter()
+        .filter(|id| !before.contains(id))
+        .collect();
+    assert_eq!(retracted, open);
+    assert_eq!(retracted.first(), Some(&(damaged as u32)));
+    assert_eq!(
+        one[one.len() - 2..],
+        [
+            Said::Retract(damaged as u32),
+            Said::Refuse(Why::Unrepairable)
+        ]
+    );
+}
+
+#[test]
+fn a_sink_that_says_stop_ends_a_wide_run() {
+    let (archive, _) = many();
+    let mut emits = Vec::new();
+    SevenZipEngine::new().start().run(
+        Gate::whole(vec![archive]),
+        &mut |emit: Emit| {
+            let stop = matches!(emit, Emit::Bytes { .. });
+            emits.push(emit);
+            !stop
+        },
+        wide(),
+    );
+    let bytes = emits
+        .iter()
+        .filter(|emit| matches!(emit, Emit::Bytes { .. }))
+        .count();
+    assert_eq!(bytes, 1, "nothing after the stop: {emits:?}");
+    assert!(matches!(emits.last(), Some(Emit::Bytes { .. })));
+}
+
+#[test]
+fn an_earlier_member_closes_while_a_later_one_waits_for_its_bytes() {
+    // The last member's folder cannot be read until the first member has
+    // closed: a worker waiting on bytes still to come holds up no folder
+    // before its own.
+    let first = payload(43, 9_000).repeat(3);
+    let second = payload(44, 7_000).repeat(3);
+    let archive = lzma2(&[("first.bin", &first), ("second.bin", &second)]);
+    let parsed =
+        sevenz_turbo::Archive::read(&mut Cursor::new(&archive), &Password::empty()).unwrap();
+    let pack = parsed.block_pack_streams(2)[0];
+    let held = Arc::new(Held {
+        bytes: archive,
+        held: ByteRange::at(pack.offset, pack.size),
+        open: Mutex::new(false),
+        changed: Condvar::new(),
+    });
+    let mut emits = Vec::new();
+    let gate = Arc::clone(&held);
+    SevenZipEngine::new().start().run(
+        Arc::clone(&held) as Arc<dyn Volumes>,
+        &mut |emit| {
+            if matches!(emit, Emit::MemberClosed(MemberId(0))) {
+                gate.open();
+            }
+            emits.push(emit);
+            true
+        },
+        wide(),
+    );
+    let said = said(&emits);
+    let closed = said.iter().position(|said| *said == Said::Closed(0));
+    let second_bytes = said
+        .iter()
+        .position(|said| matches!(said, Said::Bytes(1, _)));
+    assert!(closed < second_bytes, "{closed:?} {second_bytes:?}");
+    assert!(said.contains(&Said::Bytes(1, second)));
+    assert!(said.contains(&Said::Bytes(0, first)));
+    assert_eq!(said.last(), Some(&Said::Closed(2)));
 }
 
 // The most windows the decoder says a run on `threads` threads under
@@ -1052,4 +1379,163 @@ fn an_encrypted_7z_the_lender_refuses_is_refused_by_the_scratch() {
         ),
         "{said:?}"
     );
+}
+
+// A dictionary for folders decoded side by side under a lender: over the
+// memory `lent_side_by_side` grants, so each folder's is lent, and each
+// member a little longer, so none is clamped to its member.
+const FOLDER_DICTIONARY: u32 = 12 << 20;
+
+// Two LZMA2 folders, each of one member over `FOLDER_DICTIONARY`, beside
+// the link's; built once.
+fn lent_folders() -> Vec<u8> {
+    static BUILT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let len = FOLDER_DICTIONARY as usize + 4_096;
+            let first = payload(51, 4_096).repeat(len / 4_096);
+            let second = payload(52, 4_096).repeat(len / 4_096);
+            let mut options = Lzma2Options::from_level(1);
+            options.set_dictionary_size(FOLDER_DICTIONARY);
+            archive(
+                vec![EncoderConfiguration::from(options)],
+                &[("first.bin", &first), ("second.bin", &second)],
+            )
+        })
+        .clone()
+}
+
+// Room in RAM for two folders' input, coder state and pieces in flight
+// side by side, none for either dictionary.
+fn lent_side_by_side() -> weaver_graph::Budget {
+    weaver_graph::Budget {
+        memory_bytes: Some(10 << 20),
+        ..grant(4)
+    }
+}
+
+// Folders decoded side by side each borrow their own dictionary: the
+// second member decodes whole while the first's folder cannot be read yet,
+// which a run one folder at a time never gets past, and the run says what
+// such a run says. No more windows are out at once than the decoder says a
+// run on as many threads can have, and every one is given back.
+#[test]
+fn folders_side_by_side_each_borrow_their_own_dictionary() {
+    use crate::lent::testing::TestLender;
+    let archive = lent_folders();
+    let budget = lent_side_by_side();
+    let lender = TestLender::new();
+    let one = heard(&run_with(
+        Gate::whole(vec![archive.clone()]),
+        weaver_graph::Budget::default(),
+    ));
+    let second_len = one.bytes[&1].len();
+    // The link's body is the first folder; the first member's is the next.
+    let pack = parsed(&archive).block_pack_streams(1)[0];
+    let held = Arc::new(Held {
+        bytes: archive.clone(),
+        held: ByteRange::at(pack.offset, pack.size),
+        open: Mutex::new(false),
+        changed: Condvar::new(),
+    });
+    let gate = Arc::clone(&held);
+    let mut emits = Vec::new();
+    let mut second_got = 0usize;
+    SevenZipEngine::new().start().run(
+        held,
+        &mut |emit| {
+            if let Emit::Bytes { member, bytes, .. } = &emit
+                && member.0 == 1
+            {
+                second_got += bytes.len();
+                if second_got == second_len {
+                    gate.open();
+                }
+            }
+            emits.push(emit);
+            true
+        },
+        lender.lending(budget.clone()),
+    );
+    assert_eq!(heard(&emits), one);
+    let closed_first = emits
+        .iter()
+        .position(|emit| matches!(emit, Emit::MemberClosed(MemberId(0))));
+    let first_bytes = emits
+        .iter()
+        .position(|emit| matches!(emit, Emit::Bytes { member, .. } if member.0 == 0));
+    let second_done = emits
+        .iter()
+        .position(|emit| matches!(emit, Emit::Bytes { member, .. } if member.0 == 1));
+    assert!(second_done < first_bytes && first_bytes < closed_first);
+    let asked = lender.asked();
+    assert_eq!(
+        asked,
+        [FOLDER_DICTIONARY as usize, FOLDER_DICTIONARY as usize],
+        "each folder borrows its own"
+    );
+    let most = lent_windows(&archive, &lender.lending(budget), 4);
+    assert!(
+        lender.peak() <= most,
+        "{} at once, {most} said",
+        lender.peak()
+    );
+    assert_eq!(lender.live(), 0);
+}
+
+// A lender with room for one folder's dictionary and not two has the
+// folders decoded one at a time: never two borrowed at once, nothing
+// refused, and the run says what a run one folder at a time says.
+#[test]
+fn folders_whose_dictionaries_the_lender_cannot_hold_together_decode_one_at_a_time() {
+    use crate::lent::testing::TestLender;
+    let archive = lent_folders();
+    let budget = lent_side_by_side();
+    let one_folder = decoder_memory(&archive, &TestLender::new().lending(budget.clone()), 1);
+    let two_folders = decoder_memory(&archive, &TestLender::new().lending(budget.clone()), 2);
+    assert!(two_folders.lent_bytes > one_folder.lent_bytes);
+    let lender = TestLender::with_room(one_folder.lent_bytes);
+    let lending = lender.lending(budget);
+    assert_eq!(
+        crate::lent::sevenz_threads(
+            &parsed(&archive),
+            &crate::lent::sevenz_of(&parsed(&archive), &lending),
+            &lending,
+            4
+        ),
+        1
+    );
+    let said = run_with(Gate::whole(vec![archive.clone()]), lending);
+    assert_eq!(
+        heard(&said),
+        heard(&run_with(
+            Gate::whole(vec![archive]),
+            weaver_graph::Budget::default()
+        ))
+    );
+    assert_eq!(lender.peak(), 1);
+    assert_eq!(lender.live(), 0);
+}
+
+// Without a lender, memory for one folder's decode and not two has the
+// folders decoded one at a time, and memory for both side by side; either
+// way nothing is refused and the run says what a run one folder at a time
+// says.
+#[test]
+fn folders_decode_side_by_side_only_as_the_memory_holds_them() {
+    let archive = lent_folders();
+    let one = heard(&run_with(
+        Gate::whole(vec![archive.clone()]),
+        weaver_graph::Budget::default(),
+    ));
+    let needed = in_ram(&archive);
+    for memory in [needed, 4 * needed] {
+        let budget = weaver_graph::Budget {
+            memory_bytes: Some(memory),
+            window_bytes: Some(memory),
+            ..grant(4)
+        };
+        let said = run_with(Gate::whole(vec![archive.clone()]), budget);
+        assert_eq!(heard(&said), one, "{memory}");
+    }
 }
