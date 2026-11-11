@@ -1828,23 +1828,23 @@ async fn pausing_all_is_one_hold_over_each_torrents_own_pause() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_private_torrent_short_of_its_goal_needs_confirmation_to_delete() {
+async fn the_client_deletes_a_private_torrent_short_of_its_goal() {
     let rig = rig().await;
     rig.add_file(&metainfo("p.bin", 2000, true), &[]).await;
     let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
-    let refused = rig
-        .post(
-            "/api/v2/torrents/delete",
-            &format!("hashes={hash}&deleteFiles=false"),
-        )
-        .await;
-    assert_eq!(refused.status, StatusCode::CONFLICT);
-    assert!(refused.body.contains("seeding goal"), "{}", refused.body);
+    // Weaver's own removal still asks for a confirmation.
+    let torrents = rig.context.inner.torrents.as_ref().unwrap();
+    let job_id = rig.context.by_hash(&hash).await.unwrap().job_id;
+    assert!(matches!(
+        torrents.remove(job_id, false, false).await,
+        Err(ActionError::UnmetGoal(_))
+    ));
     assert_eq!(rig.torrents().await.len(), 1);
+    // qBittorrent's `torrents/delete` never refuses.
     let removed = rig
         .post(
             "/api/v2/torrents/delete",
-            &format!("hashes={hash}&deleteFiles=false&confirmUnmetGoal=true"),
+            &format!("hashes={hash}&deleteFiles=false"),
         )
         .await;
     assert_eq!(removed.status, StatusCode::OK);

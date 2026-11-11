@@ -2534,20 +2534,16 @@ async fn delete(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         return ok();
     };
     let delete_files = params.flag("deleteFiles").unwrap_or(false);
-    let confirm = params.flag("confirmUnmetGoal").unwrap_or(false);
-    let mut refused = Vec::new();
+    // qBittorrent's `torrents/delete` removes what it is asked to, a private
+    // torrent short of its seeding goal too (torrentscontroller.cpp
+    // `deleteAction`): the client that asks decided.
     for view in ctx.targets(params).await {
-        match torrents.remove(view.job_id, delete_files, confirm).await {
+        match torrents.remove(view.job_id, delete_files, true).await {
             Ok(()) | Err(ActionError::NotFound(_)) => {}
-            Err(error @ ActionError::UnmetGoal(_)) => refused.push(error.to_string()),
             Err(error) => return internal(error),
         }
     }
-    if refused.is_empty() {
-        ok()
-    } else {
-        text(StatusCode::CONFLICT, refused.join("\n"))
-    }
+    ok()
 }
 
 // The tags as stored: from memory when nothing changed them since the last
