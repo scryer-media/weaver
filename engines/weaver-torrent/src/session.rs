@@ -4090,7 +4090,7 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
         crate::tracker::TrackerCommsStats {
             private,
             uploaded_bytes: totals.uploaded_bytes,
-            downloaded_bytes: totals.downloaded_bytes,
+            downloaded_bytes: totals.announced_downloaded(),
             corrupt_bytes: totals.failed_bytes,
             redundant_bytes: totals.redundant_bytes,
             left_bytes,

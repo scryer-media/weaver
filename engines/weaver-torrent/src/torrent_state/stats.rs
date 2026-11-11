@@ -72,6 +72,24 @@ pub struct TorrentTotals {
     pub failed_bytes: u64,
     /// Bytes of the blocks received and not used.
     pub redundant_bytes: u64,
+    /// The part of `redundant_bytes` that is blocks cut short as their
+    /// connection closed, never counted in `fetched_bytes`.
+    pub cut_short_bytes: u64,
+}
+
+impl TorrentTotals {
+    /// The `downloaded` a tracker is told: the payload received, less what
+    /// failed its check and what was not used, and never below 0 (libtorrent
+    /// `torrent::announce_with_tracker`, `src/torrent.cpp` 3128 and
+    /// 3140-3163, under `report_true_downloaded` off, its default). A block
+    /// cut short is payload received and redundant both, as libtorrent counts
+    /// its bytes as they arrive (`src/bt_peer_connection.cpp` 1097) and then
+    /// as redundant when its connection closes (`src/peer_connection.cpp`
+    /// 4477-4482).
+    pub fn announced_downloaded(&self) -> u64 {
+        (self.fetched_bytes + self.cut_short_bytes)
+            .saturating_sub(self.failed_bytes + self.redundant_bytes)
+    }
 }
 
 impl std::ops::Add for TorrentTotals {
@@ -86,6 +104,7 @@ impl std::ops::Add for TorrentTotals {
             uploaded_protocol_bytes: self.uploaded_protocol_bytes + other.uploaded_protocol_bytes,
             failed_bytes: self.failed_bytes + other.failed_bytes,
             redundant_bytes: self.redundant_bytes + other.redundant_bytes,
+            cut_short_bytes: self.cut_short_bytes + other.cut_short_bytes,
         }
     }
 }
@@ -101,6 +120,7 @@ impl From<&StatsSnapshot> for TorrentTotals {
             uploaded_protocol_bytes: run.uploaded_protocol_bytes,
             failed_bytes: run.failed_bytes,
             redundant_bytes: run.redundant_bytes,
+            cut_short_bytes: run.cut_short_bytes,
         }
     }
 }

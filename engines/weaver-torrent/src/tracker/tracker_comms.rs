@@ -89,9 +89,8 @@ pub enum TrackerCommsStatsState {
 pub struct TrackerCommsStats {
     /// Payload bytes sent to peers during this run.
     pub uploaded_bytes: u64,
-    /// Bytes of the pieces downloaded during this run that passed their hash
-    /// check. Pieces the torrent already had when the run began are not
-    /// counted, and neither is a piece that failed its check.
+    /// Payload bytes received from peers, less the corrupt and redundant
+    /// bytes (see `TorrentTotals::announced_downloaded`).
     pub downloaded_bytes: u64,
     /// Bytes of the pieces downloaded that failed their hash check.
     pub corrupt_bytes: u64,

@@ -24,6 +24,9 @@ pub struct StatsSnapshot {
     pub failed_bytes: u64,
     /// Bytes of the blocks received and not used.
     pub redundant_bytes: u64,
+    /// The part of `redundant_bytes` that is blocks cut short as their
+    /// connection closed, never counted in `fetched_bytes`.
+    pub cut_short_bytes: u64,
 
     pub downloaded_and_checked_pieces: u64,
     pub total_piece_download_ms: u64,
