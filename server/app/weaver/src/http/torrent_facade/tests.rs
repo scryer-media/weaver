@@ -3704,3 +3704,129 @@ async fn a_categorys_options_are_set_and_read_back() {
         (StatusCode::NOT_FOUND, "Category does not exist")
     );
 }
+
+// `torrents/info` reads its hashes, category, privacy and page from the
+// torrents' records and builds the views it sends alone: each answer is the
+// rows of the whole list, filtered, sorted and paged as the client asks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn torrents_info_filters_and_pages_as_the_whole_list() {
+    let rig = rig().await;
+    rig.post("/api/v2/torrents/createCategory", "category=tv")
+        .await;
+    for index in 0..45 {
+        let category = if index % 2 == 0 { "tv" } else { "" };
+        let tags = if index % 5 == 0 { "hd" } else { "" };
+        rig.add_file(
+            &metainfo(&format!("{index:02}.mkv"), 3000, index % 3 == 0),
+            &[("stopped", "true"), ("category", category), ("tags", tags)],
+        )
+        .await;
+    }
+    // A row without the fields that move with the clock alone.
+    let steady = |rows: Value| -> Vec<Value> {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                for key in [
+                    "eta",
+                    "popularity",
+                    "seen_complete",
+                    "time_active",
+                    "seeding_time",
+                    "last_activity",
+                    "reannounce",
+                ] {
+                    row.as_object_mut().unwrap().remove(key);
+                }
+                row
+            })
+            .collect()
+    };
+    // Each torrent past checking what was saved of it, so that no read
+    // below sees one torrent checking that another read saw stopped.
+    let service = rig.context.inner.torrents.as_ref().unwrap();
+    let mut updates = service.follow(
+        weaver_server_core::torrents::service::updates::Follow::Every,
+        std::time::Duration::from_millis(10),
+    );
+    let mut states = std::collections::HashMap::new();
+    while states.len() != 45
+        || states
+            .values()
+            .any(|state| *state == TorrentState::CheckingResumeData)
+    {
+        let changes = updates.next().await;
+        for view in changes.torrents {
+            states.insert(view.job_id, view.state);
+        }
+    }
+    let all = steady(rig.get("/api/v2/torrents/info").await.json());
+    assert_eq!(all.len(), 45);
+    let hashes: Vec<String> = all
+        .iter()
+        .step_by(4)
+        .map(|row| row["hash"].as_str().unwrap().to_uppercase())
+        .collect();
+    let named = format!("{}|nothex|{}", hashes.join("|"), "ab".repeat(20));
+    let is_named = |row: &Value| {
+        hashes
+            .iter()
+            .any(|hash| hash.eq_ignore_ascii_case(row["hash"].as_str().unwrap()))
+    };
+    let page = |rows: Vec<Value>, offset: usize, limit: usize| -> Vec<Value> {
+        rows.into_iter().skip(offset).take(limit).collect()
+    };
+    let only = |keep: &dyn Fn(&Value) -> bool| -> Vec<Value> {
+        all.iter().filter(|row| keep(row)).cloned().collect()
+    };
+    let cases: Vec<(String, Vec<Value>)> = vec![
+        (format!("hashes={named}"), only(&is_named)),
+        ("limit=7&offset=5".into(), page(all.clone(), 5, 7)),
+        ("offset=-4".into(), page(all.clone(), 41, 45)),
+        ("offset=60&limit=3".into(), Vec::new()),
+        ("limit=-1&offset=40".into(), page(all.clone(), 40, 45)),
+        (
+            "category=TV&private=true&limit=3&offset=1".into(),
+            page(
+                only(&|row| row["category"] == "tv" && row["private"] == true),
+                1,
+                3,
+            ),
+        ),
+        (
+            format!("hashes={named}&category="),
+            only(&|row| is_named(row) && row["category"] == ""),
+        ),
+        ("filter=all&limit=5".into(), page(all.clone(), 0, 5)),
+        (
+            "filter=stopped&limit=5&offset=2".into(),
+            page(
+                only(&|row| matches!(row["state"].as_str(), Some("stoppedDL" | "stoppedUP"))),
+                2,
+                5,
+            ),
+        ),
+        (
+            "tag=hd&private=false".into(),
+            only(&|row| row["tags"] == "hd" && row["private"] == false),
+        ),
+        ("sort=name&reverse=true&limit=4".into(), {
+            let mut sorted = all.clone();
+            sorted.reverse();
+            page(sorted, 0, 4)
+        }),
+    ];
+    for (query, old) in cases {
+        let rows = steady(
+            rig.get(&format!("/api/v2/torrents/info?{query}"))
+                .await
+                .json(),
+        );
+        assert_eq!(rows, old, "{query}");
+    }
+    // The names were given in the order the torrents were added.
+    assert_eq!(all[0]["name"], "00.mkv");
+    assert_eq!(all[44]["name"], "44.mkv");
+}

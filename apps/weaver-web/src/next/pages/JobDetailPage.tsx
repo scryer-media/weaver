@@ -15,11 +15,14 @@ import {
   JOB_OUTPUT_FILES_QUERY,
   JOB_QUERY,
   PAUSE_JOB_MUTATION,
+  RECHECK_TORRENT_MUTATION,
   REDOWNLOAD_JOB_MUTATION,
   REPROCESS_JOB_MUTATION,
   RERUN_POST_PROCESSING_MUTATION,
   RESUME_JOB_MUTATION,
+  SET_TORRENT_CATEGORY_MUTATION,
   SET_TORRENT_FORCED_MUTATION,
+  SET_TORRENT_LOCATION_MUTATION,
 } from "@/graphql/queries";
 import { authHeaders } from "@/graphql/client";
 import { copyText } from "@/lib/clipboard";
@@ -42,6 +45,7 @@ import {
   Tag,
 } from "../components/chrome";
 import { ConfirmDialog } from "../components/ConfirmDialog";
+import { RecordEditor } from "../components/RecordEditor";
 import { ArchivePassword, ArchivePasswordDialog } from "../components/ArchivePassword";
 import { DangerButton, SecondaryButton } from "../components/controls";
 import { Icon } from "../components/icons";
@@ -237,9 +241,15 @@ function JobDetailContent() {
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
   const [, setTorrentForced] = useMutation(SET_TORRENT_FORCED_MUTATION);
+  const [, recheckTorrent] = useMutation(RECHECK_TORRENT_MUTATION);
+  const [, setTorrentLocation] = useMutation(SET_TORRENT_LOCATION_MUTATION);
+  const [, setTorrentCategory] = useMutation(SET_TORRENT_CATEGORY_MUTATION);
   const [removingTorrent, setRemovingTorrent] = useState(false);
+  // The draft of the torrent's location or category while its editor is open.
+  const [torrentEdit, setTorrentEdit] = useState<{ kind: "move" | "category"; value: string } | null>(null);
+  const { categories } = useNextData("categories");
 
-  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "cancel" | "forget" | null>(null);
+  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "cancel" | "forget" | "recheck" | null>(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -505,6 +515,23 @@ function JobDetailContent() {
                   }}
                 >
                   {torrent?.forced ? t("next.torrent.unforce") : t("next.torrent.force")}
+                </SecondaryButton>
+                <SecondaryButton size="compact" disabled={busy || torrent === null} onClick={() => setConfirm("recheck")}>
+                  {t("next.torrent.recheck")}
+                </SecondaryButton>
+                <SecondaryButton
+                  size="compact"
+                  disabled={busy || torrent === null}
+                  onClick={() => setTorrentEdit({ kind: "move", value: torrent?.savePath ?? "" })}
+                >
+                  {t("next.torrent.move")}
+                </SecondaryButton>
+                <SecondaryButton
+                  size="compact"
+                  disabled={busy || torrent === null}
+                  onClick={() => setTorrentEdit({ kind: "category", value: torrent?.category ?? "" })}
+                >
+                  {t("next.categories.category")}
                 </SecondaryButton>
                 <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setRemovingTorrent(true)}>
                   {t("next.common.remove")}
@@ -1068,6 +1095,74 @@ function JobDetailContent() {
             void refetchDuplicate({ requestPolicy: "network-only" });
             return result;
           });
+        }}
+      />
+      <ConfirmDialog
+        open={confirm === "recheck"}
+        title={t("next.torrent.recheck")}
+        note={job.displayTitle || job.name}
+        busy={busy}
+        confirmLabel={t("next.torrent.recheck")}
+        body={t("next.torrent.recheckBody")}
+        onDismiss={() => setConfirm(null)}
+        onConfirm={() => {
+          setConfirm(null);
+          void run(t("next.torrent.rechecking"), () => recheckTorrent({ id: job.id })).then(refreshTorrent);
+        }}
+      />
+      <RecordEditor
+        open={torrentEdit !== null}
+        title={torrentEdit?.kind === "move" ? t("next.torrent.move") : t("next.categories.category")}
+        note={job.displayTitle || job.name}
+        busy={busy}
+        saveDisabled={torrentEdit?.kind === "move" && torrentEdit.value.trim() === ""}
+        sections={
+          torrentEdit === null
+            ? []
+            : [
+                {
+                  id: torrentEdit.kind,
+                  title: torrentEdit.kind === "move" ? t("next.torrent.savePath") : t("next.categories.category"),
+                  fields: [
+                    torrentEdit.kind === "move"
+                      ? {
+                          id: "location",
+                          label: t("next.torrent.savePath"),
+                          control: {
+                            kind: "path" as const,
+                            value: torrentEdit.value,
+                            onChange: (value: string) => setTorrentEdit({ kind: "move", value }),
+                          },
+                        }
+                      : {
+                          id: "category",
+                          label: t("next.categories.category"),
+                          control: {
+                            kind: "select" as const,
+                            value: torrentEdit.value,
+                            options: [
+                              { value: "", label: t("next.torrent.noCategory") },
+                              ...categories.map((category) => ({ value: category.name, label: category.name })),
+                            ],
+                            onChange: (value: string) => setTorrentEdit({ kind: "category", value }),
+                          },
+                        },
+                  ],
+                },
+              ]
+        }
+        onDismiss={() => setTorrentEdit(null)}
+        onSave={() => {
+          if (torrentEdit === null) return;
+          const { kind, value } = torrentEdit;
+          setTorrentEdit(null);
+          void run(
+            kind === "move" ? t("next.torrent.moved") : t("next.torrent.categoryChanged"),
+            () =>
+              kind === "move"
+                ? setTorrentLocation({ id: job.id, path: value.trim() })
+                : setTorrentCategory({ id: job.id, category: value === "" ? null : value }),
+          ).then(refreshTorrent);
         }}
       />
       <TorrentRemoveDialog

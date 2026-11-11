@@ -6,6 +6,7 @@ import { useMutation, useQuery, useSubscription } from "urql";
 import {
   ADD_TORRENT_TRACKERS_MUTATION,
   BAN_TORRENT_PEER_MUTATION,
+  DHT_ANNOUNCE_TORRENT_MUTATION,
   SET_TORRENT_DOWNLOAD_LIMIT_MUTATION,
   REANNOUNCE_TORRENT_MUTATION,
   REMOVE_TORRENT_TRACKERS_MUTATION,
@@ -277,9 +278,11 @@ function TrackersBlock({
   const [replaceState, replaceTrackers] = useMutation(REPLACE_TORRENT_TRACKERS_MUTATION);
   const [removeState, removeTrackers] = useMutation(REMOVE_TORRENT_TRACKERS_MUTATION);
   const [reannounceState, reannounce] = useMutation(REANNOUNCE_TORRENT_MUTATION);
+  const [dhtState, dhtAnnounce] = useMutation(DHT_ANNOUNCE_TORRENT_MUTATION);
   const [editing, setEditing] = useState<TrackerEdit | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const busy = addState.fetching || replaceState.fetching || removeState.fetching || reannounceState.fetching;
+  const busy =
+    addState.fetching || replaceState.fetching || removeState.fetching || reannounceState.fetching || dhtState.fetching;
 
   const settle = (result: { error?: TorrentActionError }, report: (message: string) => void) => {
     if (result.error) {
@@ -336,6 +339,17 @@ function TrackersBlock({
           <button type="button" disabled={busy} onClick={() => announce(null)} className={action}>
             {t("next.torrent.reannounce")}
           </button>
+          {/* A private torrent is never looked up on the DHT. */}
+          {torrent.private ? null : (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => void dhtAnnounce({ id: torrent.id }).then((result) => settle(result, onReport))}
+              className={action}
+            >
+              {t("next.torrent.dhtAnnounce")}
+            </button>
+          )}
           <button type="button" onClick={() => open({ kind: "add", urls: "" })} className={action}>
             {t("next.torrent.addTrackers")}
           </button>

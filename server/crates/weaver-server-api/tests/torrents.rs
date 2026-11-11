@@ -1984,3 +1984,89 @@ async fn a_tracker_file_that_cannot_be_read_is_refused_plainly() {
         assert!(!message.contains("upload-secret-word"), "{message}");
     }
 }
+
+// `torrents` pages as the whole list does: 100 when `first` is not given,
+// at most 500, each page the torrents after its cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_torrents_list_pages_with_a_default_and_a_most() {
+    let rig = rig().await;
+    for index in 0..505 {
+        let response = rig
+            .execute(&submit(&metainfo(&format!("{index}.bin"), 2000, false), ""))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+    }
+    let ids = |response: Response| -> Vec<u64> {
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+        response.data.into_json().unwrap()["torrents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|torrent| torrent["id"].as_u64().unwrap())
+            .collect()
+    };
+    let every: Vec<u64> = rig.torrents.job_ids().await.iter().map(|id| id.0).collect();
+    assert_eq!(every.len(), 505);
+    assert_eq!(ids(rig.execute("{ torrents { id } }").await), every[..100]);
+    assert_eq!(
+        ids(rig.execute("{ torrents(first: 1000) { id tags } }").await),
+        every[..500]
+    );
+    let cursor = weaver_server_api::jobs::types::encode_offset_cursor(480);
+    assert_eq!(
+        ids(rig
+            .execute(&format!(
+                r#"{{ torrents(first: 50, after: "{cursor}") {{ id name trackers {{ url }} }} }}"#
+            ))
+            .await),
+        every[480..]
+    );
+}
+
+// A follow of a few torrents is given those of them there are, in the
+// list's order; it names one torrent or several, never both, and at most
+// a page of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn torrent_updates_follow_the_torrents_named() {
+    use tokio_stream::StreamExt;
+
+    let rig = rig().await;
+    rig.torrents.publish_to(rig.harness.handle.clone());
+    for index in 0..6 {
+        let response = rig
+            .execute(&submit(&metainfo(&format!("{index}.bin"), 2000, false), ""))
+            .await;
+        assert!(response.errors.is_empty(), "{:?}", response.errors);
+    }
+    let every: Vec<u64> = rig.torrents.job_ids().await.iter().map(|id| id.0).collect();
+    let subscribe = |arguments: String| {
+        let request = Request::new(format!(
+            "subscription {{ torrentUpdates({arguments}) {{ fullUpdate torrents {{ id }} }} }}"
+        ))
+        .data(CallerScope::Local)
+        .data(CallerIdentity::Local([7; 32]))
+        .data(rig.torrents.clone());
+        rig.harness.schema.execute_stream(request)
+    };
+    let named = [every[4], every[1], 999_999, every[4]];
+    let mut updates = subscribe(format!("ids: {named:?}"));
+    let first = updates.next().await.expect("the updates stay open");
+    assert!(first.errors.is_empty(), "{:?}", first.errors);
+    let first = first.data.into_json().unwrap()["torrentUpdates"].clone();
+    assert_eq!(first["fullUpdate"], true);
+    assert_eq!(
+        first["torrents"],
+        serde_json::json!([{ "id": every[1] }, { "id": every[4] }])
+    );
+
+    for arguments in [
+        format!("id: {}, ids: [{}]", every[0], every[1]),
+        format!("ids: {:?}", (1..=501).collect::<Vec<u64>>()),
+    ] {
+        let refused = subscribe(arguments.clone())
+            .next()
+            .await
+            .expect("an answer");
+        assert!(!refused.errors.is_empty(), "{arguments}");
+    }
+}

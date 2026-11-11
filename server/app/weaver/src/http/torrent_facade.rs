@@ -44,6 +44,7 @@ use weaver_server_core::settings::{
 use weaver_server_core::tags::{TagSnapshot, split_tags};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
 use weaver_server_core::torrents::service::fingerprint::ViewParts;
+use weaver_server_core::torrents::service::listing::{CategoryPick, Pick, Shown};
 use weaver_server_core::torrents::service::{
     ActionError, AddError, AddRequest, Placement, TorrentService, TorrentSettings, TorrentView,
 };
@@ -174,7 +175,7 @@ impl TorrentFacadeContext {
 
     async fn count(&self) -> usize {
         match &self.inner.torrents {
-            Some(torrents) => torrents.torrents(None).await.len(),
+            Some(torrents) => torrents.count().await,
             None => 0,
         }
     }
@@ -214,13 +215,7 @@ impl TorrentFacadeContext {
 
     async fn by_hash(&self, hash: &str) -> Option<TorrentView> {
         let torrents = self.inner.torrents.as_ref()?;
-        let job_id = torrents
-            .torrents(None)
-            .await
-            .into_iter()
-            .find(|view| view.infohash.eq_ignore_ascii_case(hash.trim()))?
-            .job_id;
-        torrents.torrent(job_id).await
+        torrents.torrent_by_hash(hash).await
     }
 
     // The torrents a `hashes` parameter names: `|`-separated, or `all`.
@@ -231,19 +226,32 @@ impl TorrentFacadeContext {
     // The torrents `wanted` names: `|`-separated hashes, or `all`
     // (qBittorrent `applyToTorrents`).
     async fn named(&self, wanted: &str) -> Vec<TorrentView> {
-        let views = self.views().await;
         if wanted.trim() == "all" {
-            return views;
+            return self.views().await;
         }
         let wanted: Vec<&str> = wanted.split('|').map(str::trim).collect();
-        views
-            .into_iter()
-            .filter(|view| {
-                wanted
-                    .iter()
-                    .any(|hash| view.infohash.eq_ignore_ascii_case(hash))
-            })
-            .collect()
+        self.picked(Pick {
+            hashes: Some(&wanted),
+            ..Pick::default()
+        })
+        .await
+    }
+
+    // Every torrent `pick` keeps, with its files, which its paths follow.
+    async fn picked(&self, pick: Pick<'_>) -> Vec<TorrentView> {
+        let Some(torrents) = &self.inner.torrents else {
+            return Vec::new();
+        };
+        torrents.picked(pick, |kept| 0..kept, Shown::WHOLE).await
+    }
+
+    // Every torrent `pick` keeps, its own fields alone: no files, trackers
+    // or tags.
+    async fn bare(&self, pick: Pick<'_>) -> Vec<TorrentView> {
+        let Some(torrents) = &self.inner.torrents else {
+            return Vec::new();
+        };
+        torrents.picked(pick, |kept| 0..kept, Shown::BARE).await
     }
 
     async fn resolve(&self, key: &str) -> Result<CallerScope, StatusCode> {
@@ -1066,7 +1074,7 @@ async fn transfer_action(ctx: &TorrentFacadeContext, action: &str, params: &Para
     };
     match action {
         "info" => {
-            let views = ctx.views().await;
+            let views = ctx.bare(Pick::default()).await;
             axum::Json(transfer(
                 &views,
                 ctx.torrent_download_limit(),
@@ -1530,27 +1538,44 @@ async fn torrents_info(
     let tag = params.get("tag").map(str::trim);
     let with_files = params.flag("includeFiles").unwrap_or(false);
     let with_trackers = params.flag("includeTrackers").unwrap_or(false);
+    let number = |name: &str| {
+        params
+            .get(name)
+            .and_then(|value| value.trim().parse::<i64>().ok())
+            .unwrap_or(0)
+    };
+    let (limit, offset) = (number("limit"), number("offset"));
+    let sort = params.get("sort").filter(|column| !column.is_empty());
+    // The hashes, the category and privacy are read from the torrents'
+    // records. When nothing else filters or sorts, the page is taken there
+    // too, and only its views are built.
+    let paged_first = sort.is_none() && tag.is_none() && filters_none(filter);
+    let pick = Pick {
+        hashes: (!hashes.is_empty()).then_some(hashes.as_slice()),
+        category: params.get("category").map(CategoryPick::WithSubcategories),
+        private,
+    };
+    let views = match &ctx.inner.torrents {
+        Some(torrents) if paged_first => {
+            torrents
+                .picked(
+                    pick,
+                    |size| info_page(limit, offset, size).unwrap_or(0..size),
+                    Shown::WHOLE,
+                )
+                .await
+        }
+        _ => ctx.picked(pick).await,
+    };
     let mut list: Vec<Value> = Vec::new();
-    for view in ctx.views().await {
+    for view in views {
         let passes = tag.is_none_or(|tag| {
             if tag.is_empty() {
                 view.tags.is_empty()
             } else {
                 view.tags.iter().any(|carried| carried == tag)
             }
-        }) && wanted(&view, filter)
-            && (hashes.is_empty()
-                || hashes
-                    .iter()
-                    .any(|hash| view.infohash.eq_ignore_ascii_case(hash)))
-            && params.get("category").is_none_or(|name| {
-                let category = view.category.as_deref().unwrap_or_default();
-                category.eq_ignore_ascii_case(name)
-                    || category
-                        .get(..name.len() + 1)
-                        .is_some_and(|parent| parent.eq_ignore_ascii_case(&format!("{name}/")))
-            })
-            && private.is_none_or(|private| view.private == private);
+        }) && wanted(&view, filter);
         if !passes {
             continue;
         }
@@ -1568,7 +1593,7 @@ async fn torrents_info(
         }
         list.push(row);
     }
-    if let Some(column) = params.get("sort").filter(|column| !column.is_empty()) {
+    if let Some(column) = sort {
         if list.first().is_some_and(|row| row.get(column).is_none()) {
             return text(StatusCode::BAD_REQUEST, "'sort' parameter is invalid");
         }
@@ -1589,31 +1614,51 @@ async fn torrents_info(
             }
         });
     }
-    let number = |name: &str| {
-        params
-            .get(name)
-            .and_then(|value| value.trim().parse::<i64>().ok())
-            .unwrap_or(0)
-    };
-    let (limit, mut offset) = (number("limit"), number("offset"));
-    let size = i64::try_from(list.len()).unwrap_or(i64::MAX);
-    // A negative offset counts back from the end; a limit of 0 or less is
-    // none.
+    if !paged_first && let Some(page) = info_page(limit, offset, list.len()) {
+        list = list.drain(page).collect();
+    }
+    axum::Json(list).into_response()
+}
+
+// The rows of `size` a `torrents/info` page of `limit` after `offset`
+// keeps; `None` keeps them all. A negative offset counts back from the
+// end; a limit of 0 or less is none.
+fn info_page(limit: i64, mut offset: i64, size: usize) -> Option<std::ops::Range<usize>> {
+    let size = i64::try_from(size).unwrap_or(i64::MAX);
     if offset < 0 {
         offset += size;
     }
-    if limit > 0 || offset > 0 {
-        let start = offset.clamp(0, size);
-        let end = if limit > 0 {
-            start.saturating_add(limit).min(size)
-        } else {
-            size
-        };
-        list = list
-            .drain(usize::try_from(start).unwrap_or(0)..usize::try_from(end).unwrap_or(0))
-            .collect();
+    if limit <= 0 && offset <= 0 {
+        return None;
     }
-    axum::Json(list).into_response()
+    let start = offset.clamp(0, size);
+    let end = if limit > 0 {
+        start.saturating_add(limit).min(size)
+    } else {
+        size
+    };
+    Some(usize::try_from(start).unwrap_or(0)..usize::try_from(end).unwrap_or(0))
+}
+
+// Whether a `torrents/info` status filter passes every torrent: one the
+// client does not define.
+fn filters_none(filter: &str) -> bool {
+    !matches!(
+        filter,
+        "downloading"
+            | "seeding"
+            | "completed"
+            | "stopped"
+            | "running"
+            | "active"
+            | "inactive"
+            | "stalled"
+            | "stalled_uploading"
+            | "stalled_downloading"
+            | "checking"
+            | "moving"
+            | "errored"
+    )
 }
 
 fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
@@ -2667,9 +2712,21 @@ async fn rate_limits(
     params: &Params,
     limit: impl Fn(&TorrentView) -> Option<u64>,
 ) -> Response {
-    let views = ctx.views().await;
+    let all = names_all(params);
+    let named: Vec<&str> = params
+        .get("hashes")
+        .unwrap_or_default()
+        .split('|')
+        .map(str::trim)
+        .collect();
+    let views = ctx
+        .bare(Pick {
+            hashes: (!all).then_some(named.as_slice()),
+            ..Pick::default()
+        })
+        .await;
     let reading = |view: &TorrentView| client_limit(limit(view), 0);
-    let map: Map<String, Value> = if names_all(params) {
+    let map: Map<String, Value> = if all {
         views
             .iter()
             .filter_map(|view| Some((view.infohash.to_ascii_lowercase(), reading(view)?)))
@@ -3509,8 +3566,8 @@ async fn ban_peers(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         return ok();
     };
     let mut failed = None;
-    for view in torrents.torrents(None).await {
-        match torrents.ban_peers(view.job_id, &ips).await {
+    for job_id in torrents.job_ids().await {
+        match torrents.ban_peers(job_id, &ips).await {
             Ok(()) | Err(ActionError::NotFound(_)) => {}
             Err(error) => failed = Some(internal(error)),
         }

@@ -3,6 +3,7 @@
 
 use async_graphql::{Context, Object, Result};
 use weaver_server_core::jobs::ids::JobId;
+use weaver_server_core::torrents::service::listing::{CategoryPick, Pick, Shown, page};
 
 use super::mutation::action_error;
 use super::service;
@@ -11,6 +12,11 @@ use super::types::{
 };
 use crate::auth::{ReadGuard, graphql_error};
 use crate::jobs::types::decode_offset_cursor;
+
+/// The torrents a `torrents` page holds when `first` is not given.
+pub const DEFAULT_TORRENT_PAGE: usize = 100;
+/// The most torrents a `torrents` page holds.
+pub const MAX_TORRENT_PAGE: usize = 500;
 
 #[derive(Default)]
 pub struct TorrentsQuery;
@@ -77,6 +83,7 @@ impl TorrentsQuery {
 
     /// Every torrent, or a category's, in the order they were added: the
     /// `first` after the offset cursor `after`, as `queueItems` pages.
+    /// `first` is 100 when not given, and at most 500.
     #[graphql(guard = "ReadGuard")]
     async fn torrents(
         &self,
@@ -87,13 +94,23 @@ impl TorrentsQuery {
     ) -> Result<Vec<Torrent>> {
         let offset = decode_offset_cursor(after.as_deref())
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
-        let limit = first.unwrap_or(u32::MAX) as usize;
+        let limit = first
+            .map_or(DEFAULT_TORRENT_PAGE, |first| first as usize)
+            .min(MAX_TORRENT_PAGE);
+        let field = ctx.look_ahead();
+        let shown = Shown {
+            files: false,
+            trackers: field.field("trackers").exists(),
+            tags: field.field("tags").exists(),
+        };
+        let pick = Pick {
+            category: category.as_deref().map(CategoryPick::Named),
+            ..Pick::default()
+        };
         Ok(service(ctx)?
-            .torrents(category.as_deref())
+            .picked(pick, page(offset, limit), shown)
             .await
             .into_iter()
-            .skip(offset)
-            .take(limit)
             .map(Into::into)
             .collect())
     }

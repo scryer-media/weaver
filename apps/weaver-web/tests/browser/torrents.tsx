@@ -266,11 +266,15 @@ function Fixture() {
   if (screen === "remove") return <Remove />;
   if (screen === "queue") return <Queue />;
   if (screen === "seeding") return <Seeding />;
-  if (screen === "trackers") {
+  if (screen === "trackers" || screen === "privateTrackers") {
     const tracker = (url: string, source: TorrentTrackerData["source"]): TorrentTrackerData => ({
       tier: 0, url, source, status: "WORKING", updating: false, message: null, seeders: 1, leechers: 0, peers: 1,
     });
-    const named = { ...torrent(5, "GLOBAL", null), trackers: [tracker("http://a.test/announce", "TORRENT"), tracker("http://b.test/announce", "OPERATOR")] };
+    const named = {
+      ...torrent(5, "GLOBAL", null),
+      private: screen === "privateTrackers",
+      trackers: [tracker("http://a.test/announce", "TORRENT"), tracker("http://b.test/announce", "OPERATOR")],
+    };
     return <TorrentDetail torrent={named} onChanged={() => {}} onReport={(message) => { status.textContent = message; }} />;
   }
   if (screen === "files") {
