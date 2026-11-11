@@ -71,14 +71,23 @@ async fn seeded() -> (tempfile::TempDir, Pipeline, SchedulerHandle) {
     for id in [JobId(15), JobId(16)] {
         handle.pause_job(id).await.unwrap();
     }
-    handle.update_job(JobId(40), priority_edit("high")).await.unwrap();
+    handle
+        .update_job(JobId(40), priority_edit("high"))
+        .await
+        .unwrap();
     settle(&mut pipeline).await;
     let admitted: Vec<JobId> = pipeline.nzb_admitted.iter().copied().collect();
     for id in admitted {
         activate_job(&mut pipeline, id).await;
     }
-    handle.update_job(JobId(121), priority_edit("high")).await.unwrap();
-    handle.update_job(JobId(18), priority_edit("low")).await.unwrap();
+    handle
+        .update_job(JobId(121), priority_edit("high"))
+        .await
+        .unwrap();
+    handle
+        .update_job(JobId(18), priority_edit("low"))
+        .await
+        .unwrap();
     handle.cancel_job(JobId(21)).await.unwrap();
     pipeline.shared_state.queue.write(|inner| {
         inner.job_mut(JobId(24)).unwrap().report.retiring = true;
@@ -194,8 +203,7 @@ fn former_eligible(pipeline: &Pipeline) -> Vec<JobId> {
                         position
                     }
                     None => {
-                        inner.jobs.len()
-                            + pipeline.job_order.iter().position(|id| id == job_id)?
+                        inner.jobs.len() + pipeline.job_order.iter().position(|id| id == job_id)?
                     }
                 };
                 Some((*job_id, position))
@@ -299,11 +307,24 @@ async fn operator_moves_reach_every_consumer_the_same_way() {
     settle(&mut pipeline).await;
     type Step = Box<dyn Fn(&crate::pipeline::queue::Queue)>;
     let steps: Vec<Step> = vec![
-        Box::new(|q| q.reorder_jobs(vec![(JobId(140), QueueMoveTarget::Top)]).unwrap()),
-        Box::new(|q| q.reorder_jobs(vec![(JobId(30), QueueMoveTarget::Bottom)]).unwrap()),
-        Box::new(|q| q.reorder_jobs(vec![(JobId(33), QueueMoveTarget::Offset(-20))]).unwrap()),
+        Box::new(|q| {
+            q.reorder_jobs(vec![(JobId(140), QueueMoveTarget::Top)])
+                .unwrap()
+        }),
+        Box::new(|q| {
+            q.reorder_jobs(vec![(JobId(30), QueueMoveTarget::Bottom)])
+                .unwrap()
+        }),
+        Box::new(|q| {
+            q.reorder_jobs(vec![(JobId(33), QueueMoveTarget::Offset(-20))])
+                .unwrap()
+        }),
         Box::new(|q| q.update_job(JobId(149), priority_edit("high")).unwrap()),
-        Box::new(|q| q.set_jobs_paused([JobId(42)], true).into_values().for_each(|o| o.unwrap())),
+        Box::new(|q| {
+            q.set_jobs_paused([JobId(42)], true)
+                .into_values()
+                .for_each(|o| o.unwrap())
+        }),
     ];
     let queue = pipeline.shared_state.queue.clone();
     for step in steps {
@@ -329,9 +350,9 @@ async fn operator_moves_reach_every_consumer_the_same_way() {
                             && state.run_state != crate::jobs::model::RunState::Paused
                     })
                     && pipeline.shared_state.queue.read(|inner| {
-                        inner
-                            .job(*id)
-                            .is_some_and(|row| row.intents.cancelled.is_none() && !row.report.retiring)
+                        inner.job(*id).is_some_and(|row| {
+                            row.intents.cancelled.is_none() && !row.report.retiring
+                        })
                     })
             })
             .take(pipeline.next_up.depth)

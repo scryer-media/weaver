@@ -99,7 +99,9 @@ async fn hear(pipeline: &mut Pipeline, held: &mut Vec<DbReply>, reads: &[u64]) {
     for read in reads {
         let index = held
             .iter()
-            .position(|reply| matches!(reply, DbReply::NextUp { read: number, .. } if number == read))
+            .position(
+                |reply| matches!(reply, DbReply::NextUp { read: number, .. } if number == read),
+            )
             .expect("the read is held");
         let reply = held.remove(index);
         pipeline.handle_db_reply(reply).await;
@@ -153,7 +155,10 @@ fn assert_ring(pipeline: &Pipeline, next: &[u64]) {
     assert_eq!(pipeline.next_up.ids(), pipeline.next_up.held());
     assert!(pipeline.next_up.ids().len() <= NEXT_UP_DEPTH + waiting_admitted.len());
     assert_eq!(
-        pipeline.next_up_jobs().into_iter().collect::<std::collections::BTreeSet<_>>(),
+        pipeline
+            .next_up_jobs()
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>(),
         next.iter().copied().map(JobId).collect(),
     );
 }
@@ -186,7 +191,10 @@ async fn the_ring_follows_every_queue_move() {
     assert_ring(&pipeline, &[10, 4, 5]);
 
     // To the top, ahead of the slots.
-    handle.reorder_job(JobId(50), QueueMoveTarget::Top).await.unwrap();
+    handle
+        .reorder_job(JobId(50), QueueMoveTarget::Top)
+        .await
+        .unwrap();
     turn(&mut pipeline).await;
     assert_ring(&pipeline, &[50, 10, 4]);
 
@@ -470,11 +478,9 @@ fn held_lists_unpack_to_the_lists_read() {
             })
             .collect();
         let nzb_zstd = nzb_zstd_for(&spec);
-        let read = crate::ingest::outline::read_stored_lists(
-            &nzb_zstd,
-            std::path::Path::new("held.nzb"),
-        )
-        .unwrap();
+        let read =
+            crate::ingest::outline::read_stored_lists(&nzb_zstd, std::path::Path::new("held.nzb"))
+                .unwrap();
         reposted += read
             .lists
             .iter()
@@ -484,7 +490,12 @@ fn held_lists_unpack_to_the_lists_read() {
         let held = HeldLists::pack(&read.lists).expect("fresh lists pack");
         // One block of ids and fixed records: no string or list per part.
         let parts_held = read.lists.iter().map(Vec::len).sum::<usize>();
-        let ids_held = read.lists.iter().flatten().map(|part| part.message_ids.all().len()).sum::<usize>();
+        let ids_held = read
+            .lists
+            .iter()
+            .flatten()
+            .map(|part| part.message_ids.all().len())
+            .sum::<usize>();
         let id_bytes = read
             .lists
             .iter()

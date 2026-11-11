@@ -54,10 +54,12 @@ impl QueueWalkMark {
     }
 }
 
-
 impl Pipeline {
     // Whether the row's job counts as paused for its slot.
-    pub(in crate::pipeline) fn admission_paused(&self, row: &crate::pipeline::queue::JobRow) -> bool {
+    pub(in crate::pipeline) fn admission_paused(
+        &self,
+        row: &crate::pipeline::queue::JobRow,
+    ) -> bool {
         row.intents.paused.unwrap_or_else(|| {
             row.admission
                 .as_ref()
@@ -234,7 +236,10 @@ impl Pipeline {
         candidates.sort_unstable();
         let propagating: HashSet<_> = candidates
             .iter()
-            .filter_map(|key| self.propagation_hold_until(key.job_id()).map(|_| key.job_id()))
+            .filter_map(|key| {
+                self.propagation_hold_until(key.job_id())
+                    .map(|_| key.job_id())
+            })
             .collect();
         // A hold that ran out on a job that is not a candidate, such as a
         // paused one, holds nothing. It goes once seen, so it never calls for

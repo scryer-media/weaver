@@ -109,7 +109,7 @@ mod tests {
 
     #[test]
     fn keys_order_by_priority_then_position() {
-        let mut keys = vec![
+        let mut keys = [
             DispatchKey::new(1, 0, JobId(1)),
             DispatchKey::new(0, 5, JobId(2)),
             DispatchKey::new(2, 1, JobId(3)),
