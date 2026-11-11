@@ -12,6 +12,32 @@ Weaver's authors also ask that you credit Weaver in your project's notices for a
 
 Reading Weaver to understand how something works is fine. Copying it means the terms above apply.
 
+## Performance invariants
+
+Weaver scales. A queue holds 10,000+ jobs, a job holds thousands of files and hundreds of thousands of articles, and history and event tables grow without bound. Never reason "this is low cardinality, so it does not matter". These rules apply to every change, and to review of every change.
+
+- **Know which data grows.** Before writing or changing a query, identify whether any table it touches grows with queue size, job size, activity or time (jobs, queue rows, files, article and segment state, checkpoints, history, job events, server statistics, run logs). A query against a growing table must be served by an index for its filter and its sort. Check the migrations for an existing index before adding one, and read the query plan when in doubt. SQLite cannot use a partial index when the predicate value is a bound parameter.
+- **Every growing table has a retention story.** A new table that accumulates rows states what prunes it, or why it is kept forever. History follows the standard history retention settings.
+- **Reads are bounded.** Every list has a limit with a default and a maximum, and pages in SQL, not in memory. Never load a whole table, or the whole queue, to filter, count, sort or page it in Rust. Counts and existence checks are `COUNT`, `GROUP BY` or `EXISTS` statements, not decoded rows.
+- **Read only what is used.** Select the columns the caller needs. Do not decode full rows, JSON columns or a whole job to obtain one field, and do not issue a read whose result is unused. A narrow read keeps the same fallbacks and defaults as the full decode it replaces.
+- **Id lists are bind-safe.** A statement that binds a caller-sized id list must work past SQLite's 32,766 bind limit by chunking through the existing helpers. A list that fits stays one statement.
+- **No query in a loop.** One statement per item of a list, page or batch is forbidden (N+1). Batch the read or write, or join. This includes existence checks, per-job lookups and per-row writes.
+- **No quadratic work.** Do not nest a scan of one collection inside a loop over another, clone a large collection per item, or linearly search the queue inside a loop. Use the existing position and id indexes, or build a map or set once. Any loop whose cost is the product of two sizes that both grow is a defect.
+- **Per-job memory is bounded.** A queued job outside the queue window is a lean row, not installed state. Nothing may allocate or keep per-job engine state at add or at start-up for a job that is not in the window.
+- **Per-article work is constant.** Work done for each fetched or decoded article must not walk the queue, the job's files or its other articles, and must not publish a full job report.
+- **HTTP is never coupled to the pipeline.** A request handler (API, facade or web) does not wait on the pipeline actor, and the pipeline does no work inline on a request's behalf. Use the queue that is already in place: reads come from the queue's shared rows or the database, and changes are posted to the queue for the pipeline to apply on its own turn. Do not add a new channel, lock or call path between the two.
+- **Resolvers do only the requested work.** A GraphQL resolver performs backend work only for fields the query selects. Totals, counts, nested lists and derived values are computed on demand, never eagerly for every request. Sibling fields share one load per request.
+- **The web asks only for what it shows.** Each front-end call selects exactly the fields its use case renders, and fetches one page, not every page. Do not fetch a full list to show a count or a badge, and do not refetch data the page already holds.
+- **Facades are bounded too.** A SABnzbd- or NZBGet-compatible answer that a client polls must not clone or rebuild the whole queue or history per poll.
+- **Idle loops do no writes.** A poller, scheduler tick or background pass that finds nothing to do performs no database write and publishes no event. Prefer a wake signal over a short poll, and make every path that creates the work ring it. SQLite has a single writer; an idle write delays real ones.
+- **Writes are batched.** Do not open one write transaction per row, per file or per article. Group the writes of one unit of work into one transaction. Progress and telemetry are kept in memory and persisted at a bounded rate, never once per item.
+- **The async runtime is not blocked.** Filesystem calls, large decodes, hashing and other CPU-heavy work run off the async runtime.
+- **Background tabs are quiet.** Web polling pauses while the tab is hidden and refreshes once on return. Prefer the event stream to an interval.
+- **Remote calls are not repeated.** Do not call a remote service on every page open or every pass for data that changes rarely; reuse the existing caches, and never cache a failure as a result.
+- **An optimisation keeps behaviour.** A performance change returns the same rows, order, counts, statuses and events unless the operator approved a difference. Prove it with a test that compares the new path with the old one over seeded data, and state measurements for any performance claim.
+
+When you touch code that breaks one of these rules, fix that site in the same change when it is within the task's scope. Otherwise report it.
+
 ## Markdown files
 
 - Do not create, modify, rename, or delete any Markdown file without the operator's explicit approval in the current conversation. This covers every `.md` file in the repository, including this one, READMEs, docs, fixture notes, and any plan, report, proposal, audit, or handoff file.
