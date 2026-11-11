@@ -474,7 +474,8 @@ impl TorrentStateLive {
             )
             .allowing_multiple_connections_per_ip(Arc::clone(
                 &session.allow_multiple_connections_per_ip,
-            )),
+            ))
+            .sharing_session_bans(Arc::clone(&session.bad_data_bans)),
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
                 fatal_errors_tx: Some(fatal_errors_tx),
@@ -1228,6 +1229,24 @@ impl TorrentStateLive {
     /// Bans `ip`; see [`PeerStates::ban`].
     pub(crate) fn ban_peer(&self, ip: std::net::IpAddr) {
         self.peers.ban(ip);
+    }
+
+    /// Bans `ip` for the bad data it sent: here, and on every torrent of
+    /// the session while it runs, each closing its connections to it (see
+    /// [`PeerStates::ban_for_bad_data`]). libtorrent bans a peer on the one
+    /// torrent it sent the data to (`torrent::ban_peer`).
+    pub(crate) fn ban_for_bad_data(&self, ip: std::net::IpAddr) {
+        if !self.peers.ban_for_bad_data(ip) {
+            return;
+        }
+        let Some(session) = self.shared.session.upgrade() else {
+            return;
+        };
+        for torrent in session.live_torrents() {
+            if !std::ptr::eq(Arc::as_ptr(&torrent), self) {
+                torrent.peers.close_session_banned(ip);
+            }
+        }
     }
 
     pub fn peer_id(&self) -> Id20 {
@@ -2000,7 +2019,7 @@ impl TorrentStateLive {
                 .with_peer_mut(peer, "piece_failed", |p| p.piece_failed(bannable))
                 .unwrap_or(bannable);
             if to_ban {
-                self.peers.ban(peer.ip());
+                self.ban_for_bad_data(peer.ip());
             }
         }
     }
@@ -4145,7 +4164,7 @@ impl PeerHandler {
                     // Before the storage takes the piece, while the good bytes
                     // are still there to read back.
                     for sender in smart_ban::senders_of_bad_blocks(&failed, read_block) {
-                        state.peers.ban(sender.ip());
+                        state.ban_for_bad_data(sender.ip());
                     }
                     // The piece is ours only once the storage has taken it
                     // (libtorrent: the write completes before the hash job,
@@ -4231,7 +4250,7 @@ impl PeerHandler {
                     let blocks =
                         smart_ban::read_back(&state.lengths, piece_index, &senders, read_block);
                     for liar in state.peers.piece_failed(piece_index, blocks) {
-                        state.peers.ban(liar.ip());
+                        state.ban_for_bad_data(liar.ip());
                     }
                     // Checked by v2, a piece of more than one sender has its
                     // block hashes fetched, which name the senders of its bad
