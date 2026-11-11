@@ -64,6 +64,19 @@ pub fn release_job_completion_memory() {
     }
 }
 
+// Release what the process is holding for work that has stopped, if a hook is
+// installed: the pipeline has just run out of work.
+//
+// Without a background purge thread the allocator returns freed pages only
+// while it is being used, so pages freed just before the process goes quiet
+// (the last articles of a download, the parse of a bulk add, a start-up
+// restore) would otherwise stay resident until the next burst of work. The
+// release is the same whole-process purge a finished job asks for.
+#[inline]
+pub(crate) fn release_idle_process_memory() {
+    release_job_completion_memory();
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -119,11 +132,15 @@ mod tests {
         release_job_completion_memory();
         assert_eq!(JOB_CALLS.load(Ordering::Relaxed), 2);
 
+        // A pipeline going idle asks for the same whole-process release.
+        release_idle_process_memory();
+        assert_eq!(JOB_CALLS.load(Ordering::Relaxed), 3);
+
         fn other_job_hook() {
             JOB_CALLS.fetch_add(100, Ordering::Relaxed);
         }
         install_job_completion_release(other_job_hook);
         release_job_completion_memory();
-        assert_eq!(JOB_CALLS.load(Ordering::Relaxed), 3);
+        assert_eq!(JOB_CALLS.load(Ordering::Relaxed), 4);
     }
 }

@@ -918,9 +918,11 @@ impl Pipeline {
     }
 
     // Give back the memory a pipeline with no work is holding for work that
-    // has stopped: the idle article buffers in the pool.
+    // has stopped: the idle article buffers in the pool, then every page the
+    // allocator is keeping freed, so the buffers just dropped go back too.
     pub(in crate::pipeline) fn release_idle_memory(&self) {
         self.buffers.release_idle();
+        crate::runtime::thread_release::release_idle_process_memory();
     }
 
     // Leave the gauges the parked drivers would publish saying what the
