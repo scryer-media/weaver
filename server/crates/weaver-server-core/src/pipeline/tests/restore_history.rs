@@ -1322,6 +1322,43 @@ async fn job_completed_event_publishes_after_history_archive_commits() {
     assert!(listed.iter().any(|row| row.job_id == job_id.0));
 }
 
+// A job restored in post-processing has its post-processing rows read with
+// the rest of its install, off the pipeline thread; any other job reads none.
+#[tokio::test]
+async fn an_install_read_carries_the_post_processing_rows_of_a_job_in_post_processing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    for (job_id, status, carries) in [
+        (JobId(31210), JobStatus::PostProcessing, true),
+        (JobId(31211), JobStatus::QueuedPostProcessing, true),
+        (JobId(31212), JobStatus::Downloading, false),
+    ] {
+        let working_dir = temp_dir.path().join(format!("restore-read-{}", job_id.0));
+        tokio::fs::create_dir_all(&working_dir).await.unwrap();
+        let request = RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: standalone_job_spec("Restore read", &[("sample.bin".to_string(), 100)]),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            status,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+            restart: None,
+        };
+        let read =
+            crate::jobs::service::read_install(pipeline.install_seat(job_id), request).await;
+        assert_eq!(read.carries_post_processing(), carries, "{job_id:?}");
+    }
+}
+
 #[tokio::test]
 async fn restore_job_rehydrates_existing_deterministic_staging_dir() {
     let temp_dir = tempfile::tempdir().unwrap();

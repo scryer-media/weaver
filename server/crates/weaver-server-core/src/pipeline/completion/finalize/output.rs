@@ -2180,7 +2180,11 @@ impl Pipeline {
     // weaver stopped has unknown side effects, and running it again is worse
     // than reporting that it was interrupted. The scripts of the list that
     // had not started still run, after the ones that had.
-    pub(crate) fn recover_restored_terminal_post_processing(&mut self, job_id: JobId) -> bool {
+    pub(crate) fn recover_restored_terminal_post_processing(
+        &mut self,
+        job_id: JobId,
+        read: Option<RestoredPostProcessing>,
+    ) -> bool {
         let is_terminal_post_processing = self.jobs.get(&job_id).is_some_and(|state| {
             matches!(
                 state.status,
@@ -2190,11 +2194,27 @@ impl Pipeline {
         if !is_terminal_post_processing {
             return false;
         }
+        // The install read these off the pipeline thread; a job whose status
+        // turned terminal only as it installed reads them here.
+        let read = read.unwrap_or_else(|| {
+            let category = self
+                .jobs
+                .get(&job_id)
+                .and_then(|state| state.spec.category.clone());
+            RestoredPostProcessing::read(&self.db, job_id, category.as_deref())
+        });
+        let RestoredPostProcessing {
+            facts,
+            summary,
+            results,
+            resume,
+            admission,
+        } = read;
         self.remove_pending_completion_check(job_id);
         // What the job's scripts were told when its pass began. A job in
         // post-processing does not carry its download's failure in its
         // status, so a failed one's comes back from here.
-        let facts = match self.db.job_post_processing_facts(job_id.0) {
+        let facts = match facts {
             Ok(facts) => facts,
             Err(error) => {
                 warn!(
@@ -2212,9 +2232,7 @@ impl Pipeline {
         {
             self.pipeline_failure_stages.entry(job_id).or_insert(*stage);
         }
-        let summary = self
-            .db
-            .job_post_processing_summary(job_id.0)
+        let summary = summary
             .unwrap_or_default()
             .unwrap_or(crate::post_processing::model::PostProcessingSummary::Interrupted);
         if summary == crate::post_processing::model::PostProcessingSummary::NotRun {
@@ -2233,13 +2251,16 @@ impl Pipeline {
             }
             return true;
         }
-        if self.resume_restored_terminal_post_processing(job_id, summary, facts.clone()) {
+        if self.resume_restored_terminal_post_processing(
+            job_id,
+            summary,
+            facts.clone(),
+            resume,
+            admission,
+        ) {
             return true;
         }
-        let results = self
-            .db
-            .job_post_processing_results(job_id.0)
-            .unwrap_or_default();
+        let results = results.unwrap_or_default();
         let primary_failure = self
             .jobs
             .get(&job_id)
@@ -2273,6 +2294,14 @@ impl Pipeline {
         job_id: JobId,
         summary: crate::post_processing::model::PostProcessingSummary,
         facts: Option<crate::post_processing::model::PostProcessingFacts>,
+        resume: Result<
+            Option<crate::post_processing::model::PostProcessingResume>,
+            crate::StateError,
+        >,
+        admission: Result<
+            Option<crate::post_processing::executor::PostProcessingJobAdmission>,
+            crate::StateError,
+        >,
     ) -> bool {
         use crate::post_processing::model::PostProcessingSummary;
         if !matches!(
@@ -2293,8 +2322,7 @@ impl Pipeline {
             ),
         };
         let primary_failure = facts.primary_failure();
-        let category = state.spec.category.clone();
-        let resume = match self.db.job_post_processing_resume(job_id.0) {
+        let resume = match resume {
             Ok(Some(resume)) => resume,
             Ok(None) => return false,
             Err(error) => {
@@ -2306,10 +2334,7 @@ impl Pipeline {
                 return false;
             }
         };
-        let admission = match self
-            .terminal_post_processing_executor
-            .admit_job_scripts(category.as_deref())
-        {
+        let admission = match admission {
             Ok(Some(admission)) => admission,
             Ok(None) => return false,
             Err(error) => {
@@ -2475,6 +2500,60 @@ fn queue_events_may_hold_job(db: &crate::Database, job_id: JobId) -> bool {
         warn!(job_id = job_id.0, %error, "could not read the queue script settings");
     }
     db.queue_barrier_possible(job_id.0)
+}
+
+// What a job restored in post-processing needs from its rows to be finished
+// or resumed, read before it installs so the pipeline thread does not wait on
+// the database. Each read is taken only where the recovery would use it.
+pub(crate) struct RestoredPostProcessing {
+    facts: Result<Option<crate::post_processing::model::PostProcessingFacts>, crate::StateError>,
+    summary: Result<Option<crate::post_processing::model::PostProcessingSummary>, crate::StateError>,
+    results: Result<Vec<crate::post_processing::model::ScriptResult>, crate::StateError>,
+    resume: Result<Option<crate::post_processing::model::PostProcessingResume>, crate::StateError>,
+    admission: Result<
+        Option<crate::post_processing::executor::PostProcessingJobAdmission>,
+        crate::StateError,
+    >,
+}
+
+impl RestoredPostProcessing {
+    // Blocking: run off the pipeline thread.
+    pub(crate) fn read(db: &crate::Database, job_id: JobId, category: Option<&str>) -> Self {
+        use crate::post_processing::model::PostProcessingSummary;
+        let facts = db.job_post_processing_facts(job_id.0);
+        let summary = db.job_post_processing_summary(job_id.0);
+        let ruled = summary
+            .as_ref()
+            .ok()
+            .copied()
+            .flatten()
+            .unwrap_or(PostProcessingSummary::Interrupted);
+        let mut read = Self {
+            facts,
+            summary,
+            results: Ok(Vec::new()),
+            resume: Ok(None),
+            admission: Ok(None),
+        };
+        if ruled == PostProcessingSummary::NotRun {
+            return read;
+        }
+        read.results = db.job_post_processing_results(job_id.0);
+        if !matches!(
+            ruled,
+            PostProcessingSummary::Interrupted | PostProcessingSummary::Running
+        ) {
+            return read;
+        }
+        read.resume = db.job_post_processing_resume(job_id.0);
+        if matches!(read.resume, Ok(Some(_))) {
+            read.admission =
+                crate::post_processing::executor::PostProcessingExecutor::admit_job_scripts_from(
+                    db, category,
+                );
+        }
+        read
+    }
 }
 
 #[cfg(test)]

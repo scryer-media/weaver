@@ -1061,7 +1061,7 @@ async fn restored_post_processing_is_interrupted_without_rerunning_scripts() {
     );
     pipeline.schedule_job_completion_check(job_id);
 
-    assert!(pipeline.recover_restored_terminal_post_processing(job_id));
+    assert!(pipeline.recover_restored_terminal_post_processing(job_id, Some(crate::pipeline::RestoredPostProcessing::read(&pipeline.db, job_id, None))));
     settle_failed_releases(&mut pipeline).await;
 
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
@@ -1106,7 +1106,7 @@ async fn restored_post_processing_that_already_finished_archives_as_complete() {
     );
     pipeline.schedule_job_completion_check(job_id);
 
-    assert!(pipeline.recover_restored_terminal_post_processing(job_id));
+    assert!(pipeline.recover_restored_terminal_post_processing(job_id, Some(crate::pipeline::RestoredPostProcessing::read(&pipeline.db, job_id, None))));
 
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
     assert!(!pipeline.jobs.contains_key(&job_id));
