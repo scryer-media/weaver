@@ -5,8 +5,8 @@
 // gives them, on every transport, while it reads articles far larger than
 // either buffer.
 
-use super::*;
 use super::idle::spawn_plain_body_server;
+use super::*;
 use crate::blocking::read_probe;
 
 const ARTICLE_BYTES: usize = 1024 * 1024 + 4321;
@@ -66,11 +66,7 @@ fn tls_lane_stays_within(profile: NntpBufferProfile, backend: NntpTlsBackend) {
     config.pipelining = crate::connection::PipeliningCapability::Known(true);
     let mut conn = connect_with_backend(&config, backend);
     let samples = read_articles(&mut conn, &ids);
-    assert_within(
-        &samples,
-        profile,
-        backend == NntpTlsBackend::ManualRustls,
-    );
+    assert_within(&samples, profile, backend == NntpTlsBackend::ManualRustls);
     conn.quit().unwrap();
     handle.join().unwrap();
     let _ = std::fs::remove_file(ca_path);
@@ -295,7 +291,9 @@ fn zero_connections_get_the_whole_budget() {
 // The size table, printed for the record: run with `--no-capture`.
 #[test]
 fn buffer_size_table() {
-    eprintln!("BUFFER_TABLE host connections read_buf socket_read tls_total_mib plain_total_mib budget_mib");
+    eprintln!(
+        "BUFFER_TABLE host connections read_buf socket_read tls_total_mib plain_total_mib budget_mib"
+    );
     for available in [2 * GIB, 8 * GIB, 64 * GIB] {
         for connections in [20, 50, 100, 500, 1000, 2000, 5000] {
             let profile = NntpBufferProfile::adaptive(available, connections);

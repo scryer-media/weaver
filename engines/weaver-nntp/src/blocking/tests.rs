@@ -15,8 +15,8 @@ use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig as RustlsServerConfig;
 use tokio_rustls::rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 
-mod group_discovery;
 mod buffer_cap;
+mod group_discovery;
 mod idle;
 mod socket_use;
 

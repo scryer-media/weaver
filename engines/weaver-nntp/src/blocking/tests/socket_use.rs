@@ -215,7 +215,10 @@ fn measure_read_buffer_use() {
         cpu * 1000.0 / (decoded as f64 / (1u64 << 30) as f64),
     );
     eprintln!("SOCKET_USE {}", summary("added_per_read", &mut added));
-    eprintln!("SOCKET_USE {}", summary("socket_or_recv_per_call", &mut socket));
+    eprintln!(
+        "SOCKET_USE {}",
+        summary("socket_or_recv_per_call", &mut socket)
+    );
     eprintln!(
         "SOCKET_USE read_buf_len_max={read_buf_len_max} read_buf_capacity_max={read_buf_capacity_max} transport_buffer_max={transport_buffer_max}"
     );

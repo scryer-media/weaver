@@ -2449,8 +2449,7 @@ impl BlockingNntpConnection {
         // Freed while the lane waited for work: take the normal size back
         // before the first read rather than growing into it.
         if self.read_buf.capacity() == 0 {
-            self.read_buf
-                .reserve(self.buffer_profile.read_buf_capacity);
+            self.read_buf.reserve(self.buffer_profile.read_buf_capacity);
         }
         let socket_read_size = self.buffer_profile.socket_read_size;
         let (n, stats) = self

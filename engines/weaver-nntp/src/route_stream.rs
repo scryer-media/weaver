@@ -255,10 +255,7 @@ impl BlockingSocket {
                 ..
             } => {
                 let mut limited = dst.limit(max);
-                runtime.block_on(deadline(
-                    read_timeout.get(),
-                    stream.read_buf(&mut limited),
-                ))
+                runtime.block_on(deadline(read_timeout.get(), stream.read_buf(&mut limited)))
             }
         }
     }
