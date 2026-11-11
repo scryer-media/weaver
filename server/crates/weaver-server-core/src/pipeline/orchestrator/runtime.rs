@@ -926,6 +926,38 @@ impl Pipeline {
             })
     }
 
+    // Whether the pipeline has settled with nothing it can do, so the memory
+    // its work left behind can go back: no work to drive, or jobs holding
+    // slots that no server is set up to serve; and no read ahead or install
+    // still out, so a start-up's window and ring have filled. This does not
+    // change what drives the ticks: jobs holding slots still do.
+    pub(in crate::pipeline) fn memory_settled(&self, driving: bool) -> bool {
+        let stranded = || {
+            self.nntp.pool().server_count() == 0
+                && !self.pipeline_is_live()
+                && !self.queue_walk_due
+                && !self
+                    .shared_state
+                    .queue
+                    .read(|inner| inner.globals.speed_test_paused)
+        };
+        (!driving || stranded())
+            && !self.next_up.reading()
+            && !self.restores_waiting
+            && self.installing.is_empty()
+    }
+
+    // Whether to give memory back this turn: as the pipeline settles, and
+    // after each turn that did something while it stays settled. Never on an
+    // idle tick, and never while work moves.
+    pub(in crate::pipeline) fn memory_release_due(
+        was_settled: bool,
+        settled: bool,
+        turn_active: bool,
+    ) -> bool {
+        settled && (!was_settled || turn_active)
+    }
+
     // Give back the memory a pipeline with no work is holding for work that
     // has stopped: every page the allocator is keeping freed.
     pub(in crate::pipeline) fn release_idle_memory(&self) {
@@ -989,6 +1021,9 @@ impl Pipeline {
         let mut metrics_snapshot_interval = Self::metrics_snapshot_timer(metrics_live);
         // Whether the periodic drivers ran through the previous turn.
         let mut driving = true;
+        // Whether the last turn left the pipeline settled: see
+        // `memory_settled`.
+        let mut memory_settled = false;
         // Whether the previous turn did anything that dispatch must follow.
         let mut dispatch_due = true;
         let mut tune_interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -1383,13 +1418,12 @@ impl Pipeline {
                 if driving || turn_active || !self.reports_due.is_empty() {
                     self.settle_parked_gauges();
                 }
-                // Once per turn that did something and left the pipeline
-                // with no work, never on an idle tick and never while work
-                // is moving.
-                if driving || turn_active {
-                    self.release_idle_memory();
-                }
             }
+            let settled = self.memory_settled(now_driving);
+            if Self::memory_release_due(memory_settled, settled, turn_active) {
+                self.release_idle_memory();
+            }
+            memory_settled = settled;
             driving = now_driving;
             if live != metrics_live {
                 metrics_live = live;

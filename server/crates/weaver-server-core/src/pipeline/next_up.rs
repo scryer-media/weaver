@@ -66,7 +66,6 @@ impl NextUp {
     }
 
     // Whether a read ahead is out.
-    #[cfg(test)]
     pub(crate) fn reading(&self) -> bool {
         self.entries
             .values()
