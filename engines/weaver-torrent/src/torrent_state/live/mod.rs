@@ -2109,29 +2109,7 @@ impl TorrentStateLive {
         to: SocketAddr,
         told: &mut HashSet<SocketAddr>,
     ) -> Option<UtPex<ByteBufOwned>> {
-        // BEP 11: at most 50 added and 50 dropped peers in one message.
-        const MAX_SENT_PEERS: usize = 50;
-        let listed = self.peers.pex_listed();
-        let shown = |addr: &SocketAddr| is_local(to.ip()) || !is_local(addr.ip());
-        let added: Vec<PexPeerInfo> = listed
-            .iter()
-            .filter(|(addr, _)| shown(addr) && !told.contains(*addr))
-            .take(MAX_SENT_PEERS)
-            .map(|(&addr, &flags)| PexPeerInfo { flags, addr })
-            .collect();
-        let dropped: Vec<SocketAddr> = told
-            .iter()
-            .filter(|addr| !listed.contains_key(addr))
-            .take(MAX_SENT_PEERS)
-            .copied()
-            .collect();
-        if added.is_empty() && dropped.is_empty() {
-            return None;
-        }
-        for addr in &dropped {
-            told.remove(addr);
-        }
-        told.extend(added.iter().map(|p| p.addr));
+        let (added, dropped) = pex_diff(&self.peers.pex_listed(), to, told)?;
         Some(UtPex::from_peers(added.into_iter(), dropped.into_iter()))
     }
 
@@ -2166,6 +2144,41 @@ impl TorrentStateLive {
             }
         }
     }
+}
+
+// BEP 11: at most 50 added and 50 dropped peers in one message.
+pub(crate) const MAX_SENT_PEX_PEERS: usize = 50;
+
+// The peers the next PEX message to `to` adds and drops, given the peers we
+// list and those our earlier messages to `to` told of in `told`, and `told`
+// brought up to it; None when nothing changed. See
+// [`TorrentStateLive::next_pex_message`].
+pub(crate) fn pex_diff(
+    listed: &HashMap<SocketAddr, u8>,
+    to: SocketAddr,
+    told: &mut HashSet<SocketAddr>,
+) -> Option<(Vec<PexPeerInfo>, Vec<SocketAddr>)> {
+    let shown = |addr: &SocketAddr| is_local(to.ip()) || !is_local(addr.ip());
+    let added: Vec<PexPeerInfo> = listed
+        .iter()
+        .filter(|(addr, _)| shown(addr) && !told.contains(*addr))
+        .take(MAX_SENT_PEX_PEERS)
+        .map(|(&addr, &flags)| PexPeerInfo { flags, addr })
+        .collect();
+    let dropped: Vec<SocketAddr> = told
+        .iter()
+        .filter(|addr| !listed.contains_key(*addr))
+        .take(MAX_SENT_PEX_PEERS)
+        .copied()
+        .collect();
+    if added.is_empty() && dropped.is_empty() {
+        return None;
+    }
+    for addr in &dropped {
+        told.remove(addr);
+    }
+    told.extend(added.iter().map(|p| p.addr));
+    Some((added, dropped))
 }
 
 // The ticks a peer's PEX messages go out on. A tick missed while the task
@@ -2639,7 +2652,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state
             .peers
             .with_live_mut(self.addr, "update peer holepunch support", |live| {
-                live.supports_holepunch = hs.m.ut_holepunch.is_some();
+                let holepunch = hs.m.ut_holepunch.is_some();
+                if live.supports_holepunch != holepunch {
+                    live.supports_holepunch = holepunch;
+                    self.state.peers.pex_changed();
+                }
                 live.supports_upload_only = hs.m.upload_only.is_some();
             });
         // A nonzero `upload_only` says the peer only uploads; zero or none
@@ -2728,7 +2745,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             self.state
                 .peers
                 .with_peer_mut(self.addr, "update outgoing addr", |peer| {
-                    peer.outgoing_address = Some(listen)
+                    peer.listens_at(listen, &self.state.peers)
                 });
         }
 

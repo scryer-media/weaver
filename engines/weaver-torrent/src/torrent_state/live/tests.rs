@@ -5820,7 +5820,7 @@ async fn the_extended_handshake_carries_listen_ports_and_no_claimed_address() {
         Some(Some(listen))
     );
     assert_eq!(
-        h.peers.pex_listed().into_keys().collect::<Vec<_>>(),
+        h.peers.pex_listed().keys().copied().collect::<Vec<_>>(),
         [listen]
     );
 }

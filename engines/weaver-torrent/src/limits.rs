@@ -13,6 +13,7 @@
 use parking_lot::Mutex;
 use serde::Deserialize;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::pin::Pin;
 use std::time::Duration;
@@ -92,8 +93,8 @@ const MAX_ROUND_GAP: Duration = Duration::from_secs(3);
 const REQUEST_ROUNDS: u32 = 20;
 
 // A peer's request waiting on the channel (libtorrent `bw_request`).
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Request {
-    id: u64,
     want: u64,
     // What the request has taken so far; the channel is charged for it.
     assigned: u64,
@@ -122,7 +123,11 @@ struct Budget {
     // fills only while requests wait (`update_quotas` returns early on an
     // empty queue).
     last_round: Instant,
-    queue: Vec<Request>,
+    // By id, so a waiter finds, settles and leaves its request without
+    // walking the others: a round costs each request a constant, not the
+    // queue's length. A round offers every request the same share, so the
+    // queue has no order to keep.
+    queue: HashMap<u64, Request>,
     next_id: u64,
 }
 
@@ -155,18 +160,20 @@ impl Budget {
         }
         let id = self.next_id;
         self.next_id += 1;
-        self.queue.push(Request {
+        self.queue.insert(
             id,
-            want,
-            assigned: 0,
-            share: None,
-            rounds_left: REQUEST_ROUNDS,
-        });
+            Request {
+                want,
+                assigned: 0,
+                share: None,
+                rounds_left: REQUEST_ROUNDS,
+            },
+        );
         id
     }
 
     fn request(&mut self, id: u64) -> Option<&mut Request> {
-        self.queue.iter_mut().find(|r| r.id == id)
+        self.queue.get_mut(&id)
     }
 
     // What the channel offers the request `id` now: all it still wants
@@ -196,15 +203,12 @@ impl Budget {
     }
 
     fn done(&self, id: u64) -> bool {
-        self.queue.iter().any(|r| r.id == id && r.done())
+        self.queue.get(&id).is_some_and(Request::done)
     }
 
     // The request `id` taken off the queue with what it was assigned.
     fn remove(&mut self, id: u64) -> u64 {
-        match self.queue.iter().position(|r| r.id == id) {
-            Some(at) => self.queue.remove(at).assigned,
-            None => 0,
-        }
+        self.queue.remove(&id).map_or(0, |r| r.assigned)
     }
 
     // A request given up: the quota it was assigned goes back to the
@@ -260,7 +264,7 @@ impl Budget {
         let gap_ms = i64::try_from(gap.as_millis()).unwrap_or(i64::MAX);
         self.quota_left = self.quota_left.min(0) + (limit * gap_ms + 500) / 1000;
         let share = u64::try_from(self.quota_left).unwrap_or(0) / self.queue.len().max(1) as u64;
-        for request in &mut self.queue {
+        for request in self.queue.values_mut() {
             request.rounds_left = request.rounds_left.saturating_sub(1);
             request.share = Some(share.min(request.want - request.assigned));
         }
@@ -398,7 +402,7 @@ impl Limit {
                 kind,
                 quota_left: 0,
                 last_round: Instant::now(),
-                queue: Vec::new(),
+                queue: HashMap::new(),
                 next_id: 0,
             }),
             changed: Notify::new(),
@@ -895,6 +899,180 @@ mod tests {
         torrent.set_upload_bps(bps(1000));
         assert_eq!(handshake.await, 68);
         assert_eq!(*session.watch_upload_granted().borrow(), 68);
+    }
+
+    // The queue as a list walked for each request, as the channel kept it
+    // before it kept its requests by id: the reference the test below
+    // compares the channel with.
+    struct ListBudget {
+        kind: LimitKind,
+        quota_left: i64,
+        last_round: Instant,
+        queue: Vec<(u64, super::Request)>,
+        next_id: u64,
+    }
+
+    impl ListBudget {
+        fn request(&mut self, id: u64) -> Option<&mut super::Request> {
+            self.queue
+                .iter_mut()
+                .find(|(at, _)| *at == id)
+                .map(|(_, r)| r)
+        }
+        fn enqueue(&mut self, want: u64, now: Instant) -> u64 {
+            if self.queue.is_empty() {
+                self.last_round = now;
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            self.queue.push((
+                id,
+                super::Request {
+                    want,
+                    assigned: 0,
+                    share: None,
+                    rounds_left: super::REQUEST_ROUNDS,
+                },
+            ));
+            id
+        }
+        fn offer(&mut self, id: u64) -> Option<u64> {
+            let kind = self.kind;
+            let request = self.request(id)?;
+            match kind {
+                LimitKind::Unlimited => Some(request.want - request.assigned),
+                LimitKind::Closed => None,
+                LimitKind::Bps(_) => request.share,
+            }
+        }
+        fn take(&mut self, id: u64, bytes: u64) {
+            let kind = self.kind;
+            if let Some(request) = self.request(id) {
+                request.assigned += bytes;
+                request.share = None;
+                if let LimitKind::Bps(_) = kind {
+                    self.quota_left -= i64::try_from(bytes).unwrap();
+                }
+            }
+        }
+        fn done(&self, id: u64) -> bool {
+            self.queue.iter().any(|(at, r)| *at == id && r.done())
+        }
+        fn remove(&mut self, id: u64) -> u64 {
+            match self.queue.iter().position(|(at, _)| *at == id) {
+                Some(at) => self.queue.remove(at).1.assigned,
+                None => 0,
+            }
+        }
+        fn cancel(&mut self, id: u64) {
+            let assigned = self.remove(id);
+            if let LimitKind::Bps(_) = self.kind {
+                self.quota_left += i64::try_from(assigned).unwrap();
+            }
+        }
+        fn round(&mut self, now: Instant) {
+            let gap = (now - self.last_round).min(super::MAX_ROUND_GAP);
+            self.last_round = now;
+            let LimitKind::Bps(limit) = self.kind else {
+                return;
+            };
+            let limit = i64::from(limit.get());
+            let gap_ms = i64::try_from(gap.as_millis()).unwrap();
+            self.quota_left = self.quota_left.min(0) + (limit * gap_ms + 500) / 1000;
+            let share =
+                u64::try_from(self.quota_left).unwrap_or(0) / self.queue.len().max(1) as u64;
+            for (_, request) in &mut self.queue {
+                request.rounds_left = request.rounds_left.saturating_sub(1);
+                request.share = Some(share.min(request.want - request.assigned));
+            }
+        }
+    }
+
+    // A channel keeping its requests by id assigns every request the same
+    // shares, settles the same ones and leaves the same quota as the list
+    // walked for each request, over seeded runs of requests arriving,
+    // taking their offers, settling, going and rounds passing, at a rate,
+    // unlimited and closed.
+    #[test]
+    fn requests_kept_by_id_get_the_shares_a_walked_list_gives() {
+        let mut rng = 0x6a09_e667_f3bc_c908u64;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for kind in [
+            bps(1000),
+            bps(37),
+            bps(250_000),
+            LimitKind::Unlimited,
+            LimitKind::Closed,
+        ] {
+            let mut now = Instant::now();
+            let mut by_id = super::Limit::new(kind).budget.into_inner();
+            by_id.last_round = now;
+            let mut list = ListBudget {
+                kind,
+                quota_left: 0,
+                last_round: now,
+                queue: Vec::new(),
+                next_id: 0,
+            };
+            let mut ids: Vec<u64> = Vec::new();
+            for step in 0..20_000 {
+                let r = next();
+                let pick =
+                    |ids: &[u64]| (!ids.is_empty()).then(|| ids[(r >> 16) as usize % ids.len()]);
+                match r % 7 {
+                    0 | 1 => {
+                        let want = 1 + (r >> 20) % 4000;
+                        // The channel reads the clock as a queue begins.
+                        let id = if by_id.queue.is_empty() {
+                            let id = by_id.enqueue(want);
+                            by_id.last_round = now;
+                            id
+                        } else {
+                            by_id.enqueue(want)
+                        };
+                        assert_eq!(id, list.enqueue(want, now), "step {step}");
+                        ids.push(id);
+                    }
+                    2 | 3 => {
+                        if let Some(id) = pick(&ids) {
+                            let offer = by_id.offer(id);
+                            assert_eq!(offer, list.offer(id), "step {step}");
+                            if let Some(bytes) = offer {
+                                by_id.take(id, bytes);
+                                list.take(id, bytes);
+                            }
+                            assert_eq!(by_id.done(id), list.done(id), "step {step}");
+                            if by_id.done(id) {
+                                assert_eq!(by_id.remove(id), list.remove(id), "step {step}");
+                                ids.retain(|at| *at != id);
+                            }
+                        }
+                    }
+                    4 => {
+                        if let Some(id) = pick(&ids) {
+                            by_id.cancel(id);
+                            list.cancel(id);
+                            ids.retain(|at| *at != id);
+                        }
+                    }
+                    _ => {
+                        now += ROUND + Duration::from_millis((r >> 24) % 50);
+                        by_id.round(now);
+                        list.round(now);
+                    }
+                }
+                assert_eq!(by_id.quota_left, list.quota_left, "step {step}");
+                assert_eq!(by_id.queue.len(), list.queue.len(), "step {step}");
+                for (id, request) in &list.queue {
+                    assert_eq!(by_id.queue.get(id), Some(request), "step {step}");
+                }
+            }
+        }
     }
 
     #[test]

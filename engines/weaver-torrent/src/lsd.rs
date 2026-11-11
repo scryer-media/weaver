@@ -17,7 +17,7 @@ use std::{
 use crate::core::{Id20, spawn_utils::spawn_with_cancel};
 use anyhow::Context;
 use futures::{Stream, future::BoxFuture};
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use tokio::{
     sync::{
         Notify,
@@ -250,8 +250,17 @@ impl Registry {
     }
 }
 
+/// Joins the LSD's groups afresh, on the interfaces up now.
+type Rejoin = Box<dyn Fn() -> anyhow::Result<Box<dyn Socket>> + Send + Sync>;
+
 struct LocalServiceDiscoveryInner {
-    socket: Box<dyn Socket>,
+    /// The socket sent on and received from; replaced whole by a rejoin.
+    socket: RwLock<Arc<dyn Socket>>,
+    /// How to join again, when the LSD can.
+    rejoin: Option<Rejoin>,
+    /// Rung once a rejoin replaced the socket: a receive waiting on the old
+    /// one moves to the new.
+    rejoined: Notify,
     cookie: u32,
     registry: Mutex<Registry>,
     /// Wakes the schedule when it moves earlier.
@@ -285,21 +294,27 @@ impl LocalServiceDiscovery {
         if let Some(socket) = opts.socket {
             return Ok(Self::with_socket(
                 socket,
+                None,
                 opts.cookie.unwrap_or_else(rand::random),
                 opts.cancel_token,
                 tasks,
             ));
         }
-        #[expect(
-            clippy::disallowed_methods,
-            reason = "the LSD's groups are on the local network alone, never a route"
-        )]
-        let socket = opts
-            .egress
-            .join_multicast(LSD_IPV4, LSD_IPV6)
-            .context("error binding LSD socket")?;
+        let egress = opts.egress;
+        let join: Rejoin = Box::new(move || {
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the LSD's groups are on the local network alone, never a route"
+            )]
+            let socket = egress
+                .join_multicast(LSD_IPV4, LSD_IPV6)
+                .context("error binding LSD socket")?;
+            Ok(Box::new(socket) as Box<dyn Socket>)
+        });
+        let socket = join()?;
         Ok(Self::with_socket(
-            Box::new(socket),
+            socket,
+            Some(join),
             opts.cookie.unwrap_or_else(rand::random),
             opts.cancel_token,
             tasks,
@@ -308,13 +323,16 @@ impl LocalServiceDiscovery {
 
     fn with_socket(
         socket: Box<dyn Socket>,
+        rejoin: Option<Rejoin>,
         cookie: u32,
         cancel_token: CancellationToken,
         tasks: TaskTracker,
     ) -> Self {
         let lsd = Self {
             inner: Arc::new(LocalServiceDiscoveryInner {
-                socket,
+                socket: RwLock::new(Arc::from(socket)),
+                rejoin,
+                rejoined: Notify::new(),
                 cookie,
                 registry: Mutex::new(Registry::new()),
                 reschedule: Notify::new(),
@@ -335,6 +353,28 @@ impl LocalServiceDiscovery {
         );
 
         lsd
+    }
+
+    /// Joins the LSD's groups again on the interfaces up now, and sends and
+    /// receives on the new socket from here on; the old one closes once the
+    /// receive waiting on it lets it go. A join captures the interfaces it
+    /// was made on, so one that came up since, or an address that changed,
+    /// is reached only after this. Run on an interface change. On failure
+    /// the old socket stays. Must be called within a Tokio runtime.
+    pub fn rejoin(&self) -> anyhow::Result<()> {
+        let join = self
+            .inner
+            .rejoin
+            .as_ref()
+            .context("this local service discovery cannot rejoin")?;
+        let socket = join()?;
+        *self.inner.socket.write() = Arc::from(socket);
+        self.inner.rejoined.notify_waiters();
+        Ok(())
+    }
+
+    fn socket(&self) -> Arc<dyn Socket> {
+        self.inner.socket.read().clone()
     }
 
     fn gen_announce_msg(&self, info_hash: Id20, port: u16, is_v6: bool) -> String {
@@ -364,7 +404,17 @@ cookie: {cookie}\r
     async fn recv_and_process_one(&self, buf: &mut [u8]) -> io::Result<()> {
         let mut headers = [httparse::EMPTY_HEADER; 16];
 
-        let (sz, addr) = match self.inner.socket.recv_from(buf).await {
+        // Armed before the socket is read, so a rejoin between the two
+        // still moves the receive.
+        let rejoined = self.inner.rejoined.notified();
+        let mut rejoined = std::pin::pin!(rejoined);
+        rejoined.as_mut().enable();
+        let socket = self.socket();
+        let received = tokio::select! {
+            received = socket.recv_from(buf) => received,
+            () = rejoined => return Ok(()),
+        };
+        let (sz, addr) = match received {
             Ok(received) => received,
             Err(error) if error.kind() == io::ErrorKind::NotConnected => return Err(error),
             Err(error) => {
@@ -372,7 +422,7 @@ cookie: {cookie}\r
                 return Ok(());
             }
         };
-        if !self.inner.socket.is_local(addr) {
+        if !socket.is_local(addr) {
             trace!(?addr, "ignoring a packet from outside the local network");
             return Ok(());
         }
@@ -428,8 +478,7 @@ cookie: {cookie}\r
             let due = self.inner.registry.lock().due(Instant::now());
             for (info_hash, port) in due {
                 trace!(?info_hash, port, "announcing");
-                self.inner
-                    .socket
+                self.socket()
                     .send_everywhere(&|is_v6| self.gen_announce_msg(info_hash, port, is_v6))
                     .await;
             }
@@ -708,27 +757,42 @@ mod tests {
         start: Instant,
     }
 
+    /// A socket on a host that is on 10.0.0.0/24 alone, with the ends a
+    /// test reads its sends from and injects its packets into.
+    fn test_socket() -> (
+        TestSocket,
+        UnboundedReceiver<(Instant, Id20, u16)>,
+        UnboundedSender<Incoming>,
+    ) {
+        let (incoming, incoming_rx) = unbounded_channel();
+        let (sent_tx, sent) = unbounded_channel();
+        let socket = TestSocket {
+            incoming: tokio::sync::Mutex::new(incoming_rx),
+            sent: sent_tx,
+            nics: vec![NetworkInterface::new_afinet(
+                "test0",
+                Ipv4Addr::new(10, 0, 0, 1),
+                Some(Ipv4Addr::new(255, 255, 255, 0)),
+                None,
+                1,
+                false,
+            )],
+        };
+        (socket, sent, incoming)
+    }
+
     impl Harness {
         fn new() -> Self {
-            let (incoming, incoming_rx) = unbounded_channel();
-            let (sent_tx, sent) = unbounded_channel();
-            // The host is on 10.0.0.0/24 alone.
-            let socket = TestSocket {
-                incoming: tokio::sync::Mutex::new(incoming_rx),
-                sent: sent_tx,
-                nics: vec![NetworkInterface::new_afinet(
-                    "test0",
-                    Ipv4Addr::new(10, 0, 0, 1),
-                    Some(Ipv4Addr::new(255, 255, 255, 0)),
-                    None,
-                    1,
-                    false,
-                )],
-            };
+            Self::rejoining(None)
+        }
+
+        fn rejoining(rejoin: Option<super::Rejoin>) -> Self {
+            let (socket, sent, incoming) = test_socket();
             let tasks = tokio_util::task::TaskTracker::new();
             Self {
                 lsd: LocalServiceDiscovery::with_socket(
                     Box::new(socket),
+                    rejoin,
                     1,
                     CancellationToken::new(),
                     tasks.clone(),
@@ -793,6 +857,42 @@ mod tests {
 
     fn hash(b: u8) -> Id20 {
         Id20::new([b; 20])
+    }
+
+    // A rejoin moves the sends and the receives to the new socket: the
+    // resends of the announce under way go out on it, a packet on it comes
+    // through, and the old socket is let go.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejoin_sends_and_receives_on_the_new_socket() {
+        let (socket, sent, incoming) = test_socket();
+        let fresh = std::sync::Mutex::new(Some(socket));
+        let mut h = Harness::rejoining(Some(Box::new(move || {
+            let socket = fresh.lock().unwrap().take().unwrap();
+            Ok(Box::new(socket) as Box<dyn Socket>)
+        })));
+        let a = hash(1);
+        let mut peers = h.lsd.announce(a, Some(fixed(PORT)));
+        assert_eq!(h.next().await, (a, 0));
+        h.lsd.rejoin().unwrap();
+        h.incoming.closed().await;
+        let old = std::mem::replace(&mut h.sent, sent);
+        h.incoming = incoming;
+        assert_eq!(h.until(6).await, [(a, 2), (a, 6)]);
+        h.receive("10.0.0.7:6771", a, 7001);
+        assert_eq!(peers.next().await, Some("10.0.0.7:7001".parse().unwrap()));
+        let mut old = old;
+        assert!(old.try_recv().is_err(), "nothing more on the old socket");
+    }
+
+    // With nothing to join again with, a rejoin fails and the socket stays.
+    #[tokio::test(start_paused = true)]
+    async fn a_rejoin_without_a_way_to_join_keeps_the_socket() {
+        let mut h = Harness::new();
+        let a = hash(1);
+        let _stream = h.lsd.announce(a, Some(fixed(PORT)));
+        assert_eq!(h.next().await, (a, 0));
+        assert!(h.lsd.rejoin().is_err());
+        assert_eq!(h.until(2).await, [(a, 2)]);
     }
 
     // libtorrent `lsd::announce_impl`: three sends, 2 s then 4 s apart; the

@@ -13,11 +13,40 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::ops::Range;
 use std::path::Path;
 use std::str::FromStr;
-use tokio::io::{AsyncBufRead, AsyncRead};
+use tokio::io::{AsyncBufRead, AsyncRead, AsyncReadExt};
 use tokio::{io::AsyncBufReadExt, io::BufReader};
 use tokio_util::io::StreamReader;
 use tracing::trace;
 use url::Url;
+
+/// The most bytes a list may hold once decompressed. The largest lists in
+/// use, the combined P2P blocklists of a few hundred thousand to some
+/// million ranges, run to some tens of megabytes as text; this holds
+/// several times that, and stops a small gzip that inflates without end.
+pub const MAX_LIST_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The most lines a list may hold, comments and blanks counted: several
+/// times the ranges of the largest lists in use.
+pub const MAX_LIST_LINES: usize = 8_000_000;
+
+// The text a list is parsed in, read off the stream a part at a time and
+// parsed off the async runtime, so neither the whole text nor the parse
+// sits on it.
+const PARSE_CHUNK: usize = 1024 * 1024;
+
+// What a list may hold, and the parts it is parsed in.
+#[derive(Clone, Copy)]
+struct Caps {
+    bytes: u64,
+    lines: usize,
+    chunk: usize,
+}
+
+const CAPS: Caps = Caps {
+    bytes: MAX_LIST_BYTES,
+    lines: MAX_LIST_LINES,
+    chunk: PARSE_CHUNK,
+};
 
 // The ranges sorted by start with overlaps merged, so a lookup is one binary
 // search. `len` counts the ranges as given.
@@ -196,30 +225,56 @@ impl IpRanges {
         }
     }
 
+    // Reads the text a part at a time, at most [`MAX_LIST_BYTES`] of it
+    // and [`MAX_LIST_LINES`] lines, and parses each part's whole lines, then
+    // sorts and merges the ranges, off the async runtime. A list past
+    // either cap is refused whole.
     async fn create_from_decoded_stream(
         reader: &mut (dyn AsyncBufRead + Unpin + Send),
     ) -> Result<Self> {
-        let mut v4 = Vec::new();
-        let mut v6 = Vec::new();
+        Self::parse_capped(reader, CAPS).await
+    }
 
-        let mut line = String::new();
-
-        while reader.read_line(&mut line).await? > 0 {
-            match parse_ip_range(&line) {
-                Some(IpRange::V4(r)) => {
-                    v4.push(r);
-                }
-                Some(IpRange::V6(r)) => {
-                    v6.push(r);
-                }
-                None => {
-                    tracing::debug!(line, "couldn't parse line");
-                }
+    async fn parse_capped(reader: &mut (dyn AsyncRead + Unpin + Send), caps: Caps) -> Result<Self> {
+        let mut parsed = Parsed::default();
+        let mut pending: Vec<u8> = Vec::new();
+        let mut read: u64 = 0;
+        loop {
+            let mut chunk = std::mem::take(&mut pending);
+            let had = chunk.len();
+            // One byte past the cap tells a list at the cap from one past it.
+            let room = (caps.bytes + 1 - read).min(caps.chunk as u64);
+            let n = (&mut *reader).take(room).read_to_end(&mut chunk).await?;
+            read += n as u64;
+            if read > caps.bytes {
+                anyhow::bail!("the list is larger than {} bytes decompressed", caps.bytes);
             }
-            line.clear();
+            let end = n == 0;
+            // A part's last line may go on in the next; the last part's
+            // last line ends with the stream.
+            let whole = if end {
+                chunk.len()
+            } else {
+                match memchr::memrchr(b'\n', &chunk[had..]) {
+                    Some(at) => had + at + 1,
+                    None => {
+                        pending = chunk;
+                        continue;
+                    }
+                }
+            };
+            pending = chunk.split_off(whole);
+            parsed = tokio::task::spawn_blocking(move || parsed.lines(&chunk, caps.lines))
+                .await
+                .context("parsing the list")??;
+            if end {
+                break;
+            }
         }
-
-        Ok(Self::new(v4, v6))
+        let Parsed { v4, v6, .. } = parsed;
+        tokio::task::spawn_blocking(move || Self::new(v4, v6))
+            .await
+            .context("building the list")
     }
 
     pub fn has(&self, ip: IpAddr) -> bool {
@@ -233,6 +288,35 @@ impl IpRanges {
 enum IpRange {
     V4(Range<Ipv4Addr>),
     V6(Range<Ipv6Addr>),
+}
+
+// The ranges parsed so far, and the lines read.
+#[derive(Default)]
+struct Parsed {
+    v4: Vec<Range<Ipv4Addr>>,
+    v6: Vec<Range<Ipv6Addr>>,
+    lines: usize,
+}
+
+impl Parsed {
+    // Parses `text`, whole lines of the list: a line that is no range is
+    // passed over. Text that is not UTF-8 refuses the list, as a line read
+    // as a string does.
+    fn lines(mut self, text: &[u8], max_lines: usize) -> Result<Self> {
+        let text = std::str::from_utf8(text).context("the list is not UTF-8 text")?;
+        for line in text.split_inclusive('\n') {
+            self.lines += 1;
+            if self.lines > max_lines {
+                anyhow::bail!("the list has more than {max_lines} lines");
+            }
+            match parse_ip_range(line) {
+                Some(IpRange::V4(r)) => self.v4.push(r),
+                Some(IpRange::V6(r)) => self.v6.push(r),
+                None => tracing::debug!(line, "couldn't parse line"),
+            }
+        }
+        Ok(self)
+    }
 }
 
 fn parse_ip_range(line: &str) -> Option<IpRange> {
@@ -355,6 +439,138 @@ mod tests {
             assert!(!union.has(ip(open)), "{open}");
         }
         assert!(!IpRanges::union([]).has(ip("10.0.0.1")));
+    }
+
+    // The list as each line read as a string parsed it, before lists were
+    // read a part at a time: the reference the test below compares with.
+    async fn read_by_line(text: &[u8]) -> Result<(Vec<Range<Ipv4Addr>>, Vec<Range<Ipv6Addr>>)> {
+        let mut reader = BufReader::new(Cursor::new(text.to_vec()));
+        let (mut v4, mut v6) = (Vec::new(), Vec::new());
+        let mut line = String::new();
+        while reader.read_line(&mut line).await? > 0 {
+            match parse_ip_range(&line) {
+                Some(IpRange::V4(r)) => v4.push(r),
+                Some(IpRange::V6(r)) => v6.push(r),
+                None => {}
+            }
+            line.clear();
+        }
+        Ok((v4, v6))
+    }
+
+    // A list read a part at a time holds what reading it line by line
+    // gave, over seeded lists of ranges, comments, junk, long lines and a
+    // last line with no newline, at part sizes that split lines anywhere.
+    #[tokio::test]
+    async fn a_list_read_in_parts_holds_what_reading_by_line_gives() {
+        let mut rng = 0xa54f_f53a_5f1d_36f1u64;
+        let mut next = move || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for run in 0..60 {
+            let mut text = String::new();
+            for _ in 0..(next() % 200) {
+                let r = next();
+                match r % 6 {
+                    0 => text.push_str("# a comment\n"),
+                    1 => text.push_str("  \n"),
+                    2 => text.push_str(&format!(
+                        "name é{}:not-a-range\n",
+                        "x".repeat((r >> 8) as usize % 300)
+                    )),
+                    3 => {
+                        let v6 = |b: u64| Ipv6Addr::from_bits(u128::from(b) << 64);
+                        text.push_str(&format!(
+                            "v6:{}-{}\n",
+                            v6(r >> 40),
+                            v6((r >> 40) + (r >> 8) % 9)
+                        ));
+                    }
+                    _ => {
+                        let a = Ipv4Addr::from_bits(u32::try_from(r >> 32).unwrap());
+                        let b = Ipv4Addr::from_bits(
+                            a.to_bits()
+                                .saturating_add(u32::try_from((r >> 8) % 1000).unwrap()),
+                        );
+                        text.push_str(&format!("list {run}:{a}-{b}\n"));
+                    }
+                }
+            }
+            if next() % 2 == 0 {
+                text.push_str("last:10.0.0.1-10.0.0.9");
+            }
+            let (v4, v6) = read_by_line(text.as_bytes()).await.unwrap();
+            let by_line = IpRanges::new(v4, v6);
+            for chunk in [1, 7, 64, 4096] {
+                let caps = Caps { chunk, ..CAPS };
+                let parts =
+                    IpRanges::parse_capped(&mut Cursor::new(text.clone().into_bytes()), caps)
+                        .await
+                        .unwrap();
+                assert_eq!(parts.len(), by_line.len(), "run {run} chunk {chunk}");
+                assert_eq!(
+                    parts.v4.ranges, by_line.v4.ranges,
+                    "run {run} chunk {chunk}"
+                );
+                assert_eq!(
+                    parts.v6.ranges, by_line.v6.ranges,
+                    "run {run} chunk {chunk}"
+                );
+                assert_eq!(
+                    parts.mapped_v4.ranges, by_line.mapped_v4.ranges,
+                    "run {run} chunk {chunk}"
+                );
+            }
+        }
+        // Text that is not UTF-8 refuses the list either way.
+        let bad = b"a:10.0.0.1-10.0.0.2\n\xff\xfe:1.1.1.1-1.1.1.2\n";
+        assert!(read_by_line(bad).await.is_err());
+        assert!(
+            IpRanges::parse_capped(&mut Cursor::new(bad.to_vec()), CAPS)
+                .await
+                .is_err()
+        );
+    }
+
+    // A list at the caps loads; a byte or a line past either is refused
+    // with an error naming the cap, a gzip that inflates past it too.
+    #[tokio::test]
+    async fn a_list_past_its_caps_is_refused() {
+        let line = b"a:10.0.0.1-10.0.0.2\n";
+        let text: Vec<u8> = line.repeat(10);
+        let bytes = text.len() as u64;
+        let at = |bytes, lines| Caps {
+            bytes,
+            lines,
+            chunk: 16,
+        };
+        let load = |text: Vec<u8>, caps| async move {
+            IpRanges::parse_capped(&mut Cursor::new(text), caps).await
+        };
+        assert_eq!(load(text.clone(), at(bytes, 10)).await.unwrap().len(), 10);
+        let err = load(text.clone(), at(bytes - 1, 10)).await.err().unwrap();
+        assert!(err.to_string().contains("larger than"), "{err}");
+        let err = load(text.clone(), at(bytes, 9)).await.err().unwrap();
+        assert!(err.to_string().contains("more than 9 lines"), "{err}");
+
+        // A gzip far smaller than what it inflates to.
+        let mut gzipped = Vec::new();
+        {
+            let mut encoder = GzipEncoder::new(&mut gzipped);
+            encoder.write_all(&vec![b'#'; 1 << 20]).await.unwrap();
+            encoder.shutdown().await.unwrap();
+        }
+        assert!(gzipped.len() < 1 << 16);
+        let mut reader = tokio::io::BufReader::new(Cursor::new(gzipped));
+        let mut inflated = BufReader::new(GzipDecoder::new(&mut reader));
+        let err = IpRanges::parse_capped(&mut inflated, at(1 << 16, 10))
+            .await
+            .err()
+            .unwrap();
+        assert!(err.to_string().contains("larger than"), "{err}");
     }
 
     #[test]
