@@ -43,6 +43,7 @@ impl TorrentView {
             private,
             forced,
             progress,
+            check_progress,
             total_bytes,
             have_bytes,
             wanted_bytes,
@@ -125,6 +126,7 @@ impl TorrentView {
         )
             .hash(hasher);
         (private, forced, progress.to_bits(), total_bytes, have_bytes).hash(hasher);
+        check_progress.map(f64::to_bits).hash(hasher);
         (
             wanted_bytes,
             wanted_have_bytes,

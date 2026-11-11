@@ -806,7 +806,11 @@ pub struct TorrentView {
     pub scope: TorrentScope,
     pub private: bool,
     pub forced: bool,
+    /// The wanted bytes in hand, over the wanted bytes: the pieces it
+    /// counts, a check under way included.
     pub progress: f64,
+    /// While its files are checked, the share of them the check has read.
+    pub check_progress: Option<f64>,
     pub total_bytes: u64,
     pub have_bytes: u64,
     /// The bytes of the files it wants, and how many of them are on disk;
@@ -1696,6 +1700,7 @@ impl Live {
             return Reading {
                 engine: Engine::Absent,
                 file_have: self.file_have.clone(),
+                checked: None,
                 counters: self.counters,
                 seen: self.seen,
                 timed: self.timed,
@@ -1708,7 +1713,17 @@ impl Live {
         let stats = attached.handle.stats();
         let engine = Engine::of(&stats);
         let mut file_have = self.file_have.clone();
-        take_file_have(&mut file_have, &engine, &stats.file_progress);
+        take_file_have(&mut file_have, &stats.file_progress, self.store.as_deref());
+        // How far a check under way has read (libtorrent
+        // `torrent_status::progress` while `checking_files`, torrent.cpp:2625
+        // and :12278-12292, v2.0.15).
+        let checked = matches!(engine, Engine::Starting | Engine::Checking).then(|| {
+            if stats.total_bytes == 0 {
+                0.0
+            } else {
+                (stats.progress_bytes as f64 / stats.total_bytes as f64).min(1.0)
+            }
+        });
         let live = stats.live.as_ref();
         // The session counts on from what the torrent had moved when it
         // took it, through every pause.
@@ -1745,6 +1760,7 @@ impl Live {
         Reading {
             engine,
             file_have,
+            checked,
             counters,
             seen,
             timed: self.timed,
@@ -1793,6 +1809,8 @@ struct Reading {
     engine: Engine,
     // Each file's bytes in hand.
     file_have: Vec<u64>,
+    // The share of the torrent a check under way has read, while one is.
+    checked: Option<f64>,
     // The ledger with what the session moved since it was last kept.
     counters: TorrentCounters,
     // The session's totals, which the ledger's deltas are taken from.
@@ -6513,6 +6531,12 @@ impl TorrentService {
             } else {
                 (wanted_have as f64 / wanted as f64).min(1.0)
             },
+            check_progress: reading.checked.filter(|_| {
+                matches!(
+                    state,
+                    TorrentState::CheckingFiles | TorrentState::CheckingResumeData
+                )
+            }),
             total_bytes: total,
             have_bytes: have,
             wanted_bytes: wanted,
@@ -7425,11 +7449,15 @@ fn wanted(layout: Option<&PieceLayout>, levels: &[FilePriority], file_have: &[u6
 
 // Every file's bytes in hand. The session's progress counts only the files
 // above Ignored, so each file's own figure is what is kept. While the
-// session checks the files, the checkpoint's figure stands.
-fn take_file_have(kept: &mut Vec<u64>, engine: &Engine, reported: &[u64]) {
-    if *engine != Engine::Checking && !reported.is_empty() {
+// session reports none, as while it checks the files, the store's figure
+// stands: the pieces the check has found so far, or those the checkpoint
+// it starts from vouches for, which are the pieces the torrent counts.
+fn take_file_have(kept: &mut Vec<u64>, reported: &[u64], store: Option<&TorrentStore>) {
+    if !reported.is_empty() {
         kept.clear();
         kept.extend_from_slice(reported);
+    } else if let Some(store) = store {
+        store.file_have_into(kept);
     }
 }
 

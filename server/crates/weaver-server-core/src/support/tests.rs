@@ -630,6 +630,7 @@ fn held_torrent(
         private: true,
         forced: false,
         progress: 0.25,
+        check_progress: None,
         total_bytes: 3000,
         have_bytes: 1024,
         wanted_bytes: 3000,

@@ -1278,6 +1278,17 @@ fn when(ms: Option<i64>) -> i64 {
 
 // The bytes of the files it fetches, and of those the bytes it lacks
 // (qBittorrent `wantedSize`, `remainingSize`).
+// qBittorrent's `progress`: while the torrent is checked, how far the check
+// has read; otherwise the wanted bytes in hand (qBittorrent
+// `TorrentImpl::progress`, torrentimpl.cpp:927-947, with `isChecking` at
+// :1181-1185; served in torrents/info, serialize_torrent.cpp:130, and in
+// torrents/properties, torrentscontroller.cpp:873).
+fn progress(view: &TorrentView) -> f64 {
+    view.check_progress
+        .unwrap_or(view.progress)
+        .clamp(0.0, 1.0)
+}
+
 fn wanted_and_left(view: &TorrentView) -> (u64, u64) {
     if view.files.is_empty() {
         return (
@@ -1405,7 +1416,7 @@ fn steady_fields(view: &TorrentView, scope: CallerScope) -> Vec<(&'static str, V
         ),
         ("magnet_uri", json!(view.magnet)),
         ("size", json!(wanted)),
-        ("progress", json!(view.progress.clamp(0.0, 1.0))),
+        ("progress", json!(progress(view))),
         ("total_wasted", json!(view.wasted_bytes)),
         (
             "pieces_have",
@@ -1819,7 +1830,7 @@ async fn properties(ctx: &TorrentFacadeContext, params: &Params) -> Response {
         ("download_path", json!("")),
         ("comment", json!(view.comment.clone().unwrap_or_default())),
         ("has_metadata", json!(has_metadata)),
-        ("progress", json!(view.progress.clamp(0.0, 1.0))),
+        ("progress", json!(progress(view))),
     ]);
     // The properties read no limit as -1, where the list reads it as 0.
     let fields = with_limits(
