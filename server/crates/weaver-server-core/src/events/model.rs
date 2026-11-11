@@ -121,7 +121,7 @@ pub enum PipelineEvent {
     },
 
     // ---- Decode stage ----
-    // yEnc decode completed. Data is in a pooled buffer.
+    // yEnc decode completed.
     SegmentDecoded {
         segment_id: SegmentId,
         decoded_size: u32,

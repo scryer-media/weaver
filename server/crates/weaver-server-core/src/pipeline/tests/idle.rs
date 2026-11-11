@@ -29,7 +29,6 @@ async fn idle_pipeline(
         hardware_profile: None,
         intermediate_dir: Some(intermediate_dir.display().to_string()),
         complete_dir: Some(complete_dir.display().to_string()),
-        buffer_pool: None,
         servers: vec![],
         categories: vec![],
         retry: None,
@@ -76,15 +75,10 @@ async fn idle_pipeline(
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     });
-    let buffers = BufferPool::new(BufferPoolConfig {
-        small_count: 8,
-        medium_count: 4,
-        large_count: 2,
-    });
     let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
-        buffers,
+        16 * 1024 * 1024,
         profile,
         data_dir,
         intermediate_dir.clone(),
@@ -174,35 +168,6 @@ async fn idle_pipeline_records_production_turn_histogram() {
             .count
             > 0
     );
-}
-
-// A turn that leaves the pipeline with no work frees the idle article
-// buffers, so an idle service holds none of the pool.
-#[tokio::test(start_paused = true)]
-async fn a_turn_that_leaves_the_pipeline_idle_frees_the_idle_buffers() {
-    use crate::runtime::buffers::BufferTier;
-
-    let mut pool = None;
-    let pipeline = idle_pipeline(0, Vec::new(), |pipeline| {
-        pool = Some(Arc::clone(&pipeline.buffers));
-    })
-    .await;
-    let pool = pool.unwrap();
-    // An article buffer that was used and given back, as a finished decode
-    // leaves it.
-    drop(pool.acquire(BufferTier::Small).await);
-    drop(pool.acquire(BufferTier::Large).await);
-    assert_eq!(pool.allocated(BufferTier::Small), 1);
-    assert_eq!(pool.allocated(BufferTier::Large), 1);
-
-    let mut events = pipeline.handle.subscribe_events();
-    pipeline.handle.pause_all().await.unwrap();
-    while !matches!(events.recv().await.unwrap(), PipelineEvent::GlobalPaused) {}
-    // The release runs at the end of that turn.
-    while pool.allocated(BufferTier::Small) + pool.allocated(BufferTier::Large) != 0 {
-        tokio::task::yield_now().await;
-    }
-    pipeline.shutdown().await;
 }
 
 #[tokio::test]

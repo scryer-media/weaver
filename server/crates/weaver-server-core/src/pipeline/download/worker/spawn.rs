@@ -17,7 +17,7 @@ pub(in crate::pipeline) fn lane_acquire_failure_for_work(
     }
 }
 
-// Closes one decode task's wall-clock measurement, on whichever path the task
+// Closes one test-only decode task's wall-clock measurement, on whichever path the task
 // leaves by.
 //
 // This is the single, deliberate exception to "no clock reads on a
@@ -27,11 +27,13 @@ pub(in crate::pipeline) fn lane_acquire_failure_for_work(
 // the histogram and the profile bucket — two reads per decoded article,
 // roughly one per 750 KB of work, not one per byte. Everything else on this
 // path stays `Relaxed`-atomic only.
+#[cfg(test)]
 struct DecodeTaskTimer {
     started: Instant,
     metrics: Arc<crate::operations::metrics::PipelineMetrics>,
 }
 
+#[cfg(test)]
 impl DecodeTaskTimer {
     fn start(metrics: Arc<crate::operations::metrics::PipelineMetrics>) -> Self {
         Self {
@@ -41,6 +43,7 @@ impl DecodeTaskTimer {
     }
 }
 
+#[cfg(test)]
 impl Drop for DecodeTaskTimer {
     fn drop(&mut self) {
         let elapsed = self.started.elapsed();
@@ -51,6 +54,7 @@ impl Drop for DecodeTaskTimer {
     }
 }
 
+#[cfg(test)]
 fn send_blocking_decode_failure(
     tx: &mpsc::Sender<DecodeDone>,
     segment_id: SegmentId,
@@ -81,18 +85,15 @@ impl Pipeline {
     // This is the buffer-decode path, reached only from
     // [`DownloadPayload::Raw`]. Production never takes it: the download lanes
     // decode inline and hand back [`DownloadPayload::Decoded`], so `Raw` is
-    // constructed only by tests.
+    // constructed only by tests, and this path is compiled only for them.
     //
     // It is therefore yEnc-only. The uuencode sniffer lives in the fused
     // streaming decoder, which this path does not use, so a uuencode article
     // routed through here would fail its decode exactly as it did before
     // uuencode support existed. If `Raw` is ever made production-reachable
     // again, this path needs the same sniffer the fused decoder has.
-    pub(in crate::pipeline::download::worker) fn spawn_decode_task(
-        &self,
-        work: PendingDecodeWork,
-        output: Option<BufferHandle>,
-    ) {
+    #[cfg(test)]
+    pub(in crate::pipeline::download::worker) fn spawn_decode_task(&self, work: PendingDecodeWork) {
         let tx = self.decode_done_tx.clone();
         let PendingDecodeWork {
             segment_id,
@@ -128,11 +129,76 @@ impl Pipeline {
             let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.task");
             crate::runtime::affinity::pin_current_thread_for_hot_download_path();
 
-            if let Some(mut output) = output {
-                let Some(output_buf) = output.as_mut_slice() else {
-                    let error = "failed to get unique pooled decode buffer".to_string();
+            let mut output = {
+                let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.alloc_vec");
+                Vec::with_capacity(raw.len())
+            };
+            let decode_result = {
+                let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.yenc");
+                weaver_yenc::decode_nntp_append(&raw, &mut output)
+            };
+            match decode_result {
+                Ok(decode_result) => {
+                    let yenc_layout = YencLayoutAssertions {
+                        file_size: decode_result.metadata.size,
+                        part: decode_result.metadata.part,
+                        total: decode_result.metadata.total,
+                        begin: decode_result.metadata.begin,
+                        end: decode_result.metadata.end,
+                    };
+
+                    let _profile_scope =
+                        crate::runtime::perf_probe::scope("download.decode.send_success");
+                    let _cpu_scope =
+                        crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
+                    let send_started = Instant::now();
+                    let crc_valid = crate::pipeline::crc_not_mismatched(decode_result.crc_status);
+                    let part_crc_verified =
+                        decode_result.crc_status == weaver_yenc::CrcVerification::Verified;
+                    let truncation_suspected =
+                        crate::pipeline::yenc_truncation_suspected(&decode_result);
+                    // Block evidence needs a known starting offset. An
+                    // article whose own begin was unusable has none.
+                    let offset_known = decode_result.metadata.file_offset_is_known();
+                    if let Some(counters) = &counters {
+                        counters.record_decoded(output.len() as u64);
+                    }
+                    let _ = tx.blocking_send(DecodeDone::Success {
+                        result: DecodeResult {
+                            segment_id,
+                            raw_size,
+                            // This buffer-decode path is yEnc-only; see the note at
+                            // its call site.
+                            encoding: SegmentEncoding::Yenc,
+                            yenc_layout,
+                            crc_valid,
+                            truncation_suspected,
+                            part_crc_verified,
+                            part_crc: decode_result.part_crc,
+                            expected_file_crc: decode_result.expected_file_crc,
+                            data: DecodedChunk::from(output),
+                            yenc_name: decode_result.metadata.name,
+                            checkpoint_plan: decode_result.checkpoint_plan,
+                            segments: if offset_known {
+                                decode_result.segments
+                            } else {
+                                Vec::new()
+                            },
+                        },
+                        source: SegmentSource {
+                            source_server_idx,
+                            exclude_servers,
+                        },
+                    });
+                    crate::runtime::perf_probe::record(
+                        "download.decode.done_channel.blocking_send",
+                        send_started.elapsed(),
+                    );
+                }
+                Err(e) => {
+                    let error = e.to_string();
                     metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-                    warn!(segment = %segment_id, error, "yEnc decode failed");
+                    warn!(segment = %segment_id, error = %error, "yEnc decode failed");
                     send_blocking_decode_failure(
                         &tx,
                         segment_id,
@@ -141,179 +207,14 @@ impl Pipeline {
                         exclude_servers,
                         error,
                     );
-                    return;
-                };
-
-                let decode_result = {
-                    let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.yenc");
-                    weaver_yenc::decode_nntp(&raw, output_buf)
-                };
-                match decode_result {
-                    Ok(decode_result) => {
-                        output.set_len(decode_result.bytes_written);
-                        let yenc_layout = YencLayoutAssertions {
-                            file_size: decode_result.metadata.size,
-                            part: decode_result.metadata.part,
-                            total: decode_result.metadata.total,
-                            begin: decode_result.metadata.begin,
-                            end: decode_result.metadata.end,
-                        };
-
-                        // The pool slot travels to the writer as the decoded
-                        // payload; it comes back to the pool when the write
-                        // batch drops it.
-                        let decoded = DecodedChunk::Pooled(output);
-
-                        let _profile_scope =
-                            crate::runtime::perf_probe::scope("download.decode.send_success");
-                        let _cpu_scope =
-                            crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
-                        let send_started = Instant::now();
-                        let crc_valid =
-                            crate::pipeline::crc_not_mismatched(decode_result.crc_status);
-                        let part_crc_verified =
-                            decode_result.crc_status == weaver_yenc::CrcVerification::Verified;
-                        let truncation_suspected =
-                            crate::pipeline::yenc_truncation_suspected(&decode_result);
-                        // Block evidence needs a known starting offset. An
-                        // article whose own begin was unusable has none.
-                        let offset_known = decode_result.metadata.file_offset_is_known();
-                        if let Some(counters) = &counters {
-                            counters.record_decoded(decoded.len_bytes() as u64);
-                        }
-                        let _ = tx.blocking_send(DecodeDone::Success {
-                            result: DecodeResult {
-                                segment_id,
-                                raw_size,
-                                // This buffer-decode path is yEnc-only; see the note at
-                                // its call site.
-                                encoding: SegmentEncoding::Yenc,
-                                yenc_layout,
-                                crc_valid,
-                                truncation_suspected,
-                                part_crc_verified,
-                                part_crc: decode_result.part_crc,
-                                expected_file_crc: decode_result.expected_file_crc,
-                                data: decoded,
-                                yenc_name: decode_result.metadata.name,
-                                checkpoint_plan: decode_result.checkpoint_plan,
-                                segments: if offset_known {
-                                    decode_result.segments
-                                } else {
-                                    Vec::new()
-                                },
-                            },
-                            source: SegmentSource {
-                                source_server_idx,
-                                exclude_servers,
-                            },
-                        });
-                        crate::runtime::perf_probe::record(
-                            "download.decode.done_channel.blocking_send",
-                            send_started.elapsed(),
-                        );
-                    }
-                    Err(e) => {
-                        let error = e.to_string();
-                        metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(segment = %segment_id, error = %error, "yEnc decode failed");
-                        send_blocking_decode_failure(
-                            &tx,
-                            segment_id,
-                            raw_size,
-                            source_server_idx,
-                            exclude_servers,
-                            error,
-                        );
-                    }
-                }
-            } else {
-                let mut output = {
-                    let _cpu_scope =
-                        crate::runtime::perf_probe::cpu_scope("download.decode.alloc_vec");
-                    Vec::with_capacity(raw.len())
-                };
-                let decode_result = {
-                    let _cpu_scope = crate::runtime::perf_probe::cpu_scope("download.decode.yenc");
-                    weaver_yenc::decode_nntp_append(&raw, &mut output)
-                };
-                match decode_result {
-                    Ok(decode_result) => {
-                        let yenc_layout = YencLayoutAssertions {
-                            file_size: decode_result.metadata.size,
-                            part: decode_result.metadata.part,
-                            total: decode_result.metadata.total,
-                            begin: decode_result.metadata.begin,
-                            end: decode_result.metadata.end,
-                        };
-
-                        let _profile_scope =
-                            crate::runtime::perf_probe::scope("download.decode.send_success");
-                        let _cpu_scope =
-                            crate::runtime::perf_probe::cpu_scope("download.decode.send_success");
-                        let send_started = Instant::now();
-                        let crc_valid =
-                            crate::pipeline::crc_not_mismatched(decode_result.crc_status);
-                        let part_crc_verified =
-                            decode_result.crc_status == weaver_yenc::CrcVerification::Verified;
-                        let truncation_suspected =
-                            crate::pipeline::yenc_truncation_suspected(&decode_result);
-                        // Block evidence needs a known starting offset. An
-                        // article whose own begin was unusable has none.
-                        let offset_known = decode_result.metadata.file_offset_is_known();
-                        if let Some(counters) = &counters {
-                            counters.record_decoded(output.len() as u64);
-                        }
-                        let _ = tx.blocking_send(DecodeDone::Success {
-                            result: DecodeResult {
-                                segment_id,
-                                raw_size,
-                                // This buffer-decode path is yEnc-only; see the note at
-                                // its call site.
-                                encoding: SegmentEncoding::Yenc,
-                                yenc_layout,
-                                crc_valid,
-                                truncation_suspected,
-                                part_crc_verified,
-                                part_crc: decode_result.part_crc,
-                                expected_file_crc: decode_result.expected_file_crc,
-                                data: DecodedChunk::from(output),
-                                yenc_name: decode_result.metadata.name,
-                                checkpoint_plan: decode_result.checkpoint_plan,
-                                segments: if offset_known {
-                                    decode_result.segments
-                                } else {
-                                    Vec::new()
-                                },
-                            },
-                            source: SegmentSource {
-                                source_server_idx,
-                                exclude_servers,
-                            },
-                        });
-                        crate::runtime::perf_probe::record(
-                            "download.decode.done_channel.blocking_send",
-                            send_started.elapsed(),
-                        );
-                    }
-                    Err(e) => {
-                        let error = e.to_string();
-                        metrics.decode_errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(segment = %segment_id, error = %error, "yEnc decode failed");
-                        send_blocking_decode_failure(
-                            &tx,
-                            segment_id,
-                            raw_size,
-                            source_server_idx,
-                            exclude_servers,
-                            error,
-                        );
-                    }
                 }
             }
         });
     }
 
+    // Start decodes for queued undecoded bodies while decode slots are free.
+    // Test-only, as [`Self::spawn_decode_task`] is.
+    #[cfg(test)]
     pub(crate) fn pump_decode_queue(&mut self) {
         if self.pending_decode.is_empty() {
             return;
@@ -341,21 +242,8 @@ impl Pipeline {
                 break;
             }
 
-            if work.raw.len() > crate::runtime::buffers::BufferTier::Large.size_bytes() {
-                self.note_decode_started(work.segment_id, work.raw.len() as u64);
-                self.spawn_decode_task(work, None);
-                available_decode_slots -= 1;
-                continue;
-            }
-
-            // Pool slots now stay with the decoded article until it is
-            // written, so an empty tier is not a reason to hold decode back:
-            // fall through to an owned buffer and keep the lane moving.
-            let tier = crate::runtime::buffers::BufferTier::for_size(work.raw.len());
-            let output = self.buffers.try_acquire(tier);
-
             self.note_decode_started(work.segment_id, work.raw.len() as u64);
-            self.spawn_decode_task(work, output);
+            self.spawn_decode_task(work);
             available_decode_slots -= 1;
         }
 

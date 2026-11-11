@@ -67,7 +67,7 @@ impl Pipeline {
     pub async fn new(
         event_tx: broadcast::Sender<PipelineEvent>,
         nntp: NntpClient,
-        buffers: Arc<BufferPool>,
+        backlog_base_bytes: usize,
         profile: SystemProfile,
         data_dir: PathBuf,
         intermediate_dir: PathBuf,
@@ -83,9 +83,13 @@ impl Pipeline {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let metrics = Arc::clone(shared_state.metrics());
         initial_history.truncate(crate::jobs::FINISHED_JOBS_RUNTIME_CAP);
-        let write_backlog_budget_bytes = compute_write_backlog_budget_bytes(&profile, &buffers);
-        let decode_backlog_budget_bytes =
-            compute_decode_backlog_budget_bytes(&profile, &buffers, write_backlog_budget_bytes);
+        let write_backlog_budget_bytes =
+            compute_write_backlog_budget_bytes(&profile, backlog_base_bytes);
+        let decode_backlog_budget_bytes = compute_decode_backlog_budget_bytes(
+            &profile,
+            backlog_base_bytes,
+            write_backlog_budget_bytes,
+        );
         let (hardware_profile, hold_settings, propagation_delay) = {
             let cfg = config.read().await;
             // An install that never chose one — every upgraded install — runs
@@ -261,7 +265,6 @@ impl Pipeline {
             _control_runtime: crate::pipeline::queue::RuntimeGuard(shared_state.queue.clone()),
             event_tx,
             nntp,
-            buffers,
             tuner,
             configured_hardware_profile: hardware_profile,
             scheduled_hardware_profile: None,
@@ -348,6 +351,7 @@ impl Pipeline {
             server_attribution_checkpoint_at: Instant::now(),
             #[cfg(test)]
             par2_ignore_extensions_override: None,
+            #[cfg(test)]
             pending_decode: VecDeque::new(),
             pending_completion_checks: VecDeque::new(),
             blocked_restores: HashMap::new(),
@@ -884,9 +888,13 @@ impl Pipeline {
     // that have not yet settled to zero. Every term is a length or a flag,
     // so asking costs the same however many jobs and history rows exist.
     pub(crate) fn pipeline_is_live(&self) -> bool {
+        // Only tests queue undecoded bodies.
+        #[cfg(test)]
+        if !self.pending_decode.is_empty() {
+            return true;
+        }
         self.active_downloads > 0
             || !self.active_download_connections_by_job.is_empty()
-            || !self.pending_decode.is_empty()
             || !self.active_decodes_by_job.is_empty()
             || !self.held_download_refills.is_empty()
             || !self.rate_limit_reservations.is_empty()
@@ -919,10 +927,8 @@ impl Pipeline {
     }
 
     // Give back the memory a pipeline with no work is holding for work that
-    // has stopped: the idle article buffers in the pool, then every page the
-    // allocator is keeping freed, so the buffers just dropped go back too.
+    // has stopped: every page the allocator is keeping freed.
     pub(in crate::pipeline) fn release_idle_memory(&self) {
-        self.buffers.release_idle();
         crate::runtime::thread_release::release_idle_process_memory();
     }
 
@@ -1066,6 +1072,7 @@ impl Pipeline {
             self.drain_ready_download_results(&mut pending_download_results);
             self.drain_ready_lane_control_messages();
             turn_active |= self.hear_graph_runs();
+            #[cfg(test)]
             self.pump_decode_queue();
 
             // An ordinal can be retired from outside the result handlers — a
@@ -1076,6 +1083,7 @@ impl Pipeline {
             if !self.pending_unanchored_release.is_empty() {
                 turn_active = true;
                 self.release_settled_unanchored_runs().await;
+                #[cfg(test)]
                 self.pump_decode_queue();
             }
 
@@ -1086,6 +1094,7 @@ impl Pipeline {
                     break;
                 };
                 self.check_job_completion(job_id).await;
+                #[cfg(test)]
                 self.pump_decode_queue();
             }
 
@@ -1356,6 +1365,7 @@ impl Pipeline {
                 turn_active |= !idle_tick;
             }
 
+            #[cfg(test)]
             self.pump_decode_queue();
             let live = self.pipeline_is_live();
             if turn_active {
@@ -1725,14 +1735,10 @@ impl Pipeline {
         }
         self.checkpoint_graph_holds();
 
-        if self.active_downloads > 0
-            || !self.active_decodes_by_job.is_empty()
-            || !self.pending_decode.is_empty()
-        {
+        if self.active_downloads > 0 || self.has_queued_or_active_decode() {
             warn!(
                 active_downloads = self.active_downloads,
                 active_decodes = self.active_decodes_by_job.total(),
-                pending_decode = self.pending_decode.len(),
                 "shutdown drain ended with in-flight pipeline work"
             );
         } else {
@@ -1767,14 +1773,27 @@ impl Pipeline {
         }
     }
 
-    fn has_download_or_decode_drain_work(&self) -> bool {
-        self.active_downloads > 0
-            || !self.active_decodes_by_job.is_empty()
-            || !self.pending_decode.is_empty()
+    // A decode running, or an undecoded body queued for one. Only tests
+    // queue undecoded bodies.
+    fn has_queued_or_active_decode(&self) -> bool {
+        #[cfg(test)]
+        if !self.pending_decode.is_empty() {
+            return true;
+        }
+        !self.active_decodes_by_job.is_empty()
+    }
+
+    fn has_decode_drain_work(&self) -> bool {
+        self.has_queued_or_active_decode()
             || self.metrics.decode_pending.load(Ordering::Relaxed) > 0
     }
 
+    fn has_download_or_decode_drain_work(&self) -> bool {
+        self.active_downloads > 0 || self.has_decode_drain_work()
+    }
+
     async fn drain_inflight_download_and_decode_work(&mut self) {
+        #[cfg(test)]
         self.pump_decode_queue();
 
         while self.has_download_or_decode_drain_work() {
@@ -1786,9 +1805,7 @@ impl Pipeline {
                     result = self.owned_download_lane_event_rx.recv(), if self.active_downloads > 0 => {
                         result.map(ShutdownDrainEvent::OwnedDownload)
                     }
-                    result = self.decode_done_rx.recv(), if !self.active_decodes_by_job.is_empty()
-                        || !self.pending_decode.is_empty()
-                        || self.metrics.decode_pending.load(Ordering::Relaxed) > 0 => {
+                    result = self.decode_done_rx.recv(), if self.has_decode_drain_work() => {
                         result.map(ShutdownDrainEvent::Decode)
                     }
                 }
@@ -1798,6 +1815,7 @@ impl Pipeline {
             match event {
                 Ok(Some(ShutdownDrainEvent::Download(result))) => {
                     self.handle_download_done(result).await;
+                    #[cfg(test)]
                     self.pump_decode_queue();
                 }
                 Ok(Some(ShutdownDrainEvent::OwnedDownload(event))) => {
@@ -1808,10 +1826,12 @@ impl Pipeline {
                         self.process_released_download_done(result).await;
                         self.report_job(reported_job);
                     }
+                    #[cfg(test)]
                     self.pump_decode_queue();
                 }
                 Ok(Some(ShutdownDrainEvent::Decode(result))) => {
                     self.handle_decode_done(result).await;
+                    #[cfg(test)]
                     self.pump_decode_queue();
                 }
                 Ok(None) => {
@@ -1822,7 +1842,6 @@ impl Pipeline {
                     warn!(
                         active_downloads = self.active_downloads,
                         active_decodes = self.active_decodes_by_job.total(),
-                        pending_decode = self.pending_decode.len(),
                         decode_pending = self.metrics.decode_pending.load(Ordering::Relaxed),
                         idle_timeout_secs = Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT.as_secs(),
                         "timed out waiting for in-flight download/decode work during shutdown"
@@ -1894,19 +1913,20 @@ enum ShutdownDrainEvent {
     Decode(DecodeDone),
 }
 
+// The decoded bytes that may wait for the writer, sized from the memory
+// tier's base size (`BacklogSizing::base_bytes`) and the machine's memory.
 pub(crate) fn compute_write_backlog_budget_bytes(
     profile: &SystemProfile,
-    buffers: &Arc<BufferPool>,
+    backlog_base_bytes: usize,
 ) -> usize {
     use crate::runtime::system_profile::StorageClass;
 
-    // The write backlog stays scratch-anchored: growing it with memory only
-    // defers flushing into a larger end-of-job drain tail (measured as added
-    // wall variance), while decode-side scaling is what prevents pressure
-    // latch cycles during download waves.
-    let scratch_bytes = buffer_pool_total_bytes(buffers);
+    // The write backlog stays anchored to the tier's base size: growing it
+    // with memory only defers flushing into a larger end-of-job drain tail
+    // (measured as added wall variance), while decode-side scaling is what
+    // prevents pressure latch cycles during download waves.
     let available_bytes = backlog_memory_ceiling_bytes(profile);
-    let base = scratch_bytes
+    let base = backlog_base_bytes
         .max(64 * 1024 * 1024)
         .min((available_bytes / 8).max(64 * 1024 * 1024));
 
@@ -1919,27 +1939,28 @@ pub(crate) fn compute_write_backlog_budget_bytes(
     }
 }
 
+// The bytes that may wait to be decoded, sized from the memory tier's base
+// size, the machine's memory and the write backlog limit.
 pub(crate) fn compute_decode_backlog_budget_bytes(
     profile: &SystemProfile,
-    buffers: &Arc<BufferPool>,
+    backlog_base_bytes: usize,
     write_backlog_budget_bytes: usize,
 ) -> usize {
-    const DECODE_BACKLOG_POOL_MULTIPLIER: usize = 3;
+    const DECODE_BACKLOG_BASE_MULTIPLIER: usize = 3;
     const DECODE_BACKLOG_MEMORY_FRACTION: usize = 8;
     const DECODE_BACKLOG_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
 
-    let scratch_bytes = buffer_pool_total_bytes(buffers);
     let available_bytes = backlog_memory_ceiling_bytes(profile);
     // A full download wave (every lane's leased runway decoding at once) must
     // fit under the soft limit on machines with memory to spare, or the
     // pressure latch cycles on every wave; scale the budget with available
-    // memory instead of pinning it to buffer-pool scratch alone.
+    // memory instead of pinning it to the tier's base size alone.
     let scaled = available_bytes / 12;
     let memory_cap = (available_bytes / DECODE_BACKLOG_MEMORY_FRACTION)
         .max(write_backlog_budget_bytes)
         .min(DECODE_BACKLOG_MAX_BYTES);
-    let target = scratch_bytes
-        .saturating_mul(DECODE_BACKLOG_POOL_MULTIPLIER)
+    let target = backlog_base_bytes
+        .saturating_mul(DECODE_BACKLOG_BASE_MULTIPLIER)
         .max(scaled)
         .max(write_backlog_budget_bytes);
 
@@ -1954,15 +1975,6 @@ fn backlog_memory_ceiling_bytes(profile: &SystemProfile) -> usize {
         Some(cgroup_limit) => available_bytes.min(cgroup_limit) as usize,
         None => available_bytes as usize,
     }
-}
-
-fn buffer_pool_total_bytes(buffers: &Arc<BufferPool>) -> usize {
-    use crate::runtime::buffers::BufferTier;
-
-    let metrics = buffers.metrics();
-    metrics.small_total * BufferTier::Small.size_bytes()
-        + metrics.medium_total * BufferTier::Medium.size_bytes()
-        + metrics.large_total * BufferTier::Large.size_bytes()
 }
 
 pub(crate) fn timestamp_secs() -> u64 {

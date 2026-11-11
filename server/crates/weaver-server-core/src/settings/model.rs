@@ -30,8 +30,6 @@ pub struct Config {
     // Defaults to `{data_dir}/complete`.
     pub complete_dir: Option<String>,
     #[serde(default)]
-    pub buffer_pool: Option<BufferPoolOverrides>,
-    #[serde(default)]
     pub servers: Vec<ServerConfig>,
     #[serde(default)]
     pub categories: Vec<CategoryConfig>,
@@ -328,13 +326,6 @@ impl PerJobSeries {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct BufferPoolOverrides {
-    pub small_count: Option<usize>,
-    pub medium_count: Option<usize>,
-    pub large_count: Option<usize>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetryOverrides {
     pub max_retries: Option<u32>,
     pub base_delay_secs: Option<f64>,
@@ -351,7 +342,6 @@ mod tests {
             data_dir: "/tmp/weaver".to_string(),
             intermediate_dir: None,
             complete_dir: None,
-            buffer_pool: None,
             servers: vec![ServerConfig {
                 id: 1,
                 host: "news.example.com".to_string(),

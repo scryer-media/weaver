@@ -1755,16 +1755,9 @@ async fn a_restart_reads_a_recovery_volume_after_the_restore_and_writes_nothing(
     };
 
     // Connections to lease on, so the gate is what holds the fetch back.
-    let (mut pipeline, _, _) = crate::pipeline::tests::new_direct_pipeline_with_buffers(
-        &temp_dir,
-        crate::runtime::buffers::BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        4,
-    )
-    .await;
+    let (mut pipeline, _, _) =
+        crate::pipeline::tests::new_direct_pipeline_with_backlog(&temp_dir, 16 * 1024 * 1024, 4)
+            .await;
     pipeline
         .restore_job(crate::RestoreJobRequest {
             job_id,

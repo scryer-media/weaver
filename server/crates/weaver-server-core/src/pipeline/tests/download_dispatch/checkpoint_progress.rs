@@ -416,16 +416,7 @@ async fn checkpoint_accepted_result_survives_pause_and_lane_retirement() {
 }
 
 async fn restored_with_parked_retries(temp: &TempDir) -> Pipeline {
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        temp,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        4,
-    )
-    .await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_backlog(temp, 16 * 1024 * 1024, 4).await;
     insert_active_job(
         &mut pipeline,
         HOT,

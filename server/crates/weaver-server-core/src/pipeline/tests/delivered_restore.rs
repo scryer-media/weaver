@@ -301,11 +301,7 @@ async fn new_nested_pipeline(temp: &tempfile::TempDir) -> (Pipeline, PathBuf, Pa
         intermediate_dir.clone(),
         intermediate_dir.join("complete"),
         temp.path().join("weaver.db"),
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
+        16 * 1024 * 1024,
         0,
         None,
     )

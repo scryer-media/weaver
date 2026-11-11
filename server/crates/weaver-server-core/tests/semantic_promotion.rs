@@ -20,7 +20,6 @@ use weaver_server_core::ingest::{
     SubmitNzbError, compress_nzb_bytes, materialize_semantic_promotion,
 };
 use weaver_server_core::jobs::working_dir::compute_working_dir;
-use weaver_server_core::runtime::buffers::{BufferPool, BufferPoolConfig};
 use weaver_server_core::runtime::system_profile::{
     CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
     SystemProfile,
@@ -56,7 +55,6 @@ impl Harness {
             hardware_profile: None,
             intermediate_dir: Some(intermediate_dir.display().to_string()),
             complete_dir: Some(complete_dir.display().to_string()),
-            buffer_pool: None,
             servers: vec![],
             categories: vec![],
             retry: None,
@@ -102,15 +100,11 @@ impl Harness {
                 same_filesystem: true,
             },
         };
-        let buffers = BufferPool::new(BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        });
+        let backlog_base_bytes = 16 * 1024 * 1024;
         let mut pipeline = Pipeline::new(
             event_tx,
             nntp,
-            buffers,
+            backlog_base_bytes,
             profile,
             data_dir,
             intermediate_dir,

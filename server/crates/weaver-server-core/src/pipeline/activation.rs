@@ -493,6 +493,10 @@ impl Pipeline {
     // its volumes, without which its root would say less than it did, or an
     // object out for its work, without which no checkpoint can be taken.
     fn job_has_results_out(&self, job_id: JobId) -> bool {
+        #[cfg(test)]
+        if self.job_has_queued_decode(job_id) {
+            return true;
+        }
         let counted = |counts: &HashMap<JobId, usize>| counts.get(&job_id).is_some_and(|n| *n > 0);
         self.graph_jobs
             .get(&job_id)
@@ -503,10 +507,6 @@ impl Pipeline {
                 .active_decodes_by_job
                 .get(&job_id)
                 .is_some_and(|n| *n > 0)
-            || self
-                .pending_decode
-                .iter()
-                .any(|work| work.segment_id.file_id.job_id == job_id)
     }
 
     // Stop the job's graph runtime. One with nothing out on a thread goes at

@@ -17,7 +17,7 @@ use weaver_graph::recovery::RepairOutcome;
 use weaver_model::files::FileRole;
 
 use super::super::{
-    checkpoint_plan, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
+    checkpoint_plan, insert_active_job, job_status_for_assert, new_direct_pipeline_with_backlog,
     pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use crate::history::HistoryFailureKind;
@@ -1107,13 +1107,9 @@ pub(in crate::pipeline::tests) async fn admit_with(
     let temp_dir = tempfile::tempdir().unwrap();
     // One server: an article it serves damaged has nowhere else to come
     // from, so the job gives it up for repair at once.
-    let buffers = crate::runtime::buffers::BufferPoolConfig {
-        small_count: 8,
-        medium_count: 4,
-        large_count: 2,
-    };
+    let backlog_base_bytes = 16 * 1024 * 1024;
     let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp_dir, buffers, 1).await;
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes, 1).await;
     scenario.prepare(&mut pipeline);
     setup(&mut pipeline, temp_dir.path());
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
