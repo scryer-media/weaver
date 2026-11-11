@@ -100,6 +100,7 @@ impl TorrentView {
             eta_seconds,
             seeding_left,
             last_seen_complete_ms,
+            last_activity_ms,
         } = self;
         let mut hasher = DefaultHasher::new();
         let hasher = &mut hasher;
@@ -167,6 +168,7 @@ impl TorrentView {
             (active_seconds, seeding_seconds, consecutive_seeding_seconds).hash(hasher);
             (download_avg_bps, upload_avg_bps, reannounce_seconds).hash(hasher);
             (eta_seconds, seeding_left, last_seen_complete_ms).hash(hasher);
+            last_activity_ms.hash(hasher);
         }
         hasher.finish()
     }

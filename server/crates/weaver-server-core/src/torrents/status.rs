@@ -244,8 +244,9 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
         Engine::Absent => (TorrentState::Queued, None),
         Engine::Starting => (TorrentState::CheckingResumeData, None),
         Engine::Checking => (TorrentState::CheckingFiles, None),
+        // A torrent whose unpacking came up short seeds on, and says why.
         Engine::Live { .. } | Engine::Paused { .. } if seen.seeding() => {
-            (TorrentState::Seeding, None)
+            (TorrentState::Seeding, seen.failed.clone().map(Why::Said))
         }
         Engine::Live {
             upload_mode: true, ..
@@ -261,16 +262,21 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
 /// Uploaded over downloaded; over the torrent's size while less than 1% of
 /// it was downloaded here, as for a torrent added complete.
 pub fn ratio(counters: &TorrentCounters, size: u64) -> f64 {
-    let downloaded = counters.downloaded_bytes;
-    let over = if downloaded.saturating_mul(100) < size {
-        size
-    } else {
-        downloaded
-    };
+    let over = ratio_base(counters.downloaded_bytes, size);
     if over == 0 {
         0.0
     } else {
         counters.uploaded_bytes as f64 / over as f64
+    }
+}
+
+/// The bytes a ratio is taken over: those downloaded, or the torrent's size
+/// while less than 1% of it was downloaded here.
+pub fn ratio_base(downloaded_bytes: u64, size: u64) -> u64 {
+    if downloaded_bytes.saturating_mul(100) < size {
+        size
+    } else {
+        downloaded_bytes
     }
 }
 
@@ -933,14 +939,17 @@ mod tests {
                 Some("x.exe has an unwanted extension".into())
             )
         );
-        // A refusal the operator resumed past seeds again.
+        // A refusal the operator resumed past seeds again, and says why.
         assert_eq!(
             project(&Observed {
                 complete: true,
                 failed: Some("x.exe has an unwanted extension".into()),
                 ..seen(live.clone())
             }),
-            (TorrentState::Seeding, None)
+            (
+                TorrentState::Seeding,
+                Some("x.exe has an unwanted extension".into())
+            )
         );
         assert_eq!(
             project(&Observed {

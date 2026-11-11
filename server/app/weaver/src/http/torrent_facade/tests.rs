@@ -439,6 +439,7 @@ fn view(state: TorrentState) -> TorrentView {
         upload_avg_bps: 0,
         wasted_bytes: 0,
         last_seen_complete_ms: None,
+        last_activity_ms: None,
         pieces: None,
         created_by: None,
         created_at_ms: None,
@@ -894,6 +895,107 @@ fn share_limits_report_the_torrents_own_and_those_in_force() {
     // Not yet complete: no time seeding, and last active when added.
     assert_eq!(own["seeding_time"], 0);
     assert_eq!(own["last_activity"], 1_700_000_000);
+}
+
+// Every time a torrent row carries, in qBittorrent's unit: points in time
+// in seconds since the epoch (-1 for none), durations in seconds, share
+// limits in minutes, and `eta` in seconds with 8640000 for unknown
+// (serialize_torrent.cpp:102-108, 150-186; torrentimpl.cpp:1030-1058,
+// 1403-1456).
+#[test]
+fn every_time_a_row_carries_is_in_the_clients_unit() {
+    let now = 1_700_001_000;
+    let seeding = TorrentView {
+        active_seconds: 9_000,
+        seeding_seconds: 7_200,
+        consecutive_seeding_seconds: 600,
+        reannounce_seconds: Some(30),
+        added_at_ms: 1_700_000_000_000,
+        completed_at_ms: Some(1_700_000_100_000),
+        last_seen_complete_ms: Some(1_700_000_200_999),
+        created_at_ms: Some(1_600_000_000_000),
+        last_activity_ms: Some(1_700_000_500_000),
+        uploaded_bytes: 6,
+        seeding_policy: Seeding {
+            ratio_goal: Some(1.1),
+            seed_time_goal_minutes: Some(180),
+            inactive_goal_minutes: Some(30),
+            mode: SeedingGoalMode::All,
+            ..Seeding::default()
+        },
+        ..view(TorrentState::Seeding)
+    };
+    let row: Map<String, Value> = steady_fields(&seeding, CallerScope::Admin)
+        .into_iter()
+        .chain(clock_fields(&seeding, now))
+        .map(|(name, value)| (name.to_owned(), value))
+        .collect();
+    for (field, expected) in [
+        ("added_on", json!(1_700_000_000)),
+        ("completion_on", json!(1_700_000_100)),
+        ("seen_complete", json!(1_700_000_200)),
+        ("creation_date", json!(1_600_000_000)),
+        ("last_activity", json!(1_700_000_500)),
+        ("time_active", json!(9_000)),
+        // The seconds complete, not the seconds since completion.
+        ("seeding_time", json!(7_200)),
+        ("reannounce", json!(30)),
+        ("seeding_time_limit", json!(-2)),
+        ("max_seeding_time", json!(180)),
+        ("max_inactive_seeding_time", json!(30)),
+        ("max_ratio", json!(1.1)),
+        // MatchAll: the last goal to fall, the seed time 3600 s on.
+        ("eta", json!(3_600)),
+    ] {
+        assert_eq!(row[field], expected, "{field}");
+    }
+
+    // The seed-time goal counting the current run reads that run.
+    let consecutive = TorrentView {
+        seeding_policy: Seeding {
+            seed_time_counting: SeedTimeCounting::Consecutive,
+            mode: SeedingGoalMode::Any,
+            ..seeding.seeding_policy
+        },
+        ..seeding.clone()
+    };
+    let clock = clock_fields(&consecutive, now);
+    let field = |name: &str| {
+        clock
+            .iter()
+            .find(|(key, _)| *key == name)
+            .unwrap()
+            .1
+            .clone()
+    };
+    assert_eq!(field("seeding_time"), json!(600));
+    // MatchAny: the soonest, the ratio already met.
+    assert_eq!(field("eta"), json!(0));
+
+    // Never active: last active when added.
+    let idle = TorrentView {
+        last_activity_ms: None,
+        completed_at_ms: None,
+        ..view(TorrentState::Downloading)
+    };
+    let clock = clock_fields(&idle, now);
+    assert_eq!(clock[5], ("last_activity", json!(1_700_000_000)));
+    assert_eq!(clock[4], ("seeding_time", json!(0)));
+
+    // Downloading: the wanted bytes left at the download speed; stopped,
+    // unknown.
+    let downloading = TorrentView {
+        wanted_bytes: 1_000,
+        wanted_have_bytes: 400,
+        download_bps: 100,
+        ..view(TorrentState::Downloading)
+    };
+    assert_eq!(clock_fields(&downloading, now)[0], ("eta", json!(6)));
+    let stopped = TorrentView {
+        state: TorrentState::Paused,
+        ..downloading
+    };
+    assert_eq!(clock_fields(&stopped, now)[0], ("eta", json!(ETA_UNKNOWN)));
 }
 
 // `tracker` names the tracker that last answered, else the first one
@@ -1733,23 +1835,23 @@ async fn pausing_all_is_one_hold_over_each_torrents_own_pause() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_private_torrent_short_of_its_goal_needs_confirmation_to_delete() {
+async fn the_client_deletes_a_private_torrent_short_of_its_goal() {
     let rig = rig().await;
     rig.add_file(&metainfo("p.bin", 2000, true), &[]).await;
     let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
-    let refused = rig
-        .post(
-            "/api/v2/torrents/delete",
-            &format!("hashes={hash}&deleteFiles=false"),
-        )
-        .await;
-    assert_eq!(refused.status, StatusCode::CONFLICT);
-    assert!(refused.body.contains("seeding goal"), "{}", refused.body);
+    // Weaver's own removal still asks for a confirmation.
+    let torrents = rig.context.inner.torrents.as_ref().unwrap();
+    let job_id = rig.context.by_hash(&hash).await.unwrap().job_id;
+    assert!(matches!(
+        torrents.remove(job_id, false, false).await,
+        Err(ActionError::UnmetGoal(_))
+    ));
     assert_eq!(rig.torrents().await.len(), 1);
+    // qBittorrent's `torrents/delete` never refuses.
     let removed = rig
         .post(
             "/api/v2/torrents/delete",
-            &format!("hashes={hash}&deleteFiles=false&confirmUnmetGoal=true"),
+            &format!("hashes={hash}&deleteFiles=false"),
         )
         .await;
     assert_eq!(removed.status, StatusCode::OK);
@@ -2517,13 +2619,25 @@ async fn share_limits_are_set_on_add_and_after() {
         ],
         [&json!(1.0), &json!(90), &json!(45)]
     );
-    let invalid = rig
+    // Any other negative limit is none (qBittorrent
+    // `TorrentImpl::setShareLimits`, torrentimpl.cpp:1065-1073).
+    let below = rig
         .post(
             "/api/v2/torrents/setShareLimits",
-            &limits("ratioLimit=-3&seedingTimeLimit=-2&inactiveSeedingTimeLimit=-2"),
+            &limits("ratioLimit=-3&seedingTimeLimit=-7&inactiveSeedingTimeLimit=-2"),
         )
         .await;
-    assert_eq!(invalid.status, StatusCode::BAD_REQUEST);
+    assert_eq!(below.status, StatusCode::OK);
+    let torrent = &rig.torrents().await[0];
+    assert_eq!(
+        [
+            &torrent["ratio_limit"],
+            &torrent["seeding_time_limit"],
+            &torrent["max_ratio"],
+            &torrent["max_seeding_time"],
+        ],
+        [&json!(-1), &json!(-1), &json!(-1), &json!(-1)]
+    );
 }
 
 // Share limits cleared to the client's "use global" leave the torrent no

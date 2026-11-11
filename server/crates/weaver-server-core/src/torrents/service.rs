@@ -48,6 +48,7 @@ use crate::pipeline::graph::job::Storage;
 use crate::pipeline::graph::limits::{self, Caps};
 use crate::pipeline::graph::status::RepairSlots;
 use crate::pipeline::graph::window::ScratchLedger;
+use crate::pipeline::post_health::names_a_piece;
 use crate::post_processing::model::{QueueEvent, vars};
 use crate::proxies::{
     Consumer, LegTenancy, LegTenant, NetworkRuntime, ResolvedBy, SessionTraffic, TorrentScope,
@@ -59,7 +60,7 @@ use crate::settings::{
     SeedingPolicy, TorrentConfig, TorrentEncryption,
 };
 use crate::torrents::admission::{self, Manifest, Refusal};
-use crate::torrents::files::Files;
+use crate::torrents::files::{self, Files};
 use crate::torrents::identity::{ClientIdentity, TorrentIdentity};
 use crate::torrents::intake::{Heard as IntakeHeard, Holds, Intake, Room};
 use crate::torrents::layout::{PieceLayout, layout_of};
@@ -67,6 +68,7 @@ use crate::torrents::metrics::{
     Counters, FetchOutcome, Published, SeedingSeries, SessionSeries, TorrentEvent, TorrentMetrics,
     TorrentSeries,
 };
+use crate::torrents::model::Adopted;
 use crate::torrents::rate::limit_kind;
 use crate::torrents::relocate::{self, Existing, MoveError};
 use crate::torrents::sessions::{
@@ -854,6 +856,9 @@ pub struct TorrentView {
     pub wasted_bytes: u64,
     /// The last time a complete copy was in reach.
     pub last_seen_complete_ms: Option<i64>,
+    /// The last time it sent or received payload, in milliseconds since the
+    /// epoch; None while it never has.
+    pub last_activity_ms: Option<i64>,
     /// The torrent's pieces, once its metainfo is in hand.
     pub pieces: Option<TorrentPieces>,
     pub created_by: Option<String>,
@@ -2688,14 +2693,26 @@ impl TorrentService {
                         Ok(())
                     }),
                 );
-                self.refused(job_id, error).await;
+                // With every file it wants, the torrent is done downloading
+                // whatever its unpacking came to.
+                if whole {
+                    self.short(job_id, &store, error, &[]).await;
+                } else {
+                    self.refused(job_id, error).await;
+                }
                 continue;
             }
             if tee.with(|job| job.awaits_commit() || job.moves_waiting()) {
                 self.checkpoint_tee(job_id, Arc::clone(tee), false).await;
             }
-            if whole && tee.done() && self.unpacked(job_id, &store, tee).await {
-                self.completed(job_id).await;
+            if whole && tee.done() {
+                match self.unpacked(job_id, &store, tee).await {
+                    Placing::Waits => {}
+                    Placing::Placed => self.completed(job_id).await,
+                    Placing::Short { why, placed } => {
+                        self.short(job_id, &store, why, &placed).await;
+                    }
+                }
             }
         }
         self.save_checkpoints(self.inner.signal.take_due()).await;
@@ -2721,9 +2738,11 @@ impl TorrentService {
     // torrent's files are claimed as a move claims them, so its directory
     // stays where it is with no lock its reads and writes wait on; while a
     // move has them, this waits for the move to end, which marks the
-    // torrent. False until it placed them, and while its job still uses
-    // its storage, so the next settle asks again.
-    async fn unpacked(&self, job_id: JobId, store: &Arc<TorrentStore>, tee: &Arc<Tee>) -> bool {
+    // torrent. It waits while its job still uses its storage, so the next
+    // settle asks again. Files it could not place are never removed for
+    // it: they stay in its directory, which stays, and it ends short with
+    // the ones it did place.
+    async fn unpacked(&self, job_id: JobId, store: &Arc<TorrentStore>, tee: &Arc<Tee>) -> Placing {
         let claimed = self
             .with_torrent(job_id, |torrent| {
                 if torrent.moving.is_some() {
@@ -2734,7 +2753,7 @@ impl TorrentService {
             })
             .await;
         if !matches!(claimed, Ok(true)) {
-            return false;
+            return Placing::Waits;
         }
         let releasing = Arc::clone(tee);
         let spent = match tokio::task::spawn_blocking(move || releasing.spent()).await {
@@ -2746,12 +2765,12 @@ impl TorrentService {
                     "a torrent's unpacked files wait on its job"
                 );
                 self.unclaim_outputs(job_id).await;
-                return false;
+                return Placing::Waits;
             }
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
                 self.unclaim_outputs(job_id).await;
-                return false;
+                return Placing::Waits;
             }
         };
         tee.stop_checkpoints();
@@ -2769,8 +2788,15 @@ impl TorrentService {
             Ok(outputs) => Arc::new(outputs),
             Err(error) => {
                 tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files were not placed");
+                let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
+                    db.finish_torrent_unpack(job_id, &[], &[])
+                });
+                self.recorded(job_id, recorded.await);
                 self.unclaim_outputs(job_id).await;
-                return true;
+                return Placing::Short {
+                    why: unplaced(&work, &error),
+                    placed: Vec::new(),
+                };
             }
         };
         // Kept on the row before they move, so a crash between leaves no
@@ -2783,27 +2809,46 @@ impl TorrentService {
         let (from, moving) = (work.clone(), Arc::clone(&outputs));
         let placed = tokio::task::spawn_blocking(move || {
             let _job = JobScope::enter(job_id);
-            moving.place(&from)
+            moving
+                .place(&from)
+                .map_err(|error| (error.to_string(), Some(moving.there())))
         })
         .await
-        .unwrap_or(false);
-        let names = if placed {
-            outputs.names.clone()
-        } else {
-            Vec::new()
+        .unwrap_or_else(|error| Err((error.to_string(), None)));
+        // A move that failed takes off the row the files it put back; one
+        // whose end is not known leaves every one on it, for its delete.
+        let (names, unplaced_names) = match &placed {
+            Ok(()) | Err((_, None)) => (outputs.names.clone(), Vec::new()),
+            Err((_, Some(there))) => {
+                let there: HashSet<&String> = there.iter().collect();
+                let left = outputs
+                    .names
+                    .iter()
+                    .filter(|name| !there.contains(name))
+                    .cloned()
+                    .collect();
+                (Vec::new(), left)
+            }
         };
         let recorded = self.queue_save(job_id, "finish_torrent_unpack", move |db| {
-            db.finish_torrent_unpack(job_id, &names)
+            db.finish_torrent_unpack(job_id, &names, &unplaced_names)
         });
         self.recorded(job_id, recorded.await);
         self.unclaim_outputs(job_id).await;
+        if let Err((error, there)) = placed {
+            tracing::warn!(job_id = job_id.0, error = %error, "a torrent's unpacked files did not move beside it");
+            return Placing::Short {
+                why: unplaced(&work, &error),
+                placed: there.unwrap_or_default(),
+            };
+        }
         let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(work)).await;
         if let Ok(Err(error)) = removed
             && error.kind() != std::io::ErrorKind::NotFound
         {
             tracing::warn!(job_id = job_id.0, error = %error, "could not remove a torrent's unpacking directory");
         }
-        true
+        Placing::Placed
     }
 
     fn recorded(
@@ -2823,6 +2868,11 @@ impl TorrentService {
                 );
             }
         }
+    }
+
+    // The directory a torrent's unpacking works in.
+    fn unpacking_dir(&self, job_id: JobId) -> PathBuf {
+        self.inner.env.work.join(format!("torrent-{}", job_id.0))
     }
 
     // The claim `unpacked` took on the torrent's files, given back.
@@ -3267,7 +3317,7 @@ impl TorrentService {
         passwords: Vec<String>,
         hold: Hold<W>,
     ) -> Result<(Arc<Tee>, Option<Note>), Unmade<W>> {
-        let work = self.inner.env.work.join(format!("torrent-{}", job_id.0));
+        let work = self.unpacking_dir(job_id);
         let (rows, mut fresh) = match self.inner.db.load_graph_checkpoint(job_id) {
             Ok(rows) => (rows, None),
             Err(LoadError::Read(error)) => match hold(error.to_string()) {
@@ -3364,13 +3414,39 @@ impl TorrentService {
     }
 
     // The torrent's metainfo and its store over it, at once. A store that
-    // cannot be made fails the torrent.
-    fn give_metainfo(&self, torrent: &mut Live, parsed: &Parsed) -> Result<(), String> {
+    // cannot be made fails the torrent. The files `left_out`, by their
+    // index among the manifest's paths, are not downloaded: their level is
+    // `Ignored`, kept as the operator's own would be.
+    fn give_metainfo(
+        &self,
+        torrent: &mut Live,
+        parsed: &Parsed,
+        left_out: &[usize],
+    ) -> Result<(), String> {
         let job_id = torrent.record.job_id;
-        let stored = self.inner.db.torrent_file_priorities(job_id).unwrap_or_else(|error| {
+        let mut stored = self.inner.db.torrent_file_priorities(job_id).unwrap_or_else(|error| {
             tracing::warn!(job_id = job_id.0, error = %error, "could not read a torrent's file levels");
             Vec::new()
         });
+        if !left_out.is_empty() {
+            let left_out: HashSet<usize> = left_out.iter().copied().collect();
+            stored.resize(parsed.layout.file_count(), FilePriority::Normal);
+            let listed = parsed
+                .layout
+                .files()
+                .enumerate()
+                .filter(|(_, file)| !file.padding)
+                .map(|(index, _)| index);
+            for (path, index) in listed.enumerate() {
+                if left_out.contains(&path) {
+                    stored[index] = FilePriority::Ignored;
+                }
+            }
+            self.inner
+                .db
+                .set_torrent_file_priorities(job_id, &stored)
+                .map_err(state_error)?;
+        }
         self.describe(torrent, parsed, stored);
         let Some(made) = self.making(torrent, &self.global_passwords()) else {
             return Ok(());
@@ -3669,7 +3745,7 @@ impl TorrentService {
             AddSource::Metainfo(bytes) => {
                 let bytes = Bytes::from(bytes);
                 let parsed = parse(&bytes)?;
-                self.admit(&parsed.manifest)?;
+                let left_out = self.admit(&parsed.manifest)?;
                 self.duplicate(parsed.hashes)?;
                 let job_id = self.reserve()?;
                 let mut record = self.record(
@@ -3681,7 +3757,7 @@ impl TorrentService {
                     TorrentSource::Metainfo,
                     Some(bytes),
                 );
-                let (dir, files_dir) = self
+                let (dir, files_dir, adopted) = self
                     .place(
                         &settings,
                         category.as_ref(),
@@ -3693,7 +3769,7 @@ impl TorrentService {
                 record.storage_dir = Some(dir.clone());
                 record.files_dir = files_dir;
                 record.seed_mode = request.placement.seed_mode;
-                let mut torrent = match self.insert(record, &parsed.trackers) {
+                let mut torrent = match self.insert(record, &parsed.trackers, &adopted) {
                     Ok(torrent) => torrent,
                     Err(error) => {
                         give_back(&dir).await;
@@ -3701,7 +3777,7 @@ impl TorrentService {
                     }
                 };
                 self.tag_added(job_id, &request.tags);
-                let made = self.give_metainfo(&mut torrent, &parsed);
+                let made = self.give_metainfo(&mut torrent, &parsed, &left_out);
                 // Raised for an add, never for a restore (qBittorrent emits
                 // `torrentAdded` from `addTorrent_impl` alone).
                 self.raise_script_event(&torrent, QueueEvent::TorrentAdded, &[]);
@@ -3761,7 +3837,7 @@ impl TorrentService {
                     None,
                 );
                 record.pool_member = pin;
-                let mut torrent = self.insert(record, &trackers)?;
+                let mut torrent = self.insert(record, &trackers, &Adopted::default())?;
                 self.tag_added(job_id, &request.tags);
                 let identity = identity_of(torrent.rule(&rules), &torrent.identity);
                 let terms = PeerTerms::of(&self.settings(), torrent.rule(&rules));
@@ -3838,7 +3914,8 @@ impl TorrentService {
         }
     }
 
-    fn admit(&self, manifest: &Manifest) -> Result<(), AddError> {
+    // The files of `manifest.paths`, by index, that admission leaves out.
+    fn admit(&self, manifest: &Manifest) -> Result<Vec<usize>, AddError> {
         let policy = self
             .inner
             .db
@@ -3898,7 +3975,9 @@ impl TorrentService {
     // (`SessionImpl::addTorrent_impl`), the metainfo's layout unless asked
     // otherwise, into whatever is there already. Files with no folder of
     // their own sit straight in the directory they go to, and the job
-    // writes in a folder of its own claimed as weaver claims one.
+    // writes in a folder of its own claimed as weaver claims one. With it,
+    // what was already in the directory the files go to before anything is
+    // made there: nothing in a folder Weaver claims.
     async fn place(
         &self,
         settings: &TorrentSettings,
@@ -3906,7 +3985,15 @@ impl TorrentService {
         record: &TorrentRecord,
         manifest: &Manifest,
         job_id: JobId,
-    ) -> Result<(String, Option<String>), AddError> {
+    ) -> Result<(String, Option<String>, Adopted), AddError> {
+        let found = |dir: PathBuf| {
+            let names = manifest.paths.clone();
+            async move {
+                tokio::task::spawn_blocking(move || files::adopted(&dir, &names))
+                    .await
+                    .map_err(|error| AddError::State(error.to_string()))
+            }
+        };
         let layout = record.content_layout;
         let category_parent = || {
             completion_parent(
@@ -3929,23 +4016,27 @@ impl TorrentService {
         match parent {
             Some(parent) if foldered => {
                 let dir = parent.join(admission::output_name(manifest));
+                let adopted = found(dir.clone()).await?;
                 made(&dir)?;
-                Ok((dir.to_string_lossy().into_owned(), None))
+                Ok((dir.to_string_lossy().into_owned(), None, adopted))
             }
             Some(parent) => {
+                let adopted = found(parent.clone()).await?;
                 made(&parent)?;
                 let dir = self.claim_dir(settings, category, manifest, job_id).await?;
-                Ok((dir, Some(parent.to_string_lossy().into_owned())))
+                Ok((dir, Some(parent.to_string_lossy().into_owned()), adopted))
             }
             None if layout.is_none_or(|layout| layout.foldered(manifest.single_file)) => Ok((
                 self.claim_dir(settings, category, manifest, job_id).await?,
                 None,
+                Adopted::default(),
             )),
             None => {
                 let parent = category_parent()?;
+                let adopted = found(parent.clone()).await?;
                 made(&parent)?;
                 let dir = self.claim_dir(settings, category, manifest, job_id).await?;
-                Ok((dir, Some(parent.to_string_lossy().into_owned())))
+                Ok((dir, Some(parent.to_string_lossy().into_owned()), adopted))
             }
         }
     }
@@ -4015,12 +4106,17 @@ impl TorrentService {
         &self,
         mut record: TorrentRecord,
         trackers: &[TrackerEntry],
+        adopted: &Adopted,
     ) -> Result<Live, AddError> {
         let rules = self.rules();
         let rule = tracker_rule_for(&rules, trackers.iter().map(|tracker| tracker.url.as_str()));
         record.forced |= rule.is_some_and(|rule| rule.forced);
         let rule_id = rule.map(|rule| rule.id);
-        match self.inner.db.insert_torrent(&record, trackers) {
+        match self
+            .inner
+            .db
+            .insert_placed_torrent(&record, trackers, adopted)
+        {
             Ok(TorrentInsert::Inserted) => {
                 let now = self.inner.clock.now_ms();
                 let mut torrent = Live::new(
@@ -4183,7 +4279,7 @@ impl TorrentService {
         fetched: Option<Fetched>,
     ) -> Result<(), AddError> {
         let parsed = parse(&bytes)?;
-        self.admit(&parsed.manifest)?;
+        let left_out = self.admit(&parsed.manifest)?;
         let settings = self.settings();
         let Some(record) = self
             .inner
@@ -4203,7 +4299,7 @@ impl TorrentService {
             v2: parsed.hashes.v2.filter(|_| known.v2.is_none()),
         })?;
         let category = settings.category(record.category_id).cloned();
-        let (dir, files_dir) = self
+        let (dir, files_dir, adopted) = self
             .place(
                 &settings,
                 category.as_ref(),
@@ -4249,7 +4345,11 @@ impl TorrentService {
             .db
             .set_torrent_files_dir(job_id, files_dir.as_deref())
             .map_err(|error| AddError::State(state_error(error)))?;
-        let made = self.give_metainfo(torrent, &parsed);
+        self.inner
+            .db
+            .set_torrent_adopted(job_id, &adopted)
+            .map_err(|error| AddError::State(state_error(error)))?;
+        let made = self.give_metainfo(torrent, &parsed, &left_out);
         drop(live);
         if let Err(error) = made {
             self.fail(job_id, error).await;
@@ -4679,6 +4779,35 @@ impl TorrentService {
         self.finish(report, "failed", hash, now).await;
     }
 
+    // Unpacking ended short of what it would deliver, on a torrent with
+    // every file it wants: the torrent completes and seeds on to its goal,
+    // saying `why`, and its job goes to history as what it delivered says
+    // (`short_status`): its files it has whole and the unpacked files
+    // `placed` beside them.
+    async fn short(&self, job_id: JobId, store: &TorrentStore, why: String, placed: &[String]) {
+        self.completed(job_id).await;
+        let mut delivered = store.whole_names();
+        delivered.extend(placed.iter().cloned());
+        let status = short_status(&delivered, &why);
+        let settings = self.settings();
+        let now = self.inner.clock.now_ms();
+        let (report, hash) = {
+            let mut live = self.inner.live.lock().await;
+            let Some(torrent) = live.get_mut(&job_id) else {
+                return;
+            };
+            torrent.failed = Some(why.clone());
+            let mut report = report(self.view(&settings, torrent, now), status.clone(), now);
+            report.shortfall = Some(why);
+            (report, hashes_of(&torrent.record).best())
+        };
+        if matches!(status, JobStatus::Failed { .. }) {
+            self.inner.counters.event(TorrentEvent::Failed);
+        }
+        self.finish(report, status.persisted_status(), hash, now)
+            .await;
+    }
+
     // A torrent that left the live ones goes to history: its row, then out
     // of the torrents and into the finished jobs.
     async fn retire(&self, torrent: Live, status: &str, error: Option<String>) {
@@ -4689,11 +4818,12 @@ impl TorrentService {
         }
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
-        let report = report(
+        let mut report = report(
             self.view(&settings, &torrent, now),
             job_status_from_persisted_str(status, error.as_deref()),
             now,
         );
+        report.shortfall = error;
         if let Err(error) = self.inner.db.delete_torrent(job_id) {
             tracing::warn!(job_id = job_id.0, error = %error, "could not remove a torrent");
         }
@@ -4782,16 +4912,29 @@ impl TorrentService {
         if let Some(store) = &torrent.store {
             store.forget();
         }
-        if delete_files && let Some(dir) = torrent.record.storage_dir.clone() {
-            let deleted =
-                tokio::task::spawn_blocking(move || delete_written(Path::new(&dir), &written));
+        if delete_files {
+            let deleted = tokio::task::spawn_blocking(move || delete_written(&written));
             if let Err(error) = deleted.await {
                 tracing::warn!(job_id = job_id.0, error = %error, "could not delete a torrent's files");
             }
         }
-        // The job's outcome: complete, refused by unpacking, or cut short.
+        // The job's outcome: complete, short of what unpacking would
+        // deliver, refused by unpacking, or cut short.
         let (status, error) = match (torrent.complete(), torrent.refusal()) {
-            (true, _) => ("complete", None),
+            (true, None) => ("complete", None),
+            (true, Some(why)) => {
+                let mut delivered = torrent
+                    .store
+                    .as_ref()
+                    .map(|store| store.whole_names())
+                    .unwrap_or_default();
+                delivered.extend(self.inner.db.torrent_outputs(job_id).unwrap_or_else(|error| {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent unpacked");
+                    Vec::new()
+                }));
+                let status = short_status(&delivered, &why);
+                (status.persisted_status(), Some(why))
+            }
             (false, Some(refusal)) => ("failed", Some(refusal)),
             (false, None) => ("cancelled", None),
         };
@@ -4802,27 +4945,40 @@ impl TorrentService {
     }
 
     // What a deletion of the torrent's files removes (libtorrent
-    // `storage_utils::delete_files`): its listed files, what unpacking
-    // placed beside them, and its tee's directory, nothing else.
-    fn written_paths(&self, torrent: &Live) -> Vec<PathBuf> {
+    // `storage_utils::delete_files`): its listed files Weaver made, what
+    // unpacking placed beside them, and its tee's directory, nothing else.
+    // A file that was there before the torrent stays; so does a folder
+    // that was. On a failed read of what was there, every listed file is.
+    fn written_paths(&self, torrent: &Live) -> Deletion {
+        let job_id = torrent.record.job_id;
         let Some(store) = &torrent.store else {
-            return Vec::new();
+            return Deletion::default();
         };
-        let mut paths = store.paths();
-        let dir = store.files().dir();
-        let outputs = self
-            .inner
-            .db
-            .torrent_outputs(torrent.record.job_id)
-            .unwrap_or_else(|error| {
-                tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not read what a torrent unpacked");
-                Vec::new()
-            });
-        paths.extend(outputs.iter().map(|output| dir.join(output)));
-        if let Some(tee) = store.tee() {
-            paths.push(tee.work().to_path_buf());
-        }
-        paths
+        let adopted = self.inner.db.torrent_adopted(job_id).unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not read what was on disk before a torrent");
+            Adopted {
+                all_files: true,
+                dirs: vec![String::new()],
+                ..Adopted::default()
+            }
+        });
+        let outputs = self.inner.db.torrent_outputs(job_id).unwrap_or_else(|error| {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not read what a torrent unpacked");
+            Vec::new()
+        });
+        // A torrent placed in a shared folder has a folder of its own
+        // claimed beside it, and the shared one is never its to remove.
+        let claimed = torrent
+            .record
+            .files_dir
+            .as_ref()
+            .and(torrent.record.storage_dir.as_deref())
+            .map(PathBuf::from);
+        let mut deletion = deletion(store.files(), &adopted, &outputs, claimed);
+        // With or without a tee: one whose unpacked files were not placed
+        // keeps its directory past it.
+        deletion.paths.push(self.unpacking_dir(job_id));
+        deletion
     }
 
     async fn with_torrent<T>(
@@ -6371,6 +6527,7 @@ impl TorrentService {
             upload_avg_bps: status::average_bps(counters.uploaded_bytes, active_seconds),
             wasted_bytes: wasted(&reading.seen),
             last_seen_complete_ms: counters.last_seen_complete_ms,
+            last_activity_ms: counters.last_activity_ms,
             pieces: torrent.pieces(),
             created_by: torrent.about.created_by.clone(),
             created_at_ms: torrent.about.created_at_ms,
@@ -7059,9 +7216,6 @@ fn files_dir(torrent: &Live) -> PathBuf {
     )
 }
 
-// libtorrent `storage_utils::delete_files`: the torrent's files go, here
-// with what its job made of them, and then every directory that leaves
-// empty. Whatever else is in its directory stays.
 // The torrent's listed files and what unpacking put beside them, moved to
 // `to` under the lock no read or write gets past, and read and written
 // there from then on; where they went, and whether a file already there
@@ -7088,8 +7242,58 @@ pub(super) fn move_listed(
     })
 }
 
-pub(super) fn delete_written(dir: &Path, written: &[PathBuf]) {
-    for path in written {
+// What a deletion of a torrent's files removes: see `written_paths`.
+#[derive(Debug, Default)]
+pub(super) struct Deletion {
+    // The files and folders Weaver made, removed whole.
+    pub(super) paths: Vec<PathBuf>,
+    // The directory the files are in.
+    pub(super) dir: PathBuf,
+    // Whether that directory is the torrent's own, to go once empty.
+    pub(super) own: bool,
+    // The folders that were there before the torrent, which stay.
+    pub(super) kept_dirs: HashSet<PathBuf>,
+    // The folder claimed for the torrent beside a shared one, to go once
+    // empty.
+    pub(super) claimed: Option<PathBuf>,
+}
+
+// What a deletion of the files takes: each listed file not among those
+// adopted, and each of `outputs`, in the directory the files are in. With a
+// folder `claimed` beside it, that directory is a shared one, and stays.
+pub(super) fn deletion(
+    files: &Files,
+    adopted: &Adopted,
+    outputs: &[String],
+    claimed: Option<PathBuf>,
+) -> Deletion {
+    let dir = files.dir();
+    let kept = files::adopted_paths(adopted);
+    let listed = files
+        .names()
+        .flatten()
+        .filter(|name| !adopted.all_files && !kept.contains(*name))
+        .map(|name| dir.join(name));
+    let paths = listed
+        .chain(outputs.iter().map(|output| dir.join(output)))
+        .collect();
+    let kept_dirs = adopted.dirs.iter().map(|folder| dir.join(folder)).collect();
+    Deletion {
+        paths,
+        own: claimed.is_none(),
+        dir,
+        kept_dirs,
+        claimed,
+    }
+}
+
+// libtorrent `storage_utils::delete_files`: the torrent's files go, here
+// with what its job made of them, and then each folder above them, up to
+// its directory, that this leaves empty and that was not there before the
+// torrent. Whatever else is in its directory stays.
+pub(super) fn delete_written(deletion: &Deletion) {
+    let mut folders = BTreeSet::new();
+    for path in &deletion.paths {
         let removed = match std::fs::symlink_metadata(path) {
             Ok(found) if found.is_dir() => std::fs::remove_dir_all(path),
             Ok(_) => std::fs::remove_file(path),
@@ -7102,21 +7306,71 @@ pub(super) fn delete_written(dir: &Path, written: &[PathBuf]) {
                 tracing::warn!(file = %path.display(), error = %error, "could not delete a torrent's file");
             }
         }
-    }
-    remove_empty(dir);
-}
-
-// The directory, once every directory under it that is empty went first,
-// if it is empty then.
-fn remove_empty(dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                remove_empty(&entry.path());
+        for folder in path.ancestors().skip(1) {
+            if !folder.starts_with(&deletion.dir) {
+                break;
+            }
+            if folder == deletion.dir && !deletion.own {
+                break;
+            }
+            // The folders above one already taken were taken with it.
+            if !folders.insert((folder.components().count(), folder.to_path_buf())) {
+                break;
             }
         }
     }
-    let _ = std::fs::remove_dir(dir);
+    folders.extend(
+        deletion
+            .claimed
+            .iter()
+            .map(|folder| (folder.components().count(), folder.clone())),
+    );
+    // Deepest first, so a folder emptied by the one below it goes too; one
+    // that is not empty stays, as `remove_dir` leaves it.
+    for (_, folder) in folders.iter().rev() {
+        if !deletion.kept_dirs.contains(folder) {
+            let _ = std::fs::remove_dir(folder);
+        }
+    }
+}
+
+// How a torrent's job ends when unpacking left it short of what it would
+// deliver, from the files it `delivered` whole (AGENTS.md, "Job status:
+// Partial"): partial when one of them is a file people open, read as a
+// graph job's delivery reads one (`Delivery::status`), and failed for `why`
+// when none is. An archive volume, a split part and recovery data are never
+// usable files, whole or not.
+// What placing a torrent's unpacked files came to.
+enum Placing {
+    // Not yet: the next settle asks again.
+    Waits,
+    // Every one is beside the torrent's files.
+    Placed,
+    // Some or all stay where unpacking made them, for `why`; `placed` are
+    // the ones beside the torrent's files.
+    Short { why: String, placed: Vec<String> },
+}
+
+// Why a torrent's unpacked files are not all beside its own, and where
+// they are.
+fn unplaced(work: &Path, error: &impl std::fmt::Display) -> String {
+    format!(
+        "the unpacked files could not be placed beside the torrent's files ({error}); they are kept in {}",
+        work.display()
+    )
+}
+
+fn short_status(delivered: &[String], why: &str) -> JobStatus {
+    let usable = delivered
+        .iter()
+        .any(|name| !names_a_piece(name) && weaver_graph::known_type(name));
+    if usable {
+        JobStatus::Partial
+    } else {
+        JobStatus::Failed {
+            error: why.to_owned(),
+        }
+    }
 }
 
 // Whether the torrent's job unpacks, as its metainfo fixed it.
@@ -7183,5 +7437,6 @@ fn report(view: TorrentView, status: JobStatus, now_ms: i64) -> JobReport {
         wait_reason: view.detail,
         created_at_ms: view.added_at_ms,
         metadata: view.metadata,
+        shortfall: None,
     }
 }

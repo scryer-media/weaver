@@ -9,7 +9,6 @@
 // torrent seeds from; nothing else writes them.
 
 use std::io;
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bitvec::boxed::BitBox;
@@ -235,6 +234,17 @@ impl TorrentStore {
             .all(|(index, file)| have.file_have[index] >= file.length)
     }
 
+    // The names of the listed files it has whole.
+    pub(crate) fn whole_names(&self) -> Vec<String> {
+        let have = self.have();
+        self.layout
+            .files()
+            .enumerate()
+            .filter(|(index, file)| !file.padding && have.file_have[*index] >= file.length)
+            .map(|(_, file)| file.name.clone())
+            .collect()
+    }
+
     // The piece's shares the tee waits on go to it from the files: the
     // read a restart, or a seed added over files already there, makes to
     // bring it level with the pieces the torrent has. True when it took any.
@@ -306,13 +316,6 @@ impl TorrentStore {
         if let Some(tee) = &self.tee {
             tee.forget();
         }
-    }
-
-    // The paths of the listed files, as they are now.
-    pub(crate) fn paths(&self) -> Vec<PathBuf> {
-        (0..self.layout.file_count())
-            .filter_map(|file| self.files.path(file))
-            .collect()
     }
 }
 

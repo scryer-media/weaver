@@ -658,6 +658,7 @@ fn held_torrent(
         upload_avg_bps: 0,
         wasted_bytes: 2048,
         last_seen_complete_ms: None,
+        last_activity_ms: None,
         pieces: Some(TorrentPieces {
             count: 3,
             size: 1024,

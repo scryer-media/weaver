@@ -17,7 +17,7 @@ pub struct Manifest {
 /// The torrent's job may not be made, and why.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum Refusal {
-    #[error("{path} has an unwanted extension ({pattern})")]
+    #[error("{path} has an unwanted extension ({pattern}), as every file of the torrent does")]
     Unwanted { path: String, pattern: String },
     #[error("{0} is an executable")]
     Executable(String),
@@ -31,20 +31,30 @@ fn extension(name: &str) -> Option<&str> {
     (!stem.is_empty() && !extension.is_empty()).then_some(extension)
 }
 
-/// Refuses a torrent whose name or any file carries an extension the
-/// operator does not want, or that would be named after an executable
-/// whatever the policy says.
-pub fn admit(policy: &PostProcessingSettings, manifest: &Manifest) -> Result<(), Refusal> {
+/// Admits a torrent, with the files among its `paths`, by their index
+/// there, whose extension the operator does not want: those are left out
+/// of its download. Refuses one that would leave no file wanted, one with
+/// no name, and one that would be named after an executable whatever the
+/// policy says.
+pub fn admit(policy: &PostProcessingSettings, manifest: &Manifest) -> Result<Vec<usize>, Refusal> {
     if manifest.name.trim().is_empty() {
         return Err(Refusal::Unnamed);
     }
-    for path in std::iter::once(&manifest.name).chain(&manifest.paths) {
+    let mut first = None;
+    let mut unwanted = Vec::new();
+    for (index, path) in manifest.paths.iter().enumerate() {
         if let Some(pattern) = policy.unacceptable_extension_match(path) {
-            return Err(Refusal::Unwanted {
-                path: path.clone(),
-                pattern: pattern.to_owned(),
-            });
+            first.get_or_insert((path, pattern));
+            unwanted.push(index);
         }
+    }
+    if let Some((path, pattern)) = first
+        && unwanted.len() == manifest.paths.len()
+    {
+        return Err(Refusal::Unwanted {
+            path: path.clone(),
+            pattern: pattern.to_owned(),
+        });
     }
     if let Some(extension) = extension(&manifest.name)
         && weaver_nzb::delivery_rename::EXECUTABLE_EXTENSIONS
@@ -53,7 +63,7 @@ pub fn admit(policy: &PostProcessingSettings, manifest: &Manifest) -> Result<(),
     {
         return Err(Refusal::Executable(manifest.name.clone()));
     }
-    Ok(())
+    Ok(unwanted)
 }
 
 /// The directory a torrent's files land in: the torrent's name, without
@@ -86,18 +96,17 @@ mod tests {
         }
     }
 
+    // A file with an unwanted extension is left out of the download; the
+    // torrent is refused only when that leaves no file wanted.
     #[test]
-    fn an_unwanted_extension_on_the_name_or_any_path_refuses() {
+    fn files_with_an_unwanted_extension_are_left_out_and_none_left_refuses() {
         let policy = policy(&["nfo", "sc?"]);
         assert_eq!(
             admit(
                 &policy,
-                &manifest("set", false, &["a.bin", "sub/readme.NFO"])
+                &manifest("set", false, &["a.bin", "sub/readme.NFO", "b.scr"])
             ),
-            Err(Refusal::Unwanted {
-                path: "sub/readme.NFO".into(),
-                pattern: "nfo".into()
-            })
+            Ok(vec![1, 2])
         );
         assert_eq!(
             admit(&policy, &manifest("set.scr", true, &["set.scr"])),
@@ -106,7 +115,17 @@ mod tests {
                 pattern: "sc?".into()
             })
         );
-        admit(&policy, &manifest("set", false, &["a.bin", "b.mkv"])).unwrap();
+        assert_eq!(
+            admit(&policy, &manifest("set", false, &["a.nfo", "b.NFO"])),
+            Err(Refusal::Unwanted {
+                path: "a.nfo".into(),
+                pattern: "nfo".into()
+            })
+        );
+        assert_eq!(
+            admit(&policy, &manifest("set", false, &["a.bin", "b.mkv"])),
+            Ok(Vec::new())
+        );
     }
 
     #[test]
@@ -117,7 +136,10 @@ mod tests {
             Err(Refusal::Executable("setup.EXE".into()))
         );
         // A file inside a directory is the policy's to judge.
-        admit(&policy, &manifest("set", false, &["setup.exe"])).unwrap();
+        assert_eq!(
+            admit(&policy, &manifest("set", false, &["setup.exe"])),
+            Ok(Vec::new())
+        );
         assert_eq!(
             admit(&policy, &manifest("  ", false, &[])),
             Err(Refusal::Unnamed)

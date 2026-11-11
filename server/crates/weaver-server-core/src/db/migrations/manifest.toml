@@ -1437,3 +1437,20 @@ kind = "sql"
 file = "migrations/0106_job_tags/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 107
+description = "a torrent keeps what was on disk before it wrote its files"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0107_torrent_adopted/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0107_torrent_adopted/postgres.sql"
+engine = "postgres"
+scope = "all"

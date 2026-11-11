@@ -14,6 +14,7 @@
 // least recently used closed first; one not used for `IDLE` is closed by a
 // sweep that runs only while any is open.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -301,6 +302,7 @@ impl Files {
     }
 
     // Where the file is now; none for padding.
+    #[cfg(test)]
     pub(crate) fn path(&self, file: usize) -> Option<PathBuf> {
         let name = self.names.get(file)?.as_ref()?;
         Some(self.at().dir.join(name))
@@ -385,6 +387,50 @@ impl Files {
         *at = At::new(to, self.names.len());
         Ok(outcome)
     }
+}
+
+// What of a torrent's files, named as its metainfo names them, and of the
+// folders they go in is already under `dir`, before Weaver writes any: those
+// are never Weaver's to delete. A name that cannot be a path under `dir` is
+// never written, so it is not looked for.
+pub(crate) fn adopted(dir: &Path, names: &[String]) -> super::model::Adopted {
+    let mut adopted = super::model::Adopted::default();
+    if !dir.is_dir() {
+        return adopted;
+    }
+    adopted.dirs.push(String::new());
+    let mut seen = HashSet::new();
+    for name in names {
+        let Ok(path) = relative(name) else {
+            continue;
+        };
+        if std::fs::symlink_metadata(dir.join(&path)).is_ok() {
+            adopted.files.push(name.clone());
+        }
+        for folder in path.ancestors().skip(1) {
+            // The folders above one already looked at were looked at too.
+            if folder.as_os_str().is_empty() || !seen.insert(folder.to_path_buf()) {
+                break;
+            }
+            if dir.join(folder).is_dir() {
+                adopted.dirs.push(folder.to_string_lossy().into_owned());
+            }
+        }
+    }
+    if !names.is_empty() && adopted.files.len() == names.len() {
+        adopted.files.clear();
+        adopted.all_files = true;
+    }
+    adopted
+}
+
+// The files [`adopted`] found, as paths under the directory.
+pub(crate) fn adopted_paths(adopted: &super::model::Adopted) -> HashSet<PathBuf> {
+    adopted
+        .files
+        .iter()
+        .filter_map(|name| relative(name).ok())
+        .collect()
 }
 
 fn open_for_write(path: &Path) -> io::Result<File> {

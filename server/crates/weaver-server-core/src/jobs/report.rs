@@ -35,12 +35,15 @@ pub struct JobReport {
     pub wait_reason: Option<String>,
     pub created_at_ms: i64,
     pub metadata: Vec<(String, String)>,
+    // Why a partial job is short of whole.
+    pub shortfall: Option<String>,
 }
 
 impl JobReport {
     fn error(&self) -> Option<String> {
         match &self.status {
             JobStatus::Failed { error } => Some(error.clone()),
+            JobStatus::Partial => self.shortfall.clone(),
             _ => None,
         }
     }
