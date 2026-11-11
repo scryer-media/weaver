@@ -261,16 +261,21 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
 /// Uploaded over downloaded; over the torrent's size while less than 1% of
 /// it was downloaded here, as for a torrent added complete.
 pub fn ratio(counters: &TorrentCounters, size: u64) -> f64 {
-    let downloaded = counters.downloaded_bytes;
-    let over = if downloaded.saturating_mul(100) < size {
-        size
-    } else {
-        downloaded
-    };
+    let over = ratio_base(counters.downloaded_bytes, size);
     if over == 0 {
         0.0
     } else {
         counters.uploaded_bytes as f64 / over as f64
+    }
+}
+
+/// The bytes a ratio is taken over: those downloaded, or the torrent's size
+/// while less than 1% of it was downloaded here.
+pub fn ratio_base(downloaded_bytes: u64, size: u64) -> u64 {
+    if downloaded_bytes.saturating_mul(100) < size {
+        size
+    } else {
+        downloaded_bytes
     }
 }
 

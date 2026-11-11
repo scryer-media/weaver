@@ -852,6 +852,9 @@ pub struct TorrentView {
     pub wasted_bytes: u64,
     /// The last time a complete copy was in reach.
     pub last_seen_complete_ms: Option<i64>,
+    /// The last time it sent or received payload, in milliseconds since the
+    /// epoch; None while it never has.
+    pub last_activity_ms: Option<i64>,
     /// The torrent's pieces, once its metainfo is in hand.
     pub pieces: Option<TorrentPieces>,
     pub created_by: Option<String>,
@@ -6369,6 +6372,7 @@ impl TorrentService {
             upload_avg_bps: status::average_bps(counters.uploaded_bytes, active_seconds),
             wasted_bytes: wasted(&reading.seen),
             last_seen_complete_ms: counters.last_seen_complete_ms,
+            last_activity_ms: counters.last_activity_ms,
             pieces: torrent.pieces(),
             created_by: torrent.about.created_by.clone(),
             created_at_ms: torrent.about.created_at_ms,

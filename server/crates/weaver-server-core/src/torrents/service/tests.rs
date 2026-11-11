@@ -511,6 +511,7 @@ fn a_downloading_torrent_carries_its_speed_and_eta_to_the_queue() {
         upload_avg_bps: 0,
         wasted_bytes: 0,
         last_seen_complete_ms: None,
+        last_activity_ms: None,
         pieces: None,
         created_by: None,
         created_at_ms: None,
