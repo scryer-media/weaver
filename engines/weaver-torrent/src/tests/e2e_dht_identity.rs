@@ -53,82 +53,25 @@ impl SocketFactory for LoopbackUdpOnly {
     }
 }
 
+// Whichever client a session goes as, its DHT is Weaver's own: a node id
+// that shares nothing with the peer id, and Weaver's letters and version as
+// "v".
 #[tokio::test]
-async fn test_session_peer_id_fingerprint_is_the_dht_node_id_prefix() -> anyhow::Result<()> {
-    // The DHT's one bootstrap node: a loopback socket nobody answers on.
-    let bootstrap = crate::test_support::loopback_udp().await;
-    let dir = TempDir::with_prefix("test_session_dht_identity")?;
-    let peer_id = generate_azereus_style(*b"XY", (1, 2, 3, 4));
-
-    let session = Session::new_with_opts(
-        dir.path().into(),
-        SessionOptions {
-            identity: Some(crate::Identity {
-                peer_id,
-                ..Default::default()
-            }),
-            dht: Some(DhtSessionConfig {
-                bootstrap_addrs: Some(vec![bootstrap.bind_addr().to_string()]),
-                port: None,
-                persistence: None,
-            }),
-            persistence: None,
-            disable_local_service_discovery: true,
-            socket_factory: Arc::new(LoopbackUdpOnly),
-            ..crate::test_support::session_options()
-        },
-    )
-    .await?;
-
-    let dht = session.get_dht().expect("the session runs a DHT");
-    let node_id = dht.stats().id;
-    assert_eq!(&node_id.0[..8], b"-XY1234-");
-    assert_ne!(node_id, peer_id, "only the fingerprint is shared");
-
-    // Its first query, to the bootstrap node, carries the client version (BEP 5 "v").
-    let mut buf = [0u8; 2048];
-    let query = loop {
-        let (len, from) = bootstrap.recv_from(&mut buf).await?;
-        if from == dht.listen_addr() {
-            break &buf[..len];
-        }
-    };
-    let v = b"1:v4:XY\x01\x02";
-    assert!(
-        query.windows(v.len()).any(|w| w == v),
-        "no client version in {query:?}"
-    );
-    session.cancellation_token().cancel();
-    Ok(())
-}
-
-// A session named as another client, or as this build, carries that client's
-// fingerprint as its DHT node id prefix and its letters and version as "v".
-#[tokio::test]
-async fn test_a_session_names_its_client_to_the_dht() -> anyhow::Result<()> {
-    let weaver = crate::Identity::default();
+async fn test_a_sessions_dht_is_weavers_whatever_client_it_goes_as() -> anyhow::Result<()> {
     let (major, minor, _, _) = crate::crate_version!();
-    let mut weaver_prefix = [0u8; 8];
-    weaver_prefix.copy_from_slice(&weaver.peer_id.0[..8]);
-    for (identity, prefix, v) in [
-        (
-            crate::Identity {
-                peer_id: generate_azereus_style(*b"qB", (5, 2, 3, 0)),
-                tracker_key: 1,
-                version: "qBittorrent/5.2.3".into(),
-                user_agent: "qBittorrent/5.2.3".into(),
-                tracker_ids: Default::default(),
-                shape: &crate::tracker::qbittorrent::SHAPE,
-            },
-            *b"-qB5230-",
-            b"1:v4:qB\x05\x02".to_vec(),
-        ),
-        (
-            weaver,
-            weaver_prefix,
-            [b"1:v4:WV".as_slice(), &[major, minor]].concat(),
-        ),
+    let v = [b"1:v4:WV".as_slice(), &[major, minor]].concat();
+    for identity in [
+        crate::Identity {
+            peer_id: generate_azereus_style(*b"qB", (5, 3, 0, 0)),
+            tracker_key: 1,
+            version: crate::tracker::qbittorrent::VERSION.into(),
+            user_agent: crate::tracker::qbittorrent::USER_AGENT.into(),
+            tracker_ids: Default::default(),
+            shape: &crate::tracker::qbittorrent::SHAPE,
+        },
+        crate::Identity::default(),
     ] {
+        let peer_id = identity.peer_id;
         let bootstrap = crate::test_support::loopback_udp().await;
         let dir = TempDir::with_prefix("test_session_dht_client")?;
         let session = Session::new_with_opts(
@@ -148,7 +91,9 @@ async fn test_a_session_names_its_client_to_the_dht() -> anyhow::Result<()> {
         )
         .await?;
         let dht = session.get_dht().expect("the session runs a DHT");
-        assert_eq!(&dht.stats().id.0[..8], &prefix);
+        assert!(!dht.stats().id.0.starts_with(&peer_id.0[..8]));
+        // Its first query, to the bootstrap node, carries the client version
+        // (BEP 5 "v").
         let mut buf = [0u8; 2048];
         let query = loop {
             let (len, from) = bootstrap.recv_from(&mut buf).await?;

@@ -813,27 +813,12 @@ impl AddTorrentResponse {
     }
 }
 
-// The DHT side of a configured peer id: the node id prefix, and the BEP 5 "v".
-//
-// An Azureus-style peer id (BEP 20) starts with the client's fingerprint "-XXvvvv-":
-// the DHT node id starts with the same eight bytes, and "v" is the two client letters
-// followed by the major and minor version as bytes. A peer id of another shape has no
-// fingerprint to carry over: the node id is then entirely random and no "v" is sent.
-// Without a configured peer id the DHT keeps its defaults.
-fn dht_identity(peer_id: Option<&Id20>) -> (Option<Vec<u8>>, Option<Vec<u8>>) {
-    let Some(peer_id) = peer_id else {
-        return (None, None);
-    };
-    match crate::core::peer_id::try_decode_peer_id(*peer_id) {
-        Some(crate::core::peer_id::PeerId::AzureusStyle(a)) => {
-            let p = &peer_id.0;
-            (
-                Some(p[..8].to_vec()),
-                Some(vec![p[1], p[2], a.version[0], a.version[1]]),
-            )
-        }
-        None => (Some(Vec::new()), None),
-    }
+// The DHT is Weaver's own, whichever client the session's torrents go as:
+// BEP 5's "v" is Weaver's two letters followed by its major and minor version
+// as bytes.
+fn dht_client_version() -> Vec<u8> {
+    let (major, minor, _, _) = crate::crate_version!();
+    vec![b'W', b'V', major, minor]
 }
 
 pub fn read_local_file_including_stdin(filename: &str) -> anyhow::Result<Vec<u8>> {
@@ -1497,8 +1482,6 @@ impl Session {
         mut opts: SessionOptions,
     ) -> BoxFuture<'static, anyhow::Result<Arc<Self>>> {
         async move {
-            let (dht_node_id_prefix, dht_client_version) =
-                dht_identity(opts.identity.as_ref().map(|identity| &identity.peer_id));
             let identity = opts.identity.take().unwrap_or_default();
             let token = opts.cancellation_token.take().unwrap_or_default();
             let tasks = TaskTracker::new();
@@ -1636,8 +1619,7 @@ impl Session {
                             socket: dht_socket,
                             sockets: Some(datagram_sockets.clone()),
                             resolver: Some(resolver.clone()),
-                            node_id_prefix: dht_node_id_prefix,
-                            client_version: dht_client_version,
+                            client_version: Some(dht_client_version()),
                             tasks: Some(swarm_tasks.clone()),
                             ..Default::default()
                         },
@@ -1653,8 +1635,7 @@ impl Session {
                         socket: dht_socket,
                         sockets: Some(datagram_sockets.clone()),
                         resolver: Some(resolver.clone()),
-                        node_id_prefix: dht_node_id_prefix,
-                        client_version: dht_client_version,
+                        client_version: Some(dht_client_version()),
                         tasks: Some(swarm_tasks.clone()),
                         ..Default::default()
                     })
@@ -5433,25 +5414,9 @@ mod tests {
     }
 
     #[test]
-    fn test_dht_identity_follows_the_peer_id() {
-        use super::dht_identity;
-        use crate::core::{hash_id::Id20, peer_id::generate_azereus_style};
-
-        // No configured peer id: the DHT keeps its own defaults.
-        assert_eq!(dht_identity(None), (None, None));
-
-        // Azureus style: the fingerprint, and the client letters with major.minor.
-        let id = generate_azereus_style(*b"XY", (1, 2, 3, 4));
-        assert_eq!(
-            dht_identity(Some(&id)),
-            (Some(b"-XY1234-".to_vec()), Some(b"XY\x01\x02".to_vec()))
-        );
-        let id = generate_azereus_style(*b"XY", (10, 36, 0, 0));
-        assert_eq!(dht_identity(Some(&id)).1, Some(b"XY\x0a\x24".to_vec()));
-
-        // Any other shape: no fingerprint to carry over.
-        let id = Id20::new([b'M'; 20]);
-        assert_eq!(dht_identity(Some(&id)), (Some(Vec::new()), None));
+    fn test_dht_client_version_is_weavers() {
+        let (major, minor, _, _) = crate::crate_version!();
+        assert_eq!(super::dht_client_version(), [b'W', b'V', major, minor]);
     }
 
     // A session listening on loopback that seeds a finished one-piece
