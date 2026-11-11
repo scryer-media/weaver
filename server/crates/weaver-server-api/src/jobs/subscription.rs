@@ -91,16 +91,15 @@ impl JobsSubscription {
                         }
                         memo.last = Some((state.clone(), max_download_speed));
                     }
-                    let mut items: Vec<QueueItem> =
-                        crate::jobs::paging::read_listing(
-                            &state_handle,
-                            prepared_filter.as_ref(),
-                            0,
-                            usize::MAX,
-                        )
-                        .iter()
-                        .map(queue_item_from_job)
-                        .collect();
+                    let mut items: Vec<QueueItem> = crate::jobs::paging::read_listing(
+                        &state_handle,
+                        prepared_filter.as_ref(),
+                        0,
+                        usize::MAX,
+                    )
+                    .iter()
+                    .map(queue_item_from_job)
+                    .collect();
                     let cached = {
                         let memo = memo.lock().expect("queue snapshot memo poisoned");
                         memo.summaries

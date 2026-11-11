@@ -3022,7 +3022,12 @@ async fn nzbget_log_returns_at_most_its_cap_newest_entries() {
     let entries = payload["result"].as_array().unwrap();
     assert_eq!(entries.len(), 1000);
     assert!(entries[0]["Text"].as_str().unwrap().ends_with("event 5"));
-    assert!(entries[999]["Text"].as_str().unwrap().ends_with("event 1004"));
+    assert!(
+        entries[999]["Text"]
+            .as_str()
+            .unwrap()
+            .ends_with("event 1004")
+    );
 }
 
 #[tokio::test]

@@ -276,9 +276,9 @@ impl HistoryQuery {
         let offset = offset.unwrap_or(0);
         let events =
             tokio::task::spawn_blocking(move || db.get_job_events_window(job_id, limit, offset))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?
-            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
         Ok(events
             .into_iter()
             .filter_map(crate::history::types::job_event_from_core)
@@ -839,7 +839,6 @@ fn build_history_page_from_keys(
     })
 }
 
-
 // Ids of every row the queue still owns, including hidden cancellations and
 // terminal rows whose archive acknowledgement has not retired them yet.
 //
@@ -1155,8 +1154,9 @@ fn compare_history_items(
 ) -> Ordering {
     let ordering = match sort_field {
         HistorySortField::CompletedAt => left.completed_at.cmp(&right.completed_at),
-        HistorySortField::Name => history_sort_name(&left.original_title, &left.display_title)
-            .cmp(&history_sort_name(&right.original_title, &right.display_title)),
+        HistorySortField::Name => history_sort_name(&left.original_title, &left.display_title).cmp(
+            &history_sort_name(&right.original_title, &right.display_title),
+        ),
         HistorySortField::State => {
             history_state_key(left.state).cmp(history_state_key(right.state))
         }
@@ -1180,8 +1180,9 @@ fn compare_history_keys(
 ) -> Ordering {
     let ordering = match sort_field {
         HistorySortField::CompletedAt => left.completed_at.cmp(&right.completed_at),
-        HistorySortField::Name => history_sort_name(&left.original_title, &left.display_title)
-            .cmp(&history_sort_name(&right.original_title, &right.display_title)),
+        HistorySortField::Name => history_sort_name(&left.original_title, &left.display_title).cmp(
+            &history_sort_name(&right.original_title, &right.display_title),
+        ),
         HistorySortField::State => {
             history_state_key(left.state).cmp(history_state_key(right.state))
         }
@@ -1546,7 +1547,10 @@ mod tests {
 
             let bare = build_history_page_sql(&db, plan(), &live, none).unwrap();
             assert_eq!(bare.total_count, 0);
-            assert_eq!((bare.counts.all, bare.counts.success, bare.counts.failure), (0, 0, 0));
+            assert_eq!(
+                (bare.counts.all, bare.counts.success, bare.counts.failure),
+                (0, 0, 0)
+            );
             assert_eq!(
                 bare.items.iter().map(|item| item.id).collect::<Vec<_>>(),
                 whole.items.iter().map(|item| item.id).collect::<Vec<_>>(),
@@ -1556,11 +1560,18 @@ mod tests {
                 &db,
                 plan(),
                 &live,
-                HistoryPageFields { counts: true, ..none },
+                HistoryPageFields {
+                    counts: true,
+                    ..none
+                },
             )
             .unwrap();
             assert_eq!(
-                (counts_only.counts.all, counts_only.counts.success, counts_only.counts.failure),
+                (
+                    counts_only.counts.all,
+                    counts_only.counts.success,
+                    counts_only.counts.failure
+                ),
                 (whole.counts.all, whole.counts.success, whole.counts.failure),
             );
         }
@@ -1749,9 +1760,18 @@ mod tests {
     fn assert_pages_equal(label: &str, left: &HistoryPage, right: &HistoryPage) {
         assert_eq!(left.total_count, right.total_count, "{label}: total_count");
         assert_eq!(left.counts.all, right.counts.all, "{label}: counts.all");
-        assert_eq!(left.counts.success, right.counts.success, "{label}: counts.success");
-        assert_eq!(left.counts.failure, right.counts.failure, "{label}: counts.failure");
-        assert_eq!(left.category_counts, right.category_counts, "{label}: category counts");
+        assert_eq!(
+            left.counts.success, right.counts.success,
+            "{label}: counts.success"
+        );
+        assert_eq!(
+            left.counts.failure, right.counts.failure,
+            "{label}: counts.failure"
+        );
+        assert_eq!(
+            left.category_counts, right.category_counts,
+            "{label}: category counts"
+        );
         assert_eq!(left.items, right.items, "{label}: items");
     }
 
@@ -1827,7 +1847,13 @@ mod tests {
                                             .unwrap();
                                     assert_pages_equal(&label, &keyed, &whole);
                                     if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
-                                        let sql = build_history_page_sql(&db, plan, live, HistoryPageFields::ALL).unwrap();
+                                        let sql = build_history_page_sql(
+                                            &db,
+                                            plan,
+                                            live,
+                                            HistoryPageFields::ALL,
+                                        )
+                                        .unwrap();
                                         assert_pages_equal(&label, &sql, &whole);
                                         sql_checked += 1;
                                     }
@@ -1876,9 +1902,14 @@ mod tests {
         let live = live_job_ids(&handle);
         assert!(live.contains(&3));
 
-        let page = load_history_page(db.clone(), live.clone(), page_input(0, 25, None), HistoryPageFields::ALL)
-            .await
-            .unwrap();
+        let page = load_history_page(
+            db.clone(),
+            live.clone(),
+            page_input(0, 25, None),
+            HistoryPageFields::ALL,
+        )
+        .await
+        .unwrap();
         let ids: Vec<u64> = page.items.iter().map(|item| item.id).collect();
         assert!(!ids.contains(&3), "a live job must not appear as history");
         // Excluding the row also removes it from the counts and total, so the
@@ -1925,9 +1956,14 @@ mod tests {
         )]);
         let live = live_job_ids(&handle);
         assert!(live.contains(&3));
-        let page = load_history_page(db.clone(), live, page_input(0, 25, None), HistoryPageFields::ALL)
-            .await
-            .unwrap();
+        let page = load_history_page(
+            db.clone(),
+            live,
+            page_input(0, 25, None),
+            HistoryPageFields::ALL,
+        )
+        .await
+        .unwrap();
         assert!(!page.items.iter().any(|item| item.id == 3));
 
         // Only removal from the queue makes its durable row history.

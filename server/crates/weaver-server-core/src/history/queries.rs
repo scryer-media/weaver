@@ -244,7 +244,8 @@ impl Database {
             let mut found = Vec::new();
             for chunk in job_ids.chunks(max_rows_for_engine(datastore.engine(), 1)) {
                 let placeholders = vec!["{}"; chunk.len()].join(", ");
-                let sql = format!("SELECT job_id FROM job_history WHERE job_id IN ({placeholders})");
+                let sql =
+                    format!("SELECT job_id FROM job_history WHERE job_id IN ({placeholders})");
                 let args: Vec<SqlArg> = chunk.iter().map(|id| SqlArg::I64(*id as i64)).collect();
                 for row in SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await? {
                     found.push(row.i64("job_id")? as u64);

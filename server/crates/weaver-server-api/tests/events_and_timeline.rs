@@ -279,7 +279,8 @@ async fn job_events_return_the_newest_window_and_page_back_from_it() {
                 .collect::<Vec<_>>()
         }
     };
-    let expected = |from: i64, to: i64| (from..to).map(|n| format!("event {n}")).collect::<Vec<_>>();
+    let expected =
+        |from: i64, to: i64| (from..to).map(|n| format!("event {n}")).collect::<Vec<_>>();
 
     let latest = messages(format!("{{ jobEvents(jobId: {job_id}) {{ message }} }}")).await;
     assert_eq!(latest, expected(5, 2_005));
@@ -303,9 +304,7 @@ async fn job_events_return_the_newest_window_and_page_back_from_it() {
     assert_eq!(capped, expected(5, 2_005));
 
     let resp = h
-        .execute(&format!(
-            "{{ jobTimeline(jobId: {job_id}) {{ outcome }} }}"
-        ))
+        .execute(&format!("{{ jobTimeline(jobId: {job_id}) {{ outcome }} }}"))
         .await;
     assert_no_errors(&resp);
 }

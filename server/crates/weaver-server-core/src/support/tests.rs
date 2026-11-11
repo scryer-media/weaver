@@ -446,7 +446,12 @@ fn event_kind_counts_give_what_every_event_gives() {
             "ExtractionMemberStarted",
             "ExtractionReady",
         ],
-        &["RepairStarted", "RepairComplete", "RepairStarted", "RepairFailed"],
+        &[
+            "RepairStarted",
+            "RepairComplete",
+            "RepairStarted",
+            "RepairFailed",
+        ],
         &[],
     ];
     for (index, kinds) in sequences.iter().enumerate() {

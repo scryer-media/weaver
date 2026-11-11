@@ -195,7 +195,9 @@ async fn terminal_mark(
 ) -> Result<TerminalMark, weaver_server_core::StateError> {
     tokio::task::spawn_blocking(move || {
         let archived = !db.job_history_ids_among(&[job_id])?.is_empty();
-        let delete_state = db.list_history_delete_row_states(&[job_id])?.remove(&job_id);
+        let delete_state = db
+            .list_history_delete_row_states(&[job_id])?
+            .remove(&job_id);
         Ok(TerminalMark {
             archived,
             delete_state,
