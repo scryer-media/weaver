@@ -18,7 +18,7 @@ use crate::migration_hook_ids;
 use crate::persistence::sql_runtime::SqlConn;
 
 pub(crate) mod egress_quotas_v53;
-pub(crate) mod nzb_tables_v84;
+pub(crate) mod nzb_tables_v85;
 pub(crate) mod proxy_resolver_v64;
 mod schedule_tracks_v55;
 pub(crate) mod script_concurrency_v58;
@@ -34,7 +34,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 84;
+const CURRENT_SCHEMA_VERSION: i64 = 85;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -561,6 +561,7 @@ async fn apply_single_migration(
     install_kind: MigrationInstallKind,
 ) -> Result<(), StateError> {
     let start = Instant::now();
+    run_committed_prework(pool, migration).await?;
     let mut tx = pool.begin().await.map_err(db_err)?;
     for step in &migration.steps {
         if !step.engine().applies_to(EngineScope::Sqlite) {
@@ -590,6 +591,22 @@ async fn apply_single_migration(
     let elapsed_ns = start.elapsed().as_nanos().min(i64::MAX as u128) as i64;
     insert_applied_migration(&mut tx, migration, elapsed_ns).await?;
     tx.commit().await.map_err(db_err)?;
+    Ok(())
+}
+
+// The part of a migration too large for one transaction: it runs first and
+// commits as it goes, and must carry on where it stopped if it is run again.
+async fn run_committed_prework(
+    pool: &SqlitePool,
+    migration: &CompiledMigration,
+) -> Result<(), StateError> {
+    for step in &migration.steps {
+        if let CompiledMigrationStep::Rust { hook_id, .. } = step
+            && hook_id.as_str() == nzb_tables_v85::HOOK_ID
+        {
+            nzb_tables_v85::move_nzbs_in_committed_batches(pool).await?;
+        }
+    }
     Ok(())
 }
 
@@ -859,8 +876,8 @@ async fn run_rust_hook(
         proxy_resolver_v64::HOOK_ID => {
             proxy_resolver_v64::name_proxy_resolvers(&mut SqlConn::Sqlite(tx)).await
         }
-        nzb_tables_v84::HOOK_ID => {
-            nzb_tables_v84::move_nzbs_and_outlines(&mut SqlConn::Sqlite(tx)).await
+        nzb_tables_v85::HOOK_ID => {
+            nzb_tables_v85::move_nzbs_and_outlines(&mut SqlConn::Sqlite(tx)).await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"

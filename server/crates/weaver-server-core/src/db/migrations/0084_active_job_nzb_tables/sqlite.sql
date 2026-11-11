@@ -15,6 +15,5 @@ CREATE TABLE active_job_outlines (
     outline BLOB NOT NULL
 );
 
--- The upgrade step then moves each stored NZB here, compresses each job's
--- outline rows into one, and drops `active_jobs.nzb_zstd` and
--- `active_job_nzb_files`.
+-- Migration 85 then moves each stored NZB here, compresses each job's outline
+-- rows into one, and drops `active_jobs.nzb_zstd` and `active_job_nzb_files`.
