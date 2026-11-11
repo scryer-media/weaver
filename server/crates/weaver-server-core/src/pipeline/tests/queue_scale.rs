@@ -257,6 +257,12 @@ struct Restarted {
 const LATE_HOLDER: JobId = JobId(1);
 
 async fn restarted_long_queue(temp: &tempfile::TempDir) -> Restarted {
+    restarted_long_queue_with(temp, false).await
+}
+
+// As `restarted_long_queue`; with `unoutlined`, every job is stored as one
+// admitted before outlines were, with no outline.
+async fn restarted_long_queue_with(temp: &tempfile::TempDir, unoutlined: bool) -> Restarted {
     let (mut pipeline, handle) = long_queue(temp, 2).await;
     assert!(pipeline.nzb_admitted.contains(&LATE_HOLDER));
     handle
@@ -282,7 +288,17 @@ async fn restarted_long_queue(temp: &tempfile::TempDir) -> Restarted {
         .collect();
     retire_pipeline_database(pipeline).await;
 
-    let (pipeline, intermediate, _) = new_direct_pipeline(temp).await;
+    let (mut pipeline, intermediate, _) = new_direct_pipeline(temp).await;
+    // No list is read ahead, so every parse counted is the restart's.
+    pipeline.next_up.depth = 0;
+    if unoutlined {
+        sql(&pipeline.db, "DELETE FROM active_job_nzb_files").await;
+        sql(
+            &pipeline.db,
+            "UPDATE active_jobs SET nzb_title = NULL, nzb_password = NULL, nzb_files = NULL",
+        )
+        .await;
+    }
     let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
     handle
         .set_max_concurrent_nzbs(std::num::NonZeroU32::new(2).unwrap())
@@ -337,8 +353,8 @@ async fn a_restart_restores_a_long_queue_a_batch_a_turn_holding_no_article_lists
         summaries: expected,
         recovery_parses,
     } = restarted_long_queue(&temp).await;
-    // Recovery parses each stored NZB once.
-    assert_eq!(recovery_parses, QUEUED);
+    // Recovery reads each job's stored outline and parses no stored NZB.
+    assert_eq!(recovery_parses, 0);
 
     // Each turn installs one batch: the jobs holding a slot first, wherever
     // they stand, then the rest in queue order. It says more wait.
@@ -1043,4 +1059,130 @@ async fn a_result_turn_and_a_refill_turn_walk_no_row_and_ask_no_database_on_a_lo
     assert_eq!(row_walks(), walks);
     assert_eq!(actor_db::total(), awaited);
     assert_eq!(actor_thread::total(), called);
+}
+
+// Hear the database's answers until no list read ahead is out.
+async fn settle_next_up(pipeline: &mut Pipeline) {
+    while pipeline.next_up.reading() {
+        let reply = pipeline.db_reply_rx.recv().await.expect("database replies");
+        pipeline.handle_db_reply(reply).await;
+    }
+}
+
+// The jobs that take the next slots, past the ones holding them, have their
+// lists read ahead, and a job that takes a slot keeps its lists until it
+// activates. A job that drops out of them, as one paused does, drops its
+// lists, and the next job in order has its own read. A job that takes a slot
+// activates on the lists read ahead, the same lists a read at activation
+// gives, with no parse of its own.
+#[tokio::test]
+async fn the_jobs_next_up_hold_their_lists_read_ahead() {
+    use crate::pipeline::next_up::NEXT_UP_DEPTH;
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, handle) = long_queue(&temp, 2).await;
+    settle_next_up(&mut pipeline).await;
+    // Jobs 1 and 2 hold the slots and have not activated.
+    let next: Vec<JobId> = (1..3 + NEXT_UP_DEPTH as u64).map(JobId).collect();
+    assert_eq!(pipeline.next_up.held(), next);
+
+    let paused = JobId(5);
+    handle.pause_job(paused).await.unwrap();
+    pipeline.apply_queue_intents().await;
+    settle_next_up(&mut pipeline).await;
+    let next: Vec<JobId> = (1..4 + NEXT_UP_DEPTH as u64)
+        .map(JobId)
+        .filter(|id| *id != paused)
+        .collect();
+    assert_eq!(pipeline.next_up.held(), next);
+
+    // A job holding a slot activates on the lists read ahead.
+    let job_id = JobId(1);
+    let (category, metadata) = {
+        let spec = &pipeline.jobs[&job_id].spec;
+        (spec.category.clone(), spec.metadata.clone())
+    };
+    let fresh =
+        crate::pipeline::activation::read_stored_spec(&pipeline.db, job_id, category, metadata)
+            .unwrap();
+    let parses = nzb_parses();
+    pipeline.request_job_activation(job_id);
+    let done = pipeline.job_activated_rx.recv().await.unwrap();
+    pipeline.handle_job_activated(done);
+    assert_eq!(nzb_parses(), parses);
+    let state = &pipeline.jobs[&job_id];
+    assert!(matches!(
+        state.articles,
+        crate::jobs::model::JobArticles::Active(_)
+    ));
+    let lists = |spec: &JobSpec| -> Vec<Vec<(u32, u32, u32, crate::jobs::MessageIds)>> {
+        spec.files
+            .iter()
+            .map(|file| {
+                file.segments
+                    .iter()
+                    .map(|segment| {
+                        (
+                            segment.ordinal,
+                            segment.article_number,
+                            segment.bytes,
+                            segment.message_ids.clone(),
+                        )
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    assert_eq!(lists(&state.spec), lists(&fresh));
+    assert!(!pipeline.next_up.held().contains(&job_id));
+}
+
+// A job stored before outlines were restores with no NZB read before the
+// server answers. Each such job installs, wherever it stands, reading its NZB
+// once and storing the outline it reads; the jobs out of the window leave it
+// again. Each job then holds the summaries it held before the restart, and
+// the next restart reads no NZB.
+#[tokio::test]
+async fn a_restart_fills_the_outlines_of_jobs_stored_without_one() {
+    let temp = tempfile::tempdir().unwrap();
+    let Restarted {
+        mut pipeline,
+        handle: _handle,
+        order,
+        summaries: expected,
+        recovery_parses,
+    } = restarted_long_queue_with(&temp, true).await;
+    assert_eq!(recovery_parses, 0);
+    let parses = nzb_parses();
+    settle_window(&mut pipeline).await;
+    assert_eq!(nzb_parses() - parses, QUEUED);
+    assert_eq!(pipeline.jobs.len(), QUEUE_WINDOW + 1);
+    assert!(
+        order[..QUEUE_WINDOW]
+            .iter()
+            .all(|id| pipeline.jobs.contains_key(id))
+    );
+    for (id, state) in &pipeline.jobs {
+        match &state.articles {
+            crate::jobs::model::JobArticles::Queued(summaries) => {
+                assert_eq!(summaries.0, expected[id], "job {}", id.0)
+            }
+            _ => assert!(pipeline.nzb_admitted.contains(id), "job {}", id.0),
+        }
+    }
+    pipeline.db.flush_write_queue().await.unwrap();
+    let outlines = pipeline.db.load_job_outlines(None).unwrap();
+    assert_eq!(outlines.len(), QUEUED as usize);
+    // Every job installed before the restart holds the same files.
+    for (id, summaries) in &expected {
+        let files: Vec<(u32, u64)> = outlines[id]
+            .files
+            .iter()
+            .map(|file| (file.articles, file.bytes))
+            .collect();
+        let summaries: Vec<(u32, u64)> = summaries
+            .iter()
+            .map(|file| (file.articles, file.bytes))
+            .collect();
+        assert_eq!(files, summaries, "job {}", id.0);
+    }
 }

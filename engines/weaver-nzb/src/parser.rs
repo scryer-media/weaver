@@ -205,15 +205,19 @@ pub fn parse_nzb_reader_files<R: BufRead>(
     let mut reader = reader.take(u64::try_from(read_limit).unwrap_or(u64::MAX));
     // Fan-out is counted only under a cap lowered below the segment cap, as
     // the whole-document parse counts it, here as each file is handed over.
-    let mut uses = (limits.max_message_id_uses < limits.max_segments)
-        .then(HashMap::<String, usize>::new);
+    let mut uses =
+        (limits.max_message_id_uses < limits.max_segments).then(HashMap::<String, usize>::new);
     let result = visit_nzb_files(
         &mut reader,
         limits,
         &mut ParseDiagnostics::default(),
         &mut |file| {
             if let Some(uses) = uses.as_mut() {
-                for id in file.segments.iter().flat_map(|segment| &segment.message_ids) {
+                for id in file
+                    .segments
+                    .iter()
+                    .flat_map(|segment| &segment.message_ids)
+                {
                     let count = uses.entry(id.clone()).or_default();
                     if *count >= limits.max_message_id_uses {
                         return Err(NzbError::ResourceLimit(format!(
@@ -2252,7 +2256,8 @@ mod tests {
         assert_eq!(format!("{files:?}"), format!("{:?}", whole.files));
         assert_eq!(files.len(), 2);
 
-        let empty = br#"<nzb><file poster="p" date="1" subject="s"><segments></segments></file></nzb>"#;
+        let empty =
+            br#"<nzb><file poster="p" date="1" subject="s"><segments></segments></file></nzb>"#;
         assert!(matches!(
             parse_nzb_reader_files(Cursor::new(&empty[..]), |_| Ok(())),
             Err(NzbError::EmptyNzb)

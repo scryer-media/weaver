@@ -449,6 +449,7 @@ impl Pipeline {
             process_memory_budget,
             job_article_memory: HashMap::new(),
             next_activation: 0,
+            next_up: Default::default(),
             parking_jobs: HashSet::new(),
             spilling_jobs: HashSet::new(),
             repeated_articles: HashMap::new(),

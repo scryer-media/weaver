@@ -4,6 +4,7 @@
 mod import;
 pub mod metadata;
 pub mod naming;
+pub(crate) mod outline;
 mod persisted_nzb;
 #[cfg(test)]
 pub(crate) use persisted_nzb::NZB_PARSES;

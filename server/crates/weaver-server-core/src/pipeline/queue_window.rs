@@ -42,15 +42,16 @@ fn row_priority(row: &JobRow, globals: &crate::pipeline::queue::Globals) -> u8 {
 }
 
 // What a window install reads of a job that is not installed: its active row
-// and the files of its stored NZB, as a restart reads it.
+// and its stored NZB outline, as a restart reads it.
 pub(crate) struct ParkedLoads {
     db: crate::Database,
     markers: Vec<(JobId, Result<tokio::sync::oneshot::Receiver<()>, String>)>,
 }
 
 impl ParkedLoads {
-    // Each job read back, in the order named, one parse of each stored NZB,
-    // spread over the cores.
+    // Each job read back, in the order named, from its row and outline,
+    // spread over the cores. A job with no outline yet reads its stored NZB
+    // once for one.
     pub(crate) async fn read(self) -> Vec<(JobId, Result<Option<RestoreJobRequest>, String>)> {
         let Self { db, markers } = self;
         if markers.is_empty() {
@@ -94,7 +95,11 @@ fn load_parked_job(
     else {
         return Ok(None);
     };
-    let (spec, summaries) = crate::operations::read_stored_files(db, job_id, &recovered)
+    let outline = db
+        .load_job_outlines(Some(job_id))
+        .map_err(|error| error.to_string())?
+        .remove(&job_id);
+    let (spec, summaries) = crate::operations::read_stored_files(db, job_id, &recovered, outline)
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
     let mut request = crate::operations::restore_request(job_id, recovered, spec, summaries);

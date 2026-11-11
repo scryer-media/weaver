@@ -811,6 +811,11 @@ pub struct RestartRead {
     // The job is entering the queue window again, not arriving: it raises
     // no creation event.
     pub(crate) reentry: bool,
+    // The job has no stored NZB outline yet: it holds no file, and its
+    // install reads its stored NZB once and stores the outline it reads. It
+    // installs wherever it stands, so its row says what it holds; one out
+    // of the window leaves it again once read.
+    pub(crate) outline_pending: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

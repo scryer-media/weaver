@@ -150,6 +150,15 @@ impl Pipeline {
         let staging_dir = state.staging_dir.clone();
         let spec_password = state.spec.password.clone();
         let expected = summaries.clone();
+        // Lists read ahead are taken with the job's files, to be checked
+        // as any read is.
+        let ahead = self.next_up.take(job_id).map(|lists| {
+            let mut spec = state.spec.clone();
+            for (file, list) in spec.files.iter_mut().zip(lists) {
+                file.segments = list;
+            }
+            spec
+        });
         let staging = StagingChoice {
             current: staging_dir.clone(),
             intermediate_dir: self.intermediate_dir.clone(),
@@ -181,14 +190,15 @@ impl Pipeline {
             let _ = written_rx.await;
             let categories = staging.config.read().await.categories.clone();
             let result = tokio::task::spawn_blocking(move || {
-                read_job_articles(&db, job_id, category, metadata, &expected, memory, seat).map(
-                    |mut read| {
-                        if read.restored.is_none() {
-                            read.staging = Some(staging.choose(job_id, &categories));
-                        }
-                        read
-                    },
+                read_job_articles(
+                    &db, job_id, category, metadata, &expected, ahead, memory, seat,
                 )
+                .map(|mut read| {
+                    if read.restored.is_none() {
+                        read.staging = Some(staging.choose(job_id, &categories));
+                    }
+                    read
+                })
             })
             .await
             .unwrap_or_else(|error| Err(format!("article read worker failed: {error}")));
@@ -532,6 +542,22 @@ impl Pipeline {
     }
 }
 
+// One job's spec read back from its stored NZB, every article list in it,
+// streamed from the stored bytes, with its password candidates and outline.
+pub(crate) fn read_stored_lists(
+    db: &crate::Database,
+    job_id: JobId,
+) -> Result<(PathBuf, crate::ingest::outline::StoredRead), String> {
+    let (nzb_path, nzb_zstd) = db
+        .load_active_job_persisted_nzb(job_id)
+        .map_err(|error| format!("stored NZB could not be loaded: {error}"))?
+        .ok_or_else(|| "the job has no stored row".to_string())?;
+    let nzb_zstd = nzb_zstd.ok_or_else(|| "the job has no stored NZB".to_string())?;
+    let read = crate::ingest::outline::read_stored_lists(&nzb_zstd, &nzb_path)
+        .map_err(|error| format!("stored NZB could not be parsed: {error}"))?;
+    Ok((nzb_path, read))
+}
+
 // One job's spec read back from its stored NZB, every article list in it.
 pub(crate) fn read_stored_spec(
     db: &crate::Database,
@@ -539,17 +565,8 @@ pub(crate) fn read_stored_spec(
     category: Option<String>,
     metadata: Vec<(String, String)>,
 ) -> Result<JobSpec, String> {
-    let (nzb_path, nzb_zstd) = db
-        .load_active_job_persisted_nzb(job_id)
-        .map_err(|error| format!("stored NZB could not be loaded: {error}"))?
-        .ok_or_else(|| "the job has no stored row".to_string())?;
-    let nzb_zstd = nzb_zstd.ok_or_else(|| "the job has no stored NZB".to_string())?;
-    let nzb = crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd)
-        .map_err(|error| format!("stored NZB could not be parsed: {error}"))?;
-    drop(nzb_zstd);
-    Ok(crate::ingest::nzb_to_spec(
-        &nzb, &nzb_path, category, metadata,
-    ))
+    let (nzb_path, mut read) = read_stored_lists(db, job_id)?;
+    Ok(read.spec(&nzb_path, category, metadata))
 }
 
 // As `read_stored_spec`, with the password candidates the job carries taken
@@ -567,37 +584,45 @@ pub(crate) fn read_stored_spec_and_passwords(
     let ((nzb_path, nzb_zstd), supplied) =
         sources.ok_or_else(|| "the job has no stored row".to_string())?;
     let nzb_zstd = nzb_zstd.ok_or_else(|| "the job has no stored NZB".to_string())?;
-    let nzb = crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd)
+    let mut read = crate::ingest::outline::read_stored_lists(&nzb_zstd, &nzb_path)
         .map_err(|error| format!("stored NZB could not be parsed: {error}"))?;
     drop(nzb_zstd);
     let passwords = crate::pipeline::job_carried_password_candidates(
         &supplied,
-        crate::ingest::nzb_password_candidates(&nzb, &nzb_path, None),
+        std::mem::take(&mut read.passwords),
     );
-    let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+    let spec = read.spec(&nzb_path, category, metadata);
     Ok((spec, Some(passwords)))
 }
 
 // Read one job's article lists back from its stored NZB, check they are the
 // ones the job was admitted with, and rebuild its graph from its checkpoint
-// when it has one.
+// when it has one. Lists read ahead are used when they still match.
+#[allow(clippy::too_many_arguments)]
 fn read_job_articles(
     db: &crate::Database,
     job_id: JobId,
     category: Option<String>,
     metadata: Vec<(String, String)>,
     expected: &FileSummaries,
+    ahead: Option<JobSpec>,
     memory: Arc<ProcessMemoryBudget>,
     seat: RestoreSeat,
 ) -> Result<ReadArticles, String> {
-    let spec = read_stored_spec(db, job_id, category, metadata)?;
-    let read: Vec<FileSummary> = spec.files.iter().map(FileSummary::of).collect();
-    if read.len() != expected.0.len()
-        || !read
-            .iter()
-            .zip(&expected.0)
-            .all(|(read, expected)| read.same_list(expected))
-    {
+    let matches = |spec: &JobSpec| {
+        spec.files.len() == expected.0.len()
+            && spec
+                .files
+                .iter()
+                .zip(&expected.0)
+                .all(|(file, expected)| FileSummary::of(file).same_list(expected))
+    };
+    // Lists read ahead that no longer match are read again.
+    let spec = match ahead.filter(|spec| matches(spec)) {
+        Some(spec) => spec,
+        None => read_stored_spec(db, job_id, category, metadata)?,
+    };
+    if !matches(&spec) {
         return Err("stored NZB no longer matches the job's files".to_string());
     }
     let repeated = RepeatedArticles::new(&spec, seat.working_dir(), memory)?;

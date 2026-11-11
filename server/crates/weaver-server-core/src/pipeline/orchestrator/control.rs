@@ -99,10 +99,13 @@ impl Pipeline {
             if inner.globals.shutting_down {
                 return Change::unchanged((Vec::new(), Vec::new(), Vec::new()));
             }
+            // A restore with no stored outline yet installs wherever it
+            // stands, so its row says what it holds; one out of the window
+            // leaves it again at the end of the walk.
             let enters = |row: &crate::pipeline::queue::JobRow| {
                 (row.intents.restore.is_some() || self.window_parked(row.id))
                     && !self.window_unreadable.contains(&row.id)
-                    && self.in_queue_window(&ranked, row)
+                    && (self.in_queue_window(&ranked, row) || outline_pending(row))
             };
             // One batch is read at a time; the next is taken once it is in.
             let order: Vec<usize> = if self.installing.is_empty() {
@@ -136,7 +139,10 @@ impl Pipeline {
             }
             let mut parking = Vec::new();
             for row in &mut inner.jobs {
-                if row.intents.restore.is_some() && !self.in_queue_window(&ranked, row) {
+                if row.intents.restore.is_some()
+                    && !outline_pending(row)
+                    && !self.in_queue_window(&ranked, row)
+                {
                     let request = row.intents.restore.take().expect("restore ticket");
                     let articles = match &request.restart {
                         Some(read) => read
@@ -408,6 +414,7 @@ impl Pipeline {
         }
         self.retry_pending_renames().await;
         self.evict_outside_window(&ranked);
+        self.refresh_next_up();
     }
 
     // Each job whose row asks for a rename has its folder renamed once the
@@ -927,6 +934,15 @@ pub(crate) fn queue_position_writes(
         index = end;
     }
     writes
+}
+
+// Whether the row's restore waits for its stored NZB outline to be read.
+fn outline_pending(row: &crate::pipeline::queue::JobRow) -> bool {
+    row.intents
+        .restore
+        .as_ref()
+        .and_then(|request| request.restart.as_ref())
+        .is_some_and(|read| read.outline_pending)
 }
 
 #[cfg(test)]
