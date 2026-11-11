@@ -210,6 +210,41 @@ impl SharedPipelineState {
         })
     }
 
+    // The queued jobs the diagnostics package reports on: those Weaver has
+    // started work on, post-processing first, then failed, then downloading,
+    // each group in queue order, at most `limit` of them. Every row is
+    // classified under the read lock without copying it; only the chosen
+    // rows are copied. A cancelled job, and one with a pause the pipeline has
+    // not applied yet, reads as the queue shows it and does not qualify.
+    pub fn active_report_jobs(&self, limit: usize) -> crate::support::ActiveReportJobs {
+        use crate::support::{ActiveReportGroup, ActiveReportJobs};
+        self.queue.read(|inner| {
+            let mut chosen: Vec<(ActiveReportGroup, usize)> = inner
+                .jobs
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.intents.cancelled.is_none())
+                .filter(|(_, row)| {
+                    !(row.intents.pause_seq > row.report.seen_intent_seq
+                        && row.intents.paused == Some(true))
+                })
+                .filter_map(|(position, row)| {
+                    ActiveReportGroup::of(&row.report.job.status).map(|group| (group, position))
+                })
+                .collect();
+            let qualified = chosen.len();
+            chosen.sort_unstable();
+            chosen.truncate(limit);
+            ActiveReportJobs {
+                qualified,
+                jobs: chosen
+                    .into_iter()
+                    .map(|(group, position)| (group, inner.jobs[position].info(&inner.globals)))
+                    .collect(),
+            }
+        })
+    }
+
     // The revision of the published job list; it moves on every publish.
     pub fn job_revision(&self) -> u64 {
         self.queue.revision()
@@ -1340,6 +1375,13 @@ impl SchedulerHandle {
     // [`SharedPipelineState::metrics_jobs`].
     pub fn metrics_jobs(&self, mode: crate::settings::PerJobSeries) -> Vec<JobInfo> {
         self.state.metrics_jobs(mode)
+    }
+
+    // The queued jobs the diagnostics package reports on (reads from shared
+    // state, no channel round-trip). See
+    // [`SharedPipelineState::active_report_jobs`].
+    pub fn active_report_jobs(&self, limit: usize) -> crate::support::ActiveReportJobs {
+        self.state.active_report_jobs(limit)
     }
 
     // The revision of the published job list; it moves on every publish.
