@@ -422,12 +422,14 @@ struct TrackerList {
     /// The run announces until it stops (libtorrent
     /// `torrent::m_announcing`); after that no tracker is due again.
     announcing: bool,
+    /// How the torrent's announces are written.
+    shape: &'static AnnounceShape,
 }
 
 impl TrackerList {
     /// A tracker named twice is kept where it is first named (libtorrent
     /// `tracker_list::add_tracker`).
-    fn new(tiers: &[Vec<SupportedTracker>], now: Instant) -> Self {
+    fn new(tiers: &[Vec<SupportedTracker>], now: Instant, shape: &'static AnnounceShape) -> Self {
         let mut entries: Vec<Entry> = Vec::new();
         for (tier, trackers) in tiers.iter().enumerate() {
             for tracker in trackers {
@@ -442,6 +444,7 @@ impl TrackerList {
             complete_sent: false,
             forced: Vec::new(),
             announcing: true,
+            shape,
         }
     }
 
@@ -583,12 +586,16 @@ impl TrackerList {
     /// `completed` once the torrent became a seed during this run, unless a
     /// tracker has accepted `completed` already, and `paused` while it has
     /// every piece it wants and is not a seed (`torrent::announce_with_tracker`).
+    /// A shape that says `paused` first says it in place of `started` too.
     fn event(&self, entry: &Entry, stats: &TrackerCommsStats) -> Option<TrackerRequestEvent> {
-        if !entry.start_sent {
+        let paused = stats.finished && !stats.is_completed();
+        if paused && self.shape.paused_first {
+            Some(TrackerRequestEvent::Paused)
+        } else if !entry.start_sent {
             Some(TrackerRequestEvent::Started)
         } else if stats.completed_during_run && !self.complete_sent && !entry.complete_sent {
             Some(TrackerRequestEvent::Completed)
-        } else if stats.finished && !stats.is_completed() {
+        } else if paused {
             Some(TrackerRequestEvent::Paused)
         } else {
             None
@@ -1708,13 +1715,13 @@ async fn udp_tracker_to_socket_addrs(
     Ok(res)
 }
 
-/// The `port` of an announce: the port peers reach this session on, or 0
-/// when it accepts no connections. Port 0 is the engine's one form for
-/// "unreachable": a peer at port 0 is never dialled and a DHT node at port 0
-/// is never used, so a session without a listener names no port anyone
-/// could answer on.
-fn announced_port(listen_port: Option<u16>) -> u16 {
-    listen_port.unwrap_or(0)
+/// The `port` of an announce: the port peers reach this session on, or
+/// `shape`'s port for a session that accepts no connections. Weaver's is 0,
+/// the engine's one form for "unreachable": a peer at port 0 is never
+/// dialled and a DHT node at port 0 is never used, so a session without a
+/// listener names no port anyone could answer on.
+fn announced_port(listen_port: Option<u16>, shape: &AnnounceShape) -> u16 {
+    listen_port.unwrap_or(shape.no_listener_port)
 }
 
 /// How many peers an announce asks for: none with `stopped`, since the run
@@ -1805,7 +1812,7 @@ impl TrackerComms {
                     http_clients: http_clients.clone(),
                     reachable: reachable.clone(),
                     udp_client: udp_client.clone(),
-                    list: Mutex::new(TrackerList::new(&tiers, Instant::now())),
+                    list: Mutex::new(TrackerList::new(&tiers, Instant::now(), identity.shape)),
                     started_at: Default::default(),
                     status: status.clone(),
                     poke: tokio::sync::Notify::new(),
@@ -1878,7 +1885,7 @@ impl TrackerComms {
             http_clients: self.http_clients.clone(),
             reachable: self.reachable.clone(),
             udp_client: self.udp_client.clone(),
-            list: Mutex::new(TrackerList::new(tiers, Instant::now())),
+            list: Mutex::new(TrackerList::new(tiers, Instant::now(), self.identity.shape)),
             started_at: Default::default(),
             status: self.status.clone(),
             poke: tokio::sync::Notify::new(),
@@ -2166,7 +2173,8 @@ impl TrackerComms {
         let ports = *self.announce_port.borrow();
         let mut queries = Vec::with_capacity(routes.len());
         for (family, _) in &routes {
-            request.port = announced_port(ports.of(*family == Some(Family::V6)));
+            request.port =
+                announced_port(ports.of(*family == Some(Family::V6)), self.identity.shape);
             queries.push(request.as_querystring(self.identity.shape));
         }
 
@@ -2284,15 +2292,15 @@ impl TrackerComms {
 
         match addrs {
             UdpTrackerResolveResult::One(addr) => {
-                self.announce_udp_addr(addr, event, stats)
+                self.announce_udp_addr(addr, url, event, stats)
                     .instrument(trace_span!("udp request", ?addr))
                     .await
             }
             UdpTrackerResolveResult::Two(v4, v6) => {
                 let (r4, r6) = tokio::join!(
-                    self.announce_udp_addr(v4.into(), event, stats)
+                    self.announce_udp_addr(v4.into(), url, event, stats)
                         .instrument(trace_span!("udp request", addr=?v4)),
-                    self.announce_udp_addr(v6.into(), event, stats)
+                    self.announce_udp_addr(v6.into(), url, event, stats)
                         .instrument(trace_span!("udp request", addr=?v6))
                 );
                 match (r4, r6) {
@@ -2310,6 +2318,7 @@ impl TrackerComms {
     async fn announce_udp_addr(
         &self,
         addr: SocketAddr,
+        url: &Url,
         event: Option<TrackerRequestEvent>,
         stats: &TrackerCommsStats,
     ) -> anyhow::Result<Announced> {
@@ -2324,7 +2333,11 @@ impl TrackerComms {
             event: udp_event(event),
             key: self.identity.tracker_key,
             num_want: numwant(event),
-            port: announced_port(self.announce_port.borrow().to(addr.ip())),
+            port: announced_port(
+                self.announce_port.borrow().to(addr.ip()),
+                self.identity.shape,
+            ),
+            url_data: url_data(url),
         };
 
         match self.udp_client.announce(addr, request).await {
@@ -2584,7 +2597,7 @@ mod tests {
             .iter()
             .map(|tier| tier.iter().map(|name| http(name)).collect())
             .collect::<Vec<_>>();
-        TrackerList::new(&tiers, now)
+        TrackerList::new(&tiers, now, &crate::tracker::AnnounceShape::WEAVER)
     }
 
     fn order(list: &TrackerList) -> Vec<SupportedTracker> {
@@ -2823,6 +2836,50 @@ mod tests {
             list.start_due(t3, ToldPorts::default(), &live(0, 30, false)),
             [(http("a"), None)]
         );
+    }
+
+    // As qBittorrent, a torrent with its selection done and not a seed
+    // says `paused` from its first announce, `started` never going ahead
+    // of it; once it wants pieces again a tracker not yet told hears
+    // `started`.
+    #[test]
+    fn as_qbittorrent_a_finished_torrent_says_paused_before_started() {
+        let t0 = Instant::now();
+        let mut list = TrackerList::new(&[vec![http("a")]], t0, &crate::tracker::qbittorrent::SHAPE);
+        let selection_done = TrackerCommsStats {
+            finished: true,
+            ..live(60, 30, false)
+        };
+        let paused = Some(TrackerRequestEvent::Paused);
+        assert_eq!(
+            list.start_due(t0, ToldPorts::default(), &selection_done),
+            [(http("a"), paused)]
+        );
+        list.on_success(&http("a"), paused, t0, &ANSWERED);
+        let t1 = t0 + ANSWERED.regular;
+        assert_eq!(
+            list.start_due(t1, ToldPorts::default(), &selection_done),
+            [(http("a"), paused)]
+        );
+        list.on_success(&http("a"), paused, t1, &ANSWERED);
+        let t2 = t1 + ANSWERED.regular;
+        assert_eq!(
+            list.start_due(t2, ToldPorts::default(), &live(60, 30, false)),
+            [(http("a"), STARTED)]
+        );
+    }
+
+    // A session with no listener announces port 0 as Weaver and port 1 as
+    // qBittorrent; one with a listener announces its port either way.
+    #[test]
+    fn the_port_announced_without_a_listener_is_the_shapes() {
+        let weaver = &crate::tracker::AnnounceShape::WEAVER;
+        let qbittorrent = &crate::tracker::qbittorrent::SHAPE;
+        assert_eq!(super::announced_port(None, weaver), 0);
+        assert_eq!(super::announced_port(None, qbittorrent), 1);
+        for shape in [weaver, qbittorrent] {
+            assert_eq!(super::announced_port(Some(6881), shape), 6881);
+        }
     }
 
     #[test]

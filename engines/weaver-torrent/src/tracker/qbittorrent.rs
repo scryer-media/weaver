@@ -59,6 +59,13 @@ pub const SHAPE: AnnounceShape = AnnounceShape {
         Header::ConnectionClose,
     ],
     title_case: true,
+    // libtorrent `src/session_impl.cpp` 1294-1295 and 1327
+    // (`make_announce_port`): a listen port of 0 is announced as 1.
+    no_listener_port: 1,
+    // libtorrent `src/torrent.cpp` 3115-3116 sets `paused` before the
+    // `started` fallback at 3323-3326, which only an announce with no event
+    // reaches.
+    paused_first: true,
 };
 
 /// The started announce of a qBittorrent 5.3.0 seed, as a tracker
