@@ -228,6 +228,7 @@ impl HistoryQuery {
             })
     }
     /// Get synthesized waterfall/timeline data for a job.
+    #[graphql(guard = "ReadGuard")]
     async fn job_timeline(&self, ctx: &Context<'_>, job_id: u64) -> Result<Option<JobTimeline>> {
         let handle = ctx.data::<SchedulerHandle>()?.clone();
         let db = ctx.data::<weaver_server_core::Database>()?.clone();
@@ -259,6 +260,7 @@ impl HistoryQuery {
         Ok(Some(build_job_timeline(&job, history.as_ref(), &events)))
     }
     /// Get the event log for a specific job.
+    #[graphql(guard = "ReadGuard")]
     async fn job_events(
         &self,
         ctx: &Context<'_>,

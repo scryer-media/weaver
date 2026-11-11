@@ -497,6 +497,18 @@ async fn a_script_run_reads_only_allowed_queries_and_changes_only_its_own_run() 
                 "NOT_ALLOWED_FOR_SCRIPT_RUN"
             );
         }
+
+        // A job's event log and timeline are not the run's to read.
+        for query in [
+            "{ jobEvents(jobId: 7) { kind } }",
+            "{ jobTimeline(jobId: 7) { __typename } }",
+        ] {
+            assert_eq!(
+                refused(&as_run(&harness, run, query).await).0,
+                "NOT_ALLOWED_FOR_SCRIPT_RUN",
+                "{run}: {query}"
+            );
+        }
         let response = as_run(
             &harness,
             run,
