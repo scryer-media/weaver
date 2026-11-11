@@ -32,8 +32,8 @@ pub struct Sfv {
     // The text as far as it arrived contiguously.
     text: Vec<u8>,
     // Pieces that arrived past the end of the text, by offset, until the
-    // text reaches them. A restart delivers every article again, so they
-    // are not facts.
+    // text reaches them. They are not facts: a restored SFV asks again for
+    // whatever lies past its text.
     #[serde(skip)]
     held: BTreeMap<usize, Vec<u8>>,
     // Bound members and the CRC32 their entry gives.
@@ -247,6 +247,17 @@ impl Object for Sfv {
     fn wants(&self, _out: &mut Vec<Seek>) {}
 
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
+
+    // What lies past the text, held then or never heard while the object was
+    // out for a check, is asked for again.
+    fn restored(&mut self, out: &mut Vec<Emit>) {
+        if self.text.len() < TEXT_CAP {
+            out.push(Emit::Again {
+                volume: VolumeIndex(0),
+                range: ByteRange::new(self.text.len() as u64, TEXT_CAP as u64),
+            });
+        }
+    }
 
     // The text stays where the namespace put it, in the .sfv member's file.
     // The text it copies out is in its facts, which a restart keeps: it says

@@ -777,6 +777,53 @@ fn a_delivery_with_a_withheld_member_fails_worded_by_the_refusal() {
     );
 }
 
+// An archive withheld too large is worded with the sizes its decoder said,
+// and only those: a size it did not say is never made up. Nothing whole
+// beside it fails the job; a whole file beside it leaves the job partial.
+#[test]
+fn an_archive_withheld_too_large_is_worded_with_the_sizes_it_carried() {
+    const GIB: u64 = 1 << 30;
+    let withheld = |whole: &[&str], needed, allowed| Delivery {
+        whole: whole.iter().map(ToString::to_string).collect(),
+        withheld: vec![("lantern.7z".to_string(), Why::TooLarge { needed, allowed })],
+        ..Delivery::default()
+    };
+    let cases = [
+        (
+            Some(2 * GIB),
+            Some(GIB),
+            "lantern.7z needs 2.0 GiB of decode memory, 1.0 GiB allowed",
+        ),
+        (
+            Some(2 * GIB),
+            None,
+            "lantern.7z needs 2.0 GiB of decode memory, more than could be had",
+        ),
+        (
+            None,
+            Some(GIB),
+            "lantern.7z needs more decode memory than the 1.0 GiB allowed",
+        ),
+        (
+            None,
+            None,
+            "lantern.7z needs more decode memory than could be had",
+        ),
+    ];
+    for (needed, allowed, error) in cases {
+        assert_eq!(
+            withheld(&[], needed, allowed).status(None),
+            JobStatus::Failed {
+                error: error.to_string()
+            }
+        );
+        assert_eq!(
+            withheld(&["ember.mkv"], needed, allowed).status(None),
+            JobStatus::Partial
+        );
+    }
+}
+
 // A whole file whose name and front say an object reads it, which no
 // object opened, is a container and no end file, whatever its format: alone
 // it fails the job, and beside a whole file of its own it leaves the job

@@ -52,6 +52,11 @@ pub(super) struct Owner {
     pub refetched: Vec<(VolumeIndex, ByteRange)>,
     // Runs read back and delivered again.
     pub replays: usize,
+    // The object is not lent out for what it holds until `work` is called.
+    pub lend_late: bool,
+    working: bool,
+    // Member bytes said, every time they were said.
+    pub emitted: u64,
 }
 
 // What is held of `range` of `volume`, read the way the owner reads a held
@@ -89,7 +94,6 @@ fn read_held(
 
 impl Owner {
     pub fn new(object: Zip, volumes: Vec<(String, Vec<u8>)>) -> Self {
-        let count = volumes.len();
         let index = volumes
             .iter()
             .enumerate()
@@ -99,6 +103,17 @@ impl Owner {
                 _ => VolumeIndex(position as u32),
             })
             .collect();
+        Self::with_index(object, volumes, index)
+    }
+
+    // One `.zip` alone, bound at the symbolic last as the tree binds it.
+    pub fn alone(object: Zip, bytes: Vec<u8>) -> Self {
+        let volumes = vec![("alpha.zip".to_owned(), bytes)];
+        Self::with_index(object, volumes, vec![VolumeIndex(LAST)])
+    }
+
+    fn with_index(object: Zip, volumes: Vec<(String, Vec<u8>)>, index: Vec<VolumeIndex>) -> Self {
+        let count = volumes.len();
         let mut owner = Self {
             object,
             volumes,
@@ -114,9 +129,12 @@ impl Owner {
             fetched: BTreeMap::new(),
             refetched: Vec::new(),
             replays: 0,
+            lend_late: false,
+            emitted: 0,
+            working: false,
         };
         let name = owner.volumes[0].0.clone();
-        owner.object.bound(VolumeIndex(0), &name, &[], None);
+        owner.object.bound(owner.index[0], &name, &[], None);
         owner.bound[0] = true;
         owner.size(0);
         for volume in 1..count {
@@ -177,6 +195,14 @@ impl Owner {
         self.fetch(self.index[volume], range);
         self.push(self.index[volume], range, provenance, bytes);
         self.settle();
+    }
+
+    // A range arrives and nothing else reaches the object after it: no
+    // seek is answered, nothing held is handed back.
+    pub fn arrive(&mut self, volume: usize, range: ByteRange) {
+        self.bind(volume);
+        self.fetch(self.index[volume], range);
+        self.push(self.index[volume], range, Provenance::Fresh, None);
     }
 
     // Bytes from outside.
@@ -242,6 +268,25 @@ impl Owner {
             &mut out,
         );
         self.apply(out);
+        // What arrives is the volume's bytes now, whatever was held of them
+        // before, as the namespace takes them: a repair rewrites what was
+        // held, and the held copy never goes down after it.
+        for (at, piece, provenance, held) in std::mem::take(&mut self.held) {
+            if at != volume || piece.intersect(range).is_none() {
+                self.held.push((at, piece, provenance, held));
+                continue;
+            }
+            for keep in [
+                ByteRange::new(piece.start, range.start.clamp(piece.start, piece.end)),
+                ByteRange::new(range.end.clamp(piece.start, piece.end), piece.end),
+            ] {
+                if !keep.is_empty() {
+                    let from = (keep.start - piece.start) as usize;
+                    let bytes = held[from..from + keep.len() as usize].to_vec();
+                    self.held.push((at, keep, provenance, bytes));
+                }
+            }
+        }
         let offset = range.start;
         let mut placements = Vec::new();
         self.object.locate(volume, range, &mut placements);
@@ -337,6 +382,19 @@ impl Owner {
         self.held.len()
     }
 
+    // The bytes held, every piece counted.
+    pub fn held_bytes(&self) -> u64 {
+        self.held.iter().map(|(_, range, _, _)| range.len()).sum()
+    }
+
+    // The object is lent out for what it holds, works away from every
+    // placement, and is taken back with what it said.
+    pub fn work(&mut self) {
+        let mut out = Vec::new();
+        self.object.work(&mut out);
+        self.apply(out);
+    }
+
     pub(super) fn apply(&mut self, out: Vec<Emit>) {
         let mut again = Vec::new();
         for emit in out {
@@ -370,6 +428,7 @@ impl Owner {
                     bytes,
                     provenance,
                 } => {
+                    self.emitted += bytes.len() as u64;
                     let got = self.members.get_mut(&member.0).expect("announced first");
                     let end = offset as usize + bytes.len();
                     if got.bytes.len() < end {
@@ -397,6 +456,14 @@ impl Owner {
         }
         if !again.is_empty() {
             self.again(&again);
+        }
+        // The owner lends the object out for what it holds, and takes it
+        // back with what it said, after each thing it heard and before
+        // anything else reaches it; what the loan said is not lent for.
+        if !self.lend_late && !self.working && self.object.work_due() {
+            self.working = true;
+            self.work();
+            self.working = false;
         }
     }
 

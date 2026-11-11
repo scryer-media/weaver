@@ -79,6 +79,324 @@ async fn delete_history_removes_intermediate_output_dir() {
     assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
 }
 
+// A failed job's record names its working directory: deleting the history
+// with its files takes all of it, what it delivered and the volumes and
+// recovery files beside it, and what its staging directory kept.
+#[tokio::test]
+async fn delete_history_with_files_removes_a_failed_job_s_whole_working_dir() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30027);
+    let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);
+    tokio::fs::create_dir_all(&staging).await.unwrap();
+    tokio::fs::write(staging.join("lantern.mkv"), b"staged")
+        .await
+        .unwrap();
+    let output_dir = intermediate_dir.join("history-failed-volumes-job");
+    tokio::fs::create_dir_all(output_dir.join("Sample"))
+        .await
+        .unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_working_dir(&intermediate_dir, &output_dir, job_id)
+        .unwrap();
+    for name in [
+        "lantern.part01.rar",
+        "lantern.part02.rar",
+        "lantern.vol00+01.par2",
+        "lantern.par2",
+        "Sample/lantern-sample.mkv",
+    ] {
+        tokio::fs::write(output_dir.join(name), b"kept")
+            .await
+            .unwrap();
+    }
+    pipeline
+        .db
+        .insert_job_history(&history_row_with_output_dir(
+            job_id,
+            "History Failed Volumes",
+            "failed",
+            output_dir.clone(),
+        ))
+        .unwrap();
+
+    let outcome = delete_history_batch(&mut pipeline, &[job_id], true).await;
+
+    assert!(outcome.refused.is_empty());
+    assert!(
+        outcome.deleted[&job_id]
+            .as_ref()
+            .unwrap()
+            .left_in_place
+            .is_empty()
+    );
+    assert!(!output_dir.exists());
+    assert!(!staging.exists());
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_none());
+}
+
+// A working directory under `intermediate_dir` carrying `job_id`'s marker,
+// holding one file.
+async fn marked_working_dir(intermediate_dir: &Path, name: &str, job_id: JobId) -> PathBuf {
+    let dir = intermediate_dir.join(name);
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_working_dir(intermediate_dir, &dir, job_id)
+        .unwrap();
+    tokio::fs::write(dir.join("lantern.part01.rar"), b"kept")
+        .await
+        .unwrap();
+    dir
+}
+
+fn history_row_finished_at(
+    job_id: JobId,
+    status: &str,
+    output_dir: PathBuf,
+    completed_at: i64,
+) -> crate::JobHistoryRow {
+    crate::JobHistoryRow {
+        completed_at,
+        ..history_row_with_output_dir(job_id, "Housekeeping", status, output_dir)
+    }
+}
+
+// A marker written now is younger than this, so every marked directory
+// without a row is old enough to go.
+fn after_every_marker() -> std::time::SystemTime {
+    std::time::SystemTime::now() + std::time::Duration::from_secs(24 * 60 * 60)
+}
+
+// With the setting on, a failed job that finished before the cutoff gives up
+// its working directory and its staging directory, and keeps its record.
+#[tokio::test]
+async fn housekeeping_removes_an_old_failed_job_s_files_and_keeps_its_record() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30041);
+    let output_dir = marked_working_dir(&intermediate_dir, "housekeeping-failed", job_id).await;
+    let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);
+    tokio::fs::create_dir_all(&staging).await.unwrap();
+    tokio::fs::write(staging.join("lantern.mkv"), b"staged")
+        .await
+        .unwrap();
+    pipeline
+        .db
+        .insert_job_history(&history_row_finished_at(
+            job_id,
+            "failed",
+            output_dir.clone(),
+            100,
+        ))
+        .unwrap();
+    pipeline.report_all_for_test();
+
+    pipeline
+        .shared_state
+        .queue
+        .clone()
+        .sweep_job_files(Some(100), std::time::SystemTime::UNIX_EPOCH)
+        .await;
+
+    assert!(!output_dir.exists());
+    assert!(!staging.exists());
+    assert!(pipeline.db.get_job_history(job_id.0).unwrap().is_some());
+    retire_pipeline_database(pipeline).await;
+}
+
+// With the setting off, a failed job's files stay however old it is.
+#[tokio::test]
+async fn housekeeping_with_the_setting_off_leaves_a_failed_job_s_files() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(30042);
+    let output_dir = marked_working_dir(&intermediate_dir, "housekeeping-off", job_id).await;
+    let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);
+    tokio::fs::create_dir_all(&staging).await.unwrap();
+    pipeline
+        .db
+        .insert_job_history(&history_row_finished_at(
+            job_id,
+            "failed",
+            output_dir.clone(),
+            2,
+        ))
+        .unwrap();
+    pipeline.report_all_for_test();
+
+    pipeline
+        .shared_state
+        .queue
+        .clone()
+        .sweep_job_files(None, after_every_marker())
+        .await;
+
+    assert!(output_dir.exists());
+    assert!(staging.exists());
+    retire_pipeline_database(pipeline).await;
+}
+
+// What housekeeping never takes: a failure younger than the cutoff, a
+// Partial or Complete job, a live job, a directory whose marker names
+// another job or stopped matching it, and a directory with neither a marker
+// nor a row. A marked directory whose job has no row goes.
+#[tokio::test]
+async fn housekeeping_takes_only_what_an_old_failure_or_a_rowless_marker_accounts_for() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+
+    let fresh = JobId(30043);
+    let fresh_dir = marked_working_dir(&intermediate_dir, "housekeeping-fresh", fresh).await;
+    let partial = JobId(30044);
+    let partial_dir = marked_working_dir(&intermediate_dir, "housekeeping-partial", partial).await;
+    let complete = JobId(30045);
+    let complete_dir =
+        marked_working_dir(&intermediate_dir, "housekeeping-complete", complete).await;
+    // A failed job's record names a directory another recorded job's marker owns.
+    let foreign = JobId(30046);
+    let foreign_dir = complete_dir.clone();
+    // A failed job's marker stopped matching once its directory was renamed.
+    let moved = JobId(30047);
+    let before_move =
+        marked_working_dir(&intermediate_dir, "housekeeping-before-move", moved).await;
+    let moved_dir = intermediate_dir.join("housekeeping-moved");
+    tokio::fs::rename(&before_move, &moved_dir).await.unwrap();
+    // No row and no marker.
+    let unmarked_dir = intermediate_dir.join("housekeeping-unmarked");
+    tokio::fs::create_dir_all(&unmarked_dir).await.unwrap();
+    tokio::fs::write(unmarked_dir.join("user.mkv"), b"theirs")
+        .await
+        .unwrap();
+    // A marker whose job has no row.
+    let rowless = JobId(30048);
+    let rowless_dir = marked_working_dir(&intermediate_dir, "housekeeping-rowless", rowless).await;
+    // A live job, whose record says it failed before it was restarted.
+    let live = JobId(30049);
+    let resources = pipeline.admission_resources();
+    let prepared = Pipeline::prepare_add(
+        &resources,
+        live,
+        standalone_job_spec("Housekeeping live", &[("small.bin".to_string(), 16)]),
+        PathBuf::from("30049.nzb"),
+        sample_nzb_zstd(),
+        crate::jobs::AddJobOptions::default(),
+    )
+    .await
+    .unwrap();
+    let live_dir = prepared.working_dir.clone();
+    pipeline.install_prepared_add(live, prepared);
+    tokio::fs::write(live_dir.join("lantern.part01.rar"), b"live")
+        .await
+        .unwrap();
+
+    for row in [
+        history_row_finished_at(fresh, "failed", fresh_dir.clone(), 1_000),
+        history_row_finished_at(partial, "partial", partial_dir.clone(), 2),
+        history_row_finished_at(complete, "complete", complete_dir.clone(), 2),
+        history_row_finished_at(foreign, "failed", foreign_dir.clone(), 2),
+        history_row_finished_at(moved, "failed", moved_dir.clone(), 2),
+        history_row_finished_at(live, "failed", live_dir.clone(), 2),
+    ] {
+        pipeline.db.insert_job_history(&row).unwrap();
+    }
+    pipeline.report_all_for_test();
+
+    pipeline
+        .shared_state
+        .queue
+        .clone()
+        .sweep_job_files(Some(100), after_every_marker())
+        .await;
+
+    for kept in [
+        &fresh_dir,
+        &partial_dir,
+        &complete_dir,
+        &moved_dir,
+        &unmarked_dir,
+        &live_dir,
+    ] {
+        assert!(
+            kept.join(if *kept == unmarked_dir {
+                "user.mkv"
+            } else {
+                "lantern.part01.rar"
+            })
+            .exists(),
+            "{} stayed",
+            kept.display()
+        );
+    }
+    assert!(!rowless_dir.exists());
+    retire_pipeline_database(pipeline).await;
+}
+
+// A rowless marked directory written since the cutoff may be a job still
+// being admitted, and stays.
+#[tokio::test]
+async fn housekeeping_leaves_a_rowless_marker_younger_than_the_cutoff() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let rowless_dir = marked_working_dir(
+        &intermediate_dir,
+        "housekeeping-young-rowless",
+        JobId(30050),
+    )
+    .await;
+    pipeline.report_all_for_test();
+
+    pipeline
+        .shared_state
+        .queue
+        .clone()
+        .sweep_job_files(None, std::time::SystemTime::UNIX_EPOCH)
+        .await;
+
+    assert!(rowless_dir.exists());
+    retire_pipeline_database(pipeline).await;
+}
+
+// A restart from history takes every directory still carrying the job's
+// marker, beside the one its record names and its staging directory; a
+// reprocess keeps the directory it works in and takes the others.
+#[tokio::test]
+async fn a_restart_from_history_takes_the_job_s_left_working_directories() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
+    let resources = pipeline.admission_resources();
+    let job_id = JobId(30028);
+    let mark = |dir: &std::path::Path| {
+        std::fs::create_dir_all(dir.join("lantern.vol00+01.par2")).unwrap();
+        std::fs::write(dir.join("lantern.vol00+01.par2/held"), b"held").unwrap();
+        crate::jobs::working_dir::mark_weaver_owned_working_dir(&intermediate_dir, dir, job_id)
+            .unwrap();
+    };
+    let delivered = complete_dir.join("Lantern");
+    std::fs::create_dir_all(&delivered).unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_output_dir(&delivered).unwrap();
+    let left = intermediate_dir.join("Lantern");
+    mark(&left);
+    let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);
+    std::fs::create_dir_all(&staging).unwrap();
+
+    crate::pipeline::queue::clear_restart_artifacts(&resources, job_id, &delivered)
+        .await
+        .unwrap();
+
+    assert!(!delivered.exists());
+    assert!(!left.exists());
+    assert!(!staging.exists());
+
+    let kept = intermediate_dir.join("Lantern reprocess");
+    let other = intermediate_dir.join("Lantern");
+    mark(&kept);
+    mark(&other);
+    crate::pipeline::queue::clear_left_working_dirs(&intermediate_dir, job_id, &kept)
+        .await
+        .unwrap();
+    assert!(kept.join("lantern.vol00+01.par2/held").exists());
+    assert!(!other.exists());
+    retire_pipeline_database(pipeline).await;
+}
+
 #[tokio::test]
 async fn delete_history_with_a_stale_marker_removes_the_row_and_keeps_the_dir() {
     // A marker that names this job but whose hash the directory no longer
@@ -764,6 +1082,12 @@ async fn renaming_a_quiet_job_preserves_existing_payload() {
             job_id,
         )
         .unwrap();
+        // A quiet job holds no articles and so no graph: a graph keeps the
+        // folder it was built in.
+        pipeline.release_job_articles(job_id);
+        while pipeline.retiring_graph_jobs.contains_key(&job_id) {
+            hear_graph_mail(&mut pipeline, job_id).await;
+        }
         let state = pipeline.jobs.get_mut(&job_id).unwrap();
         state.status = JobStatus::Queued;
         state.download_state = crate::jobs::model::DownloadState::Queued;

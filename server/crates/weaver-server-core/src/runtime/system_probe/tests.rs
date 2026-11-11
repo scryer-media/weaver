@@ -39,6 +39,20 @@ fn startup_and_extraction_memory_consumers_share_cached_process_facts() {
     assert_eq!(effective_total, Some(6_u64 << 30));
     assert_eq!(memory_probes.load(Ordering::Relaxed), 1);
     assert_eq!(cgroup_probes.load(Ordering::Relaxed), 1);
+    assert!(!profile.guessed);
+}
+
+// Memory that could not be read is the 16 GiB default as before, marked as
+// guessed.
+#[test]
+fn memory_that_could_not_be_read_is_a_guessed_default() {
+    let profile = memory_profile_from_facts(&ProcessMemoryFacts {
+        memory_bytes: None,
+        cgroup_limit: None,
+    });
+    assert_eq!(profile.total_bytes, 16_u64 << 30);
+    assert_eq!(profile.available_bytes, 8_u64 << 30);
+    assert!(profile.guessed);
 }
 
 #[cfg(unix)]

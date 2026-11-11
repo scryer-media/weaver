@@ -766,6 +766,7 @@ type GeneralSettings {
 	intermediateDir: String!
 	completeDir: String!
 	cleanupAfterExtract: Boolean!
+	deleteFailedJobFiles: Boolean!
 	maxDownloadSpeed: Int!
 	maxRetries: Int!
 	propagationDelaySecs: Int!
@@ -779,6 +780,7 @@ input GeneralSettingsInput {
 	intermediateDir: String
 	completeDir: String
 	cleanupAfterExtract: Boolean
+	deleteFailedJobFiles: Boolean
 	maxDownloadSpeed: Int
 	maxRetries: Int
 	propagationDelaySecs: Int
@@ -971,6 +973,11 @@ type HistoryItem {
 	full name. Empty when every file carries its full name.
 	"""
 	fullFileNames: [FullFileName!]!
+	"""
+	Whether the job failed because a decode window was over the memory
+	profile's ceiling, so `reprocessJob(noMemoryLimit: true)` may finish it.
+	"""
+	failedForMemory: Boolean!
 }
 
 type HistoryPage {
@@ -1693,8 +1700,10 @@ type MutationRoot {
 	cancelJobs(ids: [Int!]!): [CancelJobResult!]!
 	"""
 	Reprocess a completed or failed job (re-run post-download stages without re-downloading).
+	With `noMemoryLimit`, a decode window over the memory profile's ceiling
+	is granted for this job alone, up to what the machine can hold.
 	"""
-	reprocessJob(id: Int!, password: String): Boolean!
+	reprocessJob(id: Int!, password: String, noMemoryLimit: Boolean): Boolean!
 	"""
 	Re-download a completed or failed job from its persisted NZB under the same job ID.
 	"""

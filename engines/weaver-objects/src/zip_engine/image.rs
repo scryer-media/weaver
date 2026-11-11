@@ -13,11 +13,12 @@
 // entry fails that entry, not the opening of the archive.
 
 use std::io::{self, Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 use ::zip::ZipArchive;
 use ::zip::read::{ArchiveOffset, Config, ZipFileEntry};
 use ::zip::result::{ZipError, ZipResult};
-use weaver_graph::Why;
+use weaver_graph::{VolumeIndex, Why};
 
 use super::{MAX_DIRECTORY_BYTES, MAX_DIRECTORY_ENTRIES};
 use crate::engine::Joined;
@@ -38,8 +39,98 @@ impl From<io::Error> for Unopened {
     }
 }
 
-pub(super) struct Image {
+// The set's disks as its end record lays them out, end to end: each one's
+// volume and the length the run reads it at, the length its member declared
+// until it closes. Disk `n` of a set before its last is the volume numbered
+// `n`; the last is the volume that ends the set, at its own number or after
+// every numbered one. A read waits for its own bytes only, so the run reads
+// the set while it grows.
+#[derive(Clone)]
+pub(super) struct Disks {
     joined: Joined,
+    disks: Arc<[(VolumeIndex, u64)]>,
+}
+
+impl Disks {
+    fn new(joined: &Joined, disks: Vec<(VolumeIndex, u64)>) -> Self {
+        Self {
+            joined: joined.clone(),
+            disks: disks.into(),
+        }
+    }
+
+    // Where a disk starts: the length of the disks before it.
+    fn base(&self, disk: u32) -> Option<u64> {
+        self.disks
+            .get(..disk as usize)
+            .filter(|_| (disk as usize) < self.disks.len())
+            .map(|before| before.iter().map(|(_, length)| length).sum())
+    }
+
+    // Bytes at `offset` of the joined disks; short only at their end. A disk
+    // whose bytes end short of the length read for it was declared longer
+    // than it is: the read fails as the owner's, not as damage, and the run
+    // is started over on the length it closes at.
+    fn read(&self, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+        if into.is_empty() {
+            return Ok(0);
+        }
+        let mut start = 0u64;
+        for &(volume, length) in self.disks.iter() {
+            let local = offset - start;
+            if local < length {
+                let wanted =
+                    usize::try_from(length - local).map_or(into.len(), |rest| rest.min(into.len()));
+                return match self
+                    .joined
+                    .read_volume(volume, local, &mut into[..wanted])?
+                {
+                    0 => {
+                        self.joined.fail();
+                        Err(io::ErrorKind::UnexpectedEof.into())
+                    }
+                    read => Ok(read),
+                };
+            }
+            start += length;
+        }
+        Ok(0)
+    }
+
+    // Every byte of `into` from `offset`, or an error at the set's end.
+    fn read_exact(&self, offset: u64, into: &mut [u8]) -> io::Result<()> {
+        let mut filled = 0;
+        while filled < into.len() {
+            let read = self.read(offset + filled as u64, &mut into[filled..])?;
+            if read == 0 {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            filled += read;
+        }
+        Ok(())
+    }
+
+    // Whether every disk closed at the length the run read it at, waiting
+    // for each to close: a verdict rests on those lengths, so it is said only
+    // once they are final. A disk that closed at another fails the run as
+    // the owner's, which starts it over on the length it closed at.
+    pub(super) fn settled(&self) -> bool {
+        for &(volume, length) in self.disks.iter() {
+            match self.joined.closed_len(volume) {
+                Ok(closed) if closed == length => {}
+                Ok(_) => {
+                    self.joined.fail();
+                    return false;
+                }
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+}
+
+pub(super) struct Image {
+    disks: Disks,
     // The joined bytes read as they lie, up to the rewritten directory.
     prefix: u64,
     rest: Vec<u8>,
@@ -47,36 +138,108 @@ pub(super) struct Image {
 }
 
 impl Image {
-    // Once every volume has its length: the directory is at the tail, and
-    // every place in a spanned set is the length of the volumes before it.
+    // From the set's tail, as soon as it lands: the end record is in the
+    // last volume's own tail, where its declared length puts it, and says
+    // how many disks come before it; every place in a spanned set is the
+    // length of the disks before it. No volume needs to close first.
     pub(super) fn open(joined: Joined, budget: &weaver_graph::Budget) -> Result<Image, Unopened> {
-        let lengths = joined.closed_lens()?;
-        let total: u64 = lengths.iter().sum();
-        let Some((start, found)) = find_end(&joined, total)? else {
-            return Err(Unopened::Refused(Why::Unrepairable));
+        let (last, length, start, found) = loop {
+            let bound = joined.bound()?;
+            let Some(&last) = bound.last() else {
+                return Err(Unopened::Refused(Why::Unrepairable));
+            };
+            let length = joined.sized_len(last)?;
+            let tail = Disks::new(&joined, vec![(last, length)]);
+            if let Some((start, found)) = find_end(&tail, length)? {
+                break (last, length, start, found);
+            }
+            // No end record where the declared length puts the tail. The
+            // length may be wrong, which only its close tells; or a volume
+            // after this one may still join and end the set.
+            if !tail.settled() {
+                return Err(Unopened::Failed);
+            }
+            if joined.next(Some(last))?.is_none() {
+                return Err(Unopened::Refused(Why::Unrepairable));
+            }
         };
-        let base = |disk: u32| -> Option<u64> {
-            lengths
-                .get(..disk as usize)
-                .filter(|_| (disk as usize) < lengths.len())
-                .map(|before| before.iter().sum())
+        let tail = Disks::new(&joined, vec![(last, length)]);
+        let refused = |why: Why, disks: &Disks| match disks.settled() {
+            true => Unopened::Refused(why),
+            false => Unopened::Failed,
         };
+        // The disk the end record is on, which is how many come before it.
+        // A saturated one is in the zip64 locator, as the count of disks,
+        // just ahead of the end record.
+        let disk = match found.this_disk {
+            disk if disk != u32::from(u16::MAX) => Some(disk),
+            _ => {
+                let at = (start + found.at).checked_sub(LOCATOR_LEN);
+                let mut locator = [0u8; LOCATOR_LEN as usize];
+                match at {
+                    Some(at) => {
+                        tail.read_exact(at, &mut locator)?;
+                        records::locator(&locator)
+                            .and_then(|_| records::u32_at(&locator, 16)?.checked_sub(1))
+                    }
+                    None => None,
+                }
+            }
+        };
+        let Some(disk) = disk else {
+            return Err(refused(Why::Unrepairable, &tail));
+        };
+        // The set bound is the one the end record ends: the volume that ends
+        // it is past every disk before it, and every other volume bound is
+        // one of them.
+        let bound = joined.bound()?;
+        if last.0 < disk
+            || bound
+                .iter()
+                .any(|volume| *volume != last && volume.0 >= disk)
+        {
+            return Err(refused(Why::Unsupported, &tail));
+        }
+        let mut lengths = Vec::new();
+        for number in 0..disk {
+            let volume = VolumeIndex(number);
+            lengths.push((volume, joined.sized_len(volume)?));
+        }
+        lengths.push((last, length));
+        let disks = Disks::new(&joined, lengths);
+        match Self::shaped(disks.clone(), disk, start, found, budget) {
+            Err(Unopened::Refused(why)) => Err(refused(why, &disks)),
+            shaped => shaped,
+        }
+    }
+
+    // The image of the disks, the end record found at `start` of the last.
+    fn shaped(
+        disks: Disks,
+        last: u32,
+        start: u64,
+        found: End,
+        budget: &weaver_graph::Budget,
+    ) -> Result<Image, Unopened> {
+        let base = |disk: u32| disks.base(disk);
         // Where the records after the directory start.
-        let mut after = start + found.at;
+        let mut after = base(last)
+            .and_then(|base| base.checked_add(start + found.at))
+            .ok_or(Unopened::Refused(Why::Unrepairable))?;
         let end = match found.wide {
             true => {
                 let at = after
                     .checked_sub(LOCATOR_LEN)
                     .ok_or(Unopened::Refused(Why::Unrepairable))?;
                 let mut locator = [0u8; LOCATOR_LEN as usize];
-                joined.read_exact(at, &mut locator)?;
+                disks.read_exact(at, &mut locator)?;
                 let (disk, offset) =
                     records::locator(&locator).ok_or(Unopened::Refused(Why::Unrepairable))?;
                 let at = base(disk)
                     .and_then(|base| base.checked_add(offset))
                     .ok_or(Unopened::Refused(Why::Unsupported))?;
                 let mut record = [0u8; END64_LEN as usize];
-                joined.read_exact(at, &mut record)?;
+                disks.read_exact(at, &mut record)?;
                 after = at;
                 records::end64(&record, found).ok_or(Unopened::Refused(Why::Unrepairable))?
             }
@@ -84,7 +247,7 @@ impl Image {
         };
         // The end record is on the last disk; a set that disagrees is not
         // the set bound.
-        if end.this_disk as usize + 1 != lengths.len() {
+        if end.this_disk != last {
             return Err(Unopened::Refused(Why::Unsupported));
         }
         let directory_limit = budget
@@ -106,7 +269,7 @@ impl Image {
         let mut rest = match directory {
             Some(directory) => {
                 let mut bytes = vec![0u8; end.size as usize];
-                joined.read_exact(directory, &mut bytes)?;
+                disks.read_exact(directory, &mut bytes)?;
                 rewrite(&bytes, &end, directory, &base).map(|rest| (directory, rest))
             }
             None => None,
@@ -115,7 +278,7 @@ impl Image {
         // directory still ends before the end records; shift the offsets
         // only after validating that bounded directory at its actual place.
         if rest.is_none()
-            && lengths.len() == 1
+            && last == 0
             && end.directory_disk == 0
             && let Some((directory, shift)) = after.checked_sub(end.size).and_then(|directory| {
                 directory
@@ -125,7 +288,7 @@ impl Image {
             })
         {
             let mut bytes = vec![0u8; end.size as usize];
-            joined.read_exact(directory, &mut bytes)?;
+            disks.read_exact(directory, &mut bytes)?;
             rest = rewrite(&bytes, &end, directory, &|disk| {
                 (disk == 0).then_some(shift)
             })
@@ -133,13 +296,18 @@ impl Image {
         }
         match rest {
             Some((prefix, rest)) => Ok(Image {
-                joined,
+                disks,
                 prefix,
                 rest,
                 position: 0,
             }),
             None => Err(Unopened::Refused(Why::Unsupported)),
         }
+    }
+
+    // The disks the image reads, for the run to settle before a verdict.
+    pub(super) fn disks(&self) -> Disks {
+        self.disks.clone()
     }
 
     // The archive, as the library reads it. Where the run holds the records,
@@ -174,14 +342,14 @@ impl Image {
             .ok_or_else(invalid)?;
         let (central, _) = records::central(&self.rest, at).ok_or_else(invalid)?;
         let mut bytes = vec![0; records::LOCAL_LEN as usize];
-        self.joined.read_exact(entry.header_start(), &mut bytes)?;
+        self.disks.read_exact(entry.header_start(), &mut bytes)?;
         let len = records::local_len(&bytes).ok_or_else(invalid)?;
         let end = entry.header_start().checked_add(len).ok_or_else(invalid)?;
         if end > self.prefix {
             return Err(invalid());
         }
         bytes.resize(len as usize, 0);
-        self.joined.read_exact(
+        self.disks.read_exact(
             entry.header_start() + records::LOCAL_LEN,
             &mut bytes[records::LOCAL_LEN as usize..],
         )?;
@@ -199,21 +367,22 @@ impl Image {
     }
 }
 
-// The end record, searched for from the set's end backward as far as the
-// longest comment it can carry, a record's length read at a time: the search
-// reads no further back than a record's length past the record it finds,
-// into the directory or the zip64 locator ahead of it, which the open reads
-// next. Its place in the set and the record, or `None` when there is none.
-fn find_end(joined: &Joined, total: u64) -> Result<Option<(u64, End)>, Unopened> {
+// The end record, searched for from the last disk's end backward as far as
+// the longest comment it can carry, a record's length read at a time: the
+// search reads no further back than a record's length past the record it
+// finds, into the directory or the zip64 locator ahead of it, which the open
+// reads next. Its place in the disk and the record, or `None` when there is
+// none.
+fn find_end(tail: &Disks, total: u64) -> Result<Option<(u64, End)>, Unopened> {
     let floor = total.saturating_sub(TAIL);
-    let mut tail = vec![0u8; (total - floor) as usize];
+    let mut held = vec![0u8; (total - floor) as usize];
     let mut start = total;
     while start > floor {
         let from = start.saturating_sub(END_LEN).max(floor);
         let read = (from - floor) as usize..(start - floor) as usize;
-        joined.read_exact(from, &mut tail[read.clone()])?;
+        tail.read_exact(from, &mut held[read.clone()])?;
         start = from;
-        let held = &tail[read.start..];
+        let held = &held[read.start..];
         if let Some(found) = records::end_among(held, 0..read.len()) {
             return Ok(Some((start, found)));
         }
@@ -379,7 +548,7 @@ impl Read for Image {
         let read = if self.position < self.prefix {
             let wanted = usize::try_from(self.prefix - self.position)
                 .map_or(into.len(), |rest| rest.min(into.len()));
-            self.joined.read(self.position, &mut into[..wanted])?
+            self.disks.read(self.position, &mut into[..wanted])?
         } else {
             let at = usize::try_from(self.position - self.prefix)
                 .map_or(self.rest.len(), |at| at.min(self.rest.len()));

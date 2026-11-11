@@ -5,6 +5,7 @@
 // root, the tree and the namespace writer to its files.
 
 pub(crate) mod checkpoint;
+pub(crate) mod decoding;
 pub(crate) mod engine;
 pub(crate) mod envelope;
 pub(crate) mod hardware;
@@ -19,6 +20,7 @@ pub(crate) mod restore;
 pub(crate) mod root;
 pub(crate) mod sparse;
 pub(crate) mod status;
+pub(crate) mod window;
 
 // The one priority every article of a graph job is queued at. The root is
 // the only ranker: its classes raise what it wants sooner, and nothing about

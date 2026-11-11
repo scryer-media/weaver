@@ -5,9 +5,7 @@ use super::*;
 
 impl Pipeline {
     pub(crate) fn deterministic_extraction_staging_dir(&self, job_id: JobId) -> PathBuf {
-        self.complete_dir
-            .join(".weaver-staging")
-            .join(job_id.0.to_string())
+        crate::pipeline::queue::staging_dir_for(&self.complete_dir, job_id)
     }
 
     pub(crate) fn note_write_buffered(&mut self, bytes: usize, segments: usize) {

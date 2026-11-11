@@ -377,6 +377,13 @@ pub trait Object: Send + Sync {
     // The answer to a seek I made.
     fn pulled(&mut self, seek: Seek, pull: crate::seek::Pull, out: &mut Vec<Emit>);
 
+    // I was rebuilt from my facts, which a restore reads nothing to check.
+    // What of my volumes they do not hold, and what reached me while I was
+    // lent out for a repair, I ask for again through `Emit::Again`: the
+    // owner says again what of it arrived. Told once, after a restore,
+    // before any close or loss is told again.
+    fn restored(&mut self, _out: &mut Vec<Emit>) {}
+
     // The inverse map: where did this range of my volume go? One piece per
     // contiguous run, in volume order, together covering the whole range.
     fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>);
@@ -440,6 +447,12 @@ pub trait Object: Send + Sync {
         }))
     }
 
+    // The runs of my member's bytes I checksummed as they came and keep
+    // across a restart, each with its CRC32, end to end where they abut:
+    // what a restore folds for the member's own check, so the check at its
+    // close reads nothing of its file. An object that keeps none says none.
+    fn vouched(&self, _member: MemberId, _out: &mut Vec<(ByteRange, u32)>) {}
+
     // My volume's length is known: its member declared one, or it closed at
     // the length it reached. Said ahead of every delivery while it is known
     // and once more at the close, so an object acts on it once and ignores
@@ -452,6 +465,18 @@ pub trait Object: Send + Sync {
     // A password the job offers. The object checks it against its own
     // header and, if it opens, carries on.
     fn offer_password(&mut self, _secret: &str, _out: &mut Vec<Emit>) {}
+
+    // Whether I hold work too slow for the loop that delivers to me: a
+    // keystream to run over held ciphertext, a key to derive from a
+    // password. My owner lends me out to do it and takes me back with what
+    // I said, as it lends a recovery object for its repair.
+    fn work_due(&self) -> bool {
+        false
+    }
+
+    // Do the work I hold, away from the tree: no placement can be read.
+    // What I say is applied as I come back.
+    fn work(&mut self, _out: &mut Vec<Emit>) {}
 
     // Bytes of my envelope, for the inverse map's remainder.
     fn envelope(&self, envelope: u32, range: ByteRange) -> Option<bytes::Bytes>;

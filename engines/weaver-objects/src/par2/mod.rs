@@ -581,6 +581,27 @@ impl Object for Par2 {
     // still come; what is lost reaches `volume_lost` at its exact range.
     fn pulled(&mut self, _seek: Seek, _pull: Pull, _out: &mut Vec<Emit>) {}
 
+    // Nothing past each walk's front is in the facts: a packet streamed when
+    // the checkpoint was taken, the bytes held past the front, and what
+    // waited while the object was out for a repair. It is asked for again,
+    // and walked as what of it arrived comes.
+    fn restored(&mut self, out: &mut Vec<Emit>) {
+        for (index, volume) in self.volumes.iter().enumerate() {
+            let mut past = weaver_graph::Coverage::new();
+            past.write(
+                ByteRange::new(volume.walker.front(), u64::MAX),
+                weaver_graph::Provenance::Fresh,
+            );
+            for lost in volume.walker.lost() {
+                past.erase(lost);
+            }
+            let volume = VolumeIndex(index as u32);
+            self.rewalks
+                .extend(past.runs().map(|run| (volume, run.range)));
+        }
+        self.ask_again(out);
+    }
+
     // What arrived there is to come again, and the blocks it carried; a
     // volume closed over them is open until they do. The walk reads the
     // range again as it comes, so a recovery packet wholly inside it is

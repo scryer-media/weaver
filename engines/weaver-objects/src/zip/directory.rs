@@ -22,14 +22,21 @@ use crate::kept::Kept;
 use crate::zip_engine::{MAX_DIRECTORY_BYTES, MAX_DIRECTORY_ENTRIES};
 
 impl Zip {
-    // Keep a range the directory read needs, and bid for it unless a walk
-    // reads it in the normal order; its bytes once they are all in.
+    // Keep a range the directory read needs, and bid for it unless the walk
+    // already stands at the directory; its bytes once they are all in.
     fn need(&mut self, range: ByteRange) -> Option<Vec<u8>> {
         if !self.directory.contains(&range) {
             self.directory.push(range);
         }
-        self.want(range, !self.walking);
+        let reached = self.walking && self.map.as_ref().is_some_and(|map| map.end.is_some());
+        self.want(range, !reached);
         self.kept.read(range).map(<[u8]>::to_vec)
+    }
+
+    // A walk still short of the directory waits for it before the
+    // directory says anything of its entries.
+    fn walk_short(&self) -> bool {
+        self.walking && !self.rereading() && self.map.as_ref().is_none_or(|map| map.end.is_none())
     }
 
     pub(super) fn read_directory(&mut self, out: &mut Vec<Emit>) {
@@ -101,6 +108,9 @@ impl Zip {
         let Some(bytes) = self.need(range) else {
             return;
         };
+        if self.walk_short() {
+            return;
+        }
         let Some(centrals) = records::directory(&bytes, end.entries) else {
             return self.say_damaged(range, out);
         };

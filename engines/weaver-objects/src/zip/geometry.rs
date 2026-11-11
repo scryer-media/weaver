@@ -23,6 +23,11 @@ impl Geometry {
         self.lengths.insert(volume.0, length) != Some(length)
     }
 
+    // Whether a disk's length is known as `length` already.
+    pub(super) fn knows(&self, volume: VolumeIndex, length: u64) -> bool {
+        self.lengths.get(&volume.0) == Some(&length)
+    }
+
     pub(super) fn base(&self, volume: VolumeIndex) -> Option<u64> {
         (0..volume.0)
             .map(|earlier| self.lengths.get(&earlier))

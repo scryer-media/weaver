@@ -69,6 +69,9 @@ pub(crate) struct Kept {
     // The length, once its member closed, and whether nothing more will
     // come at all, not even a repair: what is missing then is lost.
     pub(crate) closed: Option<u64>,
+    // The length its member declared, known before it closes: where a run
+    // that reads a set from its tail finds the tail while the volume grows.
+    pub(crate) sized: Option<u64>,
     // The length the volume last closed at, kept across a reopen: a run
     // that read past the volume built on it until it closes at another.
     pub(crate) closed_at: Option<u64>,
@@ -96,6 +99,7 @@ impl Kept {
             leaf,
             coverage: Coverage::new(),
             closed: None,
+            sized: None,
             closed_at: None,
             settled: false,
             reached: 0,
@@ -207,6 +211,15 @@ impl Envelopes {
     ) -> bool {
         match self.shelves.get(&node) {
             Some(shelf) => shelf.read(envelope, range, into),
+            None => range.is_empty(),
+        }
+    }
+
+    // Whether every byte of `range` of an envelope was kept, from the
+    // record alone.
+    pub(crate) fn keeps(&self, node: NodeId, envelope: u32, range: ByteRange) -> bool {
+        match self.shelves.get(&node) {
+            Some(shelf) => shelf.keeps(envelope, range),
             None => range.is_empty(),
         }
     }
@@ -445,6 +458,15 @@ impl Shelf {
         };
         let len = usize::try_from(range.len()).expect("an envelope range fits the address space");
         kept.coverage.covered(range) && kept.leaf.read(range.start, len, into).is_ok()
+    }
+
+    // Whether every byte of `range` of an envelope was kept, read from the
+    // record alone: a restore cut the record to its file's length.
+    pub(crate) fn keeps(&self, envelope: u32, range: ByteRange) -> bool {
+        self.lock()
+            .kept
+            .get(&envelope)
+            .map_or(range.is_empty(), |kept| kept.coverage.covered(range))
     }
 
     // Whether any byte of any volume is in.

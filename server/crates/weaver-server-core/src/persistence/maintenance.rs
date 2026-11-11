@@ -211,12 +211,17 @@ impl Database {
         })
     }
 
-    pub(crate) fn active_job_ids(&self) -> Result<HashSet<u64>, StateError> {
+    // Every job with a record, live or in the history: the jobs whose per-job
+    // directories are still theirs.
+    pub(crate) fn recorded_job_ids(&self) -> Result<HashSet<u64>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let rows =
-                SqlRuntime::fetch_all(datastore.read_exec(), "SELECT job_id FROM active_jobs", &[])
-                    .await?;
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT job_id FROM active_jobs UNION SELECT job_id FROM job_history",
+                &[],
+            )
+            .await?;
             let mut ids = HashSet::new();
             for row in rows {
                 let id = row.i64("job_id")?;

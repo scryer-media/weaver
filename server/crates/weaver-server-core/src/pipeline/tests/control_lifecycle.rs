@@ -72,7 +72,7 @@ async fn a_repeated_article_cache_failure_fails_the_job_when_its_articles_are_bu
 // cache inside it. The cache must follow: dropping it at archive cleans the
 // directory under the new name, never a path the rename already vacated.
 #[tokio::test]
-async fn a_rename_carries_the_repeated_article_cache_to_the_new_working_dir() {
+async fn a_rename_of_an_active_job_keeps_its_folder_and_article_cache() {
     let temp = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
     let handle = handle(&pipeline);
@@ -115,15 +115,13 @@ async fn a_rename_carries_the_repeated_article_cache_to_the_new_working_dir() {
             .rename_working_dir_when_quiet(id, "cache rename fixture renamed")
             .await
     );
-    let new_dir = pipeline.jobs[&id].working_dir.clone();
-    assert_ne!(new_dir, old_dir);
-    assert!(!old_dir.exists());
-    assert_eq!(caches(&new_dir).len(), 1);
+    assert_eq!(pipeline.jobs[&id].working_dir, old_dir);
+    assert_eq!(caches(&old_dir).len(), 1);
 
     pipeline.repeated_articles.remove(&id);
     assert!(
-        caches(&new_dir).is_empty(),
-        "the dropped cache must remove its directory under the new name"
+        caches(&old_dir).is_empty(),
+        "the dropped cache must remove its directory"
     );
 }
 

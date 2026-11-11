@@ -12,8 +12,8 @@
 //
 // Restore walks the kept header bytes again and requires them to read as
 // recorded, so the layout is rebuilt rather than trusted. A member's CRC
-// runs and an open cipher's seeds are rebuilt by the server's replay of
-// the placed ranges, which every restart does; the cipher blocks it held,
+// runs and its parts' are kept, joined where they abut, so a restart reads
+// none of its bytes to judge its checksums; the cipher blocks it held,
 // parked or partial, are on no disk, so its chain is kept, never its key. What came out of the cipher
 // is the member's coverage, which the cipher reads; the one thing coverage
 // cannot say, the plaintext past the payload, is the member's padding.
@@ -34,7 +34,7 @@ use super::walk::Block;
 use super::{Entry, Lock, Out, Piece, RarStore, Volume};
 use crate::crypt::{Chain, Padding};
 use crate::kept::Kept;
-use crate::runs::CrcRuns;
+use crate::runs::{CrcRuns, KeptRun};
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct StoreFacts<V = Sealed<VolumeFacts>> {
@@ -60,6 +60,11 @@ pub(super) struct VolumeFacts {
     // What the front stated when it was bound, which can precede the walk's
     // first header read.
     front: Option<RarVolumeFacts>,
+    // The name it was posted under, last so that facts written before it was
+    // kept read as posted under the name the volume has, and a volume
+    // without one writes as they did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    posted: Option<String>,
 }
 
 impl Default for VolumeFacts {
@@ -74,6 +79,7 @@ impl Default for VolumeFacts {
             ended: false,
             locked: None,
             front: None,
+            posted: None,
         }
     }
 }
@@ -91,6 +97,7 @@ impl VolumeFacts {
             && self.ended == volume.walk.ended
             && self.locked == volume.walk.locked
             && self.front == volume.front
+            && self.posted == volume.posted
     }
 }
 
@@ -118,6 +125,7 @@ fn volume(index: VolumeIndex, volume: &Volume) -> Sealed<VolumeFacts> {
         ended: volume.walk.ended,
         locked: volume.walk.locked,
         front: volume.front.clone(),
+        posted: volume.posted.clone(),
     });
     *cached = Some(facts.clone());
     facts
@@ -137,6 +145,16 @@ pub(super) struct EntryFacts {
     padding: Padding,
     // An open cipher's blocks, never its key.
     chain: Option<Chain>,
+    // The CRC runs of what came out, and of each part's packed bytes; none
+    // in facts written before they were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runs: Option<EntryRuns>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct EntryRuns {
+    plain: Vec<KeptRun>,
+    parts: Vec<(usize, Vec<KeptRun>)>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -169,7 +187,8 @@ impl Durable for StoreFacts {
     // 2: the front each volume stated when it was bound.
     // 3: a kept cipher block says whether an arrival started inside it.
     // 4: each volume's metadata is an independently reusable sealed part.
-    const VERSION: u16 = 4;
+    // 5: each member's CRC runs and its parts'.
+    const VERSION: u16 = 5;
 
     fn parts(&self, take: &mut Take) -> Result<(), String> {
         self.volumes
@@ -185,6 +204,28 @@ impl Durable for StoreFacts {
 
     fn impossible(&self) -> Option<&'static str> {
         impossible(self.volumes.iter().map(Sealed::get), &self.entries)
+    }
+}
+
+// Version 4 kept no CRC runs: they read as none, as a version 4 restore
+// had before its replay.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
+struct Four(StoreFacts);
+
+impl Durable for Four {
+    const VERSION: u16 = 4;
+
+    fn parts(&self, take: &mut Take) -> Result<(), String> {
+        self.0.parts(take)
+    }
+
+    fn restore_parts(&mut self, give: &mut Give) -> Result<(), String> {
+        self.0.restore_parts(give)
+    }
+
+    fn impossible(&self) -> Option<&'static str> {
+        self.0.impossible()
     }
 }
 
@@ -269,6 +310,14 @@ pub(super) fn of(store: &RarStore) -> Facts {
                 Lock::Sealed(chain) => Some(Chain::clone(chain)),
                 Lock::Plain | Lock::Locked => None,
             },
+            runs: Some(EntryRuns {
+                plain: entry.plain_runs.kept(),
+                parts: entry
+                    .parts
+                    .iter()
+                    .map(|(piece, runs)| (*piece, runs.kept()))
+                    .collect(),
+            }),
         })
         .collect();
     let facts = StoreFacts {
@@ -290,6 +339,10 @@ fn keying(entry: &Entry) -> Option<KeyTuple> {
 pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
     let kept: StoreFacts<VolumeFacts> = match facts.version {
         3 => facts.read(Kind::RarStore)?,
+        4 => facts
+            .read::<Four>(Kind::RarStore)?
+            .0
+            .map_volumes(|sealed| sealed.get().clone()),
         _ => facts
             .read::<StoreFacts>(Kind::RarStore)?
             .map_volumes(|sealed| sealed.get().clone()),
@@ -297,6 +350,9 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
     let mut store = RarStore::new();
     for found in kept.volumes {
         let mut volume = Volume::new();
+        if let Some(posted) = &found.posted {
+            volume.posted_as(posted);
+        }
         if let Some(name) = &found.name {
             volume.name_as(name);
         }
@@ -383,8 +439,16 @@ fn entry(facts: EntryFacts) -> Entry {
             closed: facts.closed,
             padding: facts.padding,
         }),
-        plain_runs: CrcRuns::default(),
-        parts: Default::default(),
+        plain_runs: facts
+            .runs
+            .as_ref()
+            .map_or_else(CrcRuns::default, |runs| CrcRuns::restored(&runs.plain)),
+        parts: facts
+            .runs
+            .iter()
+            .flat_map(|runs| &runs.parts)
+            .map(|(piece, runs)| (*piece, CrcRuns::restored(runs)))
+            .collect(),
     }
 }
 
@@ -409,7 +473,7 @@ mod cache_tests {
         let legacy: StoreFacts<VolumeFacts> = original.read(Kind::RarStore).unwrap();
         assert_eq!(Facts::of(Kind::RarStore, &legacy).bytes, bytes);
         let restored = restore(&original).unwrap().facts();
-        assert_eq!(restored.version, 4);
+        assert_eq!(restored.version, 5);
         let current: StoreFacts = restored.read(Kind::RarStore).unwrap();
         assert_eq!(current.entries.len(), 1);
         assert_eq!(current.entries[0].name, "legacy.bin");
@@ -456,6 +520,24 @@ mod cache_tests {
             assert_eq!(before.key, after.key);
             assert!(Arc::ptr_eq(&before.bytes, &after.bytes), "reused encoding");
         }
+    }
+
+    // A volume a recovery set renamed keeps the name it was posted under
+    // through a checkpoint, so siblings still posted under that numbering
+    // join it after a restart as they did before.
+    #[test]
+    fn a_renamed_volume_keeps_its_posted_name_through_a_restore() {
+        let bytes = archive(Version::Rar5, "posted.bin", 64);
+        let mut store = RarStore::new();
+        store.bound(VolumeIndex(0), "lantern.part01.rar", &[], None);
+        store.sized(VolumeIndex(0), bytes.len() as u64, &mut Vec::new());
+        deliver(&mut store, 0, &bytes, Provenance::Fresh);
+        store.renamed(VolumeIndex(0), "silver.horizon.part01.rar", &mut Vec::new());
+        let restored = restore(&store.facts()).unwrap().facts();
+        let decoded: StoreFacts = restored.read(Kind::RarStore).unwrap();
+        let volume = decoded.volumes[0].get();
+        assert_eq!(volume.name.as_deref(), Some("silver.horizon.part01.rar"));
+        assert_eq!(volume.posted.as_deref(), Some("lantern.part01.rar"));
     }
 
     #[test]

@@ -68,44 +68,67 @@ fn plain_said() -> Vec<Said> {
     ]
 }
 
-// Volumes in memory whose bytes the test hands out, each up to a point. A
-// read past what was handed out waits, and says which volume it waits on,
+// Volumes in memory whose bytes the test hands out, all but a hole in each.
+// A read that reaches into a hole waits, and says which volume it waits on,
 // so a test can act once the run is truly blocked. A volume is closed once
-// all of it is handed out.
+// it has no hole. Each volume's length is declared from the start, as a
+// post's articles declare it, which a lying post declares wrong.
 struct Gate {
     volumes: Vec<Vec<u8>>,
+    declared: Vec<u64>,
     state: Mutex<State>,
     changed: Condvar,
 }
 
 struct State {
-    released: Vec<usize>,
+    holes: Vec<std::ops::Range<usize>>,
     waiting: Option<u32>,
 }
 
 impl Gate {
-    fn new(volumes: Vec<Vec<u8>>, released: Vec<usize>) -> Arc<Self> {
+    fn with_holes(volumes: Vec<Vec<u8>>, holes: Vec<std::ops::Range<usize>>) -> Arc<Self> {
         Arc::new(Self {
+            declared: volumes.iter().map(|volume| volume.len() as u64).collect(),
             volumes,
             state: Mutex::new(State {
-                released,
+                holes,
                 waiting: None,
             }),
             changed: Condvar::new(),
         })
     }
 
-    fn whole(volumes: Vec<Vec<u8>>) -> Arc<Self> {
-        let released = volumes.iter().map(Vec::len).collect();
-        Self::new(volumes, released)
+    // Every volume held back whole.
+    fn held(volumes: Vec<Vec<u8>>) -> Arc<Self> {
+        let holes = volumes.iter().map(|volume| 0..volume.len()).collect();
+        Self::with_holes(volumes, holes)
     }
 
-    fn release(&self, volume: u32) {
+    fn whole(volumes: Vec<Vec<u8>>) -> Arc<Self> {
+        let holes = volumes.iter().map(|_| 0..0).collect();
+        Self::with_holes(volumes, holes)
+    }
+
+    // Every volume handed out whole, but declared `declared` long.
+    fn lying(volumes: Vec<Vec<u8>>, declared: Vec<u64>) -> Arc<Self> {
+        let mut gate = Self::whole(volumes);
+        Arc::get_mut(&mut gate).unwrap().declared = declared;
+        gate
+    }
+
+    // Hand out all of the volume but `hole`, which waits instead.
+    fn hold(&self, volume: u32, hole: std::ops::Range<usize>) {
         let mut state = self.state.lock().unwrap();
-        state.released[volume as usize] = self.volumes[volume as usize].len();
+        state.holes[volume as usize] = hole;
+        state.waiting = None;
         self.changed.notify_all();
     }
 
+    fn release(&self, volume: u32) {
+        self.hold(volume, 0..0);
+    }
+
+    // Wait until a read is blocked on the volume's hole.
     fn wait_for_reader(&self, volume: u32) {
         let mut state = self.state.lock().unwrap();
         while state.waiting != Some(volume) {
@@ -123,7 +146,13 @@ impl Volumes for Gate {
     fn len(&self, volume: VolumeIndex) -> Option<u64> {
         let state = self.state.lock().unwrap();
         let full = self.volumes[volume.0 as usize].len();
-        (state.released[volume.0 as usize] == full).then_some(full as u64)
+        state.holes[volume.0 as usize]
+            .is_empty()
+            .then_some(full as u64)
+    }
+
+    fn sized(&self, volume: VolumeIndex) -> io::Result<Option<u64>> {
+        Ok(self.declared.get(volume.0 as usize).copied())
     }
 
     fn read_at(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
@@ -131,19 +160,20 @@ impl Volumes for Gate {
             .volumes
             .get(volume.0 as usize)
             .ok_or_else(|| io::Error::from(io::ErrorKind::NotFound))?;
-        let offset = offset as usize;
+        let offset = (offset as usize).min(bytes.len());
         let mut state = self.state.lock().unwrap();
-        while offset >= state.released[volume.0 as usize]
-            && state.released[volume.0 as usize] < bytes.len()
-        {
+        while state.holes[volume.0 as usize].contains(&offset) {
             state.waiting = Some(volume.0);
             self.changed.notify_all();
             state = self.changed.wait(state).unwrap();
         }
-        let released = state.released[volume.0 as usize];
-        let start = offset.min(released);
-        let read = into.len().min(released - start);
-        into[..read].copy_from_slice(&bytes[start..start + read]);
+        let hole = &state.holes[volume.0 as usize];
+        let end = match offset < hole.start {
+            true => hole.start,
+            false => bytes.len(),
+        };
+        let read = into.len().min(end - offset);
+        into[..read].copy_from_slice(&bytes[offset..offset + read]);
         Ok(read)
     }
 }
@@ -304,22 +334,82 @@ fn a_zip_with_prepended_bytes_extracts_normally() {
     assert_eq!(run(&mut ZipEngine::new(), vec![archive]), plain_said());
 }
 
-#[test]
-fn a_run_waits_for_the_volume_to_close_and_extracts_once_it_has() {
-    let archive = plain();
-    let gate = Gate::new(vec![archive.clone()], vec![archive.len() / 2]);
+// The run behind its own thread, saying what it finds as it finds it.
+fn running(
+    extraction: Box<dyn weaver_graph::Extraction>,
+    gate: &Arc<Gate>,
+) -> (thread::JoinHandle<()>, mpsc::Receiver<Emit>) {
     let (sent, heard) = mpsc::channel();
-    let extraction = ZipEngine::new().start();
     let volumes: Arc<dyn Volumes> = gate.clone();
     let runner = thread::spawn(move || {
         let mut sink = |emit| sent.send(emit).is_ok();
         extraction.run(volumes, &mut sink, weaver_graph::Budget::default());
     });
+    (runner, heard)
+}
+
+// The zip twin of the 7z engine's: the run reads the tail first, where the
+// declared length puts it, and inflates each entry as its bytes land, with
+// the volume still open.
+#[test]
+fn a_run_waits_for_the_tail_and_continues_when_it_lands() {
+    let archive = plain();
+    let (second_at, second_len) = {
+        let mut directory = ZipArchive::new(Cursor::new(&archive)).unwrap();
+        let file = directory.by_index_raw(3).unwrap();
+        (
+            file.data_start().unwrap() as usize,
+            file.compressed_size() as usize,
+        )
+    };
+    let gate = Gate::held(vec![archive.clone()]);
+    let (runner, heard) = running(ZipEngine::new().start(), &gate);
 
     gate.wait_for_reader(0);
     assert!(
         heard.try_iter().next().is_none(),
-        "nothing is named before the directory lands"
+        "nothing is named before the tail lands"
+    );
+
+    // The tail and every entry but the body of the last land; the volume is
+    // still open.
+    gate.hold(0, second_at + 1..second_at + second_len - 1);
+    gate.wait_for_reader(0);
+    assert_eq!(gate.len(VolumeIndex(0)), None, "the volume is still open");
+    assert_eq!(
+        said(&heard.try_iter().collect::<Vec<_>>()),
+        plain_said()[..6],
+        "the members before the hole are named, emitted and closed"
+    );
+
+    gate.release(0);
+    runner.join().unwrap();
+    assert_eq!(
+        said(&heard.try_iter().collect::<Vec<_>>()),
+        plain_said()[6..]
+    );
+}
+
+// A spanned set extracts as one, read from its last volume's tail first
+// while the volumes before it have yet to land, and waits for none of them
+// to close.
+#[test]
+fn a_spanned_set_extracts_as_one_read_from_its_last_volumes_tail_first() {
+    let gate = Gate::held(spanned(&plain(), 3));
+    let (runner, heard) = running(
+        named(&["alpha.z01", "alpha.z02", "alpha.zip"]).start(),
+        &gate,
+    );
+
+    gate.wait_for_reader(2);
+    assert!(heard.try_iter().next().is_none());
+
+    gate.release(2);
+    gate.release(1);
+    gate.wait_for_reader(0);
+    assert!(
+        heard.try_iter().next().is_none(),
+        "nothing is named before the first entry's bytes land"
     );
 
     gate.release(0);
@@ -327,25 +417,54 @@ fn a_run_waits_for_the_volume_to_close_and_extracts_once_it_has() {
     assert_eq!(said(&heard.try_iter().collect::<Vec<_>>()), plain_said());
 }
 
+// A volume declared longer or shorter than it is: the run reads where the
+// declared length puts the tail, finds the bytes say otherwise, and ends as
+// a failed read of its owner's, which starts it over on the length the
+// volume closed at. No verdict is said on a length that was not the
+// volume's.
 #[test]
-fn a_spanned_set_extracts_as_one_once_its_last_volume_lands() {
+fn a_lone_zip_declared_at_another_length_ends_the_run_without_a_verdict() {
+    let archive = plain();
+    let real = archive.len() as u64;
+    for declared in [real + 1, real + 4_096, real - 1, real / 2] {
+        let gate = Gate::lying(vec![archive.clone()], vec![declared]);
+        assert_eq!(
+            run_over(&mut ZipEngine::new(), gate),
+            Vec::<Said>::new(),
+            "declared {declared} of {real}"
+        );
+    }
+    assert_eq!(
+        run_over(
+            &mut ZipEngine::new(),
+            Gate::lying(vec![archive.clone()], vec![real])
+        ),
+        plain_said(),
+        "the declared length the volume closes at is read as it is"
+    );
+}
+
+// A spanned set whose first volume was declared longer than it is: every
+// place past it is wrong. What the run read before it stands until its
+// owner starts it over; past it, the run says no verdict.
+#[test]
+fn a_spanned_volume_declared_at_another_length_ends_the_run_without_a_verdict() {
     let volumes = spanned(&plain(), 3);
-    let released = vec![volumes[0].len(), volumes[1].len(), 0];
-    let gate = Gate::new(volumes, released);
-    let (sent, heard) = mpsc::channel();
-    let extraction = named(&["alpha.z01", "alpha.z02", "alpha.zip"]).start();
-    let volumes: Arc<dyn Volumes> = gate.clone();
-    let runner = thread::spawn(move || {
-        let mut sink = |emit| sent.send(emit).is_ok();
-        extraction.run(volumes, &mut sink, weaver_graph::Budget::default());
-    });
-
-    gate.wait_for_reader(2);
-    assert!(heard.try_iter().next().is_none());
-
-    gate.release(2);
-    runner.join().unwrap();
-    assert_eq!(said(&heard.try_iter().collect::<Vec<_>>()), plain_said());
+    let declared = vec![
+        volumes[0].len() as u64 + 7,
+        volumes[1].len() as u64,
+        volumes[2].len() as u64,
+    ];
+    let gate = Gate::lying(volumes, declared);
+    let said = run_over(&mut named(&["alpha.z01", "alpha.z02", "alpha.zip"]), gate);
+    assert!(
+        !said.iter().any(|said| matches!(
+            said,
+            Said::Refuse(_) | Said::Retract(_) | Said::NeedsPassword
+        )),
+        "{said:?}"
+    );
+    assert!(!said.contains(&Said::Closed(2)), "{said:?}");
 }
 
 #[test]
@@ -374,6 +493,35 @@ fn a_wrong_password_asks_for_another_and_the_right_one_extracts() {
     engine.offer_password(PASSWORD, &mut out);
     assert!(out.is_empty());
     assert_eq!(run(&mut engine, vec![encrypted()]), plain_said());
+}
+
+// A run with no password asks for one as soon as it meets an encrypted
+// member, with the volume still open, so the run the offer starts decrypts
+// alongside the download rather than after it.
+#[test]
+fn a_run_asks_for_a_password_before_its_volumes_close() {
+    let archive = encrypted();
+    let (last_at, last_len) = {
+        let mut directory = ZipArchive::new(Cursor::new(&archive)).unwrap();
+        let file = directory.by_index_raw(3).unwrap();
+        (
+            file.data_start().unwrap() as usize,
+            file.compressed_size() as usize,
+        )
+    };
+    let hole = last_at + 1..last_at + last_len - 1;
+    let gate = Gate::with_holes(vec![archive], std::iter::once(hole).collect());
+    let (runner, heard) = running(named(&["locked.zip"]).start(), &gate);
+    runner.join().unwrap();
+    assert_eq!(gate.len(VolumeIndex(0)), None, "the volume is still open");
+    assert_eq!(
+        said(&heard.try_iter().collect::<Vec<_>>()),
+        vec![
+            Said::Member(0, "deep/".into(), Some(0)),
+            Said::Closed(0),
+            Said::NeedsPassword,
+        ]
+    );
 }
 
 #[test]

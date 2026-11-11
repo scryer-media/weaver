@@ -222,7 +222,7 @@ function JobDetailContent() {
   }>({ query: DUPLICATE_SNAPSHOT_QUERY, variables, pause: !Number.isFinite(jobId) });
 
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
-  const [retryAction, setRetryAction] = useState<"redownload" | "reprocess" | null>(null);
+  const [retryAction, setRetryAction] = useState<"redownload" | "reprocess" | "retryNoLimit" | null>(null);
   const [, rerunPostProcessing] = useMutation(RERUN_POST_PROCESSING_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [, acceptHistoryDelete] = useMutation(ACCEPT_HISTORY_DELETE_MUTATION);
@@ -529,6 +529,18 @@ function JobDetailContent() {
                 >
                   {t("next.job.reprocess")}
                 </SecondaryButton>
+                {job.failedForMemory ? (
+                  <SecondaryButton
+                    icon="reprocess"
+                    size="compact"
+                    disabled={busy}
+                    onClick={() => {
+                      setRetryAction("retryNoLimit");
+                    }}
+                  >
+                    {t("next.job.retryNoLimit")}
+                  </SecondaryButton>
+                ) : null}
                 <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("delete")}>
                   {t("next.job.deleteSaveFiles")}
                 </DangerButton>
@@ -953,12 +965,14 @@ function JobDetailContent() {
       })}
 
       {retryAction ? <ArchivePasswordDialog
-        title={t(retryAction === "redownload" ? "next.completed.redownload" : "next.job.reprocess")}
+        title={t(retryAction === "redownload" ? "next.completed.redownload"
+          : retryAction === "retryNoLimit" ? "next.job.retryNoLimit" : "next.job.reprocess")}
         busy={busy} onDismiss={() => setRetryAction(null)}
         onConfirm={(password) => {
           setRetryAction(null);
           void run(t(retryAction === "redownload" ? "next.job.report.requeued" : "next.job.report.reprocessing"),
-            () => retryAction === "redownload" ? redownloadJob({ id: job.id, password }) : reprocessJob({ id: job.id, password }));
+            () => retryAction === "redownload" ? redownloadJob({ id: job.id, password })
+              : reprocessJob({ id: job.id, password, noMemoryLimit: retryAction === "retryNoLimit" }));
         }} /> : null}
       <ConfirmDialog
         open={confirm === "cancel"}

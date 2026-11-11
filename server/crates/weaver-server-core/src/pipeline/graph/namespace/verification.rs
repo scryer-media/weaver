@@ -65,7 +65,9 @@ impl Verification {
         };
         #[cfg(not(test))]
         let this = self;
-        this.run_with(shutdown, |_| {
+        this.run_with(shutdown, |_len| {
+            #[cfg(test)]
+            checked::read(_len);
             #[cfg(test)]
             if let Some(barrier) = barrier.take() {
                 let _ = barrier.started.send(());
@@ -260,5 +262,22 @@ impl NamespaceWriter {
             self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
         }
         Ok(())
+    }
+}
+
+// The bytes every member check in this process read from its file, so a
+// test can hold a check to what it reads.
+#[cfg(test)]
+pub(crate) mod checked {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static READ: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn read(len: usize) {
+        READ.fetch_add(len as u64, Ordering::Relaxed);
+    }
+
+    pub(crate) fn so_far() -> u64 {
+        READ.load(Ordering::Relaxed)
     }
 }

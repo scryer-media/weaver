@@ -3,6 +3,16 @@
 
 use super::*;
 
+#[cfg(test)]
+pub(crate) type FailedReleaseHook =
+    Box<dyn FnOnce(&std::path::Path, Option<&super::graph::job::GraphJob>) + Send>;
+
+// Runs with a failed job's working directory, and its graph if it has one,
+// as the release of that directory starts.
+#[cfg(test)]
+pub(crate) static BEFORE_FAILED_RELEASE: std::sync::Mutex<Option<FailedReleaseHook>> =
+    std::sync::Mutex::new(None);
+
 pub(crate) struct PendingGraphFailure {
     pub(super) error: String,
     pub(super) extraction_rejected: bool,
@@ -206,7 +216,7 @@ impl Pipeline {
         job_id: JobId,
         error: &str,
         preserve_staging: bool,
-    ) -> Option<PathBuf> {
+    ) -> Option<(PathBuf, Option<PathBuf>)> {
         let (staging_dir, working_dir, released) = if let Some(state) = self.jobs.get_mut(&job_id) {
             let released = state.post_state;
             state.queued_repair_at_epoch_ms = None;
@@ -233,7 +243,13 @@ impl Pipeline {
             self.metrics
                 .post_state_moved(released, crate::jobs::model::PostState::Failed);
         }
-        // Clean up staging directory if it was created.
+        // What the staging directory holds the job delivered: it goes back
+        // to the working directory as that is released. Kept for the
+        // scripts, or with no working directory to return to, it goes.
+        let (staging_dir, returned) = match (staging_dir, working_dir.is_some()) {
+            (Some(staging), true) => (None, Some(staging)),
+            (staging, _) => (staging, None),
+        };
         if let Some(staging) = staging_dir {
             tokio::spawn(async move {
                 if let Err(e) = tokio::fs::remove_dir_all(&staging).await
@@ -266,24 +282,49 @@ impl Pipeline {
         self.clear_job_phase_progress_runtime(job_id);
         self.clear_job_retention_excludes(job_id);
         self.clear_job_write_backlog(job_id);
-        working_dir
+        working_dir.map(|dir| (dir, returned))
     }
 
     // What the job leaves in its working directory is what it delivered:
     // the directory is released off the actor before the history records
     // it, so the record never lists the graph's internals.
-    fn finish_failed_job(&mut self, job_id: JobId, error: String, release: Option<PathBuf>) {
-        let Some(working_dir) = release else {
+    fn finish_failed_job(
+        &mut self,
+        job_id: JobId,
+        error: String,
+        release: Option<(PathBuf, Option<PathBuf>)>,
+    ) {
+        let Some((working_dir, staging)) = release else {
             self.record_failed_job(job_id, error);
             return;
         };
+        // Nothing of the job is out on a thread by now, and its decodes are
+        // refused, so the graph is the last holder of its files: it lets go
+        // of every one before any is removed. A file unlinked while open
+        // stays behind on an NFS or FUSE share, and the directory never
+        // empties.
+        if let Some(graph) = self.graph_jobs.get_mut(&job_id) {
+            graph.release_handles();
+        }
+        #[cfg(test)]
+        {
+            let hook = BEFORE_FAILED_RELEASE.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook(&working_dir, self.graph_jobs.get(&job_id));
+            }
+        }
         let root = self.intermediate_dir.clone();
         let done = self.failed_release_tx.clone();
         self.releasing_failed_jobs.insert(job_id);
         tokio::spawn(async move {
             let dir = working_dir.clone();
             let released = tokio::task::spawn_blocking(move || {
-                crate::jobs::working_dir::release_failed_working_dir(&root, &dir, job_id)
+                crate::pipeline::completion::finalize::release_failed_delivery(
+                    &root,
+                    &dir,
+                    staging.as_deref(),
+                    job_id,
+                )
             })
             .await;
             let failure = match released {

@@ -19,6 +19,7 @@ fn machine(cores: usize, memory_gib: u64) -> SystemProfile {
             total_bytes: memory_gib * GIB,
             available_bytes: memory_gib * GIB / 2,
             cgroup_limit: None,
+            guessed: false,
         },
         disk: DiskProfile {
             storage_class: StorageClass::Ssd,
@@ -128,6 +129,7 @@ fn each_profile_decides_its_own_limits() {
 
     let efficient = HardwareProfile::Efficient.tuning(&large);
     assert_eq!(efficient.sevenz_decode_memory_bytes, 512 * MIB);
+    assert_eq!(efficient.decode_window_bytes, 256 * MIB);
     assert_eq!(efficient.extraction_memory_bytes, 8 * GIB);
     assert_eq!(efficient.decode_threads, 2);
     assert_eq!(efficient.extract_threads, 4);
@@ -135,6 +137,7 @@ fn each_profile_decides_its_own_limits() {
 
     let balanced = HardwareProfile::Balanced.tuning(&large);
     assert_eq!(balanced.sevenz_decode_memory_bytes, GIB);
+    assert_eq!(balanced.decode_window_bytes, GIB);
     assert_eq!(balanced.extraction_memory_bytes, 16 * GIB);
     assert_eq!(balanced.decode_threads, 4);
     assert_eq!(balanced.extract_threads, 8);
@@ -142,10 +145,32 @@ fn each_profile_decides_its_own_limits() {
 
     let performance = HardwareProfile::Performance.tuning(&large);
     assert_eq!(performance.sevenz_decode_memory_bytes, 4 * GIB);
+    assert_eq!(performance.decode_window_bytes, 4 * GIB);
     assert_eq!(performance.extraction_memory_bytes, 16 * GIB);
     assert_eq!(performance.decode_threads, 16);
     assert_eq!(performance.extract_threads, 8);
     assert_eq!(performance.max_concurrent_downloads_cap, None);
+}
+
+// Every profile lends a window over the ceiling from scratch; where the
+// scratch is refused, only the efficient profile fails it, the others go to
+// RAM.
+#[test]
+fn only_the_efficient_profile_fails_a_window_the_scratch_refused() {
+    for probe in [machine(4, 8), machine(16, 64)] {
+        assert_eq!(
+            HardwareProfile::Efficient.tuning(&probe).over_limit,
+            OverLimit::ScratchThenFail
+        );
+        assert_eq!(
+            HardwareProfile::Balanced.tuning(&probe).over_limit,
+            OverLimit::ScratchThenRam
+        );
+        assert_eq!(
+            HardwareProfile::Performance.tuning(&probe).over_limit,
+            OverLimit::ScratchThenRam
+        );
+    }
 }
 
 // The extraction, PAR3 and holds limits shrink with the profile, and the

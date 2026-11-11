@@ -73,10 +73,14 @@ impl Pipeline {
         let category = state.spec.category.clone();
         let metadata = state.spec.metadata.clone();
         let working_dir = state.working_dir.clone();
+        let staging_dir = state.staging_dir.clone();
         let spec_password = state.spec.password.clone();
         let expected = summaries.clone();
         state.articles = JobArticles::Activating(summaries, activation);
-        let seat = self.graph_restore_seat(spec_password, &working_dir);
+        let seat = self
+            .graph_restore_seat(None, &working_dir)
+            .for_job(spec_password, &working_dir, staging_dir.as_deref())
+            .lifted(&metadata);
         // The read waits for every write already queued for the job, so a
         // checkpoint taken as the job paused is the one it reads back.
         let (written_tx, written_rx) = tokio::sync::oneshot::channel();
@@ -373,11 +377,16 @@ impl Pipeline {
     }
 
     // Whether anything of the job is still out: an article a lane holds, a
-    // result a lane released and the pipeline has yet to take, or a decode
-    // queued or running.
+    // result a lane released and the pipeline has yet to take, a decode
+    // queued or running, what a restored recovery object reads again of
+    // its volumes, without which its root would say less than it did, or an
+    // object out for its work, without which no checkpoint can be taken.
     fn job_has_results_out(&self, job_id: JobId) -> bool {
         let counted = |counts: &HashMap<JobId, usize>| counts.get(&job_id).is_some_and(|n| *n > 0);
-        counted(&self.active_downloads_by_job)
+        self.graph_jobs
+            .get(&job_id)
+            .is_some_and(|graph| graph.rewalks_owed() || graph.working())
+            || counted(&self.active_downloads_by_job)
             || counted(&self.pending_released_download_results_by_job)
             || self
                 .active_decodes_by_job
@@ -413,6 +422,11 @@ impl Pipeline {
         graph.request_stop();
         if graph.awaits_mail() {
             self.retiring_graph_jobs.insert(job_id, graph);
+        } else {
+            // Gone with what its runs reserved: the memory goes to whoever
+            // waits for it.
+            drop(graph);
+            self.wake_memory_waiters();
         }
     }
 }

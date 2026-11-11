@@ -15,10 +15,13 @@ mod counters;
 mod history;
 mod intents;
 pub mod paging;
-pub(crate) use admission::{AdmissionResources, PreparedAdd, RestartAdmission};
+pub(crate) use admission::{
+    AdmissionResources, PreparedAdd, RestartAdmission, delivery_staging_dir, make_staging_dir,
+    staging_dir_for,
+};
 #[cfg(test)]
 pub(crate) use counters::COUNTER_SAMPLES;
-pub(crate) use history::clear_restart_artifacts;
+pub(crate) use history::{clear_left_working_dirs, clear_restart_artifacts, remove_job_staging};
 
 /// The control plane's shared facts. A guard never leaves a synchronous
 /// closure, so callers copy inputs out before doing asynchronous work.

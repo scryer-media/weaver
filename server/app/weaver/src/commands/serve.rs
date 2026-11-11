@@ -474,6 +474,8 @@ pub(crate) async fn run(
     let maintenance_task = weaver_server_core::operations::spawn_maintenance_worker(
         db.clone(),
         maintenance_complete_dir,
+        handle.clone(),
+        shared_config.clone(),
         startup_disk_work.clone(),
     );
 

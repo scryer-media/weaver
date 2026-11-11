@@ -48,7 +48,11 @@ const BACKEND_SHUTDOWN_GRACE_PERIOD: StdDuration = StdDuration::from_secs(5);
 const LOCAL_AGENT_API_KEY_NAME: &str = "xtask-local-agent";
 const LOCAL_AGENT_API_KEY_SCOPE: &str = "admin";
 const LOCAL_AGENT_API_KEY_FILENAME: &str = "local-agent-api-key";
-const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[ReleaseAuditAllow] = &[];
+const RELEASE_ALLOWED_CARGO_AUDIT_IDS: &[ReleaseAuditAllow] = &[ReleaseAuditAllow {
+    id: "RUSTSEC-2026-0459",
+    expires_on: "2026-12-09",
+    reason: "bundled SQLite before 3.54.0 (CVE-2026-119375); fixed in libsqlite3-sys 0.39, which sqlx 0.9.0, the newest, does not accept (<0.38.0). Needs a crafted database and -wal pair written into Weaver's own data directory.",
+}];
 const RELEASE_LOCAL_PATH_TOKENS: &[&str] = &[
     concat!("/", "Users/"),
     concat!("/", "home/"),

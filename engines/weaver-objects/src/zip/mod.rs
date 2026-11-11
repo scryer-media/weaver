@@ -6,7 +6,9 @@
 // of its own. It bids for the directory at the container's tail and reads
 // the entries from it; a stored entry's data is its member's bytes once the
 // entry's local header says where they start. When nothing above can bring
-// the tail forward, it walks the local headers from the front instead.
+// the tail forward, it walks the local headers from the front instead, as
+// it does from the start for an archive opening with a bounded ZipCrypto
+// entry, whose keys run from its first byte.
 // Stored ZipCrypto entries decipher directly into their members. Compressed
 // entries, other ciphers and unknown extents go to an engine, before any
 // member is said whenever the directory can say so.
@@ -18,6 +20,7 @@ mod carried;
 mod crypto;
 mod directory;
 mod geometry;
+mod held;
 mod map;
 mod place;
 mod record;
@@ -26,6 +29,69 @@ mod walk;
 
 #[cfg(test)]
 mod tests;
+
+// What a test reads of where a zip's work ran: the bytes delivered to it on
+// this thread, and the cipher bytes its keys ran over on this thread and on
+// every thread.
+#[cfg(any(test, feature = "test-support"))]
+pub mod counting {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    thread_local! {
+        static DELIVERED: Cell<u64> = const { Cell::new(0) };
+        static DECIPHERED: Cell<u64> = const { Cell::new(0) };
+        // The most ciphertext a zip held for its keys on this thread.
+        static QUEUED_MOST: Cell<u64> = const { Cell::new(0) };
+        // A smaller cap on what a zip holds for its keys, for a fixture
+        // smaller than the real one.
+        static CAP: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn queued(total: u64) {
+        QUEUED_MOST.with(|most| most.set(most.get().max(total)));
+    }
+
+    pub fn queued_most_here() -> u64 {
+        QUEUED_MOST.with(Cell::get)
+    }
+
+    pub(super) fn cap() -> Option<u64> {
+        CAP.with(Cell::get)
+    }
+
+    // Cap what a zip holds for its keys on this thread at `cap` bytes, the
+    // most held so far forgotten.
+    pub fn cap_here(cap: u64) {
+        CAP.with(|here| here.set(Some(cap)));
+        QUEUED_MOST.with(|most| most.set(0));
+    }
+
+    // The cap a zip holds its keys' ciphertext to, as built.
+    pub const CAP_BUILT: u64 = super::held::CAP;
+    static DECIPHERED_EVERYWHERE: AtomicU64 = AtomicU64::new(0);
+
+    pub(super) fn delivered(len: usize) {
+        DELIVERED.with(|here| here.set(here.get() + len as u64));
+    }
+
+    pub(super) fn deciphered(len: usize) {
+        DECIPHERED.with(|here| here.set(here.get() + len as u64));
+        DECIPHERED_EVERYWHERE.fetch_add(len as u64, Ordering::Relaxed);
+    }
+
+    pub fn delivered_here() -> u64 {
+        DELIVERED.with(Cell::get)
+    }
+
+    pub fn deciphered_here() -> u64 {
+        DECIPHERED.with(Cell::get)
+    }
+
+    pub fn deciphered_everywhere() -> u64 {
+        DECIPHERED_EVERYWHERE.load(Ordering::Relaxed)
+    }
+}
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 
@@ -96,6 +162,9 @@ pub struct Zip {
     stale: bool,
     // The object gave its container up; it says nothing more.
     gone: bool,
+    // Ciphertext waiting for its keys to run over it away from the loop.
+    #[serde(default)]
+    held: Vec<held::Held>,
 }
 
 impl Durable for Zip {
@@ -114,7 +183,8 @@ impl Durable for Zip {
         self.grid.restore_parts(give)
     }
 
-    // A member said is an entry of the map, and every entry's member is one.
+    // A member said is an entry of the map, and every entry's member is one,
+    // as is every member something is held for.
     fn impossible(&self) -> Option<&'static str> {
         let sound = |map: &Map| {
             map.members.iter().all(|entry| *entry < map.entries.len())
@@ -139,7 +209,8 @@ impl Durable for Zip {
             .next
             .as_ref()
             .is_none_or(|next| self.map.is_some() && sound(next));
-        (!mapped || !next || !self.kept.sound()).then_some("members no map gives")
+        (!mapped || !next || !self.kept.sound() || !self.held_sound())
+            .then_some("members no map gives")
     }
 }
 
@@ -225,15 +296,18 @@ impl Zip {
         self.resolve_last(delivery, read, out);
     }
 
-    // A bounded ZipCrypto entry can start before a parent knows EOF.
-    // Other fronts keep waiting for their directory, which can supply
-    // extents absent from local headers without a premature refusal.
+    // A bounded ZipCrypto entry starts from the front, as the download
+    // arrives, whether or not its length is known yet: its keys run from
+    // its first byte, so nothing else lets it decipher alongside. The
+    // directory, bid for at the tail, holds the walk to account once both
+    // are in. Other fronts keep waiting for their directory, which can
+    // supply extents absent from local headers without a premature refusal.
     fn walk_encrypted_front(
         &mut self,
         delivery: &Delivery<'_>,
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
     ) {
-        if self.walking || self.map.is_some() || self.total().is_some() {
+        if self.walking || self.map.is_some() {
             return;
         }
         let Some(fixed) = read_through(ByteRange::at(0, records::LOCAL_LEN), delivery, read) else {
@@ -353,21 +427,17 @@ impl Zip {
             return;
         }
         self.find_recovery(out);
+        // A map not yet held against its directory reads it: a walk's
+        // gathers it as it comes and is checked once the walk reaches it;
+        // one the walk left reads its entries from it.
         if self.walking {
             self.walk(out);
-            if !self.gone
-                && (self.rereading()
-                    || self
-                        .map
-                        .as_ref()
-                        .is_some_and(|map| map.end.is_some() && !map.checked))
-            {
-                self.read_directory(out);
-            }
-        } else if self.map.is_none() || self.rereading() {
+        }
+        let unchecked = self.map.as_ref().is_none_or(|map| !map.checked);
+        if !self.gone && (unchecked || self.rereading()) {
             self.read_directory(out);
         }
-        if !self.walking && self.map.is_some() && !self.gone {
+        if !self.walking && self.map.as_ref().is_some_and(|map| map.checked) && !self.gone {
             self.read_locals(out);
         }
         if let (Some(end), Some(total)) = (self.map.as_ref().and_then(|map| map.end), self.total())
@@ -416,13 +486,26 @@ impl Zip {
         self.basis.clear();
     }
 
-    // Whether the range is one the directory read needs, before the map.
+    // Whether the range is one the directory read needs, before a map held
+    // against it.
     fn is_directory(&self, range: ByteRange) -> bool {
-        self.map.is_none()
+        self.map.as_ref().is_none_or(|map| !map.checked)
             && self
                 .directory
                 .iter()
                 .any(|wanted| wanted.intersect(range).is_some())
+    }
+
+    // Whether a delivery reaches nothing ahead of its members but what is
+    // kept: a map stands with none waiting to take over, nothing is to be
+    // looked at again, and where the last disk is is not being decided.
+    fn only_routes(&self, delivery: &Delivery<'_>) -> bool {
+        let deciding = if self.opens_alone {
+            self.bound.iter().any(|volume| *volume != LAST)
+        } else {
+            delivery.volume.0 == LAST && self.last_disk.is_none()
+        };
+        self.map.is_some() && self.next.is_none() && !self.stale && !deciding
     }
 }
 
@@ -437,8 +520,17 @@ impl Object for Zip {
         read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
         out: &mut Vec<Emit>,
     ) {
+        #[cfg(any(test, feature = "test-support"))]
+        counting::delivered(delivery.bytes.len());
         if self.gone {
             return;
+        }
+        // What the object holds is heard before anything that could change
+        // what it rests on. A delivery that only routes member bytes waits
+        // behind it, for the pool: route hears a member's held parts first
+        // where one of the member's own cannot wait.
+        if self.holds_any() && !self.only_routes(&delivery) {
+            self.run_held(Some(&mut *read), out);
         }
         self.install(out);
         self.decide_last(&delivery, read, out);
@@ -454,11 +546,17 @@ impl Object for Zip {
         }
         // Absorbing can make the object want more of this very delivery: the
         // tail names the directory, the directory names the local headers.
+        let kept = self.under_pending(range, delivery.bytes);
         loop {
             let generation = self.kept.generation();
+            // What the delivery changes of what is kept can move the map or
+            // its keys: what is held is heard first.
+            if self.holds_any() && self.kept.absorbs(range, &kept, delivery.provenance) {
+                self.run_held(Some(&mut *read), out);
+            }
             if self
                 .kept
-                .absorb(range, delivery.bytes, delivery.provenance)
+                .absorb(range, &kept, delivery.provenance)
                 .is_some()
             {
                 self.stale = true;
@@ -478,6 +576,7 @@ impl Object for Zip {
 
     fn volume_closed(&mut self, _volume: VolumeIndex, out: &mut Vec<Emit>) {
         if !self.gone {
+            self.run_held_first(out);
             self.install(out);
         }
         self.stale = true;
@@ -488,12 +587,22 @@ impl Object for Zip {
         if self.gone {
             return;
         }
+        self.run_held_first(out);
         self.install(out);
         let Some(range) = self.global(volume, range) else {
             return;
         };
         if self.is_directory(range) {
-            return self.start_walking(out);
+            match (&self.map, self.walking) {
+                (None, _) => return self.start_walking(out),
+                // A walk that left for the directory has no way on without
+                // it.
+                (Some(_), false) => {
+                    return self.give_up(Emit::NeedsEngine(Why::UnboundedEntry), out);
+                }
+                // A walk still on reads the rest from the front.
+                (Some(_), true) => {}
+            }
         }
         // A header that will never arrive leaves its entry's bytes nowhere.
         if self.lost_header(range) {
@@ -507,6 +616,7 @@ impl Object for Zip {
         if self.gone {
             return;
         }
+        self.run_held_first(out);
         self.install(out);
         if let Some(why) = crate::quiet::damaged(standing)
             .or_else(|| {
@@ -559,6 +669,7 @@ impl Object for Zip {
         if self.gone {
             return;
         }
+        self.run_held_first(out);
         self.install(out);
         if matches!(pull, Pull::Moved(_) | Pull::Unlocated) {
             return;
@@ -657,7 +768,15 @@ impl Object for Zip {
     }
 
     fn sized(&mut self, volume: VolumeIndex, length: u64, out: &mut Vec<Emit>) {
-        if !self.gone {
+        // A length heard again, with no map waiting to take over, changes
+        // nothing what is held rests on: it waits for the pool.
+        let news = self.next.is_some()
+            || match self.disk(volume) {
+                Some(disk) => !self.geometry.knows(disk, length),
+                None => self.last_length != Some(length),
+            };
+        if !self.gone && news {
+            self.run_held_first(out);
             self.install(out);
         }
         let Some(disk) = self.disk(volume) else {
@@ -671,6 +790,7 @@ impl Object for Zip {
     }
 
     fn offer_password(&mut self, secret: &str, out: &mut Vec<Emit>) {
+        self.run_held_first(out);
         self.asked = false;
         if !self
             .candidates
@@ -718,6 +838,17 @@ impl Object for Zip {
 
     fn facts(&self) -> Facts {
         Facts::of(Kind::Zip, self)
+    }
+
+    // A member's keys running over held ciphertext: the slowest thing the
+    // object does, done away from the loop.
+    fn work_due(&self) -> bool {
+        !self.gone && (self.held_ready() || self.kept_due())
+    }
+
+    fn work(&mut self, out: &mut Vec<Emit>) {
+        self.run_held(None, out);
+        self.emit_kept_encrypted(&mut |_, _| false, out);
     }
 }
 

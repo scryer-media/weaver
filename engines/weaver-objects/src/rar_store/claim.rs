@@ -95,14 +95,21 @@ pub(crate) fn front_facts(
     password: Option<&str>,
     kdf: Arc<KdfCache>,
 ) -> Option<RarVolumeFacts> {
-    let facts = RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
+    headers(first_bytes, password, kdf).filter(|facts| facts.is_volume)
+}
+
+// What a front's headers state, of a volume or of an archive that is none.
+pub(crate) fn headers(
+    first_bytes: &[u8],
+    password: Option<&str>,
+    kdf: Arc<KdfCache>,
+) -> Option<RarVolumeFacts> {
+    let walk = RarArchive::parse_volume_facts_walk_with_shared_kdf_cache(
         Cursor::new(first_bytes.to_vec()),
         password,
         kdf,
-    )
-    .ok()?
-    .facts;
-    facts.is_volume.then_some(facts)
+    );
+    Some(walk.ok()?.facts)
 }
 
 // The most a volume given back may carry of what was read of it: the ceiling
@@ -322,7 +329,7 @@ impl RarStore {
         let mut numbered = self
             .volumes
             .values()
-            .filter_map(|volume| volume.numbered.as_ref())
+            .flat_map(Volume::numberings)
             .peekable();
         let bound = numbered.peek().is_some();
         let ours = wanted

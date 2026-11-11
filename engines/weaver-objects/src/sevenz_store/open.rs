@@ -78,6 +78,10 @@ impl Proof {
     }
 }
 
+// A folder's key as the pool derived it: `None` when the cache knew the
+// candidate wrong, `Err` when sevenz-turbo refused the derivation.
+pub(super) type FolderKey = Result<Option<Zeroizing<[u8; 32]>>, ()>;
+
 enum Verdict {
     Waiting,
     Right,
@@ -135,11 +139,21 @@ impl SevenZipStore {
             return;
         }
         if let Some(index) = self.opened {
+            if !self.keys_known(index) {
+                self.derive_due.insert(index);
+                return;
+            }
             return self.open_all(index, out);
         }
         for index in 0..self.candidates.len() {
             if self.candidates[index].folder_wrong {
                 continue;
+            }
+            // A key the cache has no answer for is derived on the pool: the
+            // folders wait for it, and no later candidate is tried.
+            if !self.keys_known(index) {
+                self.derive_due.insert(index);
+                return;
             }
             match self.prove(index) {
                 Verdict::Waiting => return,
@@ -198,15 +212,68 @@ impl SevenZipStore {
         }
     }
 
+    // The locked folders under AES, with their properties.
+    fn locked_aes(&self) -> Vec<(usize, AesProperties)> {
+        let Some(map) = &self.map else {
+            return Vec::new();
+        };
+        map.folders
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| self.folders[*at].is_locked())
+            .filter_map(|(at, folder)| Some((at, folder.aes?)))
+            .collect()
+    }
+
+    // Whether every locked folder's key under a candidate is known without
+    // a derivation: the cache holds its answer, or the pool derived it.
+    fn keys_known(&self, index: usize) -> bool {
+        self.locked_aes().iter().all(|(at, properties)| {
+            let params = [properties.cycles_power()];
+            self.derived.contains_key(&(index, *at))
+                || self
+                    .keys
+                    .get(&self.folder_tuple(index, properties, &params))
+                    .is_some()
+        })
+    }
+
+    // Derive every folder key a candidate is waiting on, away from the
+    // loop: the folders open from them once the store is back.
+    pub(super) fn derive_due(&mut self) {
+        for index in std::mem::take(&mut self.derive_due) {
+            if index >= self.candidates.len() {
+                continue;
+            }
+            for (at, properties) in self.locked_aes() {
+                if self.derived.contains_key(&(index, at)) {
+                    continue;
+                }
+                let key = self.folder_key(index, at, &properties).map_err(|_| ());
+                self.derived.insert((index, at), key);
+            }
+        }
+        self.stale = true;
+    }
+
     // The key for a folder, through the process's cache and sevenz-turbo's
     // own derivation. `Ok(None)` when the cache knows the candidate is wrong.
+    // One the cache no longer holds is what the pool derived for it.
     fn folder_key(
         &self,
         index: usize,
+        at: usize,
         properties: &AesProperties,
     ) -> Result<Option<Zeroizing<[u8; 32]>>, sevenz_turbo::Error> {
         let params = [properties.cycles_power()];
         let tuple = self.folder_tuple(index, properties, &params);
+        if self.keys.get(&tuple).is_none()
+            && let Some(derived) = self.derived.get(&(index, at))
+        {
+            return derived.clone().map_err(|()| {
+                sevenz_turbo::Error::Other("a folder key it would not derive".into())
+            });
+        }
         let password = &self.candidates[index].password;
         let derived = self.keys.derive(&tuple, || {
             properties
@@ -251,7 +318,7 @@ impl SevenZipStore {
         if !self.kept.verified(proof.range) {
             return Verdict::Waiting;
         }
-        let key = match self.folder_key(index, &properties) {
+        let key = match self.folder_key(index, proof.folder, &properties) {
             Ok(Some(key)) => key,
             Ok(None) => return Verdict::Wrong,
             Err(_) => return Verdict::Failed,
@@ -289,7 +356,7 @@ impl SevenZipStore {
                 continue;
             };
             let lock = std::mem::replace(&mut self.folders[at], Lock::Locked);
-            let opened = match (self.folder_key(index, &properties), lock) {
+            let opened = match (self.folder_key(index, at, &properties), lock) {
                 // Sealed at a restart: the chain it kept, keyed again.
                 (Ok(Some(key)), Lock::Sealed(chain, padding)) => {
                     Cbc::unseal(&key[..], *chain).ok().map(|cbc| (cbc, padding))

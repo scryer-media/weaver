@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use weaver_graph::{VolumeIndex, Volumes};
 
+#[derive(Clone)]
 pub(crate) struct Joined {
     volumes: Arc<dyn Volumes>,
     failed: Arc<AtomicBool>,
@@ -34,17 +35,42 @@ impl Joined {
         Arc::clone(&self.failed)
     }
 
-    fn read_volume(&self, volume: VolumeIndex, offset: u64, into: &mut [u8]) -> io::Result<usize> {
+    // The owner's own failure: the run read past where a volume really
+    // ends, or built on a length the volume did not close at, and is started
+    // over on the right one.
+    pub(crate) fn fail(&self) {
+        self.failed.store(true, Ordering::Release);
+    }
+
+    // Bytes at `offset` of one volume, as the owner reads them.
+    pub(crate) fn read_volume(
+        &self,
+        volume: VolumeIndex,
+        offset: u64,
+        into: &mut [u8],
+    ) -> io::Result<usize> {
         self.volumes
             .read_at(volume, offset, into)
-            .inspect_err(|_| self.failed.store(true, Ordering::Release))
+            .inspect_err(|_| self.fail())
+    }
+
+    // The volumes bound now, past any gap between them.
+    pub(crate) fn bound(&self) -> io::Result<Vec<VolumeIndex>> {
+        self.volumes.bound().inspect_err(|_| self.fail())
+    }
+
+    // The volume's length as declared, or once it closes where nothing
+    // declared one.
+    pub(crate) fn sized_len(&self, volume: VolumeIndex) -> io::Result<u64> {
+        match self.volumes.sized(volume).inspect_err(|_| self.fail())? {
+            Some(length) => Ok(length),
+            None => self.closed_len(volume),
+        }
     }
 
     // The volume after `after` in the set's order, as the owner says.
     pub(crate) fn next(&self, after: Option<VolumeIndex>) -> io::Result<Option<VolumeIndex>> {
-        self.volumes
-            .next(after)
-            .inspect_err(|_| self.failed.store(true, Ordering::Release))
+        self.volumes.next(after).inspect_err(|_| self.fail())
     }
 
     // Every volume's length in the set's order, waiting for each to close.

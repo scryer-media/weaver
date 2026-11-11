@@ -348,14 +348,28 @@ impl NamespaceWriter {
                 })
                 .collect();
             for marked in marked {
-                self.set_volume_lost(tree, builder, marked, &mut effects);
-                self.refuse_range(tree, node, marked);
+                self.marked_lost(tree, builder, node, marked, &mut effects);
             }
         }
         if effects.is_empty() {
             return Ok(());
         }
         self.apply_all(tree, builder, segments, effects, out)
+    }
+
+    // A member range a loss told at `origin` marked: a recovery set bound
+    // to it hears its volume lost, and every set of its namespace hears it
+    // refused as far as `origin` will never bring it.
+    pub(crate) fn marked_lost(
+        &self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        origin: NodeId,
+        marked: (NodeId, MemberId, ByteRange),
+        effects: &mut Vec<Effect>,
+    ) {
+        self.set_volume_lost(tree, builder, marked, effects);
+        self.refuse_range(tree, origin, marked);
     }
 
     // The parent's other answer to a seek: the range of the member will
@@ -842,7 +856,7 @@ impl NamespaceWriter {
     // who owns it again; what the refusing object kept goes with it, made
     // over by whatever reads the volumes again, and a member no object
     // takes is a leaf for no reason.
-    fn reopen(
+    pub(super) fn reopen(
         &mut self,
         tree: &mut Tree,
         builder: &mut dyn Builder,

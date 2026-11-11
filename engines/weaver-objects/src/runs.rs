@@ -29,6 +29,9 @@ use weaver_graph::{ByteRange, Provenance, SliceVerdict};
 
 use crate::grid::crc32_combine;
 
+// A run as facts keep it: start, length, CRC32, verified.
+pub(crate) type KeptRun = (u64, u64, u32, bool);
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CrcRuns {
     runs: Vec<Run>,
@@ -121,6 +124,39 @@ impl CrcRuns {
     // The bytes the runs hold between them.
     pub(crate) fn held(&self) -> u64 {
         self.held
+    }
+
+    // The runs as facts keep them: start, length, CRC32 and whether it is
+    // verified, with verified runs that abut joined into one. Only a whole
+    // is ever composed, from offset zero, and a rewrite that cuts a joined
+    // run hands back what it no longer covers to be fed again, as it does
+    // any run's.
+    pub(crate) fn kept(&self) -> Vec<KeptRun> {
+        let mut out: Vec<KeptRun> = Vec::new();
+        for run in &self.runs {
+            match out.last_mut() {
+                Some((start, len, crc, true)) if run.verified && *start + *len == run.start => {
+                    *crc = crc32_combine(*crc, run.crc, run.len);
+                    *len += run.len;
+                }
+                _ => out.push((run.start, run.len, run.crc, run.verified)),
+            }
+        }
+        out
+    }
+
+    // The runs as facts kept them.
+    pub(crate) fn restored(kept: &[KeptRun]) -> Self {
+        let mut runs = Self::default();
+        for &(start, len, crc, verified) in kept {
+            runs.insert(Run {
+                start,
+                len,
+                crc,
+                verified,
+            });
+        }
+        runs
     }
 
     // Replaces every run overlapping `range` with a single, verified run for

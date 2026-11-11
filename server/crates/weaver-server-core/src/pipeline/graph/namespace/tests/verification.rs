@@ -452,7 +452,7 @@ fn restoring_a_pending_check_cannot_assume_the_stated_checksum_passed() {
     );
     restored.restore_verifications(&job.writer.pending_verifications());
     restored
-        .restore_file(&job.tree, NodeId::ROOT, member, &state)
+        .restore_file(&job.tree, NodeId::ROOT, member, &state, &super::Unsourced)
         .unwrap();
     assert_eq!(
         restored.files[&NodeId::ROOT].leaves[&member]

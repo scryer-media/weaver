@@ -78,12 +78,17 @@ pub(in crate::pipeline::tests) async fn run_restarting(
 
 // How the pipeline goes down: as a crash drops it, shut down, or as a crash
 // that also loses the file written for the member of this output name, so
-// the restore cannot read back any article holding its bytes.
+// the restore finds no article holding its bytes on disk, or that cuts
+// that file to the length given, as a disk that lost its tail leaves it.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(in crate::pipeline::tests) enum Down<'a> {
     Crash,
     Shutdown,
     Losing(&'a str),
+    Cutting(&'a str, u64),
+    // As a crash, once the object over the first root member that has one
+    // refused it for its holds, as an older build's did.
+    RefusingForHolds,
 }
 
 // As `run_restarting`, going down as `down` says and only after the articles
@@ -145,6 +150,14 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
             // A live run is no reason to wait: the checkpoint describes what
             // is on disk, never how far a run has read.
             if first && at(requests.len()) {
+                if down == Down::RefusingForHolds {
+                    pipeline
+                        .graph_jobs
+                        .get_mut(&JOB)
+                        .expect("the graph job")
+                        .refuse_for_holds()
+                        .expect("refused for its holds");
+                }
                 if down == Down::Shutdown {
                     shut_down(&mut pipeline).await;
                 }
@@ -153,6 +166,13 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
                     if let Down::Losing(name) = down {
                         std::fs::remove_file(working_dir.join(name))
                             .expect("the member's file is on disk to lose");
+                    }
+                    if let Down::Cutting(name, length) = down {
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(working_dir.join(name))
+                            .and_then(|file| file.set_len(length))
+                            .expect("the member's file is on disk to cut");
                     }
                     inspect(rows);
                 };
@@ -163,8 +183,24 @@ pub(in crate::pipeline::tests) async fn run_restarting_at(
                 };
                 let before = figures(&pipeline);
                 pipeline = restart(&temp_dir, pipeline, scenario, &mut owed, &mut going_down).await;
+                // Its recovery reads what arrived of it again before the job
+                // fetches: the figures stand once that is heard.
+                crate::pipeline::tests::hear_rewalks(&mut pipeline, JOB).await;
                 if let (Some(before), Some(after)) = (before, figures(&pipeline)) {
                     graph.restored_remaining.push((before, after));
+                }
+                let running = pipeline
+                    .graph_jobs
+                    .get(&JOB)
+                    .is_some_and(|job| job.awaits_mail());
+                let queued = pipeline.jobs.get(&JOB).is_some_and(|state| {
+                    state
+                        .articles
+                        .active()
+                        .is_some_and(|active| !active.download_queue.is_empty())
+                });
+                if running && queued {
+                    graph.fetching_while_running += 1;
                 }
                 in_memory.extend(owed.iter().copied());
                 restarts += 1;
@@ -397,11 +433,13 @@ pub(in crate::pipeline::tests) fn assert_restarted(restarted: &Restarted, whole:
     );
 }
 
-pub(in crate::pipeline::tests) async fn restart_row(scenario: Scenario) {
+// The run with no restart is given back, for a row to ask more of it.
+pub(in crate::pipeline::tests) async fn restart_row(scenario: Scenario) -> Outcome {
     let whole = run(&scenario).await;
     assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
     let restarted = run_restarting(&scenario, &mut |_| {}).await;
     assert_restarted(&restarted, &whole);
+    whole
 }
 
 fn with_par2(mut posts: Vec<Post>, blocks: u32) -> Vec<Post> {
@@ -462,6 +500,48 @@ async fn a_uuencoded_file_under_par2_with_a_lost_article_restarted_after_every_a
         8,
     );
     restart_row(Scenario::new(posts).uuencoded().lost(0, 2)).await;
+}
+
+// A plain file cut shorter than its checkpoint says while the pipeline is
+// down: the restore finds that from the file's length alone, the articles
+// past the cut and no other come again, and every file is delivered whole.
+#[tokio::test]
+async fn a_plain_file_cut_short_at_a_restart_fetches_again_only_what_it_lost() {
+    let posts = vec![
+        Post::plain("ember.bin", payload(9 * ARTICLE + 21, 71)),
+        Post::plain("quill.bin", payload(7 * ARTICLE + 5, 72)),
+    ];
+    let order: Vec<(u32, u32)> = (0..10).map(|ordinal| (0, ordinal)).collect();
+    let scenario = Scenario::new(posts).first(&order);
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let cut = 4 * ARTICLE as u64 + 10;
+    let down = order.len();
+    let restarted = run_restarting_at(
+        &scenario,
+        &mut |_| {},
+        Down::Cutting("ember.bin", cut),
+        &|nth| nth == down,
+    )
+    .await;
+    assert_eq!(restarted.restarts, 1);
+    assert_eq!(restarted.status, whole.status, "status");
+    assert_eq!(
+        restarted.files.keys().collect::<Vec<_>>(),
+        whole.files.keys().collect::<Vec<_>>()
+    );
+    for (name, bytes) in &whole.files {
+        assert!(restarted.files[name] == *bytes, "{name}: delivered bytes");
+    }
+    let lost: BTreeSet<(u32, u32)> = (4..10)
+        .map(|ordinal| (0, ordinal))
+        .filter(|article| !restarted.in_memory.contains(article))
+        .collect();
+    assert!(lost.contains(&(0, 4)), "the cut article was on disk");
+    assert_eq!(
+        restarted.from_disk, lost,
+        "the articles past the cut, and no other, come again"
+    );
 }
 
 // Every event `pipeline` sent since `sent` subscribed, kept in order.
@@ -764,6 +844,53 @@ async fn a_members_checksum_survives_a_restart() {
     assert_restarted(&restarted, &whole);
 }
 
+// A stored member is open at every checkpoint but the last. The store
+// checksummed its bytes as they came and keeps those runs, so the restored
+// member's own check folds them and reads nothing of its file at the close.
+#[tokio::test]
+async fn a_stored_member_open_across_a_restart_closes_with_no_check_read() {
+    use crate::pipeline::graph::namespace::checked;
+    let body = payload(11 * ARTICLE + 9, 73);
+    let scenario = Scenario::new(volumes(single_member_store_set("beacon.bin", &body, 3)));
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let unbroken = checked::so_far();
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert_restarted(&restarted, &whole);
+    assert_eq!(
+        (unbroken, checked::so_far() - unbroken),
+        (0, 0),
+        "bytes a member check read back: unbroken, restarted"
+    );
+}
+
+// One byte of the member posted wrong under articles that decode whole,
+// in a set of one volume: no part checksum of its own catches it, only the
+// member's. The runs the store kept checksum the bytes as they came, so a
+// member restored open still fails its own check, as it does with no
+// restart.
+#[tokio::test]
+async fn a_member_byte_posted_wrong_still_fails_its_check_across_a_restart() {
+    use crate::pipeline::graph::namespace::checked;
+    let body = payload(11 * ARTICLE + 9, 79);
+    let mut posts = volumes(single_member_store_set("beacon.bin", &body, 1));
+    let only = &mut posts[0].bytes;
+    let at = only.len() / 2;
+    only[at] ^= 0x5a;
+    let scenario = Scenario::new(posts);
+    let whole = run(&scenario).await;
+    assert!(!whole.completed(), "a wrong byte delivered whole");
+    let unbroken = checked::so_far();
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert_restarted(&restarted, &whole);
+    // The restarted run reads nothing back: the folded runs failed it.
+    assert_eq!(
+        checked::so_far() - unbroken,
+        0,
+        "bytes a member check read back after a restart"
+    );
+}
+
 #[tokio::test]
 async fn a_stored_rar_under_par2_restarted_after_every_article_is_repaired_with_no_refetch() {
     let body = payload(8 * ARTICLE + 17, 74);
@@ -1027,6 +1154,46 @@ async fn a_compressed_rar5_volume_restarted_after_every_article_replays_the_engi
     restart_row(Scenario::new(vec![Post::plain("mixed.rar", bytes)]).framed(64)).await;
 }
 
+// The same archive under PAR2 with its first article lost: whenever the
+// restart lands, the restored job repairs the front it never had and the
+// engine delivers every member.
+#[tokio::test]
+async fn a_compressed_rar5_volume_under_par2_with_its_front_lost_restarted_after_every_article_is_repaired()
+ {
+    let bytes = crate::pipeline::tests::rar5_fixture_bytes("rar5_multifile_lz.rar");
+    let posts = with_par2(vec![Post::plain("mixed.rar", bytes)], 8);
+    restart_row(Scenario::new(posts).framed(64).lost(0, 0)).await;
+}
+
+// A file posted under a name its PAR2 set does not give, damaged: the set
+// knows it by its contents. No checkpoint keeps that, so a restored set
+// binds over the restored members before it rules, and never takes the file
+// it describes for absent while the member that is it sits there complete.
+// Whenever the restart lands, the file is repaired and delivered once,
+// under the name the set describes.
+#[tokio::test]
+async fn a_damaged_file_under_another_name_restarted_after_every_article_is_repaired_under_its_own()
+{
+    let body = payload(5 * ARTICLE, 121);
+    let mut posts = with_par2(vec![Post::plain("lantern.bin", body.clone())], 2);
+    posts[0] = Post::plain("a1b2c3d4e5", body.clone());
+    let whole = restart_row(Scenario::new(posts).damaged(0, 1)).await;
+    assert_eq!(
+        whole.files.values().collect::<Vec<_>>(),
+        vec![&body],
+        "{:?}",
+        whole.files.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        whole
+            .files
+            .keys()
+            .all(|path| path.ends_with("/lantern.bin")),
+        "{:?}",
+        whole.files.keys().collect::<Vec<_>>()
+    );
+}
+
 // The five encrypted RARLAB volumes, offered their password again at every
 // restore, in 64 KiB articles so a restart lands inside every volume.
 #[tokio::test]
@@ -1253,6 +1420,23 @@ async fn a_gzip_stream_restarted_after_every_article_replays_from_its_start() {
     stream_row("ember.bin.gz", gzip).await;
 }
 
+// A stream restored mid-download decodes again from its start on its run's
+// thread, not in the restore: the restored job hands out the articles still
+// to come while that run is out.
+#[tokio::test]
+async fn a_gzip_stream_restored_mid_download_fetches_while_it_decodes_again() {
+    let body = gzip(&payload(30 * ARTICLE + 7, 80));
+    let scenario = Scenario::new(vec![Post::plain("ember.bin.gz", body)]);
+    let whole = run(&scenario).await;
+    assert!(whole.completed(), "{:?} {:?}", whole.status, whole.failure);
+    let restarted = run_restarting(&scenario, &mut |_| {}).await;
+    assert!(
+        restarted.graph.fetching_while_running > 0,
+        "a restored job fetches while its run decodes again"
+    );
+    assert_restarted(&restarted, &whole);
+}
+
 #[tokio::test]
 async fn a_bzip2_stream_restarted_after_every_article_replays_from_its_start() {
     stream_row("ember.bin.bz2", bzip2).await;
@@ -1454,6 +1638,38 @@ async fn a_stored_zip_of_one_member_restarted_after_every_article_delivers_it() 
         one_member_zip(),
     )]))
     .await;
+}
+
+// A ZipCrypto member's ciphertext is deciphered on the pool while its zip is
+// lent out; a restart while it is out, or before, delivers it all the same.
+fn zipcrypto() -> ::zip::write::SimpleFileOptions {
+    use ::zip::unstable::write::FileOptionsExt;
+    zip::stored()
+        .with_deprecated_encryption(SECRET.as_bytes())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_zipcrypto_zip_of_one_member_restarted_after_every_article_delivers_it() {
+    let mut writer = ::zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    writer.start_file("ember.bin", zipcrypto()).unwrap();
+    std::io::Write::write_all(&mut writer, &payload(9 * ARTICLE + 5, 88)).unwrap();
+    let bytes = writer.finish().unwrap().into_inner();
+    restart_row(Scenario::new(vec![Post::plain("lantern.zip", bytes)]).password(SECRET)).await;
+}
+
+#[tokio::test]
+async fn a_zipcrypto_zip_under_par2_restarted_after_every_article_is_repaired_with_no_refetch() {
+    let posts = with_par2(
+        vec![Post::plain("lantern.zip", zip::archive(zipcrypto()))],
+        2,
+    );
+    restart_row(Scenario::new(posts).damaged(0, 2).password(SECRET)).await;
+}
+
+#[tokio::test]
+async fn a_zipcrypto_zip_spanned_restarted_after_every_article_delivers_its_members() {
+    restart_row(Scenario::new(zip::spanned(&zip::archive(zipcrypto()), 3)).password(SECRET)).await;
 }
 
 // The engine's inflate run replays the member's stream from its start over
@@ -1738,6 +1954,51 @@ async fn starts_afresh(change: &'static str) {
     job.starts_afresh().await;
 }
 
+// A job stopped before its first checkpoint committed, as one can while the
+// change waits for its bytes or its age: its run wrote files no row names,
+// among them one a step made that the fresh job never makes again, as a
+// split's join is. Restored with no checkpoint, none of it is the job's: it
+// goes before the job starts afresh, and the job delivers only its own file.
+#[tokio::test]
+async fn a_job_stopped_before_its_first_checkpoint_starts_afresh_with_nothing_its_run_left() {
+    let job = reopened().await;
+    let datastore = job.pipeline.db.datastore();
+    crate::persistence::sql_runtime::SqlRuntime::run_in_transaction(
+        &datastore,
+        "test_drop_checkpoint",
+        |tx| {
+            Box::pin(async move {
+                for table in crate::jobs::graph_checkpoint::TABLES {
+                    tx.execute(
+                        &format!("DELETE FROM {table} WHERE job_id = {{}}"),
+                        &[crate::persistence::sql_runtime::SqlArg::I64(JOB.0 as i64)],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        job.pipeline
+            .db
+            .load_graph_checkpoint(JOB)
+            .unwrap()
+            .is_none()
+    );
+    job.starts_afresh_with_nothing_its_run_left().await;
+}
+
+// The same for a checkpoint this build does not restore.
+#[tokio::test]
+async fn a_checkpoint_this_build_does_not_restore_starts_afresh_with_nothing_its_run_left() {
+    let job = reopened().await;
+    change_checkpoint(&job.pipeline, UNKNOWN_REASON).await;
+    job.starts_afresh_with_nothing_its_run_left().await;
+}
+
 // A job served four of its twelve articles and stopped, and its pipeline
 // opened again: what a restart test changes before it restores the job.
 struct Reopened {
@@ -1784,6 +2045,38 @@ impl Reopened {
     // again, and the job finishes.
     async fn starts_afresh(mut self) {
         self.restore().await;
+        self.restored_afresh().await;
+    }
+
+    // Files the stopped run left that no row names: one a step made, one
+    // in a folder of its own and a chunk. The directory's marker and the
+    // run's cache are the directory's and stay.
+    async fn starts_afresh_with_nothing_its_run_left(mut self) {
+        let made = self.working_dir.join("ember");
+        let folder = self.working_dir.join("inner");
+        let chunk = self
+            .working_dir
+            .join(weaver_graph::names::INTERNAL_DIR)
+            .join("graph-waiting-0-0");
+        let cached = self
+            .working_dir
+            .join(weaver_graph::names::CACHE_DIR)
+            .join("kept");
+        let marker = self
+            .working_dir
+            .join(crate::jobs::working_dir::WORKING_DIR_MARKER);
+        assert!(marker.is_file(), "the job's directory has its marker");
+        for path in [&made, &folder.join("left.bin"), &chunk, &cached] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"left by the stopped run").unwrap();
+        }
+        self.restore().await;
+        assert!(!made.exists() && !folder.exists() && !chunk.exists());
+        assert!(cached.is_file() && marker.is_file());
+        self.restored_afresh().await;
+    }
+
+    async fn restored_afresh(self) {
         assert!(!self.pipeline.blocked_restores.contains_key(&JOB));
         let info = self
             .pipeline

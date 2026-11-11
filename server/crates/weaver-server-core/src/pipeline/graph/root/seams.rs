@@ -59,12 +59,21 @@ impl Pipeline {
             })
             .collect();
         let caps = self.graph_caps(&files);
+        let data_dir = self.window_data_dir();
         let Some(state) = self.jobs.get_mut(&job_id) else {
             return;
         };
         let storage = Storage {
             working_dir: state.working_dir.clone(),
+            output: state.staging_dir.clone().map(|dir| {
+                (
+                    dir,
+                    self.storage_capacity
+                        .reader(crate::operations::StorageRoot::Complete),
+                )
+            }),
             accountant: Arc::clone(&self.graph_holds),
+            decode: Arc::clone(&self.graph_decode),
             free_disk: self
                 .storage_capacity
                 .reader(crate::operations::StorageRoot::Intermediate),
@@ -73,8 +82,13 @@ impl Pipeline {
             passwords,
             caps,
             nesting: limits::NESTING,
-            hardware: self.graph_hardware.clone(),
+            // A job reprocessed with no memory limit keeps it lifted.
+            hardware: self.graph_hardware.clone().lifted(
+                crate::history::attributes::no_memory_limit(&state.spec.metadata),
+            ),
             metrics: Some(Arc::clone(&self.metrics)),
+            data_dir: Some(data_dir),
+            window_ledger: self.window_ledgers.intermediate.clone(),
         };
         let mut graph = GraphJob::admit(job_id.0, &files, storage);
         let mut queued = std::collections::HashSet::new();
@@ -136,12 +150,15 @@ impl Pipeline {
     }
 
     // Start the job's runs and lend its repairs under the slots it may hold
-    // now: none while it holds no NZB slot or is paused.
+    // now: none while it holds no NZB slot or is paused. What a restored
+    // recovery object reads again takes no slot and is read either way, so
+    // a job held or paused reports what it reported before it went down.
     fn start_graph_runs(&mut self, job_id: JobId) -> Result<(), GraphError> {
         let limit = self.graph_job_slot_limit(job_id);
         match self.graph_jobs.get_mut(&job_id) {
             Some(graph) if limit > 0 => graph.resume_runs(&mut self.graph_status.repairs, limit),
-            _ => Ok(()),
+            Some(graph) => graph.lend_rewalks(),
+            None => Ok(()),
         }
     }
 
@@ -209,10 +226,12 @@ impl Pipeline {
     // by its neighbours, is sent back to the root for another copy.
     pub(in crate::pipeline) fn graph_article_sent_back(&mut self, segment_id: SegmentId) {
         let job_id = segment_id.file_id.job_id;
+        let limit = self.graph_job_slot_limit(job_id);
         if let Some(graph) = self.graph_jobs.get_mut(&job_id)
             && let Err(error) = graph.send_back(
                 VolumeIndex(segment_id.file_id.file_index),
                 segment_id.segment_number,
+                limit,
             )
         {
             self.after_graph_result(job_id, Err(error));
@@ -338,7 +357,11 @@ impl Pipeline {
             if self.pending_graph_terminals.contains_key(&job_id)
                 || matches!(
                     &said.heard,
-                    Heard::Repaired(_) | Heard::Replayed(_) | Heard::Verified(_)
+                    Heard::Repaired(_)
+                        | Heard::Replayed(_)
+                        | Heard::Verified(_)
+                        | Heard::Worked(_)
+                        | Heard::Rewalked(_)
                 )
             {
                 if let Err(error) = graph.drain_failed_run(said) {
@@ -393,6 +416,7 @@ impl Pipeline {
                 self.download_dispatch_wake = true;
             }
             self.wake_repair_waiters();
+            self.wake_memory_waiters();
             return;
         }
         let limit = self.graph_job_slot_limit(job_id);
@@ -401,8 +425,12 @@ impl Pipeline {
         };
         let ended = matches!(
             said.heard,
-            Heard::Ended | Heard::Repaired(_) | Heard::Replayed(_) | Heard::Verified(_)
-        );
+            Heard::Ended
+                | Heard::Repaired(_)
+                | Heard::Replayed(_)
+                | Heard::Verified(_)
+                | Heard::Worked(_)
+        ) || matches!(&said.heard, Heard::Rewalked(rewalked) if rewalked.piece.is_none());
         let moving = graph.moves_waiting();
         let result = graph.run_said(said, &mut self.graph_status.repairs, limit);
         self.after_graph_result(job_id, result);
@@ -495,6 +523,28 @@ impl Pipeline {
         self.after_graph_step(job_id);
         // The step's bytes are written: the checkpoint can say so.
         self.step_graph_checkpoint(job_id);
+        self.wake_memory_waiters();
+    }
+
+    // Decode memory a step, a retired job or a new profile freed goes to the
+    // runs of every job waiting for it, each of which steps its runs again.
+    // A job that holds no slot now is woken when it is given one.
+    pub(in crate::pipeline) fn wake_memory_waiters(&mut self) {
+        let waiting: Vec<JobId> = self
+            .graph_jobs
+            .iter()
+            .filter(|(_, graph)| graph.memory_freed())
+            .map(|(job_id, _)| *job_id)
+            .collect();
+        for job_id in waiting {
+            if self
+                .graph_jobs
+                .get(&job_id)
+                .is_some_and(GraphJob::memory_freed)
+            {
+                self.resume_graph_work(job_id);
+            }
+        }
     }
 
     // Lend the job's due repairs under the repair slots every graph job
@@ -504,10 +554,13 @@ impl Pipeline {
         if limit == 0 {
             return;
         }
+        // What the lend did on the loop and could not write fails the job,
+        // as a step's error does.
         if let Some(graph) = self.graph_jobs.get_mut(&job_id)
             && let Err(error) = graph.lend(&mut self.graph_status.repairs, limit)
         {
-            warn!(job_id = job_id.0, error = %error, "graph repair lending failed");
+            self.after_graph_result(job_id, Err(error));
+            return;
         }
         self.wake_repair_waiters();
     }

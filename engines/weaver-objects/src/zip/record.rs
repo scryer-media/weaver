@@ -13,6 +13,7 @@ use weaver_graph::{
 };
 
 use super::Zip;
+use super::held::Hold;
 use crate::grid::{self, WHOLE};
 
 impl Zip {
@@ -36,12 +37,53 @@ impl Zip {
                 Some((entry.member?, part, span.start))
             })
             .collect();
+        let mut parked = Vec::new();
         for (member, part, start) in parts {
             let slice =
                 bytes.slice((part.start - range.start) as usize..(part.end - range.start) as usize);
-            self.decrypt_record(member, part.start - start, slice, provenance, read, out);
+            let offset = part.start - start;
+            if let Some((offset, slice)) =
+                self.route_part(member, offset, slice, provenance, read, out)
+            {
+                parked.push((member, offset, slice));
+            }
+        }
+        // A part parked while a later one ran what was held may park no
+        // more: the owner holds only what the object places as held, so it
+        // is routed again now, in order.
+        for (member, offset, slice) in parked {
+            if !self.parks(member, ByteRange::at(offset, slice.len() as u64)) {
+                self.route_part(member, offset, slice, provenance, read, out);
+            }
         }
         self.emit_kept_encrypted(read, out);
+    }
+
+    // One member's part of a delivery: held for the keys, parked with the
+    // owner past the cap, or heard now. What of it parked comes back, with
+    // where it starts.
+    fn route_part(
+        &mut self,
+        member: MemberId,
+        offset: u64,
+        slice: Evidenced,
+        provenance: Provenance,
+        read: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+        out: &mut Vec<Emit>,
+    ) -> Option<(u64, Evidenced)> {
+        match self.hold(member, offset, &slice, provenance) {
+            Hold::Held => return None,
+            Hold::Parked => return Some((offset, slice)),
+            Hold::Cut(taken) => return Some((offset + taken as u64, slice.slice(taken..))),
+            Hold::Declined => {}
+        }
+        // A part that cannot wait behind what the member holds is heard
+        // after it, as it came.
+        if self.holding(member) {
+            self.run_held(Some(&mut *read), out);
+        }
+        self.decrypt_record(member, offset, slice, provenance, read, out);
+        None
     }
 
     // What the object kept of a member's data, said once the data is placed.
@@ -76,10 +118,8 @@ impl Zip {
                 }
                 let len = (run.len() as u64).min(wanted.end - cursor);
                 let part = ByteRange::at(cursor, len);
-                let provenance = if self.kept.verified(part) {
-                    Provenance::Fresh
-                } else {
-                    Provenance::Damaged
+                let Some(provenance) = self.kept.provenance_at(cursor) else {
+                    break;
                 };
                 runs.push((
                     part,

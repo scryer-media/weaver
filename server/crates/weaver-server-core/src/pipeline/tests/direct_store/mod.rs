@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 pub(in crate::pipeline) mod scenarios;
 
 mod tests {
+    mod lent_store_loss;
     mod par2_schedules;
 }
 

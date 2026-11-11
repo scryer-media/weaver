@@ -47,9 +47,91 @@ pub(crate) fn sevenz(error: &sevenz_turbo::Error) -> Emit {
         Error::ChecksumVerificationFailed | Error::NextHeaderCrcMismatch | Error::Corrupted(_) => {
             DAMAGED
         }
+        // The folder's coders need more memory than a decode may hold.
+        Error::MemoryLimited {
+            limit_bytes,
+            required_bytes,
+        } => Emit::Refuse(Why::TooLarge {
+            needed: Some(*required_bytes),
+            allowed: Some(*limit_bytes),
+        }),
+        // Or a window over the most the run's lender lends, refused before
+        // the lender was asked.
+        Error::LimitExceeded {
+            what: sevenz_turbo::Limit::MemoryBytes | sevenz_turbo::Limit::LentWindowBytes,
+            limit,
+            requested,
+        } => Emit::Refuse(Why::TooLarge {
+            needed: Some(*requested),
+            allowed: Some(*limit),
+        }),
+        // A window the run's lender refused: a filesystem's refusal asks for
+        // the window in RAM, any other stands.
+        Error::WindowAllocatorFailed { bytes, error } => {
+            Emit::Refuse(crate::lent::refused(*bytes, error.kind(), None))
+        }
         Error::Io(error, _) | Error::FileOpen(error, _) => self::io(error),
         _ => TERMINAL,
     }
+}
+
+// A decode that needs more memory than it may hold, from an I/O error: an
+// LZMA decoder's limit, with the sizes it states, memory the allocator
+// would not give, which states none, or a window the run's lender would not
+// lend (`crate::lent::refused`).
+pub(crate) fn too_large(error: &io::Error) -> Option<Why> {
+    use lzma_turbo::xz::{XzError, XzErrorKind};
+    let limit = |error: &lzma_turbo::Error| match *error {
+        lzma_turbo::Error::MemoryLimit { needed, limit, .. } => Some(Why::TooLarge {
+            needed: Some(needed),
+            allowed: Some(limit),
+        }),
+        _ => None,
+    };
+    let inner = error.get_ref();
+    // A dictionary the run's lender refused, as lzma-turbo's readers hand
+    // the lender's own error back.
+    if let Some(error) =
+        inner.and_then(|inner| inner.downcast_ref::<lzma_turbo::WindowAllocError>())
+    {
+        return Some(crate::lent::refused(
+            error.needed(),
+            error.allocator_error().kind(),
+            None,
+        ));
+    }
+    if let Some(error) = inner.and_then(|inner| inner.downcast_ref::<XzError>()) {
+        match &error.kind {
+            XzErrorKind::MemoryLimit { needed, limit, .. } => {
+                return Some(Why::TooLarge {
+                    needed: Some(*needed),
+                    allowed: Some(*limit),
+                });
+            }
+            XzErrorKind::Lzma(error) => {
+                if let Some(why) = limit(error) {
+                    return Some(why);
+                }
+            }
+            // A dictionary the run's lender refused, read again from a
+            // reader that already failed on it: a filesystem's refusal asks
+            // for the window in RAM, any other stands.
+            XzErrorKind::WindowAlloc { needed, kind, .. } => {
+                return Some(crate::lent::refused(*needed, *kind, None));
+            }
+            _ => {}
+        }
+    }
+    if let Some(why) = inner
+        .and_then(|inner| inner.downcast_ref::<lzma_turbo::Error>())
+        .and_then(limit)
+    {
+        return Some(why);
+    }
+    (error.kind() == io::ErrorKind::OutOfMemory).then_some(Why::TooLarge {
+        needed: None,
+        allowed: None,
+    })
 }
 
 // An entry the library refuses to open without a password is the zip form of
@@ -88,6 +170,9 @@ pub(crate) fn io(error: &io::Error) -> Emit {
         if let Some(error) = inner.downcast_ref::<io::Error>() {
             return self::io(error);
         }
+    }
+    if let Some(why) = too_large(error) {
+        return Emit::Refuse(why);
     }
     let text = error.to_string();
     let damaged = std_read_exact_eof(&text)
