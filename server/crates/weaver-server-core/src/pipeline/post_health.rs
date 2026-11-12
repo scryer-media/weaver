@@ -284,6 +284,10 @@ pub(crate) struct Probes {
     // The posts the feed gave up, in its words.
     pub(crate) dead: HashMap<JobId, String>,
     pub(crate) verdicts: HashMap<JobId, crate::jobs::feed_verdict::FeedVerdict>,
+    // The jobs whose dead files are being abandoned now, and whether one of
+    // the refusals booked since asked for the post to be weighed again.
+    // Empty between passes.
+    abandoning: HashMap<JobId, bool>,
     // Batches waiting for a seat, in the order they will be offered one.
     pub(crate) waiting: VecDeque<ProbeBatch>,
     // The rounds out on the lanes.
@@ -299,6 +303,7 @@ impl Default for Probes {
             states: HashMap::new(),
             dead: HashMap::new(),
             verdicts: HashMap::new(),
+            abandoning: HashMap::new(),
             waiting: VecDeque::new(),
             lane_rounds: HashMap::new(),
         }
@@ -1063,10 +1068,23 @@ impl Pipeline {
     // of it still queued is refused to the root. Called whenever an article
     // of the post is lost, so a file whose first loss lands after the post
     // was given up is abandoned then.
+    //
+    // Each refusal tells the feed the post lost an article, which calls
+    // here again. A pass under way does not weigh the post per refusal: it
+    // notes the call and weighs the post once more after its refusals, so
+    // abandoning a file costs its articles and one walk of the queues, not
+    // a walk per article.
     pub(in crate::pipeline) fn abandon_dead_files(&mut self, job_id: JobId) {
         let Some(reason) = self.post_probes.dead.get(&job_id).cloned() else {
             return;
         };
+        if let Some(again) = self.post_probes.abandoning.get_mut(&job_id) {
+            *again = true;
+            // The refusal may have taken the job's last queued article: the
+            // download pass ends on it, as it would on any other.
+            self.maybe_finish_download_pass(job_id);
+            return;
+        }
         let mut verdict = self
             .post_probes
             .verdicts
@@ -1080,28 +1098,126 @@ impl Pipeline {
             .flat_map(GivenUp::missing_files)
             .collect();
         lost.extend(verdict.abandoned_files.iter().copied());
-        let Some(active) = self
-            .jobs
-            .get_mut(&job_id)
-            .and_then(|state| state.articles.active_mut())
-        else {
+        let Some(mut abandoned) = self.take_lost_work(job_id, &lost) else {
             return;
         };
-        let lost_file = |work: &QueuedWork<'_>| lost.contains(&work.segment_id.file_id.file_index);
-        let mut abandoned = active.download_queue.extract_matching(lost_file);
-        abandoned.extend(active.recovery_queue.extract_matching(lost_file));
-        for work in abandoned {
-            self.book_terminal_segment(work.segment_id, SegmentTerminalState::Abandoned);
+        self.post_probes.abandoning.insert(job_id, false);
+        loop {
+            for work in abandoned {
+                self.book_terminal_segment(work.segment_id, SegmentTerminalState::Abandoned);
+            }
+            // A refusal asked for the post to be weighed again: what its
+            // booking lost or queued of a lost file is refused now.
+            if !self
+                .post_probes
+                .abandoning
+                .insert(job_id, false)
+                .unwrap_or(false)
+            {
+                break;
+            }
+            lost.extend(
+                self.given_up
+                    .get(&job_id)
+                    .into_iter()
+                    .flat_map(GivenUp::missing_files),
+            );
+            match self.take_lost_work(job_id, &lost) {
+                Some(more) if !more.is_empty() => abandoned = more,
+                _ => break,
+            }
         }
+        self.post_probes.abandoning.remove(&job_id);
         // Publish the new decision to the checkpoint only after all its
         // refusals have reached the root. Earlier checkpoints may commit
         // earlier decisions, never this decision without its refusals.
         verdict.abandoned_files = lost;
         self.post_probes.verdicts.insert(job_id, verdict);
+        #[cfg(test)]
+        count_abandon_work(|work| work.checkpoints += 1);
         self.checkpoint_graph_job(job_id);
         self.update_queue_metrics();
         self.maybe_finish_download_pass(job_id);
     }
+
+    // Every queued article of a file in `lost`, taken out of both queues in
+    // queue order. `None` when the job holds no articles.
+    fn take_lost_work(
+        &mut self,
+        job_id: JobId,
+        lost: &BTreeSet<u32>,
+    ) -> Option<Vec<crate::pipeline::download::queue::QueueItem>> {
+        let active = self
+            .jobs
+            .get_mut(&job_id)
+            .and_then(|state| state.articles.active_mut())?;
+        #[cfg(test)]
+        count_abandon_work(|work| {
+            work.passes += 1;
+            work.lost_files += lost.len();
+            work.scanned += active.download_queue.len() + active.recovery_queue.len();
+        });
+        let lost_file = |work: &QueuedWork<'_>| lost.contains(&work.segment_id.file_id.file_index);
+        let mut abandoned = active.download_queue.extract_matching(lost_file);
+        abandoned.extend(active.recovery_queue.extract_matching(lost_file));
+        Some(abandoned)
+    }
+}
+
+// What abandoning a dead post's files cost on this thread, counted as it is
+// done: the passes that weighed the post, the queued items their walks read,
+// the files their lost sets held, and the checkpoints they took.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::pipeline) struct AbandonWork {
+    pub(in crate::pipeline) passes: usize,
+    pub(in crate::pipeline) scanned: usize,
+    pub(in crate::pipeline) lost_files: usize,
+    pub(in crate::pipeline) checkpoints: usize,
+}
+
+#[cfg(test)]
+thread_local! {
+    static ABANDON_WORK: std::cell::Cell<AbandonWork> =
+        const { std::cell::Cell::new(AbandonWork { passes: 0, scanned: 0, lost_files: 0, checkpoints: 0 }) };
+}
+
+#[cfg(test)]
+pub(in crate::pipeline) fn abandon_work() -> AbandonWork {
+    ABANDON_WORK.with(std::cell::Cell::get)
+}
+
+// The terminal states booked on this thread, in the order they were booked,
+// once a test asks for them to be kept.
+#[cfg(test)]
+thread_local! {
+    static BOOKED: std::cell::RefCell<Option<Vec<(SegmentId, SegmentTerminalState)>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(in crate::pipeline) fn note_booked(segment: SegmentId, state: SegmentTerminalState) {
+    BOOKED.with(|booked| {
+        if let Some(booked) = booked.borrow_mut().as_mut() {
+            booked.push((segment, state));
+        }
+    });
+}
+
+// Keep the terminal states booked on this thread from now on, and give back
+// the ones kept until now.
+#[cfg(test)]
+pub(in crate::pipeline) fn keep_booked() -> Vec<(SegmentId, SegmentTerminalState)> {
+    BOOKED.with(|booked| booked.replace(Some(Vec::new())).unwrap_or_default())
+}
+
+#[cfg(test)]
+fn count_abandon_work(count: impl FnOnce(&mut AbandonWork)) {
+    ABANDON_WORK.with(|cell| {
+        let mut work = cell.get();
+        count(&mut work);
+        cell.set(work);
+    });
 }
 
 // Whether a post at `health` is dead against its `critical` line. At the
