@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use super::EgressQuotaFault;
+use super::{Consumer, EgressQuotaFault, TorrentScope};
 use crate::persistence::Refusal;
 
 // Why a networking edit was refused. Each variant is one sentence; `code`
@@ -27,7 +27,8 @@ pub enum NetworkRefusal {
     EgressGone,
     EgressNotFound,
     EgressSystemUndeletable,
-    EgressInUse,
+    // Each in-use refusal names the route that holds the item.
+    EgressInUse(Consumer),
 
     // Proxy pools.
     PoolNameLength,
@@ -36,9 +37,9 @@ pub enum NetworkRefusal {
     PoolProxyMissing,
     PoolMemberKindMismatch,
     PoolGone,
-    PoolInUse,
+    PoolInUse(Consumer),
     PoolEditRepeatsProxy,
-    PoolInUseEmpty,
+    PoolInUseEmpty(Consumer),
 
     // Routes.
     RouteLegCount,
@@ -105,8 +106,10 @@ pub enum NetworkRefusal {
     ProxyRevisionChanged,
     ProxyGone,
     ProxyNotFound,
-    ProxyInPool,
-    ProxyInUse,
+    ProxyInPool {
+        pool: u32,
+    },
+    ProxyInUse(Consumer),
     ProxyHostKeyNotSsh,
 
     // Speed tests.
@@ -217,7 +220,7 @@ impl NetworkRefusal {
             Self::BandwidthSplitRange => "BANDWIDTH_SPLIT_RANGE",
             Self::EgressGone | Self::EgressNotFound => "EGRESS_NOT_FOUND",
             Self::EgressSystemUndeletable => "EGRESS_SYSTEM_UNDELETABLE",
-            Self::EgressInUse => "EGRESS_IN_USE",
+            Self::EgressInUse(_) => "EGRESS_IN_USE",
 
             Self::PoolNameLength => "POOL_NAME_LENGTH",
             Self::PoolMemberCount => "POOL_MEMBER_COUNT",
@@ -225,9 +228,9 @@ impl NetworkRefusal {
             Self::PoolProxyMissing => "POOL_PROXY_MISSING",
             Self::PoolMemberKindMismatch => "POOL_MEMBER_KIND_MISMATCH",
             Self::PoolGone => "POOL_NOT_FOUND",
-            Self::PoolInUse => "POOL_IN_USE",
+            Self::PoolInUse(_) => "POOL_IN_USE",
             Self::PoolEditRepeatsProxy => "POOL_EDIT_REPEATS_PROXY",
-            Self::PoolInUseEmpty => "POOL_IN_USE_EMPTY",
+            Self::PoolInUseEmpty(_) => "POOL_IN_USE_EMPTY",
 
             Self::RouteLegCount => "ROUTE_LEG_COUNT",
             Self::RouteLegWeightRange => "ROUTE_LEG_WEIGHT_RANGE",
@@ -272,8 +275,8 @@ impl NetworkRefusal {
             Self::ProxyLimitReached => "PROXY_LIMIT_REACHED",
             Self::ProxyRevisionChanged => "PROXY_REVISION_CHANGED",
             Self::ProxyGone | Self::ProxyNotFound => "PROXY_NOT_FOUND",
-            Self::ProxyInPool => "PROXY_IN_POOL",
-            Self::ProxyInUse => "PROXY_IN_USE",
+            Self::ProxyInPool { .. } => "PROXY_IN_POOL",
+            Self::ProxyInUse(_) => "PROXY_IN_USE",
             Self::ProxyHostKeyNotSsh => "PROXY_HOST_KEY_NOT_SSH",
 
             Self::SpeedTestAlreadyRunning { .. } => "SPEED_TEST_ALREADY_RUNNING",
@@ -334,6 +337,11 @@ impl NetworkRefusal {
                 reason,
             } => serde_json::json!({ "serverId": server, "name": name, "reason": reason }),
             Self::TestPathCount { limit } => serde_json::json!({ "limit": limit }),
+            Self::EgressInUse(holder)
+            | Self::PoolInUse(holder)
+            | Self::PoolInUseEmpty(holder)
+            | Self::ProxyInUse(holder) => serde_json::json!({ "consumer": holder.key() }),
+            Self::ProxyInPool { pool } => serde_json::json!({ "poolId": pool }),
             _ => return serde_json::Map::new(),
         };
         match value {
@@ -368,7 +376,9 @@ impl std::fmt::Display for NetworkRefusal {
             Self::EgressGone => "egress no longer exists",
             Self::EgressNotFound => "egress not found",
             Self::EgressSystemUndeletable => "the System egress cannot be deleted",
-            Self::EgressInUse => "egress is referenced by a server or RSS feed",
+            Self::EgressInUse(holder) => {
+                return write!(f, "egress is used by {}", RouteHolder(*holder));
+            }
 
             Self::PoolNameLength => "pool name must contain 1–128 characters",
             Self::PoolMemberCount => "a pool takes at most sixteen members",
@@ -376,10 +386,16 @@ impl std::fmt::Display for NetworkRefusal {
             Self::PoolProxyMissing => "pool references a missing proxy",
             Self::PoolMemberKindMismatch => "all pool members must have the pool's proxy kind",
             Self::PoolGone => "proxy pool no longer exists",
-            Self::PoolInUse => "pool is referenced by a server or RSS feed",
+            Self::PoolInUse(holder) => {
+                return write!(f, "pool is used by {}", RouteHolder(*holder));
+            }
             Self::PoolEditRepeatsProxy => "pool edit would repeat a proxy in an existing ladder",
-            Self::PoolInUseEmpty => {
-                "a pool referenced by a server or RSS feed needs at least one member"
+            Self::PoolInUseEmpty(holder) => {
+                return write!(
+                    f,
+                    "pool is used by {} and needs at least one member",
+                    RouteHolder(*holder)
+                );
             }
 
             Self::RouteLegCount => "a route requires between one and eight legs",
@@ -482,8 +498,15 @@ impl std::fmt::Display for NetworkRefusal {
             Self::ProxyRevisionChanged => "proxy revision changed",
             Self::ProxyGone => "proxy no longer exists",
             Self::ProxyNotFound => "proxy not found",
-            Self::ProxyInPool => "proxy belongs to a pool; remove it from the pool first",
-            Self::ProxyInUse => "proxy is referenced by a server or RSS feed",
+            Self::ProxyInPool { pool } => {
+                return write!(
+                    f,
+                    "proxy belongs to pool {pool}; remove it from the pool first"
+                );
+            }
+            Self::ProxyInUse(holder) => {
+                return write!(f, "proxy is used by {}", RouteHolder(*holder));
+            }
             Self::ProxyHostKeyNotSsh => "only SSH profiles have host-key trust",
 
             Self::SpeedTestAlreadyRunning { run } => {
@@ -538,6 +561,26 @@ impl std::fmt::Display for NetworkRefusal {
 }
 
 impl std::error::Error for NetworkRefusal {}
+
+// The owner of a route, as a refusal names it.
+struct RouteHolder(Consumer);
+
+impl std::fmt::Display for RouteHolder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Consumer::Server(id) => write!(f, "server {id}"),
+            Consumer::Rss(id) => write!(f, "RSS feed {id}"),
+            Consumer::Outbound => f.write_str("the default outbound route"),
+            Consumer::Torrent(TorrentScope::Default) => f.write_str("the default torrent route"),
+            Consumer::Torrent(TorrentScope::Category(id)) => {
+                write!(f, "the torrent route of category {id}")
+            }
+            Consumer::Torrent(TorrentScope::TrackerRule(id)) => {
+                write!(f, "the torrent route of tracker rule {id}")
+            }
+        }
+    }
+}
 
 // Callers that report a plain string keep `?` working.
 impl From<NetworkRefusal> for String {

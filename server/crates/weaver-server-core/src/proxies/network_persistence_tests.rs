@@ -67,6 +67,10 @@ fn pool(db: &Database) -> ProxyPool {
 }
 
 fn insert_route(db: &Database, route: Route) {
+    insert_route_for(db, Consumer::Server(1), route);
+}
+
+fn insert_route_for(db: &Database, consumer: Consumer, route: Route) {
     let store = db.datastore();
     db.run_sql_blocking(async move {
         SqlRuntime::run_in_transaction(&store, "route_fixture", |tx| {
@@ -75,7 +79,7 @@ fn insert_route(db: &Database, route: Route) {
                 tx.execute(
                     "INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {})",
                     &[
-                        SqlArg::Text("server:1".into()),
+                        SqlArg::Text(consumer.key()),
                         SqlArg::Text(serde_json::to_string(&route).unwrap()),
                     ],
                 )
@@ -279,6 +283,82 @@ fn a_pool_saves_with_any_member_count_but_a_route_needs_a_member() {
     )
     .unwrap();
     assert!(db.update_proxy_pool(&pool).unwrap().member_ids.is_empty());
+}
+
+// The sentence a write was turned away with.
+fn refused_message<T: std::fmt::Debug>(result: Result<T, StateError>) -> String {
+    match result.unwrap_err() {
+        StateError::Refused(refusal) => refusal.message,
+        other => panic!("not a refusal: {other}"),
+    }
+}
+
+// A refused delete names the route that holds the item, whoever owns it.
+#[test]
+fn a_refused_delete_names_what_holds_the_item() {
+    let one_rung = |egress_id: u32, rung: Rung| Route {
+        legs: vec![RouteLeg {
+            egress_id,
+            weight: 100,
+            path: LegPath::Ladder {
+                rungs: vec![rung],
+                direct_fallback: false,
+            },
+        }],
+        failover: Failover::Redistribute,
+    };
+    for (holder, named) in [
+        (Consumer::Server(7), "server 7"),
+        (Consumer::Rss(8), "RSS feed 8"),
+        (Consumer::Outbound, "the default outbound route"),
+        (
+            Consumer::Torrent(TorrentScope::Default),
+            "the default torrent route",
+        ),
+        (
+            Consumer::Torrent(TorrentScope::Category(5)),
+            "the torrent route of category 5",
+        ),
+        (
+            Consumer::Torrent(TorrentScope::TrackerRule(6)),
+            "the torrent route of tracker rule 6",
+        ),
+    ] {
+        // A proxy the route names.
+        let db = Database::open_in_memory().unwrap();
+        db.save_proxy_profile(&profile(1)).unwrap();
+        let egress = db.create_egress_interface(&egress()).unwrap();
+        insert_route_for(&db, holder, one_rung(egress.id, Rung::Proxy { id: 1 }));
+        assert_eq!(
+            refused_message(db.delete_proxy_profile(1)),
+            format!("proxy is used by {named}")
+        );
+        assert_eq!(
+            refused_message(db.delete_egress_interface(egress.id)),
+            format!("egress is used by {named}")
+        );
+
+        // A pool the route names, and the proxy inside it.
+        let db = Database::open_in_memory().unwrap();
+        let mut pool = pool(&db);
+        insert_route_for(&db, holder, one_rung(0, Rung::Pool { id: pool.id }));
+        assert_eq!(
+            refused_message(db.delete_proxy_pool(pool.id)),
+            format!("pool is used by {named}")
+        );
+        assert_eq!(
+            refused_message(db.delete_proxy_profile(1)),
+            format!(
+                "proxy belongs to pool {}; remove it from the pool first",
+                pool.id
+            )
+        );
+        pool.member_ids.clear();
+        assert_eq!(
+            refused_message(db.update_proxy_pool(&pool)),
+            format!("pool is used by {named} and needs at least one member")
+        );
+    }
 }
 
 #[test]

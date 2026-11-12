@@ -277,7 +277,7 @@ async fn egress_and_pool_refusals_carry_their_codes() {
         .await;
     let (message, code, _) = refusal(&response);
     assert_eq!(code, "PROXY_IN_USE");
-    assert_eq!(message, "proxy is referenced by a server or RSS feed");
+    assert_eq!(message, format!("proxy is used by RSS feed {feed}"));
     // A pool saves empty, but no route can name it until it has a member.
     let response = h
         .execute(r#"mutation{createProxyPool(input:{name:"Empty",kind:SOCKS5,memberIds:[]}){id}}"#)
