@@ -329,6 +329,10 @@ async fn a_sender_inside_the_advertised_window_is_never_dropped_for_room() {
     assert!(run.error.is_none(), "{run:?}");
     assert_eq!(run.peer.delivered, 2 * 1024 * 1024, "{run:?}");
     assert_eq!(run.peer.dropped_full, 0, "{run:?}");
+    // Every resend that a later send's delivery outran goes again a round
+    // trip and a quarter on, without the timer; one timeout is left.
+    assert_eq!(run.totals.fast_resends, 265, "{run:?}");
+    assert_eq!(run.totals.timer_expiries, 1, "{run:?}");
 }
 
 // 8000 bytes leave in ten packets, 101 to 110: slow start cuts the first

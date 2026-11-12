@@ -176,6 +176,13 @@ impl Recovery {
         matches!(self.phase, RecoveryPhase::Recovering { .. })
     }
 
+    pub fn recovering(&self) -> Option<&Recovering> {
+        match &self.phase {
+            RecoveryPhase::Recovering(rec) => Some(rec),
+            _ => None,
+        }
+    }
+
     pub fn recovering_mut(&mut self) -> Option<&mut Recovering> {
         match &mut self.phase {
             RecoveryPhase::Recovering(rec) => Some(rec),

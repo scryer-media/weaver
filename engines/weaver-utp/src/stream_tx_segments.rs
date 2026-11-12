@@ -259,6 +259,9 @@ impl core::fmt::Debug for OnAckResult {
 pub struct Pipe {
     pub pipe: usize,
     pub recalc_timer: Option<Instant>,
+    // When a resend that a later send's delivery already outran has been
+    // out long enough to count lost, and the pipe must be counted again.
+    pub reorder_at: Option<Instant>,
 }
 
 impl std::fmt::Debug for Pipe {
@@ -581,6 +584,10 @@ impl Segments {
         let mut pipe = 0;
         let mut delivered_segs = 0;
         let mut recalc_timer = None;
+        let mut reorder_at: Option<Instant> = None;
+        // A resend outrun by a later send's delivery is lost once it has
+        // been out a round trip and a quarter (RFC 8985 section 6.2).
+        let reorder_wait = rtt + rtt / 4;
         // The latest last sends among the delivered segments after the one
         // at hand, latest first: more than `SACK_DUP_THRESH` of them sent
         // after a resend say the resend was lost too.
@@ -630,8 +637,17 @@ impl Segments {
             // A segment resent already is lost again only when more than
             // that many segments sent after its resend were SACKed: its own
             // evidence, not the evidence that resent it.
+            // A resend is lost too when anything sent after it arrived and
+            // it has been out a round trip and the reordering allowance
+            // since; until then, the pipe is counted again when it has.
             let evidence = if segment.retransmit_count() > 0 {
+                let outrun = latest[0].is_some_and(|ts| ts > last_sent);
+                let due = last_sent + reorder_wait;
+                if outrun && now < due {
+                    reorder_at = Some(reorder_at.map_or(due, |at| at.min(due)));
+                }
                 latest[SACK_DUP_THRESH as usize].is_some_and(|ts| ts > last_sent)
+                    || (outrun && now >= due)
             } else {
                 delivered_segs > SACK_DUP_THRESH as usize
             };
@@ -653,7 +669,11 @@ impl Segments {
         }
 
         trace!(?pipe, ?recalc_timer, ?high_rxt, high_ack=?self.snd_una, ?high_data, "calc_pipe");
-        Pipe { pipe, recalc_timer }
+        Pipe {
+            pipe,
+            recalc_timer,
+            reorder_at,
+        }
     }
 
     // Iterate stored data - headers and their payload offsets (as a function to copy payload to some other buffer).

@@ -682,6 +682,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // leaves that to the retransmission timer.
         if let Some(rec) = self.recovery.recovering_mut() {
             in_recovery = true;
+            // A resend outrun by later deliveries may have waited long
+            // enough to count lost, with no ACK since to count it.
+            if rec
+                .pipe_estimate
+                .reorder_at
+                .is_some_and(|at| at <= self.this_poll.now)
+            {
+                rec.pipe_estimate = self.user_tx_segments.calc_pipe(
+                    rec.high_rxt,
+                    self.last_sent_seq_nr,
+                    self.rtte.roundtrip_time(),
+                    self.this_poll.now,
+                );
+            }
             let sack_depth = self.user_tx_segments.sack_depth();
             let last_sent_seq_nr = self.last_sent_seq_nr;
             let fast_resend_seq_nr = self.fast_resend_seq_nr;
@@ -1883,6 +1897,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.timers.syn_ack_resend.poll_at(),
             self.timers.pace.take().poll_at(), // armed again by each pass the pacer stops
             self.timers.tail_probe.poll_at(),
+            // Only ahead: a pass that returns before recovery sends leaves
+            // it as it was, and the next ACK or timer counts it.
+            self.recovery
+                .recovering()
+                .and_then(|rec| rec.pipe_estimate.reorder_at)
+                .filter(|at| *at > self.this_poll.now),
         ]
         .into_iter()
         .flatten()
