@@ -553,6 +553,10 @@ pub struct RoutingTable {
     // Rings as a node enters the table.
     #[serde(skip)]
     entered: Arc<tokio::sync::Notify>,
+    // How many nodes have entered the table, a node that took a bad one's
+    // place among them.
+    #[serde(skip)]
+    entries: u64,
 }
 
 impl RoutingTable {
@@ -564,6 +568,7 @@ impl RoutingTable {
             buckets: BucketTree::new(max_size.unwrap_or(Self::DEFAULT_MAX_SIZE)),
             size: 0,
             entered: Default::default(),
+            entries: 0,
         }
     }
     /// Rings each time a node enters the table.
@@ -575,6 +580,12 @@ impl RoutingTable {
     }
     pub fn len(&self) -> usize {
         self.size
+    }
+    /// How many nodes have entered the table since it was made or restored,
+    /// one that took a bad node's place included: it grows whenever `len`
+    /// does, and also as nodes are replaced.
+    pub fn entries(&self) -> u64 {
+        self.entries
     }
     /// The `k` nodes nearest `id` that `keep` accepts, nearest first.
     pub fn closest(
@@ -620,14 +631,18 @@ impl RoutingTable {
 
     pub fn add_node(&mut self, id: Id20, addr: SocketAddr) -> InsertResult {
         let res = self.buckets.add_node(&self.id, id, addr);
-        let replaced = match &res {
-            InsertResult::WasExisting => false,
+        let entered = match &res {
+            InsertResult::WasExisting | InsertResult::Ignored => false,
             InsertResult::ReplacedBad(..) => true,
-            InsertResult::Added => true,
-            InsertResult::Ignored => false,
+            InsertResult::Added => {
+                // A node that takes a bad one's place leaves the count as
+                // it was.
+                self.size += 1;
+                true
+            }
         };
-        if replaced {
-            self.size += 1;
+        if entered {
+            self.entries += 1;
             self.entered.notify_waiters();
         }
         res
