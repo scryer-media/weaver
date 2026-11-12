@@ -893,8 +893,9 @@ impl<'a> WebSeedConnection<'a> {
     // is disabled; a file moved where it may not be asked is lost to the
     // seed. A name that does not resolve leaves the seed for
     // WEB_SEED_NAME_LOOKUP_RETRY. A name the session's network resolves
-    // where it exits has no address here to check, and its client hands the
-    // name on.
+    // where it exits has no address here to check: only the name is
+    // judged (see NamedBy::may_ask_by_name), as an address is, and its
+    // client hands the name on.
     async fn reach(&self, target: &Target) -> anyhow::Result<Reached> {
         let url = &target.url;
         // Checked on every hop, before the name is looked up: a seed's
@@ -937,6 +938,13 @@ impl<'a> WebSeedConnection<'a> {
             None => return Err(anyhow!("{url}: no host")),
         };
         let addr = match addrs.map(|addrs| endpoint(&addrs, port, target, self.allowed)) {
+            None if !target.named_by.may_ask_by_name(&host) => {
+                match target.moved {
+                    Some(file) => self.link.file_missing(file),
+                    None => self.link.disable(),
+                }
+                return Err(anyhow!("{url}: a local name it may not be asked by"));
+            }
             None => None,
             Some(Ok(addr)) => Some(addr),
             Some(Err(Unreachable::Blocked(addr))) => {
@@ -2240,10 +2248,10 @@ mod tests {
         assert_eq!(server.seen().len(), 1);
     }
 
-    // A seed whose name the network resolves at its exit is asked by name:
-    // its client is built for no address, and no address of it is checked
-    // here, so neither the IP filter nor the seed's naming has anything to
-    // hold, even for a seed that came with the torrent.
+    // A seed whose public-looking name the network resolves at its exit is
+    // asked by name: its client is built for no address, and no address of
+    // it is checked here, so neither the IP filter nor the seed's naming has
+    // an address to hold, even for a seed that came with the torrent.
     #[tokio::test(start_paused = true)]
     async fn a_name_resolved_at_the_exit_is_asked_by_name() {
         struct AtExit;
@@ -2278,6 +2286,56 @@ mod tests {
         assert!(clients.built().is_empty(), "{:?}", clients.built());
         let pinned: Vec<_> = conn.pinned.lock().keys().cloned().collect();
         assert_eq!(pinned, [("seed.test".to_owned(), server.addr.port(), None)]);
+    }
+
+    // Where the network resolves names at its exit, a seed that came with
+    // the torrent under a plainly local name is not asked, and is disabled;
+    // a public-looking name is asked, and so is a local name the operator
+    // named.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_name_resolved_at_the_exit_is_asked_only_when_the_operator_named_it() {
+        struct AtExit;
+        impl Resolver for AtExit {
+            fn resolve<'a>(
+                &'a self,
+                _: &'a str,
+                _: u16,
+            ) -> crate::core::net::BoxFuture<'a, std::io::Result<Resolved>> {
+                Box::pin(async { Ok(Resolved::AtExit) })
+            }
+        }
+        async fn ask(host: &str, named_by: NamedBy) -> (crate::Result<()>, usize, bool) {
+            let f = content(100, 10);
+            let server = Server::start(move |head| Reply::ranged(&f, head));
+            let url = format!("http://{host}:{}/f", server.addr.port());
+            let layout = layout(&[("f", 100, false)]);
+            let (seeds, link) = seed_named(url, WebSeedKind::Url, named_by);
+            let conn = WebSeedConnection::new(
+                Wired::new(server.addr),
+                Arc::new(AtExit),
+                ALL,
+                &layout,
+                &link,
+                UA,
+            );
+            let fetched = drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1).await;
+            (fetched, server.seen().len(), entry(&seeds, |e| e.disabled))
+        }
+        for host in ["nas.lan", "localhost", "NAS", "printer.local."] {
+            let (fetched, seen, disabled) = ask(host, NamedBy::Torrent).await;
+            assert!(fetched.is_err(), "{host}");
+            assert_eq!(seen, 0, "{host}");
+            assert!(disabled, "{host}");
+        }
+        for (host, named_by) in [
+            ("tracker.example.org", NamedBy::Torrent),
+            ("nas.lan", NamedBy::Operator),
+        ] {
+            let (fetched, seen, disabled) = ask(host, named_by).await;
+            assert!(fetched.is_ok(), "{host}: {fetched:?}");
+            assert_eq!(seen, 1, "{host}");
+            assert!(!disabled, "{host}");
+        }
     }
 
     // A body cut short fails the connection; the whole blocks it carried

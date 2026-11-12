@@ -14,7 +14,7 @@ use crate::core::net::{
 };
 use crate::tracker::ScrapeOk;
 use crate::tracker::shape::AnnounceShape;
-use crate::tracker::tracker_comms::{Reachable, only_reachable};
+use crate::tracker::tracker_comms::{NotPublic, Reachable, only_reachable};
 use anyhow::Context;
 use either::Either;
 use futures::StreamExt;
@@ -399,8 +399,9 @@ pub(crate) async fn addresses(
 /// refusal is named; [`ssrf_refusal`] refuses the GET for any loopback
 /// address the client may pick, so it judges the addresses the client is
 /// handed, after the filter. A name the session's network resolves where it
-/// exits has no address here: nothing is checked, and the client hands the
-/// name on. Its header names are written in `shape`'s case.
+/// exits has no address here: only the name is checked (see
+/// [`NamedBy::may_ask_by_name`]), and the client hands it on. Its header
+/// names are written in `shape`'s case.
 #[allow(clippy::too_many_arguments)]
 async fn reach(
     clients: &dyn HttpClients,
@@ -413,6 +414,10 @@ async fn reach(
     shape: &AnnounceShape,
 ) -> anyhow::Result<(reqwest::Client, Vec<IpAddr>)> {
     let (host, mut found) = addresses(url, resolver).await?;
+    // No address: the name is resolved at the network's exit.
+    if found.is_empty() && !named_by.may_announce_by_name(&host) {
+        return Err(anyhow::Error::new(NotPublic).context("the tracker's name is a local one"));
+    }
     if let Some(family) = family
         && !found.is_empty()
     {
@@ -701,8 +706,8 @@ mod tests {
     // A tracker that came with the torrent is refused at a loopback,
     // private, link-local or unique-local address, at a tracker's path or
     // any other, and no client is built; one the operator named is asked at
-    // loopback at a tracker's path. Under a name the network resolves at
-    // its exit nothing is refused by address, whoever named it.
+    // loopback at a tracker's path. Under a public-looking name the network
+    // resolves at its exit nothing is refused by address, whoever named it.
     // The e2e carveout asks a torrent's tracker at these local addresses.
     #[cfg(not(feature = "e2e-local-trackers"))]
     #[tokio::test]
@@ -787,6 +792,59 @@ mod tests {
                 *clients.0.lock().unwrap(),
                 [("tracker.test".to_owned(), 80, Vec::new())]
             );
+        }
+    }
+
+    // Where the network resolves names at its exit, a tracker that came
+    // with the torrent under a plainly local name is refused as one at a
+    // local address is, and no client is built; a public-looking name is
+    // asked, and so is a local name the operator named.
+    #[cfg(not(feature = "e2e-local-trackers"))]
+    #[tokio::test]
+    async fn a_local_name_resolved_at_the_exit_is_asked_only_when_the_operator_named_it() {
+        let reachable: Reachable = std::sync::Arc::new(|_| Ok(()));
+        let ask = |host: &str, named_by: NamedBy| {
+            let url = url::Url::parse(&format!("http://{host}/announce")).unwrap();
+            let reachable = reachable.clone();
+            async move {
+                let clients = Targets::default();
+                let at_exit = Answering {
+                    answer: Resolved::AtExit,
+                    asked: Default::default(),
+                };
+                let asked = reach(
+                    &clients,
+                    &url,
+                    named_by,
+                    Ask::Announce,
+                    None,
+                    &at_exit,
+                    &reachable,
+                    &AnnounceShape::WEAVER,
+                )
+                .await;
+                let built = clients.0.lock().unwrap().clone();
+                (asked.map(|(_, addrs)| addrs), built)
+            }
+        };
+        for host in ["nas.lan", "localhost", "NAS", "printer.local."] {
+            let (asked, built) = ask(host, NamedBy::Torrent).await;
+            let refused = asked.err().unwrap_or_else(|| panic!("{host} was asked"));
+            assert!(
+                refused
+                    .downcast_ref::<crate::tracker::tracker_comms::NotPublic>()
+                    .is_some(),
+                "{host}: {refused:#}"
+            );
+            assert!(built.is_empty(), "{host}");
+        }
+        for (host, named_by) in [
+            ("tracker.example.org", NamedBy::Torrent),
+            ("nas.lan", NamedBy::Operator),
+        ] {
+            let (asked, built) = ask(host, named_by).await;
+            assert_eq!(asked.unwrap(), Vec::<IpAddr>::new(), "{host}");
+            assert_eq!(built, [(host.to_owned(), 80, Vec::new())]);
         }
     }
 

@@ -147,6 +147,40 @@ impl NamedBy {
     pub fn may_announce_to(self, ip: IpAddr) -> bool {
         cfg!(feature = "e2e-local-trackers") || self.may_ask(ip)
     }
+
+    /// Whether an endpoint so named may be asked by the name `host` where
+    /// the network resolves it at its exit ([`Resolved::AtExit`]), with no
+    /// address here to check: what came with the torrent is refused under a
+    /// plainly local name (see [`is_local_name`]). A public-looking name
+    /// passes, wherever the exit resolves it.
+    pub fn may_ask_by_name(self, host: &str) -> bool {
+        match self {
+            NamedBy::Torrent => !is_local_name(host),
+            NamedBy::Operator => true,
+        }
+    }
+
+    /// Whether a tracker so named may be announced to by the name `host`
+    /// resolved at the network's exit: where it may be asked by it, and, in
+    /// an e2e build, under any name, as [`NamedBy::may_announce_to`].
+    pub fn may_announce_by_name(self, host: &str) -> bool {
+        cfg!(feature = "e2e-local-trackers") || self.may_ask_by_name(host)
+    }
+}
+
+/// Whether `host`, a domain name, is plainly one of the local network:
+/// `localhost` or a name under it, a name of a single label (`nas`), or a
+/// name under `lan`, `local`, `internal` or `home.arpa`. Case is ignored,
+/// and so is one trailing dot.
+pub(crate) fn is_local_name(host: &str) -> bool {
+    let host = host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase();
+    !host.contains('.')
+        || ["localhost", "lan", "local", "internal", "home.arpa"]
+            .iter()
+            .any(|zone| {
+                host.strip_suffix(zone)
+                    .is_some_and(|rest| rest.is_empty() || rest.ends_with('.'))
+            })
 }
 
 /// Whether `ip` is a public internet address: global, so neither loopback,
@@ -432,6 +466,50 @@ pub enum Egress {
     From(IpAddr),
     /// The host has no route to it.
     NoRoute,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{NamedBy, is_local_name};
+
+    #[test]
+    fn plainly_local_names_are_local() {
+        for local in [
+            "localhost",
+            "LOCALHOST.",
+            "a.localhost",
+            "nas",
+            "NAS",
+            "nas.",
+            "nas.lan",
+            "NAS.LAN.",
+            "printer.local.",
+            "router.home.arpa",
+            "home.arpa",
+            "db.corp.internal",
+        ] {
+            assert!(is_local_name(local), "{local}");
+            assert!(!NamedBy::Torrent.may_ask_by_name(local), "{local}");
+            assert!(NamedBy::Operator.may_ask_by_name(local), "{local}");
+        }
+    }
+
+    #[test]
+    fn public_looking_names_are_not_local() {
+        for public in [
+            "tracker.example.org",
+            "tracker.example.org.",
+            "seed.test",
+            "planlan.org",
+            "xlocal.net",
+            "localhost.example.com",
+            "internal.example.com",
+            "myhome.arpa",
+        ] {
+            assert!(!is_local_name(public), "{public}");
+            assert!(NamedBy::Torrent.may_ask_by_name(public), "{public}");
+        }
+    }
 }
 
 #[cfg(all(test, feature = "e2e-local-trackers"))]
