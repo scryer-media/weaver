@@ -134,6 +134,17 @@ impl GraphJob {
                             return Ok(());
                         }
                         match piece {
+                            // A hold the piece read on scratch moved since
+                            // the rewalk was lent: what it read is not
+                            // trusted, and the piece is fetched again as one
+                            // that did not read back is.
+                            Ok(posted) if !self.writer.scratch_stands(&rewalked.scratch) => {
+                                let range = weaver_graph::ByteRange::at(
+                                    posted.offset,
+                                    posted.bytes.len() as u64,
+                                );
+                                self.unread(node, volume, range, limit)?;
+                            }
                             Ok(posted) => {
                                 self.tree.rewalked(
                                     node,
