@@ -678,6 +678,10 @@ fn create_parent(path: &Path) -> Result<(), LeafError> {
 
 fn write_all_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
     #[cfg(test)]
+    if counting::full(bytes.len()) {
+        return Err(io::Error::from(io::ErrorKind::StorageFull));
+    }
+    #[cfg(test)]
     counting::wrote(bytes.len());
     #[cfg(unix)]
     {
@@ -748,6 +752,27 @@ pub(crate) mod counting {
     thread_local! {
         static READ: Cell<u64> = const { Cell::new(0) };
         static WRITTEN: Cell<u64> = const { Cell::new(0) };
+        // The bytes this thread may still write before the disk is full.
+        static ROOM: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    // The disk fills once this thread has written `room` more bytes, or
+    // never again for `None`.
+    pub(crate) fn fill_after(room: Option<u64>) {
+        ROOM.with(|cell| cell.set(room));
+    }
+
+    // Whether a write of `len` bytes finds the disk full; one that fits
+    // takes its room.
+    pub(super) fn full(len: usize) -> bool {
+        ROOM.with(|cell| match cell.get() {
+            Some(room) if room < len as u64 => true,
+            Some(room) => {
+                cell.set(Some(room - len as u64));
+                false
+            }
+            None => false,
+        })
     }
 
     pub(super) fn read(len: usize) {
