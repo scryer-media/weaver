@@ -242,6 +242,7 @@ impl ProxyProfile {
             mtu: self.mtu,
             persistent_keepalive: self.keepalive_seconds.filter(|v| *v != 0),
             request_timeout: self.timeout(),
+            max_sockets: weaver_tunnel::wireguard::DEFAULT_MAX_SOCKETS,
         })
     }
 }

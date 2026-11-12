@@ -415,6 +415,9 @@ pub fn classify(error: &TunnelError, wait: Duration) -> ProxyFault {
         TunnelError::Engine(text) => from_text(text, wait).unwrap_or_else(|| ProxyFault::Other {
             detail: text.clone(),
         }),
+        TunnelError::AtCapacity { .. } => ProxyFault::Other {
+            detail: error.to_string(),
+        },
     }
 }
 
