@@ -7,8 +7,10 @@
 // (src/encoder.cc:33-151 at upstream d223ecc). `encode_simd_frame` is a port
 // of the `do_encode_simd` wrapper (src/encoder_common.h:23-97): it runs a
 // tier's main loop, then finishes whatever the main loop left with the same
-// scalar tail rapidyenc uses. Both write exactly the bytes they report; they
-// never write past the returned length.
+// scalar tail rapidyenc uses. `encode_generic` starts each line with one
+// 4-byte store of CRLF and the first byte (rapidyenc src/encoder.cc:117-129),
+// so it may store one byte past the returned length, inside the
+// `encode_max_len` budget (the `RawEncodeFn` contract in `mod.rs` allows it).
 //
 // Column bookkeeping uses `isize` like rapidyenc's `int`; the domain checks
 // in `mod.rs` keep every value far from overflow.
@@ -41,6 +43,57 @@ unsafe fn put2(p: &mut *mut u8, b: [u8; 2]) {
     }
 }
 
+// `opaque(p)` and `opaque2(p, col)` return their arguments unchanged,
+// through an empty `asm!` the optimiser cannot see into. They end the escape
+// branch of a per-byte `if`: without them LLVM merges the two branches'
+// `p += 1` / `p += 2` (and the matching `col` updates) into one add of a phi,
+// which costs every unescaped byte a constant move, and on x86-64 a taken
+// jump. With them each branch keeps its own increment, as in rapidyenc's
+// compiled loop (a post-indexed store on AArch64, `inc` on x86-64). They emit
+// no instruction. (avx512vbmi2.rs uses the same barrier.)
+#[inline(always)]
+#[allow(unused_mut)]
+fn opaque(mut p: *mut u8) -> *mut u8 {
+    #[cfg(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64"
+    ))]
+    // SAFETY: an empty template; it touches nothing but the register.
+    unsafe {
+        std::arch::asm!("/* {0} */", inout(reg) p, options(pure, nomem, nostack, preserves_flags));
+    }
+    p
+}
+
+#[inline(always)]
+#[allow(unused_mut)]
+fn opaque2(mut p: *mut u8, mut col: isize) -> (*mut u8, isize) {
+    #[cfg(any(
+        target_arch = "x86",
+        target_arch = "x86_64",
+        target_arch = "arm",
+        target_arch = "aarch64",
+        target_arch = "riscv32",
+        target_arch = "riscv64",
+        target_arch = "loongarch64"
+    ))]
+    // SAFETY: an empty template; it touches nothing but the two registers.
+    unsafe {
+        std::arch::asm!(
+            "/* {0} {1} */",
+            inout(reg) p,
+            inout(reg) col,
+            options(pure, nomem, nostack, preserves_flags)
+        );
+    }
+    (p, col)
+}
+
 // Bytes written between two cursors in the same destination.
 #[inline(always)]
 fn dist(from: *mut u8, to: *mut u8) -> isize {
@@ -70,6 +123,21 @@ pub(super) unsafe fn encode_raw(
     dst: *mut u8,
     is_end: bool,
 ) -> usize {
+    // The loop's code starts 16 bytes into a 64-byte line, wherever the
+    // linker puts this function. Measured on Zen 4: with the loop head at
+    // offset 0, 32 or 48 of its line, the escape branches mispredict twice as
+    // often (160M against 79M per 4 GiB of random data). The jump runs once
+    // per call; the padding never runs.
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        core::arch::asm!(
+            "jmp 2f",
+            ".p2align 6, 0xcc",
+            ".skip 16, 0xcc",
+            "2:",
+            options(nomem, nostack, preserves_flags)
+        )
+    };
     if len == 0 {
         return 0;
     }
@@ -77,8 +145,9 @@ pub(super) unsafe fn encode_raw(
     unsafe { encode_generic(line_size, column, src, len, dst, is_end) }
 }
 
-// rapidyenc `do_encode_generic`, line for line. rapidyenc walks a negative
-// index up to 0 from the end of the input; this walks `i` up to `len`.
+// rapidyenc `do_encode_generic` (src/encoder.cc:30-145), line for line, with
+// its negative index `i` running from `-len` up to 0 against `es`, the end
+// of the input.
 //
 // # Safety
 //
@@ -95,17 +164,19 @@ pub(super) unsafe fn encode_generic(
     debug_assert!(len >= 1);
     let ls = line_size as isize;
     let mut p = dst;
-    let mut i = 0usize;
     let mut col = *column as isize;
 
-    // SAFETY, whole function: every `src.add(i)` read happens with `i < len`
-    // (each read is guarded by a loop or `if` test on `i`, the same tests
-    // rapidyenc uses). Every write goes through `put1`/`put2`; the output is
-    // at most 2 bytes per input byte plus 2 per line break plus one trailing
-    // escape, which `encode_max_len` covers (see `mod.rs`).
+    // SAFETY, whole function: every `es.offset(i)` read happens with
+    // `-len <= i < 0` (each read is guarded by a loop or `if` test on `i`,
+    // the same tests rapidyenc uses). The output is at most 2 bytes per input
+    // byte plus 2 per line break plus one trailing escape; the line-start
+    // store writes 4 bytes for 3 or 4, so at most one byte lands past that,
+    // and `encode_max_len` has 64 bytes of room beyond it (see `mod.rs`).
     unsafe {
+        let es = src.add(len);
+        let mut i = -(len as isize);
         if col == 0 {
-            let c = *src.add(i);
+            let c = *es.offset(i);
             i += 1;
             let e = ESCAPED[c as usize];
             if e[0] != 0 {
@@ -116,20 +187,24 @@ pub(super) unsafe fn encode_generic(
                 col = 1;
             }
         }
-        'end: while i < len {
+        'end: while i < 0 {
             // Main line: eight bytes at a time while at least nine input bytes
             // remain beyond them and the line has room for eight more.
-            // (rapidyenc: `i < -1-8 && line_size-col-1 > 8`.)
             let mut sp: *mut u8 = std::ptr::null_mut();
-            while i + 9 < len && ls - col - 1 > 8 {
+            while i < -1 - 8 && ls - col - 1 > 8 {
                 sp = p;
                 for k in 0..8 {
-                    let c = *src.add(i + k);
+                    let c = *es.offset(i + k);
                     let e = ESCAPE[c as usize];
                     if e != 0 {
                         put1(&mut p, e);
                     } else {
+                        // Escapes are rare (4 of 256 byte values): keeping
+                        // them out of line lets the loop end fall through
+                        // to its back edge, one taken branch per eight bytes.
+                        core::hint::cold_path();
                         put2(&mut p, ESCAPED[c as usize]);
+                        p = opaque(p);
                     }
                 }
                 i += 8;
@@ -144,7 +219,7 @@ pub(super) unsafe fn encode_generic(
             }
             // Remaining middle-of-line bytes.
             while col < ls - 1 {
-                let c = *src.add(i);
+                let c = *es.offset(i);
                 i += 1;
                 let e = ESCAPE[c as usize];
                 if e != 0 {
@@ -153,38 +228,41 @@ pub(super) unsafe fn encode_generic(
                 } else {
                     put2(&mut p, ESCAPED[c as usize]);
                     col += 2;
+                    (p, col) = opaque2(p, col);
                 }
-                if i >= len {
+                if i >= 0 {
                     break 'end;
                 }
             }
             // Last byte of the line: TAB and SPACE are escaped here, '.' is
             // not. rapidyenc does not advance `col` for it.
             if col < ls {
-                let c = *src.add(i);
+                let c = *es.offset(i);
                 i += 1;
-                let e = ESCAPED[c as usize];
-                if e[0] != 0 && c != DOT {
-                    put2(&mut p, e);
+                // One 2-byte load and test, as rapidyenc's `uint16_t` table
+                // gives it; testing `e[0]` would split the store in two.
+                let e = u16::from_le_bytes(ESCAPED[c as usize]);
+                if e != 0 && c != DOT {
+                    put2(&mut p, e.to_le_bytes());
                 } else {
                     put1(&mut p, c.wrapping_add(42));
                 }
             }
-            if i >= len {
+            if i >= 0 {
                 break;
             }
-            // Line break, then the next line's first byte.
-            let c = *src.add(i);
+            // Line break and the next line's first byte in one 4-byte store:
+            // CRLF then the escape pair, or CRLF, the byte and a spare byte
+            // the next write overwrites.
+            let c = *es.offset(i);
             i += 1;
-            put2(&mut p, *b"\r\n");
-            let e = ESCAPED[c as usize];
-            if e[0] != 0 {
-                put2(&mut p, e);
-                col = 2;
-            } else {
-                put1(&mut p, c.wrapping_add(42));
-                col = 1;
-            }
+            let e = u16::from_le_bytes(ESCAPED[c as usize]);
+            let first = if e != 0 { e } else { u16::from(c.wrapping_add(42)) };
+            let w = u32::from_le_bytes([b'\r', b'\n', 0, 0]) | u32::from(first) << 16;
+            p.cast::<[u8; 4]>().write_unaligned(w.to_le_bytes());
+            let wide = (e != 0) as isize;
+            p = p.offset(3 + wide);
+            col = 1 + wide;
         }
         if is_end {
             fix_trailing_whitespace(dst, &mut p, &mut col);
@@ -214,6 +292,28 @@ unsafe fn fix_trailing_whitespace(dst: *mut u8, p: &mut *mut u8, col: &mut isize
             *col += 1;
         }
     }
+}
+
+// The SIMD frames' path for lines too short for a vector loop: rapidyenc
+// `do_encode_simd` calls the separately compiled `do_encode_generic`
+// (src/encoder_common.h:25-28). Out of line and used only by the frames, so
+// the scalar loop's size never moves a SIMD kernel's code, and the scalar
+// tier's own `encode_raw` keeps its inlined copy.
+//
+// # Safety
+//
+// The `RawEncodeFn` contract, with `len >= 1`.
+#[inline(never)]
+unsafe fn encode_short_lines(
+    line_size: usize,
+    column: &mut usize,
+    src: *const u8,
+    len: usize,
+    dst: *mut u8,
+    is_end: bool,
+) -> usize {
+    // SAFETY: forwarded contract.
+    unsafe { encode_generic(line_size, column, src, len, dst, is_end) }
 }
 
 // The frame every SIMD tier runs in: rapidyenc `do_encode_simd`.
@@ -254,7 +354,7 @@ where
     }
     if line_size < SIMD_MIN_LINE_SIZE {
         // SAFETY: forwarded contract, `len >= 1`.
-        return unsafe { encode_generic(line_size, column, src, len, dst, is_end) };
+        return unsafe { encode_short_lines(line_size, column, src, len, dst, is_end) };
     }
     let (consumed, written) = main_loop(line_size, column, src, len, dst);
     debug_assert!(consumed <= len);

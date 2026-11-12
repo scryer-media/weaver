@@ -324,9 +324,9 @@ impl<const POPCNT: bool> Block for Sse<POPCNT> {
     const GRID: bool = true;
     // The AVX tier (`Sse<true>`, avx.rs) decides once per two blocks, as
     // rapidyenc's 64-byte iteration (src/encoder_avx_base.h:128-131, :163):
-    // on Sapphire Rapids and Zen 4 that wins every cell but `random-4k`,
-    // which stays above rapidyenc. The SSSE3 tier keeps one block per
-    // decision; two cost it most cells on Zen 4.
+    // on Sapphire Rapids and Zen 4 one branch per 64 bytes costs less than
+    // one per block. The SSSE3 tier keeps one block per decision; two cost
+    // it on Zen 4.
     const GRID2: bool = POPCNT;
     // The SSSE3 tier only: with rapidyenc's unlikely arms out of line its
     // sparse block falls through to one taken back edge, and it gained on
@@ -361,7 +361,28 @@ pub(super) unsafe fn encode_raw(
 ) -> usize {
     unsafe {
         encode_simd_frame(line_size, column, src, len, dst, is_end, |ls, col, s, n, d| {
-            main_loop::<Sse<false>>(ls, col, s, n, d)
+            grid(ls, col, s, n, d)
         })
+    }
+}
+
+// The grid loop out of line, its code after a 64-byte boundary: where the
+// loop's branches sit in their lines then depends on this function alone,
+// not on the frame around it or on what the linker puts before it. The jump
+// runs once per call; the padding never runs.
+//
+// SAFETY: as `main_loop`; the CPU has SSSE3.
+#[target_feature(enable = "ssse3")]
+#[inline(never)]
+unsafe fn grid(
+    ls: usize,
+    col: &mut usize,
+    s: *const u8,
+    n: usize,
+    d: *mut u8,
+) -> (usize, usize) {
+    unsafe {
+        core::arch::asm!("jmp 2f", ".p2align 6, 0xcc", "2:", options(nomem, nostack, preserves_flags));
+        main_loop::<Sse<false>>(ls, col, s, n, d)
     }
 }
