@@ -457,7 +457,9 @@ mod tests {
     // Usenet held to its rate by a bucket of a quarter second's capacity, as
     // the usenet `TokenBucket` is, and torrents by a session's quota, filled
     // with half a second of their rate each half-second round with what the
-    // last round left dropped, as `weaver_torrent::limits` fills it; each
+    // last round left dropped. `weaver_torrent::limits` keeps what its
+    // waiting peers leave, up to three seconds' worth, until the split
+    // changes its rate; this model leaves that out. Each
     // side moves what it wants up to what it holds. The clock is mocked: a
     // split tick is ten steps of a tenth of a second, and at each tick the
     // split shares the cap out again from the bytes each side moved over it,
@@ -737,7 +739,8 @@ mod tests {
         }
     }
 
-    // A side moving part of its share banks nothing to spike with: torrents,
+    // A side moving part of its share, holding no more than a round as the
+    // model above holds it, has nothing to spike with: torrents,
     // or usenet, moving a fraction of the cap beside the other side pressing
     // it, then pressing it themselves, hold every five seconds within 1.05
     // of the cap.
