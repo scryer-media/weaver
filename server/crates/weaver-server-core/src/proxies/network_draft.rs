@@ -5,7 +5,7 @@ use super::*;
 use weaver_tunnel::{
     TunnelError, TunnelStream,
     bridge::{Bridge, ConnectionOutcome},
-    pipe::Purpose,
+    pipe::{Purpose, Resolution, Transports},
 };
 
 pub struct DraftNetworkRoute {
@@ -60,6 +60,9 @@ impl DraftNetworkRoute {
     pub fn runtime_handle(&self) -> &tokio::runtime::Handle {
         &self.handle
     }
+    // The dialer of a connection test of `server` over the leg at
+    // `position`. Its dials are probes of the server, never connections of
+    // its pool.
     pub fn nntp_dialer_for_leg(
         &self,
         position: usize,
@@ -67,7 +70,10 @@ impl DraftNetworkRoute {
     ) -> Result<Arc<weaver_nntp::route_dialer::RouteDialer>, String> {
         let leg = self.legs.get(position).ok_or("draft leg does not exist")?;
         Ok(Arc::new(weaver_nntp::route_dialer::RouteDialer {
-            inner: leg.stage.clone(),
+            inner: Arc::new(ServerProbe {
+                inner: leg.stage.clone(),
+                leg: position,
+            }),
             plan: leg.address_plan.as_ref().map(|plan| plan.plan.clone()),
             egress_controls: self.isolated.egress_controls.clone(),
             runtime: self.handle.clone(),
@@ -121,6 +127,63 @@ impl Drop for DraftNetworkRoute {
             }
             isolated.shutdown().await;
         });
+    }
+}
+// A connection test of a usenet server over one drafted leg. It dials as a
+// probe of the server, which a WireGuard tunnel charges to the room it keeps
+// for probes. The usenet share is sized to the connections of the servers
+// already on, so a server being added, edited while off, or turned on has
+// none of it yet; and the servers that are on may hold all of it.
+struct ServerProbe {
+    inner: Arc<dyn Dialer>,
+    leg: usize,
+}
+impl ServerProbe {
+    fn purpose(&self, purpose: &Purpose) -> Purpose {
+        match purpose {
+            Purpose::Nntp { server, .. } | Purpose::NntpProbe { server, .. } => {
+                Purpose::NntpProbe {
+                    server: *server,
+                    leg: self.leg,
+                }
+            }
+            other => other.clone(),
+        }
+    }
+}
+#[async_trait::async_trait]
+impl Dialer for ServerProbe {
+    async fn prepare(&self) -> Result<(), DialError> {
+        self.inner.prepare().await
+    }
+    fn has_capacity(&self) -> bool {
+        self.inner.has_capacity()
+    }
+    fn room(&self, purpose: &Purpose) -> Result<(), Vec<Arc<tokio::sync::Notify>>> {
+        self.inner.room(&self.purpose(purpose))
+    }
+    async fn dial(&self, target: &Target) -> Result<Dialed, DialError> {
+        self.inner
+            .dial(&Target {
+                purpose: self.purpose(&target.purpose),
+                ..target.clone()
+            })
+            .await
+    }
+    async fn resolve(&self, host: &str) -> Result<Resolution, DialError> {
+        self.inner.resolve(host).await
+    }
+    fn offers(&self) -> Transports {
+        self.inner.offers()
+    }
+    fn failing_hop(&self) -> Option<weaver_tunnel::pipe::FailingHop> {
+        self.inner.failing_hop()
+    }
+    fn budget(&self) -> Duration {
+        self.inner.budget()
+    }
+    fn describe(&self) -> String {
+        format!("server test: {}", self.inner.describe())
     }
 }
 struct ProbeProvider(Arc<dyn Dialer>);

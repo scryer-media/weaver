@@ -2364,3 +2364,141 @@ async fn a_probe_with_no_live_session_dials_through_its_own_tunnel() {
     assert!(runtime.sessions.lock().unwrap().is_empty());
     runtime.shutdown().await;
 }
+
+// WireGuard proxy 1, its tunnel a recorder; SOCKS5 proxy 3 on loopback; and
+// pool 7 of proxy 1. With `active`, server 1 is on with that many
+// connections, routed through proxy 1.
+fn server_test_runtime(active: Option<u16>) -> (Arc<NetworkRuntime>, Arc<Mutex<Vec<String>>>) {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    runtime.install_fixture(
+        1,
+        Arc::new(Recorded {
+            name: "tunnel",
+            events: events.clone(),
+        }),
+    );
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.socket_cap = 256;
+    config.profiles.insert(1, idle_wireguard_profile(1));
+    config.profiles.insert(
+        3,
+        ProxyProfile {
+            host: "127.0.0.1".into(),
+            ..proxy_with_id(3)
+        },
+    );
+    config.pools.insert(
+        7,
+        ProxyPool {
+            id: 7,
+            name: "wg-pool".into(),
+            kind: ProxyKind::WireGuard,
+            member_ids: vec![1],
+            enabled: true,
+        },
+    );
+    if let Some(connections) = active {
+        let server = Consumer::Server(1);
+        config.consumers.insert(server.key());
+        config
+            .policies
+            .insert(server.key(), wireguard_ladder(Rung::Proxy { id: 1 }));
+        config.socket_ledger = config.ledger(&HashMap::from([(1, connections)]));
+    }
+    runtime.apply_configuration(config).unwrap();
+    (runtime, events)
+}
+
+// A connection test of `server` over a draft of `rung`, as saving or
+// testing the server runs it. It returns the route's error, since the
+// recorded tunnel answers nothing.
+async fn server_test(runtime: &NetworkRuntime, server: u32, rung: Rung) -> Arc<DialError> {
+    let draft = runtime
+        .draft_route(
+            Consumer::Server(server),
+            wireguard_ladder(rung),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    let dialer = draft.nntp_dialer_for_leg(0, server).unwrap();
+    let config = weaver_nntp::ServerConfig {
+        host: "127.0.0.1".into(),
+        port: 119,
+        ..weaver_nntp::ServerConfig::new(dialer.clone())
+    };
+    match dialer.dial(&config).await {
+        Err(weaver_nntp::NntpError::Route(error)) => error,
+        Err(other) => panic!("not a route error: {other}"),
+        Ok(_) => panic!("the recorded tunnel answers nothing"),
+    }
+}
+
+// A server not on yet counts no connection on any tunnel, so a tunnel its
+// route reaches gives usenet nothing for it. Its connection test, the one
+// saving it on runs, still reaches the tunnel over a proxy, a pool of it,
+// and a chain with a SOCKS5 proxy above it.
+#[tokio::test]
+async fn a_server_not_on_yet_tests_through_a_tunnel_that_counts_none_of_its_connections() {
+    for rung in [
+        Rung::Proxy { id: 1 },
+        Rung::Pool { id: 7 },
+        Rung::Chain { ids: vec![1, 3] },
+    ] {
+        let (runtime, events) = server_test_runtime(None);
+        let error = server_test(&runtime, 1, rung.clone()).await;
+        assert!(
+            !matches!(*error, DialError::AtCapacity(_)),
+            "{rung:?}: {error}"
+        );
+        let events = taken(&events);
+        assert!(
+            events.contains(&"dial tunnel".to_owned()),
+            "{rung:?}: {events:?}"
+        );
+        runtime.shutdown().await;
+    }
+}
+
+// The servers already on may hold every usenet socket of the tunnel. A new
+// server's test takes the room the tunnel keeps for probes instead, and
+// never a usenet socket. With that room full too it waits like any probe:
+// the test never takes a socket past the tunnel's shares, and the shares
+// never add up past its cap.
+#[tokio::test]
+async fn a_server_test_takes_probe_room_beside_servers_holding_all_of_usenet() {
+    use weaver_tunnel::pipe::SocketClass;
+    let (runtime, events) = server_test_runtime(Some(20));
+    runtime
+        .route(Consumer::Server(1), 20, Duration::from_secs(1))
+        .unwrap();
+    let sockets = {
+        let map = runtime.session_sockets.lock().unwrap();
+        assert_eq!(map.len(), 1);
+        map.values().next().unwrap().2.clone()
+    };
+    let shares = sockets.shares().unwrap();
+    assert_eq!(shares.nntp, 21);
+    assert!(shares.nntp + shares.torrent + shares.core + shares.http <= 256);
+    let take_all =
+        |class| std::iter::from_fn(|| sockets.take(class).ok().flatten()).collect::<Vec<_>>();
+    let usenet = take_all(SocketClass::Nntp);
+    assert_eq!(usenet.len(), shares.nntp);
+
+    let error = server_test(&runtime, 2, Rung::Proxy { id: 1 }).await;
+    assert!(!matches!(*error, DialError::AtCapacity(_)), "{error}");
+    assert!(taken(&events).contains(&"dial tunnel".to_owned()));
+    assert_eq!(sockets.held(SocketClass::Nntp), shares.nntp);
+
+    let probes = take_all(SocketClass::ReserveCore);
+    assert_eq!(probes.len(), shares.core);
+    let error = server_test(&runtime, 2, Rung::Proxy { id: 1 }).await;
+    assert!(matches!(*error, DialError::AtCapacity(_)), "{error}");
+    assert!(!taken(&events).contains(&"dial tunnel".to_owned()));
+    drop((usenet, probes));
+    runtime.shutdown().await;
+}
