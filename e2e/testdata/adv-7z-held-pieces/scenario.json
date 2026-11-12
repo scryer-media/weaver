@@ -1,0 +1,15 @@
+{
+  "slug": "adv-7z-held-pieces",
+  "title": "E2E.Adversarial.7z.Held.Pieces.2026-TESTGRP",
+  "description": "One stored 7z of a 16 MiB member in 8 KiB articles, so about two thousand pieces of body are held before the end header names them. The job completes with the member.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 8192,
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "requiredOutputs": [
+      "harbor-pieces.mkv"
+    ]
+  }
+}

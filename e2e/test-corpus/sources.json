@@ -55,6 +55,64 @@
       }
     },
     {
+      "path": "testdata/adv-7z-end-header-2-63/lantern-header.7z",
+      "size": 0,
+      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-7z-folded-copies-over-cap/ember-copies.tar",
+      "size": 0,
+      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "tar",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-7z-folded-copies/ember-fifty.tar",
+      "size": 0,
+      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "tar",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar@go1.27.3",
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-7z-held-pieces/harbor-pieces.7z",
+      "size": 0,
+      "blake3": "0000000000000000000000000000000000000000000000000000000000000000",
+      "format": "7z",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "sevenzip-26.02"
+        ]
+      }
+    },
+    {
       "path": "testdata/adv-par2-lie-file-hash/lie-payload.mkv",
       "size": 2109497,
       "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",
@@ -391,6 +449,20 @@
       }
     },
     {
+      "path": "testdata/adv-tar-deep-long-name/deep-name.tar",
+      "size": 527872,
+      "blake3": "6ef3413d5619fe448cb16c545a92660729aebfde59d46e5ecfa7aeca2ab9dedf",
+      "format": "tar",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
       "path": "testdata/adv-tar-links/links.tar",
       "size": 5120,
       "blake3": "db34f1d427144e031e8e4172233871c9213ab07c497e08e343372881d5cea066",
@@ -405,6 +477,20 @@
       }
     },
     {
+      "path": "testdata/adv-tar-one-name-chain/harbor-crates.tar",
+      "size": 5122048,
+      "blake3": "6c5ad550758381eab7bd4956f387c98407997787b1ad81b108101347102a748f",
+      "format": "tar",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
       "path": "testdata/adv-tar-traversal/traversal.tar",
       "size": 7168,
       "blake3": "065cb9c82a95e200d760db518105c0ea21c18050c5f71d0e511f6948cb7e74f3",
@@ -415,6 +501,65 @@
         "toolchains": [
           "go-archive-tar",
           "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-tar-yenc-size-lie/ember-lie.tar",
+      "size": 14336,
+      "blake3": "1bd331651a2645b10244fb33a8b3597f663d6af6dd6b1dd501759350c500c0a2",
+      "format": "tar",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-targz-inner-over-member-cap/harbor-pair.tar.gz",
+      "size": 49043,
+      "blake3": "e19751ab90e43d5e65bc4c27e235e68c7ba4d45c5cef5963560209f2773cf790",
+      "format": "tar.gz",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar@go1.27.3",
+          "go-compress-gzip@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-targz-inner-ratio/beacon-bomb.tar.gz",
+      "size": 16409,
+      "blake3": "7e0b162a71ad5a6b5d3ac354d495060133eb0f86fdf23c56ed6441b1165c7b14",
+      "format": "tar.gz",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar@go1.27.3",
+          "go-compress-gzip@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-targz-levels-under-ratio/harbor-reel.tar.gz",
+      "size": 70164,
+      "blake3": "876fdc0610674e222d67875503d28d9d717d3f18c7491cfc73bc81781b46e660",
+      "format": "tar.gz",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar@go1.27.3",
+          "go-compress-gzip@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
         ]
       }
     },
@@ -625,6 +770,34 @@
         "toolchains": [
           "go-archive-zip",
           "go-fixture-bytes"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zstd-later-frame-honest/harbor-light.mkv.zst",
+      "size": 132,
+      "blake3": "87516e46d286885ab90fedaa4c72602a162f00c9003fcbd97d650200e8b5c5d0",
+      "format": "zstd",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "go-klauspost-zstd@v1.20.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-zstd-later-frame-wide/harbor-wide.mkv.zst",
+      "size": 130,
+      "blake3": "1c0a3746a1b92a3bd0d6ff2070d59790c0f127036f96b75ad5c97eec531e64a7",
+      "format": "zstd",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3",
+          "go-klauspost-zstd@v1.20.3"
         ]
       }
     },

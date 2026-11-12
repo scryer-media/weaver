@@ -1,0 +1,20 @@
+{
+  "slug": "adv-tar-yenc-size-lie",
+  "title": "E2E.Adversarial.Tar.Yenc.Size.Lie.2026-TESTGRP",
+  "description": "A tar of one member posted in two 8 KiB articles whose =ybegin headers state a size of 2^63-1 bytes. The tar ends at its end blocks, holds only the bytes that arrived, and the member is delivered.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 8192,
+  "yencHeaderLies": [
+    {
+      "size": 9223372036854775807
+    }
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "requiredOutputs": [
+      "ember.mkv"
+    ]
+  }
+}

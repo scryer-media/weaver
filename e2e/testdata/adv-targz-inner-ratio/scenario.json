@@ -1,0 +1,14 @@
+{
+  "slug": "adv-targz-inner-ratio",
+  "title": "E2E.Adversarial.Targz.Inner.Ratio.2026-TESTGRP",
+  "description": "A .tar.gz whose tar is padded with 16 MiB of zeros after its end blocks. The tar is never delivered, but it alone expands the post a thousand times, so with the ratio floor at 1 MiB the extraction budget refuses the job once, naming the ratio.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "ratio",
+    "outcome": "failed",
+    "errorContains": "WEAVER_EXTRACTION_REJECTED[ratio]",
+    "budgetRefusals": 1,
+    "rejectionMetric": "ratio"
+  }
+}

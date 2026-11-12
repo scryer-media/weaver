@@ -115,6 +115,13 @@ func adversarialGroups() []adversarialGroup {
 			}, nil
 		}},
 		{Name: "reserve", Env: adversarialReserveEnv},
+		// The ratio floor lowered to 1 MiB, so a nest of a few MiB is judged
+		// against the ratio of a hundred rather than the 1 GiB floor.
+		{Name: "ratio", Env: func() (map[string]string, error) {
+			return map[string]string{
+				"WEAVER_EXTRACTION_RATIO_FLOOR_BYTES": strconv.Itoa(1 << 20),
+			}, nil
+		}},
 	}
 }
 
@@ -336,7 +343,7 @@ func (spec adversarialSpec) validate() error {
 		known = known || group.Name == spec.Group
 	}
 	if !known {
-		return fmt.Errorf("adversarial group %q is not one of default, tight, reserve", spec.Group)
+		return fmt.Errorf("adversarial group %q is not one of default, tight, reserve, ratio", spec.Group)
 	}
 	switch spec.Outcome {
 	case "success", "failed", "either", "settles":

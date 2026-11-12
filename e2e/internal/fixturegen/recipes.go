@@ -1632,6 +1632,7 @@ func Recipes() []Recipe {
 	recipes = append(recipes, PAR3Recipes()...)
 	recipes = append(recipes, SpeedTestRecipes()...)
 	recipes = append(recipes, AdversarialRecipes()...)
+	recipes = append(recipes, AdversarialContainerRecipes()...)
 	recipes = append(recipes, GraphGapRecipes()...)
 	recipes = append(recipes, GraphBoundaryRecipes()...)
 	return recipes

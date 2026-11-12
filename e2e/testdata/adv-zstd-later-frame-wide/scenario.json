@@ -1,0 +1,12 @@
+{
+  "slug": "adv-zstd-later-frame-wide",
+  "title": "E2E.Adversarial.Zstd.Later.Frame.Wide.2026-TESTGRP",
+  "description": "Two zstd frames, the first naming a 1 MiB window and the second a 2 TiB one. The second is refused at its header, nothing is decoded past what was charged, and the job fails naming decode memory.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "errorContains": "decode memory"
+  }
+}

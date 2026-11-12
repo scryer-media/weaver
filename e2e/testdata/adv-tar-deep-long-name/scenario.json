@@ -1,0 +1,15 @@
+{
+  "slug": "adv-tar-deep-long-name",
+  "title": "E2E.Adversarial.Tar.Deep.Long.Name.2026-TESTGRP",
+  "description": "A tar member whose GNU long name runs through 262,000 one-letter directories, beside an ordinary member. The name ledger keeps every part, so creating the member's directories fails at the filesystem's path limit and the job fails on the namespace write; the deep member never lands.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "errorContains": "the namespace write path failed",
+    "forbiddenOutputs": [
+      "deep.txt"
+    ]
+  }
+}

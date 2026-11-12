@@ -1,0 +1,15 @@
+{
+  "slug": "adv-7z-folded-copies",
+  "title": "E2E.Adversarial.7z.Folded.Copies.2026-TESTGRP",
+  "description": "A tar of fifty identical copies of one stored 7z under the default caps. The copies fold into the first and its two members are delivered once.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "requiredOutputs": [
+      "ember-a.txt",
+      "ember-b.txt"
+    ]
+  }
+}

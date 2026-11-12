@@ -1,0 +1,14 @@
+{
+  "slug": "adv-7z-end-header-2-63",
+  "title": "E2E.Adversarial.7z.End.Header.2-63.2026-TESTGRP",
+  "description": "A stored 7z whose signature header states an end header of 2^63 bytes with a valid checksum. The store holds only the bytes posted and ends as a 7z cut short of its end header: refused as unmapped, the job fails for unpacking with nothing extracted.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "errorContains": "never placed every member it named",
+    "failureKind": "unpack",
+    "extractsNothing": true
+  }
+}

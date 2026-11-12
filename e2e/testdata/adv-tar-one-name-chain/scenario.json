@@ -1,0 +1,18 @@
+{
+  "slug": "adv-tar-one-name-chain",
+  "title": "E2E.Adversarial.Tar.One.Name.Chain.2026-TESTGRP",
+  "description": "Two thousand inner tars each holding beacon.txt, then beacon.txt one level up. The shallow member keeps the name and every other moves on a suffix in one chain; no cap, no refusal, every file delivered.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 2001,
+    "requiredOutputs": [
+      "beacon.txt",
+      "beacon (1).txt",
+      "beacon (1000).txt",
+      "beacon (2000).txt"
+    ]
+  }
+}

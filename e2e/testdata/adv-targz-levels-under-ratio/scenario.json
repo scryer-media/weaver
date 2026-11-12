@@ -1,0 +1,14 @@
+{
+  "slug": "adv-targz-levels-under-ratio",
+  "title": "E2E.Adversarial.Targz.Levels.Under.Ratio.2026-TESTGRP",
+  "description": "A .tar.gz whose tar and whose member each expand the post about seventy times: past the ratio of a hundred together, under it alone. Each level is judged on its own, so with the ratio floor at 1 MiB the job completes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "ratio",
+    "outcome": "success",
+    "requiredOutputs": [
+      "harbor-reel.mkv"
+    ]
+  }
+}

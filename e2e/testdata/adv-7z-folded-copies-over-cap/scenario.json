@@ -1,0 +1,15 @@
+{
+  "slug": "adv-7z-folded-copies-over-cap",
+  "title": "E2E.Adversarial.7z.Folded.Copies.Over.Cap.2026-TESTGRP",
+  "description": "A tar of 1,200 identical copies of one stored 7z, run with the entry cap at 1000. Folded copies count as the entries they are, so the extraction budget refuses the job once, by name.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "tight",
+    "outcome": "failed",
+    "errorContains": "WEAVER_EXTRACTION_REJECTED[entries]",
+    "failureKind": "unpack",
+    "budgetRefusals": 1,
+    "rejectionMetric": "entries"
+  }
+}
