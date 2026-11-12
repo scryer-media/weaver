@@ -462,8 +462,9 @@ impl KernelSockets {
 }
 
 // How many free IPv6 ports a pair tries before giving up on one IPv4 also
-// has free.
-const PAIR_ATTEMPTS: usize = 16;
+// has free, and how many free TCP ports a peer listener tries before giving
+// up on one UDP also has free.
+pub(crate) const PAIR_ATTEMPTS: usize = 16;
 
 // A socket for each family on one port: IPv6 alone at `addr`, then IPv4 on
 // the port it took. Port 0 lets the kernel choose, and a port it chose for

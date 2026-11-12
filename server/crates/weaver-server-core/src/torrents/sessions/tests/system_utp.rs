@@ -146,7 +146,11 @@ async fn a_system_leg_session_with_both_transports_builds_and_moves_data_over_ut
     )
     .await?
     .as_bytes()?;
-    let (seed_port, download_port) = two_free_ports();
+    let (seed_port, download_port) = two_free_ports(
+        &KernelSockets::new(None)?,
+        crate::torrents::sessions::unspecified(crate::torrents::sessions::binds),
+    )
+    .await;
 
     let (seed_factory, seed_noted) = NotingKernel::new();
     let seed_routes = system_route(seed_factory);

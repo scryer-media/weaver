@@ -13,7 +13,7 @@ use std::{
 use anyhow::Context;
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, info};
 
 use crate::{
     network::{DatagramTransport, DhtShare, DhtTap, SocketFactory, StreamListener, UtpSocket},
@@ -211,73 +211,105 @@ impl ListenerOptions {
 }
 
 // A listener's sockets on `listen_addr`, as `mode` says; a port of 0 takes
-// TCP's free port, and uTP binds the port TCP took. The session's `peers`
-// listener is the one a factory's forwarded port reaches, and its uTP
-// socket's datagram socket is kept for the DHT to share. Its uTP socket asks
-// for a receive buffer of `receive_buffer` bytes.
+// TCP's free port, and uTP binds the port TCP took. A port TCP chose that a
+// datagram socket already holds is given up for another, as a socket pair is
+// (`network::bind_pair`); the listeners given up stay open until uTP binds,
+// so TCP never chooses one again. A port the caller names is never given
+// up: uTP there fails, and the listener goes on over TCP alone. The
+// session's `peers` listener is the one
+// a factory's forwarded port reaches, and its uTP socket's datagram socket is
+// kept for the DHT to share. Its uTP socket asks for a receive buffer of
+// `receive_buffer` bytes.
 async fn bind(
     mode: ListenerMode,
-    mut listen_addr: SocketAddr,
+    asked_addr: SocketAddr,
     utp_opts: weaver_utp::SocketOpts,
     receive_buffer: usize,
     factory: &Arc<dyn SocketFactory>,
     peers: bool,
     connection_slots: &crate::connection_slots::ConnectionSlots,
 ) -> anyhow::Result<Bound> {
-    let tcp_socket = if mode.tcp_enabled() {
-        let listening = if peers {
-            factory.listen_peers_tcp(listen_addr)
+    let mut given_up = Vec::new();
+    loop {
+        let mut listen_addr = asked_addr;
+        let tcp_socket = if mode.tcp_enabled() {
+            let listening = if peers {
+                factory.listen_peers_tcp(listen_addr)
+            } else {
+                factory.listen_tcp(listen_addr)
+            };
+            let listener = listening.await.context("error starting TCP listener")?;
+            listen_addr = listener.local_addr();
+            Some(listener)
         } else {
-            factory.listen_tcp(listen_addr)
+            None
         };
-        let listener = listening.await.context("error starting TCP listener")?;
-        listen_addr = listener.local_addr();
-        info!(
-            "Listening on TCP {:?} for incoming peer connections",
-            listen_addr
-        );
-        Some(listener)
-    } else {
-        None
-    };
 
-    let (utp_socket, dht_share) = if mode.utp_enabled() {
-        match bind_shared_utp(
-            factory.as_ref(),
-            listen_addr,
-            utp_opts,
-            receive_buffer,
-            Some(connection_slots),
-            peers,
-        )
-        .await
-        {
-            Ok((sock, share)) => {
-                listen_addr = sock.bind_addr();
-                info!(
-                    "Listening on UDP {:?} for incoming uTP peer connections",
-                    listen_addr
-                );
-                (Some(sock), share)
+        let (utp_socket, dht_share) = if mode.utp_enabled() {
+            match bind_shared_utp(
+                factory.as_ref(),
+                listen_addr,
+                utp_opts.clone(),
+                receive_buffer,
+                Some(connection_slots),
+                peers,
+            )
+            .await
+            {
+                Ok((sock, share)) => {
+                    listen_addr = sock.bind_addr();
+                    info!(
+                        "Listening on UDP {:?} for incoming uTP peer connections",
+                        listen_addr
+                    );
+                    (Some(sock), share)
+                }
+                Err(e)
+                    if asked_addr.port() == 0
+                        && given_up.len() + 1 < crate::network::PAIR_ATTEMPTS
+                        && is_addr_in_use(&e) =>
+                {
+                    if let Some(listener) = tcp_socket {
+                        debug!("UDP {listen_addr:?} is in use; the listener takes another port");
+                        given_up.push(listener);
+                        continue;
+                    }
+                    return Err(e);
+                }
+                Err(e) if tcp_socket.is_some() => {
+                    // If we listen over TCP, it's not a fatal error if we can't listen over uTP.
+                    tracing::error!("Error listening on UDP {listen_addr:?}: {e:#}");
+                    (None, None)
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) if tcp_socket.is_some() => {
-                // If we listen over TCP, it's not a fatal error if we can't listen over uTP.
-                tracing::error!("Error listening on UDP {listen_addr:?}: {e:#}");
-                (None, None)
-            }
-            Err(e) => return Err(e),
+        } else {
+            (None, None)
+        };
+        if let Some(listener) = &tcp_socket {
+            info!(
+                "Listening on TCP {:?} for incoming peer connections",
+                listener.local_addr()
+            );
         }
-    } else {
-        (None, None)
-    };
 
-    Ok(Bound {
-        listening: Listening {
-            tcp_socket,
-            utp_socket,
-            addr: listen_addr,
-        },
-        dht_share,
+        return Ok(Bound {
+            listening: Listening {
+                tcp_socket,
+                utp_socket,
+                addr: listen_addr,
+            },
+            dht_share,
+        });
+    }
+}
+
+// Whether `error` says the address was already in use.
+fn is_addr_in_use(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
     })
 }
 

@@ -778,13 +778,20 @@ async fn a_route_announces_the_configured_port() {
 
 // A loopback leg whose session listens on 127.0.0.1.
 fn loopback_leg(routes: &FakeRoutes) {
+    let (kind, sockets) = loopback_sockets();
+    routes.set_leg(kind, Arc::new(sockets));
+}
+
+// The sockets of a leg bound to 127.0.0.1, and its kind.
+fn loopback_sockets() -> (LegKind, LegSockets) {
     let kind = LegKind::SourceAddress("127.0.0.1".parse().unwrap());
     let loopback = Arc::new(weaver_tunnel::pipe::Egress::new(
         4,
         weaver_tunnel::egress::SocketEgress::SourceAddress("127.0.0.1".parse().unwrap()),
         std::time::Duration::MAX,
     ));
-    routes.set_leg(kind.clone(), Arc::new(LegSockets::new(loopback, &kind)));
+    let sockets = LegSockets::new(loopback, &kind);
+    (kind, sockets)
 }
 
 // An open route's view carries the address its session bound, and each
@@ -1615,14 +1622,46 @@ fn operators(url: &str) -> weaver_torrent::AddTorrentOptions {
     }
 }
 
-// Two loopback ports free as this is called.
-fn two_free_ports() -> (u16, u16) {
-    let first = TcpListener::bind("127.0.0.1:0").unwrap();
-    let second = TcpListener::bind("127.0.0.1:0").unwrap();
-    (
-        first.local_addr().unwrap().port(),
-        second.local_addr().unwrap().port(),
-    )
+// Two ports at `ip` that `sockets` binds both a TCP listener and a datagram
+// socket on as this is called, as a session's listener, uTP and DHT bind
+// one port. The kernel chooses a TCP port, which says nothing of UDP's: a
+// port a datagram socket already holds is passed over, and stays held until
+// both are found, so it is not chosen again. A socket at the unspecified
+// IPv6 address takes IPv4 too, yet binds beside an IPv4 socket on its port,
+// which then takes the IPv4 datagrams: such a port must be free at the
+// IPv4 addresses as well.
+pub(super) async fn two_free_ports(sockets: &dyn SocketFactory, ip: IpAddr) -> (u16, u16) {
+    let mut at = vec![ip];
+    if ip == IpAddr::from(std::net::Ipv6Addr::UNSPECIFIED) {
+        at.extend([
+            IpAddr::from(std::net::Ipv4Addr::UNSPECIFIED),
+            IpAddr::from(std::net::Ipv4Addr::LOCALHOST),
+        ]);
+    }
+    let mut held = Vec::new();
+    let mut free = Vec::new();
+    while free.len() < 2 {
+        let listener = sockets.listen_tcp(SocketAddr::new(ip, 0)).await.unwrap();
+        let port = listener.local_addr().port();
+        // Each is let go before the next binds, so none stands in another's
+        // way.
+        let mut taken = false;
+        for addr in at.iter().map(|ip| SocketAddr::new(*ip, port)) {
+            match sockets.bind_udp(addr).await {
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                    taken = true;
+                    break;
+                }
+                Err(error) => panic!("binding UDP {addr}: {error}"),
+            }
+        }
+        if !taken {
+            free.push(port);
+        }
+        held.push(listener);
+    }
+    (free[0], free[1])
 }
 
 // A base port change opens the route on its new port at once: its last
@@ -1643,7 +1682,7 @@ async fn a_base_port_change_listens_on_the_new_port_while_the_old_stopped_announ
         env(dir.path()),
         Database::open_in_memory().unwrap(),
     );
-    let (first, second) = two_free_ports();
+    let (first, second) = two_free_ports(&loopback_sockets().1, IpAddr::from([127, 0, 0, 1])).await;
     // A day: the stopped announce waits on the tracker, not on its timeout.
     let on = |base_port| TorrentConfig {
         base_port,
