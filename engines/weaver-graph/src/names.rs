@@ -214,6 +214,17 @@ pub struct NameLedger {
     // How many holders a free name was offered to.
     #[cfg(test)]
     offered: usize,
+    // How many steps run at once, and the most that ever did.
+    #[cfg(test)]
+    nesting: usize,
+    #[cfg(test)]
+    deepest: usize,
+    // The most members one change moved on, and how many changes moved a
+    // file off a directory's path and that file moved another on.
+    #[cfg(test)]
+    longest: usize,
+    #[cfg(test)]
+    through_directory: usize,
 }
 
 impl NameLedger {
@@ -375,32 +386,7 @@ impl NameLedger {
     // The highest ranked file that wants the free name `name` and holds
     // another takes it.
     fn take_wanted(&mut self, name: PathId, moved: &mut Vec<Moved>) {
-        if self.taken.contains_key(&name) || self.paths.dirs(name) > 0 {
-            return;
-        }
-        let Some(&(_, holder)) = self.wanting.get(&name).and_then(BTreeSet::first) else {
-            return;
-        };
-        #[cfg(test)]
-        {
-            self.offered += 1;
-        }
-        // Held from here, the path stays while the holder stops waiting.
-        self.taken.insert(name, holder);
-        let entry = self.exit(holder).expect("a waiting holder has an entry");
-        let old = entry.name;
-        let wanted = entry.wanted;
-        let old_path = key(&old);
-        self.leave(old_path.clone(), holder);
-        self.untake(&old_path);
-        self.enter(holder, entry.rank, wanted.clone(), wanted.clone());
-        self.claim(holder, &wanted, moved);
-        moved.push(Moved {
-            holder,
-            old: old.clone(),
-            new: wanted,
-        });
-        self.unclaim(&old, moved);
+        self.run(Step::TakeWanted(name), moved);
     }
 
     // A restored holder's file still sits at `name`, which it is moving
@@ -552,8 +538,23 @@ impl NameLedger {
         wanted: &str,
         moved: &mut Vec<Moved>,
     ) -> String {
+        let (name, outranked) = self.seat(holder, rank, wanted);
+        if let Some(other) = outranked {
+            self.run(Step::Displace(other), moved);
+        }
+        name
+    }
+
+    // `holder` takes the name `place` gives it; the member it outranks
+    // there, if any, is returned to be moved on.
+    fn seat(
+        &mut self,
+        holder: Holder,
+        rank: &(Position, Holder),
+        wanted: &str,
+    ) -> (String, Option<Holder>) {
         if is_directory(wanted) {
-            return wanted.to_owned();
+            return (wanted.to_owned(), None);
         }
         let (stem, extension) = split_extension(wanted);
         for n in 0u32.. {
@@ -585,31 +586,9 @@ impl NameLedger {
                 },
             };
             self.take(&key, holder);
-            if let Some(other) = outranked {
-                self.displace(other, moved);
-            }
-            return candidate;
+            return (candidate, outranked);
         }
         unreachable!("an unbounded counter finds a free name")
-    }
-
-    // `other` lost its name to a member that outranks it and takes the next
-    // name it may. Its own move is reported after whatever it displaced in
-    // turn, so the moves apply in order.
-    fn displace(&mut self, other: Holder, moved: &mut Vec<Moved>) {
-        let Some(entry) = self.exit(other) else {
-            return;
-        };
-        let name = self.place(other, &entry.rank, &entry.wanted, moved);
-        let old = entry.name;
-        moved.push(Moved {
-            holder: other,
-            old: old.clone(),
-            new: name.clone(),
-        });
-        self.enter(other, entry.rank, entry.wanted, name.clone());
-        self.claim(other, &name, moved);
-        self.unclaim(&old, moved);
     }
 
     // `holder`'s name `name` holds every directory it runs through or is.
@@ -617,59 +596,235 @@ impl NameLedger {
     // A directory below the one it is in stays held while this runs: the
     // name holds it, so nothing a moved member does lets it go.
     fn claim(&mut self, holder: Holder, name: &str, moved: &mut Vec<Moved>) {
-        let path = key(name);
-        let mut probe = Vec::new();
-        let mut at = TOP;
-        for dir in directories(&path, is_directory(name)) {
-            at = self.paths.child_or_insert(at, dir, &mut probe);
-            self.paths.node_mut(at).dirs += 1;
-            if let Some(file) = self.taken.get(&at).copied().filter(|file| *file != holder) {
-                self.taken.remove(&at);
-                self.displace(file, moved);
-            }
-        }
+        self.run(Step::Claim(holder, Walk::new(name)), moved);
     }
 
     // `name` no longer holds its directories. A path no name holds any more
     // is free to the file that wanted it. The directories below the one
     // given up stay held by the name until it reaches them.
     fn unclaim(&mut self, name: &str, moved: &mut Vec<Moved>) {
-        let path = key(name);
-        let mut probe = Vec::new();
-        let mut at = TOP;
-        for dir in directories(&path, is_directory(name)) {
-            let Some(next) = self.paths.child(at, dir, &mut probe) else {
-                break;
-            };
-            at = next;
-            let node = self.paths.node_mut(at);
-            if node.dirs == 0 {
-                continue;
+        self.run(Step::Unclaim(Walk::new(name)), moved);
+    }
+
+    // Runs `first` and every step it sets off, each to its end before the
+    // one that set it off goes on, in a loop: a chain of members that move
+    // one another on runs at one depth however long it is.
+    fn run(&mut self, first: Step, moved: &mut Vec<Moved>) {
+        let mut steps = Vec::new();
+        let mut next = Some(first);
+        #[cfg(test)]
+        let (mut displaced, mut by_directory) = (0, false);
+        while let Some(step) = next.take().or_else(|| steps.pop()) {
+            #[cfg(test)]
+            let claim = matches!(step, Step::Claim(..));
+            #[cfg(test)]
+            {
+                displaced += usize::from(matches!(step, Step::Displace(_)));
+                self.nesting += 1;
+                self.deepest = self.deepest.max(self.nesting);
             }
-            node.dirs -= 1;
-            if node.dirs == 0 && !self.leaving.contains_key(&at) {
-                self.take_wanted(at, moved);
+            self.step(step, &mut steps, moved);
+            #[cfg(test)]
+            {
+                self.nesting -= 1;
+                by_directory |= claim && matches!(steps.last(), Some(Step::Displace(_)));
             }
         }
-        self.prune(at);
+        #[cfg(test)]
+        {
+            self.longest = self.longest.max(displaced);
+            self.through_directory += usize::from(by_directory && displaced >= 2);
+        }
+    }
+
+    // One step. The steps it sets off are pushed to `steps` with the one
+    // to run first last.
+    fn step(&mut self, step: Step, steps: &mut Vec<Step>, moved: &mut Vec<Moved>) {
+        match step {
+            // `other` lost its name to a member that outranks it and takes
+            // the next name it may. Its own move is reported after whatever
+            // it displaced in turn, so the moves apply in order.
+            Step::Displace(other) => {
+                let Some(entry) = self.exit(other) else {
+                    return;
+                };
+                let (name, outranked) = self.seat(other, &entry.rank, &entry.wanted);
+                steps.push(Step::Unclaim(Walk::new(&entry.name)));
+                steps.push(Step::Claim(other, Walk::new(&name)));
+                steps.push(Step::Enter {
+                    holder: other,
+                    rank: entry.rank,
+                    wanted: entry.wanted,
+                    old: entry.name,
+                    name,
+                });
+                if let Some(next) = outranked {
+                    steps.push(Step::Displace(next));
+                }
+            }
+            Step::Enter {
+                holder,
+                rank,
+                wanted,
+                old,
+                name,
+            } => {
+                moved.push(Moved {
+                    holder,
+                    old,
+                    new: name.clone(),
+                });
+                self.enter(holder, rank, wanted, name);
+            }
+            Step::Report(report) => moved.push(report),
+            Step::Claim(holder, mut walk) => {
+                let mut probe = Vec::new();
+                while let Some(part) = walk.next() {
+                    walk.at = self
+                        .paths
+                        .child_or_insert(walk.at, &walk.path[part], &mut probe);
+                    self.paths.node_mut(walk.at).dirs += 1;
+                    if let Some(file) = self
+                        .taken
+                        .get(&walk.at)
+                        .copied()
+                        .filter(|file| *file != holder)
+                    {
+                        self.taken.remove(&walk.at);
+                        steps.push(Step::Claim(holder, walk));
+                        steps.push(Step::Displace(file));
+                        return;
+                    }
+                }
+            }
+            Step::Unclaim(mut walk) => {
+                let mut probe = Vec::new();
+                while let Some(part) = walk.next() {
+                    let Some(next) = self.paths.child(walk.at, &walk.path[part], &mut probe) else {
+                        break;
+                    };
+                    walk.at = next;
+                    let node = self.paths.node_mut(next);
+                    if node.dirs == 0 {
+                        continue;
+                    }
+                    node.dirs -= 1;
+                    if node.dirs == 0 && !self.leaving.contains_key(&next) {
+                        steps.push(Step::Unclaim(walk));
+                        steps.push(Step::TakeWanted(next));
+                        return;
+                    }
+                }
+                self.prune(walk.at);
+            }
+            // The highest ranked file that wants the free name `name` and
+            // holds another takes it.
+            Step::TakeWanted(name) => {
+                if self.taken.contains_key(&name) || self.paths.dirs(name) > 0 {
+                    return;
+                }
+                let Some(&(_, holder)) = self.wanting.get(&name).and_then(BTreeSet::first) else {
+                    return;
+                };
+                #[cfg(test)]
+                {
+                    self.offered += 1;
+                }
+                // Held from here, the path stays while the holder stops waiting.
+                self.taken.insert(name, holder);
+                let entry = self.exit(holder).expect("a waiting holder has an entry");
+                let old = entry.name;
+                let wanted = entry.wanted;
+                let old_path = key(&old);
+                self.leave(old_path.clone(), holder);
+                self.untake(&old_path);
+                let claim = Walk::new(&wanted);
+                self.enter(holder, entry.rank, wanted.clone(), wanted.clone());
+                steps.push(Step::Unclaim(Walk::of(old_path, is_directory(&old))));
+                steps.push(Step::Report(Moved {
+                    holder,
+                    old,
+                    new: wanted,
+                }));
+                steps.push(Step::Claim(holder, claim));
+            }
+        }
+    }
+}
+
+// The work one change to the ledger sets off, a step at a time: a member
+// that loses its name moves on, and may move another on in turn.
+#[derive(Debug)]
+enum Step {
+    // A member lost its name to one that outranks it.
+    Displace(Holder),
+    // A moved member holds its new name, and its move is reported.
+    Enter {
+        holder: Holder,
+        rank: (Position, Holder),
+        wanted: String,
+        old: String,
+        name: String,
+    },
+    Report(Moved),
+    // A name holds its directories, from where the walk is on.
+    Claim(Holder, Walk),
+    // A name gives up its directories, from where the walk is on.
+    Unclaim(Walk),
+    // A path came free to the file that wants it.
+    TakeWanted(PathId),
+}
+
+// A walk down the directories a name holds, from the top, as the parts of
+// its path on disk: every one the path runs through, and the path itself
+// when the name is a directory. "a/b/c.bin" holds "a" and "a/b"; "a/b/"
+// holds both too.
+#[derive(Debug)]
+struct Walk {
+    path: String,
+    // Where the next part starts.
+    from: usize,
+    // Where the last part ends, or none when the name runs through none.
+    end: Option<usize>,
+    // The directory the walk has reached.
+    at: PathId,
+}
+
+impl Walk {
+    fn new(name: &str) -> Self {
+        Self::of(key(name), is_directory(name))
+    }
+
+    // The walk down `path`, a key, the path of a `directory` or a file.
+    fn of(path: String, directory: bool) -> Self {
+        let end = if directory {
+            Some(path.len())
+        } else {
+            path.rfind('/')
+        };
+        Self {
+            path,
+            from: 0,
+            end,
+            at: TOP,
+        }
+    }
+
+    // The next part, as a range of the path.
+    fn next(&mut self) -> Option<std::ops::Range<usize>> {
+        let end = self.end.filter(|end| self.from <= *end)?;
+        let stop = self.path[self.from..end]
+            .find('/')
+            .map_or(end, |slash| self.from + slash);
+        let part = self.from..stop;
+        self.from = stop + 1;
+        Some(part)
     }
 }
 
 // A directory member is a name ending in a separator.
 fn is_directory(name: &str) -> bool {
     name.ends_with('/')
-}
-
-// The directories a name holds, from the top, as the parts of its path
-// `path` on disk: every one the path runs through, and the path itself when
-// the name is a `directory`. "a/b/c.bin" holds "a" and "a/b"; "a/b/" holds
-// both too.
-fn directories(path: &str, directory: bool) -> std::str::Split<'_, char> {
-    let mut parts = path.split('/');
-    if !directory {
-        parts.next_back();
-    }
-    parts
 }
 
 // The directory of the working directory the job's own files live in:
@@ -1842,9 +1997,24 @@ mod tests {
     }
 
     fn answers_as_the_reference(names: &[&str]) {
+        answers_as_the_reference_among(names, 4);
+    }
+
+    // The most members one change moved on, how many changes moved a file
+    // off a directory's path and that file moved another on, and the most
+    // steps that ran at once, over every seed.
+    #[derive(Default)]
+    struct Chains {
+        longest: usize,
+        through_directory: usize,
+        deepest: usize,
+    }
+
+    fn answers_as_the_reference_among(names: &[&str], members: u32) -> Chains {
+        let mut chains = Chains::default();
         let holders: Vec<Holder> = [ROOT, STORE, NodeId(2), NodeId(3)]
             .into_iter()
-            .flat_map(|node| (0..4).map(move |member| (node, MemberId(member))))
+            .flat_map(|node| (0..members).map(move |member| (node, MemberId(member))))
             .collect();
         for seed in [1u64, 7, 42, 1_234_567, 0x9e37_79b9_7f4a_7c15, 31_337] {
             let mut draw = Draw(seed);
@@ -1921,6 +2091,274 @@ mod tests {
             }
             // The sequence moved members and handed freed names on.
             assert!(moves > 0 && ledger.offered > 0, "seed {seed}");
+            chains.longest = chains.longest.max(ledger.longest);
+            chains.through_directory += ledger.through_directory;
+            chains.deepest = chains.deepest.max(ledger.deepest);
+        }
+        chains
+    }
+
+    // Names that one stem's suffixed forms collide on, as files, as
+    // directories and as directories other names run through, so a member
+    // that takes one moves others on in chains.
+    const CHAIN_NAMES: [&str; 24] = [
+        "c.bin",
+        "C.BIN",
+        "c.bin",
+        "c (1).bin",
+        "c (2).bin",
+        "c (3).bin",
+        "c (4).bin",
+        "c",
+        "c/",
+        "c (1)",
+        "c (1)/",
+        "c (2)",
+        "c (2)/",
+        "c/c.bin",
+        "c (1)/c.bin",
+        "c (2)/c (1).bin",
+        "c.bin/",
+        "c.bin/c",
+        "c (1).bin/",
+        "c (1).bin/c (1)",
+        "c (2).bin/x",
+        "d/c.bin",
+        "d/c (1).bin/",
+        "d",
+    ];
+
+    #[test]
+    fn the_ledger_answers_as_the_reference_for_chains_of_moves() {
+        let chains = answers_as_the_reference_among(&CHAIN_NAMES, 16);
+        // Members moved one another on in chains, and a directory moved a
+        // file on whose next name moved another, at one depth throughout.
+        assert!(chains.longest >= 4, "{}", chains.longest);
+        assert!(chains.through_directory > 0);
+        assert_eq!(chains.deepest, 1);
+    }
+
+    // A directory takes the path of a file, which moves on to its first
+    // suffix and moves the member holding it on in turn.
+    #[test]
+    fn a_directory_moves_a_file_on_whose_next_name_moves_another() {
+        let (first, second, directory) = (
+            (ROOT, MemberId(1)),
+            (STORE, MemberId(0)),
+            (NodeId(2), MemberId(0)),
+        );
+        let order = [
+            (first, at(&[1]), "c"),
+            (second, at(&[0, 0]), "c"),
+            (directory, at(&[0, 0, 0]), "c/"),
+        ];
+        let mut ledger = NameLedger::new();
+        let mut reference = reference::Ledger::default();
+        let (mut ours, mut theirs) = (Vec::new(), Vec::new());
+        for (holder, position, wanted) in &order {
+            ledger.allocate(*holder, position.clone(), wanted, &mut ours);
+            reference.allocate(*holder, position.clone(), wanted, &mut theirs);
+        }
+        assert_eq!(ours, theirs);
+        assert_eq!(
+            ours,
+            vec![
+                Moved {
+                    holder: second,
+                    old: "c (1)".into(),
+                    new: "c (2)".into(),
+                },
+                Moved {
+                    holder: first,
+                    old: "c".into(),
+                    new: "c (1)".into(),
+                },
+            ]
+        );
+        assert_eq!(ledger.given(first), Some("c (1)"));
+        assert_eq!(ledger.given(second), Some("c (2)"));
+        assert_eq!(ledger.given(directory), Some("c/"));
+        assert_eq!(ledger.deepest, 1);
+    }
+
+    // Both ledgers, driven alike.
+    trait Drive {
+        fn allocate(&mut self, holder: Holder, at: Position, wanted: &str, moved: &mut Vec<Moved>);
+        fn restore(&mut self, holder: Holder, at: Position, wanted: &str, held: &str);
+        fn release(&mut self, holder: Holder, moved: &mut Vec<Moved>);
+    }
+
+    impl Drive for NameLedger {
+        fn allocate(&mut self, holder: Holder, at: Position, wanted: &str, moved: &mut Vec<Moved>) {
+            NameLedger::allocate(self, holder, at, wanted, moved);
+        }
+        fn restore(&mut self, holder: Holder, at: Position, wanted: &str, held: &str) {
+            NameLedger::restore(self, holder, at, wanted, held);
+        }
+        fn release(&mut self, holder: Holder, moved: &mut Vec<Moved>) {
+            NameLedger::release(self, holder, moved);
+        }
+    }
+
+    impl Drive for reference::Ledger {
+        fn allocate(&mut self, holder: Holder, at: Position, wanted: &str, moved: &mut Vec<Moved>) {
+            reference::Ledger::allocate(self, holder, at, wanted, moved);
+        }
+        fn restore(&mut self, holder: Holder, at: Position, wanted: &str, held: &str) {
+            reference::Ledger::restore(self, holder, at, wanted, held);
+        }
+        fn release(&mut self, holder: Holder, moved: &mut Vec<Moved>) {
+            reference::Ledger::release(self, holder, moved);
+        }
+    }
+
+    // The `k`th member of a chain, ranking below every one before it and
+    // below the root member that sets the chain off.
+    fn link(k: usize) -> (Holder, Position) {
+        let k = u32::try_from(k).unwrap();
+        ((STORE, MemberId(k)), at(&[0, k]))
+    }
+
+    const TOP_MEMBER: Holder = (ROOT, MemberId(0));
+
+    // How a chain of `n` members is set off, and the moves it makes.
+    #[derive(Clone, Copy)]
+    enum Chain {
+        // Every member wants one name and takes a suffix of it; a member
+        // that outranks them all then takes the name.
+        OneName,
+        // Each member holds the name the one before it wants; a member that
+        // outranks them all takes the first one's name.
+        Outranked,
+        // Each member's file holds the path of the directory the one
+        // before it wants; a directory takes the first one's path.
+        ThroughDirectories,
+        // Each member waits for a path the name of the one before it runs
+        // through; the name that holds the first path is released.
+        Waiting,
+    }
+
+    fn run_chain(ledger: &mut impl Drive, chain: Chain, n: usize) -> Vec<Moved> {
+        let mut moved = Vec::new();
+        for k in 0..n {
+            let (holder, position) = link(k);
+            match chain {
+                Chain::OneName => ledger.allocate(holder, position, "x.bin", &mut moved),
+                Chain::Outranked => ledger.restore(
+                    holder,
+                    position,
+                    &format!("f{}.bin", k + 1),
+                    &format!("f{k}.bin"),
+                ),
+                Chain::ThroughDirectories => ledger.restore(
+                    holder,
+                    position,
+                    &format!("f{}/x.bin", k + 1),
+                    &format!("f{k}"),
+                ),
+                Chain::Waiting => ledger.restore(
+                    holder,
+                    position,
+                    &format!("w{k}"),
+                    &format!("w{}/x.bin", k + 1),
+                ),
+            }
+        }
+        // Building it moved each member on to the next suffix as it came.
+        assert_eq!(moved, Vec::new());
+        match chain {
+            Chain::OneName => ledger.allocate(TOP_MEMBER, at(&[0]), "x.bin", &mut moved),
+            Chain::Outranked => ledger.allocate(TOP_MEMBER, at(&[0]), "f0.bin", &mut moved),
+            Chain::ThroughDirectories => {
+                ledger.allocate(TOP_MEMBER, at(&[0]), "f0/", &mut moved);
+            }
+            Chain::Waiting => {
+                ledger.restore(TOP_MEMBER, at(&[0]), "w0/x.bin", "w0/x.bin");
+                ledger.release(TOP_MEMBER, &mut moved);
+            }
+        }
+        moved
+    }
+
+    // The name the `k`th member of a chain ends with, and the one it left.
+    fn chain_names(chain: Chain, k: usize) -> (String, String) {
+        let suffix = |k: usize| match k {
+            0 => "x.bin".to_owned(),
+            k => format!("x ({k}).bin"),
+        };
+        match chain {
+            Chain::OneName => (suffix(k + 1), suffix(k)),
+            Chain::Outranked => (format!("f{}.bin", k + 1), format!("f{k}.bin")),
+            Chain::ThroughDirectories => (format!("f{}/x.bin", k + 1), format!("f{k}")),
+            Chain::Waiting => (format!("w{k}"), format!("w{}/x.bin", k + 1)),
+        }
+    }
+
+    const CHAINS: [Chain; 4] = [
+        Chain::OneName,
+        Chain::Outranked,
+        Chain::ThroughDirectories,
+        Chain::Waiting,
+    ];
+
+    // However many members a chain moves on, it runs at one depth, and
+    // gives every member the name and the move the reference does.
+    #[test]
+    fn a_chain_of_members_moved_on_runs_at_one_depth() {
+        const N: usize = 1_000;
+        for chain in CHAINS {
+            let mut ledger = NameLedger::new();
+            let mut reference = reference::Ledger::default();
+            let ours = run_chain(&mut ledger, chain, N);
+            let theirs = run_chain(&mut reference, chain, N);
+            assert_eq!(ours, theirs);
+            for k in 0..N {
+                let (holder, _) = link(k);
+                assert_eq!(ledger.given(holder), reference.given(holder));
+            }
+            assert_chain(&ledger, chain, &ours, N);
+            assert_eq!(
+                ledger.longest,
+                N * usize::from(!matches!(chain, Chain::Waiting))
+            );
+        }
+    }
+
+    // Every member of the chain moved once, to the name it ends with, in an
+    // order that moves a file off a name before another moves onto it.
+    fn assert_chain(ledger: &NameLedger, chain: Chain, moved: &[Moved], n: usize) {
+        assert_eq!(moved.len(), n);
+        for (at, report) in moved.iter().enumerate() {
+            // A member moved on by the one above it is reported first.
+            let k = match chain {
+                Chain::OneName | Chain::Outranked => n - 1 - at,
+                Chain::ThroughDirectories | Chain::Waiting => at,
+            };
+            let (name, old) = chain_names(chain, k);
+            assert_eq!(ledger.given(link(k).0), Some(name.as_str()));
+            assert_eq!(
+                report,
+                &Moved {
+                    holder: link(k).0,
+                    old,
+                    new: name,
+                }
+            );
+        }
+        assert_eq!(ledger.deepest, 1);
+    }
+
+    // A chain far longer than any stack could hold a call per member of
+    // moves every member on in one pass at one depth. Every member wanting
+    // one name probes each suffix the ones before it hold, so that chain
+    // stays at the size above.
+    #[test]
+    fn a_long_chain_of_members_moved_on_runs_at_one_depth() {
+        const N: usize = 100_000;
+        for chain in [Chain::Outranked, Chain::ThroughDirectories, Chain::Waiting] {
+            let mut ledger = NameLedger::new();
+            let moved = run_chain(&mut ledger, chain, N);
+            assert_chain(&ledger, chain, &moved, N);
         }
     }
 
