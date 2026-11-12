@@ -204,6 +204,8 @@ struct VirtualSocket<T, Env> {
     // The packet resent as this flight's tail-loss probe, until it is
     // acknowledged. One probe per flight.
     tail_probe_seq_nr: Option<SeqNr>,
+    // What this stream sent, logged when it ends.
+    totals: SendTotals,
 
     // Last remote sequence number that we fully processed.
     last_consumed_remote_seq_nr: SeqNr,
@@ -244,6 +246,20 @@ struct VirtualSocket<T, Env> {
 
     drop_guard: RetirementGuard,
     parent_span: Option<tracing::Span>,
+}
+
+// One stream's sending, counted over its life.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SendTotals {
+    // Data packets put on the wire, first sends and every resend.
+    pub(crate) packets_sent: u64,
+    // Resends of packets the SACKs or duplicate ACKs showed lost.
+    pub(crate) fast_resends: u64,
+    // Resends of the tail to draw an ACK.
+    pub(crate) tail_probes: u64,
+    // Times the retransmission timer ran out with data or our FIN
+    // unacknowledged, counted once per arming.
+    pub(crate) timer_expiries: u64,
 }
 
 // Updated on every poll
@@ -335,6 +351,7 @@ macro_rules! send_data {
             // This time better be as precise as possible as we are using it to
             // calculate recovery pipe (estimate of how many packets are in transit).
             $segment_iter_item.on_sent($self.env.now(), &$self.socket.stats);
+            $self.totals.packets_sent += 1;
             on_packet_sent!($self, $header);
 
             if $segment_iter_item.seq_nr().is_after($self.last_sent_seq_nr) {
@@ -450,6 +467,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if let Some(mut seg) = seg {
                 if self.timers.retransmit.report_expiry() {
                     self.socket.stats.timeouts.increment(1);
+                    self.totals.timer_expiries += 1;
                 }
                 // A stream that dies on a packet larger than any it saw
                 // delivered leaves later streams probing no higher.
@@ -539,6 +557,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     Some(our_fin_seq_nr) if self.last_sent_seq_nr == our_fin_seq_nr => {
                         if self.timers.retransmit.report_expiry() {
                             self.socket.stats.timeouts.increment(1);
+                            self.totals.timer_expiries += 1;
                         }
                         let timeouts = self.rtte.timeouts() as usize + 1;
                         if timeouts > self.socket_opts.num_resends
@@ -602,6 +621,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         return Ok(());
                     }
                     seg.on_resent_as_probe();
+                    self.totals.tail_probes += 1;
                     self.pacer.charge(seg.payload_size());
                     self.tail_probe_seq_nr = Some(tail);
                     trace!(%header.seq_nr, payload_size = seg.payload_size(), "tail probe: sent ST_DATA");
@@ -691,6 +711,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         .stats
                         .recovery_retransmitted_segments_count
                         .increment(1);
+                    self.totals.fast_resends += 1;
                     rec.pipe_estimate.pipe += seg.payload_size();
                     cwnd = cwnd.saturating_sub(seg.payload_size());
                     self.pacer.charge(seg.payload_size());
@@ -1146,6 +1167,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         } else {
             trace!("just_before_death: no error");
         }
+        let totals = self.totals;
+        debug!(
+            packets_sent = totals.packets_sent,
+            fast_resends = totals.fast_resends,
+            tail_probes = totals.tail_probes,
+            timer_expiries = totals.timer_expiries,
+            error = error.map(tracing::field::display),
+            "stream closed"
+        );
 
         if let Some(e) = error {
             self.user_rx.enqueue_error(format!("{e:#}"));
@@ -2220,6 +2250,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_sent_seq_nr,
             highest_sent_seq_nr: last_sent_seq_nr,
             tail_probe_seq_nr: None,
+            totals: SendTotals::default(),
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
             rto_retransmissions: 0,

@@ -22,7 +22,10 @@ use crate::{
     Error, SocketOpts,
     raw::{Type::*, UtpHeader, selective_ack::SelectiveAck},
     rtte::RttEstimator,
-    stream_dispatch::tests::{TestVsock, calc_mtu_for_mss, make_test_vsock},
+    stream_dispatch::{
+        SendTotals,
+        tests::{TestVsock, calc_mtu_for_mss, make_test_vsock},
+    },
     test_util::setup_test_logging,
     traits::UtpEnvironment,
 };
@@ -66,8 +69,8 @@ struct Peer {
     held: BTreeMap<u16, usize>,
     held_bytes: usize,
     capacity: usize,
-    // Arrivals of the first data packet that are lost on the way.
-    drop_first: usize,
+    // A data packet, and how many of its arrivals are lost on the way.
+    drop: (u16, usize),
     loss: Option<Loss>,
     counters: PeerCounters,
 }
@@ -79,7 +82,7 @@ impl Peer {
             held: BTreeMap::new(),
             held_bytes: 0,
             capacity,
-            drop_first: 0,
+            drop: (FIRST, 0),
             loss: None,
             counters: PeerCounters::default(),
         }
@@ -92,8 +95,8 @@ impl Peer {
     // The ACK for a data packet that arrived, or none when it was lost on
     // the way. The application reads all it is given at once.
     fn on_data(&mut self, seq_nr: u16, len: usize) -> Option<UtpHeader> {
-        if seq_nr == FIRST && self.drop_first > 0 {
-            self.drop_first -= 1;
+        if seq_nr == self.drop.0 && self.drop.1 > 0 {
+            self.drop.1 -= 1;
             self.counters.lost_on_path += 1;
             return None;
         }
@@ -147,10 +150,10 @@ struct Run {
     // From the first send to the end.
     took: Duration,
     peer: PeerCounters,
-    timer_expiries: u64,
-    fast_resends: u64,
     // When each send of the first data packet left.
     first_sends: Vec<Duration>,
+    // The stream's own totals, as its closing line logs them.
+    totals: SendTotals,
 }
 
 async fn stream_to(peer: &mut Peer, bytes: usize, rtt_sample: Duration) -> Run {
@@ -216,15 +219,29 @@ async fn drive(t: &mut TestVsock, peer: &mut Peer, bytes: usize) -> Run {
         tokio::task::yield_now().await;
     };
     let stats = &t.vsock.socket.stats;
+    let totals = t.vsock.totals;
+    // One stream on the socket: its totals are the socket's.
+    assert_eq!(
+        totals.packets_sent,
+        stats.send_count.load(Ordering::Relaxed)
+            + stats.data_retransmissions.load(Ordering::Relaxed)
+    );
+    assert_eq!(
+        totals.timer_expiries,
+        stats.timeouts.load(Ordering::Relaxed)
+    );
+    assert_eq!(
+        totals.fast_resends,
+        stats
+            .recovery_retransmitted_segments_count
+            .load(Ordering::Relaxed)
+    );
     Run {
         error,
         took: t.env.now() - start,
         peer: peer.counters,
-        timer_expiries: stats.rto_timeouts_count.load(Ordering::Relaxed),
-        fast_resends: stats
-            .recovery_retransmitted_segments_count
-            .load(Ordering::Relaxed),
         first_sends,
+        totals,
     }
 }
 
@@ -241,17 +258,26 @@ async fn drive(t: &mut TestVsock, peer: &mut Peer, bytes: usize) -> Run {
 #[tokio::test]
 async fn a_peer_that_loses_the_head_three_times_ends_the_stream() {
     let mut survived = Peer::new(4 * MSS);
-    survived.drop_first = 2;
+    survived.drop = (FIRST, 2);
     let run = stream_to(&mut survived, 8 * MSS, Duration::from_millis(1)).await;
     eprintln!("lost twice: {run:?}");
     assert!(run.error.is_none(), "{run:?}");
     assert_eq!(run.peer.dropped_full, 0, "{run:?}");
     assert_eq!(run.peer.delivered, 8 * MSS, "{run:?}");
     assert_eq!(run.first_sends.len(), 3, "{run:?}");
-    assert_eq!(run.fast_resends, 1, "{run:?}");
+    assert_eq!(
+        run.totals,
+        SendTotals {
+            packets_sent: 12,
+            fast_resends: 1,
+            tail_probes: 0,
+            timer_expiries: 1,
+        },
+        "{run:?}"
+    );
 
     let mut died = Peer::new(4 * MSS);
-    died.drop_first = 3;
+    died.drop = (FIRST, 3);
     let run = stream_to(&mut died, 8 * MSS, Duration::from_millis(1)).await;
     eprintln!("lost three times: {run:?}");
     assert!(
@@ -259,7 +285,18 @@ async fn a_peer_that_loses_the_head_three_times_ends_the_stream() {
         "{run:?}"
     );
     assert_eq!(run.peer.dropped_full, 0, "{run:?}");
-    assert_eq!(run.fast_resends, 1, "{run:?}");
+    // Four first sends, the fast resend, the timer's resend, and the
+    // timeout that ends the stream.
+    assert_eq!(
+        run.totals,
+        SendTotals {
+            packets_sent: 7,
+            fast_resends: 1,
+            tail_probes: 0,
+            timer_expiries: 2,
+        },
+        "{run:?}"
+    );
     assert_eq!(
         run.first_sends,
         [
@@ -292,4 +329,49 @@ async fn a_sender_inside_the_advertised_window_is_never_dropped_for_room() {
     assert!(run.error.is_none(), "{run:?}");
     assert_eq!(run.peer.delivered, 2 * 1024 * 1024, "{run:?}");
     assert_eq!(run.peer.dropped_full, 0, "{run:?}");
+}
+
+// 8000 bytes leave in ten packets, 101 to 110: slow start cuts the first
+// ones short. The last is lost once on the way. Nothing sent after it can
+// draw duplicate ACKs, so two round trips on, the tail goes again as a
+// probe, and the stream ends with no timer expiry and no fast resend.
+#[tokio::test]
+async fn a_lost_tail_is_resent_by_one_probe() {
+    let mut peer = Peer::new(64 * 1024);
+    peer.drop = (FIRST + 9, 1);
+    let run = stream_to(&mut peer, 8 * MSS, Duration::from_millis(1)).await;
+    eprintln!("tail lost once: {run:?}");
+    assert!(run.error.is_none(), "{run:?}");
+    assert_eq!(run.peer.delivered, 8 * MSS, "{run:?}");
+    assert_eq!(
+        run.totals,
+        SendTotals {
+            packets_sent: 11,
+            fast_resends: 0,
+            tail_probes: 1,
+            timer_expiries: 0,
+        },
+        "{run:?}"
+    );
+}
+
+// The third packet from the end is lost once. The two after it arrive, so
+// the peer's ACKs show it missing, but two later packets are not the three
+// the SACK rule needs, and nothing new is left to send. The probe is not
+// due: the tail itself arrived. The retransmission timer resends the hole.
+// libtorrent waits for the timer here too: it resends from a SACK only when
+// more than three packets after the hole are acknowledged
+// (utp_stream.cpp:1290-1355), from duplicate ACKs only after three
+// (2814-2834), and has no tail probe.
+#[tokio::test]
+async fn a_hole_with_two_packets_behind_it_waits_for_the_timer() {
+    let mut peer = Peer::new(64 * 1024);
+    peer.drop = (FIRST + 7, 1);
+    let run = stream_to(&mut peer, 8 * MSS, Duration::from_millis(1)).await;
+    eprintln!("third from last lost once: {run:?}");
+    assert!(run.error.is_none(), "{run:?}");
+    assert_eq!(run.peer.delivered, 8 * MSS, "{run:?}");
+    assert_eq!(run.totals.tail_probes, 0, "{run:?}");
+    assert_eq!(run.totals.fast_resends, 0, "{run:?}");
+    assert_eq!(run.totals.timer_expiries, 1, "{run:?}");
 }
