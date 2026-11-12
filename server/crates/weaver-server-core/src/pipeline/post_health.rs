@@ -48,8 +48,10 @@ use crate::jobs::model::{FileSpec, JobSpec};
 use crate::pipeline::download::queue::QueuedWork;
 use crate::pipeline::{Pipeline, SegmentTerminalState, health_milli};
 
+mod first_articles;
 mod given_up;
 
+pub(in crate::pipeline) use first_articles::FirstArticles;
 pub(in crate::pipeline) use given_up::GivenUp;
 
 // The fewest files a first-article verdict is worth taking. One article per
@@ -469,6 +471,7 @@ pub(crate) enum Gate {
 // sample that reaches the share with articles outstanding has the verdict
 // the complete sample would have, and one that cannot reach it even were
 // every outstanding article lost has let the post through.
+#[cfg(test)]
 pub(crate) fn first_article_gate(heads: impl IntoIterator<Item = Head>) -> Gate {
     let mut total = 0;
     let mut lost = 0;
@@ -481,6 +484,12 @@ pub(crate) fn first_article_gate(heads: impl IntoIterator<Item = Head>) -> Gate 
             Head::Settled => {}
         }
     }
+    gate_of(total, lost, outstanding)
+}
+
+// The sample's verdict on `total` payload files, `lost` of whose first
+// articles every server failed and `outstanding` of which are still to come.
+pub(crate) fn gate_of(total: usize, lost: usize, outstanding: usize) -> Gate {
     let reaches = |lost: usize| lost * 100 >= total * FIRST_ARTICLE_GATE_MISSING_PCT;
     if total < FIRST_ARTICLE_GATE_MIN_FILES {
         Gate::Open
@@ -585,8 +594,18 @@ impl Pipeline {
     // The first article of each file the post names, its first segment:
     // lost when every server failed it, settled when the root holds it or
     // it ended some other way, and otherwise still to come.
+    #[cfg(test)]
     fn first_article(&self, job_id: JobId, index: u32, file: &FileSpec) -> Head {
-        let Some(first) = file.segments.iter().map(|segment| segment.ordinal).min() else {
+        let first = file.segments.iter().map(|segment| segment.ordinal).min();
+        self.first_article_head(job_id, index, first)
+    }
+
+    // Where the first article of the file at `index` stands, `first` its
+    // ordinal, `None` for a file with no articles.
+    fn first_article_head(&self, job_id: JobId, index: u32, first: Option<u32>) -> Head {
+        #[cfg(test)]
+        HEADS_READ.with(|read| read.set(read.get() + 1));
+        let Some(first) = first else {
             return Head::Settled;
         };
         let segment = SegmentId {
@@ -629,7 +648,101 @@ impl Pipeline {
     // take it there, the post has no verdict yet. Only a post the sample let
     // through is weighed by its health, at the failed bytes it lost or a
     // round projected it will, against its critical line.
-    pub(in crate::pipeline) fn post_health_verdict(&self, job_id: JobId) -> Option<String> {
+    pub(in crate::pipeline) fn post_health_verdict(&mut self, job_id: JobId) -> Option<String> {
+        if self.post_probes.dead.contains_key(&job_id) || !self.jobs.contains_key(&job_id) {
+            return None;
+        }
+        let first_articles = self.read_first_articles(job_id)?;
+        let spec = &self.jobs.get(&job_id)?.spec;
+        let verdict = match first_articles.gate() {
+            Gate::Undecided => None,
+            Gate::Dead { missing, total }
+                if first_articles.weighed().0 > first_articles.weighed().1 =>
+            {
+                Some(Some(first_article_verdict_error(missing, total)))
+            }
+            Gate::Dead { .. } | Gate::Open => {
+                Some(self.health_verdict(job_id, spec, first_articles.declared_recovery()))
+            }
+        };
+        // Kept only beside the graph it was read from: a sample read with no
+        // graph in place holds nothing in hand, and is read again whole.
+        if self.graph_jobs.contains_key(&job_id)
+            && let Some(given_up) = self.given_up.get_mut(&job_id)
+        {
+            given_up.keep_first_articles(first_articles);
+        }
+        verdict.flatten()
+    }
+
+    // The job's first-article sample brought up to date: the files whose
+    // first article was given up since it was last read, and those whose
+    // first article the root began or stopped waiting on, have their heads
+    // read again. A sample never read, read from another post or beside
+    // another graph, or with no graph to read beside, is read whole.
+    fn read_first_articles(&mut self, job_id: JobId) -> Option<FirstArticles> {
+        let changed = self
+            .graph_jobs
+            .get_mut(&job_id)
+            .map(crate::pipeline::graph::job::GraphJob::take_first_changes);
+        let kept = self
+            .given_up
+            .get_mut(&job_id)
+            .and_then(GivenUp::take_first_articles);
+        let spec = &self.jobs.get(&job_id)?.spec;
+        Some(match (kept, changed) {
+            (Some(mut kept), Some(Some(volumes))) if kept.files() == spec.files.len() => {
+                for volume in volumes {
+                    kept.stale(volume.0);
+                }
+                for index in kept.take_stale() {
+                    let head = self.first_article_head(job_id, index, kept.first(index));
+                    kept.set(index, head);
+                }
+                kept
+            }
+            _ => FirstArticles::new(spec, |index, first| {
+                self.first_article_head(job_id, index, first)
+            }),
+        })
+    }
+
+    // The post's health against its critical line, once the sample has let
+    // it through: at the failed bytes it lost or a round projected it will.
+    fn health_verdict(&self, job_id: JobId, spec: &JobSpec, recovery: u64) -> Option<String> {
+        let probe = self
+            .post_probes
+            .states
+            .get(&job_id)
+            .copied()
+            .unwrap_or_default();
+        let total = self.post_bytes(job_id, spec);
+        let lost = self.missing_bytes(job_id);
+        let failed = probe.decided(lost);
+        let health = health_milli(total, failed);
+        let critical = Self::critical_health_milli(total, recovery);
+        if !below_critical(health, critical) {
+            return None;
+        }
+        let below = format!(
+            "health {:.1}% below critical {:.1}%",
+            f64::from(health) / 10.0,
+            f64::from(critical) / 10.0
+        );
+        // The probe's projection, when it is what takes the post there, is
+        // named with what the round found.
+        Some(match probe.sampled {
+            Some((missed, asked)) if probe.projected >= lost => {
+                format!("health probe: {missed} of {asked} samples missing; {below}")
+            }
+            _ => below,
+        })
+    }
+
+    // The verdict as it is reached by walking every file of the post: what
+    // the kept sample must always agree with.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn post_health_verdict_walked(&self, job_id: JobId) -> Option<String> {
         if self.post_probes.dead.contains_key(&job_id) {
             return None;
         }
@@ -666,33 +779,27 @@ impl Pipeline {
                 }
             }
         }
-        let probe = self
-            .post_probes
-            .states
+        self.health_verdict(job_id, spec, declared_recovery_bytes(spec))
+    }
+
+    // The job's sample as the feed keeps it, and as a whole read of the post
+    // finds it now.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn first_articles_kept_and_read(
+        &self,
+        job_id: JobId,
+    ) -> (Option<FirstArticles>, Option<FirstArticles>) {
+        let kept = self
+            .given_up
             .get(&job_id)
-            .copied()
-            .unwrap_or_default();
-        let total = self.post_bytes(job_id, spec);
-        let lost = self.missing_bytes(job_id);
-        let failed = probe.decided(lost);
-        let health = health_milli(total, failed);
-        let critical = Self::critical_health_milli(total, declared_recovery_bytes(spec));
-        if !below_critical(health, critical) {
-            return None;
-        }
-        let below = format!(
-            "health {:.1}% below critical {:.1}%",
-            f64::from(health) / 10.0,
-            f64::from(critical) / 10.0
-        );
-        // The probe's projection, when it is what takes the post there, is
-        // named with what the round found.
-        Some(match probe.sampled {
-            Some((missed, asked)) if probe.projected >= lost => {
-                format!("health probe: {missed} of {asked} samples missing; {below}")
-            }
-            _ => below,
-        })
+            .and_then(GivenUp::first_articles)
+            .cloned();
+        let read = self.jobs.get(&job_id).map(|state| {
+            FirstArticles::new(&state.spec, |index, first| {
+                self.first_article_head(job_id, index, first)
+            })
+        });
+        (kept, read)
     }
 
     // Arm a round once the post's losses look like a dead release and a
@@ -724,7 +831,15 @@ impl Pipeline {
         let failing_files = self.failing_files(job_id, &state.spec);
         let decided = probe.decided(self.missing_bytes(job_id));
         let health = health_milli(total, decided);
-        let critical = Self::critical_health_milli(total, declared_recovery_bytes(&state.spec));
+        let recovery = self
+            .given_up
+            .get(&job_id)
+            .and_then(GivenUp::first_articles)
+            .map_or_else(
+                || declared_recovery_bytes(&state.spec),
+                FirstArticles::declared_recovery,
+            );
+        let critical = Self::critical_health_milli(total, recovery);
         let critical_failed = critical_failed_bytes(total, critical);
         let rearmed = decided >= probe.next_failed_bytes || failing_files > probe.failing_files;
         let needed = health < 980
@@ -1180,6 +1295,17 @@ pub(in crate::pipeline) struct AbandonWork {
 thread_local! {
     static ABANDON_WORK: std::cell::Cell<AbandonWork> =
         const { std::cell::Cell::new(AbandonWork { passes: 0, scanned: 0, lost_files: 0, checkpoints: 0 }) };
+}
+
+// The first-article heads read on this thread.
+#[cfg(test)]
+thread_local! {
+    static HEADS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(in crate::pipeline) fn heads_read() -> usize {
+    HEADS_READ.with(std::cell::Cell::get)
 }
 
 #[cfg(test)]

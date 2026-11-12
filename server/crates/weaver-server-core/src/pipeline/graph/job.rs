@@ -883,6 +883,12 @@ impl GraphJob {
         self.root.map.article_settled(volume, ordinal)
     }
 
+    // The volumes whose first article began or stopped being waited on
+    // since the last call; `None` on the first, when every one counts.
+    pub(crate) fn take_first_changes(&mut self) -> Option<std::collections::BTreeSet<VolumeIndex>> {
+        self.root.map.take_first_changes()
+    }
+
     // Every article the root holds lost, with its declared encoded size.
     pub(crate) fn lost_articles(&self) -> impl Iterator<Item = (VolumeIndex, u32, u64)> + '_ {
         self.root.map.lost_articles()
