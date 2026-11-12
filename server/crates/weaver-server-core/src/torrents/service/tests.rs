@@ -3392,6 +3392,81 @@ async fn a_start_of_every_torrent_looks_again_at_those_held_for_their_files() {
     again.stop().await;
 }
 
+// A torrent held for its files moved to where they are now takes that
+// place as its own: nothing is moved or made, and it runs with every piece
+// (qBittorrent `TorrentImpl::handleMoveStorageJobFinished`,
+// torrentimpl.cpp:2140-2146; libtorrent `move_storage` passes over a file
+// that is not there, storage_utils.cpp:236-239 at v2.0.15).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_held_for_its_files_moved_to_where_they_are_runs() {
+    let rig = rig(set_clock());
+    let (job_id, dir, away) = gone_at_restart(&rig).await;
+    let elsewhere = rig.dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let there = elsewhere.join(dir.file_name().unwrap());
+    std::fs::rename(&away, &there).unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    held_for_its_files(&again, job_id, &dir).await;
+
+    again
+        .set_location(job_id, elsewhere.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    runs_with_every_piece(&again, job_id).await;
+    assert_eq!(
+        again.torrent(job_id).await.unwrap().storage_dir.as_deref(),
+        there.to_str()
+    );
+    assert_eq!(
+        rig.db
+            .get_torrent(job_id)
+            .unwrap()
+            .unwrap()
+            .storage_dir
+            .as_deref(),
+        there.to_str()
+    );
+    assert!(!dir.exists());
+    assert_eq!(
+        std::fs::read_dir(&elsewhere)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>(),
+        [there]
+    );
+    again.stop().await;
+}
+
+// A torrent held for its files moved to a place they are not either stays
+// held there with every piece kept, and nothing is made at either place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_held_for_its_files_moved_to_an_empty_place_stays_held() {
+    let rig = rig(set_clock());
+    let (job_id, dir, _away) = gone_at_restart(&rig).await;
+    let empty = rig.dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let there = empty.join(dir.file_name().unwrap());
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    held_for_its_files(&again, job_id, &dir).await;
+
+    again
+        .set_location(job_id, empty.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    held_for_its_files(&again, job_id, &there).await;
+    assert_eq!(
+        again.torrent(job_id).await.unwrap().storage_dir.as_deref(),
+        there.to_str()
+    );
+    assert!(!dir.exists());
+    assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
+    again.stop().await;
+}
+
 // A torrent whose work crashed the daemon is kept paused at the next start,
 // saying why, and its job is not restored into the same panic: a panic in
 // its tee's step leaves the torrent's marker, which stays until a resume
