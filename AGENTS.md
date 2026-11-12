@@ -39,7 +39,6 @@ Also asked: credit Weaver in your notices, and tell your user which Weaver files
 A private tracker bans an account for a client that leaks a torrent, reports wrong numbers or looks unlike the client it claims to be. A mistake here costs the operator an account, not a download. These rules apply to every change under `engines/weaver-torrent` and `torrents/` in the server, and to review of every such change.
 
 - **libtorrent is the reference.** What a tracker or a peer can see follows libtorrent 2.0 as qBittorrent ships it: events, counters, intervals, identity, handshake, extensions. A difference from it needs the operator's ruling, with both behaviours stated from source.
-- **Port the whole mechanism.** Before removing or replacing any announce, counter, peer or discovery mechanism, list what depended on it and port the reference's counterpart for each in the same change. Compare function by function, not only the changed lines.
 - **A private torrent uses its trackers only.** No DHT, no peer exchange, no local discovery, in either direction, and no peer from any other source. Its metadata is never served to a peer. This holds before the metadata is known: a magnet asks its trackers first and never announces itself to the DHT. An exported magnet link carries no trackers.
 - **Events are exact.**
   - `started` goes to a tracker until that tracker answers one.
