@@ -426,10 +426,6 @@ impl Transport for Link {
     fn link_mtu(&self) -> Option<u16> {
         Some(1500)
     }
-
-    fn dont_fragment(&self) -> bool {
-        true
-    }
 }
 
 impl PollSendToVectored for Link {

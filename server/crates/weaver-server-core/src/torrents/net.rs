@@ -667,10 +667,6 @@ impl DatagramSocket for Carried {
         self.link_mtu
     }
 
-    fn dont_fragment(&self) -> bool {
-        true
-    }
-
     fn sender(&self) -> Option<Box<dyn DatagramSend>> {
         self.send_handle()
             .map(|sender| Box::new(sender) as Box<dyn DatagramSend>)
@@ -1825,16 +1821,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn a_tunnel_datagram_socket_reports_that_packets_cannot_fragment() {
-        let sockets = LegSockets::new(carrying(), &LegKind::Ladder);
-        let udp = sockets
-            .bind_udp(SocketAddr::from(([0, 0, 0, 0], 0)))
-            .await
-            .unwrap();
-        assert!(udp.dont_fragment());
-    }
-
     // A ladder leg whose tunnel carries datagrams: the session's UDP binds
     // inside the tunnel, and its names resolve there.
     #[tokio::test]
@@ -1846,7 +1832,6 @@ mod tests {
         assert_eq!(*tunnel.bound.lock().unwrap(), [asked]);
         assert_eq!(udp.bind_addr().ip(), IpAddr::from([127, 0, 0, 1]));
         assert_eq!(udp.link_mtu(), Some(1280), "the tunnel's MTU");
-        assert!(udp.dont_fragment());
 
         let peer = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let sent = udp

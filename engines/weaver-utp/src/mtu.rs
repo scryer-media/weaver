@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-12.
 
 // Calculations for payload sizes that we should be sending, based on MTU and successfully
 // delivered payloads so far. Binary searches (probes) the payload size until convergence.
@@ -44,12 +44,6 @@ pub(crate) fn packet_mtu(payload: usize, is_ipv4: bool) -> u16 {
         .saturating_add(ip + UDP_HEADER + UTP_HEADER)
 }
 
-// The packet every path carries: a stream starts its segments here, and
-// probes no higher where datagrams may be fragmented.
-pub(crate) fn floor_mtu(is_ipv4: bool) -> u16 {
-    if is_ipv4 { 576 } else { 1280 }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSizes {
     // The minimum uTP payload size that we know can go through the link.
@@ -85,7 +79,7 @@ impl SegmentSizes {
         } else {
             IPV6_HEADER
         };
-        let default_min_mtu = floor_mtu(config.is_ipv4);
+        let default_min_mtu = if config.is_ipv4 { 576 } else { 1280 };
 
         let calc = |mtu: u16| mtu - ip_header_size - UTP_HEADER - UDP_HEADER;
 

@@ -56,7 +56,7 @@ use crate::{
         RX_BUF_SIZE_PER_VSOCK_DEFAULT, UDP_HEADER, UTP_HEADER,
     },
     message::UtpMessage,
-    mtu::{MtuCeiling, floor_mtu},
+    mtu::MtuCeiling,
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
     stream_dispatch::{StreamArgs, UtpStreamStarter},
@@ -1219,7 +1219,6 @@ pub(crate) struct SocketState<T, E> {
 
     local_addr: SocketAddr,
     link_mtu: Option<u16>,
-    dont_fragment: bool,
     opts: ValidatedSocketOpts,
     connections_limit: AtomicUsize,
 
@@ -1348,7 +1347,6 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let validated_opts = opts.validate()?;
         let local_addr = transport.bind_addr();
         let link_mtu = transport.link_mtu();
-        let dont_fragment = transport.dont_fragment();
         let transport = Arc::new(transport);
         let runtime = Runtime::new(transport, &opts.cancellation_token);
 
@@ -1365,7 +1363,6 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             retirements: Arc::default(),
             local_addr,
             link_mtu,
-            dont_fragment,
             opts: validated_opts,
             connections_limit: AtomicUsize::new(
                 opts.connections_limit.map_or(usize::MAX, NonZeroUsize::get),
@@ -1417,11 +1414,6 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         self.state.local_addr
     }
 
-    /// Whether this socket's transport sends with don't-fragment set.
-    pub fn dont_fragment(&self) -> bool {
-        self.state.dont_fragment
-    }
-
     /// Change incoming SYN admission without evicting established streams.
     /// Zero stays zero; `usize::MAX` leaves no finite bound.
     pub fn set_connections_limit(&self, limit: usize) {
@@ -1462,25 +1454,19 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
 impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
     // The link MTU a new stream probes up to: the link's, no larger than
     // the transport's path carries, and no higher than the streams that
-    // died on large packets allow. Where datagrams may be fragmented, a
-    // probe too large would arrive split rather than lost, so no stream
-    // probes past the floor.
-    pub(crate) fn probe_link_mtu(&self, is_ipv4: bool) -> u16 {
-        let (link_mtu, dont_fragment) = self
+    // died on large packets allow. A stream probes whatever the transport
+    // does with an oversized datagram, as libtorrent's does
+    // (utp_stream.cpp:1503-1505 checks no socket flag).
+    pub(crate) fn probe_link_mtu(&self) -> u16 {
+        let link_mtu = self
             .runtime
             .upgrade()
-            .and_then(|runtime| runtime.metadata())
-            .unwrap_or((self.link_mtu, self.dont_fragment));
-        let mtu = self
-            .opts
+            .and_then(|runtime| runtime.link_mtu())
+            .unwrap_or(self.link_mtu);
+        self.opts
             .link_mtu
             .min(link_mtu.unwrap_or(u16::MAX))
-            .min(self.mtu_ceiling.lock().get());
-        if dont_fragment {
-            mtu
-        } else {
-            mtu.min(floor_mtu(is_ipv4))
-        }
+            .min(self.mtu_ceiling.lock().get())
     }
 
     // A stream died on a packet of `mtu` bytes larger than it had seen

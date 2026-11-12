@@ -77,7 +77,7 @@ impl<T: Transport> Runtime<T> {
         &self.cancellation
     }
 
-    pub(crate) fn metadata(&self) -> Option<(Option<u16>, bool)> {
+    pub(crate) fn link_mtu(&self) -> Option<Option<u16>> {
         let state = self.state.lock();
         if state.closing || self.cancellation.is_cancelled() {
             return None;
@@ -85,7 +85,7 @@ impl<T: Transport> Runtime<T> {
         state
             .transport
             .as_ref()
-            .map(|transport| (transport.link_mtu(), transport.dont_fragment()))
+            .map(|transport| transport.link_mtu())
     }
 
     #[cfg(test)]

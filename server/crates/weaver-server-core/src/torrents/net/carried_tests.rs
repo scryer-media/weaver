@@ -86,7 +86,6 @@ async fn carried_utp_acceptance_uses_the_carrier_fifo_for_async_and_polled_sends
     let carried = Carried::new(socket, ([0, 0, 0, 0], 0).into(), true);
     let first = ([198, 51, 100, 1], 7001).into();
     let second = ([198, 51, 100, 2], 7002).into();
-    assert!(carried.dont_fragment());
     assert_eq!(carried.link_mtu(), Some(1280));
     assert_eq!(carried.send_to(b"handshake", first).await.unwrap(), 9);
     let waker = Waker::from(Arc::new(Woken::default()));

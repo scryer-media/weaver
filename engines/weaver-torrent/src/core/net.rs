@@ -85,12 +85,6 @@ pub trait DatagramSocket: Send + Sync + 'static {
     fn link_mtu(&self) -> Option<u16> {
         None
     }
-
-    /// Whether the socket's datagrams leave with don't-fragment set, so a
-    /// uTP probe too large for the path is lost rather than split.
-    fn dont_fragment(&self) -> bool {
-        false
-    }
 }
 
 impl DatagramSocket for tokio::net::UdpSocket {
