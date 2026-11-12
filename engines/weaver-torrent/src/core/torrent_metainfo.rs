@@ -27,7 +27,8 @@ use crate::core::{
     lengths::{Lengths, MAX_NUM_PIECES, ValidPieceIndex},
     merkle::{self, BLOCK_SIZE},
     v2_tree::{
-        FileTree, NameRules, sanitize_component, sanitize_component_with, sanitize_name_with,
+        FileTree, MAX_DIRECTORY_DEPTH, NameRules, sanitize_component, sanitize_component_with,
+        sanitize_name_with,
     },
 };
 
@@ -958,20 +959,7 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
         let mut paths = Vec::new();
         let mut files = Vec::new();
         for (filename, len, padding) in listing {
-            let mut seen_a_bit = false;
-            for bit in filename.iter_components_bytes() {
-                seen_a_bit = true;
-                if bit == b".." {
-                    return Err(Error::BadTorrentPathTraversal);
-                }
-                use memchr::memchr;
-                if memchr(b'/', bit).is_some() || memchr(b'\\', bit).is_some() {
-                    return Err(Error::BadTorrentSeparatorInName);
-                }
-            }
-            if !seen_a_bit {
-                return Err(Error::BadTorrentFileNoName);
-            }
+            check_components(filename.iter_components_bytes())?;
             paths.push(clean_path(&filename, NameRules::HOST)?);
             files.push((len, padding));
         }
@@ -1217,6 +1205,31 @@ fn reconcile_hybrid<'a, B: AsRef<[u8]> + 'a>(
         }
     }
     Ok(v2)
+}
+
+/// Checks the elements of a listed path: there is at least one, none is
+/// `..` or holds a separator, and the path has no more directories than a
+/// v2 file tree may nest. A path past that depth is refused once the first
+/// element over it is read.
+fn check_components<'a>(elements: impl Iterator<Item = &'a [u8]>) -> crate::core::Result<()> {
+    let mut count = 0usize;
+    for bit in elements {
+        count += 1;
+        if count > MAX_DIRECTORY_DEPTH + 1 {
+            return Err(Error::BadTorrentPathTooDeep);
+        }
+        if bit == b".." {
+            return Err(Error::BadTorrentPathTraversal);
+        }
+        use memchr::memchr;
+        if memchr(b'/', bit).is_some() || memchr(b'\\', bit).is_some() {
+            return Err(Error::BadTorrentSeparatorInName);
+        }
+    }
+    if count == 0 {
+        return Err(Error::BadTorrentFileNoName);
+    }
+    Ok(())
 }
 
 /// A file's path cleaned under `rules` (libtorrent
@@ -1650,6 +1663,42 @@ mod tests {
         for (index, name) in names.iter().enumerate().skip(1) {
             assert_eq!(name, &format!("same.{index}.bin"));
         }
+    }
+
+    #[test]
+    fn a_listed_path_nested_past_the_limit_is_refused() {
+        // `directories` directories deep, then a file: the depth a v2 file
+        // tree may nest.
+        fn nested(directories: usize) -> TorrentMetaV1Info<ByteBufOwned> {
+            let mut parts = vec!["d"; directories];
+            parts.push("f.bin");
+            multi_file_info(vec![file(&parts, 100, None)])
+        }
+        let names = clean_paths(nested(MAX_DIRECTORY_DEPTH));
+        assert_eq!(names[0].matches('/').count(), MAX_DIRECTORY_DEPTH);
+        assert!(matches!(
+            nested(MAX_DIRECTORY_DEPTH + 1).validate(),
+            Err(Error::BadTorrentPathTooDeep)
+        ));
+    }
+
+    #[test]
+    fn a_deep_path_is_refused_after_reading_only_the_limit() {
+        // A path a million elements deep is refused once one element past
+        // the limit is read, so no work grows with its depth.
+        let read = std::cell::Cell::new(0usize);
+        let deep = std::iter::repeat_n(&b"d"[..], 1_000_000).inspect(|_| read.set(read.get() + 1));
+        assert!(matches!(
+            check_components(deep),
+            Err(Error::BadTorrentPathTooDeep)
+        ));
+        assert_eq!(read.get(), MAX_DIRECTORY_DEPTH + 2);
+        // One just inside the limit is read whole and taken.
+        read.set(0);
+        let inside =
+            std::iter::repeat_n(&b"d"[..], MAX_DIRECTORY_DEPTH + 1).inspect(|_| read.set(read.get() + 1));
+        assert!(check_components(inside).is_ok());
+        assert_eq!(read.get(), MAX_DIRECTORY_DEPTH + 1);
     }
 
     #[test]

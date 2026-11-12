@@ -15,7 +15,7 @@ use crate::clone_to_owned::CloneToOwned;
 
 /// Directories a file tree may nest (libtorrent
 /// `load_torrent_limits::max_directory_depth`).
-const MAX_DIRECTORY_DEPTH: usize = 100;
+pub(crate) const MAX_DIRECTORY_DEPTH: usize = 100;
 
 /// Bytes of a path element kept before it is cut (the 240 in libtorrent
 /// `sanitize_append_path_element`).

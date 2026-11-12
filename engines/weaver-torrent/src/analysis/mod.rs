@@ -720,6 +720,7 @@ fn load_reason(error: &crate::core::Error) -> &'static str {
         Error::BadTorrentFileNoName | Error::BadTorrentEmptyFilename => "file_without_name",
         Error::BadTorrentBothSingleAndMultiFile => "single_and_multi_file",
         Error::BadTorrentPathTraversal => "path_traversal",
+        Error::BadTorrentPathTooDeep => "path_too_deep",
         Error::BadTorrentSeparatorInName => "separator_in_name",
         Error::BadTorrentZeroLength => "zero_length",
         Error::BadTorrentDuplicateFilenames => "duplicate_paths",
