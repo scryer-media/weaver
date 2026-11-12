@@ -38,7 +38,8 @@ Also asked: credit Weaver in your notices, and tell your user which Weaver files
 
 A private tracker bans an account for a client that leaks a torrent, reports wrong numbers or looks unlike the client it claims to be. A mistake here costs the operator an account, not a download. These rules apply to every change under `engines/weaver-torrent` and `torrents/` in the server, and to review of every such change.
 
-- **libtorrent is the reference.** What a tracker or a peer can see follows libtorrent 2.0 as qBittorrent ships it: events, counters, intervals, identity, handshake, extensions. A difference from it needs the operator's ruling, with both behaviours stated from source.
+- **libtorrent is the reference for correct behaviour.** Events, counters, intervals, handshake and extensions follow libtorrent 2.0, because that is what trackers are built against. A difference from it needs the operator's ruling, with both behaviours stated from source.
+- **Weaver is its own client.** The goal is for trackers to accept Weaver under its own name. The qBittorrent announce shape exists only until they do: it lives in one place that can be updated or deleted in one edit, and nothing outside it may depend on it. "It looks like qBittorrent" is never a reason for a behaviour; "it is correct, and a tracker can rely on it" is.
 - **A private torrent uses its trackers only.** No DHT, no peer exchange, no local discovery, in either direction, and no peer from any other source. Its metadata is never served to a peer. This holds before the metadata is known: a magnet asks its trackers first and never announces itself to the DHT. An exported magnet link carries no trackers.
 - **Events are exact.**
   - `started` goes to a tracker until that tracker answers one.
@@ -50,7 +51,7 @@ A private tracker bans an account for a client that leaks a torrent, reports wro
   - Only bytes that moved are reported. Never report a byte twice, an estimate, or a byte of a piece that was not sent.
   - What the operator sees and what the ratio and seeding goals read are the totals since the add. They are separate from what an announce reports.
 - **No announce storms.** Honour the tracker's interval and minimum interval, the 300 second floor and the failure backoff. Weaver does not scrape trackers.
-- **Identity is stable and whole.** A torrent keeps one peer id and one tracker key from add to remove within a run of the process. The announce (query order, escaping, headers, user agent, key, peer id prefix) matches the client it names, proven against a captured announce of that client. Changing any part needs that test updated from a new capture.
+- **Identity is stable and whole.** A torrent keeps one peer id and one tracker key from add to remove within a run of the process. While the qBittorrent shape exists, an announce made under it (query order, escaping, headers, user agent, key, peer id prefix) matches a captured qBittorrent announce exactly, and changing any part needs that test updated from a new capture. An announce under Weaver's own name follows the specifications.
 - **One route.** A torrent's announces and peer connections leave on its saved route and no other.
 - **Passkeys do not leak.** A tracker URL appears in no log, error, debug output, event, metric or diagnostics bundle except as scheme, host and port. `SECURITY.md` says which keys may read it.
 - **Seed only verified data**, and never super-seed.
