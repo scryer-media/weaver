@@ -68,6 +68,12 @@ type PathId = u32;
 // The working directory itself, which is no name's path.
 const TOP: PathId = 0;
 
+// What the ledger keeps for each part of a path, its text aside: the node,
+// its slot in `Paths::ids` with the table's spare room, and the shared
+// allocation of its key with the directory's id. An estimate by layout on
+// a 64-bit target; the text is counted with the names that carry it.
+const PART_BYTES: u64 = 128;
+
 #[derive(Debug)]
 struct PathNode {
     // The directory the path is in.
@@ -170,6 +176,11 @@ impl Paths {
 
     fn node_mut(&mut self, id: PathId) -> &mut PathNode {
         self.nodes[id as usize].as_mut().expect("a held path")
+    }
+
+    // How many paths are held, the working directory aside.
+    fn len(&self) -> usize {
+        self.nodes.len() - 1 - self.free.len()
     }
 
     // How many names hold the path as a directory.
@@ -418,6 +429,13 @@ impl NameLedger {
 
     pub fn given(&self, holder: Holder) -> Option<&str> {
         self.entries.get(&holder).map(|entry| entry.name.as_str())
+    }
+
+    // The bytes the ledger keeps for the parts of the paths it holds, by a
+    // fixed estimate for each part: one part however many names run
+    // through it. The text of a part is not in it.
+    pub fn resident(&self) -> u64 {
+        self.paths.len() as u64 * PART_BYTES
     }
 
     pub fn clear(&mut self) {
@@ -980,6 +998,46 @@ mod tests {
         root(&mut ledger, 1, "a.bin");
         ledger.release((ROOT, MemberId(1)), &mut Vec::new());
         assert_eq!(root(&mut ledger, 2, "a.bin"), "a.bin");
+    }
+
+    // Each part of a path is charged once, however many names run through
+    // it, and goes from the charge with the last name that holds it.
+    #[test]
+    fn the_ledger_charges_each_part_of_its_paths_once() {
+        let mut ledger = NameLedger::new();
+        assert_eq!(ledger.resident(), 0);
+        root(&mut ledger, 1, "show/season 1/e01.mkv");
+        assert_eq!(ledger.resident(), 3 * PART_BYTES);
+        root(&mut ledger, 2, "show/season 1/e02.mkv");
+        assert_eq!(
+            ledger.resident(),
+            4 * PART_BYTES,
+            "the directories are shared"
+        );
+        root(&mut ledger, 3, "show/season 1/e02.mkv");
+        assert_eq!(
+            ledger.resident(),
+            5 * PART_BYTES,
+            "the suffixed name is a part"
+        );
+        // A deep name holds one part a level.
+        let deep = format!("{}x", "a/".repeat(1000));
+        root(&mut ledger, 4, &deep);
+        assert_eq!(ledger.resident(), 1006 * PART_BYTES);
+        ledger.release((ROOT, MemberId(4)), &mut Vec::new());
+        assert_eq!(ledger.resident(), 5 * PART_BYTES);
+        for member in 1..=3 {
+            ledger.release((ROOT, MemberId(member)), &mut Vec::new());
+        }
+        assert_eq!(ledger.resident(), 0);
+        root(&mut ledger, 5, "show/e01.mkv");
+        assert_eq!(
+            ledger.resident(),
+            2 * PART_BYTES,
+            "freed slots are not counted"
+        );
+        ledger.clear();
+        assert_eq!(ledger.resident(), 0);
     }
 
     // Two stores over one set at one position: the first holds the name, the

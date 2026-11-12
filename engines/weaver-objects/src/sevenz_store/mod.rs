@@ -24,6 +24,7 @@ mod tests;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sevenz_turbo::Password;
@@ -1024,7 +1025,14 @@ impl Object for SevenZipStore {
     }
 
     fn work(&mut self, out: &mut Vec<Emit>) {
-        self.derive_due();
-        self.settle(out);
+        self.work_until(&AtomicBool::new(false), out);
+    }
+
+    // Stopped between two folder keys, the store says nothing: the keys it
+    // did not derive stay due.
+    fn work_until(&mut self, stop: &AtomicBool, out: &mut Vec<Emit>) {
+        if self.derive_due(stop) {
+            self.settle(out);
+        }
     }
 }

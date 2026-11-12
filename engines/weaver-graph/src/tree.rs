@@ -2151,6 +2151,12 @@ impl Tree {
         self.report_moves(moved, effects);
     }
 
+    // The bytes the name ledger keeps for the parts of every path it holds,
+    // for every namespace of the job: see `NameLedger::resident`.
+    pub fn names_resident(&self) -> u64 {
+        self.names.resident()
+    }
+
     // Whether the member holds its output name only while the name it wants
     // is leaving, and moves to that one once it is vacated.
     pub fn held_off(&self, node: NodeId, member: MemberId) -> bool {

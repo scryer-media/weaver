@@ -213,7 +213,8 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //                      object is not under it
 //   entries            members of the live namespaces objects produced
 //   resident           what those namespaces keep in memory for their
-//                      members, against the memory limit
+//                      members, and the job's name ledger for the parts
+//                      of its paths, against the memory limit
 //   deadline           the time the job's decoders spent executing, less
 //                      what they spent while the job was paused; waiting
 //                      for articles, a slot, memory or a thread is not
@@ -254,6 +255,10 @@ pub(crate) struct Caps {
     accounts: BTreeMap<NodeId, Account>,
     entries: u64,
     resident: u64,
+    // What the job's name ledger keeps for the parts of its paths, as last
+    // charged: one ledger names every namespace, so it is charged once, in
+    // `resident` with the records.
+    names: u64,
     refusal: Option<ExtractionFailure>,
 }
 
@@ -363,6 +368,7 @@ impl Caps {
             accounts: BTreeMap::new(),
             entries: 0,
             resident: 0,
+            names: 0,
             refusal: None,
         }
     }
@@ -519,12 +525,16 @@ impl Caps {
     }
 
     // The member's namespace as it stands now: its count of members and
-    // what it keeps for the member replace what they were charged at. A
-    // namespace that is no longer live is charged nothing.
+    // what it keeps for the member replace what they were charged at, as
+    // what the name ledger keeps replaces its charge. A namespace that is
+    // no longer live is charged nothing.
     fn charge(&mut self, tree: &Tree, node: NodeId, member: MemberId) {
         if !produced(tree, node) {
             return;
         }
+        let names = tree.names_resident();
+        self.resident = self.resident + names - self.names;
+        self.names = names;
         let Some(namespace) = tree.namespace(node).filter(|_| tree.is_live(node)) else {
             self.release(node);
             return;
