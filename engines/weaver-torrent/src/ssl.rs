@@ -197,6 +197,16 @@ impl SslTorrent {
         self.tls.load().is_some()
     }
 
+    /// The hash a connection naming `sni` asks for: one of an SSL torrent's
+    /// ids in hex, as it [answers to](Self::answers_to). libtorrent reads
+    /// the hash from the name the same way (`ssl_server_name_callback_impl`,
+    /// session_impl.cpp:465-476, v2.0.15) and finds the torrent by it.
+    pub fn hash_named(sni: &str) -> Option<Id20> {
+        let mut hash = [0; 20];
+        hex::decode_to_slice(sni, &mut hash).ok()?;
+        Some(Id20::new(hash))
+    }
+
     /// Whether a connection naming `sni` is for this torrent.
     pub fn answers_to(&self, sni: &str) -> bool {
         self.names.iter().any(|name| name.eq_ignore_ascii_case(sni))
@@ -676,6 +686,50 @@ mod tests {
         assert!(!named(&[], &[NAME, "peer"]));
         assert!(!named(&["another"], &["peer"]));
         assert!(!named(&[], &[]));
+    }
+
+    // A connection is matched to its torrent by the hash its name gives,
+    // looked up among every torrent's ids: that finds exactly the torrent
+    // whose names it matches, both of a hybrid's among them.
+    #[test]
+    fn the_hash_a_name_gives_finds_the_torrent_answering_to_it() {
+        let mut params = CertificateParams::default();
+        params.distinguished_name.push(DnType::CommonName, "ca");
+        let ca = params.self_signed(&KeyPair::generate().unwrap()).unwrap();
+        let hybrid = InfoHashes {
+            v1: Some(Id20::new([0xab; 20])),
+            v2: Some(crate::core::hash_id::Id32::new([0x5c; 32])),
+        };
+        let ssl = SslTorrent::new(ca.pem().as_bytes(), hybrid, NAME).unwrap();
+        let ids: Vec<Id20> = hybrid.ids20().collect();
+        assert_eq!(ids.len(), 2);
+
+        let v1 = ids[0].as_string();
+        let v2 = ids[1].as_string();
+        let mut names = vec![
+            v1.clone(),
+            v2.clone(),
+            v1.to_uppercase(),
+            v2.to_uppercase(),
+            // Not one of its ids.
+            Id20::new([0xac; 20]).as_string(),
+            // A character short, a character over, not hex.
+            v1[1..].to_owned(),
+            format!("{v1}0"),
+            format!("{}g", &v1[1..]),
+            String::new(),
+            // The v2 hash whole, and the v1 hash in base32.
+            hex::encode([0x5c; 32]),
+            "VOV2XK5LVOV2XK5LVOV2XK5LVOV2XK5L".to_owned(),
+        ];
+        names.push(names[0].replace('a', "A"));
+        for name in &names {
+            let found = SslTorrent::hash_named(name).filter(|hash| ids.contains(hash));
+            assert_eq!(found.is_some(), ssl.answers_to(name), "{name}");
+        }
+        for name in [&v1, &v2] {
+            assert!(ssl.answers_to(name), "{name}");
+        }
     }
 
     #[test]

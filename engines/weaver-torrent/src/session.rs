@@ -2136,14 +2136,12 @@ impl Session {
                 let sni = incoming
                     .server_name()
                     .context("the TLS connection names no torrent")?;
-                let (id, config) = self
-                    .db
-                    .read()
-                    .torrents
-                    .iter()
-                    .find_map(|(id, t)| {
+                let (id, config) = crate::ssl::SslTorrent::hash_named(&sni)
+                    .and_then(|hash| {
+                        let db = self.db.read();
+                        let (id, t) = db.by_hash(hash)?;
                         let ssl = t.shared().ssl.as_ref()?;
-                        ssl.answers_to(&sni).then(|| (*id, ssl.server_config()))
+                        ssl.answers_to(&sni).then(|| (id, ssl.server_config()))
                     })
                     .with_context(|| format!("no SSL torrent is named {sni}"))?;
                 let config =
