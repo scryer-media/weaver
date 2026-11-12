@@ -52,3 +52,26 @@ func TestAdversarialPartialRequiresExactUsableOutput(t *testing.T) {
 		t.Fatal("partial without output oracle accepted")
 	}
 }
+
+func TestAdversarialPartialAcceptsOnlyPartial(t *testing.T) {
+	tc := adversarialCase{Scenario: &Scenario{}, Spec: adversarialSpec{Group: "default", Outcome: "partial", MinOutputFiles: 1}}
+	if err := tc.Spec.validate(); err != nil {
+		t.Fatalf("partial spec refused: %v", err)
+	}
+	failed := adversarialSettled{JobID: 9, Status: "FAILED", Error: "no file was delivered whole"}
+	if problems := checkAdversarialVerdict(tc, failed); len(problems) == 0 {
+		t.Fatal("failed job accepted as partial")
+	}
+	complete := adversarialSettled{JobID: 9, Status: "COMPLETE", Outputs: []string{"show.mkv"}}
+	if problems := checkAdversarialVerdict(tc, complete); len(problems) == 0 {
+		t.Fatal("complete job accepted as partial")
+	}
+	partial := adversarialSettled{JobID: 9, Status: "PARTIAL", Outputs: []string{"show.mkv"}}
+	if problems := checkAdversarialVerdict(tc, partial); len(problems) == 0 {
+		t.Fatal("partial job without an output oracle accepted")
+	}
+	tc.Spec.FailureKind = "password"
+	if err := tc.Spec.validate(); err == nil {
+		t.Fatal("partial spec naming a failure accepted")
+	}
+}

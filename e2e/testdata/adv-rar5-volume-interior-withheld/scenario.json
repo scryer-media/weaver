@@ -1,0 +1,20 @@
+{
+  "slug": "adv-rar5-volume-interior-withheld",
+  "title": "Amber.Trail.S01E02.Withheld.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "direct-store-multivolume without its second volume and with no recovery. The one member spans every volume, so no file can be delivered whole: the missing volume is reported once, and the job fails named, publishing nothing.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "fixtureAssets": [
+    "direct-store-multivolume/archive.part1.rar",
+    "direct-store-multivolume/archive.part3.rar",
+    "direct-store-multivolume/archive.part4.rar"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "errorContains": "was delivered whole"
+  },
+  "expectedOutputBLAKE3": {
+    "amber.trail.s01e02.mkv": "0f9527235f4aeccd73d0ef80e25572b51b96d4a9dfe96d24a73911590efed9ab"
+  }
+}

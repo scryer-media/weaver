@@ -1,0 +1,13 @@
+{
+  "slug": "adv-par2-length-elimination",
+  "title": "E2E.Adversarial.Par2.Length.Elimination.2026-TESTGRP",
+  "description": "A PAR2 index over thirty-two files with no recovery block, beside thirty-one obfuscated members of the described lengths whose bytes match nothing. Length binds each short member to its one description and leaves the shared length unbound, without repeating its rejections per binding. Nothing matches and no block can rebuild it: the set rules the repair impossible and the job fails for it, publishing nothing.",
+  "category": "2000",
+  "expected_outcome": "repair_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "errorContains": "PAR2 recovery failed for 1 set(s): elimination.par2",
+    "failureKind": "repair"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "slug": "adv-recovery-sets-disagree-damaged",
+  "title": "E2E.Adversarial.Recovery.Sets.Disagree.Damaged.2026-TESTGRP",
+  "description": "adv-recovery-sets-disagree with one block of the payload zeroed, so the PAR2 and PAR3 sets each want to repair it towards their own bytes. A repair never rewrites an earlier one unless its set outranks every other, so the sets do not rewrite each other in turn. PAR2's repair stands and the payload is delivered with its original bytes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1
+  },
+  "expectedOutputBLAKE3": {
+    "contested.mkv": "d025d51a97f548746fdb981287400fa622852ef5ab9dcda9965ab0afe9eeef53"
+  }
+}

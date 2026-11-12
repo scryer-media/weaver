@@ -158,6 +158,7 @@ func checkAdversarialVerdict(tc adversarialCase, settled adversarialSettled) []e
 		"success": {"COMPLETE"},
 		"failed":  {"FAILED"},
 		"either":  {"COMPLETE", "FAILED"},
+		"partial": {"PARTIAL"},
 		"settles": {"COMPLETE", "PARTIAL", "FAILED"},
 	}[spec.Outcome]
 	if !adversarialHas(allowed, settled.Status) {

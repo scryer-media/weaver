@@ -146,6 +146,17 @@ var ScenarioOnly = map[string]string{
 	"yenc-lie-field-size-lost":                 "stages yenc-lie-field-size's payload under the same size lie and deletes one middle article",
 	"yenc-lie-size-large":                      "stages yenc-lie-field-size's payload with every header stating half as much again",
 	"yenc-lie-end-below-begin":                 "stages yenc-lie-field-size's payload with one part's end= below its begin=",
+	"adv-rar4-volumes-rotated":                 "stages direct-store-rar4's three volumes, each under another volume's name",
+	"adv-rar5-volumes-rotated":                 "stages direct-store-multivolume's four volumes, each under another volume's name",
+	"adv-rar5-volume-stray-alias":              "stages direct-store-multivolume beside direct-store-quick-open's second volume under the name archive.part03.rar",
+	"adv-rar5-volume-posted-twice":             "stages direct-store-multivolume with its second volume posted again as archive.part9.rar",
+	"adv-rar5-volume-far-names":                "stages direct-store-multivolume with three volumes named as volumes 70000, four billion and the last u32 number",
+	"adv-rar4-volume-far-names":                "stages direct-store-rar4's three volumes named as volumes past one billion",
+	"adv-rar5-volume-interior-withheld":        "stages direct-store-multivolume without its second volume, and no recovery",
+	"adv-split-7z-zero-based":                  "stages split-7z's three volumes numbered from .000",
+	"adv-password-rar4-stored":                 "stages direct-store-rar4-encrypted's volumes; the lane submits them with no password and with a wrong one",
+	"adv-password-rar4-stored-right":           "stages direct-store-rar4-encrypted's volumes with their own password, after the lane's wrong password list",
+	"adv-rar5-many-salted-entries-wrong":       "stages adv-rar5-many-salted-entries' volumes; the lane submits them with no password and with a wrong one",
 }
 
 // Recipes is the corpus, one entry per scenario directory that owns bytes.
@@ -1635,6 +1646,7 @@ func Recipes() []Recipe {
 	recipes = append(recipes, AdversarialContainerRecipes()...)
 	recipes = append(recipes, GraphGapRecipes()...)
 	recipes = append(recipes, GraphBoundaryRecipes()...)
+	recipes = append(recipes, AdversarialVolumeRecipes()...)
 	return recipes
 }
 

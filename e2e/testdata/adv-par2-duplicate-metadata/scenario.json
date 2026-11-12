@@ -1,0 +1,15 @@
+{
+  "slug": "adv-par2-duplicate-metadata",
+  "title": "E2E.Adversarial.Par2.Duplicate.Metadata.2026-TESTGRP",
+  "description": "An intact payload and its PAR2 index beside a second PAR2 file repeating the same index packets 4,096 times. A packet already held changes nothing and folds nothing. The payload is delivered with its exact bytes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1
+  },
+  "expectedOutputBLAKE3": {
+    "duplicate-meta.mkv": "eb7e0f4c0d05e565d5c7420cce77de552e6b745edf412755d6539c20f27b1afa"
+  }
+}

@@ -1,0 +1,20 @@
+{
+  "slug": "adv-split-7z-zero-based",
+  "title": "E2E.Adversarial.Split.7z.Zero.Based.2026-TESTGRP",
+  "description": "split-7z's three volumes numbered from .000 instead of .001. The first piece carries the 7z signature and the rest are plain numbered pieces; a split stream started on a piece a signed archive later takes stops its reader. The archive's member is delivered.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "fixtureAssets": [
+    "split-7z/archive.7z.001::archive.7z.000",
+    "split-7z/archive.7z.002::archive.7z.001",
+    "split-7z/archive.7z.003::archive.7z.002"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1,
+    "requiredOutputSuffixes": [
+      ".mkv"
+    ]
+  }
+}
