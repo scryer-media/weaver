@@ -91,8 +91,7 @@ impl StagingChoice {
             .current
             .as_ref()
             .filter(|dir| Some(*dir) != wanted.as_ref())
-            && let Err(error) = std::fs::remove_dir_all(current)
-            && error.kind() != std::io::ErrorKind::NotFound
+            && let Err(error) = crate::jobs::working_dir::remove_job_staging_dir(current, job_id)
         {
             warn!(job_id = job_id.0, dir = %current.display(), %error, "could not remove a staging directory the job no longer delivers into");
         }

@@ -738,6 +738,11 @@ struct Utf8OrLatin1<R> {
     pos: usize,
 }
 
+// The most input converted in one step. A reader over a whole document in
+// memory offers all of it at once; converting it in steps keeps the converted
+// copy to twice this, whatever the document's size.
+const CONVERT_STEP: usize = 64 * 1024;
+
 impl<R: BufRead> Utf8OrLatin1<R> {
     fn new(inner: R) -> Self {
         Self {
@@ -786,7 +791,8 @@ impl<R: BufRead> Read for Utf8OrLatin1<R> {
             self.out.clear();
             self.pos = 0;
             let chunk = self.inner.fill_buf()?;
-            let len = chunk.len();
+            let len = chunk.len().min(CONVERT_STEP);
+            let chunk = &chunk[..len];
             if len == 0 {
                 if self.carry.is_empty() {
                     return Ok(0);
@@ -1615,6 +1621,39 @@ mod tests {
             .read_to_string(&mut split)
             .unwrap();
         assert_eq!(split, expected);
+    }
+
+    // A document held whole in memory is offered to the converter all at
+    // once. It is converted a step at a time, so the converted copy never
+    // grows with the document, and the text is the same either way.
+    #[test]
+    fn a_whole_document_is_converted_in_bounded_steps() {
+        // Latin-1 bytes double when converted; a multi-byte character sits
+        // across every step boundary.
+        let mut input = Vec::new();
+        while input.len() < CONVERT_STEP * 5 {
+            input.extend_from_slice("x\u{20ac}".as_bytes());
+            input.push(0xe9);
+        }
+        let expected: String = "x\u{20ac}\u{e9}".repeat(input.len() / 5);
+
+        let mut reader = Utf8OrLatin1::new(Cursor::new(&input));
+        let mut text = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut largest = 0;
+        loop {
+            let n = reader.read(&mut buf).unwrap();
+            largest = largest.max(reader.out.capacity());
+            if n == 0 {
+                break;
+            }
+            text.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(String::from_utf8(text).unwrap(), expected);
+        assert!(
+            largest <= 4 * CONVERT_STEP,
+            "the converted copy grew to {largest} bytes"
+        );
     }
 
     // Counts the warning events whose message starts with `prefix`, keeping
