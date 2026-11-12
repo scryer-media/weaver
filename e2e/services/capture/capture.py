@@ -46,6 +46,10 @@ def pcap_path(name, iface):
     return os.path.join(ROOT, "{}-{}.pcap".format(name, iface))
 
 
+# Only headers are kept, in a large buffer: every count reads addresses, ports
+# and flags, and whole data packets would fill the buffer and push the packets
+# a test counts out of it.
+HEADERS = ["-s", "128", "-B", "16384"]
 DROPPED = re.compile(r"^(\d+) packets dropped by kernel", re.MULTILINE)
 
 
@@ -55,7 +59,7 @@ def start(name, expression=""):
     started = []
     for iface in interfaces():
         process = subprocess.Popen(
-            ["tcpdump", "-i", iface, "-nn", "-U", "-w", pcap_path(name, iface), kept],
+            ["tcpdump", "-i", iface, "-nn", "-U", *HEADERS, "-w", pcap_path(name, iface), kept],
             stderr=subprocess.PIPE,
             text=True,
         )

@@ -67,18 +67,16 @@ impl StagingChoice {
         job_id: JobId,
         categories: &[crate::categories::CategoryConfig],
     ) -> Option<PathBuf> {
-        if let Some(current) = self.current.as_ref()
-            && std::fs::read_dir(current).is_ok_and(|mut entries| {
-                entries.any(|entry| {
-                    entry.is_ok_and(|entry| {
-                        let name = entry.file_name();
-                        name != crate::jobs::working_dir::WORKING_DIR_MARKER
-                            && name != crate::jobs::working_dir::WORKING_DIR_MARKER_UPGRADE
-                    })
-                })
-            })
-        {
-            return self.current;
+        // Read without following a symbolic link: a staging directory swapped
+        // for a link holds nothing of the job's, and is not delivered into.
+        if let Some(current) = self.current.as_ref() {
+            match crate::jobs::working_dir::job_staging_dir_holds_files(current, job_id) {
+                Ok(true) => return self.current,
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(job_id = job_id.0, dir = %current.display(), %error, "could not read the job's staging directory; it is not delivered into");
+                }
+            }
         }
         let root = crate::pipeline::queue::destination_root(
             &self.complete_dir,
