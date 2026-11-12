@@ -231,9 +231,8 @@ impl Pipeline {
                         .is_none_or(|row| self.in_queue_window(&ranked, row))
                 });
             if !installs {
-                let mut spec = job.spec;
-                let summaries = spec.drop_article_lists();
-                let articles = summaries
+                let articles = job
+                    .summaries
                     .0
                     .iter()
                     .map(|file| u64::from(file.remaining))

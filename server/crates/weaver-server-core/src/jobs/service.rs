@@ -486,40 +486,48 @@ impl Pipeline {
         let semantic_materialization_generation = options.semantic_materialization_generation;
         let semantic_promotion_generation = options.semantic_promotion_generation;
         let is_restart = restart.is_some();
-        let (persisted, nzb_password_candidates) = tokio::task::spawn_blocking(move || {
-            // One streamed read of the bytes about to be persisted gives the
-            // job's NZB outline, written with its row, and its password
-            // candidates, so no archive file has to reload and re-parse the
-            // NZB to learn them and a restart reads no NZB to rebuild it. A
-            // parse failure leaves the harvest to read the row itself, and
-            // the outline to the job's first read of its NZB, as before.
-            let read = crate::ingest::outline::read_stored_outline(
-                &active_job.nzb_zstd,
-                &active_job.nzb_path,
-            )
-            .ok();
-            let persisted = db.materialize_admission_with_outline(
-                &active_job,
-                &initial_file_identities,
-                read.as_ref().map(|read| &read.outline),
-                semantic_materialization_generation,
-                semantic_promotion_generation,
-                is_restart,
-            );
-            let nzb_password_candidates = read.map(|read| {
-                crate::pipeline::job_carried_password_candidates(
-                    &active_job.supplied_password_candidates,
-                    read.passwords,
+        let mut spec = spec;
+        let (persisted, nzb_password_candidates, spec, summaries) =
+            tokio::task::spawn_blocking(move || {
+                // One streamed read of the bytes about to be persisted gives the
+                // job's NZB outline, written with its row, and its password
+                // candidates, so no archive file has to reload and re-parse the
+                // NZB to learn them and a restart reads no NZB to rebuild it. A
+                // parse failure leaves the harvest to read the row itself, and
+                // the outline to the job's first read of its NZB, as before.
+                let read = crate::ingest::outline::read_stored_outline(
+                    &active_job.nzb_zstd,
+                    &active_job.nzb_path,
                 )
-            });
-            (persisted, nzb_password_candidates)
-        })
-        .await
-        .map_err(|error| {
-            crate::SchedulerError::Internal(format!(
-                "create active job persistence worker panicked: {error}"
-            ))
-        })?;
+                .ok();
+                let persisted = db.materialize_admission_with_outline(
+                    &active_job,
+                    &initial_file_identities,
+                    read.as_ref().map(|read| &read.outline),
+                    semantic_materialization_generation,
+                    semantic_promotion_generation,
+                    is_restart,
+                );
+                let nzb_password_candidates = read.map(|read| {
+                    crate::pipeline::job_carried_password_candidates(
+                        &active_job.supplied_password_candidates,
+                        read.passwords,
+                    )
+                });
+                // The job waits to be installed, and then its turn, holding
+                // nothing per article: its lists are read back from the stored
+                // NZB when it is first handed work, and let go here, beside the
+                // write that stores it, so neither the runtime nor the pipeline
+                // walks or frees them.
+                let summaries = spec.drop_article_lists();
+                (persisted, nzb_password_candidates, spec, summaries)
+            })
+            .await
+            .map_err(|error| {
+                crate::SchedulerError::Internal(format!(
+                    "create active job persistence worker panicked: {error}"
+                ))
+            })?;
         match persisted {
             Err(error) => {
                 if !directory_existed
@@ -554,6 +562,7 @@ impl Pipeline {
 
         Ok(crate::pipeline::queue::PreparedAdd {
             spec,
+            summaries,
             options,
             working_dir,
             nzb_hash,
@@ -569,6 +578,7 @@ impl Pipeline {
     ) {
         let crate::pipeline::queue::PreparedAdd {
             spec,
+            summaries,
             options,
             working_dir,
             nzb_hash,
@@ -579,14 +589,12 @@ impl Pipeline {
         let stage_start = started;
         self.queue_scripts_completed.remove(&job_id);
         let reprocess = restart.as_ref().is_some_and(|restart| restart.reprocess);
-        let mut spec = spec;
         let file_identities = Self::build_initial_file_identities(&spec, &HashMap::new());
-        let par2_bytes = spec.par2_bytes();
-        // The job waits its turn holding nothing per article. Its article
-        // lists are read back from the stored NZB when it is first handed
-        // work; a reprocess fetches every article again then, as it has no
-        // checkpoint to say where any was placed.
-        let summaries = spec.drop_article_lists();
+        // The job waits its turn holding nothing per article: its lists were
+        // let go when its NZB was stored, and are read back from it when it
+        // is first handed work. A reprocess fetches every article again then,
+        // as it has no checkpoint to say where any was placed.
+        let par2_bytes = summaries.par2_bytes(&spec);
         let queue_depth: u64 = summaries
             .0
             .iter()
