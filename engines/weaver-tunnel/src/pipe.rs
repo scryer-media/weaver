@@ -7,6 +7,8 @@ mod revocable;
 pub use revocable::Revocable;
 #[path = "pipe_datagram.rs"]
 mod datagram;
+#[path = "pipe_identity.rs"]
+mod identity;
 #[path = "pipe_inbound.rs"]
 mod inbound;
 #[path = "pipe_natpmp.rs"]
@@ -716,6 +718,11 @@ pub trait Dialer: Send + Sync {
     fn failing_hop(&self) -> Option<FailingHop> {
         None
     }
+    // The activity guard of the session this stage is, for a tunnel stacked
+    // on it to name the session it rides on. Only a session hop has one.
+    fn session_activity(&self) -> Option<Arc<tokio::sync::RwLock<()>>> {
+        None
+    }
     fn budget(&self) -> Duration;
     async fn shutdown(&self) {}
     fn describe(&self) -> String;
@@ -1227,14 +1234,14 @@ impl AsyncWrite for OutcomeStream {
 #[derive(Default)]
 pub struct SessionCapacity {
     pub budget: Option<Arc<tokio::sync::Semaphore>>,
-    permit: Mutex<Option<Arc<tokio::sync::OwnedSemaphorePermit>>>,
+    held: Arc<identity::Held>,
 }
 impl SessionCapacity {
     fn acquire(&self) -> Result<Option<Arc<tokio::sync::OwnedSemaphorePermit>>, DialError> {
         let Some(budget) = &self.budget else {
             return Ok(None);
         };
-        let mut permit = self.permit.lock().expect("session capacity");
+        let mut permit = self.held.permit.lock().expect("session capacity");
         if permit.is_none() {
             *permit = Some(Arc::new(budget.clone().try_acquire_owned().map_err(|_| {
                 DialError::Skipped("WireGuard session budget is exhausted; retry after an idle session retires".into())
@@ -1243,12 +1250,21 @@ impl SessionCapacity {
         Ok(permit.clone())
     }
     fn release(&self) {
-        self.permit.lock().expect("session capacity").take();
+        self.held.release();
     }
     pub fn new(budget: Arc<tokio::sync::Semaphore>) -> Self {
         Self {
             budget: Some(budget),
-            permit: Mutex::new(None),
+            held: Default::default(),
+        }
+    }
+    // The capacity of a session built to probe a path. A probe never brings
+    // up a second tunnel for an identity a session already holds: it asks
+    // through that session's tunnel instead.
+    pub fn probing(self) -> Self {
+        Self {
+            budget: self.budget,
+            held: Arc::new(identity::Held::probe()),
         }
     }
 }
@@ -1311,6 +1327,14 @@ impl SessionHop {
 impl Dialer for SessionHop {
     async fn prepare(&self) -> Result<(), DialError> {
         self.prepare_carrier().await?;
+        if let Some(lent) = identity::claim(self).await {
+            // The lender's tunnel is up or comes up under its own claim.
+            return lent
+                .provider
+                .prepare()
+                .await
+                .map_err(|e| DialError::hop(self.id, e));
+        }
         let activity = self.activity.read().await;
         let capacity = self.capacity.acquire()?;
         let result = self
@@ -1344,6 +1368,7 @@ impl Dialer for SessionHop {
             }
             self.provider.retire().await;
             self.capacity.release();
+            identity::release(self);
             true
         } else {
             false
@@ -1358,8 +1383,17 @@ impl Dialer for SessionHop {
         let resolving = tokio::time::Instant::now();
         let destinations = hop_destinations(self, target).await?;
         let resolved = resolving.elapsed();
-        let activity = self.activity.clone().read_owned().await;
-        let capacity = self.capacity.acquire()?;
+        // A probe lent another session's tunnel dials through it, and holds
+        // that session busy, not its own; the lender's budget already counts
+        // the tunnel.
+        let (provider, activity, capacity) = match identity::claim(self).await {
+            Some(lent) => (lent.provider, lent.activity, None),
+            None => (
+                self.provider.clone(),
+                self.activity.clone().read_owned().await,
+                self.capacity.acquire()?,
+            ),
+        };
         let socket = self.take_socket(SocketClass::of(&target.purpose))?;
         let outcome = Arc::new(ConnectionOutcome::default());
         let mut connected = Err(DialError::Skipped("no destination".into()));
@@ -1374,8 +1408,7 @@ impl Dialer for SessionHop {
                 .saturating_sub(started.elapsed().saturating_sub(resolved));
             connected = tokio::time::timeout(
                 remaining / (destinations.len() - index) as u32,
-                self.provider
-                    .dial_observed(destination, target.port, outcome.clone()),
+                provider.dial_observed(destination, target.port, outcome.clone()),
             )
             .await
             .map_err(|_| DialError::Timeout {
@@ -1466,9 +1499,15 @@ impl Dialer for SessionHop {
         answers
             .resolve(Resolver::WireGuard, host, || async {
                 self.prepare_carrier().await?;
-                let _activity = self.activity.read().await;
-                let _capacity = self.capacity.acquire()?;
-                provider
+                let (resolver, _activity, _capacity) = match identity::claim(self).await {
+                    Some(lent) => (lent.resolver, lent.activity, None),
+                    None => (
+                        provider.clone(),
+                        self.activity.clone().read_owned().await,
+                        self.capacity.acquire()?,
+                    ),
+                };
+                resolver
                     .resolve_host(host)
                     .await
                     .inspect(|_| crate::metrics::record_resolution(Resolver::WireGuard, true))
@@ -1528,6 +1567,10 @@ impl Dialer for SessionHop {
     async fn shutdown(&self) {
         self.provider.shutdown().await;
         self.capacity.release();
+        identity::release(self);
+    }
+    fn session_activity(&self) -> Option<Arc<tokio::sync::RwLock<()>>> {
+        Some(self.activity.clone())
     }
     fn describe(&self) -> String {
         format!("{} → proxy {}", self.inner.describe(), self.id)
