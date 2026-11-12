@@ -568,3 +568,54 @@ async fn feed_policy_is_atomic_preserved_and_blocks_referenced_profile_deletion(
     );
     h.handle.proxy_runtime().unwrap().stop_all().await;
 }
+
+// A proxy save rebuilds the usenet connections only when a server's route
+// goes through the proxy, and a save that changes nothing rebuilds nothing,
+// not even the routes.
+#[tokio::test]
+async fn a_proxy_save_rebuilds_usenet_connections_only_for_a_proxy_a_server_routes_through() {
+    let h = harness().await;
+    let generation = || h.handle.nntp_runtime_activation().map(|a| a.generation);
+    let reloads = h.handle.proxy_runtime().unwrap().network.reloads();
+    let save = |id: Option<u64>, port: u16| {
+        let id = id.map_or("null".into(), |id| id.to_string());
+        format!(
+            r#"mutation {{ saveProxyProfile(id: {id}, input: {{
+        name: "gateway", kind: SOCKS5, resolver: PROXY, enabled: true, host: "127.0.0.1", port: {port}
+    }}) {{ id }} }}"#
+        )
+    };
+    let created = h.execute(&save(None, 1080)).await;
+    assert_no_errors(&created);
+    let id = response_data(&created)["saveProxyProfile"]["id"]
+        .as_u64()
+        .unwrap();
+
+    // No server routes through the proxy: its change reloads the routes and
+    // leaves the usenet connections alone.
+    let before = generation();
+    let reloaded = *reloads.borrow();
+    assert_no_errors(&h.execute(&save(Some(id), 1081)).await);
+    assert_eq!(generation(), before);
+    assert!(*reloads.borrow() > reloaded);
+
+    let added = h
+        .execute(&format!(
+            r#"mutation {{addServer(input:{{host:"news.fixture.invalid",port:119,tls:false,connections:2,active:false,routing:{{proxyIds:[{id}],allowDirect:false}}}}){{id}}}}"#
+        ))
+        .await;
+    assert_no_errors(&added);
+
+    // A server routes through it: its change rebuilds them.
+    let before = generation();
+    assert_no_errors(&h.execute(&save(Some(id), 1082)).await);
+    assert!(generation() > before, "{:?} after {before:?}", generation());
+
+    // The same settings again: nothing is rebuilt or reloaded.
+    let before = generation();
+    let reloaded = *reloads.borrow();
+    assert_no_errors(&h.execute(&save(Some(id), 1082)).await);
+    assert_eq!(generation(), before);
+    assert_eq!(*reloads.borrow(), reloaded);
+    h.handle.proxy_runtime().unwrap().stop_all().await;
+}
