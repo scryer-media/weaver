@@ -27,6 +27,7 @@ pub(crate) mod tests;
 use std::collections::{BTreeMap, BTreeSet, HashSet, btree_map};
 use std::ops::Bound;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use unrar_rs::{ArchiveFormat, EncryptedStore};
 use weaver_graph::{
@@ -740,8 +741,15 @@ impl Object for RarStore {
     }
 
     fn work(&mut self, out: &mut Vec<Emit>) {
-        self.derive_due();
-        self.settle(None, out);
+        self.work_until(&AtomicBool::new(false), out);
+    }
+
+    // Stopped between two file keys, the store says nothing: the keys it
+    // did not derive stay due.
+    fn work_until(&mut self, stop: &AtomicBool, out: &mut Vec<Emit>) {
+        if self.derive_due(stop) {
+            self.settle(None, out);
+        }
     }
 
     fn deliver(
