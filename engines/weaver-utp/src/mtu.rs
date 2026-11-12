@@ -51,6 +51,9 @@ pub struct SegmentSizes {
     // The maximum uTP payload size to probe for. Calculated from link MTU
     // (default 1500, ethernet)
     max_ss: u16,
+    // The payload size every path carries: where a stream starts, and
+    // where it falls back to when the host refuses a size it had proven.
+    floor_ss: u16,
 
     cooldown_remaining_packets: u16,
     cooldown_max_packets: u16,
@@ -95,15 +98,35 @@ impl SegmentSizes {
         Self {
             min_ss,
             max_ss,
+            floor_ss: min_ss,
             cooldown_remaining_packets: 1,
             cooldown_max_packets: config.probe_expiry_cooldown_packets,
         }
     }
 
+    // A delivered payload proves its size, unless the host has since
+    // refused a packet that large: a segment sent before the refusal and
+    // acknowledged after it does not raise the size again.
     pub fn on_payload_delivered(&mut self, payload_size: usize) {
         let payload_size = payload_size.min(u16::MAX as usize) as u16;
-        self.min_ss = self.min_ss.max(payload_size);
-        self.max_ss = self.max_ss.max(self.min_ss);
+        if payload_size <= self.max_ss {
+            self.min_ss = self.min_ss.max(payload_size);
+        }
+    }
+
+    // The host refused a packet of `size` payload bytes as larger than its
+    // path carries now. No segment that large is cut again. A size proven
+    // earlier that the refusal disproves falls back to the floor, and
+    // probing searches upward from there, below the refused size.
+    pub fn on_send_too_large(&mut self, size: usize) {
+        let below = u16::try_from(size)
+            .unwrap_or(u16::MAX)
+            .saturating_sub(1)
+            .max(1);
+        if self.min_ss > below {
+            self.min_ss = self.floor_ss.min(below);
+        }
+        self.max_ss = self.max_ss.min(below).max(self.min_ss);
     }
 
     pub fn mss(&self) -> u16 {

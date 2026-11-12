@@ -326,6 +326,9 @@ struct ThisPoll {
 
     restart: bool,
 
+    // A segment never sent that the host refused as too large this poll.
+    refused_unsent: Option<SeqNr>,
+
     unsegmented_data: usize,
 }
 
@@ -369,7 +372,7 @@ macro_rules! send_data {
 
             // Sent from the ring in place; the writer waits on the lock only
             // for the length of one send.
-            {
+            let refused = {
                 let g = $self.user_tx.ring.lock();
                 let offset = $segment_iter_item.payload_offset();
                 let plen = $segment_iter_item.payload_size();
@@ -381,17 +384,43 @@ macro_rules! send_data {
                     IoSlice::new(first),
                     IoSlice::new(second),
                 ];
-                $self.this_poll.transport_pending = $self
-                    .socket
-                    .try_poll_send_to_vectored(
-                        $self.transport.as_deref().ok_or(Error::DispatcherDead)?,
-                        $self.sender.as_deref_mut(),
-                        &mut $self.send_gate,
-                        $cx,
-                        &bufs,
-                        $self.remote,
-                    )
-                    .map_err(Error::Send)?;
+                match $self.socket.try_poll_send_to_vectored(
+                    $self.transport.as_deref().ok_or(Error::DispatcherDead)?,
+                    $self.sender.as_deref_mut(),
+                    &mut $self.send_gate,
+                    $cx,
+                    &bufs,
+                    $self.remote,
+                ) {
+                    Ok(pending) => {
+                        $self.this_poll.transport_pending = pending;
+                        None
+                    }
+                    Err(source) if crate::is_message_size_error(&source) => Some(source),
+                    Err(source) => return Err(Error::Send(source)),
+                }
+            };
+
+            // The host refused the packet as larger than its path carries
+            // now. No segment that large is cut again. One never sent goes
+            // back to be cut again smaller, with every unsent segment
+            // after it. One sent before cannot be cut again: the peer may
+            // hold it under its sequence number. That send counts as one
+            // the path dropped, and the packet waits for its resend as a
+            // lost one does.
+            if let Some(source) = refused {
+                let payload_size = $segment_iter_item.payload_size();
+                debug!(
+                    seq_nr = %$segment_iter_item.seq_nr(),
+                    payload_size,
+                    sends = $segment_iter_item.send_count(),
+                    "the host refused a packet as too large: {source:#}"
+                );
+                $self.segment_sizes.on_send_too_large(payload_size);
+                if $segment_iter_item.send_count() == 0 {
+                    $self.this_poll.refused_unsent = Some($segment_iter_item.seq_nr());
+                    return Err(Error::Send(source));
+                }
             }
 
             if $self.this_poll.transport_pending {
@@ -464,6 +493,34 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn send_tx_queue(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<()> {
+        match self.send_tx_queue_inner(cx) {
+            Err(Error::Send(source)) if crate::is_message_size_error(&source) => {
+                let Some(seq_nr) = self.this_poll.refused_unsent.take() else {
+                    return Err(Error::Send(source));
+                };
+                // A refused probe is the last segment; any other refused
+                // segment never sent is the first of the unsent ones, all
+                // at the back. They are cut again at the lowered size.
+                if self.user_tx_segments.pop_mtu_probe(seq_nr) {
+                    debug!("popped too large MTU probe, will retry");
+                    self.segment_sizes.disarm_cooldown();
+                } else {
+                    let dropped = self.user_tx_segments.drop_unsent();
+                    debug!(
+                        %seq_nr,
+                        dropped,
+                        segment_sizes = ?self.segment_sizes.log_debug(),
+                        "unsent segments go back to be cut smaller"
+                    );
+                }
+                self.this_poll.restart = true;
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn send_tx_queue_inner(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<()> {
         // No reason to send anything, we'll get polled next time.
         if self.this_poll.transport_pending {
             return Ok(());
@@ -953,8 +1010,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let mut sent_count = 0;
 
-        let mut message_too_long = None;
-
         // Send the stuff we haven't sent yet, up to sender's window.
         for mut item in self
             .user_tx_segments
@@ -994,34 +1049,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 Ok(false) => {
                     break;
                 }
-                // If we couldn't send due to message size, we need to tweak MTU if possible and then retry.
-                Err(Error::Send(source)) if crate::is_message_size_error(&source) => {
-                    let seq_nr = item.seq_nr();
-                    let size = item.payload_size();
-                    debug!(
-                        ?seq_nr,
-                        payload_size = size,
-                        "got message too long (EMSGSIZE): {source:#}"
-                    );
-                    message_too_long = Some((seq_nr, size));
-                    break;
-                }
                 Err(e) => return Err(e),
             }
         }
         if let Some(at) = paced.and_then(|payload| self.pacer.ready_at(payload)) {
             self.timers.pace.set(at);
-        }
-
-        if let Some((seq_nr, size)) = message_too_long {
-            if self.user_tx_segments.pop_mtu_probe(seq_nr) {
-                debug!("popped too large MTU probe, will retry");
-                self.segment_sizes.on_probe_failed(size);
-                self.segment_sizes.disarm_cooldown();
-                self.this_poll.restart = true;
-            } else {
-                return Err(Error::BugEmsgSizeNoProbe);
-            }
         }
 
         if sent_count == 0 {
@@ -2521,6 +2553,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 tmp_buf: vec![0u8; (ss.max_ss() + UTP_HEADER) as usize],
                 transport_pending: false,
                 restart: false,
+                refused_unsent: None,
                 unsegmented_data: 0,
             },
             parent_span,
