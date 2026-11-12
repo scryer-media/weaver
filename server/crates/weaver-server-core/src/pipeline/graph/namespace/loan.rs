@@ -4,8 +4,9 @@
 // A recovery set's repair, lent off the loop. The set's object leaves its
 // node, and the access it repairs through takes along what its reads reach:
 // for every member of the namespaces below the set, as far down as the tree
-// goes, its coverage, the file it is written at and the bytes still held for
-// it; for every data object there, what rebuilds its posted bytes; and the
+// goes, its coverage, the file it is written at and where the bytes still
+// held for it are, read there as the repair asks for them; for every data
+// object there, what rebuilds its posted bytes; and the
 // envelope shelves those objects keep, read as they stand. Nothing the loop
 // changes after the loan reaches it, and what the loop moved that it read is
 // known on its return: a shelf whose generation moved, or a file no longer
@@ -190,9 +191,8 @@ struct Taken {
     revision: Option<(u64, u64)>,
     scratch_revision: Option<(u64, u64)>,
     held_basis: Vec<(ByteRange, u64)>,
-    // The bytes held for it, in offset order.
+    // Where the bytes held for it are, in offset order.
     held: Vec<(ByteRange, Location)>,
-    scratch: Option<File>,
     // Its spill file, for the bytes held past the budgets, and the revision
     // that file stood at when lent.
     spill: Option<File>,
@@ -240,9 +240,19 @@ struct Lent {
     namespace: NodeId,
     set: NodeId,
     recovery: Option<NodeId>,
-    // Replay validates all node revisions on return, so it can defer reads
-    // of reusable scratch spans. Recovery snapshots retain their copies.
+    // Replay validates every node's revisions on return, so it notes
+    // nothing of what it reads.
     defer_holds: bool,
+    // Whether bytes held on scratch are read in place, through the loan's
+    // own handle on the namespace's scratch file, as the work asks for
+    // them. A loan whose return checks the holds it read does: a span is
+    // written again only once every hold on scratch has left, which that
+    // check sees. A rewalk, whose pieces are heard as read, copies them
+    // when lent.
+    scratch_in_place: bool,
+    // Each namespace's scratch file, opened when lent for a member that
+    // holds bytes there.
+    held_scratch: BTreeMap<NodeId, File>,
     // The directory the repair's scratch and output lie in, made when the
     // repair is lent. The repair never makes it again: once it is gone, the
     // job's working directory was released under the repair.
@@ -413,6 +423,8 @@ impl NamespaceWriter {
             set,
             recovery: Some(set),
             defer_holds: false,
+            scratch_in_place: true,
+            held_scratch: BTreeMap::new(),
             internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
             members: BTreeMap::new(),
             usage: RefCell::default(),
@@ -557,20 +569,31 @@ impl NamespaceWriter {
             return;
         };
         let files = self.files.get(&node);
-        let held = files
-            .map(|files| {
-                if access.defer_holds {
-                    files
-                        .holds
-                        .peek(held_volume(member), ALL)
-                        .into_iter()
-                        .map(|piece| (piece.range, piece.location))
-                        .collect()
-                } else {
-                    self.held_pieces(files, member)
+        let held = match files {
+            Some(files) if access.scratch_in_place => {
+                let held: Vec<(ByteRange, Location)> = files
+                    .holds
+                    .peek(held_volume(member), ALL)
+                    .into_iter()
+                    .map(|piece| (piece.range, piece.location))
+                    .collect();
+                let on_scratch = held
+                    .iter()
+                    .any(|(_, location)| matches!(location, Location::Scratch { .. }));
+                if on_scratch
+                    && !access.held_scratch.contains_key(&node)
+                    && let Some(file) = files
+                        .scratch
+                        .as_ref()
+                        .and_then(|leaf| File::open(leaf.path()).ok())
+                {
+                    access.held_scratch.insert(node, file);
                 }
-            })
-            .unwrap_or_default();
+                held
+            }
+            Some(files) => self.held_pieces(files, member),
+            None => Vec::new(),
+        };
         let bound = tree
             .child_of(node, member)
             .filter(|(child, _)| !tree.recovers(*child));
@@ -592,10 +615,6 @@ impl NamespaceWriter {
                     .map(|files| files.holds.revisions(held_volume(member), ALL))
                     .unwrap_or_default(),
                 held,
-                scratch: files
-                    .and_then(|files| files.scratch.as_ref())
-                    .filter(|_| access.defer_holds)
-                    .and_then(|leaf| File::open(leaf.path()).ok()),
                 spill_revision: files
                     .and_then(|files| files.spills.get(&member))
                     .map(Leaf::revision),
@@ -622,10 +641,10 @@ impl NamespaceWriter {
         self.take_namespace(tree, child, access, seen);
     }
 
-    // What is held for the member: bytes paged to scratch are copied out,
-    // since the scratch span is reused once its hold leaves, and the
-    // budgets bound them. Bytes on file stay there, read through the
-    // loan's own handle on the spill file as the repair asks for them:
+    // What is held for the member, for a loan that reads no scratch in
+    // place: bytes paged to scratch are copied out, since the scratch span
+    // is reused once its hold leaves. Bytes on file stay there, read
+    // through the loan's own handle on the spill file as it asks for them:
     // nothing bounds how much spilled, so none of it is copied here.
     fn held_pieces(&self, files: &super::Files, member: MemberId) -> Vec<(ByteRange, Location)> {
         files
@@ -777,12 +796,14 @@ impl Source for Lent {
         into: &mut Vec<u8>,
     ) -> bool {
         let Some(file) = self
-            .members
-            .get(&(node, member))
-            .and_then(|taken| taken.scratch.as_ref())
+            .held_scratch
+            .get(&node)
+            .filter(|_| self.members.contains_key(&(node, member)))
         else {
             return false;
         };
+        #[cfg(test)]
+        super::tests::SCRATCH_READ_MOST.with(|most| most.set(most.get().max(len)));
         let start = into.len();
         into.resize(start + index(len), 0);
         if read_exact_at(file, offset, &mut into[start..]).is_err() {
