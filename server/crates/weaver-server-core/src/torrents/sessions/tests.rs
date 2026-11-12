@@ -1736,8 +1736,16 @@ async fn a_base_port_change_listens_on_the_new_port_while_the_old_stopped_announ
     sessions.drop_route(&plan.key).await;
     let new = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert_eq!(new.listen_addr().map(|addr| addr.port()), Some(second));
-    // The old session still waits on its tracker.
+    // The old session still waits on its tracker, its swarm stopped before
+    // the new one read the route's DHT table.
     assert!(!old.cancellation_token().is_cancelled());
+    let stopping: Vec<(bool, bool)> = sessions
+        .closing
+        .lock()
+        .iter()
+        .map(|stopping| (*stopping.swarm.borrow(), *stopping.stopped.borrow()))
+        .collect();
+    assert_eq!(stopping, [(true, false)]);
 
     answer(stopped).await;
     sessions.stop_all().await;
@@ -1823,6 +1831,7 @@ async fn a_new_session_waits_on_a_stopping_one_only_for_a_port_it_shares() {
         ports: vec![6881, 6882, 51_413],
         moved: false,
         stopped: waiting,
+        swarm: tokio::sync::watch::channel(true).1,
     });
 
     let elsewhere = std::pin::pin!(closing.released(&plan, [6883, 51_414].into_iter()));
@@ -1844,6 +1853,50 @@ async fn a_new_session_waits_on_a_stopping_one_only_for_a_port_it_shares() {
     stopped.send_replace(true);
     shared.await;
     assert_eq!(lines.of("the stopping session released the port").len(), 1);
+}
+
+// A session opening on a route whose last session is still stopping reads
+// the route's DHT table only once that session's swarm has stopped, and so
+// its DHT has written the table for the last time, though the two share no
+// port. The stopping session's trackers are not waited on, and a session
+// stopping on another route holds nothing.
+#[tokio::test]
+async fn a_new_session_reads_its_routes_dht_table_only_once_the_stopping_one_wrote_it() {
+    let (lines, _guard) =
+        crate::pipeline::graph::lines::Lines::capture_at("weaver", tracing::Level::INFO);
+    let routes = FakeRoutes::default();
+    routes.route(TorrentScope::Category(1), 9);
+    let plan = routes.plan(TorrentScope::Default);
+    let other = routes.plan(TorrentScope::Category(1));
+    assert_ne!(plan.key, other.key);
+    let closing = Closing::default();
+    let (stopped, waiting) = tokio::sync::watch::channel(false);
+    let (swarm_stopped, swarm) = tokio::sync::watch::channel(false);
+    closing.lock().push(Stopping {
+        route: plan.key.clone(),
+        ports: vec![6881],
+        moved: false,
+        stopped: waiting,
+        swarm,
+    });
+
+    // Its ports alone let the new session open beside it.
+    let ports = std::pin::pin!(closing.released(&plan, [6882].into_iter()));
+    assert_eq!(polled(ports), Some(()));
+    let elsewhere = std::pin::pin!(closing.table_released(&other));
+    assert_eq!(polled(elsewhere), Some(()));
+
+    let mut table = std::pin::pin!(closing.table_released(&plan));
+    assert_eq!(polled(table.as_mut()), None);
+    assert_eq!(
+        lines
+            .of("a route's session waits on its stopping session to write its DHT table")
+            .len(),
+        1
+    );
+    swarm_stopped.send_replace(true);
+    table.await;
+    assert!(!*stopped.borrow());
 }
 
 #[test]

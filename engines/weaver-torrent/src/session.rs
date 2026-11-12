@@ -2646,6 +2646,15 @@ impl Session {
         self.dht.as_ref()
     }
 
+    /// Resolves once [`Session::stop`] has stopped the session's swarm: its
+    /// listeners, DHT and local discovery are gone, and its DHT has written
+    /// its table for the last time. Never before the stop begins. The
+    /// future holds no reference to the session.
+    pub fn swarm_stopped(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let swarm_tasks = self.swarm_tasks.clone();
+        async move { swarm_tasks.wait().await }
+    }
+
     /// Joins local service discovery's groups on the interfaces up now, for
     /// a caller that saw them change: again, or for the first time when no
     /// join has succeeded since the session opened, which starts its

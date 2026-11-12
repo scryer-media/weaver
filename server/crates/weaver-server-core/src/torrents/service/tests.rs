@@ -889,6 +889,7 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
         .set_category(job_id, Some("tv".into()))
         .await
         .unwrap();
+    rig.service.opened(job_id).await;
     let moved = rig.service.torrent(job_id).await.unwrap();
     assert_eq!(moved.category.as_deref(), Some("tv"));
     assert_ne!(moved.route.as_deref(), Some(first.as_str()));
@@ -2017,6 +2018,194 @@ async fn an_add_whose_route_fails_to_open_says_why_and_sends_nothing() {
     );
     assert_eq!(watched.asked.load(Ordering::SeqCst), 0);
     rig.service.stop().await;
+}
+
+// The key of the route `scope` runs on now.
+fn route_key(rig: &Rig, scope: TorrentScope) -> String {
+    rig.service
+        .inner
+        .sessions
+        .routes()
+        .plan(scope)
+        .key
+        .as_str()
+        .to_owned()
+}
+
+// A category move to a route whose session is not open yet is answered at
+// once: the torrent reads as its new route, opening, and joins that route's
+// session by itself once it opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_category_move_is_answered_before_its_new_routes_session_opens() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    rig.routes.route(TorrentScope::Category(1), 9);
+    let new = route_key(&rig, TorrentScope::Category(1));
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+
+    // The new route's open is held unanswered, and the move still answers.
+    rig.service
+        .set_category(job_id, Some("tv".into()))
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.route.as_deref(), view.route_reason),
+        (Some(new.as_str()), Some(TorrentRouteReason::Opening))
+    );
+    assert!(rig.service.attaching(job_id).await);
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+
+    rig.routes.unanswered.send_replace(false);
+    rig.service.opened(job_id).await;
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.route.as_deref(), view.route_reason),
+        (Some(new.as_str()), None)
+    );
+    handle_of(&rig.service, job_id).await;
+    rig.service.stop().await;
+}
+
+// A torrent paused while its route's session opens joins that session
+// paused, as one paused after it joined is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_paused_while_its_routes_session_opens_joins_it_paused() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+    rig.service.pause(job_id).await.unwrap();
+
+    rig.routes.unanswered.send_replace(false);
+    rig.service.opened(job_id).await;
+    let handle = handle_of(&rig.service, job_id).await;
+    assert!(handle.is_paused());
+    handle.wait_until_initialized().await.unwrap();
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().state,
+        TorrentState::Paused
+    );
+    rig.service.stop().await;
+}
+
+// A category moved while the torrent's route's session opens is not opened
+// for again in the meantime: the one wait goes on, and once its open ends
+// the torrent waits for its new route instead, and joins that route's
+// session alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_category_moved_while_its_routes_session_opens_joins_the_new_route_once() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+
+    rig.routes.route(TorrentScope::Category(1), 9);
+    let new = route_key(&rig, TorrentScope::Category(1));
+    rig.service
+        .set_category(job_id, Some("tv".into()))
+        .await
+        .unwrap();
+    rig.service
+        .set_category(job_id, Some("tv".into()))
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.route.as_deref(), view.route_reason),
+        (Some(new.as_str()), Some(TorrentRouteReason::Opening))
+    );
+    assert_eq!(*asked.borrow(), before + 1, "a second open was asked for");
+
+    rig.routes.unanswered.send_replace(false);
+    rig.service.opened(job_id).await;
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.route.as_deref(), view.route_reason),
+        (Some(new.as_str()), None)
+    );
+    handle_of(&rig.service, job_id).await;
+    // The route it left opened a session, which never took it.
+    let running = rig.service.inner.sessions.running().await;
+    let held: Vec<(String, usize)> = running
+        .iter()
+        .map(|(key, session)| {
+            (
+                key.as_str().to_owned(),
+                session.with_torrents(|torrents| torrents.count()),
+            )
+        })
+        .filter(|(_, count)| *count > 0)
+        .collect();
+    assert_eq!(held, [(new, 1)]);
+    rig.service.stop().await;
+}
+
+// A recheck of a torrent held for its files is answered before its route's
+// session opens; once it opens the torrent joins it and every piece passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recheck_of_a_held_torrent_is_answered_before_its_routes_session_opens() {
+    let rig = rig(set_clock());
+    let (job_id, dir, away) = gone_at_restart(&rig).await;
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    held_for_its_files(&again, job_id, &dir).await;
+    std::fs::rename(&away, &dir).unwrap();
+    rig.routes.unanswered.send_replace(true);
+
+    again.recheck(job_id).await.unwrap();
+    assert!(again.attaching(job_id).await);
+    assert_eq!(
+        again.torrent(job_id).await.unwrap().route_reason,
+        Some(TorrentRouteReason::Opening)
+    );
+
+    rig.routes.unanswered.send_replace(false);
+    again.opened(job_id).await;
+    runs_with_every_piece(&again, job_id).await;
+    again.stop().await;
+}
+
+// A resume that finds a held torrent's files is answered before its route's
+// session opens; once it opens the torrent runs with every piece.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_that_finds_the_files_is_answered_before_its_routes_session_opens() {
+    let rig = rig(set_clock());
+    let (job_id, dir, away) = gone_at_restart(&rig).await;
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    held_for_its_files(&again, job_id, &dir).await;
+    std::fs::rename(&away, &dir).unwrap();
+    rig.routes.unanswered.send_replace(true);
+
+    again.resume(job_id).await.unwrap();
+    assert!(again.attaching(job_id).await);
+
+    rig.routes.unanswered.send_replace(false);
+    again.opened(job_id).await;
+    runs_with_every_piece(&again, job_id).await;
+    again.stop().await;
 }
 
 // Every file under `dir`, at any depth.
@@ -3489,6 +3678,7 @@ async fn a_torrent_whose_files_are_all_gone_at_load_is_held_until_a_start_finds_
 
     std::fs::rename(&away, &dir).unwrap();
     again.resume(job_id).await.unwrap();
+    again.opened(job_id).await;
     runs_with_every_piece(&again, job_id).await;
     again.stop().await;
 }
@@ -3527,6 +3717,7 @@ async fn a_recheck_lets_go_of_a_torrent_held_for_its_files() {
 
     std::fs::rename(&away, &dir).unwrap();
     again.recheck(job_id).await.unwrap();
+    again.opened(job_id).await;
     runs_with_every_piece(&again, job_id).await;
     again.stop().await;
 }
@@ -3608,6 +3799,7 @@ async fn a_torrent_held_for_its_files_moved_to_where_they_are_runs() {
         .set_location(job_id, elsewhere.to_string_lossy().into_owned())
         .await
         .unwrap();
+    again.opened(job_id).await;
     runs_with_every_piece(&again, job_id).await;
     assert_eq!(
         again.torrent(job_id).await.unwrap().storage_dir.as_deref(),

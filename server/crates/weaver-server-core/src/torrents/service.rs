@@ -4670,36 +4670,40 @@ impl TorrentService {
     // joins it now, and one whose route must open first waits for it off
     // the caller, reading as opening meanwhile, and goes on by itself once
     // the open ends, in the session or held for why it did not open. Nothing
-    // of it reaches the route before its session is open. A torrent already
-    // waiting on its route's open is left to that wait.
+    // of it reaches the route before its session is open. What it joins
+    // with is read once the open ends, so a pause, a move or a category
+    // change made while it waited holds; one whose route changed meanwhile waits
+    // for the route it runs on now. A torrent already waiting on its route's
+    // open is left to that wait, reading as the route it runs on now.
     async fn spawn_attach(&self, job_id: JobId) {
-        if self
+        let Some(attaching) = self
             .inner
             .live
             .lock()
             .await
             .get(&job_id)
-            .is_none_or(|torrent| torrent.attaching.is_some())
-        {
-            return;
-        }
-        let Some(joining) = self.joining(job_id).await else {
+            .map(|torrent| torrent.attaching.is_some())
+        else {
             return;
         };
-        if let Some(session) = self.inner.sessions.running_session(&joining.plan).await {
+        let Some((plan, identity)) = self.route_for(job_id).await else {
+            return;
+        };
+        if attaching {
+            return;
+        }
+        if let Some(session) = self.inner.sessions.running_session(&plan).await {
             self.read_sessions().await;
-            return self.join(job_id, joining, session, None).await;
+            if let Some(joining) = self.joining(job_id).await {
+                self.join(job_id, joining, session, None).await;
+            }
+            return;
         }
         // A route its plan holds down builds nothing, so it says why at
         // once.
-        if joining.plan.down.is_some() {
-            return match self.open_session(&joining.plan, &joining.identity).await {
-                Ok(session) => self.join(job_id, joining, session, None).await,
-                Err(error) => {
-                    self.held(job_id, Some(joining.plan.key), held_by(error))
-                        .await;
-                }
-            };
+        if plan.down.is_some() {
+            self.attach(job_id, None).await;
+            return;
         }
         let service = self.clone();
         let mut live = self.inner.live.lock().await;
@@ -4712,14 +4716,30 @@ impl TorrentService {
         // The task takes this lock before it touches the torrent, so the
         // handle is the torrent's before the task lets it go.
         let task = tokio::spawn(async move {
-            let session = service.open_session(&joining.plan, &joining.identity).await;
-            match session {
-                Ok(session) => service.join(job_id, joining, session, None).await,
-                Err(error) => {
-                    service
-                        .held(job_id, Some(joining.plan.key), held_by(error))
-                        .await;
+            let (mut plan, mut identity) = (plan, identity);
+            loop {
+                let session = match service.open_session(&plan, &identity).await {
+                    Ok(session) => session,
+                    Err(error) => {
+                        service.held(job_id, Some(plan.key), held_by(error)).await;
+                        break;
+                    }
+                };
+                let Some(joining) = service.joining(job_id).await else {
+                    break;
+                };
+                if joining.plan.key == plan.key {
+                    service.join(job_id, joining, session, None).await;
+                    break;
                 }
+                // Its route changed while that one opened: it waits for the
+                // one it runs on now, and keeps what it read for the join.
+                if let Some(torrent) = service.inner.live.lock().await.get_mut(&job_id)
+                    && torrent.verified_at_boot.is_none()
+                {
+                    torrent.verified_at_boot = joining.verified;
+                }
+                (plan, identity) = (joining.plan, joining.identity);
             }
             if let Some(torrent) = service.inner.live.lock().await.get_mut(&job_id) {
                 torrent.attaching = None;
@@ -4728,6 +4748,68 @@ impl TorrentService {
             service.inner.attaches.send_modify(|ended| *ended += 1);
         });
         torrent.attaching = Some(task.abort_handle());
+    }
+
+    // The route a torrent that may join a session runs on, and who opens
+    // that route's session for it: none when it is gone, in a session
+    // already, has no metainfo yet, or its files are missing. From here it
+    // reads as that route.
+    async fn route_for(&self, job_id: JobId) -> Option<(RoutePlan, Identity)> {
+        let settings = self.settings();
+        let rules = self.rules();
+        let (scope, identity) = {
+            let live = self.inner.live.lock().await;
+            let torrent = live.get(&job_id)?;
+            if torrent.attached.is_some()
+                || torrent.files_missing
+                || torrent.record.metainfo.is_none()
+                || torrent.layout.is_none()
+                || torrent.intake.is_none()
+                || torrent.store.is_none()
+            {
+                return None;
+            }
+            let rule = torrent.rule(&rules);
+            (
+                settings.scope(torrent.record.category_id, rule),
+                identity_of(rule, &torrent.identity),
+            )
+        };
+        Some((self.planned(job_id, scope).await, identity))
+    }
+
+    // The plan of the route `job_id` runs on under `scope`. It reads as its
+    // route does while it waits for the route's session: opening, or why the
+    // route's last open failed.
+    async fn planned(&self, job_id: JobId, scope: TorrentScope) -> RoutePlan {
+        let plan = self
+            .pinned(job_id, self.inner.sessions.routes().plan(scope))
+            .await;
+        if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id)
+            && torrent.attached.is_none()
+            && torrent.held.is_none()
+        {
+            torrent.route = Some(plan.key.clone());
+            torrent.held = Some(Held::Session(OPENING));
+        }
+        plan
+    }
+
+    // Whether `torrent` joins its session paused: its intent, its turn in
+    // the queue, or a hold over it stops it.
+    fn held_back(
+        &self,
+        settings: &TorrentSettings,
+        rules: &[TrackerRule],
+        torrent: &Live,
+        now: i64,
+    ) -> bool {
+        !torrent.resumed()
+            || torrent.queued
+            || self
+                .holds()
+                .reason_for(queued(settings, rules, torrent, now).target())
+                .is_some()
     }
 
     // What a torrent joins its route's session with, read as it stands, and
@@ -4780,12 +4862,7 @@ impl TorrentService {
                 layout,
                 intake,
                 torrent.record.storage_dir.clone().unwrap_or_default(),
-                !torrent.resumed()
-                    || torrent.queued
-                    || self
-                        .holds()
-                        .reason_for(queued(&settings, &rules, torrent, now).target())
-                        .is_some(),
+                self.held_back(&settings, &rules, torrent, now),
                 ratelimits,
                 (
                     store.initial_have(placed(&torrent.record)),
@@ -4811,18 +4888,7 @@ impl TorrentService {
                 torrent.verified_at_boot.take(),
             )
         };
-        let plan = self
-            .pinned(job_id, self.inner.sessions.routes().plan(scope))
-            .await;
-        // It reads as its route does while it waits for the route's
-        // session: opening, or why the route's last open failed.
-        if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id)
-            && torrent.attached.is_none()
-            && torrent.held.is_none()
-        {
-            torrent.route = Some(plan.key.clone());
-            torrent.held = Some(Held::Session(OPENING));
-        }
+        let plan = self.planned(job_id, scope).await;
         Some(Joining {
             plan,
             scope,
@@ -5034,6 +5100,24 @@ impl TorrentService {
                 torrent.route = Some(plan.key);
                 torrent.held = None;
                 torrent.run_error = None;
+                // A pause, resume or turn made while the session took it,
+                // which found it in no session, reaches it too.
+                let paused_now = self.held_back(
+                    &self.settings(),
+                    &self.rules(),
+                    torrent,
+                    self.inner.clock.now_ms(),
+                );
+                if let Some(attached) = &torrent.attached
+                    && attached.handle.is_paused() != paused_now
+                {
+                    let result = if paused_now {
+                        attached.session.pause(&attached.handle).await
+                    } else {
+                        attached.session.unpause(&attached.handle).await
+                    };
+                    torrent.ran(result);
+                }
             }
             None => {
                 drop(live);
@@ -5719,8 +5803,9 @@ impl TorrentService {
         // `TorrentImpl::start`, torrentimpl.cpp:2048-2053).
         let found = self.look_again(job_id).await;
         self.apply_queue().await;
+        // Answered without waiting on its route, as an add is.
         if found {
-            self.attach(job_id, None).await;
+            self.spawn_attach(job_id).await;
         }
         self.publish().await;
         Ok(())
@@ -5995,7 +6080,7 @@ impl TorrentService {
         .await?;
         if self.look_again(job_id).await {
             self.apply_queue().await;
-            self.attach(job_id, None).await;
+            self.spawn_attach(job_id).await;
         }
         self.publish().await;
         Ok(())
@@ -6076,7 +6161,7 @@ impl TorrentService {
             .await?;
         if held {
             self.apply_queue().await;
-            self.attach(job_id, None).await;
+            self.spawn_attach(job_id).await;
             self.publish().await;
             return Ok(());
         }
@@ -6159,7 +6244,7 @@ impl TorrentService {
                 // torrentimpl.cpp:2140-2146).
                 if self.look_again(job_id).await {
                     self.apply_queue().await;
-                    self.attach(job_id, None).await;
+                    self.spawn_attach(job_id).await;
                 }
                 Ok(())
             }
@@ -6301,8 +6386,9 @@ impl TorrentService {
             }
             moved
         };
+        // Answered without waiting on the new route, as an add is.
         if moved {
-            self.attach(job_id, None).await;
+            self.spawn_attach(job_id).await;
         }
         self.publish().await;
         Ok(())

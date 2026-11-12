@@ -1626,6 +1626,9 @@ impl Sessions {
         self.closing
             .released(plan, on_host_ports.chain([maps]).flatten())
             .await;
+        // Nor does it read the route's DHT table before the last session
+        // on the route has written it.
+        self.closing.table_released(plan).await;
         let mut options = session_options(&leg, port, &dir, peers, &torrent, ip_filter, opener);
         options.port_map_events = Some(mappings.follow());
         options.trackers_changed = Some(Arc::clone(&self.trackers_changed));
@@ -2139,6 +2142,9 @@ struct Stopping {
     // opening now opens on the path as it stands.
     moved: bool,
     stopped: tokio::sync::watch::Receiver<bool>,
+    // Its swarm has stopped: its DHT has written the route's table for the
+    // last time.
+    swarm: tokio::sync::watch::Receiver<bool>,
 }
 
 // Whether a session on `leg` closes because its route's path changed under
@@ -2178,16 +2184,22 @@ impl Closing {
         moved: bool,
     ) {
         let (stopped, waiting) = tokio::sync::watch::channel(false);
+        let (swarm_stopped, swarm) = tokio::sync::watch::channel(false);
         self.lock().push(Stopping {
             route: key.clone(),
             ports,
             moved,
             stopped: waiting,
+            swarm,
         });
         let closing = self.clone();
         let key = key.clone();
+        let swarm = session.swarm_stopped();
         tokio::spawn(async move {
-            close(&key, session, leg).await;
+            tokio::join!(close(&key, session, leg), async move {
+                swarm.await;
+                swarm_stopped.send_replace(true);
+            });
             stopped.send_replace(true);
             closing
                 .lock()
@@ -2240,6 +2252,32 @@ impl Closing {
                 "a route's session waits on a session whose path changed to let its leg go"
             );
             let _ = stopped.wait_for(|stopped| *stopped).await;
+        }
+    }
+
+    // Resolves once no session of `plan`'s route that is still stopping
+    // keeps its swarm: its DHT has written the route's table, which a
+    // session opening on the route reads, for the last time. A session that
+    // shares none of its ports opens beside it otherwise, reads the table as
+    // it stood before that last write, and races it with its own. Only the
+    // swarm is waited on, not the trackers' `stopped`, so the route still
+    // opens again at once.
+    async fn table_released(&self, plan: &RoutePlan) {
+        let holding: Vec<_> = self
+            .lock()
+            .iter()
+            .filter(|stopping| stopping.route == plan.key)
+            .map(|stopping| stopping.swarm.clone())
+            .collect();
+        for mut swarm in holding {
+            if *swarm.borrow() {
+                continue;
+            }
+            tracing::info!(
+                route = plan.key.as_str(),
+                "a route's session waits on its stopping session to write its DHT table"
+            );
+            let _ = swarm.wait_for(|stopped| *stopped).await;
         }
     }
 
