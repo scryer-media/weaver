@@ -65,20 +65,20 @@ use std::sync::OnceLock;
 mod scalar;
 mod tables;
 
-#[cfg(target_arch = "aarch64")]
-mod neon;
-#[cfg(target_arch = "x86_64")]
-mod sse2;
-#[cfg(target_arch = "x86_64")]
-mod x86_common;
-#[cfg(target_arch = "x86_64")]
-mod ssse3;
 #[cfg(target_arch = "x86_64")]
 mod avx;
 #[cfg(target_arch = "x86_64")]
 mod avx2;
 #[cfg(target_arch = "x86_64")]
 mod avx512vbmi2;
+#[cfg(target_arch = "aarch64")]
+mod neon;
+#[cfg(target_arch = "x86_64")]
+mod sse2;
+#[cfg(target_arch = "x86_64")]
+mod ssse3;
+#[cfg(target_arch = "x86_64")]
+mod x86_common;
 
 #[cfg(test)]
 mod tests;

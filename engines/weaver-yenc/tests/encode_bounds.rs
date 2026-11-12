@@ -47,8 +47,14 @@ mod guard {
     use std::ffi::c_void;
 
     unsafe extern "C" {
-        fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
-        -> *mut c_void;
+        fn mmap(
+            addr: *mut c_void,
+            len: usize,
+            prot: i32,
+            flags: i32,
+            fd: i32,
+            off: i64,
+        ) -> *mut c_void;
         fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
         fn munmap(addr: *mut c_void, len: usize) -> i32;
         fn sysconf(name: i32) -> i64;
@@ -97,7 +103,12 @@ mod guard {
                 let base = base.cast::<u8>();
                 assert_eq!(mprotect(base.cast(), page, PROT_NONE), 0);
                 assert_eq!(mprotect(base.add(page + rw_len).cast(), page, PROT_NONE), 0);
-                Arena { base, total, rw: base.add(page), rw_len }
+                Arena {
+                    base,
+                    total,
+                    rw: base.add(page),
+                    rw_len,
+                }
             }
         }
         // `n` bytes starting right after the leading guard page.
@@ -137,7 +148,10 @@ mod guard {
 
     impl Arena {
         pub fn new(min_len: usize) -> Self {
-            Arena { buf: vec![0u8; min_len + 2 * SLACK], rw_len: min_len }
+            Arena {
+                buf: vec![0u8; min_len + 2 * SLACK],
+                rw_len: min_len,
+            }
         }
         pub fn head(&mut self, n: usize) -> *mut u8 {
             assert!(n <= self.rw_len);
@@ -279,7 +293,9 @@ const LINE_SIZES: [usize; 24] = [
 // block boundaries, and around line-length multiples.
 fn lengths(ls: usize) -> Vec<usize> {
     let mut v: Vec<usize> = (0..=300).collect();
-    for m in [320usize, 384, 448, 512, 576, 640, 768, 1024, 1536, 2048, 4096] {
+    for m in [
+        320usize, 384, 448, 512, 576, 640, 768, 1024, 1536, 2048, 4096,
+    ] {
         v.extend([m - 1, m, m + 1]);
     }
     for b in [1024usize, 4096] {
@@ -409,7 +425,11 @@ impl Checker {
                     i + 1
                 );
             }
-            let extent = o[..need].iter().rposition(|&b| b != FILL).map_or(0, |i| i + 1).max(n);
+            let extent = o[..need]
+                .iter()
+                .rposition(|&b| b != FILL)
+                .map_or(0, |i| i + 1)
+                .max(n);
             let st = &mut self.stats[ti];
             st.cases += 1;
             if extent - n > st.max_past {
@@ -428,7 +448,10 @@ impl Checker {
                 let ip = self.inp.head(len);
                 std::ptr::copy_nonoverlapping(src.as_ptr(), ip, len);
                 let op = self.out.tail(need);
-                (std::slice::from_raw_parts(ip, len), std::slice::from_raw_parts_mut(op, need))
+                (
+                    std::slice::from_raw_parts(ip, len),
+                    std::slice::from_raw_parts_mut(op, need),
+                )
             };
             let mut col = col0;
             let n = encode_body_with_tier(tier, ls, &mut col, s, as_uninit(o), is_end)
@@ -525,7 +548,12 @@ fn bounds_every_column() {
     ];
     for &ls in &[12usize, 13, 63, 64, 65, 127, 128, 129, 255, 256] {
         for &len in &lens {
-            for kind in [Kind::Random, Kind::AllCritical, Kind::AllEdge, Kind::LineEdges] {
+            for kind in [
+                Kind::Random,
+                Kind::AllCritical,
+                Kind::AllEdge,
+                Kind::LineEdges,
+            ] {
                 let src = make_input(kind, len, ls, 0xe7e7);
                 for col in 0..=ls + 1 {
                     for is_end in [false, true] {
@@ -545,17 +573,30 @@ fn bounds_every_column() {
 fn short_destination_is_refused() {
     let src = make_input(Kind::HotMix, 1000, 128, 7);
     for tier in EncoderTier::available() {
-        for &(len, ls) in &[(0usize, 1usize), (1, 1), (65, 12), (129, 128), (1000, 128), (1000, 1)] {
+        for &(len, ls) in &[
+            (0usize, 1usize),
+            (1, 1),
+            (65, 12),
+            (129, 128),
+            (1000, 128),
+            (1000, 1),
+        ] {
             let need = encode_max_len(len, ls);
             let mut dst = vec![FILL; need - 1];
             let mut col = 5;
             assert_eq!(
                 encode_body_with_tier(tier, ls, &mut col, &src[..len], as_uninit(&mut dst), true),
-                Err(EncodeError::DestinationTooSmall { needed: need, available: need - 1 }),
+                Err(EncodeError::DestinationTooSmall {
+                    needed: need,
+                    available: need - 1
+                }),
                 "{tier} len {len} line {ls}"
             );
             assert_eq!(col, 5);
-            assert!(dst.iter().all(|&b| b == FILL), "{tier}: wrote into a refused destination");
+            assert!(
+                dst.iter().all(|&b| b == FILL),
+                "{tier}: wrote into a refused destination"
+            );
         }
     }
 }
@@ -618,7 +659,9 @@ mod rapidyenc_guarded {
             ran.push(name);
             let mut cases = 0u64;
             let mut min_slack = usize::MAX;
-            for &ls in &[1usize, 2, 4, 11, 12, 13, 16, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 997] {
+            for &ls in &[
+                1usize, 2, 4, 11, 12, 13, 16, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 997,
+            ] {
                 let mut lens: Vec<usize> = (0..=300).collect();
                 lens.extend((0..=64).map(|d| 1024 + d));
                 lens.extend([511, 512, 513, 2047, 2048, 2049, 4095, 4096, 4097]);
@@ -658,14 +701,22 @@ mod rapidyenc_guarded {
                                     // sizes; distinct mappings; the lock is
                                     // held.
                                     let (n, col, o) = unsafe {
-                                        let ip = if run == 0 { inp.tail(len) } else { inp.head(len) };
+                                        let ip = if run == 0 {
+                                            inp.tail(len)
+                                        } else {
+                                            inp.head(len)
+                                        };
                                         std::ptr::copy_nonoverlapping(src.as_ptr(), ip, len);
                                         let op = if run == 0 {
                                             out.tail(cap)
                                         } else {
                                             out.head(cap + PAD)
                                         };
-                                        std::ptr::write_bytes(op, FILL, cap + if run == 0 { 0 } else { PAD });
+                                        std::ptr::write_bytes(
+                                            op,
+                                            FILL,
+                                            cap + if run == 0 { 0 } else { PAD },
+                                        );
                                         let mut col = col0 as i32;
                                         let n = weaver_rapidyenc_encode_ex(
                                             ls as i32,
@@ -684,12 +735,22 @@ mod rapidyenc_guarded {
                                     let at = format!(
                                         "rapidyenc {name} run {run}: {kind:?} len {len} line {ls} col {col0} end {is_end}"
                                     );
-                                    assert!(n == wn && col == wcol && o[..n] == want[..wn], "{at}: differs from weaver scalar");
+                                    assert!(
+                                        n == wn && col == wcol && o[..n] == want[..wn],
+                                        "{at}: differs from weaver scalar"
+                                    );
                                     if run == 1 {
                                         if let Some(i) = o[cap..].iter().rposition(|&b| b != FILL) {
-                                            panic!("{at}: wrote {} bytes past its own budget {cap}", i + 1);
+                                            panic!(
+                                                "{at}: wrote {} bytes past its own budget {cap}",
+                                                i + 1
+                                            );
                                         }
-                                        let ext = o[..cap].iter().rposition(|&b| b != FILL).map_or(0, |i| i + 1).max(n);
+                                        let ext = o[..cap]
+                                            .iter()
+                                            .rposition(|&b| b != FILL)
+                                            .map_or(0, |i| i + 1)
+                                            .max(n);
                                         min_slack = min_slack.min(cap - ext);
                                     }
                                     cases += 1;

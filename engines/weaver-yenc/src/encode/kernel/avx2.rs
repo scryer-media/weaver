@@ -17,7 +17,7 @@
 use std::arch::x86_64::*;
 
 use super::scalar::encode_simd_frame;
-use super::ssse3::{DenseX, ONE, dense32, dense_eq32};
+use super::ssse3::{DenseX, ONE, dense_eq32, dense32};
 use super::x86_common::{Block, Dense, main_loop};
 
 pub(super) struct Avx2;
@@ -213,9 +213,15 @@ pub(super) unsafe fn encode_raw(
     is_end: bool,
 ) -> usize {
     unsafe {
-        encode_simd_frame(line_size, column, src, len, dst, is_end, |ls, col, s, n, d| {
-            grid(ls, col, s, n, d)
-        })
+        encode_simd_frame(
+            line_size,
+            column,
+            src,
+            len,
+            dst,
+            is_end,
+            |ls, col, s, n, d| grid(ls, col, s, n, d),
+        )
     }
 }
 
@@ -227,15 +233,14 @@ pub(super) unsafe fn encode_raw(
 // SAFETY: as `main_loop`; the CPU has AVX2, BMI1, BMI2, POPCNT, LZCNT.
 #[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
 #[inline(never)]
-unsafe fn grid(
-    ls: usize,
-    col: &mut usize,
-    s: *const u8,
-    n: usize,
-    d: *mut u8,
-) -> (usize, usize) {
+unsafe fn grid(ls: usize, col: &mut usize, s: *const u8, n: usize, d: *mut u8) -> (usize, usize) {
     unsafe {
-        core::arch::asm!("jmp 2f", ".p2align 6, 0xcc", "2:", options(nomem, nostack, preserves_flags));
+        core::arch::asm!(
+            "jmp 2f",
+            ".p2align 6, 0xcc",
+            "2:",
+            options(nomem, nostack, preserves_flags)
+        );
         main_loop::<Avx2>(ls, col, s, n, d)
     }
 }

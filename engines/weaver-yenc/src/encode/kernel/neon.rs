@@ -88,9 +88,15 @@ pub(super) unsafe fn encode_raw(
 ) -> usize {
     // SAFETY: forwarded contract.
     unsafe {
-        scalar::encode_simd_frame(line_size, column, src, len, dst, is_end, |ls, col, s, n, d| {
-            main_loop(ls, col, s, n, d)
-        })
+        scalar::encode_simd_frame(
+            line_size,
+            column,
+            src,
+            len,
+            dst,
+            is_end,
+            |ls, col, s, n, d| main_loop(ls, col, s, n, d),
+        )
     }
 }
 
@@ -108,9 +114,15 @@ pub(super) unsafe fn encode_raw_port(
 ) -> usize {
     // SAFETY: forwarded contract.
     unsafe {
-        scalar::encode_simd_frame(line_size, column, src, len, dst, is_end, |ls, col, s, n, d| {
-            port_main_loop(ls, col, s, n, d)
-        })
+        scalar::encode_simd_frame(
+            line_size,
+            column,
+            src,
+            len,
+            dst,
+            is_end,
+            |ls, col, s, n, d| port_main_loop(ls, col, s, n, d),
+        )
     }
 }
 
@@ -204,7 +216,9 @@ unsafe fn eol_handle_pre(
             (b'=' as i8).wrapping_sub(42),
             -128,
         ];
-        const HADD: [i8; 16] = [42, 48, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66];
+        const HADD: [i8; 16] = [
+            42, 48, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
+        ];
         let tbl = int8x16x2_t(vld1q_s8(T0.as_ptr()), vld1q_s8(T1.as_ptr()));
         let idx = vreinterpretq_u8_s8(vhaddq_s8(
             vreinterpretq_s8_u8(data_a),
@@ -223,10 +237,7 @@ unsafe fn eol_handle_pre(
             ld(&CRIT_TBL),
             data_b,
         );
-        data_a = vaddq_u8(
-            data_a,
-            vbslq_u8(cmp_a, vdupq_n_u8(64 + 42), vdupq_n_u8(42)),
-        );
+        data_a = vaddq_u8(data_a, vbslq_u8(cmp_a, vdupq_n_u8(64 + 42), vdupq_n_u8(42)));
         data_b = vorrq_u8(data_b, vandq_u8(cmp_b, vdupq_n_u8(64)));
 
         let cmp_a_masked = vandq_u8(cmp_a, ld(&BIT_WEIGHTS));
@@ -288,7 +299,9 @@ unsafe fn eol_handle_pre(
         } else {
             let bit_index = clz_n(mask);
             let v_clz = vdupq_n_u8((bit_index & !64) as u8);
-            const BA: [u8; 16] = [63, 62, 61, 60, 51, 50, 49, 48, 47, 46, 45, 44, 35, 34, 33, 32];
+            const BA: [u8; 16] = [
+                63, 62, 61, 60, 51, 50, 49, 48, 47, 46, 45, 44, 35, 34, 33, 32,
+            ];
             const BB: [u8; 16] = [31, 30, 29, 28, 19, 18, 17, 16, 15, 14, 13, 12, 3, 2, 1, 0];
             let blend_a = vcgtq_u8(ld(&BA), v_clz);
             let blend_b = vcgtq_u8(ld(&BB), v_clz);
@@ -449,8 +462,9 @@ unsafe fn port_main_loop(
             } else {
                 let mut bit_index = clz_n(mask);
                 let v_clz = vdupq_n_u8((bit_index & !64) as u8);
-                const BA: [u8; 16] =
-                    [63, 62, 61, 60, 51, 50, 49, 48, 47, 46, 45, 44, 35, 34, 33, 32];
+                const BA: [u8; 16] = [
+                    63, 62, 61, 60, 51, 50, 49, 48, 47, 46, 45, 44, 35, 34, 33, 32,
+                ];
                 const BB: [u8; 16] = [31, 30, 29, 28, 19, 18, 17, 16, 15, 14, 13, 12, 3, 2, 1, 0];
                 let blend_a = vcgeq_u8(ld(&BA), v_clz);
                 let blend_b = vcgeq_u8(ld(&BB), v_clz);
@@ -607,8 +621,8 @@ unsafe fn expand32(
             let o2 = vqtbx1q_u8(s2, vextq_u8::<8>(de_a, de_a), s2);
             let o3 = vqtbx1q_u8(s3, de_b, s3);
             let o4 = vqtbx1q_u8(s4, vextq_u8::<8>(de_b, de_b), s4);
-            let counts = vget_lane_u32::<0>(vreinterpret_u32_u8(vcnt_u8(packed)))
-                .wrapping_add(0x0808_0808);
+            let counts =
+                vget_lane_u32::<0>(vreinterpret_u32_u8(vcnt_u8(packed))).wrapping_add(0x0808_0808);
             let l1 = (counts & 0xff) as usize;
             let l2 = ((counts >> 8) & 0xff) as usize;
             let l3 = ((counts >> 16) & 0xff) as usize;
@@ -638,7 +652,9 @@ unsafe fn expand32(
 static BLEND_MASK: [[[u8; 16]; 2]; 65] = build_blend_mask();
 
 const fn build_blend_mask() -> [[[u8; 16]; 2]; 65] {
-    const BA: [u8; 16] = [63, 62, 61, 60, 51, 50, 49, 48, 47, 46, 45, 44, 35, 34, 33, 32];
+    const BA: [u8; 16] = [
+        63, 62, 61, 60, 51, 50, 49, 48, 47, 46, 45, 44, 35, 34, 33, 32,
+    ];
     const BB: [u8; 16] = [31, 30, 29, 28, 19, 18, 17, 16, 15, 14, 13, 12, 3, 2, 1, 0];
     let mut t = [[[0u8; 16]; 2]; 65];
     let mut z = 0;
@@ -676,7 +692,10 @@ unsafe fn blend32(
         // escape masks stay intact (no register copies before `bsl`).
         let t_a = vbslq_u8(blend_a, de_a, a_sh);
         let t_b = vbslq_u8(blend_b, de_b, b_sh);
-        (vbslq_u8(esc_a, vdupq_n_u8(b'='), t_a), vbslq_u8(esc_b, vdupq_n_u8(b'='), t_b))
+        (
+            vbslq_u8(esc_a, vdupq_n_u8(b'='), t_a),
+            vbslq_u8(esc_b, vdupq_n_u8(b'='), t_b),
+        )
     }
 }
 
@@ -690,7 +709,8 @@ unsafe fn scalar_step(ls: isize, c: &mut isize, src: *const u8, i: &mut usize, p
         if *c < ls - 1 {
             let e = super::tables::ESCAPE[b as usize];
             if e == 0 {
-                p.cast::<[u8; 2]>().write_unaligned([b'=', b.wrapping_add(42 + 64)]);
+                p.cast::<[u8; 2]>()
+                    .write_unaligned([b'=', b.wrapping_add(42 + 64)]);
                 *p = p.add(2);
                 *c += 2;
             } else {
@@ -707,7 +727,8 @@ unsafe fn scalar_step(ls: isize, c: &mut isize, src: *const u8, i: &mut usize, p
                 *i += 1;
             }
             let e = START_ENC[b as usize];
-            p.cast::<u32>().write_unaligned(0x0a0d | ((e & 0xffff) << 16));
+            p.cast::<u32>()
+                .write_unaligned(0x0a0d | ((e & 0xffff) << 16));
             *p = p.add(2 + (e >> 16) as usize);
             *c = (e >> 16) as isize;
         }
@@ -768,11 +789,12 @@ unsafe fn main_loop(
             let de_b = esc64(de_b, esc_b);
             // The block's width, computed once for the line test and the
             // cursor advance.
-            let w = 32 + if mask & mask.wrapping_sub(1) != 0 {
-                mask.count_ones() as isize
-            } else {
-                (mask != 0) as isize
-            };
+            let w = 32
+                + if mask & mask.wrapping_sub(1) != 0 {
+                    mask.count_ones() as isize
+                } else {
+                    (mask != 0) as isize
+                };
             if c + w <= limit {
                 expand32(p, de_a, de_b, esc_a, esc_b, mask, merge);
                 p = p.offset(w);
@@ -815,10 +837,9 @@ unsafe fn main_loop(
                 let m32 = compress(mask);
                 let below = ((1u64 << r) - 1) >> 1;
                 let top = (1u64 << r) >> 1;
-                let counts = vget_lane_u32::<0>(vreinterpret_u32_u8(vcnt_u8(vcreate_u8(
-                    m32 as u64,
-                ))))
-                .wrapping_add(0x0808_0808);
+                let counts =
+                    vget_lane_u32::<0>(vreinterpret_u32_u8(vcnt_u8(vcreate_u8(m32 as u64))))
+                        .wrapping_add(0x0808_0808);
                 let l1 = counts & 0xff;
                 let l12 = l1 + ((counts >> 8) & 0xff);
                 let l123 = l12 + ((counts >> 16) & 0xff);
@@ -902,7 +923,11 @@ unsafe fn main_loop(
                 let (resc_a, resc_b) = (vqtbl2q_u8(es, idx), vqtbl2q_u8(es, idx_b));
                 let (rmask, rmerge) = mask64(resc_a, resc_b, &k);
                 expand32(q, re_a, re_b, resc_a, resc_b, rmask, rmerge);
-                (q, fl, 31 - f + (compress(mask) as u64 >> (f + 1)).count_ones())
+                (
+                    q,
+                    fl,
+                    31 - f + (compress(mask) as u64 >> (f + 1)).count_ones(),
+                )
             };
             p = q.add(rem_w as usize);
             c = fl as isize + rem_w as isize;

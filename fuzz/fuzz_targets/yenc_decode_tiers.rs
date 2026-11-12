@@ -43,8 +43,8 @@ mod buffers;
 
 use buffers::{Config, Exact, chunk_lengths};
 use libfuzzer_sys::fuzz_target;
-use weaver_yenc::YencError;
 use weaver_yenc::RapidyencDecodeState;
+use weaver_yenc::YencError;
 use weaver_yenc::simd::fuzzing::{
     ChunkState, Mode, Outcome, State, TIERS, Tier, chunk_until_end_tier, decode_dispatched,
     decode_reference, decode_tier, rapidyenc_incremental_tier, rapidyenc_oracle,
@@ -99,31 +99,65 @@ fn reference(c: &Case) -> Want {
     Want { res, state, out }
 }
 
-fn check_one(c: &Case, want: &Want, name: &str, run: &mut dyn FnMut(&[u8], &mut [u8], &mut State) -> Res) {
+fn check_one(
+    c: &Case,
+    want: &Want,
+    name: &str,
+    run: &mut dyn FnMut(&[u8], &mut [u8], &mut State) -> Res,
+) {
     let input = Exact::from_bytes(c.head, c.data);
     let cap = c.out.cap(c.data.len());
     let mut out = Exact::new(0, cap, CANARY);
     let mut state = State::new(c.entry, c.hint);
     let res = run(input.as_ref(), out.as_mut(), &mut state);
     let out = out.as_ref();
-    let ctx = || format!("{name} mode {:?} entry {} hint {:?} out {:?} head {} len {}", c.mode, c.entry, c.hint, c.out, c.head, c.data.len());
-    assert!(same(&res, &want.res), "{}: result {res:?} want {:?}", ctx(), want.res);
+    let ctx = || {
+        format!(
+            "{name} mode {:?} entry {} hint {:?} out {:?} head {} len {}",
+            c.mode,
+            c.entry,
+            c.hint,
+            c.out,
+            c.head,
+            c.data.len()
+        )
+    };
+    assert!(
+        same(&res, &want.res),
+        "{}: result {res:?} want {:?}",
+        ctx(),
+        want.res
+    );
     assert_eq!(state, want.state, "{}: state", ctx());
     if cap < c.data.len() {
         assert!(out == &want.out[..], "{}: compact output differs", ctx());
     } else {
         if let Ok(o) = &res {
-            assert!(out[..o.written] == want.out[..o.written], "{}: decoded bytes differ", ctx());
+            assert!(
+                out[..o.written] == want.out[..o.written],
+                "{}: decoded bytes differ",
+                ctx()
+            );
         }
         if let Some(at) = out[c.data.len()..].iter().position(|&b| b != CANARY) {
-            panic!("{}: write past input.len() at output offset {}", ctx(), c.data.len() + at);
+            panic!(
+                "{}: write past input.len() at output offset {}",
+                ctx(),
+                c.data.len() + at
+            );
         }
     }
 }
 
 // The input fed in chunks, each its own exact allocation and its own output
 // allocation of exactly the chunk length (plus `extra` canary bytes).
-fn check_chunked(c: &Case, want: &Want, chunks: &[usize], name: &str, run: &mut dyn FnMut(&[u8], &mut [u8], &mut State) -> Res) {
+fn check_chunked(
+    c: &Case,
+    want: &Want,
+    chunks: &[usize],
+    name: &str,
+    run: &mut dyn FnMut(&[u8], &mut [u8], &mut State) -> Res,
+) {
     let extra = match c.out {
         OutSize::Roomy(e) => e,
         _ => 0,
@@ -131,7 +165,11 @@ fn check_chunked(c: &Case, want: &Want, chunks: &[usize], name: &str, run: &mut 
     let mut state = State::new(c.entry, c.hint);
     let mut decoded = Vec::new();
     let mut consumed = 0usize;
-    let mut res: Res = Ok(Outcome { consumed: 0, written: 0, end: weaver_yenc::RapidyencDecodeEnd::None });
+    let mut res: Res = Ok(Outcome {
+        consumed: 0,
+        written: 0,
+        end: weaver_yenc::RapidyencDecodeEnd::None,
+    });
     let mut at = 0usize;
     for (k, &n) in chunks.iter().enumerate() {
         let input = Exact::from_bytes((c.head + at) % 64, &c.data[at..at + n]);
@@ -139,18 +177,28 @@ fn check_chunked(c: &Case, want: &Want, chunks: &[usize], name: &str, run: &mut 
         let r = run(input.as_ref(), out.as_mut(), &mut state);
         let out = out.as_ref();
         if let Some(p) = out[n..].iter().position(|&b| b != CANARY) {
-            panic!("{name} chunk {k} ({n} bytes at {at}): write past the chunk length at {}", n + p);
+            panic!(
+                "{name} chunk {k} ({n} bytes at {at}): write past the chunk length at {}",
+                n + p
+            );
         }
         match r {
             Ok(o) => {
                 decoded.extend_from_slice(&out[..o.written]);
                 consumed += o.consumed;
-                res = Ok(Outcome { consumed, written: decoded.len(), end: o.end });
+                res = Ok(Outcome {
+                    consumed,
+                    written: decoded.len(),
+                    end: o.end,
+                });
                 if c.mode.search_end && state.ended() {
                     break;
                 }
                 // A chunk call stops early only at an end marker.
-                assert_eq!(o.consumed, n, "{name} chunk {k}: stopped early without an end ({o:?})");
+                assert_eq!(
+                    o.consumed, n,
+                    "{name} chunk {k}: stopped early without an end ({o:?})"
+                );
             }
             Err(e) => {
                 res = Err(e);
@@ -159,11 +207,24 @@ fn check_chunked(c: &Case, want: &Want, chunks: &[usize], name: &str, run: &mut 
         }
         at += n;
     }
-    let ctx = format!("{name} chunked {chunks:?} mode {:?} entry {} hint {:?} len {}", c.mode, c.entry, c.hint, c.data.len());
-    assert!(same(&res, &want.res), "{ctx}: result {res:?} want {:?}", want.res);
+    let ctx = format!(
+        "{name} chunked {chunks:?} mode {:?} entry {} hint {:?} len {}",
+        c.mode,
+        c.entry,
+        c.hint,
+        c.data.len()
+    );
+    assert!(
+        same(&res, &want.res),
+        "{ctx}: result {res:?} want {:?}",
+        want.res
+    );
     assert_eq!(state, want.state, "{ctx}: state");
     if let Ok(o) = &want.res {
-        assert!(decoded[..] == want.out[..o.written], "{ctx}: decoded bytes differ");
+        assert!(
+            decoded[..] == want.out[..o.written],
+            "{ctx}: decoded bytes differ"
+        );
     }
 }
 
@@ -178,13 +239,30 @@ struct Variant {
 }
 
 fn variants(tier: Tier) -> Vec<Variant> {
-    let none = Variant { asm: None, and_add: None, zen4: None };
+    let none = Variant {
+        asm: None,
+        and_add: None,
+        zen4: None,
+    };
     match tier {
         Tier::Avx2 => [(true, true), (true, false), (false, true), (false, false)]
             .into_iter()
-            .map(|(a, s)| Variant { asm: Some(a), and_add: Some(s), zen4: None })
+            .map(|(a, s)| Variant {
+                asm: Some(a),
+                and_add: Some(s),
+                zen4: None,
+            })
             .collect(),
-        Tier::Avx512Vbmi2 => vec![Variant { zen4: Some(true), ..none }, Variant { zen4: Some(false), ..none }],
+        Tier::Avx512Vbmi2 => vec![
+            Variant {
+                zen4: Some(true),
+                ..none
+            },
+            Variant {
+                zen4: Some(false),
+                ..none
+            },
+        ],
         _ => vec![none],
     }
 }
@@ -215,12 +293,24 @@ fn variant_name(tier: Tier, v: Variant) -> String {
 // output of exactly its length (as `decode_body_chunk_until_end` trims it),
 // state carried through `DecodeState`. The joined result must be the
 // reference's whole-body result.
-fn check_production(data: &[u8], head: usize, hint: Option<u32>, want: &Want, splits: &[Vec<usize>], tier: Tier, name: &str) {
+fn check_production(
+    data: &[u8],
+    head: usize,
+    hint: Option<u32>,
+    want: &Want,
+    splits: &[Vec<usize>],
+    tier: Tier,
+    name: &str,
+) {
     for chunks in splits {
         let mut state = ChunkState::body(hint);
         let mut decoded = Vec::new();
         let (mut consumed, mut at) = (0usize, 0usize);
-        let mut res: Res = Ok(Outcome { consumed: 0, written: 0, end: weaver_yenc::RapidyencDecodeEnd::None });
+        let mut res: Res = Ok(Outcome {
+            consumed: 0,
+            written: 0,
+            end: weaver_yenc::RapidyencDecodeEnd::None,
+        });
         for (k, &n) in chunks.iter().enumerate() {
             let input = Exact::from_bytes((head + at) % 64, &data[at..at + n]);
             let mut out = Exact::new(0, n, CANARY);
@@ -229,11 +319,18 @@ fn check_production(data: &[u8], head: usize, hint: Option<u32>, want: &Want, sp
                 Ok(o) => {
                     decoded.extend_from_slice(&out.as_ref()[..o.written]);
                     consumed += o.consumed;
-                    res = Ok(Outcome { consumed, written: decoded.len(), end: o.end });
+                    res = Ok(Outcome {
+                        consumed,
+                        written: decoded.len(),
+                        end: o.end,
+                    });
                     if o.end != weaver_yenc::RapidyencDecodeEnd::None {
                         break;
                     }
-                    assert_eq!(o.consumed, n, "{name} production chunk {k} of {chunks:?}: stopped early without an end ({o:?})");
+                    assert_eq!(
+                        o.consumed, n,
+                        "{name} production chunk {k} of {chunks:?}: stopped early without an end ({o:?})"
+                    );
                 }
                 Err(e) => {
                     res = Err(e);
@@ -242,11 +339,21 @@ fn check_production(data: &[u8], head: usize, hint: Option<u32>, want: &Want, sp
             }
             at += n;
         }
-        let ctx = format!("{name} production {chunks:?} hint {hint:?} len {}", data.len());
-        assert!(same(&res, &want.res), "{ctx}: result {res:?} want {:?}", want.res);
+        let ctx = format!(
+            "{name} production {chunks:?} hint {hint:?} len {}",
+            data.len()
+        );
+        assert!(
+            same(&res, &want.res),
+            "{ctx}: result {res:?} want {:?}",
+            want.res
+        );
         assert_eq!(state.line_state(), want.state.without_end(), "{ctx}: state");
         if let Ok(o) = &want.res {
-            assert!(decoded[..] == want.out[..o.written], "{ctx}: decoded bytes differ");
+            assert!(
+                decoded[..] == want.out[..o.written],
+                "{ctx}: decoded bytes differ"
+            );
         }
     }
 }
@@ -273,33 +380,62 @@ fn production_splits(len: usize, pick: u8, fuzz_chunks: &[usize]) -> Vec<Vec<usi
 // rapidyenc's `decode_end` (the C library), whole and in the fuzzer's chunks,
 // against `decode_rapidyenc_incremental` with the tier forced. Only when the
 // fuzz build linked rapidyenc (`WEAVER_RAPIDYENC_SRC`).
-fn check_rapidyenc(data: &[u8], head: usize, entry: RapidyencDecodeState, chunks: &[usize], tier: Tier, name: &str) -> bool {
-    let run = |f: &mut dyn FnMut(&[u8], &mut [u8], &mut RapidyencDecodeState) -> Option<Outcome>, chunks: &[usize]| {
-        let mut st = entry;
-        let mut decoded = Vec::new();
-        let (mut consumed, mut at) = (0usize, 0usize);
-        let mut last = Outcome { consumed: 0, written: 0, end: weaver_yenc::RapidyencDecodeEnd::None };
-        for &n in chunks {
-            let input = Exact::from_bytes((head + at) % 64, &data[at..at + n]);
-            let mut out = Exact::new(0, n, CANARY);
-            let o = f(input.as_ref(), out.as_mut(), &mut st)?;
-            decoded.extend_from_slice(&out.as_ref()[..o.written]);
-            consumed += o.consumed;
-            last = Outcome { consumed, written: decoded.len(), end: o.end };
-            if o.end != weaver_yenc::RapidyencDecodeEnd::None {
-                break;
+fn check_rapidyenc(
+    data: &[u8],
+    head: usize,
+    entry: RapidyencDecodeState,
+    chunks: &[usize],
+    tier: Tier,
+    name: &str,
+) -> bool {
+    let run =
+        |f: &mut dyn FnMut(&[u8], &mut [u8], &mut RapidyencDecodeState) -> Option<Outcome>,
+         chunks: &[usize]| {
+            let mut st = entry;
+            let mut decoded = Vec::new();
+            let (mut consumed, mut at) = (0usize, 0usize);
+            let mut last = Outcome {
+                consumed: 0,
+                written: 0,
+                end: weaver_yenc::RapidyencDecodeEnd::None,
+            };
+            for &n in chunks {
+                let input = Exact::from_bytes((head + at) % 64, &data[at..at + n]);
+                let mut out = Exact::new(0, n, CANARY);
+                let o = f(input.as_ref(), out.as_mut(), &mut st)?;
+                decoded.extend_from_slice(&out.as_ref()[..o.written]);
+                consumed += o.consumed;
+                last = Outcome {
+                    consumed,
+                    written: decoded.len(),
+                    end: o.end,
+                };
+                if o.end != weaver_yenc::RapidyencDecodeEnd::None {
+                    break;
+                }
+                at += n;
             }
-            at += n;
-        }
-        Some((last, st, decoded))
-    };
+            Some((last, st, decoded))
+        };
     let whole = [data.len()];
     for split in [&whole[..], chunks] {
         let Some(want) = run(&mut |i, o, s| rapidyenc_oracle(i, o, s), split) else {
             return false;
         };
-        let got = run(&mut |i, o, s| Some(rapidyenc_incremental_tier(tier, i, o, s).expect("incremental decode never fails")), split).unwrap();
-        let ctx = format!("{name} vs rapidyenc entry {entry:?} chunks {split:?} len {}", data.len());
+        let got = run(
+            &mut |i, o, s| {
+                Some(
+                    rapidyenc_incremental_tier(tier, i, o, s)
+                        .expect("incremental decode never fails"),
+                )
+            },
+            split,
+        )
+        .unwrap();
+        let ctx = format!(
+            "{name} vs rapidyenc entry {entry:?} chunks {split:?} len {}",
+            data.len()
+        );
         assert_eq!(got.0, want.0, "{ctx}: outcome");
         assert_eq!(got.1, want.1, "{ctx}: state");
         assert!(got.2 == want.2, "{ctx}: decoded bytes differ");
@@ -310,9 +446,15 @@ fn check_rapidyenc(data: &[u8], head: usize, entry: RapidyencDecodeState, chunks
 fuzz_target!(|bytes: &[u8]| {
     static ANNOUNCE: std::sync::Once = std::sync::Once::new();
     ANNOUNCE.call_once(|| {
-        let names: Vec<_> = TIERS.into_iter().filter(|&t| runs(t)).map(|t| t.as_str()).collect();
+        let names: Vec<_> = TIERS
+            .into_iter()
+            .filter(|&t| runs(t))
+            .map(|t| t.as_str())
+            .collect();
         let ry = rapidyenc_oracle(&[], &mut [], &mut RapidyencDecodeState::CrLf).is_some();
-        eprintln!("yenc_decode_tiers: decode tiers run here: {names:?}; rapidyenc oracle linked: {ry}");
+        eprintln!(
+            "yenc_decode_tiers: decode tiers run here: {names:?}; rapidyenc oracle linked: {ry}"
+        );
     });
     let mut cfg = Config::new(bytes);
     let flags = cfg.u8();
@@ -343,7 +485,14 @@ fuzz_target!(|bytes: &[u8]| {
         2 => OutSize::Compact(size_byte + 1),
         _ => OutSize::Exact,
     };
-    let c = Case { data, head, mode, entry, hint, out };
+    let c = Case {
+        data,
+        head,
+        mode,
+        entry,
+        hint,
+        out,
+    };
     let want = reference(&c);
 
     // The reference itself is chunk-invariant when a pending escape is kept.
@@ -351,15 +500,35 @@ fuzz_target!(|bytes: &[u8]| {
     let chunked = mode.preserve_pending && chunks.len() > 1;
     // Chunks get outputs of their own length, so the whole call they are
     // compared with has a non-compact output too.
-    let roomy = Case { out: if matches!(out, OutSize::Compact(_)) { OutSize::Exact } else { out }, ..c };
+    let roomy = Case {
+        out: if matches!(out, OutSize::Compact(_)) {
+            OutSize::Exact
+        } else {
+            out
+        },
+        ..c
+    };
     let chunk_want = reference(&roomy);
     if chunked {
-        check_chunked(&roomy, &chunk_want, &chunks, "reference", &mut |i, o, s| decode_reference(i, o, s, mode));
+        check_chunked(&roomy, &chunk_want, &chunks, "reference", &mut |i, o, s| {
+            decode_reference(i, o, s, mode)
+        });
     }
 
     // The production body path's reference: from the body start, whole.
-    let prod_mode = Mode { dot_unstuffing: true, preserve_pending: true, search_end: true };
-    let prod_want = reference(&Case { data, head, mode: prod_mode, entry: 0, hint, out: OutSize::Exact });
+    let prod_mode = Mode {
+        dot_unstuffing: true,
+        preserve_pending: true,
+        search_end: true,
+    };
+    let prod_want = reference(&Case {
+        data,
+        head,
+        mode: prod_mode,
+        entry: 0,
+        hint,
+        out: OutSize::Exact,
+    });
     let prod_splits = production_splits(data.len(), size_byte as u8, &chunks);
     const RY_STATES: [RapidyencDecodeState; 7] = [
         RapidyencDecodeState::CrLf,
@@ -379,21 +548,42 @@ fuzz_target!(|bytes: &[u8]| {
         for v in variants(tier) {
             set_variant(v);
             let name = variant_name(tier, v);
-            check_one(&c, &want, &name, &mut |i, o, s| decode_tier(tier, i, o, s, mode));
+            check_one(&c, &want, &name, &mut |i, o, s| {
+                decode_tier(tier, i, o, s, mode)
+            });
             if chunked {
-                check_chunked(&roomy, &chunk_want, &chunks, &name, &mut |i, o, s| decode_tier(tier, i, o, s, mode));
+                check_chunked(&roomy, &chunk_want, &chunks, &name, &mut |i, o, s| {
+                    decode_tier(tier, i, o, s, mode)
+                });
             }
             check_production(data, head, hint, &prod_want, &prod_splits, tier, &name);
             check_rapidyenc(data, head, ry_entry, &chunks, tier, &name);
         }
-        set_variant(Variant { asm: None, and_add: None, zen4: None });
+        set_variant(Variant {
+            asm: None,
+            and_add: None,
+            zen4: None,
+        });
     }
-    check_one(&c, &want, "dispatched", &mut |i, o, s| decode_dispatched(i, o, s, mode));
+    check_one(&c, &want, "dispatched", &mut |i, o, s| {
+        decode_dispatched(i, o, s, mode)
+    });
 
     // The whole-body raw end-searching path with CRC folding, from the start
     // of a body (CRLF state), against the reference in the same mode.
-    let body_mode = Mode { dot_unstuffing: true, preserve_pending: false, search_end: true };
-    let bc = Case { data, head, mode: body_mode, entry: 0, hint, out };
+    let body_mode = Mode {
+        dot_unstuffing: true,
+        preserve_pending: false,
+        search_end: true,
+    };
+    let bc = Case {
+        data,
+        head,
+        mode: body_mode,
+        entry: 0,
+        hint,
+        out,
+    };
     let bwant = reference(&bc);
     let bcrc = match &bwant.res {
         Ok(o) => {

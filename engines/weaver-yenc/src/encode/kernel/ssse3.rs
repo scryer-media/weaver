@@ -59,8 +59,7 @@ pub(super) unsafe fn detect_lut() -> __m128i {
 #[inline(always)]
 pub(super) unsafe fn crit16(lut: __m128i, d: __m128i) -> u64 {
     unsafe {
-        _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_shuffle_epi8(lut, _mm_abs_epi8(d)), d)) as u32
-            as u64
+        _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_shuffle_epi8(lut, _mm_abs_epi8(d)), d)) as u32 as u64
     }
 }
 
@@ -90,8 +89,14 @@ pub(super) unsafe fn expand16x<const POPCNT: bool, const TW: bool>(
         let (e0, e1) = (&SMX[m0], &SMX[m1]);
         let c0 = _mm_loadu_si128(e0[0].as_ptr().cast());
         let c1 = _mm_loadu_si128(e1[1].as_ptr().cast());
-        let a = _mm_add_epi8(_mm_shuffle_epi8(d, c0), _mm_loadu_si128(e0[2].as_ptr().cast()));
-        let b = _mm_add_epi8(_mm_shuffle_epi8(d, c1), _mm_loadu_si128(e1[2].as_ptr().cast()));
+        let a = _mm_add_epi8(
+            _mm_shuffle_epi8(d, c0),
+            _mm_loadu_si128(e0[2].as_ptr().cast()),
+        );
+        let b = _mm_add_epi8(
+            _mm_shuffle_epi8(d, c1),
+            _mm_loadu_si128(e1[2].as_ptr().cast()),
+        );
         let (w0, w1) = if TW {
             (e0[3][0] as usize, e1[3][0] as usize)
         } else if POPCNT {
@@ -119,7 +124,13 @@ pub(super) unsafe fn dense32<const POPCNT: bool, const TW: bool>(
     unsafe {
         let (wa, w0, c0, c1) = expand16x::<POPCNT, TW>(lo, m & 0xffff, p);
         let (wb, w2, c2, c3) = expand16x::<POPCNT, TW>(hi, m >> 16, p.add(wa));
-        (wa + wb, DenseX { c: [c0, c1, c2, c3], o: [w0, wa, wa + w2] })
+        (
+            wa + wb,
+            DenseX {
+                c: [c0, c1, c2, c3],
+                o: [w0, wa, wa + w2],
+            },
+        )
     }
 }
 
@@ -221,12 +232,7 @@ impl<const POPCNT: bool> Block for Sse<POPCNT> {
 
     #[inline(always)]
     unsafe fn load(s: *const u8) -> Self::V {
-        unsafe {
-            (
-                _mm_loadu_si128(s.cast()),
-                _mm_loadu_si128(s.add(16).cast()),
-            )
-        }
+        unsafe { (_mm_loadu_si128(s.cast()), _mm_loadu_si128(s.add(16).cast())) }
     }
 
     #[inline(always)]
@@ -360,9 +366,15 @@ pub(super) unsafe fn encode_raw(
     is_end: bool,
 ) -> usize {
     unsafe {
-        encode_simd_frame(line_size, column, src, len, dst, is_end, |ls, col, s, n, d| {
-            grid(ls, col, s, n, d)
-        })
+        encode_simd_frame(
+            line_size,
+            column,
+            src,
+            len,
+            dst,
+            is_end,
+            |ls, col, s, n, d| grid(ls, col, s, n, d),
+        )
     }
 }
 
@@ -374,15 +386,14 @@ pub(super) unsafe fn encode_raw(
 // SAFETY: as `main_loop`; the CPU has SSSE3.
 #[target_feature(enable = "ssse3")]
 #[inline(never)]
-unsafe fn grid(
-    ls: usize,
-    col: &mut usize,
-    s: *const u8,
-    n: usize,
-    d: *mut u8,
-) -> (usize, usize) {
+unsafe fn grid(ls: usize, col: &mut usize, s: *const u8, n: usize, d: *mut u8) -> (usize, usize) {
     unsafe {
-        core::arch::asm!("jmp 2f", ".p2align 6, 0xcc", "2:", options(nomem, nostack, preserves_flags));
+        core::arch::asm!(
+            "jmp 2f",
+            ".p2align 6, 0xcc",
+            "2:",
+            options(nomem, nostack, preserves_flags)
+        );
         main_loop::<Sse<false>>(ls, col, s, n, d)
     }
 }
