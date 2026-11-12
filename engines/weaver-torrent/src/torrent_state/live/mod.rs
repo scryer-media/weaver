@@ -696,6 +696,7 @@ impl TorrentStateLive {
             tokio::time::Instant::now(),
             |handle| self.peers.is_banned(handle.ip()),
             |lacks| self.web_layout.bitfield(lacks).any(),
+            session.allow_idna,
         );
         for due in due {
             // The IP filter: a seed it blocks is tried again later.
@@ -773,6 +774,11 @@ impl TorrentStateLive {
             .fetch_add(1, Ordering::Relaxed);
         // The session's IP filter, on the address the seed's host resolved to.
         let allowed = |addr| self.may_reach(addr);
+        let allow_idna = self
+            .shared
+            .session
+            .upgrade()
+            .is_some_and(|session| session.allow_idna);
         let connection = WebSeedConnection::new(
             clients,
             resolver,
@@ -780,7 +786,8 @@ impl TorrentStateLive {
             &self.web_layout,
             &link,
             &self.shared.user_agent,
-        );
+        )
+        .allowing_idna(allow_idna);
         let res = tokio::select! {
             r = handler.task_peer_chunk_requester() => r,
             r = connection.run(&*handler, rx) => r,

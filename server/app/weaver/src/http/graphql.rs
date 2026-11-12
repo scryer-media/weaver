@@ -2,7 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use async_graphql::{Data, Executor, futures_util::StreamExt};
-use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
+use async_graphql_axum::GraphQLResponse;
 use axum::extract::{
     ConnectInfo, Extension, WebSocketUpgrade,
     ws::{CloseFrame, Message, WebSocket},
@@ -182,12 +182,16 @@ pub(super) mod refusal {
     // 403: a browser session came with the request but failed its origin or
     // CSRF binding.
     pub(in crate::http) const BROWSER_VERIFICATION_REQUIRED: &str = "BROWSER_VERIFICATION_REQUIRED";
+    // 413: an authenticated request's body is larger than the endpoint takes,
+    // by its declared length or by the bytes that arrived.
+    pub(in crate::http) const REQUEST_TOO_LARGE: &str = "REQUEST_TOO_LARGE";
 
     #[cfg(test)]
     pub(in crate::http) const ALL: &[&str] = &[
         INVALID_API_KEY,
         AUTHENTICATION_REQUIRED,
         BROWSER_VERIFICATION_REQUIRED,
+        REQUEST_TOO_LARGE,
     ];
 }
 
@@ -215,14 +219,97 @@ fn auth_refusal_response(status: StatusCode, headers: &HeaderMap) -> axum::respo
     }
 }
 
+// Room in a request body for the JSON or multipart framing around its largest
+// value.
+const BODY_FRAMING_BYTES: u64 = 1024 * 1024;
+
+// The largest request body the endpoint reads. An NZB at the upload limit has
+// to fit either way it can arrive: as base64 text inside the JSON (four
+// characters for every three bytes), or as a multipart file next to the
+// operation.
+pub(super) fn body_limit(security: &weaver_server_core::security::RuntimeSecurityConfig) -> u64 {
+    security
+        .nzb_upload_limit_bytes
+        .div_ceil(3)
+        .saturating_mul(4)
+        .saturating_add(BODY_FRAMING_BYTES)
+}
+
+// The GraphQL request in `body`, read up to `limit` bytes. A declared length
+// over the limit is refused before any of the body is read; a body that
+// passes the limit as it arrives is cut off there.
+async fn read_request(
+    headers: &HeaderMap,
+    body: axum::body::Body,
+    limit: u64,
+) -> Result<async_graphql::Request, axum::response::Response> {
+    use async_graphql::futures_util::TryStreamExt;
+
+    let too_large = || {
+        super::coded_error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            refusal::REQUEST_TOO_LARGE,
+            &format!("request body exceeds {limit} bytes"),
+        )
+    };
+    let declared = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    if declared.is_some_and(|declared| declared > limit) {
+        return Err(too_large());
+    }
+    let overflowed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut read = 0u64;
+    let flag = overflowed.clone();
+    let reader = body
+        .into_data_stream()
+        .map_err(std::io::Error::other)
+        .and_then(move |chunk| {
+            read = read.saturating_add(chunk.len() as u64);
+            let past = read > limit;
+            if past {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            async move {
+                if past {
+                    Err(std::io::Error::other("request body too large"))
+                } else {
+                    Ok(chunk)
+                }
+            }
+        })
+        .into_async_read();
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok());
+    // Uploaded files are held in memory, so the body limit is also the
+    // bound on what one request's files can hold.
+    let parsed = async_graphql::http::receive_batch_body(
+        content_type,
+        reader,
+        async_graphql::http::MultipartOptions::default(),
+    )
+    .await
+    .and_then(async_graphql::BatchRequest::into_single);
+    match parsed {
+        Ok(request) => Ok(request),
+        Err(_) if overflowed.load(std::sync::atomic::Ordering::Relaxed) => Err(too_large()),
+        Err(error) => Err(async_graphql_axum::rejection::GraphQLRejection(error).into_response()),
+    }
+}
+
+// The caller is resolved from the request's headers before any of its body
+// is read, so a request that does not authenticate costs no body read.
 pub(super) async fn graphql_handler(
     Extension(schema): Extension<WeaverSchema>,
     Extension(request_auth): Extension<super::RequestAuthContext>,
     peer: Option<Extension<ConnectInfo<SocketAddr>>>,
-    headers: HeaderMap,
-    req: GraphQLRequest,
+    req: axum::extract::Request,
 ) -> Result<GraphQLResponse, axum::response::Response> {
     let peer = peer.map(|Extension(ConnectInfo(peer))| peer);
+    let (parts, body) = req.into_parts();
+    let headers = parts.headers;
     let resolved = match super::auth::resolve_script_run(&request_auth.db, &headers).await {
         Some(resolved) => resolved,
         None => super::auth::resolve_caller(
@@ -246,7 +333,7 @@ pub(super) async fn graphql_handler(
             .await
             .map_err(|status| auth_refusal_response(status, &headers))?;
     }
-    let mut request = req.into_inner();
+    let mut request = read_request(&headers, body, body_limit(&request_auth.security)).await?;
     request = request
         .data(resolved.scope)
         .data(resolved.identity)

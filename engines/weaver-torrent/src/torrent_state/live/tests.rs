@@ -6344,6 +6344,7 @@ async fn the_web_seed_of_a_single_file_torrent_that_fails_a_piece_is_banned() {
         tokio::time::Instant::now(),
         |handle| h.peers.is_banned(handle.ip()),
         |lacks| h.web_layout.bitfield(lacks).any(),
+        false,
     );
     assert!(due.is_empty());
 }

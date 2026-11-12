@@ -167,3 +167,160 @@ async fn valid_bearer_key_reaches_the_schema() {
     assert_eq!(status, StatusCode::OK, "{payload}");
     assert_eq!(payload["data"]["__typename"], "QueryRoot", "{payload}");
 }
+
+// A body that counts the bytes the server pulls from it. Each chunk is
+// counted when it is handed over, so a body nobody reads counts zero.
+fn counted_body(chunks: Vec<Vec<u8>>, pulled: Arc<std::sync::atomic::AtomicUsize>) -> Body {
+    use async_graphql::futures_util::StreamExt;
+    Body::from_stream(
+        async_graphql::futures_util::stream::iter(chunks).map(move |chunk| {
+            pulled.fetch_add(chunk.len(), std::sync::atomic::Ordering::SeqCst);
+            Ok::<_, std::io::Error>(Bytes::from(chunk))
+        }),
+    )
+}
+
+fn security_with_nzb_limit(limit: u64) -> Arc<RuntimeSecurityConfig> {
+    let mut security = RuntimeSecurityConfig::default();
+    security.nzb_upload_limit_bytes = limit;
+    Arc::new(security)
+}
+
+#[tokio::test]
+async fn a_refused_key_costs_no_body_read() {
+    let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = graphql_router(db_with_key(), Arc::new(RuntimeSecurityConfig::default()));
+    let mut chunks = vec![br#"{"query":"{ __typename }"}"#.to_vec()];
+    chunks.extend(std::iter::repeat_n(vec![b' '; 64 * 1024], 16));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/graphql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-api-key", "fixture-wrong-key")
+        .body(counted_body(chunks, pulled.clone()))
+        .unwrap();
+    let (status, payload) = send(app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+    assert_eq!(payload["code"], refusal::INVALID_API_KEY, "{payload}");
+    assert_eq!(pulled.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn no_credentials_cost_no_body_read() {
+    let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = graphql_router(db_with_key(), Arc::new(RuntimeSecurityConfig::default()));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/graphql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(counted_body(
+            vec![br#"{"query":"{ __typename }"}"#.to_vec()],
+            pulled.clone(),
+        ))
+        .unwrap();
+    let (status, payload) = send(app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+    assert_eq!(
+        payload["code"],
+        refusal::AUTHENTICATION_REQUIRED,
+        "{payload}"
+    );
+    assert_eq!(pulled.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn a_browser_cookie_with_a_refused_key_is_still_refused() {
+    let security = Arc::new(RuntimeSecurityConfig::default());
+    security.apply_stored_access_policy_revision(None, None, false);
+    let app = graphql_router(db_with_key(), security);
+    let (status, payload) = send(
+        app,
+        graphql_request(&[
+            (header::COOKIE, "weaver_session=fixture-graphql-browser"),
+            (header::ORIGIN, "http://localhost"),
+            (
+                header::HeaderName::from_static("x-api-key"),
+                "fixture-wrong-key",
+            ),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{payload}");
+    assert_eq!(payload["code"], refusal::INVALID_API_KEY, "{payload}");
+}
+
+#[tokio::test]
+async fn a_declared_length_over_the_cap_is_refused_unread() {
+    let security = security_with_nzb_limit(30);
+    let cap = super::super::graphql::body_limit(&security);
+    let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = graphql_router(db_with_key(), security);
+    let request = Request::builder()
+        .method("POST")
+        .uri("/graphql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {VALID_KEY}"))
+        .header(header::CONTENT_LENGTH, (cap + 1).to_string())
+        .body(counted_body(
+            vec![br#"{"query":"{ __typename }"}"#.to_vec()],
+            pulled.clone(),
+        ))
+        .unwrap();
+    let (status, payload) = send(app, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{payload}");
+    assert_eq!(payload["code"], refusal::REQUEST_TOO_LARGE, "{payload}");
+    assert_eq!(pulled.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn an_undeclared_body_past_the_cap_is_cut_off() {
+    let security = security_with_nzb_limit(30);
+    let cap = usize::try_from(super::super::graphql::body_limit(&security)).unwrap();
+    let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let app = graphql_router(db_with_key(), security);
+    let mut chunks = vec![br#"{"query":"{ __typename }"}"#.to_vec()];
+    let chunk = 64 * 1024;
+    // Enough padding to pass the cap, and as much again behind it.
+    chunks.extend(std::iter::repeat_n(vec![b' '; chunk], 2 * cap / chunk + 2));
+    let request = Request::builder()
+        .method("POST")
+        .uri("/graphql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {VALID_KEY}"))
+        .body(counted_body(chunks, pulled.clone()))
+        .unwrap();
+    let (status, payload) = send(app, request).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{payload}");
+    assert_eq!(payload["code"], refusal::REQUEST_TOO_LARGE, "{payload}");
+    let pulled = pulled.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(pulled <= cap + chunk, "pulled {pulled} past a cap of {cap}");
+}
+
+#[tokio::test]
+async fn a_body_of_exactly_the_cap_is_read() {
+    let security = security_with_nzb_limit(30);
+    let cap = usize::try_from(super::super::graphql::body_limit(&security)).unwrap();
+    let app = graphql_router(db_with_key(), security);
+    let mut body = br#"{"query":"{ __typename }"}"#.to_vec();
+    body.resize(cap, b' ');
+    let request = Request::builder()
+        .method("POST")
+        .uri("/graphql")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::AUTHORIZATION, format!("Bearer {VALID_KEY}"))
+        .body(Body::from(body))
+        .unwrap();
+    let (status, payload) = send(app, request).await;
+    assert_eq!(status, StatusCode::OK, "{payload}");
+    assert_eq!(payload["data"]["__typename"], "QueryRoot", "{payload}");
+}
+
+#[test]
+fn the_cap_fits_an_nzb_at_the_upload_limit_sent_inline() {
+    let security = RuntimeSecurityConfig::default();
+    let limit = security.nzb_upload_limit_bytes;
+    let base64 = limit.div_ceil(3) * 4;
+    // The inline text plus the JSON around it, and a multipart upload of the
+    // same NZB, both fit.
+    assert!(super::super::graphql::body_limit(&security) >= base64 + 64 * 1024);
+}

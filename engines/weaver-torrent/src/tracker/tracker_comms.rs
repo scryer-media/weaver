@@ -33,7 +33,7 @@ use url::Url;
 
 use crate::Identity;
 use crate::core::hash_id::{Id20, InfoHashes};
-use crate::core::net::{Egress, HttpClients, NamedBy, Resolved, Resolver, is_public};
+use crate::core::net::{Egress, HttpClients, NamedBy, Resolved, Resolver, is_idna, is_public};
 use crate::tracker::Tracker;
 use crate::tracker::shape::AnnounceShape;
 use crate::tracker::tracker_comms_http;
@@ -57,6 +57,9 @@ pub struct TrackerComms {
     http_clients: Arc<dyn HttpClients>,
     reachable: Reachable,
     udp_client: UdpTrackerClient,
+    /// Whether an HTTP tracker whose host has an internationalized label may
+    /// be asked.
+    allow_idna: bool,
     // The trackers under this hash and what announcing to them has done.
     list: Mutex<TrackerList>,
     // The corrupt and redundant bytes the torrent had counted when each
@@ -1041,6 +1044,7 @@ struct Scraper {
     http_clients: Arc<dyn HttpClients>,
     reachable: Reachable,
     udp_client: UdpTrackerClient,
+    allow_idna: bool,
 }
 
 impl Scraper {
@@ -1098,6 +1102,7 @@ impl Scraper {
             &self.shape.scrape_query(&info_hash),
             &self.user_agent,
             self.shape,
+            self.allow_idna,
         )
         .await?;
         tracker_comms_http::parse_scrape(&answer.body, &info_hash)
@@ -1195,6 +1200,7 @@ impl TrackerStatus {
         http_clients: Arc<dyn HttpClients>,
         reachable: Reachable,
         udp_client: UdpTrackerClient,
+        allow_idna: bool,
     ) -> Self {
         let unique = unique(trackers);
         let announces = unique
@@ -1222,6 +1228,7 @@ impl TrackerStatus {
                 http_clients,
                 reachable,
                 udp_client,
+                allow_idna,
             },
             runs: Default::default(),
         }))
@@ -1904,6 +1911,7 @@ impl TrackerComms {
         udp_client: UdpTrackerClient,
         stopped: StoppedAnnounces,
         http_announces: HttpAnnounces,
+        allow_idna: bool,
     ) -> TrackerTask {
         let mut tiers = supported_tiers(tiers);
         for trackers in &mut tiers {
@@ -1918,6 +1926,7 @@ impl TrackerComms {
             http_clients.clone(),
             reachable.clone(),
             udp_client.clone(),
+            allow_idna,
         );
 
         let (tx, mut rx) = tokio::sync::mpsc::channel::<SocketAddr>(16);
@@ -1938,6 +1947,7 @@ impl TrackerComms {
                     http_clients: http_clients.clone(),
                     reachable: reachable.clone(),
                     udp_client: udp_client.clone(),
+                    allow_idna,
                     list: Mutex::new(TrackerList::new(&tiers, Instant::now(), identity.shape)),
                     started_at: Default::default(),
                     status: status.clone(),
@@ -2012,6 +2022,7 @@ impl TrackerComms {
             http_clients: self.http_clients.clone(),
             reachable: self.reachable.clone(),
             udp_client: self.udp_client.clone(),
+            allow_idna: self.allow_idna,
             list: Mutex::new(TrackerList::new(tiers, Instant::now(), self.identity.shape)),
             started_at: Default::default(),
             status: self.status.clone(),
@@ -2336,6 +2347,7 @@ impl TrackerComms {
                     query,
                     &self.identity.user_agent,
                     self.identity.shape,
+                    self.allow_idna,
                 )
             }))
             .await;
@@ -2367,6 +2379,10 @@ impl TrackerComms {
     /// family routes, so the GET fails in its own words.
     async fn http_routes(&self, url: &Url) -> Vec<(Option<Family>, Option<IpAddr>)> {
         let one = vec![(None, None)];
+        // A name the GET refuses is not looked up here either.
+        if !self.allow_idna && url.host_str().is_some_and(is_idna) {
+            return one;
+        }
         let Ok((_, found)) = tracker_comms_http::addresses(url, self.udp_client.resolver()).await
         else {
             return one;
@@ -3344,6 +3360,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         )
         .peers;
         let mut announced = Vec::new();
@@ -3399,6 +3416,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         );
         let (conn, started) = tokio::select! {
             _ = peers.next() => panic!("the tracker sent peers"),
@@ -3479,6 +3497,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         );
         let (conn, started) = tokio::select! {
             _ = peers.next() => panic!("the tracker sent peers"),
@@ -3582,6 +3601,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         )
         .peers;
         let q = answer_with_a_peer(
@@ -3645,6 +3665,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         )
         .peers;
         let q = answer_with_a_peer(
@@ -3778,6 +3799,7 @@ mod tests {
             udp_client,
             StoppedAnnounces::default(),
             Default::default(),
+            false,
         )
         .peers;
         let first = tokio::select! {
@@ -3828,6 +3850,7 @@ mod tests {
             udp_client,
             StoppedAnnounces::default(),
             Default::default(),
+            false,
         )
         .peers;
         let first = tokio::select! {
@@ -3885,6 +3908,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         )
         .peers;
 
@@ -3959,6 +3983,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         )
         .peers;
 
@@ -4004,6 +4029,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         )
         .peers;
 
@@ -4063,6 +4089,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         )
         .peers;
 
@@ -4210,6 +4237,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         )
         .peers;
         drop(peers);
@@ -4250,6 +4278,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         );
         (task, token)
     }
@@ -4515,6 +4544,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         )
         .peers;
 
@@ -4777,6 +4807,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         );
 
         for url in &forged {
@@ -4911,6 +4942,7 @@ mod tests {
             udp_client,
             StoppedAnnounces::default(),
             Default::default(),
+            false,
         )
         .peers;
 
@@ -5041,6 +5073,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         )
     }
 
@@ -5692,6 +5725,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         );
 
         for (url, why) in &refused {
@@ -5748,6 +5782,7 @@ mod tests {
             udp_client,
             stopped.clone(),
             Default::default(),
+            false,
         );
 
         let serve = async {

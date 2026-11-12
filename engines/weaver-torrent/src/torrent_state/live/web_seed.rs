@@ -35,13 +35,16 @@ use crate::{
         hash_id::Id20,
         lengths::{Lengths, ValidPieceIndex},
         magnet::Escaped,
-        net::{ClientShape, HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_public},
+        net::{
+            ClientShape, HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_idna, is_public,
+        },
         torrent_metainfo::{WebSeed, WebSeedKind, escape_path},
     },
     peer_connection::{PeerConnectionHandler, WriterRequest},
     peer_protocol::{Handshake, Message, Piece, Request},
     stream_connect::ConnectionKind,
     torrent_state::TorrentMetadata,
+    torrent_state::live::peers::holepunch::is_local,
     tracker::redacted_tracker_url,
     type_aliases::{BF, PeerHandle},
 };
@@ -267,6 +270,7 @@ impl WebSeeds {
         now: Instant,
         banned: impl Fn(PeerHandle) -> bool,
         interesting: impl Fn(&Lacks) -> bool,
+        allow_idna: bool,
     ) -> Vec<Due> {
         let mut g = self.inner.lock();
         let mut limit = MAX_WEB_SEED_CONNECTIONS;
@@ -289,7 +293,7 @@ impl WebSeeds {
             }
             // A seed's URL can carry a passkey: a log names only its
             // scheme, host and port.
-            match check_url(&entry.seed.url, entry.banned) {
+            match check_url(&entry.seed.url, entry.banned, allow_idna) {
                 Ok(endpoint) => {
                     due.push(Due {
                         id: entry.id,
@@ -384,14 +388,14 @@ enum Refused {
 
 /// Whether a seed at `url` may be connected to, and where it is when its
 /// host is an IP address (libtorrent `torrent::connect_to_url_seed`,
-/// `connect_web_seed`).
-fn check_url(url: &str, banned: bool) -> Result<Option<SocketAddr>, Refused> {
+/// `connect_web_seed`). A host with an internationalized label is refused
+/// unless `allow_idna`.
+fn check_url(url: &str, banned: bool, allow_idna: bool) -> Result<Option<SocketAddr>, Refused> {
     let Ok(parsed) = Url::parse(url) else {
         return Err(Refused::Removed("the URL does not parse"));
     };
     let host = parsed.host_str().unwrap_or_default();
-    // `allow_idna` is off.
-    if host.split('.').any(|label| label.starts_with("xn--")) {
+    if !allow_idna && is_idna(host) {
         return Err(Refused::Disabled("an internationalized host name"));
     }
     if banned {
@@ -662,6 +666,9 @@ struct Target {
     named_by: NamedBy,
     // The file moved here, when it did.
     moved: Option<usize>,
+    // Whether the URL carries a query of its own: the seed's, or the one a
+    // move pointed at, not the one added to ask a BEP 17 seed.
+    query: bool,
 }
 
 /// Where a request goes: the address its host was checked at, none when the
@@ -685,6 +692,8 @@ pub(crate) struct WebSeedConnection<'a> {
     link: &'a SeedLink,
     // The client the torrent names itself as: every request's User-Agent.
     user_agent: &'a str,
+    // Whether a host with an internationalized label may be asked.
+    allow_idna: bool,
     // The clients built for this connection, by host, port and address, so
     // its requests to one address share their connections.
     pinned: Mutex<PinnedClients>,
@@ -708,8 +717,16 @@ impl<'a> WebSeedConnection<'a> {
             layout,
             link,
             user_agent,
+            allow_idna: false,
             pinned: Mutex::default(),
         }
+    }
+
+    /// Lets the connection ask hosts with an internationalized label, on
+    /// the first hop and on every redirect.
+    pub fn allowing_idna(mut self, allow: bool) -> Self {
+        self.allow_idna = allow;
+        self
     }
 
     /// Runs the connection: tells `handler` the seed has the pieces of the
@@ -843,8 +860,10 @@ impl<'a> WebSeedConnection<'a> {
     // file whose URL names it, the file's path under the URL otherwise.
     fn file_target(&self, file: usize) -> anyhow::Result<Target> {
         if let Some(to) = self.link.redirect(file) {
+            let url = Url::parse(&to.url).context("bad web seed URL")?;
             return Ok(Target {
-                url: Url::parse(&to.url).context("bad web seed URL")?,
+                query: url.query().is_some(),
+                url,
                 named_by: to.named_by,
                 moved: Some(file),
             });
@@ -865,6 +884,7 @@ impl<'a> WebSeedConnection<'a> {
             url: Url::parse(&url).context("bad web seed URL")?,
             named_by: self.link.seed.named_by,
             moved: None,
+            query: self.link.seed.url.contains('?'),
         })
     }
 
@@ -877,6 +897,15 @@ impl<'a> WebSeedConnection<'a> {
     // name on.
     async fn reach(&self, target: &Target) -> anyhow::Result<Reached> {
         let url = &target.url;
+        // Checked on every hop, before the name is looked up: a seed's
+        // first URL is checked when it is due, a redirect only here.
+        if !self.allow_idna && url.host_str().is_some_and(is_idna) {
+            match target.moved {
+                Some(file) => self.link.file_missing(file),
+                None => self.link.disable(),
+            }
+            return Err(anyhow!("{url}: an internationalized host name"));
+        }
         let port = url.port_or_known_default().unwrap_or(0);
         let (host, addrs) = match url.host() {
             Some(url::Host::Ipv4(ip)) => (ip.to_string(), Some(vec![IpAddr::V4(ip)])),
@@ -921,6 +950,20 @@ impl<'a> WebSeedConnection<'a> {
                 return Err(anyhow!("{url}: no address it may be asked at"));
             }
         };
+        // A server on the local network is not asked with a query string of
+        // the URL's own, on any hop, whoever named the seed; an address the
+        // network resolves at its exit is not known, and not judged
+        // (libtorrent `ssrf_mitigation`, src/torrent.cpp:6860-6886 at
+        // v2.0.15).
+        if target.query && addr.is_some_and(is_local) {
+            match target.moved {
+                Some(file) => self.link.file_missing(file),
+                None => self.link.disable(),
+            }
+            return Err(anyhow!(
+                "SSRF mitigation: {url}: a query to a local address"
+            ));
+        }
         let key = (host, port, addr);
         if let Some(client) = self.pinned.lock().get(&key) {
             return Ok(Reached {
@@ -975,6 +1018,7 @@ impl<'a> WebSeedConnection<'a> {
                 return Err(anyhow!("{}: {status} without a location", target.url));
             };
             target = Target {
+                query: to.query().is_some(),
                 url: to,
                 named_by: match reached.addr {
                     Some(addr) if is_public(addr) => NamedBy::Torrent,
@@ -1733,7 +1777,7 @@ mod tests {
 
         let interesting = |l: &Lacks| layout.bitfield(l).any();
         assert_eq!(has(&layout, &lacking(&[2], &[])), [true, true, false]);
-        let due = |at| seeds.due(at, |_| false, interesting).len();
+        let due = |at| seeds.due(at, |_| false, interesting, false).len();
         assert_eq!(due(now + Duration::from_secs(119)), 0);
         assert_eq!(due(now + Duration::from_secs(120)), 1);
 
@@ -1837,6 +1881,58 @@ mod tests {
         assert_eq!(fake.pieces.lock()[0].2, [&a[32768..], &b[..]].concat());
     }
 
+    // A seed that moves a file to a host with an internationalized label is
+    // refused at the move before that name is looked up, and the file is
+    // lost to the seed; a session that allows such names follows it.
+    #[tokio::test(start_paused = true)]
+    async fn a_move_to_an_internationalized_name_is_refused() {
+        let a = content(100, 7);
+        let port = Arc::new(Mutex::new(0u16));
+        let location = port.clone();
+        let server = Server::start(move |head| match head.target.as_str() {
+            "/seed/f" => Reply::status(302).header(
+                "Location",
+                format!("http://xn--bcher-kva.test:{}/moved/f", location.lock()),
+            ),
+            _ => Reply::ranged(&a, head),
+        });
+        *port.lock() = server.addr.port();
+        let url = format!("http://seed.test:{}/seed/", server.addr.port());
+        let layout = layout(&[("f", 100, false)]);
+        let requests = blocks(&layout, 0..1);
+        let targets = || {
+            server
+                .seen()
+                .into_iter()
+                .map(|h| h.target)
+                .collect::<Vec<_>>()
+        };
+        let resolver = || {
+            names(&[
+                ("seed.test", "127.0.0.1"),
+                ("xn--bcher-kva.test", "127.0.0.2"),
+            ])
+        };
+
+        let clients = Wired::new(server.addr);
+        let (seeds, link) = one_seed(url.clone(), WebSeedKind::Url);
+        let conn = WebSeedConnection::new(clients.clone(), resolver(), ALL, &layout, &link, UA);
+        assert!(drive(&conn, &Fake::default(), &requests, 1).await.is_err());
+        assert_eq!(entry(&seeds, |e| e.lacks.files.clone()), HashSet::from([0]));
+        assert!(entry(&seeds, |e| e.redirects.is_empty()));
+        assert_eq!(targets(), ["/seed/f"]);
+        assert_eq!(clients.built(), [ip("127.0.0.1")]);
+
+        let clients = Wired::new(server.addr);
+        let (seeds, link) = one_seed(url, WebSeedKind::Url);
+        let conn = WebSeedConnection::new(clients.clone(), resolver(), ALL, &layout, &link, UA)
+            .allowing_idna(true);
+        drive(&conn, &Fake::default(), &requests, 1).await.unwrap();
+        assert!(entry(&seeds, |e| e.lacks.files.is_empty()));
+        assert_eq!(targets(), ["/seed/f", "/seed/f", "/moved/f"]);
+        assert_eq!(clients.built(), [ip("127.0.0.1"), ip("127.0.0.2")]);
+    }
+
     // The address a seed is asked at is known before it is asked, and is
     // the first its host resolves to that the seed's naming lets it be asked
     // at. A seed that came with the torrent is not asked at a loopback,
@@ -1885,7 +1981,7 @@ mod tests {
         assert_eq!(server.seen().len(), 1);
         assert_eq!(clients.built(), [ip("8.8.8.8")]);
 
-        let (seeds, link) = one_seed(format!("http://seed.test:{port}/f?x=1"), WebSeedKind::Url);
+        let (seeds, link) = one_seed(format!("http://seed.test:{port}/f"), WebSeedKind::Url);
         let resolver = names(&[("seed.test", "10.0.0.1")]);
         let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link, UA);
         drive(&conn, &Fake::default(), &blocks(&layout, 0..1), 1)
@@ -1894,6 +1990,69 @@ mod tests {
         assert!(!entry(&seeds, |e| e.disabled));
         assert_eq!(server.seen().len(), 2);
         assert_eq!(clients.built(), [ip("8.8.8.8"), ip("10.0.0.1")]);
+    }
+
+    // A seed on the local network may not carry a query string, whoever
+    // named it, judged by the address its host resolves to; it is disabled
+    // and never asked (libtorrent `ssrf_mitigation`, src/torrent.cpp:6860-6886
+    // and `aux::is_local`, src/ip_helpers.cpp:78-106, at v2.0.15). The query
+    // the engine adds to ask a BEP 17 seed is not the seed's own. A file
+    // moved to a local address with a query is lost to the seed.
+    #[tokio::test(start_paused = true)]
+    async fn a_seed_on_the_local_network_carries_no_query() {
+        let f = content(100, 9);
+        let port = Arc::new(Mutex::new(0u16));
+        let location = port.clone();
+        let server = Server::start(move |head| match head.target.as_str() {
+            "/seed/f" => Reply::status(302).header(
+                "Location",
+                format!("http://moved.test:{}/moved/f?x=1", location.lock()),
+            ),
+            _ => Reply::ranged(&f, head),
+        });
+        *port.lock() = server.addr.port();
+        let port = server.addr.port();
+        let layout = layout(&[("f", 100, false)]);
+        let requests = blocks(&layout, 0..1);
+
+        let mut refused = vec![(server.url("/f?"), names(&[]))];
+        for local in [
+            "10.0.0.1",
+            "172.16.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "fe80::1",
+        ] {
+            refused.push((
+                format!("http://seed.test:{port}/f?x=1"),
+                names(&[("seed.test", local)]),
+            ));
+        }
+        for (url, resolver) in refused {
+            let clients = Wired::new(server.addr);
+            let (seeds, link) = one_seed(url.clone(), WebSeedKind::Url);
+            let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link, UA);
+            assert!(
+                drive(&conn, &Fake::default(), &requests, 1).await.is_err(),
+                "{url}"
+            );
+            assert!(entry(&seeds, |e| e.disabled), "{url}");
+            assert!(clients.built().is_empty(), "{url}");
+        }
+        assert!(server.seen().is_empty());
+
+        // Moved to a local address with a query: the file is lost to the
+        // seed, and the new address is never asked.
+        let clients = Wired::new(server.addr);
+        let resolver = names(&[("seed.test", "10.0.0.1"), ("moved.test", "10.0.0.2")]);
+        let (seeds, link) = one_seed(format!("http://seed.test:{port}/seed/"), WebSeedKind::Url);
+        let conn = WebSeedConnection::new(clients.clone(), resolver, ALL, &layout, &link, UA);
+        assert!(drive(&conn, &Fake::default(), &requests, 1).await.is_err());
+        assert_eq!(entry(&seeds, |e| e.lacks.files.clone()), HashSet::from([0]));
+        assert!(!entry(&seeds, |e| e.disabled));
+        let targets: Vec<_> = server.seen().into_iter().map(|h| h.target).collect();
+        assert_eq!(targets, ["/seed/f"]);
+        assert_eq!(clients.built(), [ip("10.0.0.1")]);
     }
 
     // A seed at a public address may not move a file to a private one,
@@ -2406,7 +2565,12 @@ mod tests {
         assert_eq!(has(&padded, &lacking(&[0], &[])), [false, false, true]);
         assert_eq!(
             seeds
-                .due(Instant::now(), |_| false, |l| padded.bitfield(l).any())
+                .due(
+                    Instant::now(),
+                    |_| false,
+                    |l| padded.bitfield(l).any(),
+                    false
+                )
                 .len(),
             1
         );
@@ -2433,7 +2597,12 @@ mod tests {
         assert_eq!(entry(&seeds, |e| e.lacks.clone()), lacking(&[2], &[0]));
         assert!(
             seeds
-                .due(Instant::now(), |_| false, |l| spans.bitfield(l).any())
+                .due(
+                    Instant::now(),
+                    |_| false,
+                    |l| spans.bitfield(l).any(),
+                    false
+                )
                 .is_empty()
         );
 
@@ -2459,17 +2628,17 @@ mod tests {
         let seeds = Arc::new(WebSeeds::new(
             (0..5).map(|i| seed(&format!("http://h{i}.example/"))),
         ));
-        let due = seeds.due(now, |_| false, any);
+        let due = seeds.due(now, |_| false, any, false);
         assert_eq!(due.len(), MAX_WEB_SEED_CONNECTIONS);
         assert!(due.iter().all(|d| d.endpoint.is_none()));
         let _link = seeds.link(due[0].id).unwrap();
         assert!(seeds.link(due[0].id).is_none());
         assert_eq!(
-            seeds.due(now, |_| false, any).len(),
+            seeds.due(now, |_| false, any, false).len(),
             MAX_WEB_SEED_CONNECTIONS - 1
         );
         // A seed with no piece to give is not counted.
-        assert_eq!(seeds.due(now, |_| false, |_| false).len(), 0);
+        assert_eq!(seeds.due(now, |_| false, |_| false, false).len(), 0);
 
         // (url, banned, listed afterwards, disabled afterwards, endpoint)
         let cases = [
@@ -2506,7 +2675,7 @@ mod tests {
         ];
         for (url, banned, listed, disabled, endpoint) in cases {
             let seeds = WebSeeds::new([seed(url)]);
-            let due = seeds.due(now, |h| banned && h == handle_of(0), any);
+            let due = seeds.due(now, |h| banned && h == handle_of(0), any, false);
             assert_eq!(seeds.list().len(), usize::from(listed), "{url}");
             let present = seeds.with_entry(0, |e| e.disabled);
             assert_eq!(present.unwrap_or(false), disabled, "{url}");
@@ -2515,15 +2684,25 @@ mod tests {
             assert_eq!(due.len(), usize::from(listed && !disabled), "{url}");
         }
 
+        // A session that allows internationalized names connects to them.
+        for url in [
+            "http://xn--bcher-kva.example/f",
+            "http://b\u{fc}cher.example/f",
+        ] {
+            let seeds = WebSeeds::new([seed(url)]);
+            assert_eq!(seeds.due(now, |_| false, any, true).len(), 1, "{url}");
+            assert_eq!(seeds.with_entry(0, |e| e.disabled), Some(false), "{url}");
+        }
+
         // A seed's log names its scheme, host and port, never the passkey
         // its URL carries.
         let lines = crate::tests::test_util::LogLines::default();
         {
             let _capture = lines.capture();
             let disabled = WebSeeds::new([seed("ftp://h.example/0123passkey/f?pk=s3cret")]);
-            disabled.due(now, |_| false, any);
+            disabled.due(now, |_| false, any, false);
             let removed = WebSeeds::new([seed("http://h.example:0/0123passkey/f?pk=s3cret")]);
-            removed.due(now, |_| false, any);
+            removed.due(now, |_| false, any, false);
             let bad = WebSeeds::new([seed("https://u:pw@h.example:8443/0123passkey/?pk=s3cret")]);
             let single = layout(&[("f", 70000, false)]);
             let piece = single.lengths.validate_piece_index(0).unwrap();

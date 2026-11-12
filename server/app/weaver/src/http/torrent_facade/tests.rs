@@ -1134,7 +1134,9 @@ async fn login_issues_a_cookie_that_logout_ends() {
     let app = rig.send(with_cookie("/api/v2/app/version")).await;
     assert_eq!(app.body, "v5.3.0");
 
-    rig.send(with_cookie("/api/v2/auth/logout")).await;
+    let mut logout = with_cookie("/api/v2/auth/logout");
+    *logout.method_mut() = Method::POST;
+    rig.send(logout).await;
     let after = rig.send(with_cookie("/api/v2/app/webapiVersion")).await;
     assert_eq!(after.status, StatusCode::FORBIDDEN);
 }
@@ -2341,7 +2343,9 @@ async fn a_login_session_keeps_its_own_maindata_ids_until_logout() {
 
     let session = SyncClient::Session(sid.trim_start_matches("SID=").to_owned());
     assert!(rig.context.sync().holds(&session));
-    rig.send(with(&sid, "/api/v2/auth/logout")).await;
+    let mut logout = with(&sid, "/api/v2/auth/logout");
+    *logout.method_mut() = Method::POST;
+    rig.send(logout).await;
     assert!(!rig.context.sync().holds(&session));
 
     let fresh = sid_of(rig.send(login(ADMIN)).await);
@@ -3583,7 +3587,15 @@ async fn a_cookie_changes_nothing_from_another_origin() {
     let send = |path: &'static str,
                 credential: (&'static str, String),
                 headers: &[(&'static str, &'static str)]| {
-        let mut request = Request::get(path)
+        // A change is sent as a POST, a read as a GET.
+        let method = if path.contains("/info") {
+            Method::GET
+        } else {
+            Method::POST
+        };
+        let mut request = Request::builder()
+            .method(method)
+            .uri(path)
             .header(header::HOST, "weaver.test:8080")
             .header(credential.0, credential.1);
         for (name, value) in headers {
@@ -3642,6 +3654,21 @@ async fn a_cookie_changes_nothing_from_another_origin() {
     }
     // An automation client sends none of them.
     assert_eq!(send(pause, by_cookie(), &[]).await, StatusCode::OK);
+    // A change sent as a GET, which a page can send without any of them,
+    // is refused whatever it carries.
+    for headers in [&[][..], &[("sec-fetch-site", "same-origin")][..]] {
+        let request = Request::get(pause)
+            .header(header::HOST, "weaver.test:8080")
+            .header(header::COOKIE, sid.clone());
+        let request = headers.iter().fold(request, |request, (name, value)| {
+            request.header(*name, *value)
+        });
+        assert_eq!(
+            rig.send(request.body(Body::empty()).unwrap()).await.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{headers:?}"
+        );
+    }
     // A key is no cookie a page can borrow.
     let by_key = || ("x-api-key", ADMIN.to_owned());
     assert_eq!(
@@ -4119,3 +4146,161 @@ async fn torrents_info_filters_and_pages_as_the_whole_list() {
     assert_eq!(all[44]["name"], "44.mkv");
 }
 mod rows;
+
+// Every action qBittorrent 5.3.0 takes only as a POST
+// (`WebApplication::m_allowedMethod`, src/webui/webapplication.h:153-238).
+const POST_ONLY_IN_THE_CLIENT: [(&str, &str); 85] = [
+    ("app", "deleteAPIKey"),
+    ("app", "rotateAPIKey"),
+    ("app", "sendTestEmail"),
+    ("app", "setCookies"),
+    ("app", "setPreferences"),
+    ("app", "shutdown"),
+    ("auth", "login"),
+    ("auth", "logout"),
+    ("clientdata", "store"),
+    ("rss", "addFeed"),
+    ("rss", "addFolder"),
+    ("rss", "cloneRule"),
+    ("rss", "importRules"),
+    ("rss", "markAsRead"),
+    ("rss", "moveItem"),
+    ("rss", "refreshItem"),
+    ("rss", "removeItem"),
+    ("rss", "removeRule"),
+    ("rss", "renameRule"),
+    ("rss", "setFeedRefreshInterval"),
+    ("rss", "setFeedURL"),
+    ("rss", "setRule"),
+    ("search", "delete"),
+    ("search", "downloadTorrent"),
+    ("search", "enablePlugin"),
+    ("search", "installPlugin"),
+    ("search", "start"),
+    ("search", "stop"),
+    ("search", "uninstallPlugin"),
+    ("search", "updatePlugins"),
+    ("torrentcreator", "addTask"),
+    ("torrentcreator", "deleteTask"),
+    ("torrents", "add"),
+    ("torrents", "addPeers"),
+    ("torrents", "addTags"),
+    ("torrents", "addTrackers"),
+    ("torrents", "addWebSeeds"),
+    ("torrents", "bottomPrio"),
+    ("torrents", "createCategory"),
+    ("torrents", "createTags"),
+    ("torrents", "decreasePrio"),
+    ("torrents", "delete"),
+    ("torrents", "deleteTags"),
+    ("torrents", "editCategory"),
+    ("torrents", "editTracker"),
+    ("torrents", "editWebSeed"),
+    ("torrents", "fetchMetadata"),
+    ("torrents", "filePrio"),
+    ("torrents", "increasePrio"),
+    ("torrents", "parseMetadata"),
+    ("torrents", "reannounce"),
+    ("torrents", "recheck"),
+    ("torrents", "removeCategories"),
+    ("torrents", "removeTags"),
+    ("torrents", "removeTrackers"),
+    ("torrents", "removeWebSeeds"),
+    ("torrents", "rename"),
+    ("torrents", "renameFile"),
+    ("torrents", "renameFolder"),
+    ("torrents", "setAutoManagement"),
+    ("torrents", "setCategory"),
+    ("torrents", "setComment"),
+    ("torrents", "setDownloadLimit"),
+    ("torrents", "setDownloadPath"),
+    ("torrents", "setForceStart"),
+    ("torrents", "setLocation"),
+    ("torrents", "setSavePath"),
+    ("torrents", "setShareLimits"),
+    ("torrents", "setSSLParameters"),
+    ("torrents", "setSuperSeeding"),
+    ("torrents", "setTags"),
+    ("torrents", "setUploadLimit"),
+    ("torrents", "start"),
+    ("torrents", "stop"),
+    ("torrents", "toggleFirstLastPiecePrio"),
+    ("torrents", "toggleSequentialDownload"),
+    ("torrents", "topPrio"),
+    ("transfer", "banPeers"),
+    ("transfer", "pauseSession"),
+    ("transfer", "resumeSession"),
+    ("transfer", "setDownloadLimit"),
+    ("transfer", "setSpeedLimits"),
+    ("transfer", "setSpeedLimitsMode"),
+    ("transfer", "setUploadLimit"),
+    ("transfer", "toggleSpeedLimitsMode"),
+];
+
+// A change is taken only as a POST: any other method is refused before the
+// change is made, as the client refuses it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_by_any_method_but_post_is_not_allowed() {
+    let rig = rig().await;
+    rig.add_file(&metainfo("one.mkv", 3000, false), &[]).await;
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let state = |torrents: Vec<Value>| torrents[0]["state"].clone();
+    let before = state(rig.torrents().await);
+    assert_ne!(before, "stoppedDL");
+    for (group, action) in POST_ONLY_IN_THE_CLIENT {
+        for method in [Method::GET, Method::HEAD, Method::PUT, Method::DELETE] {
+            let path = format!("/api/v2/{group}/{action}?hashes={hash}");
+            let reply = rig
+                .send(
+                    Request::builder()
+                        .method(method.clone())
+                        .uri(&path)
+                        .header("x-api-key", ADMIN)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+            assert_eq!(
+                reply.status,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{method} {path}"
+            );
+        }
+    }
+    assert_eq!(state(rig.torrents().await), before);
+    // The same change sent as a POST is made.
+    assert_eq!(
+        rig.post("/api/v2/torrents/stop", &format!("hashes={hash}"))
+            .await
+            .status,
+        StatusCode::OK
+    );
+    assert_eq!(state(rig.torrents().await), "stoppedDL");
+}
+
+// A read is taken as a GET, a POST or a HEAD, and nothing else.
+#[tokio::test]
+async fn a_read_takes_get_post_or_head() {
+    let rig = rig().await;
+    let path = "/api/v2/app/version";
+    for (method, status) in [
+        (Method::GET, StatusCode::OK),
+        (Method::POST, StatusCode::OK),
+        (Method::HEAD, StatusCode::OK),
+        (Method::PUT, StatusCode::METHOD_NOT_ALLOWED),
+        (Method::DELETE, StatusCode::METHOD_NOT_ALLOWED),
+        (Method::PATCH, StatusCode::METHOD_NOT_ALLOWED),
+    ] {
+        let reply = rig
+            .send(
+                Request::builder()
+                    .method(method.clone())
+                    .uri(path)
+                    .header("x-api-key", ADMIN)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await;
+        assert_eq!(reply.status, status, "{method}");
+    }
+}
