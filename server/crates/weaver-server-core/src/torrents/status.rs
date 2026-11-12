@@ -101,7 +101,8 @@ pub enum Held {
 }
 
 impl Held {
-    // Torrents being off stops every torrent; any other hold stalls it.
+    // Torrents being off stops every torrent; a route opening queues it;
+    // any other hold stalls it.
     fn off(&self) -> bool {
         matches!(self, Self::RouteDown(failure) if failure.reason == TorrentRouteReason::TorrentsDisabled)
     }
@@ -109,6 +110,9 @@ impl Held {
     fn state(&self) -> TorrentState {
         if self.off() {
             TorrentState::Stopped
+        } else if self.reason() == TorrentRouteReason::Opening {
+            // In no session yet, as one with no session waits for one.
+            TorrentState::Queued
         } else {
             TorrentState::Stalled
         }
@@ -1097,6 +1101,17 @@ mod tests {
             (
                 TorrentState::Stopped,
                 Some(Why::Route(TorrentRouteReason::TorrentsDisabled, None))
+            )
+        );
+        // Waiting on its route's session to open, it is queued for it.
+        assert_eq!(
+            project(&Observed {
+                held: Some(Held::Session(crate::torrents::sessions::OPENING)),
+                ..seen(Engine::Absent)
+            }),
+            (
+                TorrentState::Queued,
+                Some(Why::Route(TorrentRouteReason::Opening, None))
             )
         );
     }

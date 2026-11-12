@@ -146,6 +146,9 @@ impl Dialer for Revocable {
         }
         self.inner.source_toward(to)
     }
+    fn failing_hop(&self) -> Option<super::FailingHop> {
+        self.inner.failing_hop()
+    }
     fn budget(&self) -> Duration {
         self.inner.budget()
     }

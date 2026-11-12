@@ -59,6 +59,10 @@ pub trait Inbound: Send + Sync {
         port: u16,
         forwarded: bool,
     ) -> Result<Box<dyn InboundListener>, TunnelError>;
+    // How the hop's provider forwards a port to its listener. Peers outside
+    // the tunnel reach the listener only through such a port: with none,
+    // nothing they send arrives.
+    fn forwarding(&self) -> PortForwarding;
 }
 
 #[async_trait::async_trait]
@@ -99,7 +103,10 @@ async fn listen_in(session: &SessionHop, port: u16) -> Result<WgTcpListener, Tun
     session.prepare_carrier().await.map_err(tunnel_error)?;
     match provider.listen(port, BACKLOG).await {
         Ok(listener) => Ok(listener),
+        // A tunnel that could not come up to listen is the hop's fault, as
+        // one that could not come up to dial is.
         Err(error) => {
+            session.failure.blame(&error, session.timeout);
             session.retire_idle().await;
             Err(error)
         }
@@ -166,6 +173,9 @@ impl Inbound for SessionInbound {
             _activity: activity,
             _capacity: capacity,
         }))
+    }
+    fn forwarding(&self) -> PortForwarding {
+        self.0.forwarding
     }
 }
 

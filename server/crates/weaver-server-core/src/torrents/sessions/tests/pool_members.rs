@@ -449,3 +449,103 @@ async fn a_proxy_in_two_pools_runs_one_session_until_no_pool_holds_it() {
     sessions.stop_all().await;
     network.shutdown().await;
 }
+
+// A pool member whose tunnel never completes its handshake opens no session.
+// One failed open moves no torrent off it; once sessions failed to open on
+// it as often in a row as the pool's plan takes to call a member suspect,
+// the route passes it over for a member that is up, its torrents go there
+// and stay, and the pool's plan shows it suspect.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_whose_tunnel_cannot_open_is_passed_over_after_repeated_failures() {
+    use weaver_tunnel::test_support::{WireGuardTestPeer, WireGuardTestPeerOptions, test_key};
+    // The first peer accepts only another client's key, so it answers
+    // nothing; the second answers.
+    let silent = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        client_public_key: test_key(77),
+        ..WireGuardTestPeerOptions::default()
+    })
+    .await;
+    let answering = WireGuardTestPeer::start_with(WireGuardTestPeerOptions::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.through_legs.store(true, Ordering::SeqCst);
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&wireguard_proxy(&silent, 1)).unwrap();
+    db.save_proxy_profile(&ProxyProfile {
+        id: 2,
+        name: "exit-2".into(),
+        ..wireguard_proxy(&answering, 10)
+    })
+    .unwrap();
+    let pool = db
+        .create_proxy_pool(&ProxyPool {
+            id: 0,
+            name: "Region".into(),
+            kind: ProxyKind::WireGuard,
+            member_ids: vec![1, 2],
+            enabled: true,
+        })
+        .unwrap();
+    route_through(
+        &db,
+        TorrentScope::Default,
+        SYSTEM_EGRESS_ID,
+        &pool_ladder(pool.id),
+    );
+    let network = NetworkRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
+    routes.route_pool(TorrentScope::Default, pool.id, &[1, 2]);
+    *routes.network.lock().unwrap() = Some(Arc::clone(&network));
+    let sessions = sessions_on(&routes, dir.path());
+    let place = |pinned| routes.plan(TorrentScope::Default).place(pinned, |_| 0);
+    let fails_on_one = || async {
+        let (plan, pin) = place(Some(1));
+        assert_eq!(pin, Some(1));
+        let Err(SessionError::Build(failure)) = sessions.session(&plan, &IDENTITY.identity()).await
+        else {
+            panic!("a member whose tunnel has no handshake opens no session");
+        };
+        assert_eq!(
+            failure.reason,
+            TorrentRouteReason::LegOpenFailed,
+            "{failure:?}"
+        );
+    };
+
+    fails_on_one().await;
+    // Once is not enough to move: the torrent stays on its member.
+    fails_on_one().await;
+
+    let (plan, pin) = place(Some(1));
+    assert_eq!(pin, Some(2));
+    let down = routes
+        .plan(TorrentScope::Default)
+        .members
+        .into_iter()
+        .find(|member| member.id == 1)
+        .and_then(|member| member.down)
+        .unwrap()
+        .message();
+    assert!(
+        down.contains("proxy 1 opened no session 2 times in a row: proxy 1: No handshake"),
+        "{down}"
+    );
+    let (_, _, snapshot, _) = network
+        .pool_status()
+        .into_iter()
+        .find(|(id, ..)| *id == pool.id)
+        .unwrap();
+    let one = snapshot
+        .candidates
+        .iter()
+        .find(|candidate| candidate.candidate == 1)
+        .unwrap();
+    assert_eq!(one.state, "SUSPECT");
+    assert_eq!(one.failures, 2);
+
+    sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    // It stays on the member it moved to, and a torrent placed anew goes
+    // there too.
+    assert_eq!(place(Some(2)).1, Some(2));
+    assert_eq!(place(None).1, Some(2));
+    sessions.stop_all().await;
+}

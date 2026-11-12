@@ -1139,6 +1139,73 @@ async fn a_missing_egress_has_a_typed_route_reason() {
     proxies.network.shutdown().await;
 }
 
+// A route whose proxy is disabled, alone or as a hop of its chain, plans
+// down saying which, from the reload after the save; enabled again, it is
+// up again.
+#[tokio::test]
+async fn a_route_on_a_disabled_proxy_plans_down() {
+    use crate::proxies::Rung;
+    use crate::torrents::sessions::{NetworkRoutes, RouteFailure};
+
+    let db = Database::open_in_memory().unwrap();
+    for id in 1..=2 {
+        db.save_proxy_profile(&crate::proxies::ProxyProfile {
+            id,
+            name: format!("exit-{id}"),
+            ..loopback_proxy(1080)
+        })
+        .unwrap();
+    }
+    let set_enabled = |enabled: bool| {
+        let mut profile = db
+            .list_proxy_profiles()
+            .unwrap()
+            .into_iter()
+            .find(|profile| profile.id == 1)
+            .unwrap();
+        profile.enabled = enabled;
+        profile.revision += 1;
+        db.save_proxy_profile(&profile).unwrap();
+    };
+    let proxies =
+        crate::proxies::ProxyRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let routes = NetworkRoutes::new(Arc::clone(&proxies), Duration::from_secs(30));
+    let down_on = async |rung: Rung| {
+        db.save_proxy_routing_policy(
+            Consumer::Torrent(TorrentScope::Default),
+            &RoutingPolicy {
+                legs: vec![RouteLeg {
+                    egress_id: SYSTEM_EGRESS_ID,
+                    weight: 100,
+                    path: LegPath::Ladder {
+                        rungs: vec![rung],
+                        direct_fallback: false,
+                    },
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        proxies.reload().await.unwrap();
+        routes.plan(TorrentScope::Default).down
+    };
+    let one = || Rung::Proxy { id: 1 };
+    let chain = || Rung::Chain { ids: vec![2, 1] };
+
+    assert_eq!(down_on(one()).await, None);
+    assert_eq!(down_on(chain()).await, None);
+    set_enabled(false);
+    proxies.reload().await.unwrap();
+    let disabled = Some(RouteFailure::leg_down("proxy 1 is disabled".into()));
+    assert_eq!(down_on(one()).await, disabled);
+    assert_eq!(down_on(chain()).await, disabled);
+    set_enabled(true);
+    proxies.reload().await.unwrap();
+    assert_eq!(down_on(one()).await, None);
+    assert_eq!(down_on(chain()).await, None);
+    proxies.network.shutdown().await;
+}
+
 // A route is planned from the policies the proxy runtime holds: a boot
 // that restores and attaches its torrents reads no route row, and a policy
 // saved is planned once the runtime reloads.
@@ -1764,6 +1831,198 @@ async fn a_torrent_past_the_session_limit_says_so() {
     rig.service.stop().await;
 }
 
+// A torrent whose route's session is being opened is queued for it, and
+// says its route is opening.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_waiting_on_its_routes_session_reads_as_opening() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+    let service = rig.service.clone();
+    let added = tokio::spawn(async move {
+        service
+            .add(request(AddSource::Metainfo(plain("set", 1))))
+            .await
+            .unwrap()
+    });
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+    let job_id = rig.service.torrents(None).await[0].job_id;
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.state, view.route_reason),
+        (TorrentState::Queued, Some(TorrentRouteReason::Opening))
+    );
+    rig.routes.unanswered.send_replace(false);
+    assert_eq!(added.await.unwrap(), job_id);
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().route_reason,
+        None
+    );
+    rig.service.stop().await;
+}
+
+// Every file under `dir`, at any depth.
+fn files_under(dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .flat_map(|entry| {
+            let path = entry.path();
+            if path.is_dir() {
+                files_under(&path)
+            } else {
+                vec![path]
+            }
+        })
+        .collect()
+}
+
+// A torrent with every piece in its files, and the folder they are in.
+async fn with_every_piece(rig: &Rig) -> (JobId, PathBuf) {
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    fetch_every_piece(&rig.service, job_id, &[1; 3000]).await;
+    let dir = PathBuf::from(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
+    assert_ne!(files_under(&dir), Vec::<PathBuf>::new());
+    (job_id, dir)
+}
+
+// The id the default route's session gives the next torrent it takes: 0
+// when it has taken none before.
+async fn next_taken(rig: &Rig) -> usize {
+    let next = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("next", 2))))
+        .await
+        .unwrap();
+    handle_of(&rig.service, next).await.id()
+}
+
+// A torrent removed with its files while its new route's session opens is
+// never put in that session, and nothing of it is made on disk again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_removed_while_its_new_routes_session_opens_never_joins_it() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+
+    rig.routes.route(TorrentScope::Default, 2);
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+    let service = rig.service.clone();
+    let moving = tokio::spawn(async move { service.follow_routes().await });
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.routes.unanswered.send_replace(false);
+    moving.await.unwrap();
+
+    assert_eq!(files_under(&dir), Vec::<PathBuf>::new());
+    assert!(rig.service.torrent(job_id).await.is_none());
+    assert_eq!(
+        next_taken(&rig).await,
+        0,
+        "the removed torrent joined the session"
+    );
+    rig.service.stop().await;
+}
+
+// A torrent removed with its files before its new route's session opens
+// never joins it either, and nothing of it is made on disk again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_removed_before_its_new_routes_session_opens_never_joins_it() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(&rig).await;
+
+    rig.routes.route(TorrentScope::Default, 2);
+    rig.service.remove(job_id, true, false).await.unwrap();
+    rig.service.follow_routes().await;
+
+    assert_eq!(files_under(&dir), Vec::<PathBuf>::new());
+    assert!(rig.service.torrent(job_id).await.is_none());
+    assert_eq!(
+        next_taken(&rig).await,
+        0,
+        "the removed torrent joined the session"
+    );
+    rig.service.stop().await;
+}
+
+// Every torrent moved to another route reads as that route, opening, as soon
+// as the move begins: none waits on the torrents moved before it to read so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn torrents_moved_to_a_new_route_read_as_it_at_once() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let mut jobs = Vec::new();
+    for seed in 1..=3 {
+        jobs.push(
+            rig.service
+                .add(request(AddSource::Metainfo(plain(
+                    &format!("moved-{seed}"),
+                    seed,
+                ))))
+                .await
+                .unwrap(),
+        );
+    }
+    let old = rig.service.torrent(jobs[0]).await.unwrap().route.unwrap();
+
+    rig.routes.route(TorrentScope::Default, 2);
+    let new = rig
+        .service
+        .inner
+        .sessions
+        .routes()
+        .plan(TorrentScope::Default)
+        .key;
+    assert_ne!(old, new.as_str());
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+    let service = rig.service.clone();
+    let moving = tokio::spawn(async move { service.follow_routes().await });
+    // The first torrent's attach waits on the new route's session.
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+    for job_id in &jobs {
+        let view = rig.service.torrent(*job_id).await.unwrap();
+        assert_eq!(
+            (view.route.as_deref(), view.state, view.route_reason),
+            (
+                Some(new.as_str()),
+                TorrentState::Queued,
+                Some(TorrentRouteReason::Opening)
+            ),
+            "torrent {job_id:?}"
+        );
+    }
+    rig.routes.unanswered.send_replace(false);
+    moving.await.unwrap();
+    for job_id in &jobs {
+        let view = rig.service.torrent(*job_id).await.unwrap();
+        assert_eq!(
+            (view.route.as_deref(), view.route_reason),
+            (Some(new.as_str()), None)
+        );
+    }
+    rig.service.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_that_cannot_be_built_says_why() {
     let rig = rig(set_clock());
@@ -1774,15 +2033,30 @@ async fn a_session_that_cannot_be_built_says_why() {
         .add(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
-    let view = rig.service.torrent(job_id).await.unwrap();
-    assert_eq!(view.state, TorrentState::Stalled);
-    assert_eq!(
-        (view.detail.as_deref(), view.route_reason),
-        (
-            Some("no listening port"),
-            Some(TorrentRouteReason::LegOpenFailed)
-        )
-    );
+    let said = |view: TorrentView| {
+        assert_eq!(view.state, TorrentState::Stalled);
+        assert_eq!(
+            (view.detail.as_deref(), view.route_reason),
+            (
+                Some("no listening port"),
+                Some(TorrentRouteReason::LegOpenFailed)
+            )
+        );
+    };
+    said(rig.service.torrent(job_id).await.unwrap());
+
+    // While its route opens again it still says why, until the open says
+    // otherwise.
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+    let service = rig.service.clone();
+    let tick = tokio::spawn(async move { service.tick().await });
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+    said(rig.service.torrent(job_id).await.unwrap());
+    rig.routes.unanswered.send_replace(false);
+    tick.await.unwrap();
+    said(rig.service.torrent(job_id).await.unwrap());
 }
 
 // The list of torrents carries each torrent's trackers, the same rows its
@@ -7809,8 +8083,10 @@ async fn a_tracker_edit_racing_an_attach_reaches_the_session() {
         rig.service.detach(torrent).await;
         torrent.route = None;
     }
-    // Its route's session goes with it, so the attach waits for a new one.
+    // Its route's session goes with it, so the attach waits for a new one,
+    // whose leg has not answered yet.
     rig.service.drop_idle_sessions().await;
+    rig.routes.unanswered.send_replace(true);
 
     let mut attach = std::pin::pin!(rig.service.attach(job_id, None));
     let first = std::future::poll_fn(|cx| Poll::Ready(attach.as_mut().poll(cx))).await;
@@ -7825,6 +8101,7 @@ async fn a_tracker_edit_racing_an_attach_reaches_the_session() {
         .replace_trackers(job_id, vec![(0, b.into())])
         .await
         .unwrap();
+    rig.routes.unanswered.send_replace(false);
     attach.await;
 
     assert_eq!(
@@ -11259,4 +11536,18 @@ async fn a_new_peer_limit_is_told_on_the_torrent_leg() {
         )
     );
     assert_eq!(limit(200).await, None);
+}
+
+// The routes taking a saved configuration again, as a profile saved or
+// enabled has them do, wakes the tick at once, not at its next interval.
+#[tokio::test]
+async fn the_routes_reloading_wakes_the_tick() {
+    let rig = rig(set_clock());
+    let mut reloads = rig.service.inner.sessions.routes().reloads();
+    let woken = rig.service.woken(&mut reloads);
+    tokio::pin!(woken);
+    let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+    assert!(woken.as_mut().poll(&mut cx).is_pending());
+    rig.routes.reloads.send_modify(|reloads| *reloads += 1);
+    assert!(woken.as_mut().poll(&mut cx).is_ready());
 }

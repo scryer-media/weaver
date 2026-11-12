@@ -31,8 +31,9 @@ use crate::bandwidth::TorrentRates;
 use crate::persistence::Database;
 use crate::proxies::{
     Consumer, EgressBinding, EgressHealth, EgressInterface, EgressLimitChanges, FetchOptions,
-    LegPath, MulticastInterfaces, NetworkRuntime, ProxyRuntime, ResolvedBy, Route, RoutingPolicy,
-    Rung, SYSTEM_EGRESS_ID, TorrentLeg, TorrentScope, pool_of, routed_fetch,
+    LegPath, LegTenancy, MulticastInterfaces, NetworkRuntime, ProxyRuntime, ResolvedBy, Route,
+    RoutingPolicy, Rung, SYSTEM_EGRESS_ID, SessionOpening, TorrentLeg, TorrentScope, pool_of,
+    routed_fetch,
 };
 use crate::settings::{BlocklistSource, TorrentConfig, TorrentEncryption, TorrentLimit};
 use crate::torrents::identity::IDENTITY;
@@ -379,6 +380,12 @@ pub trait Routes: Send + Sync {
     /// the scope's own route, so the session lives on in its pool after the
     /// opener's route leaves the member.
     fn join(&self, _plan: &RoutePlan, _peers: usize) {}
+    /// `plan`'s leg holds a session being built, for as long as what is
+    /// returned lives: the leg reads as opening meanwhile. Nothing to hold
+    /// by default.
+    fn opening(&self, _plan: &RoutePlan) -> Option<Arc<LegTenancy>> {
+        None
+    }
     /// The blocklist at `url`, which every route's session shares.
     async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String>;
     /// What egress `egress_id` lets its sessions move at now: its own caps
@@ -394,6 +401,11 @@ pub trait Routes: Send + Sync {
     /// What rings as the host's interfaces change as multicast sees them;
     /// none when nothing watches them.
     fn interface_changes(&self) -> Option<tokio::sync::watch::Receiver<MulticastInterfaces>> {
+        None
+    }
+    /// What rings as the routes take a saved configuration again; none when
+    /// nothing reloads them.
+    fn reloads(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
         None
     }
 }
@@ -433,8 +445,15 @@ impl Routes for NetworkRoutes {
             Ok(()) => {
                 let unavailable = leg_unavailable(self.network(), leg.egress_id);
                 let down = match pool_of(&leg.path) {
-                    None => unavailable,
+                    // A path whose every proxy is disabled or gone holds its
+                    // route down: a session on it would carry nothing.
+                    None => unavailable.or_else(|| {
+                        self.network()
+                            .path_unusable(&leg.path)
+                            .map(RouteFailure::leg_down)
+                    }),
                     Some(pool) => {
+                        let mut members_down = self.network().pool_members_down(pool, egress_id);
                         members = self
                             .network()
                             .pool_members(pool)
@@ -443,9 +462,7 @@ impl Routes for NetworkRoutes {
                                 id,
                                 key: member_key(self.network(), leg.egress_id, id),
                                 down: unavailable.clone().or_else(|| {
-                                    self.network()
-                                        .pool_member_down(pool, egress_id, id)
-                                        .map(RouteFailure::leg_down)
+                                    members_down.remove(&id).map(RouteFailure::leg_down)
                                 }),
                                 names: self.network().resolved_by(id),
                             })
@@ -525,6 +542,14 @@ impl Routes for NetworkRoutes {
         }
     }
 
+    fn opening(&self, plan: &RoutePlan) -> Option<Arc<LegTenancy>> {
+        Some(self.network().tenant_torrent(
+            Consumer::Torrent(plan.scope),
+            TORRENT_LEG,
+            SessionOpening,
+        ))
+    }
+
     fn egress_rates(&self, egress_id: u32) -> TorrentRates {
         self.network().torrent_egress_rates(egress_id)
     }
@@ -535,6 +560,10 @@ impl Routes for NetworkRoutes {
 
     fn interface_changes(&self) -> Option<tokio::sync::watch::Receiver<MulticastInterfaces>> {
         Some(self.network().interface_changes())
+    }
+
+    fn reloads(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.network().reloads())
     }
 
     // Fetched once for every route, so on Default outbound, which carries
@@ -873,22 +902,35 @@ enum Slot {
         mappings: PortMappings,
         opening: Box<Opening>,
     },
+    // `failed` when it holds closed because its session could not be built.
     Held {
         reason: RouteFailure,
         kind: LegKind,
+        failed: bool,
     },
     // Its session is being built, off the slots' lock: `done` closes once
     // that build ends, whether it opened or not. `last` is why the route
-    // held closed before, which a build that fails for the same says once.
+    // held closed before, which a build that fails for the same says once;
+    // `failed` when that was a build that failed, which the route reads as
+    // until this build says otherwise.
     Opening {
         kind: LegKind,
         done: tokio::sync::watch::Receiver<()>,
         last: Option<RouteFailure>,
+        failed: bool,
     },
 }
 
+// Why a build ended unfinished: its leg was revoked under it, with why
+// when its pool member went from under it.
+fn abandoned(detail: Option<String>) -> RouteFailure {
+    detail.map_or(REVOKED, |detail| {
+        RouteFailure::with_detail(TorrentRouteReason::LegRevoked, detail)
+    })
+}
+
 /// Why a route whose session is being built has none yet.
-const OPENING: RouteFailure = RouteFailure {
+pub(crate) const OPENING: RouteFailure = RouteFailure {
     reason: TorrentRouteReason::Opening,
     detail: None,
 };
@@ -923,6 +965,14 @@ impl Slot {
     fn held(&self) -> Option<RouteFailure> {
         match self {
             Self::Held { reason, .. } => Some(reason.clone()),
+            // A route opening again after its session could not be built
+            // reads as that cause until the build ends: a tunnel that cannot
+            // come up keeps the reason it gave, not a turn as opening.
+            Self::Opening {
+                last: Some(last),
+                failed: true,
+                ..
+            } => Some(last.clone()),
             Self::Opening { .. } if self.building() => Some(OPENING),
             Self::Opening { last, .. } => Some(
                 last.clone()
@@ -1086,9 +1136,7 @@ impl Sessions {
         tokio::spawn(async move {
             tokio::select! {
                 detail = gone => {
-                    let reason = detail.map_or(REVOKED, |detail| {
-                        RouteFailure::with_detail(TorrentRouteReason::LegRevoked, detail)
-                    });
+                    let reason = abandoned(detail);
                     tracing::info!(
                         route = key.as_str(),
                         reason = %reason.message(),
@@ -1310,12 +1358,13 @@ impl Sessions {
             self.joined(plan);
             return Ok(session);
         }
-        let port_slot = self.port_slot(&plan.key).await;
         // The slot is marked as opening and the lock let go while the
         // session is built: a build waits on its leg, which may take as long
         // as a tunnel's handshake, and no reader of the sessions waits on
         // that. An opener that finds the route opening waits for that build
-        // and takes what it left.
+        // and takes what it left: its session, or why it could not be built,
+        // which a second build at once would only say again.
+        let mut waited = false;
         let (building, last) = loop {
             let mut slots = self.slots.lock().await;
             if let Some(off) = self.off() {
@@ -1325,12 +1374,22 @@ impl Sessions {
                 self.joined(plan);
                 return Ok(Arc::clone(session));
             }
+            if waited
+                && let Some(Slot::Held {
+                    reason,
+                    failed: true,
+                    ..
+                }) = slots.get(&plan.key)
+            {
+                return Err(SessionError::Build(reason.clone()));
+            }
             if let Some(Slot::Opening { done, .. }) = slots.get(&plan.key)
                 && done.has_changed().is_ok()
             {
                 let mut done = done.clone();
                 drop(slots);
                 let _ = done.changed().await;
+                waited = true;
                 continue;
             }
             if !slots.contains_key(&plan.key) && slots.len() >= MAX_SESSIONS {
@@ -1338,16 +1397,16 @@ impl Sessions {
             }
             // A session whose leg was revoked under it stops before its route
             // opens again.
-            let last = match slots.remove(&plan.key) {
+            let (last, failed) = match slots.remove(&plan.key) {
                 Some(Slot::Open {
                     session, leg, maps, ..
                 }) => {
                     self.closing.close(&plan.key, session, leg, maps);
-                    None
+                    (None, false)
                 }
-                Some(Slot::Held { reason, .. }) => Some(reason),
-                Some(Slot::Opening { last, .. }) => last,
-                None => None,
+                Some(Slot::Held { reason, failed, .. }) => (Some(reason), failed),
+                Some(Slot::Opening { last, failed, .. }) => (last, failed),
+                None => (None, false),
             };
             if let Some(reason) = &plan.down {
                 slots.insert(
@@ -1355,6 +1414,7 @@ impl Sessions {
                     Slot::Held {
                         reason: reason.clone(),
                         kind: plan.kind.clone(),
+                        failed: false,
                     },
                 );
                 return Err(SessionError::RouteDown(reason.clone()));
@@ -1366,6 +1426,7 @@ impl Sessions {
                     kind: plan.kind.clone(),
                     done,
                     last: last.clone(),
+                    failed,
                 },
             );
             break (building, last);
@@ -1373,7 +1434,9 @@ impl Sessions {
         // The peer limit is each torrent's, whatever else is open.
         let peers = self.config().max_peers_total as usize;
         let mappings = PortMappings::default();
-        let built = self.build(plan, opener, port_slot, peers, &mappings).await;
+        let held_open = self.routes.opening(plan);
+        let built = self.build(plan, opener, peers, &mappings).await;
+        drop(held_open);
         let mut slots = self.slots.lock().await;
         // The slot may have changed while the session was built: torrents
         // turned off, the route held or dropped. What stands now wins, and
@@ -1383,7 +1446,9 @@ impl Sessions {
             Some(Slot::Opening { done, .. }) if done.same_channel(&building.subscribe())
         );
         if !ours {
-            let now = self.off().or_else(|| slots.get(&plan.key).and_then(Slot::held));
+            let now = self
+                .off()
+                .or_else(|| slots.get(&plan.key).and_then(Slot::held));
             if let Ok((session, leg, _, maps, _)) = built {
                 self.closing.close(&plan.key, session, leg, maps);
             }
@@ -1400,7 +1465,16 @@ impl Sessions {
                 if let Some(leg) = &leg {
                     self.watch(&plan.key, leg, &session);
                 }
-                tracing::info!(route = plan.key.as_str(), port, "a route's session opened");
+                // The port it announces to trackers, 0 for none, and the
+                // address it takes peers in on, or none when it takes none.
+                let listen = session.listen_addr().map(|addr| addr.to_string());
+                tracing::info!(
+                    route = plan.key.as_str(),
+                    port,
+                    announced_port = session.announce_port().unwrap_or(0),
+                    listens = listen.as_deref().unwrap_or("no"),
+                    "a route's session opened"
+                );
                 slots.insert(
                     plan.key.clone(),
                     Slot::Open {
@@ -1414,6 +1488,20 @@ impl Sessions {
                     },
                 );
                 Ok(session)
+            }
+            // A build its leg was revoked under failed for nothing of the
+            // route's own: the route opens again at once on its path as it
+            // stands, and reads as opening while it does.
+            Err(error) if error.reason == TorrentRouteReason::LegRevoked => {
+                slots.insert(
+                    plan.key.clone(),
+                    Slot::Held {
+                        reason: error.clone(),
+                        kind: plan.kind.clone(),
+                        failed: false,
+                    },
+                );
+                Err(SessionError::RouteDown(error))
             }
             Err(error) => {
                 // Logged once for each failure that differs from the one
@@ -1431,6 +1519,7 @@ impl Sessions {
                     Slot::Held {
                         reason: error.clone(),
                         kind: plan.kind.clone(),
+                        failed: true,
                     },
                 );
                 Err(SessionError::Build(error))
@@ -1453,7 +1542,6 @@ impl Sessions {
         &self,
         plan: &RoutePlan,
         opener: &Identity,
-        slot: Result<u16, String>,
         peers: usize,
         mappings: &PortMappings,
     ) -> Result<
@@ -1466,12 +1554,7 @@ impl Sessions {
         ),
         RouteFailure,
     > {
-        let slot = slot.map_err(|detail| {
-            RouteFailure::with_detail(TorrentRouteReason::SessionStateUnreadable, detail)
-        })?;
         let torrent = self.config();
-        let port = slot_port(&torrent, slot)
-            .ok_or_else(|| RouteFailure::from(TorrentRouteReason::ListenPortUnavailable))?;
         let dir = self.env.root_of(&torrent).join(plan.key.as_str());
         std::fs::create_dir_all(&dir).map_err(|error| {
             RouteFailure::with_detail(TorrentRouteReason::StateDirectoryFailed, error.to_string())
@@ -1479,6 +1562,19 @@ impl Sessions {
         let leg = self.routes.open(plan, peers).await.map_err(|detail| {
             RouteFailure::with_detail(TorrentRouteReason::LegOpenFailed, detail)
         })?;
+        // Only a session that binds ports of the host takes a port slot. One
+        // whose sockets are all a tunnel's binds its ports there, on the
+        // first slot's, and leaves the host's to the routes that bind them.
+        let on_host = leg.kind.binds_host_ports();
+        let slot = if on_host {
+            self.port_slot(&plan.key).await.map_err(|detail| {
+                RouteFailure::with_detail(TorrentRouteReason::SessionStateUnreadable, detail)
+            })?
+        } else {
+            0
+        };
+        let port = slot_port(&torrent, slot)
+            .ok_or_else(|| RouteFailure::from(TorrentRouteReason::ListenPortUnavailable))?;
         let opening = Opening::of(&self.env, &torrent, leg.shape);
         let ip_filter = self.ip_filter(&torrent).await.map_err(|detail| {
             RouteFailure::with_detail(TorrentRouteReason::BlocklistFailed, detail)
@@ -1502,8 +1598,9 @@ impl Sessions {
         // external port this one maps to remove: only then does it wait, for
         // that session.
         let maps = maps(&torrent, leg.shape, port);
+        let on_host_ports = [Some(port), ssl_port].into_iter().filter(|_| on_host);
         self.closing
-            .released(plan, [Some(port), ssl_port, maps].into_iter().flatten())
+            .released(plan, on_host_ports.chain([maps]).flatten())
             .await;
         let mut options = session_options(&leg, port, &dir, peers, &torrent, ip_filter, opener);
         options.port_map_events = Some(mappings.follow());
@@ -1524,17 +1621,48 @@ impl Sessions {
         if let Some(listen) = options.listen.as_mut() {
             listen.ssl_listen_port = ssl_port;
         }
-        Session::new_with_opts(dir.join("output"), options)
-            .await
-            .map(|session| (session, leg.leg, port, maps, opening))
-            .map_err(|error| {
+        // A build waits on its leg, which may take as long as a tunnel's
+        // handshake. A leg revoked meanwhile, its path changed by a save or
+        // its pool member gone, ends the build at once: the route opens again
+        // on its path as it stands, not once the old one has timed out.
+        let built = Session::new_with_opts(dir.join("output"), options);
+        let built = match leg.leg.as_ref().map(|leg| leg.gone()) {
+            Some(gone) => tokio::select! {
+                built = built => built,
+                detail = gone => return Err(abandoned(detail)),
+            },
+            None => built.await,
+        };
+        match built {
+            Ok(session) => {
+                if let Some(leg) = &leg.leg {
+                    leg.opened(true);
+                }
+                Ok((session, leg.leg, port, maps, opening))
+            }
+            // A session that could not open on a leg whose path has a
+            // failing hop could not open for that hop: a tunnel that never
+            // came up fails the listen, the first thing the session opens
+            // on its leg, and the hop's own fault says why. It counts
+            // against the pool member the leg holds.
+            Err(_) if let Some(hop) = leg.leg.as_ref().and_then(|leg| leg.failing_hop()) => {
+                if let Some(leg) = &leg.leg {
+                    leg.opened(false);
+                }
+                Err(RouteFailure::with_detail(
+                    TorrentRouteReason::LegOpenFailed,
+                    format!("proxy {}: {}", hop.proxy, hop.fault),
+                ))
+            }
+            Err(error) => {
                 let reason = if error.downcast_ref::<ListenFailed>().is_some() {
                     TorrentRouteReason::ListenPortBindFailed
                 } else {
                     TorrentRouteReason::SessionBuildFailed
                 };
-                RouteFailure::with_detail(reason, format!("{error:#}"))
-            })
+                Err(RouteFailure::with_detail(reason, format!("{error:#}")))
+            }
+        }
     }
 
     /// The routes whose open session would open otherwise now: its leg was
@@ -1635,7 +1763,14 @@ impl Sessions {
             }
             Slot::Held { kind, .. } | Slot::Opening { kind, .. } => kind,
         };
-        slots.insert(key.clone(), Slot::Held { reason, kind });
+        slots.insert(
+            key.clone(),
+            Slot::Held {
+                reason,
+                kind,
+                failed: false,
+            },
+        );
     }
 
     /// Drop `key`'s session, open or held. The route keeps its port slot,
@@ -1882,6 +2017,7 @@ async fn refilter(
                         Slot::Held {
                             reason,
                             kind: plan.kind,
+                            failed: false,
                         },
                     );
                 }

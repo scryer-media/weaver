@@ -71,6 +71,20 @@ impl TorrentLeg {
             Err(gone) => Some(gone),
         }
     }
+    /// The first proxy hop on the leg's path whose own last attempt failed,
+    /// and what it came to: on a pool leg, its member's.
+    pub fn failing_hop(&self) -> Option<weaver_tunnel::pipe::FailingHop> {
+        self.stage.failing_hop()
+    }
+    /// A session on the leg opened, or could not for a hop of its path:
+    /// on a pool leg, its member's setup evidence. Nothing on any other leg.
+    pub fn opened(&self, reached: bool) {
+        if let Some(member) = &self.member
+            && let Ok(pin) = member.current()
+        {
+            pin.opened(reached);
+        }
+    }
     /// Resolves once the leg can carry nothing more: its stage revoked, with
     /// why when its member went from under it.
     pub fn gone(&self) -> impl std::future::Future<Output = Option<String>> + Send + 'static {
@@ -195,6 +209,9 @@ impl Dialer for PinnedMember {
             Err(gone) => Some(Err(std::io::Error::other(gone))),
         }
     }
+    fn failing_hop(&self) -> Option<weaver_tunnel::pipe::FailingHop> {
+        self.pin().failing_hop()
+    }
     fn budget(&self) -> Duration {
         self.pin().budget()
     }
@@ -279,6 +296,9 @@ impl Inbound for CarriedInbound {
             listener: self.inbound.listen(port, forwarded).await?,
             carried: self.carried.clone(),
         }))
+    }
+    fn forwarding(&self) -> weaver_tunnel::pipe::PortForwarding {
+        self.inbound.forwarding()
     }
 }
 struct CarriedListener {
@@ -381,12 +401,27 @@ impl TunnelProvider for TorrentProvider {
 /// What torrent sessions hold on a leg: `open`, their peers' established
 /// connections, whatever sockets carry them; `opening` and
 /// `bytes_per_second`, the peers still in their handshake and what they
-/// receive on sockets of their own, which no route carries.
+/// receive on sockets of their own, which no route carries;
+/// `sessions_opening`, the sessions being built on the leg now, each
+/// waiting on it, through a tunnel's handshake among the rest.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionTraffic {
     pub open: u64,
     pub opening: u64,
     pub bytes_per_second: u64,
+    pub sessions_opening: u64,
+}
+
+/// A session being built on a leg, for as long as its tenancy lives.
+pub struct SessionOpening;
+
+impl LegTenant for SessionOpening {
+    fn traffic(&self) -> SessionTraffic {
+        SessionTraffic {
+            sessions_opening: 1,
+            ..SessionTraffic::default()
+        }
+    }
 }
 
 impl SessionTraffic {
@@ -511,6 +546,7 @@ impl NetworkRuntime {
             traffic.open += now.open;
             traffic.opening += now.opening;
             traffic.bytes_per_second += now.bytes_per_second;
+            traffic.sessions_opening += now.sessions_opening;
             true
         });
         legs
@@ -675,15 +711,54 @@ impl NetworkRuntime {
             .collect()
     }
 
-    /// Why member `member` of pool `pool` on egress `egress_id` carries
-    /// nothing now, when it does not: it was dropped from the pool, or is
-    /// blocked. A pool no route has started yet holds every member up.
-    pub fn pool_member_down(&self, pool: u32, egress_id: u32, member: u32) -> Option<String> {
-        self.pools
+    /// Why `path` can carry nothing as saved, when it cannot: every rung of
+    /// its ladder is a proxy that is disabled or gone, a chain with one such
+    /// hop, or a pool with no member that is enabled, and nothing falls back
+    /// to direct. The first rung's reason is given. A direct path, or a
+    /// ladder with one rung that may carry, has none.
+    pub fn path_unusable(&self, path: &LegPath) -> Option<String> {
+        let LegPath::Ladder {
+            rungs,
+            direct_fallback: false,
+        } = path
+        else {
+            return None;
+        };
+        let config = self.configuration.read().expect("network configuration");
+        let proxy = |id: u32| match config.profiles.get(&id) {
+            None => Some(format!("proxy {id} does not exist")),
+            Some(profile) if !profile.enabled => Some(format!("proxy {id} is disabled")),
+            Some(_) => None,
+        };
+        let rung = |rung: &Rung| match rung {
+            Rung::Proxy { id } => proxy(*id),
+            Rung::Chain { ids } => ids.iter().find_map(|id| proxy(*id)),
+            Rung::Pool { id } => match config.pools.get(id) {
+                None => Some(format!("pool {id} does not exist")),
+                Some(pool) if !pool.enabled => Some(format!("pool {id} is disabled")),
+                Some(pool) => (!pool
+                    .member_ids
+                    .iter()
+                    .any(|member| proxy(*member).is_none()))
+                .then(|| format!("pool {id} has no member that is enabled")),
+            },
+        };
+        let mut reasons = rungs.iter().map(rung);
+        let first = reasons.next()??;
+        reasons.all(|reason| reason.is_some()).then_some(first)
+    }
+
+    /// Why each member of pool `pool` on egress `egress_id` that carries
+    /// nothing now does not, by id, as `PoolStage::members_down` says. A pool
+    /// no route has started yet holds every member up.
+    pub fn pool_members_down(&self, pool: u32, egress_id: u32) -> HashMap<u32, String> {
+        let stage = self
+            .pools
             .lock()
             .expect("network pools")
-            .get(&(pool, egress_id))?
-            .member_down(member)
+            .get(&(pool, egress_id))
+            .cloned();
+        stage.map(|stage| stage.members_down()).unwrap_or_default()
     }
 }
 

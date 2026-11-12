@@ -72,8 +72,8 @@ use crate::torrents::model::Adopted;
 use crate::torrents::rate::limit_kind;
 use crate::torrents::relocate::{self, Existing, MoveError};
 use crate::torrents::sessions::{
-    NetworkRoutes, RouteFailure, RouteKey, RoutePlan, SessionEnv, SessionError, SessionView,
-    Sessions, TorrentRouteReason, encryption_policy,
+    NetworkRoutes, OPENING, RouteFailure, RouteKey, RoutePlan, SessionEnv, SessionError,
+    SessionView, Sessions, TorrentRouteReason, encryption_policy,
 };
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces};
@@ -1272,6 +1272,7 @@ impl LegTenant for LegTorrent {
             open: u64::from(peers.live),
             opening,
             bytes_per_second,
+            ..SessionTraffic::default()
         }
     }
 }
@@ -1378,6 +1379,10 @@ struct Live {
     // attach, each taken by the one it is for; a later one reads its row.
     kept_at_boot: Option<Option<Kept>>,
     verified_at_boot: Option<Option<Vec<u8>>>,
+    // Held while a session takes it and while it is removed, so the two
+    // never cross: a torrent removed is never put in a session after, and
+    // one put in a session is removed from it.
+    gate: Arc<tokio::sync::Mutex<()>>,
 }
 
 // The torrents on each route's session, attached or held there: how loaded
@@ -1513,6 +1518,7 @@ impl Live {
             failed: None,
             kept_at_boot: None,
             verified_at_boot: None,
+            gate: Arc::default(),
         }
     }
 
@@ -2581,12 +2587,11 @@ impl TorrentService {
         let tick = tokio::spawn(async move {
             let mut interval = tokio::time::interval(TICK);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut reloads = service.inner.sessions.routes().reloads();
             loop {
                 tokio::select! {
                     _ = interval.tick() => {}
-                    () = service.inner.settings_changed.notified() => {}
-                    // A session whose leg was revoked opens again at once.
-                    () = service.inner.sessions.revoked() => {}
+                    () = service.woken(&mut reloads) => {}
                 }
                 service.tick().await;
             }
@@ -2599,6 +2604,18 @@ impl TorrentService {
             .replace(tick)
         {
             before.abort();
+        }
+    }
+
+    // Resolves when the tick runs before its interval: the settings changed,
+    // a session's leg was revoked, so it opens again at once, or the routes
+    // took a saved configuration, so a route held down or failing opens
+    // again on it at once.
+    pub(crate) async fn woken(&self, reloads: &mut Option<watch::Receiver<u64>>) {
+        tokio::select! {
+            () = self.inner.settings_changed.notified() => {}
+            () = self.inner.sessions.revoked() => {}
+            () = reloaded(reloads) => {}
         }
     }
 
@@ -4518,6 +4535,15 @@ impl TorrentService {
         let plan = self
             .pinned(job_id, self.inner.sessions.routes().plan(scope))
             .await;
+        // It reads as its route does while it waits for the route's
+        // session: opening, or why the route's last open failed.
+        if let Some(torrent) = self.inner.live.lock().await.get_mut(&job_id)
+            && torrent.attached.is_none()
+            && torrent.held.is_none()
+        {
+            torrent.route = Some(plan.key.clone());
+            torrent.held = Some(Held::Session(OPENING));
+        }
         let session = match self.open_session(&plan, &identity).await {
             Ok(session) => session,
             Err(error) => {
@@ -4525,6 +4551,24 @@ impl TorrentService {
                 return;
             }
         };
+        // The session takes it only while it is still here: a remove made
+        // while the route's session opened has deleted its files, and the
+        // session would make them again. A remove made from here on waits
+        // until the session has it, then takes it out.
+        let Some(gate) = self
+            .inner
+            .live
+            .lock()
+            .await
+            .get(&job_id)
+            .map(|torrent| Arc::clone(&torrent.gate))
+        else {
+            return;
+        };
+        let _taking = gate.lock().await;
+        if self.inner.live.lock().await.get(&job_id).is_none() {
+            return;
+        }
         let (identity, tracker_handover) = match fetched {
             Some(fetched)
                 if !paused
@@ -4902,6 +4946,17 @@ impl TorrentService {
         // Its outcome is its job's: a job still waiting for the tick is
         // restored first.
         self.restore_job(job_id).await;
+        // A session taking it finishes first; one not yet taking it finds
+        // it gone and never does.
+        let gate = self
+            .inner
+            .live
+            .lock()
+            .await
+            .get(&job_id)
+            .map(|torrent| Arc::clone(&torrent.gate))
+            .ok_or(ActionError::NotFound(job_id))?;
+        let _removing = gate.lock().await;
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
         let mut live = self.inner.live.lock().await;
@@ -6073,7 +6128,17 @@ impl TorrentService {
                     })
                 {
                     self.detach(torrent).await;
-                    torrent.held = None;
+                    // A torrent placed on another route reads as that route
+                    // from here, opening, while the torrents before it take
+                    // their turn. One whose route's session could not be
+                    // built reads as that cause while the route opens
+                    // again; any other hold is over.
+                    if torrent.route.as_ref() != Some(&plan.key) {
+                        torrent.route = Some(plan.key.clone());
+                        torrent.held = Some(Held::Session(OPENING));
+                    } else if !matches!(torrent.held, Some(Held::Session(_))) {
+                        torrent.held = None;
+                    }
                     reattach.push(torrent.record.job_id);
                 }
             }
@@ -6959,6 +7024,18 @@ fn apply_initial_have(
     have: Option<bitvec::boxed::BitBox<u8, bitvec::order::Msb0>>,
 ) {
     options.checkpoint = have.map(Checkpoint::pieces);
+}
+
+// Resolves once `reloads` rings after it was last seen; never when nothing
+// reloads the routes, or once what did is gone.
+async fn reloaded(reloads: &mut Option<watch::Receiver<u64>>) {
+    if let Some(receiver) = reloads.as_mut()
+        && receiver.changed().await.is_ok()
+    {
+        return;
+    }
+    *reloads = None;
+    std::future::pending().await
 }
 
 // Whether the torrent's files went where its client asked, where they may

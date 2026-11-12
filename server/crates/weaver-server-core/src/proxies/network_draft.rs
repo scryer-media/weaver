@@ -183,6 +183,7 @@ impl NetworkRuntime {
             health_inputs: Mutex::new(None),
             torrent_legs: Mutex::default(),
             route_health: None,
+            reloads: tokio::sync::watch::Sender::new(0),
             egress_controls: Arc::new(weaver_nntp::transfer::ServerTransferRegistry::with_scope(
                 weaver_nntp::transfer::TransferScope::Egress,
             )),

@@ -76,7 +76,7 @@ mod test_support;
 // Re-export primary types for convenience.
 pub use address_plan::{
     ADDRESS_ATTEMPT_LIMIT, ADDRESS_REPLAN_INTERVAL, AddressPlanSnapshot, AddressSnapshot,
-    RaceReason,
+    RaceReason, SUSPECT_AFTER_FAILURES,
 };
 pub use blocking::{BlockingBodyLane, BlockingLaneStats, BlockingNntpConnection};
 pub use client::{

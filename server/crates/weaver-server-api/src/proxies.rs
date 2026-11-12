@@ -265,7 +265,7 @@ impl ProxyProfileInput {
             }
             (None, None) => proxies::Resolver::Proxy,
         };
-        let profile = ProxyProfile {
+        let mut profile = ProxyProfile {
             id,
             name: self.name.trim().into(),
             kind: self.kind.into(),
@@ -286,11 +286,12 @@ impl ProxyProfileInput {
             forwarded_port: self
                 .forwarded_port
                 .filter(|port| *port != 0 && self.kind == ProxyKind::WireGuard && !self.natpmp),
-            revision: existing.map_or(Ok(1), |p| {
-                p.revision.checked_add(1).ok_or("proxy revision exhausted")
-            })?,
+            revision: 0,
             secrets,
         };
+        profile.revision = profile
+            .saved_revision(existing)
+            .ok_or("proxy revision exhausted")?;
         profile.validate().map_err(refusal_error)?;
         Ok(profile)
     }

@@ -77,7 +77,10 @@ impl DatagramTransport for SessionDatagrams {
                     _share: share,
                 }))
             }
+            // A tunnel that could not come up to carry datagrams is the
+            // hop's fault, as one that could not come up to dial is.
             Err(error) => {
+                session.failure.blame(&error, session.timeout);
                 drop(share);
                 drop(capacity);
                 drop(activity);

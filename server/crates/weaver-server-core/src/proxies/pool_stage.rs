@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -15,7 +15,7 @@ use tokio::{
     time::Instant,
 };
 use weaver_nntp::{
-    ADDRESS_ATTEMPT_LIMIT,
+    ADDRESS_ATTEMPT_LIMIT, SUSPECT_AFTER_FAILURES,
     candidate_plan::{Attempt, CandidatePlan, PlanSnapshot},
 };
 use weaver_tunnel::{
@@ -91,6 +91,9 @@ struct Member {
     // Holders pinned to this member for their whole life: while one is, the
     // member's session is never retired as idle.
     pinned: AtomicU64,
+    // The sessions a holder could not open on the member in a row, for a
+    // hop of its path; none since one opened.
+    failed_opens: AtomicU32,
     // The pool's signal that its members changed, raised when this member
     // becomes blocked.
     changed: Arc<Notify>,
@@ -118,7 +121,14 @@ impl Member {
             read: AtomicU64::new(0),
             rate: Mutex::new(MemberRate::default()),
             pinned: AtomicU64::new(0),
+            failed_opens: AtomicU32::new(0),
         })
+    }
+    // Whether the member failed to open a session often enough in a row to
+    // be passed over: as often as the pool's plan takes to call a member
+    // suspect.
+    fn failing(&self) -> bool {
+        self.failed_opens.load(Ordering::Acquire) >= SUSPECT_AFTER_FAILURES
     }
     // Blocks the member for `error`, and wakes whoever waits on the pool's
     // members: a dial that waited for room on a member now fails at once
@@ -640,6 +650,12 @@ impl PoolState {
 
 pub struct PoolStage {
     state: Arc<PoolState>,
+    // A consumer dials through the pool as a whole, as a server or a feed
+    // does, rather than holding one member, as a torrent session does: only
+    // then does the pool open its members' tunnels ahead of a dial.
+    whole: AtomicBool,
+    // The pool opened its members ahead since it was first dialled whole.
+    warmed_whole: AtomicBool,
     tasks: Mutex<JoinSet<()>>,
     retirement: tokio::task::JoinHandle<()>,
     handle: tokio::runtime::Handle,
@@ -695,6 +711,8 @@ impl PoolStage {
         });
         Arc::new(Self {
             state,
+            whole: AtomicBool::new(false),
+            warmed_whole: AtomicBool::new(false),
             tasks: Mutex::new(JoinSet::new()),
             retirement,
             handle,
@@ -799,7 +817,24 @@ impl PoolStage {
         self.state.changed.notify_waiters();
         removed
     }
+    /// A consumer dials through the pool as a whole from here, for as long
+    /// as the pool runs.
+    pub fn serve_whole(&self) {
+        self.whole.store(true, Ordering::Release);
+    }
+    /// Whether a consumer dials the pool whole and it has not yet opened its
+    /// members ahead since.
+    pub fn unwarmed(&self) -> bool {
+        self.whole.load(Ordering::Acquire) && !self.warmed_whole.load(Ordering::Acquire)
+    }
+    /// Open every member's tunnel ahead of a dial, on a pool a consumer
+    /// dials through as a whole. A pool whose consumers each hold one member
+    /// opens a member's tunnel only when a holder dials through it.
     pub fn prewarm(&self) {
+        if !self.whole.load(Ordering::Acquire) {
+            return;
+        }
+        self.warmed_whole.store(true, Ordering::Release);
         let members: Vec<_> = self
             .state
             .members
@@ -818,6 +853,11 @@ impl PoolStage {
                 &self.handle,
             );
         }
+    }
+    // The member preparations the pool started ahead of a dial.
+    #[cfg(test)]
+    pub(crate) fn warmings(&self) -> usize {
+        self.tasks.lock().expect("pool tasks").len()
     }
     pub fn revision(&self) -> u64 {
         self.state.revision.load(Ordering::Acquire)
@@ -882,16 +922,24 @@ impl PoolStage {
         }))
     }
     // Why member `id` carries nothing now, when it does not: it is no
-    // member, or it is blocked.
+    // member, or it is down as `members_down` says.
     pub fn member_down(&self, id: u32) -> Option<String> {
         let members = self.state.members.read().expect("pool members");
-        let Some(member) = members.get(&id) else {
+        if !members.contains_key(&id) {
             return Some(format!(
                 "proxy {id} is no longer a member of pool {}",
                 self.state.id
             ));
-        };
-        member.status.lock().expect("pool member").blocked.clone()
+        }
+        down_of(&members).remove(&id)
+    }
+    /// Why each member that carries nothing now does not, by id: it is
+    /// blocked, or no session opened on it [`SUSPECT_AFTER_FAILURES`] times
+    /// in a row while another member is neither. A member is passed over for
+    /// failed opens only while there is another to go to: with none, each
+    /// stays up and its holders keep opening on it.
+    pub fn members_down(&self) -> HashMap<u32, String> {
+        down_of(&self.state.members.read().expect("pool members"))
     }
     pub fn lease_member(&self) -> Result<(u32, Arc<dyn Dialer>), DialError> {
         self.lease_members()
@@ -902,6 +950,39 @@ impl PoolStage {
     pub fn lease(&self) -> Result<Arc<dyn Dialer>, DialError> {
         self.lease_member().map(|(_, stage)| stage)
     }
+}
+// Why each of `members` that carries nothing does not, as
+// `PoolStage::members_down` says, in one pass.
+fn down_of(members: &HashMap<u32, Arc<Member>>) -> HashMap<u32, String> {
+    let mut down = HashMap::new();
+    let mut failing = Vec::new();
+    let mut usable = false;
+    for member in members.values() {
+        if let Some(reason) = member.status.lock().expect("pool member").blocked.clone() {
+            down.insert(member.id, reason);
+        } else if member.failing() {
+            failing.push(member);
+        } else {
+            usable = true;
+        }
+    }
+    if usable {
+        down.extend(failing.into_iter().map(|member| {
+            let failed = member.failed_opens.load(Ordering::Acquire);
+            let reason = match member.dialer.failing_hop() {
+                Some(hop) => format!(
+                    "proxy {} opened no session {failed} times in a row: proxy {}: {}",
+                    member.id, hop.proxy, hop.fault
+                ),
+                None => format!(
+                    "proxy {} opened no session {failed} times in a row",
+                    member.id
+                ),
+            };
+            (member.id, reason)
+        }));
+    }
+    down
 }
 struct MemberLease {
     member: Arc<Member>,
@@ -976,6 +1057,21 @@ impl MemberPin {
             .blocked
             .clone()
     }
+    /// A session the holder opened on the member came up, or could not for
+    /// a hop of the member's path: setup evidence for the pool's plan, as a
+    /// connection's setup is, and the member's run of failed opens, which
+    /// one that comes up ends.
+    pub fn opened(&self, reached: bool) {
+        let id = self.member.id;
+        self.state.record(&self.member, |plan| {
+            plan.setup(id, reached, Instant::now().into_std())
+        });
+        if reached {
+            self.member.failed_opens.store(0, Ordering::Release);
+        } else {
+            self.member.failed_opens.fetch_add(1, Ordering::AcqRel);
+        }
+    }
     /// Resolves once the pool's members may have changed since this was
     /// called, or at once when the member held is no longer the pool's.
     pub async fn changed(&self) {
@@ -1023,6 +1119,9 @@ impl Dialer for MemberPin {
     }
     fn source_toward(&self, to: std::net::SocketAddr) -> Option<std::io::Result<std::net::IpAddr>> {
         self.member.dialer.source_toward(to)
+    }
+    fn failing_hop(&self) -> Option<weaver_tunnel::pipe::FailingHop> {
+        self.member.dialer.failing_hop()
     }
     fn budget(&self) -> Duration {
         self.member.dialer.budget()

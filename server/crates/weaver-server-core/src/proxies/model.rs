@@ -26,7 +26,7 @@ pub enum Resolver {
     Proxy,
 }
 
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxySecrets {
     pub username: Option<String>,
     pub password: Option<String>,
@@ -72,6 +72,29 @@ pub struct ProxyProfile {
 }
 
 impl ProxyProfile {
+    /// The revision a save of `self` over `existing` stores. Everything built
+    /// from a profile is keyed by its revision, so a save that changes no
+    /// field keeps it, and its tunnels, sessions and legs stay as they are.
+    /// `None` once the revisions are exhausted.
+    pub fn saved_revision(&self, existing: Option<&ProxyProfile>) -> Option<u64> {
+        let Some(existing) = existing else {
+            return Some(1);
+        };
+        let settings = |profile: &ProxyProfile| {
+            serde_json::to_value(ProxyProfile {
+                revision: 0,
+                ..profile.clone()
+            })
+            .ok()
+        };
+        if self.secrets == existing.secrets
+            && settings(self).is_some()
+            && settings(self) == settings(existing)
+        {
+            return Some(existing.revision);
+        }
+        existing.revision.checked_add(1)
+    }
     pub fn timeout(&self) -> Duration {
         Duration::from_secs(u64::from(self.timeout_seconds))
     }

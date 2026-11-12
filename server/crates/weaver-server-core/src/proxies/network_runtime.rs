@@ -29,7 +29,9 @@ mod draft;
 pub use draft::DraftNetworkRoute;
 #[path = "network_torrent.rs"]
 mod torrent;
-pub use torrent::{EgressLimitChanges, LegTenancy, LegTenant, SessionTraffic, TorrentLeg, pool_of};
+pub use torrent::{
+    EgressLimitChanges, LegTenancy, LegTenant, SessionOpening, SessionTraffic, TorrentLeg, pool_of,
+};
 #[path = "network_test_via.rs"]
 mod test_via;
 pub use test_via::{
@@ -387,6 +389,9 @@ pub struct NetworkRuntime {
     // What the saved routes' egresses and hops last showed of their health.
     // A probe of a draft has none: its hops are no saved route's.
     route_health: Option<Arc<RouteHealth>>,
+    // Counts the reloads that took a saved configuration, so whoever waits
+    // on a route to come up tries it again at once.
+    reloads: tokio::sync::watch::Sender<u64>,
 }
 
 impl NetworkRuntime {
@@ -450,6 +455,7 @@ impl NetworkRuntime {
             health_inputs: Mutex::new(None),
             torrent_legs: Mutex::default(),
             route_health: Some(route_health),
+            reloads: tokio::sync::watch::Sender::new(0),
         });
         let weak = Arc::downgrade(&runtime);
         *runtime.poll.lock().expect("network health task") = Some(handle.spawn(async move {
@@ -940,11 +946,14 @@ impl NetworkRuntime {
         sessions.insert(key, stage.clone());
         Ok(stage)
     }
+    // Pool `id` on `bottom`'s egress, marked as one a consumer dials whole
+    // when `whole` is: only such a pool opens its members ahead of a dial.
     fn pool(
         &self,
         config: &Configuration,
         id: u32,
         bottom: Arc<Egress>,
+        whole: bool,
     ) -> Result<Arc<dyn Dialer>, String> {
         let pool = config.pools.get(&id).ok_or("proxy pool does not exist")?;
         if !pool.enabled {
@@ -978,6 +987,9 @@ impl NetworkRuntime {
             .collect::<Result<Vec<_>, String>>()?;
         let mut pools = self.pools.lock().expect("network pools");
         let stage = if let Some(stage) = pools.get(&(id, bottom.id())) {
+            if whole {
+                stage.serve_whole();
+            }
             if self.compiling {
                 self.pool_updates
                     .lock()
@@ -986,13 +998,16 @@ impl NetworkRuntime {
             } else {
                 let revision = stage.revision();
                 stage.set_members(members);
-                if stage.revision() != revision {
+                if stage.revision() != revision || stage.unwarmed() {
                     stage.prewarm();
                 }
             }
             stage.clone()
         } else {
             let stage = PoolStage::new(id, members, self.handle.clone());
+            if whole {
+                stage.serve_whole();
+            }
             pools.insert((id, bottom.id()), stage.clone());
             if !self.compiling {
                 stage.prewarm();
@@ -1062,7 +1077,10 @@ impl NetworkRuntime {
                             // leg holds is lifted on reload once a member is
                             // unblocked.
                             pool_versions.push((pool.id, pool.enabled));
-                            self.pool(config, *id, bottom.clone())?
+                            // A torrent session holds one member of it;
+                            // every other consumer dials the pool whole.
+                            let whole = !matches!(consumer, Consumer::Torrent(_));
+                            self.pool(config, *id, bottom.clone(), whole)?
                         }
                         Rung::Chain { ids } => {
                             let mut stage: Arc<dyn Dialer> = bottom.clone();
@@ -1215,7 +1233,13 @@ impl NetworkRuntime {
         self.apply_configuration(next)?;
         self.retire_unused_sessions().await;
         self.refresh_health();
+        self.reloads.send_modify(|reloads| *reloads += 1);
         Ok(())
+    }
+    /// Rings each time a reload takes the saved configuration: a profile,
+    /// pool or route saved, enabled or disabled.
+    pub fn reloads(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.reloads.subscribe()
     }
     fn apply_configuration(&self, next: Configuration) -> Result<(), String> {
         // Route lookups must see configuration and compiled paths from the same reload.
@@ -1240,6 +1264,7 @@ impl NetworkRuntime {
             health_inputs: Mutex::new(None),
             torrent_legs: Mutex::default(),
             route_health: self.route_health.clone(),
+            reloads: tokio::sync::watch::Sender::new(0),
             egress_controls: self.egress_controls.clone(),
             quota_policy: None,
             #[cfg(test)]
@@ -1418,10 +1443,11 @@ impl NetworkRuntime {
             next.configure_health(health);
         }
         *configuration = next;
-        // Only new or re-membered pools warm up; an unchanged idle member must
-        // not handshake again on every reload.
+        // Only new or re-membered pools warm up, and a pool first dialled
+        // whole; an unchanged idle member must not handshake again on every
+        // reload. A pool only torrent sessions hold members of warms none.
         for (key, pool) in self.pools.lock().expect("network pools").iter() {
-            if prior_revisions.get(key) != Some(&pool.revision()) {
+            if prior_revisions.get(key) != Some(&pool.revision()) || pool.unwarmed() {
                 pool.prewarm();
             }
         }

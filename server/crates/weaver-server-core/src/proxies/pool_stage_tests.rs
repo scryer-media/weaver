@@ -207,6 +207,7 @@ async fn a_wait_for_room_wakes_when_the_last_member_blocks() {
             break;
         }
         if !prewarmed {
+            pool.serve_whole();
             pool.prewarm();
             prewarmed = true;
         }
@@ -745,4 +746,50 @@ async fn the_member_carrying_traffic_reports_its_connections_and_rate() {
     tokio::time::advance(MEMBER_RATE_WINDOW + Duration::from_secs(1)).await;
     let status = pool.snapshot().1;
     assert_eq!((status[1].open, status[1].bytes_per_second), (0, 0));
+}
+
+// A member no session opens on is passed over once that has happened as
+// often in a row as the plan takes to call a member suspect, and only while
+// another member is up; its plan evidence says so. One failed open passes
+// nothing over, and one that comes up ends the run.
+#[tokio::test]
+async fn a_member_no_session_opens_on_is_passed_over_while_another_is_up() {
+    let (pool, _members, _opened) = fixtures();
+    let one = pool.pin_member(1).unwrap();
+    let two = pool.pin_member(2).unwrap();
+    let failures = |pool: &PoolStage, id: u32| {
+        pool.snapshot()
+            .0
+            .candidates
+            .into_iter()
+            .find(|candidate| candidate.candidate == id)
+            .map(|candidate| (candidate.failures, candidate.state))
+            .unwrap()
+    };
+
+    one.opened(false);
+    assert_eq!(pool.member_down(1), None);
+    assert!(pool.members_down().is_empty());
+    assert_eq!(failures(&pool, 1).0, 1);
+
+    one.opened(false);
+    assert_eq!(
+        pool.member_down(1).as_deref(),
+        Some("proxy 1 opened no session 2 times in a row")
+    );
+    assert_eq!(failures(&pool, 1), (SUSPECT_AFTER_FAILURES, "SUSPECT"));
+    assert_eq!(pool.member_down(2), None);
+
+    // With no other member to go to, each stays up.
+    two.opened(false);
+    two.opened(false);
+    assert!(pool.members_down().is_empty());
+
+    // A session that comes up on the other ends its run, and the first is
+    // passed over again.
+    two.opened(true);
+    assert_eq!(failures(&pool, 2).0, 0);
+    assert_eq!(pool.members_down().keys().copied().collect::<Vec<_>>(), [1]);
+    one.opened(true);
+    assert!(pool.members_down().is_empty());
 }
