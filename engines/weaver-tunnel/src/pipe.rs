@@ -17,7 +17,9 @@ mod natpmp;
 mod sockets;
 #[path = "pipe_socks5_udp.rs"]
 mod socks5_udp;
-pub use inbound::{Inbound, InboundListener, PortForwarding, PortMapping, gateway_of};
+pub use inbound::{
+    Inbound, InboundListener, LISTEN_BACKLOG, PortForwarding, PortMapping, gateway_of,
+};
 pub use sockets::{SessionSockets, SocketClass, SocketPermit, SocketShares};
 
 #[cfg(test)]

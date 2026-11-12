@@ -11731,10 +11731,10 @@ async fn a_new_peer_limit_is_told_on_the_torrent_leg() {
     assert_eq!(
         limit(500).await.as_deref(),
         Some(
-            "WireGuard proxy 1 holds torrent peers over TCP to 219 of 500; the rest connect over uTP."
+            "WireGuard proxy 1 holds torrent peers over TCP to 187 of 500; the rest connect over uTP."
         )
     );
-    assert_eq!(limit(200).await, None);
+    assert_eq!(limit(150).await, None);
 }
 
 // The routes taking a saved configuration again, as a profile saved or

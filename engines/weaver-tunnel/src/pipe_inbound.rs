@@ -33,8 +33,11 @@ use super::{
 };
 use crate::{TunnelError, wireguard::WgTcpListener};
 
-// Connections a listener holds before it accepts them.
-const BACKLOG: usize = 16;
+/// Connections a listener inside a WireGuard tunnel holds before it accepts
+/// them. The tunnel has no listen queue: a listener is a pool of this many
+/// sockets on its port, each taking one of the tunnel's sockets for as long
+/// as the listener lives.
+pub const LISTEN_BACKLOG: usize = 16;
 
 /// How the provider at a WireGuard hop's far end forwards a port to it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -110,7 +113,7 @@ async fn listen_in(
         Some(lent) => (lent.resolver, Some(lent.activity)),
         None => (provider.clone(), None),
     };
-    match provider.listen(port, BACKLOG).await {
+    match provider.listen(port, LISTEN_BACKLOG).await {
         Ok(listener) => Ok((listener, lent)),
         // A tunnel that could not come up to listen is the hop's fault, as
         // one that could not come up to dial is.
