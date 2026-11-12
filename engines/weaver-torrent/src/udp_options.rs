@@ -115,9 +115,42 @@ pub(crate) fn set_dont_fragment(socket: &tokio::net::UdpSocket, family: Family) 
 }
 
 /// Whether `socket`'s datagrams of `family` are never fragmented.
-#[cfg(test)]
 pub(crate) fn dont_fragment(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
     sys::get(socket, family)
+}
+
+/// Allow fragmenting `socket`'s datagrams of `family`.
+pub(crate) fn clear_dont_fragment(
+    socket: &tokio::net::UdpSocket,
+    family: Family,
+) -> io::Result<()> {
+    sys::clear(socket, family)
+}
+
+/// Run `send`, one send of a datagram of `family` on `socket`, allowing it
+/// to be fragmented: a socket that forbids fragmenting allows it for this
+/// send and forbids it again after, whatever the send's outcome, as
+/// libtorrent switches the option around one send (udp_socket.cpp
+/// v2.0.15:160-180, 346-350). The caller holds the socket's lock for sends
+/// that test the path's size, so no probe goes out while it is allowed.
+/// Where the option cannot be switched off the datagram goes as any other.
+pub(crate) fn send_fragmenting(
+    socket: &tokio::net::UdpSocket,
+    family: Family,
+    send: impl FnOnce() -> io::Result<usize>,
+) -> io::Result<usize> {
+    if !dont_fragment(socket, family).unwrap_or(false) {
+        return send();
+    }
+    if let Err(error) = clear_dont_fragment(socket, family) {
+        debug!(?family, %error, "a datagram that may be fragmented goes without it");
+        return send();
+    }
+    let sent = send();
+    if let Err(error) = set_dont_fragment(socket, family) {
+        warn!(?family, %error, "the socket's datagrams may be fragmented");
+    }
+    sent
 }
 
 // Linux asks for path-MTU discovery that never fragments.
@@ -149,7 +182,17 @@ mod sys {
         super::unix::set_int(socket.as_raw_fd(), level, name, value)
     }
 
-    #[cfg(test)]
+    // Never set don't-fragment, as libtorrent switches it off
+    // (socket.hpp v2.0.15:248-249).
+    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+        let (level, name, _) = option(family);
+        let value = match family {
+            Family::V4 => libc::IP_PMTUDISC_DONT,
+            Family::V6 => libc::IPV6_PMTUDISC_DONT,
+        };
+        super::unix::set_int(socket.as_raw_fd(), level, name, value)
+    }
+
     pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
         let (level, name, value) = option(family);
         Ok(super::unix::get_int(socket.as_raw_fd(), level, name)? == value)
@@ -177,7 +220,11 @@ mod sys {
         super::unix::set_int(socket.as_raw_fd(), level, name, 1)
     }
 
-    #[cfg(test)]
+    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+        let (level, name) = option(family);
+        super::unix::set_int(socket.as_raw_fd(), level, name, 0)
+    }
+
     pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
         let (level, name) = option(family);
         Ok(super::unix::get_int(socket.as_raw_fd(), level, name)? != 0)
@@ -188,11 +235,9 @@ mod sys {
 mod sys {
     use std::{io, os::windows::io::AsRawSocket};
 
-    #[cfg(test)]
-    use windows::Win32::Networking::WinSock::getsockopt;
     use windows::Win32::Networking::WinSock::{
         IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_IPV6, IPV6_DONTFRAG, SOCKET, WSAGetLastError,
-        setsockopt,
+        getsockopt, setsockopt,
     };
 
     use super::Family;
@@ -210,8 +255,16 @@ mod sys {
     }
 
     pub(super) fn set(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+        set_to(socket, family, 1)
+    }
+
+    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+        set_to(socket, family, 0)
+    }
+
+    fn set_to(socket: &tokio::net::UdpSocket, family: Family, value: i32) -> io::Result<()> {
         let (level, name) = option(family);
-        let value = 1i32.to_ne_bytes();
+        let value = value.to_ne_bytes();
         // SAFETY: the socket is open for as long as `socket` is borrowed, and
         // the option takes an int, which `value` holds.
         let done = unsafe {
@@ -225,7 +278,6 @@ mod sys {
         if done == 0 { Ok(()) } else { Err(last_error()) }
     }
 
-    #[cfg(test)]
     pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
         let (level, name) = option(family);
         let mut value = [0u8; 4];
@@ -268,7 +320,10 @@ mod sys {
         ))
     }
 
-    #[cfg(test)]
+    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+        set(socket, family)
+    }
+
     pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
         set(socket, family).map(|()| false)
     }
@@ -307,7 +362,6 @@ mod unix {
         libc::socklen_t::try_from(mem::size_of::<libc::c_int>()).map_err(io::Error::other)
     }
 
-    #[cfg(test)]
     pub(super) fn get_int(
         fd: RawFd,
         level: libc::c_int,
@@ -430,6 +484,59 @@ mod tests {
                 fresh(family).recv_buffer_size().unwrap(),
                 "{family:?}"
             );
+        }
+    }
+
+    // A send that tests the path's size, either kind, leaves the socket
+    // forbidding fragmentation as before, for each family a socket of one
+    // family or of both sends, and its datagram arrives.
+    #[tokio::test]
+    async fn a_size_send_leaves_the_socket_forbidding_fragmentation() {
+        use crate::network::Fragmenting;
+
+        let v4_receiver = crate::test_support::loopback_kernel_udp();
+        let v6_receiver = crate::test_support::sockets()
+            .bind_kernel_udp((Ipv6Addr::LOCALHOST, 0).into())
+            .unwrap();
+        for (bound, receiver, family) in [
+            (Ipv4Addr::UNSPECIFIED.into(), &v4_receiver, Family::V4),
+            (Ipv6Addr::UNSPECIFIED.into(), &v6_receiver, Family::V6),
+            // A socket of both families sends to an IPv4 peer under the
+            // IPv4 option.
+            (Ipv6Addr::UNSPECIFIED.into(), &v4_receiver, Family::V4),
+        ] {
+            let bound: std::net::IpAddr = bound;
+            let socket = crate::test_support::sockets()
+                .bind_kernel_utp((bound, 0).into(), super::STREAM_WINDOW)
+                .unwrap();
+            let before = dont_fragment(socket.socket(), family).ok();
+            let to = receiver.bind_addr();
+            for fragmenting in [Fragmenting::Allowed, Fragmenting::Never] {
+                let parts = [IoSlice::new(b"size"), IoSlice::new(b" test")];
+                let sent = std::future::poll_fn(|cx| {
+                    socket.poll_send_to_vectored_fragmenting(cx, &parts, to, fragmenting)
+                })
+                .await
+                .unwrap();
+                assert_eq!(sent, 9);
+                let mut buf = [0u8; 16];
+                let (len, _) = receiver.recv_from(&mut buf).await.unwrap();
+                assert_eq!(
+                    &buf[..len],
+                    b"size test",
+                    "{bound} {family:?} {fragmenting:?}"
+                );
+                assert_eq!(
+                    dont_fragment(socket.socket(), family).ok(),
+                    before,
+                    "{bound} {family:?} {fragmenting:?}"
+                );
+            }
+            // Where the host has the option, the socket forbids it. Apple's
+            // hosts refuse the IPv4 option on a socket of both families.
+            if !(cfg!(target_vendor = "apple") && bound.is_ipv6() && matches!(family, Family::V4)) {
+                assert_eq!(before, Some(true), "{bound} {family:?}");
+            }
         }
     }
 

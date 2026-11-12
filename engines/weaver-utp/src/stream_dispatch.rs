@@ -370,6 +370,18 @@ macro_rules! send_data {
             let mut h = [0u8; UTP_HEADER as usize];
             let hlen = $header.serialize(&mut h)?;
 
+            // A live probe must arrive whole to prove its size; a probe given
+            // up on as too large may be fragmented, so it still arrives, on
+            // every resend (utp_stream.cpp v2.0.15:1810-1812, 2045-2046).
+            // Ordinary data takes the plain send.
+            let fragmenting = if $segment_iter_item.is_mtu_probe() {
+                Some(crate::traits::Fragmenting::Never)
+            } else if $segment_iter_item.size_given_up() {
+                Some(crate::traits::Fragmenting::Allowed)
+            } else {
+                None
+            };
+
             // Sent from the ring in place; the writer waits on the lock only
             // for the length of one send.
             let refused = {
@@ -390,7 +402,10 @@ macro_rules! send_data {
                     &mut $self.send_gate,
                     $cx,
                     &bufs,
-                    $self.remote,
+                    crate::socket::Destination {
+                        addr: $self.remote,
+                        fragmenting,
+                    },
                 ) {
                     Ok(pending) => {
                         $self.this_poll.transport_pending = pending;

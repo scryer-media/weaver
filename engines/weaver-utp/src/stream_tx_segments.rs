@@ -185,6 +185,11 @@ impl SegmentForSending<'_> {
         self.segment.is_mtu_probe()
     }
 
+    // A probe given up on as too large, resent as ordinary data.
+    pub fn size_given_up(&self) -> bool {
+        self.segment.size_given_up
+    }
+
     pub fn is_delivered(&self) -> bool {
         self.segment.is_delivered
     }

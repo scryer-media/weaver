@@ -98,6 +98,12 @@ impl TestVsock {
         self.transport.take_sent_utpmessages()
     }
 
+    // The messages sent, each with how a send that controls fragmenting
+    // sent it.
+    fn take_sent_fragmenting(&self) -> Vec<(UtpMessage, Option<crate::Fragmenting>)> {
+        self.transport.take_sent_fragmenting()
+    }
+
     #[track_caller]
     fn assert_sent_empty(&self) {
         assert_eq!(self.take_sent(), Vec::<UtpMessage>::new())

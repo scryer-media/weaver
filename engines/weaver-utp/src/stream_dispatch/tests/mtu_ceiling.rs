@@ -63,15 +63,18 @@ async fn a_new_stream_probes_up_to_the_link() {
 const PATH_DELAY_US: u32 = 10_000;
 
 // A stream sending 512 KiB over a path that carries payloads of up to
-// `passes` bytes and drops larger ones whole. The peer acks, 10 ms after
-// each send, everything before the first packet the path dropped; when
-// nothing new arrived, the clock steps a millisecond, the pacer's tick.
-// The payloads sent, in order.
+// `passes` bytes and drops larger ones whole, unless the send allowed them
+// to be fragmented: those arrive. The peer acks, 10 ms after each send,
+// everything before the first packet the path dropped; when nothing new
+// arrived, the clock steps a millisecond, the pacer's tick. The payloads
+// sent, in order.
 async fn over_a_path(passes: usize) -> (super::TestVsock, Vec<usize>) {
     let env = MockUtpEnvironment::new();
     let args = test_stream_args(&env, false);
+    let transport = RememberingTransport::new(ADDR_1);
+    transport.set_controls_fragmenting();
     let mut t = make_test_vsock_on(
-        RememberingTransport::new(ADDR_1),
+        transport,
         SocketOpts {
             remote_inactivity_timeout: Some(Duration::from_secs(60)),
             vsock_tx_bufsize_bytes_initial: Some(non_zero_const!(1024 * 1024)),
@@ -92,13 +95,15 @@ async fn over_a_path(passes: usize) -> (super::TestVsock, Vec<usize>) {
         // in one task poll, the stream's inbox reads as empty.
         tokio::task::yield_now().await;
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        let data = sent.iter().filter(|msg| msg.header.get_type() == Data);
-        sizes.extend(data.clone().map(|msg| msg.payload().len()));
+        let sent = t.take_sent_fragmenting();
+        let data = sent.iter().filter(|(msg, _)| msg.header.get_type() == Data);
+        sizes.extend(data.clone().map(|(msg, _)| msg.payload().len()));
         let arrived = data
-            .take_while(|msg| msg.payload().len() <= passes)
+            .take_while(|(msg, fragmenting)| {
+                msg.payload().len() <= passes || *fragmenting == Some(crate::Fragmenting::Allowed)
+            })
             .last()
-            .map(|msg| msg.header.seq_nr);
+            .map(|(msg, _)| msg.header.seq_nr);
         match arrived {
             Some(ack_nr) => {
                 t.env.increment_now(Duration::from_millis(10));
@@ -186,8 +191,9 @@ async fn the_peers_large_data_does_not_raise_the_size() {
 }
 
 // A peer behind a path whose limit the test sets. The transport refuses a
-// datagram larger than the limit, as a host whose path MTU shrank does;
-// the peer holds what arrives and acks, 10 ms after each send, every byte
+// datagram larger than the limit, as a host whose path MTU shrank does; a
+// larger payload the transport sent allowing fragmentation arrives in
+// fragments. The peer holds what arrives and acks, 10 ms after each send, every byte
 // it holds in order. When nothing new arrived, the clock steps a
 // millisecond, the pacer's tick.
 struct Peer {
@@ -200,6 +206,8 @@ struct Peer {
     received: Vec<u8>,
     // Every DATA payload the stream tried, with whether the path took it.
     tried: Vec<(u16, usize, bool)>,
+    // For each of `tried`, how a send that controls fragmenting sent it.
+    fragmenting: Vec<Option<crate::Fragmenting>>,
 }
 
 impl Peer {
@@ -211,6 +219,7 @@ impl Peer {
             held: Default::default(),
             received: Vec::new(),
             tried: Vec::new(),
+            fragmenting: Vec::new(),
         }
     }
 
@@ -227,13 +236,14 @@ impl Peer {
         tokio::task::yield_now().await;
         t.poll_once_assert_pending().await;
         let mut arrived = false;
-        for msg in t.take_sent() {
+        for (msg, fragmenting) in t.take_sent_fragmenting() {
             if msg.header.get_type() != Data {
                 continue;
             }
             let (seq_nr, len) = (msg.header.seq_nr.0, msg.payload().len());
-            let taken = len <= self.passes;
+            let taken = len <= self.passes || fragmenting == Some(crate::Fragmenting::Allowed);
             self.tried.push((seq_nr, len, taken));
+            self.fragmenting.push(fragmenting);
             if taken {
                 self.held.insert(seq_nr, msg.payload().to_vec());
                 arrived = true;
@@ -267,10 +277,20 @@ impl Peer {
 // A stream with 1 MiB written, of bytes that each say where they belong,
 // run until it sends full-size segments.
 async fn settled_at_full_size(peer: &mut Peer) -> (super::TestVsock, Vec<u8>) {
+    let (mut t, written) = writing(RememberingTransport::new(ADDR_1)).await;
+    while t.vsock.segment_sizes.mss() < 1452 {
+        peer.round(&mut t).await;
+    }
+    (t, written)
+}
+
+// A stream over `transport` with 1 MiB written, of bytes that each say
+// where they belong.
+async fn writing(transport: RememberingTransport) -> (super::TestVsock, Vec<u8>) {
     let env = MockUtpEnvironment::new();
     let args = test_stream_args(&env, false);
     let mut t = make_test_vsock_on(
-        RememberingTransport::new(ADDR_1),
+        transport,
         SocketOpts {
             remote_inactivity_timeout: Some(Duration::from_secs(60)),
             vsock_tx_bufsize_bytes_initial: Some(non_zero_const!(1024 * 1024)),
@@ -286,10 +306,57 @@ async fn settled_at_full_size(peer: &mut Peer) -> (super::TestVsock, Vec<u8>) {
         .write_all(&written)
         .await
         .unwrap();
-    while t.vsock.segment_sizes.mss() < 1452 {
+    (t, written)
+}
+
+// A path that drops every packet larger than 1000 bytes sent forbidding
+// fragmentation, and fragments one sent allowing it. Only a probe the
+// stream gave up on is sent allowing fragmentation, on every send after it
+// was given up; a live probe never is, and nothing larger than the path
+// goes as plain data. Every byte arrives, in order.
+#[tokio::test]
+async fn only_a_given_up_probe_is_sent_allowing_fragmentation() {
+    setup_test_logging();
+    let transport = RememberingTransport::new(ADDR_1);
+    transport.set_controls_fragmenting();
+    let (mut t, written) = writing(transport).await;
+    let mut peer = Peer::new();
+    peer.passes = 1000 - 48;
+    while peer.received.len() < written.len() {
         peer.round(&mut t).await;
     }
-    (t, written)
+    assert!(peer.received == written, "every byte arrived, in order");
+
+    // Each probe's size, by sequence number, and the probes given up on.
+    let mut probes = std::collections::HashMap::new();
+    let mut given_up = std::collections::HashSet::new();
+    for (&(seq_nr, len, _), fragmenting) in peer.tried.iter().zip(&peer.fragmenting) {
+        match fragmenting {
+            Some(crate::Fragmenting::Never) => {
+                assert!(
+                    !given_up.contains(&seq_nr),
+                    "{seq_nr} probed after giving up"
+                );
+                probes.insert(seq_nr, len);
+            }
+            Some(crate::Fragmenting::Allowed) => {
+                assert_eq!(
+                    probes.get(&seq_nr),
+                    Some(&len),
+                    "{seq_nr} is a probe, whole"
+                );
+                given_up.insert(seq_nr);
+            }
+            None => {
+                assert!(
+                    !given_up.contains(&seq_nr),
+                    "{seq_nr} resent forbidding fragmentation"
+                );
+                assert!(len <= peer.passes, "{seq_nr}: {len} bytes as plain data");
+            }
+        }
+    }
+    assert!(!given_up.is_empty(), "no probe was given up on");
 }
 
 // The path's MTU drops from 1500 to 1000 under a stream sending full-size

@@ -60,7 +60,7 @@ use crate::{
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
     stream_dispatch::{StreamArgs, UtpStreamStarter},
-    traits::{Transport, UtpEnvironment},
+    traits::{Fragmenting, Transport, UtpEnvironment},
     utils::FnDropGuard,
 };
 use tokio::sync::{OwnedSemaphorePermit, mpsc, oneshot};
@@ -1664,13 +1664,19 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
         gate: &mut SendGate,
         cx: &mut std::task::Context<'_>,
         bufs: &[IoSlice<'_>],
-        addr: SocketAddr,
+        Destination { addr, fragmenting }: Destination,
     ) -> std::io::Result<bool> {
         let total_len: usize = bufs.iter().map(|buf| buf.len()).sum();
         let shared = sender.is_none();
-        let sent = self.poll_send_gated(gate, cx, shared, |cx| match sender {
-            Some(sender) => sender.poll_send_to_vectored(cx, bufs, addr),
-            None => transport.poll_send_to_vectored(cx, bufs, addr),
+        let sent = self.poll_send_gated(gate, cx, shared, |cx| match (sender, fragmenting) {
+            (Some(sender), None) => sender.poll_send_to_vectored(cx, bufs, addr),
+            (None, None) => transport.poll_send_to_vectored(cx, bufs, addr),
+            (Some(sender), Some(fragmenting)) => {
+                sender.poll_send_to_vectored_fragmenting(cx, bufs, addr, fragmenting)
+            }
+            (None, Some(fragmenting)) => {
+                transport.poll_send_to_vectored_fragmenting(cx, bufs, addr, fragmenting)
+            }
         });
         let Some(sent) = sent else {
             return Ok(true);
@@ -1701,6 +1707,14 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
         }
         Ok(false)
     }
+}
+
+/// Where a packet goes, and whether it is sent through the fragmenting
+/// send, and as which kind.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Destination {
+    pub(crate) addr: SocketAddr,
+    pub(crate) fragmenting: Option<Fragmenting>,
 }
 
 #[cfg(test)]
