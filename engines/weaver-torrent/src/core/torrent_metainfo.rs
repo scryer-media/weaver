@@ -43,14 +43,32 @@ pub struct ParsedTorrent<BufType> {
     pub info_bytes: BufType,
 }
 
+/// The largest .torrent file read, from any source (qBittorrent
+/// `Preferences::getTorrentFileSizeLimit`, preferences.cpp:325, 5.3.0,
+/// passed to libtorrent as `load_torrent_limits::max_buffer_size`,
+/// torrentdescriptor.cpp:86).
+pub const MAX_TORRENT_FILE_BYTES: usize = 100 * 1024 * 1024;
+
+/// The most bencode tokens a .torrent file or a torrent's metadata may hold
+/// (qBittorrent `Preferences::getBdecodeTokenLimit`, preferences.cpp:351,
+/// 5.3.0, passed to libtorrent as `load_torrent_limits::max_decode_tokens`,
+/// torrentdescriptor.cpp:88, and as `settings_pack::metadata_token_limit`,
+/// sessionimpl.cpp:2098).
+pub const MAX_TORRENT_TOKENS: usize = 10_000_000;
+
 /// Parse torrent metainfo from bytes, with its info hashes. Bytes past the
 /// torrent's dict are ignored, as libtorrent's `bdecode` ignores them. A v2
 /// torrent's info and piece layers are checked here, as libtorrent loads
-/// them (`parse_torrent_file`).
+/// them (`parse_torrent_file`). A buffer over [`MAX_TORRENT_FILE_BYTES`], or
+/// a torrent of more than [`MAX_TORRENT_TOKENS`] tokens, is refused.
 pub fn torrent_from_bytes<'de>(buf: &'de [u8]) -> crate::core::Result<TorrentMetaV1<ByteBuf<'de>>> {
-    let (mut t, _): (TorrentMetaV1<ByteBuf<'_>>, _) = crate::bencode::from_bytes_with_rest(buf)
-        .inspect_err(|e| tracing::trace!("error deserializing torrent: {e:#}"))
-        .map_err(|e| e.into_kind())?;
+    if buf.len() > MAX_TORRENT_FILE_BYTES {
+        return Err(Error::TorrentTooLarge);
+    }
+    let (mut t, _): (TorrentMetaV1<ByteBuf<'_>>, _) =
+        crate::bencode::from_bytes_with_rest_limited(buf, MAX_TORRENT_TOKENS)
+            .inspect_err(|e| tracing::trace!("error deserializing torrent: {e:#}"))
+            .map_err(|e| e.into_kind())?;
     t.info_hashes = t.info.data.check_info_bytes(t.info.raw_bytes.as_ref())?;
     t.info_hash = t.info_hashes.best();
     if t.info.data.meta_version() >= 2 {
@@ -1457,6 +1475,44 @@ mod tests {
     }
 
     #[test]
+    fn a_torrent_file_past_the_byte_limit_is_refused() {
+        // Bytes past the dict are not read, so a real torrent padded to the
+        // limit loads, and one byte more is refused before any is read.
+        let mut padded = TORRENT_BYTES.to_vec();
+        padded.resize(MAX_TORRENT_FILE_BYTES, 0);
+        assert!(torrent_from_bytes(&padded).is_ok());
+        padded.push(0);
+        assert!(matches!(
+            torrent_from_bytes(&padded),
+            Err(Error::TorrentTooLarge)
+        ));
+    }
+
+    #[test]
+    fn a_torrent_file_past_the_token_limit_is_refused() {
+        // A real torrent with a last key the reader ignores, a list of
+        // `strings` empty strings: its key, the list, the strings and the
+        // list's end are each a token.
+        fn with_padding(strings: usize) -> Vec<u8> {
+            let (end, dict) = TORRENT_BYTES.split_last().unwrap();
+            assert_eq!(*end, b'e');
+            [dict, b"4:zzzzl", &b"0:".repeat(strings), b"ee"].concat()
+        }
+        let own = (1..)
+            .find(|&n| {
+                crate::bencode::from_bytes_limited::<TorrentMetaV1Borrowed>(TORRENT_BYTES, n)
+                    .is_ok()
+            })
+            .unwrap();
+        let fits = MAX_TORRENT_TOKENS - own - 3;
+        assert!(torrent_from_bytes(&with_padding(fits)).is_ok());
+        assert!(matches!(
+            torrent_from_bytes(&with_padding(fits + 1)),
+            Err(Error::Bencode(crate::bencode::DeserializeError::TokenLimit))
+        ));
+    }
+
+    #[test]
     fn test_serialize_then_deserialize_bencode() {
         let torrent = from_bytes::<TorrentMetaV1<ByteBuf>>(TORRENT_BYTES)
             .unwrap()
@@ -1695,8 +1751,8 @@ mod tests {
         assert_eq!(read.get(), MAX_DIRECTORY_DEPTH + 2);
         // One just inside the limit is read whole and taken.
         read.set(0);
-        let inside =
-            std::iter::repeat_n(&b"d"[..], MAX_DIRECTORY_DEPTH + 1).inspect(|_| read.set(read.get() + 1));
+        let inside = std::iter::repeat_n(&b"d"[..], MAX_DIRECTORY_DEPTH + 1)
+            .inspect(|_| read.set(read.get() + 1));
         assert!(check_components(inside).is_ok());
         assert_eq!(read.get(), MAX_DIRECTORY_DEPTH + 1);
     }

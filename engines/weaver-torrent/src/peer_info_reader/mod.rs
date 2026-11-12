@@ -12,13 +12,13 @@ use std::{
     time::Duration,
 };
 
-use crate::bencode::from_bytes;
+use crate::bencode::from_bytes_limited;
 use crate::buffers::{ByteBuf, ByteBufOwned};
 use crate::core::{
     constants::CHUNK_SIZE,
     hash_id::{Id20, InfoHashes},
     lengths::ChunkInfo,
-    torrent_metainfo::TorrentMetaV1Info,
+    torrent_metainfo::{MAX_TORRENT_TOKENS, TorrentMetaV1Info},
 };
 use crate::peer_protocol::{
     Handshake, Message,
@@ -44,6 +44,24 @@ use crate::{
     stream_connect::{ConnectionKind, StreamConnector},
     torrent_state::live::peers::PeerStates,
 };
+
+/// Metadata that passed its hash check, decoded as an info dict of at most
+/// [`MAX_TORRENT_TOKENS`] tokens (libtorrent `torrent::set_metadata` reads it
+/// within `settings_pack::metadata_token_limit`, torrent.cpp:7933, v2.0.15).
+fn decode_info(
+    buf: Bytes,
+) -> Result<(TorrentMetaV1Info<ByteBufOwned>, ByteBufOwned), crate::bencode::DeserializeError> {
+    from_bytes_limited::<TorrentMetaV1Info<ByteBuf>>(&buf, MAX_TORRENT_TOKENS)
+        .map(|i| {
+            use crate::clone_to_owned::CloneToOwned;
+            i.clone_to_owned(Some(&buf))
+        })
+        .map_err(|e| {
+            trace!("error deserializing TorrentMetaV1Info: {e:#}");
+            e.into_kind()
+        })
+        .map(|i| (i, ByteBufOwned(buf)))
+}
 
 /// Fetches metadata from the peer at `addr`, one of `peers`, which says
 /// which handshake the connection tries and hears which one completed, as
@@ -617,17 +635,7 @@ impl PeerConnectionHandler for Handler {
             }
             Recorded::Complete(buf) => buf,
         };
-        let buf = Bytes::from(buf);
-        let info = from_bytes::<TorrentMetaV1Info<ByteBuf>>(&buf)
-            .map(|i| {
-                use crate::clone_to_owned::CloneToOwned;
-                i.clone_to_owned(Some(&buf))
-            })
-            .map_err(|e| {
-                trace!("error deserializing TorrentMetaV1Info: {e:#}");
-                e.into_kind()
-            })
-            .map(|i| (i, ByteBufOwned(buf)));
+        let info = decode_info(Bytes::from(buf));
 
         self.result_tx
             .lock()

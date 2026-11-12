@@ -14,8 +14,8 @@ mod soft_error;
 pub use bencode_value::*;
 pub use deserialize::{
     BencodeDeserializer, DEFAULT_MAX_DEPTH, Error as DeserializeError,
-    ErrorWithContext as DeserializeErrorWithContext, WithRawBytes, from_bytes,
-    from_bytes_with_rest,
+    ErrorWithContext as DeserializeErrorWithContext, WithRawBytes, from_bytes, from_bytes_limited,
+    from_bytes_with_rest, from_bytes_with_rest_limited,
 };
 pub use serialize::{Error as SerializeError, bencode_serialize_to_writer};
 pub use soft_error::has_soft_error;

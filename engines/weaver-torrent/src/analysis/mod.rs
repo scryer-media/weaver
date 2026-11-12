@@ -739,6 +739,7 @@ fn load_reason(error: &crate::core::Error) -> &'static str {
         Error::TooManyPieces => "too_many_pieces",
         Error::InvalidPieceHashes { .. } => "piece_hash_count",
         Error::TooManyChunks => "too_many_blocks",
+        Error::TorrentTooLarge => "too_large",
     }
 }
 

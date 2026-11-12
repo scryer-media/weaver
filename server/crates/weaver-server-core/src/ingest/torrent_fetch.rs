@@ -9,7 +9,6 @@
 use std::time::Duration;
 
 use crate::proxies::{Consumer, FetchOptions, ProxyRuntime, TorrentScope, routed_fetch};
-use crate::security::RuntimeSecurityConfig;
 use crate::torrents::identity::ClientIdentity;
 
 const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -17,7 +16,8 @@ const MAX_REDIRECTS: usize = 10;
 
 /// The bytes at `url`, fetched on the torrent route of `scope` as `client`,
 /// with `cookie` sent to the host named, and only to it, when one is given.
-/// A body is bounded like an NZB's.
+/// A body is bounded as a .torrent file is
+/// ([`weaver_torrent::MAX_TORRENT_FILE_BYTES`]).
 pub async fn fetch_torrent_url(
     runtime: &ProxyRuntime,
     scope: TorrentScope,
@@ -54,7 +54,7 @@ pub async fn fetch_torrent_url(
     if !response.status().is_success() {
         return Err(format!("HTTP {}", response.status()));
     }
-    let limit = RuntimeSecurityConfig::from_env_or_default_for_tests().nzb_decompressed_limit_bytes;
+    let limit = weaver_torrent::MAX_TORRENT_FILE_BYTES as u64;
     let bytes = crate::proxies::read_body(response, limit).await?;
     if bytes.is_empty() {
         return Err("empty response body".into());
@@ -153,8 +153,7 @@ mod tests {
     async fn a_body_past_the_cap_is_refused() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let limit =
-            RuntimeSecurityConfig::from_env_or_default_for_tests().nzb_decompressed_limit_bytes;
+        let limit = weaver_torrent::MAX_TORRENT_FILE_BYTES;
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             read_request(&mut stream).await;
