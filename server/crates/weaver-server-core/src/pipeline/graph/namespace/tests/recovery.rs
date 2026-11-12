@@ -727,3 +727,71 @@ fn a_repair_stopped_by_shutdown_reads_nothing_applies_nothing_and_rules_again() 
     job.rule(false);
     assert_eq!(job.file("video.mkv"), b"goOKgood");
 }
+
+// The cuts as they were first made: every boundary of every size, then
+// sorted and each kept once.
+fn listed_cuts(range: ByteRange, sizes: &[u64]) -> Vec<u64> {
+    let mut cuts = Vec::new();
+    for size in sizes.iter().copied().filter(|size| *size > 0) {
+        let mut cut = (range.start / size + 1).checked_mul(size);
+        while let Some(at) = cut.filter(|at| *at < range.end) {
+            cuts.push(at);
+            cut = at.checked_add(size);
+        }
+    }
+    cuts.sort_unstable();
+    cuts.dedup();
+    cuts
+}
+
+#[test]
+fn block_cuts_are_every_boundary_of_every_size_once() {
+    use crate::pipeline::graph::namespace::recovery::block_cuts;
+    let lists: &[&[u64]] = &[
+        &[],
+        &[0],
+        &[1],
+        &[4],
+        &[8, 4],
+        &[12, 8],
+        &[12, 8, 12, 20, 0],
+        &[3, 5, 7],
+        &[7, 0, 7, 21, 14, 6],
+        &[64, 4096, 1000, 1000],
+        &[5000, 9],
+        &[u64::MAX, 4],
+    ];
+    for start in [0, 1, 5, 63, 64, 1000, u64::MAX - 100] {
+        for len in [0, 1, 4, 7, 100, 4097] {
+            let Some(end) = u64::checked_add(start, len) else {
+                continue;
+            };
+            let range = ByteRange::new(start, end);
+            for sizes in lists {
+                assert_eq!(
+                    block_cuts(range, &mut sizes.to_vec()),
+                    listed_cuts(range, sizes),
+                    "{range:?} {sizes:?}"
+                );
+            }
+        }
+    }
+}
+
+// Thousands of sets cutting four-byte blocks over a mebibyte: one cut per
+// distinct boundary, and room for no more.
+#[test]
+fn block_cuts_keep_only_the_distinct_boundaries() {
+    use crate::pipeline::graph::namespace::recovery::block_cuts;
+    let range = ByteRange::new(0, 1 << 20);
+    let mut repeated = vec![4; 4096];
+    let cuts = block_cuts(range, &mut repeated);
+    assert_eq!(cuts.len(), (1 << 18) - 1);
+    assert_eq!(cuts.capacity(), cuts.len());
+    assert!(cuts.windows(2).all(|pair| pair[0] < pair[1]));
+
+    let mut distinct: Vec<u64> = (1..=4096).rev().map(|at| at * 4).collect();
+    let cuts = block_cuts(range, &mut distinct);
+    assert_eq!(cuts.len(), (1 << 18) - 1);
+    assert_eq!(cuts.capacity(), cuts.len());
+}

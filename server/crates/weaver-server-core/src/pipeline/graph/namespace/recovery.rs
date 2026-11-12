@@ -11,7 +11,9 @@
 // one write path. A set parses, verifies and rewrites bytes; when, and over
 // what, is decided here, by the same rules at every depth.
 
+use std::cmp::Reverse;
 use std::collections::BTreeSet;
+use std::collections::binary_heap::{BinaryHeap, PeekMut};
 
 use bytes::Bytes;
 use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling};
@@ -1009,7 +1011,7 @@ impl NamespaceWriter {
                     recovery.block_sizes(&mut sizes);
                 }
             }
-            let cuts = block_cuts(range, &sizes);
+            let cuts = block_cuts(range, &mut sizes);
             let mut rest = arrival.bytes.clone();
             let mut at = range.start;
             for cut in cuts.into_iter().chain([range.end]) {
@@ -1461,17 +1463,53 @@ fn follow_founded(tree: &mut Tree, node: NodeId) -> Vec<NodeId> {
 
 // Where, inside `range`, a block of any of `sizes` begins: the cuts a
 // piece of evidence has to be split at for a set that folds blocks of that
-// size to take it whole.
-fn block_cuts(range: ByteRange, sizes: &[u64]) -> Vec<u64> {
-    let mut cuts: Vec<u64> = Vec::new();
-    for size in sizes.iter().copied().filter(|size| *size > 0) {
-        let mut cut = (range.start / size + 1).checked_mul(size);
-        while let Some(at) = cut.filter(|at| *at < range.end) {
-            cuts.push(at);
-            cut = at.checked_add(size);
+// size to take it whole. Each cut once, in order. The smallest size that
+// cuts the range leads; a size it divides cuts nowhere new, and every other
+// size merges in by its next cut, so nothing is kept but the cuts made.
+pub(super) fn block_cuts(range: ByteRange, sizes: &mut [u64]) -> Vec<u64> {
+    let first = |size: u64| {
+        (range.start / size + 1)
+            .checked_mul(size)
+            .filter(|at| *at < range.end)
+    };
+    let next = |at: u64, size: u64| at.checked_add(size).filter(|at| *at < range.end);
+    sizes.sort_unstable();
+    let mut sizes = sizes.iter().copied().filter(|size| *size > 0);
+    let Some((lead, at)) = sizes.by_ref().find_map(|size| Some((size, first(size)?))) else {
+        return Vec::new();
+    };
+    let mut rest = BinaryHeap::new();
+    let mut last = lead;
+    for size in sizes {
+        if size == last || size % lead == 0 {
+            continue;
+        }
+        last = size;
+        if let Some(at) = first(size) {
+            rest.push(Reverse((at, size)));
         }
     }
-    cuts.sort_unstable();
-    cuts.dedup();
+    let mut cuts = Vec::with_capacity(index((range.end - 1) / lead - range.start / lead));
+    let mut ahead = Some(at);
+    while let Some(cut) = ahead
+        .into_iter()
+        .chain(rest.peek().map(|Reverse((at, _))| *at))
+        .min()
+    {
+        cuts.push(cut);
+        if ahead == Some(cut) {
+            ahead = next(cut, lead);
+        }
+        while let Some(mut head) = rest.peek_mut()
+            && head.0.0 == cut
+        {
+            match next(cut, head.0.1) {
+                Some(at) => head.0.0 = at,
+                None => {
+                    PeekMut::pop(head);
+                }
+            }
+        }
+    }
     cuts
 }
