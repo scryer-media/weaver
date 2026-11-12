@@ -106,9 +106,46 @@ struct ValueError {
     error: String,
 }
 
+// Every journal mode SQLite reports.
+const JOURNAL_MODES: [&str; 6] = ["delete", "truncate", "persist", "memory", "wal", "off"];
+
 const PAGE_VALUES: [&str; 4] = ["page_size", "page_count", "freelist_count", "journal_mode"];
 
+// The file and its manifest entries. Each also carries its name-free form,
+// which ships when the stand-in table cannot be built: the same numbers,
+// codes and reasons, with every error sentence, which may hold OS or
+// database text and so a path, replaced by a fixed one for its reason.
 pub(super) fn database_components(sizes: &SqliteFileSizes, pages: &PageOutcome) -> Vec<Component> {
+    let as_read = components_with(sizes, pages, Sentences::AsRead);
+    let fixed = components_with(sizes, pages, Sentences::Fixed);
+    as_read
+        .into_iter()
+        .zip(fixed)
+        .map(|(as_read, fixed)| as_read.names_nothing_as(fixed.outcome))
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum Sentences {
+    // The error text as the OS or the database gave it.
+    AsRead,
+    // One fixed sentence per reason code.
+    Fixed,
+}
+
+fn fixed_sentence(reason: &str) -> &'static str {
+    match reason {
+        REASON_TIMED_OUT => "the database did not answer in time",
+        REASON_UNREADABLE => "the file's size could not be read",
+        _ => "the value could not be read",
+    }
+}
+
+fn components_with(
+    sizes: &SqliteFileSizes,
+    pages: &PageOutcome,
+    sentences: Sentences,
+) -> Vec<Component> {
     let mut errors = Vec::new();
     let files = DatabaseFiles {
         database: file_size(&mut errors, "database_bytes", &sizes.database_file),
@@ -143,8 +180,35 @@ pub(super) fn database_components(sizes: &SqliteFileSizes, pages: &PageOutcome) 
             (None, None, None, None)
         }
     };
+    // Both forms carry the same manifest entries, one per value read as
+    // missing, so each entry has its name-free twin.
+    let manifest_entries = errors.len();
+    // The journal mode is text the database returns; without the table only
+    // one of SQLite's own modes is let through. One that is not is named in
+    // the file's errors only.
+    let journal_mode = match (sentences, journal_mode) {
+        (Sentences::Fixed, Some(mode)) => {
+            match JOURNAL_MODES.iter().find(|known| **known == mode) {
+                Some(known) => Some(*known),
+                None => {
+                    errors.push(ValueError {
+                        value: "journal_mode",
+                        reason: REASON_READ_FAILED,
+                        error: String::new(),
+                    });
+                    None
+                }
+            }
+        }
+        (_, mode) => mode,
+    };
+    if let Sentences::Fixed = sentences {
+        for error in &mut errors {
+            error.error = fixed_sentence(error.reason).to_string();
+        }
+    }
 
-    let mut components: Vec<Component> = errors
+    let mut components: Vec<Component> = errors[..manifest_entries]
         .iter()
         .map(|failed| {
             Component::failed_because(

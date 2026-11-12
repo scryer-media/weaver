@@ -25,6 +25,12 @@ pub(super) struct Component {
     // A stable code for why there is no file, or why the file is partial,
     // beside the sentence in `outcome`. `None` where nothing tells it apart.
     pub(super) reason: Option<&'static str>,
+    // The component's form when the stand-in table cannot be built, set
+    // where it is created and only for a component that names nothing by
+    // construction: numbers, booleans and fixed codes, with no text read from
+    // the operator, the OS or the database. A component without one is left
+    // out with the rest.
+    pub(super) without_table: Option<Result<Vec<u8>, String>>,
 }
 
 // How a component's bytes are read, which is how the sanitizer reaches the
@@ -63,6 +69,7 @@ impl Component {
             form,
             outcome: Ok(data),
             reason: None,
+            without_table: None,
         }
     }
 
@@ -76,6 +83,7 @@ impl Component {
             form: Form::Text,
             outcome: Err(error.to_string()),
             reason: None,
+            without_table: None,
         }
     }
 
@@ -88,6 +96,26 @@ impl Component {
         Self {
             reason: Some(reason),
             ..Self::failed(name, error)
+        }
+    }
+
+    // Marks a component whose outcome names nothing as it stands, so it
+    // ships as it is when the stand-in table cannot be built.
+    pub(super) fn names_nothing(self) -> Self {
+        let without_table = Some(self.outcome.clone());
+        Self {
+            without_table,
+            ..self
+        }
+    }
+
+    // Marks a component that ships as `outcome` when the stand-in table
+    // cannot be built: the same facts with every sentence that may carry a
+    // name replaced by a fixed one.
+    pub(super) fn names_nothing_as(self, outcome: Result<Vec<u8>, String>) -> Self {
+        Self {
+            without_table: Some(outcome),
+            ..self
         }
     }
 

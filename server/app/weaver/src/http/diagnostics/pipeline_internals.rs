@@ -34,7 +34,9 @@ pub(super) const ANSWER_WAIT: Duration = Duration::from_secs(3);
 const REASON_PIPELINE_STOPPED: &str = "pipeline_stopped";
 
 // The file written in place of the snapshot when the pipeline does not
-// answer.
+// answer. Every field is a number, a boolean or a fixed code, never text read
+// from a job or an error: it ships without the stand-in table, so keep it
+// that way.
 #[derive(Debug, Serialize)]
 struct UnansweredInternals {
     // Always false: this is not the pipeline's snapshot.
@@ -117,9 +119,16 @@ pub(super) async fn collect_pipeline_internals_within(
         ),
     };
     let fallback = unanswered(handle, reason, wait, now());
+    // The fallback holds only numbers, booleans and fixed codes, so it ships
+    // even when the stand-in table cannot be built; the pipeline's error may
+    // carry a name, so its entry then says only what the code says. The
+    // answered snapshot names jobs and always waits for the table.
     vec![
-        Component::failed_because(FILE, reason, error),
-        Component::json(FILE, &fallback),
+        Component::failed_because(FILE, reason, error).names_nothing_as(Err(format!(
+            "the pipeline did not answer the diagnostics request; {FILE} holds what \
+                 could be read without it"
+        ))),
+        Component::json(FILE, &fallback).names_nothing(),
     ]
 }
 

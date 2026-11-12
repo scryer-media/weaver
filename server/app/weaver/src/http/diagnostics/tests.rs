@@ -1247,3 +1247,257 @@ async fn a_stand_in_table_that_does_not_answer_in_time_leaves_every_component_ou
         assert!(!String::from_utf8_lossy(data).contains("Olaf"));
     }
 }
+
+// Archives `components` as the endpoint does when the stand-in table did not
+// answer in time.
+async fn archive_without_the_table(components: Vec<Component>) -> Vec<(String, Vec<u8>)> {
+    let (components, sanitized) = sanitize_components(
+        components,
+        Err(bounded::ReadRefused::timed_out()),
+        plain_local(),
+    )
+    .await;
+    let archive =
+        archive::build_archive(components, "0.0.0-test", "2000-01-01T00:00:00Z", sanitized)
+            .expect("archive builds");
+    unpack_package(&archive)
+}
+
+const PLANTED_NAME: &str = "Olaf.Secret.Name";
+
+fn named_components() -> Vec<Component> {
+    vec![
+        Component::bytes(
+            "weaver.log",
+            format!("INFO {PLANTED_NAME} done\n").into_bytes(),
+        ),
+        Component::json("queue.json", &serde_json::json!({ "name": PLANTED_NAME })),
+    ]
+}
+
+fn assert_left_out_with_their_reasons(
+    members: &[(String, Vec<u8>)],
+    shipped: &str,
+    own_reasons: &[&str],
+) {
+    let manifest = manifest_of(members);
+    let mut files: Vec<&str> = manifest
+        .files
+        .iter()
+        .map(|file| file.name.as_str())
+        .collect();
+    files.sort_unstable();
+    let mut expected = [archive::MANIFEST_NAME, shipped];
+    expected.sort_unstable();
+    assert_eq!(files, expected);
+    let timed_out = Some(bounded::REASON_TIMED_OUT.to_string());
+    for name in ["queue.json", "weaver.log", "stand-in-table"] {
+        let entries: Vec<_> = manifest
+            .errors
+            .iter()
+            .filter(|error| error.name == name)
+            .collect();
+        assert_eq!(entries.len(), 1, "{name}: {:?}", manifest.errors);
+        assert_eq!(entries[0].reason, timed_out, "{name}");
+    }
+    let mut shipped_reasons: Vec<String> = manifest
+        .errors
+        .iter()
+        .filter(|error| error.name == shipped)
+        .map(|error| error.reason.clone().expect("a reason code"))
+        .collect();
+    shipped_reasons.sort_unstable();
+    let mut own_reasons: Vec<String> = own_reasons
+        .iter()
+        .map(|reason| reason.to_string())
+        .collect();
+    own_reasons.sort_unstable();
+    assert_eq!(shipped_reasons, own_reasons);
+    for (member, data) in members {
+        assert!(
+            !String::from_utf8_lossy(data).contains(PLANTED_NAME),
+            "{member} carries the planted name"
+        );
+    }
+}
+
+// With no stand-in table, `database.json` still ships with its numbers and
+// codes; the OS and database error text, which can hold a path, is replaced
+// by a fixed sentence per reason; every other component is left out with
+// `timed_out`.
+#[tokio::test]
+async fn database_facts_ship_without_the_table_and_drop_error_text() {
+    use weaver_server_core::persistence::connection::{
+        SqliteFileSize, SqliteFileSizes, SqlitePageFacts,
+    };
+
+    let sizes = SqliteFileSizes {
+        database_file: SqliteFileSize::Present(8_192_000),
+        wal_file: SqliteFileSize::Present(4_096),
+        shm_file: SqliteFileSize::Unreadable(format!(
+            "/srv/{PLANTED_NAME}/weaver.db-shm: permission denied"
+        )),
+    };
+    let pages = database_facts::PageOutcome::Read(SqlitePageFacts {
+        page_size: Ok(4096),
+        page_count: Err(format!("unable to open /srv/{PLANTED_NAME}/weaver.db")),
+        freelist_count: Ok(12),
+        journal_mode: Ok("wal".to_string()),
+    });
+    let mut components = named_components();
+    components.extend(database_facts::database_components(&sizes, &pages));
+    let members = archive_without_the_table(components).await;
+
+    let database = package_member_json(&members, database_facts::FILE);
+    assert_eq!(database["files"]["database"]["bytes"], 8_192_000);
+    assert_eq!(database["files"]["wal"]["bytes"], 4_096);
+    assert_eq!(database["files"]["shm"]["state"], "unreadable");
+    assert_eq!(database["page_size"], 4096);
+    assert!(database["page_count"].is_null());
+    assert_eq!(database["freelist_count"], 12);
+    assert_eq!(database["journal_mode"], "wal");
+    assert_eq!(
+        database_value_errors(&database),
+        [
+            (
+                "shm_bytes".to_string(),
+                database_facts::REASON_UNREADABLE.to_string()
+            ),
+            (
+                "page_count".to_string(),
+                bounded::REASON_READ_FAILED.to_string()
+            ),
+        ]
+    );
+    assert_left_out_with_their_reasons(
+        &members,
+        database_facts::FILE,
+        &[
+            database_facts::REASON_UNREADABLE,
+            bounded::REASON_READ_FAILED,
+        ],
+    );
+}
+
+// A journal mode SQLite does not define is database text, so without the
+// table it is not shipped; it is null and named as unread in the file.
+#[tokio::test]
+async fn an_unknown_journal_mode_does_not_ship_without_the_table() {
+    use weaver_server_core::persistence::connection::SqlitePageFacts;
+
+    let pages = database_facts::PageOutcome::Read(SqlitePageFacts {
+        page_size: Ok(4096),
+        page_count: Ok(2000),
+        freelist_count: Ok(0),
+        journal_mode: Ok(PLANTED_NAME.to_string()),
+    });
+    let mut components = named_components();
+    components.extend(database_facts::database_components(
+        &synthetic_database_sizes(),
+        &pages,
+    ));
+    let members = archive_without_the_table(components).await;
+
+    let database = package_member_json(&members, database_facts::FILE);
+    assert!(database["journal_mode"].is_null());
+    assert_eq!(database["page_count"], 2000);
+    // Named in the file's own errors; the manifest keeps the entries the
+    // file has with the table.
+    assert_eq!(
+        database_value_errors(&database),
+        [
+            (
+                "shm_bytes".to_string(),
+                database_facts::REASON_UNREADABLE.to_string()
+            ),
+            (
+                "journal_mode".to_string(),
+                bounded::REASON_READ_FAILED.to_string()
+            ),
+        ]
+    );
+    assert_left_out_with_their_reasons(
+        &members,
+        database_facts::FILE,
+        &[database_facts::REASON_UNREADABLE],
+    );
+}
+
+// With no stand-in table, the unanswered pipeline fallback still ships as it
+// was written, its manifest entry says only what its code says, and every
+// other component is left out.
+#[tokio::test]
+async fn the_unanswered_pipeline_fallback_ships_without_the_table() {
+    use weaver_server_core::{JobStatus, PipelineMetrics, SharedPipelineState};
+
+    let metrics = PipelineMetrics::new();
+    let origin = metrics.pipeline_turn.origin();
+    let (event_tx, _) = tokio::sync::broadcast::channel(4);
+    let state = SharedPipelineState::new(metrics.clone(), Vec::new());
+    state.publish_jobs(vec![
+        queued_info(1, JobStatus::Queued),
+        queued_info(2, JobStatus::Repairing),
+    ]);
+    // No pipeline runs behind this handle, so the request is never answered.
+    let handle = SchedulerHandle::new(event_tx, state);
+    let fallback =
+        pipeline_internals::collect_pipeline_internals_within(&handle, Duration::ZERO, || {
+            origin + Duration::from_secs(5)
+        })
+        .await;
+    let written = fallback
+        .iter()
+        .find_map(|component| component.outcome.as_ref().ok())
+        .expect("the fallback is written")
+        .clone();
+    let mut components = named_components();
+    components.extend(fallback);
+    let members = archive_without_the_table(components).await;
+
+    assert_eq!(
+        member_text(&members, pipeline_internals::FILE).as_bytes(),
+        written
+    );
+    let internals = package_member_json(&members, pipeline_internals::FILE);
+    assert_eq!(internals["answered"], false);
+    assert_eq!(internals["queue"]["jobs"], 2);
+    assert_left_out_with_their_reasons(
+        &members,
+        pipeline_internals::FILE,
+        &[bounded::REASON_TIMED_OUT],
+    );
+}
+
+// With a table that builds, marking `database.json` name-free changes
+// nothing: it leaves the pass byte for byte as it did unmarked.
+#[tokio::test]
+async fn a_healthy_table_leaves_database_facts_unchanged() {
+    use weaver_server_core::persistence::connection::SqlitePageFacts;
+
+    let pages = || {
+        database_facts::PageOutcome::Read(SqlitePageFacts {
+            page_size: Ok(4096),
+            page_count: Err("database is locked".to_string()),
+            freelist_count: Ok(12),
+            journal_mode: Ok("wal".to_string()),
+        })
+    };
+    let marked = database_facts::database_components(&synthetic_database_sizes(), &pages());
+    assert!(
+        marked
+            .iter()
+            .all(|component| component.without_table.is_some())
+    );
+    let unmarked: Vec<Component> =
+        database_facts::database_components(&synthetic_database_sizes(), &pages())
+            .into_iter()
+            .map(|component| Component {
+                without_table: None,
+                ..component
+            })
+            .collect();
+    let marked = archive_through_the_pass(marked).await;
+    let unmarked = archive_through_the_pass(unmarked).await;
+    assert_eq!(marked, unmarked);
+    assert!(member_text(&marked, database_facts::FILE).contains("permission denied"));
+}

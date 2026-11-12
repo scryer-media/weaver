@@ -28,8 +28,10 @@
 //    they identify nobody. The manifest records how many stand-ins the
 //    package allocated, so a reader knows the names are not real, and how
 //    many finished jobs the history holds: names are read for the 2,000 most
-//    recent. A table source that cannot be read leaves every component out.
-//    There is no way to turn this off. The one file that skips the pass is
+//    recent. A table source that cannot be read leaves every component out
+//    but the few that name nothing by construction, `database.json` and the
+//    pipeline-internals fallback, which then ship with fixed sentences in
+//    place of any error text. There is no way to turn this off. The one file that skips the pass is
 //    `nzb-reports.json`: the support reports in it are built from fixed
 //    names and generated tokens only, and join the package as written.
 // 3. **A failed component never fails the package.** Each piece records
@@ -302,17 +304,15 @@ async fn collect_components(
 
 // The one sanitizing pass over a collected package. A table source that
 // cannot be read, or a table that cannot be built, leaves every component
-// out: a table missing a source would let that source's names leave. The
+// out but those that name nothing by construction: a table missing a source
+// would let that source's names leave. The
 // pass scans every byte, so it runs off the async runtime.
 async fn sanitize_components(
     components: Vec<Component>,
     stored: Result<sanitize::StoredNames, bounded::ReadRefused>,
     local: sanitize::LocalNames,
 ) -> (Vec<Component>, archive::ManifestSanitized) {
-    let names: Vec<String> = components
-        .iter()
-        .map(|component| component.name.clone())
-        .collect();
+    let shells: Vec<Component> = components.iter().map(sanitize::shell_of).collect();
     let history_jobs_total = stored.as_ref().ok().map(|stored| stored.history_total);
     let schema_keys = SchemaShape::current()
         .map(SchemaShape::field_names)
@@ -333,19 +333,13 @@ async fn sanitize_components(
         };
         match result {
             Ok(stand_ins) => (components, stand_ins),
-            Err((error, code)) => {
-                let names = components.into_iter().map(|component| component.name);
-                (sanitize::left_out(&local, names, &error, code), 0)
-            }
+            Err((error, code)) => (sanitize::left_out(&local, components, &error, code), 0),
         }
     })
     .await;
     let (components, stand_ins) = pass.unwrap_or_else(|error| {
         let reason = format!("the stand-in table could not be built: {error}");
-        (
-            sanitize::left_out(&fallback, names.into_iter(), &reason, None),
-            0,
-        )
+        (sanitize::left_out(&fallback, shells, &reason, None), 0)
     });
     let sanitized = archive::ManifestSanitized {
         stand_ins: stand_ins as u64,
