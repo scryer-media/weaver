@@ -39,6 +39,10 @@ use crate::{TunnelError, wireguard::WgTcpListener};
 /// as the listener lives.
 pub const LISTEN_BACKLOG: usize = 16;
 
+// The tunnel holds a larger backlog to its own bound, so the pool above is
+// this many sockets only while it stays within that bound.
+const _: () = assert!(LISTEN_BACKLOG <= crate::wireguard::MAX_LISTEN_BACKLOG);
+
 /// How the provider at a WireGuard hop's far end forwards a port to it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PortForwarding {
@@ -115,6 +119,9 @@ async fn listen_in(
     };
     match provider.listen(port, LISTEN_BACKLOG).await {
         Ok(listener) => Ok((listener, lent)),
+        // A full tunnel is working, as it is for a dial: it has room again
+        // once a socket closes, so the hop is not blamed and stays up.
+        Err(error @ TunnelError::AtCapacity { .. }) => Err(error),
         // A tunnel that could not come up to listen is the hop's fault, as
         // one that could not come up to dial is.
         Err(error) => {
