@@ -2140,3 +2140,227 @@ async fn a_pool_only_torrents_run_through_opens_no_member_ahead() {
     assert_eq!(running_pool(&runtime).warmings(), 2);
     runtime.shutdown().await;
 }
+
+// A tunnel that records when it is brought up, stopped and dialed through.
+struct Recorded {
+    name: &'static str,
+    events: Arc<Mutex<Vec<String>>>,
+}
+#[async_trait::async_trait]
+impl TunnelProvider for Recorded {
+    async fn prepare(&self) -> Result<(), weaver_tunnel::TunnelError> {
+        self.record("up");
+        Ok(())
+    }
+    async fn retire(&self) {
+        self.record("down");
+    }
+    async fn dial(
+        &self,
+        _: &str,
+        _: u16,
+    ) -> Result<Box<dyn weaver_tunnel::TunnelStream>, weaver_tunnel::TunnelError> {
+        self.record("dial");
+        Err(weaver_tunnel::TunnelError::Engine("nothing answers".into()))
+    }
+    fn describe(&self) -> String {
+        self.name.into()
+    }
+}
+impl Recorded {
+    fn record(&self, what: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(format!("{what} {}", self.name));
+    }
+}
+
+// Two WireGuard profiles, 1 and 2, with the same key pair: one identity on
+// the server, saved twice. Each tunnel is a recorder named for its role.
+fn same_identity_runtime() -> (Arc<NetworkRuntime>, Configuration, Arc<Mutex<Vec<String>>>) {
+    use base64::Engine;
+    let key = |byte: u8| base64::engine::general_purpose::STANDARD.encode([byte; 32]);
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    for (id, name) in [(1, "live"), (2, "probe")] {
+        let events = events.clone();
+        runtime.install_fixture(id, Arc::new(Recorded { name, events }));
+    }
+    let mut config = runtime.configuration.read().unwrap().clone();
+    for id in [1, 2] {
+        config.profiles.insert(
+            id,
+            ProxyProfile {
+                id,
+                name: format!("wg-{id}"),
+                kind: ProxyKind::WireGuard,
+                host: "127.0.0.1".into(),
+                port: 9,
+                tunnel_addresses: vec!["10.0.0.2/32".into()],
+                dns_servers: vec![[10, 0, 0, 1].into()],
+                peer_public_key: Some(key(2)),
+                secrets: ProxySecrets {
+                    private_key: Some(key(1)),
+                    ..Default::default()
+                },
+                ..proxy()
+            },
+        );
+    }
+    runtime.apply_configuration(config.clone()).unwrap();
+    (runtime, config, events)
+}
+
+fn probe_target() -> Target {
+    Target {
+        host: "127.0.0.1".into(),
+        port: 9,
+        purpose: weaver_tunnel::pipe::Purpose::Probe,
+        addresses: Vec::new(),
+    }
+}
+
+// A live session with the identity, up.
+async fn live_session(runtime: &NetworkRuntime, config: &Configuration) -> Arc<dyn Dialer> {
+    let bottom = NetworkRuntime::bottom(config, SYSTEM_EGRESS_ID, Duration::from_secs(1)).unwrap();
+    let live = runtime.hop(config, 1, bottom.clone(), bottom, &[]).unwrap();
+    live.prepare().await.unwrap();
+    live
+}
+
+fn taken(events: &Mutex<Vec<String>>) -> Vec<String> {
+    std::mem::take(&mut *events.lock().unwrap())
+}
+
+// The test button's probe of a profile whose identity a live session holds
+// asks through that session's tunnel: it brings up no tunnel of its own,
+// and the live session stays up and stays the runtime's.
+#[tokio::test]
+async fn a_test_button_probe_asks_through_the_live_session_with_its_identity() {
+    let (runtime, config, events) = same_identity_runtime();
+    let live = live_session(&runtime, &config).await;
+    assert_eq!(taken(&events), ["up live"]);
+
+    let route = Route {
+        legs: vec![RouteLeg {
+            egress_id: SYSTEM_EGRESS_ID,
+            weight: 100,
+            path: LegPath::Direct,
+        }],
+        failover: Failover::default(),
+    };
+    let tests = runtime
+        .test_via(&route, TestSubject::Proxy(2), Some(("127.0.0.1".into(), 9)))
+        .await
+        .unwrap();
+    assert_eq!(tests.len(), 1);
+    let events = taken(&events);
+    assert!(events.contains(&"dial live".to_owned()), "{events:?}");
+    for never in ["up probe", "dial probe", "down live"] {
+        assert!(!events.contains(&never.to_owned()), "{events:?}");
+    }
+    let sessions = runtime
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(sessions.len() == 1 && Arc::ptr_eq(&sessions[0], &live));
+    runtime.shutdown().await;
+}
+
+// A drafted route's probe through a profile whose identity a live session
+// holds dials through that session, and leaves it up.
+#[tokio::test]
+async fn a_draft_route_probe_asks_through_the_live_session_with_its_identity() {
+    let (runtime, config, events) = same_identity_runtime();
+    let live = live_session(&runtime, &config).await;
+    assert_eq!(taken(&events), ["up live"]);
+
+    let draft = runtime
+        .draft_route(
+            Consumer::Rss(1),
+            RoutingPolicy {
+                legs: vec![RouteLeg {
+                    egress_id: SYSTEM_EGRESS_ID,
+                    weight: 100,
+                    path: LegPath::Ladder {
+                        rungs: vec![Rung::Proxy { id: 2 }],
+                        direct_fallback: false,
+                    },
+                }],
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert!(
+        draft
+            .leg_stage(0)
+            .unwrap()
+            .dial(&probe_target())
+            .await
+            .is_err()
+    );
+    drop(draft);
+    let events = taken(&events);
+    assert!(events.contains(&"dial live".to_owned()), "{events:?}");
+    for never in ["up probe", "dial probe", "down live"] {
+        assert!(!events.contains(&never.to_owned()), "{events:?}");
+    }
+    let sessions = runtime
+        .sessions
+        .lock()
+        .unwrap()
+        .values()
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(sessions.len() == 1 && Arc::ptr_eq(&sessions[0], &live));
+    runtime.shutdown().await;
+}
+
+// A probe of a profile whose identity no session holds brings up its own
+// tunnel, as before.
+#[tokio::test]
+async fn a_probe_with_no_live_session_dials_through_its_own_tunnel() {
+    let (runtime, _, events) = same_identity_runtime();
+    let draft = runtime
+        .draft_route(
+            Consumer::Rss(1),
+            RoutingPolicy {
+                legs: vec![RouteLeg {
+                    egress_id: SYSTEM_EGRESS_ID,
+                    weight: 100,
+                    path: LegPath::Ladder {
+                        rungs: vec![Rung::Proxy { id: 2 }],
+                        direct_fallback: false,
+                    },
+                }],
+                ..Default::default()
+            },
+            Duration::from_secs(1),
+        )
+        .unwrap();
+    assert!(
+        draft
+            .leg_stage(0)
+            .unwrap()
+            .dial(&probe_target())
+            .await
+            .is_err()
+    );
+    let events = taken(&events);
+    assert!(events.contains(&"dial probe".to_owned()), "{events:?}");
+    assert!(
+        !events.iter().any(|event| event.ends_with(" live")),
+        "{events:?}"
+    );
+    assert!(runtime.sessions.lock().unwrap().is_empty());
+    runtime.shutdown().await;
+}
