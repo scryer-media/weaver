@@ -185,12 +185,12 @@ impl SetState {
 
     // A verdict was on the members bound then and the unnamed ones it read;
     // others, or the same members bound to other files, void it. Returns
-    // whether it was voided.
+    // the members it was bound to when it was voided.
     pub(super) fn bind(
         &mut self,
         mut members: BTreeMap<FileId, MemberId>,
         unnamed: &[(MemberId, Length)],
-    ) -> bool {
+    ) -> Option<BTreeMap<FileId, MemberId>> {
         // A member bound before that nothing names now, as one a repair
         // knew by its slices, stays that file while no other member is.
         for (file, member) in &self.members {
@@ -214,13 +214,12 @@ impl SetState {
                     && !members.values().any(|bound| bound == member)
             })
             .collect();
-        let changed = members != self.members || unnamed != self.unnamed;
-        if changed {
-            self.members = members;
-            self.unnamed = unnamed;
-            self.last = None;
+        if members == self.members && unnamed == self.unnamed {
+            return None;
         }
-        changed
+        self.unnamed = unnamed;
+        self.last = None;
+        Some(std::mem::replace(&mut self.members, members))
     }
 
     pub(super) fn unnamed(&self) -> &[(MemberId, Length)] {
@@ -446,7 +445,7 @@ impl Front {
     }
 
     // The front a description states for its file.
-    fn described(length: u64, hash_16k: [u8; 16]) -> Self {
+    pub(super) fn described(length: u64, hash_16k: [u8; 16]) -> Self {
         Self {
             window: length.min(HASH_WINDOW),
             md5: hash_16k,

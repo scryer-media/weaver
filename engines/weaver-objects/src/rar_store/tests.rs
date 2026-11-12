@@ -1634,6 +1634,50 @@ fn the_recovery_record_is_announced() {
     }
 }
 
+// A volume carries one record, so however many recovery headers it holds,
+// one record is said for it and one entry kept: what is kept grows with the
+// volumes, not with the headers. The first header is the one said.
+#[test]
+fn many_recovery_headers_in_a_volume_say_one_record() {
+    for version in [Version::Rar5, Version::Rar4] {
+        for headers in [1, 4, 64] {
+            let mut options = split(version);
+            options.recovery = true;
+            options.recovery_headers = headers;
+            let volumes = write(&items(), &options);
+            let count = volumes.len();
+            let mut owner = Owner::named(store(), volumes);
+            owner.whole(4096);
+            no_trouble(&owner);
+            posted_whole(&owner);
+            let said: Vec<(usize, ByteRange)> = owner
+                .said
+                .iter()
+                .filter_map(|emit| match emit {
+                    Emit::RecoveryAt {
+                        volume,
+                        range,
+                        kind: RecoveryKind::Rar,
+                        ..
+                    } => Some((volume.0 as usize, *range)),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(said.len(), count, "{version:?} {headers} headers");
+            assert_eq!(owner.object.recovery_said.len(), count);
+            for volume in 0..count {
+                let record = vec![0xa5; 40 + volume];
+                let first = find(&owner.volumes[volume].1, &record) as u64;
+                assert!(
+                    said.iter()
+                        .any(|(found, range)| *found == volume && range.start == first),
+                    "{version:?} {headers} headers, volume {volume}: {said:?}"
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn unlock_bids_run_ahead_of_the_volume_being_read() {
     let mut options = Options::new(Version::Rar5);

@@ -142,11 +142,18 @@ fn a_stored_archive_says_the_same_whole_in_four_kib_frames_and_a_byte_at_a_time(
 }
 
 #[test]
-fn an_oversized_directory_is_handed_to_the_bounded_engine_before_it_is_read() {
-    let mut owner = Owner::single(Zip::new(), oversized_directory());
+fn a_directory_of_more_than_eight_mib_is_read_by_the_store() {
+    let archive = oversized_directory();
+    assert!(records::find_end(&archive).unwrap().size > 8 << 20);
+    let mut owner = Owner::single(Zip::new(), archive);
     owner.whole(usize::MAX >> 1);
-    assert!(has(&owner, &Emit::NeedsEngine(Why::Unsupported)));
-    assert!(owner.members.is_empty());
+    no_trouble(&owner);
+    assert_eq!(owner.members.len(), 129);
+    for index in 0..129 {
+        let got = owner.member(&format!("f{index:03}"));
+        assert_eq!(got.length, Some(0));
+        assert!(got.closed);
+    }
 }
 
 #[test]

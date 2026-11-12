@@ -736,9 +736,11 @@ impl NamespaceWriter {
             self.bind_recoveries(tree, builder, segments, node, out)?;
             let mut rewritten = std::collections::BTreeSet::new();
             // Whether every slice was turned away. A slice lands only where
-            // no repair wrote before it: a set that disagrees with another's
-            // repair loses there, so the two never rewrite each other in
-            // turn.
+            // no repair wrote before it, unless the set outranks every other
+            // set beside it: a set that disagrees with another's repair loses
+            // there to an equal or a higher one, so no two rewrite each other
+            // in turn.
+            let contested = !tree.outranks(node, set);
             let (mut offered, mut landed) = (false, false);
             for (member, offset, bytes) in repaired.slices() {
                 let bytes = bytes?;
@@ -752,7 +754,7 @@ impl NamespaceWriter {
                     provenance: Provenance::Repaired,
                 };
                 let write = Write::new(&arrival);
-                if self.place_as(tree, builder, segments, (arrival, true), write, out)? > 0 {
+                if self.place_as(tree, builder, segments, (arrival, contested), write, out)? > 0 {
                     landed = true;
                     rewritten.insert(member);
                 }
@@ -1132,14 +1134,29 @@ impl NamespaceWriter {
         node: NodeId,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
-        let mut moved = follow_founded(tree, node);
+        let sets = tree.recovery_nodes(node);
+        let mut moved = follow_founded(tree, node, sets);
         if let Some((parent, _)) = tree.volumes(node) {
-            moved.extend(follow_founded(tree, parent));
+            let sets = tree.recovery_nodes(parent);
+            moved.extend(follow_founded(tree, parent, sets));
         }
         for into in moved.into_iter().filter(|into| *into != node) {
             self.bind_recoveries(tree, builder, segments, into, out)?;
         }
         let sets = tree.recovery_nodes(node);
+        self.bind_sets(tree, builder, segments, node, &sets, out)
+    }
+
+    // Let `sets`, bound in the namespace of `node`, match its members.
+    fn bind_sets(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        node: NodeId,
+        sets: &[NodeId],
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
         if sets.is_empty() {
             return Ok(());
         }
@@ -1149,7 +1166,7 @@ impl NamespaceWriter {
             .unwrap_or_default();
         let mut renamed = std::mem::take(&mut self.renamed);
         renamed.clear();
-        for set in sets {
+        for &set in sets {
             let newly = tree
                 .with_recovery(set, |recovery, namespace| {
                     // A member covered before the bind is not newly
@@ -1316,8 +1333,14 @@ impl NamespaceWriter {
             &mut effects,
         );
         self.apply_each(tree, builder, segments, effects, Write::Again, out)?;
-        if window.is_some() {
-            self.bind_recoveries(tree, builder, segments, parent, out)?;
+        if let Some(window) = window {
+            // The window is the one set of its namespace not yet bound: the
+            // others bound when its members last changed, and a window
+            // changes none of them. It binds alone, where it covers, so each
+            // window attached costs one bind however many came before it.
+            follow_founded(tree, parent, vec![window]);
+            let home = tree.home(window).unwrap_or(parent);
+            self.bind_sets(tree, builder, segments, home, &[window], out)?;
         }
         Ok(())
     }
@@ -1443,11 +1466,11 @@ fn covers_any(tree: &Tree, node: NodeId, recovery: &dyn Recovery) -> bool {
 // A recovery object is bound in the namespace of the member it names. One
 // that covers nothing where it is bound and names a member founded in a
 // namespace bound there moves into that namespace, where it binds, rules
-// and repairs; a set made over the posted files stays with them. The
-// namespaces it moved into.
-fn follow_founded(tree: &mut Tree, node: NodeId) -> Vec<NodeId> {
+// and repairs; a set made over the posted files stays with them. Of `sets`,
+// bound in `node`'s namespace, the namespaces they moved into.
+fn follow_founded(tree: &mut Tree, node: NodeId, sets: Vec<NodeId>) -> Vec<NodeId> {
     let mut moved = Vec::new();
-    for set in tree.recovery_nodes(node) {
+    for set in sets {
         let Some(recovery) = tree.recovery(set) else {
             continue;
         };

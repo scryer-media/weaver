@@ -29,7 +29,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use weaver_graph::{
     Budget, ByteRange, Claim, Delivery, Durable, Emit, Engine, Extent, Extraction, Facts, Kind,
-    Located, MemberId, Object, Placement, Pull, Seek, Standing, VolumeIndex,
+    Located, MemberId, Object, Placement, Pull, RestoreError, Seek, Standing, VolumeIndex,
 };
 
 pub use self::brotli::Brotli;
@@ -54,10 +54,10 @@ pub trait Decoder: Send + Sync + 'static {
     const LENDS: bool = false;
 
     // The bytes a run of this stream holds resident, as the stream's first
-    // bytes declare them, or the format's largest while they do not say. A
-    // decoder whose window the format lets grow holds it to the memory
-    // `budget` grants.
-    fn window(first: &[u8], budget: &Budget) -> u64;
+    // bytes and its volume's `length`, once known, declare them, or the
+    // format's largest while they do not say. A decoder whose window the
+    // format lets grow holds it to the memory `budget` grants.
+    fn window(first: &[u8], length: Option<u64>, budget: &Budget) -> u64;
 
     // The memory the first bytes declare the decoder needs, unbounded by any
     // grant, for a decoder whose refusal does not say it: `None` where the
@@ -118,6 +118,10 @@ pub struct Stream<D> {
     // whole of it.
     #[serde(default)]
     closed: bool,
+    // The volume's length, once its owner knows it, which bounds how many
+    // blocks a decoder can hold at once.
+    #[serde(default)]
+    length: Option<u64>,
     // What a run of it is granted, which sizes its window.
     #[serde(skip)]
     budget: Budget,
@@ -130,6 +134,7 @@ impl<D: Decoder> Default for Stream<D> {
             name: String::new(),
             first: Vec::new(),
             closed: false,
+            length: None,
             budget: Budget::default(),
         }
     }
@@ -148,10 +153,32 @@ impl<D: Decoder> Stream<D> {
 }
 
 impl<D: Decoder> Durable for Stream<D> {
-    const VERSION: u16 = 4;
+    const VERSION: u16 = 5;
 
     fn impossible(&self) -> Option<&'static str> {
         (self.first.len() > FIRST).then_some("a front longer than a stream keeps")
+    }
+}
+
+// Version 4 kept no length: it reads as unknown, as a version 4 stream
+// had it.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent, bound = "")]
+struct Four<D>(Stream<D>);
+
+impl<D: Decoder> Durable for Four<D> {
+    const VERSION: u16 = 4;
+
+    fn impossible(&self) -> Option<&'static str> {
+        self.0.impossible()
+    }
+}
+
+// The stream a blob describes, at the version it was written.
+pub(crate) fn restore<D: Decoder>(facts: &Facts) -> Result<Stream<D>, RestoreError> {
+    match facts.version {
+        Four::<D>::VERSION => Ok(facts.read::<Four<D>>(D::KIND)?.0),
+        _ => facts.read(D::KIND),
     }
 }
 
@@ -221,9 +248,10 @@ impl<D: Decoder> Object for Stream<D> {
         None
     }
 
-    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], _length: Option<u64>) {
+    fn bound(&mut self, volume: VolumeIndex, name: &str, _front: &[u8], length: Option<u64>) {
         if volume == VolumeIndex(0) {
             name.clone_into(&mut self.name);
+            self.length = length.or(self.length);
         }
     }
 
@@ -243,6 +271,7 @@ impl<D: Decoder> Object for Stream<D> {
         if volume == VolumeIndex(0) {
             self.first.clear();
             self.closed = false;
+            self.length = None;
         }
     }
 
@@ -267,8 +296,9 @@ impl<D: Decoder> Engine for Stream<D> {
     fn start(&mut self) -> Box<dyn Extraction> {
         Box::new(run::Run::<D>::new(
             D::member(&self.name),
-            D::window(&self.first, &self.budget),
+            D::window(&self.first, self.length, &self.budget),
             self.first.clone(),
+            self.length,
         ))
     }
 
@@ -276,7 +306,8 @@ impl<D: Decoder> Engine for Stream<D> {
     // in: a stream inside another object's member often arrives a sliver
     // at a time.
     fn reserve(&self) -> Option<u64> {
-        (self.closed || self.first.len() >= FIRST).then(|| D::window(&self.first, &self.budget))
+        (self.closed || self.first.len() >= FIRST)
+            .then(|| D::window(&self.first, self.length, &self.budget))
     }
 
     fn widest(&self) -> Option<u64> {

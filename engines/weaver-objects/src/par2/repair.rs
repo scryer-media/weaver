@@ -10,7 +10,6 @@
 // file: every byte goes through the namespace's access.
 
 use std::cell::RefCell;
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 
@@ -473,42 +472,240 @@ fn known_by_slices(
             known.push((*file, unnamed.swap_remove(at).0));
         }
     }
-    let mut free: Vec<(FileId, u64)> = index
+    if unnamed.is_empty() {
+        return known;
+    }
+    let taken: BTreeSet<FileId> = known.iter().map(|(file, _)| *file).collect();
+    let free: Vec<(FileId, u64)> = index
         .recovery_file_ids
         .iter()
-        .filter(|file| {
-            !state.members().contains_key(file) && !known.iter().any(|(k, _)| k == *file)
-        })
+        .filter(|file| !state.members().contains_key(file) && !taken.contains(file))
         .filter_map(|file| Some((*file, index.file_description(file)?.length)))
         .collect();
-    free.sort_by_key(|(_, long)| Reverse(*long));
-    // A file is a member's by elimination only when it is what is left: the
-    // free files the members that fit it could be are no more than they
-    // are. A file over is one a member still to come may be. Each file taken
-    // leaves less for the rest, so the files are tried again until none is.
-    while let Some((at, file, member)) = free.iter().enumerate().find_map(|(at, (file, long))| {
-        let fitting: Vec<usize> = (0..unnamed.len())
-            .filter(|candidate| unnamed[*candidate].1.fits(*long))
-            .collect();
-        let could_be = free
-            .iter()
-            .filter(|(_, other)| {
-                fitting
-                    .iter()
-                    .any(|candidate| unnamed[*candidate].1.fits(*other))
-            })
-            .count();
-        let tightest = fitting
-            .iter()
-            .copied()
-            .min_by_key(|candidate| unnamed[*candidate].1.bound())
-            .filter(|_| could_be <= fitting.len())?;
-        Some((at, *file, tightest))
-    }) {
-        free.remove(at);
+    let mut work = 0;
+    known.extend(by_elimination(&free, unnamed, &mut work));
+    known
+}
+
+// A file is a member's by elimination only when it is what is left: the
+// free files the members that fit it could be are no more than they are. A
+// file over is one a member still to come may be. The longest such file is
+// taken, the first of its length in the set's order, by the member that fits
+// it most tightly, the earliest of those still unnamed; each file taken
+// leaves less for the rest, so the files are tried again until none is.
+//
+// Whether a file is what is left depends only on its length. A member known
+// exactly fits its own length; one only bounded fits every length up to its
+// bound, so the members only bounded together reach every length up to the
+// longest bound. A length within that reach could be any free file within
+// it; a length past it could be only the free files of its own length. Each
+// length's margin, the members fitting it less the files it could be, is
+// kept in a tree over the lengths, and a file taken changes the margins by a
+// few ranges: the longest length with a margin of none or more is the next
+// file to take. `work` counts the steps through the tree.
+fn by_elimination(
+    free: &[(FileId, u64)],
+    mut unnamed: Vec<(MemberId, Length)>,
+    work: &mut u64,
+) -> Vec<(FileId, MemberId)> {
+    let mut known = Vec::new();
+    if free.is_empty() || unnamed.is_empty() {
+        return known;
+    }
+    let mut by_length: BTreeMap<u64, VecDeque<FileId>> = BTreeMap::new();
+    for &(file, long) in free {
+        by_length.entry(long).or_default().push_back(file);
+    }
+    let lengths: Vec<u64> = by_length.keys().copied().collect();
+    let mut files: Vec<VecDeque<FileId>> = by_length.into_values().collect();
+    let mut left: Vec<i64> = files.iter().map(|files| files.len() as i64).collect();
+    // The lengths at or under `long`, as a count of the shortest.
+    let upto = |long: u64| lengths.partition_point(|length| *length <= long);
+    let mut exact: BTreeMap<u64, BTreeSet<usize>> = BTreeMap::new();
+    let mut bounded: BTreeSet<(u64, usize)> = BTreeSet::new();
+    for (at, (_, length)) in unnamed.iter().enumerate() {
+        match *length {
+            Length::Exact(long) => {
+                exact.entry(long).or_default().insert(at);
+            }
+            Length::AtMost(bound) => {
+                bounded.insert((bound, at));
+            }
+        }
+    }
+    let mut reach = bounded.last().map(|(bound, _)| *bound);
+    let mut within = reach.map_or(0, upto);
+    let mut could_be: i64 = left[..within].iter().sum();
+    let bounds: Vec<u64> = bounded.iter().map(|(bound, _)| *bound).collect();
+    let margins: Vec<i64> = lengths
+        .iter()
+        .enumerate()
+        .map(|(at, long)| {
+            let fitting = exact.get(long).map_or(0, BTreeSet::len)
+                + (bounds.len() - bounds.partition_point(|bound| bound < long));
+            fitting as i64 - if at < within { could_be } else { left[at] }
+        })
+        .collect();
+    let mut tree = Margins::new(&margins);
+    while let Some(at) = tree.last_ready() {
+        let long = lengths[at];
+        let Some(file) = files[at].pop_front() else {
+            break;
+        };
+        let tightest = [
+            exact
+                .get(&long)
+                .and_then(|members| members.first())
+                .copied(),
+            bounded.range((long, 0)..).next().map(|(_, member)| *member),
+        ]
+        .into_iter()
+        .flatten()
+        .min_by_key(|member| (unnamed[*member].1.bound(), *member));
+        let Some(member) = tightest else {
+            break;
+        };
+        // The file taken is one fewer for its length to be.
+        left[at] -= 1;
+        if at < within {
+            could_be -= 1;
+            tree.add(0, within, 1);
+        } else {
+            tree.add(at, at + 1, 1);
+        }
+        if left[at] == 0 {
+            tree.add(at, at + 1, RETIRED);
+        }
+        // The member taken is one fewer to fit what it fitted.
+        match unnamed[member].1 {
+            Length::Exact(exactly) => {
+                if let Some(members) = exact.get_mut(&exactly) {
+                    members.remove(&member);
+                }
+                tree.add(at, at + 1, -1);
+            }
+            Length::AtMost(bound) => {
+                bounded.remove(&(bound, member));
+                tree.add(0, upto(bound), -1);
+                let narrowed = bounded.last().map(|(bound, _)| *bound);
+                if narrowed != reach {
+                    let still = narrowed.map_or(0, upto);
+                    let mut fell = 0;
+                    for (out, count) in (still..within).zip(&left[still..within]) {
+                        *work += 1;
+                        if *count > 0 {
+                            tree.add(out, out + 1, could_be - count);
+                            fell += count;
+                        }
+                    }
+                    tree.add(0, still, fell);
+                    could_be -= fell;
+                    reach = narrowed;
+                    within = still;
+                }
+            }
+        }
+        let last = unnamed.len() - 1;
+        if member != last {
+            match unnamed[last].1 {
+                Length::Exact(exactly) => {
+                    if let Some(members) = exact.get_mut(&exactly) {
+                        members.remove(&last);
+                        members.insert(member);
+                    }
+                }
+                Length::AtMost(bound) => {
+                    bounded.remove(&(bound, last));
+                    bounded.insert((bound, member));
+                }
+            }
+        }
         known.push((file, unnamed.swap_remove(member).0));
     }
+    *work += tree.steps;
     known
+}
+
+// A margin no later change can lift to none: the length has no file left.
+const RETIRED: i64 = i64::MIN / 4;
+
+// Margins over the lengths, shortest first, with a range made larger or
+// smaller at once and the longest length whose margin is none or more found
+// in a walk from the root. Each node holds what was added to its whole range
+// and the largest margin under it, its own addition included.
+struct Margins {
+    width: usize,
+    largest: Vec<i64>,
+    added: Vec<i64>,
+    steps: u64,
+}
+
+impl Margins {
+    fn new(margins: &[i64]) -> Self {
+        let width = margins.len();
+        let mut tree = Self {
+            width,
+            largest: vec![0; 4 * width.max(1)],
+            added: vec![0; 4 * width.max(1)],
+            steps: 0,
+        };
+        tree.build(1, 0, width, margins);
+        tree
+    }
+
+    fn build(&mut self, node: usize, low: usize, high: usize, margins: &[i64]) {
+        self.steps += 1;
+        if high - low == 1 {
+            self.added[node] = margins[low];
+            self.largest[node] = margins[low];
+            return;
+        }
+        let middle = low + (high - low) / 2;
+        self.build(2 * node, low, middle, margins);
+        self.build(2 * node + 1, middle, high, margins);
+        self.largest[node] = self.largest[2 * node].max(self.largest[2 * node + 1]);
+    }
+
+    fn add(&mut self, from: usize, to: usize, by: i64) {
+        if from < to && by != 0 {
+            self.add_under(1, 0, self.width, from, to, by);
+        }
+    }
+
+    fn add_under(&mut self, node: usize, low: usize, high: usize, from: usize, to: usize, by: i64) {
+        self.steps += 1;
+        if to <= low || high <= from {
+            return;
+        }
+        if from <= low && high <= to {
+            self.added[node] += by;
+            self.largest[node] += by;
+            return;
+        }
+        let middle = low + (high - low) / 2;
+        self.add_under(2 * node, low, middle, from, to, by);
+        self.add_under(2 * node + 1, middle, high, from, to, by);
+        self.largest[node] =
+            self.added[node] + self.largest[2 * node].max(self.largest[2 * node + 1]);
+    }
+
+    fn last_ready(&mut self) -> Option<usize> {
+        let (mut node, mut low, mut high, mut above) = (1, 0, self.width, 0);
+        if self.largest[node] < 0 {
+            return None;
+        }
+        while high - low > 1 {
+            self.steps += 1;
+            above += self.added[node];
+            let middle = low + (high - low) / 2;
+            if self.largest[2 * node + 1] + above >= 0 {
+                (node, low) = (2 * node + 1, middle);
+            } else {
+                (node, high) = (2 * node, middle);
+            }
+        }
+        Some(low)
+    }
 }
 
 // Whether the member, as long as the described file, holds one of its
@@ -973,6 +1170,242 @@ mod tests {
     use weaver_graph::{Budget, ObjectId, Recovery, VolumeIndex};
 
     const BLOCK: u64 = 512;
+
+    // Elimination tried again from the longest file after every file taken,
+    // each file's fitting members and the files they could be counted
+    // afresh, with every `fits` asked counted.
+    fn by_elimination_rescanning(
+        free: &[(FileId, u64)],
+        mut unnamed: Vec<(MemberId, Length)>,
+        asked: &mut u64,
+    ) -> Vec<(FileId, MemberId)> {
+        let mut free = free.to_vec();
+        free.sort_by_key(|(_, long)| std::cmp::Reverse(*long));
+        let mut known = Vec::new();
+        let mut fits = |length: Length, long: u64| {
+            *asked += 1;
+            length.fits(long)
+        };
+        while let Some((at, file, member)) =
+            free.iter().enumerate().find_map(|(at, (file, long))| {
+                let fitting: Vec<usize> = (0..unnamed.len())
+                    .filter(|candidate| fits(unnamed[*candidate].1, *long))
+                    .collect();
+                let could_be = free
+                    .iter()
+                    .filter(|(_, other)| {
+                        fitting
+                            .iter()
+                            .any(|candidate| fits(unnamed[*candidate].1, *other))
+                    })
+                    .count();
+                let tightest = fitting
+                    .iter()
+                    .copied()
+                    .min_by_key(|candidate| unnamed[*candidate].1.bound())
+                    .filter(|_| could_be <= fitting.len())?;
+                Some((at, *file, tightest))
+            })
+        {
+            free.remove(at);
+            known.push((file, unnamed.swap_remove(member).0));
+        }
+        known
+    }
+
+    fn file_id(at: u32) -> FileId {
+        let mut bytes = [0; 16];
+        bytes[..4].copy_from_slice(&at.to_le_bytes());
+        FileId::from_bytes(bytes)
+    }
+
+    // A small deterministic generator, so every shape is the same on every run.
+    struct Seeded(u64);
+
+    impl Seeded {
+        fn below(&mut self, bound: u64) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) % bound.max(1)
+        }
+    }
+
+    type Shape = (Vec<(FileId, u64)>, Vec<(MemberId, Length)>);
+
+    // Free files and unnamed members of the kinds a set leaves to
+    // elimination: lengths each its own, lengths shared by k files with k or
+    // k-1 members, members only bounded, some reaching past others, members
+    // of lengths no file has, and nothing at all.
+    fn shape(seed: u64) -> Shape {
+        let mut random = Seeded(seed);
+        let mut free = Vec::new();
+        let mut unnamed = Vec::new();
+        let (mut files, mut members) = (0u32, 0u32);
+        let mut file = |long: u64, free: &mut Vec<(FileId, u64)>| {
+            free.push((file_id(files), long));
+            files += 1;
+        };
+        let mut member = |length: Length, unnamed: &mut Vec<(MemberId, Length)>| {
+            unnamed.push((MemberId(members), length));
+            members += 1;
+        };
+        let groups = random.below(8);
+        for _ in 0..groups {
+            let long = 1 + random.below(40) * 100;
+            let k = 1 + random.below(5);
+            for _ in 0..k {
+                file(long, &mut free);
+            }
+            let exact = match random.below(4) {
+                0 => k,
+                1 => k.saturating_sub(1),
+                2 => random.below(k + 2),
+                _ => 0,
+            };
+            for _ in 0..exact {
+                member(Length::Exact(long), &mut unnamed);
+            }
+        }
+        for _ in 0..random.below(4) {
+            let bound = random.below(45) * 100 + random.below(3);
+            member(Length::AtMost(bound), &mut unnamed);
+        }
+        for _ in 0..random.below(3) {
+            member(Length::Exact(5_000 + random.below(3)), &mut unnamed);
+        }
+        // The members and files arrive in no order of length.
+        for at in (1..free.len()).rev() {
+            free.swap(at, random.below(at as u64 + 1) as usize);
+        }
+        for at in (1..unnamed.len()).rev() {
+            unnamed.swap(at, random.below(at as u64 + 1) as usize);
+        }
+        (free, unnamed)
+    }
+
+    // Elimination by margins binds the same members to the same files, in
+    // the same order, as elimination tried again from the top, and leaves
+    // the same ones unbound, across many shapes.
+    #[test]
+    fn elimination_by_margins_binds_as_rescanning_does() {
+        let mut bound = 0;
+        let mut shapes: Vec<Shape> = (0..20_000).map(shape).collect();
+        // Fixed shapes beside the seeded ones: lengths each their own, a
+        // shared length one member short with shorter files below it,
+        // members bounded only, one whose bound reaches a shorter exact
+        // member's length, and nothing to match.
+        let ids = |lengths: &[u64]| -> Vec<(FileId, u64)> {
+            lengths
+                .iter()
+                .enumerate()
+                .map(|(at, long)| (file_id(at as u32), *long))
+                .collect()
+        };
+        let members = |lengths: &[Length]| -> Vec<(MemberId, Length)> {
+            lengths
+                .iter()
+                .enumerate()
+                .map(|(at, length)| (MemberId(at as u32), *length))
+                .collect()
+        };
+        shapes.push((
+            ids(&[300, 100, 200]),
+            members(&[Length::Exact(200), Length::Exact(100), Length::Exact(300)]),
+        ));
+        shapes.push((
+            ids(&[900, 900, 900, 10, 20, 30]),
+            members(&[
+                Length::Exact(900),
+                Length::Exact(900),
+                Length::Exact(30),
+                Length::Exact(20),
+                Length::Exact(10),
+            ]),
+        ));
+        shapes.push((
+            ids(&[500, 400, 400, 100]),
+            members(&[
+                Length::AtMost(450),
+                Length::AtMost(600),
+                Length::AtMost(400),
+                Length::Exact(100),
+            ]),
+        ));
+        shapes.push((
+            ids(&[100, 200]),
+            members(&[Length::AtMost(150), Length::Exact(100)]),
+        ));
+        shapes.push((ids(&[100, 200]), members(&[Length::Exact(50)])));
+        shapes.push((ids(&[]), members(&[Length::Exact(50)])));
+        shapes.push((ids(&[100]), members(&[])));
+        for (free, unnamed) in &shapes {
+            let (mut asked, mut work) = (0, 0);
+            let rescanning = by_elimination_rescanning(free, unnamed.clone(), &mut asked);
+            let margins = by_elimination(free, unnamed.clone(), &mut work);
+            assert_eq!(margins, rescanning, "free {free:?} unnamed {unnamed:?}");
+            bound += margins.len();
+        }
+        // The shapes bind members, so the comparison covers bindings and
+        // not only sets left whole.
+        assert!(bound > 10_000, "{bound} bindings");
+    }
+
+    // k files of one length with k-1 members of it, and s shorter files
+    // with one member each: rescanning asks a number of `fits` that grows
+    // with the product of k and s twice over; the margins take a number of
+    // steps that grows with their sum.
+    #[test]
+    fn elimination_by_margins_grows_with_the_files_not_their_product() {
+        let case = |k: u32, s: u32| {
+            let mut free = Vec::new();
+            let mut unnamed = Vec::new();
+            for at in 0..k {
+                free.push((file_id(at), 1_000_000));
+            }
+            for at in 0..k - 1 {
+                unnamed.push((MemberId(at), Length::Exact(1_000_000)));
+            }
+            for at in 0..s {
+                free.push((file_id(k + at), 1 + u64::from(at)));
+                unnamed.push((MemberId(k + at), Length::Exact(1 + u64::from(at))));
+            }
+            let (mut asked, mut work) = (0, 0);
+            let rescanning = by_elimination_rescanning(&free, unnamed.clone(), &mut asked);
+            let margins = by_elimination(&free, unnamed, &mut work);
+            assert_eq!(margins, rescanning);
+            assert_eq!(margins.len(), s as usize);
+            (asked, work)
+        };
+        let (small_asked, small_work) = case(20, 20);
+        let (large_asked, large_work) = case(80, 80);
+        // Four times the files: rescanning asks far more than sixteen times
+        // as much, the margins take less than eight times the steps.
+        assert!(
+            large_asked > 64 * small_asked,
+            "{small_asked} -> {large_asked}"
+        );
+        assert!(large_work < 8 * small_work, "{small_work} -> {large_work}");
+        // At the finding's size the margins stay a few steps per file.
+        let mut free = Vec::new();
+        let mut unnamed = Vec::new();
+        let (k, s) = (1_000u32, 1_000u32);
+        for at in 0..k {
+            free.push((file_id(at), 1_000_000));
+        }
+        for at in 0..k - 1 {
+            unnamed.push((MemberId(at), Length::Exact(1_000_000)));
+        }
+        for at in 0..s {
+            free.push((file_id(k + at), 1 + u64::from(at)));
+            unnamed.push((MemberId(k + at), Length::Exact(1 + u64::from(at))));
+        }
+        let mut work = 0;
+        let margins = by_elimination(&free, unnamed, &mut work);
+        assert_eq!(margins.len(), s as usize);
+        assert!(work < 64 * u64::from(k + s), "{work} steps");
+    }
 
     // A held slice copied a piece at a time writes the bytes a copy taken
     // whole writes, the source's then zeros, cut at the target's end, and
