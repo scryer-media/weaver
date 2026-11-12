@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod contested;
+mod contradicted;
 mod facts;
 mod owner;
 mod recovery_contracts;
