@@ -262,6 +262,7 @@ impl PrometheusMetricsExporter {
         let job_lifecycle = self.handle.job_lifecycle_metrics_snapshot();
         let pipeline_histograms = self.handle.pipeline_histograms_snapshot();
         let db_runtime = self.db.runtime_metrics_snapshot();
+        let wal_checkpoint = self.db.wal_checkpoint_metrics_snapshot();
         let process = weaver_server_core::runtime::process_metrics::sample();
         let http_metrics = http_metrics.snapshot();
 
@@ -300,6 +301,7 @@ impl PrometheusMetricsExporter {
         input.job_lifecycle = Some(&job_lifecycle);
         input.pipeline_histograms = Some(&pipeline_histograms);
         input.db_runtime = Some(&db_runtime);
+        input.wal_checkpoint = wal_checkpoint.as_ref();
         input.process = Some(&process);
         input.disk_space = &disk_space;
         input.http_metrics = Some(&http_metrics);

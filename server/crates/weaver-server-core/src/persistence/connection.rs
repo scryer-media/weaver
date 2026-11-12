@@ -1276,6 +1276,20 @@ impl Database {
         self.sql_worker.runtime_metrics().snapshot()
     }
 
+    // What the WAL checkpoint task's passes did; `None` for every engine but
+    // a SQLite file database. Read at scrape time: atomic loads plus one
+    // `Vec` for the histogram buckets.
+    pub fn wal_checkpoint_metrics_snapshot(
+        &self,
+    ) -> Option<crate::persistence::WalCheckpointMetricsSnapshot> {
+        match self.datastore() {
+            StoreDatastore::Sqlite { writer_gate, .. } => writer_gate
+                .wal()
+                .map(crate::persistence::wal_checkpoint::WalSignal::metrics_snapshot),
+            StoreDatastore::Postgres { .. } => None,
+        }
+    }
+
     // Open (or create) the database at `path`.
     // Runs schema migrations and configures SQLite pragmas.
     pub fn open(path: &Path) -> Result<Self, StateError> {

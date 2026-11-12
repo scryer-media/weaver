@@ -20,6 +20,7 @@ use weaver_server_core::operations::instrumentation::{
     ServerMetricsSnapshot,
 };
 use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
+use weaver_server_core::persistence::WalCheckpointMetricsSnapshot;
 use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
 use weaver_server_core::post_processing::run_metrics::{
     RunStatus, ScriptMetrics, ScriptRunMetricsSnapshot,
@@ -91,6 +92,8 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) job_lifecycle: Option<&'a JobLifecycleMetricsSnapshot>,
     pub(crate) pipeline_histograms: Option<&'a PipelineHistogramsSnapshot>,
     pub(crate) db_runtime: Option<&'a DbRuntimeMetricsSnapshot>,
+    // `None` for every engine but a SQLite file database.
+    pub(crate) wal_checkpoint: Option<&'a WalCheckpointMetricsSnapshot>,
     pub(crate) process: Option<&'a ProcessMetricsSnapshot>,
     pub(crate) disk_space: &'a [DiskSpaceSnapshot],
     pub(crate) http_metrics: Option<&'a HttpMetricsSnapshot>,
@@ -137,6 +140,7 @@ impl<'a> PrometheusRenderInput<'a> {
             job_lifecycle: None,
             pipeline_histograms: None,
             db_runtime: None,
+            wal_checkpoint: None,
             process: None,
             disk_space: &[],
             http_metrics: None,
@@ -193,6 +197,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         job_lifecycle,
         pipeline_histograms,
         db_runtime,
+        wal_checkpoint,
         process,
         disk_space,
         http_metrics,
@@ -267,6 +272,9 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     }
     if let Some(db) = db_runtime {
         render_db_runtime(&mut out, db);
+    }
+    if let Some(wal) = wal_checkpoint {
+        render_wal_checkpoint(&mut out, wal);
     }
     if let Some(process) = process {
         render_process(&mut out, process, start_time_seconds);
@@ -1475,6 +1483,22 @@ fn render_db_runtime(out: &mut Encoder, db: &DbRuntimeMetricsSnapshot) {
         &[("engine", db.engine)],
         &db.op_duration,
     );
+}
+
+fn render_wal_checkpoint(out: &mut Encoder, wal: &WalCheckpointMetricsSnapshot) {
+    out.sample(&f::DB_WAL_CHECKPOINT_PASSES, &[], wal.passes);
+    out.sample(
+        &f::DB_WAL_CHECKPOINT_PASSES_INCOMPLETE,
+        &[],
+        wal.passes_left_behind,
+    );
+    out.sample(&f::DB_WAL_CHECKPOINT_BUSY, &[], wal.busy_passes);
+    out.sample(&f::DB_WAL_RESTARTS, &[], wal.restarts);
+    render_histogram(out, &f::DB_WAL_CHECKPOINT_DURATION, &[], &wal.duration);
+    out.sample(&f::DB_WAL_LOG_FRAMES, &[], wal.log_frames);
+    out.sample(&f::DB_WAL_CHECKPOINTED_FRAMES, &[], wal.checkpointed_frames);
+    out.sample(&f::DB_WAL_CHECKPOINT_COPIED_FRAMES, &[], wal.copied_frames);
+    out.sample(&f::DB_WAL_BYTES, &[], wal.wal_bytes);
 }
 
 // Standard `process_*` collector series.
