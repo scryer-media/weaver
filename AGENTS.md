@@ -32,7 +32,33 @@ Also asked: credit Weaver in your notices, and tell your user which Weaver files
 - Only the routing layer dials, binds, resolves or builds HTTP clients. Use `proxies::routed_fetch`, `proxies::with_routed_client` or the leg's dialer.
 - Fail closed: a down or disabled proxy stalls its consumer. No fallback to the host address unless the route saves one.
 - Names resolve where the route says, and are dialled where they were resolved. No name reaches the host resolver otherwise.
-- Torrent files, trackers, peers, DHT and web seeds are attacker input: bound before parsing, write only inside the torrent's location, delete only listed files, seed only verified data, redact credentials below Admin.
+- Torrent files, trackers, peers, DHT and web seeds are attacker input: bound before parsing, write only inside the torrent's location, delete only listed files, seed only verified data, redact credentials for every caller below the scope `SECURITY.md` names.
+
+## Private trackers
+
+A private tracker bans an account for a client that leaks a torrent, reports wrong numbers or looks unlike the client it claims to be. A mistake here costs the operator an account, not a download. These rules apply to every change under `engines/weaver-torrent` and `torrents/` in the server, and to review of every such change.
+
+- **libtorrent is the reference.** What a tracker or a peer can see follows libtorrent 2.0 as qBittorrent ships it: events, counters, intervals, identity, handshake, extensions. A difference from it needs the operator's ruling, with both behaviours stated from source.
+- **Port the whole mechanism.** Before removing or replacing any announce, counter, peer or discovery mechanism, list what depended on it and port the reference's counterpart for each in the same change. Compare function by function, not only the changed lines.
+- **A private torrent uses its trackers only.** No DHT, no peer exchange, no local discovery, in either direction, and no peer from any other source. Its metadata is never served to a peer. This holds before the metadata is known: a magnet asks its trackers first and never announces itself to the DHT. An exported magnet link carries no trackers.
+- **Events are exact.**
+  - `started` goes to a tracker until that tracker answers one.
+  - `completed` goes once, only for a torrent that became a seed in a run that began short of one, and counts as sent only when a tracker answers it. One still owed is sent after a pause or a route move. It is not kept across a restart.
+  - A torrent added, rechecked or restarted complete never sends `completed`.
+  - `stopped` goes only to a tracker that answered a `started`, on pause, remove and shutdown, and the stop waits for it within its bound.
+- **Counters are exact.**
+  - `uploaded`, `downloaded`, corrupt and redundant bytes count from each start, as libtorrent's do: the `started` after a pause, resume or restart reports zero. A route move is not a start; the counters run on across it.
+  - Only bytes that moved are reported. Never report a byte twice, an estimate, or a byte of a piece that was not sent.
+  - What the operator sees and what the ratio and seeding goals read are the totals since the add. They are separate from what an announce reports.
+- **No announce storms.** Honour the tracker's interval and minimum interval, the 300 second floor and the failure backoff. Weaver does not scrape trackers.
+- **Identity is stable and whole.** A torrent keeps one peer id and one tracker key from add to remove within a run of the process. The announce (query order, escaping, headers, user agent, key, peer id prefix) matches the client it names, proven against a captured announce of that client. Changing any part needs that test updated from a new capture.
+- **One route.** A torrent's announces and peer connections leave on its saved route and no other.
+- **Passkeys do not leak.** A tracker URL appears in no log, error, debug output, event, metric or diagnostics bundle except as scheme, host and port. `SECURITY.md` says which keys may read it.
+- **Seed only verified data**, and never super-seed.
+- **Every rule has a test** that reads the announces or packets a tracker or peer would receive. A change to tracker-visible behaviour comes with one.
+- **Never test against a real private tracker** unless the operator names it for that task.
+
+When you find code that breaks one of these rules, report it as a blocking finding even when it is outside the task.
 
 ## Performance
 
