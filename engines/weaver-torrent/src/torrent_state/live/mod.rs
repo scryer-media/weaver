@@ -666,6 +666,12 @@ impl TorrentStateLive {
                 }
             }
             self.maybe_connect_web_seeds()?;
+            // A session closed under the torrent ends this task, as it ends
+            // the peer adder: not a fault.
+            if self.shared.session.strong_count() == 0 {
+                debug!("the session is gone: no more web seeds are tried");
+                return Ok(());
+            }
         }
     }
 
@@ -679,11 +685,11 @@ impl TorrentStateLive {
         if self.is_finished_and_no_active_streams() {
             return Ok(());
         }
-        let session = self
-            .shared
-            .session
-            .upgrade()
-            .ok_or(Error::SessionDestroyed)?;
+        // A session closed under the torrent has no web seed to try: its
+        // task ends at its next turn.
+        let Some(session) = self.shared.session.upgrade() else {
+            return Ok(());
+        };
         let registry = &self.shared.web_seeds;
         let due = registry.due(
             tokio::time::Instant::now(),
@@ -1098,13 +1104,14 @@ impl TorrentStateLive {
                 continue;
             }
             state.peers.wait_for_candidate().await;
-            let slots = state
-                .shared
-                .session
-                .upgrade()
-                .ok_or(Error::SessionDestroyed)?
-                .connection_slots
-                .clone();
+            // A session closed under the torrent ends its adder: that is
+            // how a torrent leaves a session, not a fault.
+            let Some(session) = state.shared.session.upgrade() else {
+                debug!("the session is gone: no more peers are added");
+                return Ok(());
+            };
+            let slots = session.connection_slots.clone();
+            drop(session);
             // The torrent's own cap first, so a torrent at it holds no place
             // under the session's; then a place under the session's cap and
             // a connect from its per-second budget, both shared with every

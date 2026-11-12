@@ -1441,6 +1441,10 @@ impl DhtWorker {
                         debug!("ignoring UDP receive error: {e:#}");
                         continue;
                     }
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {
+                        debug!("the DHT's socket has closed: {e:#}");
+                        return Err(Error::SocketClosed);
+                    }
                     Err(e) => return Err(Error::Recv(e)),
                 };
                 match bprotocol::deserialize_message::<ByteBufOwned>(&buf[..size]) {
@@ -1519,6 +1523,11 @@ impl DhtWorker {
         loop {
             tokio::select! {
                 err = &mut framer => {
+                    // A socket closed under the DHT ends it, as its session
+                    // closing does: not a fault.
+                    if let Err(Error::SocketClosed) = err {
+                        return Ok(());
+                    }
                     return Error::task_finished(&"framer", err);
                 },
                 () = &mut bootstrap, if !bootstrap_done => {
@@ -2802,5 +2811,91 @@ mod tests {
                 SocketAddr::from(([10, 3, 0, 1], 6881)),
             ])
         );
+    }
+
+    // A DHT whose shared socket closes under it, as a session's uTP socket
+    // does when the session closes, ends quietly: no error is logged.
+    #[tokio::test]
+    async fn a_dht_whose_socket_closes_ends_without_an_error() {
+        use crate::core::net::BoxFuture;
+
+        // Sends go nowhere; a read waits until `closed` is told, then says
+        // the socket has closed.
+        struct Closing {
+            closed: tokio::sync::Notify,
+        }
+        impl DatagramSocket for Closing {
+            fn bind_addr(&self) -> SocketAddr {
+                (Ipv4Addr::LOCALHOST, 6881).into()
+            }
+            fn recv_from<'a>(
+                &'a self,
+                _: &'a mut [u8],
+            ) -> BoxFuture<'a, std::io::Result<(usize, SocketAddr)>> {
+                Box::pin(async move {
+                    self.closed.notified().await;
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::BrokenPipe,
+                        "the uTP socket the DHT shares has closed",
+                    ))
+                })
+            }
+            fn send_to<'a>(
+                &'a self,
+                buf: &'a [u8],
+                _: SocketAddr,
+            ) -> BoxFuture<'a, std::io::Result<usize>> {
+                Box::pin(async move { Ok(buf.len()) })
+            }
+            fn poll_send_to(
+                &self,
+                _: &mut std::task::Context<'_>,
+                buf: &[u8],
+                _: SocketAddr,
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+        }
+
+        #[derive(Clone, Default)]
+        struct Lines(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Lines {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let written = lines.clone();
+        let _capture = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("weaver_torrent=error"))
+                .with_ansi(false)
+                .with_writer(move || written.clone())
+                .finish(),
+        );
+
+        let socket = Arc::new(Closing {
+            closed: tokio::sync::Notify::new(),
+        });
+        let tasks = tokio_util::task::TaskTracker::new();
+        let dht = DhtState::with_config(DhtConfig {
+            bootstrap_addrs: Some(Vec::new()),
+            socket: Some(socket.clone()),
+            tasks: Some(tasks.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        socket.closed.notify_one();
+        tasks.close();
+        tasks.wait().await;
+
+        assert!(!dht.cancellation_token().is_cancelled());
+        let logged = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
+        assert_eq!(logged, "");
     }
 }
