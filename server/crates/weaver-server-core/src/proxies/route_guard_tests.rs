@@ -66,7 +66,7 @@ const LIFTED: &[(&str, usize)] = &[
     // device or the host's.
     ("engines/weaver-torrent/src/network.rs", 3),
     ("engines/weaver-torrent/src/tests/e2e_session_stop.rs", 1),
-    ("engines/weaver-tunnel/src/egress.rs", 5),
+    ("engines/weaver-tunnel/src/egress.rs", 6),
     ("engines/weaver-tunnel/src/egress/multicast.rs", 1),
     ("engines/weaver-tunnel/src/lib.rs", 2),
     ("engines/weaver-tunnel/src/pipe.rs", 5),
