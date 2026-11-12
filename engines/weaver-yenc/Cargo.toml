@@ -5,6 +5,8 @@ version.workspace = true
 edition.workspace = true
 license-file.workspace = true
 repository.workspace = true
+# The real-article fixtures are for the tests and decode-bench only.
+exclude = ["fixtures/"]
 
 [dependencies]
 thiserror = { workspace = true }

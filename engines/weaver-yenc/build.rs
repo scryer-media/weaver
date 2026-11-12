@@ -10,9 +10,20 @@
 use std::env;
 use std::path::PathBuf;
 
+// Start every rapidyenc decoder function on a 64-byte boundary, so its loops
+// keep one offset within a 64-byte line whatever is linked before them; the
+// Rust side of decode-bench is pinned the same way (decode-bench/.cargo).
+fn pin_functions(b: &mut cc::Build) {
+    if !b.get_compiler().is_like_msvc() {
+        b.flag("-falign-functions=64");
+    }
+}
+
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(rapidyenc_linked)");
     println!("cargo:rustc-check-cfg=cfg(weaver_yenc_raw_asm)");
+    println!("cargo:rustc-check-cfg=cfg(weaver_yenc_bench)");
+    println!("cargo:rustc-check-cfg=cfg(fuzzing)");
     println!("cargo:rerun-if-env-changed=WEAVER_RAPIDYENC_SRC");
     println!("cargo:rerun-if-env-changed=WEAVER_YENC_RAW_ASM");
     println!("cargo:rerun-if-changed=rapidyenc_shim.cc");
@@ -47,14 +58,15 @@ fn main() {
     // NEON tier; NEON is baseline on ARMv8 so no -march flag is needed. Compile
     // the dispatch + the aarch64 NEON decoder + the shim, then stop.
     if env::var("CARGO_CFG_TARGET_ARCH").as_deref() == Ok("aarch64") {
-        cc::Build::new()
-            .cpp(true)
+        let mut b = cc::Build::new();
+        b.cpp(true)
             .include(&root)
             .file(src.join("platform.cc"))
             .file(src.join("decoder.cc"))
             .file(src.join("decoder_neon64.cc"))
-            .file("rapidyenc_shim.cc")
-            .compile("rapidyenc_arm");
+            .file("rapidyenc_shim.cc");
+        pin_functions(&mut b);
+        b.compile("rapidyenc_arm");
 
         // CRC dispatch + the ARM kernels it installs (the rapidyenc CRC
         // lane of the article_profile example and the rapidyenc_parity bench). `crc_arm*.cc` self-stub when the
@@ -84,35 +96,54 @@ fn main() {
 
     // Baseline group (x64 MSVC baseline is SSE2; SSSE3 intrinsics need no arch
     // flag on MSVC) + the shim.
-    cc::Build::new()
-        .cpp(true)
+    // Per-file ISA flags as rapidyenc's CMakeLists.txt:186-197 sets them
+    // (decoder_avx.cc needs -mpopcnt, or it falls back to the SSSE3 kernel),
+    // and every function 64-byte aligned (pin_functions).
+    let mut b = cc::Build::new();
+    b.cpp(true)
         .include(&root)
         .file(src.join("platform.cc"))
         .file(src.join("decoder.cc"))
-        .file(src.join("decoder_sse2.cc"))
-        .file(src.join("decoder_ssse3.cc"))
-        .file("rapidyenc_shim.cc")
-        .compile("rapidyenc_base");
+        .file("rapidyenc_shim.cc");
+    pin_functions(&mut b);
+    b.compile("rapidyenc_base");
 
-    let groups: [(&str, &str, &[&str]); 3] = [
-        ("decoder_avx.cc", "/arch:AVX", &["-mavx"]),
-        ("decoder_avx2.cc", "/arch:AVX2", &["-mavx2", "-mbmi2"]),
+    let groups: [(&str, Option<&str>, &[&str]); 5] = [
+        ("decoder_sse2.cc", None, &["-msse2"]),
+        ("decoder_ssse3.cc", None, &["-mssse3"]),
+        ("decoder_avx.cc", Some("/arch:AVX"), &["-mavx", "-mpopcnt"]),
+        (
+            "decoder_avx2.cc",
+            Some("/arch:AVX2"),
+            &["-mavx2", "-mpopcnt", "-mbmi", "-mbmi2", "-mlzcnt"],
+        ),
         (
             "decoder_vbmi2.cc",
-            "/arch:AVX512",
-            &["-mavx512vbmi2", "-mavx512vl", "-mavx512bw"],
+            Some("/arch:AVX512"),
+            &[
+                "-mavx512vbmi2",
+                "-mavx512vl",
+                "-mavx512bw",
+                "-mpopcnt",
+                "-mbmi",
+                "-mbmi2",
+                "-mlzcnt",
+            ],
         ),
     ];
     for (file, msvc_flag, gnu_flags) in groups {
         let mut b = cc::Build::new();
         b.cpp(true).include(&root).file(src.join(file));
         if b.get_compiler().is_like_msvc() {
-            b.flag(msvc_flag);
+            if let Some(flag) = msvc_flag {
+                b.flag(flag);
+            }
         } else {
             for f in gnu_flags {
                 b.flag(f);
             }
         }
+        pin_functions(&mut b);
         let name = file.trim_end_matches(".cc");
         b.compile(&format!("rapidyenc_{name}"));
     }
