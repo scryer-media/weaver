@@ -2561,3 +2561,91 @@ async fn a_lending_run_where_no_window_can_be_mapped_starts_in_ram_above_the_cei
     runs.ended(node, said.generation, 1);
     assert_eq!(pool.room().above, 0);
 }
+
+// A run that asks for the volume after its first, which waits while a
+// volume may still join, and says what the ask came back with.
+struct WaitsForNext {
+    asked: std::sync::mpsc::Sender<()>,
+    answered: std::sync::mpsc::Sender<Result<Option<VolumeIndex>, io::ErrorKind>>,
+}
+
+impl Extraction for WaitsForNext {
+    fn run(self: Box<Self>, volumes: Arc<dyn Volumes>, _: &mut Sink<'_>, _: weaver_graph::Budget) {
+        self.asked.send(()).unwrap();
+        let next = volumes.next(Some(FIRST)).map_err(|error| error.kind());
+        self.answered.send(next).unwrap();
+    }
+}
+
+// A shelf holding volume 0, with a member beside it still deciding whether
+// it joins, so a run asking for the next volume waits on it.
+fn deciding_shelf(envelopes: &mut Envelopes, node: NodeId) -> Arc<Shelf> {
+    let shelf = envelopes.shelf(node);
+    shelf.update(|state| {
+        state.volumes.insert(0);
+        state.deciding = true;
+    });
+    shelf
+}
+
+// Runs whose engines went while their readers wait on shelves nothing feeds
+// again: each forgotten run is stopped, its reader wakes stopped and its
+// thread says it ended, which nothing hears. Its slot goes to the run
+// waiting for one, once. A run whose engine stays is not stopped: it wakes
+// when its own shelf changes, and finds no volume after its first.
+#[tokio::test]
+async fn a_forgotten_run_waiting_on_its_shelf_is_stopped_and_ends() {
+    const GONE: usize = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let mut mail = RunMail::default();
+    let limit = GONE + 1;
+    let mut runs = Runs::new(1, limit, mail.sender(), unbounded());
+    let gone: Vec<NodeId> = (1..=GONE as u32).map(NodeId).collect();
+    let (stays, waiter) = (NodeId(10), NodeId(11));
+    let (asked, asks) = std::sync::mpsc::channel();
+    let (answered, answers) = std::sync::mpsc::channel();
+    let mut shelves = std::collections::BTreeMap::new();
+    for node in gone.iter().copied().chain([stays]) {
+        assert_eq!(runs.ask(node, limit), vec![node]);
+        let shelf = deciding_shelf(&mut envelopes, node);
+        shelves.insert(node, Arc::clone(&shelf));
+        let reads = WaitsForNext {
+            asked: asked.clone(),
+            answered: answered.clone(),
+        };
+        runs.start(node, Box::new(reads), shelf);
+    }
+    for _ in 0..=GONE {
+        asks.recv().unwrap();
+    }
+    assert!(runs.ask(waiter, limit).is_empty(), "every slot is held");
+
+    let admitted = runs.forget(gone.clone(), limit);
+    assert_eq!(admitted, vec![waiter], "a slot freed admits the waiter");
+    assert_eq!(runs.holding(), vec![stays, waiter], "each slot freed once");
+    let mut ended = std::collections::BTreeSet::new();
+    while ended.len() < GONE {
+        let said = mail.recv().await.unwrap();
+        assert!(gone.contains(&said.node), "only a forgotten run ends");
+        assert!(matches!(said.heard, Heard::Ended));
+        assert!(
+            !runs.current(said.node, said.generation),
+            "nothing hears it"
+        );
+        assert!(runs.ended(said.node, said.generation, limit).is_empty());
+        ended.insert(said.node);
+    }
+    for _ in 0..GONE {
+        assert_eq!(answers.recv().unwrap(), Err(io::ErrorKind::BrokenPipe));
+    }
+    assert!(runs.has(stays), "the run whose engine stays is kept");
+
+    shelves[&stays].update(|state| state.deciding = false);
+    assert_eq!(answers.recv().unwrap(), Ok(None), "it read on, not stopped");
+    let said = mail.recv().await.unwrap();
+    assert_eq!(said.node, stays);
+    assert!(runs.current(stays, said.generation));
+    assert_eq!(runs.ended(stays, said.generation, limit), Vec::new());
+    assert_eq!(runs.holding(), vec![waiter]);
+}

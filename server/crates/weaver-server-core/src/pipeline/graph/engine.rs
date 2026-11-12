@@ -843,8 +843,10 @@ impl Runs {
     }
 
     // Forget the runs of `gone`, nodes no longer engines: refused,
-    // retracted or unbound. Their threads may still be out: what they say
-    // is under a generation no run holds, and is not heard. Their slots and
+    // retracted, unbound or taken away. Each is stopped where it stands, as
+    // a stopped job's runs are, so a reader waiting on a shelf nothing feeds
+    // again wakes and its thread returns. What a thread says from here is
+    // under a generation no run holds, and is not heard. Their slots and
     // their memory go to whoever waits; returns the nodes that may start
     // now, as a raised limit or released memory admits them even when
     // nothing is gone.
@@ -857,7 +859,10 @@ impl Runs {
         }
         for node in gone {
             admitted.extend(self.free(node));
-            if self.runs.remove(&node).is_some() {
+            if let Some(run) = self.runs.remove(&node) {
+                if let Some(volumes) = &run.volumes {
+                    volumes.stop();
+                }
                 self.marks.mark(node);
             }
         }
