@@ -217,6 +217,28 @@ fn request(source: AddSource) -> AddRequest {
     }
 }
 
+impl TorrentService {
+    // `add`, and the wait it began for the torrent's route's session ended:
+    // the torrent is in that session, or held for why it did not open.
+    async fn add_opened(&self, request: AddRequest) -> Result<JobId, AddError> {
+        let job_id = self.add(request).await?;
+        self.opened(job_id).await;
+        Ok(job_id)
+    }
+
+    // Resolves once `job_id` waits no more on its route's session.
+    async fn opened(&self, job_id: JobId) {
+        let mut ended = self.attaches();
+        loop {
+            ended.borrow_and_update();
+            if !self.attaching(job_id).await {
+                return;
+            }
+            ended.changed().await.unwrap();
+        }
+    }
+}
+
 // A queue whose pipeline holds no live jobs. A retired job goes to its
 // finished jobs, newest first.
 fn queue() -> SchedulerHandle {
@@ -231,7 +253,7 @@ async fn a_torrent_takes_the_tags_it_was_added_with_and_its_view_shows_them() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             tags: vec!["tv".to_owned(), "HD".to_owned()],
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -265,7 +287,7 @@ async fn a_metainfo_becomes_a_job_and_its_duplicate_is_refused() {
     let bytes = plain("set", 1);
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes.clone())))
+        .add_opened(request(AddSource::Metainfo(bytes.clone())))
         .await
         .unwrap();
     let stored = rig.db.get_torrent(job_id).unwrap().unwrap();
@@ -281,7 +303,9 @@ async fn a_metainfo_becomes_a_job_and_its_duplicate_is_refused() {
     assert_eq!(view.files[0].path, "set/a.bin");
     assert!(view.route.is_some());
     assert_eq!(
-        rig.service.add(request(AddSource::Metainfo(bytes))).await,
+        rig.service
+            .add_opened(request(AddSource::Metainfo(bytes)))
+            .await,
         Err(AddError::Duplicate(job_id))
     );
     let infos = rig.service.job_infos().await;
@@ -301,7 +325,7 @@ async fn the_queue_orders_torrents_and_jobs_by_when_they_were_added() {
     let revision = state.job_revision();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     assert!(state.job_revision() > revision);
@@ -357,7 +381,7 @@ async fn a_failed_torrent_reaches_the_finished_jobs() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let mut changes = state.subscribe_job_changes();
@@ -391,7 +415,7 @@ async fn the_queues_actions_reach_a_torrent() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let record = |rig: &Rig| rig.db.get_torrent(job_id).unwrap().unwrap();
@@ -461,7 +485,7 @@ async fn the_queues_actions_reach_a_torrent() {
     // A delete with data goes the same way.
     let other = rig
         .service
-        .add(request(AddSource::Metainfo(plain("other", 2))))
+        .add_opened(request(AddSource::Metainfo(plain("other", 2))))
         .await
         .unwrap();
     queue.cancel_job(other).await.unwrap();
@@ -581,7 +605,7 @@ async fn admission_leaves_out_unwanted_files_and_refuses_nothing_wanted_and_exec
     let files: [(&str, &[u8]); 2] = [("a.bin", &[1; 128]), ("b.nfo", &[2; 64])];
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set", &files, 64, false,
         ))))
         .await
@@ -615,7 +639,7 @@ async fn admission_leaves_out_unwanted_files_and_refuses_nothing_wanted_and_exec
     let unwanted = metainfo("set", &[("set/b.nfo", &[2; 10])], 64, false);
     assert_eq!(
         rig.service
-            .add(request(AddSource::Metainfo(unwanted)))
+            .add_opened(request(AddSource::Metainfo(unwanted)))
             .await,
         Err(AddError::Refused(Refusal::Unwanted {
             path: "set/b.nfo".into(),
@@ -625,7 +649,7 @@ async fn admission_leaves_out_unwanted_files_and_refuses_nothing_wanted_and_exec
     let executable = metainfo("setup.exe", &[("setup.exe", &[1; 100])], 64, false);
     assert_eq!(
         rig.service
-            .add(request(AddSource::Metainfo(executable)))
+            .add_opened(request(AddSource::Metainfo(executable)))
             .await,
         Err(AddError::Refused(Refusal::Executable("setup.exe".into())))
     );
@@ -641,21 +665,27 @@ async fn a_magnet_is_refused_without_a_network_to_fetch_it_on() {
     rig.routes.set_down(Some("tunnel gone"));
     let magnet = format!("magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce");
     assert!(matches!(
-        rig.service.add(request(AddSource::Magnet(magnet))).await,
+        rig.service
+            .add_opened(request(AddSource::Magnet(magnet)))
+            .await,
         Err(AddError::NoNetwork(_))
     ));
     // A base32 hash names the same torrent as its hex form.
     let base32 = "AERUKZ4JVPG66AJDIVTYTK6N54ASGRLH";
     let magnet = format!("magnet:?xt=urn:btih:{base32}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce");
     assert!(matches!(
-        rig.service.add(request(AddSource::Magnet(magnet))).await,
+        rig.service
+            .add_opened(request(AddSource::Magnet(magnet)))
+            .await,
         Err(AddError::NoNetwork(_))
     ));
     // A route with no DHT cannot find peers for a magnet with no trackers.
     rig.routes.set_down(None);
     let bare = format!("magnet:?xt=urn:btih:{hash}");
     assert!(matches!(
-        rig.service.add(request(AddSource::Magnet(bare))).await,
+        rig.service
+            .add_opened(request(AddSource::Magnet(bare)))
+            .await,
         Err(AddError::NoNetwork(_))
     ));
     assert!(rig.db.list_torrents().unwrap().is_empty());
@@ -679,7 +709,7 @@ async fn a_v2_torrent_is_added_and_found_by_either_hash() {
 
     let v2_only = rig
         .service
-        .add(request(AddSource::Metainfo(V2_ONLY.to_vec())))
+        .add_opened(request(AddSource::Metainfo(V2_ONLY.to_vec())))
         .await
         .unwrap();
     let stored = rig.db.get_torrent(v2_only).unwrap().unwrap();
@@ -692,14 +722,14 @@ async fn a_v2_torrent_is_added_and_found_by_either_hash() {
     assert_eq!(view.infohash, v2[..40]);
     assert_eq!(
         rig.service
-            .add(request(AddSource::Metainfo(V2_ONLY.to_vec())))
+            .add_opened(request(AddSource::Metainfo(V2_ONLY.to_vec())))
             .await,
         Err(AddError::Duplicate(v2_only))
     );
 
     let hybrid = rig
         .service
-        .add(request(AddSource::Metainfo(V2_HYBRID.to_vec())))
+        .add_opened(request(AddSource::Metainfo(V2_HYBRID.to_vec())))
         .await
         .unwrap();
     let stored = rig.db.get_torrent(hybrid).unwrap().unwrap();
@@ -714,7 +744,7 @@ async fn a_v2_torrent_is_added_and_found_by_either_hash() {
     for xt in [format!("urn:btih:{v1}"), format!("urn:btmh:1220{v2}")] {
         assert_eq!(
             rig.service
-                .add(request(AddSource::Magnet(format!(
+                .add_opened(request(AddSource::Magnet(format!(
                     "magnet:?xt={xt}{tracker}"
                 ))))
                 .await,
@@ -726,7 +756,7 @@ async fn a_v2_torrent_is_added_and_found_by_either_hash() {
     let fresh = "ab".repeat(32);
     let magnet = rig
         .service
-        .add(request(AddSource::Magnet(format!(
+        .add_opened(request(AddSource::Magnet(format!(
             "magnet:?xt=urn:btmh:1220{fresh}{tracker}"
         ))))
         .await
@@ -748,7 +778,7 @@ async fn a_torrent_keeps_the_attributes_it_was_added_with_into_history() {
     ];
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             metadata: metadata.clone(),
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -776,7 +806,7 @@ async fn a_private_torrent_with_an_unmet_goal_stays_unless_the_removal_confirms(
     let private = metainfo("p", &[("p/a.bin", &[7; 2000])], 1024, true);
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             policy_override: Some(SeedingPolicy {
                 seed_time_counting: Default::default(),
                 ratio_goal: Leaf::Set(1.0),
@@ -802,7 +832,7 @@ async fn a_private_torrent_with_an_unmet_goal_stays_unless_the_removal_confirms(
     // A public torrent with no goal leaves when asked.
     let public = rig
         .service
-        .add(request(AddSource::Metainfo(plain("q", 3))))
+        .add_opened(request(AddSource::Metainfo(plain("q", 3))))
         .await
         .unwrap();
     rig.service.remove(public, true, false).await.unwrap();
@@ -818,7 +848,7 @@ async fn a_route_that_goes_down_holds_its_torrents_and_a_category_move_changes_s
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let first = rig.service.torrent(job_id).await.unwrap().route.unwrap();
@@ -1232,7 +1262,7 @@ async fn routes_are_planned_from_the_runtime_not_the_route_rows() {
         let name = format!("planned-{seed}");
         jobs.push(
             service
-                .add(request(AddSource::Metainfo(plain(&name, seed))))
+                .add_opened(request(AddSource::Metainfo(plain(&name, seed))))
                 .await
                 .unwrap(),
         );
@@ -1563,7 +1593,7 @@ async fn a_stored_route_with_two_exits_holds_until_it_is_edited_to_one() {
     let service = service_over(&db, dir.path(), routes, job_env(), set_clock());
     service.open().await.unwrap();
     let job_id = service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     service.tick().await;
@@ -1648,7 +1678,7 @@ async fn a_new_listen_port_reopens_the_torrents_route_on_it() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -1704,7 +1734,7 @@ async fn a_new_listen_port_reaches_the_route_without_waiting_for_the_tick() {
     rig.service.start().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -1743,7 +1773,7 @@ async fn a_torrent_whose_leg_is_revoked_moves_to_a_session_on_the_new_leg() {
     rig.service.start().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -1823,7 +1853,7 @@ async fn a_torrent_past_the_session_limit_says_so() {
     }
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let view = rig.service.torrent(job_id).await.unwrap();
@@ -1847,7 +1877,7 @@ async fn a_torrent_waiting_on_its_routes_session_reads_as_opening() {
     let service = rig.service.clone();
     let added = tokio::spawn(async move {
         service
-            .add(request(AddSource::Metainfo(plain("set", 1))))
+            .add_opened(request(AddSource::Metainfo(plain("set", 1))))
             .await
             .unwrap()
     });
@@ -1864,6 +1894,128 @@ async fn a_torrent_waiting_on_its_routes_session_reads_as_opening() {
         rig.service.torrent(job_id).await.unwrap().route_reason,
         None
     );
+    rig.service.stop().await;
+}
+
+// A leg's sockets that reach no one, each one asked for counted.
+#[derive(Default)]
+struct Watched {
+    asked: AtomicUsize,
+}
+
+impl weaver_torrent::SocketFactory for Watched {
+    fn connect_tcp<'a>(
+        &'a self,
+        _: std::net::SocketAddr,
+    ) -> weaver_torrent::network::BoxFuture<
+        'a,
+        std::io::Result<(
+            weaver_torrent::network::BoxAsyncReadVectored,
+            weaver_torrent::network::BoxAsyncWrite,
+        )>,
+    > {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(std::io::Error::from(std::io::ErrorKind::Unsupported)) })
+    }
+
+    fn listen_tcp<'a>(
+        &'a self,
+        _: std::net::SocketAddr,
+    ) -> weaver_torrent::network::BoxFuture<
+        'a,
+        std::io::Result<Box<dyn weaver_torrent::StreamListener>>,
+    > {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(std::io::Error::from(std::io::ErrorKind::Unsupported)) })
+    }
+
+    fn bind_udp<'a>(
+        &'a self,
+        _: std::net::SocketAddr,
+    ) -> weaver_torrent::network::BoxFuture<
+        'a,
+        std::io::Result<Arc<dyn weaver_torrent::network::DatagramSocket>>,
+    > {
+        self.asked.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(std::io::Error::from(std::io::ErrorKind::Unsupported)) })
+    }
+}
+
+// An add is answered while its route's session is still opening: the torrent
+// reads as opening, its route not yet open, and once the route opens it joins the session by itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_is_answered_before_its_routes_session_opens() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.routes.unanswered.send_replace(true);
+    let mut asked = rig.routes.asked.subscribe();
+    let before = *asked.borrow_and_update();
+
+    // The route's open is held unanswered, and the add still answers.
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(
+        (view.state, view.route_reason),
+        (TorrentState::Queued, Some(TorrentRouteReason::Opening))
+    );
+    assert!(rig.service.attaching(job_id).await);
+    asked.wait_for(|asked| *asked > before).await.unwrap();
+    assert_eq!(rig.routes.opened.load(Ordering::SeqCst), 0);
+
+    rig.routes.unanswered.send_replace(false);
+    rig.service.opened(job_id).await;
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.route_reason, None);
+    handle_of(&rig.service, job_id).await;
+    rig.service.stop().await;
+}
+
+// An add whose route then fails to open is answered as opening, and goes on
+// to say why the route did not open: nothing of it went anywhere.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_add_whose_route_fails_to_open_says_why_and_sends_nothing() {
+    let rig = rig(set_clock());
+    let watched = Arc::new(Watched::default());
+    rig.routes.set_leg(
+        crate::torrents::net::LegKind::Ladder,
+        Arc::clone(&watched) as Arc<dyn weaver_torrent::SocketFactory>,
+    );
+    rig.service.open().await.unwrap();
+    rig.routes
+        .set_refused(Some("No handshake within 30 seconds."));
+    rig.routes.unanswered.send_replace(true);
+
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .await
+        .unwrap();
+    assert_eq!(
+        rig.service.torrent(job_id).await.unwrap().route_reason,
+        Some(TorrentRouteReason::Opening)
+    );
+
+    rig.routes.unanswered.send_replace(false);
+    rig.service.opened(job_id).await;
+    let view = rig.service.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::Stalled);
+    assert_eq!(
+        (view.detail.as_deref(), view.route_reason),
+        (
+            Some("No handshake within 30 seconds."),
+            Some(TorrentRouteReason::LegOpenFailed)
+        )
+    );
+    assert!(
+        rig.service.inner.live.lock().await[&job_id]
+            .attached
+            .is_none()
+    );
+    assert_eq!(watched.asked.load(Ordering::SeqCst), 0);
     rig.service.stop().await;
 }
 
@@ -1894,7 +2046,7 @@ async fn with_every_piece(rig: &Rig) -> (JobId, PathBuf) {
 async fn with_every_piece_of(rig: &Rig, name: &str, seed: u8) -> (JobId, PathBuf) {
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain(name, seed))))
+        .add_opened(request(AddSource::Metainfo(plain(name, seed))))
         .await
         .unwrap();
     fetch_every_piece(&rig.service, job_id, &[seed; 3000]).await;
@@ -1915,7 +2067,7 @@ async fn with_every_piece_of(rig: &Rig, name: &str, seed: u8) -> (JobId, PathBuf
 async fn next_taken(rig: &Rig) -> usize {
     let next = rig
         .service
-        .add(request(AddSource::Metainfo(plain("next", 2))))
+        .add_opened(request(AddSource::Metainfo(plain("next", 2))))
         .await
         .unwrap();
     handle_of(&rig.service, next).await.id()
@@ -1982,7 +2134,7 @@ async fn torrents_moved_to_a_new_route_read_as_it_at_once() {
     for seed in 1..=3 {
         jobs.push(
             rig.service
-                .add(request(AddSource::Metainfo(plain(
+                .add_opened(request(AddSource::Metainfo(plain(
                     &format!("moved-{seed}"),
                     seed,
                 ))))
@@ -2039,7 +2191,7 @@ async fn a_session_that_cannot_be_built_says_why() {
     rig.routes.set_refused(Some("no listening port"));
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let said = |view: TorrentView| {
@@ -2068,6 +2220,45 @@ async fn a_session_that_cannot_be_built_says_why() {
     said(rig.service.torrent(job_id).await.unwrap());
 }
 
+// A route whose session cannot be built is tried once a pass, however many
+// torrents wait on it: each says why, and the pass does not open the route
+// again for each of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failing_route_is_opened_once_a_pass_for_all_its_torrents() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    rig.routes
+        .set_refused(Some("No handshake within 30 seconds."));
+    let mut jobs = Vec::new();
+    for seed in 1..=3 {
+        jobs.push(
+            rig.service
+                .add_opened(request(AddSource::Metainfo(plain(
+                    &format!("held-{seed}"),
+                    seed,
+                ))))
+                .await
+                .unwrap(),
+        );
+    }
+    let before = *rig.routes.asked.borrow();
+    rig.service.tick().await;
+    assert_eq!(*rig.routes.asked.borrow() - before, 1);
+    for job_id in jobs {
+        let view = rig.service.torrent(job_id).await.unwrap();
+        assert_eq!(
+            (view.state, view.detail.as_deref(), view.route_reason),
+            (
+                TorrentState::Stalled,
+                Some("No handshake within 30 seconds."),
+                Some(TorrentRouteReason::LegOpenFailed)
+            ),
+            "torrent {job_id:?}"
+        );
+    }
+    rig.service.stop().await;
+}
+
 // The list of torrents carries each torrent's trackers, the same rows its
 // own view does, and no other torrent's.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2075,7 +2266,7 @@ async fn the_list_carries_each_torrents_trackers() {
     let rig = rig(set_clock());
     rig.service.open().await.unwrap();
     let add = |name: &'static str, seed| {
-        rig.service.add(AddRequest {
+        rig.service.add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain(name, seed)))
         })
@@ -2124,7 +2315,7 @@ async fn pause_resume_and_force_are_kept() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     rig.service.pause(job_id).await.unwrap();
@@ -2161,7 +2352,7 @@ async fn the_ledger_is_written_at_each_tick_it_changed() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let written = rig.service.written();
@@ -2213,7 +2404,7 @@ async fn an_unwanted_member_found_while_unpacking_fails_the_job_and_keeps_the_to
     let bytes = metainfo("set.rar", &[("set.rar", archive)], 128, false);
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     let (layout, intake) = {
@@ -2320,7 +2511,7 @@ async fn unpacks_beside_and_seeds(name: &str, archive: &[u8]) {
     let bytes = metainfo(name, &[(name, archive)], 128, false);
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     let (layout, intake) = {
@@ -2472,7 +2663,7 @@ async fn a_finished_torrent_unpacking_refused_seeds_on_and_fails_with_no_usable_
     let bytes = metainfo("set.rar", &[("set.rar", archive)], 128, false);
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     let mut retired = rig.service.retired();
@@ -2523,7 +2714,7 @@ async fn a_finished_torrent_unpacking_refused_beside_a_usable_file_is_partial() 
     let bytes = metainfo("set", &files, 128, false);
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     let mut retired = rig.service.retired();
@@ -2565,7 +2756,7 @@ async fn unpacked_files_that_cannot_be_placed_are_kept_and_the_job_is_partial() 
     let bytes = metainfo("set", &files, 128, false);
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     let work = rig.service.unpacking_dir(job_id);
@@ -2736,7 +2927,7 @@ async fn tracked(service: &TorrentService, job_id: JobId, url: &str) {
 // named again, then resumed.
 async fn fetching_from(service: &TorrentService, hash: &str, port: u16) -> JobId {
     let job_id = service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Magnet(format!(
                 "magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F127.0.0.1%3A{port}%2Fannounce"
@@ -2864,7 +3055,7 @@ async fn connected_to_a_sharer(
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
@@ -2981,7 +3172,7 @@ async fn a_full_disk_leaves_the_selection_as_it_was() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
@@ -3123,7 +3314,7 @@ async fn torrents_turn_off_and_on_while_running() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     assert!(rig.service.torrent(job_id).await.unwrap().route.is_some());
@@ -3140,7 +3331,7 @@ async fn torrents_turn_off_and_on_while_running() {
     assert!(rig.service.inner.sessions.views().await.is_empty());
     assert_eq!(
         rig.service
-            .add(request(AddSource::Metainfo(plain("other", 2))))
+            .add_opened(request(AddSource::Metainfo(plain("other", 2))))
             .await,
         Err(AddError::Off)
     );
@@ -3166,7 +3357,7 @@ async fn a_refused_unpause_keeps_the_intent_and_shows_the_error() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     rig.service.pause(job_id).await.unwrap();
@@ -3199,7 +3390,7 @@ async fn a_restart_restores_the_intent_not_the_state() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let mut settings = rig.service.settings();
@@ -3353,7 +3544,7 @@ async fn a_start_of_every_torrent_looks_again_at_those_held_for_their_files() {
     let (gone, gone_dir) = with_every_piece_of(&rig, "gone", 2).await;
     let stopped = rig
         .service
-        .add(request(AddSource::Metainfo(plain("stopped", 3))))
+        .add_opened(request(AddSource::Metainfo(plain("stopped", 3))))
         .await
         .unwrap();
     rig.service.stop().await;
@@ -3486,7 +3677,7 @@ async fn a_torrent_that_crashed_the_daemon_stays_paused_until_resumed() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             128,
@@ -3562,7 +3753,7 @@ async fn a_panic_in_a_torrents_restore_leaves_its_marker_and_parks_it() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             128,
@@ -3651,7 +3842,7 @@ async fn a_resume_racing_the_restore_pass_is_never_undone() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     rig.service.stop().await;
@@ -3700,7 +3891,7 @@ async fn a_stopped_torrent_that_crashed_the_daemon_says_why() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     rig.service
@@ -3737,7 +3928,7 @@ async fn a_forced_torrent_seeds_past_its_goal() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             policy_override: Some(SeedingPolicy {
                 seed_time_counting: Default::default(),
                 ratio_goal: Leaf::Set(0.0),
@@ -3784,7 +3975,7 @@ async fn torrents_with_one_name_get_their_own_directories() {
     for seed in [1, 2] {
         let job_id = rig
             .service
-            .add(request(AddSource::Metainfo(plain("set", seed))))
+            .add_opened(request(AddSource::Metainfo(plain("set", seed))))
             .await
             .unwrap();
         let dir = rig
@@ -3814,7 +4005,7 @@ async fn the_checkpoint_is_written_once_a_tick() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let written = rig.service.written();
@@ -3844,7 +4035,7 @@ async fn the_checkpoint_follows_the_verified_pieces_between_ticks() {
         .collect();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set",
             &[("set/a.bin", &bytes)],
             PIECE,
@@ -3903,7 +4094,7 @@ async fn the_checkpoint_between_ticks_carries_the_ledger_with_its_pieces() {
         .collect();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set",
             &[("set/a.bin", &bytes)],
             PIECE,
@@ -3971,12 +4162,12 @@ async fn the_global_pause_reaches_the_torrents() {
     rig.service.open().await.unwrap();
     let downloading = rig
         .service
-        .add(request(AddSource::Metainfo(plain("downloading", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("downloading", 1))))
         .await
         .unwrap();
     let seeding = rig
         .service
-        .add(request(AddSource::Metainfo(plain("seeding", 2))))
+        .add_opened(request(AddSource::Metainfo(plain("seeding", 2))))
         .await
         .unwrap();
     rig.service
@@ -3991,7 +4182,7 @@ async fn the_global_pause_reaches_the_torrents() {
 
     let kept = rig
         .service
-        .add(request(AddSource::Metainfo(plain("kept", 3))))
+        .add_opened(request(AddSource::Metainfo(plain("kept", 3))))
         .await
         .unwrap();
     rig.service.pause(kept).await.unwrap();
@@ -4119,7 +4310,7 @@ async fn a_complete_torrent_seeds_after_a_restart_without_fetching_again() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
@@ -4232,7 +4423,7 @@ async fn seeded() -> Seeded {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
@@ -4493,7 +4684,7 @@ async fn an_egress_upload_quota_throttles_its_seeds_and_never_pauses_them() {
     routes.route(TorrentScope::Category(1), 2);
     routes.route_on_egress(TorrentScope::Category(1), 7);
     let other = service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             category: Some("tv".into()),
             ..request(AddSource::Metainfo(plain("other", 2)))
         })
@@ -4605,7 +4796,7 @@ async fn a_torrent_that_wants_nothing_seeds_until_it_wants_a_file() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -4785,13 +4976,13 @@ async fn a_restart_starts_before_the_torrents_route_answers() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let hash = "0123456789abcdef0123456789abcdef01234567";
     let magnet = rig
         .service
-        .add(request(AddSource::Magnet(format!(
+        .add_opened(request(AddSource::Magnet(format!(
             "magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2F127.0.0.1%3A9%2Fannounce"
         ))))
         .await
@@ -4889,7 +5080,7 @@ async fn a_peers_sighting_of_a_complete_copy_dates_the_torrents() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
@@ -4969,7 +5160,7 @@ async fn a_rechecked_torrent_loses_a_damaged_piece_and_runs_again() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
@@ -5016,7 +5207,7 @@ async fn a_torrent_in_no_session_is_not_rechecked() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     rig.routes.set_down(Some("tunnel gone"));
@@ -5073,7 +5264,7 @@ async fn complete_then_damaged_of(pieces: usize) -> Damaged {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
@@ -5309,7 +5500,7 @@ async fn a_trackers_status_follows_its_announces() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
@@ -5409,7 +5600,7 @@ async fn a_follower_is_given_only_what_moved_after_the_first_push() {
     for (name, seed) in [("one", 1), ("two", 2)] {
         let job_id = rig
             .service
-            .add(request(AddSource::Metainfo(plain(name, seed))))
+            .add_opened(request(AddSource::Metainfo(plain(name, seed))))
             .await
             .unwrap();
         views.push(rig.service.torrent(job_id).await.unwrap());
@@ -5541,7 +5732,7 @@ async fn a_followed_torrent_pushes_its_trackers_answer() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("pushed", 2))))
+        .add_opened(request(AddSource::Metainfo(plain("pushed", 2))))
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
@@ -5816,7 +6007,7 @@ async fn a_magnet_added_paused_announces_only_once_resumed() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Magnet(format!(
                 "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2F127.0.0.1%3A{port}%2Fannounce",
@@ -5886,7 +6077,7 @@ async fn a_tracker_rules_client_names_its_torrents() {
     rig.service.reload_tracker_rules().await.unwrap();
     let kept = rig
         .service
-        .add(request(AddSource::Metainfo(announcing(
+        .add_opened(request(AddSource::Metainfo(announcing(
             &plain("kept", 1),
             "http://tracker.test/announce",
         ))))
@@ -5894,7 +6085,7 @@ async fn a_tracker_rules_client_names_its_torrents() {
         .unwrap();
     let plain = rig
         .service
-        .add(request(AddSource::Metainfo(plain("plain", 2))))
+        .add_opened(request(AddSource::Metainfo(plain("plain", 2))))
         .await
         .unwrap();
 
@@ -5946,7 +6137,7 @@ async fn a_route_opened_by_a_torrent_under_no_rule_names_weaver() {
     rig.service.open().await.unwrap();
     let plain = rig
         .service
-        .add(request(AddSource::Metainfo(plain("plain", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("plain", 1))))
         .await
         .unwrap();
     let identity = session_of(&rig.service, plain).await.identity().clone();
@@ -6001,7 +6192,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
     rig.service.reload_tracker_rules().await.unwrap();
     let kept = rig
         .service
-        .add(request(AddSource::Metainfo(announcing(
+        .add_opened(request(AddSource::Metainfo(announcing(
             &plain("kept", 1),
             "http://tracker.test/announce",
         ))))
@@ -6009,7 +6200,7 @@ async fn a_never_pause_rule_keeps_its_torrents_seeding_through_the_schedule() {
         .unwrap();
     let plain = rig
         .service
-        .add(request(AddSource::Metainfo(plain("plain", 2))))
+        .add_opened(request(AddSource::Metainfo(plain("plain", 2))))
         .await
         .unwrap();
     assert_eq!(
@@ -6156,7 +6347,7 @@ async fn the_download_limit_counts_downloading_torrents_as_it_is_set() {
     for seed in 1..=4 {
         ids.push(
             rig.service
-                .add(request(AddSource::Metainfo(plain(
+                .add_opened(request(AddSource::Metainfo(plain(
                     &format!("set{seed}"),
                     seed,
                 ))))
@@ -6206,7 +6397,7 @@ async fn the_download_queue_keeps_its_order_and_moves_as_qbittorrent_does() {
     for seed in 1..=5 {
         ids.push(
             rig.service
-                .add(request(AddSource::Metainfo(plain(
+                .add_opened(request(AddSource::Metainfo(plain(
                     &format!("set{seed}"),
                     seed,
                 ))))
@@ -6332,7 +6523,7 @@ async fn an_add_reads_no_other_torrent() {
         let service = rig.service.clone();
         async move {
             service
-                .add(request(AddSource::Metainfo(plain(
+                .add_opened(request(AddSource::Metainfo(plain(
                     &format!("set{seed}"),
                     seed,
                 ))))
@@ -6399,7 +6590,7 @@ impl OneSlot {
     async fn add(&self, seed: u8) -> JobId {
         self.rig
             .service
-            .add(request(AddSource::Metainfo(plain(
+            .add_opened(request(AddSource::Metainfo(plain(
                 &format!("set{seed}"),
                 seed,
             ))))
@@ -6881,13 +7072,17 @@ async fn a_tracker_rules_route_carries_its_torrents_ahead_of_their_categorys() {
     };
     let ruled = rig
         .service
-        .add(in_tv(announcing(
+        .add_opened(in_tv(announcing(
             &plain("ruled", 1),
             "http://tracker.test/announce",
         )))
         .await
         .unwrap();
-    let unruled = rig.service.add(in_tv(plain("unruled", 2))).await.unwrap();
+    let unruled = rig
+        .service
+        .add_opened(in_tv(plain("unruled", 2)))
+        .await
+        .unwrap();
     let route = async |job_id| rig.service.torrent(job_id).await.unwrap().route;
 
     assert_eq!(
@@ -6923,12 +7118,12 @@ async fn a_torrent_keeps_the_unpack_in_force_once_its_job_is_built() {
     rig.service.open().await.unwrap();
     let inherits = rig
         .service
-        .add(request(AddSource::Metainfo(plain("inherits", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("inherits", 1))))
         .await
         .unwrap();
     let off = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             unpack: Some(false),
             ..request(AddSource::Metainfo(plain("off", 2)))
         })
@@ -6972,7 +7167,7 @@ async fn a_torrents_saved_peers_and_bans_outlive_a_restart() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -7015,7 +7210,7 @@ async fn a_save_on_its_way_at_stop_lands_before_stops_own() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -7073,7 +7268,7 @@ async fn a_torrent_moves_under_another_directory_and_its_record_follows() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let stored = |rig: &Rig| {
@@ -7130,7 +7325,7 @@ async fn a_paused_torrents_peers_are_none_and_an_unknown_ones_are_not_found() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -7165,7 +7360,7 @@ async fn a_banned_peer_stays_banned_across_a_restart() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -7236,7 +7431,7 @@ async fn a_ban_made_in_no_session_holds_once_the_torrent_is_in_one() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -7273,7 +7468,7 @@ async fn a_second_checkpoint_writes_only_what_changed() {
     ));
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             128,
@@ -7321,7 +7516,7 @@ async fn a_pause_racing_completion_keeps_the_completion() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let (paused, ()) = tokio::join!(rig.service.pause(job_id), rig.service.completed(job_id));
@@ -7350,7 +7545,7 @@ async fn a_torrents_rate_limits_reach_its_session_and_outlive_a_restart() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -7428,7 +7623,7 @@ async fn the_tighter_of_a_torrents_limit_and_its_upload_cap_holds() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -7504,7 +7699,7 @@ async fn empty_seeding_terms_inherit_the_chain() {
     rig.service.reload_tracker_rules().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             policy_override: Some(SeedingPolicy::default()),
             ..request(AddSource::Metainfo(announcing(
@@ -7612,13 +7807,17 @@ async fn a_tracker_rules_privacy_terms_reach_its_torrents() {
     };
     let ruled = rig
         .service
-        .add(paused(announcing(
+        .add_opened(paused(announcing(
             &plain("ruled", 1),
             "http://tracker.example-tracker.test/announce",
         )))
         .await
         .unwrap();
-    let unruled = rig.service.add(paused(plain("unruled", 2))).await.unwrap();
+    let unruled = rig
+        .service
+        .add_opened(paused(plain("unruled", 2)))
+        .await
+        .unwrap();
 
     assert!(rig.service.torrent(ruled).await.unwrap().forced);
     assert!(rig.db.get_torrent(ruled).unwrap().unwrap().forced);
@@ -7685,7 +7884,7 @@ async fn a_tracker_rules_dht_pex_and_lsd_each_reach_its_torrents() {
     rig.service.reload_tracker_rules().await.unwrap();
     let ruled = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(announcing(
                 &plain("ruled", 1),
@@ -7755,7 +7954,7 @@ async fn the_stored_levels_and_toggles_reach_the_session_through_one_reconcile()
     );
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     let handle = handle_of(&rig.service, job_id).await;
@@ -7802,7 +8001,7 @@ async fn a_file_turned_off_counts_in_neither_the_wanted_nor_the_remaining_bytes(
     );
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(bytes))
         })
@@ -7838,7 +8037,7 @@ async fn the_two_picking_toggles_set_at_once_both_hold() {
     let bytes = metainfo("pair", &[("pair/a.bin", &[1; 3000])], 1024, false);
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     let handle = handle_of(&rig.service, job_id).await;
@@ -7887,7 +8086,7 @@ async fn file_levels_and_picking_toggles_reach_the_session_and_outlive_a_restart
     );
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     let handle = handle_of(&rig.service, job_id).await;
@@ -7970,7 +8169,7 @@ async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
             let name = format!("listed-{seed}");
             let job_id = rig
                 .service
-                .add(AddRequest {
+                .add_opened(AddRequest {
                     paused: true,
                     ..request(AddSource::Metainfo(announcing(&plain(&name, seed), a)))
                 })
@@ -7992,7 +8191,7 @@ async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
         let hash: String = v1.iter().map(|byte| format!("{byte:02x}")).collect();
         let magnet = rig
             .service
-            .add(AddRequest {
+            .add_opened(AddRequest {
                 paused: true,
                 ..request(AddSource::Magnet(format!(
                     "magnet:?xt=urn:btih:{hash}&tr=http%3A%2F%2Fy.invalid%2Fannounce"
@@ -8012,7 +8211,7 @@ async fn torrents_list_their_trackers_from_memory_after_one_boot_read() {
         std::fs::write(save.join("placed/a.bin"), &data).unwrap();
         let seeded = rig
             .service
-            .add(AddRequest {
+            .add_opened(AddRequest {
                 paused: true,
                 placement: Placement {
                     save_path: Some(save.to_string_lossy().into_owned()),
@@ -8110,7 +8309,7 @@ async fn the_trackers_a_torrent_comes_with_are_the_torrents() {
     rig.service.open().await.unwrap();
     let metainfo = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(announcing(&plain("named", 3), a)))
         })
@@ -8118,7 +8317,7 @@ async fn the_trackers_a_torrent_comes_with_are_the_torrents() {
         .unwrap();
     let magnet = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Magnet(format!(
                 "magnet:?xt=urn:btih:{}&tr=http%3A%2F%2Fa.invalid%2Fannounce&tr=udp%3A%2F%2Fb.invalid%3A80",
@@ -8168,7 +8367,7 @@ async fn tracker_edits_outlive_a_restart() {
     // Paused, it announces to none of them.
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(announcing(&plain("edited", 3), a)))
         })
@@ -8289,7 +8488,7 @@ async fn the_rule_a_tracker_edit_picks_is_the_one_a_restart_reads() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(announcing(&plain("ruled", 5), a)))
         })
@@ -8326,7 +8525,7 @@ async fn a_tracker_edit_racing_an_attach_reaches_the_session() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(announcing(&plain("raced", 6), a)))
         })
@@ -8384,7 +8583,7 @@ async fn a_reannounce_reaches_the_tracker_now() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("again", 4))))
+        .add_opened(request(AddSource::Metainfo(plain("again", 4))))
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
@@ -8460,7 +8659,7 @@ async fn a_new_encryption_setting_reaches_the_open_session_and_its_next_announce
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("crypt", 4))))
+        .add_opened(request(AddSource::Metainfo(plain("crypt", 4))))
         .await
         .unwrap();
     tracked(&rig.service, job_id, &url).await;
@@ -8575,7 +8774,7 @@ async fn partly_fetched() -> PartlyFetched {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(bytes))
         })
@@ -8944,7 +9143,7 @@ async fn a_corrupted_checkpoint_is_logged_and_the_torrent_starts_fresh() {
     ));
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             128,
@@ -9002,7 +9201,7 @@ async fn a_checkpoint_the_database_fails_to_read_holds_the_restore_until_it_read
     ));
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             128,
@@ -9103,7 +9302,7 @@ async fn a_restart_that_finds_an_unpacking_torrents_file_gone_holds_it_with_its_
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             128,
@@ -9215,7 +9414,7 @@ async fn a_restart_has_no_piece_its_file_lost() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "a.bin",
             &[("a.bin", &data)],
             128,
@@ -9339,7 +9538,7 @@ async fn a_checkpoint_the_database_refuses_ends_unpacking_and_holds_no_write_up(
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             128,
@@ -9429,7 +9628,7 @@ async fn an_unpacking_run_again_keeps_the_files_the_first_one_placed() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", b"rar")],
             128,
@@ -9570,7 +9769,7 @@ async fn a_paused_and_resumed_torrent_keeps_its_key_and_peer_id() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("kept", 7)))
         })
@@ -9615,7 +9814,7 @@ async fn a_torrent_moved_to_a_new_route_keeps_its_identity_and_counters() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(private.to_vec()))
         })
@@ -9686,7 +9885,7 @@ async fn a_torrent_moved_off_a_spent_leg_sends_no_stopped_over_it() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("spent", 8)))
         })
@@ -9732,7 +9931,7 @@ async fn a_torrent_moved_off_a_revoked_leg_sends_no_stopped_over_it() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("revoked", 10)))
         })
@@ -9781,7 +9980,7 @@ async fn a_torrent_removed_and_added_again_takes_a_new_identity() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(bytes.clone()))
         })
@@ -9798,7 +9997,7 @@ async fn a_torrent_removed_and_added_again_takes_a_new_identity() {
 
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(bytes))
         })
@@ -9828,7 +10027,7 @@ async fn the_metrics_carry_what_the_tick_read() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             category: Some("tv".into()),
             policy_override: Some(SeedingPolicy {
                 seed_time_counting: Default::default(),
@@ -9844,7 +10043,7 @@ async fn the_metrics_carry_what_the_tick_read() {
         .unwrap();
     let gone = rig
         .service
-        .add(request(AddSource::Metainfo(plain("gone", 2))))
+        .add_opened(request(AddSource::Metainfo(plain("gone", 2))))
         .await
         .unwrap();
     rig.service
@@ -9984,7 +10183,7 @@ async fn a_trackers_answer_is_published_as_it_lands() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(plain("answered", 3)))
         })
@@ -10084,7 +10283,7 @@ async fn turning_torrents_off_publishes_their_routes_closed() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("closed", 4))))
+        .add_opened(request(AddSource::Metainfo(plain("closed", 4))))
         .await
         .unwrap();
     rig.service.tick().await;
@@ -10156,7 +10355,7 @@ async fn a_torrent_given_its_session_is_published_in_it_open() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("given", 4))))
+        .add_opened(request(AddSource::Metainfo(plain("given", 4))))
         .await
         .unwrap();
     rig.service.follow_routes().await;
@@ -10200,7 +10399,7 @@ async fn seeding_placed(
     rig.service.publish_to(handle);
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             placement,
             ..request(AddSource::Metainfo(metainfo))
         })
@@ -10240,7 +10439,7 @@ async fn completed_placed(
     rig.service.publish_to(handle);
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             placement,
             ..request(AddSource::Metainfo(metainfo))
         })
@@ -10766,7 +10965,7 @@ async fn a_torrents_archive_passwords_are_its_rules_then_the_global_list() {
                 None => bytes,
             };
             service
-                .add(request(AddSource::Metainfo(bytes)))
+                .add_opened(request(AddSource::Metainfo(bytes)))
                 .await
                 .unwrap()
         }
@@ -11055,7 +11254,7 @@ async fn a_tee_writes_its_checkpoint_by_bytes_and_age_in_a_session_or_out() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             piece,
@@ -11134,7 +11333,7 @@ async fn a_paused_torrent_holds_its_tees_extraction_clock() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             128,
@@ -11186,7 +11385,7 @@ async fn a_paused_torrents_tee_starts_no_run_until_resumed() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             piece,
@@ -11229,7 +11428,7 @@ async fn a_stop_waiting_on_an_unpacking_job_holds_no_other_torrent_up() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             128,
@@ -11329,7 +11528,7 @@ async fn an_archive_and_a_plain_file_under_one_recovery_set_unpack_and_complete(
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "mixed", &listed, 256, false,
         ))))
         .await
@@ -11463,7 +11662,7 @@ async fn a_part_delivered_unpacking_restored_from_its_checkpoint_unpacks() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(metainfo(
+        .add_opened(request(AddSource::Metainfo(metainfo(
             "set.rar",
             &[("set.rar", archive)],
             128,
@@ -11540,7 +11739,7 @@ async fn a_seed_mode_add_of_an_archive_unpacks_it_and_completes() {
     rig.service.publish_to(handle);
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             placement: Placement {
                 save_path: Some(save.to_string_lossy().into_owned()),
                 seed_mode: true,
@@ -11609,7 +11808,7 @@ async fn a_seed_mode_archive_with_a_bad_file_is_fetched_again_and_unpacks_whole(
     rig.service.publish_to(handle);
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             placement: Placement {
                 save_path: Some(save.to_string_lossy().into_owned()),
                 seed_mode: true,
@@ -11661,7 +11860,7 @@ async fn pins(service: &TorrentService, db: &Database, jobs: &[JobId]) -> Vec<Op
 
 async fn add_plain(service: &TorrentService, name: &str, seed: u8) -> JobId {
     service
-        .add(request(AddSource::Metainfo(plain(name, seed))))
+        .add_opened(request(AddSource::Metainfo(plain(name, seed))))
         .await
         .unwrap()
 }
@@ -11833,7 +12032,7 @@ async fn a_proxy_in_two_pools_runs_one_session_for_both_scopes() {
     let default = add_plain(&rig.service, "default", 1).await;
     let category = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             category: Some("tv".into()),
             ..request(AddSource::Metainfo(plain("category", 2)))
         })
@@ -12027,7 +12226,7 @@ async fn a_level_asked_while_a_copy_is_out_is_taken_after_it() {
     );
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             paused: true,
             ..request(AddSource::Metainfo(meta))
         })

@@ -136,7 +136,7 @@ async fn run(count: usize, archive: bool) {
         std::fs::write(save.join(&name).join(file), data).unwrap();
         let metainfo = metainfo(&name, &[(file, data)], 1024, false);
         let job_id = service
-            .add(AddRequest {
+            .add_opened(AddRequest {
                 placement: Placement {
                     save_path: Some(save.to_string_lossy().into_owned()),
                     seed_mode: true,

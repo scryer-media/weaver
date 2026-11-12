@@ -59,7 +59,7 @@ async fn a_torrents_job_raises_each_queue_event_once_with_its_variables() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(private.to_vec())))
+        .add_opened(request(AddSource::Metainfo(private.to_vec())))
         .await
         .unwrap();
     rig.db.admitted_so_far().await;
@@ -216,7 +216,7 @@ async fn a_torrent_removed_before_it_finished_raises_its_deletion() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     let view = rig.service.torrent(job_id).await.unwrap();
@@ -264,7 +264,7 @@ async fn a_torrent_that_meets_its_goals_raises_seeding_finished_once() {
     ] {
         let job_id = rig
             .service
-            .add(AddRequest {
+            .add_opened(AddRequest {
                 policy_override: Some(goal(action)),
                 ..request(AddSource::Metainfo(plain(name, 1)))
             })
@@ -316,7 +316,7 @@ async fn the_queue_runs_seeding_finished_of_a_torrent_its_goal_removed() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             policy_override: Some(SeedingPolicy {
                 seed_time_counting: Default::default(),
                 ratio_goal: Leaf::Set(0.0),
@@ -368,7 +368,7 @@ async fn a_torrent_raises_nothing_without_queue_scripts() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     rig.service.remove(job_id, false, true).await.unwrap();
@@ -388,7 +388,7 @@ async fn a_torrents_queue_script_is_told_its_jobs_tags() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             tags: vec!["linux".into()],
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -427,7 +427,7 @@ async fn the_queue_runs_a_live_torrents_event() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(AddRequest {
+        .add_opened(AddRequest {
             tags: vec!["linux".into()],
             ..request(AddSource::Metainfo(plain("set", 1)))
         })
@@ -477,7 +477,7 @@ async fn a_script_on_the_own_and_the_generic_event_runs_for_each() {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add_opened(request(AddSource::Metainfo(plain("set", 1))))
         .await
         .unwrap();
     rig.db.admitted_so_far().await;
@@ -516,7 +516,7 @@ async fn three_files(rig: &Rig, seed: u8) -> (JobId, PieceStorage) {
     );
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(bytes)))
+        .add_opened(request(AddSource::Metainfo(bytes)))
         .await
         .unwrap();
     let (layout, intake) = {

@@ -29,7 +29,7 @@ async fn seeded(rig: &Rig, clock: &SetClock) -> Vec<JobId> {
         );
         let job_id = rig
             .service
-            .add(AddRequest {
+            .add_opened(AddRequest {
                 paused: true,
                 category: (at % 2 == 0).then(|| "tv".to_owned()),
                 tags: if at % 5 == 0 {
@@ -296,7 +296,7 @@ async fn a_row_reads_the_totals_its_files_give() {
             .collect();
         let job_id = rig
             .service
-            .add(AddRequest {
+            .add_opened(AddRequest {
                 paused: true,
                 ..request(AddSource::Metainfo(metainfo(&name, &files, 1024, false)))
             })
