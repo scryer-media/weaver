@@ -347,10 +347,12 @@ pub(super) fn sanitize_package(
 
 // Every component left out because the table could not be built, named
 // through the host's own names, and the reason, sanitized the same way, as
-// one more. `code`, when the failure has one, is carried by each.
+// one more. `code`, when the failure has one, is carried by each. A
+// component that names nothing by construction ships in its name-free form
+// instead, with its own reason.
 pub(super) fn left_out(
     local: &LocalNames,
-    names: impl Iterator<Item = String>,
+    components: Vec<Component>,
     reason: &str,
     code: Option<&'static str>,
 ) -> Vec<Component> {
@@ -359,26 +361,46 @@ pub(super) fn left_out(
         Some(table) => table.sanitize_str(text),
         None => "the stand-in table could not be built".to_string(),
     };
-    let mut components: Vec<Component> = names
-        .map(|name| {
-            let name = match &table {
-                Some(table) => table.member_name(&name),
-                None => "component".to_string(),
-            };
-            Component {
-                reason: code,
-                ..Component::failed(
-                    name,
-                    "left out because the stand-in table could not be built",
-                )
+    let mut kept: Vec<Component> = components
+        .into_iter()
+        .map(|component| match component.without_table {
+            Some(outcome) => Component {
+                outcome,
+                without_table: None,
+                ..component
+            },
+            None => {
+                let name = match &table {
+                    Some(table) => table.member_name(&component.name),
+                    None => "component".to_string(),
+                };
+                Component {
+                    reason: code,
+                    ..Component::failed(
+                        name,
+                        "left out because the stand-in table could not be built",
+                    )
+                }
             }
         })
         .collect();
-    components.push(Component {
+    kept.push(Component {
         reason: code,
         ..Component::failed("stand-in-table", sanitize(reason))
     });
-    components
+    kept
+}
+
+// What `left_out` needs of a component, kept aside before the pass takes the
+// components, so a pass that stops still leaves out the right ones.
+pub(super) fn shell_of(component: &Component) -> Component {
+    Component {
+        name: component.name.clone(),
+        form: component.form,
+        outcome: Err(String::new()),
+        reason: component.reason,
+        without_table: component.without_table.clone(),
+    }
 }
 
 // Drops everything before the first whole line of a text that was cut at an
