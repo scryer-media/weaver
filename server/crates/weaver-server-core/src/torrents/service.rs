@@ -1357,6 +1357,10 @@ struct Live {
     // Why its restore is held, while it is: a checkpoint the database did
     // not give, tried again at each restore until it does.
     restore_held: Option<String>,
+    // Not one of the files its pieces are in was there when its store was
+    // made: it is in no session, its pieces kept, until a start, a recheck
+    // or a move looks again. Found again at each load, never kept.
+    files_missing: bool,
     queued: bool,
     // Its place among the torrents still downloading, from 1, as the queue
     // was last applied; None while it seeds (qBittorrent
@@ -1424,7 +1428,8 @@ fn queued(settings: &TorrentSettings, rules: &[TrackerRule], torrent: &Live, now
         job_id: torrent.record.job_id,
         seeding,
         forced: torrent.record.forced,
-        paused: !torrent.resumed(),
+        // One whose files are missing runs nowhere, so takes no slot.
+        paused: !torrent.resumed() || torrent.files_missing,
         runs_through_schedule,
     }
 }
@@ -1513,6 +1518,7 @@ impl Live {
             engine: Engine::Absent,
             run_error: None,
             restore_held: None,
+            files_missing: false,
             queued: false,
             queue_rank: None,
             paused_by: None,
@@ -1815,6 +1821,7 @@ impl Live {
             held: self.held.clone(),
             moving: self.moving.is_some(),
             restore_held: self.restore_held.clone(),
+            files_missing: self.files_missing,
         }
     }
 }
@@ -3297,7 +3304,9 @@ impl TorrentService {
     // hold, a file gone or cut short, are had no longer either: each file
     // with a piece had is looked at by its size, once, as the store is made.
     // When none of those files is there, the pieces are kept as they were,
-    // and said. A restore whose checkpoint the database could not
+    // none is read for the tee, and the notes say so with `Note::Absent`,
+    // which holds the torrent for its files missing. A restore whose
+    // checkpoint the database could not
     // read makes no store: the torrent waits, its own rows as they were,
     // and the next restore tries it again, as a usenet job's restore is
     // held on the same error (`RestoreSeat::restore`).
@@ -3348,8 +3357,11 @@ impl TorrentService {
             None => None,
         };
         let store = TorrentStore::new(layout, files, kept.as_ref(), tee);
+        let unbacked = store.drop_unbacked();
         if let Some(tee) = store.tee() {
-            let replayed = if seeded {
+            // With none of its files there, nothing is read from them: the
+            // pieces stay for when they are.
+            let replayed = if seeded || unbacked.is_none() {
                 Replayed::default()
             } else {
                 store.replay_had()
@@ -3373,7 +3385,7 @@ impl TorrentService {
                 self.inner.signal.mark(job_id);
             }
         }
-        match store.drop_unbacked() {
+        match unbacked {
             Some(0) => {}
             Some(missing) => {
                 notes.push(Note::Missing { pieces: missing });
@@ -3539,9 +3551,10 @@ impl TorrentService {
                 Unmade::Fails(error) => error,
                 Unmade::Waits(never) => match never {},
             })?;
-        for note in notes {
+        for note in &notes {
             note.say(job_id);
         }
+        torrent.files_missing = Note::absent(&notes);
         self.give_store(torrent, store);
         Ok(())
     }
@@ -3697,12 +3710,12 @@ impl TorrentService {
         let Ok((_restoring, store)) = restoring.await else {
             return false;
         };
-        let store = match store {
+        let (store, missing) = match store {
             Ok((store, notes)) => {
-                for note in notes {
+                for note in &notes {
                     note.say(job_id);
                 }
-                store
+                (store, Note::absent(&notes))
             }
             Err(Unmade::Waits(error)) => {
                 // Said once while it stands; the torrent shows it as its
@@ -3733,8 +3746,9 @@ impl TorrentService {
         {
             Some(torrent) => {
                 torrent.restore_held = None;
+                torrent.files_missing = missing;
                 self.give_store(torrent, store);
-                torrent.held.is_none()
+                torrent.held.is_none() && !missing
             }
             None => {
                 store.forget();
@@ -4514,7 +4528,9 @@ impl TorrentService {
             let Some(torrent) = live.get_mut(&job_id) else {
                 return;
             };
-            if torrent.attached.is_some() {
+            // One whose files are missing joins no session: it would claim
+            // pieces it cannot read and write where its files are not.
+            if torrent.attached.is_some() || torrent.files_missing {
                 return;
             }
             let (Some(bytes), Some(layout), Some(intake), Some(store)) = (
@@ -5411,9 +5427,63 @@ impl TorrentService {
         if refetch {
             self.resolve(job_id).await;
         }
+        // A start looks again for files that were missing (qBittorrent
+        // `TorrentImpl::start`, torrentimpl.cpp:2048-2053).
+        let found = self.look_again(job_id).await;
         self.apply_queue().await;
+        if found {
+            self.attach(job_id, None).await;
+        }
         self.publish().await;
         Ok(())
+    }
+
+    // A torrent held for its files missing looks at them again, off the
+    // runtime, as its store did when it was made. Still not one there, it
+    // stays held; otherwise the pieces its files lost are checked or
+    // fetched again and it is let go. Whether it was let go, and so may
+    // join its session now.
+    async fn look_again(&self, job_id: JobId) -> bool {
+        let store = self
+            .inner
+            .live
+            .lock()
+            .await
+            .get(&job_id)
+            .filter(|torrent| torrent.files_missing)
+            .and_then(|torrent| torrent.store.clone());
+        let Some(store) = store else {
+            return false;
+        };
+        let looking = Arc::clone(&store);
+        let Ok(unbacked) = tokio::task::spawn_blocking(move || looking.drop_unbacked()).await
+        else {
+            return false;
+        };
+        let mut live = self.inner.live.lock().await;
+        let Some(torrent) = live.get_mut(&job_id).filter(|torrent| {
+            torrent.files_missing
+                && torrent
+                    .store
+                    .as_ref()
+                    .is_some_and(|held| Arc::ptr_eq(held, &store))
+        }) else {
+            return false;
+        };
+        let Some(lost) = unbacked else {
+            Note::Absent {
+                pieces: store.count(),
+            }
+            .say(job_id);
+            return false;
+        };
+        if lost > 0 {
+            Note::Missing { pieces: lost }.say(job_id);
+            self.inner.signal.marked(job_id, lost);
+        }
+        torrent.files_missing = false;
+        torrent.file_have = store.file_have();
+        true
     }
 
     pub async fn set_forced(&self, job_id: JobId, forced: bool) -> Result<(), ActionError> {
@@ -5596,6 +5666,30 @@ impl TorrentService {
     /// `torrents/recheck`). A running torrent runs again once checked, a
     /// paused one stays paused, and one being checked is left to its check.
     pub async fn recheck(&self, job_id: JobId) -> Result<(), ActionError> {
+        // One held for its files missing is in no session: it lets go of
+        // the hold and of every piece, and the session it joins checks
+        // them all (qBittorrent `TorrentImpl::forceRecheck` clears its
+        // missing files, torrentimpl.cpp:1736-1744).
+        let held = self
+            .with_torrent(job_id, |torrent| {
+                if !torrent.files_missing {
+                    return Ok(false);
+                }
+                if let Some(store) = &torrent.store {
+                    Pieces::checking(&**store)
+                        .map_err(|error| ActionError::State(format!("{error:#}")))?;
+                    torrent.file_have = store.file_have();
+                }
+                torrent.files_missing = false;
+                Ok(true)
+            })
+            .await?;
+        if held {
+            self.apply_queue().await;
+            self.attach(job_id, None).await;
+            self.publish().await;
+            return Ok(());
+        }
         {
             // Held across the recheck, as the queue holds it across a pause
             // or resume, so neither undoes the other halfway.
@@ -5669,6 +5763,13 @@ impl TorrentService {
                     && let Some(store) = &store
                 {
                     self.check_kept(job_id, store).await;
+                }
+                // A move looks again for files that were missing
+                // (qBittorrent `TorrentImpl::handleMoveStorageJobFinished`,
+                // torrentimpl.cpp:2140-2146).
+                if self.look_again(job_id).await {
+                    self.apply_queue().await;
+                    self.attach(job_id, None).await;
                 }
                 Ok(())
             }
@@ -7275,6 +7376,8 @@ fn job_status(view: &TorrentView) -> JobStatus {
         TorrentState::Moving => JobStatus::Moving,
         // It waits for a certificate, held where it is.
         TorrentState::NeedsCertificate => JobStatus::Stalled,
+        // Held stopped until the operator starts it again.
+        TorrentState::FilesMissing => JobStatus::Paused,
         // A stop with any reason but its met goal is a failure.
         TorrentState::Stopped => match view.detail.as_deref() {
             Some(status::GOAL_MET) => JobStatus::Complete,
@@ -7350,6 +7453,11 @@ enum Note {
 }
 
 impl Note {
+    // Whether `notes` found none of the torrent's files with a piece had.
+    fn absent(notes: &[Self]) -> bool {
+        notes.iter().any(|note| matches!(note, Self::Absent { .. }))
+    }
+
     fn say(&self, job_id: JobId) {
         match self {
             Self::Unread(error) => {
@@ -7372,7 +7480,7 @@ impl Note {
                 tracing::warn!(
                     job_id = job_id.0,
                     pieces,
-                    "none of a torrent's files is there; its pieces are kept"
+                    "none of a torrent's files is there; its pieces are kept and it is held until a start, a recheck or a move"
                 );
             }
         }

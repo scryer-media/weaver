@@ -194,6 +194,9 @@ pub struct Observed {
     /// Why its restore is held, while it is: one a crash holds keeps the
     /// torrent paused, or stopped, until a resume.
     pub restore_held: Option<String>,
+    /// Not one of the files its pieces are in was there when it was loaded:
+    /// it is held stopped until a start, a recheck or a move looks again.
+    pub files_missing: bool,
 }
 
 impl Observed {
@@ -217,6 +220,12 @@ pub fn project(seen: &Observed) -> (TorrentState, Option<Why>) {
     // `TorrentImpl::updateState` decides Moving before Checking).
     if seen.moving {
         return (TorrentState::Moving, None);
+    }
+    // Files not there show next, whatever the torrent was asked to be
+    // (qBittorrent `TorrentImpl::updateState` decides MissingFiles after
+    // Moving and before anything else, torrentimpl.cpp:1299-1301).
+    if seen.files_missing {
+        return (TorrentState::FilesMissing, None);
     }
     match seen.intent {
         TorrentIntent::Paused => {
@@ -656,7 +665,57 @@ mod tests {
             held: None,
             moving: false,
             restore_held: None,
+            files_missing: false,
         }
+    }
+
+    // A torrent whose files were not there when it was loaded says so,
+    // paused, stopped, complete or held; a move or a start from what was
+    // saved shows first.
+    #[test]
+    fn a_torrent_whose_files_are_missing_says_so() {
+        let missing = |engine| Observed {
+            files_missing: true,
+            ..seen(engine)
+        };
+        for observed in [
+            missing(Engine::Absent),
+            Observed {
+                complete: true,
+                ..missing(Engine::Absent)
+            },
+            Observed {
+                intent: TorrentIntent::Paused,
+                ..missing(Engine::Absent)
+            },
+            Observed {
+                intent: TorrentIntent::Stopped,
+                complete: true,
+                ..missing(Engine::Absent)
+            },
+            Observed {
+                queued: true,
+                paused_by: Some(HoldOrigin::Manual),
+                ..missing(Engine::Absent)
+            },
+        ] {
+            assert_eq!(
+                project(&observed),
+                (TorrentState::FilesMissing, None),
+                "{observed:?}"
+            );
+        }
+        assert_eq!(
+            project(&Observed {
+                moving: true,
+                ..missing(Engine::Absent)
+            }),
+            (TorrentState::Moving, None)
+        );
+        assert_eq!(
+            project(&missing(Engine::Starting)),
+            (TorrentState::CheckingResumeData, None)
+        );
     }
 
     // A magnet fetching its metadata says where it asks for peers.

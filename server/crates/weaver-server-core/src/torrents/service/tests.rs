@@ -3216,6 +3216,122 @@ async fn a_restart_restores_the_intent_not_the_state() {
     again.stop().await;
 }
 
+// A torrent with every piece in its files, stopped with them kept, its
+// folder then moved aside, as a drive not mounted yet leaves it: the folder
+// and where it went.
+async fn gone_at_restart(rig: &Rig) -> (JobId, PathBuf, PathBuf) {
+    rig.service.open().await.unwrap();
+    let (job_id, dir) = with_every_piece(rig).await;
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+    let away = dir.with_extension("away");
+    std::fs::rename(&dir, &away).unwrap();
+    (job_id, dir, away)
+}
+
+// The torrent is held for its files missing: in no session, so it
+// announces nothing and serves no peer, with every piece kept, its intent
+// as the operator left it, and nothing made where its files were.
+async fn held_for_its_files(service: &TorrentService, job_id: JobId, dir: &Path) {
+    let view = service.torrent(job_id).await.unwrap();
+    assert_eq!(view.state, TorrentState::FilesMissing);
+    assert_eq!(view.pieces.map(|pieces| pieces.have), Some(3));
+    {
+        let live = service.inner.live.lock().await;
+        assert!(live[&job_id].store.is_some());
+        assert!(live[&job_id].attached.is_none());
+    }
+    assert_eq!(
+        service
+            .inner
+            .db
+            .get_torrent(job_id)
+            .unwrap()
+            .unwrap()
+            .intent,
+        TorrentIntent::Resumed
+    );
+    assert!(!dir.exists());
+}
+
+// The torrent in its session, every piece had from the start.
+async fn runs_with_every_piece(service: &TorrentService, job_id: JobId) {
+    let handle = handle_of(service, job_id).await;
+    handle.wait_until_initialized().await.unwrap();
+    let stats = handle.stats();
+    assert!(stats.finished);
+    assert_eq!(stats.progress_bytes, 3000);
+    assert_eq!(job_have(service, job_id).await, 3);
+    assert_ne!(
+        service.torrent(job_id).await.unwrap().state,
+        TorrentState::FilesMissing
+    );
+}
+
+// None of a torrent's files there when it is loaded, as when the drive
+// they are on is not mounted yet, holds it for its files missing. A start
+// with them still gone leaves it held, making nothing where they were; a
+// start once they are back runs it with every piece it kept (qBittorrent
+// `TorrentImpl::start`, torrentimpl.cpp:2048-2053).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_whose_files_are_all_gone_at_load_is_held_until_a_start_finds_them() {
+    let rig = rig(set_clock());
+    let (job_id, dir, away) = gone_at_restart(&rig).await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    held_for_its_files(&again, job_id, &dir).await;
+    // A tick puts it in no session either.
+    again.tick().await;
+    held_for_its_files(&again, job_id, &dir).await;
+
+    again.resume(job_id).await.unwrap();
+    held_for_its_files(&again, job_id, &dir).await;
+
+    std::fs::rename(&away, &dir).unwrap();
+    again.resume(job_id).await.unwrap();
+    runs_with_every_piece(&again, job_id).await;
+    again.stop().await;
+}
+
+// The hold is found again at each load, never kept: a restart with the
+// files back runs the torrent with every piece.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_held_for_its_files_runs_after_a_restart_that_finds_them() {
+    let rig = rig(set_clock());
+    let (job_id, dir, away) = gone_at_restart(&rig).await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    held_for_its_files(&again, job_id, &dir).await;
+    again.stop().await;
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+
+    std::fs::rename(&away, &dir).unwrap();
+    let third = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&third).await;
+    runs_with_every_piece(&third, job_id).await;
+    third.stop().await;
+}
+
+// A recheck lets go of the hold and of every piece kept, and the session
+// it joins checks the files: back in place, every piece passes
+// (qBittorrent `TorrentImpl::forceRecheck`, torrentimpl.cpp:1736-1744).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_recheck_lets_go_of_a_torrent_held_for_its_files() {
+    let rig = rig(set_clock());
+    let (job_id, dir, away) = gone_at_restart(&rig).await;
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    held_for_its_files(&again, job_id, &dir).await;
+
+    std::fs::rename(&away, &dir).unwrap();
+    again.recheck(job_id).await.unwrap();
+    runs_with_every_piece(&again, job_id).await;
+    again.stop().await;
+}
+
 // A torrent whose work crashed the daemon is kept paused at the next start,
 // saying why, and its job is not restored into the same panic: a panic in
 // its tee's step leaves the torrent's marker, which stays until a resume
@@ -8832,13 +8948,13 @@ async fn a_checkpoint_the_database_fails_to_read_holds_the_restore_until_it_read
     again.stop().await;
 }
 
-// A restart that finds a torrent's archive file gone, as when its drive is
-// not there yet, does not fail the torrent: the pieces its files no longer
-// give are had no longer, said once, and fetched again, and the torrent
-// stays with what it has. Its tee, whose checkpoint did not restore, starts
+// A restart that finds an unpacking torrent's archive file gone, as when its
+// drive is not there yet, does not fail the torrent: it is held for its
+// files missing with every piece it kept, and nothing is read from the
+// files for its tee. Its tee, whose checkpoint did not restore, starts
 // fresh.
 #[tokio::test]
-async fn a_restart_that_cannot_read_its_files_fetches_again_and_does_not_fail() {
+async fn a_restart_that_finds_an_unpacking_torrents_file_gone_holds_it_with_its_pieces() {
     use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
 
     let archive = include_bytes!(concat!(
@@ -8934,11 +9050,7 @@ async fn a_restart_that_cannot_read_its_files_fetches_again_and_does_not_fail() 
     let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
     reopen(&again).await;
     let heard = lines.of("a torrent's pieces did not read from its files; they are fetched again");
-    assert_eq!(heard.len(), 1, "{heard:?}");
-    assert!(
-        heard[0].contains(&format!(" job_id={} pieces={fed} ", job_id.0)),
-        "{heard:?}"
-    );
+    assert!(heard.is_empty(), "{heard:?}");
     assert_eq!(
         lines
             .of("a torrent's unpacking checkpoint did not restore; it starts fresh")
@@ -8947,7 +9059,10 @@ async fn a_restart_that_cannot_read_its_files_fetches_again_and_does_not_fail() 
     );
     assert!(rig.db.get_job_history(job_id.0).unwrap().is_none());
     let view = again.torrent(job_id).await.unwrap();
-    assert_eq!(view.pieces.unwrap().have, 0);
+    assert_eq!(view.state, TorrentState::FilesMissing);
+    assert_eq!(view.pieces.unwrap().have, fed);
+    assert!(again.inner.live.lock().await[&job_id].attached.is_none());
+    assert!(!dir.join("set.rar").exists());
     again.stop().await;
 }
 
