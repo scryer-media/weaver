@@ -69,6 +69,10 @@ pub struct HistoryFilter {
     // Keep rows whose category is one of these, a row with no category
     // counting as the empty string. An empty list keeps nothing.
     pub categories_any: Option<Vec<String>>,
+    // Keep rows whose full release name contains this text, ASCII letters
+    // folded to lower case on both sides and the rest compared byte for byte,
+    // as the name sort compares.
+    pub name_contains: Option<String>,
     pub metadata_has_key: Option<String>,
     pub metadata_equals: Option<HistoryMetadataEquals>,
     pub order: HistoryOrder,
@@ -81,20 +85,5 @@ pub struct HistoryFilter {
 pub struct HistoryEditFields {
     pub name: String,
     pub category: Option<String>,
-    pub metadata: Option<String>,
-}
-
-// The columns a history page is matched and ordered by, without the row's
-// other columns. `name` and `metadata` are empty unless the read asked for
-// titles.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct HistoryKeyRow {
-    pub job_id: u64,
-    pub name: String,
-    pub status: String,
-    pub total_bytes: u64,
-    pub health: u32,
-    pub category: Option<String>,
-    pub completed_at: i64,
     pub metadata: Option<String>,
 }

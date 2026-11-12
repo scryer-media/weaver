@@ -5,7 +5,7 @@ use std::path::PathBuf;
 
 use crate::StateError;
 use crate::history::model::{
-    HistoryEditFields, HistoryFilter, HistoryKeyRow, HistoryOrder, HistoryOrderKey, HistoryRows,
+    HistoryEditFields, HistoryFilter, HistoryOrder, HistoryOrderKey, HistoryRows,
 };
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::persistence::Database;
@@ -280,52 +280,6 @@ impl Database {
         })
     }
 
-    // The match-and-order columns of every history row `rows` shows, in no
-    // particular order. `with_titles` adds the name and metadata a title is
-    // built from; without it both come back empty.
-    pub fn list_job_history_keys(
-        &self,
-        rows: HistoryRows,
-        with_titles: bool,
-    ) -> Result<Vec<HistoryKeyRow>, StateError> {
-        let datastore = self.datastore();
-        self.run_sql_blocking_read(async move {
-            let mut sql = String::from(if with_titles {
-                "SELECT h.job_id, h.name, h.status, h.total_bytes, h.health, h.category,
-                        h.completed_at, h.metadata
-                   FROM job_history h WHERE 1=1"
-            } else {
-                "SELECT h.job_id, h.status, h.total_bytes, h.health, h.category, h.completed_at
-                   FROM job_history h WHERE 1=1"
-            });
-            append_history_visibility(&mut sql, rows);
-            let found = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
-            found
-                .into_iter()
-                .map(|row| {
-                    Ok(HistoryKeyRow {
-                        job_id: row.i64("job_id")? as u64,
-                        name: if with_titles {
-                            row.text("name")?
-                        } else {
-                            String::new()
-                        },
-                        status: row.text("status")?,
-                        total_bytes: row.i64("total_bytes")? as u64,
-                        health: row.i32("health")? as u32,
-                        category: row.opt_text("category")?,
-                        completed_at: row.i64("completed_at")?,
-                        metadata: if with_titles {
-                            row.opt_text("metadata")?
-                        } else {
-                            None
-                        },
-                    })
-                })
-                .collect()
-        })
-    }
-
     pub fn list_integration_events_after(
         &self,
         after_id: Option<i64>,
@@ -477,6 +431,7 @@ fn append_history_row_filter_predicates(
     sql: &mut String,
     args: &mut Vec<SqlArg>,
     filter: &HistoryFilter,
+    engine: SqlEngine,
 ) {
     if let Some(statuses) = &filter.statuses {
         append_in_i64_or_text_filter(
@@ -529,6 +484,16 @@ fn append_history_row_filter_predicates(
             "COALESCE(h.category, '')",
             categories.iter().cloned().map(SqlArg::Text).collect(),
         );
+    }
+    if let Some(needle) = &filter.name_contains {
+        // `instr` and `strpos` find the text as it is: no LIKE wildcard in a
+        // search can widen it.
+        let name = history_order_expression(HistoryOrderKey::Name, engine);
+        sql.push_str(&match engine {
+            SqlEngine::Sqlite => format!(" AND instr({name}, {{}}) > 0"),
+            SqlEngine::Postgres => format!(" AND strpos({name}, {{}}) > 0"),
+        });
+        args.push(SqlArg::Text(needle.to_ascii_lowercase()));
     }
 }
 
@@ -736,7 +701,7 @@ async fn fetch_history_rows(
     let mut args = Vec::new();
 
     append_history_from_clause(&mut sql, &mut args, filter);
-    append_history_row_filter_predicates(&mut sql, &mut args, filter);
+    append_history_row_filter_predicates(&mut sql, &mut args, filter, datastore.engine());
     append_history_visibility(&mut sql, rows);
     sql.push_str(&history_order_sql(filter.order, datastore.engine()));
 
@@ -755,7 +720,7 @@ async fn count_history_rows(
     let mut args = Vec::new();
 
     append_history_from_clause(&mut sql, &mut args, filter);
-    append_history_row_filter_predicates(&mut sql, &mut args, filter);
+    append_history_row_filter_predicates(&mut sql, &mut args, filter, datastore.engine());
     append_history_visibility(&mut sql, rows);
 
     Ok(
@@ -777,7 +742,7 @@ async fn count_history_rows_by_category(
     let mut args = Vec::new();
 
     append_history_from_clause(&mut sql, &mut args, filter);
-    append_history_row_filter_predicates(&mut sql, &mut args, filter);
+    append_history_row_filter_predicates(&mut sql, &mut args, filter, datastore.engine());
     append_history_visibility(&mut sql, rows);
 
     sql.push_str(" GROUP BY COALESCE(h.category, '')");
@@ -857,17 +822,35 @@ mod order_index_tests {
             HistoryOrderKey::State,
             HistoryOrderKey::Category,
         ];
-        for key in keys {
+        // A search is a substring of the name, which no index seeks, so a
+        // searched page walks its order's index and stops at the page.
+        for (key, search) in keys
+            .into_iter()
+            .flat_map(|key| [(key, None), (key, Some("release".to_string()))])
+        {
             for descending in [true, false] {
                 let order = HistoryOrder { key, descending };
-                let sql = format!(
-                    "EXPLAIN QUERY PLAN SELECT h.job_id FROM job_history h WHERE 1=1{} LIMIT 25",
-                    history_order_sql(order, SqlEngine::Sqlite)
+                let filter = HistoryFilter {
+                    name_contains: search.clone(),
+                    ..Default::default()
+                };
+                let mut sql =
+                    String::from("EXPLAIN QUERY PLAN SELECT h.job_id FROM job_history h WHERE 1=1");
+                let mut args = Vec::new();
+                append_history_row_filter_predicates(
+                    &mut sql,
+                    &mut args,
+                    &filter,
+                    SqlEngine::Sqlite,
                 );
+                append_history_visibility(&mut sql, HistoryRows::Shown);
+                sql.push_str(&history_order_sql(order, SqlEngine::Sqlite));
+                sql.push_str(" LIMIT 25");
                 let datastore = db.datastore();
                 let detail = db
                     .run_sql_blocking_read(async move {
-                        let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[]).await?;
+                        let rows =
+                            SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
                         rows.iter()
                             .map(|row| row.text("detail"))
                             .collect::<Result<Vec<_>, _>>()
@@ -876,9 +859,12 @@ mod order_index_tests {
                     .join("; ");
                 assert!(
                     detail.contains("USING INDEX") || detail.contains("USING COVERING INDEX"),
-                    "{order:?}: {detail}"
+                    "{order:?} {search:?}: {detail}"
                 );
-                assert!(!detail.contains("TEMP B-TREE"), "{order:?}: {detail}");
+                assert!(
+                    !detail.contains("TEMP B-TREE"),
+                    "{order:?} {search:?}: {detail}"
+                );
             }
         }
     }
