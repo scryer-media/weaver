@@ -4900,11 +4900,18 @@ impl TorrentService {
             now,
         );
         report.shortfall = error;
-        if let Err(error) = self.inner.db.delete_torrent(job_id) {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not remove a torrent");
+        let row = report.history_row(
+            status,
+            Some(hashes_of(&torrent.record).best().0.to_vec()),
+            now,
+        );
+        // Its history row and its removal are one write: the job is never
+        // in neither, so an event raised while it was live, still being
+        // queued, finds it.
+        if let Err(error) = self.inner.db.retire_torrent(&row) {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not move a torrent to history");
         }
-        self.finish(report, status, hashes_of(&torrent.record).best(), now)
-            .await;
+        self.finished(report).await;
     }
 
     // A torrent's job, finished as `status`: into history and the queue's
@@ -4915,6 +4922,13 @@ impl TorrentService {
         if let Err(error) = self.inner.db.insert_job_history(&row) {
             tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's history");
         }
+        self.finished(report).await;
+    }
+
+    // A torrent's job, its history row written: out to the queue's
+    // finished jobs.
+    async fn finished(&self, report: JobReport) {
+        let job_id = report.job_id;
         self.publish().await;
         if let Some(queue) = self.queue()
             && let Err(error) = queue.retire_job(report.job_info()).await
