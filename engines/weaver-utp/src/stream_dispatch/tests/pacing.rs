@@ -186,3 +186,60 @@ async fn a_full_socket_with_nothing_in_flight_does_not_strand_the_stream() {
     assert!(poll_with(&mut t, &woken).is_pending());
     assert!(data_sent(&t) > 0);
 }
+
+// Polls and acknowledges everything sent until the queue is empty, then
+// returns the largest pass.
+async fn drain_acking(t: &mut TestVsock) -> usize {
+    let mut largest = 0;
+    loop {
+        t.env.increment_now(Duration::from_micros(10));
+        t.poll_once_assert_pending().await;
+        largest = largest.max(data_sent(t));
+        if t.vsock.user_tx_segments.is_empty() && t.vsock.this_poll.unsegmented_data == 0 {
+            return largest;
+        }
+        let last_sent = t.vsock.last_sent_seq_nr;
+        t.send_msg(
+            UtpHeader {
+                htype: State,
+                seq_nr: 1.into(),
+                ack_nr: last_sent,
+                wnd_size: 1024 * 1024,
+                ..Default::default()
+            },
+            "",
+        );
+    }
+}
+
+// After an idle gap the window has decayed, and the first pass sends no
+// more than half of what is left of it.
+#[tokio::test]
+async fn the_first_pass_after_idle_sends_no_more_than_half_the_decayed_window() {
+    for idle_timeouts in [1u32, 3] {
+        let mut t = sender(Duration::from_micros(100)).await;
+        drain_acking(&mut t).await;
+        assert!(t.vsock.user_tx_segments.is_empty());
+        let before = t.vsock.congestion_controller.window();
+
+        let rto = t.vsock.rtte.retransmission_timeout();
+        t.env.increment_now(rto * idle_timeouts);
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(&vec![7; 2 * WINDOW_PACKETS * MSS])
+            .await
+            .unwrap();
+        t.poll_once_assert_pending().await;
+        let burst = data_sent(&t);
+        let window = t.vsock.congestion_controller.window();
+        assert!(window < before, "the window decayed: {window} of {before}");
+        eprintln!("{idle_timeouts} timeouts idle: {burst} packets, window {window} of {before}");
+        let allowed = (window / 2).max(PACE_BURST_PACKETS * MSS);
+        assert!(
+            burst * MSS <= allowed,
+            "{idle_timeouts} timeouts idle: {burst} packets after idle, window {window}"
+        );
+        assert!(burst > 0);
+    }
+}

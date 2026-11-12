@@ -402,6 +402,29 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let mut header = self.outgoing_header();
 
+        // Each timeout that passed with nothing in flight decays the window,
+        // as libtorrent's timer does while a direction is idle
+        // (utp_stream.cpp:3461-3468). The pacer below fills to the decayed
+        // window, so the first pass after idle sends no more than half of
+        // it.
+        if !self.user_tx_segments.is_empty()
+            && let Some(since) = self.idle_since.take()
+        {
+            let rto = self
+                .rtte
+                .retransmission_timeout()
+                .max(Duration::from_millis(1));
+            let periods = self
+                .this_poll
+                .now
+                .saturating_duration_since(since)
+                .as_nanos()
+                / rto.as_nanos();
+            for _ in 0..periods.min(IDLE_DECAYS_MAX) {
+                self.congestion_controller.on_idle_timeout();
+            }
+        }
+
         self.pacer.refill(
             self.this_poll.now,
             self.congestion_controller
@@ -567,23 +590,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             }
             self.timers.tail_probe.turn_off("tail probe due");
-        }
-
-        // Each timeout that passed with nothing in flight decays the window.
-        if let Some(since) = self.idle_since.take() {
-            let rto = self
-                .rtte
-                .retransmission_timeout()
-                .max(Duration::from_millis(1));
-            let periods = self
-                .this_poll
-                .now
-                .saturating_duration_since(since)
-                .as_nanos()
-                / rto.as_nanos();
-            for _ in 0..periods.min(IDLE_DECAYS_MAX) {
-                self.congestion_controller.on_idle_timeout();
-            }
         }
 
         let mut in_recovery = false;
