@@ -12,14 +12,9 @@ use std::path::{Path, PathBuf};
 
 include!("rapidyenc_encode_build.rs");
 
-// Start every rapidyenc decoder function on a 64-byte boundary, so its loops
-// keep one offset within a 64-byte line whatever is linked before them; the
-// Rust side of decode-bench is pinned the same way (decode-bench/.cargo).
-fn pin_functions(b: &mut cc::Build) {
-    if !b.get_compiler().is_like_msvc() {
-        b.flag("-falign-functions=64");
-    }
-}
+// `pin_functions` (every rapidyenc function on a 64-byte boundary; the Rust
+// side of decode-bench is pinned the same way, decode-bench/.cargo) comes
+// from rapidyenc_encode_build.rs.
 
 fn main() {
     println!("cargo:rustc-check-cfg=cfg(rapidyenc_linked)");
