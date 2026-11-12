@@ -296,13 +296,6 @@ pub(crate) const RECEIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// (libtorrent `settings_pack::tracker_maximum_response_length`).
 pub(crate) const MAX_RESPONSE_LENGTH: usize = 1024 * 1024;
 
-/// What a GET to a tracker asks for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Ask {
-    Announce,
-    Scrape,
-}
-
 /// An address family, which a GET may be held to: libtorrent announces once
 /// from each listen socket, and each reaches only the tracker's addresses
 /// of its own family (`http_tracker_connection::on_filter`).
@@ -342,25 +335,30 @@ fn has_tracker_query(query: &str) -> bool {
     })
 }
 
-/// Why a GET of `url` for `ask`, whose host resolved to `addrs`, may not be
-/// sent: a tracker at a loopback address is asked only what a tracker
-/// answers, at a path with a segment starting `announce`, or `scrape` for a
-/// scrape, as `/announce.php`, `/<passkey>/announce` and
-/// `/announce/<passkey>` have. The client picks the address it connects
-/// to, so every address must pass. Only a tracker the operator named
-/// reaches it: one that came with the torrent is never asked at loopback
-/// (see [`NamedBy::may_ask`]). An e2e build asks any path.
-fn ssrf_refusal(url: &url::Url, ask: Ask, addrs: &[IpAddr]) -> Option<&'static str> {
+/// Why a GET of `url`, whose host resolved to `addrs`, may not be sent: a
+/// tracker at a loopback address is asked only at a path that starts
+/// `/announce` and has no `/`, `\` or `%` after it, as `/announce` and
+/// `/announce.php` (libtorrent `http_tracker_connection::on_filter`,
+/// src/http_tracker_connection.cpp:337-338 on RC_2_1). A path that could
+/// reach another resource once the server decodes it, as
+/// `/announce%2F..%2Fx`, is refused, and so is a passkey path,
+/// `/<passkey>/announce` or `/announce/<passkey>`. The URL judged is the one
+/// asked, so a scrape, asked at its scrape URL, is never sent to loopback.
+/// The client picks the address it connects to, so every address must
+/// pass. Only a tracker the operator named reaches it: one that came with
+/// the torrent is never asked at loopback (see [`NamedBy::may_ask`]). An
+/// e2e build asks any path.
+fn ssrf_refusal(url: &url::Url, addrs: &[IpAddr]) -> Option<&'static str> {
     if cfg!(feature = "e2e-local-trackers") {
         return None;
     }
-    let word = match ask {
-        Ask::Announce => "announce",
-        Ask::Scrape => "scrape",
-    };
     let loopback = addrs.iter().any(|a| a.to_canonical().is_loopback());
-    let tracker_path = url.path().split('/').any(|seg| seg.starts_with(word));
-    (loopback && !tracker_path).then_some("a loopback tracker asked at a path no tracker answers")
+    let announce_path = url
+        .path()
+        .strip_prefix("/announce")
+        .is_some_and(|rest| !rest.contains(['/', '\\', '%']));
+    (loopback && !announce_path)
+        .then_some("a loopback tracker asked at a path other than /announce")
 }
 
 /// `url`'s host as a client is told it, and its addresses: the address it
@@ -389,8 +387,8 @@ pub(crate) async fn addresses(
     Ok((name.to_owned(), found.iter().map(SocketAddr::ip).collect()))
 }
 
-/// A client from `clients` for a GET of `url`, named by `named_by`, for
-/// `ask`, and the addresses it is held to: it reaches the URL's host at the
+/// A client from `clients` for a GET of `url`, named by `named_by`, and the
+/// addresses it is held to: it reaches the URL's host at the
 /// addresses found for it now that the tracker may be asked at and the
 /// session may reach (see [`only_reachable`]), in the order found, and
 /// nowhere else, and follows no redirect. Refused when none is left, or
@@ -402,12 +400,10 @@ pub(crate) async fn addresses(
 /// exits has no address here: only the name is checked (see
 /// [`NamedBy::may_ask_by_name`]), and the client hands it on. Its header
 /// names are written in `shape`'s case.
-#[allow(clippy::too_many_arguments)]
 async fn reach(
     clients: &dyn HttpClients,
     url: &url::Url,
     named_by: NamedBy,
-    ask: Ask,
     family: Option<Family>,
     resolver: &dyn Resolver,
     reachable: &Reachable,
@@ -425,7 +421,7 @@ async fn reach(
         anyhow::ensure!(!found.is_empty(), "the tracker has no {family:?} address");
     }
     let addrs = only_reachable(found, |ip| *ip, reachable, named_by)?;
-    if let Some(why) = ssrf_refusal(url, ask, &addrs) {
+    if let Some(why) = ssrf_refusal(url, &addrs) {
         anyhow::bail!("SSRF mitigation: {why}");
     }
     let target = HttpTarget {
@@ -458,8 +454,9 @@ fn moved_by_a_public_tracker(endpoint: Option<IpAddr>, addrs: &[IpAddr]) -> bool
     }
 }
 
-/// The body of a tracker's answer to a GET for `ask` of `tracker`, named by
-/// `named_by`, with `query` added ahead of the URL's own. The GET is not
+/// The body of a tracker's answer to a GET of `tracker`, its announce or
+/// scrape URL, named by `named_by`, with `query` added ahead of the URL's
+/// own. The GET is not
 /// sent when the URL's own query already names an announce argument, and
 /// goes only where [`reach`] lets it. A redirect is a GET of where it
 /// points, reached the same way before it is sent, at most
@@ -479,7 +476,6 @@ pub(crate) async fn get(
     reachable: &Reachable,
     tracker: &url::Url,
     mut named_by: NamedBy,
-    ask: Ask,
     family: Option<Family>,
     query: &str,
     user_agent: &str,
@@ -499,10 +495,8 @@ pub(crate) async fn get(
         if !allow_idna && url.host_str().is_some_and(is_idna) {
             anyhow::bail!("blocked by IDNA: the tracker's host has an internationalized name");
         }
-        let (client, addrs) = reach(
-            clients, &url, named_by, ask, family, resolver, reachable, shape,
-        )
-        .await?;
+        let (client, addrs) =
+            reach(clients, &url, named_by, family, resolver, reachable, shape).await?;
         let request = client
             .get(url.clone())
             .headers(shape.headers(&url, user_agent)?);
@@ -688,7 +682,6 @@ mod tests {
                 &clients,
                 &url,
                 NamedBy::Operator,
-                Ask::Announce,
                 None,
                 &resolver,
                 &reachable,
@@ -724,18 +717,13 @@ mod tests {
             "169.254.1.1",
             "fd00::1",
         ] {
-            for (path, ask) in [
-                ("/announce", Ask::Announce),
-                ("/scrape", Ask::Scrape),
-                ("/admin", Ask::Announce),
-            ] {
+            for path in ["/announce", "/scrape", "/admin"] {
                 let url = url::Url::parse(&format!("http://tracker.test{path}")).unwrap();
                 let clients = Targets::default();
                 let refused = reach(
                     &clients,
                     &url,
                     NamedBy::Torrent,
-                    ask,
                     None,
                     &at(ip),
                     &reachable,
@@ -760,7 +748,6 @@ mod tests {
             &clients,
             &url,
             NamedBy::Operator,
-            Ask::Announce,
             None,
             &at("127.0.0.1"),
             &reachable,
@@ -780,7 +767,6 @@ mod tests {
                 &clients,
                 &url,
                 named_by,
-                Ask::Announce,
                 None,
                 &at_exit,
                 &reachable,
@@ -816,7 +802,6 @@ mod tests {
                     &clients,
                     &url,
                     named_by,
-                    Ask::Announce,
                     None,
                     &at_exit,
                     &reachable,
@@ -858,7 +843,7 @@ mod tests {
             answer: Resolved::Addresses(vec![SocketAddr::new(ip.parse().unwrap(), 80)]),
             asked: Default::default(),
         };
-        let ask_at = |ip: &'static str, path: &str, ask: Ask| {
+        let ask_at = |ip: &'static str, path: &str| {
             let url = url::Url::parse(&format!("http://tracker.test{path}")).unwrap();
             let at = at(ip);
             let reachable = reachable.clone();
@@ -868,7 +853,6 @@ mod tests {
                     &clients,
                     &url,
                     NamedBy::Torrent,
-                    ask,
                     None,
                     &at,
                     &reachable,
@@ -887,13 +871,8 @@ mod tests {
             "169.254.1.1",
             "fd00::1",
         ] {
-            for (path, ask) in [
-                ("/announce", Ask::Announce),
-                ("/scrape", Ask::Scrape),
-                ("/0123abcd/announce", Ask::Announce),
-                ("/admin", Ask::Announce),
-            ] {
-                let (asked, built) = ask_at(ip, path, ask).await;
+            for path in ["/announce", "/scrape", "/0123abcd/announce", "/admin"] {
+                let (asked, built) = ask_at(ip, path).await;
                 let (_, addrs) = asked.unwrap_or_else(|e| panic!("{ip} {path}: {e:#}"));
                 assert_eq!(addrs, [ip.parse::<IpAddr>().unwrap()], "{ip} {path}");
                 assert!(built, "{ip} {path}");
@@ -1154,7 +1133,6 @@ mod tests {
             &reachable,
             &tracker,
             NamedBy::Operator,
-            Ask::Announce,
             None,
             query,
             user_agent,
@@ -1511,45 +1489,48 @@ mod tests {
 
     #[cfg(not(feature = "e2e-local-trackers"))]
     #[test]
-    fn a_loopback_tracker_is_asked_only_at_a_tracker_path() {
+    fn a_loopback_tracker_is_asked_only_at_the_announce_path() {
         // Only a tracker the operator named reaches this rule.
         let url = |s: &str| url::Url::parse(s).unwrap();
         let loopback: [IpAddr; 2] = ["127.0.0.2".parse().unwrap(), "::1".parse().unwrap()];
         let lan: IpAddr = "192.168.1.2".parse().unwrap();
         let global: IpAddr = "93.184.216.34".parse().unwrap();
         for a in loopback {
-            for (u, ask) in [
-                ("http://h/announce", Ask::Announce),
-                ("http://h/announce.php?x=1", Ask::Announce),
-                ("http://h/scrape.php", Ask::Scrape),
-                // Ocelot's and UNIT3D's passkey paths.
-                ("http://h/0123abcd/announce", Ask::Announce),
-                ("http://h/0123abcd/scrape", Ask::Scrape),
-                ("http://h/announce/0123abcd", Ask::Announce),
+            for u in [
+                "http://h/announce",
+                "http://h/announce.php",
+                "http://h/announce?x=1",
+                "http://h/announce.php?x=1#y",
+                // A separator after the path, in the query, is not one.
+                "http://h/announce?x=1/../y%2F",
             ] {
-                assert_eq!(ssrf_refusal(&url(u), ask, &[a]), None, "{u} {a}");
+                assert_eq!(ssrf_refusal(&url(u), &[a]), None, "{u} {a}");
             }
-            for (u, ask) in [
-                ("http://h/admin", Ask::Announce),
-                ("http://h/x/announce", Ask::Scrape),
-                ("http://h/", Ask::Announce),
-                ("http://h/scrape", Ask::Announce),
-                ("http://h/announce", Ask::Scrape),
+            for u in [
+                "http://h/abcd/announce",
+                "http://h/announce/abcd",
+                "http://h/admin/announce",
+                "http://h/announce%2F..%2Fdelete",
+                "http://h/announce\\x",
+                "http://h/admin",
+                "http://h/",
+                // A scrape is asked at the scrape URL, which never starts
+                // `/announce`.
+                "http://h/scrape",
+                "http://h/scrape.php",
+                "http://h/abcd/scrape",
             ] {
-                assert!(ssrf_refusal(&url(u), ask, &[a]).is_some(), "{u} {a}");
+                assert!(ssrf_refusal(&url(u), &[a]).is_some(), "{u} {a}");
                 // One loopback address among others is enough.
-                assert!(
-                    ssrf_refusal(&url(u), ask, &[global, a]).is_some(),
-                    "{u} {a}"
-                );
+                assert!(ssrf_refusal(&url(u), &[global, a]).is_some(), "{u} {a}");
             }
         }
         // A v4 loopback written as v6 is loopback.
         let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
-        assert!(ssrf_refusal(&url("http://h/x"), Ask::Announce, &[mapped]).is_some());
+        assert!(ssrf_refusal(&url("http://h/x"), &[mapped]).is_some());
         // Elsewhere any path is asked.
         for a in [lan, global] {
-            assert_eq!(ssrf_refusal(&url("http://h/x"), Ask::Announce, &[a]), None);
+            assert_eq!(ssrf_refusal(&url("http://h/x"), &[a]), None);
         }
     }
 
@@ -1675,7 +1656,6 @@ mod tests {
             &reachable,
             tracker,
             NamedBy::Operator,
-            Ask::Announce,
             None,
             "info_hash=x",
             "Weaver",
