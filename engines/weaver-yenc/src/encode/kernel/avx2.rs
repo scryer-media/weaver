@@ -214,7 +214,28 @@ pub(super) unsafe fn encode_raw(
 ) -> usize {
     unsafe {
         encode_simd_frame(line_size, column, src, len, dst, is_end, |ls, col, s, n, d| {
-            main_loop::<Avx2>(ls, col, s, n, d)
+            grid(ls, col, s, n, d)
         })
+    }
+}
+
+// The grid loop out of line, its code after a 64-byte boundary: where the
+// loop's branches sit in their lines then depends on this function alone,
+// not on the frame around it or on what the linker puts before it. The jump
+// runs once per call; the padding never runs.
+//
+// SAFETY: as `main_loop`; the CPU has AVX2, BMI1, BMI2, POPCNT, LZCNT.
+#[target_feature(enable = "avx2,bmi1,bmi2,popcnt,lzcnt")]
+#[inline(never)]
+unsafe fn grid(
+    ls: usize,
+    col: &mut usize,
+    s: *const u8,
+    n: usize,
+    d: *mut u8,
+) -> (usize, usize) {
+    unsafe {
+        core::arch::asm!("jmp 2f", ".p2align 6, 0xcc", "2:", options(nomem, nostack, preserves_flags));
+        main_loop::<Avx2>(ls, col, s, n, d)
     }
 }

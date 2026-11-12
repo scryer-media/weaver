@@ -1686,8 +1686,8 @@ jne 2095f
 // compiler, with one change: the clean loop a chunk without escapes turns on
 // is a lean one (line end straight from the `EOL` and `START` tables, no
 // expand, no mask chain), and its first block with an escape goes back to a
-// new chunk. Measured on Zen 4: zeros 1.6x faster, every other fixture the
-// same as the Rust loop. It builds on every x86_64 target: it takes the
+// new chunk, so long runs with nothing to escape skip the expand and the
+// mask chain. It builds on every x86_64 target: it takes the
 // SysV argument registers and clobbers what SysV lets a callee clobber, so
 // on Windows the caller saves RSI, RDI and XMM6-XMM15 around the call.
 unsafe extern "sysv64" {
@@ -1706,7 +1706,7 @@ unsafe fn encode_asm_zen4(line_size: usize, column: &mut usize, src: *const u8, 
 
 // The tier's loop for this CPU, chosen once per process: the Zen 4 line end
 // on AMD family 19h, the table line end everywhere else. The Zen 4 line end
-// measured faster only on Zen 4 (edge-heavy and random) and slower on
+// measured faster only on Zen 4 and slower on
 // Sapphire Rapids; Zen 5 (family 1Ah) is unmeasured, so it keeps the table
 // line end. Family 19h with AVX-512 VBMI2 is Zen 4 alone (Zen 3 has no
 // AVX-512).

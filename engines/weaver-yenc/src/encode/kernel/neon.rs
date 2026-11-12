@@ -850,7 +850,7 @@ unsafe fn main_loop(
             if f > 31 {
                 if !sparse {
                     // Escape-dense data keeps the grid: on the M5, moving it
-                    // costs all-critical about 4%.
+                    // costs escape-dense blocks time.
                     let mut i = s.offset_from(src) as usize;
                     let end = i + 32;
                     while i < end {
