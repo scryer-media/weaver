@@ -1888,6 +1888,7 @@ export const nextZh: LocaleDictionary = {
   "next.torrent.force": "强制",
   "next.torrent.needsCertificate": "需要证书",
   "next.torrent.checkingResumeData": "正在检查恢复数据",
+  "next.torrent.filesMissing": "文件缺失",
   "next.torrent.unforce": "取消强制",
   "next.torrent.forced": "已强制",
   "next.torrent.unforced": "已取消强制",

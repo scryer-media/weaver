@@ -1888,6 +1888,7 @@ export const nextFr: LocaleDictionary = {
   "next.torrent.force": "Forcer",
   "next.torrent.needsCertificate": "Certificat requis",
   "next.torrent.checkingResumeData": "Vérification des données de reprise",
+  "next.torrent.filesMissing": "Fichiers manquants",
   "next.torrent.unforce": "Ne plus forcer",
   "next.torrent.forced": "Forcé",
   "next.torrent.unforced": "N’est plus forcé",

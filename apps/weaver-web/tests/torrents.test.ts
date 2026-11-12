@@ -262,13 +262,16 @@ test("a torrentUpdates push lands on the torrents held: whole when full, else wh
   assert.deepEqual([...again.values()], [row(3, 0)]);
 });
 
-test("a torrent starting from what was saved and one needing a certificate name their own state", () => {
+test("a torrent starting from what was saved, one needing a certificate and one missing its files name their own state", () => {
   assert.equal(torrentStateLabelKey("CHECKING_RESUME_DATA"), "next.torrent.checkingResumeData");
   assert.equal(torrentStateLabelKey("NEEDS_CERTIFICATE"), "next.torrent.needsCertificate");
+  assert.equal(torrentStateLabelKey("FILES_MISSING"), "next.torrent.filesMissing");
+  assert.equal(t("next.torrent.filesMissing"), "Files missing");
   assert.equal(torrentStateLabelKey("QUEUED"), null);
   assert.equal(torrentStateLabelKey(undefined), null);
   assert.equal(t("next.torrent.checkingResumeData"), "Checking resume data");
   for (const [locale, dictionary] of Object.entries({ en: nextEn, de: nextDe, es: nextEs, fr: nextFr, it: nextIt, ja: nextJa, ko: nextKo, pt: nextPt, zh: nextZh })) {
     assert.ok(dictionary["next.torrent.checkingResumeData"], locale);
+    assert.ok(dictionary["next.torrent.filesMissing"], locale);
   }
 });

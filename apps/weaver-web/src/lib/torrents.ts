@@ -32,7 +32,8 @@ export type TorrentState =
   | "STOPPED"
   | "MOVING"
   | "NEEDS_CERTIFICATE"
-  | "CHECKING_RESUME_DATA";
+  | "CHECKING_RESUME_DATA"
+  | "FILES_MISSING";
 
 /** A level a torrent takes a setting from. */
 export type SettingLevel = "TORRENT" | "TRACKER_RULE" | "CATEGORY" | "GLOBAL";
@@ -235,8 +236,9 @@ export interface TorrentData extends TorrentSummaryData {
 
 /**
  * The label key of a torrent state its job's status does not name: a torrent
- * waiting for a certificate, or one starting from what was saved (qBittorrent's
- * "Checking resume data"). Null for every other state.
+ * waiting for a certificate, one starting from what was saved (qBittorrent's
+ * "Checking resume data"), or one held because its files were not there
+ * (qBittorrent's "Missing Files"). Null for every other state.
  */
 export function torrentStateLabelKey(state: TorrentState | undefined): string | null {
   switch (state) {
@@ -244,6 +246,8 @@ export function torrentStateLabelKey(state: TorrentState | undefined): string | 
       return "next.torrent.needsCertificate";
     case "CHECKING_RESUME_DATA":
       return "next.torrent.checkingResumeData";
+    case "FILES_MISSING":
+      return "next.torrent.filesMissing";
     default:
       return null;
   }
