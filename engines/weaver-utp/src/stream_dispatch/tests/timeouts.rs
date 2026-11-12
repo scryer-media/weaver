@@ -72,6 +72,62 @@ async fn data_is_sent_three_times_then_the_stream_gives_up() {
     assert_eq!(stats.packets_lost, 0);
 }
 
+// The remote hears at once that the stream gave up, with the id it knows
+// the stream by and an acknowledgement it accepts.
+#[tokio::test]
+async fn a_stream_that_gives_up_on_resends_sends_a_reset() {
+    let mut t = make_test_vsock(patient(), false);
+    open_window(&mut t);
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(b"hello")
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    t.take_sent();
+    for _ in 0..2 {
+        t.env.increment_now(t.vsock.rtte.retransmission_timeout());
+        t.poll_once_assert_pending().await;
+        t.take_sent();
+    }
+    t.env.increment_now(t.vsock.rtte.retransmission_timeout());
+    assert!(matches!(
+        t.poll_once_assert_ready().await,
+        Err(Error::MaxRetransmissionsReached)
+    ));
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_eq!(sent[0].header.htype, Reset);
+    assert_eq!(sent[0].header.connection_id, t.vsock.conn_id_send);
+    // The last packet acknowledged, the one before the remote's first.
+    assert_eq!(sent[0].header.ack_nr, 0.into());
+}
+
+// A reset from the remote ends the stream with nothing sent back.
+#[tokio::test]
+async fn a_reset_from_the_remote_is_not_answered() {
+    let mut t = make_test_vsock(patient(), false);
+    open_window(&mut t);
+    t.poll_once_assert_pending().await;
+    t.take_sent();
+    t.send_msg(
+        UtpHeader {
+            htype: Reset,
+            connection_id: t.vsock.conn_id_send - 1,
+            seq_nr: 1.into(),
+            ack_nr: 100.into(),
+            ..Default::default()
+        },
+        "",
+    );
+    assert!(matches!(
+        t.poll_once_assert_ready().await,
+        Err(Error::StResetReceived)
+    ));
+    t.assert_sent_empty();
+}
+
 #[tokio::test]
 async fn an_rto_is_counted_once_while_transport_sends_stay_pending() {
     let mut t = make_test_vsock(patient(), false);

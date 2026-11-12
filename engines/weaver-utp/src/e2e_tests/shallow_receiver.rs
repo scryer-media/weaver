@@ -11,8 +11,8 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::poll_fn,
     io::{self, IoSlice},
-    num::NonZeroUsize,
     net::{Ipv4Addr, SocketAddr},
+    num::NonZeroUsize,
     sync::Arc,
     task::{Context, Poll, Waker},
     time::Duration,
@@ -26,9 +26,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    PollSendToVectored, SocketOpts, Transport, UtpSocket, traits::DefaultUtpEnvironment,
-};
+use crate::{PollSendToVectored, SocketOpts, Transport, UtpSocket, traits::DefaultUtpEnvironment};
 
 #[derive(Clone, Copy)]
 struct Shallow {
@@ -176,7 +174,8 @@ impl Network {
             model.ordinal += 1;
             let key = (now + model.one_way, model.ordinal);
             model.in_flight.insert(key, (source, target, data));
-            model.counters.peak_in_flight = model.counters.peak_in_flight.max(model.in_flight.len());
+            model.counters.peak_in_flight =
+                model.counters.peak_in_flight.max(model.in_flight.len());
             wakes
         };
         for waker in wakes {

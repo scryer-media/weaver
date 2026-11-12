@@ -1065,12 +1065,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // This will close the writer.
         self.user_tx.mark_vsock_closed();
 
-        if error.is_some() && !self.state.is_local_fin_or_later() {
-            let mut fin = self.outgoing_header();
-            fin.set_type(Type::Fin);
-            fin.seq_nr = self.seq_nr;
-            if let Err(e) = self.send_control_packet(cx, &fin) {
-                trace!("error sending FIN: {e:#}")
+        // A stream that fails tells the remote with a reset, so the remote
+        // ends its side now instead of retransmitting into its own timeout.
+        // A reset the remote sent needs no answer, and a remote that went
+        // quiet after our FIN is the ordinary end of a close.
+        let closing = self.state.is_local_fin_or_later();
+        if error.is_some_and(|error| match error {
+            Error::StResetReceived => false,
+            Error::RemoteInactiveForTooLong => !closing,
+            _ => true,
+        }) {
+            let mut reset = self.outgoing_header();
+            reset.set_type(Type::Reset);
+            if let Err(e) = self.send_control_packet(cx, &reset) {
+                trace!("error sending ST_RESET: {e:#}")
             }
         }
     }
@@ -1845,6 +1853,11 @@ pub struct StreamArgs {
 }
 
 impl StreamArgs {
+    /// The connection id the stream sends with: the remote's receive id.
+    pub(crate) fn conn_id_send(&self) -> SeqNr {
+        self.conn_id_send
+    }
+
     pub fn new_outgoing(
         remote_ack: &UtpHeader,
         syn_sent_ts: Instant,

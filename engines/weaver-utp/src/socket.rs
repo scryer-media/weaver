@@ -387,10 +387,68 @@ impl ConnectingPerAddr {
 const ACCEPT_QUEUE_MAX_ACCEPTORS: usize = 32;
 const ACCEPT_QUEUE_MAX_SYNS: usize = 32;
 const CONTROL_RESPONSES_MAX: usize = 32;
+// ST_RESETs the socket sends per interval, whatever prompts them.
+const RESETS_PER_INTERVAL: usize = 16;
+const RESET_INTERVAL: Duration = Duration::from_millis(100);
+// Streams that ended whose send ids the socket remembers.
+const TOMBSTONES_MAX: usize = 256;
 
 pub(crate) struct RegisteredStream {
     tx: crate::ingress::Sender,
     retired: Arc<RetirementFlag>,
+    // The remote's receive id for the stream, which its ST_RESET carries.
+    send_id: SeqNr,
+}
+
+// The send ids of the streams that ended last, so a packet for one is
+// answered with the id the remote knows it by. The oldest goes first.
+#[derive(Default)]
+struct Tombstones {
+    order: VecDeque<StreamRecvKey>,
+    send_ids: BTreeMap<StreamRecvKey, SeqNr>,
+}
+
+impl Tombstones {
+    fn bury(&mut self, key: StreamRecvKey, send_id: SeqNr) {
+        if self.send_ids.insert(key, send_id).is_some() {
+            return;
+        }
+        self.order.push_back(key);
+        if self.order.len() > TOMBSTONES_MAX
+            && let Some(oldest) = self.order.pop_front()
+        {
+            self.send_ids.remove(&oldest);
+        }
+    }
+
+    fn send_id(&self, key: &StreamRecvKey) -> Option<SeqNr> {
+        self.send_ids.get(key).copied()
+    }
+}
+
+// A fixed window of RESET_INTERVAL in which at most RESETS_PER_INTERVAL
+// resets go out.
+#[derive(Default)]
+struct ResetBudget {
+    window_start: Option<Instant>,
+    sent: usize,
+}
+
+impl ResetBudget {
+    fn take(&mut self, now: Instant) -> bool {
+        if self
+            .window_start
+            .is_none_or(|start| now.saturating_duration_since(start) >= RESET_INTERVAL)
+        {
+            self.window_start = Some(now);
+            self.sent = 0;
+        }
+        if self.sent >= RESETS_PER_INTERVAL {
+            return false;
+        }
+        self.sent += 1;
+        true
+    }
 }
 
 struct Syn {
@@ -446,6 +504,8 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     connect_rx: mpsc::Receiver<PendingConnectRequest>,
     control_sends: Vec<PendingSend>,
     next_connection_id: SeqNr,
+    tombstones: Tombstones,
+    reset_budget: ResetBudget,
 }
 
 fn poll_control_sends(
@@ -489,7 +549,14 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     ) -> Option<RegisteredStream> {
         let (retired, mut guard) = self.socket.retirements.registration();
         guard.disarm();
-        self.streams.insert(key, RegisteredStream { tx, retired })
+        self.streams.insert(
+            key,
+            RegisteredStream {
+                tx,
+                retired,
+                send_id: SeqNr(key.1) - 1,
+            },
+        )
     }
     fn finish_send(&mut self, completion: SendCompletion) -> crate::Result<()> {
         match completion {
@@ -716,12 +783,28 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
 
     fn reap_retired(&mut self) {
         if self.socket.retirements.take_dirty() {
-            self.streams
-                .retain(|_, stream| !stream.retired.is_retired());
+            let tombstones = &mut self.tombstones;
+            self.streams.retain(|key, stream| {
+                let live = !stream.retired.is_retired();
+                if !live {
+                    tombstones.bury(*key, stream.send_id);
+                }
+                live
+            });
         }
-        self.connecting.retain(|_, pending| {
+        // A connect given up is remembered too: the remote may yet answer
+        // the SYN, and its receive id is one above the one the SYN carried.
+        let tombstones = &mut self.tombstones;
+        self.connecting.retain(|remote, pending| {
             pending.by_id.retain(|_, connect| {
-                !connect.retired.is_retired() && !connect.requester.tx.is_closed()
+                let live = !connect.retired.is_retired() && !connect.requester.tx.is_closed();
+                if !live {
+                    tombstones.bury(
+                        (*remote, connect.connection_id.0),
+                        connect.connection_id + 1,
+                    );
+                }
+                live
             });
             !pending.is_empty()
         });
@@ -781,10 +864,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let mut occ = match self.connecting.entry(addr) {
             Entry::Occupied(occ) => occ,
             Entry::Vacant(_) => {
-                trace!(
-                    ?msg,
-                    "dropping packet, noone is connecting, and no registered streams"
-                );
+                trace!(?msg, "no stream and no connect for the packet, resetting");
+                self.reset_unknown_stream(addr, &msg.header);
                 return Ok(());
             }
         };
@@ -813,6 +894,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 "dropping packet, connection ID or SYN acknowledgement does not match"
             );
             self.socket.stats.invalid_packets.increment(1);
+            // A connect with this id may still be answered properly.
+            if !occ.get().contains(msg.header.connection_id.0) {
+                self.reset_unknown_stream(addr, &msg.header);
+            }
             return Ok(());
         };
 
@@ -827,7 +912,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     /// instead holds the attempt open for nothing.
     fn on_maybe_connect_refused(&mut self, addr: SocketAddr, msg: UtpMessage) {
         let Some(pending) = self.connecting.get_mut(&addr) else {
-            trace!(?msg, ?addr, "dropping packet");
+            trace!(?msg, ?addr, "no stream and no connect for the packet");
+            self.reset_unknown_stream(addr, &msg.header);
             return;
         };
         let Some(conn) = pending.pop(msg.header.connection_id, msg.header.ack_nr) else {
@@ -836,6 +922,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 ?addr,
                 "dropping packet, it answers no pending connect"
             );
+            if !pending.contains(msg.header.connection_id.0) {
+                self.reset_unknown_stream(addr, &msg.header);
+            }
             return;
         };
         if pending.is_empty() {
@@ -869,8 +958,15 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let (tx, rx) = crate::ingress::channel(self.socket.opts.vsock_rx_bufsize);
         let args = StreamArgs::new_outgoing(&msg.header, start, msg.received)
             .with_parent_span(conn.requester.created_span.clone());
-        self.streams
-            .insert(recv_key, RegisteredStream { tx, retired });
+        let send_id = args.conn_id_send();
+        self.streams.insert(
+            recv_key,
+            RegisteredStream {
+                tx,
+                retired,
+                send_id,
+            },
+        );
         let stream = UtpStreamStarter::new_registered(&self.socket, addr, rx, args, guard).start();
         drop(conn.permit);
         if conn.requester.tx.send(stream).is_ok() {
@@ -901,10 +997,17 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let (tx, rx) = crate::ingress::channel(self.socket.opts.vsock_rx_bufsize);
 
         let (retired, guard) = self.socket.retirements.registration();
+        let send_id = args.conn_id_send();
         let starter = UtpStreamStarter::new_registered(&self.socket, syn.remote, rx, args, guard);
 
-        self.streams
-            .insert(recv_key, RegisteredStream { tx, retired });
+        self.streams.insert(
+            recv_key,
+            RegisteredStream {
+                tx,
+                retired,
+                send_id,
+            },
+        );
         match accept.tx.send(starter) {
             Ok(()) => {
                 trace!("created stream and passed to acceptor");
@@ -919,26 +1022,8 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     }
 
     fn try_send_rst(&mut self, syn: Syn) {
-        if self.control_sends.len() == CONTROL_RESPONSES_MAX {
+        if !self.send_reset(syn.remote, syn.header.connection_id, syn.header.seq_nr) {
             self.socket.stats.syn_flood_dropped.increment(1);
-            trace!("dropping best-effort ST_RESET, response queue is full");
-            return;
-        }
-        let mut buf: [u8; UTP_HEADER as usize] = [0; UTP_HEADER as usize];
-        let packet = UtpHeader {
-            htype: Type::Reset,
-            connection_id: syn.header.connection_id,
-            seq_nr: 0.into(),
-            ack_nr: syn.header.seq_nr,
-            ..Default::default()
-        };
-        if let Some(transport) = self.transport.clone()
-            && let Ok(len) = packet.serialize(&mut buf[..])
-        {
-            self.control_sends
-                .push(PendingSend::new(Box::pin(async move {
-                    transport.send_to(&buf[..len], syn.remote).await
-                })));
         }
     }
 
@@ -1002,7 +1087,9 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                     ?key,
                     "stream dead, but wasn't cleaned up yet, this is probably a race"
                 );
-                self.streams.remove(&key);
+                if let Some(stream) = self.streams.remove(&key) {
+                    self.tombstones.bury(key, stream.send_id);
+                }
             }
             return Ok(());
         }
@@ -1019,11 +1106,87 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             Type::Fin | Type::Reset => {
                 self.on_maybe_connect_refused(addr, message);
             }
-            _ => {
-                trace!(?message, ?addr, "dropping packet");
+            Type::Data => {
+                self.reset_unknown_stream(addr, &message.header);
             }
         }
         Ok(())
+    }
+
+    /// Answers a packet for a stream this socket does not hold with an
+    /// ST_RESET, so the remote ends its side now rather than at its timeout.
+    /// BEP 29 has a socket answer a packet for an unknown connection with a
+    /// reset; libtorrent v2.0.15 answers every packet for a socket it is
+    /// closing with one (utp_stream.cpp:3233-3239) and leaves the unknown
+    /// case undone (utp_socket_manager.cpp:228-230). A reset is never
+    /// answered.
+    ///
+    /// A stream that ended lately is answered with the id the remote knows
+    /// it by. Any other is taken as one the remote opened, whose receive id
+    /// is one below the id it sends with; that reset is left unsent when a
+    /// live stream to the remote already sends with that id.
+    ///
+    /// The remote takes a reset only when it acknowledges a packet the
+    /// remote sent (utp_stream.cpp:2624-2640, 2680-2693): a data packet or
+    /// FIN takes its own sequence number, and a state packet, which takes
+    /// none, the one before.
+    fn reset_unknown_stream(&mut self, remote: SocketAddr, header: &UtpHeader) {
+        let ack_nr = match header.get_type() {
+            Type::Reset | Type::Syn => return,
+            Type::State => header.seq_nr - 1,
+            Type::Data | Type::Fin => header.seq_nr,
+        };
+        let key = (remote, header.connection_id.0);
+        let send_id = match self.tombstones.send_id(&key) {
+            Some(send_id) => send_id,
+            None => {
+                let send_id = header.connection_id - 1;
+                let taken = self
+                    .streams
+                    .range((remote, ConnectionId::MIN)..=(remote, ConnectionId::MAX))
+                    .any(|(_, stream)| stream.send_id == send_id);
+                if taken {
+                    return;
+                }
+                send_id
+            }
+        };
+        if self.send_reset(remote, send_id, ack_nr) {
+            self.socket.stats.unknown_stream_resets.increment(1);
+        }
+    }
+
+    // Queues an ST_RESET within the socket's reset budget and the bound on
+    // control sends; false when it is left unsent.
+    fn send_reset(&mut self, remote: SocketAddr, connection_id: SeqNr, ack_nr: SeqNr) -> bool {
+        if self.control_sends.len() == CONTROL_RESPONSES_MAX {
+            trace!("dropping best-effort ST_RESET, response queue is full");
+            return false;
+        }
+        if !self.reset_budget.take(self.env.now()) {
+            self.socket.stats.resets_rate_limited.increment(1);
+            trace!("dropping best-effort ST_RESET, reset budget spent");
+            return false;
+        }
+        let mut buf: [u8; UTP_HEADER as usize] = [0; UTP_HEADER as usize];
+        let packet = UtpHeader {
+            htype: Type::Reset,
+            connection_id,
+            seq_nr: 0.into(),
+            ack_nr,
+            ..Default::default()
+        };
+        let Some(transport) = self.transport.clone() else {
+            return false;
+        };
+        let Ok(len) = packet.serialize(&mut buf[..]) else {
+            return false;
+        };
+        self.control_sends
+            .push(PendingSend::new(Box::pin(async move {
+                transport.send_to(&buf[..len], remote).await
+            })));
+        true
     }
 }
 
@@ -1182,6 +1345,8 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             next_connection_id: env.random_u16().into(),
             connect_rx,
             control_sends: Vec::new(),
+            tombstones: Tombstones::default(),
+            reset_budget: ResetBudget::default(),
             socket: state,
             transport: None,
             env,
