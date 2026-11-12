@@ -534,6 +534,38 @@ async fn cancellation_does_not_allow_a_late_retry_to_write() {
     assert_eq!(pipeline.write_buffered_bytes, 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn decode_retries_share_the_files_group_list() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, _) = setup(&temp, 40211, &[16, 16, 16, 16]).await;
+    // One server, so each damaged copy is fetched again.
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0]));
+    let shared = std::sync::Arc::clone(
+        pipeline.jobs[&file_id.job_id]
+            .articles
+            .download_queue()
+            .unwrap()
+            .file_groups(file_id)
+            .unwrap(),
+    );
+    for number in 0..4u32 {
+        deliver(
+            &mut pipeline,
+            file_id,
+            number,
+            u64::from(number) * 4,
+            b"bad!",
+            false,
+        )
+        .await;
+    }
+    for _ in 0..4 {
+        let retry = pipeline.retry_rx.recv().await.unwrap();
+        assert_eq!(retry.work.segment_id.file_id, file_id);
+        assert!(std::sync::Arc::ptr_eq(&retry.work.groups, &shared));
+    }
+}
+
 // A part with no usable start is laid immediately after the part before it.
 #[tokio::test]
 async fn an_article_without_a_start_follows_the_one_before_it() {

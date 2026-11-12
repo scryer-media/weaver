@@ -97,6 +97,77 @@ async fn a_credentials_refusal_retries_on_a_server_that_may_still_serve() {
     assert!(!pipeline.no_server_can_serve(job_id, &ready[0].work.exclude_servers));
 }
 
+// Every article of a file refused by one server waits to retry on the other,
+// and every one of those retries holds the file's one group list.
+#[tokio::test]
+async fn refused_articles_of_a_file_retry_holding_its_one_group_list() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    pipeline.nntp = std::sync::Arc::new(retention_client(&[0, 0]));
+    let job_id = JobId(41962);
+    let segments = 64u32;
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        segmented_job_spec("Refused File", "payload.bin", &vec![128; segments as usize]),
+    )
+    .await;
+    pipeline
+        .nntp
+        .pool()
+        .health()
+        .lock()
+        .await
+        .record_failure(0, true);
+    let file_id = held_segment(job_id, 0, 0).file_id;
+    let shared = {
+        let active = pipeline
+            .jobs
+            .get_mut(&job_id)
+            .unwrap()
+            .articles
+            .active_mut()
+            .unwrap();
+        active.download_queue.drain_all();
+        std::sync::Arc::clone(active.download_queue.file_groups(file_id).unwrap())
+    };
+    let held: Vec<_> = (0..segments)
+        .map(|number| held_segment(job_id, 0, number))
+        .collect();
+    hold_on_test_lane(&mut pipeline, &held);
+    pipeline.active_download_passes.insert(job_id);
+
+    for segment_id in held {
+        pipeline
+            .handle_download_done(DownloadResult {
+                lane_id: 0,
+                job_id,
+                runtime_generation: 0,
+                segment_id,
+                data: Err(DownloadError::fetch(
+                    DownloadFailureKind::Auth,
+                    "server 0 refuses credentials",
+                )),
+                attempts: Vec::new(),
+                lane_observation: None,
+                source_server_idx: Some(0),
+                origin: DownloadResultOrigin::NormalPrimary,
+                retry_count: 0,
+                exclude_servers: Vec::new(),
+                release_connection_slot: true,
+            })
+            .await;
+    }
+
+    let ready = pipeline.infrastructure_retries.wake_all();
+    assert_eq!(ready.len(), segments as usize);
+    assert!(
+        ready
+            .iter()
+            .all(|retry| std::sync::Arc::ptr_eq(&retry.work.groups, &shared))
+    );
+}
+
 // A fill server refusing the credentials does not lack the article, so it
 // never opens the backfill tier: with a backfill server the only other
 // server, the article is booked at once and the backfill server is never

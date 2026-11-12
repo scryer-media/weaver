@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::jobs::assembly::{DetectedArchiveIdentity, JobAssembly};
-use crate::jobs::ids::JobId;
+use crate::jobs::ids::{JobId, NzbFileId};
 use crate::jobs::record::ActiveFileIdentity;
 use crate::jobs::server_attribution::JobServerAttribution;
 use crate::pipeline::download::queue::DownloadQueue;
@@ -998,6 +998,21 @@ impl JobArticles {
 
     pub fn recovery_queue_mut(&mut self) -> Option<&mut DownloadQueue> {
         self.active_mut().map(|active| &mut active.recovery_queue)
+    }
+
+    // A file's newsgroups for work built for one of its articles: the list
+    // the job's queues already share among the file's items, so the work
+    // holds no copy of its own, or a new one from `groups` when neither queue
+    // has held an item of the file.
+    pub fn file_groups(&self, file_id: NzbFileId, groups: &[String]) -> Arc<[String]> {
+        self.active()
+            .and_then(|active| {
+                active
+                    .download_queue
+                    .file_groups(file_id)
+                    .or_else(|| active.recovery_queue.file_groups(file_id))
+            })
+            .map_or_else(|| Arc::from(groups), Arc::clone)
     }
 
     pub fn assembly(&self) -> Option<&JobAssembly> {
