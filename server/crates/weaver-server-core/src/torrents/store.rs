@@ -9,7 +9,8 @@
 // torrent seeds from; nothing else writes them.
 
 use std::io;
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use bitvec::boxed::BitBox;
 use bitvec::order::Msb0;
@@ -18,6 +19,7 @@ use bytes::Bytes;
 
 use super::files::Files;
 use super::layout::PieceLayout;
+use super::side::Side;
 use super::storage::Pieces;
 use super::tee::Tee;
 
@@ -120,6 +122,13 @@ pub(crate) struct TorrentStore {
     // it: a checkpoint writes them again only once they differ.
     saved: Mutex<Option<Kept>>,
     tee: Option<Arc<Tee>>,
+    // Which files are set aside: a piece never writes them, its share of
+    // them goes to the side store, and a share kept there is read from
+    // there. Taken to read for a piece's write or a read, and to write only
+    // by a change of which files are, so a change waits on every write and
+    // read under way and none starts until it is done.
+    aside: RwLock<Vec<bool>>,
+    side: Mutex<Side>,
 }
 
 impl TorrentStore {
@@ -138,6 +147,8 @@ impl TorrentStore {
             have: Mutex::new(have),
             saved: Mutex::new(None),
             tee,
+            aside: RwLock::new(Vec::new()),
+            side: Mutex::new(Side::none()),
         };
         *store.saved() = Some(store.kept());
         store
@@ -163,6 +174,185 @@ impl TorrentStore {
     // the next checkpoint writes them.
     pub(crate) fn lost_saved(&self) {
         *self.saved() = None;
+    }
+
+    // The store with its side store at `side`, and the files `ignored`
+    // names set aside. A slot of a piece not had, unless a check of every
+    // piece is under way, or one no file set aside has a share in, is
+    // dropped: what it holds is no piece's the torrent reads from there.
+    // The only files written here are those the side store's head names
+    // and `ignored` does not: their shares of the pieces kept are copied
+    // out to them. Nothing reads or writes the store before it is made, so
+    // that copy comes before all else, as a change of levels's does.
+    pub(crate) fn with_side(mut self, side: PathBuf, ignored: &[bool]) -> io::Result<Self> {
+        let aside: Vec<bool> = self
+            .layout
+            .files()
+            .enumerate()
+            .map(|(index, file)| !file.padding && ignored.get(index).copied().unwrap_or(false))
+            .collect();
+        let mut opened = Side::open(side, self.layout.piece_length(), self.layout.file_count())?;
+        let checking = self.have().unchecked.any();
+        let mut buffer = Vec::new();
+        for piece in opened.pieces() {
+            if !(checking || self.has(piece)) {
+                opened.drop_piece(piece)?;
+                continue;
+            }
+            // A file set aside when the piece was kept and wanted now, its
+            // levels changed while the torrent had no store, takes its
+            // share out first, as a change of levels would.
+            for span in self.layout.spans(piece) {
+                if opened.recorded(span.file) && !aside[span.file] {
+                    buffer.resize(span.range.len() as usize, 0);
+                    opened.read(piece, span.at, &mut buffer)?;
+                    self.files.write(span.file, span.range.start, &buffer)?;
+                }
+            }
+            if !self.layout.spans(piece).iter().any(|span| aside[span.file]) {
+                opened.drop_piece(piece)?;
+            }
+        }
+        opened.record(&aside)?;
+        *self.aside.get_mut().unwrap_or_else(PoisonError::into_inner) = aside;
+        *self.side.get_mut().unwrap_or_else(PoisonError::into_inner) = opened;
+        Ok(self)
+    }
+
+    fn aside(&self) -> RwLockReadGuard<'_, Vec<bool>> {
+        self.aside.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // Holds off a change of which files are set aside while held, as a
+    // piece's write or a read under way does.
+    #[cfg(test)]
+    pub(crate) fn hold_reads(&self) -> RwLockReadGuard<'_, Vec<bool>> {
+        self.aside()
+    }
+
+    fn aside_mut(&self) -> RwLockWriteGuard<'_, Vec<bool>> {
+        self.aside.write().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn side(&self) -> MutexGuard<'_, Side> {
+        self.side.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    // Where its side store is, when it has one.
+    pub(crate) fn side_path(&self) -> Option<PathBuf> {
+        self.side().path().map(Path::to_path_buf)
+    }
+
+    // The pieces its side store keeps.
+    #[cfg(test)]
+    pub(crate) fn side_pieces(&self) -> Vec<u32> {
+        self.side().pieces()
+    }
+
+    // Whether setting aside the files `ignored` names, and no other, has a
+    // file's bytes to copy out of the side store into the file first.
+    pub(crate) fn needs_copy(&self, ignored: &[bool]) -> bool {
+        let aside = self.aside();
+        let side = self.side();
+        side.pieces().into_iter().any(|piece| {
+            self.layout.spans(piece).iter().any(|span| {
+                aside.get(span.file).copied().unwrap_or(false)
+                    && !ignored.get(span.file).copied().unwrap_or(false)
+            })
+        })
+    }
+
+    // The files `ignored` names set aside from now on, and no other. A file
+    // no longer set aside first takes its shares out of the side store,
+    // written to it where they lie, and a slot no file set aside still has
+    // a share in is dropped. Every write and read of the torrent's pieces
+    // waits until it is done (libtorrent runs it as a fence job,
+    // `mmap_storage::set_file_priority`, mmap_storage.cpp:176-234 at
+    // v2.0.15). A copy that fails changes nothing: the bytes stay in the
+    // side store, and the files set aside are as they were.
+    pub(crate) fn relevel(&self, ignored: &[bool]) -> io::Result<()> {
+        let mut aside = self.aside_mut();
+        let mut side = self.side();
+        let wanted: Vec<bool> = self
+            .layout
+            .files()
+            .enumerate()
+            .map(|(index, file)| !file.padding && ignored.get(index).copied().unwrap_or(false))
+            .collect();
+        let turned_on = |file: usize| aside[file] && !wanted[file];
+        let touched: Vec<u32> = side
+            .pieces()
+            .into_iter()
+            .filter(|piece| {
+                self.layout
+                    .spans(*piece)
+                    .iter()
+                    .any(|span| turned_on(span.file))
+            })
+            .collect();
+        let mut buffer = Vec::new();
+        for piece in &touched {
+            for span in self.layout.spans(*piece) {
+                if !turned_on(span.file) {
+                    continue;
+                }
+                buffer.resize(span.range.len() as usize, 0);
+                side.read(*piece, span.at, &mut buffer)?;
+                self.files.write(span.file, span.range.start, &buffer)?;
+            }
+        }
+        if !touched.is_empty() {
+            // The files copied out are no longer named in the head; one
+            // turned on with nothing to copy stays named, harmless, until
+            // the next copy or open.
+            side.record(&wanted)?;
+        }
+        *aside = wanted;
+        for piece in touched {
+            let shares = self.layout.spans(piece).iter().any(|span| aside[span.file]);
+            if !shares {
+                // A tag left behind names a slot no file set aside has a
+                // share in: the next open drops it.
+                let _ = side.drop_piece(piece);
+            }
+        }
+        Ok(())
+    }
+
+    // The file's bytes from `offset` into `out`, with which files are set
+    // aside: a share of a file set aside that the side store keeps comes
+    // from there, any other from the file.
+    fn read_in(&self, aside: &[bool], file: usize, offset: u64, out: &mut [u8]) -> io::Result<()> {
+        if !aside.get(file).copied().unwrap_or(false) {
+            return self.files.read(file, offset, out);
+        }
+        let side = self.side();
+        if side.is_empty() {
+            drop(side);
+            return self.files.read(file, offset, out);
+        }
+        let start = self.layout.torrent_offset(file, offset).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("no file {file} in the torrent"),
+            )
+        })?;
+        let piece_length = self.layout.piece_length();
+        let mut done = 0;
+        while done < out.len() {
+            let at = start + done as u64;
+            let piece = (at / piece_length) as u32;
+            let within = at % piece_length;
+            let len = ((piece_length - within) as usize).min(out.len() - done);
+            let chunk = &mut out[done..done + len];
+            if side.kept(piece) {
+                side.read(piece, within, chunk)?;
+            } else {
+                self.files.read(file, offset + done as u64, chunk)?;
+            }
+            done += len;
+        }
+        Ok(())
     }
 
     fn have(&self) -> MutexGuard<'_, Have> {
@@ -240,12 +430,25 @@ impl TorrentStore {
     }
 
     // The names of the listed files it has whole.
+    // A file set aside with any of its bytes in the side store is not whole
+    // on disk.
     pub(crate) fn whole_names(&self) -> Vec<String> {
+        let aside = self.aside();
+        let kept: Vec<usize> = self
+            .side()
+            .pieces()
+            .into_iter()
+            .flat_map(|piece| self.layout.spans(piece))
+            .map(|span| span.file)
+            .filter(|file| aside.get(*file).copied().unwrap_or(false))
+            .collect();
         let have = self.have();
         self.layout
             .files()
             .enumerate()
-            .filter(|(index, file)| !file.padding && have.file_have[*index] >= file.length)
+            .filter(|(index, file)| {
+                !file.padding && have.file_have[*index] >= file.length && !kept.contains(index)
+            })
             .map(|(_, file)| file.name.clone())
             .collect()
     }
@@ -258,7 +461,7 @@ impl TorrentStore {
             return Ok(false);
         };
         tee.replay(piece, |file, offset, out| {
-            self.files.read(file, offset, out)
+            self.read_in(&self.aside(), file, offset, out)
         })
     }
 
@@ -303,13 +506,36 @@ impl TorrentStore {
     // keeps a torrent's progress whose resume data was rejected,
     // `TorrentImpl::prepareResumeData`, torrentimpl.cpp:2305-2318). A file
     // gone while another is there is a file lost, as libtorrent finds it.
+    //
+    // A share of a file set aside that the side store keeps is backed by
+    // it, whatever the file holds: a file whose bytes had are all kept
+    // there is not looked at, and counts neither as there nor as gone.
     pub(crate) fn drop_unbacked(&self) -> Option<u32> {
+        let aside = self.aside();
+        let kept = self.side().pieces();
+        let mut in_side = vec![0u64; self.layout.file_count()];
+        {
+            let have = self.have();
+            for piece in &kept {
+                if !have.pieces.get(*piece as usize).is_some_and(|bit| *bit) {
+                    continue;
+                }
+                for span in self.layout.spans(*piece) {
+                    if aside.get(span.file).copied().unwrap_or(false) {
+                        in_side[span.file] += span.range.len();
+                    }
+                }
+            }
+        }
+        let backed = |file: usize, piece: u32| {
+            aside.get(file).copied().unwrap_or(false) && kept.binary_search(&piece).is_ok()
+        };
         let touched: Vec<(usize, u64)> = self
             .have()
             .file_have
             .iter()
             .enumerate()
-            .filter(|(_, had)| **had > 0)
+            .filter(|(file, had)| **had > in_side[*file])
             // Padding is on no disk, and holds nothing to lose.
             .filter_map(|(file, _)| {
                 let found = self.layout.file(file).filter(|found| !found.padding)?;
@@ -331,10 +557,11 @@ impl TorrentStore {
             }
             let mut have = self.have();
             for piece in self.layout.file_pieces(file) {
-                let past = self
-                    .layout
-                    .share(file, piece)
-                    .is_some_and(|share| share.end > held);
+                let past = !backed(file, piece)
+                    && self
+                        .layout
+                        .share(file, piece)
+                        .is_some_and(|share| share.end > held);
                 if past && have.set(&self.layout, piece, false) {
                     dropped += 1;
                 }
@@ -381,9 +608,23 @@ impl TorrentStore {
 impl Pieces for TorrentStore {
     // Written to the files, then had, then on to the tee: a piece had is
     // on disk, and a share the tee took is had.
+    //
+    // A file set aside is never written: when the piece has a share of one,
+    // the piece is kept whole in the side store, in the same pass, before
+    // it is had (libtorrent `mmap_storage::writev`, mmap_storage.cpp:655-670
+    // at v2.0.15).
     fn verified(&self, piece: u32, held: &Bytes) -> anyhow::Result<()> {
+        let aside = self.aside();
+        let mut kept = false;
         for span in self.layout.spans(piece) {
             if self.layout.file(span.file).is_none_or(|file| file.padding) {
+                continue;
+            }
+            if aside.get(span.file).copied().unwrap_or(false) {
+                if !kept {
+                    self.side().keep(piece, held, &aside)?;
+                    kept = true;
+                }
                 continue;
             }
             let at = span.at as usize;
@@ -400,7 +641,9 @@ impl Pieces for TorrentStore {
         Ok(())
     }
 
+    // A piece the side store keeps is dropped from it with the piece.
     fn failed(&self, piece: u32) -> anyhow::Result<bool> {
+        self.side().drop_piece(piece)?;
         let mut have = self.have();
         if let Some(mut bit) = have.unchecked.get_mut(piece as usize) {
             bit.set(false);
@@ -449,19 +692,30 @@ impl Pieces for TorrentStore {
     }
 
     fn read(&self, file: usize, offset: u64, out: &mut [u8]) -> io::Result<()> {
-        self.files.read(file, offset, out)
+        self.read_in(&self.aside(), file, offset, out)
     }
 
-    fn readv(&self, file: usize, offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
-        self.files.readv(file, offset, outs)
+    fn readv(&self, file: usize, mut offset: u64, outs: &mut [&mut [u8]]) -> io::Result<()> {
+        let aside = self.aside();
+        if !aside.get(file).copied().unwrap_or(false) {
+            return self.files.readv(file, offset, outs);
+        }
+        for out in outs.iter_mut() {
+            self.read_in(&aside, file, offset, out)?;
+            offset += out.len() as u64;
+        }
+        Ok(())
     }
 
     // Only a file it has whole is made its full length, an empty one among
     // them: the others grow as their pieces are written, sparse, as
     // libtorrent leaves them, and a file already there that the torrent has
     // none of yet is left as it is.
+    // A file set aside is never made.
     fn grow(&self, file: usize, length: u64) -> io::Result<()> {
-        if self.layout.file(file).is_none_or(|file| file.padding) {
+        if self.layout.file(file).is_none_or(|file| file.padding)
+            || self.aside().get(file).copied().unwrap_or(false)
+        {
             return Ok(());
         }
         let whole = self

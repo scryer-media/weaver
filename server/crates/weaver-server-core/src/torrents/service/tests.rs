@@ -161,9 +161,12 @@ fn service_over(
     db: &Database,
     dir: &Path,
     routes: Arc<dyn Routes>,
-    job_env: JobEnv,
+    mut job_env: JobEnv,
     clock: Arc<dyn Clock>,
 ) -> TorrentService {
+    // Its working root lies under `dir`, as the daemon's lies under its data
+    // directory: a restart over `dir` finds what the last run left there.
+    job_env.work = dir.join("work");
     let sessions = Sessions::new(routes, env(&dir.join("sessions")), db.clone());
     let settings = TorrentSettings {
         upload_cap: None,
@@ -11864,4 +11867,106 @@ async fn the_routes_reloading_wakes_the_tick() {
     assert!(woken.as_mut().poll(&mut cx).is_pending());
     rig.routes.reloads.send_modify(|reloads| *reloads += 1);
     assert!(woken.as_mut().poll(&mut cx).is_ready());
+}
+
+// Downloading again a file whose share of a piece the side store keeps
+// copies that share out as a job of its own: the call does not wait for it,
+// the levels change only once it is done, and a level asked meanwhile is
+// taken after it. The copy puts the torrent's own bytes in the file, and
+// the side store goes when the torrent does (libtorrent
+// `torrent::prioritize_files`, `on_file_priority`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_level_asked_while_a_copy_is_out_is_taken_after_it() {
+    use FilePriority::*;
+    let rig = rig(set_clock() as Arc<dyn Clock>);
+    rig.service.open().await.unwrap();
+    let bytes: Vec<u8> = (0..3584u32).map(|at| (at * 7 % 251) as u8).collect();
+    let meta = metainfo(
+        "side",
+        &[
+            ("side/a.bin", &bytes[..1536]),
+            ("side/b.bin", &bytes[1536..]),
+        ],
+        1024,
+        false,
+    );
+    let job_id = rig
+        .service
+        .add(AddRequest {
+            paused: true,
+            ..request(AddSource::Metainfo(meta))
+        })
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(1, Ignored)])
+        .await
+        .unwrap();
+    let store = rig.service.inner.live.lock().await[&job_id]
+        .store
+        .clone()
+        .unwrap();
+    // Piece 1 is a's last 512 bytes and b's first 512.
+    Pieces::verified(
+        &*store,
+        1,
+        &bytes::Bytes::copy_from_slice(&bytes[1024..2048]),
+    )
+    .unwrap();
+    let b = store.files().path(1).unwrap();
+    assert!(!b.exists());
+    let side = store.side_path().unwrap();
+    assert!(side.exists());
+
+    // Reads held on a thread of their own, as a piece's write under way
+    // holds them, until the second change is asked.
+    let (held_tx, held) = std::sync::mpsc::channel();
+    let (release, release_rx) = std::sync::mpsc::channel::<()>();
+    let holding = Arc::clone(&store);
+    let holder = std::thread::spawn(move || {
+        let _reads = holding.hold_reads();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held.recv().unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(1, Normal)])
+        .await
+        .unwrap();
+    rig.service
+        .set_file_priorities(job_id, &[(0, High)])
+        .await
+        .unwrap();
+    let task = {
+        let mut live = rig.service.inner.live.lock().await;
+        let torrent = live.get_mut(&job_id).unwrap();
+        assert_eq!(torrent.levels, [Normal, Ignored]);
+        let leveling = torrent.leveling.as_mut().unwrap();
+        assert_eq!(leveling.next.as_deref(), Some(&[High, Normal][..]));
+        leveling.task.take().unwrap()
+    };
+    assert_eq!(
+        rig.db.torrent_file_priorities(job_id).unwrap(),
+        [Normal, Ignored]
+    );
+    assert!(!b.exists());
+    release.send(()).unwrap();
+    holder.join().unwrap();
+    task.await.unwrap();
+
+    {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        assert_eq!(torrent.levels, [High, Normal]);
+        assert!(torrent.leveling.is_none());
+    }
+    // The levels are stored with the default ones after the last left out.
+    let mut stored = rig.db.torrent_file_priorities(job_id).unwrap();
+    stored.resize(2, Normal);
+    assert_eq!(stored, [High, Normal]);
+    assert_eq!(std::fs::read(&b).unwrap(), bytes[1536..2048]);
+    assert!(store.side_pieces().is_empty());
+    rig.service.remove(job_id, false, true).await.unwrap();
+    assert!(!side.exists());
+    rig.service.stop().await;
 }

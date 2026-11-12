@@ -153,6 +153,55 @@ impl Shim {
     }
 }
 
+// A torrent of plain files under its own directory, the files `ignored`
+// names set aside in its side store, which is kept apart from them under
+// `work`.
+fn shim_aside(
+    piece_length: u64,
+    files: Vec<PieceFile>,
+    ignored: &[bool],
+    work: &Path,
+    kept: Option<&Kept>,
+    dir: tempfile::TempDir,
+) -> Shim {
+    let layout = Arc::new(PieceLayout::new(piece_length, files).unwrap());
+    let store = Arc::new(
+        TorrentStore::new(
+            Arc::clone(&layout),
+            Files::new(&layout, dir.path().to_path_buf()).unwrap(),
+            kept,
+            None,
+        )
+        .with_side(work.join("torrent-1.side"), ignored)
+        .unwrap(),
+    );
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        Arc::clone(&store) as Arc<dyn Pieces>,
+        unbounded(),
+    );
+    Shim {
+        store,
+        storage,
+        layout,
+        dir,
+        room: Arc::default(),
+    }
+}
+
+// File a (wanted) is 1536 bytes, file b (not downloaded) 2048 after it,
+// pieces of 1024: piece 1 is a's last 512 bytes and b's first 512.
+fn wanted_then_ignored(work: &Path, dir: tempfile::TempDir, kept: Option<&Kept>) -> Shim {
+    shim_aside(
+        1024,
+        vec![file("a.bin", 1536), file("sub/b.bin", 2048)],
+        &[false, true],
+        work,
+        kept,
+        dir,
+    )
+}
+
 fn three_files() -> (Shim, Vec<u8>) {
     let shim = shim(
         1024,
@@ -1398,4 +1447,131 @@ impl Pieces for Counted {
     fn grow(&self, file: usize, length: u64) -> std::io::Result<()> {
         self.store.grow(file, length)
     }
+}
+
+// A piece shared by a wanted file and one not downloaded writes only the
+// wanted one: the other's share goes to the side store, from where the piece
+// reads back whole, and its file and folder are never made. Downloading the
+// file again copies its share out into it, and the side store keeps nothing
+// then (libtorrent `mmap_storage::writev` and `set_file_priority`).
+#[test]
+fn an_ignored_files_share_of_a_piece_goes_to_the_side_store_not_the_file() {
+    let work = tempfile::tempdir().unwrap();
+    let shim = wanted_then_ignored(work.path(), tempfile::tempdir().unwrap(), None);
+    let torrent = noise(3584, 11);
+    shim.complete(0, &torrent);
+    shim.complete(1, &torrent);
+    assert_eq!(
+        std::fs::read(shim.dir.path().join("a.bin")).unwrap(),
+        torrent[..1536]
+    );
+    assert!(!shim.dir.path().join("sub").exists());
+    assert!(shim.store.has(1));
+    assert_eq!(shim.read(1), torrent[1024..2048]);
+    assert_eq!(shim.store.side_pieces(), [1]);
+    // A file set aside is never made, even at its length.
+    shim.storage.ensure_file_length(1, 2048).unwrap();
+    assert!(!shim.dir.path().join("sub").exists());
+    assert!(!shim.store.whole_names().contains(&"sub/b.bin".to_owned()));
+
+    assert!(shim.store.needs_copy(&[false, false]));
+    shim.store.relevel(&[false, false]).unwrap();
+    assert!(shim.store.side_pieces().is_empty());
+    assert_eq!(
+        std::fs::read(shim.dir.path().join("sub/b.bin")).unwrap(),
+        torrent[1536..2048]
+    );
+    assert_eq!(shim.read(1), torrent[1024..2048]);
+    for piece in 2..4 {
+        shim.complete(piece, &torrent);
+    }
+    assert_eq!(
+        std::fs::read(shim.dir.path().join("sub/b.bin")).unwrap(),
+        torrent[1536..]
+    );
+}
+
+// A file already at the path of one not downloaded, which the torrent did
+// not write, is left as it is: the torrent's share of it goes to the side
+// store, and the torrent reads its own bytes back from there.
+#[test]
+fn a_file_at_an_ignored_path_is_never_written() {
+    let work = tempfile::tempdir().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("sub/b.bin"), b"the operator's own").unwrap();
+    let shim = wanted_then_ignored(work.path(), dir, None);
+    let torrent = noise(3584, 12);
+    shim.complete(1, &torrent);
+    assert_eq!(
+        std::fs::read(shim.dir.path().join("sub/b.bin")).unwrap(),
+        b"the operator's own"
+    );
+    assert_eq!(shim.read(1), torrent[1024..2048]);
+}
+
+// The side store outlives the run: a store made again from what it kept
+// reads the piece back from it, loses no piece to the file not being
+// there, and a check of every piece finds the piece from it. A piece the
+// check does not find leaves the side store with it.
+#[test]
+fn a_side_store_is_found_again_and_checked_from() {
+    let work = tempfile::tempdir().unwrap();
+    let shim = wanted_then_ignored(work.path(), tempfile::tempdir().unwrap(), None);
+    let torrent = noise(3584, 13);
+    shim.complete(0, &torrent);
+    shim.complete(1, &torrent);
+    let kept = shim.store.kept();
+    let Shim { store, dir, .. } = shim;
+    drop(store);
+
+    let again = wanted_then_ignored(work.path(), dir, Some(&kept));
+    assert_eq!(again.store.drop_unbacked(), Some(0));
+    assert_eq!(again.store.count(), 2);
+    assert_eq!(again.read(1), torrent[1024..2048]);
+
+    assert!(Pieces::checking(&*again.store).unwrap());
+    assert_eq!(again.read(1), torrent[1024..2048]);
+    assert!(Pieces::found(&*again.store, 1).unwrap());
+    assert!(again.store.has(1));
+    assert_eq!(again.store.side_pieces(), [1]);
+    assert!(Pieces::failed(&*again.store, 1).unwrap());
+    assert!(again.store.side_pieces().is_empty());
+    let mut out = vec![0; 512];
+    assert!(again.storage.pread_exact(1, 0, &mut out).is_err());
+}
+
+// A side store whose piece the pieces kept do not have holds nothing the
+// torrent reads: it is dropped as the store opens.
+#[test]
+fn a_side_store_piece_not_kept_is_dropped() {
+    let work = tempfile::tempdir().unwrap();
+    let shim = wanted_then_ignored(work.path(), tempfile::tempdir().unwrap(), None);
+    let torrent = noise(3584, 14);
+    shim.complete(1, &torrent);
+    let Shim { store, dir, .. } = shim;
+    drop(store);
+    let again = wanted_then_ignored(work.path(), dir, None);
+    assert!(again.store.side_pieces().is_empty());
+}
+
+// The side store is not among the torrent's files: a move of them leaves
+// it where it is, and the piece still reads whole from the new place.
+#[test]
+fn a_move_keeps_the_side_store() {
+    let work = tempfile::tempdir().unwrap();
+    let shim = wanted_then_ignored(work.path(), tempfile::tempdir().unwrap(), None);
+    let torrent = noise(3584, 15);
+    shim.complete(0, &torrent);
+    shim.complete(1, &torrent);
+    let moved_dir = tempfile::tempdir().unwrap();
+    let moved = moved_dir.path().join("moved");
+    std::fs::create_dir_all(&moved).unwrap();
+    move_listed(shim.store.files(), &[], moved.clone(), Existing::Keep).unwrap();
+    assert_eq!(std::fs::read(moved.join("a.bin")).unwrap(), torrent[..1536]);
+    assert!(!moved.join("sub").exists());
+    assert_eq!(shim.read(1), torrent[1024..2048]);
+    let side = shim.store.side_path().unwrap();
+    assert!(side.starts_with(work.path()));
+    assert!(side.exists());
 }

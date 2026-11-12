@@ -75,6 +75,7 @@ use crate::torrents::sessions::{
     NetworkRoutes, OPENING, RouteFailure, RouteKey, RoutePlan, SessionEnv, SessionError,
     SessionView, Sessions, TorrentRouteReason, encryption_policy,
 };
+use crate::torrents::side::Side;
 use crate::torrents::status::{self, Engine, Held, Observed, Queued};
 use crate::torrents::storage::{PieceStorageFactory, Pieces};
 use crate::torrents::store::{Kept, Replayed, TorrentStore};
@@ -1376,6 +1377,12 @@ struct Live {
     peers: (u32, u32, u32),
     // Where a move goes, while it is under way.
     moving: Option<Moving>,
+    // A change of its files' levels that copies bytes out of its side
+    // store, while it is under way.
+    leveling: Option<Leveling>,
+    // Why its files' bytes did not copy out of its side store, until it is
+    // started again: it is in error, stopped.
+    copy_error: Option<String>,
     // How many pieces had passed their check in seed mode when they were
     // last kept.
     seed_verified: usize,
@@ -1526,6 +1533,8 @@ impl Live {
             speeds: (0, 0),
             peers: (0, 0, 0),
             moving: None,
+            leveling: None,
+            copy_error: None,
             seed_verified: 0,
             file_have: Vec::new(),
             kept_pieces: 0,
@@ -1809,6 +1818,7 @@ impl Live {
             engine: self
                 .run_error
                 .clone()
+                .or_else(|| self.copy_error.clone())
                 .or_else(|| self.restore_held.clone())
                 .map_or(engine, Engine::Error),
             has_metadata: self.layout.is_some(),
@@ -2950,6 +2960,17 @@ impl TorrentService {
         self.inner.env.work.join(format!("torrent-{}", job_id.0))
     }
 
+    // Where a torrent's side store is: in Weaver's working directory, beside
+    // its unpacking directory and never in it, so it stays where it is
+    // whatever moves or clears the torrent's files or its unpacking, and
+    // goes only with the torrent.
+    fn side_store(&self, job_id: JobId) -> PathBuf {
+        self.inner
+            .env
+            .work
+            .join(format!("torrent-{}.side", job_id.0))
+    }
+
     // The claim `unpacked` took on the torrent's files, given back.
     async fn unclaim_outputs(&self, job_id: JobId) {
         let _ = self
@@ -3323,6 +3344,8 @@ impl TorrentService {
             tee,
             passwords,
             seeded,
+            side,
+            ignored,
             kept,
         } = made;
         // One policy for both of a restore's database reads, the pieces it
@@ -3356,7 +3379,11 @@ impl TorrentService {
             }
             None => None,
         };
-        let store = TorrentStore::new(layout, files, kept.as_ref(), tee);
+        let store = TorrentStore::new(layout, files, kept.as_ref(), tee)
+            .with_side(side, &ignored)
+            .map_err(|error| {
+                Unmade::Fails(format!("could not open the torrent's side store: {error}"))
+            })?;
         let unbacked = store.drop_unbacked();
         if let Some(tee) = store.tee() {
             // With none of its files there, nothing is read from them: the
@@ -3471,6 +3498,8 @@ impl TorrentService {
             tee: unpacks(torrent) && !torrent.complete(),
             passwords: self.archive_passwords(torrent, global),
             seeded: torrent.record.seed_mode,
+            side: self.side_store(torrent.record.job_id),
+            ignored: ignored_of(&torrent.levels),
             kept: None,
         })
     }
@@ -3736,7 +3765,7 @@ impl TorrentService {
                 return false;
             }
         };
-        match self
+        let (started, copy) = match self
             .inner
             .live
             .lock()
@@ -3748,13 +3777,56 @@ impl TorrentService {
                 torrent.restore_held = None;
                 torrent.files_missing = missing;
                 self.give_store(torrent, store);
-                torrent.held.is_none() && !missing
+                let copy = self.catch_up_levels(torrent);
+                (torrent.held.is_none() && !missing, copy)
             }
             None => {
                 store.forget();
-                false
+                (false, None)
             }
+        };
+        if let Some((store, asked)) = copy {
+            self.start_copy(job_id, store, asked).await;
         }
+        started
+    }
+
+    // A store made from the levels of when its restore began, brought to
+    // those of now: a change asked while it was made has the files it sets
+    // aside, and, when that has bytes to copy out of the side store, the
+    // copy to start, as a change of levels starts it.
+    fn catch_up_levels(
+        &self,
+        torrent: &mut Live,
+    ) -> Option<(Arc<TorrentStore>, Vec<FilePriority>)> {
+        let store = torrent.store.as_ref()?;
+        let ignored = ignored_of(&torrent.levels);
+        if store.needs_copy(&ignored) {
+            let asked: Vec<FilePriority> = torrent
+                .levels
+                .iter()
+                .zip(store.layout().files())
+                .map(|(level, file)| {
+                    if file.padding {
+                        FilePriority::Normal
+                    } else {
+                        *level
+                    }
+                })
+                .collect();
+            torrent.leveling = Some(Leveling {
+                task: None,
+                asked: asked.clone(),
+                next: None,
+            });
+            return Some((Arc::clone(store), asked));
+        }
+        // Nothing to copy: only which files are set aside changes, in
+        // memory.
+        if let Err(error) = store.relevel(&ignored) {
+            tracing::warn!(job_id = torrent.record.job_id.0, error = %error, "could not set a torrent's files aside");
+        }
+        None
     }
 
     // Keep a torrent that crashed the daemon paused, its restore held for
@@ -4935,11 +5007,22 @@ impl TorrentService {
 
     // A torrent that left the live ones goes to history: its row, then out
     // of the torrents and into the finished jobs.
-    async fn retire(&self, torrent: Live, status: &str, error: Option<String>) {
+    async fn retire(&self, mut torrent: Live, status: &str, error: Option<String>) {
         let job_id = torrent.record.job_id;
         self.inner.env.outside.leave(job_id.0);
+        // A copy out of the side store under way ends before the store goes.
+        if let Some(task) = torrent.leveling.take().and_then(|leveling| leveling.task) {
+            let _ = task.await;
+        }
         if let Some(store) = &torrent.store {
             store.forget();
+            // Its side store goes with it: nothing else reads it.
+            if let Some(side) = store.side_path() {
+                let removed = tokio::task::spawn_blocking(move || Side::remove(&side)).await;
+                if let Ok(Err(error)) = removed {
+                    tracing::warn!(job_id = job_id.0, error = %error, "could not remove a torrent's side store");
+                }
+            }
         }
         let settings = self.settings();
         let now = self.inner.clock.now_ms();
@@ -5415,6 +5498,11 @@ impl TorrentService {
             .await?;
         }
         self.set_intent(job_id, TorrentIntent::Resumed).await?;
+        self.with_torrent(job_id, |torrent| {
+            torrent.copy_error = None;
+            Ok(())
+        })
+        .await?;
         // A fetch the pause ended starts again.
         let refetch = self
             .with_torrent(job_id, |torrent| {
@@ -6489,56 +6577,190 @@ impl TorrentService {
     }
 
     /// Set the operator's level for each given file, by its index in the
-    /// torrent, and push the levels to the torrent's session.
+    /// torrent, and push the levels to the torrent's session. A file
+    /// downloaded again whose bytes the side store keeps has them copied
+    /// out into it first, as a job of the torrent's own, and the call does
+    /// not wait for it: the levels are stored and reach the session once it
+    /// is done, and a change asked meanwhile follows it (libtorrent
+    /// `torrent::prioritize_files`, torrent.cpp:5749-5829 at v2.0.15).
     pub async fn set_file_priorities(
         &self,
         job_id: JobId,
         priorities: &[(u32, FilePriority)],
     ) -> Result<(), ActionError> {
-        self.with_torrent(job_id, |torrent| {
-            let mut levels = torrent.levels.clone();
-            let count = levels.len();
-            for (index, priority) in priorities {
-                let Some(level) = levels.get_mut(*index as usize) else {
-                    return Err(ActionError::Invalid(format!(
-                        "file {index} is out of range: the torrent has {count} files"
-                    )));
-                };
-                *level = *priority;
-            }
-            let padding: Vec<bool> = torrent
-                .layout
-                .iter()
-                .flat_map(|layout| layout.files().map(|file| file.padding))
-                .collect();
-            // Padding holds Ignored whatever is asked, and is stored as
-            // nothing asked: the metainfo says which files are padding.
-            let asked: Vec<FilePriority> = levels
-                .iter()
-                .zip(&padding)
-                .map(|(level, padding)| {
-                    if *padding {
-                        FilePriority::Normal
-                    } else {
-                        *level
-                    }
-                })
-                .collect();
-            self.inner
-                .db
-                .set_torrent_file_priorities(job_id, &asked)
-                .map_err(|error| ActionError::State(state_error(error)))?;
-            torrent.levels = asked
-                .iter()
-                .zip(&padding)
-                .map(|(level, padding)| level.held_by(*padding))
-                .collect();
-            Ok(())
-        })
-        .await?;
+        let copy = self
+            .with_torrent(job_id, |torrent| {
+                // A change asked while a copy is out builds on the one
+                // already waiting for it, or on the one under way.
+                let mut levels = torrent
+                    .leveling
+                    .as_ref()
+                    .map(|leveling| leveling.next.as_ref().unwrap_or(&leveling.asked).clone())
+                    .unwrap_or_else(|| torrent.levels.clone());
+                let count = levels.len();
+                for (index, priority) in priorities {
+                    let Some(level) = levels.get_mut(*index as usize) else {
+                        return Err(ActionError::Invalid(format!(
+                            "file {index} is out of range: the torrent has {count} files"
+                        )));
+                    };
+                    *level = *priority;
+                }
+                let padding: Vec<bool> = torrent
+                    .layout
+                    .iter()
+                    .flat_map(|layout| layout.files().map(|file| file.padding))
+                    .collect();
+                // Padding holds Ignored whatever is asked, and is stored as
+                // nothing asked: the metainfo says which files are padding.
+                let asked: Vec<FilePriority> = levels
+                    .iter()
+                    .zip(&padding)
+                    .map(|(level, padding)| {
+                        if *padding {
+                            FilePriority::Normal
+                        } else {
+                            *level
+                        }
+                    })
+                    .collect();
+                if let Some(leveling) = &mut torrent.leveling {
+                    leveling.next = Some(asked);
+                    return Ok(None);
+                }
+                let held: Vec<FilePriority> = asked
+                    .iter()
+                    .zip(&padding)
+                    .map(|(level, padding)| level.held_by(*padding))
+                    .collect();
+                let ignored = ignored_of(&held);
+                if let Some(store) = &torrent.store
+                    && store.needs_copy(&ignored)
+                {
+                    torrent.leveling = Some(Leveling {
+                        task: None,
+                        asked: asked.clone(),
+                        next: None,
+                    });
+                    return Ok(Some((Arc::clone(store), asked)));
+                }
+                self.inner
+                    .db
+                    .set_torrent_file_priorities(job_id, &asked)
+                    .map_err(|error| ActionError::State(state_error(error)))?;
+                // No file's bytes to copy: only which files are set aside
+                // changes, in memory.
+                if let Some(store) = &torrent.store {
+                    store
+                        .relevel(&ignored)
+                        .map_err(|error| ActionError::State(error.to_string()))?;
+                }
+                torrent.levels = held;
+                Ok(None)
+            })
+            .await?;
+        if let Some((store, asked)) = copy {
+            self.start_copy(job_id, store, asked).await;
+            self.publish().await;
+            return Ok(());
+        }
         self.apply_picking().await;
         self.publish().await;
         Ok(())
+    }
+
+    // The copy out of the side store a change of levels needs, started off
+    // the request, its handle kept on the change it is for.
+    async fn start_copy(&self, job_id: JobId, store: Arc<TorrentStore>, asked: Vec<FilePriority>) {
+        let service = self.clone();
+        let task = tokio::spawn(async move { service.copy_out(job_id, store, asked).await });
+        // A job already over has left nothing to keep its handle on.
+        let _ = self
+            .with_torrent(job_id, |torrent| {
+                if let Some(leveling) = &mut torrent.leveling {
+                    leveling.task = Some(task);
+                }
+                Ok(())
+            })
+            .await;
+    }
+
+    // The job of a change of levels that copies bytes out of the side store:
+    // the copy runs off the runtime, with every read and write of the
+    // torrent's pieces waiting on it, and only then are the levels stored,
+    // taken and pushed to the session; then the change asked meanwhile, if
+    // any, the same way. A copy that fails leaves the levels as they were
+    // and the bytes where they were, drops the changes after it, and puts
+    // the torrent in error, stopped (libtorrent `torrent::on_file_priority`,
+    // torrent.cpp:5695-5720 at v2.0.15).
+    async fn copy_out(
+        &self,
+        job_id: JobId,
+        store: Arc<TorrentStore>,
+        mut asked: Vec<FilePriority>,
+    ) {
+        loop {
+            let held: Vec<FilePriority> = asked
+                .iter()
+                .zip(store.layout().files())
+                .map(|(level, file)| level.held_by(file.padding))
+                .collect();
+            let ignored = ignored_of(&held);
+            let copying = Arc::clone(&store);
+            let copied = tokio::task::spawn_blocking(move || copying.relevel(&ignored))
+                .await
+                .unwrap_or_else(|error| Err(std::io::Error::other(error)));
+            let now = self.inner.clock.now_ms();
+            let next = self
+                .with_torrent(job_id, |torrent| {
+                    if !torrent
+                        .store
+                        .as_ref()
+                        .is_some_and(|own| Arc::ptr_eq(own, &store))
+                    {
+                        return Ok((None, None));
+                    }
+                    let mut landing = None;
+                    let mut next = None;
+                    match copied {
+                        Ok(()) => {
+                            if let Err(error) = self.inner.db.set_torrent_file_priorities(job_id, &asked) {
+                                tracing::warn!(job_id = job_id.0, error = %error, "could not keep a torrent's file levels");
+                            }
+                            torrent.levels = held;
+                            if let Some(leveling) = &mut torrent.leveling {
+                                next = leveling.next.take();
+                                if let Some(next) = &next {
+                                    leveling.asked = next.clone();
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(job_id = job_id.0, error = %error, "a file's bytes did not copy out of a torrent's side store");
+                            landing = self.stop_torrent(torrent, now);
+                            torrent.copy_error = Some(format!(
+                                "could not copy a file's bytes out of the side store: {error}"
+                            ));
+                        }
+                    }
+                    if next.is_none() {
+                        torrent.leveling = None;
+                    }
+                    Ok((next, landing))
+                })
+                .await
+                .unwrap_or((None, None));
+            let (next, landing) = next;
+            if landing.is_some() {
+                let _ = self.landed(landing).await;
+            }
+            self.apply_picking().await;
+            self.publish().await;
+            match next {
+                Some(next) => asked = next,
+                None => return,
+            }
+        }
     }
 
     /// Whether the torrent's pieces are fetched in order.
@@ -7415,6 +7637,25 @@ fn fetch_levels(torrent: &Live) -> Vec<FilePriority> {
     torrent.levels.clone()
 }
 
+// A change of a torrent's files' levels under way: the job that copies
+// their bytes out of the side store and then takes the levels, and the
+// levels asked for while it runs, which it takes after (libtorrent
+// `torrent::m_deferred_file_priorities`, torrent.cpp:5803-5807 at v2.0.15).
+struct Leveling {
+    task: Option<tokio::task::JoinHandle<()>>,
+    // The levels the job takes, as stored.
+    asked: Vec<FilePriority>,
+    next: Option<Vec<FilePriority>>,
+}
+
+// Which of the files `levels` sets aside: those not downloaded.
+fn ignored_of(levels: &[FilePriority]) -> Vec<bool> {
+    levels
+        .iter()
+        .map(|level| *level == FilePriority::Ignored)
+        .collect()
+}
+
 // What a torrent's move takes.
 #[derive(Debug, Clone)]
 enum Moving {
@@ -7498,6 +7739,9 @@ struct Making {
     // In seed mode: its pieces had are unchecked, and go to the tee only
     // as their seed-mode check passes.
     seeded: bool,
+    // Its side store, and the files set aside in it.
+    side: PathBuf,
+    ignored: Vec<bool>,
     // The pieces it kept as the boot read them; none to read its row.
     kept: Option<Option<Kept>>,
 }

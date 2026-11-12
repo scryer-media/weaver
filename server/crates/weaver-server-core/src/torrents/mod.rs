@@ -15,6 +15,7 @@ pub mod rate;
 pub(crate) mod relocate;
 pub mod service;
 pub mod sessions;
+pub(crate) mod side;
 pub mod status;
 pub(crate) mod storage;
 pub(crate) mod store;
