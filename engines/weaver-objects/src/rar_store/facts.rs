@@ -43,8 +43,14 @@ pub(super) struct StoreFacts<V = Sealed<VolumeFacts>> {
     asked: bool,
     damage_said: BTreeSet<(VolumeIndex, u64, u64, u32)>,
     recovery_said: BTreeSet<(VolumeIndex, u64)>,
+    // Volumes said missing one by one, as facts kept them before the runs
+    // below. Read and folded into the runs; written empty.
     gaps_said: BTreeSet<VolumeIndex>,
     gone: bool,
+    // Volumes said missing, as runs from a first number up to an end. Last,
+    // so facts written before them read as none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    gap_runs: Vec<(u32, u32)>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -249,6 +255,7 @@ impl<V> StoreFacts<V> {
             recovery_said: self.recovery_said,
             gaps_said: self.gaps_said,
             gone: self.gone,
+            gap_runs: self.gap_runs,
         }
     }
 }
@@ -326,8 +333,9 @@ pub(super) fn of(store: &RarStore) -> Facts {
         asked: store.asked,
         damage_said: store.damage_said.iter().copied().collect(),
         recovery_said: store.recovery_said.clone(),
-        gaps_said: store.gaps_said.clone(),
+        gaps_said: BTreeSet::new(),
         gone: store.gone,
+        gap_runs: store.gaps_said.runs().collect(),
     };
     Facts::of(Kind::RarStore, &facts)
 }
@@ -382,7 +390,12 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
     store.remap();
     store.damage_said = kept.damage_said.into_iter().collect();
     store.recovery_said = kept.recovery_said;
-    store.gaps_said = kept.gaps_said;
+    for (first, end) in kept.gap_runs {
+        store.gaps_said.say(first, end);
+    }
+    for volume in kept.gaps_said {
+        store.gaps_said.say(volume.0, volume.0.saturating_add(1));
+    }
     store.gone = kept.gone;
     // The walk reads the kept headers again; what it says now was said
     // before the checkpoint, so it goes nowhere.

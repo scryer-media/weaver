@@ -14,6 +14,7 @@
 
 pub(crate) mod claim;
 pub(crate) mod facts;
+mod gaps;
 mod image;
 mod layout;
 mod lock;
@@ -47,12 +48,6 @@ use walk::{Step, Walk};
 // How many volumes past the one being read are bid for. A solid set never
 // streams here, so only the non-solid window applies.
 const WINDOW: u32 = 8;
-
-// The most volumes a set may number. RAR 1.5 to 4.x number a volume in 16
-// bits, so no set they write runs past it, and a RAR5 set that long is far
-// past any post. A set whose last volume is numbered beyond it is refused
-// before its gaps are said one by one.
-pub(super) const MOST_VOLUMES: u32 = 1 << 16;
 
 // One volume as the store holds it: everything it read of it, the headers
 // walked and the bytes kept for that, which is what travels with the member
@@ -354,7 +349,7 @@ pub struct RarStore {
     condemned: BTreeMap<usize, Condemned>,
     damage_said: HashSet<(VolumeIndex, u64, u64, u32)>,
     recovery_said: BTreeSet<(VolumeIndex, u64)>,
-    gaps_said: BTreeSet<VolumeIndex>,
+    gaps_said: gaps::Gaps,
     // The files may open now: a password, a cipher or a condemned key
     // changed.
     stale: bool,
@@ -413,7 +408,7 @@ impl RarStore {
             condemned: BTreeMap::new(),
             damage_said: HashSet::new(),
             recovery_said: BTreeSet::new(),
-            gaps_said: BTreeSet::new(),
+            gaps_said: gaps::Gaps::default(),
             stale: false,
             gone: false,
             placed: next_placed(),
@@ -699,7 +694,10 @@ impl RarStore {
     }
 
     // Numbered volumes that never came, once everything else has: damaged
-    // whole, at the length every volume but the last shares.
+    // whole, at the length every volume but the last shares. A volume held
+    // with no name may place bytes, so it is said alone; the runs between
+    // the volumes held hold nothing and are each said once, as a gap. The
+    // cost is that of the volumes held, never of the last one's number.
     fn say_gaps(&mut self, out: &mut Vec<Emit>) {
         let Some(last) = self.last().filter(|_| self.finished()) else {
             return;
@@ -712,21 +710,37 @@ impl RarStore {
         else {
             return;
         };
-        if last.0 >= MOST_VOLUMES {
-            return self.give_up(Emit::Refuse(Why::InvalidArchive), out);
-        }
-        for index in 0..last.0 {
-            let volume = VolumeIndex(index);
-            let missing = self
-                .volumes
-                .get(&volume)
-                .is_none_or(|found| found.name.is_none());
-            if missing && self.gaps_said.insert(volume) {
-                out.push(Emit::Damaged {
-                    volume,
-                    range: ByteRange::new(0, length),
-                });
+        let range = ByteRange::new(0, length);
+        let held: Vec<(u32, bool)> = self
+            .volumes
+            .range(..last)
+            .map(|(index, found)| (index.0, found.name.is_none()))
+            .collect();
+        let mut next = 0;
+        for (index, nameless) in held {
+            self.say_gap(next, index, range, out);
+            if nameless {
+                for _ in self.gaps_said.say(index, index + 1) {
+                    out.push(Emit::Damaged {
+                        volume: VolumeIndex(index),
+                        range,
+                    });
+                }
             }
+            next = index + 1;
+        }
+        self.say_gap(next, last.0, range, out);
+    }
+
+    // The volumes from `first` up to `end`, none of them held, as gaps:
+    // only the parts not said before.
+    fn say_gap(&mut self, first: u32, end: u32, range: ByteRange, out: &mut Vec<Emit>) {
+        for (first, end) in self.gaps_said.say(first, end) {
+            out.push(Emit::Gap {
+                first: VolumeIndex(first),
+                end: VolumeIndex(end),
+                range,
+            });
         }
     }
 }

@@ -3802,6 +3802,7 @@ impl Tree {
                 } => self.unkept(node, (volume, range), (envelope, at), effects),
                 Emit::Again { volume, range } => again.push((volume, range)),
                 Emit::Damaged { volume, range } => self.damaged(node, volume, range, effects),
+                Emit::Gap { first, end, range } => self.gap(node, (first, end), range, effects),
                 Emit::NeedsPassword => effects.push(Effect::NeedsPassword { node }),
                 Emit::NeedsEngine(why) => {
                     self.unbind(node, Unbinding::Engine(why), builder, effects);
@@ -4428,6 +4429,33 @@ impl Tree {
                 self.descend(pending, Down::Refuted, effects);
             }
             None => self.damage(node, volume, range, effects),
+        }
+    }
+
+    // A run of an object's volumes never came, and the object holds nothing
+    // of any of them. A volume of the run bound as a member is judged as
+    // `damaged` judges it. One not bound would descend as a loss, and the
+    // object, which is in its node as its word is applied, places none of
+    // its bytes anywhere but held: the loss marks nothing, so the run costs
+    // its bound volumes and no more.
+    fn gap(
+        &mut self,
+        node: NodeId,
+        (first, end): (VolumeIndex, VolumeIndex),
+        range: ByteRange,
+        effects: &mut Vec<Effect>,
+    ) {
+        if first >= end {
+            return;
+        }
+        let bound: Vec<VolumeIndex> = self
+            .nodes
+            .get(&node)
+            .and_then(|found| found.binding.as_ref())
+            .map(|binding| binding.volumes.range(first..end).map(|(v, _)| *v).collect())
+            .unwrap_or_default();
+        for volume in bound {
+            self.damaged(node, volume, range, effects);
         }
     }
 
@@ -6275,6 +6303,36 @@ mod tests {
                 },
             ]
         );
+    }
+
+    // A gap over a run that takes in a bound volume judges that volume as a
+    // damage report for it alone does, and marks nothing for the rest.
+    #[test]
+    fn a_gap_over_a_bound_volume_marks_what_its_own_report_marks() {
+        let said = |emit: Emit| {
+            let (mut tree, _, child, _) = bound_tree();
+            let mut effects = Vec::new();
+            tree.emitted(child, vec![emit], &mut Build, &mut effects);
+            effects
+        };
+        let range = ByteRange::new(7, 12);
+        let alone = said(Emit::Damaged {
+            volume: VolumeIndex(0),
+            range,
+        });
+        assert!(!alone.is_empty());
+        let gap = said(Emit::Gap {
+            first: VolumeIndex(0),
+            end: VolumeIndex(u32::MAX),
+            range,
+        });
+        assert_eq!(gap, alone);
+        let past = said(Emit::Gap {
+            first: VolumeIndex(1),
+            end: VolumeIndex(u32::MAX),
+            range,
+        });
+        assert!(past.is_empty(), "{past:?}");
     }
 
     #[test]
