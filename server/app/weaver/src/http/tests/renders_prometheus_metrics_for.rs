@@ -1228,8 +1228,8 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
 
     // One 0/1 sample per value of each state family, exactly one of them 1.
     for (family, labels, values) in [
-        ("weaver_torrent_state", SEEDING, 11),
-        ("weaver_torrent_state", MAGNET, 11),
+        ("weaver_torrent_state", SEEDING, 12),
+        ("weaver_torrent_state", MAGNET, 12),
         ("weaver_torrent_metadata_fetch_phase", MAGNET, 3),
         ("weaver_torrent_tracker_status", TRACKER, 6),
         ("weaver_torrent_tracker_status", BACKUP, 6),
