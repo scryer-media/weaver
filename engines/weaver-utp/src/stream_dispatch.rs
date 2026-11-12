@@ -1790,10 +1790,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 let assembler_was_empty = self.user_rx.assembler_empty();
                 let hdr = msg.header;
 
-                self.segment_sizes.on_payload_delivered(msg.payload().len());
-                self.congestion_controller
-                    .set_mss(self.segment_sizes.mss() as usize);
-
                 match self.user_rx.add_remove(cx, msg, offset as usize)? {
                     AssemblerAddRemoveResult::Consumed {
                         sequence_numbers,

@@ -153,6 +153,33 @@ async fn a_stream_settles_at_the_largest_size_the_path_passes() {
     assert!(after.len() >= 300, "{} sent at the size found", after.len());
 }
 
+// A peer's large DATA proves the path toward us, not the path toward it:
+// only an acked probe raises the size, as in libtorrent (utp_stream.cpp
+// 2184-2189).
+#[tokio::test]
+async fn the_peers_large_data_does_not_raise_the_size() {
+    setup_test_logging();
+    let mut t = make_test_vsock(Default::default(), false);
+    t.send_data(1, 100, &"x".repeat(1354));
+    t.poll_once_assert_pending().await;
+    t.take_sent();
+    assert_eq!(t.vsock.segment_sizes.mss(), 528);
+
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&[0u8; 2000])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    let data: Vec<_> = t
+        .take_sent()
+        .into_iter()
+        .filter(|msg| msg.header.get_type() == Data)
+        .collect();
+    assert_eq!(data[0].payload().len(), 528, "the floor");
+}
+
 #[tokio::test]
 async fn no_packet_outgrows_a_1280_byte_tunnel() {
     setup_test_logging();
