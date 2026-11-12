@@ -19,7 +19,7 @@ use crate::{
     SocketOpts,
     pacer::PACE_BURST_PACKETS,
     raw::{Type::*, UtpHeader},
-    stream_dispatch::{SEND_RETRY, StreamArgs},
+    stream_dispatch::StreamArgs,
     test_util::env::MockUtpEnvironment,
     traits::UtpEnvironment,
 };
@@ -141,10 +141,10 @@ fn poll_with(t: &mut TestVsock, woken: &Arc<Woken>) -> Poll<crate::Result<()>> {
 }
 
 // The pace timer wakes a stream with nothing in flight, and its socket is
-// full. The socket never wakes it, as when another task polled the socket
-// full after it; no ACK is coming either. The stream still tries again.
+// full. No ACK is coming. The clock does not wake the stream again; the
+// socket's writable wake does, and the data goes.
 #[tokio::test(start_paused = true)]
-async fn a_full_socket_with_nothing_in_flight_does_not_strand_the_stream() {
+async fn a_full_socket_with_nothing_in_flight_waits_for_its_writable_wake() {
     let rtt = Duration::from_millis(100);
     let mut t = sender(rtt).await;
     let woken = Arc::new(Woken::default());
@@ -177,14 +177,21 @@ async fn a_full_socket_with_nothing_in_flight_does_not_strand_the_stream() {
     assert_eq!(data_sent(&t), 0);
     assert!(!woken.take());
 
-    t.env.increment_now(SEND_RETRY);
-    tokio::time::advance(SEND_RETRY).await;
-    assert!(woken.take(), "nothing woke the stream after a full socket");
+    let step = Duration::from_millis(1);
+    t.env.increment_now(step);
+    tokio::time::advance(step).await;
+    assert!(
+        !woken.take(),
+        "the clock woke a stream waiting on its socket"
+    );
+    assert_eq!(t.transport.refused(), 1);
 
-    // Once the socket takes datagrams, the data goes.
+    // Once the socket takes datagrams, it wakes the stream and the data goes.
     t.transport.set_poll_send_pending(false);
+    assert!(woken.take(), "the writable wake did not reach the stream");
     assert!(poll_with(&mut t, &woken).is_pending());
     assert!(data_sent(&t) > 0);
+    assert_eq!(t.transport.refused(), 1);
 }
 
 // Polls and acknowledges everything sent until the queue is empty, then

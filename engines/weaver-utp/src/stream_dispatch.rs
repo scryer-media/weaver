@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-10.
+// Modified by the Weaver authors, 2026-11-12.
 
 #[cfg(test)]
 mod tests;
@@ -189,6 +189,11 @@ struct VirtualSocket<T, Env> {
     // out. What is left lost waits for the next ACK, which spaces the
     // resends at the rate the peer's packets arrive.
     fast_resend_budget: usize,
+    // The socket refused a resend that budget was spent on; the budget
+    // stays for that resend, and later ACKs add to it.
+    resend_refused: bool,
+    // Where the stream is in its socket's writable wakes.
+    send_gate: crate::socket::SendGate,
 
     // The remote has sent a packet other than its SYN: it is there, not a
     // spoofed address. A stream that is not fails on its first timeout.
@@ -377,10 +382,10 @@ macro_rules! send_data {
                     .try_poll_send_to_vectored(
                         $self.transport.as_deref().ok_or(Error::DispatcherDead)?,
                         $self.sender.as_deref_mut(),
+                        &mut $self.send_gate,
                         $cx,
                         &bufs,
                         $self.remote,
-                        hlen + plen,
                     )
                     .map_err(Error::Send)?;
             }
@@ -554,10 +559,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     );
                     return Err(Error::MaxRetransmissionsReached);
                 }
-                if self.fast_resend_seq_nr == seg.seq_nr() {
-                    self.fast_resend_seq_nr += 1;
-                }
                 if send_data!(self, cx, header, seg)? {
+                    if self.fast_resend_seq_nr == seg.seq_nr() {
+                        self.fast_resend_seq_nr += 1;
+                    }
                     trace!(
                         %header.seq_nr,
                         %header.ack_nr,
@@ -593,7 +598,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     // Increase the counter so that we don't send anything past it until it gets ACKed.
                     self.rto_retransmissions += 1;
                 } else {
-                    // This will retry on next poll.
+                    // Tried again on the socket's writable wake: the
+                    // expiry is counted, the send is not.
                     return Ok(());
                 }
             } else {
@@ -784,6 +790,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.pacer.charge(seg.payload_size());
                     sent += 1;
                 } else {
+                    self.resend_refused = true;
                     return Ok(());
                 }
             }
@@ -880,6 +887,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     break;
                 }
                 if !send_data!(self, cx, header, seg)? {
+                    self.resend_refused = true;
                     return Ok(());
                 }
                 event!(
@@ -913,6 +921,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 lost_left = it.any(|seg| seg.is_lost());
             }
         }
+        self.resend_refused = false;
 
         // The peer's advertised window bounds every byte sent and not yet
         // acknowledged, those presumed lost included: the peer must still
@@ -1085,6 +1094,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             .try_poll_send_to(
                 self.transport.as_deref().ok_or(Error::DispatcherDead)?,
                 self.sender.as_deref_mut(),
+                &mut self.send_gate,
                 cx,
                 &self.this_poll.tmp_buf[..len],
                 self.remote,
@@ -1463,7 +1473,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
 
         if processed > 0 {
-            self.fast_resend_budget = processed.saturating_mul(FAST_RESENDS_PER_ACK);
+            let grant = processed.saturating_mul(FAST_RESENDS_PER_ACK);
+            self.fast_resend_budget = if self.resend_refused {
+                self.fast_resend_budget.saturating_add(grant)
+            } else {
+                grant
+            };
         }
         if let Some(rec) = self.recovery.recovering_mut() {
             rec.pipe_estimate = self.user_tx_segments.calc_pipe(
@@ -1991,17 +2006,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn next_timer_to_poll(&mut self) -> Option<Instant> {
-        // A send waits on the transport: try it again after SEND_RETRY at the
-        // latest, as the transport's own wake may never come.
-        if self.this_poll.transport_pending {
-            let retry = self.this_poll.now + SEND_RETRY;
-            return Some(
-                self.timers
-                    .remote_inactivity_timer
-                    .poll_at()
-                    .map_or(retry, |at| at.min(retry)),
-            );
-        }
+        // A send the transport refused goes on its writable wake, which
+        // reaches every stream it refused; a timer already due waits for it
+        // too, not for the clock.
+        let blocked = self.this_poll.transport_pending;
+        let now = self.this_poll.now;
 
         // Wait for the earliest of our timers to fire.
         [
@@ -2020,6 +2029,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         ]
         .into_iter()
         .flatten()
+        .filter(|at| !blocked || *at > now)
         .min()
     }
 
@@ -2473,6 +2483,8 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             rto_retransmissions: 0,
             fast_resend_seq_nr: seq_nr,
             fast_resend_budget: 0,
+            resend_refused: false,
+            send_gate: Default::default(),
             confirmed: !matches!(
                 state,
                 VirtualSocketState::SynReceived | VirtualSocketState::SynAckSent { .. }
@@ -2550,14 +2562,6 @@ const TIMER_TAIL_PROBE: u8 = 6;
 // What a tail probe waits past two round trips: RFC 8985 section 7.2.
 const TAIL_PROBE_SLACK: Duration = Duration::from_millis(2);
 const TAIL_PROBE_LATE_ACK: Duration = Duration::from_millis(200);
-
-/// A send the transport could not take is tried again after this, whether
-/// or not the transport wakes the stream first. A kernel datagram socket
-/// wakes only the last task that found it full (tokio 1.54.1
-/// `ScheduledIo` keeps one writer waker, scheduled_io.rs:119), and every
-/// stream on the socket and the socket's own dispatcher send through it, so
-/// that wake can go to another task.
-pub(crate) const SEND_RETRY: Duration = Duration::from_millis(1);
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 enum Timer<const NAME: u8> {

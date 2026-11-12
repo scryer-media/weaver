@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-10.
+// Modified by the Weaver authors, 2026-11-12.
 
 use std::{
     collections::{BTreeMap, VecDeque, btree_map::Entry},
@@ -12,9 +12,9 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Weak,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
-    task::Poll,
+    task::{Poll, Wake, Waker},
     time::Duration,
 };
 
@@ -1229,9 +1229,47 @@ pub(crate) struct SocketState<T, E> {
 
     mtu_ceiling: Mutex<MtuCeiling>,
 
+    // The one waker the socket's streams hand the transport, so its
+    // writable wake reaches every stream it refused.
+    send_wake: Arc<SendWake>,
+    send_waker: Waker,
+
     // Why each retransmission timeout of the socket's streams came.
     #[cfg(test)]
     pub(crate) expiry_causes: Mutex<Vec<crate::stream_dispatch::ExpiryCause>>,
+}
+
+// A transport keeps one waker for its writable wake, the last it was handed
+// (tokio 1.54.1 keeps one `writer` waker for poll sends, scheduled_io.rs:117-118;
+// its async sends wait in a list apart). Streams sharing the transport all hand it
+// this one, and it wakes each stream the transport refused, as libtorrent's
+// socket manager does on writable (utp_socket_manager.cpp:235-250).
+#[derive(Default)]
+struct SendWake {
+    // Moves on each writable wake.
+    epoch: AtomicU64,
+    waiters: Mutex<Vec<Waker>>,
+}
+
+impl Wake for SendWake {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
+        let waiters = std::mem::take(&mut *self.waiters.lock());
+        for waker in waiters {
+            waker.wake();
+        }
+    }
+}
+
+/// A stream's place in its socket's writable wakes: a stream the shared
+/// transport refused tries it again only after the next one.
+#[derive(Debug, Default)]
+pub(crate) struct SendGate {
+    refused_at: Option<u64>,
 }
 
 impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
@@ -1318,6 +1356,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let pending_connects = pending_connects(opts.connections_limit);
         let (connect_tx, connect_rx) = mpsc::channel(pending_connects);
 
+        let send_wake = Arc::new(SendWake::default());
         let state = Arc::new(SocketState {
             runtime: Arc::downgrade(&runtime),
             created: env.now(),
@@ -1336,6 +1375,8 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             cancellation_token: runtime.cancellation().clone(),
             stats: UtpStats::default(),
             mtu_ceiling: Default::default(),
+            send_waker: Waker::from(send_wake.clone()),
+            send_wake,
             #[cfg(test)]
             expiry_causes: Default::default(),
         });
@@ -1548,18 +1589,59 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
         stream_or_err
     }
 
+    // Polls one send. A stream with its own registration polls it with its
+    // own waker. On the shared transport a stream the transport refused
+    // waits, without polling it, for the next writable wake; a refusal
+    // puts the stream among those that wake reaches. None: still waiting.
+    fn poll_send_gated<R>(
+        &self,
+        gate: &mut SendGate,
+        cx: &mut std::task::Context<'_>,
+        shared: bool,
+        send: impl FnOnce(&mut std::task::Context<'_>) -> Poll<R>,
+    ) -> Option<Poll<R>> {
+        if !shared {
+            return Some(send(cx));
+        }
+        let epoch = self.send_wake.epoch.load(Ordering::SeqCst);
+        if gate.refused_at == Some(epoch) {
+            return None;
+        }
+        gate.refused_at = None;
+        let sent = send(&mut std::task::Context::from_waker(&self.send_waker));
+        if sent.is_pending() {
+            gate.refused_at = Some(epoch);
+            {
+                let mut waiters = self.send_wake.waiters.lock();
+                if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                    waiters.push(cx.waker().clone());
+                }
+            }
+            // A wake between the refusal and the line above found no waiter.
+            if self.send_wake.epoch.load(Ordering::SeqCst) != epoch {
+                cx.waker().wake_by_ref();
+            }
+        }
+        Some(sent)
+    }
+
     /// Returns true if saw Poll::Pending
     pub(crate) fn try_poll_send_to(
         &self,
         transport: &T,
         sender: Option<&mut (dyn DatagramSend + 'static)>,
+        gate: &mut SendGate,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
         addr: SocketAddr,
     ) -> std::io::Result<bool> {
-        let sent = match sender {
+        let shared = sender.is_none();
+        let sent = self.poll_send_gated(gate, cx, shared, |cx| match sender {
             Some(sender) => sender.poll_send_to(cx, buf, addr),
             None => transport.poll_send_to(cx, buf, addr),
+        });
+        let Some(sent) = sent else {
+            return Ok(true);
         };
         match sent {
             Poll::Ready(Ok(sz)) => {
@@ -1593,14 +1675,19 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
         &self,
         transport: &T,
         sender: Option<&mut (dyn DatagramSend + 'static)>,
+        gate: &mut SendGate,
         cx: &mut std::task::Context<'_>,
         bufs: &[IoSlice<'_>],
         addr: SocketAddr,
-        total_len: usize,
     ) -> std::io::Result<bool> {
-        let sent = match sender {
+        let total_len: usize = bufs.iter().map(|buf| buf.len()).sum();
+        let shared = sender.is_none();
+        let sent = self.poll_send_gated(gate, cx, shared, |cx| match sender {
             Some(sender) => sender.poll_send_to_vectored(cx, bufs, addr),
             None => transport.poll_send_to_vectored(cx, bufs, addr),
+        });
+        let Some(sent) = sent else {
+            return Ok(true);
         };
         match sent {
             Poll::Ready(Ok(sz)) => {
