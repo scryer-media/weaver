@@ -1,0 +1,15 @@
+{
+  "slug": "adv-recovery-sets-disagree",
+  "title": "E2E.Adversarial.Recovery.Sets.Disagree.2026-TESTGRP",
+  "description": "An intact payload with a PAR2 set made from it and a PAR3 set made from other bytes under the same name and length. PAR2 ranks first and agrees with the posted bytes, so no repair rewrites them. The payload is delivered with its exact bytes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1
+  },
+  "expectedOutputBLAKE3": {
+    "contested.mkv": "d025d51a97f548746fdb981287400fa622852ef5ab9dcda9965ab0afe9eeef53"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "slug": "adv-par2-independent-recovery",
+  "title": "E2E.Adversarial.Par2.Independent.Recovery.2026-TESTGRP",
+  "description": "The honest twin of adv-par2-dependent-recovery: the same damage, with recovery blocks of exponents 0 to 7. Two of them rebuild the two slices, and the payload is delivered with its original bytes.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 1
+  },
+  "expectedOutputBLAKE3": {
+    "independent.mkv": "8b2447b453aae7a8419c6bf7e605b3e411b24b006c138805233b75daff3f5b44"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "slug": "adv-par2-dependent-recovery",
+  "title": "E2E.Adversarial.Par2.Dependent.Recovery.2026-TESTGRP",
+  "description": "A payload with two slices zeroed beside eight recovery blocks whose exponents are multiples of 4369, each weighing the two damaged slices alike. No number of them rebuilds the payload, and asking for more holds no more of them than the memory granted. The job fails named and publishes nothing.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "errorContains": "was delivered whole"
+  }
+}

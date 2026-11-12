@@ -1,0 +1,13 @@
+{
+  "slug": "adv-par3-length-elimination",
+  "title": "E2E.Adversarial.Par3.Length.Elimination.2026-TESTGRP",
+  "description": "The PAR3 twin of adv-par2-length-elimination: a par3cmdline set with one recovery block over thirty-two described files, beside thirty-one obfuscated members of their lengths whose bytes match nothing. Length matching settles without repeating its rejections; one block rebuilds none of it, so the set rules the repair impossible and the job fails for it, publishing nothing.",
+  "category": "2000",
+  "expected_outcome": "repair_failure",
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "errorContains": "PAR3 recovery failed for 1 set(s)",
+    "failureKind": "repair"
+  }
+}

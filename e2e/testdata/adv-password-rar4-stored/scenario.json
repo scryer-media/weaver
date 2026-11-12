@@ -1,0 +1,27 @@
+{
+  "slug": "adv-password-rar4-stored",
+  "title": "E2E.Adversarial.Password.Rar4.Stored.2026-TESTGRP",
+  "description": "A stored RAR4 set with encrypted member data across three volumes, submitted once with no password and once with a wrong one, with a configured password list that holds only wrong passwords. Each wrong key fails the member's checksum; the ranges read again are read a bounded piece at a time. Each job fails with the password verdict, once.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "fixtureAssets": [
+    "direct-store-rar4-encrypted/archive.part1.rar",
+    "direct-store-rar4-encrypted/archive.part2.rar",
+    "direct-store-rar4-encrypted/archive.part3.rar"
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "failureKind": "password",
+    "submissions": [
+      {
+        "label": "absent",
+        "password": ""
+      },
+      {
+        "label": "wrong",
+        "password": "adversarial-wrong-password"
+      }
+    ]
+  }
+}
