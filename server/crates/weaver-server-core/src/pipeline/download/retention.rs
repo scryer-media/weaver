@@ -296,11 +296,73 @@ impl Pipeline {
         exclude_servers: &[usize],
         warn_per_article: bool,
     ) -> Vec<usize> {
-        // The id in use failed on every server it may use. When the NZB gave
-        // the part another id, the article moves to it instead of being booked.
-        if self.spend_message_id(segment_id) {
-            return Vec::new();
+        #[cfg(test)]
+        {
+            let (depth, deepest) = &mut self.unservable_booking_depth;
+            *depth += 1;
+            *deepest = (*deepest).max(*depth);
         }
+        let refused_by =
+            self.book_unservable_segment_inner(segment_id, exclude_servers, warn_per_article);
+        #[cfg(test)]
+        {
+            self.unservable_booking_depth.0 -= 1;
+        }
+        refused_by
+    }
+
+    fn book_unservable_segment_inner(
+        &mut self,
+        segment_id: SegmentId,
+        exclude_servers: &[usize],
+        warn_per_article: bool,
+    ) -> Vec<usize> {
+        // The id in use failed on every server it may use. When the NZB gave
+        // the part another id, the article moves to it instead of being
+        // booked. An id no server may serve either is spent the same way, one
+        // turn of this loop per id, until an id is queued or none is left.
+        let job_id = segment_id.file_id.job_id;
+        let mut unservable: Option<DownloadWork> = None;
+        while let Some(work) = self.spend_message_id_for_work(segment_id) {
+            match self.enqueue_servable_download_work(work) {
+                Some(work) => unservable = Some(work),
+                None => {
+                    self.update_queue_metrics();
+                    if unservable.is_some() {
+                        self.finish_spent_message_ids(job_id);
+                    }
+                    return Vec::new();
+                }
+            }
+        }
+        let Some(work) = unservable else {
+            return self.book_unservable_article(segment_id, exclude_servers, warn_per_article);
+        };
+        // The last id is booked as the article's own requeue is: with the
+        // exclusions that work carried, warned per article.
+        self.book_unservable_article(segment_id, &work.exclude_servers, true);
+        self.finish_spent_message_ids(job_id);
+        Vec::new()
+    }
+
+    // What follows an article that spent ids no server could serve, once it
+    // is queued or booked: the queue metrics and the download pass are
+    // brought up to date. Both answer the same however often they are asked
+    // in a row, so once covers every id spent.
+    fn finish_spent_message_ids(&mut self, job_id: JobId) {
+        self.update_queue_metrics();
+        self.maybe_finish_download_pass(job_id);
+        self.update_queue_metrics();
+    }
+
+    // Books the article missing, every id spent, and returns the servers
+    // refusing credentials that would otherwise have served it.
+    fn book_unservable_article(
+        &mut self,
+        segment_id: SegmentId,
+        exclude_servers: &[usize],
+        warn_per_article: bool,
+    ) -> Vec<usize> {
         let job_id = segment_id.file_id.job_id;
         let retention = self.job_retention_excludes(job_id);
         let pool = self.nntp.pool();

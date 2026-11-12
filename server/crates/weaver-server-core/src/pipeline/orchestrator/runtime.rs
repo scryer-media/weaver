@@ -428,6 +428,12 @@ impl Pipeline {
             propagation_delay,
             #[cfg(test)]
             propagation_delay_forced: None,
+            #[cfg(test)]
+            unservable_booking_depth: (0, 0),
+            #[cfg(test)]
+            spent_message_ids: Vec::new(),
+            #[cfg(test)]
+            dispatch_hold_items_examined: Default::default(),
             last_download_dispatch_stall_log_at: None,
             download_dispatch_stall: None,
             download_stall_recovery,
@@ -1707,6 +1713,25 @@ impl Pipeline {
     // for fresh work would cancel some other segment's real pending retry and
     // let the download pass end before that retry fires.
     pub(crate) fn enqueue_download_work(&mut self, work: DownloadWork) {
+        // Work every server is excluded from can never be seated by a lane:
+        // the queue would hold it, and the job with it, indefinitely. Every
+        // producer of a re-queue passes through here, so this is where the
+        // article is retired instead.
+        if let Some(work) = self.enqueue_servable_download_work(work) {
+            let job_id = work.segment_id.file_id.job_id;
+            self.book_unservable_work(&work);
+            self.update_queue_metrics();
+            self.maybe_finish_download_pass(job_id);
+        }
+    }
+
+    // [`Self::enqueue_download_work`], except that work no server may serve
+    // is handed back instead of booked.
+    #[inline]
+    pub(crate) fn enqueue_servable_download_work(
+        &mut self,
+        work: DownloadWork,
+    ) -> Option<DownloadWork> {
         let job_id = work.segment_id.file_id.job_id;
         let segment_id = work.segment_id;
         if self
@@ -1719,7 +1744,7 @@ impl Pipeline {
                 segment = %segment_id,
                 "dropping download work for a job that is gone or terminal"
             );
-            return;
+            return None;
         }
         // A lane or delayed retry may return work after the feed's verdict.
         // It must not put an abandoned file back into dispatch.
@@ -1736,17 +1761,10 @@ impl Pipeline {
             self.book_terminal_segment(segment_id, SegmentTerminalState::Abandoned);
             self.update_queue_metrics();
             self.maybe_finish_download_pass(job_id);
-            return;
+            return None;
         }
-        // Work every server is excluded from can never be seated by a lane:
-        // the queue would hold it, and the job with it, indefinitely. Every
-        // producer of a re-queue passes through here, so this is where the
-        // article is retired instead.
         if self.no_server_can_serve(job_id, &work.exclude_servers) {
-            self.book_unservable_work(&work);
-            self.update_queue_metrics();
-            self.maybe_finish_download_pass(job_id);
-            return;
+            return Some(work);
         }
         // The job's root classes the work.
         let mut work = work;
@@ -1763,6 +1781,7 @@ impl Pipeline {
                 active.download_queue.push(work);
             }
         }
+        None
     }
 
     pub(crate) async fn drain(&mut self) {

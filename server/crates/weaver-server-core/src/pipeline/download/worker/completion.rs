@@ -149,6 +149,20 @@ impl Pipeline {
     // the article moves to it and is queued afresh; false when every id is
     // spent and the article is lost.
     pub(in crate::pipeline) fn spend_message_id(&mut self, segment_id: SegmentId) -> bool {
+        let Some(work) = self.spend_message_id_for_work(segment_id) else {
+            return false;
+        };
+        self.enqueue_download_work(work);
+        self.update_queue_metrics();
+        true
+    }
+
+    // Spends the article's id in use and returns its work under the next
+    // id, not yet queued; `None` when every id is spent.
+    pub(in crate::pipeline) fn spend_message_id_for_work(
+        &mut self,
+        segment_id: SegmentId,
+    ) -> Option<DownloadWork> {
         let moved = self
             .jobs
             .get_mut(&segment_id.file_id.job_id)
@@ -169,18 +183,15 @@ impl Pipeline {
                     active.download_queue.pin_message_id(segment_id, pin);
                     active.recovery_queue.pin_message_id(segment_id, pin);
                 }
+                #[cfg(test)]
+                self.spent_message_ids
+                    .push(segment.message_ids.in_use().to_string());
                 Some(segment.message_ids.spend())
             })
             .unwrap_or(false);
-        let Some(work) = moved
+        moved
             .then(|| self.download_retry_work(segment_id, 0, Vec::new()))
             .flatten()
-        else {
-            return false;
-        };
-        self.enqueue_download_work(work);
-        self.update_queue_metrics();
-        true
     }
 
     // Whether the NZB gave `segment_id`'s part an id behind the one in use.
