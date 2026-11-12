@@ -5,7 +5,9 @@
 // per drain interval, run on tokio's paused clock: what a peer whose UDP
 // socket keeps the host's default receive buffer looks like to a sender.
 // Every datagram that arrives while the queue already holds its bound is
-// lost before the receiver sees it.
+// lost before the receiver sees it. A sender's socket may hold a bound of
+// its own, put on the wire once per interval: a send it has no room for
+// waits, as a full kernel send buffer makes it.
 
 use std::{
     collections::{BTreeMap, VecDeque},
@@ -58,12 +60,19 @@ struct Counters {
     // evidence, and times it entered recovery.
     rtos: u64,
     fast_resends: u64,
+    // Sends the sender's own socket refused.
+    refused: u64,
     recoveries: u64,
     max_cwnd: u64,
 }
 
 struct Endpoint {
     shallow: Option<Shallow>,
+    // The bound on datagrams the socket holds before they go on the wire,
+    // what it holds, and the send that waits for room.
+    outbound: Option<Shallow>,
+    out_queue: VecDeque<(SocketAddr, Vec<u8>)>,
+    send_waker: Option<Waker>,
     // Arrived, waiting for the next drain.
     queue: VecDeque<(SocketAddr, Vec<u8>)>,
     // Drained, for the socket to read.
@@ -78,6 +87,7 @@ struct Model {
     ordinal: u64,
     endpoints: BTreeMap<SocketAddr, Endpoint>,
     next_drain: Option<Instant>,
+    next_out_drain: Option<Instant>,
     counters: Counters,
     // The instant and endpoint of the last data datagram sent, and how many
     // that endpoint sent then.
@@ -87,7 +97,18 @@ struct Model {
 impl Model {
     fn next_event(&self) -> Option<Instant> {
         let delivery = self.in_flight.first_key_value().map(|((at, _), _)| *at);
-        delivery.into_iter().chain(self.next_drain).min()
+        delivery
+            .into_iter()
+            .chain(self.next_drain)
+            .chain(self.next_out_drain)
+            .min()
+    }
+
+    fn put_on_wire(&mut self, at: Instant, source: SocketAddr, target: SocketAddr, data: Vec<u8>) {
+        self.ordinal += 1;
+        let key = (at + self.one_way, self.ordinal);
+        self.in_flight.insert(key, (source, target, data));
+        self.counters.peak_in_flight = self.counters.peak_in_flight.max(self.in_flight.len());
     }
 
     // A drain at an instant comes before deliveries at that instant: they
@@ -95,6 +116,25 @@ impl Model {
     fn advance(&mut self, now: Instant) -> Vec<Waker> {
         let mut wakes = Vec::new();
         loop {
+            if let Some(drain) = self.next_out_drain.filter(|&drain| drain <= now) {
+                let mut every = None;
+                let mut sent = Vec::new();
+                for (address, endpoint) in &mut self.endpoints {
+                    let Some(outbound) = endpoint.outbound else {
+                        continue;
+                    };
+                    every = Some(outbound.drain_every);
+                    for (target, data) in endpoint.out_queue.drain(..) {
+                        sent.push((*address, target, data));
+                    }
+                    wakes.extend(endpoint.send_waker.take());
+                }
+                for (source, target, data) in sent {
+                    self.put_on_wire(drain, source, target, data);
+                }
+                self.next_out_drain = every.map(|every| drain + every);
+                continue;
+            }
             let delivery = self.in_flight.first_key_value().map(|((at, _), _)| *at);
             match (self.next_drain, delivery) {
                 (Some(drain), _) if drain <= now && delivery.is_none_or(|at| drain <= at) => {
@@ -154,6 +194,7 @@ impl Network {
                 ordinal: 0,
                 endpoints: BTreeMap::new(),
                 next_drain: None,
+                next_out_drain: None,
                 counters: Counters::default(),
                 burst: None,
             }),
@@ -161,15 +202,26 @@ impl Network {
         })
     }
 
-    fn transport(self: &Arc<Self>, address: SocketAddr, shallow: Option<Shallow>) -> Link {
+    fn transport(
+        self: &Arc<Self>,
+        address: SocketAddr,
+        shallow: Option<Shallow>,
+        outbound: Option<Shallow>,
+    ) -> Link {
         let mut model = self.model.lock();
         if let Some(shallow) = shallow {
             model.next_drain = Some(Instant::now() + shallow.drain_every);
+        }
+        if let Some(outbound) = outbound {
+            model.next_out_drain = Some(Instant::now() + outbound.drain_every);
         }
         model.endpoints.insert(
             address,
             Endpoint {
                 shallow,
+                outbound,
+                out_queue: VecDeque::new(),
+                send_waker: None,
                 queue: VecDeque::new(),
                 readable: VecDeque::new(),
                 arrivals: 0,
@@ -183,11 +235,42 @@ impl Network {
     }
 
     fn send(&self, source: SocketAddr, target: SocketAddr, data: Vec<u8>) -> io::Result<usize> {
-        let len = data.len();
-        let wakes = {
+        match self.poll_send(None, source, target, || data) {
+            Poll::Ready(sent) => sent,
+            Poll::Pending => unreachable!("a send without a waker never waits"),
+        }
+    }
+
+    // A send the source's socket has no room for waits for the next time
+    // it puts its datagrams on the wire.
+    fn poll_send(
+        &self,
+        cx: Option<&mut Context<'_>>,
+        source: SocketAddr,
+        target: SocketAddr,
+        data: impl FnOnce() -> Vec<u8>,
+    ) -> Poll<io::Result<usize>> {
+        let (len, wakes) = {
             let mut model = self.model.lock();
             let now = Instant::now();
             let wakes = model.advance(now);
+            let endpoint = model.endpoints.get_mut(&source).unwrap();
+            let queued = match (endpoint.outbound, cx) {
+                (Some(outbound), Some(cx)) => {
+                    if endpoint.out_queue.len() >= outbound.queue_packets {
+                        endpoint.send_waker = Some(cx.waker().clone());
+                        drop(model);
+                        for waker in wakes {
+                            waker.wake();
+                        }
+                        return Poll::Pending;
+                    }
+                    true
+                }
+                _ => false,
+            };
+            let data = data();
+            let len = data.len();
             if data.first().map(|byte| byte >> 4) == Some(crate::raw::Type::Data as u8) {
                 model.counters.data_sent += 1;
                 let (_, header_len) = crate::raw::UtpHeader::deserialize(&data).unwrap();
@@ -203,18 +286,19 @@ impl Network {
                 model.burst = Some((now, source, burst));
                 model.counters.peak_data_burst = model.counters.peak_data_burst.max(burst);
             }
-            model.ordinal += 1;
-            let key = (now + model.one_way, model.ordinal);
-            model.in_flight.insert(key, (source, target, data));
-            model.counters.peak_in_flight =
-                model.counters.peak_in_flight.max(model.in_flight.len());
-            wakes
+            if queued {
+                let endpoint = model.endpoints.get_mut(&source).unwrap();
+                endpoint.out_queue.push_back((target, data));
+            } else {
+                model.put_on_wire(now, source, target, data);
+            }
+            (len, wakes)
         };
         for waker in wakes {
             waker.wake();
         }
         self.changed.notify_one();
-        Ok(len)
+        Poll::Ready(Ok(len))
     }
 
     // Brought up to now first, so drains that are due are counted.
@@ -288,11 +372,12 @@ impl Transport for Link {
 
     fn poll_send_to(
         &self,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        Poll::Ready(self.network.send(self.address, target, buf.to_vec()))
+        self.network
+            .poll_send(Some(cx), self.address, target, || buf.to_vec())
     }
 
     fn bind_addr(&self) -> SocketAddr {
@@ -311,12 +396,13 @@ impl Transport for Link {
 impl PollSendToVectored for Link {
     fn poll_send_to_vectored(
         &self,
-        _cx: &mut Context<'_>,
+        cx: &mut Context<'_>,
         bufs: &[IoSlice<'_>],
         target: SocketAddr,
     ) -> Poll<io::Result<usize>> {
-        let data: Vec<u8> = bufs.iter().flat_map(|buf| buf.iter().copied()).collect();
-        Poll::Ready(self.network.send(self.address, target, data))
+        self.network.poll_send(Some(cx), self.address, target, || {
+            bufs.iter().flat_map(|buf| buf.iter().copied()).collect()
+        })
     }
 }
 
@@ -364,6 +450,7 @@ async fn transfer_in_rounds(
             writes,
             reads: None,
             tx_buffer_initial,
+            send_queue: None,
         },
     )
     .await
@@ -389,6 +476,9 @@ struct Upload {
     // fast as the bytes come.
     reads: Option<(usize, Duration)>,
     tx_buffer_initial: Option<NonZeroUsize>,
+    // The sender's socket holds this many datagrams and puts them on the
+    // wire once an interval; otherwise each goes out as it is sent.
+    send_queue: Option<Shallow>,
 }
 
 async fn transfer_with(
@@ -401,6 +491,7 @@ async fn transfer_with(
         writes,
         reads,
         tx_buffer_initial,
+        send_queue,
     } = upload;
     let network = Network::new(one_way);
     let stop = CancellationToken::new();
@@ -416,8 +507,8 @@ async fn transfer_with(
         )
         .unwrap()
     };
-    let sender = socket(network.transport(address(1), None));
-    let receiver = socket(network.transport(address(2), shallow));
+    let sender = socket(network.transport(address(1), None, send_queue));
+    let receiver = socket(network.transport(address(2), shallow, None));
     let driver = tokio::spawn(Arc::clone(&network).run(stop.clone()));
 
     let send = async {
@@ -470,6 +561,7 @@ async fn transfer_with(
     let counters = Counters {
         drains,
         rtos: stats.rto_timeouts_count.load(Ordering::Relaxed),
+        refused: stats.send_poll_pending.load(Ordering::Relaxed),
         fast_resends: stats
             .recovery_retransmitted_segments_count
             .load(Ordering::Relaxed),
@@ -647,6 +739,7 @@ async fn a_writer_in_pieces_fills_every_packet() {
                 writes: Writes::Pieces(sizes),
                 reads,
                 tx_buffer_initial,
+                send_queue: None,
             },
         )
         .await;
@@ -667,5 +760,52 @@ async fn a_writer_in_pieces_fills_every_packet() {
             counters.short_data * 100 <= counters.data_sent,
             "{case}: {counters:?}"
         );
+    }
+}
+
+// An upload capped at 20 MB/s, a second's quota written at once, to the
+// same receiver 1 ms away: about one datagram in eight is lost. Through a
+// sender socket that takes 48 datagrams every 2 ms, many sends are
+// refused as well. The stream never dies and every byte arrives; only the
+// tail of a lump waits for the retransmission timer.
+#[tokio::test(start_paused = true)]
+async fn a_capped_upload_through_a_full_socket_never_dies() {
+    const BYTES: usize = 64 * 1024 * 1024;
+    const LUMP: usize = 20_000_000;
+    let shallow = Shallow {
+        queue_packets: 48,
+        drain_every: Duration::from_millis(1),
+    };
+    let full_socket = Shallow {
+        queue_packets: 48,
+        drain_every: Duration::from_millis(2),
+    };
+    for (case, send_queue) in [("open socket", None), ("full socket", Some(full_socket))] {
+        let counters = transfer_with(
+            BYTES,
+            Duration::from_micros(500),
+            Some(shallow),
+            Upload {
+                writes: Writes::Rounds(LUMP, Duration::from_secs(1)),
+                reads: None,
+                tx_buffer_initial: None,
+                send_queue,
+            },
+        )
+        .await;
+        report(case, &counters);
+        assert!(counters.data_sent > 46_000, "{case}: {counters:?}");
+        assert!(
+            counters.rtos <= BYTES.div_ceil(LUMP) as u64,
+            "{case}: {counters:?}"
+        );
+        if send_queue.is_some() {
+            assert!(counters.refused > 0, "{case}: {counters:?}");
+        } else {
+            assert!(
+                counters.dropped * 10 > counters.data_sent,
+                "{case}: {counters:?}"
+            );
+        }
     }
 }
