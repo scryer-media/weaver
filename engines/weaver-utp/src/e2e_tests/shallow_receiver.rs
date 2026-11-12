@@ -43,6 +43,10 @@ struct Counters {
     // dropped ones included.
     peak_arrivals: usize,
     data_sent: u64,
+    // Data datagrams that carried less than a full packet, and the payload
+    // bytes of every data datagram.
+    short_data: u64,
+    data_payload: u64,
     // The most datagrams on the wire at once.
     peak_in_flight: usize,
     // The most data datagrams one endpoint sent at one instant: on the
@@ -186,6 +190,12 @@ impl Network {
             let wakes = model.advance(now);
             if data.first().map(|byte| byte >> 4) == Some(crate::raw::Type::Data as u8) {
                 model.counters.data_sent += 1;
+                let (_, header_len) = crate::raw::UtpHeader::deserialize(&data).unwrap();
+                let payload = (len - header_len) as u64;
+                model.counters.data_payload += payload;
+                if payload < PACKET_PAYLOAD as u64 {
+                    model.counters.short_data += 1;
+                }
                 let burst = match model.burst {
                     Some((at, from, sent)) if at == now && from == source => sent + 1,
                     _ => 1,
@@ -342,6 +352,56 @@ async fn transfer_in_rounds(
     rounds: Option<(usize, Duration)>,
     tx_buffer_initial: Option<NonZeroUsize>,
 ) -> Counters {
+    let writes = match rounds {
+        None => Writes::Whole,
+        Some((per_round, round)) => Writes::Rounds(per_round, round),
+    };
+    transfer_with(
+        bytes,
+        one_way,
+        shallow,
+        Upload {
+            writes,
+            reads: None,
+            tx_buffer_initial,
+        },
+    )
+    .await
+}
+
+// How the writer hands the stream its bytes.
+#[derive(Clone, Copy)]
+enum Writes {
+    // In one write.
+    Whole,
+    // `.0` bytes at the start of each round of `.1`.
+    Rounds(usize, Duration),
+    // Writes of these sizes in turn, as a peer writes a message header and
+    // then its block.
+    Pieces(&'static [usize]),
+}
+
+#[derive(Clone, Copy)]
+struct Upload {
+    writes: Writes,
+    // The receiving application reads `.0` bytes every `.1`, so the window
+    // it advertises closes and opens by that much; otherwise it reads as
+    // fast as the bytes come.
+    reads: Option<(usize, Duration)>,
+    tx_buffer_initial: Option<NonZeroUsize>,
+}
+
+async fn transfer_with(
+    bytes: usize,
+    one_way: Duration,
+    shallow: Option<Shallow>,
+    upload: Upload,
+) -> Counters {
+    let Upload {
+        writes,
+        reads,
+        tx_buffer_initial,
+    } = upload;
     let network = Network::new(one_way);
     let stop = CancellationToken::new();
     let socket = |transport| {
@@ -363,13 +423,24 @@ async fn transfer_in_rounds(
     let send = async {
         let mut stream = sender.connect(address(2)).await.unwrap();
         let data = payload(bytes);
-        match rounds {
-            None => stream.write_all(&data).await.unwrap(),
-            Some((per_round, round)) => {
+        match writes {
+            Writes::Whole => stream.write_all(&data).await.unwrap(),
+            Writes::Rounds(per_round, round) => {
                 let mut rounds = tokio::time::interval(round);
                 for lump in data.chunks(per_round) {
                     rounds.tick().await;
                     stream.write_all(lump).await.unwrap();
+                }
+            }
+            Writes::Pieces(sizes) => {
+                let mut rest = &data[..];
+                for size in sizes.iter().cycle() {
+                    if rest.is_empty() {
+                        break;
+                    }
+                    let (piece, after) = rest.split_at((*size).min(rest.len()));
+                    stream.write_all(piece).await.unwrap();
+                    rest = after;
                 }
             }
         }
@@ -379,7 +450,17 @@ async fn transfer_in_rounds(
     let receive = async {
         let mut stream = receiver.accept().await.unwrap();
         let mut received = vec![0; bytes];
-        stream.read_exact(&mut received).await.unwrap();
+        match reads {
+            None => stream.read_exact(&mut received).await.unwrap(),
+            Some((per_read, every)) => {
+                let mut reads = tokio::time::interval(every);
+                for chunk in received.chunks_mut(per_read) {
+                    reads.tick().await;
+                    stream.read_exact(chunk).await.unwrap();
+                }
+                bytes
+            }
+        };
         let drains = network.counters().drains;
         assert!(received == payload(bytes), "the payload arrived intact");
         (stream, drains)
@@ -530,4 +611,61 @@ async fn the_default_send_buffer_grows_to_the_window() {
         grown.peak_in_flight * 10 >= full.peak_in_flight * 9,
         "{grown:?} against {full:?}"
     );
+}
+
+// A peer writes each block as a 13-byte message header and then 16 KiB of
+// data, or in many small writes. Every data packet but the last carries a
+// full packet's payload: a part-filled one waits for more while data is in
+// flight.
+#[tokio::test(start_paused = true)]
+async fn a_writer_in_pieces_fills_every_packet() {
+    const BYTES: usize = 16 * 1024 * 1024;
+    let one_way = Duration::from_micros(500);
+    let mut results = Vec::new();
+    for (case, sizes, reads, tx_buffer_initial) in [
+        ("header and block", &[13, 16384][..], None, None),
+        (
+            "header and block, megabyte buffer",
+            &[13, 16384][..],
+            None,
+            NonZeroUsize::new(1024 * 1024),
+        ),
+        ("small writes", &[100][..], None, None),
+        (
+            "header and block, slow reader",
+            &[13, 16384][..],
+            Some((16384, Duration::from_micros(200))),
+            None,
+        ),
+    ] {
+        let started = Instant::now();
+        let counters = transfer_with(
+            BYTES,
+            one_way,
+            None,
+            Upload {
+                writes: Writes::Pieces(sizes),
+                reads,
+                tx_buffer_initial,
+            },
+        )
+        .await;
+        eprintln!(
+            "{case}: {} data packets, {} short, {:.0} payload bytes each, {:?}; {counters:?}",
+            counters.data_sent,
+            counters.short_data,
+            counters.data_payload as f64 / counters.data_sent.max(1) as f64,
+            started.elapsed(),
+        );
+        results.push((case, counters));
+    }
+    for (case, counters) in results {
+        assert_eq!(counters.dropped, 0, "{case}: {counters:?}");
+        // Short packets are the probes that find the path's size and the
+        // last tail: one in a hundred at most.
+        assert!(
+            counters.short_data * 100 <= counters.data_sent,
+            "{case}: {counters:?}"
+        );
+    }
 }

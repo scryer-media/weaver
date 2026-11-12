@@ -1044,6 +1044,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if !self.user_tx_segments.enqueue(payload_size, is_mtu_probe) {
                 break;
             }
+            self.segment_sizes.on_segmented(is_mtu_probe);
             remaining -= payload_size;
             remote_window_remaining -= payload_size;
             starved = remaining == 0;
