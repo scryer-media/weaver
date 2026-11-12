@@ -116,36 +116,337 @@ impl AtomicHistogram {
 
 /// Measures one pipeline turn, excluding the idle select wait. Awaited work
 /// inside a handler remains part of the observation, including slow I/O.
+///
+/// It also keeps the turn stamp current, from the clock readings the
+/// measurement takes anyway, so a reader that cannot wait for the pipeline
+/// still learns what it is doing.
 pub(crate) struct TurnTimer<'a> {
     histogram: &'a AtomicHistogram,
+    stamp: &'a PipelineTurnStamp,
     started: Option<std::time::Instant>,
     elapsed: Duration,
 }
 
 impl<'a> TurnTimer<'a> {
-    pub(crate) fn new(histogram: &'a AtomicHistogram) -> Self {
+    // A turn opens by reading the queue's intents.
+    pub(crate) fn new(histogram: &'a AtomicHistogram, stamp: &'a PipelineTurnStamp) -> Self {
+        let now = std::time::Instant::now();
+        stamp.busy(PipelinePhase::QueueIntents, now);
         Self {
             histogram,
-            started: Some(std::time::Instant::now()),
+            stamp,
+            started: Some(now),
             elapsed: Duration::ZERO,
         }
     }
 
+    // The turn moves on to another part of its work.
+    pub(crate) fn phase(&self, phase: PipelinePhase) {
+        self.stamp.phase(phase);
+    }
+
+    // The turn waits for its next event; the wait is not turn time.
     pub(crate) fn pause(&mut self) {
         if let Some(started) = self.started.take() {
             self.elapsed += started.elapsed();
+            self.stamp.phase(PipelinePhase::WaitingForWork);
         }
     }
 
-    pub(crate) fn resume(&mut self) {
-        self.started.get_or_insert_with(std::time::Instant::now);
+    // An event ended the wait, and `phase` is the handling of it.
+    pub(crate) fn resume(&mut self, phase: PipelinePhase) {
+        if self.started.is_none() {
+            let now = std::time::Instant::now();
+            self.started = Some(now);
+            self.stamp.busy(phase, now);
+        } else {
+            self.stamp.phase(phase);
+        }
+    }
+
+    // The turn's closing bookkeeping, with the jobs it left installed.
+    pub(crate) fn end_of_turn(&self, installed_jobs: usize) {
+        self.stamp.end_of_turn(installed_jobs);
     }
 }
 
 impl Drop for TurnTimer<'_> {
     fn drop(&mut self) {
-        self.pause();
+        let now = std::time::Instant::now();
+        if let Some(started) = self.started.take() {
+            self.elapsed += now.saturating_duration_since(started);
+        }
         self.histogram.observe(self.elapsed);
+        self.stamp.ended(now);
+    }
+}
+
+// What a pipeline turn is doing, as a stable code. The codes are written
+// into the diagnostics package, so a released code keeps its meaning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PipelinePhase {
+    // Between one turn's end and the next one's start.
+    BetweenTurns = 0,
+    // Waiting in the select for an event; no work is being done.
+    WaitingForWork = 1,
+    // The steps every turn takes before it waits.
+    QueueIntents = 2,
+    ReadyResults = 3,
+    CompletionChecks = 4,
+    ParkAndSpill = 5,
+    Dispatch = 6,
+    DownloadResults = 7,
+    // Handling the event that ended the wait.
+    IntentChanged = 8,
+    DownloadDone = 9,
+    LaneRefill = 10,
+    LaneParked = 11,
+    LaneEvent = 12,
+    PostProbe = 13,
+    DecodeDone = 14,
+    NntpHandoffDrained = 15,
+    JobActivated = 16,
+    DbReply = 17,
+    MoveDone = 18,
+    FailedRelease = 19,
+    ScriptEffects = 20,
+    TerminalPostProcessing = 21,
+    Retry = 22,
+    MetricsTick = 23,
+    RateLimit = 24,
+    DurableLeadRetry = 25,
+    Propagation = 26,
+    InfrastructureRetry = 27,
+    ServerHealth = 28,
+    ConnectionHold = 29,
+    RenameRetry = 30,
+    TuneTick = 31,
+    StallCheck = 32,
+    StateReconcile = 33,
+    RestoreBatch = 34,
+    // The bookkeeping that closes every turn.
+    EndOfTurn = 35,
+    // The turn that saw shutdown, settling the queue before the loop ends.
+    Shutdown = 36,
+    // A select arm: a graph run or repair off the loop reported back.
+    GraphRun = 37,
+}
+
+impl PipelinePhase {
+    const ALL: [Self; 38] = [
+        Self::BetweenTurns,
+        Self::WaitingForWork,
+        Self::QueueIntents,
+        Self::ReadyResults,
+        Self::CompletionChecks,
+        Self::ParkAndSpill,
+        Self::Dispatch,
+        Self::DownloadResults,
+        Self::IntentChanged,
+        Self::DownloadDone,
+        Self::LaneRefill,
+        Self::LaneParked,
+        Self::LaneEvent,
+        Self::PostProbe,
+        Self::DecodeDone,
+        Self::NntpHandoffDrained,
+        Self::JobActivated,
+        Self::DbReply,
+        Self::MoveDone,
+        Self::FailedRelease,
+        Self::ScriptEffects,
+        Self::TerminalPostProcessing,
+        Self::Retry,
+        Self::MetricsTick,
+        Self::RateLimit,
+        Self::DurableLeadRetry,
+        Self::Propagation,
+        Self::InfrastructureRetry,
+        Self::ServerHealth,
+        Self::ConnectionHold,
+        Self::RenameRetry,
+        Self::TuneTick,
+        Self::StallCheck,
+        Self::StateReconcile,
+        Self::RestoreBatch,
+        Self::EndOfTurn,
+        Self::Shutdown,
+        Self::GraphRun,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BetweenTurns => "between_turns",
+            Self::WaitingForWork => "waiting_for_work",
+            Self::QueueIntents => "queue_intents",
+            Self::ReadyResults => "ready_results",
+            Self::CompletionChecks => "completion_checks",
+            Self::ParkAndSpill => "park_and_spill",
+            Self::Dispatch => "dispatch",
+            Self::DownloadResults => "download_results",
+            Self::IntentChanged => "intent_changed",
+            Self::DownloadDone => "download_done",
+            Self::LaneRefill => "lane_refill",
+            Self::LaneParked => "lane_parked",
+            Self::LaneEvent => "lane_event",
+            Self::PostProbe => "post_probe",
+            Self::DecodeDone => "decode_done",
+            Self::NntpHandoffDrained => "nntp_handoff_drained",
+            Self::JobActivated => "job_activated",
+            Self::DbReply => "db_reply",
+            Self::MoveDone => "move_done",
+            Self::FailedRelease => "failed_release",
+            Self::ScriptEffects => "script_effects",
+            Self::TerminalPostProcessing => "terminal_post_processing",
+            Self::Retry => "retry",
+            Self::MetricsTick => "metrics_tick",
+            Self::RateLimit => "rate_limit",
+            Self::DurableLeadRetry => "durable_lead_retry",
+            Self::Propagation => "propagation",
+            Self::InfrastructureRetry => "infrastructure_retry",
+            Self::ServerHealth => "server_health",
+            Self::ConnectionHold => "connection_hold",
+            Self::RenameRetry => "rename_retry",
+            Self::TuneTick => "tune_tick",
+            Self::StallCheck => "stall_check",
+            Self::StateReconcile => "state_reconcile",
+            Self::RestoreBatch => "restore_batch",
+            Self::EndOfTurn => "end_of_turn",
+            Self::Shutdown => "shutdown",
+            Self::GraphRun => "graph_run",
+        }
+    }
+
+    // Whether the pipeline is doing work in this phase, rather than waiting
+    // for it or passing between turns.
+    pub const fn is_busy(self) -> bool {
+        !matches!(self, Self::BetweenTurns | Self::WaitingForWork)
+    }
+
+    fn from_code(code: u8) -> Self {
+        Self::ALL
+            .get(usize::from(code))
+            .copied()
+            .unwrap_or(Self::BetweenTurns)
+    }
+}
+
+// The pipeline's own record of the turn it is in, for readers that must not
+// wait for the pipeline to answer.
+//
+// Hot-path contract: the pipeline writes it a few times per turn, never per
+// article or per job, with plain atomic stores fed by the clock readings
+// [`TurnTimer`] already takes. It allocates nothing, formats nothing and
+// takes no lock, so no reader can hold it against the pipeline. The fields
+// are written one at a time, so a reader can see a phase with the start of
+// the busy stretch before it; that skew is one turn at most.
+#[derive(Debug)]
+pub struct PipelineTurnStamp {
+    origin: std::time::Instant,
+    phase: std::sync::atomic::AtomicU8,
+    // Nanoseconds after `origin` at which the current busy stretch began:
+    // the turn's start, or the end of its wait.
+    busy_since_nanos: AtomicU64,
+    turns_completed: AtomicU64,
+    last_turn_ended_nanos: AtomicU64,
+    // Jobs installed in the pipeline when the last turn closed; `u64::MAX`
+    // until a turn has closed.
+    installed_jobs: AtomicU64,
+}
+
+// A point-in-time reading of a [`PipelineTurnStamp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PipelineTurnReading {
+    pub phase: PipelinePhase,
+    // How long the pipeline has been busy without waiting, while it is.
+    pub busy_for: Option<Duration>,
+    pub turns_completed: u64,
+    // How long ago the last turn ended, once one has.
+    pub since_last_turn_ended: Option<Duration>,
+    pub installed_jobs: Option<u64>,
+}
+
+impl Default for PipelineTurnStamp {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PipelineTurnStamp {
+    pub fn new() -> Self {
+        Self {
+            origin: std::time::Instant::now(),
+            phase: std::sync::atomic::AtomicU8::new(PipelinePhase::BetweenTurns as u8),
+            busy_since_nanos: AtomicU64::new(0),
+            turns_completed: AtomicU64::new(0),
+            last_turn_ended_nanos: AtomicU64::new(0),
+            installed_jobs: AtomicU64::new(u64::MAX),
+        }
+    }
+
+    // The instant every stamped time is measured from.
+    pub fn origin(&self) -> std::time::Instant {
+        self.origin
+    }
+
+    fn nanos_at(&self, at: std::time::Instant) -> u64 {
+        u64::try_from(at.saturating_duration_since(self.origin).as_nanos()).unwrap_or(u64::MAX)
+    }
+
+    // A busy stretch began at `at`, doing `phase`.
+    pub fn busy(&self, phase: PipelinePhase, at: std::time::Instant) {
+        self.busy_since_nanos
+            .store(self.nanos_at(at), Ordering::Relaxed);
+        self.phase.store(phase as u8, Ordering::Release);
+    }
+
+    // The current busy stretch moved on to `phase`.
+    pub fn phase(&self, phase: PipelinePhase) {
+        self.phase.store(phase as u8, Ordering::Release);
+    }
+
+    pub fn end_of_turn(&self, installed_jobs: usize) {
+        self.installed_jobs.store(
+            u64::try_from(installed_jobs).unwrap_or(u64::MAX - 1),
+            Ordering::Relaxed,
+        );
+        self.phase
+            .store(PipelinePhase::EndOfTurn as u8, Ordering::Release);
+    }
+
+    // A turn ended at `at`.
+    pub fn ended(&self, at: std::time::Instant) {
+        self.last_turn_ended_nanos
+            .store(self.nanos_at(at), Ordering::Relaxed);
+        self.turns_completed.fetch_add(1, Ordering::Relaxed);
+        self.phase
+            .store(PipelinePhase::BetweenTurns as u8, Ordering::Release);
+    }
+
+    // Reads the stamp as of `now`. Loads only.
+    pub fn read(&self, now: std::time::Instant) -> PipelineTurnReading {
+        let phase = PipelinePhase::from_code(self.phase.load(Ordering::Acquire));
+        let now_nanos = self.nanos_at(now);
+        let busy_for = phase.is_busy().then(|| {
+            Duration::from_nanos(
+                now_nanos.saturating_sub(self.busy_since_nanos.load(Ordering::Relaxed)),
+            )
+        });
+        let turns_completed = self.turns_completed.load(Ordering::Relaxed);
+        let since_last_turn_ended = (turns_completed > 0).then(|| {
+            Duration::from_nanos(
+                now_nanos.saturating_sub(self.last_turn_ended_nanos.load(Ordering::Relaxed)),
+            )
+        });
+        let installed_jobs = self.installed_jobs.load(Ordering::Relaxed);
+        PipelineTurnReading {
+            phase,
+            busy_for,
+            turns_completed,
+            since_last_turn_ended,
+            installed_jobs: (installed_jobs != u64::MAX).then_some(installed_jobs),
+        }
     }
 }
 

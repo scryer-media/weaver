@@ -22,6 +22,9 @@ pub(super) struct Component {
     pub(super) name: String,
     pub(super) form: Form,
     pub(super) outcome: Result<Vec<u8>, String>,
+    // A stable code for why there is no file, or why the file is partial,
+    // beside the sentence in `outcome`. `None` where nothing tells it apart.
+    pub(super) reason: Option<&'static str>,
 }
 
 // How a component's bytes are read, which is how the sanitizer reaches the
@@ -59,6 +62,7 @@ impl Component {
             name: name.into(),
             form,
             outcome: Ok(data),
+            reason: None,
         }
     }
 
@@ -71,6 +75,19 @@ impl Component {
             name: name.into(),
             form: Form::Text,
             outcome: Err(error.to_string()),
+            reason: None,
+        }
+    }
+
+    // A component that failed for a reason a reader can tell apart.
+    pub(super) fn failed_because(
+        name: impl Into<String>,
+        reason: &'static str,
+        error: impl std::fmt::Display,
+    ) -> Self {
+        Self {
+            reason: Some(reason),
+            ..Self::failed(name, error)
         }
     }
 
@@ -116,6 +133,9 @@ pub(super) struct ManifestFile {
 pub(super) struct ManifestError {
     pub(super) name: String,
     pub(super) error: String,
+    // The stable code beside the sentence, when the failure has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) reason: Option<String>,
 }
 
 // The archive name, which is also the download filename.
@@ -153,6 +173,7 @@ pub(super) fn build_archive(
             Err(error) => errors.push(ManifestError {
                 name: component.name,
                 error,
+                reason: component.reason.map(str::to_string),
             }),
         }
     }

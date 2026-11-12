@@ -191,6 +191,41 @@ pub struct LaneDiagnostics {
     pub recovering: usize,
 }
 
+// What the queue's shared rows say about the pipeline's work, read without
+// the pipeline answering: one pass over the rows under the queue's lock, the
+// same read the metrics scrape makes for its job counts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueueStateCounts {
+    // Queued jobs in each status, in `JOB_STATUS_KEYS` order.
+    pub jobs_by_status: crate::operations::metrics_store::JobStatusCounts,
+    pub jobs: usize,
+    pub max_concurrent_nzbs: usize,
+    // How many queued jobs the pipeline keeps installed for that slot limit.
+    pub queue_window: usize,
+    pub global_paused: bool,
+    pub scheduled_pause: bool,
+}
+
+impl QueueStateCounts {
+    pub(crate) fn read(inner: &crate::pipeline::queue::QueueInner) -> Self {
+        let max_concurrent_nzbs = inner
+            .globals
+            .max_concurrent_nzbs
+            .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
+            .get() as usize;
+        Self {
+            jobs_by_status: crate::operations::metrics_store::JobStatusCounts::from_statuses(
+                inner.jobs.iter().map(|row| &row.report.job.status),
+            ),
+            jobs: inner.jobs.len(),
+            max_concurrent_nzbs,
+            queue_window: super::queue_window::window_size(max_concurrent_nzbs),
+            global_paused: inner.globals.paused,
+            scheduled_pause: inner.globals.scheduled_pause,
+        }
+    }
+}
+
 impl Pipeline {
     // Copy the read-only diagnostics snapshot out of the actor.
     //

@@ -347,11 +347,12 @@ pub(super) fn sanitize_package(
 
 // Every component left out because the table could not be built, named
 // through the host's own names, and the reason, sanitized the same way, as
-// one more.
+// one more. `code`, when the failure has one, is carried by each.
 pub(super) fn left_out(
     local: &LocalNames,
     names: impl Iterator<Item = String>,
     reason: &str,
+    code: Option<&'static str>,
 ) -> Vec<Component> {
     let table = StandIns::build(&[], local, &StoredNames::default()).ok();
     let sanitize = |text: &str| match &table {
@@ -364,13 +365,19 @@ pub(super) fn left_out(
                 Some(table) => table.member_name(&name),
                 None => "component".to_string(),
             };
-            Component::failed(
-                name,
-                "left out because the stand-in table could not be built",
-            )
+            Component {
+                reason: code,
+                ..Component::failed(
+                    name,
+                    "left out because the stand-in table could not be built",
+                )
+            }
         })
         .collect();
-    components.push(Component::failed("stand-in-table", sanitize(reason)));
+    components.push(Component {
+        reason: code,
+        ..Component::failed("stand-in-table", sanitize(reason))
+    });
     components
 }
 
