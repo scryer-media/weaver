@@ -11,7 +11,9 @@ use std::{
     task::Poll,
 };
 
-use crate::{PollSendToVectored, SocketOpts, Transport, message::UtpMessage, raw::UtpHeader};
+use crate::{
+    Fragmenting, PollSendToVectored, SocketOpts, Transport, message::UtpMessage, raw::UtpHeader,
+};
 use parking_lot::Mutex;
 use tokio::sync::{
     Notify,
@@ -140,6 +142,10 @@ impl PollSendToVectored for MockUtpTransport {
 #[derive(Default)]
 struct RememberingTransportLocked {
     messages: Vec<Msg>,
+    // For each message, how a send that controls fragmenting sent it.
+    fragmenting: Vec<Option<Fragmenting>>,
+    // Whether the transport controls fragmenting, as a kernel socket does.
+    controls_fragmenting: bool,
     max_payload_len: Option<usize>,
     link_mtu: Option<u16>,
     poll_send_pending: bool,
@@ -202,11 +208,27 @@ impl RememberingTransport {
         self.locked.lock().max_payload_len = Some(len);
     }
 
+    // Sends that say how they may be fragmented are recorded as such from
+    // now on; until then they are sent as any other datagram.
+    pub fn set_controls_fragmenting(&self) {
+        self.locked.lock().controls_fragmenting = true;
+    }
+
     pub fn send(&self, addr: SocketAddr, buf: &[u8]) -> std::io::Result<()> {
+        self.send_as(addr, buf, None)
+    }
+
+    fn send_as(
+        &self,
+        addr: SocketAddr,
+        buf: &[u8],
+        fragmenting: Option<Fragmenting>,
+    ) -> std::io::Result<()> {
         let mut g = self.locked.lock();
         let too_large = g.max_payload_len.is_some_and(|l| buf.len() > l);
         // A failed send is kept too, so tests can inspect the rejected packet.
         g.messages.push((addr, buf.to_owned()));
+        g.fragmenting.push(fragmenting);
         drop(g);
         self.sent.notify_waiters();
         if too_large {
@@ -231,7 +253,26 @@ impl RememberingTransport {
     }
 
     pub fn take_sent(&self) -> Vec<Msg> {
-        std::mem::take(&mut self.locked.lock().messages)
+        let mut g = self.locked.lock();
+        g.fragmenting.clear();
+        std::mem::take(&mut g.messages)
+    }
+
+    // The messages sent, each with how a send that controls fragmenting
+    // sent it.
+    pub fn take_sent_fragmenting(&self) -> Vec<(UtpMessage, Option<Fragmenting>)> {
+        let (messages, fragmenting) = {
+            let mut g = self.locked.lock();
+            (
+                std::mem::take(&mut g.messages),
+                std::mem::take(&mut g.fragmenting),
+            )
+        };
+        messages
+            .into_iter()
+            .map(|(_, msg)| UtpMessage::deserialize(&msg, tokio::time::Instant::now()).unwrap())
+            .zip(fragmenting)
+            .collect()
     }
 
     pub fn take_sent_utpmessages(&self) -> Vec<UtpMessage> {
@@ -265,6 +306,25 @@ impl Transport for RememberingTransport {
             return Poll::Pending;
         }
         self.send(target, buf)?;
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_send_to_vectored_fragmenting(
+        &self,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+        target: SocketAddr,
+        fragmenting: Fragmenting,
+    ) -> Poll<std::io::Result<usize>> {
+        if !self.locked.lock().controls_fragmenting {
+            return self.poll_send_to_vectored(cx, bufs, target);
+        }
+        if self.refuse(cx) {
+            return Poll::Pending;
+        }
+        let mut buf = Vec::new();
+        bufs.iter().for_each(|b| buf.extend_from_slice(b.as_ref()));
+        self.send_as(target, &buf, Some(fragmenting))?;
         Poll::Ready(Ok(buf.len()))
     }
 

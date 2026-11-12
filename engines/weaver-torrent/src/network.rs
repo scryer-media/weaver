@@ -28,7 +28,9 @@ pub use weaver_utp::{
     canonical_ip_addr, canonical_socket_addr, is_message_size_error, message_size_error,
 };
 
-pub use crate::core::net::{BoxFuture, DatagramSend, DatagramSocket, NoNames, Resolved, Resolver};
+pub use crate::core::net::{
+    BoxFuture, DatagramSend, DatagramSocket, Fragmenting, NoNames, Resolved, Resolver,
+};
 pub use crate::type_aliases::{BoxAsyncReadVectored, BoxAsyncWrite};
 pub use crate::vectored_traits::{
     AsyncReadToVectoredCompat, AsyncReadVectored, AsyncReadVectoredIntoCompat,
@@ -345,6 +347,17 @@ impl Transport for DatagramTransport {
         self.0.poll_send_to(cx, buf, target)
     }
 
+    fn poll_send_to_vectored_fragmenting(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+        fragmenting: Fragmenting,
+    ) -> Poll<io::Result<usize>> {
+        self.0
+            .poll_send_to_vectored_fragmenting(cx, bufs, target, fragmenting)
+    }
+
     fn bind_addr(&self) -> SocketAddr {
         self.0.bind_addr()
     }
@@ -421,6 +434,7 @@ impl KernelSockets {
             local: socket.local_addr()?,
             socket,
             dual_stack,
+            size_sends: parking_lot::Mutex::new(()),
         })
     }
 
@@ -703,6 +717,17 @@ impl DatagramSocket for PairedUdp {
         let (socket, target) = self.toward(target);
         socket.poll_send_to_vectored(cx, bufs, target)
     }
+
+    fn poll_send_to_vectored_fragmenting(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+        fragmenting: Fragmenting,
+    ) -> Poll<io::Result<usize>> {
+        let (socket, target) = self.toward(target);
+        socket.poll_send_to_vectored_fragmenting(cx, bufs, target, fragmenting)
+    }
 }
 
 /// A kernel datagram socket: the address it is bound at, and whether it
@@ -711,6 +736,10 @@ pub(crate) struct KernelUdp {
     socket: tokio::net::UdpSocket,
     local: SocketAddr,
     dual_stack: bool,
+    // Held by the sends that test a uTP path's size alone: a send that
+    // allows fragmenting, while don't-fragment is off, and a size probe, so
+    // it never goes out while it is off. Ordinary sends never take it.
+    size_sends: parking_lot::Mutex<()>,
 }
 
 impl KernelUdp {
@@ -828,6 +857,51 @@ impl DatagramSocket for KernelUdp {
                     }
                     return Poll::Ready(sent);
                 }
+            }
+        }
+    }
+
+    // One datagram from every slice, as the vectored send above, under the
+    // socket's lock for sends that test the path's size. One that may be
+    // fragmented goes with don't-fragment off for its family, switched on
+    // again before the lock is released. An ordinary datagram another task
+    // sends inside that window may go out without don't-fragment too; that
+    // is harmless, as it is no larger than the size the path has proven,
+    // and the DHT's and trackers' datagrams keep no such setting.
+    fn poll_send_to_vectored_fragmenting(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+        fragmenting: Fragmenting,
+    ) -> Poll<io::Result<usize>> {
+        let family = match target {
+            SocketAddr::V4(_) => crate::udp_options::Family::V4,
+            SocketAddr::V6(v6) if v6.ip().to_ipv4_mapped().is_some() => {
+                crate::udp_options::Family::V4
+            }
+            SocketAddr::V6(_) => crate::udp_options::Family::V6,
+        };
+        let target = self.toward(target);
+        let socket = &self.socket;
+        loop {
+            std::task::ready!(socket.poll_send_ready(cx))?;
+            let sent = {
+                let _held = self.size_sends.lock();
+                socket.try_io(tokio::io::Interest::WRITABLE, || {
+                    let send =
+                        || socket2::SockRef::from(socket).send_to_vectored(bufs, &target.into());
+                    match fragmenting {
+                        Fragmenting::Never => send(),
+                        Fragmenting::Allowed => {
+                            crate::udp_options::send_fragmenting(socket, family, send)
+                        }
+                    }
+                })
+            };
+            match sent {
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                sent => return Poll::Ready(sent),
             }
         }
     }

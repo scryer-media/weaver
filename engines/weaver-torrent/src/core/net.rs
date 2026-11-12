@@ -30,7 +30,7 @@ use std::{
 /// transport abstraction this trait is adapted to.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + Sync + 'a>>;
 
-pub use weaver_utp::DatagramSend;
+pub use weaver_utp::{DatagramSend, Fragmenting};
 
 /// An unconnected, message-oriented socket: the shape of a UDP socket, without
 /// requiring it to be one.
@@ -78,6 +78,20 @@ pub trait DatagramSocket: Send + Sync + 'static {
             joined.extend_from_slice(b);
         }
         self.poll_send_to(cx, &joined, target)
+    }
+
+    /// Sends a uTP size probe or a packet given up on as too large, as
+    /// `fragmenting` says. A socket that cannot control fragmenting, such as
+    /// a tunnel's, sends it as any other datagram.
+    fn poll_send_to_vectored_fragmenting(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+        fragmenting: Fragmenting,
+    ) -> Poll<io::Result<usize>> {
+        let _ = fragmenting;
+        self.poll_send_to_vectored(cx, bufs, target)
     }
 
     /// The largest IP packet the socket's route carries, where it knows

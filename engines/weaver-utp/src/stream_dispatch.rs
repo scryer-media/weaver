@@ -43,7 +43,7 @@ use crate::{
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{UserTx, UtpStreamWriteHalf},
-    stream_tx_segments::{OnAckResult, PopExpiredProbe, Segments},
+    stream_tx_segments::{ExpiredProbe, OnAckResult, Segments},
     traits::{Transport, UtpEnvironment},
     utils::update_optional_waker,
 };
@@ -370,6 +370,18 @@ macro_rules! send_data {
             let mut h = [0u8; UTP_HEADER as usize];
             let hlen = $header.serialize(&mut h)?;
 
+            // A live probe must arrive whole to prove its size; a probe given
+            // up on as too large may be fragmented, so it still arrives, on
+            // every resend (utp_stream.cpp v2.0.15:1810-1812, 2045-2046).
+            // Ordinary data takes the plain send.
+            let fragmenting = if $segment_iter_item.is_mtu_probe() {
+                Some(crate::traits::Fragmenting::Never)
+            } else if $segment_iter_item.size_given_up() {
+                Some(crate::traits::Fragmenting::Allowed)
+            } else {
+                None
+            };
+
             // Sent from the ring in place; the writer waits on the lock only
             // for the length of one send.
             let refused = {
@@ -390,7 +402,10 @@ macro_rules! send_data {
                     &mut $self.send_gate,
                     $cx,
                     &bufs,
-                    $self.remote,
+                    crate::socket::Destination {
+                        addr: $self.remote,
+                        fragmenting,
+                    },
                 ) {
                     Ok(pending) => {
                         $self.this_poll.transport_pending = pending;
@@ -1247,13 +1262,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
-        match self.user_tx_segments.pop_expired_mtu_probe(
+        match self.user_tx_segments.expire_mtu_probe(
             self.timers.retransmit.expired(self.this_poll.now)
                 && self.user_tx_segments.sole_outstanding_is_mtu_probe()
                 && !(self.fin_sends > 0 && self.state.our_fin_if_unacked().is_some()),
             self.socket_opts.mtu_probe_max_retransmissions,
         ) {
-            PopExpiredProbe::Expired {
+            ExpiredProbe::Expired {
                 rewind_to,
                 payload_size,
             } => {
@@ -1266,16 +1281,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.timers.retransmit.turn_off("MTU probe is not real RTO");
                 self.rto_retransmissions = 0;
 
+                // The probe goes again whole, under its own sequence
+                // number, as ordinary data: the ceiling below lowers the
+                // segments cut after it, not the probe.
                 if self.last_sent_seq_nr.is_after(rewind_to) {
                     self.last_sent_seq_nr = rewind_to;
                 }
                 self.segment_sizes.on_probe_failed(payload_size);
             }
-            PopExpiredProbe::NotExpired => {
+            ExpiredProbe::NotExpired => {
                 trace!("MTU probe hasnt expired yet");
                 return Ok(());
             }
-            PopExpiredProbe::Empty => {}
+            ExpiredProbe::Empty => {}
         }
 
         let segmented_len = self.user_tx_segments.total_len_bytes();
@@ -1298,11 +1316,43 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.last_remote_window
         );
 
+        // A probe is cut only while the congestion window holds more than
+        // three packets of the proven size, header included, so packets
+        // that are no probes go around it and its loss tells of its size,
+        // not of congestion (libtorrent v2.0.15 utp_stream.cpp:1522-1530,
+        // `(m_cwnd >> 16) > m_mtu_floor * 3`). The window does not change
+        // while this pass cuts.
+        let min_ss = self.segment_sizes.mss();
+        let probe_room = self.congestion_controller.cwnd_bytes()
+            > 3 * usize::from(min_ss.saturating_add(UTP_HEADER));
+        // While a probe is due and the window is too small for it, no more
+        // is cut than may be in flight, so the probe is cut once the window
+        // has grown, not after everything written. Segments a SACK reported
+        // delivered are out of the network and do not count. A stream with
+        // no probe due cuts as far ahead as before.
+        let mut hold = (!probe_room).then(|| {
+            (
+                self.congestion_controller.window(),
+                self.user_tx_segments.undelivered_bytes(),
+            )
+        });
+
         // Whether the loop stopped for want of written data.
         let mut starved = remaining == 0;
         while remaining > 0 && remote_window_remaining > 0 {
-            let ss = self.segment_sizes.next_segment_size();
-            let min_ss = self.segment_sizes.mss();
+            if let Some((window, undelivered)) = hold
+                && self.segment_sizes.probe_due()
+                && undelivered >= window
+            {
+                trace!(window, "probe due, window too small: segmenting no further");
+                starved = false;
+                break;
+            }
+            let ss = if probe_room {
+                self.segment_sizes.next_segment_size()
+            } else {
+                min_ss
+            };
             let max_payload_size = (ss as usize).min(remote_window_remaining);
             let payload_size = max_payload_size.min(remaining);
 
@@ -1324,6 +1374,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 break;
             }
             self.segment_sizes.on_segmented(is_mtu_probe);
+            if let Some((_, undelivered)) = hold.as_mut() {
+                *undelivered += payload_size;
+            }
             remaining -= payload_size;
             remote_window_remaining -= payload_size;
             starved = remaining == 0;

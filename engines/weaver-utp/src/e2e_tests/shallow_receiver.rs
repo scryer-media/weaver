@@ -679,29 +679,64 @@ fn report(case: &str, (counters, causes): &(Counters, Causes)) {
 }
 
 // The same receiver 1 ms and 0.1 ms away. The window overflows the queue
-// and packets are lost, as they are for libtorrent there; every hole is
-// resent on SACK evidence, so no retransmission timer fires, and the
-// receiver gets at least half of what it can drain: 24 full packets for
-// every millisecond it reads.
+// and packets are lost, as they are for libtorrent there. A hole followed
+// by enough delivered packets to show it lost is resent on SACK evidence,
+// never by the retransmission timer. Only a hole in the transfer's last
+// packets may wait for the timer: nothing after it arrived, or only one or
+// two packets, fewer than the SACK rule needs. libtorrent resends a hole
+// only once more than three later packets are acked (utp_stream.cpp
+// v2.0.15:140, 1288-1318) and sends no tail-loss probe, so its timer finds
+// such a tail too (utp_stream.cpp v2.0.15:3389, 3553). Whether the last
+// flight meets an overflow depends on where the transfer ends, so several
+// lengths run, some ending in one and some not. A run the timer did not
+// touch also resends every lost packet on SACK evidence, and the receiver
+// gets at least half of what it can drain: 24 full packets for every
+// millisecond it reads.
 #[tokio::test(start_paused = true)]
-async fn a_short_path_recovers_its_losses_without_timeouts() {
-    const BYTES: usize = 4 * 1024 * 1024;
+async fn a_short_path_resends_on_sack_evidence_and_times_out_only_on_its_tail() {
     let shallow = Shallow {
         queue_packets: 48,
         drain_every: Duration::from_millis(1),
     };
-    for one_way in [Duration::from_micros(500), Duration::from_micros(50)] {
-        let run = transfer(BYTES, one_way, Some(shallow)).await;
-        report(&format!("one way {one_way:?}"), &run);
-        let counters = run.0;
-        assert!(counters.data_sent > 2800, "{counters:?}");
-        assert_eq!(counters.rtos, 0, "{one_way:?}: {counters:?}");
-        assert!(counters.fast_resends >= counters.dropped, "{counters:?}");
-        assert!(
-            BYTES / PACKET_PAYLOAD >= 24 * counters.drains as usize,
-            "{one_way:?}: {counters:?}"
-        );
+    let mut tail_timeouts = 0;
+    for bytes in [3_477_000, 4_110_000, 4 * 1024 * 1024, 5_165_000] {
+        for one_way in [Duration::from_micros(500), Duration::from_micros(50)] {
+            let run = transfer(bytes, one_way, Some(shallow)).await;
+            report(&format!("{bytes} bytes, one way {one_way:?}"), &run);
+            let (counters, causes) = run;
+            assert!(!counters.died, "{bytes}, {one_way:?}: {counters:?}");
+            assert!(
+                counters.data_sent as usize >= bytes / PACKET_PAYLOAD,
+                "{counters:?}"
+            );
+            assert_eq!(
+                causes.0.values().sum::<u64>(),
+                counters.rtos,
+                "{bytes}, {one_way:?}: every timeout has its cause"
+            );
+            for cause in causes.0.keys() {
+                assert!(
+                    matches!(
+                        cause,
+                        ExpiryCause::TailNoProbeRecovering
+                            | ExpiryCause::OneLaterArrived
+                            | ExpiryCause::TwoLaterArrived
+                    ),
+                    "{bytes}, {one_way:?}: a timeout not on the tail: {causes:?}"
+                );
+            }
+            tail_timeouts += counters.rtos;
+            if counters.rtos == 0 {
+                assert!(counters.fast_resends >= counters.dropped, "{counters:?}");
+                assert!(
+                    bytes / PACKET_PAYLOAD >= 24 * counters.drains as usize,
+                    "{bytes}, {one_way:?}: {counters:?}"
+                );
+            }
+        }
     }
+    // The lengths include ends that meet an overflow, so the tail case runs.
+    assert!(tail_timeouts > 0, "no run lost its tail");
 }
 
 // An upload capped at 5 MB/s, 1 ms away: each half-second round hands the

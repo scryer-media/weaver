@@ -22,6 +22,19 @@ pub trait PollSendToVectored {
     ) -> Poll<std::io::Result<usize>>;
 }
 
+/// Whether a packet that tests the path's size may be fragmented on its way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fragmenting {
+    /// A size probe. It is never fragmented: its arrival must prove the
+    /// path carries it whole.
+    Never,
+    /// A packet the stream gave up on as larger than the path. The path may
+    /// fragment it, so it still arrives (libtorrent sends every packet but a
+    /// live probe without don't-fragment: utp_stream.cpp v2.0.15:1810-1812,
+    /// 1835-1836, 2045-2046).
+    Allowed,
+}
+
 /// A stream's send readiness registration. Dropping it releases that
 /// stream's registration, including a waiter left by a pending poll.
 pub trait DatagramSend: Send + Sync + Unpin {
@@ -31,6 +44,20 @@ pub trait DatagramSend: Send + Sync + Unpin {
         bufs: &[IoSlice<'_>],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>>;
+
+    /// Sends a size probe or a packet given up on as too large, as
+    /// `fragmenting` says. A sender that cannot control fragmenting sends it
+    /// as any other datagram.
+    fn poll_send_to_vectored_fragmenting(
+        &mut self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+        fragmenting: Fragmenting,
+    ) -> Poll<std::io::Result<usize>> {
+        let _ = fragmenting;
+        self.poll_send_to_vectored(cx, bufs, target)
+    }
 
     fn poll_send_to(
         &mut self,
@@ -73,6 +100,21 @@ pub trait Transport: PollSendToVectored + Send + Sync + Unpin + 'static {
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>>;
+
+    /// Sends a size probe or a packet given up on as too large, as
+    /// `fragmenting` says. Ordinary data goes through
+    /// [`PollSendToVectored::poll_send_to_vectored`]. A transport that cannot
+    /// control fragmenting, such as a tunnel, sends it as any other datagram.
+    fn poll_send_to_vectored_fragmenting(
+        &self,
+        cx: &mut Context<'_>,
+        bufs: &[IoSlice<'_>],
+        target: SocketAddr,
+        fragmenting: Fragmenting,
+    ) -> Poll<std::io::Result<usize>> {
+        let _ = fragmenting;
+        self.poll_send_to_vectored(cx, bufs, target)
+    }
 
     // The local address transport is bound to. Used only for logging.
     fn bind_addr(&self) -> SocketAddr;

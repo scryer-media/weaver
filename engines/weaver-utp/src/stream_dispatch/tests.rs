@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-12.
 
 mod arrival_time;
 mod basics;
@@ -55,6 +55,10 @@ fn make_msg(header: UtpHeader, payload: &str) -> UtpMessage {
     UtpMessage::new_test(header, payload.as_bytes())
 }
 
+// The smallest congestion window that lets a new IPv4 stream probe: more
+// than three packets of 528 bytes of payload and the 20-byte uTP header.
+const PROBE_WINDOW: usize = 3 * (528 + UTP_HEADER as usize) + 1;
+
 const fn calc_mtu_for_mss(mss: usize) -> NonZeroUsize {
     const IP_HEADER: usize = 20;
     NonZero::new(mss + UTP_HEADER as usize + UDP_HEADER as usize + IP_HEADER).unwrap()
@@ -92,6 +96,12 @@ impl TestVsock {
 
     fn take_sent(&self) -> Vec<UtpMessage> {
         self.transport.take_sent_utpmessages()
+    }
+
+    // The messages sent, each with how a send that controls fragmenting
+    // sent it.
+    fn take_sent_fragmenting(&self) -> Vec<(UtpMessage, Option<crate::Fragmenting>)> {
+        self.transport.take_sent_fragmenting()
     }
 
     #[track_caller]
