@@ -20,6 +20,7 @@ use std::{
     path::PathBuf,
 };
 use tracing::debug;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::core::{
     Error, Id32, InfoHashes,
@@ -1287,11 +1288,18 @@ fn clean_path<B: AsRef<[u8]>>(
 /// torrent_info.cpp:806-905, v2.0.15). `files` holds each file's length and
 /// whether it is padding. libtorrent folds ASCII case alone; this folds
 /// every letter, as the case-insensitive filesystems of Windows and macOS
-/// do. Each path keeps the next number to try, so many files of one name
-/// are renamed in linear time: a number below it is taken already.
+/// do, and compares names in their canonical decomposition, as APFS does,
+/// so an NFC `é` and an NFD `e` with a combining acute are one name, on
+/// every platform. Each path keeps the next number to try, so many files of
+/// one name are renamed in linear time: a number below it is taken already.
 fn rename_duplicates(paths: &mut [Vec<String>], files: &[(u64, bool)]) {
     fn key(parts: &[String]) -> String {
-        parts.join("/").to_lowercase()
+        fold(&parts.join("/"))
+    }
+    // Case folded, then canonically decomposed, so names a filesystem
+    // takes as one file share a key.
+    fn fold(text: &str) -> String {
+        text.to_lowercase().nfd().collect()
     }
     // A path and the file that has it, or none for a directory.
     let mut taken = HashMap::<String, Option<usize>>::new();
@@ -1302,7 +1310,7 @@ fn rename_duplicates(paths: &mut [Vec<String>], files: &[(u64, bool)]) {
             if !directory.is_empty() {
                 directory.push('/');
             }
-            directory.push_str(&part.to_lowercase());
+            directory.push_str(&fold(part));
             if directories.insert(directory.clone()) {
                 taken.insert(directory.clone(), None);
             }
@@ -1340,7 +1348,7 @@ fn rename_duplicates(paths: &mut [Vec<String>], files: &[(u64, bool)]) {
         let renamed = loop {
             let candidate = format!("{base}.{number}{extension}");
             number += 1;
-            let candidate_key = format!("{prefix}{}", candidate.to_lowercase());
+            let candidate_key = format!("{prefix}{}", fold(&candidate));
             if let std::collections::hash_map::Entry::Vacant(free) = taken.entry(candidate_key) {
                 free.insert(Some(index));
                 break candidate;
@@ -1709,6 +1717,70 @@ mod tests {
             .collect();
         assert_eq!(offsets, after);
         assert_eq!(validated.info(), &info);
+    }
+
+    #[test]
+    fn names_that_differ_only_by_normalization_are_renamed() {
+        // NFC `é` (U+00E9) and NFD `e` + combining acute (U+0301) are one
+        // name on APFS.
+        let nfc = "caf\u{e9}";
+        let nfd = "cafe\u{301}";
+        let files = vec![
+            file(&[&format!("{nfc}.txt")], 1, None),
+            file(&[&format!("{nfd}.txt")], 1, None),
+            // With case on top.
+            file(&["CAFE\u{301}.TXT"], 1, None),
+            // A directory in one form, a file in the other.
+            file(&[nfc, "a.txt"], 1, None),
+            file(&[nfd], 1, None),
+            file(&[nfd, "A.txt"], 1, None),
+            // A rename's own name in the other form is taken too.
+            file(&[&format!("{nfd}.1.txt")], 1, None),
+        ];
+        assert_eq!(
+            clean_paths(multi_file_info(files)),
+            [
+                format!("{nfc}.txt"),
+                format!("{nfd}.1.txt"),
+                "CAFE\u{301}.2.TXT".to_owned(),
+                format!("{nfc}/a.txt"),
+                format!("{nfd}.1"),
+                format!("{nfd}/A.1.txt"),
+                format!("{nfd}.1.1.txt"),
+            ]
+        );
+        // Names with no twin in another form keep what they had.
+        let alone = vec![
+            file(&[&format!("{nfc}.txt")], 1, None),
+            file(&[&format!("{nfd}.mkv")], 1, None),
+            file(&["\u{212b}"], 1, None),
+        ];
+        assert_eq!(
+            clean_paths(multi_file_info(alone)),
+            [
+                format!("{nfc}.txt"),
+                format!("{nfd}.mkv"),
+                "\u{212b}".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn many_files_of_one_name_in_two_forms_are_each_renamed_once() {
+        let files = (0..2000)
+            .map(|i| match i % 2 {
+                0 => file(&["caf\u{e9}.bin"], 1, None),
+                _ => file(&["cafe\u{301}.bin"], 1, None),
+            })
+            .collect();
+        let names = clean_paths(multi_file_info(files));
+        for (index, name) in names.iter().enumerate().skip(1) {
+            let base = match index % 2 {
+                0 => "caf\u{e9}",
+                _ => "cafe\u{301}",
+            };
+            assert_eq!(name, &format!("{base}.{index}.bin"));
+        }
     }
 
     #[test]
