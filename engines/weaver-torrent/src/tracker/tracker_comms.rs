@@ -5392,6 +5392,55 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "e2e-local-trackers"))]
+    #[tokio::test]
+    async fn a_tracker_answering_at_its_local_address_may_move_an_announce_to_a_private_one() {
+        // The operator's tracker is found at a public and a local address
+        // and answers at the local one: its redirect is not held to public
+        // addresses, as one found at local addresses only is not.
+        let (tracker, at) = http_listener().await;
+        let port = at.port().unwrap();
+        let url = Url::parse(&format!("http://mixed.invalid:{port}/announce")).unwrap();
+        let public = IpAddr::from(Ipv4Addr::new(8, 8, 8, 8));
+        let private = IpAddr::from(Ipv4Addr::new(10, 0, 0, 1));
+        let names = Names(vec![
+            ("mixed.invalid", public),
+            ("mixed.invalid", Ipv4Addr::LOCALHOST.into()),
+            ("private.invalid", private),
+        ]);
+        let clients = Wired::new(&at);
+        let token = CancellationToken::new();
+        let stopped = StoppedAnnounces::default();
+        let TrackerTask { mut peers, .. } = start_through(
+            vec![vec![Tracker {
+                url,
+                named_by: NamedBy::Operator,
+            }]],
+            clients.clone(),
+            names,
+            &token,
+            &stopped,
+        );
+        let (conn, q) = tokio::select! {
+            _ = peers.next() => panic!("the tracker sent no peers"),
+            r = read_announce(&tracker) => r,
+        };
+        redirect(conn, &format!("http://private.invalid:{port}/announce?{q}")).await;
+        answer_with_a_peer(
+            &tracker,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
+        assert_eq!(
+            *clients.built.lock(),
+            [public, Ipv4Addr::LOCALHOST.into(), private]
+        );
+        drop(peers);
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
     struct CountingResolver {
         calls: AtomicUsize,
     }
