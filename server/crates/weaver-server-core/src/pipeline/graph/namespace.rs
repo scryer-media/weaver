@@ -179,6 +179,10 @@ impl Files {
 struct Acknowledging {
     set: NodeId,
     closed: BTreeSet<(NodeId, MemberId)>,
+    // Bytes the namespace holds already are being delivered again under a
+    // set's verdict: read back, they are the bytes every set over them
+    // ruled on, so they take no ruling back.
+    rereading: bool,
 }
 
 // An archive given up on as an archive: its members are delivered or
