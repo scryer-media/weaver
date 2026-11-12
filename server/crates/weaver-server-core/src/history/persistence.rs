@@ -171,9 +171,9 @@ impl Database {
                         "INSERT INTO job_history
                             (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                              optional_recovery_bytes, optional_recovery_downloaded_bytes,
-                             failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
+                             failed_bytes, health, category, output_dir, nzb_path,
                              created_at, completed_at, metadata, server_attribution)
-                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
                          ON CONFLICT(job_id) DO UPDATE SET
                             job_hash = excluded.job_hash,
                             name = excluded.name,
@@ -188,7 +188,6 @@ impl Database {
                             category = excluded.category,
                             output_dir = excluded.output_dir,
                             nzb_path = excluded.nzb_path,
-                            nzb_zstd = COALESCE(excluded.nzb_zstd, job_history.nzb_zstd),
                             created_at = excluded.created_at,
                             completed_at = excluded.completed_at,
                             metadata = excluded.metadata,
@@ -413,6 +412,9 @@ pub(crate) async fn delete_job_history_bundles_tx(
             &args,
         )
         .await?;
+        // The stored NZB goes with the history row, unless the job is in the
+        // queue again.
+        crate::jobs::nzb_persistence::delete_unowned_job_nzbs_tx(tx, &present).await?;
         deleted.extend(present.into_iter().map(|id| JobId(id as u64)));
     }
     Ok(deleted)
@@ -434,7 +436,6 @@ fn job_history_args(entry: &JobHistoryRow) -> Vec<SqlArg> {
         SqlArg::OptText(entry.category.clone()),
         SqlArg::OptText(entry.output_dir.clone()),
         SqlArg::OptText(entry.nzb_path.clone()),
-        SqlArg::OptBytes(None),
         SqlArg::I64(entry.created_at),
         SqlArg::I64(entry.completed_at),
         SqlArg::OptText(entry.metadata.clone()),

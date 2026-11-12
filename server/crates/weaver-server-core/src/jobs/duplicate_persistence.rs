@@ -1088,12 +1088,12 @@ impl Database {
                      SELECT a.job_id, a.nzb_hash AS raw_job_hash, n.nzb_zstd,
                             'active' AS lifecycle, a.created_at
                        FROM active_jobs AS a
-                       LEFT JOIN active_job_nzbs AS n ON n.job_id = a.job_id
+                       LEFT JOIN job_nzbs AS n ON n.job_id = a.job_id
                       WHERE NOT EXISTS (
                             SELECT 1 FROM job_history AS h WHERE h.job_id = a.job_id
                         )
                      UNION ALL
-                     SELECT h.job_id, h.job_hash AS raw_job_hash, h.nzb_zstd,
+                     SELECT h.job_id, h.job_hash AS raw_job_hash, hn.nzb_zstd,
                             CASE
                                 WHEN h.status IN ('complete', 'succeeded') THEN 'succeeded'
                                 WHEN h.status = 'cancelled' THEN 'cancelled'
@@ -1101,6 +1101,7 @@ impl Database {
                             END AS lifecycle,
                             h.created_at
                        FROM job_history AS h
+                       LEFT JOIN job_nzbs AS hn ON hn.job_id = h.job_id
                  ) AS source
                  WHERE job_id > {}
                    AND NOT EXISTS (

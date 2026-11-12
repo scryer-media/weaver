@@ -1154,10 +1154,12 @@ async fn import_sqlite_table(
         .iter()
         .map(|column| column.name.clone())
         .collect::<BTreeSet<_>>();
+    let history_nzbs = carries_history_nzbs(table, source);
     let unknown = source
         .columns
         .iter()
         .filter(|column| !target.contains(*column))
+        .filter(|column| !(history_nzbs && column.as_str() == HISTORY_NZB_COLUMN))
         .cloned()
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
@@ -1212,8 +1214,39 @@ async fn import_sqlite_table(
                 line_number + 1
             ))
         })?;
+        if let Some(nzb) = history_nzbs.then(|| history_nzb(&object)).flatten() {
+            let query = sqlx::query("INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES (?, ?)");
+            let query = bind_sqlite_value(query, object.get("job_id").unwrap_or(&JsonValue::Null))?;
+            bind_sqlite_value(query, nzb)?
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| {
+                    StateError::Database(format!(
+                        "failed to import the stored NZB of backup row {table}:{}: {error}",
+                        line_number + 1
+                    ))
+                })?;
+        }
     }
     Ok(())
+}
+
+// A bundle written before a finished job's stored NZB had a table of its own
+// carries it on the history row; it is restored to `job_nzbs`.
+const HISTORY_NZB_COLUMN: &str = "nzb_zstd";
+
+fn carries_history_nzbs(table: &str, source: &TablePartMetadata) -> bool {
+    table == "job_history"
+        && source
+            .columns
+            .iter()
+            .any(|column| column == HISTORY_NZB_COLUMN)
+}
+
+fn history_nzb(object: &serde_json::Map<String, JsonValue>) -> Option<&JsonValue> {
+    object
+        .get(HISTORY_NZB_COLUMN)
+        .filter(|value| !value.is_null())
 }
 
 #[expect(
@@ -1232,10 +1265,12 @@ async fn import_postgres_table(
         .iter()
         .map(|column| column.name.as_str())
         .collect::<BTreeSet<_>>();
+    let history_nzbs = carries_history_nzbs(table, source);
     let unknown = source
         .columns
         .iter()
         .filter(|column| !target_names.contains(column.as_str()))
+        .filter(|column| !(history_nzbs && column.as_str() == HISTORY_NZB_COLUMN))
         .cloned()
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
@@ -1300,6 +1335,24 @@ async fn import_postgres_table(
                 line_number + 1
             ))
         })?;
+        if let Some(nzb) = history_nzbs.then(|| history_nzb(&object)).flatten() {
+            let query =
+                sqlx::query("INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES ($1::bigint, $2)");
+            let query = bind_postgres_value(
+                query,
+                "int8",
+                object.get("job_id").unwrap_or(&JsonValue::Null),
+            )?;
+            bind_postgres_value(query, "bytea", nzb)?
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    StateError::Database(format!(
+                        "failed to import the stored NZB of backup row {table}:{}: {error}",
+                        line_number + 1
+                    ))
+                })?;
+        }
     }
     Ok(())
 }

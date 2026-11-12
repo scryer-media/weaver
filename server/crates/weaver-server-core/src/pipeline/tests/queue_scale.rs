@@ -1216,12 +1216,12 @@ async fn a_restart_fails_the_jobs_stored_without_an_outline_whose_nzb_cannot_be_
     .await;
     sql(
         &pipeline.db,
-        "UPDATE active_job_nzbs SET nzb_zstd = x'' WHERE job_id = 1",
+        "UPDATE job_nzbs SET nzb_zstd = x'' WHERE job_id = 1",
     )
     .await;
     sql(
         &pipeline.db,
-        "UPDATE active_job_nzbs SET nzb_zstd = x'01020304' WHERE job_id = 2",
+        "UPDATE job_nzbs SET nzb_zstd = x'01020304' WHERE job_id = 2",
     )
     .await;
     let handle = SchedulerHandle::new(pipeline.event_tx.clone(), pipeline.shared_state.clone());
