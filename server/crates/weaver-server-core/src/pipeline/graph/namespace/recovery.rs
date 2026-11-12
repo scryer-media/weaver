@@ -740,7 +740,7 @@ impl NamespaceWriter {
             // set beside it: a set that disagrees with another's repair loses
             // there to an equal or a higher one, so no two rewrite each other
             // in turn.
-            let contested = true || !tree.outranks(node, set);
+            let contested = !tree.outranks(node, set);
             let (mut offered, mut landed) = (false, false);
             for (member, offset, bytes) in repaired.slices() {
                 let bytes = bytes?;
