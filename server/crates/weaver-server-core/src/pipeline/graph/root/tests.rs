@@ -875,6 +875,84 @@ fn a_job_is_queued_in_posted_order_at_one_neutral_priority() {
 }
 
 #[tokio::test]
+async fn retried_articles_of_a_file_share_the_one_group_list_the_queue_holds() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(91_012);
+    let segments = 512;
+    insert_active_job(
+        &mut pipeline,
+        job_id,
+        spec(
+            "lantern shared groups",
+            vec![
+                ("lantern.mkv".to_string(), FileRole::Standalone, 4),
+                (
+                    "lantern.vol000+512.par2".to_string(),
+                    FileRole::Par2 {
+                        is_index: false,
+                        recovery_block_count: 512,
+                    },
+                    segments,
+                ),
+            ],
+        ),
+    )
+    .await;
+    let volume = segment_id(job_id, 1, 0).file_id;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    let active = state.articles.active_mut().unwrap();
+    let shared = Arc::clone(active.download_queue.file_groups(volume).unwrap());
+    while active.download_queue.pop().is_some() {}
+
+    // Every article of the volume fails and is retried: each retry holds the
+    // list the queue built for the file, and none allocates its own.
+    let retries: Vec<_> = (0..segments)
+        .map(|ordinal| {
+            pipeline
+                .download_retry_work(segment_id(job_id, 1, ordinal), 1, Vec::new())
+                .unwrap()
+        })
+        .collect();
+    let lists: HashSet<*const [String]> = retries
+        .iter()
+        .map(|work| Arc::as_ptr(&work.groups))
+        .collect();
+    assert_eq!(lists, HashSet::from([Arc::as_ptr(&shared)]));
+    assert_eq!(*shared, ["alt.binaries.test".to_string()]);
+
+    // Back on the queue they still share it, parked or not.
+    for work in retries {
+        pipeline.enqueue_download_work(work);
+    }
+    let active = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap();
+    let mut requeued = 0;
+    while let Some(item) = active
+        .download_queue
+        .pop()
+        .or_else(|| active.recovery_queue.pop())
+    {
+        assert!(Arc::ptr_eq(&item.groups, &shared));
+        requeued += 1;
+    }
+    assert_eq!(requeued, segments);
+}
+
+#[test]
+fn a_file_no_queue_has_held_gets_its_group_list_from_the_post() {
+    let queued = crate::jobs::model::JobArticles::Queued(Default::default());
+    let groups = vec!["alt.binaries.test".to_string()];
+    let list = queued.file_groups(segment_id(JobId(91_013), 0, 0).file_id, &groups);
+    assert_eq!(*list, *groups);
+}
+
+#[tokio::test]
 async fn a_requeued_graph_article_comes_back_at_the_roots_priority_not_its_roles() {
     let temp_dir = tempfile::tempdir().unwrap();
     let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
