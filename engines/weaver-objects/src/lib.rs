@@ -7,6 +7,7 @@
 // asks for an object by kind through `build`.
 
 pub mod crypt;
+mod elimination;
 pub mod engine;
 mod grid;
 mod kept;

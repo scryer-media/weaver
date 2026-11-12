@@ -41,6 +41,7 @@ use weaver_graph::{
     Object, ObjectId, Placement, Pull, Recovery, Seek, Segment, SliceVerdict, VolumeIndex, Weight,
 };
 
+use crate::elimination::{self, Length};
 use crate::par2::combine;
 use crate::recovery_volume::{self, Refusal, Shown};
 
@@ -156,14 +157,35 @@ impl Unnamed {
         })
     }
 
-    // Whether the member could be a described file of `long` bytes.
-    fn fits(self, long: u64) -> bool {
+    // What is known of its length: exact once a byte of it checked.
+    fn bound(self) -> Length {
         if self.intact {
-            self.length == long
+            Length::Exact(self.length)
         } else {
-            long <= self.length
+            Length::AtMost(self.length)
         }
     }
+
+    // Whether the member could be a described file of `long` bytes.
+    fn fits(self, long: u64) -> bool {
+        self.bound().fits(long)
+    }
+}
+
+// The free files the members with no intact byte are by elimination, each
+// with the member it is: longest file first, each free file no member is
+// takes the member it fits most tightly, once the files those members could
+// be are no more than they are.
+fn by_elimination(
+    free: &[(String, u64)],
+    blank: &[(MemberId, Unnamed)],
+    work: &mut u64,
+) -> Vec<(String, MemberId)> {
+    let unnamed = blank
+        .iter()
+        .map(|(member, unnamed)| (*member, unnamed.bound()))
+        .collect();
+    elimination::by_elimination(free, unnamed, work)
 }
 
 pub struct Par3 {
@@ -403,35 +425,34 @@ impl Par3 {
             .filter_map(|set| BlockLayout::new(set, &ExecutionOptions::default()).ok())
             .collect();
         let files: Vec<&FileLayout> = layouts.iter().flat_map(BlockLayout::files).collect();
+        let candidates = identity::Candidates::new(&files, |path| self.free(path));
         let mut read = 0;
         for (&member, unnamed) in &self.unnamed {
             if !unnamed.complete || !unnamed.intact || self.identified.contains_key(&member) {
                 continue;
             }
-            let free = |path: &str| self.free(path);
             let len = unnamed.length;
-            if let Some(path) = identity::identify(&files, free, access, member, len, &mut read) {
+            if let Some(path) = candidates.identify(access, member, len, &mut read) {
                 self.identified.insert(member, path.to_owned());
             }
         }
         // A member with no intact byte has nothing to say what it is, so it
-        // is what is left, as a PAR2 member no slice named is: longest file
-        // first, each free file no member is takes the member it fits most
-        // tightly, once the files those members could be are no more than
-        // they are. The repair makes every byte of it over.
+        // is what is left, as a PAR2 member no slice named is. The repair
+        // makes every byte of it over.
+        let taken: BTreeSet<&str> = self.identified.values().map(String::as_str).collect();
         let mut free: Vec<(String, u64)> = files
             .iter()
             .filter(|file| {
                 file.len != 0
                     && self.free(&file.path)
                     && !self.bound.contains_key(&file.path)
-                    && !self.identified.values().any(|path| *path == file.path)
+                    && !taken.contains(file.path.as_str())
             })
             .map(|file| (file.path.clone(), file.len))
             .collect();
         free.sort_by_key(|(_, long)| std::cmp::Reverse(*long));
         free.dedup();
-        let mut blank: Vec<(MemberId, Unnamed)> = self
+        let blank: Vec<(MemberId, Unnamed)> = self
             .unnamed
             .iter()
             .filter(|(member, unnamed)| {
@@ -439,23 +460,9 @@ impl Par3 {
             })
             .map(|(member, unnamed)| (*member, *unnamed))
             .collect();
-        while let Some((at, member)) = free.iter().enumerate().find_map(|(at, (_, long))| {
-            let fitting: Vec<usize> = (0..blank.len())
-                .filter(|candidate| blank[*candidate].1.fits(*long))
-                .collect();
-            let could_be = free
-                .iter()
-                .filter(|(_, other)| fitting.iter().any(|c| blank[*c].1.fits(*other)))
-                .count();
-            let tightest = fitting
-                .iter()
-                .copied()
-                .min_by_key(|candidate| blank[*candidate].1.length)
-                .filter(|_| could_be <= fitting.len())?;
-            Some((at, tightest))
-        }) {
-            let (path, _) = free.remove(at);
-            self.identified.insert(blank.swap_remove(member).0, path);
+        let mut work = 0;
+        for (path, member) in by_elimination(&free, &blank, &mut work) {
+            self.identified.insert(member, path);
         }
         let found = self.by_content();
         self.bound.extend(found);

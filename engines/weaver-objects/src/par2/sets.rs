@@ -18,6 +18,7 @@ use weaver_graph::{ByteRange, Coverage, MemberId, Sealed, Seek, VolumeIndex, Wei
 use super::facts::Packets;
 use super::repair::SetRepair;
 use super::walker::Walker;
+pub(super) use crate::elimination::Length;
 use crate::lost::Lost;
 use crate::recovery_volume;
 
@@ -508,30 +509,5 @@ fn validate_par2_geometry(set: &Par2FileSet, output_limit: u64) -> par2_rs::Resu
 fn par2_resource_error(reason: &str) -> par2_rs::Par2Error {
     par2_rs::Par2Error::ResourceLimitExceeded {
         reason: format!("WEAVER_RESOURCE_LIMIT[par2_metadata]: {reason}"),
-    }
-}
-
-// What is known of an unnamed member's length. A member some byte of which
-// decoded knows its length exactly; one none of whose did is only bounded
-// by its post's encoded size.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Length {
-    Exact(u64),
-    AtMost(u64),
-}
-
-impl Length {
-    // Whether the member could be a described file of `long`.
-    pub(super) fn fits(self, long: u64) -> bool {
-        match self {
-            Self::Exact(length) => length == long,
-            Self::AtMost(bound) => long <= bound,
-        }
-    }
-
-    pub(super) fn bound(self) -> u64 {
-        match self {
-            Self::Exact(length) | Self::AtMost(length) => length,
-        }
     }
 }
