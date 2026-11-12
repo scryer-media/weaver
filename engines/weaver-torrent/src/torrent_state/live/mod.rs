@@ -1101,8 +1101,27 @@ impl TorrentStateLive {
             if !state.wants_peers() {
                 // Nothing to fetch and nothing to give: connect to no one until
                 // the peers are wanted again.
+                debug!("connect loop idle: no peers are wanted");
                 state.peers.candidates_changed().await;
                 continue;
+            }
+            // Why the loop waits, so a torrent that connects to no one shows
+            // whether it knows no one, or is held by a cap.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let next = state.peers.next_candidate(tokio::time::Instant::now());
+                if next != peers::NextCandidate::Due {
+                    let stats = state.peers.stats();
+                    debug!(
+                        ?next,
+                        seen = stats.seen,
+                        queued = stats.queued,
+                        connecting = stats.connecting,
+                        live = stats.live,
+                        dead = stats.dead,
+                        not_needed = stats.not_needed,
+                        "connect loop waiting for a candidate"
+                    );
+                }
             }
             state.peers.wait_for_candidate().await;
             // A session closed under the torrent ends its adder: that is
@@ -1117,8 +1136,27 @@ impl TorrentStateLive {
             // under the session's; then a place under the session's cap and
             // a connect from its per-second budget, both shared with every
             // torrent in turn.
-            let permit = state.peer_semaphore.clone().acquire_owned().await?;
-            let slot = slots.open().await?;
+            let permit = match state.peer_semaphore.clone().try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    debug!(
+                        limit = state.peer_limit,
+                        "connect loop waiting: the torrent is at its peer limit"
+                    );
+                    state.peer_semaphore.clone().acquire_owned().await?
+                }
+            };
+            let slot = match slots.try_open() {
+                Some(slot) => slot,
+                None => {
+                    debug!(
+                        in_use = slots.in_use(),
+                        limit = slots.limit(),
+                        "connect loop waiting: the session is at its connection limit"
+                    );
+                    slots.open().await?
+                }
+            };
             // The slots may have taken a while: we may have finished since,
             // so the list looks again, and we connect to whoever is due now.
             state

@@ -219,11 +219,31 @@ impl Socks5Front {
             .remove(&stream.peer_addr()?)
             .and_then(|value| value.upgrade())
             .unwrap_or_default();
+        // How long the tunnel took to reach the target, so a caller's own
+        // timeout can be split into the tunnel's dial and what followed it.
+        let began = tokio::time::Instant::now();
         let dialled = tokio::select! {
             biased;
-            result = Self::read_until_closed(&mut stream, &mut pending) => return result,
+            result = Self::read_until_closed(&mut stream, &mut pending) => {
+                tracing::debug!(
+                    proxy_config_id = self.proxy_config_id.as_str(),
+                    host = host.as_str(),
+                    port,
+                    elapsed_ms = began.elapsed().as_millis(),
+                    "the caller left before the tunnel reached its target"
+                );
+                return result;
+            }
             result = tokio::time::timeout(self.timeout, self.provider.dial_observed(&host, port, outcome)) => result,
         };
+        tracing::debug!(
+            proxy_config_id = self.proxy_config_id.as_str(),
+            host = host.as_str(),
+            port,
+            reached = matches!(dialled, Ok(Ok(_))),
+            elapsed_ms = began.elapsed().as_millis(),
+            "tunnel SOCKS5 dial finished"
+        );
         let mut upstream = match dialled {
             Ok(Ok(upstream)) => upstream,
             Ok(Err(error)) => {
