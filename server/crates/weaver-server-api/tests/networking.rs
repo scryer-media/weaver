@@ -624,6 +624,7 @@ async fn a_torrent_leg_on_its_own_sockets_shows_the_sessions_peers_in_the_flow()
             open: 3,
             opening: 2,
             bytes_per_second: 4_000_000,
+            ..SessionTraffic::default()
         }),
     );
     assert_eq!(
@@ -635,6 +636,72 @@ async fn a_torrent_leg_on_its_own_sockets_shows_the_sessions_peers_in_the_flow()
     drop(tenancy);
     assert_eq!(default_torrent_leg(&h).await, (0, 0, "IDLE".into(), 0));
     runtime.stop_all().await;
+}
+
+// A leg a torrent session is being built on reads as opening, as the
+// session's route and its torrents do, until the build lets it go.
+#[tokio::test]
+async fn a_torrent_leg_a_session_is_being_built_on_reads_as_opening() {
+    use weaver_server_core::proxies::{Consumer, SessionOpening, TorrentScope};
+    let h = harness().await;
+    let runtime = h.handle.proxy_runtime().unwrap();
+    let consumer = Consumer::Torrent(TorrentScope::Default);
+    assert_eq!(default_torrent_leg(&h).await, (0, 0, "IDLE".into(), 0));
+
+    let building = runtime.network.tenant_torrent(consumer, 0, SessionOpening);
+    assert_eq!(default_torrent_leg(&h).await, (0, 0, "OPENING".into(), 0));
+
+    drop(building);
+    assert_eq!(default_torrent_leg(&h).await, (0, 0, "IDLE".into(), 0));
+    runtime.stop_all().await;
+}
+
+// A leg through a proxy that is disabled has nothing it can carry: it reads
+// down with the reason its route reads, not idle, and idle again once the
+// proxy is turned back on.
+#[tokio::test]
+async fn a_leg_through_a_disabled_proxy_reads_down_with_why() {
+    let h = harness().await;
+    let save = |id: &str, enabled: bool| {
+        format!(
+            r#"mutation{{saveProxyProfile({id}input:{{name:"Gateway",kind:SOCKS5,resolver:PROXY,enabled:{enabled},host:"127.0.0.1",port:1080}}){{id}}}}"#
+        )
+    };
+    let response = h.execute(&save("", true)).await;
+    assert_no_errors(&response);
+    let proxy = response_data(&response)["saveProxyProfile"]["id"]
+        .as_u64()
+        .unwrap();
+    assert_no_errors(&h.execute(&format!("mutation{{saveNetworkRoute(kind:TORRENT_DEFAULT,id:0,input:{{legs:[{{egressId:0,weight:100,path:{{ladder:{{rungs:[{{proxy:{proxy}}}],directFallback:false}}}}}}]}}){{consumer}}}}")).await);
+    let leg = || async {
+        let response = h
+            .execute("{ networkFlow { legs { consumer position state reason } } }")
+            .await;
+        assert_no_errors(&response);
+        let legs = response_data(&response)["networkFlow"]["legs"].clone();
+        let leg = legs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|leg| leg["consumer"] == "torrent:default" && leg["position"] == 0)
+            .unwrap_or_else(|| panic!("no default torrent leg in {legs}"))
+            .clone();
+        (leg["state"].clone(), leg["reason"].clone())
+    };
+    assert_eq!(leg().await.0, "IDLE");
+
+    assert_no_errors(&h.execute(&save(&format!("id:{proxy},"), false)).await);
+    assert_eq!(
+        leg().await,
+        (
+            serde_json::json!("DOWN"),
+            serde_json::json!(format!("proxy {proxy} is disabled"))
+        )
+    );
+
+    assert_no_errors(&h.execute(&save(&format!("id:{proxy},"), true)).await);
+    assert_eq!(leg().await.0, "IDLE");
+    h.handle.proxy_runtime().unwrap().stop_all().await;
 }
 
 // A tracker rule that routes its torrents itself is listed by its host

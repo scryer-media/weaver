@@ -897,6 +897,7 @@ fn route_reason(reason: TorrentRouteReason) -> &'static str {
         TorrentRouteReason::SessionBuildFailed => "session_build_failed",
         TorrentRouteReason::BlocklistFailed => "blocklist_failed",
         TorrentRouteReason::SessionLimit => "session_limit",
+        TorrentRouteReason::Opening => "opening",
     }
 }
 

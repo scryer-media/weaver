@@ -1829,6 +1829,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrents.routeReason.SESSION_BUILD_FAILED": "세션을 열지 못함",
   "next.torrents.routeReason.BLOCKLIST_FAILED": "차단 목록을 불러오지 못함",
   "next.torrents.routeReason.SESSION_LIMIT": "세션 한도 도달",
+  "next.torrents.routeReason.OPENING": "여는 중",
   "next.torrents.routesEmpty": "경로가 없습니다.",
   "next.seeding.ratioGoal": "비율 목표",
   "next.seeding.seedTimeGoal": "시딩 시간 목표",

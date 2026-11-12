@@ -29,7 +29,7 @@ use weaver_torrent::{
 use weaver_tunnel::bridge::ConnectionOutcome;
 use weaver_tunnel::endpoint::{DatagramSocket as TunnelSocket, DatagramTransport};
 use weaver_tunnel::pipe::{
-    DialedStream, Dialer, InboundListener as Listening, Purpose, Resolution, Target,
+    DialedStream, Dialer, InboundListener as Listening, PortForwarding, Purpose, Resolution, Target,
 };
 
 use crate::proxies::{EgressBinding, LegPath, PathBridge, ResolvedBy};
@@ -65,6 +65,13 @@ impl LegKind {
         matches!(self, Self::System | Self::Interface(_))
     }
 
+    /// Whether a session on this leg binds ports of the host: its own
+    /// sockets, or the leg's at a pinned source address. A ladder leg's
+    /// sockets are all the tunnel's or the proxy's, and take none.
+    pub fn binds_host_ports(&self) -> bool {
+        self.own_sockets() || self.listen_ip().is_some()
+    }
+
     /// What a session on this leg may do over `dialer`, the leg's dialer
     /// when its sockets come from one. A ladder leg carries datagrams, and so
     /// DHT, exactly when its dialer does.
@@ -75,6 +82,7 @@ impl LegKind {
                 dht: true,
                 upnp: true,
                 listen: true,
+                mapped: false,
                 utp: true,
                 datagrams: true,
             },
@@ -85,6 +93,7 @@ impl LegKind {
                 dht: true,
                 upnp: true,
                 listen: true,
+                mapped: false,
                 utp: true,
                 datagrams: true,
             },
@@ -93,16 +102,25 @@ impl LegKind {
                 dht: true,
                 upnp: true,
                 listen: true,
+                mapped: false,
                 utp: true,
                 datagrams: true,
             },
+            // A ladder leg listens only when its last hop's provider
+            // forwards a port to it: peers outside the tunnel reach nothing
+            // else. A port the gateway maps on request reaches it only once
+            // the gateway has mapped one.
             Self::Ladder => {
                 let datagrams = dialer.is_some_and(|dialer| carrier(dialer).is_some());
+                let forwarding = dialer
+                    .and_then(|dialer| Arc::clone(dialer).inbound())
+                    .map(|inbound| inbound.forwarding());
                 Shape {
                     own_sockets: false,
                     dht: datagrams,
                     upnp: false,
-                    listen: dialer.is_some_and(|dialer| Arc::clone(dialer).inbound().is_some()),
+                    listen: forwarding.is_some_and(|forwarding| forwarding != PortForwarding::None),
+                    mapped: matches!(forwarding, Some(PortForwarding::NatPmp { .. })),
                     utp: datagrams,
                     datagrams,
                 }
@@ -137,6 +155,9 @@ pub struct Shape {
     pub upnp: bool,
     /// Incoming peer connections.
     pub listen: bool,
+    /// Peers reach the listener only through a port the gateway maps on
+    /// request, so only once it has mapped one.
+    pub mapped: bool,
     /// uTP on the leg's datagram route.
     pub utp: bool,
     /// UDP of any kind: UDP trackers, uTP and DHT.
@@ -1900,6 +1921,10 @@ mod tests {
                 .map_err(|error| weaver_tunnel::TunnelError::Engine(error.to_string()))?;
             Ok(Box::new(LoopbackListener(listener, self.0.clone())))
         }
+        // It stands in for a hop whose provider forwards a port to it.
+        fn forwarding(&self) -> weaver_tunnel::pipe::PortForwarding {
+            weaver_tunnel::pipe::PortForwarding::Fixed(6881)
+        }
     }
     #[async_trait::async_trait]
     impl Listening for LoopbackListener {
@@ -1946,6 +1971,58 @@ mod tests {
         fn describe(&self) -> String {
             "accepting".into()
         }
+    }
+
+    // A ladder leg over a WireGuard hop listens only when the hop's
+    // provider forwards a port to it, a fixed one or one its gateway maps on
+    // request; with none, peers outside the tunnel reach nothing, and it
+    // listens on nothing.
+    #[tokio::test]
+    async fn a_ladder_leg_over_a_wireguard_hop_listens_only_through_a_forwarded_port() {
+        use weaver_tunnel::test_support::{TEST_CLIENT_ADDRESS, WireGuardTestPeer};
+        let peer = WireGuardTestPeer::start_with(Default::default()).await;
+        let shape = |forwarding| {
+            let hop: Arc<dyn Dialer> = wireguard_hop(1, peer.client_spec("1"), None, forwarding);
+            LegKind::Ladder.shape(Some(&hop))
+        };
+        let none = shape(PortForwarding::None);
+        assert!(!none.listen && !none.mapped);
+        let fixed = shape(PortForwarding::Fixed(47001));
+        assert!(fixed.listen && !fixed.mapped);
+        let natpmp = shape(PortForwarding::NatPmp {
+            gateway: weaver_tunnel::pipe::gateway_of(TEST_CLIENT_ADDRESS),
+        });
+        assert!(natpmp.listen && natpmp.mapped);
+    }
+
+    // On a leg whose gateway maps a port on request, peers reach the
+    // session only once the gateway has mapped one; on a leg with a fixed
+    // forwarded port, as soon as it announces it. A session that announces
+    // no port is reached by no one.
+    #[test]
+    fn a_leg_whose_gateway_maps_on_request_is_reachable_only_once_it_has_mapped() {
+        let natpmp = Shape {
+            listen: true,
+            mapped: true,
+            ..LegKind::Ladder.shape(None)
+        };
+        let report = |external_port| PortMapped {
+            transport: PortmapTransport::NatPmp,
+            protocol: PortmapProtocol::Tcp,
+            local_port: 6881,
+            external_port,
+            external_ip: None,
+            error: None,
+        };
+        assert!(!reachable(6881, natpmp, &[]));
+        assert!(!reachable(6881, natpmp, &[report(None)]));
+        assert!(reachable(47002, natpmp, &[report(Some(47002))]));
+        let fixed = Shape {
+            mapped: false,
+            ..natpmp
+        };
+        assert!(reachable(47001, fixed, &[]));
+        assert!(!reachable(0, fixed, &[]));
     }
 
     // A ladder leg whose last hop takes connections listens through it, and
@@ -2566,6 +2643,17 @@ mod tests {
     }
 }
 
+// Whether peers can connect in to a session that announces `announced_port`
+// on a leg of `shape`: it announces a port, and on a leg whose gateway maps
+// one on request, the gateway has mapped one.
+fn reachable(announced_port: u16, shape: Shape, mappings: &[PortMapped]) -> bool {
+    announced_port != 0
+        && (!shape.mapped
+            || mappings
+                .iter()
+                .any(|mapping| mapping.external_port.is_some()))
+}
+
 /// What a session on one leg shows the trackers and peers it reaches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Exposure {
@@ -2603,7 +2691,7 @@ impl Exposure {
                 .copied()
                 .or_else(|| mappings.iter().find_map(|mapping| mapping.external_ip)),
             announced_port,
-            inbound: announced_port != 0,
+            inbound: reachable(announced_port, shape, mappings),
             udp_trackers: shape.datagrams,
             dht: shape.dht,
             utp: session.uses_utp(),

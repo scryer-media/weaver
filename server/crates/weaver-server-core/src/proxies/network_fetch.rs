@@ -314,7 +314,8 @@ impl NetworkRuntime {
                         if config.pools.get(&id).is_none_or(|pool| !pool.enabled) {
                             continue;
                         }
-                        self.pool(&config, id, bottom.clone())?;
+                        // A fetch leases any member: it dials the pool whole.
+                        self.pool(&config, id, bottom.clone(), true)?;
                         let pools = self.pools.lock().expect("network pools");
                         let Some(pool) = pools.get(&(id, bottom.id())) else {
                             continue;

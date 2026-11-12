@@ -1829,6 +1829,7 @@ export const nextIt: LocaleDictionary = {
   "next.torrents.routeReason.SESSION_BUILD_FAILED": "Apertura della sessione non riuscita",
   "next.torrents.routeReason.BLOCKLIST_FAILED": "Caricamento della lista di blocco non riuscito",
   "next.torrents.routeReason.SESSION_LIMIT": "Limite di sessioni raggiunto",
+  "next.torrents.routeReason.OPENING": "Apertura in corso",
   "next.torrents.routesEmpty": "Nessuna rotta.",
   "next.seeding.ratioGoal": "Obiettivo ratio",
   "next.seeding.seedTimeGoal": "Obiettivo di tempo",

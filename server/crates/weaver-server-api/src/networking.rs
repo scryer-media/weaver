@@ -1063,6 +1063,26 @@ pub struct NetworkPoolMemberFlow {
     // What the member's open connections carry now, all together.
     pub live_bytes_per_second: u64,
 }
+// A leg that is up with nothing open or opening is idle, unless every rung
+// of its path fails at a hop: it then has nothing it can carry, and is down
+// for its first failing hop. Short of that, a leg a torrent session is
+// being built on is opening, as that session's route and torrents read.
+fn settle_unused(leg: &mut NetworkLegFlow, sessions_opening: u64) {
+    if leg.state != "UP" || leg.open != 0 || leg.opening != 0 {
+        return;
+    }
+    let failing = (!leg.rung_states.is_empty() && leg.failing_hops.len() == leg.rung_states.len())
+        .then(|| leg.failing_hops.first())
+        .flatten();
+    match failing {
+        Some(hop) => {
+            leg.reason = Some(format!("proxy {}: {}", hop.proxy_id, hop.reason));
+            leg.state = "DOWN".into();
+        }
+        None if sessions_opening > 0 => leg.state = "OPENING".into(),
+        None => leg.state = "IDLE".into(),
+    }
+}
 // One pool on one egress as its plan and members report it. Members keep
 // their id order; `rank` carries where the plan dials each one.
 fn pool_flow(
@@ -1114,6 +1134,20 @@ fn pool_flow(
 pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
     let mut legs = Vec::new();
     for route in runtime.network.live_routes() {
+        // A leg whose path cannot be used, a proxy or pool on it gone or
+        // disabled, is down for that reason, as its route reads. Read off
+        // the legs' lock: a reload takes the configuration before the legs.
+        let paths: Vec<_> = route
+            .legs
+            .read()
+            .expect("route legs")
+            .iter()
+            .map(|leg| leg.definition.path.clone())
+            .collect();
+        let unusable: Vec<_> = paths
+            .iter()
+            .map(|path| runtime.network.path_unusable(path))
+            .collect();
         let definitions = route.legs.read().expect("route legs");
         for allocation in route.weighted.allocations() {
             let Some(leg) = definitions.get(allocation.position) else {
@@ -1129,7 +1163,13 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
                 && allocation.opening == 0
                 && !rung_states.is_empty()
                 && rung_states.iter().all(|state| state == "COOLDOWN");
+            let unusable = unusable
+                .get(allocation.position)
+                .cloned()
+                .flatten()
+                .filter(|_| paths.get(allocation.position) == Some(&leg.definition.path));
             let (state, reason) = match allocation.health {
+                core::LegHealthState::Up if unusable.is_some() => ("DOWN", unusable),
                 core::LegHealthState::Up if ladder_cooling => {
                     ("DOWN", Some("every rung is cooling down".to_owned()))
                 }
@@ -1183,7 +1223,11 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
     // inactive server, are part of the picture too: the operator configured
     // them, and an egress they depend on may already be missing.
     for leg in runtime.network.dormant_legs() {
+        let unusable = runtime.network.path_unusable(&leg.definition.path);
         let (state, reason) = match leg.health {
+            core::LegHealthState::Up | core::LegHealthState::Probing if unusable.is_some() => {
+                ("DOWN", unusable)
+            }
             core::LegHealthState::Up | core::LegHealthState::Probing => ("UP", None),
             core::LegHealthState::Down(reason) => ("DOWN", Some(reason)),
             core::LegHealthState::Blocked(reason) => ("BLOCKED", Some(reason)),
@@ -1210,18 +1254,19 @@ pub(crate) fn flow(runtime: &ProxyRuntime) -> NetworkFlow {
     }
     // A leg torrent sessions run on carries what they hold on it, whether
     // they dial through its route or on sockets of their own. A leg that is
-    // up with nothing open or opening is idle.
+    // up with nothing open or opening is idle, or opening while a session
+    // is being built on it.
     let sessions = runtime.network.torrent_traffic();
     for leg in &mut legs {
+        let mut sessions_opening = 0;
         if let Some(traffic) = sessions.get(&(leg.consumer.clone(), leg.position as usize)) {
             let (open, opening) = traffic.connections(u64::from(leg.open), u64::from(leg.opening));
             leg.open = u16::try_from(open).unwrap_or(u16::MAX);
             leg.opening = u16::try_from(opening).unwrap_or(u16::MAX);
             leg.bytes_per_second += traffic.bytes_per_second;
+            sessions_opening = traffic.sessions_opening;
         }
-        if leg.state == "UP" && leg.open == 0 && leg.opening == 0 {
-            leg.state = "IDLE".into();
-        }
+        settle_unused(leg, sessions_opening);
     }
     let mut pools: Vec<_> = runtime
         .network

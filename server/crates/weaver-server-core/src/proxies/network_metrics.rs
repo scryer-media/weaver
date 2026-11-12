@@ -516,6 +516,7 @@ mod tests {
                 open: 63,
                 opening: 5,
                 bytes_per_second: 31_000_000,
+                ..Default::default()
             }),
         );
         assert_eq!(leg(&snapshot(&runtime)), (true, 63, 5, 31_000_000));

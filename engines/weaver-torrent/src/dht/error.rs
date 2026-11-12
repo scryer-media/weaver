@@ -57,6 +57,11 @@ pub enum Error {
     #[error("error in recv: {0:#}")]
     Recv(#[source] std::io::Error),
 
+    /// The socket the DHT reads closed under it, as a shared socket does
+    /// when its session closes: the DHT ends with it.
+    #[error("the DHT's socket has closed")]
+    SocketClosed,
+
     #[error("bencode serialize error: {0:#}")]
     Serialize(#[source] Box<SerializeError>),
 }

@@ -99,6 +99,11 @@ pub(crate) struct FakeRoutes {
     // The legs it opens run no local service discovery, so a session on
     // the host's own sockets sends nothing past loopback.
     pub(crate) no_local_discovery: std::sync::atomic::AtomicBool,
+    // The legs it opens on the network carry the session's sockets and
+    // names through the network's leg, as the network's own routes do.
+    pub(crate) through_legs: std::sync::atomic::AtomicBool,
+    // Rung as the routes take a saved configuration again.
+    pub(crate) reloads: tokio::sync::watch::Sender<u64>,
 }
 
 // The route of a scope mapped to `proxy`.
@@ -144,15 +149,24 @@ impl FakeRoutes {
         }
     }
 
-    // Why pool member `member`, on `key`, carries nothing, when it does not.
-    fn member_down(&self, member: u32, key: &RouteKey) -> Option<String> {
-        self.key_down(key).or_else(|| {
-            self.members_down
-                .lock()
-                .unwrap()
-                .contains(&member)
-                .then(|| format!("proxy {member} failed"))
-        })
+    // Why pool member `member` of `pool`, on `key`, carries nothing, when it
+    // does not: set down here, or down in the network's pool when a network
+    // is set.
+    fn member_down(&self, pool: u32, member: u32, key: &RouteKey) -> Option<String> {
+        self.key_down(key)
+            .or_else(|| {
+                self.members_down
+                    .lock()
+                    .unwrap()
+                    .contains(&member)
+                    .then(|| format!("proxy {member} failed"))
+            })
+            .or_else(|| {
+                let network = self.network.lock().unwrap().clone()?;
+                network
+                    .pool_members_down(pool, SYSTEM_EGRESS_ID)
+                    .remove(&member)
+            })
     }
 
     pub(crate) fn set_down(&self, reason: Option<&str>) {
@@ -219,7 +233,7 @@ impl Routes for FakeRoutes {
                         let key = pool_member_key(id);
                         MemberPlan {
                             id,
-                            down: self.member_down(id, &key).map(RouteFailure::leg_down),
+                            down: self.member_down(pool, id, &key).map(RouteFailure::leg_down),
                             key,
                             names: Some(ResolvedBy::Proxy),
                         }
@@ -265,8 +279,14 @@ impl Routes for FakeRoutes {
     }
 
     fn leg_down(&self, plan: &RoutePlan) -> Option<RouteFailure> {
-        match plan.member {
-            Some(member) => self.member_down(member, &plan.key),
+        let pool = self
+            .pools
+            .lock()
+            .unwrap()
+            .get(&scope_name(plan.scope))
+            .map(|(pool, _)| *pool);
+        match plan.member.zip(pool) {
+            Some((member, pool)) => self.member_down(pool, member, &plan.key),
             None => self.key_down(&plan.key),
         }
         .map(RouteFailure::leg_down)
@@ -298,6 +318,15 @@ impl Routes for FakeRoutes {
                 None => network.torrent_leg(plan.scope, TORRENT_LEG, 8, Duration::from_secs(30)),
             })
             .transpose()?;
+        if self.through_legs.load(Ordering::SeqCst)
+            && let Some(leg) = leg
+        {
+            let bridge = match plan.kind {
+                LegKind::Ladder => Some(leg.bridge()?),
+                _ => None,
+            };
+            return OpenLeg::on(plan.kind.clone(), leg.dialer(), bridge, Some(leg));
+        }
         Ok(OpenLeg {
             kind: plan.kind.clone(),
             shape: {
@@ -326,6 +355,16 @@ impl Routes for FakeRoutes {
         }
     }
 
+    // As the network's routes hold it, when a network is set.
+    fn opening(&self, plan: &RoutePlan) -> Option<Arc<crate::proxies::LegTenancy>> {
+        let network = self.network.lock().unwrap().clone()?;
+        Some(network.tenant_torrent(
+            Consumer::Torrent(plan.scope),
+            TORRENT_LEG,
+            crate::proxies::SessionOpening,
+        ))
+    }
+
     fn egress_rates(&self, egress_id: u32) -> crate::bandwidth::TorrentRates {
         self.egress_rates
             .lock()
@@ -341,6 +380,10 @@ impl Routes for FakeRoutes {
             self.egress_capacity.subscribe(),
             self.egress_capacity.subscribe(),
         ))
+    }
+
+    fn reloads(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.reloads.subscribe())
     }
 
     async fn fetch_blocklist(&self, url: &reqwest::Url) -> Result<IpRanges, String> {
@@ -776,6 +819,13 @@ async fn session_setup_failures_keep_the_cause_that_failed() {
         let db = Database::open_in_memory().unwrap();
         let root = dir.path().join("state");
         let sessions = Sessions::new(routes.clone(), env(&root), db.clone());
+        // A leg on a host address, whose session takes a port slot.
+        let on_host = || {
+            routes.set_leg(
+                LegKind::SourceAddress("127.0.0.1".parse().unwrap()),
+                Arc::new(NoUdp),
+            )
+        };
         match expected {
             TorrentRouteReason::LegOpenFailed => routes.set_refused(Some("the leg failed to open")),
             TorrentRouteReason::StateDirectoryFailed => {
@@ -788,8 +838,10 @@ async fn session_setup_failures_keep_the_cause_that_failed() {
                     base_port: u16::MAX,
                     ..Default::default()
                 });
+                on_host();
             }
             TorrentRouteReason::SessionStateUnreadable => {
+                on_host();
                 use crate::persistence::sql_runtime::SqlRuntime;
                 let store = db.datastore();
                 db.run_sql_blocking(async move {
@@ -803,10 +855,7 @@ async fn session_setup_failures_keep_the_cause_that_failed() {
                 })
                 .unwrap();
             }
-            TorrentRouteReason::SessionBuildFailed => routes.set_leg(
-                LegKind::SourceAddress("127.0.0.1".parse().unwrap()),
-                Arc::new(NoUdp),
-            ),
+            TorrentRouteReason::SessionBuildFailed => on_host(),
             _ => unreachable!(),
         }
         let plan = routes.plan(TorrentScope::Default);
@@ -902,6 +951,433 @@ async fn a_session_that_cannot_open_is_logged_once_for_each_cause() {
     let heard = lines.of("a route's session could not be opened");
     assert_eq!(heard.len(), 2, "{heard:?}");
     sessions.stop_all().await;
+}
+
+// A route whose session is being built reads as opening at once: its build
+// waits on its leg, and no reader of the sessions waits with it. A second
+// opener of the route waits for that build and is handed its session; one
+// leg is opened.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_reads_as_opening_while_its_leg_has_not_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let sessions = Arc::new(Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    ));
+    sessions.set_config(any_port());
+    let plan = routes.plan(TorrentScope::Default);
+    routes.unanswered.send_replace(true);
+    let mut asked = routes.asked.subscribe();
+    let opening = |sessions: Arc<Sessions>, plan: RoutePlan| {
+        tokio::spawn(async move { sessions.session(&plan, &IDENTITY.identity()).await })
+    };
+    let first = opening(Arc::clone(&sessions), plan.clone());
+    asked.wait_for(|asked| *asked == 1).await.unwrap();
+
+    let views = polled(std::pin::pin!(sessions.views()))
+        .expect("the sessions read while a route's leg has not answered");
+    assert_eq!(views.len(), 1);
+    assert_eq!(views[0].held, Some(OPENING));
+    let view = polled(std::pin::pin!(sessions.view(&plan.key))).unwrap();
+    assert_eq!(
+        view.unwrap().held.map(|held| held.reason),
+        Some(TorrentRouteReason::Opening)
+    );
+    let read = Mutex::new(Vec::new());
+    assert_eq!(
+        polled(std::pin::pin!(sessions.read_into(&read))),
+        Some(()),
+        "the exporter reads while a route's leg has not answered"
+    );
+    assert_eq!(read.lock().unwrap().len(), 1);
+
+    let second = opening(Arc::clone(&sessions), plan.clone());
+    routes.unanswered.send_replace(false);
+    let first = first.await.unwrap().unwrap();
+    let second = second.await.unwrap().unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    assert_eq!(routes.opened.load(Ordering::SeqCst), 1);
+    assert_eq!(sessions.view(&plan.key).await.unwrap().held, None);
+    sessions.stop_all().await;
+}
+
+// A route whose session is being built when torrents are turned off holds
+// no session: the one built stops, and its opener is told why.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_built_after_torrents_were_turned_off_is_not_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let sessions = Arc::new(Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    ));
+    sessions.set_config(any_port());
+    let plan = routes.plan(TorrentScope::Default);
+    routes.unanswered.send_replace(true);
+    let mut asked = routes.asked.subscribe();
+    let opener = {
+        let (sessions, plan) = (Arc::clone(&sessions), plan.clone());
+        tokio::spawn(async move { sessions.session(&plan, &IDENTITY.identity()).await })
+    };
+    asked.wait_for(|asked| *asked == 1).await.unwrap();
+    sessions.turn(false).await;
+    routes.unanswered.send_replace(false);
+
+    assert_eq!(
+        opener.await.unwrap().err(),
+        Some(SessionError::RouteDown(
+            TorrentRouteReason::TorrentsDisabled.into()
+        ))
+    );
+    assert!(sessions.views().await.is_empty());
+    assert!(sessions.running().await.is_empty());
+    sessions.stop_all().await;
+}
+
+// A WireGuard proxy of id 1 for `peer`, keyed as its client, which waits
+// `timeout_seconds` for the peer's handshake.
+fn wireguard_proxy(
+    peer: &weaver_tunnel::test_support::WireGuardTestPeer,
+    timeout_seconds: u32,
+) -> crate::proxies::ProxyProfile {
+    use base64::Engine;
+    let spec = peer.client_spec("route");
+    let key = |bytes: [u8; 32]| base64::engine::general_purpose::STANDARD.encode(bytes);
+    crate::proxies::ProxyProfile {
+        kind: crate::proxies::ProxyKind::WireGuard,
+        host: spec.endpoint_host.clone(),
+        port: spec.endpoint_port,
+        dns_servers: spec.dns_servers.clone(),
+        tunnel_addresses: vec![format!(
+            "{}/32",
+            weaver_tunnel::test_support::TEST_CLIENT_ADDRESS
+        )],
+        peer_public_key: Some(key(spec.peer_public_key)),
+        mtu: spec.mtu,
+        timeout_seconds,
+        secrets: crate::proxies::ProxySecrets {
+            private_key: Some(key(spec.private_key)),
+            ..Default::default()
+        },
+        ..loopback_proxy(spec.endpoint_port)
+    }
+}
+
+// A route through a WireGuard tunnel whose peer never completes the
+// handshake cannot open its session: its reason is the tunnel's hop and
+// what it came to, not the listen that failed under it, and it is logged
+// once however often the route opens again. While it opens again it reads
+// as that cause, not as opening.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_whose_tunnel_has_no_handshake_names_its_hop() {
+    use weaver_tunnel::test_support::{WireGuardTestPeer, WireGuardTestPeerOptions, test_key};
+    // The peer accepts only another client's key, so it answers nothing.
+    let peer = WireGuardTestPeer::start_with(WireGuardTestPeerOptions {
+        client_public_key: test_key(77),
+        ..WireGuardTestPeerOptions::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.through_legs.store(true, Ordering::SeqCst);
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&wireguard_proxy(&peer, 1)).unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: SYSTEM_EGRESS_ID,
+                weight: 100,
+                path: ladder(1),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let network = NetworkRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
+    routes.route(TorrentScope::Default, 1);
+    *routes.network.lock().unwrap() = Some(Arc::clone(&network));
+    let sessions = Arc::new(Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    ));
+    sessions.set_config(any_port());
+    let (lines, _guard) = crate::pipeline::graph::lines::Lines::capture_at(
+        "weaver_server_core::torrents",
+        tracing::Level::WARN,
+    );
+    let plan = routes.plan(TorrentScope::Default);
+
+    let Err(SessionError::Build(failure)) = sessions.session(&plan, &IDENTITY.identity()).await
+    else {
+        panic!("a tunnel with no handshake opens no session");
+    };
+    assert_eq!(
+        failure.reason,
+        TorrentRouteReason::LegOpenFailed,
+        "{failure:?}"
+    );
+    let detail = failure.detail.clone().unwrap();
+    assert!(
+        detail.starts_with("proxy 1: No handshake within 1 seconds."),
+        "{detail}"
+    );
+    assert_eq!(
+        sessions.view(&plan.key).await.unwrap().held,
+        Some(failure.clone())
+    );
+
+    // Opened again, it reads as the cause it last failed for while its leg
+    // has not answered, and fails for the same, said once.
+    routes.unanswered.send_replace(true);
+    let mut asked = routes.asked.subscribe();
+    let again = {
+        let sessions = Arc::clone(&sessions);
+        let plan = plan.clone();
+        tokio::spawn(async move { sessions.session(&plan, &IDENTITY.identity()).await })
+    };
+    asked.wait_for(|asked| *asked == 2).await.unwrap();
+    assert_eq!(
+        sessions.view(&plan.key).await.unwrap().held,
+        Some(failure.clone())
+    );
+    routes.unanswered.send_replace(false);
+    let Err(SessionError::Build(second)) = again.await.unwrap() else {
+        panic!("the tunnel still has no handshake");
+    };
+    assert_eq!(second, failure);
+    let heard = lines.of("a route's session could not be opened");
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(heard[0].contains("proxy 1: No handshake"), "{heard:?}");
+    sessions.stop_all().await;
+    network.shutdown().await;
+}
+
+// A network whose WireGuard proxy 1 sends its handshake to `endpoint` and
+// waits the longest a proxy may for an answer, the default scope routed
+// through it, and sessions whose legs are that route's.
+async fn opening_through_proxy_1(
+    peer: &weaver_tunnel::test_support::WireGuardTestPeer,
+    endpoint: SocketAddr,
+    dir: &Path,
+) -> (
+    Database,
+    Arc<NetworkRuntime>,
+    Arc<FakeRoutes>,
+    Arc<Sessions>,
+) {
+    let routes = Arc::new(FakeRoutes::default());
+    routes.through_legs.store(true, Ordering::SeqCst);
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&crate::proxies::ProxyProfile {
+        host: endpoint.ip().to_string(),
+        port: endpoint.port(),
+        ..wireguard_proxy(peer, 300)
+    })
+    .unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: SYSTEM_EGRESS_ID,
+                weight: 100,
+                path: ladder(1),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let network = NetworkRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    routes.route(TorrentScope::Default, 1);
+    *routes.network.lock().unwrap() = Some(Arc::clone(&network));
+    let sessions = Arc::new(Sessions::new(
+        routes.clone(),
+        env(dir),
+        Database::open_in_memory().unwrap(),
+    ));
+    sessions.set_config(any_port());
+    (db, network, routes, sessions)
+}
+
+// How many sessions are being built on the default scope's leg now.
+fn sessions_opening(network: &NetworkRuntime) -> u64 {
+    network
+        .torrent_traffic()
+        .get(&(Consumer::Torrent(TorrentScope::Default).key(), TORRENT_LEG))
+        .map_or(0, |traffic| traffic.sessions_opening)
+}
+
+// The default scope's session, opened off the caller.
+fn opening_default(
+    sessions: &Arc<Sessions>,
+    routes: &FakeRoutes,
+) -> tokio::task::JoinHandle<Result<Arc<Session>, SessionError>> {
+    let (sessions, plan) = (Arc::clone(sessions), routes.plan(TorrentScope::Default));
+    tokio::spawn(async move { sessions.session(&plan, &IDENTITY.identity()).await })
+}
+
+// A route whose tunnel is waiting on a handshake that will not come when its
+// proxy is saved with an endpoint that answers opens at once on that
+// endpoint: the save revokes the leg the open in flight waits on, which ends
+// it, and the route opens again on the proxy as saved. It never waits out
+// the handshake it was waiting on.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_save_that_changes_a_routes_tunnel_ends_its_open_in_flight() {
+    let peer = weaver_tunnel::test_support::WireGuardTestPeer::start().await;
+    // It hears the tunnel's handshake and answers nothing.
+    let silent = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (db, network, routes, sessions) =
+        opening_through_proxy_1(&peer, silent.local_addr().unwrap(), dir.path()).await;
+    let opening = opening_default(&sessions, &routes);
+    // The handshake reached the endpoint: the open is waiting on it.
+    let mut heard = [0u8; 2048];
+    silent.recv_from(&mut heard).await.unwrap();
+    assert_eq!(
+        sessions.views().await[0].held,
+        Some(OPENING),
+        "the route is opening"
+    );
+    assert_eq!(sessions_opening(&network), 1, "its leg is opening");
+
+    let mut profile = db.list_proxy_profiles().unwrap().remove(0);
+    profile.port = peer.endpoint().port();
+    profile.revision += 1;
+    db.save_proxy_profile(&profile).unwrap();
+    network.reload().await.unwrap();
+
+    assert_eq!(
+        opening.await.unwrap().err(),
+        Some(SessionError::RouteDown(REVOKED)),
+        "the open in flight ends as its leg is revoked"
+    );
+    assert_eq!(sessions.views().await[0].held, Some(REVOKED));
+    assert_eq!(sessions_opening(&network), 0);
+    let session = opening_default(&sessions, &routes).await.unwrap().unwrap();
+    assert!(!session.cancellation_token().is_cancelled());
+    let view = sessions.views().await.remove(0);
+    assert_eq!(view.held, None, "the route opened on the saved endpoint");
+    assert_eq!(sessions_opening(&network), 0, "its leg is opening no more");
+    sessions.stop_all().await;
+    network.shutdown().await;
+}
+
+// A torrent scope whose route is changed while its old route's tunnel is
+// waiting on a handshake leaves that route at once: the save revokes the
+// old leg, which ends the open in flight on it, and the new route opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_route_change_ends_the_old_routes_open_in_flight() {
+    let peer = weaver_tunnel::test_support::WireGuardTestPeer::start().await;
+    let silent = tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let (db, network, routes, sessions) =
+        opening_through_proxy_1(&peer, silent.local_addr().unwrap(), dir.path()).await;
+    db.save_proxy_profile(&crate::proxies::ProxyProfile {
+        id: 2,
+        name: "answering".into(),
+        ..wireguard_proxy(&peer, 300)
+    })
+    .unwrap();
+    network.reload().await.unwrap();
+    let opening = opening_default(&sessions, &routes);
+    let mut heard = [0u8; 2048];
+    silent.recv_from(&mut heard).await.unwrap();
+
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: SYSTEM_EGRESS_ID,
+                weight: 100,
+                path: ladder(2),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    network.reload().await.unwrap();
+    routes.route(TorrentScope::Default, 2);
+
+    assert_eq!(
+        opening.await.unwrap().err(),
+        Some(SessionError::RouteDown(REVOKED)),
+        "the old route's open ends as its leg is revoked"
+    );
+    let session = opening_default(&sessions, &routes).await.unwrap().unwrap();
+    assert!(!session.cancellation_token().is_cancelled());
+    let plan = routes.plan(TorrentScope::Default);
+    assert_eq!(sessions.view(&plan.key).await.unwrap().held, None);
+    sessions.stop_all().await;
+    network.shutdown().await;
+}
+
+// A route's proxy saved again with every field as it was keeps its revision,
+// so the reload revokes nothing: the route's session stays open on the same
+// tunnel, and no new one is built. A save that changes a field takes the
+// next revision.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_save_that_changes_nothing_leaves_the_routes_session_open() {
+    let peer = weaver_tunnel::test_support::WireGuardTestPeer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let (db, network, routes, sessions) =
+        opening_through_proxy_1(&peer, peer.endpoint(), dir.path()).await;
+    let plan = routes.plan(TorrentScope::Default);
+    let stage = |slots: &BTreeMap<RouteKey, Slot>| match slots.get(&plan.key) {
+        Some(Slot::Open { leg: Some(leg), .. }) => Arc::clone(&leg.stage),
+        _ => panic!("the route is not open on a leg"),
+    };
+    let open = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    let open_stage = stage(&*sessions.slots.lock().await);
+
+    let existing = db.list_proxy_profiles().unwrap().remove(0);
+    let resaved = crate::proxies::ProxyProfile {
+        revision: existing.saved_revision(Some(&existing)).unwrap(),
+        ..existing.clone()
+    };
+    assert_eq!(resaved.revision, existing.revision);
+    db.save_proxy_profile(&resaved).unwrap();
+    network.reload().await.unwrap();
+
+    assert!(!open_stage.is_revoked(), "the route's leg was kept");
+    assert!(sessions.outdated().await.is_empty());
+    let after = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    assert!(Arc::ptr_eq(&open, &after), "the same session");
+    assert!(Arc::ptr_eq(
+        &open_stage,
+        &stage(&*sessions.slots.lock().await)
+    ));
+    assert!(!open.cancellation_token().is_cancelled());
+
+    let changed = crate::proxies::ProxyProfile {
+        keepalive_seconds: Some(17),
+        ..existing.clone()
+    };
+    assert_eq!(
+        changed.saved_revision(Some(&existing)),
+        Some(existing.revision + 1)
+    );
+    let rekeyed = crate::proxies::ProxyProfile {
+        secrets: crate::proxies::ProxySecrets {
+            preshared_key: Some("another".into()),
+            ..existing.secrets.clone()
+        },
+        ..existing.clone()
+    };
+    assert_eq!(
+        rekeyed.saved_revision(Some(&existing)),
+        Some(existing.revision + 1)
+    );
+    assert_eq!(existing.saved_revision(None), Some(1));
+    sessions.stop_all().await;
+    network.shutdown().await;
 }
 
 // The SSL port chosen while the settings name none is chosen once, above
@@ -2765,4 +3241,133 @@ async fn several_interface_changes_before_the_follower_runs_make_one_rejoin() {
     })
     .await;
     assert_eq!(*seen.lock().unwrap(), [3], "one run, on the last set");
+}
+
+// A session on a WireGuard tunnel whose provider forwards no port listens
+// on nothing, announces no port, and says peers cannot connect in; one with
+// a forwarded port listens and announces that port.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tunnel_with_no_forwarded_port_takes_no_peers_in() {
+    use weaver_tunnel::test_support::WireGuardTestPeer;
+    let peer = WireGuardTestPeer::start_with(Default::default()).await;
+    for forwarded_port in [None, Some(47001)] {
+        let dir = tempfile::tempdir().unwrap();
+        let routes = Arc::new(FakeRoutes::default());
+        routes.through_legs.store(true, Ordering::SeqCst);
+        let db = Database::open_in_memory().unwrap();
+        db.save_proxy_profile(&crate::proxies::ProxyProfile {
+            forwarded_port,
+            ..wireguard_proxy(&peer, 10)
+        })
+        .unwrap();
+        db.save_proxy_routing_policy(
+            Consumer::Torrent(TorrentScope::Default),
+            &RoutingPolicy {
+                legs: vec![RouteLeg {
+                    egress_id: SYSTEM_EGRESS_ID,
+                    weight: 100,
+                    path: ladder(1),
+                }],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let network = NetworkRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
+        routes.route(TorrentScope::Default, 1);
+        *routes.network.lock().unwrap() = Some(Arc::clone(&network));
+        let sessions = Sessions::new(
+            routes.clone(),
+            env(dir.path()),
+            Database::open_in_memory().unwrap(),
+        );
+        sessions.set_config(any_port());
+        let plan = routes.plan(TorrentScope::Default);
+        let (lines, guard) =
+            crate::pipeline::graph::lines::Lines::capture_at("weaver", tracing::Level::INFO);
+        sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+        drop(guard);
+        let view = sessions.view(&plan.key).await.unwrap();
+        let exposure = view.exposure.unwrap();
+        // The line that says it opened says what it announces and where it
+        // takes peers in.
+        let opened = lines.of("a route's session opened");
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        match forwarded_port {
+            None => {
+                assert_eq!(view.listen, None);
+                assert_eq!((exposure.announced_port, exposure.inbound), (0, false));
+                assert!(
+                    opened[0].contains(" announced_port=0 listens=\"no\""),
+                    "{opened:?}"
+                );
+            }
+            Some(port) => {
+                assert_eq!(view.listen.map(|listen| listen.port()), Some(port));
+                assert_eq!((exposure.announced_port, exposure.inbound), (port, true));
+                let listen = view.listen.unwrap();
+                assert!(
+                    opened[0].contains(&format!(" announced_port={port} listens=\"{listen}\"")),
+                    "{opened:?}"
+                );
+            }
+        }
+        sessions.stop_all().await;
+    }
+}
+
+// A session whose sockets are all a tunnel's binds no port of the host, so
+// its route takes no port slot: a route on the host's own sockets that opens
+// after it still takes the first slot, the base port.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tunnel_session_leaves_the_hosts_ports_to_the_routes_that_bind_them() {
+    use weaver_tunnel::test_support::WireGuardTestPeer;
+    let peer = WireGuardTestPeer::start_with(Default::default()).await;
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    routes.through_legs.store(true, Ordering::SeqCst);
+    let db = Database::open_in_memory().unwrap();
+    db.save_proxy_profile(&wireguard_proxy(&peer, 10)).unwrap();
+    db.save_proxy_routing_policy(
+        Consumer::Torrent(TorrentScope::Default),
+        &RoutingPolicy {
+            legs: vec![RouteLeg {
+                egress_id: SYSTEM_EGRESS_ID,
+                weight: 100,
+                path: ladder(1),
+            }],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let network = NetworkRuntime::new(db, tokio::runtime::Handle::current()).unwrap();
+    routes.route(TorrentScope::Default, 1);
+    *routes.network.lock().unwrap() = Some(Arc::clone(&network));
+    let slots = Database::open_in_memory().unwrap();
+    let sessions = Sessions::new(routes.clone(), env(dir.path()), slots.clone());
+    sessions.set_config(any_port());
+    let tunnel = routes.plan(TorrentScope::Default);
+    sessions
+        .session(&tunnel, &IDENTITY.identity())
+        .await
+        .unwrap();
+    assert_eq!(sessions.view(&tunnel.key).await.unwrap().listen, None);
+    assert!(
+        load_slots(&slots).unwrap().is_empty(),
+        "the tunnel's route took no slot"
+    );
+
+    routes.through_legs.store(false, Ordering::SeqCst);
+    *routes.network.lock().unwrap() = None;
+    loopback_leg(&routes);
+    routes.route(TorrentScope::Category(5), 2);
+    let host = routes.plan(TorrentScope::Category(5));
+    sessions.session(&host, &IDENTITY.identity()).await.unwrap();
+    assert_eq!(
+        load_slots(&slots).unwrap(),
+        BTreeMap::from([(host.key.as_str().to_owned(), 0)]),
+        "the host's route took the first slot"
+    );
+    assert_eq!(sessions.view(&host.key).await.unwrap().port, Some(0));
+    sessions.stop_all().await;
+    network.shutdown().await;
 }

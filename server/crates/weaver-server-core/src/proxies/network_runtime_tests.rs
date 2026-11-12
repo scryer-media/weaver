@@ -2080,3 +2080,63 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
     assert_eq!(warning(&runtime), None);
     runtime.shutdown().await;
 }
+
+// Each reload that takes the saved configuration rings.
+#[tokio::test]
+async fn a_reload_that_takes_the_saved_configuration_rings() {
+    let db = Database::open_in_memory().unwrap();
+    let runtime = NetworkRuntime::new(db.clone(), tokio::runtime::Handle::current()).unwrap();
+    let mut reloads = runtime.reloads();
+    assert!(!reloads.has_changed().unwrap());
+
+    db.save_proxy_profile(&proxy()).unwrap();
+    runtime.reload().await.unwrap();
+    assert!(reloads.has_changed().unwrap());
+    assert_eq!(*reloads.borrow_and_update(), 1);
+}
+
+// A pool only torrent routes run through opens no member ahead of a dial,
+// when it starts or when its members change: each torrent session opens the
+// one member it holds. Once a server routes through it too, it opens its
+// members ahead, as a pool a consumer dials whole does.
+#[tokio::test]
+async fn a_pool_only_torrents_run_through_opens_no_member_ahead() {
+    let runtime = NetworkRuntime::new(
+        Database::open_in_memory().unwrap(),
+        tokio::runtime::Handle::current(),
+    )
+    .unwrap();
+    let timeout = Duration::from_secs(1);
+    let torrent = Consumer::Torrent(TorrentScope::Category(1));
+    let mut config = runtime.configuration.read().unwrap().clone();
+    config.profiles.insert(1, proxy());
+    config.profiles.insert(2, ProxyProfile { id: 2, ..proxy() });
+    config.pools.insert(
+        7,
+        ProxyPool {
+            id: 7,
+            name: "fixture".into(),
+            kind: ProxyKind::Socks5,
+            member_ids: vec![1],
+            enabled: true,
+        },
+    );
+    config.consumers.insert(torrent.key());
+    config.policies.insert(torrent.key(), pool_policy());
+    runtime.apply_configuration(config.clone()).unwrap();
+    runtime.route(torrent, 5, timeout).unwrap();
+    assert_eq!(running_pool(&runtime).warmings(), 0);
+
+    config.pools.get_mut(&7).unwrap().member_ids = vec![1, 2];
+    runtime.apply_configuration(config.clone()).unwrap();
+    assert_eq!(running_pool(&runtime).warmings(), 0);
+
+    config.consumers.insert(Consumer::Server(1).key());
+    config
+        .policies
+        .insert(Consumer::Server(1).key(), pool_policy());
+    runtime.apply_configuration(config).unwrap();
+    server_route(&runtime);
+    assert_eq!(running_pool(&runtime).warmings(), 2);
+    runtime.shutdown().await;
+}

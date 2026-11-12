@@ -1807,6 +1807,13 @@ impl Dialer for Fallback {
         let index = (0..self.rungs.len()).find(|index| self.allows_rung(*index, false))?;
         Arc::clone(&self.rungs[index]).inbound()
     }
+    // The failing hop of the first rung a dial would try, else of the first
+    // rung that has one.
+    fn failing_hop(&self) -> Option<FailingHop> {
+        self.answering()
+            .and_then(|index| self.rungs[index].failing_hop())
+            .or_else(|| self.rungs.iter().find_map(|rung| rung.failing_hop()))
+    }
     fn budget(&self) -> Duration {
         self.rungs.iter().fold(Duration::ZERO, |sum, rung| {
             sum.saturating_add(rung.budget())
