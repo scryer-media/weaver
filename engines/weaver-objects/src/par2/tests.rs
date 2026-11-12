@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod carriers;
+mod cross_sets;
 mod facts;
 mod per_call;
 mod range_names;
