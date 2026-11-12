@@ -1,0 +1,38 @@
+{
+  "slug": "adv-nzb-subject-traversal",
+  "title": "E2E.Adversarial.NZB.Subject.Traversal.2026-TESTGRP",
+  "description": "Loose text files whose NZB subjects are rewritten to a parent path, an absolute path, a backslash parent and a parent inside a directory, while each article's yEnc name stays true. Files are named from the subject, with each path separator made an underscore, so the job completes with the five files inside its output directory, each byte-equal to its source, and no file lands outside it.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "nzb_subject_filename_overrides": {
+    "subject-a.txt": "../../adv-nzb-subject-parent.txt",
+    "subject-b.txt": "/adv-nzb-subject-absolute.txt",
+    "subject-c.txt": "..\\..\\adv-nzb-subject-backslash.txt",
+    "subject-d.txt": "inner/../../../adv-nzb-subject-inner.txt"
+  },
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "escapeNames": [
+      "../../adv-nzb-subject-parent.txt",
+      "/adv-nzb-subject-absolute.txt",
+      "..\\..\\adv-nzb-subject-backslash.txt",
+      "inner/../../../adv-nzb-subject-inner.txt"
+    ],
+    "minOutputFiles": 5,
+    "requiredOutputs": [
+      ".._.._adv-nzb-subject-parent.txt",
+      "_adv-nzb-subject-absolute.txt",
+      ".._.._adv-nzb-subject-backslash.txt",
+      "inner_.._.._.._adv-nzb-subject-inner.txt",
+      "subject-plain.txt"
+    ]
+  },
+  "expectedOutputBLAKE3": {
+    ".._.._adv-nzb-subject-parent.txt": "6582c5ddfcd70194b0fed437e10d169db09830c03ebec592e0f50104908aa51e",
+    "_adv-nzb-subject-absolute.txt": "403b9fab9c9348cfc5351ee62c85d7e3ae5dc25d776273eed3204ce72d6a22cd",
+    ".._.._adv-nzb-subject-backslash.txt": "e615f9fb60994a3ca6c9760b327cbfed00427946441d27c493da8e695e1e74b8",
+    "inner_.._.._.._adv-nzb-subject-inner.txt": "6691b053a38d893b9e7820ec61b2c36d0c94205b024ef2affe35cabbb538eead",
+    "subject-plain.txt": "ef9a1e5fce59074b306fa71cc13283c9cc9630c8b7ca2da00a5f62e54288abe8"
+  }
+}

@@ -138,11 +138,11 @@ func AdversarialVolumeRecipes() []Recipe {
 				"of the large file has the checksums of the small file's one padded slice, so the large file is rebuilt by copying with no recovery " +
 				"block at all. The copy goes a piece at a time within the memory granted, and the job completes with both files.",
 			Build: func(_ context.Context, env *Env) error {
-				if err := writeZeros(env.OutputPath("seed.mkv"), 4<<10); err != nil {
+				if err := writeZeroFile(env.OutputPath("seed.mkv"), 4<<10); err != nil {
 					return err
 				}
 				hollow := env.StagePath("hollow/hollow.mkv")
-				if err := writeZeros(hollow, 128<<20); err != nil {
+				if err := writeZeroFile(hollow, 128<<20); err != nil {
 					return err
 				}
 				seed, err := describeForPAR2(env.OutputPath("seed.mkv"), "seed.mkv", 16<<20)
@@ -320,8 +320,8 @@ func expectStaged(name, seed string, size int64) func(context.Context, *Env) (ma
 	}
 }
 
-// writeZeros writes a file of zeros as a hole, which reads back as zeros.
-func writeZeros(path string, size int64) error {
+// writeZeroFile writes a file of zeros as a hole, which reads back as zeros.
+func writeZeroFile(path string, size int64) error {
 	file, err := os.Create(path)
 	if err != nil {
 		return err

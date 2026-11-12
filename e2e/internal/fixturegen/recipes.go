@@ -157,6 +157,8 @@ var ScenarioOnly = map[string]string{
 	"adv-password-rar4-stored":                 "stages direct-store-rar4-encrypted's volumes; the lane submits them with no password and with a wrong one",
 	"adv-password-rar4-stored-right":           "stages direct-store-rar4-encrypted's volumes with their own password, after the lane's wrong password list",
 	"adv-rar5-many-salted-entries-wrong":       "stages adv-rar5-many-salted-entries' volumes; the lane submits them with no password and with a wrong one",
+	"adv-nzb-yenc-size-lie-tail-lost":          "stages adv-nzb-yenc-size-lie-whole's payload under the same 3 GiB size lie and deletes its last article",
+	"adv-nzb-yenc-size-lie-int64":              "stages adv-nzb-yenc-size-lie-whole's payload with every header stating the largest signed 64-bit size",
 }
 
 // Recipes is the corpus, one entry per scenario directory that owns bytes.
@@ -1644,6 +1646,7 @@ func Recipes() []Recipe {
 	recipes = append(recipes, SpeedTestRecipes()...)
 	recipes = append(recipes, AdversarialRecipes()...)
 	recipes = append(recipes, AdversarialContainerRecipes()...)
+	recipes = append(recipes, AdversarialNZBRecipes()...)
 	recipes = append(recipes, GraphGapRecipes()...)
 	recipes = append(recipes, GraphBoundaryRecipes()...)
 	recipes = append(recipes, AdversarialVolumeRecipes()...)

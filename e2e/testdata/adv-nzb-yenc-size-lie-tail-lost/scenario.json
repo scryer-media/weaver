@@ -1,0 +1,26 @@
+{
+  "slug": "adv-nzb-yenc-size-lie-tail-lost",
+  "title": "Lie.Tail.S01E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "The adv-nzb-yenc-size-lie-whole payload under the same 3 GiB size lie, its last article deleted after posting and no recovery set. Health stays above the critical line, so the post is not ruled dead; the one file is not whole, so the job fails at delivery with no file delivered whole; the range the lost article covers is never written as zeros up to the stated size, so scratch stays within what was posted.",
+  "category": "2000",
+  "expected_outcome": "extraction_failure",
+  "segment_size": 262144,
+  "fixtureAssets": [
+    "adv-nzb-yenc-size-lie-whole/lie.whole.s01e02.mkv"
+  ],
+  "yencHeaderLies": [
+    {
+      "size": 3221225472
+    }
+  ],
+  "deleteSubjectContains": [
+    "lie.whole.s01e02.mkv"
+  ],
+  "deleteSubjectTailArticles": 1,
+  "adversarial": {
+    "group": "default",
+    "outcome": "failed",
+    "errorContains": "no file was delivered whole",
+    "failureKind": "unpack"
+  }
+}
