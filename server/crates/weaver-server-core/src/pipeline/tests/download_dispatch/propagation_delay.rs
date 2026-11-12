@@ -1471,7 +1471,8 @@ async fn redownload_job_rebuilds_failed_history_as_queued_download() {
         .join(job_id.0.to_string());
 
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
-    tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+    // Made and marked as a job's staging directory is.
+    crate::jobs::working_dir::make_job_staging_dir(&staging_dir, job_id).unwrap();
     tokio::fs::write(working_dir.join("partial.mkv"), b"partial")
         .await
         .unwrap();
@@ -1518,7 +1519,8 @@ async fn redownload_job_rebuilds_complete_history_as_queued_download() {
         .join(job_id.0.to_string());
 
     tokio::fs::create_dir_all(&working_dir).await.unwrap();
-    tokio::fs::create_dir_all(&staging_dir).await.unwrap();
+    // Made and marked as a job's staging directory is.
+    crate::jobs::working_dir::make_job_staging_dir(&staging_dir, job_id).unwrap();
     tokio::fs::create_dir_all(working_dir.join("subs"))
         .await
         .unwrap();

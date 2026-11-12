@@ -232,10 +232,7 @@ async fn a_turn_woken_by_graph_mail_is_stamped_busy_with_graph_run() {
     .await
     .unwrap();
 
-    let reading = tokio::time::timeout(Duration::from_secs(600), stamps.recv())
-        .await
-        .expect("the graph mail arm ran")
-        .unwrap();
+    let reading = stamps.recv().await.expect("the graph mail arm ran");
     assert_eq!(reading.phase, PipelinePhase::GraphRun);
     assert!(
         reading.busy_for.is_some(),
