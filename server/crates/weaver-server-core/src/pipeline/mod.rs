@@ -1687,6 +1687,16 @@ pub struct Pipeline {
     pub(super) propagation_delay: Duration,
     #[cfg(test)]
     pub(super) propagation_delay_forced: Option<Duration>,
+    // How deep the unservable-article booking is nested in itself now, and
+    // the deepest it has been.
+    #[cfg(test)]
+    pub(super) unservable_booking_depth: (usize, usize),
+    // Every message-id an article spent, in the order spent.
+    #[cfg(test)]
+    pub(super) spent_message_ids: Vec<String>,
+    // Queued articles the dispatch-hold reason has read.
+    #[cfg(test)]
+    pub(super) dispatch_hold_items_examined: std::sync::atomic::AtomicUsize,
     // Last time we logged a queued/no-active-download liveness stall.
     pub(super) last_download_dispatch_stall_log_at: Option<Instant>,
     // The dispatch stall the watchdog is timing toward a kick or a release.
