@@ -1603,6 +1603,57 @@ async fn a_run_refused_within_the_ceiling_starts_again_at_the_wider_window() {
     assert_eq!(pool.room().above, 0);
 }
 
+// A run reserved under a narrow profile and started once a wider profile is
+// in force holds only the window it was reserved: its decoder refuses a
+// wider frame with the sizes, the raised grant lets it have that window,
+// and the run starts again with it reserved whole from the pool, never held
+// uncharged and never failed. A refusal no wider than that then stands.
+#[tokio::test]
+async fn a_run_reserved_before_a_profile_raise_starts_again_reserved_at_the_wider_window() {
+    let raised = crate::pipeline::graph::hardware::Hardware::granting(
+        crate::pipeline::graph::hardware::Grant {
+            run: weaver_graph::Budget {
+                memory_bytes: Some(WIDE),
+                window_bytes: Some(WIDE),
+                threads: 1,
+                ..weaver_graph::Budget::default()
+            },
+            over_limit: crate::runtime::OverLimit::ScratchThenFail,
+            machine_bytes: Some(64 << 20),
+            ..Default::default()
+        },
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let pool = bounded(WIDE + RUN_OVERHEAD);
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), Arc::clone(&pool))
+        .on(over_limit(crate::runtime::OverLimit::ScratchThenFail));
+    let node = NodeId(1);
+    assert_eq!(runs.ask(node, 1), vec![node]);
+    assert_eq!(runs.reserve(node, CEILING), Reservation::Granted);
+    assert_eq!(runs.reserved(node), CEILING + RUN_OVERHEAD);
+
+    let mut runs = runs.on(raised);
+    runs.start(node, Box::new(Quiet), envelopes.shelf(node));
+    assert!(runs.widen(node, Some(WIDE), Some(2 << 30)));
+    let said = mail.recv().await.unwrap();
+    assert_eq!(runs.ended(node, said.generation, 1), vec![node]);
+    assert_eq!(pool.room().reserved, 0);
+    assert_eq!(runs.reserve(node, CEILING), Reservation::Granted);
+    assert_eq!(runs.reserved(node), WIDE + RUN_OVERHEAD);
+    assert_eq!(pool.room().reserved, WIDE + RUN_OVERHEAD);
+    assert_eq!(pool.room().above, 0);
+    runs.start(node, Box::new(Quiet), envelopes.shelf(node));
+    assert!(
+        !runs.widen(node, Some(WIDE), Some(2 << 30)),
+        "no wider than it was given"
+    );
+    let said = mail.recv().await.unwrap();
+    runs.ended(node, said.generation, 1);
+    assert_eq!(pool.room().reserved, 0);
+}
+
 // Under scratch-then-RAM a run whose decoder refused a window over the
 // ceiling is stopped, gives back what it reserved, and starts again under
 // the slot it holds, reserving the wider window in RAM above the ceiling,

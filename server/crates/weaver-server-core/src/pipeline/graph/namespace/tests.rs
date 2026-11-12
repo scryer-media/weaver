@@ -367,6 +367,8 @@ struct Seen {
     read: Option<Vec<u8>>,
     volume: Option<Vec<u8>>,
     between: Option<Box<dyn FnMut() + Send>>,
+    // What of its volume it asks to hear again once restored.
+    again: Option<ByteRange>,
 }
 
 // The repair the pretend set makes: read the named member, write a fix.
@@ -425,6 +427,15 @@ impl Object for Par {
     fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
     fn wants(&self, _: &mut Vec<Seek>) {}
     fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
+
+    fn restored(&mut self, out: &mut Vec<Emit>) {
+        if let Some(range) = self.seen.lock().unwrap().again {
+            out.push(Emit::Again {
+                volume: VolumeIndex(0),
+                range,
+            });
+        }
+    }
 
     fn locate(&self, _: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         out.push(Placement::Envelope { envelope: 0, range });
@@ -3243,6 +3254,49 @@ fn a_gone_stores_envelope_file_stays_until_the_checkpoint_saying_so_commits() {
     assert!(!job.writer.awaits_commit());
 }
 
+// A store gives its one volume back and goes. The volume's envelope is the
+// member's file again; what else the store kept goes with the store, and its
+// file stays until the checkpoint that records it gone has committed, not
+// until something else in the job is refused or the job ends.
+#[test]
+fn a_store_gone_with_a_volume_given_back_leaves_no_other_envelope() {
+    let mut job = Job::new(PLENTY);
+    let member = job.member("pack.bin", None);
+    job.send(member, 0, SIGNATURE, Provenance::Fresh);
+    let (child, volume) = job
+        .tree
+        .child_of(NodeId::ROOT, member)
+        .expect("bound to the store");
+    job.writer
+        .envelopes
+        .keep(child, 7, 0, b"other volume", Provenance::Fresh)
+        .expect("kept");
+    let other = job
+        .dir
+        .path()
+        .join(crate::pipeline::graph::envelope::envelope_name(child, 7));
+    assert!(other.exists());
+    assert_eq!(job.writer.envelopes.records(child).len(), 2);
+
+    let mut build = job.build();
+    job.writer
+        .said(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            child,
+            Emit::GiveBack(volume),
+            &mut job.out,
+        )
+        .expect("give back");
+    assert!(job.tree.buried(child));
+    assert!(job.writer.envelopes.records(child).is_empty());
+    assert!(other.exists(), "no checkpoint has said the store is gone");
+    job.commit();
+    assert!(!other.exists());
+    assert_eq!(job.file("pack.bin"), SIGNATURE);
+}
+
 // A root member recognised as the name a store's member was written under
 // takes it, since it sits higher; the store's file moves aside on disk and
 // keeps its bytes.
@@ -4334,6 +4388,85 @@ fn a_lent_repair_reads_held_bytes_in_place_and_nothing_it_does_not_ask_for() {
             )
             .expect("returned");
     }
+}
+
+// A restored set asks to hear again what arrived of its volume past the
+// front, which is held for the volume on scratch. Lending its rewalk reads
+// nothing held: the rewalk reads the bytes on scratch in place, and the
+// piece stands while the hold it read is as lent. Once that hold is
+// replaced, the same piece no longer stands, and is fetched again.
+#[test]
+fn a_rewalk_reads_scratch_in_place_and_its_piece_stands_while_the_hold_does() {
+    use crate::pipeline::graph::leaf::counting;
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    })
+    .with_set(None);
+    let volume = job.root().find_by_name("set.par2").expect("the set").id;
+    let tail = ByteRange::at(PAR2_SIGNATURE.len() as u64, 8);
+    job.writer
+        .keep_held(
+            NodeId::ROOT,
+            volume,
+            tail.start,
+            Bytes::from_static(b"recovery").into(),
+        )
+        .unwrap();
+    job.tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(volume)
+        .unwrap()
+        .coverage
+        .write(tail, Provenance::Fresh);
+    assert_eq!(job.accountant.usage().scratch, tail.len());
+    job.par.lock().unwrap().again = Some(tail);
+    let mut build = job.build();
+    let mut effects = Vec::new();
+    job.tree.restored(&mut build, &mut effects);
+    let [set] = job.tree.rewalks()[..] else {
+        panic!("one rewalk owed: {:?}", job.tree.rewalks());
+    };
+
+    let (before, _) = counting::so_far();
+    let loan = job
+        .writer
+        .lend_rewalk(&mut job.tree, set)
+        .unwrap()
+        .expect("a rewalk");
+    assert_eq!(
+        counting::so_far().0 - before,
+        0,
+        "lending reads nothing held"
+    );
+    SCRATCH_READ_MOST.set(0);
+    let mut pieces = Vec::new();
+    let whole = loan.run(&Default::default(), &mut |volume, piece, scratch| {
+        pieces.push((volume, piece, scratch));
+        true
+    });
+    assert!(whole);
+    assert_eq!(SCRATCH_READ_MOST.get(), tail.len(), "read on scratch");
+    let [(VolumeIndex(0), Ok(posted), scratch)] = &pieces[..] else {
+        panic!("one piece of the volume read back");
+    };
+    assert_eq!(posted.offset, tail.start);
+    assert_eq!(posted.bytes.as_ref(), b"recovery");
+    assert!(job.writer.scratch_stands(scratch), "the hold is as lent");
+
+    job.writer
+        .keep_held(
+            NodeId::ROOT,
+            volume,
+            tail.start,
+            Bytes::from_static(b"replaced").into(),
+        )
+        .unwrap();
+    assert!(
+        !job.writer.scratch_stands(scratch),
+        "the hold the piece read was replaced"
+    );
 }
 
 // A hold on scratch the repair read is replaced while the repair is out,

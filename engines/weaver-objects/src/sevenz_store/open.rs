@@ -15,6 +15,7 @@
 // the repaired bytes. Every candidate condemned leaves the store asking.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use sevenz_turbo::AesProperties;
 use weaver_graph::{ByteRange, Emit, Evidenced, Why};
@@ -239,9 +240,12 @@ impl SevenZipStore {
     }
 
     // Derive every folder key a candidate is waiting on, away from the
-    // loop: the folders open from them once the store is back.
-    pub(super) fn derive_due(&mut self) {
-        for index in std::mem::take(&mut self.derive_due) {
+    // loop: the folders open from them once the store is back. Once `stop`
+    // is set no further key is begun, and every candidate with a key still
+    // to derive stays due; `false` then.
+    pub(super) fn derive_due(&mut self, stop: &AtomicBool) -> bool {
+        let mut due = std::mem::take(&mut self.derive_due).into_iter();
+        while let Some(index) = due.next() {
             if index >= self.candidates.len() {
                 continue;
             }
@@ -249,11 +253,17 @@ impl SevenZipStore {
                 if self.derived.contains_key(&(index, at)) {
                     continue;
                 }
+                if stop.load(Ordering::Relaxed) {
+                    self.derive_due.insert(index);
+                    self.derive_due.extend(due);
+                    return false;
+                }
                 let key = self.folder_key(index, at, &properties).map_err(|_| ());
                 self.derived.insert((index, at), key);
             }
         }
         self.stale = true;
+        true
     }
 
     // The key for a folder, through the process's cache and sevenz-turbo's

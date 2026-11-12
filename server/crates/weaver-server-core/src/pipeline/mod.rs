@@ -584,12 +584,29 @@ impl DownloadFailureKind {
     }
 }
 
+// What a refusal for want of a selected group (412) says about the article.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) enum GroupRefusal {
+    // The failure is not a 412.
+    #[default]
+    None,
+    // The refusal teaches the server's requirement, and the next connection
+    // selects one of the work's groups before asking again. It costs the
+    // article nothing.
+    Learning,
+    // The work had no group to select, or the connection had one selected
+    // and the server refused anyway. Asking again is answered the same way,
+    // so the article pays a retry like for any other refusal.
+    Settled,
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct DownloadFailure {
     pub(super) kind: DownloadFailureKind,
     pub(super) message: String,
     pub(super) retry_after: Option<Duration>,
     pub(super) quota_rejection: Option<weaver_nntp::transfer::QuotaRejection>,
+    pub(super) group_refusal: GroupRefusal,
 }
 
 impl DownloadFailure {
@@ -599,6 +616,21 @@ impl DownloadFailure {
             message: message.into(),
             retry_after: None,
             quota_rejection: None,
+            group_refusal: GroupRefusal::None,
+        }
+    }
+
+    // Whether the article keeps its retry count for this failure.
+    pub(super) fn preserves_article_retry_budget(&self) -> bool {
+        self.kind.preserves_article_retry_budget() && self.group_refusal != GroupRefusal::Settled
+    }
+
+    // Settle a 412 the next connection cannot answer by selecting a group:
+    // `no_group` when the work lists none, `group_selected` when the
+    // connection that was refused had one selected.
+    pub(super) fn settle_group_refusal(&mut self, no_group: bool, group_selected: bool) {
+        if self.group_refusal == GroupRefusal::Learning && (no_group || group_selected) {
+            self.group_refusal = GroupRefusal::Settled;
         }
     }
 
@@ -614,6 +646,7 @@ impl DownloadFailure {
             message: message.into(),
             retry_after,
             quota_rejection: Some(rejection),
+            group_refusal: GroupRefusal::None,
         }
     }
 
@@ -708,7 +741,11 @@ impl DownloadFailure {
                 .unwrap_or(DownloadFailureKind::ContentOrProtocol),
         };
 
-        Self::new(kind, error.to_string())
+        let mut failure = Self::new(kind, error.to_string());
+        if matches!(error, NntpError::NoGroupSelected) {
+            failure.group_refusal = GroupRefusal::Learning;
+        }
+        failure
     }
 }
 

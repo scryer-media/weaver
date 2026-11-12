@@ -9,6 +9,9 @@
 // A lost input block the set carries as a Data packet, whose bytes the
 // set's own fingerprints vouch for, is input the set holds: it is written
 // back as it is and costs no recovery block.
+//
+// The set's data and recovery blocks stay in its volumes: each is read back
+// a stripe at a time as the decoder takes it, never held whole.
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
@@ -18,15 +21,17 @@ use std::sync::Arc;
 use par3_rs::evidence::{ExtentVerdict, FileEvidence, StreamingVerifier};
 use par3_rs::fft::{FftCodec, FftGeometry, FftInput};
 use par3_rs::gf::{AnyField, for_set};
+use par3_rs::ingest::PayloadRef;
 use par3_rs::layout::{BlockLayout, ExtentKind, FileExtent, FileLayout};
 use par3_rs::runtime::{EngineError, ExecutionOptions};
 use par3_rs::source::{SourceId, SourceSnapshot};
 use par3_rs::{
     CodecLimits, Decoder, FingerprintHasher, Geometry, PacketBody, Par3Set, RecoveredBlock,
-    RecoveryBlock,
 };
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{Budget, ByteRange, MemberId};
+
+use super::volumes::{Payloads, Row, Volumes};
 
 // How much of a member one verification read takes.
 pub(super) const READ: u64 = 1 << 20;
@@ -109,19 +114,15 @@ fn by_cohort(indices: &[u64], cohorts: u64) -> BTreeMap<u64, Vec<u64>> {
 
 // Recovery blocks the set can spend: computed with its one matrix, carried
 // with it, and of the set's block size. Ascending.
-pub(super) fn usable_recovery(set: &Par3Set) -> Vec<u64> {
+pub(super) fn usable_recovery(set: &Par3Set, payloads: &Payloads) -> Vec<u64> {
     let Some((matrix, _)) = Matrix::of(set) else {
         return Vec::new();
     };
-    let mut rows: Vec<u64> = set
-        .recovery_blocks()
+    let mut rows: Vec<u64> = payloads
+        .recovery
         .iter()
-        .filter(|block| {
-            block.matrix_hash() == matrix
-                && block.matrix_present()
-                && block.data_len() as u64 == set.block_size()
-        })
-        .map(|block| block.index())
+        .filter(|row| row.matrix == matrix && row.present && row.payload.len() == set.block_size())
+        .map(|row| row.index)
         .collect();
     rows.sort_unstable();
     rows.dedup();
@@ -130,22 +131,33 @@ pub(super) fn usable_recovery(set: &Par3Set) -> Vec<u64> {
 
 // The input blocks the set carries as Data packets whose bytes every
 // extent naming the block vouches for by its fingerprint. A block some
-// extent of has no fingerprint is not vouched for, and is not carried.
-fn carried<'s>(set: &'s Par3Set, layout: &BlockLayout) -> BTreeMap<u64, &'s [u8]> {
+// extent of has no fingerprint is not vouched for, and is not carried, nor
+// is one whose bytes do not read back.
+fn carried<'p>(
+    set: &Par3Set,
+    layout: &BlockLayout,
+    (payloads, volumes): (&'p Payloads, &Volumes),
+    access: &mut dyn MemberAccess,
+) -> BTreeMap<u64, &'p PayloadRef> {
     let mut carried = BTreeMap::new();
-    for packet in set.data_packets() {
-        let data = packet.data.as_slice();
-        if data.len() as u64 > set.block_size() || carried.contains_key(&packet.block_index) {
+    let mut piece = Vec::new();
+    for (index, data) in &payloads.data {
+        if data.len() > set.block_size() || carried.contains_key(index) {
             continue;
         }
-        if vouched(layout, packet.block_index, data) {
-            carried.insert(packet.block_index, data);
+        if vouched(layout, *index, (data, volumes, &mut piece), access) {
+            carried.insert(*index, data);
         }
     }
     carried
 }
 
-fn vouched(layout: &BlockLayout, block: u64, data: &[u8]) -> bool {
+fn vouched(
+    layout: &BlockLayout,
+    block: u64,
+    (data, volumes, piece): (&PayloadRef, &Volumes, &mut Vec<u8>),
+    access: &mut dyn MemberAccess,
+) -> bool {
     let Some(locations) = layout.locations(block) else {
         return false;
     };
@@ -168,10 +180,19 @@ fn vouched(layout: &BlockLayout, block: u64, data: &[u8]) -> bool {
         };
         let length = extent.range.end - extent.range.start;
         let mut hash = FingerprintHasher::new();
-        let start = (offset as usize).min(data.len());
-        let end = offset.saturating_add(length).min(data.len() as u64) as usize;
-        hash.update(&data[start..end.max(start)]);
-        hash.update_zeros(length - (end.max(start) - start) as u64);
+        let start = offset.min(data.len());
+        let end = offset.saturating_add(length).min(data.len()).max(start);
+        let mut at = start;
+        while at < end {
+            let take = (end - at).min(READ);
+            piece.resize(take as usize, 0);
+            if !volumes.read(data, at, piece, access) {
+                return false;
+            }
+            hash.update(piece);
+            at += take;
+        }
+        hash.update_zeros(length - (end - start));
         if hash.finalize() != expected {
             return false;
         }
@@ -181,7 +202,7 @@ fn vouched(layout: &BlockLayout, block: u64, data: &[u8]) -> bool {
 }
 
 pub(super) fn repair_set(
-    set: &Par3Set,
+    (set, payloads, volumes): (&Par3Set, &Payloads, &Volumes),
     bound: &BTreeMap<String, MemberId>,
     coming: bool,
     budget: Budget,
@@ -260,12 +281,12 @@ pub(super) fn repair_set(
         };
     }
     let rebuilt = count + copied.len() as u64;
-    let carried = carried(set, &layout);
+    let carried = carried(set, &layout, (payloads, volumes), access);
     let lost: Vec<u64> = lost
         .into_iter()
         .filter(|block| !carried.contains_key(block))
         .collect();
-    let available = usable_recovery(set);
+    let available = usable_recovery(set, payloads);
     let matrix = Matrix::of(set);
     let rebuilds = lost.is_empty()
         || matrix
@@ -286,6 +307,8 @@ pub(super) fn repair_set(
     };
     let solve = Solve {
         set,
+        payloads,
+        volumes,
         layout: &layout,
         bound,
         rewrite: &rewrite,
@@ -294,7 +317,9 @@ pub(super) fn repair_set(
         rows,
         limits: CodecLimits::new(memory),
     };
-    solve.write_carried(access);
+    if solve.write_carried(access).is_none() {
+        return failed(count, available.len() as u64, &proven, access);
+    }
     let solved = match &matrix {
         _ if lost.is_empty() => Some(()),
         Some((_, Matrix::Cauchy)) => solve.run(access),
@@ -473,26 +498,33 @@ fn overlap(extent: &FileExtent, stripe: &Range<u64>) -> Option<(u64, Range<usize
 // blocks the set carries, and the members the rebuilt bytes go back into.
 struct Solve<'a> {
     set: &'a Par3Set,
+    payloads: &'a Payloads,
+    volumes: &'a Volumes,
     layout: &'a BlockLayout,
     bound: &'a BTreeMap<String, MemberId>,
     rewrite: &'a BTreeSet<usize>,
-    carried: &'a BTreeMap<u64, &'a [u8]>,
+    carried: &'a BTreeMap<u64, &'a PayloadRef>,
     lost: &'a [u64],
     rows: &'a [u64],
     limits: CodecLimits,
 }
 
 impl Solve<'_> {
-    // Each carried block, into every damaged file that names it.
-    fn write_carried(&self, access: &mut dyn MemberAccess) {
+    // Each carried block, into every damaged file that names it. `None`
+    // once one does not read back.
+    fn write_carried(&self, access: &mut dyn MemberAccess) -> Option<()> {
         let whole = 0..self.set.block_size();
         let mut block = Vec::new();
         for (&index, data) in self.carried {
             block.clear();
-            block.extend_from_slice(data);
             block.resize(whole.end as usize, 0);
+            let len = usize::try_from(data.len()).ok()?;
+            if !self.volumes.read(data, 0, block.get_mut(..len)?, access) {
+                return None;
+            }
             self.put(index, &whole, &block, access);
         }
+        Some(())
     }
 
     // Each cohort with a lost block decoded on its own, a stripe at a time
@@ -517,7 +549,7 @@ impl Solve<'_> {
                 .iter()
                 .map(|index| ((index - first) / cohorts) as usize)
                 .collect();
-            let recovery: BTreeMap<usize, &RecoveryBlock> = rows
+            let recovery: BTreeMap<usize, &Row> = rows
                 .get(&cohort)?
                 .iter()
                 .map(|&row| Some(((row / cohorts) as usize, self.recovery(row)?)))
@@ -531,7 +563,6 @@ impl Solve<'_> {
                     &lost,
                     &indices,
                     |row, offset, out| {
-                        let start = offset as usize;
                         match row {
                             FftInput::Original(local) if block(local) >= coverage.end => {
                                 out.fill(0);
@@ -544,11 +575,11 @@ impl Solve<'_> {
                                 out.copy_from_slice(&bytes);
                             }
                             FftInput::Recovery(local) => {
-                                let data = recovery
-                                    .get(&local)
-                                    .and_then(|row| row.data().get(start..start + out.len()))
-                                    .ok_or_else(refused)?;
-                                out.copy_from_slice(data);
+                                let row = recovery.get(&local).ok_or_else(refused)?;
+                                let mut access = access.borrow_mut();
+                                if !self.volumes.read(&row.payload, offset, out, *access) {
+                                    return Err(refused());
+                                }
                             }
                         }
                         Ok(())
@@ -566,11 +597,11 @@ impl Solve<'_> {
 
     // The recovery block a row names, of the set's block size: a set may
     // carry two copies of one block.
-    fn recovery(&self, row: u64) -> Option<&RecoveryBlock> {
-        self.set
-            .recovery_blocks()
+    fn recovery(&self, row: u64) -> Option<&Row> {
+        self.payloads
+            .recovery
             .iter()
-            .find(|block| block.index() == row && block.data_len() as u64 == self.set.block_size())
+            .find(|block| block.index == row && block.payload.len() == self.set.block_size())
     }
 
     // The decoder holds two buffers per lost block and the matrix over them,
@@ -621,10 +652,16 @@ impl Solve<'_> {
             self.assemble(block, stripe, &mut bytes, access)?;
             decoder.add_input(block, &bytes)?;
         }
-        let range = stripe.start as usize..stripe.end as usize;
+        bytes.resize((stripe.end - stripe.start) as usize, 0);
         for &row in self.rows {
             let recovery = self.recovery(row)?;
-            decoder.add_recovery(row, recovery.data().get(range.clone())?)?;
+            if !self
+                .volumes
+                .read(&recovery.payload, stripe.start, &mut bytes, access)
+            {
+                return None;
+            }
+            decoder.add_recovery(row, &bytes)?;
         }
         decoder.solve()
     }
@@ -641,10 +678,10 @@ impl Solve<'_> {
         bytes.clear();
         bytes.resize((stripe.end - stripe.start) as usize, 0);
         if let Some(data) = self.carried.get(&block) {
-            let start = (stripe.start as usize).min(data.len());
-            let end = (stripe.end as usize).min(data.len());
-            bytes[..end - start].copy_from_slice(&data[start..end]);
-            return Some(());
+            let start = stripe.start.min(data.len());
+            let end = stripe.end.min(data.len());
+            let into = bytes.get_mut(..(end - start) as usize)?;
+            return self.volumes.read(data, start, into, access).then_some(());
         }
         let Some(locations) = self.layout.locations(block) else {
             return Some(());

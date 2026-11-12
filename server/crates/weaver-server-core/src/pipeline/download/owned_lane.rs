@@ -235,6 +235,12 @@ enum OwnedLanePoolCommand {
 struct CachedOwnedLane {
     nntp: Arc<weaver_nntp::NntpClient>,
     lane: weaver_nntp::blocking::BlockingBodyLane,
+    // The server had proven before this connection was dialled that it
+    // refuses message-id fetches without a selected group, so the
+    // connection selects one of the groups of every lease that lists any.
+    group_required_at_dial: bool,
+    // The connection has a group selected.
+    group_selected: bool,
 }
 
 // What a warm dial needs: the article exclusions and size a lease for this
@@ -1010,6 +1016,24 @@ fn answer_idle_command(
 }
 
 impl CachedOwnedLane {
+    // A connection just dialled for `groups`. `group_required_at_dial` is
+    // read before the dial: the requirement is only ever learned, never
+    // forgotten, so a dial that started after it was learned selected a
+    // group whenever it was given one.
+    fn dialled(
+        nntp: Arc<weaver_nntp::NntpClient>,
+        lane: weaver_nntp::blocking::BlockingBodyLane,
+        group_required_at_dial: bool,
+        groups: &[String],
+    ) -> Self {
+        Self {
+            nntp,
+            lane,
+            group_required_at_dial,
+            group_selected: group_required_at_dial && !groups.is_empty(),
+        }
+    }
+
     // Whether this connection can carry `lease` without redialling.
     //
     // The lease's newsgroups are not a condition: a socket opened for one
@@ -1059,8 +1083,35 @@ impl CachedOwnedLane {
     // nothing. `Err` means the socket could not be re-pointed and is no
     // longer worth keeping.
     fn adopt_groups(&mut self, groups: &[String]) -> weaver_nntp::Result<()> {
-        self.lane.adopt_groups(groups)
+        self.lane.adopt_groups(groups)?;
+        if !groups.is_empty() {
+            self.group_selected |= self.group_required_at_dial;
+        }
+        Ok(())
     }
+}
+
+// Whether server `idx` has proven it refuses message-id fetches without a
+// selected group.
+fn server_requires_group(nntp: &weaver_nntp::NntpClient, idx: usize) -> bool {
+    nntp.pool().server_configs().get(idx).is_some_and(|config| {
+        weaver_nntp::server_caps::requires_group_selection(&config.host, config.port)
+    })
+}
+
+// The servers that have proven they refuse message-id fetches without a
+// selected group, one bit per server position. A server past the mask reads
+// as not requiring one, which leaves its refusals free.
+fn servers_requiring_group(nntp: &weaver_nntp::NntpClient) -> u64 {
+    nntp.pool()
+        .server_configs()
+        .iter()
+        .take(u64::BITS as usize)
+        .enumerate()
+        .filter(|(_, config)| {
+            weaver_nntp::server_caps::requires_group_selection(&config.host, config.port)
+        })
+        .fold(0, |mask, (idx, _)| mask | (1 << idx))
 }
 
 fn cached_lane_matches_selection(
@@ -1095,9 +1146,10 @@ fn warm_cached_lane(cached_lane: &mut Option<CachedOwnedLane>, warm: OwnedLaneWa
         byte_estimate,
         seat,
     } = warm;
+    let group_required = server_requires_group(&nntp, seat.0);
     match nntp.try_warm_blocking_body_lane(&[], &exclude_servers, byte_estimate, seat) {
         Ok(lane) => {
-            *cached_lane = Some(CachedOwnedLane { nntp, lane });
+            *cached_lane = Some(CachedOwnedLane::dialled(nntp, lane, group_required, &[]));
         }
         Err(error) => {
             // A refused warm costs nothing: the worker is simply still
@@ -1129,6 +1181,7 @@ fn ask_owned_lane_probe(
         let exclude: Vec<usize> = (0..probe.nntp.pool().server_count())
             .filter(|server| *server != probe.seat.0)
             .collect();
+        let group_required = server_requires_group(&probe.nntp, probe.seat.0);
         let dialled = acquire_owned_lane_through_contention(
             || true,
             || {
@@ -1139,10 +1192,12 @@ fn ask_owned_lane_probe(
         );
         match dialled {
             Ok(lane) => {
-                *cached_lane = Some(CachedOwnedLane {
-                    nntp: Arc::clone(&probe.nntp),
+                *cached_lane = Some(CachedOwnedLane::dialled(
+                    Arc::clone(&probe.nntp),
                     lane,
-                });
+                    group_required,
+                    &[],
+                ));
             }
             // A busy health state or a seat not free yet is the wait a lease
             // the scheduler takes back makes, not an answer from the server.
@@ -1500,6 +1555,9 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 .expect("owned download lease must contain work")
                 .byte_estimate,
         );
+        // The dial picks its own server, so the requirement is read for
+        // every server before it.
+        let group_required = servers_requiring_group(&nntp);
         let dialled = acquire_owned_lane_through_contention(
             || lease_is_current(&state, &nntp, &lease),
             || {
@@ -1512,10 +1570,14 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         );
         match dialled {
             Ok(lane) => {
-                *cached_lane = Some(CachedOwnedLane {
-                    nntp: Arc::clone(&nntp),
+                let server = lane.server_id().0;
+                let required = server < u64::BITS as usize && group_required & (1 << server) != 0;
+                *cached_lane = Some(CachedOwnedLane::dialled(
+                    Arc::clone(&nntp),
                     lane,
-                });
+                    required,
+                    lease_groups(&lease),
+                ));
             }
             Err(error) => {
                 let _ =
@@ -1534,10 +1596,11 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
         return;
     }
 
-    let lane = &mut cached_lane
+    let cached = cached_lane
         .as_mut()
-        .expect("owned lane cache populated before run")
-        .lane;
+        .expect("owned lane cache populated before run");
+    let group_selected = cached.group_selected;
+    let lane = &mut cached.lane;
     let server_idx = lane.server_id().0;
     let supports_pipelining = lane.supports_pipelining();
     let recovery_probe = lane.is_recovery_probe();
@@ -1711,6 +1774,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                     connection_discarded: discarded,
                 },
                 &work_context.retention_excludes,
+                group_selected,
             );
             if matches!(stop, Some(LaneStop::PolicyBlocked)) && egress_quota_refused(&result.data) {
                 stop = Some(LaneStop::EgressQuota);
@@ -1874,6 +1938,7 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
                 connection_discarded: meta.connection_discarded,
             },
             &work_context.retention_excludes,
+            group_selected,
         );
         let keeps_connection = download_outcome_keeps_connection(&result.data);
         let policy_blocked = matches!(
@@ -2160,6 +2225,7 @@ pub(in crate::pipeline) fn credit_transfer(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn result_from_trace(
     mut work: DownloadWork,
     runtime_generation: u64,
@@ -2168,6 +2234,7 @@ fn result_from_trace(
     trace: weaver_nntp::client::DecodedBodyTrace,
     mut observation: DownloadLaneObservation,
     retention_excludes: &[usize],
+    group_selected: bool,
 ) -> DownloadResult {
     let segment_id = work.segment_id;
     let retry_count = work.retry_count;
@@ -2177,7 +2244,7 @@ fn result_from_trace(
     // fetched.
     let is_recovery = work.is_recovery;
     let completion_critical = work.completion_critical;
-    let (data, attempts, source_server_idx) =
+    let (mut data, attempts, source_server_idx) =
         Pipeline::download_data_from_decoded_trace(segment_id, trace);
     if let Some(counters) = &work.counters {
         credit_transfer(counters, &data);
@@ -2188,6 +2255,10 @@ fn result_from_trace(
     if !download_outcome_keeps_connection(&data) {
         observation.batch_clean = false;
         observation.connection_discarded = true;
+        // A 412 dirties the batch too, so it is settled here.
+        if let Err(DownloadError::Fetch(failure)) = &mut data {
+            failure.settle_group_refusal(work.groups.is_empty(), group_selected);
+        }
     }
     DownloadResult {
         lane_id,
@@ -2415,6 +2486,7 @@ mod tests {
             },
             observation,
             &old.retention_excludes,
+            false,
         );
 
         assert_eq!(
@@ -2477,6 +2549,7 @@ mod tests {
                 connection_discarded: false,
             },
             &context.retention_excludes,
+            false,
         );
 
         assert_eq!(
@@ -2821,6 +2894,7 @@ mod tests {
                 connection_discarded: false,
             },
             &[],
+            false,
         );
 
         // The work item itself still fails, so the completion path excludes
@@ -2922,6 +2996,7 @@ mod tests {
                 connection_discarded: false,
             },
             &[],
+            false,
         );
 
         assert!(matches!(
@@ -2935,6 +3010,125 @@ mod tests {
         assert!(observation.batch_clean);
         assert!(!observation.connection_discarded);
         assert_eq!(observation.unresolved_count, 0);
+    }
+
+    fn group_refusal_result(work: DownloadWork, group_selected: bool) -> DownloadFailure {
+        let result = result_from_trace(
+            work,
+            0,
+            0,
+            JobId(42),
+            weaver_nntp::client::DecodedBodyTrace {
+                attempts: Vec::new(),
+                result: Err(weaver_nntp::client::DecodedBodyError::Nntp(
+                    weaver_nntp::NntpError::NoGroupSelected,
+                )),
+            },
+            DownloadLaneObservation {
+                server_idx: Some(0),
+                mode: DownloadLaneMode::Sequential,
+                supports_pipelining: true,
+                latency_sample: None,
+                cold: false,
+                transfer: None,
+                payload_bytes: 0,
+                policy_elapsed: Duration::ZERO,
+                pressure_clear: true,
+                fed: false,
+                batch_complete: true,
+                batch_clean: true,
+                unresolved_count: 0,
+                connection_discarded: false,
+            },
+            &[],
+            group_selected,
+        );
+        let observation = result.lane_observation.unwrap();
+        assert!(
+            observation.connection_discarded,
+            "a 412 still drops the socket"
+        );
+        match result.data {
+            Err(DownloadError::Fetch(failure)) => {
+                assert_eq!(failure.kind, DownloadFailureKind::ConnectionEstablishment);
+                failure
+            }
+            _ => panic!("a 412 is a fetch failure"),
+        }
+    }
+
+    // The first 412 a server gives teaches it needs GROUP; the next
+    // connection selects one of the work's groups, so it costs the article
+    // nothing. A 412 with no group to select, or one given while a group was
+    // selected, is answered the same way every time, so it costs a retry.
+    #[test]
+    fn a_412_is_free_only_while_the_next_connection_can_select_a_group() {
+        let learning = group_refusal_result(tail_work(1, 0), false);
+        assert_eq!(learning.group_refusal, GroupRefusal::Learning);
+        assert!(learning.preserves_article_retry_budget());
+
+        let selected = group_refusal_result(tail_work(1, 0), true);
+        assert_eq!(selected.group_refusal, GroupRefusal::Settled);
+        assert!(!selected.preserves_article_retry_budget());
+
+        for group_selected in [false, true] {
+            let mut work = tail_work(1, 0);
+            work.groups = Arc::from(Vec::<String>::new());
+            let no_group = group_refusal_result(work, group_selected);
+            assert_eq!(no_group.group_refusal, GroupRefusal::Settled);
+            assert!(!no_group.preserves_article_retry_budget());
+        }
+    }
+
+    // Settling looks only at 412s: every other failure keeps its kind's
+    // retry-budget verdict whatever the work's groups.
+    #[test]
+    fn settling_a_group_refusal_leaves_other_failures_alone() {
+        for error in [
+            weaver_nntp::NntpError::Timeout,
+            weaver_nntp::NntpError::ConnectionClosed,
+            weaver_nntp::NntpError::ArticleNotFound,
+            weaver_nntp::NntpError::AuthenticationFailed,
+        ] {
+            let mut failure = DownloadFailure::from_nntp(error);
+            let before = failure.preserves_article_retry_budget();
+            failure.settle_group_refusal(true, true);
+            assert_eq!(failure.group_refusal, GroupRefusal::None);
+            assert_eq!(failure.preserves_article_retry_budget(), before);
+        }
+    }
+
+    // The requirement is read per server position, before a dial picks one.
+    #[test]
+    fn servers_requiring_group_marks_only_the_servers_that_proved_it() {
+        let server = |host: &str| weaver_nntp::ServerPoolConfig {
+            max_connections: 1,
+            ..weaver_nntp::ServerPoolConfig::new(weaver_nntp::ServerConfig {
+                host: host.to_string(),
+                port: 1,
+                tls: false,
+                ..Default::default()
+            })
+        };
+        let nntp = weaver_nntp::client::NntpClient::new(weaver_nntp::client::NntpClientConfig {
+            servers: vec![
+                server("free-fetch.owned-lane.invalid"),
+                server("group-required.owned-lane.invalid"),
+            ],
+            ..weaver_nntp::client::NntpClientConfig::single(weaver_nntp::ServerConfig::default(), 1)
+        });
+        assert_eq!(servers_requiring_group(&nntp), 0);
+        assert!(!server_requires_group(&nntp, 1));
+
+        weaver_nntp::server_caps::note_group_required("group-required.owned-lane.invalid", 1);
+
+        assert_eq!(servers_requiring_group(&nntp), 0b10);
+        assert!(!server_requires_group(&nntp, 0));
+        assert!(server_requires_group(&nntp, 1));
+        assert!(
+            !server_requires_group(&nntp, 2),
+            "past the pool reads as not required"
+        );
     }
 
     #[test]

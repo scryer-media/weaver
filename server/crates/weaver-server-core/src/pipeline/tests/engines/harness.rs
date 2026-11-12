@@ -969,7 +969,8 @@ pub(in crate::pipeline::tests) struct GraphView {
     // look.
     pub(in crate::pipeline::tests) checkpoints: crate::pipeline::graph::checkpoint::Tally,
     // The most the live namespaces objects produced kept resident for their
-    // members at any look, summed from the tree.
+    // members, with the name ledger for the parts of its paths, at any
+    // look, summed from the tree.
     pub(in crate::pipeline::tests) resident: u64,
     // The time the looks themselves took, which a run's time is not.
     pub(in crate::pipeline::tests) observed: std::time::Duration,
@@ -1803,7 +1804,8 @@ pub(in crate::pipeline::tests) fn observe(
                 .records()
                 .map(|record| namespace.resident(record.id))
         })
-        .sum();
+        .sum::<u64>()
+        + tree.names_resident();
     view.resident = view.resident.max(resident);
     let held = tree
         .live()

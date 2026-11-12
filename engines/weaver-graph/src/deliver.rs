@@ -341,6 +341,16 @@ pub enum Emit {
         volume: VolumeIndex,
         range: ByteRange,
     },
+    // "My volumes from `first` up to `end` never came, and I hold nothing
+    // of any of them": each is bad at `range`, as a `Damaged` for each
+    // would say, in one report however many volumes the run spans. A
+    // volume of the run its object holds anything of is said by `Damaged`
+    // instead, since only a volume held places anywhere.
+    Gap {
+        first: VolumeIndex,
+        end: VolumeIndex,
+        range: ByteRange,
+    },
     // "I cannot read further without a password."
     NeedsPassword,
     // "This is readable, but not by streaming; hand it to an engine."

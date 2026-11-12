@@ -27,7 +27,7 @@ pub(super) fn limits(edit: impl FnOnce(&mut ExtractionLimits)) -> ExtractionLimi
     let mut limits = ExtractionLimits {
         max_job_bytes: 2 * 1024 * GIB,
         max_member_bytes: 1024 * GIB,
-        max_entries: 100_000,
+        max_entries: 1_000_000,
         max_ratio: 100,
         ratio_floor_bytes: 1 << 30,
         max_seconds: 43_200,
@@ -182,6 +182,42 @@ async fn an_archive_past_the_entry_cap_fails_naming_entries() {
         .limits(limits(|limits| limits.max_entries = 3));
     let graph = run(&scenario).await;
     assert_refused(&graph, "entries");
+}
+
+// One member in `lantern.tar`, named `levels` directories deep.
+fn deep_scenario(levels: usize, edit: impl FnOnce(&mut ExtractionLimits)) -> Scenario {
+    let name = format!("{}beacon.bin", "a/".repeat(levels));
+    let archive = tar(&[(name.as_str(), payload(ARTICLE + 1, 76))]);
+    Scenario::new(vec![Post::plain("lantern.tar", archive)]).limits(limits(edit))
+}
+
+// A name two thousand directories deep keeps about eight KiB of text in its
+// record, far under the limit; the part of the name ledger each directory
+// takes passes it, so the job is refused naming memory. A name eight
+// directories deep under the same limit completes.
+#[tokio::test]
+async fn a_name_whose_path_parts_pass_the_memory_limit_fails_naming_memory() {
+    const LIMIT: u64 = 128 * 1024;
+    let refused = run(&deep_scenario(2_000, |limits| {
+        limits.max_memory_bytes = LIMIT
+    }))
+    .await;
+    assert_refused(&refused, "memory");
+    let shallow = run(&deep_scenario(8, |limits| limits.max_memory_bytes = LIMIT)).await;
+    assert!(
+        shallow.completed(),
+        "{:?} {:?}",
+        shallow.status,
+        shallow.failure
+    );
+    assert!(
+        shallow
+            .files
+            .keys()
+            .any(|path| path.ends_with("a/a/a/a/a/a/a/a/beacon.bin")),
+        "{:?}",
+        shallow.files.keys()
+    );
 }
 
 // `beacon.bin` inside `levels` stored RARs, each the only member of the one
