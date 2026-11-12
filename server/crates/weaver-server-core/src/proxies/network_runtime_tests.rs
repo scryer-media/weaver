@@ -2009,7 +2009,7 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
         shares(&runtime, 256),
         SocketShares {
             nntp: 101,
-            torrent: 118,
+            torrent: 86,
             core: 13,
             http: 8
         }
@@ -2029,7 +2029,7 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
     assert_eq!(
         warning(&runtime).as_deref(),
         Some(
-            "WireGuard proxy 1 holds torrent peers over TCP to 118 of 200; the rest connect over uTP."
+            "WireGuard proxy 1 holds torrent peers over TCP to 86 of 200; the rest connect over uTP."
         )
     );
 
@@ -2039,7 +2039,7 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
         shares(&runtime, 256),
         SocketShares {
             nntp: 51,
-            torrent: 168,
+            torrent: 136,
             core: 13,
             http: 8
         }
@@ -2050,7 +2050,7 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
     // leave, and every leg over it says so beside any other warning.
     budget(&mut config, 230);
     runtime.apply_configuration(config.clone()).unwrap();
-    let over = "Usenet servers ask 231 sockets of WireGuard proxy 1 on egress 0, 37 are reserved and 16 kept for torrent peers, over the 256 it holds; usenet is held to 203.";
+    let over = "Usenet servers ask 231 sockets of WireGuard proxy 1 on egress 0, 69 are reserved and 16 kept for torrent peers, over the 256 it holds; usenet is held to 171.";
     assert_eq!(
         warning(&runtime).as_deref(),
         Some(format!("{over} WireGuard proxy 1 holds torrent peers over TCP to 16 of 200; the rest connect over uTP.").as_str())
@@ -2072,9 +2072,9 @@ async fn wireguard_sessions_hold_their_sockets_to_the_routes_shares() {
         shares(&runtime, 512),
         SocketShares {
             nntp: 51,
-            torrent: 397,
+            torrent: 368,
             core: 13,
-            http: 19
+            http: 16
         }
     );
     assert_eq!(warning(&runtime), None);

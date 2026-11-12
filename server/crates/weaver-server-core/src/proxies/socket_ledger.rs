@@ -9,9 +9,11 @@
 // for the rest. A sixteenth is never handed out, so sockets closed but still
 // lingering in the tunnel never leave a new one without room. The tunnel's
 // own sockets (name lookups, probes, and each torrent session's datagram
-// sockets) are counted from the routes that reach it, and HTTP (trackers,
-// web seeds, feeds) has what else the reserve holds, so a tracker storm
-// never takes the sockets DHT and uTP bind. A tunnel whose own sockets need
+// sockets and listeners) are counted from the routes that reach it, and HTTP
+// (trackers, web seeds, feeds) has what else the reserve holds, so a tracker
+// storm never takes the sockets DHT and uTP bind. A listener's sockets are
+// held for as long as it listens and never through a share, so the reserve
+// keeps them and no share hands them out. A tunnel whose own sockets need
 // more than the eighth reserves more. Torrent peers over TCP take what is
 // left; once that is full they connect over uTP, which needs no socket of
 // its own.
@@ -22,7 +24,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use weaver_tunnel::pipe::SocketShares;
+use weaver_tunnel::pipe::{LISTEN_BACKLOG, SocketShares};
 
 use super::{
     Consumer, Failover, LegPath, NetworkRefusal, ProxyKind, ProxyPool, ProxyProfile, Route, Rung,
@@ -40,7 +42,20 @@ pub const SOCKET_CORE_BASE: usize = 8;
 // life: uTP for its peer listener (or for outgoing peers when it does not
 // listen), uTP for its SSL listener, DHT, UDP trackers, and the NAT-PMP
 // mapping of a provider that forwards its port that way.
-pub const SOCKETS_PER_TORRENT_SESSION: usize = 5;
+pub const DATAGRAMS_PER_TORRENT_SESSION: usize = 5;
+
+// The TCP listeners one torrent session opens on a tunnel: its peer
+// listener, and its SSL listener when SSL torrents are on. Each holds the
+// tunnel's listen backlog in sockets for as long as it listens.
+pub const LISTENERS_PER_TORRENT_SESSION: usize = 2;
+
+// The sockets one torrent session's listeners hold on a tunnel.
+pub const LISTENING_PER_TORRENT_SESSION: usize = LISTENERS_PER_TORRENT_SESSION * LISTEN_BACKLOG;
+
+// Every socket one torrent session holds on a tunnel for its whole life: its
+// datagram sockets and its listeners' sockets.
+pub const SOCKETS_PER_TORRENT_SESSION: usize =
+    DATAGRAMS_PER_TORRENT_SESSION + LISTENING_PER_TORRENT_SESSION;
 
 // The fewest HTTP sockets a tunnel keeps however many torrent sessions it
 // carries.
@@ -52,9 +67,16 @@ pub fn socket_http_floor(cap: usize) -> usize {
     SOCKET_HTTP_FLOOR.max(cap / 32)
 }
 
-// The tunnel's own sockets when `torrent_sessions` torrent sessions use it.
+// The tunnel's own sockets when `torrent_sessions` torrent sessions use it,
+// their listeners' sockets among them.
 pub fn socket_core(torrent_sessions: usize) -> usize {
     SOCKET_CORE_BASE + SOCKETS_PER_TORRENT_SESSION * torrent_sessions
+}
+
+// The sockets the listeners of `torrent_sessions` torrent sessions hold on a
+// tunnel, which no share hands out.
+pub fn socket_listening(torrent_sessions: usize) -> usize {
+    LISTENING_PER_TORRENT_SESSION * torrent_sessions
 }
 
 // The sockets a tunnel of `cap` reserves for everything but usenet and
@@ -119,17 +141,20 @@ impl TunnelSockets {
         self.nntp + self.reserve() + self.peer_floor() > self.cap
     }
 
-    // The shares the session holds its sockets to. A tunnel over budget,
-    // as one becomes when the hardware profile lowers the cap under a saved
-    // configuration, holds usenet to what the reserve and the peer floor
-    // leave.
+    // The shares the session holds its sockets to. The torrent sessions'
+    // listeners hold their sockets outside every share, so the reserve
+    // hands out what is left of it once they and the lingering sockets are
+    // kept. A tunnel over budget, as one becomes when the hardware profile
+    // lowers the cap under a saved configuration, holds usenet to what the
+    // reserve and the peer floor leave.
     pub fn shares(&self) -> SocketShares {
         let reserve = self.reserve().min(self.cap);
         let nntp = self
             .nntp
             .min(self.cap.saturating_sub(reserve + self.peer_floor()));
-        let handed = reserve.saturating_sub(socket_linger(self.cap));
-        let core = self.core().min(handed);
+        let listening = socket_listening(self.torrent_sessions);
+        let handed = reserve.saturating_sub(socket_linger(self.cap) + listening);
+        let core = (self.core() - listening).min(handed);
         SocketShares {
             nntp,
             torrent: self.cap - reserve - nntp,
