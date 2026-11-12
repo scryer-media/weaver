@@ -1901,6 +1901,23 @@ impl SchedulerHandle {
         crate::e2e_failpoint::release_shutdown_holds();
         Ok(())
     }
+
+    // What the diagnostics package can say about the pipeline when it does
+    // not answer: the queue's shared rows and the pipeline's turn stamp,
+    // read as of `now`. Nothing here waits on the pipeline.
+    pub fn pipeline_unanswered_state(
+        &self,
+        now: std::time::Instant,
+    ) -> (
+        crate::pipeline::diagnostics::QueueStateCounts,
+        crate::operations::instrumentation::PipelineTurnReading,
+    ) {
+        let queue = self
+            .state
+            .queue
+            .read(crate::pipeline::diagnostics::QueueStateCounts::read);
+        (queue, self.state.metrics().pipeline_turn.read(now))
+    }
 }
 
 #[cfg(test)]

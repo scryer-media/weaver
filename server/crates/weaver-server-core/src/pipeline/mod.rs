@@ -1348,6 +1348,12 @@ pub struct Pipeline {
     pub(super) graph_decode: Arc<graph::engine::DecodePool>,
     // Where the engines graph jobs run say what they found.
     pub(super) graph_runs: graph::engine::RunMail,
+    // Where a test hears the turn stamp as the select arm handling graph mail
+    // left it, so the stamp of a turn woken by that mail can be pinned.
+    #[cfg(test)]
+    pub(super) graph_mail_stamps: Option<
+        tokio::sync::mpsc::UnboundedSender<crate::operations::instrumentation::PipelineTurnReading>,
+    >,
     // Each graph job's health probe, and where its rounds say what they
     // found.
     pub(super) post_probes: post_health::Probes,

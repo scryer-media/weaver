@@ -170,6 +170,80 @@ async fn idle_pipeline_records_production_turn_histogram() {
     );
 }
 
+// The loop stamps its turns where the handle reads them: once the pipeline
+// has stopped, turns have completed, none is in progress, and the last one
+// to close counted the jobs it had installed.
+#[tokio::test(start_paused = true)]
+async fn idle_pipeline_stamps_its_turns_where_the_handle_reads_them() {
+    use crate::operations::instrumentation::PipelinePhase;
+
+    let pipeline = idle_pipeline(2, Vec::new(), |_| {}).await;
+    let handle = pipeline.handle.clone();
+    let mut events = handle.subscribe_events();
+    handle.pause_all().await.unwrap();
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::GlobalPaused) {}
+    pipeline.shutdown().await;
+
+    let (queue, turn) = handle.pipeline_unanswered_state(std::time::Instant::now());
+    assert_eq!(turn.phase, PipelinePhase::BetweenTurns);
+    assert_eq!(turn.busy_for, None);
+    assert!(turn.turns_completed > 0);
+    assert!(turn.since_last_turn_ended.is_some());
+    assert_eq!(turn.installed_jobs, Some(2));
+    assert_eq!(queue.jobs, 2);
+    assert_eq!(queue.jobs_by_status.count("paused"), 2.0);
+    assert!(queue.global_paused);
+}
+
+// Graph mail that ends the wait (a run or repair reporting back) makes the
+// turn busy under its own phase, as every other event does.
+#[tokio::test(start_paused = true)]
+async fn a_turn_woken_by_graph_mail_is_stamped_busy_with_graph_run() {
+    use crate::operations::instrumentation::PipelinePhase;
+    use crate::pipeline::graph::engine::{Heard, Said};
+
+    let (stamps_tx, mut stamps) = tokio::sync::mpsc::unbounded_channel();
+    let mut mail = None;
+    let pipeline = idle_pipeline(0, Vec::new(), |pipeline| {
+        pipeline.graph_mail_stamps = Some(stamps_tx);
+        mail = Some(pipeline.graph_runs.sender());
+    })
+    .await;
+    let mail = mail.unwrap();
+    let mut events = pipeline.handle.subscribe_events();
+    pipeline.handle.pause_all().await.unwrap();
+    while !matches!(events.recv().await.unwrap(), PipelineEvent::GlobalPaused) {}
+
+    // Mail that is already waiting when a turn opens is heard before the
+    // wait; only mail arriving during the wait reaches the select arm.
+    let turn = &pipeline.shared_state.metrics().pipeline_turn;
+    let mut yields = 0;
+    while turn.read(std::time::Instant::now()).phase != PipelinePhase::WaitingForWork {
+        yields += 1;
+        assert!(yields < 100_000, "the pipeline never reached its wait");
+        tokio::task::yield_now().await;
+    }
+    mail.send(Said {
+        scope: 92_099,
+        node: weaver_graph::NodeId(1),
+        generation: 0,
+        heard: Heard::Ended,
+    })
+    .await
+    .unwrap();
+
+    let reading = tokio::time::timeout(Duration::from_secs(600), stamps.recv())
+        .await
+        .expect("the graph mail arm ran")
+        .unwrap();
+    assert_eq!(reading.phase, PipelinePhase::GraphRun);
+    assert!(
+        reading.busy_for.is_some(),
+        "the turn is busy while it handles the mail"
+    );
+    pipeline.shutdown().await;
+}
+
 #[tokio::test]
 async fn idle_footprint_tick_tracks_queue_edits_while_globally_paused() {
     let temp = tempfile::tempdir().unwrap();

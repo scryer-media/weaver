@@ -2944,3 +2944,34 @@ fn a_sync_write_returns_its_connection_without_another_job() {
         std::thread::yield_now();
     }
 }
+
+// A scratch database's storage facts are read without a write: its files
+// measured where they are, its page layout and journal mode as SQLite
+// reports them.
+#[test]
+fn sqlite_storage_facts_read_a_scratch_database() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("storage-facts.db");
+    let db = Database::open(&path).unwrap();
+
+    let sizes = db.sqlite_file_sizes().expect("a SQLite database has files");
+    let main_len = std::fs::metadata(&path).unwrap().len();
+    assert_eq!(sizes.database_file, SqliteFileSize::Present(main_len));
+    assert!(main_len > 0);
+    for (name, file) in [("wal", &sizes.wal_file), ("shm", &sizes.shm_file)] {
+        assert!(
+            !matches!(file, SqliteFileSize::Unreadable(_)),
+            "{name}: {file:?}"
+        );
+    }
+    let facts = db.sqlite_page_facts().expect("a SQLite database has pages");
+    let page_size = facts.page_size.clone().unwrap();
+    assert!(
+        page_size.is_power_of_two() && page_size >= 512,
+        "{page_size}"
+    );
+    assert!(facts.page_count.clone().unwrap() > 0);
+    assert!(facts.freelist_count.clone().unwrap() <= facts.page_count.clone().unwrap());
+    assert_eq!(facts.journal_mode.as_deref(), Ok("wal"));
+    db.close().unwrap();
+}

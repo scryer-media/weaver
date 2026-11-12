@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use super::*;
+use crate::operations::instrumentation::PipelinePhase;
 
 const UU_SPOOL_MIN_BYTES: usize = 64 * 1024 * 1024;
 const UU_SPOOL_MAX_BYTES: usize = 4 * 1024 * 1024 * 1024;
@@ -276,6 +277,8 @@ impl Pipeline {
             graph_holds,
             graph_decode,
             graph_runs: Default::default(),
+            #[cfg(test)]
+            graph_mail_stamps: None,
             post_probes: Default::default(),
             nzb_admitted,
             nzb_seen: HashSet::new(),
@@ -1046,6 +1049,7 @@ impl Pipeline {
         loop {
             let mut turn_timer = crate::operations::instrumentation::TurnTimer::new(
                 &turn_metrics.pipeline_histograms.turn_duration,
+                &turn_metrics.pipeline_turn,
             );
             // A replaced pool brings its own servers; watch those, and give
             // their waiting work a pass.
@@ -1054,6 +1058,7 @@ impl Pipeline {
                 self.download_dispatch_wake = true;
             }
             if queue.read(|inner| inner.globals.shutting_down) {
+                turn_timer.phase(PipelinePhase::Shutdown);
                 // Readmission can wait for cancellation cleanup, whose terminal
                 // completion event releases the last script cancellation sender.
                 // Keep servicing those events while accepted admissions settle.
@@ -1096,6 +1101,7 @@ impl Pipeline {
                 break;
             }
             self.run_queue_intents().await;
+            turn_timer.phase(PipelinePhase::ReadyResults);
             // Whether this turn was woken by, or found, anything other than a
             // periodic tick. Only such a turn can have changed what the job
             // snapshot shows or what dispatch would hand out.
@@ -1118,6 +1124,7 @@ impl Pipeline {
                 self.pump_decode_queue();
             }
 
+            turn_timer.phase(PipelinePhase::CompletionChecks);
             let pending_completion_checks = self.pending_completion_checks.len();
             turn_active |= pending_completion_checks > 0;
             for _ in 0..pending_completion_checks {
@@ -1129,9 +1136,11 @@ impl Pipeline {
                 self.pump_decode_queue();
             }
 
+            turn_timer.phase(PipelinePhase::ParkAndSpill);
             self.consume_due_checkpoint_rechecks();
             self.park_drained_jobs();
             self.spill_parked_parts().await;
+            turn_timer.phase(PipelinePhase::Dispatch);
             // A pass over the eligible jobs follows only something that could
             // change its answer: activity, a wake, live transfers, or a gate
             // that lifts with time. An idle turn would find what the last one
@@ -1181,6 +1190,7 @@ impl Pipeline {
                 self.dispatch_downloads();
             }
 
+            turn_timer.phase(PipelinePhase::DownloadResults);
             let processed_results = self
                 .process_download_result_turn(
                     &mut pending_download_results,
@@ -1205,9 +1215,11 @@ impl Pipeline {
                     ($($biased:tt)?) => {
                         tokio::select! {
                             $($biased;)?
-                            _ = queue.intent_changed() => { turn_timer.resume(); }
+                            _ = queue.intent_changed() => {
+                                turn_timer.resume(PipelinePhase::IntentChanged);
+                            }
                             Some(result) = self.download_done_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::DownloadDone);
                                 if !self.release_download_result(&result) { continue; }
                                 self.note_released_download_result_pending(
                                     result.job_id,
@@ -1216,30 +1228,37 @@ impl Pipeline {
                                 pending_download_results.push_back(result);
                             }
                             Some(request) = self.download_refill_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::LaneRefill);
                                 self.drain_ready_download_results(&mut pending_download_results);
                                 self.handle_download_lane_refill_request(request);
                             }
                             Some(parked) = self.download_lane_parked_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::LaneParked);
                                 self.handle_download_lane_parked(parked);
                             }
                             Some(event) = self.owned_download_lane_event_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::LaneEvent);
                                 self.handle_owned_download_lane_event(
                                     event,
                                     &mut pending_download_results,
                                 );
                             }
                             Some(said) = self.graph_runs.recv() => {
+                                turn_timer.resume(PipelinePhase::GraphRun);
                                 self.graph_run_said(said);
+                                #[cfg(test)]
+                                if let Some(stamps) = &self.graph_mail_stamps {
+                                    let _ = stamps.send(
+                                        turn_metrics.pipeline_turn.read(std::time::Instant::now()),
+                                    );
+                                }
                             }
                             Some(mail) = self.post_probes.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::PostProbe);
                                 self.post_probe_mail(mail);
                             }
                             Some(result) = self.decode_done_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::DecodeDone);
                                 #[cfg(test)]
                                 if restoring {
                                     DECODES_HEARD_RESTORING.fetch_add(1, Ordering::Relaxed);
@@ -1251,29 +1270,29 @@ impl Pipeline {
                                 self.handle_decode_done(result).await;
                             }
                             Some(generation) = self.nntp_handoff_drained_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::NntpHandoffDrained);
                                 self.handle_nntp_handoff_drained(generation);
                             }
                             Some(done) = self.job_activated_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::JobActivated);
                                 self.handle_job_activated(done);
                             }
                             Some(reply) = self.db_reply_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::DbReply);
                                 self.handle_db_reply(reply).await;
                             }
                             Some(done) = self.move_done_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::MoveDone);
                                 let reported_job = done.job_id;
                                 self.handle_move_to_complete_done(done).await;
                                 self.report_job(reported_job);
                             }
                             Some(released) = self.failed_release_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::FailedRelease);
                                 self.handle_failed_job_released(released);
                             }
                             Ok(()) = self.script_effects_rx.changed() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::ScriptEffects);
                                 for job_id in self.db.take_script_effects() {
                                     let job_id = JobId(job_id);
                                     // A job out of the queue window is called
@@ -1288,17 +1307,17 @@ impl Pipeline {
                                 }
                             }
                             Some(event) = self.terminal_post_processing_done_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::TerminalPostProcessing);
                                 self.handle_terminal_post_processing_event(event).await;
                             }
                             Some(retry) = self.retry_rx.recv() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::Retry);
                                 let reported_job = retry.work.segment_id.file_id.job_id;
                                 self.receive_retry_work(retry);
                                 self.report_job_soon(reported_job);
                             }
                             _ = metrics_snapshot_interval.tick(), if drive => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::MetricsTick);
                                 idle_tick = true;
                                 count_periodic_tick();
                                 self.refresh_periodic_snapshot();
@@ -1307,28 +1326,34 @@ impl Pipeline {
                                 // wake comes.
                                 self.service_held_download_refills();
                             }
-                            _ = rate_sleep, if !rate_delay.is_zero() => { turn_timer.resume(); }
+                            _ = rate_sleep, if !rate_delay.is_zero() => {
+                                turn_timer.resume(PipelinePhase::RateLimit);
+                            }
                             _ = durable_lead_retry_sleep, if durable_lead_retry_delay.is_some() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::DurableLeadRetry);
                                 self.consume_due_checkpoint_rechecks();
                             }
-                            _ = propagation_sleep, if propagation_delay.is_some() => { turn_timer.resume(); }
+                            _ = propagation_sleep, if propagation_delay.is_some() => {
+                                turn_timer.resume(PipelinePhase::Propagation);
+                            }
                             _ = infrastructure_retry_sleep, if infrastructure_retry_deadline.is_some() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::InfrastructureRetry);
                                 self.requeue_due_infrastructure_retries();
                             }
                             () = server_health.changed() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::ServerHealth);
                                 self.download_dispatch_wake = true;
                             }
                             _ = connection_hold_sleep, if connection_hold_deadline.is_some() => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::ConnectionHold);
                                 self.download_dispatch_wake = true;
                             }
                             // The next turn's queue pass retries the rename.
-                            _ = rename_retry_sleep, if rename_retry_at.is_some() => { turn_timer.resume(); }
+                            _ = rename_retry_sleep, if rename_retry_at.is_some() => {
+                                turn_timer.resume(PipelinePhase::RenameRetry);
+                            }
                             _ = tune_interval.tick(), if drive => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::TuneTick);
                                 idle_tick = true;
                                 count_periodic_tick();
                                 self.refresh_download_pressure();
@@ -1366,7 +1391,7 @@ impl Pipeline {
                                 }
                             }
                             _ = stalled_download_interval.tick(), if drive => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::StallCheck);
                                 count_periodic_tick();
                                 // A stall needs a transfer in flight; with none the
                                 // walk over every job would find nothing.
@@ -1376,13 +1401,13 @@ impl Pipeline {
                                 }
                             }
                             _ = state_reconcile_interval.tick(), if drive => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::StateReconcile);
                                 idle_tick = true;
                                 count_periodic_tick();
                                 self.reconcile_candidate_jobs().await;
                             }
                             () = std::future::ready(()), if next_batch => {
-                                turn_timer.resume();
+                                turn_timer.resume(PipelinePhase::RestoreBatch);
                                 idle_tick = true;
                             }
                         }
@@ -1398,6 +1423,7 @@ impl Pipeline {
 
             #[cfg(test)]
             self.pump_decode_queue();
+            turn_timer.end_of_turn(self.jobs.len());
             let live = self.pipeline_is_live();
             if turn_active {
                 self.reconcile_clean = false;

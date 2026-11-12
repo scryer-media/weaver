@@ -252,6 +252,13 @@ async fn stored_names(db: &Database) -> Result<sanitize::StoredNames, String> {
         .expect("the read runs")
 }
 
+// A table read as the endpoint reads it: an error is a failed read.
+fn as_read(
+    stored: Result<sanitize::StoredNames, String>,
+) -> Result<sanitize::StoredNames, bounded::ReadRefused> {
+    stored.map_err(bounded::ReadRefused::read_failed)
+}
+
 fn plain_local() -> sanitize::LocalNames {
     sanitize::LocalNames {
         data_dir: PathBuf::from("/srv/olaf-data"),
@@ -376,7 +383,7 @@ async fn a_package_takes_its_names_from_one_read() {
         ..plain_local()
     };
     let (components, sanitized) =
-        sanitize_components(components, stored_names(&db).await, local).await;
+        sanitize_components(components, as_read(stored_names(&db).await), local).await;
     assert!(sanitized.stand_ins >= 10, "{}", sanitized.stand_ins);
     let archive =
         archive::build_archive(components, "0.0.0-test", "2000-01-01T00:00:00Z", sanitized)
@@ -512,7 +519,7 @@ async fn a_database_the_table_cannot_read_leaves_every_component_out() {
         "olafhost.log",
         b"INFO Olaf.Secret.Name done\n".to_vec(),
     )];
-    let (components, sanitized) = sanitize_components(components, stored, local).await;
+    let (components, sanitized) = sanitize_components(components, as_read(stored), local).await;
     assert_eq!(sanitized.stand_ins, 0);
     assert_eq!(sanitized.history_jobs_total, None);
     let archive =
@@ -840,4 +847,403 @@ async fn a_spent_budget_writes_what_was_made_and_says_so() {
     assert_eq!(reports["qualified"], 1);
     assert_eq!(reports["written"], 0);
     assert_eq!(reports["cut_short"], "time_budget_spent");
+}
+
+fn package_member_json(members: &[(String, Vec<u8>)], name: &str) -> serde_json::Value {
+    serde_json::from_str(&member_text(members, name)).expect("member is JSON")
+}
+
+// Archives `components` as the endpoint does, through the stand-in pass.
+async fn archive_through_the_pass(components: Vec<Component>) -> Vec<(String, Vec<u8>)> {
+    let db = Database::open_in_memory().expect("database");
+    let (components, sanitized) =
+        sanitize_components(components, as_read(stored_names(&db).await), plain_local()).await;
+    let archive =
+        archive::build_archive(components, "0.0.0-test", "2000-01-01T00:00:00Z", sanitized)
+            .expect("archive builds");
+    unpack_package(&archive)
+}
+
+// A pipeline that does not answer still leaves a pipeline-internals.json:
+// it says the pipeline did not answer, what the turn in progress is and how
+// long it has been busy by the clock the reader is given, and the counts the
+// shared state holds. The manifest still names the full snapshot as missing.
+#[tokio::test]
+async fn an_unanswered_pipeline_leaves_what_could_be_read_without_it() {
+    use weaver_server_core::operations::instrumentation::PipelinePhase;
+    use weaver_server_core::{JobStatus, PipelineMetrics, SharedPipelineState};
+
+    let metrics = PipelineMetrics::new();
+    let stamp = &metrics.pipeline_turn;
+    let origin = stamp.origin();
+    stamp.ended(origin + Duration::from_millis(400));
+    stamp.end_of_turn(5);
+    stamp.ended(origin + Duration::from_millis(900));
+    stamp.busy(PipelinePhase::DecodeDone, origin + Duration::from_secs(2));
+    metrics
+        .repair_active
+        .store(3, std::sync::atomic::Ordering::Relaxed);
+    let (event_tx, _) = tokio::sync::broadcast::channel(4);
+    let state = SharedPipelineState::new(metrics.clone(), Vec::new());
+    state.publish_jobs(vec![
+        queued_info(1, JobStatus::Queued),
+        queued_info(2, JobStatus::Queued),
+        queued_info(3, JobStatus::Repairing),
+    ]);
+    // No pipeline runs behind this handle, so the request is never answered.
+    let handle = SchedulerHandle::new(event_tx, state);
+
+    let components =
+        pipeline_internals::collect_pipeline_internals_within(&handle, Duration::ZERO, || {
+            origin + Duration::from_secs(65)
+        })
+        .await;
+    let members = archive_through_the_pass(components).await;
+
+    let internals = package_member_json(&members, pipeline_internals::FILE);
+    assert_eq!(internals["answered"], false, "{internals:#}");
+    assert_eq!(internals["reason"], "timed_out");
+    assert_eq!(internals["timeout_ms"], 0);
+    let turn = &internals["turn"];
+    assert_eq!(turn["phase"], "decode_done", "{internals:#}");
+    assert_eq!(turn["in_progress"], true);
+    assert_eq!(turn["busy_ms"], 63_000);
+    assert_eq!(turn["turns_completed"], 2);
+    assert_eq!(turn["since_last_turn_ended_ms"], 64_100);
+    assert_eq!(turn["installed_jobs"], 5);
+    let queue = &internals["queue"];
+    assert_eq!(queue["jobs"], 3);
+    assert_eq!(queue["jobs_by_status"]["queued"], 2);
+    assert_eq!(queue["jobs_by_status"]["repairing"], 1);
+    assert_eq!(queue["jobs_by_status"]["downloading"], 0);
+    assert_eq!(queue["queue_window"], 100);
+    assert_eq!(internals["work"]["jobs_repairing"], 3);
+
+    let manifest: archive::Manifest =
+        serde_json::from_str(&member_text(&members, archive::MANIFEST_NAME))
+            .expect("manifest parses");
+    assert!(
+        manifest
+            .files
+            .iter()
+            .any(|file| file.name == pipeline_internals::FILE),
+        "{:?}",
+        manifest.files
+    );
+    assert_eq!(
+        manifest
+            .errors
+            .iter()
+            .filter(|error| error.name == pipeline_internals::FILE)
+            .count(),
+        1,
+        "{:?}",
+        manifest.errors
+    );
+}
+
+// A pipeline that answers is written as it answered: one component, the
+// pipeline's own snapshot, and nothing in the manifest's errors.
+#[tokio::test]
+async fn an_answering_pipeline_writes_its_own_snapshot() {
+    let root = tempfile::tempdir().expect("temporary directory");
+    let config: SharedConfig = Arc::new(tokio::sync::RwLock::new(
+        weaver_server_core::settings::model::Config {
+            data_dir: root.path().to_string_lossy().into_owned(),
+            hardware_profile: None,
+            intermediate_dir: None,
+            complete_dir: None,
+            servers: vec![],
+            categories: vec![],
+            retry: None,
+            max_download_speed: None,
+            cleanup_after_extract: None,
+            delete_failed_job_files: None,
+            propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
+            watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),
+            duplicate_policy: Default::default(),
+            direct_store: None,
+            delivery_naming: None,
+            metrics: Default::default(),
+            config_path: None,
+        },
+    ));
+    let (mut pipeline, handle, _) = weaver_server_core::pipeline::test_support::idle_pipeline(
+        Database::open_in_memory().expect("database"),
+        config,
+    )
+    .await;
+    let task = tokio::spawn(async move { pipeline.run().await });
+
+    let components = pipeline_internals::collect_pipeline_internals_within(
+        &handle,
+        UNBOUNDED,
+        std::time::Instant::now,
+    )
+    .await;
+    assert_eq!(components.len(), 1);
+    let component = &components[0];
+    assert_eq!(component.name, pipeline_internals::FILE);
+    assert_eq!(component.form, archive::Form::Json);
+    let written = component.outcome.as_ref().expect("the snapshot is written");
+    let snapshot: weaver_server_core::pipeline::diagnostics::PipelineDiagnostics =
+        serde_json::from_slice(written).expect("the pipeline's own snapshot");
+    // Byte for byte what the snapshot serializes to.
+    assert_eq!(
+        written,
+        &serde_json::to_vec_pretty(&snapshot).expect("snapshot serializes")
+    );
+
+    handle.shutdown().await.expect("shutdown");
+    task.await.expect("pipeline stops");
+}
+
+// Errors in `database.json` as (value, reason) pairs.
+fn database_value_errors(database: &serde_json::Value) -> Vec<(String, String)> {
+    database["errors"]
+        .as_array()
+        .expect("errors list")
+        .iter()
+        .map(|error| {
+            (
+                error["value"].as_str().expect("value name").to_string(),
+                error["reason"].as_str().expect("reason code").to_string(),
+            )
+        })
+        .collect()
+}
+
+fn database_manifest_errors(members: &[(String, Vec<u8>)]) -> usize {
+    let manifest: archive::Manifest =
+        serde_json::from_str(&member_text(members, archive::MANIFEST_NAME))
+            .expect("manifest parses");
+    assert!(
+        manifest
+            .files
+            .iter()
+            .any(|file| file.name == database_facts::FILE),
+        "{:?}",
+        manifest.files
+    );
+    manifest
+        .errors
+        .iter()
+        .filter(|error| error.name == database_facts::FILE)
+        .count()
+}
+
+fn synthetic_database_sizes() -> weaver_server_core::persistence::connection::SqliteFileSizes {
+    use weaver_server_core::persistence::connection::{SqliteFileSize, SqliteFileSizes};
+    SqliteFileSizes {
+        database_file: SqliteFileSize::Present(8_192_000),
+        wal_file: SqliteFileSize::Absent,
+        shm_file: SqliteFileSize::Unreadable("permission denied".to_string()),
+    }
+}
+
+// The database's storage facts are written as fields. A value that could not
+// be read is null in the file, named with a reason code in its `errors`, and
+// an error entry in the manifest; the file itself still goes into the
+// package through the stand-in pass.
+#[tokio::test]
+async fn database_facts_keep_what_was_read_and_name_what_was_not() {
+    use weaver_server_core::persistence::connection::SqlitePageFacts;
+
+    let pages = database_facts::PageOutcome::Read(SqlitePageFacts {
+        page_size: Ok(4096),
+        page_count: Err("database is locked".to_string()),
+        freelist_count: Ok(12),
+        journal_mode: Ok("wal".to_string()),
+    });
+    let members = archive_through_the_pass(database_facts::database_components(
+        &synthetic_database_sizes(),
+        &pages,
+    ))
+    .await;
+
+    let database = package_member_json(&members, database_facts::FILE);
+    assert_eq!(database["engine"], "sqlite");
+    assert_eq!(database["files"]["database"]["state"], "present");
+    assert_eq!(database["files"]["database"]["bytes"], 8_192_000);
+    assert_eq!(database["files"]["wal"]["state"], "absent");
+    assert!(database["files"]["wal"]["bytes"].is_null());
+    assert_eq!(database["files"]["shm"]["state"], "unreadable");
+    assert_eq!(database["page_size"], 4096);
+    assert!(database["page_count"].is_null());
+    assert_eq!(database["freelist_count"], 12);
+    assert_eq!(database["journal_mode"], "wal");
+    assert_eq!(
+        database_value_errors(&database),
+        [
+            (
+                "shm_bytes".to_string(),
+                database_facts::REASON_UNREADABLE.to_string()
+            ),
+            (
+                "page_count".to_string(),
+                bounded::REASON_READ_FAILED.to_string()
+            ),
+        ]
+    );
+    assert_eq!(database_manifest_errors(&members), 2);
+}
+
+// A database whose read executor does not answer still leaves its file
+// sizes: the page read is abandoned at the wait, its four values are null
+// with `timed_out`, and the package is built.
+#[tokio::test]
+async fn a_stalled_database_still_leaves_its_file_sizes() {
+    let never_answers = std::future::pending();
+    let components =
+        database_facts::collect_within(synthetic_database_sizes(), never_answers, Duration::ZERO)
+            .await;
+    let members = archive_through_the_pass(components).await;
+
+    let database = package_member_json(&members, database_facts::FILE);
+    assert_eq!(database["files"]["database"]["bytes"], 8_192_000);
+    assert_eq!(database["files"]["wal"]["state"], "absent");
+    for value in ["page_size", "page_count", "freelist_count", "journal_mode"] {
+        assert!(database[value].is_null(), "{value}");
+    }
+    let timed_out = bounded::REASON_TIMED_OUT.to_string();
+    assert_eq!(
+        database_value_errors(&database),
+        [
+            (
+                "shm_bytes".to_string(),
+                database_facts::REASON_UNREADABLE.to_string()
+            ),
+            ("page_size".to_string(), timed_out.clone()),
+            ("page_count".to_string(), timed_out.clone()),
+            ("freelist_count".to_string(), timed_out.clone()),
+            ("journal_mode".to_string(), timed_out),
+        ]
+    );
+    assert_eq!(database_manifest_errors(&members), 5);
+}
+
+fn manifest_of(members: &[(String, Vec<u8>)]) -> archive::Manifest {
+    serde_json::from_str(&member_text(members, archive::MANIFEST_NAME)).expect("manifest parses")
+}
+
+// GraphQL fields run together until one deadline. A field that does not
+// answer by then is named in its file, and its file is recorded in the
+// manifest as `timed_out`; a file with nothing that answered is left out
+// with that reason; fields that answered are written as before.
+#[tokio::test]
+async fn graphql_fields_that_do_not_answer_in_time_are_recorded_as_timed_out() {
+    const GROUPS: &[GraphqlComponent] = &[
+        GraphqlComponent {
+            file: "answered.json",
+            fields: &[("answers", None)],
+            redact: true,
+        },
+        GraphqlComponent {
+            file: "partial.json",
+            fields: &[("answers", None), ("stalls", None)],
+            redact: true,
+        },
+        GraphqlComponent {
+            file: "stalled.json",
+            fields: &[("stalls", None)],
+            redact: true,
+        },
+        GraphqlComponent {
+            file: SERVICE_LOG_FILE,
+            fields: &[("stalls", None)],
+            redact: false,
+        },
+    ];
+    // The deadline has already passed: what answers at once is kept, and
+    // what waits is given up on without the test waiting for anything.
+    let components = collect_graphql_within(
+        GROUPS,
+        tokio::time::Instant::now(),
+        |field: &'static str, _arguments| async move {
+            if field == "stalls" {
+                std::future::pending::<()>().await;
+            }
+            Ok((serde_json::json!({ "count": 7 }), Vec::new()))
+        },
+    )
+    .await;
+    let members = archive_through_the_pass(components).await;
+
+    let answered = package_member_json(&members, "answered.json");
+    assert_eq!(answered, serde_json::json!({ "answers": { "count": 7 } }));
+    let partial = package_member_json(&members, "partial.json");
+    assert_eq!(partial["data"]["answers"]["count"], 7);
+    assert_eq!(partial["timed_out"], serde_json::json!(["stalls"]));
+
+    let manifest = manifest_of(&members);
+    let reason_of = |name: &str| -> Vec<Option<String>> {
+        manifest
+            .errors
+            .iter()
+            .filter(|error| error.name == name)
+            .map(|error| error.reason.clone())
+            .collect()
+    };
+    let timed_out = Some(bounded::REASON_TIMED_OUT.to_string());
+    assert!(reason_of("answered.json").is_empty());
+    assert_eq!(reason_of("partial.json"), [timed_out.clone()]);
+    assert_eq!(reason_of("stalled.json"), [timed_out.clone()]);
+    assert_eq!(reason_of(SERVICE_LOG_FILE), [timed_out]);
+    for name in ["stalled.json", SERVICE_LOG_FILE] {
+        assert!(
+            !manifest.files.iter().any(|file| file.name == name),
+            "{name} has no file"
+        );
+    }
+}
+
+// A stand-in table that cannot be read in time is treated as one that cannot
+// be read at all: every component is left out, none ships with less
+// sanitizing, each carries `timed_out`, and the package is still built.
+#[tokio::test]
+async fn a_stand_in_table_that_does_not_answer_in_time_leaves_every_component_out() {
+    let stored = bounded::within(tokio::time::Instant::now(), std::future::pending()).await;
+    let components = vec![
+        Component::bytes("weaver.log", b"INFO Olaf.Secret.Name done\n".to_vec()),
+        Component::json(
+            "queue.json",
+            &serde_json::json!({ "name": "Olaf.Secret.Name" }),
+        ),
+    ];
+    let (components, sanitized) = sanitize_components(components, stored, plain_local()).await;
+    assert_eq!(sanitized.stand_ins, 0);
+    assert_eq!(sanitized.history_jobs_total, None);
+    let archive =
+        archive::build_archive(components, "0.0.0-test", "2000-01-01T00:00:00Z", sanitized)
+            .expect("archive builds");
+    let members = unpack_package(&archive);
+
+    let manifest = manifest_of(&members);
+    assert!(
+        manifest
+            .files
+            .iter()
+            .all(|file| file.name == archive::MANIFEST_NAME),
+        "{:?}",
+        manifest.files
+    );
+    let mut left_out: Vec<&str> = manifest
+        .errors
+        .iter()
+        .map(|error| error.name.as_str())
+        .collect();
+    left_out.sort_unstable();
+    assert_eq!(left_out, ["queue.json", "stand-in-table", "weaver.log"]);
+    assert!(
+        manifest
+            .errors
+            .iter()
+            .all(|error| error.reason.as_deref() == Some(bounded::REASON_TIMED_OUT)),
+        "{:?}",
+        manifest.errors
+    );
+    for (_, data) in &members {
+        assert!(!String::from_utf8_lossy(data).contains("Olaf"));
+    }
 }

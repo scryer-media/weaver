@@ -37,8 +37,11 @@
 //    A report that is missing one section is still a report; a 500 is not.
 
 mod archive;
+mod bounded;
+mod database_facts;
 mod graphql;
 mod nzb_reports;
+mod pipeline_internals;
 mod redact;
 mod sanitize;
 
@@ -73,6 +76,19 @@ const MAX_LOG_BYTES: u64 = 32 * 1024 * 1024;
 // Ceiling on a single copied configuration file. A config this large is not a
 // config, and reading it into memory to redact it should stay bounded.
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+// How long the stand-in table may take to read. It reads every table source,
+// the NZB of every job named in the package among them, so a healthy but
+// large instance takes far longer than a single read; the bound is the one
+// the support reports already give their NZB reads.
+const STORED_NAMES_WAIT: Duration = nzb_reports::REPORT_BUDGET;
+
+// How long the GraphQL root fields may take together. They run at once, so
+// this is spent once. A busy instance with thousands of jobs answers the
+// queue snapshot in many seconds while nothing is stalled, and the package
+// is worth little without it, so the wait is the long one, not the short
+// wait a single pragma gets.
+const GRAPHQL_WAIT: Duration = nzb_reports::REPORT_BUDGET;
 
 // Arguments for the two bounded root fields. The ring buffer holds far fewer
 // lines than the service-log limit, so that one asks for all of them; the job
@@ -209,8 +225,16 @@ async fn collect_components(
         exporter.render(disk_space, http_metrics).await,
     ));
 
-    components.extend(collect_graphql_components(schema, &caller).await);
-    components.push(collect_pipeline_internals(handle).await);
+    // These wait on the pipeline or the database only until their own short
+    // deadlines, and together: a stall costs the package that wait once.
+    let (graphql, pipeline, database) = tokio::join!(
+        collect_graphql_components(schema, &caller),
+        pipeline_internals::collect_pipeline_internals(handle),
+        database_facts::collect_database_facts(db),
+    );
+    components.extend(graphql);
+    components.extend(pipeline);
+    components.extend(database);
     // The support reports name nothing to begin with, so they join the
     // package as their report code wrote them, after the stand-in pass.
     let nzb_reports = nzb_reports::collect_nzb_reports(db, handle).await;
@@ -261,15 +285,15 @@ async fn collect_components(
     let local = sanitize::LocalNames::current(data_dir, intermediate_dir, complete_dir, watch_dir);
     // The table is read once everything is collected, so a name added
     // during the collection is in it.
+    // A table that cannot be read in time is a table that cannot be read:
+    // every component is left out, as for any other failure to read it.
     let stored = {
         let db = db.clone();
-        tokio::task::spawn_blocking(move || sanitize::read_stored_names(&db))
-            .await
-            .unwrap_or_else(|error| {
-                Err(format!(
-                    "the stand-in table could not read the database: {error}"
-                ))
-            })
+        bounded::within(
+            tokio::time::Instant::now() + STORED_NAMES_WAIT,
+            bounded::blocking(move || sanitize::read_stored_names(&db)),
+        )
+        .await
     };
     let (mut components, sanitized) = sanitize_components(components, stored, local).await;
     components.push(nzb_reports);
@@ -282,7 +306,7 @@ async fn collect_components(
 // pass scans every byte, so it runs off the async runtime.
 async fn sanitize_components(
     components: Vec<Component>,
-    stored: Result<sanitize::StoredNames, String>,
+    stored: Result<sanitize::StoredNames, bounded::ReadRefused>,
     local: sanitize::LocalNames,
 ) -> (Vec<Component>, archive::ManifestSanitized) {
     let names: Vec<String> = components
@@ -296,21 +320,32 @@ async fn sanitize_components(
     let fallback = local.clone();
     let pass = tokio::task::spawn_blocking(move || {
         let mut components = components;
-        let result = stored.and_then(|stored| {
-            sanitize::sanitize_package(&mut components, &local, &stored, schema_keys)
-        });
+        let result = match stored {
+            Ok(stored) => sanitize::sanitize_package(&mut components, &local, &stored, schema_keys)
+                .map_err(|error| (error, None)),
+            Err(refused) => Err((
+                format!(
+                    "the stand-in table could not read the database: {}",
+                    refused.message
+                ),
+                Some(refused.reason),
+            )),
+        };
         match result {
             Ok(stand_ins) => (components, stand_ins),
-            Err(error) => {
+            Err((error, code)) => {
                 let names = components.into_iter().map(|component| component.name);
-                (sanitize::left_out(&local, names, &error), 0)
+                (sanitize::left_out(&local, names, &error, code), 0)
             }
         }
     })
     .await;
     let (components, stand_ins) = pass.unwrap_or_else(|error| {
         let reason = format!("the stand-in table could not be built: {error}");
-        (sanitize::left_out(&fallback, names.into_iter(), &reason), 0)
+        (
+            sanitize::left_out(&fallback, names.into_iter(), &reason, None),
+            0,
+        )
     });
     let sanitized = archive::ManifestSanitized {
         stand_ins: stand_ins as u64,
@@ -326,6 +361,10 @@ async fn sanitize_components(
 // simpler, but the schema caps query complexity, and the whole point of a
 // generated selection is that it grows: a shared budget would mean a new field
 // on `Metrics` silently costing `queueSnapshot` its place in the package.
+//
+// Some fields read the database (the queue's duplicate summaries, the
+// servers' TLS diagnostics, the schedules), so the fields run together and
+// each waits only until one shared deadline.
 async fn collect_graphql_components(
     schema: &WeaverSchema,
     caller: &super::auth::ResolvedCaller,
@@ -339,27 +378,55 @@ async fn collect_graphql_components(
                 .collect();
         }
     };
-
-    let mut components = Vec::new();
-    for group in GRAPHQL_COMPONENTS {
-        let mut data = serde_json::Map::new();
-        let mut errors = Vec::new();
-        for (field, arguments) in group.fields {
-            match graphql::run_root_field(
+    collect_graphql_within(
+        GRAPHQL_COMPONENTS,
+        tokio::time::Instant::now() + GRAPHQL_WAIT,
+        |field, arguments| {
+            graphql::run_root_field(
                 schema,
                 shape,
                 caller.scope,
                 caller.identity.clone(),
                 field,
-                *arguments,
+                arguments,
             )
-            .await
-            {
+        },
+    )
+    .await
+}
+
+async fn collect_graphql_within<Run, Fut>(
+    groups: &[GraphqlComponent],
+    deadline: tokio::time::Instant,
+    run: Run,
+) -> Vec<Component>
+where
+    Run: Fn(&'static str, Option<&'static str>) -> Fut,
+    Fut: std::future::Future<Output = Result<(serde_json::Value, Vec<String>), String>>,
+{
+    let fields: Vec<_> = groups
+        .iter()
+        .flat_map(|group| group.fields.iter())
+        .map(|&(field, arguments)| bounded::within(deadline, run(field, arguments)))
+        .collect();
+    let mut answers = bounded::join_all(fields).await.into_iter();
+
+    let mut components = Vec::new();
+    for group in groups {
+        let mut data = serde_json::Map::new();
+        let mut errors = Vec::new();
+        let mut timed_out = Vec::new();
+        for (field, _) in group.fields {
+            match answers.next().expect("one answer per field") {
                 Ok((value, field_errors)) => {
                     data.insert((*field).to_string(), value);
                     errors.extend(field_errors);
                 }
-                Err(error) => errors.push(error),
+                Err(refused) if refused.reason == bounded::REASON_TIMED_OUT => {
+                    errors.push(format!("`{field}`: {}", refused.message));
+                    timed_out.push(*field);
+                }
+                Err(refused) => errors.push(refused.message),
             }
         }
 
@@ -368,9 +435,32 @@ async fn collect_graphql_components(
             redact_json(&mut data, is_sensitive_json_key);
         }
 
+        let empty = data.as_object().is_some_and(serde_json::Map::is_empty);
+        if !timed_out.is_empty() && (empty || group.file == SERVICE_LOG_FILE) {
+            components.push(Component::failed_because(
+                group.file,
+                bounded::REASON_TIMED_OUT,
+                errors.join("; "),
+            ));
+            continue;
+        }
+        if !timed_out.is_empty() {
+            // Partial because a field did not answer in time: the file names
+            // those fields, and the manifest records the file as timed out.
+            components.push(Component::failed_because(
+                group.file,
+                bounded::REASON_TIMED_OUT,
+                format!("{} did not answer in time", timed_out.join(", ")),
+            ));
+            components.push(Component::json(
+                group.file,
+                &serde_json::json!({ "data": data, "errors": errors, "timed_out": timed_out }),
+            ));
+            continue;
+        }
         components.push(if group.file == SERVICE_LOG_FILE {
             Component::text(group.file, service_log_text(&data))
-        } else if data.as_object().is_some_and(serde_json::Map::is_empty) {
+        } else if empty {
             Component::failed(group.file, errors.join("; "))
         } else if errors.is_empty() {
             Component::json(group.file, &data)
@@ -455,22 +545,6 @@ fn service_log_text(data: &serde_json::Value) -> String {
         }
     }
     text
-}
-
-// The read-only pipeline snapshot, which exists nowhere else.
-async fn collect_pipeline_internals(handle: &SchedulerHandle) -> Component {
-    const FILE: &str = "pipeline-internals.json";
-    // A wedged pipeline is exactly the case this endpoint is for, so the
-    // request must not inherit the wedge: if the pipeline cannot answer
-    // promptly, that fact is the diagnostic.
-    match tokio::time::timeout(Duration::from_secs(3), handle.pipeline_diagnostics()).await {
-        Ok(Ok(diagnostics)) => Component::json(FILE, &diagnostics),
-        Ok(Err(error)) => Component::failed(FILE, error),
-        Err(_) => Component::failed(
-            FILE,
-            "the pipeline did not answer the diagnostics request within 3s",
-        ),
-    }
 }
 
 // Host facts, including a storage classification per configured directory.

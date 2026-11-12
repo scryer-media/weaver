@@ -499,6 +499,9 @@ pub struct PipelineMetrics {
     // Pipeline stage duration histograms, read on demand through
     // [`crate::SchedulerHandle::pipeline_histograms_snapshot`].
     pub pipeline_histograms: PipelineHistograms,
+    // What the pipeline's turn is doing right now, read by the diagnostics
+    // package when the pipeline cannot answer it.
+    pub pipeline_turn: crate::operations::instrumentation::PipelineTurnStamp,
     // PAR3 recovery counters, phases and stalls. Unlike the three registries
     // above these *are* folded into [`MetricsSnapshot`]: every field is a
     // relaxed atomic over fixed storage, so the tick stays a struct copy.
@@ -663,6 +666,7 @@ impl PipelineMetrics {
             server_metrics: ServerMetricsRegistry::new(),
             job_lifecycle: JobLifecycleMetrics::new(),
             pipeline_histograms: PipelineHistograms::new(),
+            pipeline_turn: crate::operations::instrumentation::PipelineTurnStamp::new(),
             par3: Par3Metrics::default(),
             start_time: Instant::now(),
         })
