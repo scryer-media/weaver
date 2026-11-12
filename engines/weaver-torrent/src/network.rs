@@ -415,15 +415,15 @@ impl KernelSockets {
             && addr.ip().is_unspecified()
     }
 
-    /// A datagram socket at `addr`, at the kernel's defaults. One at the
-    /// unspecified IPv6 address takes IPv4 as well, unless it is one of a
-    /// pair.
-    fn kernel_udp(&self, addr: SocketAddr) -> io::Result<KernelUdp> {
+    /// A datagram socket at `addr`, at the kernel's defaults, reusing the
+    /// address when `reuse`. One at the unspecified IPv6 address takes IPv4
+    /// as well, unless it is one of a pair.
+    fn kernel_udp(&self, addr: SocketAddr, reuse: bool) -> io::Result<KernelUdp> {
         #[expect(
             clippy::disallowed_methods,
             reason = "the kernel's own route binds on its device, or the host's"
         )]
-        let (socket, dual_stack) = self.egress.bind_udp_reusing(addr)?;
+        let (socket, dual_stack) = self.egress.bind_udp_reusing(addr, reuse)?;
         let socket = tokio::net::UdpSocket::from_std(socket)?;
         let mut socket = KernelUdp {
             local: socket.local_addr()?,
@@ -450,9 +450,13 @@ impl KernelSockets {
             socket
         };
         if !self.paired(addr) {
-            return Ok(Arc::new(set(self.kernel_udp(addr)?, addr)));
+            return Ok(Arc::new(set(self.kernel_udp(addr, reuses(addr))?, addr)));
         }
-        let (v6, v4) = bind_pair(addr, |at| self.kernel_udp(at), |socket| socket.local.port())?;
+        let (v6, v4) = bind_pair(
+            addr,
+            |at, reuse| self.kernel_udp(at, reuse),
+            |socket| socket.local.port(),
+        )?;
         let (v6_addr, v4_addr) = (v6.local, v4.local);
         Ok(Arc::new(PairedUdp {
             v6: set(v6, v6_addr),
@@ -466,19 +470,34 @@ impl KernelSockets {
 // up on one UDP also has free.
 pub(crate) const PAIR_ATTEMPTS: usize = 16;
 
+// Whether a socket at `addr` reuses the address: only at a port the caller
+// names, which a socket bound before it may have left in use. A port the
+// kernel chooses is bound without reuse, so it is one no socket of the
+// family holds at any address. With reuse a BSD kernel checks only the exact
+// address: it chooses a port a socket at a host address holds, and the
+// datagrams and connections to that address go to the other socket.
+pub(crate) fn reuses(addr: SocketAddr) -> bool {
+    addr.port() != 0
+}
+
 // A socket for each family on one port: IPv6 alone at `addr`, then IPv4 on
-// the port it took. Port 0 lets the kernel choose, and a port it chose for
-// IPv6 that IPv4 holds is given up for another; the IPv6 sockets given up
-// stay bound until the pair is made, so the kernel never chooses one again.
+// the port it took, both reusing the address as one at `addr` would. Port 0
+// lets the kernel choose, and a port it chose for IPv6 that IPv4 holds, at
+// any address, is given up for another; the IPv6 sockets given up stay bound
+// until the pair is made, so the kernel never chooses one again.
 fn bind_pair<T>(
     addr: SocketAddr,
-    bind: impl Fn(SocketAddr) -> io::Result<T>,
+    bind: impl Fn(SocketAddr, bool) -> io::Result<T>,
     port_of: impl Fn(&T) -> u16,
 ) -> io::Result<(T, T)> {
+    let reuse = reuses(addr);
     let mut given_up = Vec::new();
     loop {
-        let v6 = bind(addr)?;
-        match bind(SocketAddr::from((Ipv4Addr::UNSPECIFIED, port_of(&v6)))) {
+        let v6 = bind(addr, reuse)?;
+        match bind(
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, port_of(&v6))),
+            reuse,
+        ) {
             Ok(v4) => return Ok((v6, v4)),
             Err(error)
                 if addr.port() == 0
@@ -516,19 +535,20 @@ impl SocketFactory for KernelSockets {
         addr: SocketAddr,
     ) -> BoxFuture<'a, io::Result<Box<dyn StreamListener>>> {
         Box::pin(async move {
-            let listen = |at| -> io::Result<KernelListener> {
+            let listen = |at, reuse| -> io::Result<KernelListener> {
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "the kernel's own route listens on its device, or the host's"
                 )]
-                let listener = tokio::net::TcpListener::from_std(self.egress.listen_tcp(at)?)?;
+                let listener =
+                    tokio::net::TcpListener::from_std(self.egress.listen_tcp(at, reuse)?)?;
                 Ok(KernelListener {
                     local: listener.local_addr()?,
                     listener,
                 })
             };
             if !self.paired(addr) {
-                return Ok(Box::new(listen(addr)?) as Box<dyn StreamListener>);
+                return Ok(Box::new(listen(addr, reuses(addr))?) as Box<dyn StreamListener>);
             }
             let (v6, v4) = bind_pair(addr, listen, |listener| listener.local.port())?;
             Ok(Box::new(PairedListener { v6, v4 }) as Box<dyn StreamListener>)
@@ -752,7 +772,7 @@ pub(crate) static VECTORED_SENDS: std::sync::atomic::AtomicUsize =
 impl KernelSockets {
     /// A datagram socket at `addr`, bound at once, as the kernel socket it is.
     pub(crate) fn bind_kernel_udp(&self, addr: SocketAddr) -> io::Result<Arc<KernelUdp>> {
-        self.kernel_udp(addr).map(Arc::new)
+        self.kernel_udp(addr, reuses(addr)).map(Arc::new)
     }
 
     /// [`Self::bind_kernel_udp`], set for uTP with `receive_buffer`.
@@ -761,7 +781,7 @@ impl KernelSockets {
         addr: SocketAddr,
         receive_buffer: usize,
     ) -> io::Result<Arc<KernelUdp>> {
-        let mut socket = self.kernel_udp(addr)?;
+        let mut socket = self.kernel_udp(addr, reuses(addr))?;
         crate::udp_options::set_for_utp(&socket.socket, addr, receive_buffer);
         socket.cache_dont_fragment();
         Ok(Arc::new(socket))
@@ -874,6 +894,45 @@ mod tests {
         error.kind() == io::ErrorKind::PermissionDenied
     }
 
+    // A pair whose port the kernel chooses never shares it with a socket at
+    // an IPv4 host address: the IPv4 bind is refused there, the pair takes
+    // another port, and datagrams to IPv4 loopback on it reach the pair.
+    #[tokio::test]
+    async fn a_chosen_pair_port_a_socket_at_ipv4_loopback_holds_is_given_up() {
+        let sockets = KernelSockets::new(None).unwrap();
+        // Once the kernel chooses the IPv6 port, IPv4 loopback holds it: by
+        // a socket here, or by one elsewhere when that bind is refused.
+        let held = std::cell::RefCell::new(None);
+        let (v6, v4) = super::bind_pair(
+            (Ipv6Addr::LOCALHOST, 0).into(),
+            |at, reuse| {
+                let socket = sockets.kernel_udp(at, reuse)?;
+                if at.is_ipv6() && held.borrow().is_none() {
+                    let port = socket.local.port();
+                    let holder = sockets.kernel_udp((Ipv4Addr::LOCALHOST, port).into(), true);
+                    *held.borrow_mut() = Some((port, holder.ok()));
+                }
+                Ok(socket)
+            },
+            |socket| socket.local.port(),
+        )
+        .unwrap();
+        let (held_port, _holder) = held.into_inner().unwrap();
+        let port = v6.local.port();
+        assert_eq!(v4.local.port(), port);
+        assert_ne!(port, held_port);
+
+        let peer = crate::test_support::loopback_udp().await;
+        peer.send_to(b"in", (Ipv4Addr::LOCALHOST, port).into())
+            .await
+            .unwrap();
+        let mut buf = [0u8; 8];
+        let (len, from) = super::DatagramSocket::recv_from(&v4, &mut buf)
+            .await
+            .unwrap();
+        assert_eq!((&buf[..len], from), (&b"in"[..], peer.bind_addr()));
+    }
+
     #[tokio::test]
     async fn an_interface_leg_at_the_unspecified_v6_address_reaches_both_families() {
         let leg = KernelSockets::new(Some(LOOPBACK)).unwrap();
@@ -951,11 +1010,12 @@ mod pair_tests {
 
     // A host whose IPv6 binds at port 0 take the lowest port no IPv6
     // socket holds, from 1, and whose IPv4 binds fail with `v4` while it
-    // returns an error.
+    // returns an error. It keeps whether each bind reused the address.
     struct Host {
         bound: Rc<RefCell<BTreeSet<(bool, u16)>>>,
         v4_binds: Cell<usize>,
         v4: Box<dyn Fn(usize) -> Option<io::ErrorKind>>,
+        reused: RefCell<Vec<bool>>,
     }
 
     impl Host {
@@ -964,10 +1024,12 @@ mod pair_tests {
                 bound: Rc::default(),
                 v4_binds: Cell::new(0),
                 v4: Box::new(v4),
+                reused: RefCell::default(),
             }
         }
 
-        fn bind(&self, at: SocketAddr) -> io::Result<Held> {
+        fn bind(&self, at: SocketAddr, reuse: bool) -> io::Result<Held> {
+            self.reused.borrow_mut().push(reuse);
             let v6 = at.is_ipv6();
             if !v6 {
                 let n = self.v4_binds.get();
@@ -993,7 +1055,7 @@ mod pair_tests {
         fn pair(&self, port: u16) -> io::Result<(Held, Held)> {
             bind_pair(
                 (Ipv6Addr::UNSPECIFIED, port).into(),
-                |at| self.bind(at),
+                |at, reuse| self.bind(at, reuse),
                 |held| held.port,
             )
         }
@@ -1010,6 +1072,9 @@ mod pair_tests {
             *host.bound.borrow(),
             BTreeSet::from([(true, 3), (false, 3)])
         );
+        // A port the kernel chooses is bound without reuse, the IPv4 socket
+        // on it included, so a port IPv4 holds at any address refuses it.
+        assert_eq!(*host.reused.borrow(), [false; 6]);
     }
 
     #[test]
@@ -1029,6 +1094,8 @@ mod pair_tests {
         assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
         assert_eq!(host.v4_binds.get(), 1);
         assert!(host.bound.borrow().is_empty());
+        // A port asked for is bound reusing the address, on both families.
+        assert_eq!(*host.reused.borrow(), [true, true]);
     }
 
     #[test]
@@ -1044,8 +1111,12 @@ mod pair_tests {
     async fn a_mapped_ipv4_target_goes_out_on_the_ipv4_socket_unmapped() {
         let sockets = KernelSockets::new(None).unwrap();
         let paired = PairedUdp {
-            v6: sockets.kernel_udp((Ipv6Addr::LOCALHOST, 0).into()).unwrap(),
-            v4: sockets.kernel_udp((Ipv4Addr::LOCALHOST, 0).into()).unwrap(),
+            v6: sockets
+                .kernel_udp((Ipv6Addr::LOCALHOST, 0).into(), false)
+                .unwrap(),
+            v4: sockets
+                .kernel_udp((Ipv4Addr::LOCALHOST, 0).into(), false)
+                .unwrap(),
         };
         let peer = crate::test_support::udp((Ipv4Addr::LOCALHOST, 0)).await;
         let port = peer.bind_addr().port();
