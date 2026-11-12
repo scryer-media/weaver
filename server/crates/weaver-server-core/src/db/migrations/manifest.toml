@@ -1039,7 +1039,7 @@ scope = "all"
 
 [[migration]]
 version = 84
-description = "active job NZB and outline tables"
+description = "job NZB and active job outline tables"
 checksum_algo = "blake3"
 
 [[migration.steps]]
@@ -1056,7 +1056,7 @@ scope = "all"
 
 [[migration]]
 version = 85
-description = "active job NZBs and outlines move to their tables"
+description = "job NZBs and active job outlines move to their tables"
 checksum_algo = "blake3"
 
 [[migration.steps]]

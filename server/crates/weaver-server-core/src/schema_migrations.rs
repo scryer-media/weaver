@@ -1437,7 +1437,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(nzb_cols, 0);
-        assert!(sqlite_table_exists(&pool, "active_job_nzbs").await);
+        assert!(sqlite_table_exists(&pool, "job_nzbs").await);
         assert!(!sqlite_table_exists(&pool, "active_segments").await);
 
         let server_limit_cols: i64 = sqlx::query_scalar(
@@ -2142,7 +2142,7 @@ mod tests {
                 ]
             )
             .await,
-            3
+            2
         );
         assert_eq!(
             pragma_column_count(
@@ -2165,14 +2165,14 @@ mod tests {
         );
 
         let job_history_nzb: Vec<u8> =
-            sqlx::query_scalar("SELECT nzb_zstd FROM job_history WHERE job_id = 41")
+            sqlx::query_scalar("SELECT nzb_zstd FROM job_nzbs WHERE job_id = 41")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
         assert_eq!(job_history_nzb, expected_nzb_bytes);
 
         let active_job_nzb: Vec<u8> =
-            sqlx::query_scalar("SELECT nzb_zstd FROM active_job_nzbs WHERE job_id = 42")
+            sqlx::query_scalar("SELECT nzb_zstd FROM job_nzbs WHERE job_id = 42")
                 .fetch_one(&pool)
                 .await
                 .unwrap();

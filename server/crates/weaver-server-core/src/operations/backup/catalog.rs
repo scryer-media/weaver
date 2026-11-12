@@ -65,6 +65,9 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("job_history", Export, RequireEmpty),
     table!("job_history_attributes", Export, RequireEmpty),
     table!("job_events", Export, RequireEmpty),
+    // Finished jobs' stored NZBs travel with their history; an active job's
+    // goes with the rest of its active rows.
+    table!("job_nzbs", Export, RequireEmpty),
     // Execution queues and output caches cannot be resumed from a logical
     // configuration backup. History keeps its result excerpts.
     table!("script_event_queue", ResetOnRestore, RequireEmpty),
@@ -94,7 +97,6 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("active_extracted", ResetOnRestore, RequireEmpty),
     table!("active_detected_archives", ResetOnRestore, RequireEmpty),
     table!("active_file_identities", ResetOnRestore, RequireEmpty),
-    table!("active_job_nzbs", ResetOnRestore, RequireEmpty),
     table!("active_job_outlines", ResetOnRestore, RequireEmpty),
     // Direct-store coverage is claimed against working-directory destination
     // files that a database restore does not restore, so the claim must be
@@ -139,7 +141,9 @@ pub(crate) fn export_query(table: &str, columns: &[String]) -> String {
         .join(", ");
     let predicate = match table {
         "settings" => "key <> 'nzbget.scheduled_resume_at'",
-        "job_history_attributes" | "job_events" => "job_id IN (SELECT job_id FROM job_history)",
+        "job_history_attributes" | "job_events" | "job_nzbs" => {
+            "job_id IN (SELECT job_id FROM job_history)"
+        }
         "duplicate_job_snapshots" => "lifecycle IN ('succeeded', 'failed', 'cancelled')",
         "job_fingerprints" | "duplicate_admission_claims" | "submission_idempotency" => {
             "job_id IN (
