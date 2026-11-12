@@ -106,6 +106,10 @@ struct Open {
     // The volumes that began or stopped being waited on since the bootstrap
     // last read them.
     reopened: BTreeSet<VolumeIndex>,
+    // The volumes whose first article began or stopped being waited on
+    // since the feed last read them. `None` until the feed first reads
+    // them, when every volume counts as changed, so nothing is filed.
+    firsts: Option<BTreeSet<VolumeIndex>>,
     // The volumes and articles the readers looked at, for the tests that
     // hold them to the ones still open.
     #[cfg(test)]
@@ -278,6 +282,11 @@ impl Volume {
                 State::Waiting => self.settled_bytes - size,
                 _ => self.settled_bytes + size,
             };
+            if ordinal == self.articles[0].ordinal
+                && let Some(firsts) = open.firsts.as_mut()
+            {
+                firsts.insert(self.at);
+            }
         }
         let decoded = |state: State| match state {
             State::Arrived(Some(range)) => range.end - range.start,
@@ -764,6 +773,19 @@ impl ArticleMap {
                 article.intact && matches!(article.state, State::Arrived(Some(_)))
             })
         })
+    }
+
+    // The volumes whose first article began or stopped being waited on
+    // since the last call. `None` on the first call: every volume counts as
+    // changed, and the volumes are filed from then on.
+    pub(crate) fn take_first_changes(&mut self) -> Option<BTreeSet<VolumeIndex>> {
+        match self.open.firsts.as_mut() {
+            Some(firsts) => Some(std::mem::take(firsts)),
+            None => {
+                self.open.firsts = Some(BTreeSet::new());
+                None
+            }
+        }
     }
 
     // Every server failed the article.

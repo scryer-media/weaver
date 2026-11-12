@@ -15,6 +15,7 @@
 use std::collections::btree_map::BTreeMap;
 use std::collections::hash_map::{Entry, HashMap};
 
+use super::first_articles::FirstArticles;
 use super::names_a_place;
 use crate::jobs::ids::SegmentId;
 use crate::jobs::model::JobSpec;
@@ -53,6 +54,8 @@ pub(in crate::pipeline) struct GivenUp {
     // The health-counted bytes of every posting of a place past the largest
     // one.
     again_bytes: u64,
+    // The post's first-article sample, once the feed has read it.
+    first_articles: Option<FirstArticles>,
 }
 
 impl GivenUp {
@@ -134,6 +137,11 @@ impl GivenUp {
         end: Option<SegmentTerminalState>,
         bytes: u64,
     ) {
+        // Even an article already held: the end it is booked at now may
+        // change where its file's first article stands.
+        if let Some(first_articles) = self.first_articles.as_mut() {
+            first_articles.touch(segment.file_id.file_index, segment.segment_number);
+        }
         match self.articles.entry(segment) {
             Entry::Occupied(_) => return,
             Entry::Vacant(slot) => {
@@ -181,6 +189,21 @@ impl GivenUp {
     // place: what its size counts twice.
     pub(in crate::pipeline) fn again_bytes(&self) -> u64 {
         self.again_bytes
+    }
+
+    // The post's first-article sample as the feed last read it, if it has.
+    pub(in crate::pipeline) fn first_articles(&self) -> Option<&FirstArticles> {
+        self.first_articles.as_ref()
+    }
+
+    pub(in crate::pipeline) fn take_first_articles(&mut self) -> Option<FirstArticles> {
+        self.first_articles.take()
+    }
+
+    // The sample is kept here, so an article given up from now on marks
+    // its file's head to be read again.
+    pub(in crate::pipeline) fn keep_first_articles(&mut self, first_articles: FirstArticles) {
+        self.first_articles = Some(first_articles);
     }
 
     pub(in crate::pipeline) fn file(&self, index: u32) -> FileLosses {
