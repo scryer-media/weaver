@@ -2042,16 +2042,31 @@ fn critical_health_of(total_bytes: u64, optional_recovery_bytes: u64) -> u64 {
 const SUBMITTED_CATEGORY_KEY: &str = "weaver.nzbget.category";
 const SUBMITTED_CATEGORY_FOR_KEY: &str = "weaver.nzbget.category_for";
 
+// Longest submitted label kept, in bytes. `listfiles` repeats the label once
+// per file, so its size multiplies by the job's file count. Real labels such
+// as `tv` or `movies-uhd` are far shorter.
+const MAX_SUBMITTED_CATEGORY_BYTES: usize = 256;
+
 // Replace the submitted-category label in `metadata` for a job whose
 // canonical category is `canonical`. A label equal to the canonical name
-// needs no entry.
+// needs no entry. A longer label is cut to `MAX_SUBMITTED_CATEGORY_BYTES` on a
+// character boundary.
 fn record_submitted_category(
     metadata: &mut Vec<(String, String)>,
     submitted: Option<&str>,
     canonical: Option<&str>,
 ) {
     metadata.retain(|(key, _)| key != SUBMITTED_CATEGORY_KEY && key != SUBMITTED_CATEGORY_FOR_KEY);
-    let submitted = submitted.map(str::trim).filter(|value| !value.is_empty());
+    let submitted = submitted
+        .map(|value| {
+            let value = value.trim();
+            let mut end = value.len().min(MAX_SUBMITTED_CATEGORY_BYTES);
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            value[..end].trim_end()
+        })
+        .filter(|value| !value.is_empty());
     if let (Some(submitted), Some(canonical)) = (submitted, canonical)
         && submitted != canonical
     {
@@ -4509,6 +4524,41 @@ mod active_download_state_tests {
         assert!(!nzbget_has_active_download(
             QueueItemState::FinalizingDownload
         ));
+    }
+}
+
+#[cfg(test)]
+mod submitted_category_tests {
+    use super::*;
+
+    fn stored(submitted: &str) -> Option<String> {
+        let mut metadata = Vec::new();
+        record_submitted_category(&mut metadata, Some(submitted), Some("tv"));
+        metadata
+            .into_iter()
+            .find(|(key, _)| key == SUBMITTED_CATEGORY_KEY)
+            .map(|(_, value)| value)
+    }
+
+    #[test]
+    fn short_labels_are_kept_as_submitted() {
+        assert_eq!(stored(" TV-Sonarr ").as_deref(), Some("TV-Sonarr"));
+        assert_eq!(stored("tv"), None);
+        let exact = "a".repeat(MAX_SUBMITTED_CATEGORY_BYTES);
+        assert_eq!(stored(&exact), Some(exact));
+    }
+
+    #[test]
+    fn long_labels_are_cut_on_a_character_boundary() {
+        let long = format!("tv-{}", "x".repeat(1 << 20));
+        let kept = stored(&long).unwrap();
+        assert_eq!(kept.len(), MAX_SUBMITTED_CATEGORY_BYTES);
+        assert!(long.starts_with(&kept));
+
+        // A two-byte character straddling the limit is left out whole.
+        let straddling = format!("{}é", "a".repeat(MAX_SUBMITTED_CATEGORY_BYTES - 1));
+        let kept = stored(&straddling).unwrap();
+        assert_eq!(kept, "a".repeat(MAX_SUBMITTED_CATEGORY_BYTES - 1));
     }
 }
 
