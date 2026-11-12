@@ -68,7 +68,7 @@ Fix a violation you touch when it is in scope. Otherwise report it.
 - **Blobs.**
   - A blob is opaque: nothing filters, sorts, joins or counts on its contents. A value that is queried gets its own column and index.
   - Keep blobs out of rows that lists read. Put them in their own table keyed by the owner's id, fetched one at a time by key and only when used. No `SELECT *` on a table with a blob.
-  - Bound every blob's size at write, and reject past the bound. A payload that can reach megabytes lives in its own keyed table or in a file (the row holds path, length and hash), and no list or scan reads it. Bulk data (piece data, article bodies, logs) is never a database blob.
+  - Bound every blob's size at write, and reject past the bound. A payload that can reach megabytes lives in its own keyed table or in a file (the row holds path, length and hash), and no list or scan reads it. Bulk data (piece data, article bodies, logs) is never a database blob. Existing exception, not a pattern: `active_jobs.nzb_zstd` and `job_history.nzb_zstd` sit in the job row and are read by job id at activation only; no list selects them, and no new blob joins a list-read row.
   - Never rewrite a large blob to change a small part of it. Progress that changes often is rows or a compact bitmap written at a bounded rate.
   - A blob has a version or format tag, and a decode failure is handled, not a panic.
   - JSON columns follow the same rules: not a place to hide queryable fields or unbounded lists.
