@@ -37,3 +37,17 @@ path = "fuzz_targets/yenc_decode_tiers.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "yenc_encode_tiers"
+path = "fuzz_targets/yenc_encode_tiers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yenc_roundtrip"
+path = "fuzz_targets/yenc_roundtrip.rs"
+test = false
+doc = false
+bench = false
