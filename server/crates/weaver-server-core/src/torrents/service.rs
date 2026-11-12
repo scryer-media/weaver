@@ -913,12 +913,8 @@ pub struct TorrentSupport {
     pub view: TorrentView,
     /// The one copy of its metainfo, once it is in hand.
     pub metainfo: Option<Bytes>,
-    /// The ledger as of this reading.
+    /// The ledger as of this reading, with the bytes it wasted.
     pub counters: TorrentCounters,
-    /// Of the bytes wasted this run, those of pieces that failed their
-    /// check, and those of blocks that arrived when already in hand.
-    pub failed_bytes: u64,
-    pub redundant_bytes: u64,
     /// Its established peers, the seeders among them, and the peers still
     /// in their handshake.
     pub peers: (u32, u32, u32),
@@ -1750,6 +1746,7 @@ impl Live {
         let mut counters = self.counters;
         counters.uploaded_bytes += up;
         counters.downloaded_bytes += down;
+        count_waste(&mut counters, &self.seen, &seen);
         if up + down > 0 {
             counters.last_activity_ms = Some(now);
         }
@@ -1879,11 +1876,15 @@ impl Unviewed {
     }
 }
 
-// Bytes a torrent received and threw away since it was added in this
-// process: pieces that failed their check, and blocks that arrived when
-// already in hand.
-fn wasted(totals: &TorrentTotals) -> u64 {
-    totals.failed_bytes + totals.redundant_bytes
+// Fold into the ledger the bytes the session threw away between its totals
+// `then` and `now`, so its wasted bytes are the torrent's across restarts.
+fn count_waste(counters: &mut TorrentCounters, then: &TorrentTotals, now: &TorrentTotals) {
+    counters.failed_bytes = counters
+        .failed_bytes
+        .saturating_add(now.failed_bytes.saturating_sub(then.failed_bytes));
+    counters.redundant_bytes = counters
+        .redundant_bytes
+        .saturating_add(now.redundant_bytes.saturating_sub(then.redundant_bytes));
 }
 
 // The instant a torrent's durations run to, and the milliseconds each ran
@@ -1948,10 +1949,13 @@ impl Timed {
 
 // Whether two ledgers differ at most in the times that run on by themselves
 // while a torrent sits: its durations and when a complete copy was last
-// seen. Bytes moved and activity are written at the tick they change.
+// seen. Bytes moved, bytes wasted and activity are written at the tick they
+// change.
 fn same_but_times(a: &TorrentCounters, b: &TorrentCounters) -> bool {
     a.uploaded_bytes == b.uploaded_bytes
         && a.downloaded_bytes == b.downloaded_bytes
+        && a.failed_bytes == b.failed_bytes
+        && a.redundant_bytes == b.redundant_bytes
         && a.last_activity_ms == b.last_activity_ms
 }
 
@@ -4900,11 +4904,18 @@ impl TorrentService {
             now,
         );
         report.shortfall = error;
-        if let Err(error) = self.inner.db.delete_torrent(job_id) {
-            tracing::warn!(job_id = job_id.0, error = %error, "could not remove a torrent");
+        let row = report.history_row(
+            status,
+            Some(hashes_of(&torrent.record).best().0.to_vec()),
+            now,
+        );
+        // Its history row and its removal are one write: the job is never
+        // in neither, so an event raised while it was live, still being
+        // queued, finds it.
+        if let Err(error) = self.inner.db.retire_torrent(&row) {
+            tracing::warn!(job_id = job_id.0, error = %error, "could not move a torrent to history");
         }
-        self.finish(report, status, hashes_of(&torrent.record).best(), now)
-            .await;
+        self.finished(report).await;
     }
 
     // A torrent's job, finished as `status`: into history and the queue's
@@ -4915,6 +4926,13 @@ impl TorrentService {
         if let Err(error) = self.inner.db.insert_job_history(&row) {
             tracing::warn!(job_id = job_id.0, error = %error, "could not record a torrent's history");
         }
+        self.finished(report).await;
+    }
+
+    // A torrent's job, its history row written: out to the queue's
+    // finished jobs.
+    async fn finished(&self, report: JobReport) {
+        let job_id = report.job_id;
         self.publish().await;
         if let Some(queue) = self.queue()
             && let Err(error) = queue.retire_job(report.job_info()).await
@@ -6628,7 +6646,7 @@ impl TorrentService {
             consecutive_seeding_seconds: counters.consecutive_seeding_s,
             download_avg_bps: status::average_bps(counters.downloaded_bytes, active_seconds),
             upload_avg_bps: status::average_bps(counters.uploaded_bytes, active_seconds),
-            wasted_bytes: wasted(&reading.seen),
+            wasted_bytes: counters.wasted_bytes(),
             last_seen_complete_ms: counters.last_seen_complete_ms,
             last_activity_ms: counters.last_activity_ms,
             pieces: torrent.pieces(),
@@ -6717,8 +6735,6 @@ impl TorrentService {
                 view: self.view(&settings, torrent, now),
                 metainfo: torrent.record.metainfo.clone(),
                 counters: reading.counters,
-                failed_bytes: reading.seen.failed_bytes,
-                redundant_bytes: reading.seen.redundant_bytes,
                 peers: reading.peers,
                 peer_kinds: PeerKinds::default(),
                 fetch: torrent.fetching.as_ref().map(|fetch| *fetch.phase.borrow()),
@@ -6898,8 +6914,8 @@ impl TorrentService {
         );
         Unviewed {
             wanted_bytes,
-            hash_failed_bytes: reading.seen.failed_bytes,
-            redundant_bytes: reading.seen.redundant_bytes,
+            hash_failed_bytes: reading.counters.failed_bytes,
+            redundant_bytes: reading.counters.redundant_bytes,
             seeding_seconds: reading.counters.finished_duration_s,
             consecutive_seeding_seconds: reading.counters.consecutive_seeding_s,
             peers_connecting: reading.peers.2,

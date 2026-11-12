@@ -408,6 +408,18 @@ pub struct TorrentCounters {
     // reading that finds the torrent not seeding, and at a restart.
     pub consecutive_seeding_s: u64,
     pub last_activity_ms: Option<i64>,
+    // Bytes fetched and thrown away: those of pieces that failed their
+    // check, and those of blocks that arrived when already in hand. Their
+    // sum is the torrent's wasted bytes.
+    pub failed_bytes: u64,
+    pub redundant_bytes: u64,
+}
+
+impl TorrentCounters {
+    // Every byte fetched and thrown away.
+    pub fn wasted_bytes(&self) -> u64 {
+        self.failed_bytes.saturating_add(self.redundant_bytes)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

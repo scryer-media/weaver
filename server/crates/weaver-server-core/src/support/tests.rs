@@ -719,10 +719,10 @@ fn held_torrent(
             uploaded_bytes: 512,
             downloaded_bytes: 2048,
             active_duration_s: 120,
+            failed_bytes: 1024,
+            redundant_bytes: 1024,
             ..TorrentCounters::default()
         },
-        failed_bytes: 1024,
-        redundant_bytes: 1024,
         peers: (3, 1, 2),
         peer_kinds: PeerKinds {
             tcp: 2,

@@ -1702,6 +1702,15 @@ mod tests {
             pragma_column_count(&fresh, "torrent_counters", &gone_counters).await,
             0
         );
+        assert_eq!(
+            pragma_column_count(
+                &fresh,
+                "torrent_counters",
+                &["failed_bytes", "redundant_bytes"]
+            )
+            .await,
+            2
+        );
         fresh.close().await;
 
         let db_path = temp.path().join("pre-lean-resume.db");
@@ -1763,6 +1772,15 @@ mod tests {
                 (8, 0, None, Some("10.0.0.8".to_string())),
             ]
         );
+        // The ledger keeps the wasted bytes, from none for every torrent.
+        let wasted: Vec<(i64, i64, i64)> = sqlx::query_as(
+            "SELECT job_id, failed_bytes, redundant_bytes
+               FROM torrent_counters ORDER BY job_id",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(wasted, [(7, 0, 0), (8, 0, 0)]);
         pool.close().await;
     }
 

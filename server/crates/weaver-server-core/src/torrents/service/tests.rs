@@ -10555,6 +10555,86 @@ async fn an_idle_seeds_times_are_written_on_the_long_timer_not_each_tick() {
     );
 }
 
+// A torrent's wasted bytes are its own across restarts: the bytes of a
+// piece that failed its check and of a block that arrived when already in
+// hand go into its ledger, the next tick writes them, and the service a
+// restart builds over the same database reads the same wasted bytes and
+// the same two parts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_torrents_wasted_bytes_survive_a_restart() {
+    let seeded = seeded().await;
+    {
+        let mut live = seeded.rig.service.inner.live.lock().await;
+        let torrent = live.get_mut(&seeded.job_id).unwrap();
+        // The session's totals after one 16 KiB piece failed its check
+        // and one 16 KiB block came twice.
+        let then = torrent.seen;
+        let now = TorrentTotals {
+            failed_bytes: then.failed_bytes + 16_384,
+            redundant_bytes: then.redundant_bytes + 16_384,
+            ..then
+        };
+        count_waste(&mut torrent.counters, &then, &now);
+    }
+    seeded.advance(TICK.as_millis() as i64);
+    seeded.rig.service.tick().await;
+    let kept = seeded.kept().await;
+    assert_eq!((kept.failed_bytes, kept.redundant_bytes), (16_384, 16_384));
+    let stored = seeded.stored();
+    assert_eq!(
+        (stored.failed_bytes, stored.redundant_bytes),
+        (kept.failed_bytes, kept.redundant_bytes)
+    );
+    let parts = |support: &TorrentSupport| {
+        (
+            support.view.wasted_bytes,
+            support.counters.failed_bytes,
+            support.counters.redundant_bytes,
+        )
+    };
+    let before = parts(&seeded.rig.service.support(seeded.job_id).await.unwrap());
+    assert_eq!(before, (32_768, 16_384, 16_384));
+    assert_eq!(seeded.view().await.wasted_bytes, before.0);
+
+    let Seeded {
+        rig,
+        job_id,
+        seeder,
+        _seeds,
+        ..
+    } = seeded;
+    rig.service.stop().await;
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    let after = parts(&again.support(job_id).await.unwrap());
+    assert_eq!(after, before);
+    assert_eq!(again.torrent(job_id).await.unwrap().wasted_bytes, before.0);
+    again.stop().await;
+    seeder.stop().await;
+}
+
+// A tick that finds a torrent's ledger as last written writes nothing of
+// it; one that finds more wasted bytes writes the ledger once, with them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unchanged_ledger_is_not_written_and_wasted_bytes_are() {
+    let seeded = seeded().await;
+    seeded.advance(super::TIMES_EVERY_MS);
+    seeded.rig.service.tick().await;
+    let now = seeded.clock.0.load(Ordering::SeqCst);
+    let mut live = seeded.rig.service.inner.live.lock().await;
+    let torrent = live.get_mut(&seeded.job_id).unwrap();
+    assert!(torrent.take_resume(now, false).is_none());
+    torrent.counters.redundant_bytes += 16_384;
+    let written = torrent
+        .take_resume(now, false)
+        .and_then(|resume| resume.counters)
+        .unwrap();
+    assert_eq!(written, torrent.counters);
+    assert!(torrent.take_resume(now, false).is_none());
+    drop(live);
+    seeded.stop().await;
+}
+
 // Ten thousand torrents added one after another write their times spread
 // over the whole period: no tick takes more than twice its even share.
 #[test]

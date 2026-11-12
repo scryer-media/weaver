@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::StateError;
+use crate::history::record::JobHistoryRow;
 use crate::jobs::ids::JobId;
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, SqlTx};
@@ -38,7 +39,7 @@ fn resume_update(
         sets.push(
             "uploaded_bytes = {}, downloaded_bytes = {}, active_duration_s = {}, \
              last_seen_complete_ms = {}, finished_duration_s = {}, last_activity_ms = {}, \
-             consecutive_seeding_s = {}",
+             consecutive_seeding_s = {}, failed_bytes = {}, redundant_bytes = {}",
         );
         args.extend([
             SqlArg::I64(stored(counters.uploaded_bytes)?),
@@ -48,6 +49,8 @@ fn resume_update(
             SqlArg::I64(stored(counters.finished_duration_s)?),
             SqlArg::OptI64(counters.last_activity_ms),
             SqlArg::I64(stored(counters.consecutive_seeding_s)?),
+            SqlArg::I64(stored(counters.failed_bytes)?),
+            SqlArg::I64(stored(counters.redundant_bytes)?),
         ]);
     }
     if let Some(peers) = peers {
@@ -101,6 +104,22 @@ fn stored(value: u64) -> Result<i64, StateError> {
 }
 
 // What was on disk before a torrent's files, as JSON; NULL when nothing.
+// Removes the torrent with its files, trackers, ledger and checkpoint, in
+// `tx`. Returns whether it was there.
+async fn delete_torrent_tx(tx: &mut SqlTx<'_>, id: i64) -> Result<bool, StateError> {
+    let changed = tx
+        .execute("DELETE FROM torrents WHERE job_id = {}", &[SqlArg::I64(id)])
+        .await?;
+    for table in crate::jobs::graph_checkpoint::TABLES {
+        tx.execute(
+            &format!("DELETE FROM {table} WHERE job_id = {{}}"),
+            &[SqlArg::I64(id)],
+        )
+        .await?;
+    }
+    Ok(changed > 0)
+}
+
 fn adopted_text(adopted: &super::model::Adopted) -> Result<Option<String>, StateError> {
     (!adopted.is_empty())
         .then(|| serde_json::to_string(adopted))
@@ -526,22 +545,37 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "delete_torrent", |tx| {
-                Box::pin(async move {
-                    let changed = tx
-                        .execute("DELETE FROM torrents WHERE job_id = {}", &[SqlArg::I64(id)])
-                        .await?;
-                    for table in crate::jobs::graph_checkpoint::TABLES {
-                        tx.execute(
-                            &format!("DELETE FROM {table} WHERE job_id = {{}}"),
-                            &[SqlArg::I64(id)],
-                        )
-                        .await?;
-                    }
-                    Ok(changed > 0)
-                })
+                Box::pin(async move { delete_torrent_tx(tx, id).await })
             })
             .await
         })
+    }
+
+    // The torrent's job leaves the torrents for history in one write: its
+    // history row is written and the torrent removed as `delete_torrent`
+    // removes it. No reader finds the job in neither, so an event raised
+    // for it while it was live is still queued for it after.
+    pub fn retire_torrent(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
+        let id = stored(entry.job_id)?;
+        let datastore = self.datastore();
+        let cache_entry = entry.clone();
+        let observed_generation = self.job_history_cache_generation();
+        let entry_in_tx = entry.clone();
+        let result = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "retire_torrent", |tx| {
+                let entry = entry_in_tx.clone();
+                Box::pin(async move {
+                    crate::history::persistence::insert_job_history_tx(tx, &entry).await?;
+                    delete_torrent_tx(tx, id).await?;
+                    Ok(())
+                })
+            })
+            .await
+        });
+        if result.is_ok() {
+            self.cache_job_history_at(cache_entry, observed_generation);
+        }
+        result
     }
 
     // The torrent's category. Returns whether the torrent exists.
@@ -946,7 +980,8 @@ impl Database {
                 datastore.read_exec(),
                 "SELECT job_id, uploaded_bytes, downloaded_bytes, active_duration_s,
                         last_seen_complete_ms, finished_duration_s, last_activity_ms,
-                        consecutive_seeding_s, pieces, pieces_checking, peers, banned_peers
+                        consecutive_seeding_s, failed_bytes, redundant_bytes, pieces,
+                        pieces_checking, peers, banned_peers
                    FROM torrent_counters",
                 &[],
             )

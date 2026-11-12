@@ -197,6 +197,8 @@ fn intent_and_counters_update_in_place() {
         last_seen_complete_ms: Some(8_800),
         finished_duration_s: 600,
         last_activity_ms: Some(8_500),
+        failed_bytes: 32_768,
+        redundant_bytes: 16_384,
     };
     assert!(db.update_torrent_counters(JobId(3), &counters).unwrap());
     assert_eq!(db.get_torrent_counters(JobId(3)).unwrap(), Some(counters));

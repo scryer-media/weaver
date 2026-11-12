@@ -327,7 +327,7 @@ impl Database {
                 datastore.read_exec(),
                 "SELECT uploaded_bytes, downloaded_bytes, active_duration_s,
                         last_seen_complete_ms, finished_duration_s, last_activity_ms,
-                        consecutive_seeding_s
+                        consecutive_seeding_s, failed_bytes, redundant_bytes
                    FROM torrent_counters WHERE job_id = {}",
                 &[SqlArg::I64(job_id.0 as i64)],
             )
@@ -408,6 +408,8 @@ pub(crate) fn counters_from_row(row: &SqlRow) -> Result<TorrentCounters, StateEr
         finished_duration_s: count(row, "finished_duration_s")?,
         last_activity_ms: row.opt_i64("last_activity_ms")?,
         consecutive_seeding_s: count(row, "consecutive_seeding_s")?,
+        failed_bytes: count(row, "failed_bytes")?,
+        redundant_bytes: count(row, "redundant_bytes")?,
     })
 }
 

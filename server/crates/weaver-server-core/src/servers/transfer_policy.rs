@@ -1042,13 +1042,31 @@ fn quota_states(
     policy: &ServerPolicyState,
 ) -> EgressQuotaStates {
     let download = match policy.quota.download_bytes {
-        Some(_) if snapshot.quota_blocked => QuotaState::Stopped,
+        Some(_) if quota_blocked(snapshot, policy) => QuotaState::Stopped,
         budget => QuotaState::of(snapshot.quota_used_bytes, None, budget),
     };
     EgressQuotaStates {
         download,
         upload: policy.upload_state(),
     }
+}
+
+// Whether the holder's download quota turns work away. A holder at a rate
+// of 0 turns every request away, quota or not: its quota does so only once
+// its bytes reach the budget.
+fn quota_blocked(
+    snapshot: &weaver_nntp::transfer::ServerTransferSnapshot,
+    policy: &ServerPolicyState,
+) -> bool {
+    if policy.rate == Some(0) {
+        return policy.quota.download_bytes.is_some_and(|limit| {
+            snapshot
+                .quota_used_bytes
+                .saturating_add(snapshot.quota_reserved_bytes)
+                >= limit
+        });
+    }
+    snapshot.quota_blocked
 }
 
 fn monotonic_deadline(window: ServerQuotaWindow) -> Option<Instant> {
@@ -1086,7 +1104,7 @@ fn snapshot_for_policy(
                     .saturating_add(snapshot.quota_reserved_bytes),
             )
         }),
-        blocked: snapshot.quota_blocked,
+        blocked: quota_blocked(snapshot, policy),
         window_start: policy.window.map(|value| value.start),
         window_end: policy.window.map(|value| value.end),
         timezone: local_timezone_label(now),
@@ -1369,6 +1387,56 @@ mod tests {
             .try_reserve(egress.quota.download_bytes.unwrap())
             .unwrap();
         assert!(control.try_reserve(1).is_err());
+    }
+
+    // An egress at a download rate of 0 moves nothing, but its download
+    // quota stands where its bytes put it: room left reads Normal and turns
+    // nothing away, its budget taken reads Stopped.
+    #[test]
+    fn a_closed_egress_reads_its_download_quota_by_its_bytes() {
+        let db = Database::open_in_memory().unwrap();
+        let registry = ServerTransferPolicyRegistry::new(db, &[]).unwrap();
+        let mut egress = crate::proxies::EgressInterface {
+            id: 7,
+            name: "Metered link".into(),
+            binding: crate::proxies::EgressBinding::System,
+            enabled: true,
+            download_bps: Some(0),
+            upload_bps: None,
+            quota: egress_quota(ServerDownloadQuotaPeriod::OneTime),
+        };
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        let control = registry
+            .egress_transfer_registry()
+            .control(StableServerId(7));
+        // Closed, it refuses work, and its quota has all its room.
+        assert!(control.try_reserve(1).is_err());
+        assert!(control.snapshot().quota_blocked);
+        assert_eq!(
+            registry.egress_quota_states(7).unwrap().download,
+            QuotaState::Normal
+        );
+        assert!(!registry.egress_snapshot(7).unwrap().blocked);
+
+        // Open, its budget taken; closed again, the quota is what stops it.
+        egress.download_bps = None;
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        let _reservation = control
+            .try_reserve(egress.quota.download_bytes.unwrap())
+            .unwrap();
+        egress.download_bps = Some(0);
+        registry
+            .reconfigure_egresses(std::slice::from_ref(&egress))
+            .unwrap();
+        assert_eq!(
+            registry.egress_quota_states(7).unwrap().download,
+            QuotaState::Stopped
+        );
+        assert!(registry.egress_snapshot(7).unwrap().blocked);
     }
 
     fn upload_capped_egress(db: &Database) -> crate::proxies::EgressInterface {

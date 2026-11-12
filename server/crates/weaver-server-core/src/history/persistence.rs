@@ -112,21 +112,13 @@ pub(crate) async fn replace_job_history_attributes_tx(
     Ok(())
 }
 
-impl Database {
-    pub fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
-        let datastore = self.datastore();
-        let cache_entry = entry.clone();
-        // Capture the cache generation before the write so a delete racing this
-        // insert (invalidating after its commit) makes the re-cache a no-op.
-        let observed_generation = self.job_history_cache_generation();
-        let args = job_history_args(entry);
-        let attribute_entry = entry.clone();
-        let result = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "insert_job_history", |tx| {
-                let args = args.clone();
-                let attribute_entry = attribute_entry.clone();
-                Box::pin(async move {
-                    tx.execute(
+// The job's history row, its attributes and its duplicate identity's move
+// to history, written in `tx`.
+pub(crate) async fn insert_job_history_tx(
+    tx: &mut SqlTx<'_>,
+    entry: &JobHistoryRow,
+) -> Result<(), StateError> {
+    tx.execute(
                         "INSERT INTO job_history
                             (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                              optional_recovery_bytes, optional_recovery_downloaded_bytes,
@@ -153,23 +145,36 @@ impl Database {
                             metadata = excluded.metadata,
                             server_attribution = COALESCE(excluded.server_attribution, job_history.server_attribution),
                             protocol = excluded.protocol",
-                        &args,
+                        &job_history_args(entry),
                     )
                     .await?;
-                    replace_job_history_attributes_tx(tx, &attribute_entry).await?;
-                    crate::jobs::duplicate_persistence::transition_duplicate_snapshot_for_history_tx(
-                        tx,
-                        crate::JobId(attribute_entry.job_id),
-                        &attribute_entry.status,
-                        attribute_entry.error_message.as_deref(),
-                        None,
-                        attribute_entry.health,
-                        attribute_entry.failed_bytes,
-                        attribute_entry.completed_at,
-                    )
-                    .await?;
-                    Ok(())
-                })
+    replace_job_history_attributes_tx(tx, entry).await?;
+    crate::jobs::duplicate_persistence::transition_duplicate_snapshot_for_history_tx(
+        tx,
+        crate::JobId(entry.job_id),
+        &entry.status,
+        entry.error_message.as_deref(),
+        None,
+        entry.health,
+        entry.failed_bytes,
+        entry.completed_at,
+    )
+    .await?;
+    Ok(())
+}
+
+impl Database {
+    pub fn insert_job_history(&self, entry: &JobHistoryRow) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let cache_entry = entry.clone();
+        // Capture the cache generation before the write so a delete racing this
+        // insert (invalidating after its commit) makes the re-cache a no-op.
+        let observed_generation = self.job_history_cache_generation();
+        let entry_in_tx = entry.clone();
+        let result = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "insert_job_history", |tx| {
+                let entry = entry_in_tx.clone();
+                Box::pin(async move { insert_job_history_tx(tx, &entry).await })
             })
             .await
         });
