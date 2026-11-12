@@ -32,6 +32,18 @@ impl Database {
                             )
                             .await?;
                         }
+                        // A category this drops takes its torrent route.
+                        tx.execute(
+                            "DELETE FROM proxy_routes
+                              WHERE consumer LIKE 'torrent:category:%'
+                                AND NOT EXISTS (
+                                    SELECT 1 FROM categories
+                                     WHERE 'torrent:category:' || CAST(categories.id AS TEXT)
+                                         = proxy_routes.consumer
+                                )",
+                            &[],
+                        )
+                        .await?;
                         Ok(())
                     })
                 })

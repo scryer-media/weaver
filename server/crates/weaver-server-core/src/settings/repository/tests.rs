@@ -1010,3 +1010,112 @@ fn a_rules_archive_passwords_are_sealed_and_follow_its_tracker_file() {
     assert!(passwords(rule.id).is_empty());
     assert_eq!(global(), listed(&["global"]));
 }
+
+fn store_route_rows(db: &Database, consumers: &[&str]) {
+    use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+    let store = db.datastore();
+    let keys: Vec<String> = consumers.iter().map(|key| (*key).to_owned()).collect();
+    let policy = serde_json::to_string(&crate::proxies::RoutingPolicy::default()).unwrap();
+    db.run_sql_blocking(async move {
+        SqlRuntime::run_in_transaction(&store, "route_rows", |tx| {
+            let (keys, policy) = (keys.clone(), policy.clone());
+            Box::pin(async move {
+                for key in keys {
+                    tx.execute(
+                        "INSERT INTO proxy_routes (consumer, policy) VALUES ({}, {})",
+                        &[SqlArg::Text(key), SqlArg::Text(policy.clone())],
+                    )
+                    .await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+    })
+    .unwrap();
+}
+fn route_rows(db: &Database) -> Vec<String> {
+    let mut keys: Vec<_> = db
+        .list_proxy_routes()
+        .unwrap()
+        .into_iter()
+        .map(|(key, _)| key)
+        .collect();
+    keys.sort();
+    keys
+}
+
+// Removing a category or a tracker rule removes its torrent route with it,
+// and only its own; so does a replacement of the categories that drops one.
+#[test]
+fn a_removed_route_owner_takes_its_route_row() {
+    let db = Database::open_in_memory().unwrap();
+    let category = |id: u32| CategoryConfig {
+        upload_cap: Default::default(),
+        seeding: None,
+        torrent_route: true,
+        unpack: None,
+        id,
+        name: format!("category {id}"),
+        dest_dir: None,
+        aliases: String::new(),
+    };
+    for id in 1..=3 {
+        db.insert_category(&category(id)).unwrap();
+    }
+    let rule = db
+        .insert_tracker_rule(
+            &TrackerRule {
+                archive_passwords: Default::default(),
+                bound: None,
+                id: 0,
+                host_pattern: "tracker.invalid".into(),
+                seeding: None,
+                never_pause: false,
+                unpack: None,
+                client: None,
+                torrent_route: true,
+                dht: None,
+                pex: None,
+                lsd: None,
+                encryption: None,
+                upload_cap: Leaf::Inherit,
+                forced: false,
+                ssl: None,
+            },
+            1,
+        )
+        .unwrap();
+    store_route_rows(
+        &db,
+        &[
+            "torrent:category:1",
+            "torrent:category:2",
+            "torrent:category:3",
+            "torrent:tracker:1",
+            "torrent:default",
+        ],
+    );
+
+    assert!(db.delete_category(1).unwrap());
+    assert_eq!(
+        route_rows(&db),
+        [
+            "torrent:category:2",
+            "torrent:category:3",
+            "torrent:default",
+            "torrent:tracker:1"
+        ]
+    );
+    assert!(db.delete_tracker_rule(rule.id).unwrap());
+    assert_eq!(
+        route_rows(&db),
+        [
+            "torrent:category:2",
+            "torrent:category:3",
+            "torrent:default"
+        ]
+    );
+    db.replace_categories(&[category(3)]).unwrap();
+    assert_eq!(route_rows(&db), ["torrent:category:3", "torrent:default"]);
+}

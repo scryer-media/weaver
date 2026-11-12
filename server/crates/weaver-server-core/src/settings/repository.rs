@@ -276,17 +276,33 @@ impl Database {
     }
 
     // Returns whether the rule existed. A torrent it matched keeps no rule
-    // until its trackers are matched again.
+    // until its trackers are matched again. Its torrent route goes with it,
+    // so a rule given its id later starts on the default route.
     pub fn delete_tracker_rule(&self, id: u32) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.write_exec(),
-                "DELETE FROM tracker_rules WHERE id = {}",
-                &[SqlArg::I64(i64::from(id))],
-            )
-            .await?;
-            Ok(changed > 0)
+            SqlRuntime::run_in_transaction(&datastore, "delete_tracker_rule", |tx| {
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "DELETE FROM tracker_rules WHERE id = {}",
+                            &[SqlArg::I64(i64::from(id))],
+                        )
+                        .await?;
+                    tx.execute(
+                        "DELETE FROM proxy_routes WHERE consumer = {}",
+                        &[SqlArg::Text(
+                            crate::proxies::Consumer::Torrent(
+                                crate::proxies::TorrentScope::TrackerRule(id),
+                            )
+                            .key(),
+                        )],
+                    )
+                    .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
         })
     }
 
