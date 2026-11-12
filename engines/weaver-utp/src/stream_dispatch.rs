@@ -199,6 +199,9 @@ struct VirtualSocket<T, Env> {
     // The highest seq_nr we ever sent, kept through a rewind: an ACK past
     // it acks nothing we sent.
     highest_sent_seq_nr: SeqNr,
+    // The packet resent as this flight's tail-loss probe, until it is
+    // acknowledged. One probe per flight.
+    tail_probe_seq_nr: Option<SeqNr>,
 
     // Last remote sequence number that we fully processed.
     last_consumed_remote_seq_nr: SeqNr,
@@ -338,6 +341,8 @@ macro_rules! send_data {
             }
             if $self.last_sent_seq_nr.is_after($self.highest_sent_seq_nr) {
                 $self.highest_sent_seq_nr = $self.last_sent_seq_nr;
+                // A new tail: its probe waits from now.
+                $self.timers.tail_probe.turn_off("new tail sent");
             }
 
             // Data sent: start the timer if it is not running.
@@ -538,6 +543,30 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         if self.user_tx_segments.is_empty() {
             return Ok(());
+        }
+
+        // The flight's tail, unacknowledged for two round trips with
+        // nothing new to send, is resent once so the ACK it draws shows
+        // what was lost (RFC 8985 section 7). The probe is no judgement of
+        // loss: the window and the count toward giving up stay as they are.
+        if self.timers.tail_probe.expired(self.this_poll.now) {
+            if self.tail_probe_due() {
+                let tail = self.highest_sent_seq_nr;
+                if let Some(mut seg) = self
+                    .user_tx_segments
+                    .iter_mut_for_sending(Some(tail))
+                    .next()
+                {
+                    if !send_data!(self, cx, header, seg)? {
+                        return Ok(());
+                    }
+                    seg.on_resent_as_probe();
+                    self.pacer.charge(seg.payload_size());
+                    self.tail_probe_seq_nr = Some(tail);
+                    trace!(%header.seq_nr, payload_size = seg.payload_size(), "tail probe: sent ST_DATA");
+                }
+            }
+            self.timers.tail_probe.turn_off("tail probe due");
         }
 
         // Each timeout that passed with nothing in flight decays the window.
@@ -1166,6 +1195,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             if self.fast_resend_seq_nr.is_before(snd_una) {
                 self.fast_resend_seq_nr = snd_una;
             }
+            // The flight moved: a tail probe waits from now, and a probe
+            // acknowledged ends its flight's.
+            self.timers.tail_probe.turn_off("ACK received");
+            if self
+                .tail_probe_seq_nr
+                .is_some_and(|probe| probe.is_before(snd_una))
+            {
+                self.tail_probe_seq_nr = None;
+            }
 
             // Reset retransmit timer.
             if self.user_tx_segments.is_empty() && self.state.our_fin_if_unacked().is_none() {
@@ -1631,6 +1669,52 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     // When do we need to poll next time based on timers expiring
+    // Whether the flight's tail may be probed: it is outstanding, nothing
+    // new waits behind it, no probe went out for this flight, and neither
+    // recovery nor the retransmission timer is resending.
+    fn tail_probe_due(&self) -> bool {
+        self.confirmed
+            && self.rto_retransmissions == 0
+            && self.tail_probe_seq_nr.is_none()
+            && !self.recovery.is_recovering()
+            && self.last_sent_seq_nr == self.highest_sent_seq_nr
+            && self.user_tx_segments.next_seq_nr() - 1 == self.highest_sent_seq_nr
+            && self.user_tx_segments.tail_is_outstanding_data()
+    }
+
+    // Two measured round trips after the tail went out or the last ACK
+    // came, and the time a receiver may hold back an ACK, unless the
+    // retransmission timer comes first (RFC 8985 section 7.2: 2 ms more,
+    // 200 ms when one packet is out, which a receiver may ACK late).
+    fn update_tail_probe_timer(&mut self) {
+        if !self.rtte.has_sample() || !self.tail_probe_due() {
+            self.timers.tail_probe.turn_off("no tail to probe");
+            return;
+        }
+        if self.timers.tail_probe.poll_at().is_some() {
+            return;
+        }
+        let one_out = self.user_tx_segments.acked_seq_nr() + 1 == self.highest_sent_seq_nr;
+        let wait = self.rtte.roundtrip_time() * 2
+            + if one_out {
+                TAIL_PROBE_LATE_ACK
+            } else {
+                TAIL_PROBE_SLACK
+            };
+        if self
+            .timers
+            .retransmit
+            .poll_at()
+            .is_some_and(|rto| rto <= self.this_poll.now + wait)
+        {
+            self.timers.tail_probe.turn_off("the timer comes first");
+            return;
+        }
+        self.timers
+            .tail_probe
+            .arm(self.this_poll.now, wait, false, "tail outstanding");
+    }
+
     fn next_timer_to_poll(&mut self) -> Option<Instant> {
         // A send waits on the transport: try it again after SEND_RETRY at the
         // latest, as the transport's own wake may never come.
@@ -1652,6 +1736,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.timers.recovery_pipe_expiry.take().poll_at(), // take() disarms it on every call
             self.timers.syn_ack_resend.poll_at(),
             self.timers.pace.take().poll_at(), // armed again by each pass the pacer stops
+            self.timers.tail_probe.poll_at(),
         ]
         .into_iter()
         .flatten()
@@ -1858,6 +1943,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 );
             }
 
+            self.update_tail_probe_timer();
             self.arm_next_poll(cx);
 
             if ingress_remaining == 0 {
@@ -2078,6 +2164,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 recovery_pipe_expiry: Timer::default(),
                 syn_ack_resend: Timer::default(),
                 pace: Timer::default(),
+                tail_probe: Timer::default(),
                 remote_inactivity_timer: {
                     let mut timer = Timer::default();
                     if matches!(
@@ -2099,6 +2186,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             seq_nr,
             last_sent_seq_nr,
             highest_sent_seq_nr: last_sent_seq_nr,
+            tail_probe_seq_nr: None,
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
             rto_retransmissions: 0,
@@ -2175,6 +2263,10 @@ const IDLE_DECAYS_MAX: u128 = 64;
 
 const TIMER_SYN_ACK_RESEND: u8 = 4;
 const TIMER_PACE: u8 = 5;
+const TIMER_TAIL_PROBE: u8 = 6;
+// What a tail probe waits past two round trips: RFC 8985 section 7.2.
+const TAIL_PROBE_SLACK: Duration = Duration::from_millis(2);
+const TAIL_PROBE_LATE_ACK: Duration = Duration::from_millis(200);
 
 /// A send the transport could not take is tried again after this, whether
 /// or not the transport wakes the stream first. A kernel datagram socket
@@ -2203,6 +2295,7 @@ impl<const NAME: u8> Timer<NAME> {
             TIMER_RECOVERY_PIPE => "recovery pipe",
             TIMER_SYN_ACK_RESEND => "syn ack resend",
             TIMER_PACE => "pace",
+            TIMER_TAIL_PROBE => "tail probe",
             _ => "unknown",
         }
     }
@@ -2297,6 +2390,8 @@ struct Timers {
     syn_ack_resend: Timer<TIMER_SYN_ACK_RESEND>,
     // Data waits on the pacer until then.
     pace: Timer<TIMER_PACE>,
+    // The flight's tail is resent then, if still unacknowledged.
+    tail_probe: Timer<TIMER_TAIL_PROBE>,
 }
 
 impl Timers {

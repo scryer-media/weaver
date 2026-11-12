@@ -50,6 +50,8 @@ pub struct Segment {
     is_mtu_probe: bool,
     // Resends past the first that SACKs of later sends asked for.
     evidence_resends: usize,
+    // Resends of the flight's tail as a tail-loss probe.
+    probe_resends: usize,
 
     // Lost: three or more later segments were delivered.
     is_lost: bool,
@@ -138,16 +140,23 @@ impl SegmentForSending<'_> {
     // evidence before it is lost again.
     pub fn on_resent_as_lost(&mut self) {
         self.segment.is_lost = false;
-        if self.segment.retransmit_count() > 1 {
+        if self.segment.retransmit_count() - self.segment.probe_resends > 1 {
             self.segment.evidence_resends += 1;
         }
     }
 
+    // Resent as a tail-loss probe: the probe asks for an ACK, it is no
+    // judgement that the packet is lost.
+    pub fn on_resent_as_probe(&mut self) {
+        self.segment.probe_resends += 1;
+    }
+
     // Sends that count toward giving up: the first send, the first resend
     // and the timer's, as libtorrent counts them (utp_stream.cpp:3523);
-    // resends of a resend that SACKs showed lost are not among them.
+    // resends of a resend that SACKs showed lost, and tail-loss probes, are
+    // not among them.
     pub fn counted_sends(&self) -> usize {
-        self.segment.send_count() - self.segment.evidence_resends
+        self.segment.send_count() - self.segment.evidence_resends - self.segment.probe_resends
     }
 
     pub fn is_expired(&self) -> bool {
@@ -317,6 +326,14 @@ impl Segments {
         self.segments.front().is_some_and(|s| s.is_mtu_probe())
     }
 
+    // Whether the last segment is data sent and not yet delivered: no
+    // unsent segment waits behind it, and it is no MTU probe.
+    pub fn tail_is_outstanding_data(&self) -> bool {
+        self.segments
+            .back()
+            .is_some_and(|s| s.send_count() > 0 && !s.is_delivered && !s.is_mtu_probe)
+    }
+
     pub fn sole_outstanding_is_mtu_probe(&self) -> bool {
         let mut outstanding = self
             .segments
@@ -371,6 +388,7 @@ impl Segments {
             is_mtu_probe,
             sent: SentStatus::NotSent,
             evidence_resends: 0,
+            probe_resends: 0,
             is_lost: false,
             is_expired: false,
         });

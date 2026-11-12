@@ -92,6 +92,11 @@ impl RttEstimator {
         }
     }
 
+    /// Whether a round trip was measured, not assumed.
+    pub fn has_sample(&self) -> bool {
+        matches!(self.state, RttState::Subsequent { .. })
+    }
+
     /// How long to wait for an ACK before the oldest packet in flight counts
     /// as lost: the mean round trip plus twice its deviation, never under
     /// the floor, a second more for the first timeout in a row and doubling

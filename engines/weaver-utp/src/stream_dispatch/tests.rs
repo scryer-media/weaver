@@ -26,6 +26,7 @@ mod sequence_wrap;
 mod shutdown;
 mod small_window;
 mod stream_api;
+mod tail_probe;
 mod timeouts;
 
 use std::{
