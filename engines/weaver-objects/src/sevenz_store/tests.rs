@@ -1000,6 +1000,68 @@ fn every_unproven_candidate_wrong_needs_a_password() {
     assert!(has(&owner, &Emit::Refuse(Why::EncryptedHeader)));
 }
 
+// A wrong candidate condemned over a folder two cipher strides long: the
+// folder, asked for again whole, is read back as the tree reads it, a piece
+// at a time, and no piece reads more than a piece of plaintext at once,
+// gives back more than a piece, or enciphers more than the stride behind it
+// and itself, however long the folder. The right candidate then opens the
+// same bytes.
+#[test]
+fn a_condemned_folder_is_read_back_a_bounded_piece_at_a_time() {
+    use crate::crypt::{BLOCK, STRIDE};
+    use weaver_graph::AGAIN_PIECE;
+
+    let file = payload(52, 2 * STRIDE as usize + 12_345);
+    let bytes = write(aes(), false, &[(None, Entry::File("large.bin", &file))]);
+    let mut owner = Owner::single(store(), bytes.clone());
+    owner.offer("not-the-passphrase");
+    owner.offer(PASSWORD);
+    owner.frames(0, 256 << 10);
+    owner.close(0);
+    no_trouble(&owner);
+    let again: Vec<ByteRange> = owner
+        .said
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::Again { range, .. } => Some(*range),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(again.len(), 1, "one folder, once");
+    assert!(again[0].len() > file.len() as u64, "the whole folder");
+    assert!(
+        owner.again_pieces as u64 > 2 * STRIDE / AGAIN_PIECE,
+        "{} pieces",
+        owner.again_pieces
+    );
+    assert!(owner.again_read_most > 0, "read back");
+    assert!(
+        owner.again_read_most <= AGAIN_PIECE,
+        "one read of {}",
+        owner.again_read_most
+    );
+    assert!(
+        owner.again_piece_most <= AGAIN_PIECE,
+        "one piece of {}",
+        owner.again_piece_most
+    );
+    assert!(
+        owner.again_sealed_most > AGAIN_PIECE,
+        "a seed lies behind a piece"
+    );
+    assert!(
+        owner.again_sealed_most <= STRIDE + AGAIN_PIECE + 2 * BLOCK,
+        "one piece enciphered {}",
+        owner.again_sealed_most
+    );
+    let got = owner.member("large.bin");
+    assert!(got.closed);
+    assert!(got.bytes == file, "byte-identical");
+    assert!(got.coverage.verified(ByteRange::new(0, file.len() as u64)));
+    assert_eq!(owner.held(), 0);
+    assert!(owner.posted(0).as_deref() == Some(bytes.as_slice()));
+}
+
 fn member_id(owner: &Owner, name: &str) -> MemberId {
     owner
         .members

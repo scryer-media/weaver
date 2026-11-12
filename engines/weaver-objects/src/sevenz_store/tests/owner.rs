@@ -45,6 +45,12 @@ pub(super) struct Owner {
     pub refetched: Vec<(VolumeIndex, ByteRange)>,
     // Runs read back and delivered again.
     pub replays: usize,
+    // Pieces read back, the most one read of a placement asked for, the
+    // most one piece gave back, and the most plaintext one piece enciphered.
+    pub again_pieces: usize,
+    pub again_read_most: u64,
+    pub again_piece_most: u64,
+    pub again_sealed_most: u64,
 }
 
 impl Owner {
@@ -64,6 +70,10 @@ impl Owner {
             fetched: BTreeMap::new(),
             refetched: Vec::new(),
             replays: 0,
+            again_pieces: 0,
+            again_read_most: 0,
+            again_piece_most: 0,
+            again_sealed_most: 0,
         };
         let (name, bytes) = &owner.volumes[0];
         let (front, length) = (&bytes[..bytes.len().min(32)], Some(bytes.len() as u64));
@@ -377,29 +387,45 @@ impl Owner {
     }
 
     // Ranges asked for again, as the tree answers them: what of each was
-    // delivered is read back, every range while the store still stands as
-    // it said them all, every member they reached is open again, and the
-    // bytes come again as they came.
+    // delivered is read back in pieces of at most `AGAIN_PIECE` bytes, each
+    // read on its own, every range while the store still stands as it said
+    // them all, every member they reached is open again, and the bytes come
+    // again as they came.
     fn again(&mut self, ranges: &[(VolumeIndex, ByteRange)]) {
         let mut read_back = Vec::new();
         for &(volume, range) in ranges {
-            let runs: Vec<(ByteRange, Provenance)> = self
+            let pieces: Vec<(ByteRange, Provenance)> = self
                 .delivered
                 .get(&volume.0)
                 .map(|coverage| {
                     coverage
                         .overlapping(range)
                         .filter_map(|run| Some((run.range.intersect(range)?, run.provenance)))
+                        .flat_map(|(run, provenance)| {
+                            (run.start..run.end)
+                                .step_by(weaver_graph::AGAIN_PIECE as usize)
+                                .map(move |at| {
+                                    let end = run.end.min(at + weaver_graph::AGAIN_PIECE);
+                                    (ByteRange::new(at, end), provenance)
+                                })
+                        })
                         .collect()
                 })
                 .unwrap_or_default();
-            for (piece, provenance) in runs {
+            for (piece, provenance) in pieces {
                 let (members, object) = (&self.members, &self.object);
+                let most = &mut self.again_read_most;
                 let mut read = |placement: &Placement, into: &mut Vec<u8>| {
+                    *most = (*most).max(placement.len());
                     read_posted(members, object, placement, into)
                 };
                 let mut bytes = Vec::new();
-                if self.object.posted(volume, piece, &mut read, &mut bytes) {
+                crate::crypt::sealed();
+                let posted = self.object.posted(volume, piece, &mut read, &mut bytes);
+                self.again_sealed_most = self.again_sealed_most.max(crate::crypt::sealed());
+                if posted {
+                    self.again_pieces += 1;
+                    self.again_piece_most = self.again_piece_most.max(bytes.len() as u64);
                     read_back.push((volume, piece, provenance, bytes));
                 }
             }
