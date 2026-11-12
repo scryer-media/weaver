@@ -5,8 +5,9 @@
 // socket loses its access the moment the credential it was admitted with does.
 
 use super::*;
-use async_graphql::futures_util::{SinkExt, StreamExt};
-use async_graphql::{EmptyMutation, EmptySubscription, Object, Schema};
+use async_graphql::futures_util::{SinkExt, Stream, StreamExt, stream};
+use async_graphql::{Context, EmptyMutation, Object, Schema, Subscription};
+use std::collections::BTreeSet;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
 use tokio_tungstenite::tungstenite::{Error as SocketError, Message};
@@ -21,7 +22,27 @@ impl Query {
     }
 }
 
-type TestSchema = Schema<Query, EmptyMutation, EmptySubscription>;
+// The values a test sends to every live `ticks` subscription.
+struct Ticks(broadcast::Sender<i32>);
+
+struct TestSubscription;
+
+#[Subscription]
+impl TestSubscription {
+    // 0 at once, then each value the test sends. With `until`, the stream ends
+    // by itself when that value arrives, without sending it.
+    async fn ticks(&self, ctx: &Context<'_>, until: Option<i32>) -> impl Stream<Item = i32> {
+        let receiver = ctx.data_unchecked::<Ticks>().0.subscribe();
+        stream::once(async { 0 }).chain(stream::unfold(receiver, move |mut receiver| async move {
+            match receiver.recv().await {
+                Ok(value) if Some(value) != until => Some((value, receiver)),
+                _ => None,
+            }
+        }))
+    }
+}
+
+type TestSchema = Schema<Query, EmptyMutation, TestSubscription>;
 
 type Client =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
@@ -35,22 +56,24 @@ struct SocketServer {
     auth_cache: LoginAuthCache,
     api_key_cache: ApiKeyCache,
     security: Arc<RuntimeSecurityConfig>,
+    ticks: broadcast::Sender<i32>,
 }
 
 impl SocketServer {
     async fn start(db: Database, auth_cache: LoginAuthCache) -> Self {
         let api_key_cache = ApiKeyCache::default();
         let security = Arc::new(RuntimeSecurityConfig::default());
+        let (ticks, _) = broadcast::channel(64);
         let app = Router::new()
             .route(
                 "/graphql/ws",
                 get(super::super::graphql::ws_handler::<TestSchema>),
             )
-            .layer(Extension(Schema::new(
-                Query,
-                EmptyMutation,
-                EmptySubscription,
-            )))
+            .layer(Extension(
+                Schema::build(Query, EmptyMutation, TestSubscription)
+                    .data(Ticks(ticks.clone()))
+                    .finish(),
+            ))
             .layer(Extension(RequestAuthContext {
                 db: db.clone(),
                 auth_cache: auth_cache.clone(),
@@ -74,6 +97,7 @@ impl SocketServer {
             auth_cache,
             api_key_cache,
             security,
+            ticks,
         }
     }
 
@@ -354,4 +378,177 @@ async fn authenticated_browser_socket_keeps_origin_binding_and_closes_after_logo
         .revoke_browser_session(&hex_hash(token), now)
         .unwrap();
     assert_closed_forbidden(&mut client).await;
+}
+
+async fn subscribe(client: &mut Client, id: &str, query: &str) {
+    send(
+        client,
+        serde_json::json!({ "id": id, "type": "subscribe", "payload": { "query": query } }),
+    )
+    .await;
+}
+
+// The next message for operation `id`, passing over messages for the others.
+async fn receive_for(client: &mut Client, id: &str) -> serde_json::Value {
+    loop {
+        let message = receive(client).await;
+        if message["id"] == id {
+            return message;
+        }
+    }
+}
+
+// The ids of the next `count` messages, each a `next` carrying `value`.
+async fn receive_ticks(client: &mut Client, count: usize, value: i32) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for _ in 0..count {
+        let message = receive(client).await;
+        assert_eq!(message["type"], "next", "{message}");
+        assert_eq!(message["payload"]["data"]["ticks"], value, "{message}");
+        ids.insert(message["id"].as_str().unwrap().to_string());
+    }
+    ids
+}
+
+fn assert_refused_as_full(message: &serde_json::Value, id: &str) {
+    assert_eq!(message["type"], "error", "{message}");
+    assert_eq!(message["id"], id, "{message}");
+    assert_eq!(
+        message["payload"][0]["message"],
+        "Too many live subscriptions on this connection (limit 32)",
+        "{message}"
+    );
+}
+
+async fn read_key_socket(server: &SocketServer, key: &str) -> Client {
+    server
+        .admitted(&[], serde_json::json!({ "api_key": key }))
+        .await
+}
+
+fn insert_read_key(server: &SocketServer, key: &str) {
+    server
+        .db
+        .insert_api_key(key, &hash_api_key(key), "read")
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_socket_holds_at_most_32_live_subscriptions_and_a_stop_frees_one() {
+    let server = SocketServer::start(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+    )
+    .await;
+    insert_read_key(&server, "subscription-cap-key");
+    let mut client = read_key_socket(&server, "subscription-cap-key").await;
+
+    let ids: BTreeSet<String> = (0..32).map(|index| format!("live-{index}")).collect();
+    for id in &ids {
+        subscribe(&mut client, id, "subscription { ticks }").await;
+    }
+    assert_eq!(receive_ticks(&mut client, 32, 0).await, ids);
+
+    subscribe(&mut client, "over", "subscription { ticks }").await;
+    assert_refused_as_full(&receive(&mut client).await, "over");
+
+    // The refusal left the socket and the 32 others running.
+    server.ticks.send(1).unwrap();
+    assert_eq!(receive_ticks(&mut client, 32, 1).await, ids);
+    assert_answers(&mut client, "query-while-full").await;
+
+    // A stopped subscription gives its place to the next subscribe.
+    send(
+        &mut client,
+        serde_json::json!({ "id": "live-0", "type": "complete" }),
+    )
+    .await;
+    subscribe(&mut client, "after-stop", "subscription { ticks }").await;
+    let started = receive_for(&mut client, "after-stop").await;
+    assert_eq!(started["type"], "next", "{started}");
+    assert_eq!(started["payload"]["data"]["ticks"], 0, "{started}");
+
+    subscribe(&mut client, "over-again", "subscription { ticks }").await;
+    assert_refused_as_full(&receive_for(&mut client, "over-again").await, "over-again");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_subscription_that_ends_by_itself_frees_its_place() {
+    let server = SocketServer::start(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+    )
+    .await;
+    insert_read_key(&server, "subscription-end-key");
+    let mut client = read_key_socket(&server, "subscription-end-key").await;
+
+    for index in 0..31 {
+        subscribe(
+            &mut client,
+            &format!("live-{index}"),
+            "subscription { ticks }",
+        )
+        .await;
+    }
+    subscribe(&mut client, "ending", "subscription { ticks(until: 99) }").await;
+    receive_ticks(&mut client, 32, 0).await;
+    subscribe(&mut client, "over", "subscription { ticks }").await;
+    assert_refused_as_full(&receive(&mut client).await, "over");
+
+    server.ticks.send(99).unwrap();
+    assert_eq!(receive_for(&mut client, "ending").await["type"], "complete");
+
+    subscribe(&mut client, "after-end", "subscription { ticks }").await;
+    let started = receive_for(&mut client, "after-end").await;
+    assert_eq!(started["type"], "next", "{started}");
+    subscribe(&mut client, "over-again", "subscription { ticks }").await;
+    assert_refused_as_full(&receive_for(&mut client, "over-again").await, "over-again");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_credential_holds_at_most_8_open_sockets() {
+    let server = SocketServer::start(
+        Database::open_in_memory().unwrap(),
+        LoginAuthCache::default(),
+    )
+    .await;
+    insert_read_key(&server, "socket-cap-key");
+    insert_read_key(&server, "socket-cap-other-key");
+
+    let mut open = Vec::new();
+    for _ in 0..8 {
+        open.push(read_key_socket(&server, "socket-cap-key").await);
+    }
+
+    let mut ninth = server.open(&[]).await.expect("upgrade accepted");
+    send(
+        &mut ninth,
+        serde_json::json!({ "type": "connection_init", "payload": { "api_key": "socket-cap-key" } }),
+    )
+    .await;
+    let refused = ninth
+        .next()
+        .await
+        .expect("a close frame precedes the end of the stream")
+        .unwrap();
+    let Message::Close(Some(frame)) = refused else {
+        panic!("expected the ninth socket to be closed, got {refused:?}");
+    };
+    assert_eq!(frame.code, CloseCode::Library(4429));
+    assert_eq!(
+        frame.reason.as_str(),
+        "Too many open connections for this credential (limit 8)"
+    );
+
+    // Another credential is counted on its own.
+    read_key_socket(&server, "socket-cap-other-key").await;
+
+    // A closed socket gives its place back; the eight still open keep working.
+    let mut closed = open.pop().unwrap();
+    closed.close(None).await.unwrap();
+    while closed.next().await.is_some() {}
+    open.push(read_key_socket(&server, "socket-cap-key").await);
+    for client in &mut open {
+        assert_answers(client, "still-open").await;
+    }
 }
