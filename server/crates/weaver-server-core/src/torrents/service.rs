@@ -3278,7 +3278,11 @@ impl TorrentService {
     // longer, and is checked or fetched again. Nothing here fails the
     // torrent: a tee that cannot start ends its unpacking, and the torrent
     // keeps its files. It reads the database and the files, so it runs off
-    // the tick's task. A restore whose checkpoint the database could not
+    // the tick's task. The pieces it kept whose bytes its files no longer
+    // hold, a file gone or cut short, are had no longer either: each file
+    // with a piece had is looked at by its size, once, as the store is made.
+    // When none of those files is there, the pieces are kept as they were,
+    // and said. A restore whose checkpoint the database could not
     // read makes no store: the torrent waits, its own rows as they were,
     // and the next restore tries it again, as a usenet job's restore is
     // held on the same error (`RestoreSeat::restore`).
@@ -3353,6 +3357,16 @@ impl TorrentService {
             if tee.refusal().is_some() {
                 self.inner.signal.mark(job_id);
             }
+        }
+        match store.drop_unbacked() {
+            Some(0) => {}
+            Some(missing) => {
+                notes.push(Note::Missing { pieces: missing });
+                self.inner.signal.marked(job_id, missing);
+            }
+            None => notes.push(Note::Absent {
+                pieces: store.count(),
+            }),
         }
         Ok((store, notes))
     }
@@ -5082,7 +5096,7 @@ impl TorrentService {
         let mut deletion = deletion(store.files(), &adopted, &outputs, claimed);
         // With or without a tee: one whose unpacked files were not placed
         // keeps its directory past it.
-        deletion.paths.push(self.unpacking_dir(job_id));
+        deletion.made.push(self.unpacking_dir(job_id));
         deletion
     }
 
@@ -7301,6 +7315,8 @@ enum Note {
     Unread(String),
     Unrestored(String),
     Dropped { pieces: u32, error: String },
+    Missing { pieces: u32 },
+    Absent { pieces: u32 },
 }
 
 impl Note {
@@ -7314,6 +7330,20 @@ impl Note {
             }
             Self::Dropped { pieces, error } => {
                 tracing::warn!(job_id = job_id.0, pieces, error = %error, "a torrent's pieces did not read from its files; they are fetched again");
+            }
+            Self::Missing { pieces } => {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    pieces,
+                    "a torrent's pieces are not in its files; they are checked or fetched again"
+                );
+            }
+            Self::Absent { pieces } => {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    pieces,
+                    "none of a torrent's files is there; its pieces are kept"
+                );
             }
         }
     }
@@ -7376,8 +7406,10 @@ pub(super) fn move_listed(
 // What a deletion of a torrent's files removes: see `written_paths`.
 #[derive(Debug, Default)]
 pub(super) struct Deletion {
-    // The files and folders Weaver made, removed whole.
+    // The torrent's own files Weaver made, each removed only as a file.
     pub(super) paths: Vec<PathBuf>,
+    // What its job made of them, files or folders, removed whole.
+    pub(super) made: Vec<PathBuf>,
     // The directory the files are in.
     pub(super) dir: PathBuf,
     // Whether that directory is the torrent's own, to go once empty.
@@ -7405,12 +7437,12 @@ pub(super) fn deletion(
         .flatten()
         .filter(|name| !adopted.all_files && !kept.contains(*name))
         .map(|name| dir.join(name));
-    let paths = listed
-        .chain(outputs.iter().map(|output| dir.join(output)))
-        .collect();
+    let paths = listed.collect();
+    let made = outputs.iter().map(|output| dir.join(output)).collect();
     let kept_dirs = adopted.dirs.iter().map(|folder| dir.join(folder)).collect();
     Deletion {
         paths,
+        made,
         own: claimed.is_none(),
         dir,
         kept_dirs,
@@ -7421,12 +7453,20 @@ pub(super) fn deletion(
 // libtorrent `storage_utils::delete_files`: the torrent's files go, here
 // with what its job made of them, and then each folder above them, up to
 // its directory, that this leaves empty and that was not there before the
-// torrent. Whatever else is in its directory stays.
+// torrent. Whatever else is in its directory stays, and so does a folder
+// found where one of the torrent's files was (`delete_one_file` removes a
+// file, never a folder's contents).
 pub(super) fn delete_written(deletion: &Deletion) {
     let mut folders = BTreeSet::new();
-    for path in &deletion.paths {
+    let listed = deletion.paths.iter().map(|path| (path, false));
+    let made = deletion.made.iter().map(|path| (path, true));
+    for (path, whole) in listed.chain(made) {
         let removed = match std::fs::symlink_metadata(path) {
-            Ok(found) if found.is_dir() => std::fs::remove_dir_all(path),
+            Ok(found) if found.is_dir() && whole => std::fs::remove_dir_all(path),
+            Ok(found) if found.is_dir() => {
+                tracing::warn!(file = %path.display(), "a folder is where a torrent's file was, and stays");
+                Ok(())
+            }
             Ok(_) => std::fs::remove_file(path),
             Err(error) => Err(error),
         };

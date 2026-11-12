@@ -350,6 +350,18 @@ impl Files {
         weaver_torrent::storage::filesystem::pread_exact_vectored(&handle, offset, outs)
     }
 
+    // How many bytes the file holds on disk, by its size alone: none when
+    // what is there is not a file, and nothing known when nothing can be
+    // found there at all.
+    pub(crate) fn held(&self, file: usize) -> Option<u64> {
+        let name = self.name(file).ok()?;
+        let path = self.at().dir.join(name);
+        #[cfg(test)]
+        LOOKS.with(|looks| looks.set(looks.get() + 1));
+        let found = std::fs::metadata(path).ok()?;
+        Some(if found.is_file() { found.len() } else { 0 })
+    }
+
     // The file made `length` long when it is shorter, so a file whose
     // pieces are all had is there whole, an empty one among them. A longer
     // one stays as it is.
@@ -431,6 +443,12 @@ pub(crate) fn adopted_paths(adopted: &super::model::Adopted) -> HashSet<PathBuf>
         .iter()
         .filter_map(|name| relative(name).ok())
         .collect()
+}
+
+// How many times this thread looked at a file's size.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn open_for_write(path: &Path) -> io::Result<File> {

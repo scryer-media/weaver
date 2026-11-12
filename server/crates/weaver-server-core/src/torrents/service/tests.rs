@@ -8950,6 +8950,124 @@ async fn a_restart_that_cannot_read_its_files_fetches_again_and_does_not_fail() 
     again.stop().await;
 }
 
+// libtorrent `storage_utils::verify_resume_data`: a restart has the pieces
+// it kept only while its files hold them. A restart with its file as it
+// was has every piece; one with its file cut short has only the pieces
+// still in it, says so once, and fetches the rest again.
+#[tokio::test]
+async fn a_restart_has_no_piece_its_file_lost() {
+    let data: Vec<u8> = (0..512u32).map(|at| (at % 251) as u8 ^ 0x5a).collect();
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let job_id = rig
+        .service
+        .add(request(AddSource::Metainfo(metainfo(
+            "a.bin",
+            &[("a.bin", &data)],
+            128,
+            false,
+        ))))
+        .await
+        .unwrap();
+    let (layout, intake) = {
+        let live = rig.service.inner.live.lock().await;
+        let torrent = &live[&job_id];
+        (
+            torrent.layout.clone().unwrap(),
+            torrent.intake.clone().unwrap(),
+        )
+    };
+    let storage = PieceStorage::new(
+        Arc::clone(&layout),
+        intake as Arc<dyn Pieces>,
+        rig.service.resident(job_id),
+    );
+    let lengths = Lengths::new(data.len() as u64, layout.piece_length() as u32).unwrap();
+    for piece in 0..4 {
+        let index = lengths.try_validate_piece_index(piece).unwrap();
+        assert!(storage.reserve_piece(index, &Arc::default()));
+        let range = layout.piece_range(piece);
+        storage
+            .pwrite_all(
+                0,
+                range.start,
+                &data[range.start as usize..range.end as usize],
+            )
+            .unwrap();
+        storage.on_piece_completed(index).unwrap();
+    }
+    let dir = PathBuf::from(
+        rig.service
+            .torrent(job_id)
+            .await
+            .unwrap()
+            .storage_dir
+            .unwrap(),
+    );
+    save_with_tee(&rig.service, job_id).await;
+    rig.service.stop().await;
+    assert_eq!(kept_pieces(&rig.db, job_id), 4);
+
+    let lost = "a torrent's pieces are not in its files; they are checked or fetched again";
+    let (lines, _guard) = crate::pipeline::graph::lines::Lines::capture_at(
+        "weaver_server_core::torrents",
+        tracing::Level::WARN,
+    );
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    assert_eq!(again.torrent(job_id).await.unwrap().pieces.unwrap().have, 4);
+    assert!(lines.of(lost).is_empty());
+    again.stop().await;
+    assert_eq!(kept_pieces(&rig.db, job_id), 4);
+
+    // Cut to 256 bytes: pieces 0 and 1 are still in it, 2 and 3 are not.
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("a.bin"))
+        .unwrap();
+    file.set_len(256).unwrap();
+    drop(file);
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    let heard = lines.of(lost);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(
+        heard[0].contains(&format!(" job_id={} pieces=2", job_id.0)),
+        "{heard:?}"
+    );
+    let view = again.torrent(job_id).await.unwrap();
+    assert_eq!(view.pieces.unwrap().have, 2);
+    assert_eq!(view.file_have, vec![256]);
+    again.stop().await;
+    assert_eq!(kept_pieces(&rig.db, job_id), 2);
+
+    // Its file not there at all, as on a drive not mounted yet: the pieces
+    // are kept, said once, and saved as they were; back again, they are had.
+    let aside = rig.dir.path().join("aside.bin");
+    std::fs::rename(dir.join("a.bin"), &aside).unwrap();
+    let absent = "none of a torrent's files is there; its pieces are kept";
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    let heard = lines.of(absent);
+    assert_eq!(heard.len(), 1, "{heard:?}");
+    assert!(
+        heard[0].contains(&format!(" job_id={} pieces=2", job_id.0)),
+        "{heard:?}"
+    );
+    assert_eq!(again.torrent(job_id).await.unwrap().pieces.unwrap().have, 2);
+    again.stop().await;
+    assert_eq!(kept_pieces(&rig.db, job_id), 2);
+    assert!(!dir.join("a.bin").exists());
+    std::fs::rename(&aside, dir.join("a.bin")).unwrap();
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    assert_eq!(again.torrent(job_id).await.unwrap().pieces.unwrap().have, 2);
+    assert_eq!(lines.of(absent).len(), 1);
+    assert_eq!(lines.of(lost).len(), 1);
+    again.stop().await;
+    assert_eq!(kept_pieces(&rig.db, job_id), 2);
+}
+
 // A tee's checkpoint that the database refuses for good does not hold the
 // torrent's writes up for ever: as a job of the pipeline pauses for one,
 // the torrent's unpacking ends for it, said in its history, the checkpoint

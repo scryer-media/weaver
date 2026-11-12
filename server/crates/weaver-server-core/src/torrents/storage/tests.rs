@@ -257,6 +257,180 @@ fn a_kept_store_gives_the_session_the_pieces_it_has() {
     assert_eq!(placed.initial_have(false).unwrap().count_ones(), 0);
 }
 
+// libtorrent `storage_utils::verify_resume_data`: the pieces kept are had
+// at the next start only while their files hold them. A file gone, a file
+// cut short and a folder in a file's place each lose the pieces whose bytes
+// they no longer hold; a file still its full length, or still past its last
+// piece had, keeps them.
+#[test]
+fn a_kept_store_has_no_piece_its_files_lost() {
+    let (shim, torrent) = three_files();
+    for piece in 0..5 {
+        shim.complete(piece, &torrent);
+    }
+    let kept = shim.store.kept();
+    let dir = shim.dir.path();
+    shim.store.forget();
+
+    // Nothing changed: every piece stays, and there is nothing to save.
+    let again = store_in(&shim.layout, dir, Some(&kept));
+    assert_eq!(again.drop_unbacked(), Some(0));
+    assert_eq!(again.count(), 5);
+    assert!(again.unsaved().is_none());
+    again.forget();
+
+    // b.bin is torrent bytes 1000..3500, pieces 0 to 3. Cut to 2499 bytes,
+    // one short of its length, it loses its last piece only; c.bin, in
+    // pieces 3 and 4, is gone.
+    let b = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("b.bin"))
+        .unwrap();
+    b.set_len(2499).unwrap();
+    drop(b);
+    std::fs::remove_file(dir.join("c.bin")).unwrap();
+    let again = store_in(&shim.layout, dir, Some(&kept));
+    assert_eq!(again.drop_unbacked(), Some(2));
+    let have = again.initial_have(false).unwrap();
+    assert_eq!(have.iter_ones().collect::<Vec<_>>(), vec![0, 1, 2]);
+    assert_eq!(again.file_have(), [1000, 2048 - 1000 + 1024, 0]);
+    // The pieces it lost are saved as lost.
+    assert!(again.unsaved().is_some());
+    again.forget();
+
+    // Cut to 1048 bytes, b.bin still holds pieces 0 and 1 whole, and loses
+    // piece 2, whose share of it goes past that.
+    let b = std::fs::OpenOptions::new()
+        .write(true)
+        .open(dir.join("b.bin"))
+        .unwrap();
+    b.set_len(1048).unwrap();
+    drop(b);
+    let again = store_in(&shim.layout, dir, Some(&kept));
+    assert_eq!(again.drop_unbacked(), Some(3));
+    let have = again.initial_have(false).unwrap();
+    assert_eq!(have.iter_ones().collect::<Vec<_>>(), vec![0, 1]);
+    again.forget();
+
+    // A folder where a.bin was holds none of its bytes.
+    std::fs::remove_file(dir.join("a.bin")).unwrap();
+    std::fs::create_dir_all(dir.join("a.bin/inner")).unwrap();
+    let again = store_in(&shim.layout, dir, Some(&kept));
+    assert_eq!(again.drop_unbacked(), Some(4));
+    let have = again.initial_have(false).unwrap();
+    assert_eq!(have.iter_ones().collect::<Vec<_>>(), vec![1]);
+}
+
+// Padding is on no disk: a torrent whose files are all there keeps every
+// piece, those that end in padding among them.
+#[test]
+fn a_kept_store_loses_nothing_to_its_padding() {
+    let padding = PieceFile {
+        name: ".pad/24".to_owned(),
+        length: 24,
+        padding: true,
+    };
+    let shim = shim(1024, vec![file("a.bin", 1000), padding, file("b.bin", 500)]);
+    let mut torrent = noise(1524, 7);
+    torrent[1000..1024].fill(0);
+    for piece in 0..2 {
+        shim.complete(piece, &torrent);
+    }
+    let kept = shim.store.kept();
+    shim.store.forget();
+    let again = store_in(&shim.layout, shim.dir.path(), Some(&kept));
+    assert_eq!(again.drop_unbacked(), Some(0));
+    assert_eq!(again.count(), 2);
+}
+
+// A store that kept no piece looks at no file.
+#[test]
+fn a_store_with_no_piece_looks_at_no_file() {
+    let (shim, _) = three_files();
+    assert_eq!(shim.store.drop_unbacked(), Some(0));
+    assert_eq!(shim.store.count(), 0);
+    assert!(!shim.dir.path().join("a.bin").exists());
+}
+
+// A start that finds none of the files with a piece had, as when the drive
+// or share they are on is not there yet, keeps every piece and has nothing
+// to save; so does one whose directory is gone. One file gone while another
+// is there loses that file's pieces only.
+#[test]
+fn a_kept_store_keeps_its_pieces_while_none_of_its_files_is_there() {
+    let (shim, torrent) = three_files();
+    for piece in 0..5 {
+        shim.complete(piece, &torrent);
+    }
+    let kept = shim.store.kept();
+    let dir = shim.dir.path();
+    shim.store.forget();
+    let aside = tempfile::tempdir().unwrap();
+    for name in ["a.bin", "b.bin", "c.bin"] {
+        std::fs::rename(dir.join(name), aside.path().join(name)).unwrap();
+    }
+
+    let again = store_in(&shim.layout, dir, Some(&kept));
+    assert_eq!(again.drop_unbacked(), None);
+    assert_eq!(again.count(), 5);
+    assert!(again.unsaved().is_none());
+    again.forget();
+
+    let gone = dir.join("not-mounted");
+    let again = store_in(&shim.layout, &gone, Some(&kept));
+    assert_eq!(again.drop_unbacked(), None);
+    assert_eq!(again.count(), 5);
+    assert!(again.unsaved().is_none());
+    assert!(!gone.exists());
+    again.forget();
+
+    // Back again, with a.bin, all of piece 0 and none of the others, still
+    // away: only piece 0 is lost.
+    for name in ["b.bin", "c.bin"] {
+        std::fs::rename(aside.path().join(name), dir.join(name)).unwrap();
+    }
+    let again = store_in(&shim.layout, dir, Some(&kept));
+    assert_eq!(again.drop_unbacked(), Some(1));
+    let have = again.initial_have(false).unwrap();
+    assert_eq!(have.iter_ones().collect::<Vec<_>>(), vec![1, 2, 3, 4]);
+    assert!(again.unsaved().is_some());
+}
+
+// The look at the files costs one size per file with a piece had, and none
+// for a torrent that kept no piece, at 1, 100 and 5,000 files.
+#[test]
+fn a_kept_store_looks_at_each_file_once() {
+    use crate::torrents::files::LOOKS;
+    for count in [1usize, 100, 5000] {
+        let files: Vec<PieceFile> = (0..count)
+            .map(|at| file(&format!("f/{at}.bin"), 64))
+            .collect();
+        let layout = Arc::new(PieceLayout::new(1024, files).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("f")).unwrap();
+        for at in 0..count {
+            std::fs::write(dir.path().join(format!("f/{at}.bin")), [7u8; 64]).unwrap();
+        }
+        let pieces = layout.piece_count() as usize;
+        let kept = Kept {
+            bits: vec![0xff; pieces.div_ceil(8)],
+            checking: false,
+        };
+
+        let store = store_in(&layout, dir.path(), Some(&kept));
+        assert_eq!(store.count() as usize, pieces);
+        LOOKS.with(|looks| looks.set(0));
+        assert_eq!(store.drop_unbacked(), Some(0));
+        assert_eq!(LOOKS.with(std::cell::Cell::get), count as u64);
+        store.forget();
+
+        let store = store_in(&layout, dir.path(), None);
+        LOOKS.with(|looks| looks.set(0));
+        assert_eq!(store.drop_unbacked(), Some(0));
+        assert_eq!(LOOKS.with(std::cell::Cell::get), 0);
+    }
+}
+
 // libtorrent `torrent::force_recheck`: once a check of every piece began, a
 // run stopped before it gave every piece its verdict has only what it found,
 // and checks every piece again.
@@ -399,6 +573,39 @@ fn deleting_a_torrents_files_leaves_what_was_there_before_it() {
     left.sort();
     assert_eq!(left, ["empty", "kept", "kept/a.bin"]);
     assert!(dir.exists());
+}
+
+// libtorrent `storage_utils::delete_one_file`: a torrent's file is removed
+// as a file. A folder now where one of its files was is not the torrent's,
+// and stays with all it holds; what unpacking made is still removed whole.
+#[test]
+fn deleting_a_torrents_files_leaves_a_folder_where_a_file_was() {
+    let shim = shim(1024, vec![file("a.bin", 1000), file("b.bin", 500)]);
+    let torrent = noise(1500, 6);
+    for piece in 0..2 {
+        shim.complete(piece, &torrent);
+    }
+    let dir = shim.dir.path().to_path_buf();
+    shim.store.forget();
+    std::fs::remove_file(dir.join("a.bin")).unwrap();
+    std::fs::create_dir_all(dir.join("a.bin/deep")).unwrap();
+    std::fs::write(dir.join("a.bin/deep/photo.jpg"), b"the operator's").unwrap();
+    std::fs::create_dir_all(dir.join("out/inner")).unwrap();
+    std::fs::write(dir.join("out/inner/member.txt"), b"unpacked").unwrap();
+
+    delete_written(&deletion(
+        shim.store.files(),
+        &Adopted::default(),
+        &["out".to_owned()],
+        None,
+    ));
+    let mut left = walkdir(&dir);
+    left.sort();
+    assert_eq!(left, ["a.bin", "a.bin/deep", "a.bin/deep/photo.jpg"]);
+    assert_eq!(
+        std::fs::read(dir.join("a.bin/deep/photo.jpg")).unwrap(),
+        b"the operator's"
+    );
 }
 
 // Every path under the directory, relative to it.

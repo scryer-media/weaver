@@ -289,6 +289,60 @@ impl TorrentStore {
         replayed
     }
 
+    // libtorrent `storage_utils::verify_resume_data`: the pieces kept are
+    // had only while the files hold them. Each file with bytes in a piece
+    // had is looked at once, by its size alone, never read: a piece whose
+    // share of a file lies past that file's end, or in a file not there, is
+    // had no longer, so the session checks or fetches it again. How many
+    // pieces that took. A file whose pieces are all still in it costs one
+    // look and changes nothing.
+    //
+    // When not one of those files can be found, nothing is had no longer
+    // and none is returned: that is a drive or share not there yet as much
+    // as files deleted, and the pieces stay for when it is (qBittorrent
+    // keeps a torrent's progress whose resume data was rejected,
+    // `TorrentImpl::prepareResumeData`, torrentimpl.cpp:2305-2318). A file
+    // gone while another is there is a file lost, as libtorrent finds it.
+    pub(crate) fn drop_unbacked(&self) -> Option<u32> {
+        let touched: Vec<(usize, u64)> = self
+            .have()
+            .file_have
+            .iter()
+            .enumerate()
+            .filter(|(_, had)| **had > 0)
+            // Padding is on no disk, and holds nothing to lose.
+            .filter_map(|(file, _)| {
+                let found = self.layout.file(file).filter(|found| !found.padding)?;
+                Some((file, found.length))
+            })
+            .collect();
+        let held: Vec<(usize, u64, Option<u64>)> = touched
+            .into_iter()
+            .map(|(file, length)| (file, length, self.files.held(file)))
+            .collect();
+        if !held.is_empty() && held.iter().all(|(_, _, held)| held.is_none()) {
+            return None;
+        }
+        let mut dropped = 0;
+        for (file, length, held) in held {
+            let held = held.unwrap_or(0);
+            if held >= length {
+                continue;
+            }
+            let mut have = self.have();
+            for piece in self.layout.file_pieces(file) {
+                let past = self
+                    .layout
+                    .share(file, piece)
+                    .is_some_and(|share| share.end > held);
+                if past && have.set(&self.layout, piece, false) {
+                    dropped += 1;
+                }
+            }
+        }
+        Some(dropped)
+    }
+
     // A piece found where the files were placed, had from there, under
     // `keep` (a seed-mode session's `while_seeding`), which reads nothing.
     // The tee is not given it: nothing has checked it yet, and the graph
