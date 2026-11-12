@@ -149,6 +149,10 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
         SqlArg::I64(history.created_at),
         SqlArg::I64(history.completed_at),
         SqlArg::OptText(history.metadata.clone()),
+        SqlArg::Text(history::history_release_name(
+            &history.name,
+            history.metadata.as_deref(),
+        )),
         SqlArg::I64(job_id.0 as i64),
         SqlArg::I64(job_id.0 as i64),
         SqlArg::OptText(history.server_attribution.clone()),
@@ -209,12 +213,12 @@ async fn archive_job_sql(
                  (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                   optional_recovery_bytes, optional_recovery_downloaded_bytes,
                   failed_bytes, health, category, output_dir, nzb_path,
-                  created_at, completed_at, metadata,
+                  created_at, completed_at, metadata, release_name,
                   post_processing_summary, script_results_json, server_attribution, support_facts)
                  VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
                          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                          COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
-                         {}, {}, {},
+                         {}, {}, {}, {},
                          COALESCE((SELECT post_processing_summary FROM active_jobs WHERE job_id = {}), 'not_run'),
                          (SELECT script_results_json FROM active_jobs WHERE job_id = {}),
                          COALESCE({}, (SELECT server_attribution FROM active_jobs WHERE job_id = {})),
@@ -236,6 +240,7 @@ async fn archive_job_sql(
                     created_at = excluded.created_at,
                     completed_at = excluded.completed_at,
                     metadata = excluded.metadata,
+                    release_name = excluded.release_name,
                     post_processing_summary = excluded.post_processing_summary,
                     script_results_json = excluded.script_results_json,
                     server_attribution =

@@ -46,6 +46,13 @@ pub fn history_metadata_has_password(metadata: &[(String, String)]) -> bool {
         .any(|(key, _)| is_password_attribute_key(key))
 }
 
+// The full release name of a history row: the name the History page shows,
+// sorts and searches. It is stored on the row as `release_name`, so every
+// write of a row's name or metadata sets it from this.
+pub fn history_release_name(name: &str, metadata: Option<&str>) -> String {
+    crate::ingest::metadata::original_release_title(name, &parse_history_metadata(metadata))
+}
+
 pub fn parse_history_metadata(metadata: Option<&str>) -> Vec<(String, String)> {
     metadata
         .and_then(|value| serde_json::from_str::<Vec<(String, String)>>(value).ok())

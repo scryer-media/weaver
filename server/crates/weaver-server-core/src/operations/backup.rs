@@ -17,9 +17,10 @@ use crate::StateError;
 use crate::persistence::Database;
 #[cfg(test)]
 use crate::persistence::database_target::DatabaseTarget;
-use crate::persistence::sql_runtime::{SqlRuntime, StoreDatastore};
+use crate::persistence::sql_runtime::{SqlConn, SqlRuntime, StoreDatastore};
 #[cfg(test)]
 use crate::rss::RssService;
+use crate::schema_migrations::history_release_name_v87::fill_history_release_names;
 #[cfg(test)]
 use crate::{HistoryFilter, SchedulerHandle};
 
@@ -437,7 +438,12 @@ async fn import_stable_state_to_postgres(pool: PgPool, src: PathBuf) -> Result<(
             continue;
         }
 
-        let columns = postgres_columns(&mut tx, table).await?;
+        let mut columns = postgres_columns(&mut tx, table).await?;
+        // A legacy bundle may predate the stored release name; it is filled
+        // from each row's name and metadata once the rows are in.
+        if *table == "job_history" {
+            columns.retain(|column| column.name != "release_name");
+        }
         if columns.is_empty() {
             return Err(StateError::Database(format!(
                 "restore target is missing table {table}"
@@ -546,6 +552,7 @@ async fn import_stable_state_to_postgres(pool: PgPool, src: PathBuf) -> Result<(
         }
     }
     copy_legacy_history_nzbs_to_postgres(&mut source, &mut tx).await?;
+    fill_history_release_names(&mut SqlConn::Postgres(&mut tx)).await?;
 
     for (table, column) in [
         ("api_keys", "id"),
@@ -1131,6 +1138,7 @@ impl Database {
                             .await
                             .map_err(db_err)?;
                             rebuild_job_history_attributes_tx(&mut tx).await?;
+                            fill_history_release_names(&mut SqlConn::Sqlite(&mut tx)).await?;
 
                             // Archives created before proxy routing omit these tables.
                             // Restore both together so a restricted consumer cannot lose its policy.

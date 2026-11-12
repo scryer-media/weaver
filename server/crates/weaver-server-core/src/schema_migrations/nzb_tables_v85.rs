@@ -494,8 +494,9 @@ mod tests {
     // Every history column but the stored NZB, each job's rendered as text.
     async fn history_without_nzbs(pool: &SqlitePool) -> Vec<(i64, String)> {
         let columns: Vec<String> = sqlx::query_scalar(
+            // `release_name` is added after 85 and filled by its own step.
             "SELECT name FROM pragma_table_info('job_history')
-              WHERE name != 'nzb_zstd' ORDER BY cid",
+              WHERE name NOT IN ('nzb_zstd', 'release_name') ORDER BY cid",
         )
         .fetch_all(pool)
         .await
