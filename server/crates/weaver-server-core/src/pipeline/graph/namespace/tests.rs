@@ -2706,6 +2706,85 @@ fn a_bound_member_reads_back_through_its_envelope_and_its_child() {
     );
 }
 
+// Bytes kept in an envelope that the store's map now places elsewhere, more
+// of them than one read back takes, are read back from the envelope a
+// `READ_BACK` at a time and held for the member byte for byte, in RAM or in
+// its spill file at their own offsets.
+#[test]
+fn unkept_envelope_bytes_are_read_back_a_bounded_piece_at_a_time() {
+    for (budgets, case) in [(PLENTY, "in RAM"), (NO_ROOM, "spilled")] {
+        let mut job = Job::new(budgets);
+        let (member, child) = bound_store(&mut job);
+        let (_, volume) = job.tree.child_of(NodeId::ROOT, member).expect("bound");
+        let kept = payload(3 * READ_BACK as usize + 5);
+        let range = ByteRange::at(4096, kept.len() as u64);
+        job.writer
+            .envelopes
+            .keep(child, volume.0, range.start, &kept, Provenance::Fresh)
+            .expect("kept");
+
+        crate::pipeline::graph::envelope::READ_MOST.set(0);
+        job.writer
+            .unkept(
+                (NodeId::ROOT, member, child),
+                (range, volume.0, range.start),
+            )
+            .expect("unkept");
+        assert_eq!(
+            crate::pipeline::graph::envelope::READ_MOST.get(),
+            READ_BACK,
+            "{case}"
+        );
+
+        let holds = &job.writer.files[&NodeId::ROOT].holds;
+        assert_eq!(
+            holds.held_in(held_volume(member), range).len(),
+            4,
+            "{case}: one hold a piece"
+        );
+        let held: Vec<u8> = match case {
+            "in RAM" => holds
+                .peek(held_volume(member), range)
+                .into_iter()
+                .flat_map(|taken| match taken.location {
+                    weaver_graph::holds::Location::Ram(bytes) => bytes.to_vec(),
+                    other => panic!("{case}: held at {other:?}"),
+                })
+                .collect(),
+            _ => std::fs::read(job.spill(member)).expect("spill file")
+                [range.start as usize..range.end as usize]
+                .to_vec(),
+        };
+        assert!(held == kept, "{case}: byte-identical");
+    }
+}
+
+// Unkept bytes of a range not every byte of which the envelope kept are
+// not read at all, and nothing is held.
+#[test]
+fn unkept_bytes_the_envelope_never_kept_are_not_held() {
+    let mut job = Job::new(PLENTY);
+    let (member, child) = bound_store(&mut job);
+    let (_, volume) = job.tree.child_of(NodeId::ROOT, member).expect("bound");
+    let kept = payload(2 * READ_BACK as usize);
+    job.writer
+        .envelopes
+        .keep(child, volume.0, 4096, &kept, Provenance::Fresh)
+        .expect("kept");
+    let range = ByteRange::at(4096, kept.len() as u64 + 1);
+
+    crate::pipeline::graph::envelope::READ_MOST.set(0);
+    job.writer
+        .unkept(
+            (NodeId::ROOT, member, child),
+            (range, volume.0, range.start),
+        )
+        .expect("unkept");
+    assert_eq!(crate::pipeline::graph::envelope::READ_MOST.get(), 0);
+    let holds = &job.writer.files[&NodeId::ROOT].holds;
+    assert!(holds.held_in(held_volume(member), range).is_empty());
+}
+
 #[test]
 fn an_envelope_on_disk_reads_through_the_root_only_after_its_ownership_is_restored() {
     let mut job = Job::new(PLENTY);

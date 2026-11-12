@@ -373,6 +373,8 @@ impl Drop for Envelopes {
 thread_local! {
     pub(crate) static LOCKED: std::cell::RefCell<Vec<NodeId>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    // The most bytes one read of a kept envelope asked for on this thread.
+    pub(crate) static READ_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 impl Shelf {
@@ -457,6 +459,8 @@ impl Shelf {
             return range.is_empty();
         };
         let len = usize::try_from(range.len()).expect("an envelope range fits the address space");
+        #[cfg(test)]
+        READ_MOST.set(READ_MOST.get().max(range.len()));
         kept.coverage.covered(range) && kept.leaf.read(range.start, len, into).is_ok()
     }
 

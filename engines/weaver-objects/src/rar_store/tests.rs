@@ -918,6 +918,49 @@ fn a_wrong_rar4_key_on_verified_bytes_is_condemned_and_the_right_one_opens_the_s
     posted_whole(&owner);
 }
 
+// A wrong RAR4 key condemned over a file larger than a cipher stride: its
+// part, read back as it was posted, is re-enciphered from its plaintext no
+// more than a piece at a time, however long the part, and the right key then
+// opens the same bytes.
+#[test]
+fn a_condemned_rar4_part_is_read_back_a_bounded_piece_at_a_time() {
+    let large = payload(4, 2 * crate::crypt::STRIDE as usize + 12_345);
+    let items = vec![Item::File("large.bin", large.clone())];
+    let volumes = write(&items, &encrypted(Version::Rar4, false));
+    let mut owner = Owner::named(store(), volumes);
+    owner.frames(0, 1 << 16);
+    owner.offer("not-the-passphrase");
+    let again: Vec<ByteRange> = owner
+        .said
+        .iter()
+        .filter_map(|emit| match emit {
+            Emit::Again { range, .. } => Some(*range),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(again.len(), 1, "one part, once");
+    assert!(again[0].len() > large.len() as u64, "the whole part");
+    assert!(owner.again_read_most > 0, "read back");
+    assert!(
+        owner.again_read_most <= weaver_graph::AGAIN_PIECE,
+        "one read of {}",
+        owner.again_read_most
+    );
+
+    owner.offer(PASSWORD);
+    owner.close(0);
+    owner
+        .said
+        .retain(|emit| !matches!(emit, Emit::NeedsPassword | Emit::Again { .. }));
+    no_trouble(&owner);
+    let got = owner.member("large.bin");
+    assert!(got.closed);
+    assert!(got.coverage.verified(ByteRange::new(0, large.len() as u64)));
+    assert!(got.bytes == large, "byte-identical");
+    assert_eq!(owner.held(), 0);
+    posted_whole(&owner);
+}
+
 // The same failure on bytes not verified is damage: nothing is condemned
 // while the files' bytes stand as they came, and once a repair verifies
 // them and they fail again, the candidate is condemned and the next opens
