@@ -3394,6 +3394,13 @@ impl TorrentService {
             .map_err(|error| {
                 Unmade::Fails(format!("could not open the torrent's side store: {error}"))
             })?;
+        if let Some(reason) = store.side_reset() {
+            tracing::warn!(
+                job_id = job_id.0,
+                reason,
+                "a torrent's side store was not valid and was removed; its pieces are checked again"
+            );
+        }
         let unbacked = store.drop_unbacked();
         if let Some(tee) = store.tee() {
             // With none of its files there, nothing is read from them: the

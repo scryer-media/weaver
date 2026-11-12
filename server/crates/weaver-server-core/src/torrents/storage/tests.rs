@@ -1541,6 +1541,52 @@ fn a_side_store_is_found_again_and_checked_from() {
     assert!(again.storage.pread_exact(1, 0, &mut out).is_err());
 }
 
+// A side store left short, as by a crash while it is first written, is no
+// side store: the torrent's store opens with it empty, and the pieces kept
+// are checked again, since what it held is gone. Piece 1, kept with its
+// share of b there alone, is had no longer and does not read; piece 0 is
+// found again from a.bin. Piece 1 fetched again goes to a fresh side store
+// and reads back whole, there and once the store is made again.
+#[test]
+fn a_short_side_store_opens_empty_and_its_pieces_are_checked_again() {
+    let work = tempfile::tempdir().unwrap();
+    let shim = wanted_then_ignored(work.path(), tempfile::tempdir().unwrap(), None);
+    let torrent = noise(3584, 16);
+    shim.complete(0, &torrent);
+    shim.complete(1, &torrent);
+    let kept = shim.store.kept();
+    let side = shim.store.side_path().unwrap();
+    let Shim { store, dir, .. } = shim;
+    drop(store);
+    std::fs::write(&side, [0x48, 0x53, 0x44]).unwrap();
+
+    let again = wanted_then_ignored(work.path(), dir, Some(&kept));
+    assert_eq!(again.store.side_reset(), Some("its head is short"));
+    assert!(again.store.side_pieces().is_empty());
+    assert!(!side.exists());
+    assert!(!again.store.has(0) && !again.store.has(1));
+    assert!(again.store.initial_have(false).is_none());
+    assert!(again.store.kept().checking);
+    assert_eq!(again.store.drop_unbacked(), Some(0));
+    let mut out = vec![0; 512];
+    assert!(again.storage.pread_exact(1, 0, &mut out).is_err());
+    assert_eq!(again.read(0), torrent[..1024]);
+    assert!(Pieces::found(&*again.store, 0).unwrap());
+
+    again.complete(1, &torrent);
+    assert!(again.store.has(1));
+    assert_eq!(again.store.side_pieces(), [1]);
+    assert_eq!(again.read(1), torrent[1024..2048]);
+    assert!(!again.dir.path().join("sub").exists());
+    let kept = again.store.kept();
+    let Shim { store, dir, .. } = again;
+    drop(store);
+    let third = wanted_then_ignored(work.path(), dir, Some(&kept));
+    assert!(third.store.side_reset().is_none());
+    assert_eq!(third.store.side_pieces(), [1]);
+    assert_eq!(third.read(1), torrent[1024..2048]);
+}
+
 // A side store whose piece the pieces kept do not have holds nothing the
 // torrent reads: it is dropped as the store opens.
 #[test]
