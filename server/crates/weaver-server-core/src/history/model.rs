@@ -26,6 +26,13 @@ pub enum HistoryOrderKey {
     CompletedAt,
     TotalBytes,
     Health,
+    // The full release name, ASCII letters folded to lower case and the
+    // rest compared byte for byte.
+    Name,
+    // Completed, then failed, then paused: the order of the state names.
+    State,
+    // The category, folded like the name, a row with none sorting as empty.
+    Category,
 }
 
 // The order a history listing returns its rows in: newest first unless a
@@ -67,6 +74,14 @@ pub struct HistoryFilter {
     pub order: HistoryOrder,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+}
+
+// The columns of a history row that a history edit changes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HistoryEditFields {
+    pub name: String,
+    pub category: Option<String>,
+    pub metadata: Option<String>,
 }
 
 // The columns a history page is matched and ordered by, without the row's

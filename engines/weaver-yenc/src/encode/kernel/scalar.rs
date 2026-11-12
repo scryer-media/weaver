@@ -192,9 +192,14 @@ pub(super) unsafe fn encode_generic(
         'end: while i < 0 {
             // Main line: eight bytes at a time while at least nine input bytes
             // remain beyond them and the line has room for eight more.
-            let mut sp: *mut u8 = std::ptr::null_mut();
+            // Where the last run of eight began, once one ran. `NonNull`
+            // keeps the "none ran" test a null test, as rapidyenc's null
+            // `sp` is, without a null pointer that could reach a write.
+            let mut sp: Option<std::ptr::NonNull<u8>> = None;
             while i < -1 - 8 && ls - col - 1 > 8 {
-                sp = p;
+                // SAFETY: `p` points into the destination, so it is not null.
+                sp = Some(std::ptr::NonNull::new_unchecked(p));
+                let start = p;
                 for k in 0..8 {
                     let c = *es.offset(i + k);
                     let e = ESCAPE[c as usize];
@@ -210,11 +215,14 @@ pub(super) unsafe fn encode_generic(
                     }
                 }
                 i += 8;
-                col += dist(sp, p);
+                col += dist(start, p);
             }
-            if !sp.is_null() && col >= ls - 1 {
+            if let Some(sp) = sp
+                && col >= ls - 1
+            {
                 // The last eight overflowed the line: undo them and redo them
                 // one at a time below.
+                let sp = sp.as_ptr();
                 col -= dist(sp, p);
                 p = sp;
                 i -= 8;

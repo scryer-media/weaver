@@ -241,7 +241,10 @@ impl HistoryQuery {
         let live_only = live_job.is_some();
 
         let (events, history) = tokio::task::spawn_blocking(move || {
-            let events = db.get_job_events_latest(job_id, JOB_DETAIL_EVENT_CAP)?;
+            // Every event the timeline acts on, however old: a newest-N
+            // window would drop the early stage and member boundaries.
+            let events =
+                db.get_job_events_of_kinds(job_id, crate::history::timeline::TIMELINE_EVENT_KINDS)?;
             let history = if live_only {
                 None
             } else {
@@ -462,11 +465,10 @@ async fn load_history_page(
         // category filters, ordering, counts, and LIMIT/OFFSET into the database,
         // each order served by its own index. A free-text search, whose
         // semantics are `to_lowercase().contains()` over computed titles that
-        // sqlite's ASCII-only LOWER and LIKE cannot reproduce, and a sort by
-        // name, state or category, which compare computed or lowercased values,
-        // take the key path (`build_history_page_from_keys`): it reads only the
-        // columns a row is matched and ordered by, decides the page in Rust, and
-        // reads whole rows for that page alone.
+        // sqlite's ASCII-only LOWER and LIKE cannot reproduce, takes the key
+        // path (`build_history_page_from_keys`): it reads only the columns a
+        // row is matched and ordered by, decides the page in Rust, and reads
+        // whole rows for that page alone.
         let page = if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
             build_history_page_sql(&db, plan, &live_in_history, fields)?
         } else {
@@ -541,19 +543,9 @@ impl HistoryPageSqlPlan {
         if normalize_history_search(input.search.clone()).is_some() {
             return None;
         }
-        // Completion time, size and integrity compare stored integers, and ties
-        // go to the job id in the sort's direction, which is the order of the
-        // index on each column. A name sort compares computed titles, and state
-        // and category sorts compare mapped or lowercased values, none of which
-        // SQL can reproduce, so they stay on the key path.
-        let key = match input.sort_field.unwrap_or(HistorySortField::CompletedAt) {
-            HistorySortField::CompletedAt => weaver_server_core::HistoryOrderKey::CompletedAt,
-            HistorySortField::Size => weaver_server_core::HistoryOrderKey::TotalBytes,
-            HistorySortField::Health => weaver_server_core::HistoryOrderKey::Health,
-            HistorySortField::Name | HistorySortField::State | HistorySortField::Category => {
-                return None;
-            }
-        };
+        // Every sort compares stored columns, and ties go to the job id in the
+        // sort's direction, which is the order of the index on each key.
+        let key = history_order_key(input.sort_field.unwrap_or(HistorySortField::CompletedAt));
         let descending = input.sort_direction.unwrap_or(HistorySortDirection::Desc)
             == HistorySortDirection::Desc;
 
@@ -566,6 +558,17 @@ impl HistoryPageSqlPlan {
             page_index: input.page_index as usize,
             page_size: sanitize_page_size(input.page_size),
         })
+    }
+}
+
+fn history_order_key(field: HistorySortField) -> weaver_server_core::HistoryOrderKey {
+    match field {
+        HistorySortField::CompletedAt => weaver_server_core::HistoryOrderKey::CompletedAt,
+        HistorySortField::Size => weaver_server_core::HistoryOrderKey::TotalBytes,
+        HistorySortField::Health => weaver_server_core::HistoryOrderKey::Health,
+        HistorySortField::Name => weaver_server_core::HistoryOrderKey::Name,
+        HistorySortField::State => weaver_server_core::HistoryOrderKey::State,
+        HistorySortField::Category => weaver_server_core::HistoryOrderKey::Category,
     }
 }
 
@@ -751,7 +754,8 @@ fn build_history_page_from_keys(
     let status = input.status.unwrap_or(HistoryStatusFilter::All);
     let sort_field = input.sort_field.unwrap_or(HistorySortField::CompletedAt);
     let sort_direction = input.sort_direction.unwrap_or(HistorySortDirection::Desc);
-    let with_titles = search.is_some() || sort_field == HistorySortField::Name;
+    // Only a search reaches this path, and it matches the titles.
+    let with_titles = search.is_some();
 
     let matched_search: Vec<HistoryPageKey> = db
         .list_job_history_keys(HistoryRows::Shown, with_titles)?
@@ -1002,7 +1006,7 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
     let status = input.status.unwrap_or(HistoryStatusFilter::All);
     let sort_field = input.sort_field.unwrap_or(HistorySortField::CompletedAt);
     let sort_direction = input.sort_direction.unwrap_or(HistorySortDirection::Desc);
-    let requires_full_display_projection = search.is_some() || sort_field == HistorySortField::Name;
+    let requires_full_display_projection = search.is_some();
 
     let matched_search: Vec<HistoryItem> = rows
         .into_iter()
@@ -1156,9 +1160,9 @@ fn compare_history_items(
 ) -> Ordering {
     let ordering = match sort_field {
         HistorySortField::CompletedAt => left.completed_at.cmp(&right.completed_at),
-        HistorySortField::Name => history_sort_name(&left.original_title, &left.display_title).cmp(
-            &history_sort_name(&right.original_title, &right.display_title),
-        ),
+        HistorySortField::Name => {
+            history_sort_name(&left.name).cmp(&history_sort_name(&right.name))
+        }
         HistorySortField::State => {
             history_state_key(left.state).cmp(history_state_key(right.state))
         }
@@ -1168,8 +1172,14 @@ fn compare_history_items(
             .category
             .as_deref()
             .unwrap_or_default()
-            .to_lowercase()
-            .cmp(&right.category.as_deref().unwrap_or_default().to_lowercase()),
+            .to_ascii_lowercase()
+            .cmp(
+                &right
+                    .category
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            ),
     };
     directed_history_order(ordering, left.id, right.id, sort_direction)
 }
@@ -1182,9 +1192,9 @@ fn compare_history_keys(
 ) -> Ordering {
     let ordering = match sort_field {
         HistorySortField::CompletedAt => left.completed_at.cmp(&right.completed_at),
-        HistorySortField::Name => history_sort_name(&left.original_title, &left.display_title).cmp(
-            &history_sort_name(&right.original_title, &right.display_title),
-        ),
+        HistorySortField::Name => {
+            history_sort_name(&left.name).cmp(&history_sort_name(&right.name))
+        }
         HistorySortField::State => {
             history_state_key(left.state).cmp(history_state_key(right.state))
         }
@@ -1194,8 +1204,14 @@ fn compare_history_keys(
             .category
             .as_deref()
             .unwrap_or_default()
-            .to_lowercase()
-            .cmp(&right.category.as_deref().unwrap_or_default().to_lowercase()),
+            .to_ascii_lowercase()
+            .cmp(
+                &right
+                    .category
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            ),
     };
     directed_history_order(ordering, left.id, right.id, sort_direction)
 }
@@ -1218,13 +1234,10 @@ fn directed_history_order(
     }
 }
 
-fn history_sort_name(original_title: &str, display_title: &str) -> String {
-    let title = original_title.trim();
-    if title.is_empty() {
-        display_title.to_lowercase()
-    } else {
-        title.to_lowercase()
-    }
+// The full release name with its ASCII letters folded, as the database's
+// name order compares it.
+fn history_sort_name(name: &str) -> String {
+    name.to_ascii_lowercase()
 }
 
 fn history_state_key(state: QueueItemState) -> &'static str {
@@ -1682,23 +1695,14 @@ mod tests {
     }
 
     #[test]
-    fn only_column_sorts_take_sql_path() {
-        for field in [
-            HistorySortField::Name,
-            HistorySortField::State,
-            HistorySortField::Category,
-        ] {
-            for direction in [HistorySortDirection::Asc, HistorySortDirection::Desc] {
-                let mut input = page_input(0, 25, None);
-                input.sort_field = Some(field);
-                input.sort_direction = Some(direction);
-                assert!(HistoryPageSqlPlan::for_input(&input).is_none());
-            }
-        }
+    fn every_sort_takes_sql_path_without_a_search() {
         for field in [
             HistorySortField::CompletedAt,
             HistorySortField::Size,
             HistorySortField::Health,
+            HistorySortField::Name,
+            HistorySortField::State,
+            HistorySortField::Category,
         ] {
             for direction in [HistorySortDirection::Asc, HistorySortDirection::Desc] {
                 let mut input = page_input(0, 25, None);

@@ -282,6 +282,42 @@ impl Database {
         })
     }
 
+    // Every one of a job's events of `kinds`, ordered by insertion order.
+    pub fn get_job_events_of_kinds(
+        &self,
+        job_id: u64,
+        kinds: &[&str],
+    ) -> Result<Vec<JobEvent>, StateError> {
+        if kinds.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args = vec![SqlArg::I64(job_id as i64)];
+        args.extend(kinds.iter().map(|kind| SqlArg::Text((*kind).to_string())));
+        let sql = format!(
+            "SELECT job_id, timestamp, kind, message, file_id
+               FROM job_events
+              WHERE job_id = {{}}
+                AND kind IN ({})
+              ORDER BY id ASC",
+            vec!["{}"; kinds.len()].join(", ")
+        );
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+            rows.into_iter()
+                .map(|row| {
+                    Ok(JobEvent {
+                        job_id: row.i64("job_id")? as u64,
+                        timestamp: row.i64("timestamp")?,
+                        kind: row.text("kind")?,
+                        message: row.text("message")?,
+                        file_id: row.opt_text("file_id")?,
+                    })
+                })
+                .collect()
+        })
+    }
+
     // The newest of a job's events of `kinds`, leaving out a `DownloadFinished`
     // that does not carry `download_finished_file_id`.
     pub fn get_last_job_event_of_kinds(

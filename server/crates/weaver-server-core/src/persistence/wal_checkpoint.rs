@@ -373,10 +373,6 @@ impl Drop for WalCheckpointer {
     }
 }
 
-#[expect(
-    clippy::disallowed_methods,
-    reason = "writer gate: the checkpoint task's own connection runs a PASSIVE checkpoint and never takes the gate"
-)]
 async fn run(
     signal: &'static WalSignal,
     mut connection: SqliteConnection,

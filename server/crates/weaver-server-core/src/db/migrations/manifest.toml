@@ -1063,3 +1063,20 @@ checksum_algo = "blake3"
 kind = "rust"
 hook_id = "move_nzbs_and_outlines_v85"
 scope = "all"
+
+[[migration]]
+version = 86
+description = "index the history page's name, state and category sorts"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0086_history_page_text_sort_indexes/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0086_history_page_text_sort_indexes/postgres.sql"
+engine = "postgres"
+scope = "all"

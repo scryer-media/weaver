@@ -647,9 +647,7 @@ impl Scenario {
         }
     }
 
-    // Everything a run says is told to `heard` first. Only the rows that
-    // lend windows listen, and only where windows are mapped.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Everything a run says is told to `heard` first.
     pub(in crate::pipeline::tests) fn heard(
         mut self,
         heard: impl Fn(&crate::pipeline::graph::engine::Said) + Send + Sync + 'static,
