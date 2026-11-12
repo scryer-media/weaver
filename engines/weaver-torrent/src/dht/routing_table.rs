@@ -21,10 +21,41 @@ use crate::dht::INACTIVITY_TIMEOUT;
 // The nodes a bucket holds: BEP 5's k.
 const BUCKET_SIZE: usize = 8;
 
+/// Whether `addr` is an IPv4 address written as IPv6 (`::ffff:a.b.c.d`). It is
+/// never a node of either family: an IPv6 node is asked over IPv6, and an
+/// IPv4 node is kept under its IPv4 address.
+pub fn is_v4_mapped(addr: SocketAddr) -> bool {
+    matches!(addr, SocketAddr::V6(a) if a.ip().to_ipv4_mapped().is_some())
+}
+
+// A node heard of, not yet in its bucket: libtorrent's replacement bucket
+// (routing_table.cpp:879-900, v2.0.15), up to BUCKET_SIZE per bucket, the
+// oldest asked one, else the oldest, making way for a new one. It enters the
+// bucket only once it answers.
+#[derive(Clone, Debug)]
+struct Replacement {
+    id: Id20,
+    addr: SocketAddr,
+    asked: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct LeafBucket {
     pub nodes: Vec<RoutingTableNode>,
     pub last_refreshed: Instant,
+    // Not saved: a restored table hears of its nodes again.
+    replacements: Vec<Replacement>,
+}
+
+/// A node to ask into the table (see [`RoutingTable::next_refresh`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refresh {
+    pub id: Id20,
+    pub addr: SocketAddr,
+    /// A random id in the node's bucket, for a get_peers.
+    pub target: Id20,
+    /// The bucket is full: ping the node instead.
+    pub ping: bool,
 }
 
 impl Serialize for LeafBucket {
@@ -54,6 +85,7 @@ impl<'de> Deserialize<'de> for LeafBucket {
         Tmp::deserialize(deserializer).map(|t| Self {
             nodes: t.nodes,
             last_refreshed: Instant::now(),
+            replacements: Vec::new(),
         })
     }
 }
@@ -63,6 +95,7 @@ impl Default for LeafBucket {
         Self {
             nodes: Default::default(),
             last_refreshed: Instant::now(),
+            replacements: Vec::new(),
         }
     }
 }
@@ -302,8 +335,115 @@ impl BucketTree {
     }
 
     pub fn add_node(&mut self, self_id: &Id20, id: Id20, addr: SocketAddr) -> InsertResult {
+        if is_v4_mapped(addr) {
+            return InsertResult::Ignored;
+        }
         let idx = self.get_leaf(&id);
-        self.insert_into_leaf(idx, self_id, id, addr)
+        let res = self.insert_into_leaf(idx, self_id, id, addr);
+        if matches!(res, InsertResult::Added | InsertResult::ReplacedBad(_)) {
+            let idx = self.get_leaf(&id);
+            if let BucketTreeNodeData::Leaf(leaf) = &mut self.data[idx].data {
+                leaf.replacements.retain(|r| r.id != id);
+            }
+        }
+        res
+    }
+
+    fn leaf_mut(&mut self, idx: usize) -> &mut LeafBucket {
+        match &mut self.data[idx].data {
+            BucketTreeNodeData::Leaf(leaf) => leaf,
+            BucketTreeNodeData::LeftRight(_, _) => unreachable!(),
+        }
+    }
+
+    // A node heard of enters the replacements of its bucket, unless the
+    // bucket or its replacements hold it, or a node of its /24 or /64
+    // already (libtorrent `routing_table::heard_about`, routing_table.cpp:
+    // 1085-1090, which adds the node unpinged, so `add_node_impl` keeps it
+    // in the replacement bucket at 879-900). Whether it entered.
+    fn heard_about(&mut self, self_id: &Id20, id: Id20, addr: SocketAddr) -> bool {
+        if id == *self_id || is_v4_mapped(addr) {
+            return false;
+        }
+        let idx = self.get_leaf(&id);
+        let leaf = self.leaf_mut(idx);
+        if leaf
+            .nodes
+            .iter()
+            .any(|n| n.id == id || same_subnet(n.addr, addr))
+            || leaf
+                .replacements
+                .iter()
+                .any(|r| r.id == id || same_subnet(r.addr, addr))
+        {
+            return false;
+        }
+        if leaf.replacements.len() >= BUCKET_SIZE {
+            let gone = leaf.replacements.iter().position(|r| r.asked).unwrap_or(0);
+            leaf.replacements.remove(gone);
+        }
+        leaf.replacements.push(Replacement {
+            id,
+            addr,
+            asked: false,
+        });
+        true
+    }
+
+    // Marks the replacement `id` as asked; whether there was one.
+    fn mark_replacement_asked(&mut self, id: &Id20) -> bool {
+        let idx = self.get_leaf(id);
+        match self
+            .leaf_mut(idx)
+            .replacements
+            .iter_mut()
+            .find(|r| r.id == *id)
+        {
+            Some(r) => {
+                r.asked = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    // The replacement to ask next, marked as asked: one not asked yet, of
+    // the nearest bucket that has room for it, can split, or holds a bad
+    // node it may take the place of (libtorrent `routing_table::
+    // next_refresh`, routing_table.cpp:392-445, which looks for an unpinged
+    // replacement in a bucket that is not full or can split, nearest bucket
+    // first).
+    fn next_refresh(&mut self, self_id: &Id20, now: Instant) -> Option<Refresh> {
+        let room = self.size < self.max_size;
+        // Nearer buckets cover fewer bits; of the two nearest, ours first.
+        let mut best: Option<((u8, bool), usize)> = None;
+        for (idx, node) in self.data.iter().enumerate() {
+            let BucketTreeNodeData::Leaf(leaf) = &node.data else {
+                continue;
+            };
+            if !leaf.replacements.iter().any(|r| !r.asked) {
+                continue;
+            }
+            let ours = node.start <= *self_id && *self_id <= node.end_inclusive;
+            let fits = (room && (leaf.nodes.len() < BUCKET_SIZE || ours))
+                || leaf.nodes.iter().any(|n| n.status(now) == NodeStatus::Bad);
+            let key = (node.bits, !ours);
+            if fits && best.is_none_or(|(best, _)| key < best) {
+                best = Some((key, idx));
+            }
+        }
+        let (_, idx) = best?;
+        let (start, bits) = (self.data[idx].start, self.data[idx].bits);
+        let leaf = self.leaf_mut(idx);
+        let ping = leaf.nodes.len() >= BUCKET_SIZE;
+        let r = leaf.replacements.iter_mut().find(|r| !r.asked)?;
+        r.asked = true;
+        Some(Refresh {
+            id: r.id,
+            addr: r.addr,
+            target: generate_random_id(&start, bits),
+            ping,
+        })
     }
 
     fn insert_into_leaf(
@@ -347,30 +487,13 @@ impl BucketTree {
                 errors_in_a_row: 0,
             };
 
-            // Try replace a bad node
-
-            if let Some(bad_node) = nodes
-                .nodes
-                .iter_mut()
-                .find(|r| matches!(r.status(now), NodeStatus::Bad))
-            {
-                std::mem::swap(bad_node, &mut new_node);
-                nodes.nodes.sort_by_key(|n| n.id);
-                debug!("replaced bad node {:?}", new_node);
-                nodes.last_refreshed = now;
-                return InsertResult::ReplacedBad(new_node);
-            }
-
-            // if max size reached, don't bother
-            if self.size == self.max_size {
-                trace!(
-                    "can't add node to routing table, max size of {} reached",
-                    self.max_size
-                );
-                return InsertResult::Ignored;
-            }
-
-            if nodes.nodes.len() < BUCKET_SIZE {
+            // As libtorrent's `add_node_impl` (routing_table.cpp:811-851,
+            // v2.0.15): a bucket with room takes the node, then the bucket
+            // holding our id splits, and only a full bucket that cannot
+            // split gives a bad node's place to it. The table never holds
+            // more than `max_size`.
+            let full = self.size >= self.max_size;
+            if !full && nodes.nodes.len() < BUCKET_SIZE {
                 nodes.nodes.push(new_node);
                 nodes.nodes.sort_by_key(|n| n.id);
                 nodes.last_refreshed = now;
@@ -378,8 +501,25 @@ impl BucketTree {
                 return InsertResult::Added;
             }
 
-            // if our id is not inside, don't bother.
-            if *self_id < leaf.start || *self_id > leaf.end_inclusive {
+            let ours = leaf.start <= *self_id && *self_id <= leaf.end_inclusive;
+            if full || !ours {
+                if let Some(bad_node) = nodes
+                    .nodes
+                    .iter_mut()
+                    .find(|r| matches!(r.status(now), NodeStatus::Bad))
+                {
+                    std::mem::swap(bad_node, &mut new_node);
+                    nodes.nodes.sort_by_key(|n| n.id);
+                    debug!("replaced bad node {:?}", new_node);
+                    nodes.last_refreshed = now;
+                    return InsertResult::ReplacedBad(new_node);
+                }
+                if full {
+                    trace!(
+                        "can't add node to routing table, max size of {} reached",
+                        self.max_size
+                    );
+                }
                 return InsertResult::Ignored;
             }
 
@@ -394,6 +534,7 @@ impl BucketTree {
                     rd.push(node)
                 }
             }
+            let (lr, rr) = nodes.replacements.drain(0..).partition(|r| r.id < rs);
 
             let left = BucketTreeNode {
                 bits: leaf.bits - 1,
@@ -401,6 +542,7 @@ impl BucketTree {
                 end_inclusive: le,
                 data: BucketTreeNodeData::Leaf(LeafBucket {
                     nodes: ld,
+                    replacements: lr,
                     ..Default::default()
                 }),
             };
@@ -410,6 +552,7 @@ impl BucketTree {
                 end_inclusive: re,
                 data: BucketTreeNodeData::Leaf(LeafBucket {
                     nodes: rd,
+                    replacements: rr,
                     ..Default::default()
                 }),
             };
@@ -557,6 +700,9 @@ pub struct RoutingTable {
     // place among them.
     #[serde(skip)]
     entries: u64,
+    // Holds a permit once a node is heard of (see `heard_about`).
+    #[serde(skip)]
+    heard: Arc<tokio::sync::Notify>,
 }
 
 impl RoutingTable {
@@ -569,7 +715,58 @@ impl RoutingTable {
             size: 0,
             entered: Default::default(),
             entries: 0,
+            heard: Default::default(),
         }
+    }
+
+    /// The table with only the nodes of the IPv4 family when `is_v4`, the
+    /// IPv6 one when not, never an IPv4 address written as IPv6. A table
+    /// that holds no other is returned as it is.
+    pub fn of_family(self, is_v4: bool) -> Self {
+        let keeps = |addr: SocketAddr| addr.is_ipv4() == is_v4 && !is_v4_mapped(addr);
+        if self.iter().all(|n| keeps(n.addr)) {
+            return self;
+        }
+        let mut table = Self::new(self.id, Some(self.buckets.max_size));
+        for node in self.iter().filter(|n| keeps(n.addr)) {
+            table.add_node(node.id, node.addr);
+        }
+        // Restored, as the nodes it kept were: none has entered yet.
+        table.entries = 0;
+        table
+    }
+
+    /// Holds a permit once a node is heard of that the table may ask into
+    /// it (see [`Self::next_refresh`]).
+    pub fn heard(&self) -> Arc<tokio::sync::Notify> {
+        self.heard.clone()
+    }
+
+    /// A node a search, a reply or a query told us of. It does not enter
+    /// the table: it waits among its bucket's replacements, up to a
+    /// bucket's worth of them, until [`Self::next_refresh`] has it asked and
+    /// it answers. Whether it was new.
+    pub fn heard_about(&mut self, id: Id20, addr: SocketAddr) -> bool {
+        let heard = self.buckets.heard_about(&self.id, id, addr);
+        if heard {
+            self.heard.notify_one();
+        }
+        heard
+    }
+
+    /// The node heard of to ask next, if any is due, marked as asked so it
+    /// is asked once (see `BucketTree::next_refresh`).
+    pub fn next_refresh(&mut self, now: Instant) -> Option<Refresh> {
+        self.buckets.next_refresh(&self.id, now)
+    }
+
+    /// How many nodes heard of wait to be asked into the table, asked ones
+    /// included.
+    pub fn heard_of(&self) -> usize {
+        self.buckets
+            .iter_leaves()
+            .map(|l| l.leaf.replacements.len())
+            .sum()
     }
     /// Rings each time a node enters the table.
     pub fn entered(&self) -> Arc<tokio::sync::Notify> {
@@ -647,10 +844,16 @@ impl RoutingTable {
         }
         res
     }
+    /// Marks the node `id` as asked; a node heard of but not in the table
+    /// is marked too, so it is not asked again for the table. Whether the
+    /// table holds `id`.
     pub fn mark_outgoing_request(&mut self, id: &Id20, now: Instant) -> bool {
         let r = match self.buckets.get_mut(id, None) {
             Some(r) => r,
-            None => return false,
+            None => {
+                self.buckets.mark_replacement_asked(id);
+                return false;
+            }
         };
         r.mark_outgoing_request(now);
         true
@@ -890,5 +1093,213 @@ mod tests {
         // A near node in a far node's /24 goes to the near bucket.
         assert!(matches!(add(0x01, [5, 6, 0, 2]), InsertResult::Added));
         assert!(matches!(add(0x02, [5, 6, 0, 3]), InsertResult::Ignored));
+    }
+
+    // Our id is 0x00..; the far bucket is 0x80.. once the root splits.
+    fn bad(table: &mut RoutingTable, id: Id20) {
+        let now = std::time::Instant::now();
+        table.mark_outgoing_request(&id, now);
+        table.mark_error(&id);
+        table.mark_error(&id);
+    }
+
+    // libtorrent routing_table.cpp:811-816: a bucket with room takes a new
+    // node beside a bad one, which keeps its place until the bucket is full.
+    #[test]
+    fn test_a_bucket_with_room_keeps_its_bad_node() {
+        use super::InsertResult;
+
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        let first = Id20::new([0x80; 20]);
+        table.add_node(first, SocketAddr::from(([5, 6, 0, 1], 6881)));
+        bad(&mut table, first);
+        assert!(matches!(
+            table.add_node(
+                Id20::new([0x81; 20]),
+                SocketAddr::from(([5, 6, 1, 1], 6881))
+            ),
+            InsertResult::Added
+        ));
+        assert_eq!(table.len(), 2);
+        assert!(table.iter().any(|n| n.id == first));
+    }
+
+    // A full bucket that cannot split gives a bad node's place to a new one
+    // (routing_table.cpp:851, `replace_node_impl`), and the count stays.
+    #[test]
+    fn test_a_full_far_bucket_gives_a_bad_nodes_place() {
+        use super::InsertResult;
+
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        for i in 0..8 {
+            table.add_node(
+                Id20::new([0x80 + i; 20]),
+                SocketAddr::from(([5, 6, i, 1], 6881)),
+            );
+        }
+        // A near node splits the root: the eight far ones are a bucket of
+        // their own, full, without our id.
+        table.add_node(
+            Id20::new([0x01; 20]),
+            SocketAddr::from(([5, 7, 0, 1], 6881)),
+        );
+        assert_eq!(table.len(), 9);
+        let far = Id20::new([0x90; 20]);
+        assert!(matches!(
+            table.add_node(far, SocketAddr::from(([5, 6, 9, 1], 6881))),
+            InsertResult::Ignored
+        ));
+        bad(&mut table, Id20::new([0x83; 20]));
+        assert!(matches!(
+            table.add_node(far, SocketAddr::from(([5, 6, 9, 1], 6881))),
+            InsertResult::ReplacedBad(_)
+        ));
+        assert_eq!(table.len(), 9);
+        assert!(table.iter().any(|n| n.id == far));
+    }
+
+    // An IPv4 address written as IPv6 is no node: it neither enters the
+    // table nor is heard of.
+    #[test]
+    fn test_a_mapped_address_is_never_a_node() {
+        use super::InsertResult;
+
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        let mapped: SocketAddr = "[::ffff:5.6.7.8]:6881".parse().unwrap();
+        assert!(matches!(
+            table.add_node(Id20::new([0x80; 20]), mapped),
+            InsertResult::Ignored
+        ));
+        assert!(!table.heard_about(Id20::new([0x80; 20]), mapped));
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.heard_of(), 0);
+    }
+
+    // A node heard of waits among its bucket's replacements; it is asked
+    // once, the nearest bucket's first, and leaves them as it enters.
+    #[test]
+    fn test_nodes_heard_of_are_asked_once_nearest_first() {
+        let now = std::time::Instant::now();
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        assert_eq!(table.next_refresh(now), None);
+        let far = (
+            Id20::new([0x80; 20]),
+            SocketAddr::from(([5, 6, 0, 1], 6881)),
+        );
+        let near = (
+            Id20::new([0x01; 20]),
+            SocketAddr::from(([5, 7, 0, 1], 6881)),
+        );
+        assert!(table.heard_about(far.0, far.1));
+        assert!(table.heard_about(near.0, near.1));
+        // Heard again, or at a /24 already heard of: nothing new.
+        assert!(!table.heard_about(far.0, far.1));
+        assert!(!table.heard_about(
+            Id20::new([0x82; 20]),
+            SocketAddr::from(([5, 6, 0, 2], 6881))
+        ));
+        assert_eq!(table.len(), 0);
+        assert_eq!(table.heard_of(), 2);
+
+        // One bucket: both are as near; the first heard goes first.
+        let first = table.next_refresh(now).unwrap();
+        assert_eq!((first.id, first.addr, first.ping), (far.0, far.1, false));
+        let second = table.next_refresh(now).unwrap();
+        assert_eq!(second.id, near.0);
+        assert_eq!(table.next_refresh(now), None);
+
+        // It answers and enters: it is no longer heard of.
+        table.add_node(near.0, near.1);
+        assert_eq!(table.heard_of(), 1);
+        assert_eq!(table.len(), 1);
+    }
+
+    // The replacements of a bucket that splits go with their ids, and the
+    // near bucket's are asked first.
+    #[test]
+    fn test_replacements_follow_a_split_and_the_near_bucket_goes_first() {
+        let now = std::time::Instant::now();
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        for i in 0..8 {
+            table.add_node(
+                Id20::new([0x80 + i; 20]),
+                SocketAddr::from(([5, 6, i, 1], 6881)),
+            );
+        }
+        let far = Id20::new([0x90; 20]);
+        let near = Id20::new([0x02; 20]);
+        table.heard_about(far, SocketAddr::from(([6, 6, 0, 1], 6881)));
+        table.heard_about(near, SocketAddr::from(([6, 7, 0, 1], 6881)));
+        table.add_node(
+            Id20::new([0x01; 20]),
+            SocketAddr::from(([5, 7, 0, 1], 6881)),
+        );
+        assert_eq!(table.heard_of(), 2);
+        let next = table.next_refresh(now).unwrap();
+        assert_eq!((next.id, next.ping), (near, false));
+        assert!(!next.target.get_bit(0), "{:?}", next.target);
+        // The far bucket is full and cannot split: its replacement waits.
+        assert_eq!(table.next_refresh(now), None);
+        // Until one of its nodes turns bad; then it is pinged.
+        bad(&mut table, Id20::new([0x83; 20]));
+        let next = table.next_refresh(now).unwrap();
+        assert_eq!((next.id, next.ping), (far, true));
+    }
+
+    // A bucket keeps at most a bucket's worth of replacements, an asked one
+    // making way first.
+    #[test]
+    fn test_replacements_are_bounded() {
+        let now = std::time::Instant::now();
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        for i in 0..8 {
+            table.heard_about(
+                Id20::new([0x80 + i; 20]),
+                SocketAddr::from(([5, 6, i, 1], 6881)),
+            );
+        }
+        let asked = table.next_refresh(now).unwrap().id;
+        assert_eq!(asked, Id20::new([0x80; 20]));
+        table.heard_about(
+            Id20::new([0x90; 20]),
+            SocketAddr::from(([5, 6, 9, 1], 6881)),
+        );
+        assert_eq!(table.heard_of(), 8);
+        let mut left = Vec::new();
+        while let Some(next) = table.next_refresh(now) {
+            left.push(next.id);
+        }
+        assert_eq!(left.len(), 8);
+        assert!(!left.contains(&asked));
+    }
+
+    // A restored table keeps only its own family's nodes.
+    #[test]
+    fn test_a_table_of_a_family_drops_the_others() {
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        table.add_node(
+            Id20::new([0x80; 20]),
+            SocketAddr::from(([5, 6, 0, 1], 6881)),
+        );
+        table.add_node(Id20::new([0x81; 20]), "[2001:db8::1]:6881".parse().unwrap());
+        let v6 = table.clone().of_family(false);
+        assert_eq!(v6.len(), 1);
+        assert!(v6.iter().all(|n| n.addr.is_ipv6()));
+        assert_eq!(v6.entries(), 0);
+        let v4 = table.clone().of_family(true);
+        assert_eq!(v4.len(), 1);
+        assert!(v4.iter().all(|n| n.addr.is_ipv4()));
+
+        // A table saved with an IPv4 address written as IPv6 keeps it in
+        // neither family.
+        let json = serde_json::to_string(&table)
+            .unwrap()
+            .replace("\"5.6.0.1:6881\"", "\"[::ffff:5.6.0.1]:6881\"");
+        let saved: RoutingTable = serde_json::from_str(&json).unwrap();
+        assert!(saved.iter().any(|n| super::is_v4_mapped(n.addr)));
+        assert_eq!(saved.clone().of_family(true).len(), 0);
+        let v6 = saved.of_family(false);
+        assert_eq!(v6.len(), 1);
+        assert!(v6.iter().all(|n| !super::is_v4_mapped(n.addr)));
     }
 }
