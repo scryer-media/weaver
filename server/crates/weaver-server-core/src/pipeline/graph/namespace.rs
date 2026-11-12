@@ -1974,6 +1974,8 @@ impl NamespaceWriter {
         segments: &dyn Segments,
         out: &mut Vec<Effect>,
     ) -> Result<bool, WriteError> {
+        #[cfg(test)]
+        let _pass = tests::ReleasePass::enter();
         let mut released = false;
         let parents: Vec<NodeId> = self
             .files

@@ -963,13 +963,26 @@ impl HoldLedger {
     }
 
     // Remove `range` from every hold it overlaps, releasing the accounting
-    // of the removed parts and keeping the parts outside it.
+    // of the removed parts and keeping the parts outside it. Holds never
+    // overlap, so the only one that starts before `range` and reaches into
+    // it is the last that starts at or before its start: the holds looked
+    // at are that one and those that start inside it, however many lie
+    // before.
     fn cut(&mut self, volume: VolumeIndex, range: ByteRange) -> Vec<Taken> {
         let Some(holds) = self.volumes.get(&volume) else {
             return Vec::new();
         };
+        let start = holds
+            .range(..=range.start)
+            .next_back()
+            .filter(|(_, hold)| hold.range.end > range.start)
+            .map_or(range.start, |(&start, _)| start);
         let touched: Vec<u64> = holds
-            .range(..range.end)
+            .range(start..range.end.max(start))
+            .inspect(|_| {
+                #[cfg(test)]
+                tests::CUT_LOOKED.with(|looked| looked.set(looked.get() + 1));
+            })
             .filter(|(_, hold)| hold.range.intersect(range).is_some())
             .map(|(&start, _)| start)
             .collect();
@@ -1061,6 +1074,11 @@ impl Drop for HoldLedger {
 mod tests {
     use super::*;
 
+    thread_local! {
+        // How many holds a cut looked at.
+        pub(super) static CUT_LOOKED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
     const NS: HoldsNamespace = HoldsNamespace {
         scope: 1,
         node: NodeId(0),
@@ -1093,6 +1111,75 @@ mod tests {
                 namespaces: 0
             }
         );
+    }
+
+    // A take hands back what a peek of the same range shows, in the same
+    // order, and leaves held exactly the parts of each hold outside it,
+    // for every range over holds that touch, holds with gaps between and
+    // the space around them.
+    #[test]
+    fn a_take_cuts_exactly_the_holds_the_range_overlaps() {
+        let holds = [(10, 1), (20, 2), (30, 3), (50, 4)];
+        for start in 0..70 {
+            for end in start..70 {
+                let range = ByteRange::new(start, end);
+                let accountant = Arc::new(HoldsAccountant::new(budgets(100)));
+                let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+                for (offset, fill) in holds {
+                    ledger.hold(VolumeIndex(0), offset, bytes(fill, 10), PLENTY);
+                }
+                let before = ledger.held_ranges(VolumeIndex(0));
+                let peeked = ledger.peek(VolumeIndex(0), range);
+                let taken = ledger.take(VolumeIndex(0), range);
+                assert_eq!(taken, peeked, "{range:?}");
+                let left: Vec<ByteRange> = before
+                    .iter()
+                    .flat_map(|hold| match hold.intersect(range) {
+                        Some(inside) => vec![
+                            ByteRange::new(hold.start, inside.start),
+                            ByteRange::new(inside.end, hold.end),
+                        ],
+                        None => vec![*hold],
+                    })
+                    .filter(|piece| !piece.is_empty())
+                    .collect();
+                assert_eq!(ledger.held_ranges(VolumeIndex(0)), left, "{range:?}");
+                let taken_len: u64 = taken.iter().map(|piece| piece.range.len()).sum();
+                assert_eq!(accountant.usage().resident, 40 - taken_len, "{range:?}");
+            }
+        }
+    }
+
+    // A volume held a piece at a time, in order, and taken a piece at a
+    // time behind holds that stay: each hold and each take looks at the
+    // holds it overlaps and the one before, never at every hold before it.
+    #[test]
+    fn holding_and_taking_in_order_looks_at_a_constant_number_of_holds_each() {
+        for pieces in [1_000u64, 4_000] {
+            let accountant = Arc::new(HoldsAccountant::new(budgets(u64::MAX)));
+            let mut ledger = HoldLedger::new(NS, Arc::clone(&accountant));
+            CUT_LOOKED.set(0);
+            for piece in 0..pieces {
+                ledger.hold(VolumeIndex(0), piece * 16, bytes(1, 16), PLENTY);
+            }
+            assert!(
+                CUT_LOOKED.get() as u64 <= pieces,
+                "{pieces}: holding looked at {}",
+                CUT_LOOKED.get()
+            );
+            // The first quarter stays held while the rest is taken.
+            CUT_LOOKED.set(0);
+            for piece in pieces / 4..pieces {
+                let taken = ledger.take(VolumeIndex(0), ByteRange::at(piece * 16, 16));
+                assert_eq!(taken.len(), 1);
+            }
+            assert!(
+                CUT_LOOKED.get() as u64 <= 2 * pieces,
+                "{pieces}: taking looked at {}",
+                CUT_LOOKED.get()
+            );
+            assert_eq!(ledger.held_ranges(VolumeIndex(0)).len() as u64, pieces / 4);
+        }
     }
 
     #[test]
