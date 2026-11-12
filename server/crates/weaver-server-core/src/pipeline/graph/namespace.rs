@@ -932,22 +932,50 @@ impl NamespaceWriter {
         write: Write,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        self.place_as(tree, builder, segments, (arrival, false), write, out)
+            .map(|_| ())
+    }
+
+    // `place`, for a set's own repair as it comes back when `repair` says
+    // so: bytes a repair already wrote stand against it. Returns how many of
+    // the bytes the member took.
+    fn place_as(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (arrival, repair): (Arrival, bool),
+        write: Write,
+        out: &mut Vec<Effect>,
+    ) -> Result<u64, WriteError> {
         let (node, member) = (arrival.node, arrival.member);
         // Every article routes through here, so its effects go in the room
         // the writer keeps. A delivery that routes again while this one
         // applies finds the room taken and uses a list of its own.
         let mut effects = std::mem::take(&mut self.effects);
-        tree.deliver(
-            node,
-            member,
-            Posted {
-                offset: arrival.offset,
-                bytes: arrival.bytes.clone(),
-                provenance: arrival.provenance,
-            },
-            &mut self.placing(builder),
-            &mut effects,
-        );
+        let posted = Posted {
+            offset: arrival.offset,
+            bytes: arrival.bytes.clone(),
+            provenance: arrival.provenance,
+        };
+        let took = if repair {
+            tree.deliver_repair(
+                node,
+                member,
+                posted,
+                &mut self.placing(builder),
+                &mut effects,
+            )
+        } else {
+            tree.deliver(
+                node,
+                member,
+                posted,
+                &mut self.placing(builder),
+                &mut effects,
+            );
+            arrival.range().len()
+        };
         let recovery_volume = tree
             .child_of(node, member)
             .is_some_and(|(child, _)| tree.recovers(child));
@@ -965,7 +993,7 @@ impl NamespaceWriter {
         if recovery_volume || front || complete {
             self.bind_recoveries(tree, builder, segments, node, out)?;
         }
-        Ok(())
+        Ok(took)
     }
 
     // The bytes a bound member's object kept for no member of its own: its

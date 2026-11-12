@@ -648,7 +648,29 @@ impl Namespace {
         range: ByteRange,
         provenance: Provenance,
     ) -> (MemberId, Vec<(ByteRange, Provenance)>) {
-        let (member, taken) = self.taking(posting, range, provenance);
+        self.land(posting, range, provenance, false)
+    }
+
+    // A set's own repair of `range`, as it comes back: as `arrive`, except
+    // that bytes a repair already wrote stand against it. Two sets that
+    // disagree on a member never rewrite each other's repair: the first
+    // stands, and the second loses where they differ.
+    pub fn arrive_repair(
+        &mut self,
+        posting: MemberId,
+        range: ByteRange,
+    ) -> (MemberId, Vec<(ByteRange, Provenance)>) {
+        self.land(posting, range, Provenance::Repaired, true)
+    }
+
+    fn land(
+        &mut self,
+        posting: MemberId,
+        range: ByteRange,
+        provenance: Provenance,
+        contested: bool,
+    ) -> (MemberId, Vec<(ByteRange, Provenance)>) {
+        let (member, taken) = self.taken_of(posting, range, provenance, contested);
         // A further posting records what the member took of it: bytes the
         // first copy answered were never its, and say nothing of it.
         let postings: &[MemberId] = if posting == member {
@@ -674,6 +696,16 @@ impl Namespace {
         range: ByteRange,
         provenance: Provenance,
     ) -> (MemberId, Vec<(ByteRange, Provenance)>) {
+        self.taken_of(posting, range, provenance, false)
+    }
+
+    fn taken_of(
+        &self,
+        posting: MemberId,
+        range: ByteRange,
+        provenance: Provenance,
+        contested: bool,
+    ) -> (MemberId, Vec<(ByteRange, Provenance)>) {
         let member = self.resolve(posting);
         // A member that holds nothing over `range` has nothing to land on.
         let held = self
@@ -686,7 +718,8 @@ impl Namespace {
             Some((last, was)) if last.end == piece.start && *was == landed => last.end = piece.end,
             _ => taken.push((piece, landed)),
         };
-        for part in gaps(range, &self.standing(posting, member, range, provenance)) {
+        let standing = self.standing(posting, member, range, provenance, contested);
+        for part in gaps(range, &standing) {
             let mut at = part.start;
             for run in held.into_iter().flat_map(|held| held.overlapping(part)) {
                 let Some(piece) = run.range.intersect(part) else {
@@ -708,13 +741,14 @@ impl Namespace {
     // What of `range` stands against bytes of `posting` arriving with
     // `provenance`: what another posting brought first, against any copy
     // but a repair, since the first copy stands, and what the member's own
-    // record answers.
+    // record answers: a contested repair is answered by an earlier one too.
     fn standing(
         &self,
         posting: MemberId,
         member: MemberId,
         range: ByteRange,
         provenance: Provenance,
+        contested: bool,
     ) -> Coverage {
         let mut standing = match provenance {
             Provenance::Repaired => Coverage::new(),
@@ -724,7 +758,8 @@ impl Namespace {
         };
         if let Some(record) = self.members.get(&member) {
             for run in record.coverage.overlapping(range) {
-                if run.provenance.answers(provenance)
+                if (run.provenance.answers(provenance)
+                    || (contested && run.provenance == Provenance::Repaired))
                     && let Some(piece) = run.range.intersect(range)
                 {
                     standing.write(piece, Provenance::Fresh);
@@ -1200,6 +1235,32 @@ mod tests {
             runs(&namespace.get(member).unwrap().coverage),
             vec![(0, 30, Provenance::Repaired)]
         );
+    }
+
+    // A set's repair as it comes back lands over anything but an earlier
+    // repair: there the first repair stands.
+    #[test]
+    fn a_returned_repair_never_rewrites_an_earlier_repair() {
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("ember.bin", Some(30));
+        namespace.arrive(member, ByteRange::new(0, 10), Provenance::Fresh);
+        namespace.arrive(member, ByteRange::new(10, 20), Provenance::Damaged);
+        let (_, taken) = namespace.arrive_repair(member, ByteRange::new(10, 20));
+        assert_eq!(taken, landed(&[(10, 20, Provenance::Repaired)]));
+        let (_, taken) = namespace.arrive_repair(member, ByteRange::new(5, 30));
+        assert_eq!(
+            taken,
+            landed(&[
+                (5, 10, Provenance::Repaired),
+                (20, 30, Provenance::Repaired)
+            ])
+        );
+        assert_eq!(
+            runs(&namespace.get(member).unwrap().coverage),
+            vec![(0, 5, Provenance::Fresh), (5, 30, Provenance::Repaired)]
+        );
+        let (_, taken) = namespace.arrive_repair(member, ByteRange::new(0, 30));
+        assert_eq!(taken, landed(&[(0, 5, Provenance::Repaired)]));
     }
 
     // A member and a further posting of it, folded: whichever posting brings
