@@ -130,6 +130,13 @@ pub(crate) fn opens_in_external_browser(app_origin: &str, url: &str) -> bool {
     }
 }
 
+// Whether a URL a page asked to open is an absolute `http`/`https` URL with a
+// host part. Any other scheme names a program the shell would launch, so a
+// page's request for one is dropped.
+pub(crate) fn is_http_url(url: &str) -> bool {
+    http_origin(url).is_some_and(|origin| !origin.ends_with("://"))
+}
+
 // The `scheme://authority` prefix of an absolute `http`/`https` URL.
 //
 // This is deliberately a prefix slice rather than a parsed origin: the
@@ -1366,7 +1373,7 @@ mod tests {
     use super::{
         HttpResponse, PopoverContent, QueueRow, SMOKE_BODY, SMOKE_RESPONSE, app_origin, app_url,
         build_server_command, decode_chunked, desktop_profile_dir_from, format_bytes, format_speed,
-        http_origin, is_weaver_document, last_logged_error, logged_error_message,
+        http_origin, is_http_url, is_weaver_document, last_logged_error, logged_error_message,
         note_version_change, opens_in_external_browser, parse_http_response, parse_setup_code_line,
         popover_content_from_graphql, remove_desktop_profile, row_detail, set_cookie_value,
         tcp_table_port,
@@ -1685,6 +1692,38 @@ mod tests {
                 "{internal} should be left to the webview"
             );
             assert_eq!(http_origin(internal), None);
+        }
+    }
+
+    #[test]
+    fn only_http_links_are_opened_for_a_page() {
+        for opened in [
+            "http://example.invalid/item",
+            "https://example.invalid/item?id=1#top",
+            "HTTPS://Example.Invalid/",
+            "hTtP://127.0.0.1:9090",
+        ] {
+            assert!(is_http_url(opened), "{opened} should open");
+        }
+        for dropped in [
+            "file:///etc/passwd",
+            "file://server/share/run.exe",
+            "ms-settings:privacy",
+            "steam://run/1",
+            "x-custom://payload",
+            "javascript:alert(1)",
+            "mailto:someone@example.invalid",
+            "data:text/html,<p>hi</p>",
+            "",
+            "http",
+            "http:",
+            "http:/example.invalid",
+            "http://",
+            "https:///path",
+            "httpx://example.invalid/",
+            " https://example.invalid/",
+        ] {
+            assert!(!is_http_url(dropped), "{dropped:?} should be dropped");
         }
     }
 

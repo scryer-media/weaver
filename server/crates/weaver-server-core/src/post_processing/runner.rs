@@ -1862,41 +1862,14 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
     } else {
         Some(tempfile::tempdir()?)
     };
-    let mut commands = Vec::new();
-    if let Some(build_dir) = &build_dir {
-        let source = args
-            .get(1)
-            .ok_or_else(|| RunnerError::SupervisorProtocol("missing Go source".into()))?;
-        let binary = build_dir.path().join(if cfg!(windows) {
-            "script.exe"
-        } else {
-            "script"
-        });
-        let mut build = std::process::Command::new(&request.program);
-        build.arg("build").arg("-o").arg(&binary).arg(source);
-        commands.push(build);
-        let mut run = std::process::Command::new(binary);
-        run.args(&args[2..]);
-        commands.push(run);
-    } else {
-        let mut run = std::process::Command::new(&request.program);
-        #[cfg(windows)]
-        if request.raw_args {
-            use std::os::windows::process::CommandExt;
-            for arg in &args {
-                run.raw_arg(arg);
-            }
-        } else {
-            run.args(&args);
-        }
-        // Batch scripts only run on Windows.
-        #[cfg(not(windows))]
-        {
-            let _ = request.raw_args;
-            run.args(&args);
-        }
-        commands.push(run);
-    }
+    let commands = supervisor_commands(
+        &request.program,
+        &args,
+        &env,
+        &request.cwd,
+        request.raw_args,
+        build_dir.as_ref().map(|dir| dir.path()),
+    )?;
     let parent_pipe_lost = Arc::new(AtomicBool::new(false));
     let parent_liveness = parent_pipe_lost.clone();
     std::thread::spawn(move || {
@@ -1916,9 +1889,6 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
             return Ok(125);
         }
         command
-            .env_clear()
-            .envs(env.iter().cloned())
-            .current_dir(&request.cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1960,6 +1930,70 @@ fn run_supervisor_stdio_inner() -> Result<i32, RunnerError> {
         }
     }
     Ok(0)
+}
+
+// The commands the supervisor spawns in order, each with its environment and
+// working directory. A script runs in `cwd`. A Go script is first built from
+// `build_dir`, which holds nothing but the build's own output: Go reads module
+// and workspace files from its working directory and its parents, and the
+// files of a download must never steer the build of the script.
+fn supervisor_commands(
+    program: &Path,
+    args: &[OsString],
+    env: &[(OsString, OsString)],
+    cwd: &Path,
+    raw_args: bool,
+    build_dir: Option<&Path>,
+) -> Result<Vec<std::process::Command>, RunnerError> {
+    let command = |program: &Path, dir: &Path| {
+        let mut command = std::process::Command::new(program);
+        command
+            .env_clear()
+            .envs(env.iter().cloned())
+            .current_dir(dir);
+        command
+    };
+    let mut commands = Vec::new();
+    if let Some(build_dir) = build_dir {
+        let source = args
+            .get(1)
+            .ok_or_else(|| RunnerError::SupervisorProtocol("missing Go source".into()))?;
+        let binary = build_dir.join(if cfg!(windows) {
+            "script.exe"
+        } else {
+            "script"
+        });
+        let mut build = command(program, build_dir);
+        build
+            .env("GOWORK", "off")
+            .arg("build")
+            .arg("-o")
+            .arg(&binary)
+            .arg(source);
+        commands.push(build);
+        let mut run = command(&binary, cwd);
+        run.args(&args[2..]);
+        commands.push(run);
+    } else {
+        let mut run = command(program, cwd);
+        #[cfg(windows)]
+        if raw_args {
+            use std::os::windows::process::CommandExt;
+            for arg in args {
+                run.raw_arg(arg);
+            }
+        } else {
+            run.args(args);
+        }
+        // Batch scripts only run on Windows.
+        #[cfg(not(windows))]
+        {
+            let _ = raw_args;
+            run.args(args);
+        }
+        commands.push(run);
+    }
+    Ok(commands)
 }
 
 // Bounded diagnostic tail retained by the relay.
@@ -2532,6 +2566,7 @@ mod capture_tests {
 #[cfg(test)]
 mod go_run_tests {
     use super::*;
+    use std::ffi::OsStr;
 
     fn text_env(env: BTreeMap<OsStringWire, OsStringWire>) -> BTreeMap<String, String> {
         env.into_iter()
@@ -2591,6 +2626,92 @@ mod go_run_tests {
         assert_eq!(
             text_env(env),
             BTreeMap::from([("GOPROXY".to_string(), "off".to_string())])
+        );
+    }
+
+    #[test]
+    fn a_go_script_is_built_away_from_the_download_and_run_in_it() {
+        let job = Path::new("/downloads/job");
+        let build_dir = Path::new("/data/.weaver-go-build/one");
+        let args = [
+            OsString::from("run"),
+            OsString::from("/scripts/report.go"),
+            OsString::from("first"),
+        ];
+        let env = [(OsString::from("PATH"), OsString::from("/bin"))];
+        let commands = supervisor_commands(
+            Path::new("/opt/go/bin/go"),
+            &args,
+            &env,
+            job,
+            false,
+            Some(build_dir),
+        )
+        .unwrap();
+        let [build, run] = commands.as_slice() else {
+            panic!("a Go script is built, then run");
+        };
+        let envs = |command: &std::process::Command| {
+            command
+                .get_envs()
+                .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(build.get_program(), "/opt/go/bin/go");
+        assert_eq!(build.get_current_dir(), Some(build_dir));
+        let binary = build_dir.join(if cfg!(windows) {
+            "script.exe"
+        } else {
+            "script"
+        });
+        assert_eq!(
+            build.get_args().collect::<Vec<_>>(),
+            [
+                OsStr::new("build"),
+                OsStr::new("-o"),
+                binary.as_os_str(),
+                OsStr::new("/scripts/report.go"),
+            ]
+        );
+        assert_eq!(
+            envs(build),
+            [
+                ("GOWORK".into(), Some("off".into())),
+                ("PATH".into(), Some("/bin".into())),
+            ]
+        );
+
+        assert_eq!(run.get_program(), binary.as_os_str());
+        assert_eq!(run.get_current_dir(), Some(job));
+        assert_eq!(run.get_args().collect::<Vec<_>>(), [OsStr::new("first")]);
+        assert_eq!(envs(run), [("PATH".into(), Some("/bin".into()))]);
+    }
+
+    #[test]
+    fn a_script_without_a_build_runs_in_the_download() {
+        let job = Path::new("/downloads/job");
+        let args = [
+            OsString::from("/scripts/report.py"),
+            OsString::from("first"),
+        ];
+        let env = [(OsString::from("PATH"), OsString::from("/bin"))];
+        let commands =
+            supervisor_commands(Path::new("python3"), &args, &env, job, false, None).unwrap();
+        let [run] = commands.as_slice() else {
+            panic!("a script is only run");
+        };
+        assert_eq!(run.get_program(), "python3");
+        assert_eq!(run.get_current_dir(), Some(job));
+        assert_eq!(
+            run.get_args().collect::<Vec<_>>(),
+            [OsStr::new("/scripts/report.py"), OsStr::new("first")]
+        );
+        assert_eq!(
+            run.get_envs()
+                .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+                .collect::<Vec<_>>(),
+            [("PATH".into(), Some("/bin".into()))]
         );
     }
 

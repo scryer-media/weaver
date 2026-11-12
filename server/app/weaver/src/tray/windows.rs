@@ -1687,11 +1687,14 @@ fn attach_controller(
             };
             // Every `target="_blank"` leaves the app: the app window is one
             // window, and a second frameless WebView2 with no chrome would be
-            // a worse browser than the user's own.
+            // a worse browser than the user's own. Only an `http`/`https`
+            // link is opened; any other scheme is dropped.
             // SAFETY: Marking the request handled is only valid from inside
             // this event.
             unsafe { arguments.SetHandled(true) }?;
-            let _ = open_target(&uri);
+            if shared::is_http_url(&uri) {
+                let _ = open_target(&uri);
+            }
             Ok(())
         }));
 
