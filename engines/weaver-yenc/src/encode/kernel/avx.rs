@@ -21,8 +21,14 @@ pub(super) unsafe fn encode_raw(
     is_end: bool,
 ) -> usize {
     unsafe {
-        encode_simd_frame(line_size, column, src, len, dst, is_end, |ls, col, s, n, d| {
-            main_loop::<Sse<true>>(ls, col, s, n, d)
-        })
+        encode_simd_frame(
+            line_size,
+            column,
+            src,
+            len,
+            dst,
+            is_end,
+            |ls, col, s, n, d| main_loop::<Sse<true>>(ls, col, s, n, d),
+        )
     }
 }

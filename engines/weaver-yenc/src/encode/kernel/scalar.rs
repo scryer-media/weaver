@@ -52,7 +52,8 @@ unsafe fn put2(p: &mut *mut u8, b: [u8; 2]) {
 // compiled loop (a post-indexed store on AArch64, `inc` on x86-64). They emit
 // no instruction. (avx512vbmi2.rs uses the same barrier.)
 #[inline(always)]
-#[allow(unused_mut)]
+// The template is empty, so the pointer is never dereferenced.
+#[allow(unused_mut, clippy::pointers_in_nomem_asm_block)]
 fn opaque(mut p: *mut u8) -> *mut u8 {
     #[cfg(any(
         target_arch = "x86",
@@ -71,7 +72,8 @@ fn opaque(mut p: *mut u8) -> *mut u8 {
 }
 
 #[inline(always)]
-#[allow(unused_mut)]
+// The template is empty, so the pointer is never dereferenced.
+#[allow(unused_mut, clippy::pointers_in_nomem_asm_block)]
 fn opaque2(mut p: *mut u8, mut col: isize) -> (*mut u8, isize) {
     #[cfg(any(
         target_arch = "x86",
@@ -257,7 +259,11 @@ pub(super) unsafe fn encode_generic(
             let c = *es.offset(i);
             i += 1;
             let e = u16::from_le_bytes(ESCAPED[c as usize]);
-            let first = if e != 0 { e } else { u16::from(c.wrapping_add(42)) };
+            let first = if e != 0 {
+                e
+            } else {
+                u16::from(c.wrapping_add(42))
+            };
             let w = u32::from_le_bytes([b'\r', b'\n', 0, 0]) | u32::from(first) << 16;
             p.cast::<[u8; 4]>().write_unaligned(w.to_le_bytes());
             let wide = (e != 0) as isize;

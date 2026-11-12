@@ -102,7 +102,10 @@ pub(super) trait Block {
             locate_one(m, r)
         } else {
             let eq = out_eq32(m);
-            (r - Self::popcnt(eq & low64(r)), (((eq << 1) >> r) & 1) as usize)
+            (
+                r - Self::popcnt(eq & low64(r)),
+                (((eq << 1) >> r) & 1) as usize,
+            )
         }
     }
 }
@@ -469,354 +472,365 @@ unsafe fn step<B: Block>(
 // (the SSSE3 loop compiled with the hints off).
 macro_rules! grid_loop {
     ($cold:literal) => {
-    // `step` with the block grid fixed across line ends, the NEON tier's line
-    // start (neon.rs:719-913): the break block is stored whole, the last byte and
-    // CRLF go over it at the line's last column, the next line's first byte is a
-    // table store whose width comes from the block's own masks (no branch, no
-    // load on the column chain), and the rest of the block is stored after it.
-    // The next block is still `N` on, so no load address waits on where the line
-    // ended. A line that ends on the block's last byte keeps `step`'s handling.
-    //
-    // SAFETY: `2 * N + 64` bytes readable at `*s`; the line holds `2 * N + 2`
-    // columns; output as `step`.
-    #[inline(always)]
-    unsafe fn step_grid<B: Dense>(
-        v: B::V,
-        last: usize,
-        s: &mut *const u8,
-        p: &mut *mut u8,
-        room: &mut isize,
-    ) -> bool {
-        unsafe {
-            let m = B::crit_mask(v);
-            if m & m.wrapping_sub(1) == 0 {
-                grid_one::<B>(v, m, last, s, p, room)
-            } else {
-                // rapidyenc `LIKELIHOOD(0.089, manyBitsSet)`
-                // (src/encoder_sse_base.h:281): the sparse arm falls through.
-                if $cold {
-                    std::hint::cold_path();
+        // `step` with the block grid fixed across line ends, the NEON tier's line
+        // start (neon.rs:719-913): the break block is stored whole, the last byte and
+        // CRLF go over it at the line's last column, the next line's first byte is a
+        // table store whose width comes from the block's own masks (no branch, no
+        // load on the column chain), and the rest of the block is stored after it.
+        // The next block is still `N` on, so no load address waits on where the line
+        // ended. A line that ends on the block's last byte keeps `step`'s handling.
+        //
+        // SAFETY: `2 * N + 64` bytes readable at `*s`; the line holds `2 * N + 2`
+        // columns; output as `step`.
+        #[inline(always)]
+        unsafe fn step_grid<B: Dense>(
+            v: B::V,
+            last: usize,
+            s: &mut *const u8,
+            p: &mut *mut u8,
+            room: &mut isize,
+        ) -> bool {
+            unsafe {
+                let m = B::crit_mask(v);
+                if m & m.wrapping_sub(1) == 0 {
+                    grid_one::<B>(v, m, last, s, p, room)
+                } else {
+                    // rapidyenc `LIKELIHOOD(0.089, manyBitsSet)`
+                    // (src/encoder_sse_base.h:281): the sparse arm falls through.
+                    if $cold {
+                        std::hint::cold_path();
+                    }
+                    grid_many::<B>(v, m, last, s, p, room)
                 }
-                grid_many::<B>(v, m, last, s, p, room)
             }
         }
-    }
 
-    // Two blocks per decision, rapidyenc's 64-byte iteration
-    // (src/encoder_avx_base.h:128-131, :163): one test sends both blocks down
-    // the sparse path when neither has two escapes, and one width test covers
-    // both, so a line takes about half the branches `step_grid` takes and the
-    // clean path stores two blocks per branch pair. A line end inside the pair
-    // is the block it falls in, through `grid_one`; the other block cannot end a
-    // line too (the line holds `2 * N + 8` columns or more).
-    //
-    // SAFETY: `3 * N + 64` bytes readable at `*s`; otherwise as `step_grid`.
-    #[inline(always)]
-    unsafe fn step_grid2<B: Dense>(
-        va: B::V,
-        vb: B::V,
-        last: usize,
-        s: &mut *const u8,
-        p: &mut *mut u8,
-        room: &mut isize,
-    ) -> bool {
-        unsafe {
-            let ma = B::crit_mask(va);
-            let mb = B::crit_mask(vb);
-            // Either block dense: both take the general expansion, with no second
-            // sparse test, as rapidyenc's dense arm covers both vectors
-            // (src/encoder_avx_base.h:163-255).
-            if (ma & ma.wrapping_sub(1)) | (mb & mb.wrapping_sub(1)) != 0 {
-                // rapidyenc `LIKELIHOOD(0.170, ...)` (src/encoder_avx_base.h:163).
+        // Two blocks per decision, rapidyenc's 64-byte iteration
+        // (src/encoder_avx_base.h:128-131, :163): one test sends both blocks down
+        // the sparse path when neither has two escapes, and one width test covers
+        // both, so a line takes about half the branches `step_grid` takes and the
+        // clean path stores two blocks per branch pair. A line end inside the pair
+        // is the block it falls in, through `grid_one`; the other block cannot end a
+        // line too (the line holds `2 * N + 8` columns or more).
+        //
+        // SAFETY: `3 * N + 64` bytes readable at `*s`; otherwise as `step_grid`.
+        #[inline(always)]
+        unsafe fn step_grid2<B: Dense>(
+            va: B::V,
+            vb: B::V,
+            last: usize,
+            s: &mut *const u8,
+            p: &mut *mut u8,
+            room: &mut isize,
+        ) -> bool {
+            unsafe {
+                let ma = B::crit_mask(va);
+                let mb = B::crit_mask(vb);
+                // Either block dense: both take the general expansion, with no second
+                // sparse test, as rapidyenc's dense arm covers both vectors
+                // (src/encoder_avx_base.h:163-255).
+                if (ma & ma.wrapping_sub(1)) | (mb & mb.wrapping_sub(1)) != 0 {
+                    // rapidyenc `LIKELIHOOD(0.170, ...)` (src/encoder_avx_base.h:163).
+                    if $cold {
+                        std::hint::cold_path();
+                    }
+                    if !grid_many::<B>(va, ma, last, s, p, room) {
+                        return false;
+                    }
+                    return grid_many::<B>(vb, mb, last, s, p, room);
+                }
+                let wa = B::N + (ma != 0) as usize;
+                let wb = B::N + (mb != 0) as usize;
+                let nr = *room - (wa + wb) as isize;
+                if nr >= 0 {
+                    B::store_one(va, *s, ma, *p);
+                    B::store_one(vb, s.add(B::N), mb, p.add(wa));
+                    *p = p.add(wa + wb);
+                    *room = nr;
+                    *s = s.add(2 * B::N);
+                    return true;
+                }
+                // rapidyenc `LIKELIHOOD(0.3, col >= 0)` (src/encoder_sse_base.h:604).
                 if $cold {
                     std::hint::cold_path();
                 }
-                if !grid_many::<B>(va, ma, last, s, p, room) {
+                if *room - wa as isize >= 0 {
+                    B::store_one(va, *s, ma, *p);
+                    *p = p.add(wa);
+                    *room -= wa as isize;
+                    *s = s.add(B::N);
+                    return grid_one::<B>(vb, mb, last, s, p, room);
+                }
+                if !grid_one::<B>(va, ma, last, s, p, room) {
                     return false;
                 }
-                return grid_many::<B>(vb, mb, last, s, p, room);
-            }
-            let wa = B::N + (ma != 0) as usize;
-            let wb = B::N + (mb != 0) as usize;
-            let nr = *room - (wa + wb) as isize;
-            if nr >= 0 {
-                B::store_one(va, *s, ma, *p);
-                B::store_one(vb, s.add(B::N), mb, p.add(wa));
-                *p = p.add(wa + wb);
-                *room = nr;
-                *s = s.add(2 * B::N);
-                return true;
-            }
-            // rapidyenc `LIKELIHOOD(0.3, col >= 0)` (src/encoder_sse_base.h:604).
-            if $cold {
-                std::hint::cold_path();
-            }
-            if *room - wa as isize >= 0 {
-                B::store_one(va, *s, ma, *p);
-                *p = p.add(wa);
-                *room -= wa as isize;
+                B::store_one(vb, *s, mb, *p);
+                *p = p.add(wb);
+                *room -= wb as isize;
                 *s = s.add(B::N);
-                return grid_one::<B>(vb, mb, last, s, p, room);
+                true
             }
-            if !grid_one::<B>(va, ma, last, s, p, room) {
-                return false;
-            }
-            B::store_one(vb, *s, mb, *p);
-            *p = p.add(wb);
-            *room -= wb as isize;
-            *s = s.add(B::N);
-            true
         }
-    }
 
-    // A line that ends on the block's last byte, after its last byte and CRLF
-    // (`q` past them): the next line starts at the next block, and its first
-    // byte is escaped by a branch, as `step`.
-    #[inline(always)]
-    unsafe fn grid_edge_n<B: Block>(
-        q: *mut u8,
-        last: usize,
-        s: &mut *const u8,
-        p: &mut *mut u8,
-        room: &mut isize,
-    ) -> bool {
-        unsafe {
-            let c = *s.add(B::N);
-            if first_only_bit(c) != 0 {
-                // rapidyenc `LIKELIHOOD(0.0273, escapedLUT[c] != 0)` for a line's
-                // first byte (src/encoder_sse_base.h:198).
+        // A line that ends on the block's last byte, after its last byte and CRLF
+        // (`q` past them): the next line starts at the next block, and its first
+        // byte is escaped by a branch, as `step`.
+        #[inline(always)]
+        unsafe fn grid_edge_n<B: Block>(
+            q: *mut u8,
+            last: usize,
+            s: &mut *const u8,
+            p: &mut *mut u8,
+            room: &mut isize,
+        ) -> bool {
+            unsafe {
+                let c = *s.add(B::N);
+                if first_only_bit(c) != 0 {
+                    // rapidyenc `LIKELIHOOD(0.0273, escapedLUT[c] != 0)` for a line's
+                    // first byte (src/encoder_sse_base.h:198).
+                    if $cold {
+                        std::hint::cold_path();
+                    }
+                    q.cast::<[u8; 2]>().write_unaligned(ESCAPED[c as usize]);
+                    *p = q.add(2);
+                    *room = (last - 2) as isize;
+                    *s = s.add(B::N + 1);
+                    return false;
+                }
+                *p = q;
+                *room = last as isize;
+                *s = s.add(B::N);
+                true
+            }
+        }
+
+        // At most one escape (the common case), at index `j` (64 when none): the
+        // block's width is `N + (m != 0)`, and every width of a break block comes
+        // from compares on `j`, so nothing on the line's column and cursor chain
+        // waits on a popcount (the NEON tier's sparse break, neon.rs:808-814,
+        // :882-889).
+        #[inline(always)]
+        unsafe fn grid_one<B: Block>(
+            v: B::V,
+            m: u64,
+            last: usize,
+            s: &mut *const u8,
+            p: &mut *mut u8,
+            room: &mut isize,
+        ) -> bool {
+            unsafe {
+                let w = B::N + (m != 0) as usize;
+                let r = *room;
+                let nr = r - w as isize;
+                if nr >= 0 {
+                    B::store_one(v, *s, m, *p);
+                    *p = p.add(w);
+                    *room = nr;
+                    *s = s.add(B::N);
+                    return true;
+                }
+                // rapidyenc `LIKELIHOOD(0.3, col >= 0)` (src/encoder_sse_base.h:604).
                 if $cold {
                     std::hint::cold_path();
                 }
-                q.cast::<[u8; 2]>().write_unaligned(ESCAPED[c as usize]);
-                *p = q.add(2);
-                *room = (last - 2) as isize;
-                *s = s.add(B::N + 1);
-                return false;
-            }
-            *p = q;
-            *room = last as isize;
-            *s = s.add(B::N);
-            true
-        }
-    }
-
-    // At most one escape (the common case), at index `j` (64 when none): the
-    // block's width is `N + (m != 0)`, and every width of a break block comes
-    // from compares on `j`, so nothing on the line's column and cursor chain
-    // waits on a popcount (the NEON tier's sparse break, neon.rs:808-814,
-    // :882-889).
-    #[inline(always)]
-    unsafe fn grid_one<B: Block>(
-        v: B::V,
-        m: u64,
-        last: usize,
-        s: &mut *const u8,
-        p: &mut *mut u8,
-        room: &mut isize,
-    ) -> bool {
-        unsafe {
-            let w = B::N + (m != 0) as usize;
-            let r = *room;
-            let nr = r - w as isize;
-            if nr >= 0 {
-                B::store_one(v, *s, m, *p);
-                *p = p.add(w);
-                *room = nr;
-                *s = s.add(B::N);
-                return true;
-            }
-            // rapidyenc `LIKELIHOOD(0.3, col >= 0)` (src/encoder_sse_base.h:604).
-            if $cold {
-                std::hint::cold_path();
-            }
-            let r = r as usize;
-            let (k, st) = locate_one(m, r);
-            let j = m.trailing_zeros() as usize;
-            let e = EOL[*s.add(k) as usize] >> (8 * st);
-            let q = p.add(r + 3 + (e >> 27) as usize);
-            let f = k + 1;
-            let pp = *p;
-            if f == B::N {
-                B::store_one(v, *s, m, pp);
-                pp.add(r).cast::<u32>().write_unaligned(e.to_le());
-                return grid_edge_n::<B>(q, last, s, p, room);
-            }
-            let fe = START[*s.add(f) as usize];
-            let fb = (fe >> 16) as usize - 1;
-            // The rest's width: the block's width less its first `w1` output
-            // columns (neon.rs:882, :889 counts the same).
-            let rw = w - (f + 1 + (j <= f) as usize);
-            let q2 = q.add(1 + fb);
-            B::break_one(v, *s, m, pp, f, q2, || {
-                pp.add(r).cast::<u32>().write_unaligned(e.to_le());
-                q.cast::<u16>().write_unaligned((fe as u16).to_le());
-            });
-            *p = q2.add(rw);
-            *room = (last - 1 - fb - rw) as isize;
-            *s = s.add(B::N);
-            true
-        }
-    }
-
-    // Two or more escapes: the widths come from popcounts, and the rest of a
-    // break block is stored again from one load at the next line's second byte
-    // with the block's mask shifted down.
-    #[inline(always)]
-    unsafe fn grid_many<B: Dense>(
-        v: B::V,
-        m: u64,
-        last: usize,
-        s: &mut *const u8,
-        p: &mut *mut u8,
-        room: &mut isize,
-    ) -> bool {
-        unsafe {
-            let (w, d) = B::store_dense(v, m, *p);
-            let nr = *room - w as isize;
-            if nr >= 0 {
-                *p = p.add(w);
-                *room = nr;
-                *s = s.add(B::N);
-                return true;
-            }
-            // rapidyenc `LIKELIHOOD(0.3, col >= 0)` (src/encoder_sse_base.h:378).
-            if $cold {
-                std::hint::cold_path();
-            }
-            let r = (nr + w as isize) as usize;
-            let eq = B::dense_eq(d);
-            let (k, st) = (r - B::popcnt(eq & low64(r)), (((eq << 1) >> r) & 1) as usize);
-            let e = EOL[*s.add(k) as usize] >> (8 * st);
-            p.add(r).cast::<u32>().write_unaligned(e.to_le());
-            let q = p.add(r + 3 + (e >> 27) as usize);
-            let f = k + 1;
-            if f == B::N {
-                return grid_edge_n::<B>(q, last, s, p, room);
-            }
-            let fe = START[*s.add(f) as usize];
-            let fb = (fe >> 16) as usize - 1;
-            q.cast::<u16>().write_unaligned((fe as u16).to_le());
-            let rs = s.add(f + 1);
-            let rm = m >> (f + 1);
-            let q = q.add(1 + fb);
-            // The rest's width is its store's own (a table width, or none-or-one
-            // by a compare), not a second popcount of the mask: the store
-            // encodes `N` source bytes, the `f + 1` past the block unescaped.
-            let rw = B::store(B::load(rs), rs, rm, q) - (f + 1);
-            *p = q.add(rw);
-            *room = (last - 1 - fb - rw) as isize;
-            *s = s.add(B::N);
-            true
-        }
-    }
-
-    // Main loop for the frame (`scalar::encode_simd_frame`): encodes a prefix of
-    // the input, updates `*column`, returns (consumed, written).
-    //
-    // SAFETY: the `RawEncodeFn` contract, `line_size >= 12`, and the CPU has the
-    // features `B` uses.
-    #[inline(always)]
-    pub(super) unsafe fn main_loop<B: Dense>(
-        ls: usize,
-        column: &mut usize,
-        src: *const u8,
-        len: usize,
-        dst: *mut u8,
-    ) -> (usize, usize) {
-        // While the next block's vector is loaded ahead, an iteration reads up
-        // to `s + 2N + 1` (a restart one byte past the next block); the last
-        // blocks load their own vector and read `READ_AHEAD` and the byte at
-        // `s + N`. The scalar tail gets fewer than `need_b` bytes.
-        let need_a = if 2 * B::N + 1 > B::READ_AHEAD { 2 * B::N + 1 } else { B::READ_AHEAD };
-        let need_b = if B::N + 2 > B::READ_AHEAD { B::N + 2 } else { B::READ_AHEAD };
-        if len < need_a {
-            return (0, 0);
-        }
-        // SAFETY, whole body: every read is below `s + need <= src + len` for
-        // the phase's `need` (each loop runs only while `s` is at most its
-        // limit); output stays inside the `encode_max_len` budget: at most 2
-        // bytes per consumed byte plus 2 per line, plus vector overrun of at
-        // most 96 bytes while at least `need_b` (>= 34) input bytes, so 68 + 66
-        // budget bytes, remain.
-        unsafe {
-            let end = src.add(len);
-            let limit_a = end.sub(need_a);
-            let limit_b = end.sub(need_b);
-            let mut s = src;
-            let mut p = dst;
-            let mut col = *column;
-            let last = ls - 1;
-            enter(last, &mut col, &mut s, &mut p);
-            if col == 0 {
-                let c = *s;
-                if first_only_bit(c) != 0 {
-                    p.cast::<[u8; 2]>().write_unaligned(ESCAPED[c as usize]);
-                    p = p.add(2);
-                    s = s.add(1);
-                    col = 2;
+                let r = r as usize;
+                let (k, st) = locate_one(m, r);
+                let j = m.trailing_zeros() as usize;
+                let e = EOL[*s.add(k) as usize] >> (8 * st);
+                let q = p.add(r + 3 + (e >> 27) as usize);
+                let f = k + 1;
+                let pp = *p;
+                if f == B::N {
+                    B::store_one(v, *s, m, pp);
+                    pp.add(r).cast::<u32>().write_unaligned(e.to_le());
+                    return grid_edge_n::<B>(q, last, s, p, room);
                 }
+                let fe = START[*s.add(f) as usize];
+                let fb = (fe >> 16) as usize - 1;
+                // The rest's width: the block's width less its first `w1` output
+                // columns (neon.rs:882, :889 counts the same).
+                let rw = w - (f + 1 + (j <= f) as usize);
+                let q2 = q.add(1 + fb);
+                B::break_one(v, *s, m, pp, f, q2, || {
+                    pp.add(r).cast::<u32>().write_unaligned(e.to_le());
+                    q.cast::<u16>().write_unaligned((fe as u16).to_le());
+                });
+                *p = q2.add(rw);
+                *room = (last - 1 - fb - rw) as isize;
+                *s = s.add(B::N);
+                true
             }
-            let mut room = (last - col) as isize;
-            // The next block's vector is loaded before this block's stores, so
-            // the load never waits behind them. (Loading each block at the loop
-            // head, as rapidyenc does at src/encoder_avx_base.h:129-130, cost
-            // Zen 4 6 to 12% on every AVX2 and AVX cell.)
-            let need_g = 2 * B::N + 64;
-            let need_g2 = 3 * B::N + 64;
-            if B::GRID2 && B::PIPELINE && ls >= 2 * B::N + 8 && len >= need_g2 {
-                let limit_g2 = end.sub(need_g2);
-                let mut va = B::load(s);
-                let mut vb = B::load(s.add(B::N));
-                while s <= limit_g2 {
-                    let na = B::load(s.add(2 * B::N));
-                    let nb = B::load(s.add(3 * B::N));
-                    if step_grid2::<B>(va, vb, last, &mut s, &mut p, &mut room) {
-                        va = na;
-                        vb = nb;
-                    } else {
-                        va = B::load(s);
-                        vb = B::load(s.add(B::N));
+        }
+
+        // Two or more escapes: the widths come from popcounts, and the rest of a
+        // break block is stored again from one load at the next line's second byte
+        // with the block's mask shifted down.
+        #[inline(always)]
+        unsafe fn grid_many<B: Dense>(
+            v: B::V,
+            m: u64,
+            last: usize,
+            s: &mut *const u8,
+            p: &mut *mut u8,
+            room: &mut isize,
+        ) -> bool {
+            unsafe {
+                let (w, d) = B::store_dense(v, m, *p);
+                let nr = *room - w as isize;
+                if nr >= 0 {
+                    *p = p.add(w);
+                    *room = nr;
+                    *s = s.add(B::N);
+                    return true;
+                }
+                // rapidyenc `LIKELIHOOD(0.3, col >= 0)` (src/encoder_sse_base.h:378).
+                if $cold {
+                    std::hint::cold_path();
+                }
+                let r = (nr + w as isize) as usize;
+                let eq = B::dense_eq(d);
+                let (k, st) = (
+                    r - B::popcnt(eq & low64(r)),
+                    (((eq << 1) >> r) & 1) as usize,
+                );
+                let e = EOL[*s.add(k) as usize] >> (8 * st);
+                p.add(r).cast::<u32>().write_unaligned(e.to_le());
+                let q = p.add(r + 3 + (e >> 27) as usize);
+                let f = k + 1;
+                if f == B::N {
+                    return grid_edge_n::<B>(q, last, s, p, room);
+                }
+                let fe = START[*s.add(f) as usize];
+                let fb = (fe >> 16) as usize - 1;
+                q.cast::<u16>().write_unaligned((fe as u16).to_le());
+                let rs = s.add(f + 1);
+                let rm = m >> (f + 1);
+                let q = q.add(1 + fb);
+                // The rest's width is its store's own (a table width, or none-or-one
+                // by a compare), not a second popcount of the mask: the store
+                // encodes `N` source bytes, the `f + 1` past the block unescaped.
+                let rw = B::store(B::load(rs), rs, rm, q) - (f + 1);
+                *p = q.add(rw);
+                *room = (last - 1 - fb - rw) as isize;
+                *s = s.add(B::N);
+                true
+            }
+        }
+
+        // Main loop for the frame (`scalar::encode_simd_frame`): encodes a prefix of
+        // the input, updates `*column`, returns (consumed, written).
+        //
+        // SAFETY: the `RawEncodeFn` contract, `line_size >= 12`, and the CPU has the
+        // features `B` uses.
+        #[inline(always)]
+        pub(super) unsafe fn main_loop<B: Dense>(
+            ls: usize,
+            column: &mut usize,
+            src: *const u8,
+            len: usize,
+            dst: *mut u8,
+        ) -> (usize, usize) {
+            // While the next block's vector is loaded ahead, an iteration reads up
+            // to `s + 2N + 1` (a restart one byte past the next block); the last
+            // blocks load their own vector and read `READ_AHEAD` and the byte at
+            // `s + N`. The scalar tail gets fewer than `need_b` bytes.
+            let need_a = if 2 * B::N + 1 > B::READ_AHEAD {
+                2 * B::N + 1
+            } else {
+                B::READ_AHEAD
+            };
+            let need_b = if B::N + 2 > B::READ_AHEAD {
+                B::N + 2
+            } else {
+                B::READ_AHEAD
+            };
+            if len < need_a {
+                return (0, 0);
+            }
+            // SAFETY, whole body: every read is below `s + need <= src + len` for
+            // the phase's `need` (each loop runs only while `s` is at most its
+            // limit); output stays inside the `encode_max_len` budget: at most 2
+            // bytes per consumed byte plus 2 per line, plus vector overrun of at
+            // most 96 bytes while at least `need_b` (>= 34) input bytes, so 68 + 66
+            // budget bytes, remain.
+            unsafe {
+                let end = src.add(len);
+                let limit_a = end.sub(need_a);
+                let limit_b = end.sub(need_b);
+                let mut s = src;
+                let mut p = dst;
+                let mut col = *column;
+                let last = ls - 1;
+                enter(last, &mut col, &mut s, &mut p);
+                if col == 0 {
+                    let c = *s;
+                    if first_only_bit(c) != 0 {
+                        p.cast::<[u8; 2]>().write_unaligned(ESCAPED[c as usize]);
+                        p = p.add(2);
+                        s = s.add(1);
+                        col = 2;
                     }
                 }
-            }
-            if B::GRID && B::PIPELINE && ls >= 2 * B::N + 8 && len >= need_g {
-                let limit_g = end.sub(need_g);
-                let mut v = B::load(s);
-                while s <= limit_g {
-                    let vn = B::load(s.add(B::N));
-                    v = if step_grid::<B>(v, last, &mut s, &mut p, &mut room) {
-                        vn
-                    } else {
-                        if $cold {
-                            std::hint::cold_path();
+                let mut room = (last - col) as isize;
+                // The next block's vector is loaded before this block's stores, so
+                // the load never waits behind them. (Loading each block at the loop
+                // head, as rapidyenc does at src/encoder_avx_base.h:129-130, cost
+                // Zen 4 6 to 12% on every AVX2 and AVX cell.)
+                let need_g = 2 * B::N + 64;
+                let need_g2 = 3 * B::N + 64;
+                if B::GRID2 && B::PIPELINE && ls >= 2 * B::N + 8 && len >= need_g2 {
+                    let limit_g2 = end.sub(need_g2);
+                    let mut va = B::load(s);
+                    let mut vb = B::load(s.add(B::N));
+                    while s <= limit_g2 {
+                        let na = B::load(s.add(2 * B::N));
+                        let nb = B::load(s.add(3 * B::N));
+                        if step_grid2::<B>(va, vb, last, &mut s, &mut p, &mut room) {
+                            va = na;
+                            vb = nb;
+                        } else {
+                            va = B::load(s);
+                            vb = B::load(s.add(B::N));
                         }
-                        B::load(s)
-                    };
+                    }
                 }
-            }
-            // A grid tier runs only the grid loop and the tail loop below: one
-            // hot loop in the function keeps its column, cursor and source in
-            // registers (with the pipelined `step` loop beside it, LLVM kept the
-            // column on the stack).
-            if B::PIPELINE && !B::GRID {
-                let mut v = B::load(s);
-                while s <= limit_a {
-                    let vn = B::load(s.add(B::N));
-                    v = if step::<B>(v, last, &mut s, &mut p, &mut room) {
-                        vn
-                    } else {
-                        B::load(s)
-                    };
+                if B::GRID && B::PIPELINE && ls >= 2 * B::N + 8 && len >= need_g {
+                    let limit_g = end.sub(need_g);
+                    let mut v = B::load(s);
+                    while s <= limit_g {
+                        let vn = B::load(s.add(B::N));
+                        v = if step_grid::<B>(v, last, &mut s, &mut p, &mut room) {
+                            vn
+                        } else {
+                            if $cold {
+                                std::hint::cold_path();
+                            }
+                            B::load(s)
+                        };
+                    }
                 }
+                // A grid tier runs only the grid loop and the tail loop below: one
+                // hot loop in the function keeps its column, cursor and source in
+                // registers (with the pipelined `step` loop beside it, LLVM kept the
+                // column on the stack).
+                if B::PIPELINE && !B::GRID {
+                    let mut v = B::load(s);
+                    while s <= limit_a {
+                        let vn = B::load(s.add(B::N));
+                        v = if step::<B>(v, last, &mut s, &mut p, &mut room) {
+                            vn
+                        } else {
+                            B::load(s)
+                        };
+                    }
+                }
+                while s <= limit_b {
+                    step::<B>(B::load(s), last, &mut s, &mut p, &mut room);
+                }
+                *column = last - room as usize;
+                (s as usize - src as usize, p as usize - dst as usize)
             }
-            while s <= limit_b {
-                step::<B>(B::load(s), last, &mut s, &mut p, &mut room);
-            }
-            *column = last - room as usize;
-            (s as usize - src as usize, p as usize - dst as usize)
         }
-    }
     };
 }
 
@@ -954,14 +968,23 @@ mod dense_tests {
                             // SAFETY: `want` holds `encode_max_len` bytes; the
                             // domain is in range; scalar needs no feature.
                             let wn = unsafe {
-                                scalar::encode_raw(ls, &mut wcol, src.as_ptr(), len, want.as_mut_ptr(), is_end)
+                                scalar::encode_raw(
+                                    ls,
+                                    &mut wcol,
+                                    src.as_ptr(),
+                                    len,
+                                    want.as_mut_ptr(),
+                                    is_end,
+                                )
                             };
                             for &(name, f) in &loops {
                                 let mut got = vec![0u8; cap];
                                 let mut gcol = col0;
                                 // SAFETY: as above; the loop's features were
                                 // detected when it was listed.
-                                let gn = unsafe { f(ls, &mut gcol, src.as_ptr(), len, got.as_mut_ptr(), is_end) };
+                                let gn = unsafe {
+                                    f(ls, &mut gcol, src.as_ptr(), len, got.as_mut_ptr(), is_end)
+                                };
                                 assert!(
                                     gn == wn && gcol == wcol && got[..gn] == want[..wn],
                                     "{name}: kind {kind} len {len} line {ls} col {col0} end {is_end}"
