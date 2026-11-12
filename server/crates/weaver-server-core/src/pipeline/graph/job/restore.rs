@@ -252,12 +252,8 @@ impl GraphJob {
         // Nothing is lent inside a restore: the job lends once installed.
         for (volume, ordinal) in missing {
             self.unarrive(volume, ordinal, 0)?;
-            if let Some(found) = self
-                .tree
-                .namespace_mut(NodeId::ROOT)
-                .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
-            {
-                found.closed = false;
+            if let Some(namespace) = self.tree.namespace_mut(NodeId::ROOT) {
+                namespace.reopen(MemberId(volume.0));
             }
             refetched.push((volume, ordinal));
         }

@@ -599,3 +599,75 @@ async fn a_breadth_post_restarted_counts_its_entries_and_resident_bytes_as_befor
         assert!(restarted.files.is_empty(), "{:?}", restarted.files.keys());
     }
 }
+
+// A TAR holding one stored 7z `copies` times, each under a name of its own,
+// posted as `lantern.tar`. Every copy after the first is another posting of
+// the first, folded into it; its record is still an entry the TAR holds.
+fn copies_scenario(copies: usize, edit: impl FnOnce(&mut ExtractionLimits)) -> Scenario {
+    let archive = super::sevenz::container(
+        sevenz_turbo::EncoderConfiguration::new(sevenz_turbo::EncoderMethod::COPY),
+        None,
+    );
+    let names: Vec<String> = (0..copies)
+        .map(|index| format!("ember{index}.7z"))
+        .collect();
+    let members: Vec<(&str, Vec<u8>)> = names
+        .iter()
+        .map(|name| (name.as_str(), archive.clone()))
+        .collect();
+    Scenario::new(vec![Post::plain("lantern.tar", tar(&members))]).limits(limits(edit))
+}
+
+// The 7z's members, once each, every byte as written.
+fn assert_sevenz_members(graph: &super::harness::Outcome) {
+    assert!(graph.completed(), "{:?} {:?}", graph.status, graph.failure);
+    let expected = super::sevenz::members();
+    assert_eq!(
+        graph.files.len(),
+        expected.len(),
+        "{:?}",
+        graph.files.keys()
+    );
+    for (name, bytes) in expected {
+        assert!(
+            graph.files.get(&super::sevenz::delivered(name)) == Some(&bytes),
+            "{name}: {:?}",
+            graph.files.keys()
+        );
+    }
+}
+
+// Six copies are six entries of the TAR, beside the 7z's two members: eight
+// entries, as six distinct files and two members would be. One entry under
+// that the job is refused; at it the copies fold and the members come out.
+#[tokio::test]
+async fn copies_of_one_archive_count_as_the_entries_they_are() {
+    let entries = 6 + super::sevenz::members().len() as u64;
+    let refused = run(&copies_scenario(6, |limits| {
+        limits.max_entries = entries - 1
+    }))
+    .await;
+    assert_refused(&refused, "entries");
+    assert!(
+        refused
+            .failure
+            .as_deref()
+            .is_some_and(|failure| failure.ends_with(&format!(
+                "archive contains {entries} entries, limit is {}",
+                entries - 1
+            ))),
+        "{:?}",
+        refused.failure
+    );
+    let at = run(&copies_scenario(6, |limits| limits.max_entries = entries)).await;
+    assert_sevenz_members(&at);
+}
+
+// Fifty copies of one archive in a TAR, under the default limits: they fold
+// into the first and its members come out once.
+#[tokio::test]
+async fn fifty_copies_of_one_archive_complete_under_the_default_limits() {
+    let graph = run(&copies_scenario(50, |_| {})).await;
+    assert_sevenz_members(&graph);
+    assert_fetched_once(&graph);
+}

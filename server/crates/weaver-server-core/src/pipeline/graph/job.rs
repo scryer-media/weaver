@@ -861,12 +861,8 @@ impl GraphJob {
         }
         for (volume, ordinal) in under {
             self.unarrive(volume, ordinal, limit)?;
-            if let Some(found) = self
-                .tree
-                .namespace_mut(NodeId::ROOT)
-                .and_then(|namespace| namespace.get_mut(MemberId(volume.0)))
-            {
-                found.closed = false;
+            if let Some(namespace) = self.tree.namespace_mut(NodeId::ROOT) {
+                namespace.reopen(MemberId(volume.0));
             }
             self.notes.push(Note::Unread(volume, ordinal));
         }

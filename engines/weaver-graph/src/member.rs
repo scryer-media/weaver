@@ -9,6 +9,8 @@
 // under.
 
 use std::collections::{BTreeMap, BTreeSet};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::deliver::Provenance;
@@ -299,12 +301,23 @@ pub struct Namespace {
     // of what arrived under its name and whether it ended; everywhere else
     // it is the member, and the namespace lists it nowhere.
     copies: BTreeMap<MemberId, MemberId>,
-    // How many further postings fold into each member that has any, filed
-    // with `copies`, so a member posted once asks nothing of them.
-    folded: BTreeMap<MemberId, usize>,
+    // The further postings that fold into each member that has any, filed
+    // with `copies`, so a member posted once asks nothing of them and one
+    // posted again reads only its own.
+    folded: BTreeMap<MemberId, Folded>,
     // The members posted more than once whose own posting ended. Such a
     // member closes once its own posting and every further one have.
     ended: BTreeSet<MemberId>,
+    // How many further postings' records `copies_of` has read.
+    #[cfg(test)]
+    copies_read: AtomicUsize,
+}
+
+// The further postings of one member, and how many of them have not ended.
+#[derive(Debug, Default)]
+struct Folded {
+    copies: BTreeSet<MemberId>,
+    open: usize,
 }
 
 // What arrived of a member's first FIRST_BYTES, and how: bytes past a
@@ -362,7 +375,10 @@ impl Namespace {
     // takes the names back with `Tree::rebuild_names`.
     pub fn restore(&mut self, member: Member) {
         self.next = self.next.max(member.id.0 + 1);
-        self.members.insert(member.id, member);
+        let (id, now) = (member.id, member.closed);
+        if let Some(was) = self.members.insert(id, member) {
+            self.closing(id, was.closed, now);
+        }
     }
 
     pub fn get(&self, member: MemberId) -> Option<&Member> {
@@ -407,6 +423,12 @@ impl Namespace {
         self.members.len() - self.copies.len()
     }
 
+    // How many records the namespace keeps: its members, and each further
+    // posting folded into one, which keeps a record of its own.
+    pub fn records_len(&self) -> usize {
+        self.members.len()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -423,25 +445,44 @@ impl Namespace {
 
     // `copy` is a further posting of `into` from now on.
     fn link(&mut self, copy: MemberId, into: MemberId) {
-        if let Some(was) = self.copies.insert(copy, into) {
-            self.unfold(was);
-        }
-        *self.folded.entry(into).or_default() += 1;
+        self.unlink(copy);
+        let open = self.members.get(&copy).is_some_and(|record| !record.closed);
+        let folded = self.folded.entry(into).or_default();
+        folded.copies.insert(copy);
+        folded.open += usize::from(open);
+        self.copies.insert(copy, into);
     }
 
     // `copy` is no further posting of anything.
     fn unlink(&mut self, copy: MemberId) {
-        if let Some(was) = self.copies.remove(&copy) {
-            self.unfold(was);
+        let Some(was) = self.copies.remove(&copy) else {
+            return;
+        };
+        let open = self.members.get(&copy).is_some_and(|record| !record.closed);
+        if let Some(folded) = self.folded.get_mut(&was) {
+            folded.copies.remove(&copy);
+            folded.open -= usize::from(open);
+            if folded.copies.is_empty() {
+                self.folded.remove(&was);
+            }
         }
     }
 
-    fn unfold(&mut self, member: MemberId) {
-        if let Some(count) = self.folded.get_mut(&member) {
-            *count -= 1;
-            if *count == 0 {
-                self.folded.remove(&member);
-            }
+    // The record of `posting` went from closed `was` to closed `now`: a
+    // further posting that ends, or opens again, is counted for the member
+    // it folds into.
+    fn closing(&mut self, posting: MemberId, was: bool, now: bool) {
+        let Some(folded) = self
+            .copies
+            .get(&posting)
+            .and_then(|into| self.folded.get_mut(into))
+        else {
+            return;
+        };
+        match (was, now) {
+            (false, true) => folded.open -= 1,
+            (true, false) => folded.open += 1,
+            _ => {}
         }
     }
 
@@ -453,12 +494,31 @@ impl Namespace {
         has
     }
 
+    // How many further postings of the member have not ended.
+    fn open_copies(&self, member: MemberId) -> usize {
+        let open = self.folded.get(&member).map_or(0, |folded| folded.open);
+        #[cfg(test)]
+        assert_eq!(
+            open,
+            self.copies
+                .iter()
+                .filter(|(copy, of)| **of == member && !self.members[*copy].closed)
+                .count()
+        );
+        open
+    }
+
     // The further postings of the member, by their own records.
     pub fn copies_of(&self, member: MemberId) -> impl Iterator<Item = &Member> + '_ {
-        self.copies
-            .iter()
-            .filter(move |(_, of)| **of == member)
-            .filter_map(|(copy, _)| self.members.get(copy))
+        self.folded
+            .get(&member)
+            .into_iter()
+            .flat_map(|folded| folded.copies.iter())
+            .filter_map(|copy| self.members.get(copy))
+            .inspect(|_| {
+                #[cfg(test)]
+                self.copies_read.fetch_add(1, Ordering::Relaxed);
+            })
     }
 
     // Which posting brought each part of `range` of a member: a further
@@ -513,7 +573,7 @@ impl Namespace {
         if copy == into
             || self.copies.contains_key(&copy)
             || self.copies.contains_key(&into)
-            || self.copies.values().any(|of| *of == copy)
+            || self.folded.contains_key(&copy)
         {
             return false;
         }
@@ -580,14 +640,17 @@ impl Namespace {
     pub fn end(&mut self, posting: MemberId) -> bool {
         let member = self.resolve(posting);
         match self.members.get_mut(&posting) {
-            Some(copy) if posting != member => copy.closed = true,
+            Some(copy) if posting != member => {
+                let was = std::mem::replace(&mut copy.closed, true);
+                self.closing(posting, was, true);
+            }
             Some(_) => {
                 self.ended.insert(member);
             }
             None => return false,
         }
-        let every = self.ended.contains(&member) && self.copies_of(member).all(|copy| copy.closed);
-        if self.copies_of(member).next().is_none() {
+        let every = self.ended.contains(&member) && self.open_copies(member) == 0;
+        if !self.has_copies(member) {
             self.ended.remove(&member);
         }
         let Some(record) = self
@@ -622,7 +685,8 @@ impl Namespace {
         };
         if let Some(record) = self.members.get_mut(&posting) {
             record.coverage.erase(range);
-            record.closed = false;
+            let was = std::mem::replace(&mut record.closed, false);
+            self.closing(posting, was, false);
         }
         if let Some(record) = self.members.get_mut(&member) {
             for part in &lost {
@@ -631,6 +695,14 @@ impl Namespace {
             record.closed = false;
         }
         (member, lost)
+    }
+
+    // More of `posting` comes again: its record is open until it ends.
+    pub fn reopen(&mut self, posting: MemberId) {
+        if let Some(record) = self.members.get_mut(&posting) {
+            let was = std::mem::replace(&mut record.closed, false);
+            self.closing(posting, was, false);
+        }
     }
 
     // Bytes of `posting` arrived over `range` with `provenance`. The
@@ -781,9 +853,6 @@ impl Namespace {
         if !self.has_copies(member) {
             return clean;
         }
-        for copy in self.copies_of(member).filter(|copy| copy.id != posting) {
-            clean_within(&copy.coverage, range, &mut clean);
-        }
         if posting != member
             && let (Some(record), Some(own)) =
                 (self.members.get(&member), self.members.get(&posting))
@@ -804,6 +873,14 @@ impl Namespace {
             for run in held.runs() {
                 clean.write(run.range, Provenance::Fresh);
             }
+        }
+        // Where what the member holds stands over all of `range`, no other
+        // posting adds to it, and none is asked.
+        if clean.covered(range) {
+            return clean;
+        }
+        for copy in self.copies_of(member).filter(|copy| copy.id != posting) {
+            clean_within(&copy.coverage, range, &mut clean);
         }
         clean
     }
@@ -894,11 +971,12 @@ impl Namespace {
             found.coverage.clear();
             found.bound_to = None;
             found.length = None;
-            found.closed = false;
+            let was = std::mem::replace(&mut found.closed, false);
             found.crc32 = None;
             found.fronted = false;
             found.refuted = None;
             found.reached = None;
+            self.closing(member, was, false);
         }
         self.ended.remove(&member);
         self.first_bytes.remove(&member);
@@ -1303,6 +1381,85 @@ mod tests {
             runs(&namespace.get(member).unwrap().coverage),
             vec![(0, 10, Provenance::Fresh), (30, 40, Provenance::Fresh)]
         );
+    }
+
+    // A member and `copies` further postings of it, folded while every one
+    // of them is open, the member holding all its bytes from its own.
+    fn posted_many(copies: u32) -> (Namespace, MemberId, Vec<MemberId>) {
+        let mut namespace = Namespace::new();
+        let member = namespace.announce("ember.bin", Some(40));
+        namespace.keep_first_bytes(member, 0, &[7; 40], Provenance::Fresh);
+        namespace.arrive(member, ByteRange::new(0, 40), Provenance::Fresh);
+        let copies: Vec<MemberId> = (0..copies)
+            .map(|index| {
+                let copy = namespace.announce(&format!("ember.copy{index}"), Some(40));
+                namespace.keep_first_bytes(copy, 0, &[7; 40], Provenance::Fresh);
+                namespace.arrive(copy, ByteRange::new(0, 10), Provenance::Fresh);
+                assert!(namespace.fold(copy, member).is_some());
+                copy
+            })
+            .collect();
+        (namespace, member, copies)
+    }
+
+    // Every further posting keeps a record of its own: the namespace lists
+    // the member once and holds a record for each posting.
+    #[test]
+    fn each_folded_posting_is_a_record_the_namespace_holds() {
+        let (namespace, member, copies) = posted_many(50);
+        assert_eq!(namespace.len(), 1);
+        assert_eq!(namespace.records_len(), 51);
+        assert_eq!(namespace.copies_of(member).count(), copies.len());
+        assert!(copies.iter().all(|copy| namespace.resident(*copy) > 0));
+    }
+
+    // Postings that end one by one, the member's own first: the member
+    // closes with the last of them, and neither ending one nor its bytes
+    // coming again over what the member holds reads any other posting.
+    #[test]
+    fn ending_further_postings_one_by_one_reads_none_of_the_others() {
+        let (mut namespace, member, copies) = posted_many(1000);
+        assert_eq!(namespace.copies_read.load(Ordering::Relaxed), 0);
+        assert!(!namespace.end(member));
+        let (last, rest) = copies.split_last().unwrap();
+        for copy in rest {
+            let (_, taken) = namespace.arrive(*copy, ByteRange::new(0, 40), Provenance::Fresh);
+            assert!(taken.is_empty(), "{taken:?}");
+            assert!(!namespace.end(*copy));
+            assert!(!namespace.get(member).unwrap().closed);
+        }
+        namespace.arrive(*last, ByteRange::new(0, 40), Provenance::Fresh);
+        assert!(namespace.end(*last));
+        assert!(namespace.get(member).unwrap().closed);
+        assert_eq!(namespace.copies_read.load(Ordering::Relaxed), 0);
+    }
+
+    // A further posting opened again, by a loss, a retraction, a restore or
+    // more of it coming, holds its member open until it ends again.
+    #[test]
+    fn a_further_posting_opened_again_holds_its_member_open() {
+        let reopen: [fn(&mut Namespace, MemberId); 4] = [
+            |namespace, copy| {
+                namespace.uncover(copy, ByteRange::new(0, 10));
+            },
+            |namespace, copy| namespace.retract(copy),
+            |namespace, copy| {
+                let mut record = namespace.get(copy).unwrap().clone();
+                record.closed = false;
+                namespace.restore(record);
+            },
+            |namespace, copy| namespace.reopen(copy),
+        ];
+        for (case, again) in reopen.into_iter().enumerate() {
+            let (mut namespace, member, copies) = posted_many(2);
+            namespace.end(member);
+            namespace.end(copies[0]);
+            assert!(namespace.end(copies[1]), "case {case}");
+            again(&mut namespace, copies[0]);
+            namespace.get_mut(member).unwrap().closed = false;
+            assert!(!namespace.end(copies[1]), "case {case}");
+            assert!(namespace.end(copies[0]), "case {case}");
+        }
     }
 
     // A further posting whose bytes were not read back after a restart
