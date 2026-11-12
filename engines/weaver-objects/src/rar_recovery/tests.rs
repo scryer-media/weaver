@@ -111,20 +111,23 @@ fn verdict(job: &Job<RarRecovery>, member: MemberId) -> Vec<SliceVerdict> {
     verdicts
 }
 
+// A RAR 1.5 to 4.x header of `kind` and `flags` around `body`, under its
+// CRC16.
+fn rar4_block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+    let mut header = vec![0, 0, kind];
+    header.extend_from_slice(&flags.to_le_bytes());
+    header.extend_from_slice(&((7 + body.len()) as u16).to_le_bytes());
+    header.extend_from_slice(body);
+    let crc = (crc32(&header[2..]) & 0xffff) as u16;
+    header[..2].copy_from_slice(&crc.to_le_bytes());
+    header
+}
+
 // A stored RAR 1.5 to 4.x volume of one member's `part`, every header under
 // its CRC16, its end-of-archive header stating the CRC32 of every byte
 // before it and the volume's number, and keeping seven zero bytes for a
 // recovery volume's footer, as RAR writes a volume.
 fn rar4_volume(part: &[u8], number: u16, last: bool) -> Vec<u8> {
-    fn block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
-        let mut header = vec![0, 0, kind];
-        header.extend_from_slice(&flags.to_le_bytes());
-        header.extend_from_slice(&((7 + body.len()) as u16).to_le_bytes());
-        header.extend_from_slice(body);
-        let crc = (crc32(&header[2..]) & 0xffff) as u16;
-        header[..2].copy_from_slice(&crc.to_le_bytes());
-        header
-    }
     let name = b"lantern.bin";
     let mut file = Vec::new();
     file.extend_from_slice(&(part.len() as u32).to_le_bytes());
@@ -138,15 +141,15 @@ fn rar4_volume(part: &[u8], number: u16, last: bool) -> Vec<u8> {
     file.extend_from_slice(name);
     let mut volume = b"Rar!\x1a\x07\x00".to_vec();
     // A volume, named by part.
-    volume.extend(block(0x73, 0x0001 | 0x0010, &[0; 6]));
-    volume.extend(block(0x74, 0x8000, &file));
+    volume.extend(rar4_block(0x73, 0x0001 | 0x0010, &[0; 6]));
+    volume.extend(rar4_block(0x74, 0x8000, &file));
     volume.extend_from_slice(part);
     let crc = crc32(&volume);
     let next = if last { 0 } else { 0x0001 };
     let mut end = crc.to_le_bytes().to_vec();
     end.extend_from_slice(&number.to_le_bytes());
     end.extend_from_slice(&[0; RAR3_FOOTER]);
-    volume.extend(block(0x7b, 0x0002 | 0x0004 | 0x0008 | next, &end));
+    volume.extend(rar4_block(0x7b, 0x0002 | 0x0004 | 0x0008 | next, &end));
     volume
 }
 
@@ -478,6 +481,82 @@ fn a_rar4_volume_whose_header_fails_its_crc16_is_not_whole() {
         }
     );
     assert_eq!(verdict(&job, changed), vec![SliceVerdict::Damaged]);
+}
+
+// The header walk's verdict on `bytes`, read back with no fold to speak for
+// them.
+fn sound_rar4(bytes: &[u8]) -> Option<bool> {
+    let mut read = |range: ByteRange, into: &mut Vec<u8>| {
+        into.extend_from_slice(&bytes[range.start as usize..range.end as usize]);
+        true
+    };
+    let mut buffer = Vec::new();
+    check::Volume::new(&mut read, bytes.len() as u64, None, &mut buffer).sound_rar4()
+}
+
+// A RAR4 signature and main header, then a file header of `size` bytes with
+// the LARGE flag stating `packed` as its packed size, then `tail` bytes.
+fn rar4_large(size: usize, packed: u64, tail: usize) -> Vec<u8> {
+    let mut body = vec![0; size - 7];
+    body[..4].copy_from_slice(&(packed as u32).to_le_bytes());
+    body[25..29].copy_from_slice(&((packed >> 32) as u32).to_le_bytes());
+    let mut volume = b"Rar!\x1a\x07\x00".to_vec();
+    volume.extend(rar4_block(0x73, 0, &[0; 6]));
+    volume.extend(rar4_block(0x74, 0x0100, &body));
+    volume.extend(vec![0; tail]);
+    volume
+}
+
+// A file header whose size and packed size sum to exactly 2^64 names itself
+// as the next header: the walk ends there instead of reading it forever.
+#[test]
+fn a_rar4_header_whose_sizes_sum_past_64_bits_to_itself_is_not_sound() {
+    assert_eq!(
+        sound_rar4(&rar4_large(36, 0xffff_ffff_ffff_ffdc, 0)),
+        Some(false)
+    );
+}
+
+// A sum that wraps to any other small span is refused the same way.
+#[test]
+fn a_rar4_header_whose_sizes_sum_past_64_bits_is_not_sound() {
+    for span in [1, 7, 36] {
+        let packed = 0u64.wrapping_sub(36).wrapping_add(span);
+        assert_eq!(sound_rar4(&rar4_large(36, packed, 64)), Some(false));
+    }
+}
+
+// A header past the next one's offset, by a sum that fits 64 bits only
+// before it is added to where the header stands.
+#[test]
+fn a_rar4_header_whose_next_offset_passes_64_bits_is_not_sound() {
+    assert_eq!(
+        sound_rar4(&rar4_large(36, u64::MAX - 36 - 5, 0)),
+        Some(false)
+    );
+}
+
+// Any other header's data area, stated in 32 bits, that reaches past the
+// volume's end.
+#[test]
+fn a_rar4_data_area_past_the_volume_is_not_sound() {
+    let mut volume = b"Rar!\x1a\x07\x00".to_vec();
+    volume.extend(rar4_block(0x73, 0, &[0; 6]));
+    volume.extend(rar4_block(0x75, 0x8000, &u32::MAX.to_le_bytes()));
+    volume.extend(vec![0; 64]);
+    assert_eq!(sound_rar4(&volume), Some(false));
+}
+
+// A well-formed volume walks through to its end header as before, and one
+// whose packed data changed does not hold to that header's CRC32.
+#[test]
+fn a_well_formed_rar4_volume_walks_to_its_end_header() {
+    let mut volume = rar4_volume(&payload(1, 200), 0, true);
+    assert_eq!(sound_rar4(&volume), Some(true));
+    let inside = volume.len() - 11 - 100;
+    volume[inside] ^= 0x01;
+    assert_eq!(sound_rar4(&volume), Some(false));
+    assert_eq!(sound_rar4(b"not a rar volume"), None);
 }
 
 // Every article of a RAR5 set's volumes arrived with its CRC32 verified: the
