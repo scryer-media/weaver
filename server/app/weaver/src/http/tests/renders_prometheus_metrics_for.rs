@@ -829,6 +829,7 @@ fn renders_collected_instrumentation_snapshots() {
         "weaver_pipeline_decode_task_duration_seconds",
         "weaver_pipeline_extract_member_duration_seconds",
         "weaver_db_op_duration_seconds",
+        "weaver_db_wal_checkpoint_duration_seconds",
         "weaver_http_request_duration_seconds",
     ] {
         assert!(
@@ -893,6 +894,15 @@ fn renders_collected_instrumentation_snapshots() {
     assert!(rendered.contains("weaver_db_runtime_in_flight 2"));
     assert!(rendered.contains("weaver_db_runtime_blocked_submissions_total 9"));
     assert!(rendered.contains("weaver_db_op_duration_seconds_count{engine=\"sqlite\"} 6"));
+    assert!(rendered.contains("weaver_db_wal_checkpoint_passes_total 31"));
+    assert!(rendered.contains("weaver_db_wal_checkpoint_passes_incomplete_total 12"));
+    assert!(rendered.contains("weaver_db_wal_checkpoint_busy_total 3"));
+    assert!(rendered.contains("weaver_db_wal_restarts_total 17"));
+    assert!(rendered.contains("weaver_db_wal_checkpoint_duration_seconds_count 6"));
+    assert!(rendered.contains("weaver_db_wal_log_frames 785"));
+    assert!(rendered.contains("weaver_db_wal_checkpointed_frames 19"));
+    assert!(rendered.contains("weaver_db_wal_checkpoint_copied_frames 0"));
+    assert!(rendered.contains("weaver_db_wal_bytes 3218032"));
 
     // Process collector names are deliberately unprefixed.
     assert!(rendered.contains("process_cpu_seconds_total 12.5"));
@@ -943,6 +953,8 @@ fn absent_instrumentation_omits_its_families() {
         "weaver_job_duration_seconds",
         "weaver_pipeline_disk_write_duration_seconds",
         "weaver_db_runtime_info",
+        "weaver_db_wal_checkpoint_passes_total",
+        "weaver_db_wal_bytes",
         "process_cpu_seconds_total",
         "process_start_time_seconds",
         "weaver_disk_total_bytes",
