@@ -104,7 +104,11 @@ pub(crate) struct FakeRoutes {
     pub(crate) through_legs: std::sync::atomic::AtomicBool,
     // Rung as the routes take a saved configuration again.
     pub(crate) reloads: tokio::sync::watch::Sender<u64>,
+    // Called as each leg is asked to open, before it dials.
+    pub(crate) on_open: OnOpen,
 }
+
+pub(crate) type OnOpen = Mutex<Option<Box<dyn Fn() + Send + Sync>>>;
 
 // The route of a scope mapped to `proxy`.
 fn proxy_key(proxy: u32) -> RouteKey {
@@ -293,6 +297,9 @@ impl Routes for FakeRoutes {
     }
 
     async fn open(&self, plan: &RoutePlan, peers: usize) -> Result<OpenLeg, String> {
+        if let Some(on_open) = self.on_open.lock().unwrap().as_ref() {
+            on_open();
+        }
         let mut unanswered = self.unanswered.subscribe();
         self.asked.send_modify(|asked| *asked += 1);
         let _ = unanswered.wait_for(|unanswered| !unanswered).await;
@@ -527,6 +534,99 @@ async fn a_route_whose_leg_is_revoked_opens_again_on_the_new_leg() {
     assert!(!new_stage.is_revoked());
     assert_eq!(sessions.view(&plan.key).await.unwrap().held, None);
     assert!(sessions.outdated().await.is_empty());
+    sessions.stop_all().await;
+    network.shutdown().await;
+}
+
+// A route whose path changed under its open session opens its new leg only
+// once the old session has closed its peer streams and sockets and let its
+// leg go, whether it opens again at once or after the follower drops it. A
+// route whose path did not change keeps its session and opens nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changed_route_dials_its_new_leg_after_the_old_session_lets_go() {
+    let dir = tempfile::tempdir().unwrap();
+    let routes = Arc::new(FakeRoutes::default());
+    let (db, network) = on_network(&routes);
+    let sessions = Sessions::new(
+        routes.clone(),
+        env(dir.path()),
+        Database::open_in_memory().unwrap(),
+    );
+    sessions.set_config(any_port());
+    let plan = routes.plan(TorrentScope::Default);
+    let leg_of = |slots: &BTreeMap<RouteKey, Slot>| match slots.get(&plan.key) {
+        Some(Slot::Open { leg: Some(leg), .. }) => Arc::downgrade(leg),
+        _ => panic!("the route is not open on a leg"),
+    };
+    type Old = (
+        Box<dyn Fn() -> bool + Send + Sync>,
+        std::sync::Weak<TorrentLeg>,
+    );
+    let old: Arc<Mutex<Option<Old>>> = Arc::default();
+    let events: Arc<Mutex<Vec<&'static str>>> = Arc::default();
+    *routes.on_open.lock().unwrap() = Some(Box::new({
+        let (old, events) = (old.clone(), events.clone());
+        move || {
+            let mut events = events.lock().unwrap();
+            if let Some((stopped, leg)) = old.lock().unwrap().as_ref() {
+                if stopped() {
+                    events.push("old session stopped");
+                }
+                if leg.upgrade().is_none() {
+                    events.push("old leg let go");
+                }
+            }
+            events.push("new leg dials");
+        }
+    }));
+    let watch = |session: &Arc<Session>, leg: std::sync::Weak<TorrentLeg>| {
+        let token = session.cancellation_token().clone();
+        *old.lock().unwrap() = Some((Box::new(move || token.is_cancelled()), leg));
+    };
+
+    let first = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    let first_leg = leg_of(&*sessions.slots.lock().await);
+    assert_eq!(
+        std::mem::take(&mut *events.lock().unwrap()),
+        ["new leg dials"]
+    );
+
+    // The path as it was: the same session, on the same leg, nothing closed.
+    let again = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    assert!(Arc::ptr_eq(&first, &again));
+    assert!(events.lock().unwrap().is_empty(), "no leg opened");
+    assert!(!first.cancellation_token().is_cancelled());
+    assert!(
+        first_leg
+            .upgrade()
+            .is_some_and(|leg| !leg.stage.is_revoked())
+    );
+
+    // Changed, and opened again at once.
+    watch(&first, first_leg);
+    save_again(&db, &network).await;
+    let second = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    assert!(!Arc::ptr_eq(&first, &second));
+    assert_eq!(
+        std::mem::take(&mut *events.lock().unwrap()),
+        ["old session stopped", "old leg let go", "new leg dials"]
+    );
+
+    // Changed, and opened again once the follower dropped it.
+    watch(&second, leg_of(&*sessions.slots.lock().await));
+    save_again(&db, &network).await;
+    sessions.revoked().await;
+    assert_eq!(
+        sessions.outdated().await,
+        BTreeSet::from([plan.key.clone()])
+    );
+    sessions.drop_route(&plan.key).await;
+    let third = sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    assert!(!Arc::ptr_eq(&second, &third));
+    assert_eq!(
+        std::mem::take(&mut *events.lock().unwrap()),
+        ["old session stopped", "old leg let go", "new leg dials"]
+    );
     sessions.stop_all().await;
     network.shutdown().await;
 }
@@ -1682,6 +1782,7 @@ async fn a_new_session_waits_on_a_stopping_one_only_for_a_port_it_shares() {
     closing.lock().push(Stopping {
         route: plan.key.clone(),
         ports: vec![6881, 6882, 51_413],
+        moved: false,
         stopped: waiting,
     });
 
@@ -2824,7 +2925,8 @@ fn port_mapping_is_what_a_mapping_leg_opens_with() {
 
 // The peer protocol is what a session opens with: a route open with one
 // is outdated once the settings give another, and its next session listens
-// with the new one.
+// with the new one. The line that says each opened names the transports it
+// uses.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_new_peer_protocol_reopens_the_route_with_it() {
     use crate::settings::TorrentPeerProtocol;
@@ -2844,6 +2946,8 @@ async fn a_new_peer_protocol_reopens_the_route_with_it() {
         env(dir.path()),
         Database::open_in_memory().unwrap(),
     );
+    let (lines, guard) =
+        crate::pipeline::graph::lines::Lines::capture_at("weaver", tracing::Level::INFO);
     sessions.set_config(both.clone());
     let plan = routes.plan(TorrentScope::Default);
     sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
@@ -2852,7 +2956,7 @@ async fn a_new_peer_protocol_reopens_the_route_with_it() {
 
     sessions.set_config(TorrentConfig {
         peer_protocol: TorrentPeerProtocol::Tcp,
-        ..both
+        ..both.clone()
     });
     assert_eq!(
         sessions.outdated().await,
@@ -2862,6 +2966,22 @@ async fn a_new_peer_protocol_reopens_the_route_with_it() {
     sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
     assert!(!sessions.view(&plan.key).await.unwrap().utp);
     assert!(sessions.outdated().await.is_empty());
+
+    sessions.set_config(TorrentConfig {
+        peer_protocol: TorrentPeerProtocol::Utp,
+        ..both
+    });
+    sessions.drop_route(&plan.key).await;
+    sessions.session(&plan, &IDENTITY.identity()).await.unwrap();
+    assert!(sessions.view(&plan.key).await.unwrap().utp);
+    drop(guard);
+    let opened = lines.of("a route's session opened");
+    let named: Vec<bool> = ["tcp+utp", "tcp", "utp"]
+        .iter()
+        .zip(&opened)
+        .map(|(names, line)| line.contains(&format!(" transports=\"{names}\"")))
+        .collect();
+    assert_eq!((opened.len(), named), (3, vec![true; 3]), "{opened:?}");
     sessions.stop_all().await;
 }
 
