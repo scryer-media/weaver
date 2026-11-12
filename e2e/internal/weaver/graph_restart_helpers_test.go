@@ -331,6 +331,9 @@ var testRustSteps = map[string][]string{
 		`ALTER TABLE active_jobs DROP COLUMN nzb_zstd`,
 		`ALTER TABLE job_history DROP COLUMN nzb_zstd`,
 	},
+	"fill_history_release_names_v87": {
+		`UPDATE job_history SET release_name = name`,
+	},
 }
 
 func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
