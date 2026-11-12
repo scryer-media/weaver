@@ -1057,6 +1057,83 @@ async fn group_discovery_at_retry_limit_preserves_the_article_for_a_grouped_retr
     assert!(setup.kind.preserves_article_retry_budget());
 }
 
+// A 412 the next connection cannot answer by selecting a group (no group to
+// select, or one already selected) pays a retry: below the limit the article
+// comes back with one more retry spent, at the limit it fails, so a job
+// whose articles the server will never serve ends instead of retrying them
+// every second.
+#[tokio::test]
+async fn a_settled_group_refusal_spends_the_article_retry_budget() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let job_id = JobId(20025);
+    let segment_ids: Vec<SegmentId> = (0..2)
+        .map(|segment_number| SegmentId {
+            file_id: NzbFileId {
+                job_id,
+                file_index: 0,
+            },
+            segment_number,
+        })
+        .collect();
+    let spec = segmented_job_spec("Group refused", "group.bin", &[128, 128]);
+    insert_active_job(&mut pipeline, job_id, spec).await;
+    let state = pipeline.jobs.get_mut(&job_id).unwrap();
+    state.articles.active_mut().unwrap().download_queue = DownloadQueue::new();
+    state.articles.active_mut().unwrap().recovery_queue = DownloadQueue::new();
+    hold_on_test_lane(&mut pipeline, &segment_ids);
+    pipeline.active_download_passes.insert(job_id);
+
+    let settled = || {
+        let mut failure = DownloadFailure::from_nntp(weaver_nntp::NntpError::NoGroupSelected);
+        failure.settle_group_refusal(true, false);
+        DownloadError::Fetch(failure)
+    };
+    let refused = |segment_id, retry_count| DownloadResult {
+        runtime_generation: 0,
+        lane_id: 0,
+        job_id,
+        segment_id,
+        data: Err(settled()),
+        attempts: Vec::new(),
+        lane_observation: None,
+        source_server_idx: Some(0),
+        origin: DownloadResultOrigin::NormalPrimary,
+        retry_count,
+        exclude_servers: Vec::new(),
+        release_connection_slot: true,
+    };
+
+    pipeline
+        .handle_download_done(refused(segment_ids[0], 0))
+        .await;
+    assert_eq!(pipeline.wake_all_infrastructure_retries(), 1);
+    let retry = pipeline
+        .jobs
+        .get_mut(&job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .pop()
+        .unwrap();
+    assert_eq!(retry.segment_id, segment_ids[0]);
+    assert_eq!(retry.retry_count, 1, "the refusal spent one retry");
+
+    pipeline
+        .handle_download_done(refused(segment_ids[1], MAX_SEGMENT_RETRIES))
+        .await;
+    assert_eq!(
+        pipeline
+            .metrics
+            .segments_failed_permanent
+            .load(Ordering::Relaxed),
+        1,
+        "the article at the retry limit fails"
+    );
+}
+
 #[test]
 fn infrastructure_failures_preserve_article_retry_budget() {
     for kind in [
