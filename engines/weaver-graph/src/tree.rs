@@ -2240,6 +2240,33 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        self.deliver_as(node, posting, arrival, false, builder, effects);
+    }
+
+    // A set's own repair of a member, as it comes back: delivered as any
+    // repair, except that bytes a repair already wrote stand against it
+    // (`Namespace::arrive_repair`). Returns how many of its bytes the member
+    // took.
+    pub fn deliver_repair(
+        &mut self,
+        node: NodeId,
+        posting: MemberId,
+        arrival: Posted,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) -> u64 {
+        self.deliver_as(node, posting, arrival, true, builder, effects)
+    }
+
+    fn deliver_as(
+        &mut self,
+        node: NodeId,
+        posting: MemberId,
+        arrival: Posted,
+        repair: bool,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) -> u64 {
         let Posted {
             offset,
             bytes,
@@ -2247,15 +2274,22 @@ impl Tree {
         } = arrival;
         let range = ByteRange::at(offset, bytes.len() as u64);
         let Some(namespace) = self.nodes.namespace_mut(node) else {
-            return;
+            return 0;
         };
-        let (member, taken) = namespace.arrive(posting, range, provenance);
+        let (member, taken) = if repair {
+            namespace.arrive_repair(posting, range)
+        } else {
+            namespace.arrive(posting, range, provenance)
+        };
+        let mut took = 0;
         for (part, landed) in taken {
+            took += part.len();
             let from = (part.start - offset) as usize;
             let piece = bytes.slice(from..from + part.len() as usize);
             let arrived = (part.start, piece, landed);
             self.take(node, member, arrived, builder, effects);
         }
+        took
     }
 
     // What a member took of a delivery: kept at its front, handed to its

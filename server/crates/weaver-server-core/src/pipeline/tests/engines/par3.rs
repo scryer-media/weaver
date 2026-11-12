@@ -443,6 +443,35 @@ async fn a_member_a_par2_and_a_par3_set_describe_is_repaired_once() {
     );
 }
 
+// `ember.bin` is posted whole as the PAR2 set describes it; a PAR3 set
+// describes the same name and length with its second slice different, and
+// has the blocks to rebuild it. The PAR3 set rewrites the slice; the PAR2
+// set then finds bytes another set repaired and does not rewrite them back.
+// The member is repaired once and the job completes with the PAR3 bytes.
+#[tokio::test]
+async fn a_par2_and_a_par3_set_disagreeing_on_a_member_repair_it_once() {
+    let ember = payload(3 * ARTICLE, 69);
+    let mut other = ember.clone();
+    other[ARTICLE..2 * ARTICLE].copy_from_slice(&payload(ARTICLE, 70));
+    let mut posts = vec![Post::plain("ember.bin", ember.clone())];
+    posts.extend(par2_set("lantern", &[("ember.bin", &ember)], 2));
+    posts.extend(par3_set("beacon", &[("ember.bin", &other)], 2));
+    let graph = run(&Scenario::new(posts)).await;
+    assert_fetched_once(&graph);
+    assert!(
+        graph.completed(),
+        "{:?} {:?} {:?}",
+        graph.status,
+        graph.graph().outcomes,
+        repair_and_terminal_events(&graph)
+    );
+    assert_eq!(
+        repair_and_terminal_events(&graph),
+        ["RepairComplete 1", "JobCompleted"]
+    );
+    assert_delivers(&graph, &[("ember.bin", &other)]);
+}
+
 // `beacon.bin` takes two damaged slices against one recovery block;
 // `lantern.bin` beside it arrives whole. The partial-delivery invariant
 // (2026-10-18) keeps the whole member delivered and ends the job Partial,

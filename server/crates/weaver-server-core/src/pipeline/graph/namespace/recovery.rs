@@ -733,9 +733,14 @@ impl NamespaceWriter {
             let mut rejected = tree.rejected_inputs(node, repaired.members());
             self.bind_recoveries(tree, builder, segments, node, out)?;
             let mut rewritten = std::collections::BTreeSet::new();
+            // Whether every slice was turned away. A slice lands only where
+            // no repair wrote before it: a set that disagrees with another's
+            // repair loses there, so the two never rewrite each other in
+            // turn.
+            let (mut offered, mut landed) = (false, false);
             for (member, offset, bytes) in repaired.slices() {
                 let bytes = bytes?;
-                rewritten.insert(member);
+                offered = true;
                 let arrival = Arrival {
                     node,
                     member,
@@ -744,7 +749,11 @@ impl NamespaceWriter {
                     bytes: bytes.into(),
                     provenance: Provenance::Repaired,
                 };
-                self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
+                let write = Write::new(&arrival);
+                if self.place_as(tree, builder, segments, (arrival, true), write, out)? > 0 {
+                    landed = true;
+                    rewritten.insert(member);
+                }
             }
             repaired.remove()?;
             for (member, range) in found {
@@ -776,13 +785,16 @@ impl NamespaceWriter {
                 }
             }
             self.queue_rechecks(rejected);
-            self.release_held(tree, builder, segments, out)
+            self.release_held(tree, builder, segments, out)?;
+            Ok::<_, WriteError>(offered && !landed)
         })();
         let batch = self.acknowledging.take().expect("the batch opened above");
-        applied?;
+        let turned_away = applied?;
         self.acknowledged(tree, builder, segments, batch, out)?;
+        // A repair none of whose slices landed rewrote nothing, and is not
+        // said to have.
         Ok(match outcome {
-            Some(RepairOutcome::Repaired { slices }) => Some(slices),
+            Some(RepairOutcome::Repaired { slices }) if !turned_away => Some(slices),
             _ => None,
         })
     }
