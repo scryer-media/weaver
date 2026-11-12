@@ -1987,6 +1987,59 @@ fn a_repair_reads_another_block_when_those_read_do_not_rebuild() {
     assert!(job.store.members[&member] == data);
 }
 
+// Blocks 0, 4369, 8738 and 13107 all fail to tell slices 0 and 8 apart, so
+// the repair reads five blocks to rebuild two. Under a memory limit no
+// larger than those two, it holds the payloads of four, lets the fifth go
+// once it is counted, and reads it again when the plan chooses it: the same
+// repair, with one more volume read.
+#[test]
+fn a_block_read_past_what_the_repair_holds_is_read_again_when_chosen() {
+    // Large enough for the repair's own workspace under the tight limit.
+    const SLICE: u64 = 16 * 1024;
+    let constants = par2_rs::input_slice_constants(9);
+    for exponent in [8738, 13107] {
+        assert_eq!(
+            par2_rs::gf_pow(constants[0], exponent),
+            par2_rs::gf_pow(constants[8], exponent)
+        );
+    }
+    let data = payload(45, 9 * SLICE as usize);
+    let described = [("payload.bin", data.as_slice())];
+    let mut files = par2_set_from("set", &described, SLICE, 0, 1, 1);
+    for (first, count) in [(4369, 1), (8738, 1), (13107, 2)] {
+        files.push(par2_set_from("set", &described, SLICE, first, count, 1)[1].clone());
+    }
+    let mut wrong = data.clone();
+    for slice in [0, 8] {
+        wrong[(slice * SLICE) as usize] ^= 0x5A;
+    }
+    let repaired = |budget: weaver_graph::Budget| {
+        let mut job = job(&files);
+        let member = job.member("payload.bin", &wrong);
+        for slice in [0, 8] {
+            let at = slice * SLICE / ARTICLE * ARTICLE;
+            let article = ByteRange::new(at, (at + ARTICLE).min(data.len() as u64));
+            job.arrive(
+                member,
+                article.start,
+                &wrong[article.start as usize..article.end as usize],
+                Provenance::Damaged,
+            );
+        }
+        bind(&mut job);
+        let outcome = job.object.repair(&mut job.store, budget);
+        assert!(job.store.members[&member] == data, "{outcome:?}");
+        (outcome, job.store.volume_reads)
+    };
+    let (outcome, reads) = repaired(weaver_graph::Budget::default());
+    assert_eq!(outcome, RepairOutcome::Repaired { slices: 2 });
+    let tight = weaver_graph::Budget {
+        memory_bytes: Some(2 * SLICE),
+        ..weaver_graph::Budget::default()
+    };
+    assert_eq!(repaired(tight), (outcome, reads + 1));
+}
+
 // A file refused whole beside another the set describes with the same
 // bytes: every slice of it is held, so it needs no recovery block, and the
 // repair copies them from the file that holds them.
