@@ -2673,3 +2673,43 @@ fn a_repair_behind_the_cursor_that_changes_only_trust_walks_again_from_the_signa
         streamed(&owner);
     }
 }
+
+// The set of bound, open volumes agrees with a walk of every volume held,
+// through binds, closes, a give-back and a restore.
+#[test]
+fn the_open_volumes_filed_agree_with_a_walk_of_every_volume() {
+    fn walked(store: &RarStore) -> bool {
+        store
+            .volumes
+            .values()
+            .filter(|volume| volume.name.is_some())
+            .all(|volume| volume.closed)
+    }
+    let mut store = RarStore::new();
+    let mut out = Vec::new();
+    assert_eq!(store.finished(), walked(&store));
+    for index in 0..6 {
+        store.bound(
+            VolumeIndex(index),
+            &format!("set.part{:02}.rar", index + 1),
+            &[],
+            None,
+        );
+        assert!(!store.finished());
+        assert_eq!(store.finished(), walked(&store));
+    }
+    for index in [4, 1, 3] {
+        store.volume_closed(VolumeIndex(index), &mut out);
+        assert_eq!(store.finished(), walked(&store));
+    }
+    store.give_back_held(vec![VolumeIndex(0), VolumeIndex(3)], &mut out);
+    assert_eq!(store.finished(), walked(&store));
+    let restored = super::facts::restored(&store.facts()).expect("restores");
+    assert_eq!(restored.open, store.open);
+    assert_eq!(restored.finished(), walked(&restored));
+    for index in [2, 5] {
+        store.volume_closed(VolumeIndex(index), &mut out);
+        assert_eq!(store.finished(), walked(&store));
+    }
+    assert!(store.finished());
+}

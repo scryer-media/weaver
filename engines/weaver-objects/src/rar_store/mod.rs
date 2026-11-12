@@ -318,6 +318,10 @@ pub struct RarStore {
     // the ones that can travel to another owner. Filed where a volume comes
     // or goes and where pieces do, so no question about one scans pieces.
     unmapped: BTreeSet<VolumeIndex>,
+    // The volumes held that are bound and not yet closed: more of them is
+    // still to come. Filed where a volume is named, closes, comes or goes,
+    // so asking whether everything bound has closed scans no volume.
+    open: BTreeSet<VolumeIndex>,
     // Every entry's pieces by the volume they lie in, as (entry, piece),
     // filed where `unmapped` is, so finding a volume's parts scans no other
     // volume's pieces.
@@ -387,6 +391,7 @@ impl RarStore {
             volumes: BTreeMap::new(),
             giving: BTreeMap::new(),
             unmapped: BTreeSet::new(),
+            open: BTreeSet::new(),
             pieces_in: BTreeMap::new(),
             dirty: BTreeSet::new(),
             lasts: BTreeSet::new(),
@@ -429,6 +434,19 @@ impl RarStore {
                 place.insert(Volume::new())
             }
         }
+    }
+
+    // File whether a volume is bound and still open, as it stands now: said
+    // wherever its name, its close or its being held changes.
+    fn file_open(&mut self, volume: VolumeIndex) {
+        let open = self
+            .volumes
+            .get(&volume)
+            .is_some_and(|found| found.name.is_some() && !found.closed);
+        match open {
+            true => self.open.insert(volume),
+            false => self.open.remove(&volume),
+        };
     }
 
     // Something the walk or the layout reads of a volume changed, or the
@@ -669,16 +687,14 @@ impl RarStore {
                 out.push(Emit::GiveBack(index));
             }
             self.file(index);
+            self.file_open(index);
             self.touch(index);
         }
     }
 
     // Everything bound has closed: nothing more will arrive.
     fn finished(&self) -> bool {
-        self.volumes
-            .values()
-            .filter(|volume| volume.name.is_some())
-            .all(|volume| volume.closed)
+        self.open.is_empty()
     }
 
     // The last volume, once some volume's headers say it is.
@@ -838,6 +854,7 @@ impl Object for RarStore {
         // A volume adopted closed was walked to its close already.
         let found = self.volume(volume);
         if !std::mem::replace(&mut found.closed, true) {
+            self.file_open(volume);
             self.touch(volume);
         }
         self.settle(None, out);
@@ -1008,6 +1025,7 @@ impl Object for RarStore {
         let bound = self.volume(volume);
         bound.name_as(name);
         bound.front = facts;
+        self.file_open(volume);
         self.touch(volume);
     }
 
@@ -1058,6 +1076,7 @@ impl Object for RarStore {
             self.unmapped.remove(&volume);
         }
         self.file(volume);
+        self.file_open(volume);
         self.touch(volume);
         given.map(|volume| Box::new(volume) as weaver_graph::Carried)
     }
@@ -1113,6 +1132,7 @@ impl Object for RarStore {
         held.name_as(name);
         *self.volume(volume) = *held;
         self.file(volume);
+        self.file_open(volume);
         self.touch(volume);
     }
 
@@ -1134,6 +1154,7 @@ impl Object for RarStore {
         // what it settles is said now, as a length said anew is: a
         // checkpoint before the next delivery records the name, and a
         // restore reads it again as said already.
+        self.file_open(volume);
         self.touch(volume);
         if misplaced && self.carried(volume).is_some() {
             self.give_back_held(vec![volume], out);

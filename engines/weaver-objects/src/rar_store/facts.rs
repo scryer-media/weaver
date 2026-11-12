@@ -345,6 +345,11 @@ fn keying(entry: &Entry) -> Option<KeyTuple> {
 }
 
 pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
+    restored(facts).map(|store| Box::new(store) as Box<dyn Object>)
+}
+
+// The store its facts describe, as the store itself.
+pub(super) fn restored(facts: &Facts) -> Result<RarStore, RestoreError> {
     let kept: StoreFacts<VolumeFacts> = match facts.version {
         3 => facts.read(Kind::RarStore)?,
         4 => facts
@@ -383,6 +388,7 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
         store.volumes.insert(found.index, volume);
         // The walk reads the kept headers again at the look below.
         store.file(found.index);
+        store.file_open(found.index);
         store.touch(found.index);
     }
     let keyings: Vec<_> = kept.entries.iter().map(|entry| entry.keying).collect();
@@ -416,7 +422,7 @@ pub(crate) fn restore(facts: &Facts) -> Result<Box<dyn Object>, RestoreError> {
             reason: "kept headers that no longer read as recorded",
         });
     }
-    Ok(Box::new(store))
+    Ok(store)
 }
 
 fn entry(facts: EntryFacts) -> Entry {
