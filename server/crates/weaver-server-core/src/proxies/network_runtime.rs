@@ -389,6 +389,10 @@ pub struct NetworkRuntime {
     // What the saved routes' egresses and hops last showed of their health.
     // A probe of a draft has none: its hops are no saved route's.
     route_health: Option<Arc<RouteHealth>>,
+    // A probe runtime's: its WireGuard sessions are probes, which ask
+    // through a live session that holds their identity instead of bringing
+    // up a second tunnel with the same keys.
+    probing: bool,
     // Counts the reloads that took a saved configuration, so whoever waits
     // on a route to come up tries it again at once.
     reloads: tokio::sync::watch::Sender<u64>,
@@ -455,6 +459,7 @@ impl NetworkRuntime {
             health_inputs: Mutex::new(None),
             torrent_legs: Mutex::default(),
             route_health: Some(route_health),
+            probing: false,
             reloads: tokio::sync::watch::Sender::new(0),
         });
         let weak = Arc::downgrade(&runtime);
@@ -915,7 +920,13 @@ impl NetworkRuntime {
                 };
                 Arc::new(SessionHop {
                     capacity: if profile.kind == ProxyKind::WireGuard {
-                        weaver_tunnel::pipe::SessionCapacity::new(wireguard_session_budget())
+                        let capacity =
+                            weaver_tunnel::pipe::SessionCapacity::new(wireguard_session_budget());
+                        if self.probing {
+                            capacity.probing()
+                        } else {
+                            capacity
+                        }
                     } else {
                         Default::default()
                     },
@@ -1289,6 +1300,7 @@ impl NetworkRuntime {
             health_inputs: Mutex::new(None),
             torrent_legs: Mutex::default(),
             route_health: self.route_health.clone(),
+            probing: self.probing,
             reloads: tokio::sync::watch::Sender::new(0),
             egress_controls: self.egress_controls.clone(),
             quota_policy: None,
