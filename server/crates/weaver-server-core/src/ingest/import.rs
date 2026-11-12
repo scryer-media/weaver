@@ -440,7 +440,7 @@ mod tests {
         ] {
             assert!(is_password_protection_marker(marker), "{marker:?}");
         }
-        for password in [
+        for value in [
             "-10",
             "1abc",
             "true-story",
@@ -449,7 +449,7 @@ mod tests {
             "",
             "synthetic-key",
         ] {
-            assert!(!is_password_protection_marker(password), "{password:?}");
+            assert!(!is_password_protection_marker(value), "{value:?}");
         }
     }
 }
