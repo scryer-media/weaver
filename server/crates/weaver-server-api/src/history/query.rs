@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
+#[cfg(test)]
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -460,20 +461,11 @@ async fn load_history_page(
         // indexed lookup over the live ids; when it is not, the SQL path still
         // pages in SQL with a `NOT IN` over that handful of ids.
         let live_in_history = live_jobs_in_history(&db, &live_jobs)?;
-        // Two code paths, selected by whether the request's semantics map exactly
-        // onto SQL. The SQL path (`build_history_page_sql`) pushes the status and
-        // category filters, ordering, counts, and LIMIT/OFFSET into the database,
-        // each order served by its own index. A free-text search, whose
-        // semantics are `to_lowercase().contains()` over computed titles that
-        // sqlite's ASCII-only LOWER and LIKE cannot reproduce, takes the key
-        // path (`build_history_page_from_keys`): it reads only the columns a
-        // row is matched and ordered by, decides the page in Rust, and reads
-        // whole rows for that page alone.
-        let page = if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
-            build_history_page_sql(&db, plan, &live_in_history, fields)?
-        } else {
-            build_history_page_from_keys(&db, input, &live_in_history)?
-        };
+        // The search, the status and category filters, the order, the counts
+        // and LIMIT/OFFSET all run in the database, each order served by its
+        // own index.
+        let plan = HistoryPageSqlPlan::for_input(&input);
+        let page = build_history_page_sql(&db, plan, &live_in_history, fields)?;
         attach_history_page_badges(&db, page, fields)
     })
     .await
@@ -520,12 +512,11 @@ fn attach_history_page_badges(
     Ok(page)
 }
 
-// A History-page request whose semantics map exactly onto SQL filtering,
-// ordering, counting, and pagination.
-//
-// This is only constructed for requests with no free-text search, ordered by
-// completion time, size or integrity; see [`HistoryPageSqlPlan::for_input`].
+// A History-page request as SQL filtering, ordering, counting, and
+// pagination.
 struct HistoryPageSqlPlan {
+    // Text the full release name contains, ASCII letters folded.
+    search: Option<String>,
     status: HistoryStatusFilter,
     categories: Option<Vec<String>>,
     order: weaver_server_core::HistoryOrder,
@@ -534,22 +525,17 @@ struct HistoryPageSqlPlan {
 }
 
 impl HistoryPageSqlPlan {
-    // Returns a SQL plan when the request maps exactly onto SQL, or `None` when
-    // the caller must take the key path in [`build_history_page_from_keys`].
-    fn for_input(input: &HistoryPageInput) -> Option<Self> {
-        // A search term uses Rust `to_lowercase().contains()` over computed
-        // display titles; SQL LOWER/LIKE has ASCII-only + Unicode divergence and
-        // cannot see the computed fields, so it must not be approximated in SQL.
-        if normalize_history_search(input.search.clone()).is_some() {
-            return None;
-        }
+    fn for_input(input: &HistoryPageInput) -> Self {
         // Every sort compares stored columns, and ties go to the job id in the
         // sort's direction, which is the order of the index on each key.
         let key = history_order_key(input.sort_field.unwrap_or(HistorySortField::CompletedAt));
         let descending = input.sort_direction.unwrap_or(HistorySortDirection::Desc)
             == HistorySortDirection::Desc;
 
-        Some(Self {
+        Self {
+            // A search matches the full release name, as the name sort orders
+            // it.
+            search: normalize_history_search(input.search.clone()),
             status: input.status.unwrap_or(HistoryStatusFilter::All),
             // A category is the row's own column, compared exactly, with a row
             // that has none matching the empty string.
@@ -557,7 +543,7 @@ impl HistoryPageSqlPlan {
             order: weaver_server_core::HistoryOrder { key, descending },
             page_index: input.page_index as usize,
             page_size: sanitize_page_size(input.page_size),
-        })
+        }
     }
 }
 
@@ -611,8 +597,10 @@ fn build_history_page_sql(
     live_in_history: &HashSet<u64>,
     fields: HistoryPageFields,
 ) -> Result<HistoryPage, weaver_server_core::StateError> {
-    // Every count and the page itself leave out rows of jobs still live.
-    let excluding_live = |mut filter: weaver_server_core::HistoryFilter| {
+    // Every count and the page itself keep only the rows the search matches,
+    // and leave out rows of jobs still live.
+    let searched = |mut filter: weaver_server_core::HistoryFilter| {
+        filter.name_contains = plan.search.clone();
         if !live_in_history.is_empty() {
             let mut ids: Vec<u64> = live_in_history.iter().copied().collect();
             ids.sort_unstable();
@@ -624,11 +612,11 @@ fn build_history_page_sql(
     // categories.
     let in_categories = |mut filter: weaver_server_core::HistoryFilter| {
         filter.categories_any = plan.categories.clone();
-        excluding_live(filter)
+        searched(filter)
     };
 
     // Counts are computed over the category-filtered set before the status
-    // filter, just like the key path computes them. The total is the bucket
+    // filter. The total is the bucket
     // count of the requested status, so it is read once for either field.
     let bucket = |status: HistoryStatusFilter| -> Result<u32, weaver_server_core::StateError> {
         if !(fields.counts || (fields.total_count && plan.status == status)) {
@@ -660,11 +648,12 @@ fn build_history_page_sql(
         HistoryStatusFilter::Failure => failure_history_filter(),
     });
 
-    // Facet counts describe every category, before the category filter: a
-    // facet's count has to survive that facet's rivals being selected.
+    // Facet counts describe every category the search matches, before the
+    // category filter: a facet's count has to survive that facet's rivals
+    // being selected.
     let mut category_counts: Vec<HistoryCategoryCount> = if fields.category_counts {
         db.count_job_history_by_category(
-            &excluding_live(weaver_server_core::HistoryFilter::default()),
+            &searched(weaver_server_core::HistoryFilter::default()),
             HistoryRows::Shown,
         )?
         .into_iter()
@@ -683,158 +672,6 @@ fn build_history_page_sql(
     let items = rows
         .into_iter()
         .map(|row| history_table_item_from_row(&row, None))
-        .collect();
-
-    Ok(HistoryPage {
-        items,
-        total_count,
-        counts,
-        category_counts,
-    })
-}
-
-// What a History-page row is matched and ordered by on the key path.
-struct HistoryPageKey {
-    id: u64,
-    state: QueueItemState,
-    completed_at: chrono::DateTime<chrono::Utc>,
-    total_bytes: u64,
-    health: u32,
-    category: Option<String>,
-    name: String,
-    display_title: String,
-    original_title: String,
-}
-
-impl HistoryPageKey {
-    // The key of `row`. With `with_titles` the titles are the ones the row's
-    // full history item carries; without it they are empty and unused.
-    fn of(row: weaver_server_core::HistoryKeyRow, with_titles: bool) -> Self {
-        let (original_title, display_title) = if with_titles {
-            let metadata = weaver_server_core::parse_history_metadata(row.metadata.as_deref());
-            let display = crate::jobs::release_display::release_display_info(
-                crate::jobs::release_display::ReleaseDisplayInput {
-                    job_name: &row.name,
-                    metadata: &metadata,
-                    category: row.category.as_deref(),
-                    cache: crate::jobs::release_display::ReleaseDisplayCache::History(row.job_id),
-                },
-            );
-            (display.original_title, display.display_title)
-        } else {
-            (String::new(), String::new())
-        };
-        Self {
-            id: row.job_id,
-            state: crate::history::types::history_state_from_status(&row.status),
-            completed_at: chrono::DateTime::from_timestamp(row.completed_at, 0)
-                .unwrap_or(chrono::DateTime::<chrono::Utc>::UNIX_EPOCH),
-            total_bytes: row.total_bytes,
-            health: row.health,
-            category: row.category,
-            name: row.name,
-            display_title,
-            original_title,
-        }
-    }
-}
-
-// A History page built from the match-and-order columns of every row: the
-// rows are searched, counted, filtered, sorted and paged in Rust exactly as
-// whole items would be, and only the page's rows are read whole.
-fn build_history_page_from_keys(
-    db: &Database,
-    input: HistoryPageInput,
-    live_in_history: &HashSet<u64>,
-) -> Result<HistoryPage, weaver_server_core::StateError> {
-    let page_size = sanitize_page_size(input.page_size);
-    let page_index = input.page_index as usize;
-    let search = normalize_history_search(input.search);
-    let categories = normalize_history_categories(input.categories);
-    let status = input.status.unwrap_or(HistoryStatusFilter::All);
-    let sort_field = input.sort_field.unwrap_or(HistorySortField::CompletedAt);
-    let sort_direction = input.sort_direction.unwrap_or(HistorySortDirection::Desc);
-    // Only a search reaches this path, and it matches the titles.
-    let with_titles = search.is_some();
-
-    let matched_search: Vec<HistoryPageKey> = db
-        .list_job_history_keys(HistoryRows::Shown, with_titles)?
-        .into_iter()
-        .filter(|row| !live_in_history.contains(&row.job_id))
-        .map(|row| HistoryPageKey::of(row, with_titles))
-        .filter(|key| {
-            history_titles_match_search(
-                [
-                    key.display_title.as_str(),
-                    key.original_title.as_str(),
-                    key.name.as_str(),
-                ],
-                search.as_deref(),
-            )
-        })
-        .collect();
-
-    // Before the category filter: a facet's count has to survive that facet's
-    // rivals being selected, or the rail empties itself as you use it.
-    let category_counts =
-        count_history_categories(matched_search.iter().map(|key| key.category.as_deref()));
-
-    let filtered_by_search: Vec<HistoryPageKey> = matched_search
-        .into_iter()
-        .filter(|key| history_category_selected(key.category.as_deref(), categories.as_deref()))
-        .collect();
-
-    let counts = HistoryPageCounts {
-        all: filtered_by_search.len() as u32,
-        success: filtered_by_search
-            .iter()
-            .filter(|key| key.state == QueueItemState::Completed)
-            .count() as u32,
-        failure: filtered_by_search
-            .iter()
-            .filter(|key| key.state == QueueItemState::Failed)
-            .count() as u32,
-    };
-
-    let mut matching: Vec<HistoryPageKey> = filtered_by_search
-        .into_iter()
-        .filter(|key| history_state_matches(key.state, status))
-        .collect();
-    matching.sort_by(|left, right| compare_history_keys(left, right, sort_field, sort_direction));
-
-    let total_count = matching.len() as u32;
-    let page_ids: Vec<u64> = matching
-        .iter()
-        .skip(page_index.saturating_mul(page_size))
-        .take(page_size)
-        .map(|key| key.id)
-        .collect();
-    drop(matching);
-
-    let mut rows: HashMap<u64, JobHistoryRow> = if page_ids.is_empty() {
-        HashMap::new()
-    } else {
-        db.list_job_history(
-            &weaver_server_core::HistoryFilter {
-                item_ids: Some(page_ids.clone()),
-                ..Default::default()
-            },
-            HistoryRows::Shown,
-        )?
-        .into_iter()
-        .map(|row| (row.job_id, row))
-        .collect()
-    };
-    let items = page_ids
-        .iter()
-        .filter_map(|id| rows.remove(id))
-        .map(|row| {
-            if with_titles {
-                history_item_from_row(&row, None)
-            } else {
-                history_table_item_from_row(&row, None)
-            }
-        })
         .collect();
 
     Ok(HistoryPage {
@@ -995,8 +832,7 @@ fn history_query_plan(
     HistoryQueryPlan::Query(Box::new(history_filter))
 }
 
-// The page the key path builds, decided from whole items. Tests hold the key
-// path to it.
+// The page decided from whole items. Tests hold the SQL path to it.
 #[cfg(test)]
 fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> HistoryPage {
     let page_size = sanitize_page_size(input.page_size);
@@ -1006,26 +842,13 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
     let status = input.status.unwrap_or(HistoryStatusFilter::All);
     let sort_field = input.sort_field.unwrap_or(HistorySortField::CompletedAt);
     let sort_direction = input.sort_direction.unwrap_or(HistorySortDirection::Desc);
-    let requires_full_display_projection = search.is_some();
-
     let matched_search: Vec<HistoryItem> = rows
         .into_iter()
-        .map(|row| {
-            if requires_full_display_projection {
-                history_item_from_row(&row, None)
-            } else {
-                history_table_item_from_row(&row, None)
-            }
-        })
+        .map(|row| history_table_item_from_row(&row, None))
         .filter(|item| {
-            history_titles_match_search(
-                [
-                    item.display_title.as_str(),
-                    item.original_title.as_str(),
-                    item.name.as_str(),
-                ],
-                search.as_deref(),
-            )
+            search
+                .as_deref()
+                .is_none_or(|search| history_sort_name(&item.name).contains(search))
         })
         .collect();
 
@@ -1073,6 +896,7 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
 
 // Tally the rows per category, ordered by category so the response does not
 // depend on hash iteration order.
+#[cfg(test)]
 fn count_history_categories<'a>(
     categories: impl Iterator<Item = Option<&'a str>>,
 ) -> Vec<HistoryCategoryCount> {
@@ -1098,23 +922,14 @@ fn sanitize_page_size(page_size: u32) -> usize {
     }
 }
 
+// The search text, trimmed, its ASCII letters folded as the name's are.
 fn normalize_history_search(search: Option<String>) -> Option<String> {
-    let trimmed = search?.trim().to_lowercase();
+    let trimmed = search?.trim().to_ascii_lowercase();
     if trimmed.is_empty() {
         None
     } else {
         Some(trimmed)
     }
-}
-
-// Whether any of a row's titles contains the lowercased `search`.
-fn history_titles_match_search(titles: [&str; 3], search: Option<&str>) -> bool {
-    let Some(search) = search else {
-        return true;
-    };
-    titles
-        .into_iter()
-        .any(|value| value.to_lowercase().contains(search))
 }
 
 // Drop blank entries and an empty list, so a request that filters by nothing
@@ -1134,6 +949,7 @@ fn normalize_history_categories(categories: Option<Vec<String>>) -> Option<Vec<S
     }
 }
 
+#[cfg(test)]
 fn history_category_selected(category: Option<&str>, categories: Option<&[String]>) -> bool {
     let Some(categories) = categories else {
         return true;
@@ -1142,6 +958,7 @@ fn history_category_selected(category: Option<&str>, categories: Option<&[String
     categories.iter().any(|wanted| wanted == category)
 }
 
+#[cfg(test)]
 fn history_state_matches(state: QueueItemState, status: HistoryStatusFilter) -> bool {
     match status {
         HistoryStatusFilter::All => true,
@@ -1150,7 +967,7 @@ fn history_state_matches(state: QueueItemState, status: HistoryStatusFilter) -> 
     }
 }
 
-// The order of two whole items; the key path's order is held to it.
+// The order of two whole items; the database's order is held to it.
 #[cfg(test)]
 fn compare_history_items(
     left: &HistoryItem,
@@ -1184,39 +1001,8 @@ fn compare_history_items(
     directed_history_order(ordering, left.id, right.id, sort_direction)
 }
 
-fn compare_history_keys(
-    left: &HistoryPageKey,
-    right: &HistoryPageKey,
-    sort_field: HistorySortField,
-    sort_direction: HistorySortDirection,
-) -> Ordering {
-    let ordering = match sort_field {
-        HistorySortField::CompletedAt => left.completed_at.cmp(&right.completed_at),
-        HistorySortField::Name => {
-            history_sort_name(&left.name).cmp(&history_sort_name(&right.name))
-        }
-        HistorySortField::State => {
-            history_state_key(left.state).cmp(history_state_key(right.state))
-        }
-        HistorySortField::Health => left.health.cmp(&right.health),
-        HistorySortField::Size => left.total_bytes.cmp(&right.total_bytes),
-        HistorySortField::Category => left
-            .category
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .cmp(
-                &right
-                    .category
-                    .as_deref()
-                    .unwrap_or_default()
-                    .to_ascii_lowercase(),
-            ),
-    };
-    directed_history_order(ordering, left.id, right.id, sort_direction)
-}
-
 // Ties go to the job id; the direction applies to both.
+#[cfg(test)]
 fn directed_history_order(
     ordering: Ordering,
     left_id: u64,
@@ -1236,10 +1022,12 @@ fn directed_history_order(
 
 // The full release name with its ASCII letters folded, as the database's
 // name order compares it.
+#[cfg(test)]
 fn history_sort_name(name: &str) -> String {
     name.to_ascii_lowercase()
 }
 
+#[cfg(test)]
 fn history_state_key(state: QueueItemState) -> &'static str {
     match state {
         QueueItemState::AwaitingQueueScripts => "awaiting_queue_scripts",
@@ -1402,8 +1190,7 @@ mod tests {
     }
 
     fn assert_parity_excluding(db: &Database, input: HistoryPageInput, live: &HashSet<u64>) {
-        let plan = HistoryPageSqlPlan::for_input(&input)
-            .expect("input should be SQL-eligible for this parity check");
+        let plan = HistoryPageSqlPlan::for_input(&input);
         let sql = build_history_page_sql(db, plan, live, HistoryPageFields::ALL).unwrap();
         let rust = rust_page(db, input, live);
 
@@ -1544,7 +1331,7 @@ mod tests {
             HistoryStatusFilter::Success,
             HistoryStatusFilter::Failure,
         ] {
-            let plan = || HistoryPageSqlPlan::for_input(&page_input(0, 3, Some(status))).unwrap();
+            let plan = || HistoryPageSqlPlan::for_input(&page_input(0, 3, Some(status)));
             let whole = build_history_page_sql(&db, plan(), &live, HistoryPageFields::ALL).unwrap();
             let total_only = build_history_page_sql(
                 &db,
@@ -1611,7 +1398,7 @@ mod tests {
             }
         }
 
-        let plan = HistoryPageSqlPlan::for_input(&page_input(0, 25, None)).unwrap();
+        let plan = HistoryPageSqlPlan::for_input(&page_input(0, 25, None));
         let page = build_history_page_sql(&db, plan, &live, HistoryPageFields::ALL).unwrap();
         assert_eq!(page.total_count, 5);
         assert!(page.items.iter().all(|item| !live.contains(&item.id)));
@@ -1624,28 +1411,29 @@ mod tests {
         assert_parity(&db, page_input(0, 25, Some(HistoryStatusFilter::Failure)));
     }
 
+    // A search is trimmed and its ASCII letters folded, as the name is.
     #[test]
-    fn search_term_forces_rust_path() {
+    fn a_search_is_trimmed_and_folded() {
         let mut input = page_input(0, 25, None);
-        input.search = Some("release".to_string());
-        assert!(
-            HistoryPageSqlPlan::for_input(&input).is_none(),
-            "a free-text search term must not take the SQL path"
+        input.search = Some("  ReLeAse.ÜNÏ ".to_string());
+        assert_eq!(
+            HistoryPageSqlPlan::for_input(&input).search.as_deref(),
+            Some("release.Ünï")
         );
-        // Whitespace-only search is normalized away and stays SQL-eligible.
+        // A whitespace-only search searches nothing.
         input.search = Some("   ".to_string());
-        assert!(HistoryPageSqlPlan::for_input(&input).is_some());
+        assert_eq!(HistoryPageSqlPlan::for_input(&input).search, None);
     }
 
     #[test]
     fn category_filter_takes_sql_path() {
         let mut input = page_input(0, 25, None);
         input.categories = Some(vec!["movies".to_string()]);
-        let plan = HistoryPageSqlPlan::for_input(&input).expect("a category filter pages in SQL");
+        let plan = HistoryPageSqlPlan::for_input(&input);
         assert_eq!(plan.categories, Some(vec!["movies".to_string()]));
         // An empty list filters by nothing.
         input.categories = Some(Vec::new());
-        let plan = HistoryPageSqlPlan::for_input(&input).unwrap();
+        let plan = HistoryPageSqlPlan::for_input(&input);
         assert_eq!(plan.categories, None);
     }
 
@@ -1694,25 +1482,6 @@ mod tests {
         assert_eq!(ids, vec![2]);
     }
 
-    #[test]
-    fn every_sort_takes_sql_path_without_a_search() {
-        for field in [
-            HistorySortField::CompletedAt,
-            HistorySortField::Size,
-            HistorySortField::Health,
-            HistorySortField::Name,
-            HistorySortField::State,
-            HistorySortField::Category,
-        ] {
-            for direction in [HistorySortDirection::Asc, HistorySortDirection::Desc] {
-                let mut input = page_input(0, 25, None);
-                input.sort_field = Some(field);
-                input.sort_direction = Some(direction);
-                assert!(HistoryPageSqlPlan::for_input(&input).is_some());
-            }
-        }
-    }
-
     // Many rows with ties on every sort column, categories that differ only by
     // case, rows with no category or an empty one, and titles whose lowercase
     // form is outside ASCII.
@@ -1734,6 +1503,7 @@ mod tests {
             "plain.release.name.720p",
             "Ωmega.Ψ.Collection.1080p",
             "Release.Year.2024.1080p.WEB-DL",
+            "Under_Score.100%.Done.720p",
         ];
         let mut rows = Vec::new();
         for job_id in 1..=280u64 {
@@ -1743,7 +1513,7 @@ mod tests {
                 // Four rows share each completion time.
                 10_000 + (job_id / 4) as i64,
             );
-            row.name = format!("{}.{}", names[(job_id % 7) as usize], job_id % 11);
+            row.name = format!("{}.{}", names[job_id as usize % names.len()], job_id % 11);
             row.category = categories[(job_id % 6) as usize].map(str::to_string);
             row.total_bytes = 1_000 * (job_id % 9);
             row.health = 100 * (job_id % 4) as u32;
@@ -1798,6 +1568,11 @@ mod tests {
             Some("gâteau"),
             Some("release"),
             Some("no such title"),
+            // LIKE's wildcards, which a search must match as themselves.
+            Some("%"),
+            Some("_score"),
+            Some("100%.done"),
+            Some("e_s"),
         ];
         let category_sets: [Option<Vec<String>>; 5] = [
             None,
@@ -1821,7 +1596,7 @@ mod tests {
         ];
         let lives: [HashSet<u64>; 2] = [HashSet::new(), [3, 40, 41, 200].into_iter().collect()];
 
-        let mut sql_checked = 0;
+        let mut matched = 0;
         for live in &lives {
             let rows = exclude_live_rows(
                 db.list_job_history(
@@ -1848,20 +1623,16 @@ mod tests {
                                     };
                                     let label = format!("{input:?} live={live:?}");
                                     let whole = build_history_page(rows.clone(), input.clone());
-                                    let keyed =
-                                        build_history_page_from_keys(&db, input.clone(), live)
-                                            .unwrap();
-                                    assert_pages_equal(&label, &keyed, &whole);
-                                    if let Some(plan) = HistoryPageSqlPlan::for_input(&input) {
-                                        let sql = build_history_page_sql(
-                                            &db,
-                                            plan,
-                                            live,
-                                            HistoryPageFields::ALL,
-                                        )
-                                        .unwrap();
-                                        assert_pages_equal(&label, &sql, &whole);
-                                        sql_checked += 1;
+                                    let sql = build_history_page_sql(
+                                        &db,
+                                        HistoryPageSqlPlan::for_input(&input),
+                                        live,
+                                        HistoryPageFields::ALL,
+                                    )
+                                    .unwrap();
+                                    assert_pages_equal(&label, &sql, &whole);
+                                    if whole.total_count > 0 {
+                                        matched += 1;
                                     }
                                 }
                             }
@@ -1870,7 +1641,7 @@ mod tests {
                 }
             }
         }
-        assert!(sql_checked > 0);
+        assert!(matched > 0);
     }
 
     // A scheduler handle that reports `jobs` as its resident job list. Nothing
