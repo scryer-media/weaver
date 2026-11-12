@@ -43,7 +43,13 @@ pub(super) fn span_end_state(win: &[u8], fixed_eq: u64, dot_unstuffing: bool) ->
             return DecoderState::Cr;
         }
     }
-    if !last_escaped && last == b'\n' && prev == b'\r' && fixed_eq & (LAST >> 2) == 0 {
+    // A `\r\n` arms `CrLf` whether the `\r` was a real break or, in raw
+    // mode, the escaped byte of a `=\r` (the `Eq` arm maps it to `Cr`).
+    if !last_escaped
+        && last == b'\n'
+        && prev == b'\r'
+        && (fixed_eq & (LAST >> 2) == 0 || dot_unstuffing)
+    {
         return DecoderState::CrLf;
     }
     DecoderState::None
