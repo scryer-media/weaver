@@ -36,6 +36,7 @@ pub enum TorrentStateGql {
     Moving,
     NeedsCertificate,
     CheckingResumeData,
+    FilesMissing,
 }
 
 impl From<TorrentState> for TorrentStateGql {
@@ -52,6 +53,7 @@ impl From<TorrentState> for TorrentStateGql {
             TorrentState::Moving => Self::Moving,
             TorrentState::NeedsCertificate => Self::NeedsCertificate,
             TorrentState::CheckingResumeData => Self::CheckingResumeData,
+            TorrentState::FilesMissing => Self::FilesMissing,
         }
     }
 }
@@ -885,4 +887,20 @@ pub struct SubmitTorrentInput {
     /// The tags its job is added with.
     #[graphql(default)]
     pub tags: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A torrent held for its files missing reads as FILES_MISSING.
+    #[test]
+    fn a_torrent_missing_its_files_reads_as_files_missing() {
+        let state = TorrentStateGql::from(TorrentState::FilesMissing);
+        assert_eq!(state, TorrentStateGql::FilesMissing);
+        assert_eq!(
+            async_graphql::InputType::to_value(&state),
+            async_graphql::Value::Enum(async_graphql::Name::new("FILES_MISSING"))
+        );
+    }
 }

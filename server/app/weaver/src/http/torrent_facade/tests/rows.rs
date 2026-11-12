@@ -15,7 +15,7 @@ use super::*;
 
 const TORRENTS: usize = 10_000;
 
-const STATES: [TorrentState; 11] = [
+const STATES: [TorrentState; 12] = [
     TorrentState::Queued,
     TorrentState::FetchingMetadata,
     TorrentState::CheckingResumeData,
@@ -27,6 +27,7 @@ const STATES: [TorrentState; 11] = [
     TorrentState::Paused,
     TorrentState::Moving,
     TorrentState::Stopped,
+    TorrentState::FilesMissing,
 ];
 
 // The bytes of the files a row fetches and of those it lacks, read from its

@@ -1174,6 +1174,8 @@ pub(super) fn state(view: &TorrentView) -> &'static str {
         TorrentState::Seeding => "stalledUP",
         TorrentState::Paused => side("stoppedDL", "stoppedUP"),
         TorrentState::Moving => "moving",
+        // qBittorrent serialize_torrent.cpp:50.
+        TorrentState::FilesMissing => "missingFiles",
         // A stop with any reason but its met goal is a failure.
         TorrentState::Stopped => match view.detail.as_deref() {
             None | Some(status::GOAL_MET) => side("stoppedDL", "stoppedUP"),
