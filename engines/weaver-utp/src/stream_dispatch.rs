@@ -187,6 +187,8 @@ struct VirtualSocket<T, Env> {
     // The remote has sent a packet other than its SYN: it is there, not a
     // spoofed address. A stream that is not fails on its first timeout.
     confirmed: bool,
+    // When the remote's last valid packet arrived.
+    last_remote_packet: Instant,
     // Sends of our FIN.
     fin_sends: usize,
     // Since when nothing of ours has been in flight, the window decaying
@@ -470,7 +472,23 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
                 if seg.counted_sends() >= self.socket_opts.num_resends {
                     self.socket.stats.max_retransmissions_reached.increment(1);
+                    let (seq_nr, sends, evidence_resends) =
+                        (seg.seq_nr(), seg.send_count(), seg.evidence_resends());
                     restrict(&self.socket, seg.payload_size());
+                    debug!(
+                        %seq_nr,
+                        sends,
+                        evidence_resends,
+                        rto = ?self.rtte.retransmission_timeout(),
+                        cwnd = self.congestion_controller.window(),
+                        in_flight = self.user_tx_segments.calc_flight_size(self.highest_sent_seq_nr),
+                        peer_window = self.last_remote_window,
+                        since_peer_packet = ?self
+                            .this_poll
+                            .now
+                            .saturating_duration_since(self.last_remote_packet),
+                        "giving up: retransmissions exhausted"
+                    );
                     return Err(Error::MaxRetransmissionsReached);
                 }
                 if self.fast_resend_seq_nr == seg.seq_nr() {
@@ -1442,6 +1460,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         // A packet past every check: the remote is there.
         self.confirmed = true;
+        self.last_remote_packet = self.this_poll.now;
         self.rtte.on_valid_packet();
 
         let in_flight_before = self
@@ -2201,6 +2220,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 state,
                 VirtualSocketState::SynReceived | VirtualSocketState::SynAckSent { .. }
             ),
+            last_remote_packet: last_remote_received,
             fin_sends: 0,
             idle_since: None,
             consumed_but_unacked_bytes: 0,

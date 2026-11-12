@@ -163,6 +163,11 @@ impl SegmentForSending<'_> {
         self.segment.is_expired
     }
 
+    // Resends on the evidence of SACKs, beyond the first.
+    pub fn evidence_resends(&self) -> usize {
+        self.segment.evidence_resends
+    }
+
     pub fn send_count(&self) -> usize {
         self.segment.send_count()
     }
