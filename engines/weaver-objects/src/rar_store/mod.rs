@@ -40,6 +40,7 @@ use crate::engine::SetName;
 use crate::grid::crc32;
 use crate::kept::Kept;
 use crate::keys::Keys;
+use crate::placed::Placed;
 use crate::rar_engine::naming;
 use crate::runs::CrcRuns;
 use walk::{Step, Walk};
@@ -363,7 +364,7 @@ pub struct RarStore {
     // Moved wherever anything `place` reads may change: a look at what
     // changed, a volume touched, a condemned file's cipher taken or let go.
     // Data that only passes through moves nothing.
-    placed: u64,
+    placed: Placed,
     // The keys a file needs of a candidate that the cache holds no answer
     // for, as (candidate, entry): derived away from the loop while the
     // store is lent out, and the files open once it is back.
@@ -371,14 +372,6 @@ pub struct RarStore {
     // What the pool derived for them, until the files take it: the
     // process's cache is shared and may drop an entry before then.
     derived: BTreeMap<(usize, usize), lock::Derived>,
-}
-
-// Every store's placement numbers, so no two stores, a store restored in
-// place of another included, ever share one.
-static PLACED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-fn next_placed() -> u64 {
-    PLACED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 impl Default for RarStore {
@@ -416,7 +409,7 @@ impl RarStore {
             gaps_said: BTreeSet::new(),
             stale: false,
             gone: false,
-            placed: next_placed(),
+            placed: Placed::default(),
             derive_due: BTreeSet::new(),
             derived: BTreeMap::new(),
         }
@@ -424,7 +417,7 @@ impl RarStore {
 
     // Something `place` reads may have changed.
     fn moved(&mut self) {
-        self.placed = next_placed();
+        self.placed.moved();
     }
 
     // A volume newly held lies under no piece: a layout maps only volumes
@@ -923,7 +916,7 @@ impl Object for RarStore {
     }
 
     fn placement(&self) -> Option<u64> {
-        Some(self.placed)
+        Some(self.placed.number())
     }
 
     fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {

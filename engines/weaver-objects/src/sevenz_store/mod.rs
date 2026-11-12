@@ -40,6 +40,7 @@ use crate::grid::{Grid, crc32};
 use crate::kept::Kept;
 use crate::keys::Keys;
 use crate::lost::minus;
+use crate::placed::Placed;
 use header::{SIGNATURE, Signature, Start};
 use map::Map;
 
@@ -276,6 +277,13 @@ pub struct SevenZipStore {
     // folders take it.
     #[serde(skip)]
     derived: BTreeMap<(usize, usize), open::FolderKey>,
+    // Moved wherever anything `place` reads may change: a look at what
+    // changed, which reads the headers, opens and locks folders and wants
+    // ranges, and a changed header's map taking over or its footing going.
+    // While a look is due no number is reported. Bytes that only pass
+    // through, or wait for the map or a key, move nothing.
+    #[serde(skip)]
+    placed: Placed,
 }
 
 impl Durable for SevenZipStore {
@@ -369,6 +377,7 @@ impl SevenZipStore {
             window: None,
             derive_due: BTreeSet::new(),
             derived: BTreeMap::new(),
+            placed: Placed::default(),
         }
     }
 
@@ -425,6 +434,7 @@ impl SevenZipStore {
         if self.gone || !std::mem::take(&mut self.stale) {
             return;
         }
+        self.placed.moved();
         if self.start.is_none() && !self.read_signature(out) {
             return;
         }
@@ -630,6 +640,7 @@ impl SevenZipStore {
         let Some(old) = self.map.take() else {
             return;
         };
+        self.placed.moved();
         let moved = moved(&old, &new);
         for &id in moved.iter().filter(|id| **id < old.entries.len()) {
             out.push(Emit::Retract(MemberId(id as u32)));
@@ -705,6 +716,7 @@ impl SevenZipStore {
         if footing && !same {
             self.basis.clear();
             self.start = None;
+            self.placed.moved();
         }
     }
 }
@@ -899,6 +911,11 @@ impl Object for SevenZipStore {
 
     fn locate(&self, _volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
         self.place(range, out);
+    }
+
+    // A look still due may move it: until then it is asked every time.
+    fn placement(&self) -> Option<u64> {
+        (!self.stale).then(|| self.placed.number())
     }
 
     fn extent(&self, member: MemberId, range: ByteRange, out: &mut Vec<Extent>) -> Located {

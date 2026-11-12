@@ -160,6 +160,43 @@ fn bytes_ahead_of_the_tail_are_held_until_it_arrives() {
     streamed(&owner);
 }
 
+// Bytes ahead of the tail are held a piece per delivery, and the placement
+// number stands over them until the end header moves it: an owner that asks
+// only once it moves places every held piece as one that asks after every
+// delivery, and asks nothing while the body comes.
+#[test]
+fn held_pieces_place_the_same_asked_only_once_the_placement_number_moves() {
+    let bytes = archive(copy(), false);
+    let tail = end_header(&bytes);
+    let mut owner = Owner::single(store(), bytes);
+    owner.pull = Pull::Moved(0);
+    let mut asked = crate::testing::Asked::default();
+    let (mut pieces, mut saved) = (0, 0);
+    let mut standing = None;
+    for start in (0..tail.start).step_by(64) {
+        let range = ByteRange::new(start, (start + 64).min(tail.start));
+        owner.deliver(0, range);
+        asked.hold(&owner.object, VolumeIndex(0), range);
+        saved += asked.compare(&owner.object);
+        pieces += 1;
+        let number = owner.object.placement();
+        assert!(number.is_some(), "at {start}");
+        assert_eq!(*standing.get_or_insert(number), number, "at {start}");
+    }
+    assert!(asked.unplaced());
+    assert_eq!(owner.held(), pieces);
+    assert_eq!(saved, pieces * (pieces + 1) / 2);
+    assert!(owner.skipped > 0);
+
+    owner.deliver(0, tail);
+    assert_ne!(owner.object.placement(), standing.flatten());
+    assert_eq!(asked.compare(&owner.object), 0, "the end header moved it");
+    assert!(!asked.unplaced());
+    owner.close(0);
+    no_trouble(&owner);
+    streamed(&owner);
+}
+
 // A 7z posted again is the file when its signature header measures the same
 // container; a name, a piece with no signature, or another container's
 // front is nothing of it.
