@@ -841,11 +841,17 @@ impl StandIns {
             if let Some(username) = &proxy.secrets.username {
                 table.name(username, &format!("{stand_in}/account"));
             }
-            let tunnel_key = proxy.wireguard_spec().ok().map(|spec| spec.public_key());
+            // A WireGuard log line names the peer by the first characters of
+            // its key (`wireguard AbCdEfGh…@host:port`), so that spelling is
+            // the key's too.
+            let spec = proxy.wireguard_spec().ok();
+            let tunnel_key = spec.as_ref().map(|spec| spec.public_key());
+            let peer_key_prefix = spec.as_ref().map(|spec| spec.peer_public_key_prefix());
             for key in [
                 &proxy.peer_public_key,
                 &proxy.host_key_fingerprint,
                 &tunnel_key,
+                &peer_key_prefix,
             ]
             .into_iter()
             .flatten()
@@ -1843,6 +1849,88 @@ mod json_log_spellings {
             format!("2026-11-03T08:10:00.123456-07:00  INFO weaver: job added name={name:?}");
         let text = table.sanitize_str(&line);
         assert!(text.ends_with(r#"name="job-4""#), "text line: {text}");
+    }
+
+    // The tunnel's log lines name its peer by a key prefix and its endpoint
+    // (`wireguard AbCdEfGh…@host:port`), its own public key after a failed
+    // handshake, and its interface address once the DHT listens there. The
+    // package holds none of them: the keys and the host become the proxy's
+    // stand-ins, the address its shape.
+    #[test]
+    fn a_wireguard_tunnel_line_names_no_key_host_or_address() {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        use weaver_server_core::proxies::{ProxyKind, ProxySecrets, Resolver};
+
+        let proxy = ProxyProfile {
+            id: 1,
+            name: "Frankfurt".into(),
+            kind: ProxyKind::WireGuard,
+            enabled: true,
+            host: "fra.vpn.example".into(),
+            port: 51820,
+            resolver: Resolver::Proxy,
+            dns_servers: vec!["10.2.0.1".parse().unwrap()],
+            tunnel_addresses: vec!["10.2.0.2/32".into()],
+            peer_public_key: Some(STANDARD.encode([9u8; 32])),
+            mtu: 1420,
+            keepalive_seconds: None,
+            timeout_seconds: 30,
+            host_key_fingerprint: None,
+            revision: 1,
+            natpmp: false,
+            forwarded_port: None,
+            secrets: ProxySecrets {
+                private_key: Some(STANDARD.encode([7u8; 32])),
+                preshared_key: Some(STANDARD.encode([5u8; 32])),
+                ..ProxySecrets::default()
+            },
+        };
+        let spec = proxy.wireguard_spec().expect("spec");
+        let peer_key = STANDARD.encode([9u8; 32]);
+        let own_key = spec.public_key();
+        let stored = StoredNames {
+            proxies: vec![proxy],
+            ..StoredNames::default()
+        };
+        let table = StandIns::build(&[], &local_unix(), &stored).expect("table");
+
+        let up = format!(
+            r#"{{"level":"INFO","fields":{{"message":"brought up a WireGuard tunnel","proxy_config_id":"1","tunnel":{}}}}}"#,
+            serde_json::to_string(&spec.describe()).unwrap()
+        );
+        let failed = format!(
+            "WARN a route's session could not be opened reason=\"proxy 1: No handshake within 30 \
+             seconds. Check the endpoint, and that the server's peer list has public key {own_key}.\""
+        );
+        let listening = "INFO DHT listening on 10.2.0.2:54180";
+        for line in [up.as_str(), failed.as_str(), listening] {
+            let text = table.sanitize_str(line);
+            for value in [
+                &peer_key[..8],
+                own_key.as_str(),
+                "fra.vpn.example",
+                "10.2.0.2",
+            ] {
+                assert!(!text.contains(value), "{value} in {text}");
+            }
+        }
+        assert!(
+            table
+                .sanitize_str(&up)
+                .contains(r#""tunnel":"wireguard proxy-1/key@proxy-1:51820""#),
+            "{}",
+            table.sanitize_str(&up)
+        );
+        assert!(
+            table
+                .sanitize_str(&failed)
+                .contains("public key proxy-1/key.")
+        );
+        assert_eq!(
+            table.sanitize_str(listening),
+            "INFO DHT listening on <ip>:54180"
+        );
     }
 
     fn local_unix() -> LocalNames {
