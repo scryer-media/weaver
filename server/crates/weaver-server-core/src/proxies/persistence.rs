@@ -148,17 +148,17 @@ impl Database {
                 Box::pin(async move {
                     super::network_persistence::lock_network(tx).await?;
                     for row in tx
-                        .fetch_all("SELECT member_ids FROM proxy_pools", &[])
+                        .fetch_all("SELECT id, member_ids FROM proxy_pools ORDER BY id", &[])
                         .await?
                     {
                         let members: Vec<u32> =
                             serde_json::from_str(&row.text("member_ids")?).map_err(error)?;
                         if members.contains(&id) {
-                            return Err(NetworkRefusal::ProxyInPool.into());
+                            let pool = u32::try_from(row.i64("id")?).map_err(error)?;
+                            return Err(NetworkRefusal::ProxyInPool { pool }.into());
                         }
                     }
-                    for row in tx.fetch_all("SELECT policy FROM proxy_routes", &[]).await? {
-                        let route = super::network_persistence::stored_route(&row.text("policy")?)?;
+                    for (holder, route) in super::network_persistence::routes_by_holder(tx).await? {
                         if route.legs.iter().any(|leg| match &leg.path {
                             super::LegPath::Direct => false,
                             super::LegPath::Ladder { rungs, .. } => {
@@ -169,7 +169,7 @@ impl Database {
                                 })
                             }
                         }) {
-                            return Err(NetworkRefusal::ProxyInUse.into());
+                            return Err(NetworkRefusal::ProxyInUse(holder).into());
                         }
                     }
                     tx.execute(

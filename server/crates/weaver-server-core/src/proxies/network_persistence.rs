@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use super::{
-    Bandwidth, EgressBinding, EgressInterface, EgressQuota, LegPath, NetworkRefusal, ProxyPool,
-    ProxyProfile, Route, RoutingPolicy, Rung,
+    Bandwidth, Consumer, EgressBinding, EgressInterface, EgressQuota, LegPath, NetworkRefusal,
+    ProxyPool, ProxyProfile, Route, RoutingPolicy, Rung,
 };
 use crate::bandwidth::BandwidthSplit;
 use crate::persistence::sql_runtime::{SqlArg, SqlRow, SqlRuntime, SqlTx};
@@ -136,6 +136,26 @@ async fn routes(tx: &mut SqlTx<'_>) -> Result<Vec<Route>, StateError> {
         .into_iter()
         .map(|row| stored_route(&row.text("policy")?))
         .collect()
+}
+
+// Every stored route with the consumer that holds it, in one read, so a
+// refusal to delete something a route uses names that route's owner.
+pub(super) async fn routes_by_holder(
+    tx: &mut SqlTx<'_>,
+) -> Result<Vec<(Consumer, Route)>, StateError> {
+    tx.fetch_all(
+        "SELECT consumer, policy FROM proxy_routes ORDER BY consumer",
+        &[],
+    )
+    .await?
+    .into_iter()
+    .map(|row| {
+        let key = row.text("consumer")?;
+        let holder = Consumer::from_key(&key)
+            .ok_or_else(|| error(format!("unknown stored route consumer {key}")))?;
+        Ok((holder, stored_route(&row.text("policy")?)?))
+    })
+    .collect()
 }
 
 // The next free egress id. An id a route still names stays reserved even
@@ -458,12 +478,12 @@ impl Database {
             SqlRuntime::run_in_transaction(&store, "delete_egress", |tx| {
                 Box::pin(async move {
                     lock_network(tx).await?;
-                    if routes(tx)
+                    if let Some((holder, _)) = routes_by_holder(tx)
                         .await?
-                        .iter()
-                        .any(|route| route.legs.iter().any(|leg| leg.egress_id == id))
+                        .into_iter()
+                        .find(|(_, route)| route.legs.iter().any(|leg| leg.egress_id == id))
                     {
-                        return Err(NetworkRefusal::EgressInUse.into());
+                        return Err(NetworkRefusal::EgressInUse(holder).into());
                     }
                     tx.execute(
                         "DELETE FROM egress_interfaces WHERE id = {}",
@@ -520,12 +540,11 @@ impl Database {
                     pools.insert(pool.id, pool.clone());
                     // Revalidate all consumers that use this pool before changing its members.
                     // Disabled egresses are runtime state, so only path references are checked here.
-                    for row in tx.fetch_all("SELECT consumer, policy FROM proxy_routes", &[]).await? {
-                        let route = stored_route(&row.text("policy")?)?;
+                    for (holder, route) in routes_by_holder(tx).await? {
                         for leg in route.legs {
                             let LegPath::Ladder { rungs, .. } = leg.path else { continue };
                             if !rungs.iter().any(|rung| matches!(rung, Rung::Pool { id } if *id == pool.id)) { continue; }
-                            if pool.member_ids.is_empty() { return Err(NetworkRefusal::PoolInUseEmpty.into()); }
+                            if pool.member_ids.is_empty() { return Err(NetworkRefusal::PoolInUseEmpty(holder).into()); }
                             let mut seen = std::collections::HashSet::new();
                             for rung in rungs {
                                 let ids = match rung {
@@ -554,11 +573,11 @@ impl Database {
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&store, "delete_proxy_pool", |tx| Box::pin(async move {
                 lock_network(tx).await?;
-                for route in routes(tx).await? {
+                for (holder, route) in routes_by_holder(tx).await? {
                     for leg in route.legs {
                         if let LegPath::Ladder { rungs, .. } = leg.path
                             && rungs.iter().any(|rung| matches!(rung, Rung::Pool { id: referenced } if *referenced == id)) {
-                            return Err(NetworkRefusal::PoolInUse.into());
+                            return Err(NetworkRefusal::PoolInUse(holder).into());
                         }
                     }
                 }

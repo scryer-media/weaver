@@ -213,7 +213,7 @@ test("P09 pool shape rules reject oversized, duplicated and mixed pools, and a r
   expect((await route(empty)).join("\n"), "a route on an empty pool").toContain("route references a pool with no members");
   expect(await route(single), "a route on a one-member pool").toEqual([]);
   expect((await graphqlErrors(request, UPDATE_POOL, { id: single, input: { name: `p09-${Date.now()}`, kind: "HTTP_CONNECT", memberIds: [] } })).join("\n"), "emptying a pool a route uses")
-    .toContain("a pool referenced by a server or RSS feed needs at least one member");
+    .toContain(`pool is used by server ${server} and needs at least one member`);
 });
 
 test("P10 an RSS fetch through a pool resolves and fetches on one member", async ({ request }) => {

@@ -92,7 +92,7 @@ test("E06 a referenced egress cannot be deleted; moving the route frees it and t
   const b = await world.egress("b");
   const server = await world.server({ route: { legs: [directLeg(b.id, 100)] } });
   const refused = await graphqlErrors(request, "mutation($id: Int!) { deleteEgressInterface(id: $id) }", { id: b.id });
-  expect(refused.join("\n")).toContain("egress is referenced by a server or RSS feed");
+  expect(refused.join("\n")).toContain(`egress is used by server ${server}`);
   await world.route("SERVER", server, { legs: [directLeg(a.id, 100)] });
   expect((await graphql<{ deleteEgressInterface: boolean }>(request, "mutation($id: Int!) { deleteEgressInterface(id: $id) }", { id: b.id })).deleteEgressInterface).toBe(true);
   world.egresses.splice(world.egresses.indexOf(b.id), 1);

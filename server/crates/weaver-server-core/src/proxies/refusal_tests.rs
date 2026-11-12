@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::EgressQuotaFault as Quota;
 use super::NetworkRefusal as R;
+use super::{Consumer, TorrentScope};
 use crate::{Refusal, StateError};
 
 // Every refusal with the code and the sentence a client is promised. A code
@@ -89,9 +90,9 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "the System egress cannot be deleted",
         ),
         (
-            R::EgressInUse,
+            R::EgressInUse(Consumer::Torrent(TorrentScope::Category(5))),
             "EGRESS_IN_USE",
-            "egress is referenced by a server or RSS feed",
+            "egress is used by the torrent route of category 5",
         ),
         (
             R::PoolNameLength,
@@ -120,9 +121,9 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
         ),
         (R::PoolGone, "POOL_NOT_FOUND", "proxy pool no longer exists"),
         (
-            R::PoolInUse,
+            R::PoolInUse(Consumer::Rss(4)),
             "POOL_IN_USE",
-            "pool is referenced by a server or RSS feed",
+            "pool is used by RSS feed 4",
         ),
         (
             R::PoolEditRepeatsProxy,
@@ -130,9 +131,9 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
             "pool edit would repeat a proxy in an existing ladder",
         ),
         (
-            R::PoolInUseEmpty,
+            R::PoolInUseEmpty(Consumer::Torrent(TorrentScope::Default)),
             "POOL_IN_USE_EMPTY",
-            "a pool referenced by a server or RSS feed needs at least one member",
+            "pool is used by the default torrent route and needs at least one member",
         ),
         (
             R::RouteLegCount,
@@ -381,14 +382,14 @@ fn table() -> Vec<(R, &'static str, &'static str)> {
         (R::ProxyGone, "PROXY_NOT_FOUND", "proxy no longer exists"),
         (R::ProxyNotFound, "PROXY_NOT_FOUND", "proxy not found"),
         (
-            R::ProxyInPool,
+            R::ProxyInPool { pool: 2 },
             "PROXY_IN_POOL",
-            "proxy belongs to a pool; remove it from the pool first",
+            "proxy belongs to pool 2; remove it from the pool first",
         ),
         (
-            R::ProxyInUse,
+            R::ProxyInUse(Consumer::Server(3)),
             "PROXY_IN_USE",
-            "proxy is referenced by a server or RSS feed",
+            "proxy is used by server 3",
         ),
         (
             R::ProxyHostKeyNotSsh,
@@ -487,16 +488,16 @@ fn slot(refusal: &R) -> usize {
         R::EgressGone => 14,
         R::EgressNotFound => 15,
         R::EgressSystemUndeletable => 16,
-        R::EgressInUse => 17,
+        R::EgressInUse(_) => 17,
         R::PoolNameLength => 18,
         R::PoolMemberCount => 19,
         R::PoolProxyRepeated => 20,
         R::PoolProxyMissing => 21,
         R::PoolMemberKindMismatch => 22,
         R::PoolGone => 23,
-        R::PoolInUse => 24,
+        R::PoolInUse(_) => 24,
         R::PoolEditRepeatsProxy => 25,
-        R::PoolInUseEmpty => 26,
+        R::PoolInUseEmpty(_) => 26,
         R::RouteLegCount => 27,
         R::RouteLegWeightRange => 28,
         R::RouteLegWeightSum => 29,
@@ -539,8 +540,8 @@ fn slot(refusal: &R) -> usize {
         R::ProxyRevisionChanged => 66,
         R::ProxyGone => 67,
         R::ProxyNotFound => 68,
-        R::ProxyInPool => 69,
-        R::ProxyInUse => 70,
+        R::ProxyInPool { .. } => 69,
+        R::ProxyInUse(_) => 70,
         R::ProxyHostKeyNotSsh => 71,
         R::SpeedTestAlreadyRunning { .. } => 72,
         R::SpeedTestQueueBusy => 73,
@@ -671,6 +672,16 @@ fn only_the_sentences_that_name_values_carry_them() {
                 })
             ),
             "TEST_PATH_COUNT" => assert_eq!(params, serde_json::json!({ "limit": 64 })),
+            "EGRESS_IN_USE" => assert_eq!(
+                params,
+                serde_json::json!({ "consumer": "torrent:category:5" })
+            ),
+            "POOL_IN_USE" => assert_eq!(params, serde_json::json!({ "consumer": "rss:4" })),
+            "POOL_IN_USE_EMPTY" => {
+                assert_eq!(params, serde_json::json!({ "consumer": "torrent:default" }))
+            }
+            "PROXY_IN_POOL" => assert_eq!(params, serde_json::json!({ "poolId": 2 })),
+            "PROXY_IN_USE" => assert_eq!(params, serde_json::json!({ "consumer": "server:3" })),
             _ => assert_eq!(params, serde_json::json!({}), "{code}"),
         }
     }
