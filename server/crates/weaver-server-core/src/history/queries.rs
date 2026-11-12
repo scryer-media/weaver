@@ -167,7 +167,7 @@ impl Database {
                         };
                         page.extend(fetch_history_rows(&datastore, &filter, rows).await?);
                     }
-                    page.sort_by(|a, b| history_order_cmp(base.order, a, b));
+                    sort_history_rows(base.order, &mut page);
                     page
                 }
                 HistoryIdSplit::NotIn(excluded, _) => {
@@ -504,7 +504,8 @@ const PG_ASCII_UPPER: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
 const PG_ASCII_LOWER: &str = "abcdefghijklmnopqrstuvwxyz";
 
 // The expression `key` orders rows by. Each is the expression of its history
-// index in migration 86, character for character, so the index serves it.
+// index in migration 86, or 87 for the name, character for character, so the
+// index serves it. The name is the full release name.
 fn history_order_expression(key: HistoryOrderKey, engine: SqlEngine) -> String {
     let fold = |column: &str| match engine {
         SqlEngine::Sqlite => format!("LOWER({column})"),
@@ -516,7 +517,7 @@ fn history_order_expression(key: HistoryOrderKey, engine: SqlEngine) -> String {
         HistoryOrderKey::CompletedAt => "h.completed_at".to_string(),
         HistoryOrderKey::TotalBytes => "h.total_bytes".to_string(),
         HistoryOrderKey::Health => "h.health".to_string(),
-        HistoryOrderKey::Name => fold("h.name"),
+        HistoryOrderKey::Name => fold("h.release_name"),
         HistoryOrderKey::Category => fold("COALESCE(h.category, '')"),
         HistoryOrderKey::State => {
             let status = match engine {
@@ -548,20 +549,20 @@ fn history_state_rank(status: &str) -> i64 {
     }
 }
 
-// Two rows in `order`, comparing the stored column values the way the
-// database orders them.
-fn history_order_cmp(
-    order: HistoryOrder,
-    a: &JobHistoryRow,
-    b: &JobHistoryRow,
-) -> std::cmp::Ordering {
+// Sorts `rows` into `order`, comparing the stored column values the way the
+// database orders them. Each row's key is built once, not per comparison.
+fn sort_history_rows(order: HistoryOrder, rows: &mut Vec<JobHistoryRow>) {
     let value = |row: &JobHistoryRow| -> (i64, String) {
         match order.key {
             HistoryOrderKey::CompletedAt => (row.completed_at, String::new()),
             HistoryOrderKey::TotalBytes => (row.total_bytes as i64, String::new()),
             HistoryOrderKey::Health => (i64::from(row.health as i32), String::new()),
             HistoryOrderKey::State => (history_state_rank(&row.status), String::new()),
-            HistoryOrderKey::Name => (0, row.name.to_ascii_lowercase()),
+            HistoryOrderKey::Name => (
+                0,
+                super::history_release_name(&row.name, row.metadata.as_deref())
+                    .to_ascii_lowercase(),
+            ),
             HistoryOrderKey::Category => (
                 0,
                 row.category
@@ -571,14 +572,19 @@ fn history_order_cmp(
             ),
         }
     };
-    let ascending = value(a)
-        .cmp(&value(b))
-        .then_with(|| a.job_id.cmp(&b.job_id));
-    if order.descending {
-        ascending.reverse()
-    } else {
-        ascending
-    }
+    let mut keyed = rows
+        .drain(..)
+        .map(|row| (value(&row), row))
+        .collect::<Vec<_>>();
+    keyed.sort_by(|(a_key, a), (b_key, b)| {
+        let ascending = a_key.cmp(b_key).then_with(|| a.job_id.cmp(&b.job_id));
+        if order.descending {
+            ascending.reverse()
+        } else {
+            ascending
+        }
+    });
+    rows.extend(keyed.into_iter().map(|(_, row)| row));
 }
 
 fn append_in_i64_or_text_filter(
@@ -869,10 +875,10 @@ mod order_index_tests {
         }
     }
 
-    // The order the database returns is the order `history_order_cmp`
+    // The order the database returns is the order `sort_history_rows`
     // gives, so pages merged from several statements stay in order.
     #[test]
-    fn history_order_cmp_matches_the_database_order() {
+    fn sort_history_rows_matches_the_database_order() {
         let db = Database::open_in_memory().unwrap();
         let names = [
             "b.Release",
@@ -913,7 +919,16 @@ mod order_index_tests {
                 nzb_path: None,
                 created_at: 1,
                 completed_at: (job_id % 7) as i64,
-                metadata: None,
+                // The name sort is by the full release name, which the
+                // original or renamed title in the metadata can replace.
+                metadata: match job_id % 5 {
+                    1 => Some(r#"[["weaver.original_title","A.Full.Release.1080p"]]"#.into()),
+                    2 => Some(
+                        r#"[["weaver.original_title","Y.Full"],["weaver.renamed_title","m.Renamed"]]"#
+                            .into(),
+                    ),
+                    _ => None,
+                },
                 server_attribution: None,
             })
             .unwrap();
@@ -935,7 +950,7 @@ mod order_index_tests {
                 };
                 let read = db.list_job_history(&filter, HistoryRows::All).unwrap();
                 let mut sorted = read.clone();
-                sorted.sort_by(|a, b| history_order_cmp(order, a, b));
+                sort_history_rows(order, &mut sorted);
                 let ids =
                     |rows: &[JobHistoryRow]| rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
                 assert_eq!(ids(&read), ids(&sorted), "{order:?}");

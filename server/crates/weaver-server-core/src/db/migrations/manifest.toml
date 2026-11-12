@@ -1080,3 +1080,37 @@ kind = "sql"
 file = "migrations/0086_history_page_text_sort_indexes/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 87
+description = "store and index the history page's full release name"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_history_release_name/sqlite_column.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_history_release_name/postgres_column.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "fill_history_release_names_v87"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_history_release_name/sqlite_index.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_history_release_name/postgres_index.sql"
+engine = "postgres"
+scope = "all"

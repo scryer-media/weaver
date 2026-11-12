@@ -848,7 +848,7 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
         .filter(|item| {
             search
                 .as_deref()
-                .is_none_or(|search| history_sort_name(&item.name).contains(search))
+                .is_none_or(|search| history_sort_name(&item.original_title).contains(search))
         })
         .collect();
 
@@ -978,7 +978,7 @@ fn compare_history_items(
     let ordering = match sort_field {
         HistorySortField::CompletedAt => left.completed_at.cmp(&right.completed_at),
         HistorySortField::Name => {
-            history_sort_name(&left.name).cmp(&history_sort_name(&right.name))
+            history_sort_name(&left.original_title).cmp(&history_sort_name(&right.original_title))
         }
         HistorySortField::State => {
             history_state_key(left.state).cmp(history_state_key(right.state))
@@ -1425,6 +1425,63 @@ mod tests {
         assert_eq!(HistoryPageSqlPlan::for_input(&input).search, None);
     }
 
+    // The page searches and sorts by the full release name, not the shortened
+    // name stored beside it: the original title, or a rename that replaced it.
+    #[test]
+    fn search_and_name_sort_use_the_full_release_name() {
+        let db = Database::open_in_memory().unwrap();
+        let mut original = history_row(1, "complete", 1_000);
+        original.name = "The Movie".to_string();
+        original.metadata = Some(
+            serde_json::to_string(&vec![(
+                "weaver.original_title".to_string(),
+                "Zeta.The.Movie.2024.2160p.WEB".to_string(),
+            )])
+            .unwrap(),
+        );
+        let mut renamed = history_row(2, "complete", 1_000);
+        renamed.name = "Zz Renamed".to_string();
+        renamed.metadata = Some(
+            serde_json::to_string(&vec![
+                (
+                    "weaver.original_title".to_string(),
+                    "Before.Rename.1080p".to_string(),
+                ),
+                (
+                    "weaver.renamed_title".to_string(),
+                    "Beta.Renamed".to_string(),
+                ),
+            ])
+            .unwrap(),
+        );
+        let mut plain = history_row(3, "complete", 1_000);
+        plain.name = "Alpha.Plain.720p".to_string();
+        for row in [&original, &renamed, &plain] {
+            db.insert_job_history(row).unwrap();
+        }
+        let page = |search: Option<&str>| {
+            let mut input = page_input(0, 25, None);
+            input.search = search.map(str::to_string);
+            input.sort_field = Some(HistorySortField::Name);
+            input.sort_direction = Some(HistorySortDirection::Asc);
+            let page = build_history_page_sql(
+                &db,
+                HistoryPageSqlPlan::for_input(&input),
+                &HashSet::new(),
+                HistoryPageFields::ALL,
+            )
+            .unwrap();
+            page.items.iter().map(|item| item.id).collect::<Vec<_>>()
+        };
+        assert_eq!(page(Some("2024.2160P")), vec![1]);
+        assert_eq!(page(Some("the movie")), Vec::<u64>::new());
+        assert_eq!(page(Some("before.rename")), Vec::<u64>::new());
+        assert_eq!(page(Some("beta.renamed")), vec![2]);
+        // Alpha.Plain, Beta.Renamed, Zeta.The.Movie. The stored names would
+        // give Alpha.Plain, The Movie, Zz Renamed: 3, 1, 2.
+        assert_eq!(page(None), vec![3, 2, 1]);
+    }
+
     #[test]
     fn category_filter_takes_sql_path() {
         let mut input = page_input(0, 25, None);
@@ -1525,6 +1582,30 @@ mod tests {
                     )])
                     .unwrap(),
                 );
+            } else if job_id % 7 == 0 {
+                // The stored name is the shortened title; the full release
+                // name the page sorts and searches by is the original title.
+                row.metadata = Some(
+                    serde_json::to_string(&vec![(
+                        "weaver.original_title".to_string(),
+                        format!("Zz.Original.Search.Me.{job_id}.2160p"),
+                    )])
+                    .unwrap(),
+                );
+            } else if job_id % 11 == 0 {
+                row.metadata = Some(
+                    serde_json::to_string(&vec![
+                        (
+                            "weaver.original_title".to_string(),
+                            format!("Aa.Before.Rename.{job_id}"),
+                        ),
+                        (
+                            "weaver.renamed_title".to_string(),
+                            format!("Mm.Renamed.{job_id}"),
+                        ),
+                    ])
+                    .unwrap(),
+                );
             }
             rows.push(row);
         }
@@ -1573,6 +1654,10 @@ mod tests {
             Some("_score"),
             Some("100%.done"),
             Some("e_s"),
+            // Text only the full release name holds, and text a rename replaced.
+            Some("search.me"),
+            Some("mm.renamed"),
+            Some("before.rename"),
         ];
         let category_sets: [Option<Vec<String>>; 5] = [
             None,

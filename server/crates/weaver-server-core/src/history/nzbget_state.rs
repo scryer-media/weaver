@@ -90,9 +90,11 @@ impl Database {
                 Box::pin(async move {
                     let lookup = match tx {
                         SqlTx::Postgres(_) => {
-                            "SELECT metadata FROM job_history WHERE job_id = {} FOR UPDATE"
+                            "SELECT name, metadata FROM job_history WHERE job_id = {} FOR UPDATE"
                         }
-                        SqlTx::Sqlite(_) => "SELECT metadata FROM job_history WHERE job_id = {}",
+                        SqlTx::Sqlite(_) => {
+                            "SELECT name, metadata FROM job_history WHERE job_id = {}"
+                        }
                     };
                     let row = tx.fetch_optional(lookup, &[SqlArg::I64(job_id)]).await?;
                     let Some(row) = row else {
@@ -113,6 +115,7 @@ impl Database {
                     } else {
                         None
                     };
+                    let update_name = update.name.clone();
                     if let Some(name) = update.name {
                         tx.execute(
                             "UPDATE job_history SET name = {} WHERE job_id = {}",
@@ -133,9 +136,21 @@ impl Database {
                         .await?;
                     }
                     if let Some(metadata) = metadata {
+                        // The full release name follows the row's name and
+                        // metadata, and a rename always rewrites the metadata.
+                        let name = match &update_name {
+                            Some(name) => name.clone(),
+                            None => row.text("name")?,
+                        };
+                        let release_name =
+                            crate::history::history_release_name(&name, metadata.as_deref());
                         tx.execute(
-                            "UPDATE job_history SET metadata = {} WHERE job_id = {}",
-                            &[SqlArg::OptText(metadata), SqlArg::I64(job_id)],
+                            "UPDATE job_history SET metadata = {}, release_name = {} WHERE job_id = {}",
+                            &[
+                                SqlArg::OptText(metadata),
+                                SqlArg::Text(release_name),
+                                SqlArg::I64(job_id),
+                            ],
                         )
                         .await?;
                     }
