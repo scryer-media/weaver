@@ -13,11 +13,10 @@ use weaver_graph::{Extraction, Kind};
 
 use crate::engine::{EngineObject, Format};
 
-// The directory is copied and decoded into entry metadata before any member
-// is emitted. Reserve its bounded peak ahead of the run.
+// The directory is rewritten and decoded into entry metadata before any
+// member is emitted. The run reserves this much ahead of it; a directory
+// takes what its own bytes take, however large.
 const ZIP_RUN_WINDOW: u64 = 60 << 20;
-pub(crate) const MAX_DIRECTORY_BYTES: u64 = 8 << 20;
-pub(crate) const MAX_DIRECTORY_ENTRIES: u64 = 50_000;
 
 pub struct ZipFormat;
 
