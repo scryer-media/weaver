@@ -66,15 +66,13 @@ pub(super) async fn within<T>(
 
 // A blocking database read, run off the async runtime. Dropping the returned
 // future detaches the read rather than stopping it.
-pub(super) fn blocking<T: Send + 'static>(
+pub(super) async fn blocking<T: Send + 'static>(
     read: impl FnOnce() -> Result<T, String> + Send + 'static,
-) -> impl Future<Output = Result<T, String>> {
-    async move {
-        tokio::task::spawn_blocking(read)
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|read| read)
-    }
+) -> Result<T, String> {
+    tokio::task::spawn_blocking(read)
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|read| read)
 }
 
 // Runs `futures` concurrently and returns their outputs in order, so reads
