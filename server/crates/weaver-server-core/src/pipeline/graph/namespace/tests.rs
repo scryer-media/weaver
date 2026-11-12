@@ -17,6 +17,7 @@ use crate::pipeline::graph::lines::Lines;
 mod again;
 mod recovery;
 mod recovery_contracts;
+mod refusal;
 mod replay;
 mod split;
 mod store_proof;
