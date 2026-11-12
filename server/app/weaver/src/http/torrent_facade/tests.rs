@@ -4118,3 +4118,4 @@ async fn torrents_info_filters_and_pages_as_the_whole_list() {
     assert_eq!(all[0]["name"], "00.mkv");
     assert_eq!(all[44]["name"], "44.mkv");
 }
+mod rows;

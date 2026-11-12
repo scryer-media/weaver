@@ -12,6 +12,8 @@ use weaver_torrent::core::Id20;
 
 use super::{Live, TorrentService, TorrentSettings, TorrentView, hashes_of};
 use crate::jobs::JobId;
+use crate::torrents::FilePriority;
+use crate::torrents::layout::PieceLayout;
 
 /// What a view carries beside its own fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -40,6 +42,66 @@ impl Shown {
         trackers: true,
         tags: true,
     };
+}
+
+/// What a list's row reads of a torrent's files, without the files: whether
+/// it has any, whether it is one file named as the torrent is, and the
+/// bytes of the files it fetches with the bytes of those it still lacks.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct FileTotals {
+    pub any: bool,
+    pub one_file: bool,
+    pub selected_bytes: u64,
+    pub selected_left_bytes: u64,
+}
+
+impl FileTotals {
+    /// The totals of a view that carries its files.
+    pub fn of(view: &TorrentView) -> Self {
+        let mut totals = Self {
+            any: !view.files.is_empty(),
+            one_file: view.is_one_file(),
+            ..Self::default()
+        };
+        for file in view.files.iter().filter(|file| file.selected()) {
+            let have = view
+                .file_have
+                .get(file.index as usize)
+                .copied()
+                .unwrap_or(0);
+            totals.add(file.length, have);
+        }
+        totals
+    }
+
+    // The totals of a torrent named `name` with these files at these
+    // levels, read as `of` reads its view's files.
+    pub(super) fn of_layout(
+        name: &str,
+        layout: Option<&PieceLayout>,
+        levels: &[FilePriority],
+        file_have: &[u64],
+    ) -> Self {
+        let mut totals = Self::default();
+        let mut count = 0usize;
+        for (index, file) in layout.iter().flat_map(|layout| layout.files()).enumerate() {
+            count += 1;
+            if count == 1 {
+                totals.one_file = file.name == name;
+            }
+            if levels.get(index).copied().unwrap_or_default().wanted() {
+                totals.add(file.length, file_have.get(index).copied().unwrap_or(0));
+            }
+        }
+        totals.any = count > 0;
+        totals.one_file &= count == 1;
+        totals
+    }
+
+    fn add(&mut self, length: u64, have: u64) {
+        self.selected_bytes += length;
+        self.selected_left_bytes += length.saturating_sub(have);
+    }
 }
 
 /// The category a pick keeps.
@@ -125,6 +187,20 @@ impl Pick<'_> {
         kept.sort_unstable();
         kept.into_iter().map(|(_, job_id)| job_id).collect()
     }
+
+    // Of the torrents it keeps, those at the places `page` gives for how
+    // many it keeps.
+    fn paged(
+        &self,
+        settings: &TorrentSettings,
+        live: &BTreeMap<JobId, Live>,
+        page: impl FnOnce(usize) -> Range<usize>,
+    ) -> Vec<JobId> {
+        let ids = self.ids(settings, live);
+        let Range { start, end } = page(ids.len());
+        let end = end.min(ids.len());
+        ids.get(start.min(end)..end).unwrap_or_default().to_vec()
+    }
 }
 
 impl TorrentService {
@@ -149,15 +225,30 @@ impl TorrentService {
         shown: Shown,
     ) -> Vec<TorrentView> {
         let now = self.inner.clock.now_ms();
-        self.listed_by(shown, false, now, |settings, live| {
-            let ids = pick.ids(settings, live);
-            let Range { start, end } = page(ids.len());
-            let end = end.min(ids.len());
-            ids.get(start.min(end)..end).unwrap_or_default().to_vec()
+        self.listed_by(shown, false, false, now, |settings, live| {
+            pick.paged(settings, live, page)
         })
         .await
         .into_iter()
-        .map(|(view, _)| view)
+        .map(|(view, ..)| view)
+        .collect()
+    }
+
+    /// The torrents `picked` gives, each with the totals of its files: what
+    /// a list's row reads of the files when it does not show them.
+    pub async fn picked_rows(
+        &self,
+        pick: Pick<'_>,
+        page: impl FnOnce(usize) -> Range<usize>,
+        shown: Shown,
+    ) -> Vec<(TorrentView, FileTotals)> {
+        let now = self.inner.clock.now_ms();
+        self.listed_by(shown, false, true, now, |settings, live| {
+            pick.paged(settings, live, page)
+        })
+        .await
+        .into_iter()
+        .map(|(view, _, totals)| (view, totals.expect("asked for")))
         .collect()
     }
 
@@ -165,7 +256,7 @@ impl TorrentService {
     /// lists them and in its order. Only their views are built.
     pub async fn torrents_of(&self, ids: &BTreeSet<JobId>) -> Vec<TorrentView> {
         let now = self.inner.clock.now_ms();
-        self.listed_by(Shown::LISTED, false, now, |_, live| {
+        self.listed_by(Shown::LISTED, false, false, now, |_, live| {
             let mut kept: Vec<(i64, JobId)> = ids
                 .iter()
                 .filter_map(|job_id| live.get(job_id))
@@ -176,7 +267,7 @@ impl TorrentService {
         })
         .await
         .into_iter()
-        .map(|(view, _)| view)
+        .map(|(view, ..)| view)
         .collect()
     }
 

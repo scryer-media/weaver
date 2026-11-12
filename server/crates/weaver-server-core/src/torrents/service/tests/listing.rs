@@ -5,7 +5,7 @@
 // and paging every torrent's view gives.
 
 use super::*;
-use crate::torrents::service::listing::{CategoryPick, Pick, Shown, page};
+use crate::torrents::service::listing::{CategoryPick, FileTotals, Pick, Shown, page};
 use crate::torrents::service::updates::Follow;
 
 const TORRENTS: usize = 120;
@@ -262,5 +262,137 @@ async fn a_followed_set_is_given_its_torrents_of_every_torrent() {
     let now = rig.service.torrents_of(&followed).await;
     assert_eq!(now.len(), TORRENTS / 4 - 1);
     assert!(now.iter().all(|view| view.job_id != jobs[4]));
+    rig.service.stop().await;
+}
+
+// A list's row read without its files gives the view read with them, its
+// files left out, and the totals those files give: over torrents of one
+// file named as the torrent, one file in a folder, and many files at mixed
+// levels, every page and pick reading the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_reads_the_totals_its_files_give() {
+    use FilePriority::*;
+    let clock = set_clock();
+    let rig = rig(clock.clone());
+    rig.service.open().await.unwrap();
+    let mut jobs = Vec::new();
+    for at in 0..24usize {
+        clock.0.store(EPOCH_MS + at as i64 * 1000, Ordering::SeqCst);
+        let name = format!("r{at}");
+        let paths: Vec<String> = match at % 3 {
+            0 => vec![name.clone()],
+            1 => vec![format!("{name}/only.bin")],
+            _ => (0..=at % 7)
+                .map(|file| format!("{name}/part{file}.bin"))
+                .collect(),
+        };
+        let bodies: Vec<Vec<u8>> = (0..paths.len())
+            .map(|file| vec![(at + file) as u8; 700 + 311 * file + at])
+            .collect();
+        let files: Vec<(&str, &[u8])> = paths
+            .iter()
+            .zip(&bodies)
+            .map(|(path, body)| (path.as_str(), body.as_slice()))
+            .collect();
+        let job_id = rig
+            .service
+            .add(AddRequest {
+                paused: true,
+                ..request(AddSource::Metainfo(metainfo(&name, &files, 1024, false)))
+            })
+            .await
+            .unwrap();
+        if paths.len() > 2 {
+            rig.service
+                .set_file_priorities(job_id, &[(0, Ignored), (2, High)])
+                .await
+                .unwrap();
+        } else if at % 4 == 0 {
+            rig.service
+                .set_file_priorities(job_id, &[(0, Ignored)])
+                .await
+                .unwrap();
+        }
+        jobs.push(job_id);
+    }
+    settled(&rig.service, jobs.len()).await;
+
+    let whole = rig
+        .service
+        .picked(Pick::default(), |kept| 0..kept, Shown::WHOLE)
+        .await;
+    assert_eq!(whole.len(), jobs.len());
+    // Every shape is there: one file named as the torrent, one file in a
+    // folder, many files, and a file not fetched.
+    assert!(whole.iter().any(TorrentView::is_one_file));
+    assert!(
+        whole
+            .iter()
+            .any(|view| view.files.len() == 1 && !view.is_one_file())
+    );
+    assert!(whole.iter().any(|view| view.files.len() > 2));
+    assert!(
+        whole
+            .iter()
+            .flat_map(|view| &view.files)
+            .any(|file| !file.selected())
+    );
+    let without = |view: &TorrentView| TorrentView {
+        files: Vec::new(),
+        ..view.clone()
+    };
+    let rows = rig
+        .service
+        .picked_rows(Pick::default(), |kept| 0..kept, Shown::LISTED)
+        .await;
+    assert_eq!(rows.len(), whole.len());
+    for ((view, totals), old) in rows.iter().zip(&whole) {
+        assert_eq!(*view, without(old));
+        assert_eq!(*totals, FileTotals::of(old), "{}", old.name);
+        assert_eq!(view.paths_as(totals.one_file), old.paths());
+    }
+    // With its files asked for, the row is the whole view.
+    let rows = rig
+        .service
+        .picked_rows(Pick::default(), |kept| 0..kept, Shown::WHOLE)
+        .await;
+    assert_eq!(
+        rows.iter()
+            .map(|(view, _)| view.clone())
+            .collect::<Vec<_>>(),
+        whole
+    );
+    // A page and a pick of hashes read the rows `picked` reads.
+    let named: Vec<String> = whole
+        .iter()
+        .step_by(5)
+        .map(|view| view.infohash.clone())
+        .collect();
+    let named: Vec<&str> = named.iter().map(String::as_str).collect();
+    for pick in [
+        Pick::default(),
+        Pick {
+            hashes: Some(&named),
+            ..Pick::default()
+        },
+    ] {
+        for (offset, first) in [(0, 5), (3, 100), (30, 2)] {
+            let picked = rig
+                .service
+                .picked(pick, page(offset, first), Shown::WHOLE)
+                .await;
+            let rows = rig
+                .service
+                .picked_rows(pick, page(offset, first), Shown::LISTED)
+                .await;
+            assert_eq!(
+                rows,
+                picked
+                    .iter()
+                    .map(|view| (without(view), FileTotals::of(view)))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
     rig.service.stop().await;
 }

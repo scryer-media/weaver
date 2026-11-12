@@ -87,7 +87,7 @@ use crate::torrents::{
 
 pub mod fingerprint;
 pub mod listing;
-use listing::{CategoryPick, Pick, Shown};
+use listing::{CategoryPick, FileTotals, Pick, Shown};
 mod scripts;
 use scripts::Ending;
 pub use scripts::ScriptDirs;
@@ -986,13 +986,25 @@ impl TorrentView {
     /// output itself, its file when it is one file named as the torrent is,
     /// else its folder. Both are empty until weaver has placed the torrent.
     pub fn paths(&self) -> (String, String) {
+        self.paths_as(self.is_one_file())
+    }
+
+    /// Whether it is one file named as the torrent is.
+    pub fn is_one_file(&self) -> bool {
+        matches!(self.files.as_slice(), [file] if file.path == self.name)
+    }
+
+    /// Its `paths`, given whether it is one file named as the torrent is:
+    /// for a view read without its files.
+    pub fn paths_as(&self, one_file: bool) -> (String, String) {
         let Some(dir) = self.files_dir.as_ref().or(self.storage_dir.as_ref()) else {
             return (String::new(), String::new());
         };
         let dir = PathBuf::from(dir);
-        let single = match self.files.as_slice() {
-            [file] if file.path == self.name => Path::new(&file.path).file_name(),
-            _ => None,
+        let single = if one_file {
+            Path::new(&self.name).file_name()
+        } else {
+            None
         };
         let content = match single {
             Some(name) => dir.join(name),
@@ -6811,24 +6823,28 @@ impl TorrentService {
             category: category.map(CategoryPick::Named),
             ..Pick::default()
         };
-        self.listed_by(shown, true, now, |settings, live| pick.ids(settings, live))
-            .await
-            .into_iter()
-            .map(|(view, series)| (view, series.expect("asked for")))
-            .collect()
+        self.listed_by(shown, true, false, now, |settings, live| {
+            pick.ids(settings, live)
+        })
+        .await
+        .into_iter()
+        .map(|(view, series, _)| (view, series.expect("asked for")))
+        .collect()
     }
 
     // The torrents `pick` names, in the order it names them, each with what
-    // `shown` asks for, and with its figures as the exporter reads them when
-    // `series` asks for those: both from one reading of its session. Only
-    // the torrents picked are read.
+    // `shown` asks for, with its figures as the exporter reads them when
+    // `series` asks for those, both from one reading of its session, and
+    // with the totals of its files when `totals` asks for those. Only the
+    // torrents picked are read.
     async fn listed_by(
         &self,
         shown: Shown,
         series: bool,
+        totals: bool,
         now: i64,
         pick: impl FnOnce(&TorrentSettings, &BTreeMap<JobId, Live>) -> Vec<JobId>,
-    ) -> Vec<(TorrentView, Option<TorrentSeries>)> {
+    ) -> Vec<(TorrentView, Option<TorrentSeries>, Option<FileTotals>)> {
         // A torrent's figures name its trackers.
         let shown = Shown {
             trackers: shown.trackers || series,
@@ -6857,8 +6873,7 @@ impl TorrentService {
                     let reading = torrent.reading(now);
                     let unviewed = series.then(|| self.unviewed(&settings, torrent, &reading, now));
                     let view = self.view_of(&settings, torrent, reading, now);
-                    let files = shown
-                        .files
+                    let files = (shown.files || totals)
                         .then(|| (torrent.layout.clone(), torrent.levels.clone()));
                     (
                         view,
@@ -6876,9 +6891,20 @@ impl TorrentService {
                 .collect()
         };
         let mut names = HashMap::new();
+        let mut file_totals = Vec::with_capacity(if totals { views.len() } else { 0 });
         for (view, announces, _, files, pinned, listed) in &mut views {
             if let Some((layout, levels)) = files.take() {
-                view.files = files_of(layout.as_deref(), &levels);
+                if totals {
+                    file_totals.push(FileTotals::of_layout(
+                        &view.name,
+                        layout.as_deref(),
+                        &levels,
+                        &view.file_have,
+                    ));
+                }
+                if shown.files {
+                    view.files = files_of(layout.as_deref(), &levels);
+                }
             }
             if let Some(listed) = listed {
                 self.track(view, *pinned, listed, announces, &mut names);
@@ -6887,11 +6913,12 @@ impl TorrentService {
         if shown.tags {
             self.tag(&mut views.iter_mut().map(|(view, ..)| view).collect::<Vec<_>>());
         }
+        let mut file_totals = file_totals.into_iter();
         views
             .into_iter()
             .map(|(view, announces, unviewed, ..)| {
                 let series = unviewed.map(|unviewed| unviewed.series(&view, &announces));
-                (view, series)
+                (view, series, file_totals.next())
             })
             .collect()
     }
