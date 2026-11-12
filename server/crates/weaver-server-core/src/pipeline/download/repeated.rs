@@ -480,8 +480,13 @@ impl RepeatedArticles {
                 excludes,
             )
             .await;
-        let (data, attempts, source) =
+        let (mut data, attempts, source) =
             Pipeline::download_data_from_decoded_trace(work.segment_id, trace);
+        // Whether this connection had a group selected is not known here, so
+        // only a work with no group to select settles a 412.
+        if let Err(DownloadError::Fetch(failure)) = &mut data {
+            failure.settle_group_refusal(work.groups.is_empty(), false);
+        }
         // The one wire fetch here, credited exactly as a lane credits one.
         if let Some(counters) = &work.counters {
             super::owned_lane::credit_transfer(counters, &data);
