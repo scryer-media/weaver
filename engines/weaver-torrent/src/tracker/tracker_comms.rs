@@ -37,7 +37,6 @@ use crate::core::net::{Egress, HttpClients, NamedBy, Resolved, Resolver, is_idna
 use crate::tracker::Tracker;
 use crate::tracker::shape::AnnounceShape;
 use crate::tracker::tracker_comms_http;
-use crate::tracker::tracker_comms_http::Ask;
 use crate::tracker::tracker_comms_http::Family;
 use crate::tracker::tracker_comms_http::TrackerRequestEvent;
 use crate::tracker::tracker_comms_udp;
@@ -1097,7 +1096,6 @@ impl Scraper {
             &self.reachable,
             &url,
             tracker.named_by,
-            Ask::Scrape,
             None,
             &self.shape.scrape_query(&info_hash),
             &self.user_agent,
@@ -2342,7 +2340,6 @@ impl TrackerComms {
                     &self.reachable,
                     tracker_url,
                     tracker.named_by,
-                    Ask::Announce,
                     *family,
                     query,
                     &self.identity.user_agent,
@@ -2662,9 +2659,11 @@ mod tests {
     async fn an_answered_announce_logs_no_passkey() {
         let lines = Lines::default();
         let _capture = lines.capture();
-        let (listener, url) = private_listener().await;
+        // A passkey path is never asked at loopback.
+        let (listener, at) = private_listener().await;
+        let url = off_loopback(&at);
         let stopped = StoppedAnnounces::default();
-        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let (task, token) = start_off_loopback(vec![vec![url.clone()]], &stopped).await;
         let TrackerTask { mut peers, status } = task;
         let mut rx = status.subscribe();
         answer(&listener, &mut peers, "d8:intervali1800e5:peers0:e").await;
@@ -2684,9 +2683,11 @@ mod tests {
     async fn a_failed_announce_logs_and_keeps_no_passkey() {
         let lines = Lines::default();
         let _capture = lines.capture();
-        let (listener, url) = private_listener().await;
+        // A passkey path is never asked at loopback.
+        let (listener, at) = private_listener().await;
+        let url = off_loopback(&at);
         let stopped = StoppedAnnounces::default();
-        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let (task, token) = start_off_loopback(vec![vec![url.clone()]], &stopped).await;
         let TrackerTask { mut peers, status } = task;
         let mut rx = status.subscribe();
         // The tracker hangs up on the request: the client's error names
@@ -4258,13 +4259,45 @@ mod tests {
         (listener, url)
     }
 
+    /// `at`, a listener's URL, named by a name [`start_off_loopback`]
+    /// resolves to a documentation address instead of loopback, where a
+    /// tracker the operator named is asked at any path: a scrape is never
+    /// sent to loopback.
+    fn off_loopback(at: &Url) -> Url {
+        let mut url = at.clone();
+        url.set_host(Some("tracker.invalid")).unwrap();
+        url
+    }
+
     async fn start(
         tiers: Vec<Vec<Url>>,
         stopped: &StoppedAnnounces,
     ) -> (TrackerTask, CancellationToken) {
+        start_over(tiers, stopped, crate::test_support::loopback(), None).await
+    }
+
+    /// The tracker task for `tiers` named by [`off_loopback`], each reached
+    /// at the loopback listener on its URL's port by [`Wired`] clients.
+    async fn start_off_loopback(
+        tiers: Vec<Vec<Url>>,
+        stopped: &StoppedAnnounces,
+    ) -> (TrackerTask, CancellationToken) {
+        let listener = Url::parse("http://127.0.0.1:1/").unwrap();
+        let resolver = Arc::new(FixedResolver {
+            at: Ipv4Addr::new(192, 0, 2, 1).into(),
+        });
+        start_over(tiers, stopped, Wired::new(&listener), Some(resolver)).await
+    }
+
+    async fn start_over(
+        tiers: Vec<Vec<Url>>,
+        stopped: &StoppedAnnounces,
+        clients: Arc<dyn HttpClients>,
+        resolver: Option<Arc<dyn Resolver>>,
+    ) -> (TrackerTask, CancellationToken) {
         let token = CancellationToken::new();
         let udp_sock = crate::test_support::loopback_udp().await;
-        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, None);
+        let udp_client = UdpTrackerClient::new_with_socket(token.clone(), udp_sock, resolver);
         let task = TrackerComms::start_with_tiers(
             v1_hash(),
             identity(),
@@ -4273,7 +4306,7 @@ mod tests {
             None,
             tokio::sync::watch::channel(ToldPorts::both(Some(6881))).1,
             no_vote(),
-            crate::test_support::loopback(),
+            clients,
             reach_all(),
             udp_client,
             stopped.clone(),
@@ -4619,11 +4652,12 @@ mod tests {
 
     #[tokio::test]
     async fn scrape_asks_the_tracker_that_last_answered_and_keeps_its_counts() {
-        let (ok, ok_url) = http_listener().await;
-        let (err, err_url) = http_listener().await;
+        let (ok, ok_at) = http_listener().await;
+        let (err, err_at) = http_listener().await;
+        let (ok_url, err_url) = (off_loopback(&ok_at), off_loopback(&err_at));
         let stopped = StoppedAnnounces::default();
         let (task, token) =
-            start(vec![vec![err_url.clone()], vec![ok_url.clone()]], &stopped).await;
+            start_off_loopback(vec![vec![err_url.clone()], vec![ok_url.clone()]], &stopped).await;
         let TrackerTask { mut peers, status } = task;
         assert_eq!(
             status.scrapes(),
@@ -4705,9 +4739,9 @@ mod tests {
 
     #[tokio::test]
     async fn scrape_without_an_answered_announce_asks_the_first_tracker() {
-        let (listener, url) = http_listener().await;
+        let (listener, at) = http_listener().await;
         let stopped = StoppedAnnounces::default();
-        let (task, token) = start(vec![vec![url.clone()]], &stopped).await;
+        let (task, token) = start_off_loopback(vec![vec![off_loopback(&at)]], &stopped).await;
         // Never polled: nothing was announced.
         let TrackerTask { peers, status } = task;
         drop(peers);
@@ -4723,6 +4757,25 @@ mod tests {
         assert!(last.result.unwrap_err().contains("nope"));
         // A refused scrape leaves the announce table alone.
         assert_eq!(status.announces()[0].last, None);
+        stopped.wait_idle().await;
+        token.cancel();
+    }
+
+    // A scrape is asked at the tracker's scrape URL, which never starts
+    // `/announce`, so one at loopback is refused before it is sent
+    // (libtorrent `http_tracker_connection::on_filter` judges the URL
+    // asked). An e2e build asks a loopback tracker at any path.
+    #[cfg(not(feature = "e2e-local-trackers"))]
+    #[tokio::test]
+    async fn a_loopback_tracker_is_never_scraped() {
+        let (listener, url) = http_listener().await;
+        let stopped = StoppedAnnounces::default();
+        let (task, token) = start(vec![vec![url]], &stopped).await;
+        let TrackerTask { peers, status } = task;
+        drop(peers);
+        let e = status.scrape().await.unwrap_err();
+        assert!(format!("{e:#}").contains("SSRF"), "{e:#}");
+        assert!(listener.accept().now_or_never().is_none());
         stopped.wait_idle().await;
         token.cancel();
     }
@@ -4771,9 +4824,10 @@ mod tests {
     #[tokio::test]
     async fn a_tracker_url_that_could_forge_a_request_is_never_asked() {
         // A URL whose query names an announce argument is refused, and so is
-        // a loopback tracker the operator named at a path with no segment
-        // starting `announce`, whatever name it is reached by. Each is refused before
-        // any request; the next tier's tracker is asked.
+        // a loopback tracker the operator named at a path other than
+        // `/announce` with no `/`, `\` or `%` after it, whatever name it is
+        // reached by. Each is refused before any request; the next tier's
+        // tracker is asked.
         let (refused, at) = http_listener().await;
         let port = at.port().unwrap();
         let named = |s: &str| Url::parse(&s.replace("PORT", &port.to_string())).unwrap();
@@ -4782,6 +4836,10 @@ mod tests {
             named("http://127.0.0.1:PORT/x?y=1"),
             named("http://[::1]:PORT/api"),
             named("http://tracker.invalid:PORT/announce/../admin"),
+            named("http://127.0.0.1:PORT/admin/announce"),
+            named("http://127.0.0.1:PORT/abcd/announce"),
+            named("http://tracker.invalid:PORT/announce/abcd"),
+            named("http://tracker.invalid:PORT/announce%2F..%2Fdelete"),
         ];
         let (ok, ok_url) = http_listener().await;
         let mut tiers: Vec<Vec<Url>> = forged.iter().map(|u| vec![u.clone()]).collect();
