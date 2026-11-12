@@ -48,11 +48,12 @@ pub struct Segment {
     sent: SentStatus,
 
     is_mtu_probe: bool,
+    // Resends past the first that SACKs of later sends asked for.
+    evidence_resends: usize,
 
     // Lost: three or more later segments were delivered.
     is_lost: bool,
     is_expired: bool,
-    has_sacks_after_it: bool,
 }
 
 pub fn rtt_min(rtt1: Option<Duration>, rtt2: Option<Duration>) -> Option<Duration> {
@@ -116,7 +117,6 @@ pub struct Segments {
 
     // If a SACK seen, this will set how many sgements did it cover.
     sack_depth: usize,
-    last_sack_empty: bool,
 
     // SND.UNA - the sequence number of first unacknowledged segment.
     // If all acknowledged, this is the same as SND.NEXT.
@@ -134,16 +134,28 @@ impl SegmentForSending<'_> {
         self.segment.is_lost
     }
 
+    // Resent on the evidence that marked it lost: it waits for new
+    // evidence before it is lost again.
+    pub fn on_resent_as_lost(&mut self) {
+        self.segment.is_lost = false;
+        if self.segment.retransmit_count() > 1 {
+            self.segment.evidence_resends += 1;
+        }
+    }
+
+    // Sends that count toward giving up: the first send, the first resend
+    // and the timer's, as libtorrent counts them (utp_stream.cpp:3523);
+    // resends of a resend that SACKs showed lost are not among them.
+    pub fn counted_sends(&self) -> usize {
+        self.segment.send_count() - self.segment.evidence_resends
+    }
+
     pub fn is_expired(&self) -> bool {
         self.segment.is_expired
     }
 
     pub fn send_count(&self) -> usize {
         self.segment.send_count()
-    }
-
-    pub fn has_sacks_after_it(&self) -> bool {
-        self.segment.has_sacks_after_it
     }
 
     pub fn seq_nr(&self) -> SeqNr {
@@ -264,7 +276,6 @@ impl Segments {
             offset: 0,
             removed_offset: 0,
             sack_depth: 0,
-            last_sack_empty: false,
             snd_una,
         }
     }
@@ -359,9 +370,9 @@ impl Segments {
             is_delivered: false,
             is_mtu_probe,
             sent: SentStatus::NotSent,
+            evidence_resends: 0,
             is_lost: false,
             is_expired: false,
-            has_sacks_after_it: false,
         });
         self.offset += payload_len as u64;
         self.len_bytes += payload_len;
@@ -426,6 +437,12 @@ impl Segments {
         let mut max_acked_payload_size: usize = 0;
 
         let mut new_rtt: Option<Duration> = None;
+        // The receiver holds what it got past a hole until the hole is
+        // filled, and a SACK reaches only so far past the cumulative ACK, so
+        // an ACK that reports a resent packet can report packets it got long
+        // ago: such an ACK times nothing (Karn). Otherwise a packet sent once
+        // and not reported before is a sample.
+        let mut covers_resend = false;
 
         if let Some(offset) = ack_header
             .ack_nr
@@ -434,7 +451,10 @@ impl Segments {
         {
             let drain_count = (offset as usize + 1).min(self.segments.len());
             for segment in self.segments.drain(0..drain_count) {
-                segment.update_rtt(now, &mut new_rtt);
+                if !segment.is_delivered {
+                    covers_resend |= segment.retransmit_count() > 0;
+                    segment.update_rtt(now, &mut new_rtt);
+                }
                 removed += 1;
                 payload_size += segment.payload_size;
                 self.snd_una += 1;
@@ -447,7 +467,6 @@ impl Segments {
         match (self.first_seq_nr(), ack_header.extensions.selective_ack) {
             (Some(first_seq_nr), Some(sack)) if first_seq_nr.is_after(ack_header.ack_nr) => {
                 self.sack_depth = sack.len();
-                self.last_sack_empty = sack.as_bitslice().not_any();
 
                 let sack_start_offset =
                     2 - first_seq_nr.forward_distance_from(ack_header.ack_nr) as isize;
@@ -455,6 +474,7 @@ impl Segments {
                 let mut process_sack = |segment: &mut Segment, is_sacked: bool| {
                     if !segment.is_delivered && is_sacked && segment.send_count() > 0 {
                         segment.is_delivered = true;
+                        covers_resend |= segment.retransmit_count() > 0;
                         segment.update_rtt(now, &mut new_rtt);
                         max_acked_payload_size = max_acked_payload_size.max(segment.payload_size);
                         newly_sacked_segment_count += 1;
@@ -497,6 +517,9 @@ impl Segments {
         }
 
         self.removed_offset += payload_size as u64;
+        if covers_resend {
+            new_rtt = None;
+        }
 
         OnAckResult {
             acked_segments_count: removed,
@@ -535,6 +558,10 @@ impl Segments {
         let mut pipe = 0;
         let mut delivered_segs = 0;
         let mut recalc_timer = None;
+        // The latest last sends among the delivered segments after the one
+        // at hand, latest first: more than `SACK_DUP_THRESH` of them sent
+        // after a resend say the resend was lost too.
+        let mut latest = [None::<Instant>; SACK_DUP_THRESH as usize + 1];
 
         let take = high_data
             .signed_offset_from(self.snd_una)
@@ -556,10 +583,14 @@ impl Segments {
         {
             if segment.is_delivered {
                 delivered_segs += 1;
+                let mut carried = Some(last_sent);
+                for slot in latest.iter_mut() {
+                    if carried > *slot {
+                        std::mem::swap(slot, &mut carried);
+                    }
+                }
                 continue;
             }
-
-            segment.has_sacks_after_it = delivered_segs > 0 || self.last_sack_empty;
 
             if seq_nr.is_at_or_before(high_rxt) {
                 pipe += segment.payload_size;
@@ -573,8 +604,15 @@ impl Segments {
             // late segment is reordering until the SACKs or the
             // retransmission timer say otherwise. Past the SACK's reach
             // nothing is known, so nothing is lost there.
-            segment.is_lost =
-                offset <= self.sack_depth + 1 && delivered_segs > SACK_DUP_THRESH as usize;
+            // A segment resent already is lost again only when more than
+            // that many segments sent after its resend were SACKed: its own
+            // evidence, not the evidence that resent it.
+            let evidence = if segment.retransmit_count() > 0 {
+                latest[SACK_DUP_THRESH as usize].is_some_and(|ts| ts > last_sent)
+            } else {
+                delivered_segs > SACK_DUP_THRESH as usize
+            };
+            segment.is_lost = offset <= self.sack_depth + 1 && evidence;
 
             // A segment in flight past the expiry has likely left the
             // network, so it no longer counts against the pipe.
@@ -902,6 +940,106 @@ mod tests {
         assert_eq!(res.acked_segments_count, 2);
         // This inflates rtt
         assert_eq!(res.new_rtt, None);
+    }
+
+    // An ACK whose cumulative part or SACK reports a resent packet can
+    // report packets the receiver got long before it: it gives no sample.
+    #[test]
+    fn an_ack_that_reports_a_resent_packet_times_nothing() {
+        let stats = UtpStats::default();
+        let sent = Instant::now();
+        let mut ftx = make_segments(10, 8);
+        for mut item in ftx.iter_mut_for_sending(None) {
+            item.on_sent(sent, &stats);
+        }
+        let resent = sent + Duration::from_secs(5);
+        ftx.iter_mut_for_sending(None)
+            .next()
+            .unwrap()
+            .on_sent(resent, &stats);
+
+        let now = resent + Duration::from_millis(10);
+        let res = ftx.remove_up_to_ack(now, &make_sack_header(11, []));
+        assert_eq!(res.acked_segments_count, 2);
+        assert_eq!(res.new_rtt, None);
+
+        // Packet 13 resent; a SACK reports it with packet 15.
+        ftx.iter_mut_for_sending(None)
+            .nth(1)
+            .unwrap()
+            .on_sent(resent, &stats);
+        let res = ftx.remove_up_to_ack(now, &make_sack_header(11, [0, 2]));
+        assert_eq!(res.newly_sacked_segment_count, 2);
+        assert_eq!(res.new_rtt, None);
+
+        // Packets sent once and not reported before still give a sample.
+        let res = ftx.remove_up_to_ack(now, &make_sack_header(11, [4]));
+        assert_eq!(res.newly_sacked_segment_count, 1);
+        assert_eq!(res.new_rtt, Some(now - sent));
+    }
+
+    // A resent packet is lost again only when more than three packets sent
+    // after its resend are SACKed; the SACKs that resent it do not count.
+    #[test]
+    fn a_resend_is_lost_again_only_on_its_own_evidence() {
+        let stats = UtpStats::default();
+        let rtt = Duration::from_millis(1);
+        let t0 = Instant::now();
+        let mut ftx = make_segments(10, 12);
+        for mut item in ftx.iter_mut_for_sending(None).take(6) {
+            item.on_sent(t0, &stats);
+        }
+        // 11-14 SACKed: 10 is lost and resent.
+        ftx.remove_up_to_ack(t0, &make_sack_header(9, [0, 1, 2, 3]));
+        ftx.calc_pipe(9.into(), 15.into(), rtt, t0);
+        let t1 = t0 + rtt;
+        {
+            let mut head = ftx.iter_mut_for_sending(None).next().unwrap();
+            assert!(head.is_lost());
+            head.on_sent(t1, &stats);
+            head.on_resent_as_lost();
+        }
+        // The same evidence again, plus 15, sent before the resend.
+        ftx.remove_up_to_ack(t1, &make_sack_header(9, [0, 1, 2, 3, 4]));
+        ftx.calc_pipe(10.into(), 15.into(), rtt, t1);
+        assert!(!ftx.iter_mut_for_sending(None).next().unwrap().is_lost());
+
+        // 16-21 go out after the resend; three SACKed are not enough, four
+        // are.
+        let t2 = t1 + rtt;
+        for mut item in ftx.iter_mut_for_sending(Some(16.into())) {
+            item.on_sent(t2, &stats);
+        }
+        ftx.remove_up_to_ack(t2, &make_sack_header(9, [0, 1, 2, 3, 4, 5, 6, 7]));
+        ftx.calc_pipe(10.into(), 21.into(), rtt, t2);
+        assert!(!ftx.iter_mut_for_sending(None).next().unwrap().is_lost());
+        ftx.remove_up_to_ack(t2, &make_sack_header(9, [8]));
+        ftx.calc_pipe(10.into(), 21.into(), rtt, t2);
+        let head = ftx.iter_mut_for_sending(None).next().unwrap();
+        assert_eq!(head.seq_nr(), 10.into());
+        assert!(head.is_lost());
+    }
+
+    // Toward giving up count the first send, the first resend and the
+    // timer's; a resend of a resend that SACKs showed lost does not.
+    #[test]
+    fn resends_on_new_evidence_do_not_count_toward_giving_up() {
+        let stats = UtpStats::default();
+        let now = Instant::now();
+        let mut ftx = make_segments(10, 1);
+        let mut head = ftx.iter_mut_for_sending(None).next().unwrap();
+        head.on_sent(now, &stats);
+        head.on_sent(now, &stats);
+        head.on_resent_as_lost();
+        assert_eq!((head.send_count(), head.counted_sends()), (2, 2));
+        head.on_sent(now, &stats);
+        head.on_resent_as_lost();
+        head.on_sent(now, &stats);
+        head.on_resent_as_lost();
+        assert_eq!((head.send_count(), head.counted_sends()), (4, 2));
+        // The timer's resend counts.
+        head.on_sent(now, &stats);
+        assert_eq!((head.send_count(), head.counted_sends()), (5, 3));
     }
 
     #[test]

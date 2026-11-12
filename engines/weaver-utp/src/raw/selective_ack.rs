@@ -13,6 +13,10 @@ use crate::constants::SACK_DEPTH;
 /// receives (utp_stream.cpp:1238-1281).
 pub const SACK_MAX_BYTES: usize = u8::MAX as usize;
 
+// The most bits Weaver sends: the whole four-byte words the length byte
+// allows.
+const SACK_SENT_MAX_BITS: usize = SACK_MAX_BYTES / 4 * 4 * 8;
+
 type SelectiveAckData = BitArr!(for SACK_MAX_BYTES * 8, in u8, Lsb0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,16 +27,19 @@ pub struct SelectiveAck {
 }
 
 impl SelectiveAck {
-    /// The SACK Weaver sends: `SACK_DEPTH` bits.
+    /// The SACK Weaver sends: every packet held past the first missing one,
+    /// as libtorrent sizes its own, in whole four-byte words, at least
+    /// `SACK_DEPTH` bits and no more than the length byte allows. A sender
+    /// sees a packet lost only when later ones were SACKed, so a SACK that
+    /// stops short of the flight hides every loss beyond it.
     pub fn new(unacked: impl Iterator<Item = usize>) -> Self {
         let mut data = SelectiveAckData::default();
-        for idx in unacked.take_while(|i| *i < SACK_DEPTH) {
+        let mut len = SACK_DEPTH;
+        for idx in unacked.take_while(|i| *i < SACK_SENT_MAX_BITS) {
             data.set(idx, true);
+            len = len.max((idx / 32 + 1) * 32);
         }
-        Self {
-            data,
-            len: SACK_DEPTH,
-        }
+        Self { data, len }
     }
 
     #[cfg(test)]
@@ -130,5 +137,24 @@ mod tests {
         );
 
         assert_eq!(sack, SelectiveAck::deserialize(sack.as_bytes()));
+    }
+
+    // A packet held 100 places past the hole is reported, so the sender
+    // can see the hole lost however wide its flight; the SACK grows in
+    // whole words and stops at what its length byte allows.
+    #[test]
+    fn the_sack_sent_covers_every_packet_held() {
+        let sack = SelectiveAck::new([0, 99].into_iter());
+        assert_eq!(sack.len(), 128);
+        assert!(sack.as_bitslice()[99]);
+        assert_eq!(sack, SelectiveAck::deserialize(sack.as_bytes()));
+
+        let near = SelectiveAck::new([1].into_iter());
+        assert_eq!(near.len(), crate::constants::SACK_DEPTH);
+
+        let far = SelectiveAck::new([2015, 2016, 5000].into_iter());
+        assert_eq!(far.len(), 2016);
+        assert_eq!(far.as_bytes().len(), 252);
+        assert!(far.as_bitslice()[2015]);
     }
 }

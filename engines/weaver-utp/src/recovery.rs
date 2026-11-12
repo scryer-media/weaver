@@ -45,10 +45,6 @@ pub struct Recovering {
 }
 
 impl Recovering {
-    pub fn recovery_point(&self) -> SeqNr {
-        self.recovery_point
-    }
-
     pub fn cwnd(&self) -> usize {
         self.cwnd.saturating_sub(self.pipe_estimate.pipe)
     }
@@ -84,17 +80,16 @@ struct LastAck {
 // (parse_sack, 1286-1320: "dups > dup_ack_limit"). Otherwise a STATE packet
 // that repeats the cumulative ACK while data is outstanding counts as one
 // duplicate, and `SACK_DUP_THRESH` of them mark it lost (2723-2728, 2814).
-// An ACK that moves the cumulative ACK forward, or a DATA packet, is no
-// duplicate.
+// Without such a SACK, an ACK that moves the cumulative ACK forward, or a
+// DATA packet, is no duplicate.
 fn count_sack_duplicates(
     header: &UtpHeader,
     on_ack_result: &OnAckResult,
     prev_dup_acks: u8,
     stats: &UtpStats,
 ) -> u8 {
-    if on_ack_result.acked_segments_count > 0 {
-        return 0;
-    }
+    // Every SACK is read for losses, whether or not the cumulative ACK
+    // moved (parse_sack runs for each, 2792-2795).
     let sacked = header
         .extensions
         .selective_ack
@@ -110,6 +105,9 @@ fn count_sack_duplicates(
         );
         stats.duplicate_acks_received.increment(1);
         return SACK_DUP_THRESH;
+    }
+    if on_ack_result.acked_segments_count > 0 {
+        return 0;
     }
     if header.htype == Type::State {
         stats.duplicate_acks_received.increment(1);
@@ -422,6 +420,36 @@ mod tests {
         );
         assert_eq!(
             super::count_sack_duplicates(&header(Type::State), &advanced, 2, &stats),
+            0
+        );
+    }
+
+    // A SACK naming more than three packets past a hole marks it lost even
+    // when the cumulative ACK moved with it, as libtorrent reads every SACK:
+    // with many holes in one window, each new hole is seen on the ACK that
+    // fills the one before it.
+    #[test]
+    fn a_sack_past_a_new_hole_counts_when_the_ack_moves_too() {
+        let stats = UtpStats::default();
+        let advanced = OnAckResult {
+            acked_segments_count: 1,
+            ..Default::default()
+        };
+        let sack = |bits: std::ops::Range<usize>| UtpHeader {
+            htype: Type::State,
+            ack_nr: 9.into(),
+            extensions: crate::raw::Extensions {
+                selective_ack: crate::raw::selective_ack::SelectiveAck::new_test(bits),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(
+            super::count_sack_duplicates(&sack(0..4), &advanced, 0, &stats),
+            crate::constants::SACK_DUP_THRESH
+        );
+        assert_eq!(
+            super::count_sack_duplicates(&sack(0..3), &advanced, 2, &stats),
             0
         );
     }

@@ -440,7 +440,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         return Err(Error::TimedOut);
                     }
                 }
-                if seg.send_count() >= self.socket_opts.num_resends {
+                if seg.counted_sends() >= self.socket_opts.num_resends {
                     self.socket.stats.max_retransmissions_reached.increment(1);
                     restrict(&self.socket, seg.payload_size());
                     return Err(Error::MaxRetransmissionsReached);
@@ -559,51 +559,47 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let mut in_recovery = false;
 
-        // If we are in recovery, retransmit as many unacked packets as we are allowed by the recovery algorithm.
+        // In recovery, resend what the SACKs show lost, as far as the
+        // recovery window and the pacer allow. Every hole a SACK reaches is
+        // a candidate, not only those before the point recovery began at:
+        // libtorrent resends from each SACK (utp_stream.cpp:1235-1355). A
+        // packet resent once waits for evidence of its own, SACKs of packets
+        // sent after the resend, before it counts lost again; libtorrent
+        // leaves that to the retransmission timer.
         if let Some(rec) = self.recovery.recovering_mut() {
             in_recovery = true;
-            let high_rxt = rec.high_rxt;
-            let recovery_point = rec.recovery_point();
             let sack_depth = self.user_tx_segments.sack_depth();
+            let last_sent_seq_nr = self.last_sent_seq_nr;
             let fast_resend_seq_nr = self.fast_resend_seq_nr;
             let mut it = self
                 .user_tx_segments
                 .iter_mut_for_sending(None)
                 .take(sack_depth + 1)
-                .skip_while(|seg| seg.seq_nr().is_at_or_before(high_rxt))
-                .take_while(|seg| seg.seq_nr().is_at_or_before(recovery_point))
-                .filter(|s| !s.is_delivered())
-                .filter(move |s| s.seq_nr().is_at_or_after(fast_resend_seq_nr));
+                .take_while(|seg| seg.seq_nr().is_at_or_before(last_sent_seq_nr))
+                .filter(|seg| seg.send_count() > 0);
 
             let mut cwnd = rec.cwnd();
             let mut sent = 0;
             let mss = self.segment_sizes.mss() as usize;
-            while rec.total_retransmitted_segments() == 0 || cwnd > mss {
+            let mut force_head = rec.total_retransmitted_segments() == 0;
+            while force_head || cwnd > mss {
                 let mut seg = match it.next() {
                     Some(seg) => seg,
                     None => break,
                 };
 
-                // we MUST transmit the first segment no matter what.
-                if rec.total_retransmitted_segments() > 0 {
-                    if !self.pacer.allows(seg.payload_size()) {
-                        paced = Some(seg.payload_size());
-                        break;
-                    }
+                // The first packet recovery resends is the oldest, lost or
+                // not, as the duplicates that began recovery point at it,
+                // unless it was resent already (libtorrent v2.0.15
+                // utp_stream.cpp:2814-2827).
+                let forced = std::mem::take(&mut force_head)
+                    && seg.seq_nr().is_at_or_after(fast_resend_seq_nr);
+                if !forced {
                     if !seg.is_lost() {
-                        event!(
-                            RECOVERY_TRACING_LOG_LEVEL,
-                            "skipping segment that is not lost"
-                        );
                         continue;
                     }
-
-                    if !seg.has_sacks_after_it() {
-                        event!(
-                            RECOVERY_TRACING_LOG_LEVEL,
-                            seq_nr = ?seg.seq_nr(),
-                            "stopping iteration. has no sacks after it"
-                        );
+                    if !self.pacer.allows(seg.payload_size()) {
+                        paced = Some(seg.payload_size());
                         break;
                     }
                 }
@@ -620,8 +616,23 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         is_expired = seg.is_expired(),
                         "RECOVERY: sent ST_DATA"
                     );
-                    rec.high_rxt = seg.seq_nr();
-                    self.fast_resend_seq_nr = seg.seq_nr() + 1;
+                    // Each loss may cut the window, once per window of
+                    // packets and cut timer (libtorrent v2.0.15
+                    // utp_stream.cpp:1346-1349, 2833 and 2116-2121).
+                    if !seg.is_mtu_probe() {
+                        self.congestion_controller.on_enter_recovery(
+                            self.this_poll.now,
+                            seg.seq_nr(),
+                            self.highest_sent_seq_nr + 1,
+                        );
+                    }
+                    seg.on_resent_as_lost();
+                    if seg.seq_nr().is_after(rec.high_rxt) {
+                        rec.high_rxt = seg.seq_nr();
+                    }
+                    if seg.seq_nr().is_at_or_after(self.fast_resend_seq_nr) {
+                        self.fast_resend_seq_nr = seg.seq_nr() + 1;
+                    }
                     rec.increment_total_transmitted_segments();
                     self.socket
                         .stats
