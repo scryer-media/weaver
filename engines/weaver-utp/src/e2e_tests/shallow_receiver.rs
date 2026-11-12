@@ -307,6 +307,18 @@ fn payload(bytes: usize) -> Vec<u8> {
 // behind `shallow`, and returns what the network counted. The send buffer
 // starts at a megabyte, so the window, not the buffer, bounds the flight.
 async fn transfer(bytes: usize, one_way: Duration, shallow: Option<Shallow>) -> Counters {
+    transfer_in_rounds(bytes, one_way, shallow, None).await
+}
+
+// [`transfer`], with the writer handing the stream `per_round` bytes at the
+// start of each round, as an upload rate limit grants a round's quota at
+// once and the peer writes it in one go.
+async fn transfer_in_rounds(
+    bytes: usize,
+    one_way: Duration,
+    shallow: Option<Shallow>,
+    rounds: Option<(usize, Duration)>,
+) -> Counters {
     let network = Network::new(one_way);
     let stop = CancellationToken::new();
     let socket = |transport| {
@@ -327,7 +339,17 @@ async fn transfer(bytes: usize, one_way: Duration, shallow: Option<Shallow>) -> 
 
     let send = async {
         let mut stream = sender.connect(address(2)).await.unwrap();
-        stream.write_all(&payload(bytes)).await.unwrap();
+        let data = payload(bytes);
+        match rounds {
+            None => stream.write_all(&data).await.unwrap(),
+            Some((per_round, round)) => {
+                let mut rounds = tokio::time::interval(round);
+                for lump in data.chunks(per_round) {
+                    rounds.tick().await;
+                    stream.write_all(lump).await.unwrap();
+                }
+            }
+        }
         stream.flush().await.unwrap();
         stream
     };
@@ -387,4 +409,30 @@ async fn a_short_path_never_sends_more_than_the_burst_at_once() {
             "{one_way:?}: {counters:?}"
         );
     }
+}
+
+// An upload capped at 5 MB/s, 1 ms away: each half-second round hands the
+// stream 2.5 MB at once after an idle gap, and still no instant sees more
+// than the burst leave and nothing is lost.
+#[tokio::test(start_paused = true)]
+async fn a_capped_upload_hands_over_lumps_that_leave_in_bursts_of_sixteen() {
+    let shallow = Shallow {
+        queue_packets: 48,
+        drain_every: Duration::from_millis(1),
+    };
+    let rounds = Some((2_500_000, Duration::from_millis(500)));
+    let counters = transfer_in_rounds(
+        8 * 1024 * 1024,
+        Duration::from_micros(500),
+        Some(shallow),
+        rounds,
+    )
+    .await;
+    eprintln!("capped: {counters:?}");
+    assert!(counters.data_sent > 5700, "{counters:?}");
+    assert!(
+        counters.peak_data_burst <= PACE_BURST_PACKETS + 1,
+        "{counters:?}"
+    );
+    assert_eq!(counters.dropped, 0, "{counters:?}");
 }
