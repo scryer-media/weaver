@@ -478,6 +478,21 @@ var rustStepReverses = map[string]rustStepReverse{
 	// Migration 87 fills the release_name column its own SQL step adds. The
 	// rewind drops that column, which undoes the fill with it.
 	"fill_history_release_names_v87": {Plan: func(schemaShape) []string { return nil }},
+	// Migration 88 fills the search_key column its own SQL step adds, and
+	// the rewind drops that column. On Postgres the step also makes a
+	// function and, where pg_trgm installs, an index: both go first, so the
+	// step makes them again when it is replayed.
+	"fill_history_search_keys_v88": {Plan: reverseHistorySearchV88},
+}
+
+func reverseHistorySearchV88(shape schemaShape) []string {
+	if shape.Datastore != weaverDatastorePostgres {
+		return nil
+	}
+	return []string{
+		`DROP INDEX IF EXISTS idx_job_history_search_key_trgm`,
+		`DROP FUNCTION IF EXISTS weaver_history_fuzzy`,
+	}
 }
 
 // reverseNzbMoveV85 undoes migration 85: each job's stored NZB goes back

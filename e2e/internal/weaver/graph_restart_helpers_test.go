@@ -334,6 +334,9 @@ var testRustSteps = map[string][]string{
 	"fill_history_release_names_v87": {
 		`UPDATE job_history SET release_name = name`,
 	},
+	"fill_history_search_keys_v88": {
+		`UPDATE job_history SET search_key = name`,
+	},
 }
 
 func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
