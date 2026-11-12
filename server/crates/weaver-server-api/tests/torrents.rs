@@ -1680,8 +1680,8 @@ async fn the_routes_and_trackers_say_who_resolves_their_names() {
     }
 }
 
-// A torrent its route holds says why as the route's reason code, not in
-// words, in the list and in its own view.
+// A torrent its route holds says why as the route's reason code, with the
+// cause behind it as its detail, in the list and in its own view.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_torrent_carries_its_routes_reason_code() {
     let offline = rig().await;
@@ -1697,7 +1697,7 @@ async fn a_held_torrent_carries_its_routes_reason_code() {
     let submitted = response.data.into_json().unwrap()["submitTorrent"].clone();
     let id = submitted["id"].as_u64().unwrap();
     let held = serde_json::json!({
-        "id": id, "state": "STALLED", "detail": null, "routeReason": "LEG_DOWN"
+        "id": id, "state": "STALLED", "detail": "offline", "routeReason": "LEG_DOWN"
     });
     assert_eq!(submitted, held);
     let response = offline
