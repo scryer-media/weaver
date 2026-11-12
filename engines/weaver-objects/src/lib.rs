@@ -86,9 +86,7 @@ pub fn restore(facts: &Facts, budget: Budget) -> Result<Box<dyn Object>, Restore
         facts: &Facts,
         budget: Budget,
     ) -> Result<Box<dyn Object>, RestoreError> {
-        Ok(Box::new(
-            facts.read::<stream::Stream<D>>(facts.kind)?.within(budget),
-        ))
+        Ok(Box::new(stream::restore::<D>(facts)?.within(budget)))
     }
     match facts.kind {
         Kind::Par2 => par2::facts::restore(facts),
