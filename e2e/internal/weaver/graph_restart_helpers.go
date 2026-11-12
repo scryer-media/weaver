@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -474,6 +475,9 @@ type rustStepReverse struct {
 // rustStepReverses is every Rust migration step a rewind can undo, by hook.
 var rustStepReverses = map[string]rustStepReverse{
 	"move_nzbs_and_outlines_v85": {Tables: []string{"active_jobs", "job_history"}, Plan: reverseNzbMoveV85},
+	// Migration 87 fills the release_name column its own SQL step adds. The
+	// rewind drops that column, which undoes the fill with it.
+	"fill_history_release_names_v87": {Plan: func(schemaShape) []string { return nil }},
 }
 
 // reverseNzbMoveV85 undoes migration 85: each job's stored NZB goes back
@@ -731,6 +735,7 @@ var (
 	sqlLineComment        = regexp.MustCompile(`--[^\n]*`)
 	sqlCreateTable        = regexp.MustCompile(`(?is)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\(`)
 	sqlCreateIndex        = regexp.MustCompile(`(?is)^CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\b`)
+	sqlDropIndex          = regexp.MustCompile(`(?is)^DROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?"?([A-Za-z_][A-Za-z0-9_]*)"?\s*$`)
 	sqlAddColumn          = regexp.MustCompile(`(?is)^ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\b`)
 )
 
@@ -811,7 +816,8 @@ type laterMigrations struct {
 
 // readLaterMigrations reads every step of each migration the manifest in dir
 // lists after the given version. A rewind can undo only a table created, a
-// column added, an index created, or a Rust step rustStepReverses names, so a
+// column added, an index created (and dropped again by a later one of these
+// migrations), or a Rust step rustStepReverses names, so a
 // later step of any other kind is an error naming it, never something the
 // rewind leaves in place.
 func readLaterMigrations(dir string, after int) (laterMigrations, error) {
@@ -855,6 +861,12 @@ func readLaterMigrations(dir string, after int) (laterMigrations, error) {
 				}
 				if index := sqlCreateIndex.FindStringSubmatch(statement); index != nil {
 					out.Indexes = appendNew(out.Indexes, index[1])
+					continue
+				}
+				// An index a later migration made and a still later one drops
+				// is gone either way once the rewind drops it. One made at or
+				// before the version rewound to would have to be made again.
+				if drop := sqlDropIndex.FindStringSubmatch(statement); drop != nil && slices.Contains(out.Indexes, drop[1]) {
 					continue
 				}
 				if add := sqlAddColumn.FindStringSubmatch(statement); add != nil {
