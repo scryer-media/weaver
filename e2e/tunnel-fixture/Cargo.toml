@@ -13,7 +13,7 @@ description = "SSH and WireGuard endpoints for the Weaver advanced-networking e2
 
 [dependencies]
 # Keep this rev identical to engines/weaver-tunnel/Cargo.toml.
-proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", rev = "5ad8d63d4d378019e3f67004e68b99bf6beb1ccc", features = ["test-support"] }
+proxy-tunnels = { git = "https://github.com/scryer-media/proxy-tunnels.git", rev = "cf43a74f2468168509a9ed018f9f819160a4fbe5", features = ["test-support"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 base64 = "0.22"
 serde = { version = "1.0", features = ["derive"] }

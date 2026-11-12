@@ -2295,7 +2295,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.4.2#5ad8d63d4d378019e3f67004e68b99bf6beb1ccc"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.0#cf43a74f2468168509a9ed018f9f819160a4fbe5"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2308,7 +2308,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.4.2#5ad8d63d4d378019e3f67004e68b99bf6beb1ccc"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.0#cf43a74f2468168509a9ed018f9f819160a4fbe5"
 dependencies = [
  "bytes",
  "futures",
@@ -3865,8 +3865,8 @@ dependencies = [
 
 [[package]]
 name = "proxy-tunnels"
-version = "0.4.2"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.4.2#5ad8d63d4d378019e3f67004e68b99bf6beb1ccc"
+version = "0.5.0"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.5.0#cf43a74f2468168509a9ed018f9f819160a4fbe5"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
