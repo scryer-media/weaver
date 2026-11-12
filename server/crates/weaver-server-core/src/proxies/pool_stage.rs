@@ -5,7 +5,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         Arc, Mutex, RwLock,
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -77,6 +77,12 @@ impl MemberRate {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+struct FailedOpens {
+    count: u32,
+    last: Option<Instant>,
+}
+
 struct Member {
     id: u32,
     dialer: Arc<dyn Dialer>,
@@ -92,8 +98,9 @@ struct Member {
     // member's session is never retired as idle.
     pinned: AtomicU64,
     // The sessions a holder could not open on the member in a row, for a
-    // hop of its path; none since one opened.
-    failed_opens: AtomicU32,
+    // hop of its path, and when the last of them failed; none since one
+    // opened.
+    failed_opens: Mutex<FailedOpens>,
     // The pool's signal that its members changed, raised when this member
     // becomes blocked.
     changed: Arc<Notify>,
@@ -121,14 +128,24 @@ impl Member {
             read: AtomicU64::new(0),
             rate: Mutex::new(MemberRate::default()),
             pinned: AtomicU64::new(0),
-            failed_opens: AtomicU32::new(0),
+            failed_opens: Mutex::new(FailedOpens::default()),
         })
     }
-    // Whether the member failed to open a session often enough in a row to
-    // be passed over: as often as the pool's plan takes to call a member
-    // suspect.
-    fn failing(&self) -> bool {
-        self.failed_opens.load(Ordering::Acquire) >= SUSPECT_AFTER_FAILURES
+    // How many sessions in a row failed to open on the member, while that
+    // is often enough to pass it over: as often as the pool's plan takes to
+    // call a member suspect, the last of them within the plan's replan
+    // interval. Past that interval the member is tried again, as a plan's
+    // interval race tries every candidate again: the next session placed on
+    // it opens, which ends the run, or fails, which passes it over for
+    // another interval.
+    fn failing(&self, now: Instant) -> Option<u32> {
+        let failed = *self.failed_opens.lock().expect("member opens");
+        (failed.count >= SUSPECT_AFTER_FAILURES
+            && failed.last.is_some_and(|at| {
+                now.saturating_duration_since(at)
+                    < weaver_nntp::plan_timing::timing().replan_interval
+            }))
+        .then_some(failed.count)
     }
     // Blocks the member for `error`, and wakes whoever waits on the pool's
     // members: a dial that waited for room on a member now fails at once
@@ -806,6 +823,12 @@ impl PoolStage {
         self.state.revision.fetch_add(1, Ordering::AcqRel);
         {
             let mut plan = self.state.plan.lock().expect("pool plan");
+            // A member dialled through another session now is a proxy the
+            // plan has not tried: what the one it replaces did says nothing
+            // about it.
+            for member in &recalled {
+                plan.forget(member.id);
+            }
             plan.set_candidates(order, Instant::now().into_std());
             plan.replan();
         }
@@ -935,9 +958,10 @@ impl PoolStage {
     }
     /// Why each member that carries nothing now does not, by id: it is
     /// blocked, or no session opened on it [`SUSPECT_AFTER_FAILURES`] times
-    /// in a row while another member is neither. A member is passed over for
-    /// failed opens only while there is another to go to: with none, each
-    /// stays up and its holders keep opening on it.
+    /// in a row, the last within the plan's replan interval, while another
+    /// member is neither. A member is passed over for failed opens only
+    /// while there is another to go to: with none, each stays up and its
+    /// holders keep opening on it.
     pub fn members_down(&self) -> HashMap<u32, String> {
         down_of(&self.state.members.read().expect("pool members"))
     }
@@ -954,21 +978,21 @@ impl PoolStage {
 // Why each of `members` that carries nothing does not, as
 // `PoolStage::members_down` says, in one pass.
 fn down_of(members: &HashMap<u32, Arc<Member>>) -> HashMap<u32, String> {
+    let now = Instant::now();
     let mut down = HashMap::new();
     let mut failing = Vec::new();
     let mut usable = false;
     for member in members.values() {
         if let Some(reason) = member.status.lock().expect("pool member").blocked.clone() {
             down.insert(member.id, reason);
-        } else if member.failing() {
-            failing.push(member);
+        } else if let Some(failed) = member.failing(now) {
+            failing.push((member, failed));
         } else {
             usable = true;
         }
     }
     if usable {
-        down.extend(failing.into_iter().map(|member| {
-            let failed = member.failed_opens.load(Ordering::Acquire);
+        down.extend(failing.into_iter().map(|(member, failed)| {
             let reason = match member.dialer.failing_hop() {
                 Some(hop) => format!(
                     "proxy {} opened no session {failed} times in a row: proxy {}: {}",
@@ -1066,11 +1090,15 @@ impl MemberPin {
         self.state.record(&self.member, |plan| {
             plan.setup(id, reached, Instant::now().into_std())
         });
-        if reached {
-            self.member.failed_opens.store(0, Ordering::Release);
+        let mut failed = self.member.failed_opens.lock().expect("member opens");
+        *failed = if reached {
+            FailedOpens::default()
         } else {
-            self.member.failed_opens.fetch_add(1, Ordering::AcqRel);
-        }
+            FailedOpens {
+                count: failed.count.saturating_add(1),
+                last: Some(Instant::now()),
+            }
+        };
     }
     /// Resolves once the pool's members may have changed since this was
     /// called, or at once when the member held is no longer the pool's.

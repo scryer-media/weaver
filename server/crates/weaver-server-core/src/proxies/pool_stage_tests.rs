@@ -92,30 +92,29 @@ impl Dialer for Fixture {
         format!("fixture {}", self.id)
     }
 }
+fn fixture(id: u32, opened: mpsc::UnboundedSender<u32>) -> Arc<Fixture> {
+    Arc::new(Fixture {
+        id,
+        opened,
+        gate: Semaphore::new(0),
+        prepared: AtomicU64::new(0),
+        retired: AtomicU64::new(0),
+        full: Default::default(),
+        pool: Default::default(),
+        asked_unlocked: AtomicU64::new(0),
+        fatal: Default::default(),
+        asked_full: Default::default(),
+        dials: AtomicU64::new(0),
+        frees_after_dial: Default::default(),
+    })
+}
 fn fixtures() -> (
     Arc<PoolStage>,
     Vec<Arc<Fixture>>,
     mpsc::UnboundedReceiver<u32>,
 ) {
     let (opened, recv) = mpsc::unbounded_channel();
-    let members: Vec<_> = (1..=2)
-        .map(|id| {
-            Arc::new(Fixture {
-                id,
-                opened: opened.clone(),
-                gate: Semaphore::new(0),
-                prepared: AtomicU64::new(0),
-                retired: AtomicU64::new(0),
-                full: Default::default(),
-                pool: Default::default(),
-                asked_unlocked: AtomicU64::new(0),
-                fatal: Default::default(),
-                asked_full: Default::default(),
-                dials: AtomicU64::new(0),
-                frees_after_dial: Default::default(),
-            })
-        })
-        .collect();
+    let members: Vec<_> = (1..=2).map(|id| fixture(id, opened.clone())).collect();
     let pool = PoolStage::new(
         3,
         members
@@ -792,4 +791,78 @@ async fn a_member_no_session_opens_on_is_passed_over_while_another_is_up() {
     assert_eq!(pool.members_down().keys().copied().collect::<Vec<_>>(), [1]);
     one.opened(true);
     assert!(pool.members_down().is_empty());
+}
+
+fn plan_state(pool: &PoolStage, id: u32) -> (u32, &'static str) {
+    pool.snapshot()
+        .0
+        .candidates
+        .into_iter()
+        .find(|candidate| candidate.candidate == id)
+        .map(|candidate| (candidate.failures, candidate.state))
+        .unwrap()
+}
+
+// A member passed over for failed opens is tried again once the plan's
+// replan interval has passed since its last failed open. That try failing
+// passes it over for another interval; one that opens ends the run, and the
+// plan no longer holds the member suspect.
+#[tokio::test(start_paused = true)]
+async fn a_member_passed_over_for_failed_opens_is_tried_again_after_the_replan_interval() {
+    let (pool, _members, _opened) = fixtures();
+    let one = pool.pin_member(1).unwrap();
+    let interval = weaver_nntp::plan_timing::timing().replan_interval;
+    one.opened(false);
+    one.opened(false);
+    assert_eq!(pool.members_down().keys().copied().collect::<Vec<_>>(), [1]);
+
+    tokio::time::advance(interval - Duration::from_millis(1)).await;
+    assert_eq!(pool.members_down().keys().copied().collect::<Vec<_>>(), [1]);
+    tokio::time::advance(Duration::from_millis(1)).await;
+    assert!(pool.members_down().is_empty(), "due to be tried again");
+    assert_eq!(plan_state(&pool, 1), (SUSPECT_AFTER_FAILURES, "SUSPECT"));
+
+    // The try fails: passed over for another interval from that failure.
+    one.opened(false);
+    assert_eq!(
+        pool.member_down(1).as_deref(),
+        Some("proxy 1 opened no session 3 times in a row")
+    );
+    tokio::time::advance(interval).await;
+    assert!(pool.members_down().is_empty());
+
+    // The next opens: no longer passed over, nor suspect to the plan.
+    one.opened(true);
+    assert!(pool.members_down().is_empty());
+    assert_eq!(plan_state(&pool, 1).0, 0);
+    assert_ne!(plan_state(&pool, 1).1, "SUSPECT");
+}
+
+// A member whose proxy an edit replaced is a proxy nothing has tried: the
+// plan forgets what the replaced one failed, and the member is not passed
+// over for it. A member the edit left alone keeps its evidence.
+#[tokio::test]
+async fn a_member_an_edit_replaced_starts_untried() {
+    let (pool, members, _opened) = fixtures();
+    let (opened, _replaced_opened) = mpsc::unbounded_channel();
+    let one = pool.pin_member(1).unwrap();
+    let two = pool.pin_member(2).unwrap();
+    one.opened(false);
+    one.opened(false);
+    two.opened(false);
+    assert_eq!(plan_state(&pool, 1), (SUSPECT_AFTER_FAILURES, "SUSPECT"));
+    assert!(pool.member_down(1).is_some());
+
+    let replacement = fixture(1, opened);
+    pool.set_members(vec![
+        (1, replacement as Arc<dyn Dialer>),
+        (2, members[1].clone() as Arc<dyn Dialer>),
+    ]);
+    assert_eq!(plan_state(&pool, 1), (0, "UNMEASURED"));
+    assert_eq!(pool.member_down(1), None);
+    assert_eq!(
+        plan_state(&pool, 2).0,
+        1,
+        "the member left alone keeps its evidence"
+    );
 }
