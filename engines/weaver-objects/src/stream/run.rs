@@ -31,15 +31,19 @@ pub(super) struct Run<D> {
     // The stream's front, which sizes the window again against the grant
     // the run is given, where that is wider.
     first: Vec<u8>,
+    // The volume's length as the stream knew it, which sizes the window
+    // with the front.
+    length: Option<u64>,
 }
 
 impl<D: Decoder> Run<D> {
-    pub(super) fn new(name: String, window: u64, first: Vec<u8>) -> Self {
+    pub(super) fn new(name: String, window: u64, first: Vec<u8>, length: Option<u64>) -> Self {
         Self {
             decoder: PhantomData,
             name,
             window,
             first,
+            length,
         }
     }
 }
@@ -67,7 +71,8 @@ impl<D: Decoder> Extraction for Run<D> {
         let window = if budget.window_reserved {
             budget.window_or(self.window).max(self.window)
         } else {
-            self.window.max(D::window(&self.first, &budget))
+            self.window
+                .max(D::window(&self.first, self.length, &budget))
         };
         // What the front declares the decoder needs, where the decoder's
         // own refusal does not say.
