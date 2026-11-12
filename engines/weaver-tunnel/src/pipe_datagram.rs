@@ -110,6 +110,15 @@ impl DatagramSocket for HeldSocket {
     async fn send_to(&self, data: &[u8], target: SocketAddr) -> std::io::Result<()> {
         self.socket.send_to(data, target).await
     }
+    // A batch goes to the socket beneath whole, so a socket that sends
+    // several datagrams for less than several single sends still does.
+    async fn send_batch_to(
+        &self,
+        datagrams: &[&[u8]],
+        target: SocketAddr,
+    ) -> std::io::Result<usize> {
+        self.socket.send_batch_to(datagrams, target).await
+    }
     async fn recv_from(&self, buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         self.socket.recv_from(buffer).await
     }
@@ -124,5 +133,78 @@ impl DatagramSocket for HeldSocket {
     }
     async fn closed(&self) {
         self.socket.closed().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    // A socket that records each call it is handed.
+    #[derive(Default)]
+    struct Recording {
+        singles: Mutex<Vec<Vec<u8>>>,
+        batches: Mutex<Vec<(Vec<Vec<u8>>, SocketAddr)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DatagramSocket for Recording {
+        async fn send_to(&self, data: &[u8], _target: SocketAddr) -> std::io::Result<()> {
+            self.singles.lock().unwrap().push(data.to_vec());
+            Ok(())
+        }
+        async fn send_batch_to(
+            &self,
+            datagrams: &[&[u8]],
+            target: SocketAddr,
+        ) -> std::io::Result<usize> {
+            let batch = datagrams.iter().map(|datagram| datagram.to_vec()).collect();
+            self.batches.lock().unwrap().push((batch, target));
+            Ok(datagrams.len())
+        }
+        async fn recv_from(&self, _buffer: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+            std::future::pending().await
+        }
+        fn local_addr(&self) -> Option<SocketAddr> {
+            None
+        }
+        fn link_mtu(&self) -> Option<u16> {
+            None
+        }
+        fn is_closed(&self) -> bool {
+            false
+        }
+        async fn closed(&self) {
+            std::future::pending().await
+        }
+    }
+
+    // A batch sent through a held socket reaches the socket beneath as one
+    // batch, in order, to the same target, and not as single sends.
+    #[tokio::test]
+    async fn a_held_socket_hands_a_batch_down_whole() {
+        let inner = Arc::new(Recording::default());
+        let held = HeldSocket {
+            socket: inner.clone(),
+            _activity: Arc::new(tokio::sync::RwLock::new(())).read_owned().await,
+            _capacity: None,
+            _share: None,
+        };
+        let target: SocketAddr = "10.0.0.2:51820".parse().unwrap();
+        let datagrams: [&[u8]; 3] = [b"one", b"two", b"three"];
+
+        assert_eq!(held.send_batch_to(&datagrams, target).await.unwrap(), 3);
+
+        let batches = inner.batches.lock().unwrap();
+        assert_eq!(
+            *batches,
+            [(
+                vec![b"one".to_vec(), b"two".to_vec(), b"three".to_vec()],
+                target
+            )]
+        );
+        assert!(inner.singles.lock().unwrap().is_empty());
     }
 }

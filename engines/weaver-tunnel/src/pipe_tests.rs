@@ -2222,6 +2222,40 @@ async fn a_wireguard_listener_listens_again_inside_a_replaced_tunnel() {
     assert_eq!(&heard, b"again");
 }
 
+// A listener the tunnel has no sockets left for is refused as full, not
+// broken: the hop is not marked failing, and the tunnel stays up with the
+// listener that filled it.
+#[tokio::test]
+async fn a_listener_a_full_tunnel_cannot_hold_leaves_the_hop_working() {
+    use crate::test_support::WireGuardTestPeer;
+    let near = WireGuardTestPeer::start().await;
+    let provider = Arc::new(
+        crate::WireGuardTunnelProvider::new(
+            crate::WireGuardSpec {
+                // One listener's backlog fills the smallest tunnel.
+                max_sockets: crate::wireguard::MIN_MAX_SOCKETS,
+                ..near.client_spec("1")
+            },
+            Arc::new(crate::NoopTunnelObserver),
+        )
+        .with_udp_factory(bottom()),
+    );
+    let session = wireguard_session(1, provider.clone(), provider, bottom(), vec![], 2);
+    let inbound = Arc::clone(&session).inbound().unwrap();
+    let first = inbound.listen(0, true).await.unwrap();
+    let port = first.local_addr().port();
+
+    let Err(refused) = inbound.listen(0, false).await else {
+        panic!("a full tunnel takes no second listener");
+    };
+    assert!(
+        matches!(refused, TunnelError::AtCapacity { .. }),
+        "{refused:?}"
+    );
+    assert!(session.failure.of(1).is_none(), "the hop is not failing");
+    assert!(session.resolver.as_ref().unwrap().listens_on(port).await);
+}
+
 // Only a WireGuard hop at the top of a path takes connections: a chain ends
 // in one or it listens nowhere, and an SSH session or a SOCKS or HTTP hop
 // takes none, whatever runs beneath it.
