@@ -388,9 +388,10 @@ impl Database {
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT nzb_path, nzb_zstd
-                   FROM job_history
-                  WHERE job_id = {}
+                "SELECT h.nzb_path, n.nzb_zstd
+                   FROM job_history AS h
+                   LEFT JOIN job_nzbs AS n ON n.job_id = h.job_id
+                  WHERE h.job_id = {}
                   LIMIT 1",
                 &[SqlArg::I64(job_id as i64)],
             )

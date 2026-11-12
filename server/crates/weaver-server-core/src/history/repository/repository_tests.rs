@@ -69,8 +69,8 @@ fn upsert_preserves_persisted_nzb_bytes_when_update_omits_them() {
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
             datastore.write_exec(),
-            "UPDATE job_history SET nzb_zstd = {} WHERE job_id = {}",
-            &[SqlArg::Bytes(expected_for_update), SqlArg::I64(1)],
+            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES ({}, {})",
+            &[SqlArg::I64(1), SqlArg::Bytes(expected_for_update)],
         )
         .await?;
         Ok(())

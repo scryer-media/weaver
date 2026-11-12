@@ -262,12 +262,13 @@ impl Database {
         let sql = match source {
             DiagnosticNzbSource::Active => format!(
                 "SELECT a.job_id, a.nzb_path, n.nzb_zstd FROM active_jobs AS a
-                   LEFT JOIN active_job_nzbs AS n ON n.job_id = a.job_id
+                   LEFT JOIN job_nzbs AS n ON n.job_id = a.job_id
                   WHERE a.job_id > {{}} ORDER BY a.job_id LIMIT {DIAGNOSTIC_NZB_PAGE}"
             ),
             DiagnosticNzbSource::History => format!(
-                "SELECT job_id, nzb_path, nzb_zstd FROM job_history
-                  WHERE job_id > {{}} AND {} ORDER BY job_id LIMIT {DIAGNOSTIC_NZB_PAGE}",
+                "SELECT h.job_id, h.nzb_path, n.nzb_zstd FROM job_history AS h
+                   LEFT JOIN job_nzbs AS n ON n.job_id = h.job_id
+                  WHERE h.job_id > {{}} AND h.{} ORDER BY h.job_id LIMIT {DIAGNOSTIC_NZB_PAGE}",
                 recent_history()
             ),
         };
