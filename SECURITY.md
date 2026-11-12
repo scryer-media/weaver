@@ -43,7 +43,10 @@ Torrent files, magnets, trackers, peers, DHT nodes and web seeds are attacker in
   - Internationalised host names are refused where libtorrent refuses them.
   - TLS certificates are always verified.
   - A cookie is sent only to the origin it was saved for and does not follow a redirect to another origin.
-- **Credentials stay with their scope.** Passkeys and other tracker, web seed, RSS and proxy URL secrets are shown only to an Admin key. Read and Control keys, the compatibility facades, events, metrics, logs and error text get the redacted form. A request error is stored with its URL stripped.
+- **Credentials stay with their scope.**
+  - A tracker URL with its passkey, and an exported `.torrent` that carries one, are shown to an Admin or a Control key, as qBittorrent shows them to any signed-in user. A Read key gets the redacted form, on the API and on the compatibility facades.
+  - Web seed, RSS and proxy URL secrets are shown only to an Admin key. Read and Control keys get the redacted form.
+  - Events, metrics, logs, diagnostics bundles and error text get the redacted form whatever the key. A request error is stored with its URL stripped.
 - **Private torrents** use their trackers only: no DHT, no peer exchange, no local discovery.
 - **The API costs what it returns.** `/graphql` checks the credential before reading a body. A socket holds at most 32 live subscriptions; a credential holds at most 8 sockets. State-changing facade calls are POST only. A poll or subscription never rebuilds every torrent per tick.
 - **Listeners are accounted.** Every listening socket is taken through the route's ledger and released when its session ends.
