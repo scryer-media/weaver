@@ -431,9 +431,10 @@ impl Caps {
     }
 
     // A namespace announced a member, or bytes of one reached it: the
-    // member is charged again as it stands. Every member an object's
-    // namespace holds is an entry, and what the namespace keeps of it is
-    // resident; the posts are neither.
+    // member is charged again as it stands. Every record an object's
+    // namespace holds is an entry, a further posting folded into another
+    // member among them, and what the namespace keeps of it is resident;
+    // the posts are neither.
     pub(crate) fn admit_member(
         &mut self,
         tree: &Tree,
@@ -472,7 +473,7 @@ impl Caps {
             return;
         };
         let account = self.accounts.entry(node).or_default();
-        let members = namespace.len() as u64;
+        let members = namespace.records_len() as u64;
         self.entries = self.entries + members - account.members;
         account.members = members;
         let resident = namespace.resident(member);
