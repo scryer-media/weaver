@@ -19,17 +19,22 @@ use super::records::{self, Central, END64_LEN, LOCAL_LEN, LOCATOR_LEN, Shape, TA
 use super::{Zip, refusal};
 use crate::grid::crc32;
 use crate::kept::Kept;
-use crate::zip_engine::{MAX_DIRECTORY_BYTES, MAX_DIRECTORY_ENTRIES};
 
 impl Zip {
     // Keep a range the directory read needs, and bid for it unless the walk
-    // already stands at the directory; its bytes once they are all in.
-    fn need(&mut self, range: ByteRange) -> Option<Vec<u8>> {
+    // already stands at the directory.
+    fn bid(&mut self, range: ByteRange) {
         if !self.directory.contains(&range) {
             self.directory.push(range);
         }
         let reached = self.walking && self.map.as_ref().is_some_and(|map| map.end.is_some());
         self.want(range, !reached);
+    }
+
+    // A range the directory read needs, bid for; its bytes once they are
+    // all in.
+    fn need(&mut self, range: ByteRange) -> Option<Vec<u8>> {
+        self.bid(range);
         self.kept.read(range).map(<[u8]>::to_vec)
     }
 
@@ -88,9 +93,6 @@ impl Zip {
             after = start;
             read.extend([range, record]);
         }
-        if end.size > MAX_DIRECTORY_BYTES || end.entries > MAX_DIRECTORY_ENTRIES {
-            return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
-        }
         // A directory the volumes bound cannot hold is not one this store
         // reads: prepended bytes, or a set whose last volume is misplaced.
         let start = self
@@ -104,14 +106,21 @@ impl Zip {
         let Some(start) = start else {
             return self.give_up(Emit::NeedsEngine(Why::Unsupported), out);
         };
+        // The directory is held as its bytes arrive, and its entries are
+        // read from where it is held, once all of it is in.
         let range = ByteRange::at(start, end.size);
-        let Some(bytes) = self.need(range) else {
-            return;
-        };
+        self.bid(range);
         if self.walk_short() {
             return;
         }
-        let Some(centrals) = records::directory(&bytes, end.entries) else {
+        let Some(centrals) = self
+            .kept
+            .read(range)
+            .map(|bytes| records::directory(bytes, end.entries))
+        else {
+            return;
+        };
+        let Some(centrals) = centrals else {
             return self.say_damaged(range, out);
         };
         read.push(range);
