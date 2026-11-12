@@ -16,6 +16,7 @@ mod error;
 mod ingress;
 mod message;
 pub mod mtu;
+mod pacer;
 pub mod raw;
 mod recovery;
 mod rtte;

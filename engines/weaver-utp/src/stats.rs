@@ -30,6 +30,10 @@ pub struct UtpStats {
     pub redundant_packets: AtomicU64,
     pub syn_flood_dropped: AtomicU64,
     pub syn_rst: AtomicU64,
+    /// ST_RESETs sent for packets that name no stream this socket holds.
+    pub unknown_stream_resets: AtomicU64,
+    /// ST_RESETs left unsent because the socket's reset budget was spent.
+    pub resets_rate_limited: AtomicU64,
     /// Largest per-stream congestion window observed on this socket, in bytes.
     pub max_congestion_window_bytes: AtomicU64,
     pub live_virtual_sockets: AtomicU64,

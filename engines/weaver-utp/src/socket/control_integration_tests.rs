@@ -229,6 +229,7 @@ async fn exhausted_parity_search_returns_then_reuses_a_released_key() {
             RegisteredStream {
                 tx: tx.clone(),
                 retired: Arc::clone(&flag),
+                send_id: crate::seq_nr::SeqNr(id) + 1,
             },
         );
     }
@@ -294,6 +295,7 @@ async fn an_old_retirement_cannot_remove_a_live_replacement_at_the_same_key() {
         RegisteredStream {
             tx: old_tx,
             retired: old_flag,
+            send_id: crate::seq_nr::SeqNr(9),
         },
     );
     dispatcher.streams.remove(&(ADDR_2, 8));
@@ -304,6 +306,7 @@ async fn an_old_retirement_cannot_remove_a_live_replacement_at_the_same_key() {
         RegisteredStream {
             tx: new_tx,
             retired: new_flag,
+            send_id: crate::seq_nr::SeqNr(9),
         },
     );
     drop(old_guard);
@@ -638,7 +641,12 @@ async fn an_early_ack_waits_for_syn_acceptance_and_cancellation_drops_the_send()
 #[tokio::test(start_paused = true)]
 async fn bounded_rst_outbox_counts_active_sends_and_keeps_the_first_reservations() {
     let (socket, mut dispatcher) = bare();
-    for id in 0..96 {
+    for id in 0..96u16 {
+        // A fresh reset budget for each sixteen, so the outbox bound is
+        // what stops them.
+        if id % 16 == 0 {
+            tokio::time::advance(super::RESET_INTERVAL).await;
+        }
         dispatcher
             .on_syn(
                 ADDR_2,
@@ -843,5 +851,174 @@ async fn canceling_an_early_ack_attempt_retires_its_send_without_stopping_the_so
         &[],
     );
     let _stream = replacement.await.unwrap();
+    socket.shutdown().await.unwrap();
+}
+
+// Sends every queued control packet and returns the resets that went out.
+async fn sent_resets(
+    dispatcher: &mut Dispatcher<RememberingTransport, DefaultUtpEnvironment>,
+) -> Vec<UtpHeader> {
+    let transport = dispatcher.transport.as_ref().unwrap().clone();
+    while !dispatcher.control_sends.is_empty() {
+        let ready = poll_fn(|cx| {
+            poll_control_sends(
+                &mut dispatcher.connecting,
+                &mut dispatcher.control_sends,
+                cx,
+            )
+        })
+        .await;
+        dispatcher.finish_send(ready).unwrap();
+    }
+    transport
+        .take_sent()
+        .into_iter()
+        .map(|(target, packet)| {
+            assert_eq!(target, ADDR_2);
+            UtpHeader::deserialize(&packet).unwrap().0
+        })
+        .inspect(|header| assert_eq!(header.htype, Type::Reset))
+        .collect()
+}
+
+fn packet(htype: Type, connection_id: u16, seq_nr: u16) -> UtpMessage {
+    UtpMessage::new_test(
+        UtpHeader {
+            htype,
+            connection_id: connection_id.into(),
+            seq_nr: seq_nr.into(),
+            ack_nr: 3.into(),
+            ..Default::default()
+        },
+        if htype == Type::Data { b"x" } else { &[] },
+    )
+}
+
+// A data packet for a connection the socket never had is taken as one the
+// remote opened: the reset carries the id one below and acknowledges the
+// packet.
+#[tokio::test(start_paused = true)]
+async fn a_packet_for_an_unknown_stream_gets_one_reset() {
+    let (socket, mut dispatcher) = bare();
+    dispatcher
+        .on_recv(ADDR_2, packet(Type::Data, 500, 7))
+        .await
+        .unwrap();
+    let resets = sent_resets(&mut dispatcher).await;
+    assert_eq!(resets.len(), 1);
+    assert_eq!(resets[0].connection_id, 499.into());
+    assert_eq!(resets[0].ack_nr, 7.into());
+    assert_eq!(
+        socket.stats().unknown_stream_resets.load(Ordering::Relaxed),
+        1
+    );
+    drop(dispatcher);
+    socket.shutdown().await.unwrap();
+}
+
+// A stream that ended is answered with the id the remote knows it by; a
+// state packet takes no sequence number, so the one before it is acked.
+#[tokio::test(start_paused = true)]
+async fn a_packet_for_an_ended_stream_is_reset_with_its_send_id() {
+    let (socket, mut dispatcher) = bare();
+    let (flag, guard) = socket.state.retirements.registration();
+    let (tx, _rx) = crate::ingress::channel(NonZeroUsize::new(1).unwrap());
+    dispatcher.streams.insert(
+        (ADDR_2, 500),
+        RegisteredStream {
+            tx,
+            retired: flag,
+            send_id: SeqNr(501),
+        },
+    );
+    drop(guard);
+    dispatcher.reap_retired();
+    assert!(dispatcher.streams.is_empty());
+    for htype in [Type::State, Type::Fin] {
+        dispatcher
+            .on_recv(ADDR_2, packet(htype, 500, 9))
+            .await
+            .unwrap();
+    }
+    let resets = sent_resets(&mut dispatcher).await;
+    let answers: Vec<_> = resets
+        .iter()
+        .map(|reset| (reset.connection_id, reset.ack_nr))
+        .collect();
+    assert_eq!(
+        answers,
+        vec![(501.into(), 8.into()), (501.into(), 9.into())]
+    );
+    drop(dispatcher);
+    socket.shutdown().await.unwrap();
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_reset_for_an_unknown_stream_gets_no_reply() {
+    let (socket, mut dispatcher) = bare();
+    dispatcher
+        .on_recv(ADDR_2, packet(Type::Reset, 500, 7))
+        .await
+        .unwrap();
+    assert!(sent_resets(&mut dispatcher).await.is_empty());
+    assert_eq!(
+        socket.stats().unknown_stream_resets.load(Ordering::Relaxed),
+        0
+    );
+    drop(dispatcher);
+    socket.shutdown().await.unwrap();
+}
+
+// A reset that would name a live stream's remote id is not sent.
+#[tokio::test(start_paused = true)]
+async fn an_unknown_packet_never_resets_a_live_stream() {
+    let (socket, mut dispatcher) = bare();
+    let (tx, _rx) = crate::ingress::channel(NonZeroUsize::new(1).unwrap());
+    dispatcher.register_stream((ADDR_2, 498), tx);
+    assert_eq!(dispatcher.streams[&(ADDR_2, 498)].send_id, SeqNr(497));
+    dispatcher.streams.get_mut(&(ADDR_2, 498)).unwrap().send_id = SeqNr(499);
+    dispatcher
+        .on_recv(ADDR_2, packet(Type::Data, 500, 7))
+        .await
+        .unwrap();
+    assert!(sent_resets(&mut dispatcher).await.is_empty());
+    drop(dispatcher);
+    socket.shutdown().await.unwrap();
+}
+
+// However many unknown packets or overflowing SYNs arrive, one interval
+// sends no more resets than the budget, and the next interval sends again.
+#[tokio::test(start_paused = true)]
+async fn a_flood_gets_no_more_resets_than_the_budget() {
+    let (socket, mut dispatcher) = bare();
+    for id in 0..1000u16 {
+        dispatcher
+            .on_recv(ADDR_2, packet(Type::Data, id.wrapping_mul(3), 7))
+            .await
+            .unwrap();
+        // Overflowing SYNs share the budget.
+        dispatcher
+            .on_syn(ADDR_2, packet(Type::Syn, 10_000 + id, 1))
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        sent_resets(&mut dispatcher).await.len(),
+        RESETS_PER_INTERVAL
+    );
+    let stats = socket.stats();
+    assert_eq!(
+        stats.unknown_stream_resets.load(Ordering::Relaxed),
+        RESETS_PER_INTERVAL as u64
+    );
+    assert!(stats.resets_rate_limited.load(Ordering::Relaxed) > 1000);
+
+    tokio::time::advance(RESET_INTERVAL).await;
+    dispatcher
+        .on_recv(ADDR_2, packet(Type::Data, 40_000, 7))
+        .await
+        .unwrap();
+    assert_eq!(sent_resets(&mut dispatcher).await.len(), 1);
+    drop(dispatcher);
     socket.shutdown().await.unwrap();
 }

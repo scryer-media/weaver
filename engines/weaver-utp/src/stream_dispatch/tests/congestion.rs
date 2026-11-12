@@ -202,9 +202,17 @@ async fn ledbat_grows_under_target_and_backs_off_over_it() {
     // Every round acks all that is in flight, the peer reporting our delay
     // as `gap_us`; its first report is the base.
     let mut last = t.take_sent().last().unwrap().header.seq_nr;
-    // Each round trip takes 250 ms, so a delay of 200 ms stands under it.
+    // Each round trip takes a second, the round trip the stream starts
+    // with, so a delay of 200 ms stands under it.
+    // The pacer spreads each window across the round trip.
     let mut round = async |t: &mut super::TestVsock, gap_us: u32| {
-        t.env.increment_now(Duration::from_millis(250));
+        for _ in 0..100 {
+            t.env.increment_now(Duration::from_millis(10));
+            t.poll_once_assert_pending().await;
+        }
+        if let Some(sent) = t.take_sent().last() {
+            last = sent.header.seq_nr;
+        }
         t.send_msg(
             UtpHeader {
                 htype: State,
@@ -218,9 +226,6 @@ async fn ledbat_grows_under_target_and_backs_off_over_it() {
             "",
         );
         t.poll_once_assert_pending().await;
-        if let Some(sent) = t.take_sent().last() {
-            last = sent.header.seq_nr;
-        }
         t.vsock.congestion_controller.window()
     };
 

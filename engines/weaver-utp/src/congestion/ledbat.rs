@@ -149,7 +149,11 @@ impl Ledbat {
         } else {
             stats.delay_samples_below_target.increment(1);
         }
-        let acked = sample.acked_bytes as i64;
+        // An ACK acknowledges no more than was in flight when it came, so
+        // one stretched across a rewound or partly SACKed flight does not
+        // count as more than a round trip of growth.
+        let acked = sample.acked_bytes.min(sample.in_flight_before) as i64;
+        let before = self.cwnd;
 
         let saturated = (sample.in_flight_after + sample.acked_bytes + sample.segment.max(self.mss))
             as i64
@@ -177,7 +181,11 @@ impl Ledbat {
             linear
         };
 
-        self.cwnd = self.cwnd.saturating_add(gain);
+        // The window grows to no more than what was in flight plus the
+        // larger of what this ACK acknowledged and one segment.
+        let ceiling =
+            ((sample.in_flight_before as i64).saturating_add(acked.max(self.mss as i64))) << FRAC;
+        self.cwnd = self.cwnd.saturating_add(gain).min(before.max(ceiling));
         self.floor();
     }
 
@@ -421,6 +429,48 @@ mod tests {
         let before = l.window();
         l.on_enter_recovery(now + Duration::from_secs(1), 18.into(), 30.into());
         assert_eq!(l.window(), before);
+    }
+
+    // After a timeout only the resent segment is in flight. One ACK that
+    // also covers fifty segments sent before the timeout grows the window
+    // to two segments, not back to fifty-one; each round trip after that
+    // doubles it.
+    #[test]
+    fn a_window_after_a_timeout_ramps_instead_of_snapping_back() {
+        let mut l = grown();
+        l.on_retransmission_timeout(Instant::now(), 20.into());
+        assert_eq!(l.window(), MSS);
+        let stretched = DelaySample {
+            delay: Duration::from_millis(10),
+            acked_bytes: 50 * MSS,
+            in_flight_before: MSS,
+            in_flight_after: 0,
+            segment: MSS,
+        };
+        l.on_delay_sample(stretched, &UtpStats::default());
+        assert_eq!(l.window(), 2 * MSS);
+        for round in 2..6 {
+            let w = l.window();
+            l.on_delay_sample(sample(10, w, w), &UtpStats::default());
+            assert_eq!(l.window(), (1 << round) * MSS);
+        }
+    }
+
+    // One ACK never grows the window past what was in flight plus what it
+    // acknowledged.
+    #[test]
+    fn one_ack_grows_the_window_by_no_more_than_it_acknowledged() {
+        let mut l = grown();
+        let before = l.window();
+        let wide = DelaySample {
+            delay: Duration::from_millis(10),
+            acked_bytes: 4 * before,
+            in_flight_before: before,
+            in_flight_after: 0,
+            segment: MSS,
+        };
+        l.on_delay_sample(wide, &UtpStats::default());
+        assert_eq!(l.window(), 2 * before);
     }
 
     #[test]

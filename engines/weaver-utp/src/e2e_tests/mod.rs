@@ -7,6 +7,7 @@
 // connect, an accept and a counter echoed both ways, clean and with loss.
 
 mod bottleneck;
+mod shallow_receiver;
 mod small_window;
 
 use std::{
