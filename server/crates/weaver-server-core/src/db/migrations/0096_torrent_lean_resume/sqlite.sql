@@ -1,11 +1,16 @@
 -- A torrent keeps only what its next start needs. The ledger drops the
--- verified bytes (a run's wasted bytes are the session's own), the upload
--- total of the last announce (never written) and the time it was written
--- (the service keeps that in memory). The torrent row drops whether it is
--- private (its metainfo says so).
+-- verified bytes, the upload total of the last announce (never written) and
+-- the time it was written (the service keeps that in memory). The torrent
+-- row drops whether it is private (its metainfo says so).
 ALTER TABLE torrent_counters DROP COLUMN checked_bytes;
 ALTER TABLE torrent_counters DROP COLUMN last_announce_uploaded_bytes;
 ALTER TABLE torrent_counters DROP COLUMN updated_at_ms;
+
+-- The bytes a torrent fetched and threw away, kept across restarts: those of
+-- pieces that failed their check, and those of blocks that arrived when
+-- already in hand.
+ALTER TABLE torrent_counters ADD COLUMN failed_bytes INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE torrent_counters ADD COLUMN redundant_bytes INTEGER NOT NULL DEFAULT 0;
 
 -- The peers and bans a torrent starts from move to its ledger row, which is
 -- written as it runs, off the row that holds its metainfo. Every torrent has

@@ -512,8 +512,8 @@ impl TorrentJobSection {
             downloaded_bytes: held.counters.downloaded_bytes,
             uploaded_bytes: held.counters.uploaded_bytes,
             wasted_bytes: view.wasted_bytes,
-            hash_failed_bytes: held.failed_bytes,
-            redundant_bytes: held.redundant_bytes,
+            hash_failed_bytes: held.counters.failed_bytes,
+            redundant_bytes: held.counters.redundant_bytes,
             active_secs: view.active_seconds,
             seeding_secs: held.counters.finished_duration_s,
             consecutive_seeding_secs: held.counters.consecutive_seeding_s,
@@ -525,7 +525,11 @@ impl TorrentJobSection {
             piece_bytes: pieces.size,
             wanted_bytes: held.wanted_bytes,
             wanted_have_bytes: held.wanted_have_bytes,
-            hash_failures: held.failed_bytes.checked_div(pieces.size).unwrap_or(0),
+            hash_failures: held
+                .counters
+                .failed_bytes
+                .checked_div(pieces.size)
+                .unwrap_or(0),
         });
         section.peers = Some(PeerCounts::of(held.peers, held.peer_kinds));
         section.trackers = view

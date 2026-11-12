@@ -39,7 +39,7 @@ fn resume_update(
         sets.push(
             "uploaded_bytes = {}, downloaded_bytes = {}, active_duration_s = {}, \
              last_seen_complete_ms = {}, finished_duration_s = {}, last_activity_ms = {}, \
-             consecutive_seeding_s = {}",
+             consecutive_seeding_s = {}, failed_bytes = {}, redundant_bytes = {}",
         );
         args.extend([
             SqlArg::I64(stored(counters.uploaded_bytes)?),
@@ -49,6 +49,8 @@ fn resume_update(
             SqlArg::I64(stored(counters.finished_duration_s)?),
             SqlArg::OptI64(counters.last_activity_ms),
             SqlArg::I64(stored(counters.consecutive_seeding_s)?),
+            SqlArg::I64(stored(counters.failed_bytes)?),
+            SqlArg::I64(stored(counters.redundant_bytes)?),
         ]);
     }
     if let Some(peers) = peers {
@@ -978,7 +980,8 @@ impl Database {
                 datastore.read_exec(),
                 "SELECT job_id, uploaded_bytes, downloaded_bytes, active_duration_s,
                         last_seen_complete_ms, finished_duration_s, last_activity_ms,
-                        consecutive_seeding_s, pieces, pieces_checking, peers, banned_peers
+                        consecutive_seeding_s, failed_bytes, redundant_bytes, pieces,
+                        pieces_checking, peers, banned_peers
                    FROM torrent_counters",
                 &[],
             )
