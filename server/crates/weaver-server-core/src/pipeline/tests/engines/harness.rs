@@ -216,6 +216,16 @@ pub(in crate::pipeline::tests) fn par3_set(
     files: &[(&str, &[u8])],
     blocks: u64,
 ) -> Vec<Post> {
+    par3_set_sized(base, files, ARTICLE as u64, blocks)
+}
+
+// The same, in blocks of `size` bytes.
+pub(in crate::pipeline::tests) fn par3_set_sized(
+    base: &str,
+    files: &[(&str, &[u8])],
+    size: u64,
+    blocks: u64,
+) -> Vec<Post> {
     let source = tempfile::tempdir().unwrap();
     let names: Vec<std::path::PathBuf> = files
         .iter()
@@ -229,7 +239,7 @@ pub(in crate::pipeline::tests) fn par3_set(
         &par3_rs::InputSpec::new(source.path(), &names),
         &out.path().join(base),
         &par3_rs::CreateOptions::default()
-            .with_block_size(ARTICLE as u64)
+            .with_block_size(size)
             .with_recovery(par3_rs::RecoveryAmount::Blocks(blocks)),
     )
     .unwrap();

@@ -108,9 +108,13 @@ impl NamespaceWriter {
         tree.live()
             .into_iter()
             .flat_map(|namespace| {
-                tree.recovery_nodes(namespace)
-                    .into_iter()
-                    .map(move |set| (namespace, set))
+                let sets = tree.recovery_nodes(namespace);
+                let standing: Vec<NodeId> = sets
+                    .iter()
+                    .copied()
+                    .filter(|set| !yields(tree, &sets, *set))
+                    .collect();
+                standing.into_iter().map(move |set| (namespace, set))
             })
             .collect()
     }
@@ -126,7 +130,7 @@ impl NamespaceWriter {
     ) -> impl Iterator<Item = NodeId> + 't {
         sets.iter()
             .copied()
-            .filter(move |set| self.covers(tree, *set, member))
+            .filter(move |set| self.covers(tree, *set, member) && !yields(tree, sets, *set))
     }
 
     // Whether the set covers the member: the one place a member is matched
@@ -149,14 +153,16 @@ impl NamespaceWriter {
     // is out has its ruling still to come, and so has one whose own volume
     // still has an article coming.
     pub(crate) fn ruled(&self, tree: &Tree, node: NodeId, coming: &Coming) -> bool {
-        tree.recovery_nodes(node).into_iter().all(|set| {
-            !tree.lent(set)
-                && !coming.sets.contains(&set)
-                && tree.recovery(set).is_none_or(|recovery| {
-                    recovery
-                        .outcome()
-                        .is_some_and(|outcome| outcome != RepairOutcome::Waiting)
-                })
+        let sets = tree.recovery_nodes(node);
+        sets.iter().copied().all(|set| {
+            yields(tree, &sets, set)
+                || (!tree.lent(set)
+                    && !coming.sets.contains(&set)
+                    && tree.recovery(set).is_none_or(|recovery| {
+                        recovery
+                            .outcome()
+                            .is_some_and(|outcome| outcome != RepairOutcome::Waiting)
+                    }))
         })
     }
 
@@ -472,6 +478,9 @@ impl NamespaceWriter {
                 else {
                     return false;
                 };
+                if yields(tree, &sets, set) {
+                    return false;
+                }
                 if !known
                     || !namespace.members().all(|member| {
                         !recovery.covers(member.id)
@@ -714,6 +723,7 @@ impl NamespaceWriter {
         self.acknowledging = Some(Acknowledging {
             set,
             closed: BTreeSet::new(),
+            rereading: false,
         });
         let applied = (|| {
             let mut rejected = tree.rejected_inputs(node, repaired.members());
@@ -929,10 +939,22 @@ impl NamespaceWriter {
                     bytes: Bytes::from(bytes).into(),
                     provenance,
                 };
-                self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out)?;
+                let rereading = self.rereading(true);
+                let delivered =
+                    self.arrive(tree, builder, segments, Write::new(&arrival), arrival, out);
+                self.rereading(rereading);
+                delivered?;
             }
         }
         Ok(())
+    }
+
+    // Mark the bytes being delivered as ones the namespace held already, or
+    // not; returns what was marked before.
+    fn rereading(&mut self, rereading: bool) -> bool {
+        self.acknowledging
+            .as_mut()
+            .is_some_and(|batch| std::mem::replace(&mut batch.rereading, rereading))
     }
 
     // The evidence the grid folds: the segment checksums of the range, to
@@ -1018,11 +1040,15 @@ impl NamespaceWriter {
                 true
             });
         }
+        // Bytes said again keep every ruling over them: they are the bytes
+        // each set read, cut wherever the read back cut them, which a set's
+        // fold cannot tell from a change. Only bytes the namespace did not
+        // hold, a repair's among them, take a ruling back.
         for set in covering {
             if self
                 .acknowledging
                 .as_ref()
-                .is_some_and(|batch| batch.set == set)
+                .is_some_and(|batch| batch.set == set || batch.rereading)
             {
                 tree.feed_proven(set, member, &self.segments);
             } else {
@@ -1287,6 +1313,7 @@ fn pending_covers(
     sets: &[NodeId],
 ) -> Vec<(NodeId, BTreeSet<MemberId>)> {
     sets.iter()
+        .filter(|&&set| !yields(tree, sets, set))
         .filter_map(|&set| {
             let covers: BTreeSet<MemberId> = match tree.recovery(set) {
                 Some(recovery) if recovery.outcome().is_none() => namespace
@@ -1304,6 +1331,23 @@ fn pending_covers(
             Some((set, covers))
         })
         .collect()
+}
+
+// An SFV listing stands aside while parity beside it can rule: a PAR2 or
+// PAR3 object among the namespace's `sets` that knows what each of its sets
+// describes, or, out on a repair, covered a member when it left. It does
+// not rule, is never lent, and no byte reaches it, so it takes back no
+// ruling and makes no other set rule again. With no such parity, as when
+// its index never came or does not read, the listing rules as before.
+fn yields(tree: &Tree, sets: &[NodeId], set: NodeId) -> bool {
+    tree.kind(set) == Some(Kind::Sfv)
+        && sets.iter().any(|&other| {
+            matches!(tree.kind(other), Some(Kind::Par2 | Kind::Par3))
+                && match tree.recovery(other) {
+                    Some(recovery) => !recovery.undescribed(),
+                    None => tree.lent_covers_any(other),
+                }
+        })
 }
 
 // How many of the set's own volumes are closed.

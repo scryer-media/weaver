@@ -217,6 +217,14 @@ impl Tree {
             .is_some_and(|lent| lent.covers.contains(&member))
     }
 
+    // Whether the object lent from `node` covered any member when it left.
+    pub fn lent_covers_any(&self, node: NodeId) -> bool {
+        self.nodes
+            .get(&node)
+            .and_then(|found| found.lent.as_ref())
+            .is_some_and(|lent| !lent.covers.is_empty())
+    }
+
     pub(super) fn lent_kind(&self, node: NodeId) -> Option<Kind> {
         Some(self.nodes.get(&node)?.lent.as_ref()?.kind)
     }
