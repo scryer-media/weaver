@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//! The limit on the queries the DHT answers from one source.
+//! The limit on the datagrams the DHT reads from one source, answers to its
+//! own queries among them (libtorrent `dos_blocker::incoming`, called for
+//! every datagram in dht_tracker.cpp:538, v2.0.15).
 //!
 //! The thresholds are libtorrent's: its `dht_block_ratelimit` of 5 messages a
 //! second is counted over 10 second windows, so the 50th message one source
