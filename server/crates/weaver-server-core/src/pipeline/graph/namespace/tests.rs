@@ -31,6 +31,8 @@ thread_local! {
     pub(crate) static RELEASE_LOCATED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // The most bytes one read took back from a spill file.
     pub(super) static SPILL_READ_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    // The most bytes one read of a lent repair took from a scratch file.
+    pub(super) static SCRATCH_READ_MOST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_DELIVERIES: std::cell::RefCell<Option<Vec<(ByteRange, Provenance)>>> = const { std::cell::RefCell::new(None) };
     // Each delivery the pretend 7z store heard, with the CRC32 its bytes
     // came proven by, when every byte of them was.
@@ -4209,6 +4211,179 @@ fn replacement_of_a_borrowed_hold_invalidates_repair_loan() {
             "borrowed RAM and scratch sources keep their own identities"
         );
     }
+}
+
+// A repair lent over a namespace that also holds a large backlog for an
+// open member the set does not cover. Lending reads nothing held, in memory
+// or on scratch: the loan takes where the held bytes are. The repair reads
+// only what it asks for, there, and sees the same bytes; the backlog stays
+// held as it was, and the repair applies.
+#[test]
+fn a_lent_repair_reads_held_bytes_in_place_and_nothing_it_does_not_ask_for() {
+    use crate::pipeline::graph::leaf::counting;
+    for resident_limit in [u64::MAX, 0] {
+        let mut job = Job::new(HoldBudgets {
+            resident_limit,
+            ..PLENTY
+        })
+        .with_set(Some(Fix {
+            name: "payload.bin",
+            read: ByteRange::new(0, 8),
+            fix: (2, b"OK"),
+        }));
+        let member = job.member("payload.bin", Some(8));
+        let other = job.member("other.pending", None);
+        let backlog = payload(3 * READ_BACK as usize + 5);
+        job.writer
+            .keep_held(NodeId::ROOT, other, 0, Bytes::from(backlog.clone()).into())
+            .unwrap();
+        job.writer
+            .keep_held(
+                NodeId::ROOT,
+                member,
+                0,
+                Bytes::from_static(b"original").into(),
+            )
+            .unwrap();
+        job.tree
+            .namespace_mut(NodeId::ROOT)
+            .unwrap()
+            .get_mut(member)
+            .unwrap()
+            .coverage
+            .write(ByteRange::new(0, 8), Provenance::Fresh);
+        let held = backlog.len() as u64 + 8;
+        let paged = resident_limit == 0;
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), held);
+        assert_eq!(job.accountant.usage().scratch, if paged { held } else { 0 });
+
+        let (before, _) = counting::so_far();
+        let mut lent = Inline::default();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        assert_eq!(
+            counting::so_far().0 - before,
+            0,
+            "limit {resident_limit}: lending reads nothing held"
+        );
+
+        SCRATCH_READ_MOST.set(0);
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        assert_eq!(
+            job.par.lock().unwrap().read.as_deref(),
+            Some(b"original".as_slice())
+        );
+        assert_eq!(SCRATCH_READ_MOST.get(), if paged { 8 } else { 0 });
+        assert_eq!(
+            counting::so_far().0 - before,
+            PAR2_SIGNATURE.len() as u64 + if paged { 8 } else { 0 },
+            "limit {resident_limit}: the repair reads its volume and what it asked for"
+        );
+        assert!(!job.writer.moved_since(&job.tree, &returned));
+        assert_eq!(job.writer.held_bytes(NodeId::ROOT), held);
+        let mut backlog_back = Vec::new();
+        assert!(job.writer.access(&job.tree).read_at(
+            NodeId::ROOT,
+            other,
+            ByteRange::at(0, backlog.len() as u64),
+            &mut backlog_back
+        ));
+        assert!(backlog_back == backlog, "the backlog is held byte for byte");
+        let mut build = job.build();
+        job.writer
+            .returned(
+                &mut job.tree,
+                &mut build,
+                &Source,
+                &weaver_objects::Objects::default(),
+                returned,
+                &mut job.out,
+            )
+            .expect("returned");
+    }
+}
+
+// A hold on scratch the repair read is replaced while the repair is out,
+// before it reads it. The span it was lent stays as it was, since scratch is
+// written again only once nothing lives there, so it reads what it was lent;
+// its ruling is taken back on return, and nothing it rebuilt is applied.
+#[test]
+fn a_scratch_hold_replaced_while_its_repair_is_out_takes_the_repair_back() {
+    let mut job = Job::new(HoldBudgets {
+        resident_limit: 0,
+        ..PLENTY
+    })
+    .with_set(Some(Fix {
+        name: "payload.bin",
+        read: ByteRange::new(0, 8),
+        fix: (2, b"OK"),
+    }));
+    let member = job.member("payload.bin", Some(8));
+    job.writer
+        .keep_held(
+            NodeId::ROOT,
+            member,
+            0,
+            Bytes::from_static(b"original").into(),
+        )
+        .unwrap();
+    job.tree
+        .namespace_mut(NodeId::ROOT)
+        .unwrap()
+        .get_mut(member)
+        .unwrap()
+        .coverage
+        .write(ByteRange::new(0, 8), Provenance::Fresh);
+    let mut lent = Inline::default();
+    let due = job.tree.recovery_nodes(NodeId::ROOT);
+    job.writer
+        .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+        .unwrap();
+    job.writer
+        .keep_held(
+            NodeId::ROOT,
+            member,
+            0,
+            Bytes::from_static(b"replaced").into(),
+        )
+        .unwrap();
+    let returned = lent
+        .0
+        .pop()
+        .unwrap()
+        .run(weaver_graph::Budget::default(), &Default::default());
+    assert_eq!(
+        job.par.lock().unwrap().read.as_deref(),
+        Some(b"original".as_slice())
+    );
+    assert!(job.writer.moved_since(&job.tree, &returned));
+    let mut build = job.build();
+    let error = job
+        .writer
+        .returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        )
+        .unwrap_err();
+    assert!(matches!(error, WriteError::StaleRecovery { .. }));
+    let mut now = Vec::new();
+    assert!(job.writer.access(&job.tree).read_at(
+        NodeId::ROOT,
+        member,
+        ByteRange::new(0, 8),
+        &mut now
+    ));
+    assert_eq!(now, b"replaced");
 }
 
 #[test]
