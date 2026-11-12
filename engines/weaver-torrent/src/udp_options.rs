@@ -36,8 +36,18 @@ pub(crate) fn set_for_utp(
         if let Err(error) = set_dont_fragment(socket, Family::V4) {
             warn!(%requested, %error, "the socket's IPv4 datagrams may be fragmented");
         }
-    } else if let Err(error) = set_dont_fragment(socket, Family::V6) {
-        debug!(%requested, %error, "the socket's IPv6 datagrams may be fragmented");
+    } else {
+        if let Err(error) = set_dont_fragment(socket, Family::V6) {
+            debug!(%requested, %error, "the socket's IPv6 datagrams may be fragmented");
+        }
+        // A socket at an IPv6 address that takes IPv4 as well sends its IPv4
+        // datagrams under the IPv4 option. Some hosts refuse it on such a
+        // socket; those datagrams then keep the host's default.
+        if takes_ipv4(socket)
+            && let Err(error) = set_dont_fragment(socket, Family::V4)
+        {
+            debug!(%requested, %error, "the socket's IPv4 datagrams may be fragmented");
+        }
     }
 
     let socket = socket2::SockRef::from(socket);
@@ -90,6 +100,13 @@ pub(crate) fn raise_receive_buffer(socket: &socket2::SockRef<'_>, ask: usize) ->
 pub(crate) enum Family {
     V4,
     V6,
+}
+
+// Whether `socket`, an IPv6 one, takes IPv4 peers too.
+fn takes_ipv4(socket: &tokio::net::UdpSocket) -> bool {
+    socket2::SockRef::from(socket)
+        .only_v6()
+        .is_ok_and(|only_v6| !only_v6)
 }
 
 /// Forbid fragmenting `socket`'s datagrams of `family`.
@@ -335,18 +352,23 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn a_dualstack_socket_requires_df_confirmation_for_both_families() {
+    async fn a_dualstack_socket_forbids_fragmenting_each_family_the_host_allows() {
         let socket = crate::test_support::sockets()
             .bind_kernel_utp((Ipv6Addr::UNSPECIFIED, 0).into(), super::STREAM_WINDOW)
             .unwrap();
         assert!(!socket2::SockRef::from(socket.socket()).only_v6().unwrap());
         assert!(dont_fragment(socket.socket(), Family::V6).unwrap());
-        // An unavailable IPv4 option leaves that family's behavior unconfirmed.
-        assert!(!matches!(
-            dont_fragment(socket.socket(), Family::V4),
-            Ok(true)
-        ));
-        assert!(!socket.dont_fragment());
+        match dont_fragment(socket.socket(), Family::V4) {
+            Ok(set) => assert!(set, "IPv4 datagrams may be fragmented"),
+            // Apple's hosts refuse the IPv4 option on a socket of both
+            // families; its IPv4 datagrams keep the host's default.
+            Err(_) if cfg!(target_vendor = "apple") => {}
+            Err(error) => panic!("{error}"),
+        }
+        assert_eq!(
+            socket.dont_fragment(),
+            dont_fragment(socket.socket(), Family::V4).is_ok_and(|set| set)
+        );
     }
 
     #[tokio::test]
