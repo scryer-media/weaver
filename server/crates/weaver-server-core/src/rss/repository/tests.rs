@@ -103,6 +103,65 @@ fn rss_seen_items_dedupe_and_purge() {
     assert!(!db.rss_seen_item_exists(1, "guid-1").unwrap());
 }
 
+// Every feed's last items read in one call give, feed by feed, what a read
+// of each feed alone gives: same items, same order, same cap. Items of one
+// poll share their `seen_at`, so most of them tie.
+#[test]
+fn seen_items_per_feed_match_one_read_per_feed() {
+    const CAP: u32 = 50;
+    let db = Database::open_in_memory().unwrap();
+    let counts = [0usize, 1, 49, 50, 51, 137];
+    for (index, count) in counts.iter().enumerate() {
+        let feed_id = index as u32 + 1;
+        db.insert_rss_feed(&sample_feed(feed_id)).unwrap();
+        for item in 0..*count {
+            // Ids out of their insertion order, ten items a poll.
+            let id = (item * 37) % count.max(&1);
+            db.insert_rss_seen_item(&RssSeenItemRow {
+                feed_id,
+                item_id: format!("guid-{id:04}"),
+                item_title: format!("Item {feed_id}/{id}"),
+                published_at: (id % 3 == 0).then_some(id as i64),
+                size_bytes: Some(id as u64 * 1_000),
+                decision: "accepted".to_string(),
+                seen_at: 10_000 + (item / 10) as i64,
+                job_id: None,
+                item_url: Some(format!("https://example.com/{feed_id}/{id}.torrent")),
+                error: None,
+            })
+            .unwrap();
+        }
+    }
+    let feeds = db.list_rss_feeds().unwrap();
+
+    crate::persistence::connection::blocking_call_probe::arm();
+    let one = db.list_rss_seen_items_per_feed(CAP).unwrap();
+    let one_calls = crate::persistence::connection::blocking_call_probe::take().len();
+
+    crate::persistence::connection::blocking_call_probe::arm();
+    let each: Vec<Vec<RssSeenItemRow>> = feeds
+        .iter()
+        .map(|feed| db.list_rss_seen_items(Some(feed.id), Some(CAP)).unwrap())
+        .collect();
+    let each_calls = crate::persistence::connection::blocking_call_probe::take().len();
+
+    let grouped: Vec<Vec<RssSeenItemRow>> = feeds
+        .iter()
+        .map(|feed| {
+            one.iter()
+                .filter(|item| item.feed_id == feed.id)
+                .cloned()
+                .collect()
+        })
+        .collect();
+    assert_eq!(grouped, each);
+    assert_eq!(
+        each.iter().map(Vec::len).collect::<Vec<_>>(),
+        [0, 1, 49, 50, 50, 50]
+    );
+    assert_eq!((one_calls, each_calls), (1, feeds.len()));
+}
+
 #[test]
 fn clear_rss_seen_items_can_scope_to_feed() {
     let db = Database::open_in_memory().unwrap();

@@ -3531,6 +3531,47 @@ async fn a_read_key_sees_no_trackers_passkey() {
     assert_eq!(urls(ADMIN).await, [PRIVATE]);
 }
 
+// The exported metainfo carries its trackers' URLs as added, so only a key
+// that controls may have it.
+#[tokio::test]
+async fn only_a_key_that_controls_exports_the_metainfo() {
+    const ANNOUNCE: &[u8] = b"https://tracker.invalid/announce?passkey=export5ecret";
+    const CONTROLLER: &str = "facade-control-key";
+    let rig = rig().await;
+    rig.keys.upsert(ApiKeyAuthRow {
+        key_hash: hash_api_key(CONTROLLER),
+        id: 3,
+        scope: "control".to_owned(),
+    });
+    let plain = metainfo("one.mkv", 3000, true);
+    let mut torrent = b"d".to_vec();
+    bstr(&mut torrent, b"announce");
+    bstr(&mut torrent, ANNOUNCE);
+    torrent.extend_from_slice(&plain[1..]);
+    assert_eq!(rig.add_file(&torrent, &[]).await.status, StatusCode::OK);
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let export = |key: &'static str| {
+        let (rig, hash) = (&rig, &hash);
+        async move {
+            rig.send(
+                Request::get(format!("/api/v2/torrents/export?hash={hash}"))
+                    .header("x-api-key", key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    let refused = export(READER).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert!(!refused.body.contains("export5ecret"));
+    for key in [CONTROLLER, ADMIN] {
+        let exported = export(key).await;
+        assert_eq!(exported.status, StatusCode::OK, "{key}");
+        assert_eq!(exported.body.as_bytes(), torrent, "{key}");
+    }
+}
+
 // A request with the login cookie that changes anything must come from a
 // page of this listener, whatever its method; one that only reads, or one
 // carrying its key, need not.
@@ -3799,6 +3840,124 @@ async fn rss_feeds_are_added_listed_renamed_and_removed() {
     assert_eq!(rig.get("/api/v2/rss/items").await.json(), json!({}));
 }
 
+// Each feed's articles are the 50 it saw last, as a read of that feed
+// alone gives them.
+#[tokio::test]
+async fn rss_articles_are_each_feeds_last_fifty() {
+    let rig = rig().await;
+    for (name, url) in [
+        ("one", "http://feeds.invalid/one.xml"),
+        ("two", "http://feeds.invalid/two.xml"),
+        ("three", "http://feeds.invalid/three.xml"),
+    ] {
+        let added = rig
+            .post(
+                "/api/v2/rss/addFeed",
+                &format!("url={}&path={name}", url_encode(url)),
+            )
+            .await;
+        assert_eq!(added.status, StatusCode::OK);
+    }
+    let feeds = rig.db.list_rss_feeds().unwrap();
+    for (feed, count) in feeds.iter().zip([53usize, 2, 0]) {
+        for item in 0..count {
+            let id = (item * 7) % count;
+            rig.db
+                .insert_rss_seen_item(&weaver_server_core::RssSeenItemRow {
+                    feed_id: feed.id,
+                    item_id: format!("{}-{id:03}", feed.name),
+                    item_title: format!("{} {id}", feed.name),
+                    published_at: None,
+                    size_bytes: None,
+                    decision: "accepted".to_owned(),
+                    seen_at: 1_700_000_000 + (item / 10) as i64,
+                    job_id: None,
+                    item_url: Some(format!("http://feeds.invalid/{id}.torrent")),
+                    error: None,
+                })
+                .unwrap();
+        }
+    }
+    let items = rig.get("/api/v2/rss/items?withData=true").await.json();
+    for feed in &feeds {
+        let alone: Vec<String> = rig
+            .db
+            .list_rss_seen_items(Some(feed.id), Some(50))
+            .unwrap()
+            .into_iter()
+            .map(|item| item.item_id)
+            .collect();
+        let shown: Vec<String> = items[&feed.name]["articles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|article| article["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(shown, alone, "{}", feed.name);
+    }
+    assert_eq!(items["one"]["articles"].as_array().unwrap().len(), 50);
+}
+
+// A feed's or a blocklist's URL can carry a passkey: a key that only reads
+// sees its scheme, host and port, one that controls sees it whole. A
+// blocklist path reads as it is.
+#[tokio::test]
+async fn a_read_key_sees_no_feed_or_blocklist_passkey() {
+    const FEED: &str = "https://user:pw@feeds.invalid/rss?passkey=feed5ecret";
+    const LIST: &str = "https://lists.invalid:8443/level1.gz?token=list5ecret";
+    const PATH: &str = "/var/lib/weaver/level1.p2p";
+    const PREFERENCES: &str = "/api/v2/app/preferences";
+    let rig = rig().await;
+    let added = rig
+        .post(
+            "/api/v2/rss/addFeed",
+            &format!("url={}&path=one", url_encode(FEED)),
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    let read = |path: &'static str, key: &'static str| {
+        let rig = &rig;
+        async move {
+            rig.send(
+                Request::get(path)
+                    .header("x-api-key", key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    for path in ["/api/v2/rss/items", "/api/v2/rss/items?withData=true"] {
+        let reader = read(path, READER).await;
+        assert!(!reader.body.contains("5ecret"), "{path}");
+        assert_eq!(reader.json()["one"]["url"], "https://feeds.invalid:443/…");
+        assert_eq!(read(path, ADMIN).await.json()["one"]["url"], FEED);
+    }
+    let reader = read(PREFERENCES, READER).await.json();
+    let admin = read(PREFERENCES, ADMIN).await.json();
+    assert_eq!(reader, admin);
+
+    let json = format!(r#"{{"ip_filter_path":"{LIST}"}}"#);
+    assert_eq!(rig.set_preferences(&json).await, StatusCode::OK);
+    let reader = read(PREFERENCES, READER).await;
+    assert!(!reader.body.contains("5ecret"));
+    let mut reader = reader.json();
+    assert_eq!(reader["ip_filter_path"], "https://lists.invalid:8443/…");
+    let mut admin = read(PREFERENCES, ADMIN).await.json();
+    assert_eq!(admin["ip_filter_path"], LIST);
+    // Nothing else differs.
+    reader["ip_filter_path"].take();
+    admin["ip_filter_path"].take();
+    assert_eq!(reader, admin);
+
+    let json = format!(r#"{{"ip_filter_path":"{PATH}"}}"#);
+    assert_eq!(rig.set_preferences(&json).await, StatusCode::OK);
+    assert_eq!(
+        read(PREFERENCES, READER).await.json()["ip_filter_path"],
+        PATH
+    );
+}
+
 // A category's save path and share limits are set where it is created and
 // edited, and read back as the client reads them.
 #[tokio::test]
@@ -3959,3 +4118,4 @@ async fn torrents_info_filters_and_pages_as_the_whole_list() {
     assert_eq!(all[0]["name"], "00.mkv");
     assert_eq!(all[44]["name"], "44.mkv");
 }
+mod rows;

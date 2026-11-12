@@ -27,6 +27,39 @@ pub fn setup_test_logging() {
     let _ = tracing_subscriber::fmt::try_init();
 }
 
+/// Every line the crate logs, at trace level, on the thread that holds
+/// [`LogLines::capture`].
+#[derive(Clone, Default)]
+pub struct LogLines(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl Write for LogLines {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl LogLines {
+    pub fn capture(&self) -> tracing::subscriber::DefaultGuard {
+        let lines = self.clone();
+        tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("weaver_torrent=trace"))
+                .with_ansi(false)
+                .with_writer(move || lines.clone())
+                .finish(),
+        )
+    }
+
+    pub fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
 pub fn create_new_file_with_random_content(path: &Path, mut size: usize) {
     let mut file = std::fs::OpenOptions::new()
         .create_new(true)

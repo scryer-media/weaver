@@ -269,6 +269,34 @@ impl Database {
             rows.into_iter().map(map_seen_item_row).collect()
         })
     }
+
+    /// The `limit` items each feed saw last, in one statement: feed by
+    /// feed, each feed's items in the order `list_rss_seen_items` gives
+    /// for that feed alone.
+    pub fn list_rss_seen_items_per_feed(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<RssSeenItemRow>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let rows = SqlRuntime::fetch_all(
+                datastore.read_exec(),
+                "SELECT feed_id, item_id, item_title, published_at, size_bytes, decision,
+                    seen_at, job_id, item_url, error
+                   FROM (SELECT feed_id, item_id, item_title, published_at, size_bytes,
+                            decision, seen_at, job_id, item_url, error,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY feed_id ORDER BY seen_at DESC
+                            ) AS feed_rank
+                           FROM rss_seen_items) ranked
+                  WHERE feed_rank <= {}
+                  ORDER BY feed_id, feed_rank",
+                &[SqlArg::I64(i64::from(limit))],
+            )
+            .await?;
+            rows.into_iter().map(map_seen_item_row).collect()
+        })
+    }
 }
 
 fn rss_feed_from_sql(row: SqlRow) -> Result<RssFeedRow, StateError> {

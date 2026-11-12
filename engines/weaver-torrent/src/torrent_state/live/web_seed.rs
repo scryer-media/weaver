@@ -42,6 +42,7 @@ use crate::{
     peer_protocol::{Handshake, Message, Piece, Request},
     stream_connect::ConnectionKind,
     torrent_state::TorrentMetadata,
+    tracker::redacted_tracker_url,
     type_aliases::{BF, PeerHandle},
 };
 
@@ -286,6 +287,8 @@ impl WebSeeds {
             if banned(handle_of(entry.id)) {
                 entry.banned = true;
             }
+            // A seed's URL can carry a passkey: a log names only its
+            // scheme, host and port.
             match check_url(&entry.seed.url, entry.banned) {
                 Ok(endpoint) => {
                     due.push(Due {
@@ -295,12 +298,18 @@ impl WebSeeds {
                     at += 1;
                 }
                 Err(Refused::Disabled(why)) => {
-                    debug!(url = entry.seed.url, why, "web seed disabled");
+                    debug!(
+                        url = redacted_tracker_url(&entry.seed.url),
+                        why, "web seed disabled"
+                    );
                     entry.disabled = true;
                     at += 1;
                 }
                 Err(Refused::Removed(why)) => {
-                    debug!(url = entry.seed.url, why, "web seed removed");
+                    debug!(
+                        url = redacted_tracker_url(&entry.seed.url),
+                        why, "web seed removed"
+                    );
                     remove_at(&mut g, at);
                 }
             }
@@ -339,7 +348,7 @@ impl WebSeeds {
         let entry = g.seeds.iter_mut().find(|e| handle_of(e.id) == handle)?;
         layout.failed(piece, &mut entry.lacks);
         debug!(
-            url = entry.seed.url,
+            url = redacted_tracker_url(&entry.seed.url),
             piece = piece.get(),
             "web seed sent a bad piece"
         );
@@ -2505,6 +2514,36 @@ mod tests {
             assert_eq!(due.first().and_then(|d| d.endpoint), endpoint, "{url}");
             assert_eq!(due.len(), usize::from(listed && !disabled), "{url}");
         }
+
+        // A seed's log names its scheme, host and port, never the passkey
+        // its URL carries.
+        let lines = crate::tests::test_util::LogLines::default();
+        {
+            let _capture = lines.capture();
+            let disabled = WebSeeds::new([seed("ftp://h.example/0123passkey/f?pk=s3cret")]);
+            disabled.due(now, |_| false, any);
+            let removed = WebSeeds::new([seed("http://h.example:0/0123passkey/f?pk=s3cret")]);
+            removed.due(now, |_| false, any);
+            let bad = WebSeeds::new([seed("https://u:pw@h.example:8443/0123passkey/?pk=s3cret")]);
+            let single = layout(&[("f", 70000, false)]);
+            let piece = single.lengths.validate_piece_index(0).unwrap();
+            bad.piece_failed(handle_of(0), piece, &single).unwrap();
+        }
+        let text = lines.text();
+        for (url, message) in [
+            ("ftp://h.example:21/…", "web seed disabled"),
+            ("http://h.example:0/…", "web seed removed"),
+            ("https://h.example:8443/…", "web seed sent a bad piece"),
+        ] {
+            assert!(
+                text.lines()
+                    .any(|line| line.contains(url) && line.contains(message)),
+                "{url}\n{text}"
+            );
+        }
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!text.contains("0123passkey"), "{text}");
+        assert!(!text.contains("pw@"), "{text}");
 
         // A seed is listed once; removing it ends its connection.
         let seeds = Arc::new(WebSeeds::new([seed("http://h/"), seed("http://h/")]));

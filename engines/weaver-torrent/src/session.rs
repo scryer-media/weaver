@@ -139,15 +139,31 @@ struct ParsedTorrentFile {
 }
 
 fn torrent_from_bytes(bytes: Bytes) -> anyhow::Result<ParsedTorrentFile> {
-    trace!(
-        "all fields in torrent: {:#?}",
-        crate::bencode::dyn_from_bytes::<ByteBuf>(&bytes)
-    );
     let parsed = crate::core::torrent_metainfo::torrent_from_bytes(&bytes)?;
+    // Its shape alone: the values carry the trackers' and seeds' passkeys.
+    trace!(
+        bytes = bytes.len(),
+        info_bytes = parsed.info.raw_bytes.0.len(),
+        keys = ?metainfo_keys(&bytes),
+        info_hash = ?parsed.info_hash,
+        "torrent read"
+    );
     Ok(ParsedTorrentFile {
         meta: parsed.clone_to_owned(Some(&bytes)),
         torrent_bytes: bytes,
     })
+}
+
+// The names of a metainfo's top-level keys, sorted.
+fn metainfo_keys(bytes: &[u8]) -> Vec<String> {
+    match crate::bencode::dyn_from_bytes::<ByteBuf>(bytes) {
+        Ok(crate::bencode::BencodeValue::Dict(dict)) => {
+            let mut keys: Vec<String> = dict.keys().map(ToString::to_string).collect();
+            keys.sort();
+            keys
+        }
+        _ => Vec::new(),
+    }
 }
 
 #[derive(Default)]
@@ -5513,6 +5529,39 @@ mod tests {
         assert_eq!(parsed.meta.info_hash, generated_parsed.meta.info_hash);
         assert_eq!(parsed.meta.info, generated_parsed.meta.info);
         assert_eq!(parsed_tiers, metainfo_tracker_tiers(&generated_parsed.meta));
+    }
+
+    // Reading a torrent logs its shape at trace level, never a value: the
+    // passkey in its trackers' and seed's URLs stays out of the log.
+    #[test]
+    fn a_read_torrent_logs_no_passkey() {
+        let announce = "https://t.test/0123passkey/announce?pk=s3cret";
+        let seed = "https://s.test/files/?token=s3cret";
+        let torrent = format!(
+            "d8:announce{}13:announce-listll{}ee4:infod6:lengthi1e4:name{}12:piece lengthi16384e6:pieces{}e8:url-list{}e",
+            bstr(announce),
+            bstr(announce),
+            bstr("x"),
+            bstr(&"x".repeat(20)),
+            bstr(seed),
+        );
+        let lines = crate::tests::test_util::LogLines::default();
+        let parsed = {
+            let _capture = lines.capture();
+            torrent_from_bytes(Bytes::from(torrent.into_bytes())).unwrap()
+        };
+        let text = lines.text();
+        assert!(text.contains("torrent read"), "{text}");
+        assert!(
+            text.contains(r#"keys=["announce", "announce-list", "info", "url-list"]"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{:?}", parsed.meta.info_hash)),
+            "{text}"
+        );
+        assert!(!text.contains("s3cret"), "{text}");
+        assert!(!text.contains("0123passkey"), "{text}");
     }
 
     #[test]
