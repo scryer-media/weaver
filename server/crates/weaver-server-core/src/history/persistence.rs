@@ -172,8 +172,9 @@ impl Database {
                             (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                              optional_recovery_bytes, optional_recovery_downloaded_bytes,
                              failed_bytes, health, category, output_dir, nzb_path,
-                             created_at, completed_at, metadata, server_attribution, release_name)
-                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+                             created_at, completed_at, metadata, server_attribution, release_name,
+                             search_key)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
                          ON CONFLICT(job_id) DO UPDATE SET
                             job_hash = excluded.job_hash,
                             name = excluded.name,
@@ -192,6 +193,7 @@ impl Database {
                             completed_at = excluded.completed_at,
                             metadata = excluded.metadata,
                             release_name = excluded.release_name,
+                            search_key = excluded.search_key,
                             server_attribution = COALESCE(excluded.server_attribution, job_history.server_attribution)",
                         &args,
                     )
@@ -422,6 +424,8 @@ pub(crate) async fn delete_job_history_bundles_tx(
 }
 
 fn job_history_args(entry: &JobHistoryRow) -> Vec<SqlArg> {
+    let (release_name, search_key) =
+        super::history_search_columns(&entry.name, entry.metadata.as_deref());
     vec![
         SqlArg::I64(entry.job_id as i64),
         SqlArg::OptBytes(entry.job_hash.clone()),
@@ -441,9 +445,7 @@ fn job_history_args(entry: &JobHistoryRow) -> Vec<SqlArg> {
         SqlArg::I64(entry.completed_at),
         SqlArg::OptText(entry.metadata.clone()),
         SqlArg::OptText(entry.server_attribution.clone()),
-        SqlArg::Text(super::history_release_name(
-            &entry.name,
-            entry.metadata.as_deref(),
-        )),
+        SqlArg::Text(release_name),
+        SqlArg::Text(search_key),
     ]
 }

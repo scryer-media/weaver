@@ -848,7 +848,7 @@ fn build_history_page(rows: Vec<JobHistoryRow>, input: HistoryPageInput) -> Hist
         .filter(|item| {
             search
                 .as_deref()
-                .is_none_or(|search| history_sort_name(&item.original_title).contains(search))
+                .is_none_or(|search| history_search_matches(item, search))
         })
         .collect();
 
@@ -922,14 +922,28 @@ fn sanitize_page_size(page_size: u32) -> usize {
     }
 }
 
-// The search text, trimmed, its ASCII letters folded as the name's are.
+// The search text, normalized as each row's search key is.
 fn normalize_history_search(search: Option<String>) -> Option<String> {
-    let trimmed = search?.trim().to_ascii_lowercase();
-    if trimmed.is_empty() {
+    let normalized = weaver_server_core::history::normalize_history_search_text(&search?);
+    if normalized.is_empty() {
         None
     } else {
-        Some(trimmed)
+        Some(normalized)
     }
+}
+
+// Whether a normalized search is in any of an item's titles, normalized:
+// what the stored search key holds, line by line. The database's exact
+// match is held to it; a Postgres trigram match can only widen it.
+#[cfg(test)]
+fn history_search_matches(item: &HistoryItem, search: &str) -> bool {
+    [
+        item.display_title.as_str(),
+        item.original_title.as_str(),
+        item.name.as_str(),
+    ]
+    .into_iter()
+    .any(|title| weaver_server_core::history::normalize_history_search_text(title).contains(search))
 }
 
 // Drop blank entries and an empty list, so a request that filters by nothing
@@ -1411,17 +1425,19 @@ mod tests {
         assert_parity(&db, page_input(0, 25, Some(HistoryStatusFilter::Failure)));
     }
 
-    // A search is trimmed and its ASCII letters folded, as the name is.
+    // A search is normalized as each row's search key is.
     #[test]
-    fn a_search_is_trimmed_and_folded() {
+    fn a_search_is_normalized() {
         let mut input = page_input(0, 25, None);
         input.search = Some("  ReLeAse.ÜNÏ ".to_string());
         assert_eq!(
             HistoryPageSqlPlan::for_input(&input).search.as_deref(),
-            Some("release.Ünï")
+            Some("release uni")
         );
-        // A whitespace-only search searches nothing.
+        // A search of white space or separators alone searches nothing.
         input.search = Some("   ".to_string());
+        assert_eq!(HistoryPageSqlPlan::for_input(&input).search, None);
+        input.search = Some(" ._- ".to_string());
         assert_eq!(HistoryPageSqlPlan::for_input(&input).search, None);
     }
 
@@ -1474,7 +1490,10 @@ mod tests {
             page.items.iter().map(|item| item.id).collect::<Vec<_>>()
         };
         assert_eq!(page(Some("2024.2160P")), vec![1]);
-        assert_eq!(page(Some("the movie")), Vec::<u64>::new());
+        // The shortened name and display title are searched too, accents,
+        // case and separators aside.
+        assert_eq!(page(Some("the movie")), vec![1]);
+        assert_eq!(page(Some("zeta the movie")), vec![1]);
         assert_eq!(page(Some("before.rename")), Vec::<u64>::new());
         assert_eq!(page(Some("beta.renamed")), vec![2]);
         // Alpha.Plain, Beta.Renamed, Zeta.The.Movie. The stored names would
@@ -1561,6 +1580,7 @@ mod tests {
             "Ωmega.Ψ.Collection.1080p",
             "Release.Year.2024.1080p.WEB-DL",
             "Under_Score.100%.Done.720p",
+            "Back\\Slash.Release.1080p",
         ];
         let mut rows = Vec::new();
         for job_id in 1..=280u64 {
@@ -1654,6 +1674,9 @@ mod tests {
             Some("_score"),
             Some("100%.done"),
             Some("e_s"),
+            Some("k\\s"),
+            Some("ecole"),
+            Some("show s01e01"),
             // Text only the full release name holds, and text a rename replaced.
             Some("search.me"),
             Some("mm.renamed"),
