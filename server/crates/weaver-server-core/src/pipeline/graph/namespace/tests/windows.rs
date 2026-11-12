@@ -20,6 +20,9 @@ fn volume() -> Vec<u8> {
 struct Carrier {
     kind: RecoveryKind,
     announced: bool,
+    // How many ranges it says recovery data lies at: the trailer, then one
+    // byte further on for each more.
+    windows: u64,
 }
 
 impl Object for Carrier {
@@ -43,12 +46,18 @@ impl Object for Carrier {
                 name: "inner.bin".into(),
                 length: Some(BODY.len()),
             });
-            out.push(Emit::RecoveryAt {
-                volume: delivery.volume,
-                range: TRAILER,
-                kind: self.kind,
-                handed: weaver_graph::Handed::default(),
-            });
+            for more in 0..self.windows {
+                let range = match more {
+                    0 => TRAILER,
+                    _ => ByteRange::at(TRAILER.start + more, 1),
+                };
+                out.push(Emit::RecoveryAt {
+                    volume: delivery.volume,
+                    range,
+                    kind: self.kind,
+                    handed: weaver_graph::Handed::default(),
+                });
+            }
         }
         let range = ByteRange::at(delivery.offset, delivery.bytes.len() as u64);
         if let Some(part) = range.intersect(BODY) {
@@ -105,6 +114,8 @@ struct Tape {
     closed: bool,
     lost: Vec<ByteRange>,
     volume: Option<Vec<u8>>,
+    // How many times a window's object was bound in its namespace.
+    binds: usize,
 }
 
 // A recovery object that keeps a tape of its one volume and, asked to
@@ -172,6 +183,10 @@ impl Object for Trail {
 }
 
 impl Recovery for Trail {
+    fn bind(&mut self, _: &mut weaver_graph::Namespace, _: &mut Vec<MemberId>) {
+        self.tape.lock().unwrap().binds += 1;
+    }
+
     fn covers(&self, _: MemberId) -> bool {
         false
     }
@@ -204,6 +219,7 @@ impl Recovery for Trail {
 
 struct Carrying {
     kind: RecoveryKind,
+    windows: u64,
     tape: Arc<Mutex<Tape>>,
 }
 
@@ -213,6 +229,7 @@ impl Builder for Carrying {
             Kind::RarStore => Some(Box::new(Carrier {
                 kind: self.kind,
                 announced: false,
+                windows: self.windows,
             })),
             Kind::Par3 => Some(Box::new(Trail {
                 tape: Arc::clone(&self.tape),
@@ -243,9 +260,15 @@ struct Carried {
 impl Carried {
     // The carrier's volume, announced, with its first fifteen bytes in.
     fn new(kind: RecoveryKind) -> Self {
+        Self::saying(kind, 1)
+    }
+
+    // The same, the carrier saying recovery data lies at `windows` ranges.
+    fn saying(kind: RecoveryKind, windows: u64) -> Self {
         let mut job = Job::new(PLENTY);
         let mut build = Carrying {
             kind,
+            windows,
             tape: Arc::default(),
         };
         let member = job
@@ -357,4 +380,26 @@ fn damage_on_the_volume_is_lost_to_the_window_where_it_falls() {
         )
         .expect("apply");
     assert_eq!(carried.tape().lost, vec![ByteRange::new(0, 2)]);
+}
+
+// Every range said gets its window, and each window is bound once as it is
+// attached: the windows before it are not bound again, so the binds grow
+// with the windows, not with their square. Each window binds as many times
+// as a lone one does.
+#[test]
+fn each_window_attached_is_bound_once_however_many_came_before() {
+    let lone = Carried::saying(RecoveryKind::Par3, 1).tape().binds as u64;
+    assert!(lone > 0);
+    for windows in [8, 64, 512] {
+        let carried = Carried::saying(RecoveryKind::Par3, windows);
+        assert_eq!(
+            carried.job.tree.recovery_nodes(NodeId::ROOT).len() as u64,
+            windows
+        );
+        assert_eq!(
+            carried.tape().binds as u64,
+            windows * lone,
+            "{windows} windows"
+        );
+    }
 }

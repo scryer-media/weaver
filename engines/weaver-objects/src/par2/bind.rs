@@ -22,6 +22,7 @@ use std::collections::BTreeMap;
 use par2_rs::{FileDescription, FileId, Par2FileSet};
 use weaver_graph::{Member, MemberId, Namespace, ObjectId};
 
+use super::catalogue::Catalogue;
 use super::sets::{Front, Length, SetState};
 
 // One member as the rules see it.
@@ -90,16 +91,16 @@ impl<'a> Candidate<'a> {
 }
 
 // The members a set's index named, by file.
-type Bindings = BTreeMap<FileId, MemberId>;
+pub(super) type Bindings = BTreeMap<FileId, MemberId>;
 
 // Each posting's front as PAR2 names files, under the stamp of the front
 // it was hashed from.
 pub(super) type Fronts = BTreeMap<MemberId, (u64, Option<Front>)>;
 
 // What binding the sets over the namespace came to.
-pub(super) struct Bound {
-    // Each set's bindings, in the order the sets were given.
-    pub(super) sets: Vec<Bindings>,
+pub(super) struct Bound<S> {
+    // Each set's bindings.
+    pub(super) sets: S,
     // Each complete member no set matched, with the length it has of its
     // own: one whose front could not name it, which a repair may still
     // know by its slices or by elimination.
@@ -107,24 +108,77 @@ pub(super) struct Bound {
     // How many fronts the binding hashed.
     #[cfg(test)]
     pub(super) digests: usize,
+    // How many times a member was matched against a set.
+    #[cfg(test)]
+    pub(super) checks: usize,
 }
 
-// Bind each set over the namespace: a set whose index is not usable binds
-// nothing. `fronts` is what the last binding hashed: a front whose stamp
-// is unchanged is not hashed again, and what this binding hashed replaces
-// it.
+// Bind the usable sets the catalogue files over the namespace. A member is
+// matched only against the sets the catalogue finds for its front or its
+// name: no other set can match it. Only a set some member claimed has
+// bindings, by its key. `fronts` is what the last binding hashed: a front
+// whose stamp is unchanged is not hashed again, and what this binding
+// hashed replaces it.
+pub(super) fn bind_catalogued(
+    sets: &BTreeMap<[u8; 16], SetState>,
+    catalogue: &Catalogue,
+    namespace: &Namespace,
+    own: ObjectId,
+    fronts: &mut Fronts,
+) -> Bound<BTreeMap<[u8; 16], Bindings>> {
+    bind_over(namespace, own, fronts, catalogue.any(), |front, name| {
+        catalogue
+            .candidates(front, name)
+            .map(|(_, key)| (key, &sets[&key]))
+    })
+}
+
+// Bind each set over the namespace, matching every member against every
+// set given, in the order given: a set whose index is not usable binds
+// nothing. Each set's bindings, in that order.
+#[cfg(test)]
 pub(super) fn bind_sets(
     sets: &[&SetState],
     namespace: &Namespace,
     own: ObjectId,
     fronts: &mut Fronts,
-) -> Bound {
-    let mut claims: Vec<BTreeMap<FileId, Vec<(MemberId, bool)>>> =
-        vec![BTreeMap::new(); sets.len()];
+) -> Bound<Vec<Bindings>> {
+    let any = sets.iter().any(|state| state.usable().is_some());
+    let found = bind_over(namespace, own, fronts, any, |_, _| {
+        sets.iter().copied().enumerate()
+    });
+    let mut bound = found.sets;
+    Bound {
+        sets: (0..sets.len())
+            .map(|at| bound.remove(&at).unwrap_or_default())
+            .collect(),
+        unnamed: found.unnamed,
+        digests: found.digests,
+        checks: found.checks,
+    }
+}
+
+// Bind the sets `candidates` lists for each member's front and name, in
+// their order, over the namespace. `any` says whether a usable set is
+// listed at all: only then is a member's front hashed.
+fn bind_over<'s, K, I>(
+    namespace: &Namespace,
+    own: ObjectId,
+    fronts: &mut Fronts,
+    any: bool,
+    candidates: impl Fn(Option<Front>, &str) -> I,
+) -> Bound<BTreeMap<K, Bindings>>
+where
+    K: Copy + Ord,
+    I: Iterator<Item = (K, &'s SetState)>,
+{
+    let mut claims: BTreeMap<K, BTreeMap<FileId, Vec<(MemberId, bool)>>> = BTreeMap::new();
     let mut complete = BTreeMap::new();
     let last = std::mem::take(fronts);
     #[cfg(test)]
     let mut digests = 0;
+    #[cfg(test)]
+    let mut checks = 0;
     for posting in namespace.records() {
         let member = namespace.resolve(posting.id);
         if namespace
@@ -145,7 +199,12 @@ pub(super) fn bind_sets(
             complete.insert(member, length);
         }
         let mut first = None;
-        for (at, state) in sets.iter().enumerate() {
+        let listed = any.then(|| candidates(candidate.front(), candidate.name));
+        for (at, state) in listed.into_iter().flatten() {
+            #[cfg(test)]
+            {
+                checks += 1;
+            }
             if let Some((file, content)) = match_member(state, &candidate) {
                 if content {
                     first = Some((at, (file, content)));
@@ -155,7 +214,7 @@ pub(super) fn bind_sets(
             }
         }
         if let Some((at, (file, content))) = first {
-            let claimants = claims[at].entry(file).or_default();
+            let claimants = claims.entry(at).or_default().entry(file).or_default();
             if let Some((_, proven)) = claimants.iter_mut().find(|(id, _)| *id == member) {
                 *proven |= content;
             } else {
@@ -170,10 +229,10 @@ pub(super) fn bind_sets(
             digests += candidate.hashed.get();
         }
     }
-    let bound: Vec<Bindings> = claims
+    let bound: BTreeMap<K, Bindings> = claims
         .into_iter()
-        .map(|claims| {
-            claims
+        .map(|(at, claims)| {
+            let bindings = claims
                 .into_iter()
                 .filter_map(|(file, mut claimants)| {
                     // Verified content outranks a posted name. Equal evidence
@@ -186,10 +245,11 @@ pub(super) fn bind_sets(
                         _ => None,
                     }
                 })
-                .collect()
+                .collect();
+            (at, bindings)
         })
         .collect();
-    for members in &bound {
+    for members in bound.values() {
         for member in members.values() {
             complete.remove(member);
         }
@@ -201,6 +261,8 @@ pub(super) fn bind_sets(
         unnamed: complete.into_iter().collect(),
         #[cfg(test)]
         digests,
+        #[cfg(test)]
+        checks,
     }
 }
 
