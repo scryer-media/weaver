@@ -1888,6 +1888,7 @@ export const nextKo: LocaleDictionary = {
   "next.torrent.force": "강제",
   "next.torrent.needsCertificate": "인증서 필요",
   "next.torrent.checkingResumeData": "재개 데이터 확인 중",
+  "next.torrent.filesMissing": "파일 없음",
   "next.torrent.unforce": "강제 해제",
   "next.torrent.forced": "강제됨",
   "next.torrent.unforced": "강제 해제됨",

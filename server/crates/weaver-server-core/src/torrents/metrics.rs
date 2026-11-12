@@ -24,7 +24,7 @@ use crate::torrents::service::TorrentPieces;
 use crate::torrents::{TorrentCounters, TorrentState, TorrentTracker, TrackerStatus, status};
 
 /// Every state a torrent can be in, in the order they are exported.
-pub const TORRENT_STATES: [TorrentState; 11] = [
+pub const TORRENT_STATES: [TorrentState; 12] = [
     TorrentState::Queued,
     TorrentState::CheckingResumeData,
     TorrentState::FetchingMetadata,
@@ -36,6 +36,7 @@ pub const TORRENT_STATES: [TorrentState; 11] = [
     TorrentState::Stopped,
     TorrentState::Moving,
     TorrentState::NeedsCertificate,
+    TorrentState::FilesMissing,
 ];
 
 /// Every phase of a magnet's metadata fetch.

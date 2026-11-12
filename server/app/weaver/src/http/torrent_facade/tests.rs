@@ -675,6 +675,35 @@ fn every_weaver_state_maps_to_one_client_state() {
     }
 }
 
+// A torrent held for its files missing reads as missingFiles, complete or
+// not (qBittorrent serialize_torrent.cpp:50), and passes the errored filter
+// and the running one, as it is not stopped (qBittorrent torrentfilter.cpp
+// and `TorrentImpl::isErrored`, torrentimpl.cpp:1257-1261).
+#[test]
+fn a_torrent_missing_its_files_reads_as_missing_files() {
+    let missing = view(TorrentState::FilesMissing);
+    let complete = TorrentView {
+        completed_at_ms: Some(1),
+        ..view(TorrentState::FilesMissing)
+    };
+    for view in [&missing, &complete] {
+        assert_eq!(state(view), "missingFiles");
+        assert!(wanted(view, "errored"));
+        assert!(wanted(view, "running"));
+        for filter in [
+            "downloading",
+            "seeding",
+            "completed",
+            "stopped",
+            "stalled",
+            "checking",
+            "moving",
+        ] {
+            assert!(!wanted(view, filter), "{filter}");
+        }
+    }
+}
+
 // A torrent checking its resume data passes the checking filter alone of
 // the state filters (qBittorrent torrentfilter.cpp:186-190); a queued one
 // still reads as queued.

@@ -102,6 +102,10 @@ pub enum TorrentState {
     // An SSL torrent with no certificate from its tracker rule: it connects
     // to no peer and announces nowhere.
     NeedsCertificate,
+    // Held stopped, its pieces kept: not one of the files its pieces are in
+    // was there when it was loaded, as when the drive they are on is not
+    // mounted yet. A start, a recheck or a move looks again.
+    FilesMissing,
 }
 
 impl TorrentState {
@@ -118,6 +122,7 @@ impl TorrentState {
             Self::Stopped => "stopped",
             Self::Moving => "moving",
             Self::NeedsCertificate => "needs_certificate",
+            Self::FilesMissing => "files_missing",
         }
     }
 
@@ -134,6 +139,7 @@ impl TorrentState {
             "stopped" => Some(Self::Stopped),
             "moving" => Some(Self::Moving),
             "needs_certificate" => Some(Self::NeedsCertificate),
+            "files_missing" => Some(Self::FilesMissing),
             _ => None,
         }
     }
