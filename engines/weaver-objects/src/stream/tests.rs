@@ -814,6 +814,47 @@ fn a_later_zstd_frame_wider_than_the_first_decodes_within_a_window_reserved_whol
     );
 }
 
+// What a zstd run is charged is the most its decoder holds, whatever comes
+// after the first frame: a narrow first frame reserves the decoder's own
+// 128 MiB, and a later frame wider than that is refused at its header, with
+// the window it was held to, before its window is held. That holds past a
+// skippable frame at the start, and for a later single-segment frame whose
+// content size is its window. Two thousand frames of the same window decode
+// whole under the one charge.
+#[test]
+fn a_later_zstd_frame_is_never_held_past_what_the_run_was_charged() {
+    let charged = 128 * MIB;
+    // Single segment, four content-size bytes: 256 MiB, one raw byte.
+    let mut single = vec![0x28, 0xB5, 0x2F, 0xFD, 0xA0];
+    single.extend_from_slice(&(256u32 << 20).to_le_bytes());
+    single.extend_from_slice(&[0x09, 0x00, 0x00, b'z']);
+    let skipped = [0x50, 0x2A, 0x4D, 0x18, 4, 0, 0, 0, 1, 2, 3, 4];
+    let later = [
+        [zstd_window(20), zstd_window(28)].concat(),
+        [skipped.to_vec(), zstd_window(20), zstd_window(28)].concat(),
+        [zstd_window(20), single].concat(),
+    ];
+    for bytes in later {
+        let mut stream = fronted_within::<Zstd>("a.zst", &bytes, 512 * MIB);
+        stream.volume_closed(VolumeIndex(0), &mut Vec::new());
+        assert_eq!(stream.reserve(), Some(charged));
+        too_large(
+            &closed_run(&mut stream, bytes, granted(512 * MIB, false)),
+            None,
+            Some(charged),
+        );
+    }
+
+    let equal = zstd_window(20).repeat(2_000);
+    let mut stream = fronted_within::<Zstd>("a.zst", &equal, 512 * MIB);
+    stream.volume_closed(VolumeIndex(0), &mut Vec::new());
+    assert_eq!(stream.reserve(), Some(charged));
+    assert_eq!(
+        closed_run(&mut stream, equal, granted(512 * MIB, false)),
+        decoded("a", vec![b'z'; 2_000])
+    );
+}
+
 #[test]
 fn every_byte_of_the_volume_is_its_envelope() {
     let stream = stream::<Gzip>("a.gz");
