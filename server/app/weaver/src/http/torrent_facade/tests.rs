@@ -3840,6 +3840,64 @@ async fn rss_feeds_are_added_listed_renamed_and_removed() {
     assert_eq!(rig.get("/api/v2/rss/items").await.json(), json!({}));
 }
 
+// Each feed's articles are the 50 it saw last, as a read of that feed
+// alone gives them.
+#[tokio::test]
+async fn rss_articles_are_each_feeds_last_fifty() {
+    let rig = rig().await;
+    for (name, url) in [
+        ("one", "http://feeds.invalid/one.xml"),
+        ("two", "http://feeds.invalid/two.xml"),
+        ("three", "http://feeds.invalid/three.xml"),
+    ] {
+        let added = rig
+            .post(
+                "/api/v2/rss/addFeed",
+                &format!("url={}&path={name}", url_encode(url)),
+            )
+            .await;
+        assert_eq!(added.status, StatusCode::OK);
+    }
+    let feeds = rig.db.list_rss_feeds().unwrap();
+    for (feed, count) in feeds.iter().zip([53usize, 2, 0]) {
+        for item in 0..count {
+            let id = (item * 7) % count;
+            rig.db
+                .insert_rss_seen_item(&weaver_server_core::RssSeenItemRow {
+                    feed_id: feed.id,
+                    item_id: format!("{}-{id:03}", feed.name),
+                    item_title: format!("{} {id}", feed.name),
+                    published_at: None,
+                    size_bytes: None,
+                    decision: "accepted".to_owned(),
+                    seen_at: 1_700_000_000 + (item / 10) as i64,
+                    job_id: None,
+                    item_url: Some(format!("http://feeds.invalid/{id}.torrent")),
+                    error: None,
+                })
+                .unwrap();
+        }
+    }
+    let items = rig.get("/api/v2/rss/items?withData=true").await.json();
+    for feed in &feeds {
+        let alone: Vec<String> = rig
+            .db
+            .list_rss_seen_items(Some(feed.id), Some(50))
+            .unwrap()
+            .into_iter()
+            .map(|item| item.item_id)
+            .collect();
+        let shown: Vec<String> = items[&feed.name]["articles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|article| article["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(shown, alone, "{}", feed.name);
+    }
+    assert_eq!(items["one"]["articles"].as_array().unwrap().len(), 50);
+}
+
 // A feed's or a blocklist's URL can carry a passkey: a key that only reads
 // sees its scheme, host and port, one that controls sees it whole. A
 // blocklist path reads as it is.

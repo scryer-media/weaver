@@ -4040,6 +4040,26 @@ async fn rss_items(ctx: &TorrentFacadeContext, with_data: bool, scope: CallerSco
         Ok(feeds) => feeds,
         Err(response) => return response,
     };
+    // Every feed's last articles, read at once.
+    let mut seen_by_feed = HashMap::<u32, Vec<_>>::new();
+    if with_data {
+        let db = ctx.inner.db.clone();
+        let seen = match tokio::task::spawn_blocking(move || {
+            db.list_rss_seen_items_per_feed(RSS_ARTICLES)
+        })
+        .await
+        {
+            Ok(Ok(seen)) => seen,
+            Ok(Err(error)) => return internal(error),
+            Err(error) => return internal(error),
+        };
+        for article in seen {
+            seen_by_feed
+                .entry(article.feed_id)
+                .or_default()
+                .push(article);
+        }
+    }
     let mut root = Map::new();
     for feed in feeds {
         let mut item = Map::new();
@@ -4052,17 +4072,7 @@ async fn rss_items(ctx: &TorrentFacadeContext, with_data: bool, scope: CallerSco
         item.insert("url".to_owned(), json!(url));
         item.insert("refreshInterval".to_owned(), json!(feed.poll_interval_secs));
         if with_data {
-            let db = ctx.inner.db.clone();
-            let id = feed.id;
-            let seen = match tokio::task::spawn_blocking(move || {
-                db.list_rss_seen_items(Some(id), Some(RSS_ARTICLES))
-            })
-            .await
-            {
-                Ok(Ok(seen)) => seen,
-                Ok(Err(error)) => return internal(error),
-                Err(error) => return internal(error),
-            };
+            let seen = seen_by_feed.remove(&feed.id).unwrap_or_default();
             let articles: Vec<Value> = seen
                 .iter()
                 .map(|article| {
