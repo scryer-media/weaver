@@ -71,13 +71,29 @@ fn data_sent(t: &TestVsock) -> usize {
         .count()
 }
 
-// On a path with no delay to spread over, the whole window goes in the
-// first pass.
+// However short the path, one pass sends no more than the burst, and the
+// rest of the window follows as the bucket fills.
 #[tokio::test]
-async fn a_zero_delay_path_sends_the_whole_window_in_one_pass() {
-    let mut t = sender(Duration::ZERO).await;
-    t.poll_once_assert_pending().await;
-    assert_eq!(data_sent(&t), WINDOW_PACKETS);
+async fn a_short_path_sends_no_more_than_the_burst_in_one_pass() {
+    for rtt in [
+        Duration::ZERO,
+        Duration::from_micros(100),
+        Duration::from_millis(1),
+    ] {
+        let mut t = sender(rtt).await;
+        t.poll_once_assert_pending().await;
+        assert_eq!(data_sent(&t), PACE_BURST_PACKETS, "rtt {rtt:?}");
+
+        let mut sent = PACE_BURST_PACKETS;
+        while sent < WINDOW_PACKETS {
+            t.env.increment_now(Duration::from_micros(10));
+            t.poll_once_assert_pending().await;
+            let pass = data_sent(&t);
+            assert!(pass <= PACE_BURST_PACKETS, "{pass} packets in one pass");
+            sent += pass;
+        }
+        assert_eq!(sent, WINDOW_PACKETS);
+    }
 }
 
 // With a round trip to spread over, one pass sends no more than the burst,

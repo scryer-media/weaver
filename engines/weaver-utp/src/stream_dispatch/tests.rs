@@ -142,6 +142,20 @@ impl TestVsock {
         };
     }
 
+    /// Polls, stepping the clock between passes, until `packets` have been
+    /// sent: the pacer lets at most a burst out per pass.
+    async fn poll_until_sent(&mut self, packets: usize) -> Vec<UtpMessage> {
+        let mut sent = Vec::new();
+        loop {
+            self.poll_once_assert_pending().await;
+            sent.extend(self.take_sent());
+            if sent.len() >= packets {
+                return sent;
+            }
+            self.env.increment_now(Duration::from_micros(10));
+        }
+    }
+
     async fn poll_once_assert_ready(&mut self) -> crate::Result<()> {
         let res = self.poll_once().await;
         match res {

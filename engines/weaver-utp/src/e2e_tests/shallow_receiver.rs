@@ -26,7 +26,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{PollSendToVectored, SocketOpts, Transport, UtpSocket, traits::DefaultUtpEnvironment};
+use crate::{
+    PollSendToVectored, SocketOpts, Transport, UtpSocket, pacer::PACE_BURST_PACKETS,
+    traits::DefaultUtpEnvironment,
+};
 
 #[derive(Clone, Copy)]
 struct Shallow {
@@ -45,6 +48,9 @@ struct Counters {
     data_sent: u64,
     // The most datagrams on the wire at once.
     peak_in_flight: usize,
+    // The most data datagrams one endpoint sent at one instant: on the
+    // paused clock, every pass of a stream at that instant together.
+    peak_data_burst: usize,
 }
 
 struct Endpoint {
@@ -64,6 +70,9 @@ struct Model {
     endpoints: BTreeMap<SocketAddr, Endpoint>,
     next_drain: Option<Instant>,
     counters: Counters,
+    // The instant and endpoint of the last data datagram sent, and how many
+    // that endpoint sent then.
+    burst: Option<(Instant, SocketAddr, usize)>,
 }
 
 impl Model {
@@ -136,6 +145,7 @@ impl Network {
                 endpoints: BTreeMap::new(),
                 next_drain: None,
                 counters: Counters::default(),
+                burst: None,
             }),
             changed: Notify::new(),
         })
@@ -170,6 +180,12 @@ impl Network {
             let wakes = model.advance(now);
             if data.first().map(|byte| byte >> 4) == Some(crate::raw::Type::Data as u8) {
                 model.counters.data_sent += 1;
+                let burst = match model.burst {
+                    Some((at, from, sent)) if at == now && from == source => sent + 1,
+                    _ => 1,
+                };
+                model.burst = Some((now, source, burst));
+                model.counters.peak_data_burst = model.counters.peak_data_burst.max(burst);
             }
             model.ordinal += 1;
             let key = (now + model.one_way, model.ordinal);
@@ -347,4 +363,28 @@ async fn a_receiver_holding_48_datagrams_per_drain_loses_none() {
     assert!(counters.peak_in_flight > 48, "{counters:?}");
     assert!(counters.peak_arrivals <= 48, "{counters:?}");
     assert_eq!(counters.dropped, 0, "{counters:?}");
+}
+
+// The same receiver 1 ms and 0.1 ms away, where a bucket sized by its rate
+// would hold the whole window: no instant sees more than the burst leave,
+// and the upload completes.
+#[tokio::test(start_paused = true)]
+async fn a_short_path_never_sends_more_than_the_burst_at_once() {
+    let shallow = Shallow {
+        queue_packets: 48,
+        drain_every: Duration::from_millis(1),
+    };
+    for one_way in [Duration::from_micros(500), Duration::from_micros(50)] {
+        let started = Instant::now();
+        let counters = transfer(4 * 1024 * 1024, one_way, Some(shallow)).await;
+        eprintln!(
+            "one way {one_way:?}: {counters:?} in {:?} of the paused clock",
+            started.elapsed()
+        );
+        assert!(counters.data_sent > 2800, "{counters:?}");
+        assert!(
+            counters.peak_data_burst <= PACE_BURST_PACKETS + 1,
+            "{one_way:?}: {counters:?}"
+        );
+    }
 }

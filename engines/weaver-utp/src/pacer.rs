@@ -8,10 +8,15 @@
 //
 // A token bucket fills at twice the window per smoothed round trip, so a
 // window that doubles each round trip in slow start is never held back. It
-// holds at most a small burst: sixteen packets, or one timer tick of the
-// rate when that is larger, so a stream woken once per tick still sends at
-// the full rate. Each packet costs at least one segment, as a receiver's
-// queue counts datagrams, not bytes.
+// holds sixteen packets at most, at any rate and round trip, so no wake of
+// the stream sends more than that: a receiver's queue of a few dozen
+// datagrams takes any one pass whole. Each packet costs at least one
+// segment, as a receiver's queue counts datagrams, not bytes.
+//
+// libtorrent v2.0.15 does not pace: each ACK runs `while (send_pkt());`
+// (utp_stream.cpp:3023) and a write does the same (757, 779), so one pass
+// sends all the window has room for, which is what the ACK freed plus the
+// window's growth, in slow start the acked bytes again (3290-3308).
 
 use std::time::Duration;
 
@@ -19,10 +24,8 @@ use tokio::time::Instant;
 
 // The bucket fills at this multiple of window per round trip.
 const PACE_GAIN: u128 = 2;
-// Packets the bucket holds at least.
+// Packets the bucket holds, and so the most one pass sends.
 pub(crate) const PACE_BURST_PACKETS: usize = 16;
-// The coarsest step at which the stream's timer wakes it.
-const PACE_TICK: Duration = Duration::from_millis(1);
 
 #[derive(Debug, Default)]
 pub(crate) struct Pacer {
@@ -49,8 +52,7 @@ impl Pacer {
     }
 
     fn capacity(&self) -> usize {
-        let tick = usize::try_from(self.fill(PACE_TICK)).unwrap_or(usize::MAX);
-        tick.max(PACE_BURST_PACKETS.saturating_mul(self.mss))
+        PACE_BURST_PACKETS.saturating_mul(self.mss)
     }
 
     /// Brings the budget up to `now` for a window of `window` bytes per
@@ -157,17 +159,24 @@ mod tests {
         assert_eq!(sent, PACE_BURST_PACKETS);
     }
 
-    // At a rate past one burst per timer tick the bucket holds a tick of it.
+    // However short the round trip, one pass sends no more than the burst.
     #[test]
-    fn a_fast_path_holds_one_tick_of_its_rate() {
-        let now = Instant::now();
-        let mut pacer = pacer(now, 1000 * MSS, Duration::from_micros(100));
-        let mut sent = 0;
-        while pacer.allows(MSS) {
-            pacer.charge(MSS);
-            sent += 1;
+    fn a_fast_path_holds_no_more_than_the_burst() {
+        for srtt in [
+            Duration::from_millis(1),
+            Duration::from_micros(100),
+            Duration::ZERO,
+        ] {
+            let now = Instant::now();
+            let mut pacer = pacer(now, 1000 * MSS, srtt);
+            pacer.refill(now + Duration::from_millis(1), 1000 * MSS, srtt, MSS);
+            let mut sent = 0;
+            while pacer.allows(MSS) {
+                pacer.charge(MSS);
+                sent += 1;
+            }
+            assert_eq!(sent, PACE_BURST_PACKETS, "srtt {srtt:?}");
         }
-        assert_eq!(sent, 20_000);
     }
 
     #[test]
