@@ -3278,7 +3278,11 @@ impl TorrentService {
     // longer, and is checked or fetched again. Nothing here fails the
     // torrent: a tee that cannot start ends its unpacking, and the torrent
     // keeps its files. It reads the database and the files, so it runs off
-    // the tick's task. A restore whose checkpoint the database could not
+    // the tick's task. The pieces it kept whose bytes its files no longer
+    // hold, a file gone or cut short, are had no longer either: each file
+    // with a piece had is looked at by its size, once, as the store is made.
+    // When none of those files is there, the pieces are kept as they were,
+    // and said. A restore whose checkpoint the database could not
     // read makes no store: the torrent waits, its own rows as they were,
     // and the next restore tries it again, as a usenet job's restore is
     // held on the same error (`RestoreSeat::restore`).
@@ -3353,6 +3357,16 @@ impl TorrentService {
             if tee.refusal().is_some() {
                 self.inner.signal.mark(job_id);
             }
+        }
+        match store.drop_unbacked() {
+            Some(0) => {}
+            Some(missing) => {
+                notes.push(Note::Missing { pieces: missing });
+                self.inner.signal.marked(job_id, missing);
+            }
+            None => notes.push(Note::Absent {
+                pieces: store.count(),
+            }),
         }
         Ok((store, notes))
     }
@@ -7301,6 +7315,8 @@ enum Note {
     Unread(String),
     Unrestored(String),
     Dropped { pieces: u32, error: String },
+    Missing { pieces: u32 },
+    Absent { pieces: u32 },
 }
 
 impl Note {
@@ -7314,6 +7330,20 @@ impl Note {
             }
             Self::Dropped { pieces, error } => {
                 tracing::warn!(job_id = job_id.0, pieces, error = %error, "a torrent's pieces did not read from its files; they are fetched again");
+            }
+            Self::Missing { pieces } => {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    pieces,
+                    "a torrent's pieces are not in its files; they are checked or fetched again"
+                );
+            }
+            Self::Absent { pieces } => {
+                tracing::warn!(
+                    job_id = job_id.0,
+                    pieces,
+                    "none of a torrent's files is there; its pieces are kept"
+                );
             }
         }
     }
