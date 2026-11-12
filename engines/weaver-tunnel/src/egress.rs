@@ -228,23 +228,36 @@ impl SocketEgress {
         Ok(socket.into())
     }
 
-    /// A datagram socket bound as [`Self::bind_udp_at`] binds, on an address
-    /// a socket bound before it may have left in use, and whether it takes
-    /// IPv4 as well as IPv6.
-    pub fn bind_udp_reusing(&self, local: SocketAddr) -> io::Result<(UdpSocket, bool)> {
+    /// A datagram socket bound as [`Self::bind_udp_at`] binds, and whether it
+    /// takes IPv4 as well as IPv6. With `reuse` it binds on an address a
+    /// socket bound before it may have left in use. Without, the bind fails
+    /// on a port another socket of the family holds at any address, and a
+    /// port the kernel chooses is one no socket of the family holds: with
+    /// reuse a BSD kernel checks only the exact address, so a socket at the
+    /// unspecified address shares its port with one at a host address, which
+    /// then takes the datagrams sent to that address.
+    pub fn bind_udp_reusing(
+        &self,
+        local: SocketAddr,
+        reuse: bool,
+    ) -> io::Result<(UdpSocket, bool)> {
         let (socket, local, dual_stack) = self.local_socket(local, Type::DGRAM, Protocol::UDP)?;
         #[cfg(not(windows))]
-        socket.set_reuse_address(true)?;
+        socket.set_reuse_address(reuse)?;
+        #[cfg(windows)]
+        let _ = reuse;
         socket.bind(&local.into())?;
         socket.set_nonblocking(true)?;
         Ok((socket.into(), dual_stack))
     }
 
     /// A stream listener bound as [`Self::bind_udp_at`] binds a datagram
-    /// socket, on an address a listener before it may have left in use.
-    pub fn listen_tcp(&self, local: SocketAddr) -> io::Result<TcpListener> {
+    /// socket. With `reuse` it binds on an address a listener before it may
+    /// have left in use; without, as [`Self::bind_udp_reusing`] binds
+    /// without.
+    pub fn listen_tcp(&self, local: SocketAddr, reuse: bool) -> io::Result<TcpListener> {
         let (socket, local, _) = self.local_socket(local, Type::STREAM, Protocol::TCP)?;
-        socket.set_reuse_address(true)?;
+        socket.set_reuse_address(reuse)?;
         socket.bind(&local.into())?;
         socket.listen(1024)?;
         socket.set_nonblocking(true)?;
@@ -405,7 +418,7 @@ mod connect_tests {
     #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
     fn a_reusing_datagram_socket_says_whether_it_takes_both_families() {
         let (socket, dual_stack) = SocketEgress::System
-            .bind_udp_reusing("[::]:0".parse().unwrap())
+            .bind_udp_reusing("[::]:0".parse().unwrap(), true)
             .unwrap();
         assert!(dual_stack);
         let socket = socket2::SockRef::from(&socket);
@@ -414,10 +427,38 @@ mod connect_tests {
         assert!(socket.reuse_address().unwrap());
         let loopback = IpAddr::from(Ipv4Addr::LOCALHOST);
         let (socket, dual_stack) = SocketEgress::System
-            .bind_udp_reusing(SocketAddr::new(loopback, 0))
+            .bind_udp_reusing(SocketAddr::new(loopback, 0), false)
             .unwrap();
         assert!(!dual_stack);
         assert_eq!(socket.local_addr().unwrap().ip(), loopback);
+        assert!(!socket2::SockRef::from(&socket).reuse_address().unwrap());
+    }
+
+    // Without reuse, a datagram socket or a listener at the unspecified
+    // IPv4 address is refused a port a socket at a host address holds; with
+    // reuse it shares it.
+    #[cfg(not(windows))]
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
+    fn without_reuse_a_port_held_at_a_host_address_is_refused() {
+        let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+        let (held, _) = SocketEgress::System
+            .bind_udp_reusing(loopback, false)
+            .unwrap();
+        let unspecified =
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, held.local_addr().unwrap().port()));
+        let refused = SocketEgress::System
+            .bind_udp_reusing(unspecified, false)
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::AddrInUse);
+
+        let held = SocketEgress::System.listen_tcp(loopback, false).unwrap();
+        let unspecified =
+            SocketAddr::from((Ipv4Addr::UNSPECIFIED, held.local_addr().unwrap().port()));
+        let refused = SocketEgress::System
+            .listen_tcp(unspecified, false)
+            .unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::AddrInUse);
     }
 
     // A listener at the unspecified IPv6 address takes an IPv4 peer.
@@ -425,7 +466,7 @@ mod connect_tests {
     #[expect(clippy::disallowed_methods, reason = "a loopback fixture")]
     fn a_listener_at_the_unspecified_v6_address_takes_an_ipv4_peer() {
         let listener = SocketEgress::System
-            .listen_tcp("[::]:0".parse().unwrap())
+            .listen_tcp("[::]:0".parse().unwrap(), true)
             .unwrap();
         assert!(socket2::SockRef::from(&listener).reuse_address().unwrap());
         let port = listener.local_addr().unwrap().port();
@@ -454,7 +495,7 @@ mod connect_tests {
         );
         let egress = SocketEgress::existing_interface(device).unwrap();
         assert_eq!(egress, SocketEgress::Interface(device.into()));
-        let listener = match egress.listen_tcp("[::]:0".parse().unwrap()) {
+        let listener = match egress.listen_tcp("[::]:0".parse().unwrap(), false) {
             Ok(listener) => listener,
             // Binding to a device needs a privilege some Linux hosts withhold.
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => return,
