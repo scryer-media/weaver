@@ -233,6 +233,46 @@ fn renumbered(volume: &[u8], number: u32) -> Vec<u8> {
     out
 }
 
+// The gap two far-numbered volumes leave before them, said as one run,
+// marks what one loss told for each of its volumes marks: nothing, since
+// the store holds none of them.
+#[test]
+fn a_gap_marks_what_a_loss_for_each_of_its_volumes_marks() {
+    const AT: u32 = 2_000;
+    let set = write(&items(), &split(Version::Rar5));
+    let length = set[1].len() as u64;
+    let posted = [renumbered(&set[1], AT), renumbered(&set[2], AT + 1)];
+    let mut run = Run::new();
+    let mut members = Vec::new();
+    for (name, bytes) in ["c0ffee", "d00d"].into_iter().zip(&posted) {
+        let member = run.announce(name, bytes.len());
+        run.deliver(member, 0, bytes);
+        members.push(member);
+    }
+    let before = run.effects.len();
+    for member in &members {
+        run.close(*member);
+    }
+    let marked = |effects: &[Effect]| {
+        effects
+            .iter()
+            .filter(|effect| matches!(effect, Effect::Damaged { .. } | Effect::Lost { .. }))
+            .count()
+    };
+    assert_eq!(marked(&run.effects[before..]), 0);
+    let (node, _) = run.tree.child_of(NodeId::ROOT, members[0]).expect("bound");
+    let mut each = Vec::new();
+    for volume in 0..AT {
+        run.tree.damage(
+            node,
+            VolumeIndex(volume),
+            weaver_graph::ByteRange::new(0, length),
+            &mut each,
+        );
+    }
+    assert!(each.is_empty(), "{each:?}");
+}
+
 // Two volumes of a set numbered far past any first, the second its set's
 // last, posted under names that number nothing. The work their close does
 // for the volumes before them is a few effects, not one for every number.
@@ -252,7 +292,7 @@ fn two_volumes_numbered_far_out_say_no_gap_for_every_number_before_them() {
     assert_eq!(run.at(members[0]), Some(VolumeIndex(FAR)));
     assert_eq!(run.at(members[1]), Some(VolumeIndex(FAR + 1)));
     let before = run.effects.len();
-    for member in members {
+    for &member in &members {
         run.close(member);
     }
     let damaged = run.effects[before..]
@@ -266,11 +306,22 @@ fn two_volumes_numbered_far_out_say_no_gap_for_every_number_before_them() {
         "{}",
         run.effects.len() - before
     );
-    // The set is refused as no set can be, as one numbered past every set is.
+    // The gap before them is said as one run, which marks nothing: no
+    // volume of it is held. The set still never opens, and the quiet job
+    // refuses it for the first volume it never had.
+    assert!(
+        !run.effects[before..]
+            .iter()
+            .any(|effect| matches!(effect, Effect::Refused { .. })),
+    );
+    let (node, _) = run.tree.child_of(NodeId::ROOT, members[0]).expect("bound");
+    let before = run.effects.len();
+    run.tree
+        .quiet(node, &mut Objects::default(), &mut run.effects);
     assert!(run.effects[before..].iter().any(|effect| matches!(
         effect,
         Effect::Refused {
-            why: Why::InvalidArchive,
+            why: Why::FirstBytesLost,
             ..
         }
     )));
