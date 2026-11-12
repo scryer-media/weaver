@@ -109,10 +109,11 @@ impl NamespaceWriter {
             .into_iter()
             .flat_map(|namespace| {
                 let sets = tree.recovery_nodes(namespace);
+                let aside = Aside::of(tree, &sets);
                 let standing: Vec<NodeId> = sets
                     .iter()
                     .copied()
-                    .filter(|set| !yields(tree, &sets, *set))
+                    .filter(|set| !aside.yields(*set))
                     .collect();
                 standing.into_iter().map(move |set| (namespace, set))
             })
@@ -128,9 +129,10 @@ impl NamespaceWriter {
         sets: &'t [NodeId],
         member: MemberId,
     ) -> impl Iterator<Item = NodeId> + 't {
+        let aside = Aside::of(tree, sets);
         sets.iter()
             .copied()
-            .filter(move |set| self.covers(tree, *set, member) && !yields(tree, sets, *set))
+            .filter(move |set| self.covers(tree, *set, member) && !aside.yields(*set))
     }
 
     // Whether the set covers the member: the one place a member is matched
@@ -154,8 +156,9 @@ impl NamespaceWriter {
     // still has an article coming.
     pub(crate) fn ruled(&self, tree: &Tree, node: NodeId, coming: &Coming) -> bool {
         let sets = tree.recovery_nodes(node);
+        let aside = Aside::of(tree, &sets);
         sets.iter().copied().all(|set| {
-            yields(tree, &sets, set)
+            aside.yields(set)
                 || (!tree.lent(set)
                     && !coming.sets.contains(&set)
                     && tree.recovery(set).is_none_or(|recovery| {
@@ -469,6 +472,7 @@ impl NamespaceWriter {
         // and only once a set is otherwise due, for its own ruling and for
         // every wider set beside it.
         let mut pending: Option<Vec<(NodeId, BTreeSet<MemberId>)>> = None;
+        let aside = Aside::of(tree, &sets);
         sets.iter()
             .copied()
             .filter(|&set| {
@@ -478,7 +482,7 @@ impl NamespaceWriter {
                 else {
                     return false;
                 };
-                if yields(tree, &sets, set) {
+                if aside.yields(set) {
                     return false;
                 }
                 if !known
@@ -1312,8 +1316,9 @@ fn pending_covers(
     namespace: &weaver_graph::Namespace,
     sets: &[NodeId],
 ) -> Vec<(NodeId, BTreeSet<MemberId>)> {
+    let aside = Aside::of(tree, sets);
     sets.iter()
-        .filter(|&&set| !yields(tree, sets, set))
+        .filter(|&&set| !aside.yields(set))
         .filter_map(|&set| {
             let covers: BTreeSet<MemberId> = match tree.recovery(set) {
                 Some(recovery) if recovery.outcome().is_none() => namespace
@@ -1339,15 +1344,38 @@ fn pending_covers(
 // not rule, is never lent, and no byte reaches it, so it takes back no
 // ruling and makes no other set rule again. With no such parity, as when
 // its index never came or does not read, the listing rules as before.
-fn yields(tree: &Tree, sets: &[NodeId], set: NodeId) -> bool {
-    tree.kind(set) == Some(Kind::Sfv)
-        && sets.iter().any(|&other| {
-            matches!(tree.kind(other), Some(Kind::Par2 | Kind::Par3))
-                && match tree.recovery(other) {
-                    Some(recovery) => !recovery.undescribed(),
-                    None => tree.lent_covers_any(other),
-                }
-        })
+//
+// Whether such parity is there is one answer for the whole namespace: it is
+// found the first time a listing asks, and never again in the same pass,
+// however many listings the namespace holds. A namespace with no listing
+// never looks.
+struct Aside<'t> {
+    tree: &'t Tree,
+    sets: &'t [NodeId],
+    parity: std::cell::OnceCell<bool>,
+}
+
+impl<'t> Aside<'t> {
+    fn of(tree: &'t Tree, sets: &'t [NodeId]) -> Self {
+        Self {
+            tree,
+            sets,
+            parity: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn yields(&self, set: NodeId) -> bool {
+        self.tree.kind(set) == Some(Kind::Sfv)
+            && *self.parity.get_or_init(|| {
+                self.sets.iter().any(|&other| {
+                    matches!(self.tree.kind(other), Some(Kind::Par2 | Kind::Par3))
+                        && match self.tree.recovery(other) {
+                            Some(recovery) => !recovery.undescribed(),
+                            None => self.tree.lent_covers_any(other),
+                        }
+                })
+            })
+    }
 }
 
 // How many of the set's own volumes are closed.
