@@ -16,7 +16,8 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_REDIRECTS: usize = 10;
 
 /// The bytes at `url`, fetched on the torrent route of `scope` as `client`,
-/// with `cookie` sent to the host named, and only to it, when one is given.
+/// with `cookie` sent to the host named, and only to it, when one is given;
+/// a fetch begun over https never sends it over http.
 /// A body is bounded like an NZB's.
 pub async fn fetch_torrent_url(
     runtime: &ProxyRuntime,
@@ -37,14 +38,13 @@ pub async fn fetch_torrent_url(
         allow_private_network: runtime.allow_private_network(),
     };
     let cookie = cookie.map(str::trim).filter(|cookie| !cookie.is_empty());
-    let site = url.host_str();
     let response = routed_fetch(
         runtime,
         Consumer::Torrent(scope),
         url,
         &options,
         |request, current, _| match cookie {
-            Some(cookie) if current.host_str() == site => {
+            Some(cookie) if sends_cookie(url, current) => {
                 request.header(reqwest::header::COOKIE, cookie)
             }
             _ => request,
@@ -60,6 +60,14 @@ pub async fn fetch_torrent_url(
         return Err("empty response body".into());
     }
     Ok(bytes)
+}
+
+// Whether a fetch that began at `first` sends the cookie on to `current`:
+// to the host it named, on any port, as a browser or Qt scopes a cookie,
+// and never over http once it began over https.
+fn sends_cookie(first: &reqwest::Url, current: &reqwest::Url) -> bool {
+    current.host_str() == first.host_str()
+        && !(first.scheme() == "https" && current.scheme() == "http")
 }
 
 #[cfg(test)]
@@ -124,6 +132,78 @@ mod tests {
             )),
             "{request}"
         );
+    }
+
+    #[test]
+    fn the_cookie_goes_to_the_host_named_and_never_down_to_http() {
+        let url = |url: &str| reqwest::Url::parse(url).unwrap();
+        let first = url("https://site.invalid/a.torrent");
+        for (current, sent) in [
+            ("https://site.invalid/b.torrent", true),
+            ("https://site.invalid:8443/b.torrent", true),
+            ("http://site.invalid/b.torrent", false),
+            ("http://site.invalid:8080/b.torrent", false),
+            ("https://other.invalid/b.torrent", false),
+            ("https://cdn.site.invalid/b.torrent", false),
+        ] {
+            assert_eq!(sends_cookie(&first, &url(current)), sent, "{current}");
+        }
+        // A fetch that began over http may go up to https.
+        let first = url("http://site.invalid/a.torrent");
+        for (current, sent) in [
+            ("http://site.invalid:8080/b.torrent", true),
+            ("https://site.invalid/b.torrent", true),
+            ("http://other.invalid/b.torrent", false),
+        ] {
+            assert_eq!(sends_cookie(&first, &url(current)), sent, "{current}");
+        }
+    }
+
+    // A redirect to the same host on another port carries the cookie on.
+    #[tokio::test]
+    async fn the_cookie_follows_a_redirect_to_another_port_of_the_host() {
+        let first = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = reqwest::Url::parse(&format!("http://{}/a.torrent", first.local_addr().unwrap()))
+            .unwrap();
+        let next = format!("http://{}/b.torrent", second.local_addr().unwrap());
+        let body = b"d4:infod4:name1:aee";
+        let redirect = tokio::spawn(async move {
+            let (mut stream, _) = first.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            let head = format!(
+                "HTTP/1.1 302 Found\r\nLocation: {next}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            request
+        });
+        let answer = tokio::spawn(async move {
+            let (mut stream, _) = second.accept().await.unwrap();
+            let request = read_request(&mut stream).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(body).await.unwrap();
+            request
+        });
+
+        let bytes = fetch_torrent_url(
+            &crate::proxies::direct_runtime(),
+            TorrentScope::Default,
+            &url,
+            Some("uid=1; pass=2"),
+            IDENTITY,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(bytes, body);
+        for request in [redirect.await.unwrap(), answer.await.unwrap()] {
+            let request = request.to_ascii_lowercase();
+            assert!(request.contains("cookie: uid=1; pass=2"), "{request}");
+        }
     }
 
     #[tokio::test]
