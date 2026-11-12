@@ -12,6 +12,9 @@
  *
  * Reading a link consumes it: the caller puts the returned query string back
  * in the address bar, so a reload cannot quietly mint a second key.
+ *
+ * A link may mint a Read or Control key on arrival. A link asking for Admin
+ * only fills the form: the key is minted when the person clicks create.
  */
 
 const GENERATE_PARAMS = ["apiKeyGenerate", "createApiKey"] as const;
@@ -38,6 +41,11 @@ function linkScope(value: string | null): ApiKeyLinkScope | null {
     default:
       return null;
   }
+}
+
+/** Whether a link's key is minted on arrival, rather than waiting for a click. */
+export function mintsOnArrival(link: ApiKeyLink): boolean {
+  return link.scope !== "ADMIN";
 }
 
 /** The first of these parameters the query string carries, if any. */
