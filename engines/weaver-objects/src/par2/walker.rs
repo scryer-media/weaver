@@ -64,6 +64,9 @@ pub(super) enum Found {
     },
     // A packet that passed its hash and is of no use.
     Unused,
+    // A packet that failed its hash or ran past the volume's end: examined,
+    // and no packet. What it read past is read again (`Again`).
+    Failed,
     // Bytes the walk read past as a packet that was none, which it reads
     // again from the volume.
     Again(ByteRange),
@@ -359,6 +362,7 @@ impl Walker {
         let range = ByteRange::new(from, self.next);
         self.streamed = None;
         self.unposted(range, found);
+        found.push(Found::Failed);
         found.push(Found::Again(range));
     }
 
@@ -612,7 +616,7 @@ fn find_magic(bytes: &[u8]) -> Option<u64> {
 // What one job's packets may cost across every volume, by par2-rs's three
 // scan meters. Its budget keeps them in cells, which an object shared across
 // threads cannot hold, so they are counted here the same way.
-const MAX_EXAMINED: u64 = 1_048_576;
+pub(super) const MAX_EXAMINED: u64 = 1_048_576;
 const MAX_RETAINED: usize = 262_144;
 const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
 
@@ -624,13 +628,28 @@ pub(super) struct Meter {
 }
 
 impl Meter {
-    // Charge one packet the walk found; false once a limit is passed.
+    // A meter that has examined this many packets.
+    #[cfg(test)]
+    pub(super) fn spent(examined: u64) -> Self {
+        Self {
+            examined,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn examined(&self) -> u64 {
+        self.examined
+    }
+
+    // Charge one packet the walk found, or read as one and found none;
+    // false once a limit is passed.
     // Variable metadata plus container and allocation overhead; recovery
     // payloads stay in the volume and cost nothing here.
     pub(super) fn charge(&mut self, found: &Found) -> bool {
         self.examined += 1;
         let variable = match found {
-            Found::Unused | Found::Again(_) => None,
+            Found::Unused | Found::Failed | Found::Again(_) => None,
             Found::Recovery { .. } => Some(0),
             Found::Metadata { packet, .. } => Some(match packet {
                 Packet::Main(main) => (main.recovery_file_ids.len()

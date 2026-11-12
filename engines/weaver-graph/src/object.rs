@@ -604,6 +604,14 @@ pub trait Object: Send + Sync {
         false
     }
 
+    // Whether what I ask for again while my bytes are being said again may
+    // wait until they all are: whatever comes past my front meanwhile I
+    // hold, or ask for again myself. The owner then answers it after that
+    // replay, not inside it.
+    fn again_waits(&self) -> bool {
+        false
+    }
+
     // My recovery face, if I am a recovery object: the namespace I live in
     // feeds, binds and repairs through it.
     fn recovery(&self) -> Option<&dyn crate::recovery::Recovery> {

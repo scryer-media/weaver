@@ -647,6 +647,12 @@ impl Tree {
         self.object(node).is_some_and(Object::reads_in_order)
     }
 
+    // Whether what the object at `node` asks for again during a replay of
+    // its bytes may wait for that replay to end: see `Object::again_waits`.
+    pub fn again_waits(&self, node: NodeId) -> bool {
+        self.object(node).is_some_and(Object::again_waits)
+    }
+
     // The recovery face of the object at `node`, if it has one and is in
     // its node.
     pub fn recovery(&self, node: NodeId) -> Option<&dyn Recovery> {

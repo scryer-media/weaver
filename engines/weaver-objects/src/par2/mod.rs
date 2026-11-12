@@ -447,7 +447,7 @@ impl Par2 {
                     self.rewalks.push((volume, *range));
                     continue;
                 }
-                Found::Unused => None,
+                Found::Unused | Found::Failed => None,
             };
             let new_set = set.is_some_and(|set| !self.sets.contains_key(&set));
             if !self.meter.charge(&item) || (new_set && self.sets.len() >= MAX_PAR2_RECOVERY_SETS) {
@@ -459,7 +459,7 @@ impl Par2 {
                 return;
             }
             match item {
-                Found::Unused | Found::Again(_) => {}
+                Found::Unused | Found::Failed | Found::Again(_) => {}
                 Found::Metadata {
                     set,
                     at,
@@ -677,6 +677,12 @@ impl Object for Par2 {
 
     fn recovery_mut(&mut self) -> Option<&mut dyn Recovery> {
         Some(self)
+    }
+
+    // Each walk holds what comes past its front, and notes what it cannot
+    // hold to ask for again: a range asked for again mid-replay waits.
+    fn again_waits(&self) -> bool {
+        true
     }
 }
 
