@@ -17,6 +17,7 @@ mod ingress_limits;
 mod mtu_ceiling;
 mod mtu_probing;
 mod nagle;
+mod pacing;
 mod packet_validation;
 mod probe_payload;
 mod retransmit_timer;

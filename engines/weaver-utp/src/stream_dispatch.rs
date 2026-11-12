@@ -31,6 +31,7 @@ use crate::{
     delay::DelayTracker,
     ingress::{Event as IngressEvent, Receiver as IngressReceiver},
     mtu::{SegmentSizes, SegmentSizesConfig, packet_mtu},
+    pacer::Pacer,
     raw::{Type, UtpHeader},
     recovery::Recovery,
     rtte::RttEstimator,
@@ -227,6 +228,8 @@ struct VirtualSocket<T, Env> {
 
     rtte: RttEstimator,
     congestion_controller: Ledbat,
+    // When the data the window allows goes out.
+    pacer: Pacer,
 
     recovery: Recovery,
 
@@ -394,6 +397,17 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
         let mut header = self.outgoing_header();
 
+        self.pacer.refill(
+            self.this_poll.now,
+            self.congestion_controller
+                .window()
+                .min(self.last_remote_window as usize),
+            self.rtte.roundtrip_time(),
+            usize::from(self.segment_sizes.mss()),
+        );
+        // The payload of the packet the pacer held back, if one was.
+        let mut paced = None;
+
         // Retransmit timer expired, rewind state backwards.
         if self.timers.retransmit.expired(self.this_poll.now) {
             trace!("retransmit timer expired");
@@ -440,6 +454,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         payload_size = seg.payload_size(),
                         "RTO expired: sent ST_DATA"
                     );
+                    self.pacer.charge(seg.payload_size());
 
                     // A lone probe can fail because it is too large. Other
                     // outstanding packets make this a congestion timeout.
@@ -570,6 +585,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                 // we MUST transmit the first segment no matter what.
                 if rec.total_retransmitted_segments() > 0 {
+                    if !self.pacer.allows(seg.payload_size()) {
+                        paced = Some(seg.payload_size());
+                        break;
+                    }
                     if !seg.is_lost() {
                         event!(
                             RECOVERY_TRACING_LOG_LEVEL,
@@ -609,10 +628,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         .increment(1);
                     rec.pipe_estimate.pipe += seg.payload_size();
                     cwnd = cwnd.saturating_sub(seg.payload_size());
+                    self.pacer.charge(seg.payload_size());
                     sent += 1;
                 } else {
                     return Ok(());
                 }
+            }
+            if let Some(at) = paced.and_then(|payload| self.pacer.ready_at(payload)) {
+                self.timers.pace.set(at);
             }
 
             event!(
@@ -684,6 +707,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 trace_every_ms!(100, "remote recv window exhausted");
                 break;
             }
+            if !self.pacer.allows(item.payload_size()) {
+                paced = Some(item.payload_size());
+                break;
+            }
 
             let go_back = item.send_count() > 0;
             match send_data!(self, cx, header, item) {
@@ -702,6 +729,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         "sent ST_DATA"
                     );
                     remaining_cwnd -= item.payload_size();
+                    self.pacer.charge(item.payload_size());
                     sent_count += 1;
                 }
                 // Transport was pending, need to retry
@@ -722,6 +750,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
                 Err(e) => return Err(e),
             }
+        }
+        if let Some(at) = paced.and_then(|payload| self.pacer.ready_at(payload)) {
+            self.timers.pace.set(at);
         }
 
         if let Some((seq_nr, size)) = message_too_long {
@@ -1574,6 +1605,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.timers.remote_inactivity_timer.poll_at(),
             self.timers.recovery_pipe_expiry.take().poll_at(), // take() disarms it on every call
             self.timers.syn_ack_resend.poll_at(),
+            self.timers.pace.take().poll_at(), // armed again by each pass the pacer stops
         ]
         .into_iter()
         .flatten()
@@ -1988,6 +2020,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 ack_delay_timer: Timer::default(),
                 recovery_pipe_expiry: Timer::default(),
                 syn_ack_resend: Timer::default(),
+                pace: Timer::default(),
                 remote_inactivity_timer: {
                     let mut timer = Timer::default();
                     if matches!(
@@ -2058,6 +2091,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             transport: None,
             sender: None,
             recovery: Recovery::default(),
+            pacer: Pacer::default(),
         };
 
         socket.stats.live_virtual_sockets.increment(1);
@@ -2083,6 +2117,7 @@ const TIMER_RECOVERY_PIPE: u8 = 3;
 const IDLE_DECAYS_MAX: u128 = 64;
 
 const TIMER_SYN_ACK_RESEND: u8 = 4;
+const TIMER_PACE: u8 = 5;
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 enum Timer<const NAME: u8> {
@@ -2102,6 +2137,7 @@ impl<const NAME: u8> Timer<NAME> {
             TIMER_ACK_DELAY => "ack delay",
             TIMER_RECOVERY_PIPE => "recovery pipe",
             TIMER_SYN_ACK_RESEND => "syn ack resend",
+            TIMER_PACE => "pace",
             _ => "unknown",
         }
     }
@@ -2194,6 +2230,8 @@ struct Timers {
     retransmit: Timer<TIMER_RETRANSMIT>,
     ack_delay_timer: Timer<TIMER_ACK_DELAY>,
     syn_ack_resend: Timer<TIMER_SYN_ACK_RESEND>,
+    // Data waits on the pacer until then.
+    pace: Timer<TIMER_PACE>,
 }
 
 impl Timers {
