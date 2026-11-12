@@ -317,6 +317,62 @@ fn replay_stages_bounded_chunks_before_invalidating_coverage() {
     assert!(!job.writer.rechecks_waiting());
 }
 
+// The copies a replay staged that are still on disk.
+fn staged_copies(job: &Job) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(job.dir.path().join(weaver_graph::names::INTERNAL_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "repaired"))
+        .collect()
+}
+
+#[test]
+fn a_refused_replay_write_stops_reading_and_removes_the_copy_at_once() {
+    use crate::pipeline::graph::leaf::counting;
+    // What a replay reads through its second chunk, stopped there.
+    let (mut whole, _, _, _) = staged_job();
+    let replay = whole.writer.take_replay(&whole.tree).unwrap().unwrap();
+    let stop = Arc::clone(&replay.stop);
+    let mut chunks = 0;
+    let (from, _) = counting::so_far();
+    let replayed = replay.run_with(&Default::default(), || {
+        chunks += 1;
+        if chunks == 2 {
+            stop.store(true, Ordering::Relaxed);
+        }
+    });
+    let two_chunks = counting::so_far().0 - from;
+    assert_eq!(replayed.chunk_lengths(), vec![READ_BACK, READ_BACK]);
+    replayed.remove().unwrap();
+
+    // The disk fills after the first chunk: the second is read, its write
+    // refused, and nothing after it is read.
+    let (mut job, _, node, expected) = staged_job();
+    let before = job.tree.record(node).unwrap();
+    let replay = job.writer.take_replay(&job.tree).unwrap().unwrap();
+    let mut staged = 0;
+    let (from, _) = counting::so_far();
+    counting::fill_after(Some(READ_BACK));
+    let replayed = replay.run_with(&Default::default(), || staged += 1);
+    counting::fill_after(None);
+    assert_eq!(staged, 1);
+    assert_eq!(counting::so_far().0 - from, two_chunks);
+    assert!(
+        staged_copies(&job).is_empty(),
+        "the copy goes before the return is heard"
+    );
+    let mut build = job.build();
+    assert!(
+        job.writer
+            .replayed(&mut job.tree, &mut build, &Source, replayed, &mut job.out)
+            .is_err()
+    );
+    assert_eq!(job.tree.record(node).unwrap(), before);
+    assert_eq!(job.file("inner.bin"), expected);
+}
+
 #[test]
 fn changed_inputs_discard_a_staged_replay_before_uncovering() {
     let (mut job, member, node, mut expected) = staged_job();

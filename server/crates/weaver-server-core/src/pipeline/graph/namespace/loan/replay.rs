@@ -67,7 +67,8 @@ impl Replay {
         self.access.shutdown = shutdown.clone();
         let mut provenance = Vec::new();
         let staged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            for &(volume, range) in &self.ranges {
+            // A write the staging refused ends it: nothing more is read.
+            'staging: for &(volume, range) in &self.ranges {
                 let Some(&(_, member)) = self.access.volumes.get(&volume) else {
                     continue;
                 };
@@ -98,6 +99,9 @@ impl Replay {
                             self.access
                                 .repaired
                                 .write(MemberId(volume.0), piece.start, &bytes);
+                            if self.access.repaired.failed.is_some() {
+                                break 'staging;
+                            }
                             provenance.push(source);
                             chunk_read();
                         }
