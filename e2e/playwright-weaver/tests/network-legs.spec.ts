@@ -311,8 +311,11 @@ test("L11 reweighting a running route moves connections without revoking them", 
   // health check and this test's probes.
   const ifaceA = await ifaceFor(request, egressAddress("a"));
   const ifaceB = await ifaceFor(request, egressAddress("b"));
-  await startCapture(request, "l11");
+  // Only the accepts are captured: the download's own packets would fill the
+  // capture buffer and push an accept out of it.
+  await startCapture(request, "l11", NNTP_ACCEPTED);
   let flow: NetworkFlow;
+  let dropped = 0;
   try {
     await world.route("SERVER", server, { legs: [directLeg(a.id, 25), directLeg(b.id, 75)] });
     flow = await flowAfter(request, await flowMark(request), sample => carrying(sample, server, [[a.id, 1], [b.id, 3]]), "legs 1/3 open");
@@ -320,13 +323,15 @@ test("L11 reweighting a running route moves connections without revoking them", 
     // runs until leg B's new connection has been accepted.
     await expect.poll(() => packetCount(request, "l11", ifaceB, NNTP_ACCEPTED), { message: "leg B's new connection accepted", timeout: 0 }).toBeGreaterThanOrEqual(1);
   } finally {
-    await stopCapture(request);
+    dropped = await stopCapture(request);
   }
+  // A capture that lost packets cannot count connections.
+  expect(dropped, "packets the L11 capture dropped").toBe(0);
   const accepted = {
     a: await packetCount(request, "l11", ifaceA, NNTP_ACCEPTED),
     b: await packetCount(request, "l11", ifaceB, NNTP_ACCEPTED),
   };
-  await saveEvidence(info, "L11", { flow, accepted });
+  await saveEvidence(info, "L11", { flow, accepted, dropped });
   // One more connection on leg B, and none to replace a revoked one.
   expect(accepted.a + accepted.b).toBeLessThanOrEqual(1);
   expect(await download.release()).toBe("COMPLETED");

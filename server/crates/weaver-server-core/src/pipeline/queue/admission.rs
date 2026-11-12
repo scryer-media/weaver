@@ -258,16 +258,15 @@ pub(crate) fn delivery_staging_dir(
 
 pub(crate) fn staging_dir_for(destination_root: &Path, job_id: JobId) -> PathBuf {
     destination_root
-        .join(".weaver-staging")
+        .join(crate::jobs::working_dir::STAGING_DIR_NAME)
         .join(job_id.0.to_string())
 }
 
 // Make the job's staging directory and mark it the job's, as its working
-// directory is.
+// directory is. Nothing under the destination is reached through a symbolic
+// link.
 pub(crate) fn make_staging_dir(staging_dir: &Path, job_id: JobId) -> std::io::Result<()> {
-    std::fs::create_dir_all(staging_dir)?;
-    let root = staging_dir.parent().unwrap_or(staging_dir);
-    crate::jobs::working_dir::mark_weaver_owned_working_dir(root, staging_dir, job_id)
+    crate::jobs::working_dir::make_job_staging_dir(staging_dir, job_id)
 }
 
 // Every directory a job's staging directory can lie under: the complete

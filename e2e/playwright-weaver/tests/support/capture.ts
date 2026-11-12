@@ -19,13 +19,19 @@ async function post(request: APIRequestContext, path: string, data: unknown) {
   return JSON.parse(body);
 }
 
-/** Start one capture per interface; returns once each is listening. */
-export async function startCapture(request: APIRequestContext, name: string): Promise<Array<{ iface: string; path: string }>> {
-  return (await post(request, "/start", { name })).captures;
+/**
+ * Start one capture per interface; returns once each is listening. With a
+ * tcpdump `filter` the capture keeps only the packets it matches: a test that
+ * counts a few packets on a link busy with data captures only those, so the
+ * data cannot crowd them out of the capture buffer.
+ */
+export async function startCapture(request: APIRequestContext, name: string, filter = ""): Promise<Array<{ iface: string; path: string }>> {
+  return (await post(request, "/start", { name, ...(filter ? { filter } : {}) })).captures;
 }
 
-export async function stopCapture(request: APIRequestContext): Promise<void> {
-  await post(request, "/stop", {});
+/** Stop every capture; returns how many packets the kernel dropped from them. */
+export async function stopCapture(request: APIRequestContext): Promise<number> {
+  return (await post(request, "/stop", {}) as { dropped: number }).dropped;
 }
 
 /** Packets in capture `name` on `iface`, optionally narrowed by a tcpdump filter. */

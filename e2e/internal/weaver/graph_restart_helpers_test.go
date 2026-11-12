@@ -167,12 +167,170 @@ scope = "all"
 	if latest, err := latestMigration(dir); err != nil || latest != 2 {
 		t.Fatalf("latest = %d, %v; want 2", latest, err)
 	}
-	if _, err := readLaterMigrations(dir, 0); err == nil || !strings.Contains(err.Error(), `migration 1 has a "rust" step`) {
-		t.Fatalf("from 0 = %v, want the rust step named", err)
+	if _, err := readLaterMigrations(dir, 0); err == nil || !strings.Contains(err.Error(), `migration 1 has a "rust" step (hook "a")`) {
+		t.Fatalf("from 0 = %v, want the rust step and its hook named", err)
 	}
 	if _, err := readLaterMigrations(dir, 1); err == nil || !strings.Contains(err.Error(), "UPDATE t SET c = 'x'") {
 		t.Fatalf("from 1 = %v, want the update named", err)
 	}
+}
+
+// A created index and a Rust step with a named reverse are steps the rewind
+// can undo, and are reported.
+func TestLaterMigrationsReportIndexesAndReversibleRustSteps(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "migrations")
+	if err := os.MkdirAll(filepath.Join(dir, "0002_b"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := `format_version = 1
+
+[[migration]]
+version = 1
+description = "a"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "move_nzbs_and_outlines_v85"
+scope = "all"
+
+[[migration]]
+version = 2
+description = "b"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0002_b/schema.sql"
+scope = "all"
+`
+	if err := os.WriteFile(filepath.Join(dir, "manifest.toml"), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sql := "CREATE INDEX IF NOT EXISTS idx_a\n    ON t (a DESC);\nCREATE UNIQUE INDEX idx_b ON t (b);\n"
+	if err := os.WriteFile(filepath.Join(dir, "0002_b", "schema.sql"), []byte(sql), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	later, err := readLaterMigrations(dir, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := laterMigrations{Indexes: []string{"idx_a", "idx_b"}, Hooks: []string{"move_nzbs_and_outlines_v85"}}
+	if !reflect.DeepEqual(later, want) {
+		t.Fatalf("later = %+v, want %+v", later, want)
+	}
+}
+
+// The checked-in manifest reads whole: every step after the graph-engine
+// migration is one the rewind can undo.
+func TestLaterMigrationsReadTheCheckedInManifest(t *testing.T) {
+	later, err := readLaterMigrations(testMigrationsDir, graphEngineMigration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, index := range []string{"idx_job_history_size_job", "idx_job_history_name_job"} {
+		if !contains(later.Indexes, index) {
+			t.Fatalf("later indexes = %v, missing %s", later.Indexes, index)
+		}
+	}
+	for _, table := range []string{"active_job_nzb_files", "job_nzbs", "active_job_outlines"} {
+		if !contains(later.Tables, table) {
+			t.Fatalf("later tables = %v, missing %s", later.Tables, table)
+		}
+	}
+	if !contains(later.Columns, tableColumn{"active_jobs", "staging_dir"}) {
+		t.Fatalf("later columns = %v, missing active_jobs.staging_dir", later.Columns)
+	}
+	if !contains(later.Hooks, "move_nzbs_and_outlines_v85") {
+		t.Fatalf("later hooks = %v, want the NZB move", later.Hooks)
+	}
+}
+
+// The 0.16.5 rewind undoes what came after the graph-engine migration as the
+// engine-stamped one does, on top of its own part, naming each thing once.
+func TestRewindTo0165FollowsTheLaterMigrations(t *testing.T) {
+	later, err := readLaterMigrations(testMigrationsDir, graphEngineMigration)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rewind := rewindTo0165(later)
+	stamped := preGraphEngineRewind(later)
+	if !reflect.DeepEqual(rewind.Reverses, stamped.Reverses) || !reflect.DeepEqual(rewind.DropIndexes, stamped.DropIndexes) {
+		t.Fatalf("0.16.5 reverses %v indexes %v, engine-stamped %v %v", rewind.Reverses, rewind.DropIndexes, stamped.Reverses, stamped.DropIndexes)
+	}
+	for _, table := range append(append([]string(nil), graphTables...), later.Tables...) {
+		if !contains(rewind.DropTables, table) {
+			t.Fatalf("0.16.5 drops tables %v, missing %s", rewind.DropTables, table)
+		}
+	}
+	for _, column := range append([]tableColumn{{"active_jobs", "engine"}, {"job_history", "engine"}}, later.Columns...) {
+		if !contains(rewind.DropColumns, column) {
+			t.Fatalf("0.16.5 drops columns %v, missing %v", rewind.DropColumns, column)
+		}
+	}
+	if len(appendNew(nil, rewind.DropTables...)) != len(rewind.DropTables) || len(appendNew(nil, rewind.DropColumns...)) != len(rewind.DropColumns) {
+		t.Fatalf("0.16.5 names a table or column twice: %v %v", rewind.DropTables, rewind.DropColumns)
+	}
+	if rewind.LedgerFrom != 66 {
+		t.Fatalf("0.16.5 ledger from %d, want 66", rewind.LedgerFrom)
+	}
+}
+
+// The NZB move is undone first, in the datastore's dialect, so the NZBs are
+// back on their rows before job_nzbs and the indexes go.
+func TestSchemaRewindPlanPutsTheNZBsBackFirst(t *testing.T) {
+	rewind := schemaRewind{
+		Reverses:    []string{"move_nzbs_and_outlines_v85"},
+		DropIndexes: []string{"idx_job_history_size_job"},
+		DropTables:  []string{"job_nzbs", "active_job_outlines"},
+		DropColumns: []tableColumn{{"active_jobs", "staging_dir"}, {"job_nzbs", "nzb_zstd"}},
+		LedgerFrom:  74,
+	}
+	shape := schemaShape{
+		Datastore: weaverDatastorePostgres,
+		Tables:    map[string]bool{"active_jobs": true, "job_history": true, "job_nzbs": true},
+		Columns: map[string]map[string]bool{
+			"active_jobs": {"job_id": true, "staging_dir": true},
+			"job_history": {"job_id": true, "nzb_zstd": true},
+			"job_nzbs":    {"job_id": true, "nzb_zstd": true},
+		},
+	}
+	want := []string{
+		"ALTER TABLE active_jobs ADD COLUMN nzb_zstd BYTEA",
+		"UPDATE active_jobs SET nzb_zstd = (SELECT n.nzb_zstd FROM job_nzbs AS n WHERE n.job_id = active_jobs.job_id) WHERE nzb_zstd IS NULL",
+		"UPDATE job_history SET nzb_zstd = (SELECT n.nzb_zstd FROM job_nzbs AS n WHERE n.job_id = job_history.job_id) WHERE nzb_zstd IS NULL",
+		"DROP INDEX IF EXISTS idx_job_history_size_job",
+		"ALTER TABLE active_jobs DROP COLUMN staging_dir",
+		"DROP TABLE job_nzbs",
+		"DELETE FROM _sqlx_migrations WHERE version >= 74",
+	}
+	if got := rewind.plan(shape); !reflect.DeepEqual(got, want) {
+		t.Fatalf("plan =\n%s\nwant\n%s", strings.Join(got, "\n"), strings.Join(want, "\n"))
+	}
+	shape.Datastore = weaverDatastoreSQLite
+	if got := rewind.plan(shape)[0]; got != "ALTER TABLE active_jobs ADD COLUMN nzb_zstd BLOB" {
+		t.Fatalf("SQLite column = %s", got)
+	}
+}
+
+func contains[T comparable](items []T, want T) bool {
+	for _, item := range items {
+		if item == want {
+			return true
+		}
+	}
+	return false
+}
+
+// testRustSteps does on SQLite what each Rust step does to the rows these
+// tests hold, so the checked-in migrations replay whole.
+var testRustSteps = map[string][]string{
+	"move_nzbs_and_outlines_v85": {
+		`INSERT INTO job_nzbs (job_id, nzb_zstd) SELECT job_id, nzb_zstd FROM active_jobs WHERE nzb_zstd IS NOT NULL`,
+		`INSERT INTO job_nzbs (job_id, nzb_zstd) SELECT job_id, nzb_zstd FROM job_history WHERE nzb_zstd IS NOT NULL ON CONFLICT (job_id) DO NOTHING`,
+		`DROP TABLE active_job_nzb_files`,
+		`ALTER TABLE active_jobs DROP COLUMN nzb_zstd`,
+		`ALTER TABLE job_history DROP COLUMN nzb_zstd`,
+	},
 }
 
 func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
@@ -197,6 +355,14 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 			continue
 		}
 		for _, step := range entry.Steps {
+			if step.Kind == "rust" {
+				statements, known := testRustSteps[step.HookID]
+				if !known {
+					t.Fatalf("migration %d: no test stand-in for hook %q", entry.Version, step.HookID)
+				}
+				migrations = append(migrations, statements...)
+				continue
+			}
 			if strings.Contains(step.File, "postgres") {
 				continue
 			}
@@ -210,18 +376,25 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 	if len(ledger) != latest-73+1 {
 		t.Fatalf("ledger rows = %v, want every version from 73 to %d", ledger, latest)
 	}
+	// The shape migration 74 left: the stored NZBs still on the job rows.
 	if err := execAll(dbPath, []string{
 		`CREATE TABLE _sqlx_migrations (version INTEGER PRIMARY KEY, success BOOLEAN NOT NULL)`,
 		`INSERT INTO _sqlx_migrations VALUES ` + strings.Join(ledger, ", "),
-		`CREATE TABLE active_jobs (job_id INTEGER PRIMARY KEY)`,
-		`CREATE TABLE job_history (job_id INTEGER PRIMARY KEY)`,
+		`CREATE TABLE active_jobs (job_id INTEGER PRIMARY KEY, nzb_zstd BLOB)`,
+		`CREATE TABLE job_history (job_id INTEGER PRIMARY KEY, name TEXT, status TEXT, category TEXT, total_bytes INTEGER, health INTEGER, completed_at INTEGER, nzb_zstd BLOB)`,
 		`CREATE TABLE graph_members (job_id INTEGER, member_id INTEGER)`,
 		`CREATE TABLE graph_envelopes (job_id INTEGER, node_id INTEGER)`,
+		`CREATE TABLE graph_holds (job_id INTEGER)`,
+		`INSERT INTO active_jobs VALUES (7, x'0107'), (8, NULL)`,
+		`INSERT INTO job_history (job_id, name, status, nzb_zstd) VALUES (3, 'done', 'complete', x'0203')`,
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := execAll(dbPath, migrations); err != nil {
 		t.Fatal(err)
+	}
+	if got := storedNZBs(t, dbPath, `SELECT job_id, hex(nzb_zstd) AS nzb FROM job_nzbs`); got != "3=0203 7=0107" {
+		t.Fatalf("job_nzbs after the upgrade = %s", got)
 	}
 	later, err := readLaterMigrations(testMigrationsDir, graphEngineMigration)
 	if err != nil {
@@ -230,13 +403,67 @@ func TestEngineStampedRewindAllowsLaterGraphMigrationsToReplay(t *testing.T) {
 	if err := applySchemaRewind(dbPath, preGraphEngineRewind(later), nil); err != nil {
 		t.Fatal(err)
 	}
+	if got := storedNZBs(t, dbPath, `SELECT job_id, hex(nzb_zstd) AS nzb FROM active_jobs UNION ALL SELECT job_id, hex(nzb_zstd) AS nzb FROM job_history`); got != "3=0203 7=0107 8=" {
+		t.Fatalf("NZBs on the rewound rows = %s", got)
+	}
+	err = withStateDB(dbPath, func(db *stateConn) error {
+		tables, err := existingTables(db)
+		if err != nil {
+			return err
+		}
+		for _, table := range []string{"job_nzbs", "active_job_outlines", "active_job_nzb_files"} {
+			if tables[table] {
+				t.Fatalf("rewound database keeps %s", table)
+			}
+		}
+		var indexes int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_job_history_%'`).Scan(&indexes); err != nil {
+			return err
+		}
+		if indexes != 0 {
+			t.Fatalf("rewound database keeps %d history indexes", indexes)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := execAll(dbPath, migrations); err != nil {
 		t.Fatalf("the historical schema must accept the original migrations again: %v", err)
+	}
+	if got := storedNZBs(t, dbPath, `SELECT job_id, hex(nzb_zstd) AS nzb FROM job_nzbs`); got != "3=0203 7=0107" {
+		t.Fatalf("job_nzbs after the second upgrade = %s", got)
 	}
 	versions, err := migrationVersions(dbPath)
 	if err != nil || !reflect.DeepEqual(versions, map[int]bool{73: true}) {
 		t.Fatalf("historical ledger = %v, error = %v", versions, err)
 	}
+}
+
+// storedNZBs is "job=hex" for each (job_id, nzb) row the query gives, in job order.
+func storedNZBs(t *testing.T, dbPath, query string) string {
+	t.Helper()
+	var out []string
+	err := withStateDB(dbPath, func(db *stateConn) error {
+		rows, err := db.Query(`SELECT job_id, COALESCE(nzb, '') FROM (` + query + `) ORDER BY job_id`)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var id int
+			var nzb string
+			if err := rows.Scan(&id, &nzb); err != nil {
+				return err
+			}
+			out = append(out, fmt.Sprintf("%d=%s", id, nzb))
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Join(out, " ")
 }
 
 // The rewind and the history clone run against a real SQLite file shaped

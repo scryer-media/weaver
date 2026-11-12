@@ -449,10 +449,13 @@ type schemaShape struct {
 }
 
 // schemaRewind turns a database into the shape an older build left: the
-// tables and columns later migrations added are dropped, the ones later
-// migrations dropped are put back, and the migration ledger forgets every
-// version from LedgerFrom on, so the current build applies them again.
+// reverses of later Rust steps run first, the indexes, tables and columns
+// later migrations added are dropped, the ones later migrations dropped are
+// put back, and the migration ledger forgets every version from LedgerFrom
+// on, so the current build applies them again.
 type schemaRewind struct {
+	Reverses      []string
+	DropIndexes   []string
 	DropTables    []string
 	DropColumns   []tableColumn
 	RestoreTables []tableDDL
@@ -460,13 +463,60 @@ type schemaRewind struct {
 	LedgerFrom    int
 }
 
+// rustStepReverse undoes one Rust migration step: the tables whose columns it
+// reads from the shape, and the statements that undo the step on a database
+// of that shape.
+type rustStepReverse struct {
+	Tables []string
+	Plan   func(shape schemaShape) []string
+}
+
+// rustStepReverses is every Rust migration step a rewind can undo, by hook.
+var rustStepReverses = map[string]rustStepReverse{
+	"move_nzbs_and_outlines_v85": {Tables: []string{"active_jobs", "job_history"}, Plan: reverseNzbMoveV85},
+}
+
+// reverseNzbMoveV85 undoes migration 85: each job's stored NZB goes back
+// from job_nzbs onto its active and history rows, in the nullable column
+// those rows held it in, before the rewind drops job_nzbs. The outlines are
+// not put back: a job with no outline reads its stored NZB again.
+func reverseNzbMoveV85(shape schemaShape) []string {
+	blob := "BLOB"
+	if shape.Datastore == weaverDatastorePostgres {
+		blob = "BYTEA"
+	}
+	var statements []string
+	for _, table := range []string{"active_jobs", "job_history"} {
+		if !shape.Tables[table] {
+			continue
+		}
+		if !shape.Columns[table]["nzb_zstd"] {
+			statements = append(statements, fmt.Sprintf(`ALTER TABLE %s ADD COLUMN nzb_zstd %s`, table, blob))
+		}
+		if shape.Tables["job_nzbs"] {
+			statements = append(statements, fmt.Sprintf(`UPDATE %[1]s SET nzb_zstd = (SELECT n.nzb_zstd FROM job_nzbs AS n WHERE n.job_id = %[1]s.job_id) WHERE nzb_zstd IS NULL`, table))
+		}
+	}
+	return statements
+}
+
 // plan is the statements that rewind a database of the given shape. Only what
 // is there is dropped and only what is missing is put back, so the same rewind
 // serves whether or not a later migration has already run.
 func (rewind schemaRewind) plan(shape schemaShape) []string {
 	var statements []string
+	for _, hook := range rewind.Reverses {
+		statements = append(statements, rustStepReverses[hook].Plan(shape)...)
+	}
+	for _, index := range rewind.DropIndexes {
+		statements = append(statements, fmt.Sprintf(`DROP INDEX IF EXISTS %s`, index))
+	}
+	droppedTable := map[string]bool{}
+	for _, table := range rewind.DropTables {
+		droppedTable[table] = true
+	}
 	for _, drop := range rewind.DropColumns {
-		if !shape.Columns[drop.Table][drop.Column] {
+		if droppedTable[drop.Table] || !shape.Columns[drop.Table][drop.Column] {
 			continue
 		}
 		names := make([]string, 0, len(shape.Indexes[drop.Table]))
@@ -513,6 +563,11 @@ func readSchemaShape(db *stateConn, rewind schemaRewind) (schemaShape, error) {
 	}
 	for _, add := range rewind.AddColumns {
 		touched[add.Table] = true
+	}
+	for _, hook := range rewind.Reverses {
+		for _, table := range rustStepReverses[hook].Tables {
+			touched[table] = true
+		}
 	}
 	for table := range touched {
 		if !tables[table] {
@@ -605,19 +660,40 @@ func plantClassicRows(jobID int) []string {
 
 // rewindTo0165 is a 0.16.5 database: its last migration is 65, so it has no
 // engine stamp, no root phase, no NZB admission columns and no graph
-// checkpoint, and it still has every classic-only table.
-var rewindTo0165 = schemaRewind{
-	DropTables: graphTables,
-	DropColumns: []tableColumn{
-		{"active_jobs", "engine"},
-		{"active_jobs", "root_phase"},
-		{"active_jobs", "nzb_admitted"},
-		{"active_jobs", "nzb_release_pending"},
-		{"active_jobs", "feed_verdict"},
-		{"job_history", "engine"},
-	},
-	RestoreTables: classicOnlyTables,
-	LedgerFrom:    66,
+// checkpoint, and it still has every classic-only table. The fixed part
+// undoes migrations 66 to 74; what came after the graph-engine migration is
+// undone as the later migrations say, the same way the engine-stamped rewind
+// undoes it.
+func rewindTo0165(later laterMigrations) schemaRewind {
+	return schemaRewind{
+		Reverses:    later.Hooks,
+		DropIndexes: later.Indexes,
+		DropTables:  appendNew(append([]string(nil), graphTables...), later.Tables...),
+		DropColumns: appendNew([]tableColumn{
+			{"active_jobs", "engine"},
+			{"active_jobs", "root_phase"},
+			{"active_jobs", "nzb_admitted"},
+			{"active_jobs", "nzb_release_pending"},
+			{"job_history", "engine"},
+		}, later.Columns...),
+		RestoreTables: classicOnlyTables,
+		LedgerFrom:    66,
+	}
+}
+
+// appendNew appends each item base does not already hold.
+func appendNew[T comparable](base []T, items ...T) []T {
+	seen := map[T]bool{}
+	for _, item := range base {
+		seen[item] = true
+	}
+	for _, item := range items {
+		if !seen[item] {
+			seen[item] = true
+			base = append(base, item)
+		}
+	}
+	return base
 }
 
 // graphEngineMigration is the migration that leaves the graph engine the only
@@ -634,8 +710,9 @@ func weaverMigrationsDir() string {
 // migrationStep is one step of a migration as the manifest lists it: its kind
 // and, for an SQL step, its file relative to the migration folder's parent.
 type migrationStep struct {
-	Kind string
-	File string
+	Kind   string
+	File   string
+	HookID string
 }
 
 // migrationEntry is one migration the manifest lists, with its steps.
@@ -650,8 +727,10 @@ var (
 	manifestVersionLine   = regexp.MustCompile(`^version\s*=\s*(\d+)$`)
 	manifestFileLine      = regexp.MustCompile(`^file\s*=\s*"([^"]+)"$`)
 	manifestKindLine      = regexp.MustCompile(`^kind\s*=\s*"([^"]+)"$`)
+	manifestHookLine      = regexp.MustCompile(`^hook_id\s*=\s*"([^"]+)"$`)
 	sqlLineComment        = regexp.MustCompile(`--[^\n]*`)
 	sqlCreateTable        = regexp.MustCompile(`(?is)^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s*\(`)
+	sqlCreateIndex        = regexp.MustCompile(`(?is)^CREATE\s+(?:UNIQUE\s+)?INDEX\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\s+ON\b`)
 	sqlAddColumn          = regexp.MustCompile(`(?is)^ALTER\s+TABLE\s+(\w+)\s+ADD\s+COLUMN\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)\b`)
 )
 
@@ -690,6 +769,8 @@ func readMigrationManifest(dir string) ([]migrationEntry, error) {
 			step.Kind = match[1]
 		} else if match := manifestFileLine.FindStringSubmatch(line); match != nil {
 			step.File = match[1]
+		} else if match := manifestHookLine.FindStringSubmatch(line); match != nil {
+			step.HookID = match[1]
 		}
 	}
 	if len(entries) == 0 {
@@ -718,17 +799,21 @@ func latestMigration(dir string) (int, error) {
 	return latest, nil
 }
 
-// laterMigrations is what the migrations after a version add: the tables
-// they create and the columns they add, each named once.
+// laterMigrations is what the migrations after a version do: the tables
+// they create, the columns they add, the indexes they create, and the Rust
+// steps they run, each named once.
 type laterMigrations struct {
 	Tables  []string
 	Columns []tableColumn
+	Indexes []string
+	Hooks   []string
 }
 
-// readLaterMigrations reads every SQL step of each migration the manifest in
-// dir lists after the given version. A rewind can undo only a table created
-// or a column added, so a later step of any other kind is an error naming it,
-// never something the rewind leaves in place.
+// readLaterMigrations reads every step of each migration the manifest in dir
+// lists after the given version. A rewind can undo only a table created, a
+// column added, an index created, or a Rust step rustStepReverses names, so a
+// later step of any other kind is an error naming it, never something the
+// rewind leaves in place.
 func readLaterMigrations(dir string, after int) (laterMigrations, error) {
 	entries, err := readMigrationManifest(dir)
 	if err != nil {
@@ -742,6 +827,13 @@ func readLaterMigrations(dir string, after int) (laterMigrations, error) {
 			continue
 		}
 		for _, step := range entry.Steps {
+			if step.Kind == "rust" {
+				if _, known := rustStepReverses[step.HookID]; !known {
+					return laterMigrations{}, fmt.Errorf("migration %d has a %q step (hook %q) the rewind cannot undo", entry.Version, step.Kind, step.HookID)
+				}
+				out.Hooks = appendNew(out.Hooks, step.HookID)
+				continue
+			}
 			if step.Kind != "sql" {
 				return laterMigrations{}, fmt.Errorf("migration %d has a %q step the rewind cannot undo", entry.Version, step.Kind)
 			}
@@ -759,6 +851,10 @@ func readLaterMigrations(dir string, after int) (laterMigrations, error) {
 						seenTable[create[1]] = true
 						out.Tables = append(out.Tables, create[1])
 					}
+					continue
+				}
+				if index := sqlCreateIndex.FindStringSubmatch(statement); index != nil {
+					out.Indexes = appendNew(out.Indexes, index[1])
 					continue
 				}
 				if add := sqlAddColumn.FindStringSubmatch(statement); add != nil {
@@ -781,6 +877,8 @@ func readLaterMigrations(dir string, after int) (laterMigrations, error) {
 // nothing a later migration added is.
 func preGraphEngineRewind(later laterMigrations) schemaRewind {
 	return schemaRewind{
+		Reverses:      later.Hooks,
+		DropIndexes:   later.Indexes,
 		DropTables:    later.Tables,
 		DropColumns:   later.Columns,
 		RestoreTables: classicOnlyTables,

@@ -88,7 +88,7 @@ async fn delete_history_with_files_removes_a_failed_job_s_whole_working_dir() {
     let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30027);
     let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);
-    tokio::fs::create_dir_all(&staging).await.unwrap();
+    crate::pipeline::queue::make_staging_dir(&staging, job_id).unwrap();
     tokio::fs::write(staging.join("lantern.mkv"), b"staged")
         .await
         .unwrap();
@@ -174,7 +174,7 @@ async fn housekeeping_removes_an_old_failed_job_s_files_and_keeps_its_record() {
     let job_id = JobId(30041);
     let output_dir = marked_working_dir(&intermediate_dir, "housekeeping-failed", job_id).await;
     let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);
-    tokio::fs::create_dir_all(&staging).await.unwrap();
+    crate::pipeline::queue::make_staging_dir(&staging, job_id).unwrap();
     tokio::fs::write(staging.join("lantern.mkv"), b"staged")
         .await
         .unwrap();

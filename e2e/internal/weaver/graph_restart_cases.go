@@ -738,10 +738,15 @@ func runUpgradeFrom0165Database(ctx *restartCaseContext) (restartCaseResult, err
 	for _, id := range seed.active {
 		plant = append(plant, plantClassicRows(id)...)
 	}
-	if err := applySchemaRewind(caseDBPath(ctx), rewindTo0165, plant); err != nil {
+	later, err := readLaterMigrations(weaverMigrationsDir(), graphEngineMigration)
+	if err != nil {
+		return restartCaseResult{}, err
+	}
+	rewind := rewindTo0165(later)
+	if err := applySchemaRewind(caseDBPath(ctx), rewind, plant); err != nil {
 		return restartCaseResult{}, fmt.Errorf("rewind to the 0.16.5 schema: %w", err)
 	}
-	return ctx.judgeUpgrade(seed, rewindTo0165.LedgerFrom)
+	return ctx.judgeUpgrade(seed, rewind.LedgerFrom)
 }
 
 // G9b. A database written before the graph engine became the only engine,
