@@ -55,6 +55,280 @@
       }
     },
     {
+      "path": "testdata/adv-nzb-backup-names/Backup_12345S12-1€",
+      "size": 49,
+      "blake3": "d26bb5545acf96cdc93986316dc56dfcbaf0a658b7a83191cb521c868f21ec71",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-backup-names/Backup_12345S12-𝄞",
+      "size": 49,
+      "blake3": "87c5a23da6485cf2dbb842b42cb7a452d8adc7decd45e2c405fa32d571e5e30d",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-backup-names/Backup_12345S12€02",
+      "size": 49,
+      "blake3": "d2484a9d27d88b497ffd0714fd523cc98b528f4d4a214917e16e8c7ad3d1dbe0",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-backup-names/Backup_12345S1é-02",
+      "size": 48,
+      "blake3": "6be86457424ac78f7bd19c9f1722d99e5ad7f51e0d8474ec6759e5089d63b83a",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-backup-names/Backup_12345Sé",
+      "size": 44,
+      "blake3": "8bbfb4d5d79add9c32afba1f0b80592b33ed6cf768a2691140599233be403403",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-backup-names/Backup_12345S𝄞2-02",
+      "size": 50,
+      "blake3": "80aefef8440315e956280efff13eeae0ee12f2e031af552a5a5f2454678b365f",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-backup-names/ordinary-backup.txt",
+      "size": 48,
+      "blake3": "5822535fc817d6c7686e0a1f526936e553dff66ea0749b6da1000c41b754de96",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-classifier-names/aé",
+      "size": 32,
+      "blake3": "7019371ebf68f1c09693198e7be8516c2755960ba8be0a080768c1f7fc422e03",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-classifier-names/ordinary-classifier.txt",
+      "size": 52,
+      "blake3": "4624ee5dbb985989fa6c1e35ab56c0cf5a219f8c07712460a553af38ad5f2bb1",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-classifier-names/x.r0é",
+      "size": 35,
+      "blake3": "432b8b83b4973437661a16350e85db48664fceb9736fd05b2677d8d5b82e382e",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-classifier-names/x.€",
+      "size": 34,
+      "blake3": "fac48bf1ba3dd76ed8d1dee587f03ebdbe5fb476c82d8ecd9f7caf405450f6d8",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-classifier-names/é",
+      "size": 31,
+      "blake3": "fe3dbc08e3c8f3c27d5f0a5b6b59250ff9a19b3732580302a72ca53bb66eefb1",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-classifier-names/éabc",
+      "size": 34,
+      "blake3": "a4cdd5458314121e27040661bdb3a4b595b6e6c08cc21b0d486ad575d632314b",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-classifier-names/日本",
+      "size": 35,
+      "blake3": "e62302d8d38a3e101923d30e1494995f3dbce852b124371f7ba2fce85af78b31",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-subject-traversal/subject-a.txt",
+      "size": 42,
+      "blake3": "6582c5ddfcd70194b0fed437e10d169db09830c03ebec592e0f50104908aa51e",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-subject-traversal/subject-b.txt",
+      "size": 42,
+      "blake3": "403b9fab9c9348cfc5351ee62c85d7e3ae5dc25d776273eed3204ce72d6a22cd",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-subject-traversal/subject-c.txt",
+      "size": 42,
+      "blake3": "e615f9fb60994a3ca6c9760b327cbfed00427946441d27c493da8e695e1e74b8",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-subject-traversal/subject-d.txt",
+      "size": 42,
+      "blake3": "6691b053a38d893b9e7820ec61b2c36d0c94205b024ef2affe35cabbb538eead",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-subject-traversal/subject-plain.txt",
+      "size": 46,
+      "blake3": "ef9a1e5fce59074b306fa71cc13283c9cc9630c8b7ca2da00a5f62e54288abe8",
+      "format": "bin",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-tar-size-lie/stated.tar",
+      "size": 2099712,
+      "blake3": "89e213df718cbc9528a54e3f7ba21c09d2c8501e827ce0cfddd62a2c447a9895",
+      "format": "tar",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-archive-tar@go1.27.3",
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
+      "path": "testdata/adv-nzb-yenc-size-lie-whole/lie.whole.s01e02.mkv",
+      "size": 3158073,
+      "blake3": "6ba7f079cfbd1ce96cec036c9c0bf01ae12bce0c2ac5f8fb8b81f3cef7831156",
+      "format": "mkv",
+      "source": {
+        "kind": "generated",
+        "generator": "fixturegen",
+        "toolchains": [
+          "go-fixture-bytes@go1.27.3"
+        ]
+      }
+    },
+    {
       "path": "testdata/adv-par2-lie-file-hash/lie-payload.mkv",
       "size": 2109497,
       "blake3": "4ef22180acec70979fca9c9f7a43dda5e8a66c14a36b02e5215bea89e4544a9c",

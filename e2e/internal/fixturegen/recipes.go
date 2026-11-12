@@ -146,6 +146,8 @@ var ScenarioOnly = map[string]string{
 	"yenc-lie-field-size-lost":                 "stages yenc-lie-field-size's payload under the same size lie and deletes one middle article",
 	"yenc-lie-size-large":                      "stages yenc-lie-field-size's payload with every header stating half as much again",
 	"yenc-lie-end-below-begin":                 "stages yenc-lie-field-size's payload with one part's end= below its begin=",
+	"adv-nzb-yenc-size-lie-tail-lost":          "stages adv-nzb-yenc-size-lie-whole's payload under the same 3 GiB size lie and deletes its last article",
+	"adv-nzb-yenc-size-lie-int64":              "stages adv-nzb-yenc-size-lie-whole's payload with every header stating the largest signed 64-bit size",
 }
 
 // Recipes is the corpus, one entry per scenario directory that owns bytes.
@@ -1632,6 +1634,7 @@ func Recipes() []Recipe {
 	recipes = append(recipes, PAR3Recipes()...)
 	recipes = append(recipes, SpeedTestRecipes()...)
 	recipes = append(recipes, AdversarialRecipes()...)
+	recipes = append(recipes, AdversarialNZBRecipes()...)
 	recipes = append(recipes, GraphGapRecipes()...)
 	recipes = append(recipes, GraphBoundaryRecipes()...)
 	return recipes

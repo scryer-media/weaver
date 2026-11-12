@@ -1,0 +1,23 @@
+{
+  "slug": "adv-nzb-yenc-size-lie-int64",
+  "title": "Lie.Int64.S01E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "The adv-nzb-yenc-size-lie-whole payload with every =ybegin stating size=9223372036854775807, past what the layout trusts and at the edge of signed 64-bit arithmetic. The header parses as an unsigned 64-bit size, the layout refuses it above the largest declared file it trusts and falls back to the NZB's own sizes, so the job completes without overflow and delivers the file byte-equal at its real length.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 262144,
+  "fixtureAssets": [
+    "adv-nzb-yenc-size-lie-whole/lie.whole.s01e02.mkv"
+  ],
+  "yencHeaderLies": [
+    {
+      "size": 9223372036854775807
+    }
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success"
+  },
+  "expectedOutputBLAKE3": {
+    "lie.whole.s01e02.mkv": "6ba7f079cfbd1ce96cec036c9c0bf01ae12bce0c2ac5f8fb8b81f3cef7831156"
+  }
+}

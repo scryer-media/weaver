@@ -1,0 +1,21 @@
+{
+  "slug": "adv-nzb-backup-names",
+  "title": "E2E.Adversarial.NZB.Backup.Names.2026-TESTGRP",
+  "description": "Loose text files whose names open like the Backup_ obfuscation pattern and put a multibyte character where the pattern reads a digit, a dash or the S. The obfuscation check reads every name at download and at finalize; none is obfuscated, so the job completes and delivers each file byte-equal under its own name.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "adversarial": {
+    "group": "default",
+    "outcome": "success",
+    "minOutputFiles": 7
+  },
+  "expectedOutputBLAKE3": {
+    "Backup_12345S12-1€": "d26bb5545acf96cdc93986316dc56dfcbaf0a658b7a83191cb521c868f21ec71",
+    "Backup_12345S12-𝄞": "87c5a23da6485cf2dbb842b42cb7a452d8adc7decd45e2c405fa32d571e5e30d",
+    "Backup_12345S12€02": "d2484a9d27d88b497ffd0714fd523cc98b528f4d4a214917e16e8c7ad3d1dbe0",
+    "Backup_12345S1é-02": "6be86457424ac78f7bd19c9f1722d99e5ad7f51e0d8474ec6759e5089d63b83a",
+    "Backup_12345Sé": "8bbfb4d5d79add9c32afba1f0b80592b33ed6cf768a2691140599233be403403",
+    "Backup_12345S𝄞2-02": "80aefef8440315e956280efff13eeae0ee12f2e031af552a5a5f2454678b365f",
+    "ordinary-backup.txt": "5822535fc817d6c7686e0a1f526936e553dff66ea0749b6da1000c41b754de96"
+  }
+}

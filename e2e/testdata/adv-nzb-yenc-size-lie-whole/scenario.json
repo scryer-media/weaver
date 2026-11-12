@@ -1,0 +1,20 @@
+{
+  "slug": "adv-nzb-yenc-size-lie-whole",
+  "title": "Lie.Whole.S01E02.2026.1080p.WEB-DL.H264-TESTGRP",
+  "description": "A payload of 3,158,073 bytes in 256 KiB articles whose every =ybegin states size=3221225472, a thousand times the file. Every article arrives, so the file comes out byte-equal at its real length and scratch never grows toward the stated size.",
+  "category": "2000",
+  "expected_outcome": "success",
+  "segment_size": 262144,
+  "yencHeaderLies": [
+    {
+      "size": 3221225472
+    }
+  ],
+  "adversarial": {
+    "group": "default",
+    "outcome": "success"
+  },
+  "expectedOutputBLAKE3": {
+    "lie.whole.s01e02.mkv": "6ba7f079cfbd1ce96cec036c9c0bf01ae12bce0c2ac5f8fb8b81f3cef7831156"
+  }
+}
