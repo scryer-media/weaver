@@ -1050,21 +1050,36 @@ impl NamespaceWriter {
 
     // What the object at `child` kept in its envelope of its volume, the
     // member, and now places elsewhere: read back from where it was kept,
-    // and held for the member until the object places it again.
+    // a `READ_BACK` at a time, and each piece held for the member until the
+    // object places it again. Nothing is held when any byte of the range was
+    // never kept; a piece that does not read ends it, the pieces before it
+    // held.
     fn unkept(
         &mut self,
         (node, member, child): (NodeId, MemberId, NodeId),
         (range, envelope, at): (ByteRange, u32, u64),
     ) -> Result<(), WriteError> {
-        let mut bytes = Vec::new();
         if !self
             .envelopes
-            .read(child, envelope, ByteRange::at(at, range.len()), &mut bytes)
+            .keeps(child, envelope, ByteRange::at(at, range.len()))
         {
             return Ok(());
         }
-        let held = vec![(range.start, Bytes::from(bytes).into())];
-        self.hold_for((node, member), held)
+        let mut done = 0;
+        while done < range.len() {
+            let take = (range.len() - done).min(READ_BACK);
+            let mut bytes = Vec::new();
+            if !self
+                .envelopes
+                .read(child, envelope, ByteRange::at(at + done, take), &mut bytes)
+            {
+                return Ok(());
+            }
+            let held = vec![(range.start + done, Bytes::from(bytes).into())];
+            self.hold_for((node, member), held)?;
+            done += take;
+        }
+        Ok(())
     }
 
     // Bytes of a bound member, held until its object places them, as any

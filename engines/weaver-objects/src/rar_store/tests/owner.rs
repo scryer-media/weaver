@@ -66,6 +66,9 @@ pub(super) struct Owner {
     // bytes were held in.
     pub gated: Vec<(&'static str, usize, VolumeIndex)>,
     doing: (&'static str, usize),
+    // The most bytes one read of a range asked for again took from any
+    // place they lie.
+    pub again_read_most: u64,
 }
 
 impl Owner {
@@ -95,6 +98,7 @@ impl Owner {
             skipped: false,
             gated: Vec::new(),
             doing: ("found", first),
+            again_read_most: 0,
         };
         let (name, bytes) = &owner.volumes[first];
         let front = &bytes[..bytes.len().min(FRONT)];
@@ -501,7 +505,9 @@ impl Owner {
         let mut read_back = Vec::new();
         for (piece, provenance) in runs {
             let (members, shelves) = (&self.members, &self.shelves);
+            let most = &mut self.again_read_most;
             let mut read = |placement: &Placement, into: &mut Vec<u8>| -> bool {
+                *most = (*most).max(placement.len());
                 match placement {
                     Placement::Member { .. } => read_member(members, placement, into),
                     Placement::Envelope { envelope, range } => {
