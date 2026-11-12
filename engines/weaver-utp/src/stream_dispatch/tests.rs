@@ -11,6 +11,7 @@ mod delayed_ack;
 mod fast_retransmit;
 mod fin_half_close;
 mod flow_control;
+mod full_receiver;
 mod guards;
 mod inactivity_timeout;
 mod ingress_limits;

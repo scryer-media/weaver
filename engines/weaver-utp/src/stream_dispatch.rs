@@ -745,18 +745,26 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
 
-        let mut remaining_cwnd = self
-            .recovery
-            .remaining_cwnd(self.last_remote_window)
-            .unwrap_or_else(|| {
-                self.congestion_controller
-                    .window()
-                    .min(self.last_remote_window as usize)
-                    .saturating_sub(
-                        self.user_tx_segments
-                            .calc_flight_size(self.last_sent_seq_nr),
-                    )
-            });
+        // The peer's advertised window bounds every byte sent and not yet
+        // acknowledged, those presumed lost included: the peer must still
+        // find room for each hole when its resend arrives. libtorrent drops
+        // even the next packet in order when it does not fit
+        // (utp_stream.cpp:2384-2389) and checks its own sends against all
+        // bytes in flight (1568-1570). In recovery the pipe, which leaves
+        // out lost and long-outstanding packets, bounds only the congestion
+        // window.
+        let in_flight = self
+            .user_tx_segments
+            .calc_flight_size(self.last_sent_seq_nr);
+        let peer_room = (self.last_remote_window as usize).saturating_sub(in_flight);
+        let mut remaining_cwnd = match self.recovery.remaining_cwnd(self.last_remote_window) {
+            Some(recovery_room) => recovery_room.min(peer_room),
+            None => self
+                .congestion_controller
+                .window()
+                .min(self.last_remote_window as usize)
+                .saturating_sub(in_flight),
+        };
 
         let mut sent_count = 0;
 
