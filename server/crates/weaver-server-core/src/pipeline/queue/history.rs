@@ -87,39 +87,45 @@ pub(crate) async fn clear_left_working_dirs(
 // category's folder. A job's staging directory is under the complete folder
 // unless its category delivers elsewhere, and a history row does not say
 // which, so every root is swept. The complete folder must be reachable. A
-// category folder that cannot be opened is passed over with a warning, so
-// one unreachable category does not stop the cleanup of jobs that never
-// used it; whatever is found under a folder that opens is removed or fails
-// as before.
+// category folder in which the job's staging directory cannot be looked up
+// is passed over with a warning, so one unreachable category does not stop
+// the cleanup of jobs that never used it; whatever is found under a folder
+// that can be searched is removed or fails as before.
 pub(crate) async fn remove_job_staging(
     roots: &[std::path::PathBuf],
     id: JobId,
 ) -> Result<(), SchedulerError> {
     for (index, root) in roots.iter().enumerate() {
-        if index > 0 && !staging_root_opens(root.clone(), id).await? {
+        let staging = super::staging_dir_for(root, id);
+        if index > 0 && !staging_dir_reachable(root.clone(), staging.clone(), id).await? {
             continue;
         }
-        remove_staging_dir(super::staging_dir_for(root, id), id).await?;
+        remove_staging_dir(staging, id).await?;
     }
     Ok(())
 }
 
-// Whether a category's destination folder can be opened. A folder that does
-// not exist opens, as it holds no staging directory to remove.
-async fn staging_root_opens(root: std::path::PathBuf, id: JobId) -> Result<bool, SchedulerError> {
-    tokio::task::spawn_blocking(move || {
-        match cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()) {
-            Ok(_) => true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-            Err(error) => {
-                tracing::warn!(
-                    job_id = id.0,
-                    dir = %root.display(),
-                    %error,
-                    "a category folder could not be opened; its staging directory for the job is not checked"
-                );
-                false
-            }
+// Whether the job's staging directory under a category's folder can be looked
+// up, which is what removing it needs. Opening the folder is not the test: on
+// Linux a directory opens with `O_PATH` even when its mode lets nothing be
+// looked up in it. A staging directory that does not exist is reachable, as
+// there is nothing to remove.
+async fn staging_dir_reachable(
+    root: std::path::PathBuf,
+    staging: std::path::PathBuf,
+    id: JobId,
+) -> Result<bool, SchedulerError> {
+    tokio::task::spawn_blocking(move || match std::fs::symlink_metadata(&staging) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::warn!(
+                job_id = id.0,
+                dir = %root.display(),
+                %error,
+                "a category folder could not be searched; its staging directory for the job is not checked"
+            );
+            false
         }
     })
     .await
