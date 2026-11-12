@@ -18,6 +18,9 @@ use tracing::{debug, trace};
 
 use crate::dht::INACTIVITY_TIMEOUT;
 
+// The nodes a bucket holds: BEP 5's k.
+const BUCKET_SIZE: usize = 8;
+
 #[derive(Clone, Debug)]
 pub struct LeafBucket {
     pub nodes: Vec<RoutingTableNode>,
@@ -367,7 +370,7 @@ impl BucketTree {
                 return InsertResult::Ignored;
             }
 
-            if nodes.nodes.len() < 8 {
+            if nodes.nodes.len() < BUCKET_SIZE {
                 nodes.nodes.push(new_node);
                 nodes.nodes.sort_by_key(|n| n.id);
                 nodes.last_refreshed = now;
@@ -532,6 +535,13 @@ impl RoutingTableNode {
     pub fn mark_error(&mut self) {
         self.errors_in_a_row += 1;
     }
+
+    /// Whether the node has answered us and has not failed since: one a
+    /// search can count on, unlike a node only heard of or restored from an
+    /// earlier run, or one that stopped answering.
+    pub fn is_confirmed(&self, now: Instant) -> bool {
+        self.last_response.is_some() && self.status(now) != NodeStatus::Bad
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -582,6 +592,30 @@ impl RoutingTable {
 
     pub fn iter(&self) -> impl Iterator<Item = &'_ RoutingTableNode> + '_ {
         self.buckets.iter()
+    }
+
+    /// How deep the table reaches towards our own id: past the farthest
+    /// bucket, the buckets in a row, far to near, that hold at least half a
+    /// bucket of confirmed nodes (libtorrent `routing_table::depth`,
+    /// routing_table.cpp:368-391, v2.0.15, over its `live_nodes`). An empty
+    /// table, or one that has not split, is 0 deep.
+    pub fn depth(&self, now: Instant) -> usize {
+        let mut buckets: Vec<(u8, bool, usize)> = self
+            .iter_buckets()
+            .map(|b| {
+                let ours = *b.start <= self.id && self.id <= *b.end_inclusive;
+                let confirmed = b.leaf.nodes.iter().filter(|n| n.is_confirmed(now));
+                (b.bits, ours, confirmed.count())
+            })
+            .collect();
+        // A bucket nearer our id covers fewer bits; of the two nearest, the
+        // one holding our id is last, as libtorrent's last bucket is.
+        buckets.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        buckets
+            .iter()
+            .skip(1)
+            .take_while(|(_, _, confirmed)| *confirmed >= BUCKET_SIZE / 2)
+            .count()
     }
 
     pub fn add_node(&mut self, id: Id20, addr: SocketAddr) -> InsertResult {

@@ -116,6 +116,14 @@ const SEARCH_K: usize = 8;
 // A search that starts from fewer nodes than this also asks the routers
 // (libtorrent `traversal_algorithm::start`).
 const SEARCH_MIN_SEEDS: usize = 3;
+// A table this many buckets deep no longer bootstraps again, and how often
+// it searches for our own id once it is (libtorrent `node::tick`,
+// node.cpp:654, v2.0.15).
+const SHALLOW_DEPTH: usize = 4;
+const SELF_REFRESH_INTERVAL: Duration = Duration::from_secs(10 * 60);
+// The first wait before a shallow table bootstraps again: libtorrent's
+// `dht_tracker` ticks its node every 5 seconds (dht_tracker.cpp:268-283).
+const BOOTSTRAP_RETRY_MIN: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateState {
@@ -359,7 +367,10 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksFindNodes {
     // A node a search is told of enters the table only once it answers
     // (libtorrent routing_table.cpp:816-822, 1085-1099, v2.0.15: a node not
     // yet pinged never takes a place in a bucket). One the table holds
-    // already is marked as asked.
+    // already is marked as asked. An error reply is no answer: it counts as
+    // a failure, as a timeout does, and enters nothing (rpc_manager.cpp:
+    // 316-350, where an error calls the observer's `timeout`, and only a
+    // response reaches `node_seen` at 389).
     fn on_request_start(&self, req: &RecursiveRequest<Self>, target_node: Id20, addr: SocketAddr) {
         req.dht
             .get_table_for_addr(addr)
@@ -375,14 +386,10 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksFindNodes {
         resp: &crate::dht::Result<ResponseOrError>,
     ) {
         let mut table = req.dht.get_table_for_addr(addr).write();
-        if let Ok(answer) = resp {
+        if let Ok(ResponseOrError::Response(response)) = resp {
             // The node enters under the id it answered with.
-            let id = match answer {
-                ResponseOrError::Response(response) => response.id,
-                ResponseOrError::Error(_) => target_node,
-            };
-            table.add_node(id, addr);
-            table.mark_response(&id, now());
+            table.add_node(response.id, addr);
+            table.mark_response(&response.id, now());
         } else {
             table.mark_error(&target_node);
         }
@@ -456,14 +463,14 @@ impl Stream for RequestPeersStream {
 
 impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
     // A find_node search of the `is_v4` family for `target`, from `addrs`, or
-    // with none from the table (see `start`): a bootstrap from a router's
-    // addresses, a bucket refresh from the table.
+    // with none from the table (see `start`): a refresh of our own id or of a
+    // bucket.
     async fn find_node_for_routing_table(
         dht: Arc<DhtState>,
         target: Id20,
         is_v4: bool,
         addrs: impl Iterator<Item = SocketAddr>,
-    ) -> crate::dht::Result<()> {
+    ) -> crate::dht::Result<SearchOutcome> {
         let req = RecursiveRequest {
             info_hash: target,
             request: Request::FindNode(target),
@@ -475,16 +482,11 @@ impl RecursiveRequest<RecursiveRequestCallbacksFindNodes> {
             .search(is_v4, addrs.map(|addr| (None, addr)))
             .instrument(debug_span!("find_node", target = format!("{target:?}")))
             .await?;
-        if outcome.answered == 0 {
-            return Err(Error::NoSuccessfulLookups {
-                errors: outcome.failed,
-            });
-        }
         debug!(
             "finished, answered = {}, failed = {}",
             outcome.answered, outcome.failed
         );
-        Ok(())
+        Ok(outcome)
     }
 }
 
@@ -513,7 +515,11 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
     // `session_impl::on_dht_announce` gives every torrent its
     // `torrent::dht_announce` once a `dht_announce_interval`). A search due
     // while the table is empty and no router is known starts as the first
-    // node enters the table.
+    // node enters the table or the first router becomes known, whichever is
+    // first. A search that fell short, fewer than k nodes answering it, as
+    // one made before the route carried datagrams or before the table
+    // filled, also searches again as the table turns deep, ahead of its turn;
+    // the turn after stays where it was.
     fn request_peers_forever(self: Arc<Self>, is_v4: bool) -> tokio::task::JoinHandle<()> {
         spawn::<Error>(
             debug_span!(parent: None, "get_peers", is_v4, info_hash = format!("{:?}", self.info_hash)),
@@ -521,9 +527,16 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
             async move {
                 let entered = self.table(is_v4).read().entered();
                 let mut wait = announce_slot(&self.info_hash);
+                // When the next search is due: set as a search ends, kept
+                // when a short one is made again early.
+                let mut due = None;
                 loop {
                     let mut next_entered = std::pin::pin!(entered.notified());
                     next_entered.as_mut().enable();
+                    let mut next_router = std::pin::pin!(self.dht.routers_known.notified());
+                    next_router.as_mut().enable();
+                    let mut deepened = std::pin::pin!(self.dht.deepened(is_v4).notified());
+                    deepened.as_mut().enable();
                     let turn = self
                         .dht
                         .walks
@@ -533,13 +546,25 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                     let candidates = self.start(is_v4, std::iter::empty());
                     if candidates.list.is_empty() {
                         drop(turn);
-                        next_entered.await;
+                        tokio::select! {
+                            () = next_entered => {}
+                            () = next_router => {}
+                        }
                         continue;
                     }
                     let outcome = self.walk(candidates).await?;
                     drop(turn);
                     trace!(?outcome, "search finished");
-                    tokio::time::sleep(wait).await;
+                    let due_at = *due.get_or_insert_with(|| tokio::time::Instant::now() + wait);
+                    if outcome.answered < SEARCH_K {
+                        tokio::select! {
+                            () = tokio::time::sleep_until(due_at) => {}
+                            () = deepened => continue,
+                        }
+                    } else {
+                        tokio::time::sleep_until(due_at).await;
+                    }
+                    due = None;
                     wait = DHT_ANNOUNCE_INTERVAL;
                 }
             },
@@ -564,21 +589,22 @@ fn announce_slot(info_hash: &Id20) -> std::time::Duration {
 
 impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
     fn table(&self, is_v4: bool) -> &RwLock<RoutingTable> {
-        if is_v4 {
-            &self.dht.routing_table_v4
-        } else {
-            &self.dht.routing_table_v6
-        }
+        self.dht.table(is_v4)
     }
 
     // The candidates every search of the `is_v4` family starts from, whatever
     // it looks for (libtorrent `find_data::start`, then
     // `traversal_algorithm::start`, which a get_peers, a bootstrap and a
     // refresh each run): the nodes `given`, or with none given the table's
-    // SEARCH_K closest to the target; and when that makes fewer than
-    // SEARCH_MIN_SEEDS, every router of the family too (`add_router_entries`).
-    // A router already among them is asked once, as `offer` keeps one
-    // candidate per address.
+    // SEARCH_K closest to the target; and when fewer than SEARCH_MIN_SEEDS of
+    // those are nodes we can count on, every router of the family too
+    // (`add_router_entries`). A node given is counted; one from the table
+    // only once it has answered and not failed since, as libtorrent's table
+    // holds no other: its saved nodes seed a bootstrap without entering the
+    // table (dht_tracker.cpp:184-191, v2.0.15), and a node that keeps
+    // failing leaves it. So a table of stale or silent nodes does not keep a
+    // search from the routers. A router already among them is asked once,
+    // as `offer` keeps one candidate per address.
     fn start(
         &self,
         is_v4: bool,
@@ -588,6 +614,7 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
         for (id, addr) in given {
             candidates.offer(id, addr);
         }
+        let mut seeds = candidates.list.len();
         if candidates.list.is_empty() {
             // Good nodes first, then questionable, unknown and bad, each
             // tier nearest first.
@@ -609,15 +636,16 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
                             n.status(now) == tier
                         })
                         .iter()
-                        .map(|n| (n.id(), n.addr())),
+                        .map(|n| (n.id(), n.addr(), n.is_confirmed(now))),
                 );
             }
             drop(table);
-            for (id, addr) in closest {
+            for (id, addr, confirmed) in closest {
                 candidates.offer(Some(id), addr);
+                seeds += usize::from(confirmed);
             }
         }
-        if candidates.list.len() < SEARCH_MIN_SEEDS {
+        if seeds < SEARCH_MIN_SEEDS {
             for router in self.dht.routers.read().iter() {
                 if router.is_ipv4() == is_v4 {
                     candidates.offer(None, *router);
@@ -674,8 +702,11 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
             outcome.answered += 1;
             candidates.settle(addr, CandidateState::Answered);
             candidates.give_token(addr, response.token);
+            // A search that wants no peers (a bootstrap or a refresh) has no
+            // receiver: a node that names peers anyway is still walked past,
+            // never the end of the search.
             for peer in response.values.into_iter().flatten() {
-                self.peer_tx.send(peer.0).ok().ok_or(Error::ReceiverDead)?;
+                let _ = self.peer_tx.send(peer.0);
             }
             let nodes = response
                 .nodes
@@ -730,6 +761,14 @@ pub struct DhtState {
     // The addresses the bootstrap names resolved to: the routers a search
     // short of nodes also asks (libtorrent `routing_table::m_router_nodes`).
     routers: RwLock<BTreeSet<SocketAddr>>,
+    // Rings as a router address becomes known: a bootstrap or a search that
+    // had nothing to ask has something now.
+    routers_known: tokio::sync::Notify,
+    // Ring as the table of each family turns deep enough (see
+    // `refresh_self`): a torrent's search that fell short
+    // before then searches again.
+    deepened_v4: tokio::sync::Notify,
+    deepened_v6: tokio::sync::Notify,
     listen_addr: SocketAddr,
 
     // Sending requests to the worker.
@@ -782,6 +821,9 @@ impl DhtState {
             routing_table_v4: RwLock::new(routing_table_v4),
             routing_table_v6: RwLock::new(routing_table_v6),
             routers: RwLock::default(),
+            routers_known: tokio::sync::Notify::new(),
+            deepened_v4: tokio::sync::Notify::new(),
+            deepened_v6: tokio::sync::Notify::new(),
             worker_sender: sender,
             listen_addr,
             rate_limiter: make_rate_limiter(),
@@ -794,6 +836,108 @@ impl DhtState {
             cancellation_token,
             client_version,
             walks: tokio::sync::Semaphore::new(WALKS_AT_ONCE),
+        }
+    }
+
+    fn table(&self, is_v4: bool) -> &RwLock<RoutingTable> {
+        if is_v4 {
+            &self.routing_table_v4
+        } else {
+            &self.routing_table_v6
+        }
+    }
+
+    fn deepened(&self, is_v4: bool) -> &tokio::sync::Notify {
+        if is_v4 {
+            &self.deepened_v4
+        } else {
+            &self.deepened_v6
+        }
+    }
+
+    // libtorrent `dht_tracker::add_router_node` for each address a router's
+    // name resolves to. Wakes what waits for a router when one is new.
+    fn add_routers(&self, addrs: &[SocketAddr]) {
+        let mut routers = self.routers.write();
+        let before = routers.len();
+        routers.extend(addrs);
+        let added = routers.len() > before;
+        drop(routers);
+        if added {
+            self.routers_known.notify_waiters();
+        }
+    }
+
+    // Keep the `is_v4` table filled: a find_node search for our own id,
+    // from the table and, while it holds fewer than SEARCH_MIN_SEEDS nodes
+    // that answer, the routers (see `start`). The first runs at once. While
+    // the table is shallow, under SHALLOW_DEPTH deep, the next runs after a
+    // backoff, from BOOTSTRAP_RETRY_MIN doubling to SELF_REFRESH_INTERVAL,
+    // back to the start as a round adds nodes; once it is deep, one every
+    // SELF_REFRESH_INTERVAL. libtorrent bootstraps from its saved nodes and
+    // routers at start (dht_tracker.cpp:184-195, v2.0.15) and bootstraps
+    // again from `node::tick` whenever the table is under 4 deep and its
+    // last one is 10 minutes old (node.cpp:647-662), so a bootstrap made
+    // while nothing reached the network is not the last. The backoff makes
+    // the first retries sooner and keeps a route that carries nothing to a
+    // few datagrams a round, a round every SELF_REFRESH_INTERVAL at most.
+    // A round that had no one to ask waits for a node to enter the table or
+    // a router to become known, and a new router also ends a backoff early.
+    async fn refresh_self(self: Arc<Self>, is_v4: bool) -> crate::dht::Result<()> {
+        let entered = self.table(is_v4).read().entered();
+        let mut retry = BOOTSTRAP_RETRY_MIN;
+        let mut deep = false;
+        loop {
+            let mut next_entered = std::pin::pin!(entered.notified());
+            next_entered.as_mut().enable();
+            let mut next_router = std::pin::pin!(self.routers_known.notified());
+            next_router.as_mut().enable();
+            let before = self.table(is_v4).read().len();
+            let outcome = RecursiveRequest::find_node_for_routing_table(
+                self.clone(),
+                self.id,
+                is_v4,
+                std::iter::empty(),
+            )
+            .instrument(debug_span!("refresh_self"))
+            .await?;
+            let (nodes, depth) = {
+                let table = self.table(is_v4).read();
+                (table.len(), table.depth(now()))
+            };
+            debug!(
+                answered = outcome.answered,
+                failed = outcome.failed,
+                nodes,
+                depth,
+                "own id refreshed"
+            );
+            if outcome.answered + outcome.failed == 0 {
+                tokio::select! {
+                    () = next_entered => {}
+                    () = next_router => {}
+                }
+                retry = BOOTSTRAP_RETRY_MIN;
+                continue;
+            }
+            if depth >= SHALLOW_DEPTH {
+                if !deep {
+                    deep = true;
+                    self.deepened(is_v4).notify_waiters();
+                }
+                retry = BOOTSTRAP_RETRY_MIN;
+                tokio::time::sleep(SELF_REFRESH_INTERVAL).await;
+                continue;
+            }
+            deep = false;
+            if nodes > before {
+                retry = BOOTSTRAP_RETRY_MIN;
+            }
+            tokio::select! {
+                () = tokio::time::sleep(retry) => {}
+                () = next_router => {}
+            }
+            retry = (retry * 2).min(SELF_REFRESH_INTERVAL);
         }
     }
 
@@ -1190,15 +1334,18 @@ struct DhtWorker {
 // - WSAEMSGSIZE: the datagram was longer than the buffer and got truncated.
 // - WSAENETRESET: an earlier send_to got an ICMP time exceeded back.
 // - WSAECONNRESET: an earlier send_to got an ICMP port unreachable back.
+// A socket carried through a tunnel fails it with InvalidData for a datagram
+// longer than the buffer, and also keeps working.
 fn is_datagram_error(e: &std::io::Error) -> bool {
     const WSAEMSGSIZE: i32 = 10040;
     const WSAENETRESET: i32 = 10052;
     const WSAECONNRESET: i32 = 10054;
-    cfg!(windows)
-        && matches!(
-            e.raw_os_error(),
-            Some(WSAEMSGSIZE | WSAENETRESET | WSAECONNRESET)
-        )
+    e.kind() == std::io::ErrorKind::InvalidData
+        || cfg!(windows)
+            && matches!(
+                e.raw_os_error(),
+                Some(WSAEMSGSIZE | WSAENETRESET | WSAECONNRESET)
+            )
 }
 
 impl DhtWorker {
@@ -1232,68 +1379,51 @@ impl DhtWorker {
         }
     }
 
-    async fn bootstrap_hostname(&self, hostname: &str) -> crate::dht::Result<()> {
-        let addrs = self
-            .lookup_bootstrap(hostname)
-            .await
-            .map_err(|err| Error::lookup(hostname, err))?;
-        // libtorrent `dht_tracker::add_router_node` for each address a
-        // router's name resolves to.
-        self.dht.routers.write().extend(&addrs);
-        let v4 = RecursiveRequest::find_node_for_routing_table(
-            self.dht.clone(),
-            self.dht.id,
-            true,
-            addrs.iter().copied().filter(|a| a.is_ipv4()),
-        )
-        .instrument(debug_span!("v4"));
-
-        let v6 = RecursiveRequest::find_node_for_routing_table(
-            self.dht.clone(),
-            self.dht.id,
-            false,
-            addrs.iter().copied().filter(|a| a.is_ipv6()),
-        )
-        .instrument(debug_span!("v6"));
-
-        let (v4, v6) = tokio::join!(v4, v6);
-        v4.or(v6)
-    }
-
-    // Bootstrap from `addr` until it answers, at most a minute apart. The first
-    // failure of the whole bootstrap is logged at WARN, every later one at
-    // DEBUG: `warned` is shared by every host of it.
-    async fn bootstrap_hostname_with_backoff(
-        &self,
-        addr: &str,
-        warned: &AtomicBool,
-    ) -> crate::dht::Result<()> {
+    // Resolve the router `hostname` until it resolves, at most a minute
+    // apart, and make its addresses known (libtorrent
+    // `dht_tracker::add_router_node` for each address). A name that cannot
+    // give an address, a malformed one or one resolved where a leg exits, is
+    // not tried again. The first failure of all the routers is logged at
+    // WARN, every later one at DEBUG: `warned` is shared by them.
+    async fn resolve_router(&self, hostname: &str, warned: &AtomicBool) {
         let backoff = ExponentialBuilder::new()
             .with_max_delay(Duration::from_secs(60))
             .with_jitter()
             .without_max_times();
-
-        (|| self.bootstrap_hostname(addr))
+        let retried = |err: &std::io::Error| {
+            !matches!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput | std::io::ErrorKind::Unsupported
+            )
+        };
+        let found = (|| self.lookup_bootstrap(hostname))
             .retry(backoff)
-            .notify(|error, retry_in| {
+            .when(retried)
+            .notify(|err, retry_in| {
                 if warned.swap(true, Ordering::Relaxed) {
-                    debug!(?retry_in, ?addr, "error in bootstrap: {error:#}");
+                    debug!(?retry_in, "error looking up {hostname}: {err:#}");
                 } else {
                     warn!(
                         ?retry_in,
-                        ?addr,
-                        "error in bootstrap: {error:#}; the DHT runs from its saved nodes and the nodes peers name, and keeps retrying"
+                        "error looking up {hostname}: {err:#}; the DHT runs from its saved nodes and the nodes peers name, and keeps retrying"
                     );
                 }
             })
-            .instrument(debug_span!("bootstrap", hostname = addr))
-            .await
+            .instrument(debug_span!("bootstrap", hostname))
+            .await;
+        match found {
+            Ok(addrs) => {
+                debug!(hostname, routers = addrs.len(), "router resolved");
+                self.dht.add_routers(&addrs);
+            }
+            Err(err) => warn!("error looking up {hostname}: {err:#}; it is not tried again"),
+        }
     }
 
-    // Bootstrap hosts are one way to seed the routing table; the table saved
-    // from an earlier run and the nodes peers name (`add_node`) are the
-    // others. So the DHT runs whatever the bootstrap does: each host is
-    // retried until it answers, and with none the table seeds from the rest.
+    // Routers are one way to seed the routing table; the table saved from an
+    // earlier run and the nodes peers name (`add_node`) are the others. Each
+    // router's name is resolved until it resolves; `refresh_self` asks the
+    // routers, as many times as the table needs them.
     async fn bootstrap(&self, bootstrap_addrs: &[String]) {
         if bootstrap_addrs.is_empty() {
             info!(
@@ -1304,7 +1434,7 @@ impl DhtWorker {
         let warned = AtomicBool::new(false);
         let mut futs = bootstrap_addrs
             .iter()
-            .map(|addr| self.bootstrap_hostname_with_backoff(addr, &warned))
+            .map(|addr| self.resolve_router(addr, &warned))
             .collect::<FuturesUnordered<_>>();
         while futs.next().await.is_some() {}
     }
@@ -1397,10 +1527,16 @@ impl DhtWorker {
                     let (id, addr) = r.unwrap();
                     futs.push(async move {
                         table.write().mark_outgoing_request(&id, now());
+                        // An error reply is no answer (see
+                        // `RecursiveRequestCallbacksFindNodes`).
                         match self.dht.request(Request::Ping, addr).await {
-                            Ok(_) => {
+                            Ok(ResponseOrError::Response(_)) => {
                                 table.write().mark_response(&id, now());
                             },
+                            Ok(ResponseOrError::Error(e)) => {
+                                table.write().mark_error(&id);
+                                debug!(?e, "node refused the ping");
+                            }
                             Err(e) => {
                                 table.write().mark_error(&id);
                                 debug!("error: {e:#}");
@@ -1526,6 +1662,19 @@ impl DhtWorker {
             .peer_store_purger()
             .instrument(debug_span!("peer_store_purger"));
 
+        let refresh_self_v4 = self
+            .dht
+            .clone()
+            .refresh_self(true)
+            .instrument(debug_span!("refresh_self_v4"));
+        let refresh_self_v6 = self
+            .dht
+            .clone()
+            .refresh_self(false)
+            .instrument(debug_span!("refresh_self_v6"));
+
+        tokio::pin!(refresh_self_v4);
+        tokio::pin!(refresh_self_v6);
         tokio::pin!(framer);
         tokio::pin!(bootstrap);
         tokio::pin!(response_reader);
@@ -1547,6 +1696,12 @@ impl DhtWorker {
                 },
                 () = &mut bootstrap, if !bootstrap_done => {
                     bootstrap_done = true;
+                },
+                err = &mut refresh_self_v4 => {
+                    return Error::task_finished(&"refresh_self_v4", err);
+                },
+                err = &mut refresh_self_v6 => {
+                    return Error::task_finished(&"refresh_self_v6", err);
                 },
                 err = &mut pinger_v4 => {
                     return Error::task_finished(&"pinger_v4", err);
@@ -2519,10 +2674,26 @@ mod tests {
         assert_eq!(announced, at);
     }
 
-    // A search that starts from fewer than three nodes also asks the routers
-    // of its family; one with three does not (libtorrent
-    // `traversal_algorithm::start`, `add_router_entries`). With no node at all,
-    // the routers alone start it, at once.
+    // A table of `nodes` nodes at 10.0.i.1, each one that has answered when
+    // `answered`, one only heard of or restored from an earlier run when not.
+    fn add_table_nodes(dht: &DhtState, nodes: u8, answered: bool) {
+        use crate::core::hash_id::Id20;
+        let mut table = dht.routing_table_v4.write();
+        for i in 0..nodes {
+            let id = Id20::new([i + 1; 20]);
+            table.add_node(id, SocketAddr::from(([10, 0, i, 1], 6881)));
+            if answered {
+                table.mark_response(&id, std::time::Instant::now());
+            }
+        }
+    }
+
+    // A search that starts from fewer than three nodes that have answered
+    // also asks the routers of its family; one with three does not (libtorrent
+    // `traversal_algorithm::start`, `add_router_entries`, over a table that
+    // holds only nodes that answered). With no node at all, the routers alone
+    // start it, at once; three nodes that never answered do not keep it from
+    // them.
     #[tokio::test(start_paused = true)]
     async fn test_a_search_short_of_nodes_also_asks_the_routers() {
         use crate::core::hash_id::Id20;
@@ -2531,14 +2702,15 @@ mod tests {
         let router: SocketAddr = ([192, 0, 2, 1], 6881).into();
         let router_v6: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
         let node = |i: u8| SocketAddr::from(([10, 0, i, 1], 6881));
-        for (nodes, routers_asked) in [(0, true), (2, true), (3, false)] {
+        for (nodes, answered, routers_asked) in [
+            (0, true, true),
+            (2, true, true),
+            (3, true, false),
+            (3, false, true),
+        ] {
             let (dht, mut sent) = fixture_dht();
             dht.routers.write().extend([router, router_v6]);
-            for i in 0..nodes {
-                dht.routing_table_v4
-                    .write()
-                    .add_node(Id20::new([i + 1; 20]), node(i));
-            }
+            add_table_nodes(&dht, nodes, answered);
             let req = std::sync::Arc::new(super::RecursiveRequest::get_peers(
                 dht.clone(),
                 Id20::new([0x22; 20]),
@@ -2554,6 +2726,7 @@ mod tests {
             let mut asked = HashSet::new();
             while asked.len() < want.len() {
                 asked.insert(sent.recv().await.unwrap().addr);
+                assert_eq!(tokio::time::Instant::now(), start, "{nodes} nodes");
             }
             assert!(sent.try_recv().is_err(), "{nodes} nodes");
             assert_eq!(asked, want, "{nodes} nodes");
@@ -2564,8 +2737,9 @@ mod tests {
 
     // `traversal_algorithm::start` runs for a refresh too: a bucket refresh,
     // a find_node from the table's nodes nearest its target as
-    // `bucket_refresher` starts it, that finds fewer than three also asks the
-    // routers of its family; one that finds three does not.
+    // `bucket_refresher` starts it, that finds fewer than three nodes that
+    // have answered also asks the routers of its family; one that finds three
+    // does not.
     #[tokio::test(start_paused = true)]
     async fn test_a_bucket_refresh_short_of_nodes_also_asks_the_routers() {
         use crate::core::hash_id::Id20;
@@ -2574,14 +2748,15 @@ mod tests {
         let router: SocketAddr = ([192, 0, 2, 1], 6881).into();
         let router_v6: SocketAddr = "[2001:db8::1]:6881".parse().unwrap();
         let node = |i: u8| SocketAddr::from(([10, 0, i, 1], 6881));
-        for (nodes, routers_asked) in [(0, true), (2, true), (3, false)] {
+        for (nodes, answered, routers_asked) in [
+            (0, true, true),
+            (2, true, true),
+            (3, true, false),
+            (3, false, true),
+        ] {
             let (dht, mut sent) = fixture_dht();
             dht.routers.write().extend([router, router_v6]);
-            for i in 0..nodes {
-                dht.routing_table_v4
-                    .write()
-                    .add_node(Id20::new([i + 1; 20]), node(i));
-            }
+            add_table_nodes(&dht, nodes, answered);
             let mut refresh = std::pin::pin!(super::RecursiveRequest::find_node_for_routing_table(
                 dht.clone(),
                 Id20::new([0x22; 20]),
@@ -2677,10 +2852,10 @@ mod tests {
         assert!(!in_table(silent.0), "the silent node entered the table");
     }
 
-    // libtorrent `node::bootstrap` starts its traversal from the nodes it is
-    // given and `traversal_algorithm::start` adds the routers when they are
-    // fewer than three: a bootstrap from a router name's addresses asks every
-    // router of the family, the ones it names among them, each once.
+    // A router name's addresses join the routers (libtorrent
+    // `dht_tracker::add_router_node`), and the next search for our own id
+    // asks every router of the family, the ones the name gave among them,
+    // each once (`traversal_algorithm::start` and `add_router_entries`).
     #[tokio::test(start_paused = true)]
     async fn test_a_bootstrap_from_the_routers_asks_each_router_once() {
         use crate::core::net::{BoxFuture, Resolver};
@@ -2714,8 +2889,14 @@ mod tests {
             resolver: Arc::new(Names(vec![new, known])),
             dht: dht.clone(),
         };
-        let mut bootstrap = std::pin::pin!(worker.bootstrap_hostname("router.invalid:6881"));
-        assert!(futures::poll!(bootstrap.as_mut()).is_pending());
+        worker
+            .resolve_router(
+                "router.invalid:6881",
+                &std::sync::atomic::AtomicBool::new(false),
+            )
+            .await;
+        let mut refresh = std::pin::pin!(dht.clone().refresh_self(true));
+        assert!(futures::poll!(refresh.as_mut()).is_pending());
 
         let mut asked = Vec::new();
         while let Ok(request) = sent.try_recv() {
@@ -2990,5 +3171,573 @@ mod tests {
         assert!(!dht.cancellation_token().is_cancelled());
         let logged = String::from_utf8(lines.0.lock().unwrap().clone()).unwrap();
         assert_eq!(logged, "");
+    }
+
+    // Reply to `request` as the node `id`, naming `nodes` and `values`.
+    fn reply(
+        dht: &std::sync::Arc<DhtState>,
+        request: &super::WorkerSendRequest,
+        id: crate::core::hash_id::Id20,
+        nodes: &[(crate::core::hash_id::Id20, std::net::SocketAddrV4)],
+        values: &[SocketAddr],
+    ) {
+        let nodes = (!nodes.is_empty()).then(|| {
+            bprotocol::CompactNodeInfoOwned::new_from_iter(
+                nodes.iter().map(|&(id, addr)| bprotocol::Node { id, addr }),
+            )
+        });
+        let values = (!values.is_empty()).then(|| values.iter().map(|&v| v.into()).collect());
+        dht.on_received_message(
+            bprotocol::Message {
+                transaction_id: request.message.transaction_id.clone(),
+                version: None,
+                ip: None,
+                kind: MessageKind::Response(bprotocol::Response {
+                    id,
+                    nodes,
+                    values,
+                    ..Default::default()
+                }),
+            },
+            request.addr,
+        )
+        .unwrap();
+    }
+
+    // Reply to `request` with a KRPC error.
+    fn refuse(dht: &std::sync::Arc<DhtState>, request: &super::WorkerSendRequest) {
+        dht.on_received_message(
+            bprotocol::Message {
+                transaction_id: request.message.transaction_id.clone(),
+                version: None,
+                ip: None,
+                kind: MessageKind::Error(bprotocol::ErrorDescription {
+                    code: 202,
+                    description: ByteBufOwned::from(&b"Server Error"[..]),
+                }),
+            },
+            request.addr,
+        )
+        .unwrap();
+    }
+
+    // On the same network as the nodes the tests have it name: a node named
+    // at a local address is asked only when a local node names it.
+    const ROUTER: ([u8; 4], u16) = ([10, 200, 0, 1], 6881);
+
+    // A first bootstrap whose router answers while the nodes it names do not,
+    // as on a route that carries a datagram now and then before it settles,
+    // does not leave the table empty for good: the table is still shallow,
+    // so the routers are asked again a backoff later, and once the nodes
+    // answer they fill the table; the round after that starts from them.
+    // libtorrent bootstraps again from `node::tick` while the table is under
+    // 4 deep (node.cpp:647-662, v2.0.15).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_bootstrap_that_got_no_answers_fills_the_table_once_the_path_comes_up() {
+        use super::BOOTSTRAP_RETRY_MIN;
+        use crate::core::hash_id::Id20;
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::collections::BTreeSet;
+
+        let (dht, mut sent) = fixture_dht();
+        let router = SocketAddr::from(ROUTER);
+        dht.add_routers(&[router]);
+        let named: Vec<(Id20, std::net::SocketAddrV4)> = (1..=4u8)
+            .map(|i| {
+                (
+                    Id20::new([0x80 + i; 20]),
+                    std::net::SocketAddrV4::new([10, 0, i, 1].into(), 6881),
+                )
+            })
+            .collect();
+        let named_addrs: BTreeSet<SocketAddr> = named.iter().map(|n| n.1.into()).collect();
+        let start = tokio::time::Instant::now();
+        let task = tokio::spawn(dht.clone().refresh_self(true));
+
+        // Round one: the router answers, the nodes it names never do.
+        let request = sent.recv().await.unwrap();
+        assert_eq!(request.addr, router);
+        assert!(matches!(
+            request.message.kind,
+            MessageKind::FindNodeRequest(_)
+        ));
+        reply(&dht, &request, Id20::new([0x99; 20]), &named, &[]);
+        let mut asked = BTreeSet::new();
+        for _ in 0..named.len() {
+            asked.insert(sent.recv().await.unwrap().addr);
+        }
+        assert_eq!(asked, named_addrs);
+        assert_eq!(dht.routing_table_v4.read().len(), 0);
+
+        // Round two, once those time out and a backoff after: the router
+        // again; now the nodes answer.
+        let request = sent.recv().await.unwrap();
+        assert_eq!(request.addr, router);
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            RESPONSE_TIMEOUT + BOOTSTRAP_RETRY_MIN
+        );
+        reply(&dht, &request, Id20::new([0x99; 20]), &named, &[]);
+        for _ in 0..named.len() {
+            let request = sent.recv().await.unwrap();
+            let &(id, _) = named
+                .iter()
+                .find(|n| SocketAddr::from(n.1) == request.addr)
+                .unwrap();
+            reply(&dht, &request, id, &[], &[]);
+        }
+
+        // Round three starts from the four nodes that answered, not the router.
+        let mut asked = BTreeSet::new();
+        for _ in 0..named.len() {
+            asked.insert(sent.recv().await.unwrap().addr);
+        }
+        assert_eq!(asked, named_addrs);
+        assert_eq!(dht.routing_table_v4.read().len(), 4);
+        task.abort();
+    }
+
+    // A torrent's search asked for while the table is empty and no router is
+    // known starts as soon as a router becomes known, as its name resolves.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_search_starts_as_the_first_router_becomes_known() {
+        use crate::core::hash_id::Id20;
+
+        let (dht, mut sent) = fixture_dht();
+        let req = std::sync::Arc::new(super::RecursiveRequest::get_peers(
+            dht.clone(),
+            Id20::new([0x22; 20]),
+            Some(6881),
+            tokio::sync::mpsc::unbounded_channel().0,
+        ));
+        let task = req.request_peers_forever(true);
+        tokio::time::advance(Duration::from_millis(8_400)).await;
+        assert!(sent.try_recv().is_err());
+
+        let known = tokio::time::Instant::now();
+        dht.add_routers(&[SocketAddr::from(ROUTER)]);
+        let request = sent.recv().await.unwrap();
+        assert!(matches!(
+            request.message.kind,
+            MessageKind::GetPeersRequest(_)
+        ));
+        assert_eq!(request.addr, SocketAddr::from(ROUTER));
+        assert_eq!(tokio::time::Instant::now(), known);
+        task.abort();
+    }
+
+    // Our id with bit `bit` flipped, and `n` in its last byte: a node of the
+    // bucket `bit` buckets from the farthest.
+    fn id_in_bucket(own: crate::core::hash_id::Id20, bit: u8, n: u8) -> crate::core::hash_id::Id20 {
+        let mut id = own.0;
+        id[usize::from(bit / 8)] ^= 0x80 >> (bit % 8);
+        id[19] ^= n + 1;
+        crate::core::hash_id::Id20::new(id)
+    }
+
+    // A table `buckets` buckets past the farthest, each a full bucket of
+    // nodes that answered, each node in its own /24.
+    fn fill_deep_table(
+        dht: &DhtState,
+        buckets: u8,
+    ) -> Vec<(crate::core::hash_id::Id20, SocketAddr)> {
+        let mut table = dht.routing_table_v4.write();
+        let mut nodes = Vec::new();
+        for bit in 0..=buckets {
+            for n in 0..8u8 {
+                let id = id_in_bucket(dht.id, bit, n);
+                let addr = SocketAddr::from(([10, bit + 1, n + 1, 1], 6881));
+                table.add_node(id, addr);
+                table.mark_response(&id, std::time::Instant::now());
+                nodes.push((id, addr));
+            }
+        }
+        nodes
+    }
+
+    // libtorrent `routing_table::depth` (routing_table.cpp:368-391, v2.0.15):
+    // past the farthest bucket, the buckets in a row with half a bucket of
+    // nodes that answered. Nodes only heard of do not count.
+    #[test]
+    fn test_table_depth_counts_buckets_of_nodes_that_answered() {
+        let (dht, _sent) = fixture_state();
+        assert_eq!(
+            dht.routing_table_v4.read().depth(std::time::Instant::now()),
+            0
+        );
+        fill_deep_table(&dht, 5);
+        assert_eq!(
+            dht.routing_table_v4.read().depth(std::time::Instant::now()),
+            5
+        );
+
+        let (dht, _sent) = fixture_state();
+        {
+            let mut table = dht.routing_table_v4.write();
+            for bit in 0..=5 {
+                for n in 0..8u8 {
+                    table.add_node(
+                        id_in_bucket(dht.id, bit, n),
+                        SocketAddr::from(([10, bit + 1, n + 1, 1], 6881)),
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            dht.routing_table_v4.read().depth(std::time::Instant::now()),
+            0
+        );
+    }
+
+    // A deep table searches for our own id once every SELF_REFRESH_INTERVAL
+    // and not from the routers. When its nodes later stop answering, the
+    // next round has no node to count on and asks the routers again
+    // (node.cpp:647-662: a table under 4 deep bootstraps again).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_table_that_empties_later_bootstraps_again() {
+        use super::SELF_REFRESH_INTERVAL;
+        use crate::dht::RESPONSE_TIMEOUT;
+
+        let (dht, mut sent) = fixture_dht();
+        let router = SocketAddr::from(ROUTER);
+        dht.add_routers(&[router]);
+        let nodes = fill_deep_table(&dht, 5);
+        let deepened = dht.deepened(true).notified();
+        let mut deepened = std::pin::pin!(deepened);
+        deepened.as_mut().enable();
+        let start = tokio::time::Instant::now();
+        let task = tokio::spawn(dht.clone().refresh_self(true));
+
+        // Round one: the eight nodes nearest our id, and they answer; the
+        // round ends with the table deep.
+        for _ in 0..8 {
+            let request = sent.recv().await.unwrap();
+            assert_ne!(request.addr, router);
+            let &(id, _) = nodes.iter().find(|n| n.1 == request.addr).unwrap();
+            reply(&dht, &request, id, &[], &[]);
+        }
+        deepened.await;
+
+        // Every node stops answering.
+        {
+            let mut table = dht.routing_table_v4.write();
+            for (id, _) in &nodes {
+                table.mark_outgoing_request(id, std::time::Instant::now());
+                table.mark_error(id);
+                table.mark_error(id);
+            }
+        }
+
+        // Round two, SELF_REFRESH_INTERVAL later, asks the router too.
+        let first = sent.recv().await.unwrap();
+        assert_eq!(tokio::time::Instant::now() - start, SELF_REFRESH_INTERVAL);
+        let mut request = first;
+        while request.addr != router {
+            request = sent.recv().await.unwrap();
+            assert!(
+                tokio::time::Instant::now() - start <= SELF_REFRESH_INTERVAL + RESPONSE_TIMEOUT,
+                "round two ended without asking the router"
+            );
+        }
+        task.abort();
+    }
+
+    // An error reply is no answer (libtorrent rpc_manager.cpp:316-350): the
+    // node that sent it counts as failed and does not enter the table.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_node_that_replies_with_an_error_does_not_enter_the_table() {
+        use crate::core::hash_id::Id20;
+
+        let (dht, mut sent) = fixture_dht();
+        let node = (
+            Id20::new([0x21; 20]),
+            SocketAddr::from(([10, 0, 1, 1], 6881)),
+        );
+        let target = dht.id;
+        let req = super::RecursiveRequest {
+            info_hash: target,
+            request: super::Request::FindNode(target),
+            dht: dht.clone(),
+            peer_tx: tokio::sync::mpsc::unbounded_channel().0,
+            callbacks: super::RecursiveRequestCallbacksFindNodes {},
+        };
+        let search =
+            tokio::spawn(
+                async move { req.search(true, [(Some(node.0), node.1)].into_iter()).await },
+            );
+        let request = sent.recv().await.unwrap();
+        refuse(&dht, &request);
+        let outcome = search.await.unwrap().unwrap();
+        assert_eq!(
+            outcome,
+            super::SearchOutcome {
+                answered: 0,
+                failed: 1
+            }
+        );
+        assert_eq!(dht.routing_table_v4.read().len(), 0);
+    }
+
+    // A router that refuses the bootstrap does not end it: the table is still
+    // empty, so the router is asked again a backoff later.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_bootstrap_refused_by_its_router_is_made_again() {
+        use super::BOOTSTRAP_RETRY_MIN;
+
+        let (dht, mut sent) = fixture_dht();
+        let router = SocketAddr::from(ROUTER);
+        dht.add_routers(&[router]);
+        let start = tokio::time::Instant::now();
+        let task = tokio::spawn(dht.clone().refresh_self(true));
+        let request = sent.recv().await.unwrap();
+        refuse(&dht, &request);
+        let request = sent.recv().await.unwrap();
+        assert_eq!(request.addr, router);
+        assert_eq!(tokio::time::Instant::now() - start, BOOTSTRAP_RETRY_MIN);
+        task.abort();
+    }
+
+    // A find_node reply that also names peers, as some nodes send, is walked
+    // past: the nodes it names are asked next, and the search goes on.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_find_node_reply_naming_peers_does_not_end_the_search() {
+        use crate::core::hash_id::Id20;
+
+        let (dht, mut sent) = fixture_dht();
+        let router = SocketAddr::from(ROUTER);
+        dht.add_routers(&[router]);
+        let task = tokio::spawn(dht.clone().refresh_self(true));
+        let request = sent.recv().await.unwrap();
+        assert_eq!(request.addr, router);
+        let named = (
+            Id20::new([0x81; 20]),
+            std::net::SocketAddrV4::new([10, 0, 1, 1].into(), 6881),
+        );
+        reply(
+            &dht,
+            &request,
+            Id20::new([0x99; 20]),
+            &[named],
+            &[SocketAddr::from(([10, 9, 9, 9], 51413))],
+        );
+        let request = sent.recv().await.unwrap();
+        assert_eq!(request.addr, SocketAddr::from(named.1));
+        task.abort();
+    }
+
+    // A route that carries nothing costs one router query a round: rounds
+    // back off from BOOTSTRAP_RETRY_MIN, doubling to SELF_REFRESH_INTERVAL
+    // apart, each after the last one's queries time out.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_dead_route_backs_off_and_sends_a_bounded_number_of_datagrams() {
+        let (dht, mut sent) = fixture_dht();
+        let router = SocketAddr::from(ROUTER);
+        dht.add_routers(&[router]);
+        let start = tokio::time::Instant::now();
+        let task = tokio::spawn(dht.clone().refresh_self(true));
+        let hour = Duration::from_secs(3600);
+        let mut at = Vec::new();
+        loop {
+            let request = sent.recv().await.unwrap();
+            assert_eq!(request.addr, router);
+            let elapsed = tokio::time::Instant::now() - start;
+            if elapsed > hour {
+                break;
+            }
+            at.push(elapsed.as_secs());
+        }
+        task.abort();
+        assert_eq!(
+            at,
+            [0, 15, 35, 65, 115, 205, 375, 705, 1315, 1925, 2535, 3145]
+        );
+    }
+
+    // A table restored from an earlier run holds nodes that have not answered
+    // this run: they do not keep a search from the routers. libtorrent seeds
+    // its bootstrap with its saved nodes and adds the routers
+    // (dht_tracker.cpp:184-191, v2.0.15).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_restored_table_of_stale_nodes_does_not_keep_the_routers_out() {
+        use crate::core::hash_id::Id20;
+        use crate::dht::routing_table::RoutingTable;
+
+        let (saved, _sent) = fixture_state();
+        add_table_nodes(&saved, 5, true);
+        let json = serde_json::to_string(&*saved.routing_table_v4.read()).unwrap();
+        let restored: RoutingTable = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.len(), 5);
+
+        let router = SocketAddr::from(ROUTER);
+        for refresh in [true, false] {
+            let (tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+            let dht = std::sync::Arc::new(DhtState::new_internal(
+                saved.id,
+                tx,
+                Some(restored.clone()),
+                None,
+                (Ipv4Addr::LOCALHOST, 0).into(),
+                tokio_util::sync::CancellationToken::new(),
+                None,
+            ));
+            dht.add_routers(&[router]);
+            let task = if refresh {
+                tokio::spawn(dht.clone().refresh_self(true)).abort_handle()
+            } else {
+                let req = std::sync::Arc::new(super::RecursiveRequest::get_peers(
+                    dht.clone(),
+                    Id20::new([0x22; 20]),
+                    Some(6881),
+                    tokio::sync::mpsc::unbounded_channel().0,
+                ));
+                req.request_peers_forever(true).abort_handle()
+            };
+            // The router is asked in the first search, after the nodes ahead
+            // of it fail.
+            let start = tokio::time::Instant::now();
+            loop {
+                let request = sent.recv().await.unwrap();
+                if request.addr == router {
+                    break;
+                }
+                assert!(
+                    tokio::time::Instant::now() - start <= crate::dht::RESPONSE_TIMEOUT,
+                    "the first search ended without asking the router"
+                );
+            }
+            task.abort();
+        }
+    }
+
+    // A search that fell short of k answers, as one made before the table
+    // filled, searches again as the table turns deep, ahead of its turn; the
+    // turn stays where it was.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_short_search_searches_again_as_the_table_turns_deep() {
+        use crate::core::hash_id::Id20;
+        use std::collections::BTreeSet;
+
+        let (dht, mut sent) = fixture_dht();
+        add_table_nodes(&dht, 3, true);
+        let info_hash = Id20::new([0x22; 20]);
+        let slot = super::announce_slot(&info_hash);
+        // Whole milliseconds, the timer's grain.
+        let early = Duration::from_secs(60);
+        assert!(early < slot);
+        let req = std::sync::Arc::new(super::RecursiveRequest::get_peers(
+            dht.clone(),
+            info_hash,
+            None,
+            tokio::sync::mpsc::unbounded_channel().0,
+        ));
+        let start = tokio::time::Instant::now();
+        let task = req.request_peers_forever(true);
+
+        let mut searched = BTreeSet::new();
+        for _ in 0..3 {
+            for _ in 0..3 {
+                let request = sent.recv().await.unwrap();
+                searched.insert(tokio::time::Instant::now() - start);
+                answer(&dht, &request, Id20::new([0x33; 20]), None, &[]);
+            }
+            if searched.len() == 1 {
+                tokio::time::sleep_until(start + early).await;
+                dht.deepened(true).notify_waiters();
+            }
+        }
+        task.abort();
+        assert_eq!(searched, BTreeSet::from([Duration::ZERO, early, slot]));
+    }
+
+    // A datagram too long for the buffer, which a socket carried through a
+    // tunnel reports as InvalidData, costs that datagram only: the DHT reads
+    // on and answers the next query.
+    #[tokio::test]
+    async fn test_a_datagram_that_does_not_fit_costs_only_that_datagram() {
+        use crate::core::net::BoxFuture;
+
+        type Incoming = std::io::Result<(Vec<u8>, SocketAddr)>;
+        struct Queued {
+            incoming: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<Incoming>>,
+            sent: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+        }
+        impl DatagramSocket for Queued {
+            fn bind_addr(&self) -> SocketAddr {
+                (Ipv4Addr::LOCALHOST, 6881).into()
+            }
+            fn recv_from<'a>(
+                &'a self,
+                buf: &'a mut [u8],
+            ) -> BoxFuture<'a, std::io::Result<(usize, SocketAddr)>> {
+                Box::pin(async move {
+                    match self.incoming.lock().await.recv().await {
+                        Some(Ok((datagram, from))) => {
+                            buf[..datagram.len()].copy_from_slice(&datagram);
+                            Ok((datagram.len(), from))
+                        }
+                        Some(Err(e)) => Err(e),
+                        None => std::future::pending().await,
+                    }
+                })
+            }
+            fn send_to<'a>(
+                &'a self,
+                buf: &'a [u8],
+                _: SocketAddr,
+            ) -> BoxFuture<'a, std::io::Result<usize>> {
+                Box::pin(async move {
+                    let _ = self.sent.send(buf.to_vec());
+                    Ok(buf.len())
+                })
+            }
+            fn poll_send_to(
+                &self,
+                _: &mut std::task::Context<'_>,
+                buf: &[u8],
+                _: SocketAddr,
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                let _ = self.sent.send(buf.to_vec());
+                std::task::Poll::Ready(Ok(buf.len()))
+            }
+        }
+
+        let (incoming, incoming_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sent_tx, mut sent) = tokio::sync::mpsc::unbounded_channel();
+        let socket = Arc::new(Queued {
+            incoming: tokio::sync::Mutex::new(incoming_rx),
+            sent: sent_tx,
+        });
+        let tasks = tokio_util::task::TaskTracker::new();
+        let dht = DhtState::with_config(DhtConfig {
+            bootstrap_addrs: Some(Vec::new()),
+            socket: Some(socket),
+            tasks: Some(tasks.clone()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        tasks.close();
+
+        let from = SocketAddr::from(([10, 0, 0, 1], 6881));
+        incoming
+            .send(Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the datagram did not fit",
+            )))
+            .unwrap();
+        incoming
+            .send(Ok((
+                b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe".to_vec(),
+                from,
+            )))
+            .unwrap();
+        let answer = tokio::select! {
+            answer = sent.recv() => answer.unwrap(),
+            () = tasks.wait() => panic!("the DHT ended"),
+        };
+        let answer = bprotocol::deserialize_message::<ByteBufOwned>(&answer).unwrap();
+        assert!(matches!(answer.kind, MessageKind::Response(_)));
+        assert_eq!(answer.transaction_id.as_ref(), b"aa");
+        dht.cancellation_token().cancel();
     }
 }
