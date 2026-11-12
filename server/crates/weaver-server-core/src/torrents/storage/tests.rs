@@ -401,6 +401,39 @@ fn deleting_a_torrents_files_leaves_what_was_there_before_it() {
     assert!(dir.exists());
 }
 
+// libtorrent `storage_utils::delete_one_file`: a torrent's file is removed
+// as a file. A folder now where one of its files was is not the torrent's,
+// and stays with all it holds; what unpacking made is still removed whole.
+#[test]
+fn deleting_a_torrents_files_leaves_a_folder_where_a_file_was() {
+    let shim = shim(1024, vec![file("a.bin", 1000), file("b.bin", 500)]);
+    let torrent = noise(1500, 6);
+    for piece in 0..2 {
+        shim.complete(piece, &torrent);
+    }
+    let dir = shim.dir.path().to_path_buf();
+    shim.store.forget();
+    std::fs::remove_file(dir.join("a.bin")).unwrap();
+    std::fs::create_dir_all(dir.join("a.bin/deep")).unwrap();
+    std::fs::write(dir.join("a.bin/deep/photo.jpg"), b"the operator's").unwrap();
+    std::fs::create_dir_all(dir.join("out/inner")).unwrap();
+    std::fs::write(dir.join("out/inner/member.txt"), b"unpacked").unwrap();
+
+    delete_written(&deletion(
+        shim.store.files(),
+        &Adopted::default(),
+        &["out".to_owned()],
+        None,
+    ));
+    let mut left = walkdir(&dir);
+    left.sort();
+    assert_eq!(left, ["a.bin", "a.bin/deep", "a.bin/deep/photo.jpg"]);
+    assert_eq!(
+        std::fs::read(dir.join("a.bin/deep/photo.jpg")).unwrap(),
+        b"the operator's"
+    );
+}
+
 // Every path under the directory, relative to it.
 fn walkdir(dir: &Path) -> Vec<String> {
     let mut found = Vec::new();
