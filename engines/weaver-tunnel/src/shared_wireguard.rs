@@ -27,7 +27,8 @@ impl WireGuardTunnelProvider {
     pub fn new(spec: WireGuardSpec, observer: Arc<dyn TunnelObserver>) -> Self {
         Self(
             proxy_tunnels::WireGuardTunnelProvider::new(spec, Arc::new(Observer(observer, None)))
-                .with_download_tuning(),
+                .with_download_tuning()
+                .with_endpoint_resolver(Arc::new(crate::resolution::HostEndpoints)),
         )
     }
     pub async fn resolve_host(&self, host: &str) -> Result<Vec<std::net::IpAddr>, TunnelError> {

@@ -469,6 +469,21 @@ pub async fn host_lookup(host: &str) -> io::Result<Vec<IpAddr>> {
     .inspect_err(|error| record::failed_saying(host, error))
 }
 
+// Resolves the name of a tunnel's own endpoint with the host's own DNS: the
+// endpoint carries the tunnel, so nothing inside the tunnel can answer it.
+pub struct HostEndpoints;
+
+#[async_trait::async_trait]
+impl crate::endpoint::EndpointResolver for HostEndpoints {
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "a tunnel's own endpoint is the first hop of the route"
+    )]
+    async fn resolve(&self, host: &str) -> io::Result<Vec<IpAddr>> {
+        host_lookup(host).await
+    }
+}
+
 // `host_lookup` for a thread that may block.
 #[expect(
     clippy::disallowed_methods,
