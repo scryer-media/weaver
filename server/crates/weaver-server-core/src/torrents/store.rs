@@ -192,6 +192,12 @@ impl TorrentStore {
             .map(|(index, file)| !file.padding && ignored.get(index).copied().unwrap_or(false))
             .collect();
         let mut opened = Side::open(side, self.layout.piece_length(), self.layout.file_count())?;
+        if opened.reset().is_some() && self.count() > 0 {
+            // What the side store held is gone, and with its head which
+            // files' shares were there alone: the store vouches for no
+            // piece it had, and every piece is checked again.
+            self.check_every_piece();
+        }
         let checking = self.have().unchecked.any();
         let mut buffer = Vec::new();
         for piece in opened.pieces() {
@@ -380,6 +386,24 @@ impl TorrentStore {
 
     pub(crate) fn count(&self) -> u32 {
         self.have().count
+    }
+
+    // A check of every piece begun: none is had until it finds it. True
+    // when any was had.
+    fn check_every_piece(&self) -> bool {
+        let mut have = self.have();
+        let had = have.pieces.clone();
+        have.unchecked.fill(true);
+        for piece in had.iter_ones() {
+            have.set(&self.layout, piece as u32, false);
+        }
+        had.any()
+    }
+
+    // Why the side store found at open was not trusted and was removed,
+    // when it was not.
+    pub(crate) fn side_reset(&self) -> Option<&'static str> {
+        self.side().reset()
     }
 
     pub(crate) fn file_have(&self) -> Vec<u64> {
@@ -652,13 +676,7 @@ impl Pieces for TorrentStore {
     }
 
     fn checking(&self) -> anyhow::Result<bool> {
-        let mut have = self.have();
-        let had = have.pieces.clone();
-        have.unchecked.fill(true);
-        for piece in had.iter_ones() {
-            have.set(&self.layout, piece as u32, false);
-        }
-        Ok(had.any())
+        Ok(self.check_every_piece())
     }
 
     // A check of the files reads a piece the tee waits on whole, and hands

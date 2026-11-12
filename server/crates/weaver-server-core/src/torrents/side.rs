@@ -46,6 +46,9 @@ pub(crate) struct Side {
     free: Vec<u32>,
     // How many slots the file has room for.
     count: u32,
+    // Why the file found there was not this torrent's side store, when it
+    // was not.
+    reset: Option<&'static str>,
 }
 
 // The head's length for `files` files: the magic, the count, the bits,
@@ -64,10 +67,6 @@ fn head(recorded: &[bool]) -> Vec<u8> {
         }
     }
     head
-}
-
-fn bad(what: &str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, what.to_string())
 }
 
 fn tag(piece: Option<u32>) -> [u8; TAG as usize] {
@@ -117,54 +116,37 @@ impl Side {
             slots: HashMap::new(),
             free: Vec::new(),
             count: 0,
+            reset: None,
+        }
+    }
+
+    fn empty(piece_length: u64, files: usize) -> Self {
+        Self {
+            slot_len: TAG + piece_length,
+            base: head_len(files),
+            recorded: vec![false; files],
+            ..Self::none()
         }
     }
 
     // The side store at `path` for pieces of `piece_length` over `files`
     // files, its slots found by their tags. None of it there is an empty
-    // store.
+    // store. A file there that is not this torrent's side store, its head
+    // short or another's, or longer than any it makes, is removed and the
+    // store is empty, with the reason in `reset`: nothing of it is read
+    // back as a slot, and the next piece kept lays down a fresh head
+    // (libtorrent takes such a part file as empty and writes over it,
+    // `part_file::part_file`, part_file.cpp:87-118 at v2.0.15). A file
+    // that cannot be opened or read is an error.
     pub(crate) fn open(path: PathBuf, piece_length: u64, files: usize) -> io::Result<Self> {
-        let mut side = Self {
-            path: None,
-            slot_len: TAG + piece_length,
-            base: head_len(files),
-            recorded: vec![false; files],
-            made: false,
-            slots: HashMap::new(),
-            free: Vec::new(),
-            count: 0,
-        };
+        let mut side = Self::empty(piece_length, files);
         match File::open(&path) {
             Ok(file) => {
-                let len = file.metadata()?.len();
-                let mut found = vec![0; side.base as usize];
-                read_exact_at(&file, 0, &mut found)
-                    .map_err(|_| bad("the side store has no head"))?;
-                let magic = u32::from_le_bytes(found[..4].try_into().unwrap_or_default());
-                let count = u32::from_le_bytes(found[4..8].try_into().unwrap_or_default());
-                if magic != HEAD_MAGIC || count as usize != files {
-                    return Err(bad("the side store's head is not this torrent's"));
-                }
-                for (file, set) in side.recorded.iter_mut().enumerate() {
-                    *set = found[8 + file / 8] & (1 << (file % 8)) != 0;
-                }
-                side.made = true;
-                side.count = u32::try_from((len - side.base).div_ceil(side.slot_len))
-                    .map_err(|_| bad("the side store is too long"))?;
-                for slot in 0..side.count {
-                    let mut found = [0; TAG as usize];
-                    let at = side.base + u64::from(slot) * side.slot_len;
-                    let piece = match read_exact_at(&file, at, &mut found) {
-                        Ok(()) => untag(found),
-                        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => None,
-                        Err(error) => return Err(error),
-                    };
-                    match piece {
-                        Some(piece) if !side.slots.contains_key(&piece) => {
-                            side.slots.insert(piece, slot);
-                        }
-                        _ => side.free.push(slot),
-                    }
+                if let Some(reason) = side.load(&file)? {
+                    drop(file);
+                    Self::remove(&path)?;
+                    side = Self::empty(piece_length, files);
+                    side.reset = Some(reason);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -172,6 +154,55 @@ impl Side {
         }
         side.path = Some(path);
         Ok(side)
+    }
+
+    // The head and slots of `file`, or why it is not this torrent's side
+    // store; nothing is taken from it then.
+    fn load(&mut self, file: &File) -> io::Result<Option<&'static str>> {
+        let len = file.metadata()?.len();
+        let mut found = vec![0; self.base as usize];
+        match read_exact_at(file, 0, &mut found) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Ok(Some("its head is short"));
+            }
+            Err(error) => return Err(error),
+        }
+        let magic = u32::from_le_bytes(found[..4].try_into().unwrap_or_default());
+        let count = u32::from_le_bytes(found[4..8].try_into().unwrap_or_default());
+        if magic != HEAD_MAGIC || count as usize != self.recorded.len() {
+            return Ok(Some("its head is not this torrent's"));
+        }
+        let Ok(slots) = u32::try_from(len.saturating_sub(self.base).div_ceil(self.slot_len)) else {
+            return Ok(Some("it is longer than any side store"));
+        };
+        for (file, set) in self.recorded.iter_mut().enumerate() {
+            *set = found[8 + file / 8] & (1 << (file % 8)) != 0;
+        }
+        self.made = true;
+        self.count = slots;
+        for slot in 0..slots {
+            let mut found = [0; TAG as usize];
+            let at = self.base + u64::from(slot) * self.slot_len;
+            let piece = match read_exact_at(file, at, &mut found) {
+                Ok(()) => untag(found),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => None,
+                Err(error) => return Err(error),
+            };
+            match piece {
+                Some(piece) if !self.slots.contains_key(&piece) => {
+                    self.slots.insert(piece, slot);
+                }
+                _ => self.free.push(slot),
+            }
+        }
+        Ok(None)
+    }
+
+    // Why the file found at open was not this torrent's side store, and was
+    // removed, when it was not.
+    pub(crate) fn reset(&self) -> Option<&'static str> {
+        self.reset
     }
 
     pub(crate) fn path(&self) -> Option<&Path> {
@@ -329,9 +360,64 @@ mod tests {
         again.record(&[true, false]).unwrap();
         let again = Side::open(path.clone(), 4, 2).unwrap();
         assert!(again.recorded(0) && !again.recorded(1));
-        assert!(Side::open(path.clone(), 4, 3).is_err());
+        assert!(again.reset().is_none());
         Side::remove(&path).unwrap();
         Side::remove(&path).unwrap();
         assert!(!path.exists());
+    }
+
+    // A file that is not this torrent's side store opens as an empty one:
+    // its head short, another's magic, or another count of files. It is
+    // removed, so none of its slots is read back later, even one whose tag
+    // a fresh head would make look kept, and the next piece kept lays down
+    // a fresh head.
+    #[test]
+    fn a_file_that_is_not_this_side_store_opens_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.side");
+        let mut other = Side::open(path.clone(), 4, 3).unwrap();
+        other.keep(5, b"abcd", &[false, true, false]).unwrap();
+        other.keep(6, b"efgh", &[false, true, false]).unwrap();
+        let three = std::fs::read(&path).unwrap();
+        // The same slots under a two-file head, its magic broken.
+        let mut magic = head(&[false, true]);
+        magic[0] ^= 1;
+        magic.extend_from_slice(&three[head_len(3) as usize..]);
+        let cases: [(&str, Vec<u8>); 3] = [
+            ("its head is short", vec![0x48, 0x53, 0x44]),
+            ("its head is not this torrent's", magic),
+            ("its head is not this torrent's", three),
+        ];
+        for (reason, bytes) in cases {
+            std::fs::write(&path, &bytes).unwrap();
+            let mut side = Side::open(path.clone(), 4, 2).unwrap();
+            assert_eq!(side.reset(), Some(reason));
+            assert!(side.is_empty());
+            assert!(!side.recorded(0) && !side.recorded(1));
+            assert!(!path.exists());
+            side.keep(6, b"ijkl", &[false, true]).unwrap();
+            let mut out = [0; 4];
+            side.read(6, 0, &mut out).unwrap();
+            assert_eq!(&out, b"ijkl");
+            let again = Side::open(path.clone(), 4, 2).unwrap();
+            assert!(again.reset().is_none());
+            assert_eq!(again.pieces(), [6]);
+            assert!(again.recorded(1));
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().len(),
+                head_len(2) + TAG + 4
+            );
+        }
+    }
+
+    // A file that cannot be read as a side store at all, here a folder, is
+    // an error, and is left where it is.
+    #[test]
+    fn a_side_store_that_cannot_be_read_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.side");
+        std::fs::create_dir(&path).unwrap();
+        assert!(Side::open(path.clone(), 4, 2).is_err());
+        assert!(path.is_dir());
     }
 }
