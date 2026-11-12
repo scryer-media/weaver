@@ -5178,10 +5178,31 @@ mod tests {
         }
     }
 
-    /// Kernel sockets that note each receive buffer a uTP socket asks for.
+    /// Kernel sockets that note each receive buffer a uTP socket asks for,
+    /// the port of each TCP listener, each port uTP asks for, and each
+    /// address a datagram socket of its own is bound at. With
+    /// `first_utp_port_held`, another socket holds the first port uTP asks
+    /// for.
     struct NotingAsks {
         kernel: Arc<dyn crate::network::SocketFactory>,
+        first_utp_port_held: bool,
         asked: std::sync::Mutex<Vec<usize>>,
+        tcp_ports: std::sync::Mutex<Vec<u16>>,
+        utp_ports: std::sync::Mutex<Vec<u16>>,
+        udp_binds: std::sync::Mutex<Vec<std::net::SocketAddr>>,
+    }
+
+    impl NotingAsks {
+        fn new(first_utp_port_held: bool) -> Arc<Self> {
+            Arc::new(Self {
+                kernel: crate::test_support::socket_factory(),
+                first_utp_port_held,
+                asked: Default::default(),
+                tcp_ports: Default::default(),
+                utp_ports: Default::default(),
+                udp_binds: Default::default(),
+            })
+        }
     }
 
     impl crate::network::SocketFactory for NotingAsks {
@@ -5203,7 +5224,14 @@ mod tests {
             addr: std::net::SocketAddr,
         ) -> crate::network::BoxFuture<'a, std::io::Result<Box<dyn crate::network::StreamListener>>>
         {
-            self.kernel.listen_tcp(addr)
+            Box::pin(async move {
+                let listener = self.kernel.listen_tcp(addr).await?;
+                self.tcp_ports
+                    .lock()
+                    .unwrap()
+                    .push(listener.local_addr().port());
+                Ok(listener)
+            })
         }
 
         fn bind_udp<'a>(
@@ -5211,6 +5239,7 @@ mod tests {
             addr: std::net::SocketAddr,
         ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
         {
+            self.udp_binds.lock().unwrap().push(addr);
             self.kernel.bind_udp(addr)
         }
 
@@ -5221,6 +5250,16 @@ mod tests {
         ) -> crate::network::BoxFuture<'a, std::io::Result<Arc<dyn crate::network::DatagramSocket>>>
         {
             self.asked.lock().unwrap().push(receive_buffer);
+            let first = {
+                let mut ports = self.utp_ports.lock().unwrap();
+                ports.push(addr.port());
+                ports.len() == 1
+            };
+            if first && self.first_utp_port_held {
+                return Box::pin(async {
+                    Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+                });
+            }
             self.kernel.bind_utp(addr, receive_buffer)
         }
     }
@@ -5228,10 +5267,7 @@ mod tests {
     #[tokio::test]
     async fn a_sessions_utp_socket_asks_for_a_window_per_connection() {
         let dir = TempDir::new().unwrap();
-        let sockets = Arc::new(NotingAsks {
-            kernel: crate::test_support::socket_factory(),
-            asked: Default::default(),
-        });
+        let sockets = NotingAsks::new(false);
         let _session = Session::new_with_opts(
             dir.path().into(),
             SessionOptions {
@@ -5250,9 +5286,15 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(
-            *sockets.asked.lock().unwrap(),
-            [7 * crate::udp_options::STREAM_WINDOW]
+        // A listener port whose UDP port another socket holds is given up,
+        // so uTP may ask more than once: once for each port TCP took.
+        let asked = sockets.asked.lock().unwrap().clone();
+        assert_eq!(asked.len(), sockets.tcp_ports.lock().unwrap().len());
+        assert!(
+            asked
+                .iter()
+                .all(|&ask| ask == 7 * crate::udp_options::STREAM_WINDOW),
+            "{asked:?}"
         );
     }
 
@@ -5262,10 +5304,7 @@ mod tests {
     #[tokio::test]
     async fn the_dht_shares_the_utp_listeners_socket() {
         let dir = TempDir::new().unwrap();
-        let sockets = Arc::new(NotingAsks {
-            kernel: crate::test_support::socket_factory(),
-            asked: Default::default(),
-        });
+        let sockets = NotingAsks::new(false);
         let session = Session::new_with_opts(
             dir.path().into(),
             SessionOptions {
@@ -5290,6 +5329,15 @@ mod tests {
         .unwrap();
         let listening = session.listen_addr().unwrap();
         assert_eq!(session.get_dht().unwrap().listen_addr(), listening);
+        // One datagram socket is bound beside uTP's, the UDP tracker
+        // client's: the DHT binds none of its own.
+        assert_eq!(
+            *sockets.udp_binds.lock().unwrap(),
+            [std::net::SocketAddr::from((
+                std::net::Ipv4Addr::UNSPECIFIED,
+                0
+            ))]
+        );
 
         let client = crate::test_support::loopback_udp().await;
         client
@@ -5325,6 +5373,62 @@ mod tests {
         .await
         .unwrap();
         peer.connect(listening).await.unwrap();
+        session.stop().await;
+    }
+
+    // A port the TCP listener chose that a datagram socket holds is given up
+    // for another, so uTP and the DHT still listen on the listener's port
+    // over one socket, and the DHT binds none of its own.
+    #[tokio::test]
+    async fn a_listener_port_whose_udp_port_is_held_is_given_up_for_another() {
+        let dir = TempDir::new().unwrap();
+        let sockets = NotingAsks::new(true);
+        let session = Session::new_with_opts(
+            dir.path().into(),
+            SessionOptions {
+                dht: Some(crate::DhtSessionConfig {
+                    bootstrap_addrs: Some(Vec::new()),
+                    port: Some(0),
+                    persistence: None,
+                }),
+                persistence: None,
+                disable_trackers: true,
+                disable_local_service_discovery: true,
+                ipv4_only: true,
+                listen: Some(crate::ListenerOptions {
+                    mode: crate::ListenerMode::TcpAndUtp,
+                    listen_addr: (std::net::Ipv4Addr::LOCALHOST, 0).into(),
+                    ..Default::default()
+                }),
+                ..SessionOptions::new(sockets.clone())
+            },
+        )
+        .await
+        .unwrap();
+        // Another socket on the host may hold a later port too, and that one
+        // is given up as well.
+        let tcp_ports = sockets.tcp_ports.lock().unwrap().clone();
+        assert!(tcp_ports.len() >= 2, "the listener took {tcp_ports:?}");
+        assert_eq!(
+            tcp_ports
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            tcp_ports.len(),
+            "the listener took {tcp_ports:?}"
+        );
+        assert_eq!(*sockets.utp_ports.lock().unwrap(), tcp_ports);
+        let listening = session.listen_addr().unwrap();
+        assert_eq!(Some(&listening.port()), tcp_ports.last());
+        assert_eq!(session.get_dht().unwrap().listen_addr(), listening);
+        // The UDP tracker client's socket alone: the DHT binds none.
+        assert_eq!(
+            *sockets.udp_binds.lock().unwrap(),
+            [std::net::SocketAddr::from((
+                std::net::Ipv4Addr::UNSPECIFIED,
+                0
+            ))]
+        );
         session.stop().await;
     }
 
