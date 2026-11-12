@@ -687,6 +687,42 @@ impl Segments {
             })
             .filter(|s| !s.is_delivered())
     }
+
+    // The oldest segment not delivered, as the retransmission timer finds
+    // it, and how many segments sent after it were.
+    #[cfg(test)]
+    pub fn head_for_tests(&self) -> Option<HeadForTests> {
+        let mut segments = self.segments.iter().skip_while(|s| s.is_delivered);
+        let head = segments.next()?;
+        let head_sent = head.last_sent();
+        let mut delivered_after = 0;
+        let mut delivered_sent_later = 0;
+        for s in segments.filter(|s| s.is_delivered) {
+            delivered_after += 1;
+            if s.last_sent() > head_sent {
+                delivered_sent_later += 1;
+            }
+        }
+        Some(HeadForTests {
+            sends: head.send_count(),
+            probe_resends: head.probe_resends,
+            payload_size: head.payload_size,
+            is_lost: head.is_lost,
+            delivered_after,
+            delivered_sent_later,
+        })
+    }
+}
+
+#[cfg(test)]
+pub struct HeadForTests {
+    pub sends: usize,
+    pub probe_resends: usize,
+    pub payload_size: usize,
+    pub is_lost: bool,
+    pub delivered_after: usize,
+    // Of those, the ones sent after the head's last send.
+    pub delivered_sent_later: usize,
 }
 
 #[cfg(test)]

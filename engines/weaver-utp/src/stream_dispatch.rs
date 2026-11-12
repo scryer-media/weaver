@@ -262,6 +262,41 @@ pub(crate) struct SendTotals {
     pub(crate) timer_expiries: u64,
 }
 
+// Why the retransmission timer ran out, read from the stream when it did.
+// The head is the oldest packet not delivered.
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ExpiryCause {
+    // The peer advertised less room than the head needs.
+    PeerWindowClosed,
+    // The head was resent before, and that resend is unanswered too; with
+    // how many packets sent after that resend arrived, three meaning three
+    // or more.
+    ResendLost(u8),
+    // Nothing sent after the head arrived: the flight's tail is lost. A
+    // probe went and is unanswered.
+    TailProbeLost,
+    // Tail lost, no probe sent, for the first reason here that holds.
+    TailNoProbeUnconfirmed,
+    TailNoProbeTimerResending,
+    TailNoProbeRecovering,
+    TailNoProbeRewound,
+    TailNoProbeNewDataWaits,
+    TailNoProbeTailIsMtuProbe,
+    TailNoProbeNoRttSample,
+    TailNoProbeTimerFirst,
+    // The head's first send is lost and only one or two packets sent after
+    // it arrived: too few for the three the SACK rule needs.
+    OneLaterArrived,
+    TwoLaterArrived,
+    // Three or more later packets arrived; the head is lost and unsent,
+    // or, when they were not counted since, not yet lost.
+    LostNotResent,
+    ThreeLaterArrivedNotLost,
+    // Nothing of the head is known; our FIN is what is out.
+    Fin,
+}
+
 // Updated on every poll
 struct ThisPoll {
     // Set here once per poll for consistent reproducible calculations.
@@ -463,11 +498,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             let only_packet_outstanding = self.user_tx_segments.sole_outstanding_is_mtu_probe()
                 && !(self.fin_sends > 0 && self.state.our_fin_if_unacked().is_some());
+            #[cfg(test)]
+            let cause = self.expiry_cause();
             let seg = self.user_tx_segments.iter_mut_for_sending(None).next();
             if let Some(mut seg) = seg {
                 if self.timers.retransmit.report_expiry() {
                     self.socket.stats.timeouts.increment(1);
                     self.totals.timer_expiries += 1;
+                    #[cfg(test)]
+                    self.socket.expiry_causes.lock().push(cause);
                 }
                 // A stream that dies on a packet larger than any it saw
                 // delivered leaves later streams probing no higher.
@@ -558,6 +597,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         if self.timers.retransmit.report_expiry() {
                             self.socket.stats.timeouts.increment(1);
                             self.totals.timer_expiries += 1;
+                            #[cfg(test)]
+                            self.socket.expiry_causes.lock().push(ExpiryCause::Fin);
                         }
                         let timeouts = self.rtte.timeouts() as usize + 1;
                         if timeouts > self.socket_opts.num_resends
@@ -1743,6 +1784,48 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             && self.last_sent_seq_nr == self.highest_sent_seq_nr
             && self.user_tx_segments.next_seq_nr() - 1 == self.highest_sent_seq_nr
             && self.user_tx_segments.tail_is_outstanding_data()
+    }
+
+    #[cfg(test)]
+    fn expiry_cause(&self) -> ExpiryCause {
+        let Some(head) = self.user_tx_segments.head_for_tests() else {
+            return ExpiryCause::Fin;
+        };
+        if (self.last_remote_window as usize) < head.payload_size {
+            return ExpiryCause::PeerWindowClosed;
+        }
+        if head.sends - head.probe_resends >= 2 {
+            return ExpiryCause::ResendLost(head.delivered_sent_later.min(3) as u8);
+        }
+        match head.delivered_after {
+            0 => {}
+            1 => return ExpiryCause::OneLaterArrived,
+            2 => return ExpiryCause::TwoLaterArrived,
+            _ if head.is_lost => return ExpiryCause::LostNotResent,
+            _ => return ExpiryCause::ThreeLaterArrivedNotLost,
+        }
+        if self.tail_probe_seq_nr.is_some() {
+            return ExpiryCause::TailProbeLost;
+        }
+        if !self.confirmed {
+            ExpiryCause::TailNoProbeUnconfirmed
+        } else if self.rto_retransmissions > 0 {
+            ExpiryCause::TailNoProbeTimerResending
+        } else if self.recovery.is_recovering() {
+            ExpiryCause::TailNoProbeRecovering
+        } else if self.last_sent_seq_nr != self.highest_sent_seq_nr {
+            ExpiryCause::TailNoProbeRewound
+        } else if self.user_tx_segments.next_seq_nr() - 1 != self.highest_sent_seq_nr {
+            ExpiryCause::TailNoProbeNewDataWaits
+        } else if !self.user_tx_segments.tail_is_outstanding_data() {
+            // Nothing after the head arrived, so the tail is out: it is an
+            // MTU probe.
+            ExpiryCause::TailNoProbeTailIsMtuProbe
+        } else if !self.rtte.has_sample() {
+            ExpiryCause::TailNoProbeNoRttSample
+        } else {
+            ExpiryCause::TailNoProbeTimerFirst
+        }
     }
 
     // Two measured round trips after the tail went out or the last ACK

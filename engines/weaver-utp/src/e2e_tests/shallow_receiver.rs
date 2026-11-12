@@ -28,7 +28,10 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{PollSendToVectored, SocketOpts, Transport, UtpSocket, traits::DefaultUtpEnvironment};
+use crate::{
+    PollSendToVectored, SocketOpts, Transport, UtpSocket, stream_dispatch::ExpiryCause,
+    traits::DefaultUtpEnvironment,
+};
 
 #[derive(Clone, Copy)]
 struct Shallow {
@@ -64,6 +67,31 @@ struct Counters {
     refused: u64,
     recoveries: u64,
     max_cwnd: u64,
+    // Data datagrams to the receiver lost at random on the way.
+    lost_on_path: u64,
+    // The stream ended before every byte arrived.
+    died: bool,
+}
+
+// What the sender's retransmission timeouts came from, by cause.
+#[derive(Debug, Default)]
+struct Causes(BTreeMap<ExpiryCause, u64>);
+
+// Data datagrams to the receiver lost on the way: a fixed pseudo-random draw,
+// so every run loses the same ones.
+struct Loss {
+    state: u64,
+    per_mille: u64,
+}
+
+impl Loss {
+    fn lost(&mut self) -> bool {
+        self.state = self
+            .state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (self.state >> 33) % 1000 < self.per_mille
+    }
 }
 
 struct Endpoint {
@@ -92,6 +120,7 @@ struct Model {
     // The instant and endpoint of the last data datagram sent, and how many
     // that endpoint sent then.
     burst: Option<(Instant, SocketAddr, usize)>,
+    loss: Option<Loss>,
 }
 
 impl Model {
@@ -157,6 +186,15 @@ impl Model {
                 (_, Some(at)) if at <= now => {
                     let (_, (source, target, data)) = self.in_flight.pop_first().unwrap();
                     let endpoint = self.endpoints.get_mut(&target).unwrap();
+                    let is_data =
+                        data.first().map(|byte| byte >> 4) == Some(crate::raw::Type::Data as u8);
+                    if endpoint.shallow.is_some()
+                        && is_data
+                        && self.loss.as_mut().is_some_and(Loss::lost)
+                    {
+                        self.counters.lost_on_path += 1;
+                        continue;
+                    }
                     match endpoint.shallow {
                         Some(shallow) => {
                             endpoint.arrivals += 1;
@@ -186,7 +224,7 @@ struct Network {
 }
 
 impl Network {
-    fn new(one_way: Duration) -> Arc<Self> {
+    fn new(one_way: Duration, loss: Option<Loss>) -> Arc<Self> {
         Arc::new(Self {
             model: Mutex::new(Model {
                 one_way,
@@ -197,6 +235,7 @@ impl Network {
                 next_out_drain: None,
                 counters: Counters::default(),
                 burst: None,
+                loss,
             }),
             changed: Notify::new(),
         })
@@ -417,7 +456,7 @@ fn payload(bytes: usize) -> Vec<u8> {
 // Sends `bytes` from a sender with an ample receive queue to a receiver
 // behind `shallow`, and returns what the network counted. The send buffer
 // starts at a megabyte, so the window, not the buffer, bounds the flight.
-async fn transfer(bytes: usize, one_way: Duration, shallow: Option<Shallow>) -> Counters {
+async fn transfer(bytes: usize, one_way: Duration, shallow: Option<Shallow>) -> (Counters, Causes) {
     transfer_in_rounds(
         bytes,
         one_way,
@@ -437,7 +476,7 @@ async fn transfer_in_rounds(
     shallow: Option<Shallow>,
     rounds: Option<(usize, Duration)>,
     tx_buffer_initial: Option<NonZeroUsize>,
-) -> Counters {
+) -> (Counters, Causes) {
     let writes = match rounds {
         None => Writes::Whole,
         Some((per_round, round)) => Writes::Rounds(per_round, round),
@@ -451,6 +490,8 @@ async fn transfer_in_rounds(
             reads: None,
             tx_buffer_initial,
             send_queue: None,
+            loss_per_mille: 0,
+            loss_seed: 0,
         },
     )
     .await
@@ -479,6 +520,10 @@ struct Upload {
     // The sender's socket holds this many datagrams and puts them on the
     // wire once an interval; otherwise each goes out as it is sent.
     send_queue: Option<Shallow>,
+    // Data datagrams to a shallow receiver lost at random on the way, per
+    // thousand, drawn from the seed.
+    loss_per_mille: u64,
+    loss_seed: u64,
 }
 
 async fn transfer_with(
@@ -486,14 +531,22 @@ async fn transfer_with(
     one_way: Duration,
     shallow: Option<Shallow>,
     upload: Upload,
-) -> Counters {
+) -> (Counters, Causes) {
     let Upload {
         writes,
         reads,
         tx_buffer_initial,
         send_queue,
+        loss_per_mille,
+        loss_seed,
     } = upload;
-    let network = Network::new(one_way);
+    let network = Network::new(
+        one_way,
+        (loss_per_mille > 0).then_some(Loss {
+            state: loss_seed,
+            per_mille: loss_per_mille,
+        }),
+    );
     let stop = CancellationToken::new();
     let socket = |transport| {
         UtpSocket::new_with_opts(
@@ -515,12 +568,12 @@ async fn transfer_with(
         let mut stream = sender.connect(address(2)).await.unwrap();
         let data = payload(bytes);
         match writes {
-            Writes::Whole => stream.write_all(&data).await.unwrap(),
+            Writes::Whole => stream.write_all(&data).await?,
             Writes::Rounds(per_round, round) => {
                 let mut rounds = tokio::time::interval(round);
                 for lump in data.chunks(per_round) {
                     rounds.tick().await;
-                    stream.write_all(lump).await.unwrap();
+                    stream.write_all(lump).await?;
                 }
             }
             Writes::Pieces(sizes) => {
@@ -530,35 +583,45 @@ async fn transfer_with(
                         break;
                     }
                     let (piece, after) = rest.split_at((*size).min(rest.len()));
-                    stream.write_all(piece).await.unwrap();
+                    stream.write_all(piece).await?;
                     rest = after;
                 }
             }
         }
-        stream.flush().await.unwrap();
-        stream
+        stream.flush().await?;
+        io::Result::Ok(stream)
     };
     let receive = async {
         let mut stream = receiver.accept().await.unwrap();
         let mut received = vec![0; bytes];
         match reads {
-            None => stream.read_exact(&mut received).await.unwrap(),
+            None => stream.read_exact(&mut received).await?,
             Some((per_read, every)) => {
                 let mut reads = tokio::time::interval(every);
                 for chunk in received.chunks_mut(per_read) {
                     reads.tick().await;
-                    stream.read_exact(chunk).await.unwrap();
+                    stream.read_exact(chunk).await?;
                 }
                 bytes
             }
         };
         let drains = network.counters().drains;
         assert!(received == payload(bytes), "the payload arrived intact");
-        (stream, drains)
+        io::Result::Ok((stream, drains))
     };
-    let (_sent, (_received, drains)) = tokio::join!(send, receive);
+    let (sent, received) = tokio::join!(send, receive);
+    // Only a run with random loss may end in a dead stream; it is counted.
+    let died = sent.is_err() || received.is_err();
+    assert!(
+        loss_per_mille > 0 || !died,
+        "{:?} {:?}",
+        sent.err(),
+        received.as_ref().err()
+    );
+    let drains = received.map_or_else(|_| network.counters().drains, |(_, drains)| drains);
     let stats = sender.stats();
     let counters = Counters {
+        died,
         drains,
         rtos: stats.rto_timeouts_count.load(Ordering::Relaxed),
         refused: stats.send_poll_pending.load(Ordering::Relaxed),
@@ -569,11 +632,15 @@ async fn transfer_with(
         max_cwnd: stats.max_congestion_window_bytes.load(Ordering::Relaxed),
         ..network.counters()
     };
+    let mut causes = Causes::default();
+    for cause in sender.state.expiry_causes.lock().iter() {
+        *causes.0.entry(*cause).or_default() += 1;
+    }
     sender.shutdown().await.unwrap();
     receiver.shutdown().await.unwrap();
     stop.cancel();
     driver.await.unwrap();
-    counters
+    (counters, causes)
 }
 
 // A receiver that holds 48 datagrams and reads them once a millisecond, a
@@ -586,8 +653,9 @@ async fn a_receiver_holding_48_datagrams_per_drain_loses_none() {
         queue_packets: 48,
         drain_every: Duration::from_millis(1),
     };
-    let counters = transfer(4 * 1024 * 1024, Duration::from_millis(50), Some(shallow)).await;
-    report("50 ms", &counters);
+    let run = transfer(4 * 1024 * 1024, Duration::from_millis(50), Some(shallow)).await;
+    report("50 ms", &run);
+    let counters = run.0;
     assert!(counters.data_sent > 2800, "{counters:?}");
     // The window opened past what the queue holds.
     assert!(counters.peak_in_flight > 48, "{counters:?}");
@@ -598,16 +666,19 @@ async fn a_receiver_holding_48_datagrams_per_drain_loses_none() {
 // Payload bytes in one full data packet on the test links' 1500-byte MTU.
 const PACKET_PAYLOAD: usize = 1452;
 
-fn report(case: &str, counters: &Counters) {
+fn report(case: &str, (counters, causes): &(Counters, Causes)) {
     eprintln!(
-        "{case}: lost {} of {} data packets ({:.1}%), {} resent on SACK evidence, {} timeouts, {} recoveries, window at most {} bytes; {counters:?}",
-        counters.dropped,
+        "{case}:{} lost {} of {} data packets ({:.1}%), {} resent on SACK evidence, {} timeouts, {} recoveries, window at most {} bytes; timeouts by cause {:?}; {counters:?}",
+        if counters.died { " DIED," } else { "" },
+        counters.dropped + counters.lost_on_path,
         counters.data_sent,
-        counters.dropped as f64 * 100.0 / counters.data_sent.max(1) as f64,
+        (counters.dropped + counters.lost_on_path) as f64 * 100.0
+            / counters.data_sent.max(1) as f64,
         counters.fast_resends,
         counters.rtos,
         counters.recoveries,
         counters.max_cwnd,
+        causes.0,
     );
 }
 
@@ -624,8 +695,9 @@ async fn a_short_path_recovers_its_losses_without_timeouts() {
         drain_every: Duration::from_millis(1),
     };
     for one_way in [Duration::from_micros(500), Duration::from_micros(50)] {
-        let counters = transfer(BYTES, one_way, Some(shallow)).await;
-        report(&format!("one way {one_way:?}"), &counters);
+        let run = transfer(BYTES, one_way, Some(shallow)).await;
+        report(&format!("one way {one_way:?}"), &run);
+        let counters = run.0;
         assert!(counters.data_sent > 2800, "{counters:?}");
         assert_eq!(counters.rtos, 0, "{one_way:?}: {counters:?}");
         assert!(counters.fast_resends >= counters.dropped, "{counters:?}");
@@ -650,7 +722,7 @@ async fn a_capped_upload_times_out_only_on_the_tail_of_a_lump() {
         drain_every: Duration::from_millis(1),
     };
     let rounds = Some((LUMP, Duration::from_millis(500)));
-    let counters = transfer_in_rounds(
+    let run = transfer_in_rounds(
         BYTES,
         Duration::from_micros(500),
         Some(shallow),
@@ -658,7 +730,8 @@ async fn a_capped_upload_times_out_only_on_the_tail_of_a_lump() {
         NonZeroUsize::new(1024 * 1024),
     )
     .await;
-    report("capped", &counters);
+    report("capped", &run);
+    let counters = run.0;
     assert!(counters.data_sent > 5700, "{counters:?}");
     assert!(counters.rtos <= BYTES.div_ceil(LUMP) as u64, "{counters:?}");
 }
@@ -671,7 +744,7 @@ async fn a_deep_receiver_is_fed_at_the_rate_of_the_window() {
     const BYTES: usize = 64 * 1024 * 1024;
     for one_way in [Duration::from_micros(500), Duration::from_micros(50)] {
         let started = Instant::now();
-        let counters = transfer(BYTES, one_way, None).await;
+        let (counters, _) = transfer(BYTES, one_way, None).await;
         let elapsed = started.elapsed();
         eprintln!(
             "deep, one way {one_way:?}: {counters:?}, {:.0} MB/s of the paused clock",
@@ -692,12 +765,12 @@ async fn the_default_send_buffer_grows_to_the_window() {
     const BYTES: usize = 64 * 1024 * 1024;
     let one_way = Duration::from_micros(500);
     let started = Instant::now();
-    let grown = transfer_in_rounds(BYTES, one_way, None, None, None).await;
+    let (grown, _) = transfer_in_rounds(BYTES, one_way, None, None, None).await;
     eprintln!(
         "deep from the default buffer: {grown:?}, {:.0} MB/s of the paused clock",
         BYTES as f64 / started.elapsed().as_secs_f64() / 1e6
     );
-    let full = transfer(BYTES, one_way, None).await;
+    let (full, _) = transfer(BYTES, one_way, None).await;
     assert_eq!(grown.dropped, 0, "{grown:?}");
     assert!(
         grown.peak_in_flight * 10 >= full.peak_in_flight * 9,
@@ -731,7 +804,7 @@ async fn a_writer_in_pieces_fills_every_packet() {
         ),
     ] {
         let started = Instant::now();
-        let counters = transfer_with(
+        let (counters, _) = transfer_with(
             BYTES,
             one_way,
             None,
@@ -740,6 +813,8 @@ async fn a_writer_in_pieces_fills_every_packet() {
                 reads,
                 tx_buffer_initial,
                 send_queue: None,
+                loss_per_mille: 0,
+                loss_seed: 0,
             },
         )
         .await;
@@ -781,7 +856,7 @@ async fn a_capped_upload_through_a_full_socket_never_dies() {
         drain_every: Duration::from_millis(2),
     };
     for (case, send_queue) in [("open socket", None), ("full socket", Some(full_socket))] {
-        let counters = transfer_with(
+        let run = transfer_with(
             BYTES,
             Duration::from_micros(500),
             Some(shallow),
@@ -790,10 +865,13 @@ async fn a_capped_upload_through_a_full_socket_never_dies() {
                 reads: None,
                 tx_buffer_initial: None,
                 send_queue,
+                loss_per_mille: 0,
+                loss_seed: 0,
             },
         )
         .await;
-        report(case, &counters);
+        report(case, &run);
+        let counters = run.0;
         assert!(counters.data_sent > 46_000, "{case}: {counters:?}");
         assert!(
             counters.rtos <= BYTES.div_ceil(LUMP) as u64,
@@ -807,5 +885,44 @@ async fn a_capped_upload_through_a_full_socket_never_dies() {
                 "{case}: {counters:?}"
             );
         }
+    }
+}
+
+// The shallow receiver 1 ms away, and one data datagram in eight to it
+// lost at random besides, as an upload capped at 20 MB/s writes a second's
+// quota at once, for four loss draws. Every timeout is counted by its
+// cause, and a stream that dies is counted, not failed: three sends of one
+// packet lost in a row end a stream, as they do in libtorrent
+// (utp_stream.cpp:3523), and with one in eight lost that is likely over
+// 64 MiB.
+#[tokio::test(start_paused = true)]
+async fn timeouts_under_random_loss_by_cause() {
+    const BYTES: usize = 64 * 1024 * 1024;
+    const LUMP: usize = 20_000_000;
+    let shallow = Shallow {
+        queue_packets: 48,
+        drain_every: Duration::from_millis(1),
+    };
+    for loss_seed in 1..=4 {
+        let run = transfer_with(
+            BYTES,
+            Duration::from_micros(500),
+            Some(shallow),
+            Upload {
+                writes: Writes::Rounds(LUMP, Duration::from_secs(1)),
+                reads: None,
+                tx_buffer_initial: None,
+                send_queue: None,
+                loss_per_mille: 120,
+                loss_seed,
+            },
+        )
+        .await;
+        report(&format!("12% random loss, draw {loss_seed}"), &run);
+        let (counters, _) = &run;
+        assert!(
+            counters.lost_on_path * 10 > counters.data_sent,
+            "{counters:?}"
+        );
     }
 }

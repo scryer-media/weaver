@@ -1228,6 +1228,10 @@ pub(crate) struct SocketState<T, E> {
     pub(crate) stats: UtpStats,
 
     mtu_ceiling: Mutex<MtuCeiling>,
+
+    // Why each retransmission timeout of the socket's streams came.
+    #[cfg(test)]
+    pub(crate) expiry_causes: Mutex<Vec<crate::stream_dispatch::ExpiryCause>>,
 }
 
 impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
@@ -1332,6 +1336,8 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             cancellation_token: runtime.cancellation().clone(),
             stats: UtpStats::default(),
             mtu_ceiling: Default::default(),
+            #[cfg(test)]
+            expiry_causes: Default::default(),
         });
 
         let sock = Arc::new(Self {
