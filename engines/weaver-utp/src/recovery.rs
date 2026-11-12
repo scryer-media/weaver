@@ -60,8 +60,16 @@ impl Recovering {
 
 #[derive(Debug, Clone, Copy)]
 enum RecoveryPhase {
-    IgnoringUntilRecoveryPoint { recovery_point: SeqNr },
-    CountingDuplicates { dup_acks: u8 },
+    // After a timer expiry in recovery: no new recovery begins until the
+    // ACK passes the point (RFC 6675 section 5.1), but what the SACKs show
+    // lost is still resent. `reorder_at` is as in `Pipe`.
+    IgnoringUntilRecoveryPoint {
+        recovery_point: SeqNr,
+        reorder_at: Option<Instant>,
+    },
+    CountingDuplicates {
+        dup_acks: u8,
+    },
     Recovering(Recovering),
 }
 
@@ -176,10 +184,22 @@ impl Recovery {
         matches!(self.phase, RecoveryPhase::Recovering { .. })
     }
 
-    pub fn recovering(&self) -> Option<&Recovering> {
-        match &self.phase {
-            RecoveryPhase::Recovering(rec) => Some(rec),
+    // While waiting for the recovery point after a timer expiry: when a
+    // resend outrun by later deliveries next counts lost.
+    pub(crate) fn waiting_reorder_at_mut(&mut self) -> Option<&mut Option<Instant>> {
+        match &mut self.phase {
+            RecoveryPhase::IgnoringUntilRecoveryPoint { reorder_at, .. } => Some(reorder_at),
             _ => None,
+        }
+    }
+
+    // When a resend outrun by later deliveries next counts lost, in a
+    // phase that resends on the SACKs' evidence.
+    pub(crate) fn reorder_at(&self) -> Option<Instant> {
+        match &self.phase {
+            RecoveryPhase::Recovering(rec) => rec.pipe_estimate.reorder_at,
+            RecoveryPhase::IgnoringUntilRecoveryPoint { reorder_at, .. } => *reorder_at,
+            RecoveryPhase::CountingDuplicates { .. } => None,
         }
     }
 
@@ -208,7 +228,7 @@ impl Recovery {
         self.receiver_supports_sack |= header.extensions.selective_ack.is_some();
 
         match &mut self.phase {
-            RecoveryPhase::IgnoringUntilRecoveryPoint { recovery_point } => {
+            RecoveryPhase::IgnoringUntilRecoveryPoint { recovery_point, .. } => {
                 if header.ack_nr.is_at_or_after(*recovery_point) {
                     event!(RECOVERY_TRACING_LOG_LEVEL, ?recovery_point, ?header.ack_nr, "exiting IgnoringUntilRecoveryPoint");
                     self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 }
@@ -289,6 +309,7 @@ impl Recovery {
             stats.recovery_rto_during_recovery_count.increment(1);
             self.phase = RecoveryPhase::IgnoringUntilRecoveryPoint {
                 recovery_point: last_sent_seq_nr,
+                reorder_at: None,
             }
         }
     }

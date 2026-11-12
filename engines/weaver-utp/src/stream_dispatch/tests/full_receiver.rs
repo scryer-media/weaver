@@ -54,6 +54,15 @@ impl Loss {
     }
 }
 
+// After its `after`-th loss of the dropped packet, the peer reads nothing
+// for `length`: what arrives meanwhile waits in its socket and is read in
+// order after. With no length it never reads again, and nothing comes back.
+#[derive(Clone, Copy)]
+struct Stall {
+    after: usize,
+    length: Option<Duration>,
+}
+
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct PeerCounters {
     // Data packets lost on the way, and those the peer dropped for want of
@@ -71,6 +80,10 @@ struct Peer {
     capacity: usize,
     // A data packet, and how many of its arrivals are lost on the way.
     drop: (u16, usize),
+    dropped: usize,
+    stall: Option<Stall>,
+    // Reading resumes then; `None` with a stall begun: never.
+    stalled_until: Option<Option<Instant>>,
     loss: Option<Loss>,
     counters: PeerCounters,
 }
@@ -83,6 +96,9 @@ impl Peer {
             held_bytes: 0,
             capacity,
             drop: (FIRST, 0),
+            dropped: 0,
+            stall: None,
+            stalled_until: None,
             loss: None,
             counters: PeerCounters::default(),
         }
@@ -92,12 +108,24 @@ impl Peer {
         (self.capacity - self.held_bytes) as u32
     }
 
+    fn reads_at(&self, now: Instant) -> bool {
+        match self.stalled_until {
+            None => true,
+            Some(None) => false,
+            Some(Some(until)) => now >= until,
+        }
+    }
+
     // The ACK for a data packet that arrived, or none when it was lost on
     // the way. The application reads all it is given at once.
-    fn on_data(&mut self, seq_nr: u16, len: usize) -> Option<UtpHeader> {
+    fn on_data(&mut self, now: Instant, seq_nr: u16, len: usize) -> Option<UtpHeader> {
         if seq_nr == self.drop.0 && self.drop.1 > 0 {
             self.drop.1 -= 1;
+            self.dropped += 1;
             self.counters.lost_on_path += 1;
+            if let Some(stall) = self.stall.filter(|s| s.after == self.dropped) {
+                self.stalled_until = Some(stall.length.map(|length| now + length));
+            }
             return None;
         }
         if self.loss.as_mut().is_some_and(Loss::lost) {
@@ -150,8 +178,13 @@ struct Run {
     // From the first send to the end.
     took: Duration,
     peer: PeerCounters,
-    // When each send of the first data packet left.
+    // When each send of the first data packet left, and how many timer
+    // expiries the stream had counted by then.
     first_sends: Vec<Duration>,
+    first_send_expiries: Vec<u64>,
+    // The first packet's resends on SACK evidence, beyond its first
+    // resend, as last seen while it was outstanding.
+    first_evidence_resends: usize,
     // The stream's own totals, as its closing line logs them.
     totals: SendTotals,
 }
@@ -185,11 +218,13 @@ async fn drive(t: &mut TestVsock, peer: &mut Peer, bytes: usize) -> Run {
     let mut to_peer: VecDeque<(Instant, u16, usize)> = VecDeque::new();
     let mut to_us: VecDeque<(Instant, UtpHeader)> = VecDeque::new();
     let mut first_sends = Vec::new();
+    let mut first_send_expiries = Vec::new();
+    let mut first_evidence_resends = 0;
     let error = loop {
         let now = t.env.now();
-        while to_peer.front().is_some_and(|(at, ..)| *at <= now) {
+        while peer.reads_at(now) && to_peer.front().is_some_and(|(at, ..)| *at <= now) {
             let (_, seq_nr, len) = to_peer.pop_front().unwrap();
-            if let Some(ack) = peer.on_data(seq_nr, len) {
+            if let Some(ack) = peer.on_data(now, seq_nr, len) {
                 to_us.push_back((now + ONE_WAY, ack));
             }
         }
@@ -204,10 +239,16 @@ async fn drive(t: &mut TestVsock, peer: &mut Peer, bytes: usize) -> Run {
             Poll::Ready(result) => break Some(result.unwrap_err()),
             Poll::Pending => {}
         }
+        if t.vsock.user_tx_segments.acked_seq_nr().0 == FIRST - 1
+            && let Some(head) = t.vsock.user_tx_segments.head_for_tests()
+        {
+            first_evidence_resends = head.evidence_resends;
+        }
         for msg in t.take_sent() {
             if msg.header.get_type() == Data {
                 if msg.header.seq_nr.0 == FIRST {
                     first_sends.push(now - start);
+                    first_send_expiries.push(t.vsock.totals.timer_expiries);
                 }
                 to_peer.push_back((now + ONE_WAY, msg.header.seq_nr.0, msg.payload().len()));
             }
@@ -241,6 +282,8 @@ async fn drive(t: &mut TestVsock, peer: &mut Peer, bytes: usize) -> Run {
         took: t.env.now() - start,
         peer: peer.counters,
         first_sends,
+        first_send_expiries,
+        first_evidence_resends,
         totals,
     }
 }
@@ -378,4 +421,72 @@ async fn a_hole_with_two_packets_behind_it_waits_for_the_timer() {
     assert_eq!(run.totals.tail_probes, 0, "{run:?}");
     assert_eq!(run.totals.fast_resends, 0, "{run:?}");
     assert_eq!(run.totals.timer_expiries, 1, "{run:?}");
+}
+
+// The first packet is lost on the way, and so is its fast resend. The peer
+// then reads nothing for 600 ms, longer than the retransmission timeout, as
+// a receiver held up by its disk does: what we send in that time waits in
+// its socket. The timer resends the first packet and that is lost as well.
+// When the peer reads again, its SACKs show everything sent after the timer
+// arriving. That is evidence the third send is lost, and it is resent on it
+// before the timer runs out again.
+async fn lose_the_head_after_a_stall(sends_lost: usize) -> Run {
+    let mut peer = Peer::new(1 << 20);
+    peer.drop = (FIRST, sends_lost);
+    peer.stall = Some(Stall {
+        after: 2,
+        length: Some(Duration::from_millis(600)),
+    });
+    stream_to(&mut peer, 2 << 20, Duration::from_millis(1)).await
+}
+
+#[tokio::test]
+async fn a_head_lost_after_a_timer_expiry_is_resent_on_the_sacks_evidence() {
+    for sends_lost in [3, 4, 5] {
+        let run = lose_the_head_after_a_stall(sends_lost).await;
+        eprintln!("head lost {sends_lost} times: {run:?}");
+        assert!(run.error.is_none(), "{run:?}");
+        assert_eq!(run.peer.delivered, 2 << 20, "{run:?}");
+        assert_eq!(run.peer.dropped_full, 0, "{run:?}");
+        // The first send, the fast resend and the timer's go before the
+        // one expiry is counted; every send after it, before another.
+        assert_eq!(run.totals.timer_expiries, 1, "{run:?}");
+        let mut expiries = vec![0, 0];
+        expiries.resize(sends_lost + 1, 1);
+        assert_eq!(run.first_send_expiries, expiries, "{run:?}");
+        // Every send after the timer's went on evidence, and none of them
+        // counts toward giving up.
+        assert_eq!(run.first_evidence_resends, sends_lost - 2, "{run:?}");
+    }
+}
+
+// The same stall, but the peer never reads again: nothing comes back, so
+// there is no evidence, and the stream gives up at the timer expiries it
+// always did.
+#[tokio::test]
+async fn a_dead_path_after_a_lost_resend_gives_up_at_the_same_expiries() {
+    let mut peer = Peer::new(1 << 20);
+    peer.drop = (FIRST, 2);
+    peer.stall = Some(Stall {
+        after: 2,
+        length: None,
+    });
+    let run = stream_to(&mut peer, 2 << 20, Duration::from_millis(1)).await;
+    eprintln!("dead after the fast resend: {run:?}");
+    assert!(
+        matches!(run.error, Some(Error::MaxRetransmissionsReached)),
+        "{run:?}"
+    );
+    assert_eq!(
+        run.first_sends,
+        [
+            Duration::ZERO,
+            Duration::from_millis(2),
+            Duration::from_millis(502)
+        ],
+        "{run:?}"
+    );
+    assert_eq!(run.first_evidence_resends, 0, "{run:?}");
+    assert_eq!(run.totals.timer_expiries, 2, "{run:?}");
+    assert_eq!(run.took, Duration::from_millis(2002), "{run:?}");
 }

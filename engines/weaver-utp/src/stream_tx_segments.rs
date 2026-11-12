@@ -191,6 +191,9 @@ impl SegmentForSending<'_> {
     }
 
     pub fn on_sent(&mut self, now: Instant, stats: &UtpStats) {
+        // A loss mark is about the send before this one: this send waits
+        // for evidence of its own.
+        self.segment.is_lost = false;
         let ps = self.segment.payload_size as u64;
         self.segment.sent = match self.segment.sent {
             SentStatus::NotSent => {
@@ -726,6 +729,7 @@ impl Segments {
         Some(HeadForTests {
             sends: head.send_count(),
             probe_resends: head.probe_resends,
+            evidence_resends: head.evidence_resends,
             payload_size: head.payload_size,
             is_lost: head.is_lost,
             delivered_after,
@@ -738,6 +742,7 @@ impl Segments {
 pub struct HeadForTests {
     pub sends: usize,
     pub probe_resends: usize,
+    pub evidence_resends: usize,
     pub payload_size: usize,
     pub is_lost: bool,
     pub delivered_after: usize,

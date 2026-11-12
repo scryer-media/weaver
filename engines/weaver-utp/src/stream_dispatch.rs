@@ -821,6 +821,77 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
         }
 
+        // Waiting, after a timer expiry, for the ACK to pass the point
+        // recovery had reached, no new recovery begins and the window stays
+        // the timer's (RFC 6675 section 5.1). The SACKs still say what is
+        // lost: a packet whose newest send the loss rule marks lost, by SACKs
+        // of packets sent after that send or by the reordering wait, is
+        // resent on that evidence, oldest first. Each send clears the mark,
+        // so a packet goes once per round of evidence about its newest send.
+        // The oldest packet goes whatever the pacer says, as recovery's first
+        // resend does: nothing behind it reaches the peer's reader until it
+        // arrives.
+        if let Some(reorder_at) = self.recovery.waiting_reorder_at_mut() {
+            if reorder_at.is_some_and(|at| at <= self.this_poll.now) {
+                *reorder_at = self
+                    .user_tx_segments
+                    .calc_pipe(
+                        self.user_tx_segments.acked_seq_nr(),
+                        self.last_sent_seq_nr,
+                        self.rtte.roundtrip_time(),
+                        self.this_poll.now,
+                    )
+                    .reorder_at;
+            }
+            let sack_depth = self.user_tx_segments.sack_depth();
+            let last_sent_seq_nr = self.last_sent_seq_nr;
+            let mut oldest = true;
+            let mut it = self
+                .user_tx_segments
+                .iter_mut_for_sending(None)
+                .take(sack_depth + 1)
+                .take_while(|seg| seg.seq_nr().is_at_or_before(last_sent_seq_nr))
+                .filter(|seg| seg.send_count() > 0);
+            while let Some(mut seg) = it.next() {
+                let is_oldest = std::mem::take(&mut oldest);
+                if !seg.is_lost() {
+                    continue;
+                }
+                if !is_oldest && !self.pacer.allows(seg.payload_size()) {
+                    paced = Some(seg.payload_size());
+                    break;
+                }
+                if !send_data!(self, cx, header, seg)? {
+                    return Ok(());
+                }
+                event!(
+                    RECOVERY_TRACING_LOG_LEVEL,
+                    %header.seq_nr,
+                    payload_size = seg.payload_size(),
+                    "resent on evidence after a timer expiry"
+                );
+                // A packet sent after the expiry and lost is a new loss;
+                // one sent before it is counted already (the loss gate).
+                if !seg.is_mtu_probe() {
+                    self.congestion_controller.on_enter_recovery(
+                        self.this_poll.now,
+                        seg.seq_nr(),
+                        self.highest_sent_seq_nr + 1,
+                    );
+                }
+                seg.on_resent_as_lost();
+                if seg.seq_nr().is_at_or_after(self.fast_resend_seq_nr) {
+                    self.fast_resend_seq_nr = seg.seq_nr() + 1;
+                }
+                self.socket
+                    .stats
+                    .recovery_retransmitted_segments_count
+                    .increment(1);
+                self.totals.fast_resends += 1;
+                self.pacer.charge(seg.payload_size());
+            }
+        }
+
         // The peer's advertised window bounds every byte sent and not yet
         // acknowledged, those presumed lost included: the peer must still
         // find room for each hole when its resend arrives. libtorrent drops
@@ -1270,6 +1341,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         remaining: &mut usize,
     ) -> crate::Result<()> {
         let mut result = ProcessIncomingMessageResult::default();
+        let mut processed = 0;
 
         while *remaining > 0 {
             let Poll::Ready(msg) = self.rx.poll_recv(cx) else {
@@ -1294,6 +1366,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 }
             };
             result.update(&self.process_incoming_message(cx, msg)?);
+            processed += 1;
             if self.state_is_closed() || self.this_poll.transport_pending {
                 break;
             }
@@ -1371,6 +1444,20 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.rtte.roundtrip_time(),
                 self.this_poll.now,
             );
+        } else if processed > 0
+            && let Some(reorder_at) = self.recovery.waiting_reorder_at_mut()
+        {
+            // Waiting for the recovery point, the SACKs still mark what is
+            // lost; the pipe itself is not used.
+            *reorder_at = self
+                .user_tx_segments
+                .calc_pipe(
+                    self.user_tx_segments.acked_seq_nr(),
+                    self.last_sent_seq_nr,
+                    self.rtte.roundtrip_time(),
+                    self.this_poll.now,
+                )
+                .reorder_at;
         }
 
         #[cfg(test)]
@@ -1900,8 +1987,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             // Only ahead: a pass that returns before recovery sends leaves
             // it as it was, and the next ACK or timer counts it.
             self.recovery
-                .recovering()
-                .and_then(|rec| rec.pipe_estimate.reorder_at)
+                .reorder_at()
                 .filter(|at| *at > self.this_poll.now),
         ]
         .into_iter()
