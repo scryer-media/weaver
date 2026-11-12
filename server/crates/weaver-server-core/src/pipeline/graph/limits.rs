@@ -201,9 +201,16 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 // stands: every later check answers with it, so nothing more of the job is
 // written, and what is already written stays.
 //
-//   job bytes, ratio   bytes objects produced, against the job byte cap or
-//                      the ratio over the bytes posted for the objects
-//   member bytes       one member's extent
+// Output counts once. A member another object reads is the same output as
+// what that object makes of it, one level on, so the two are never added:
+// the files the job delivers, at any depth, are one total, and what waits
+// for an object at each depth is a total of its own. Each total is held to
+// the job byte cap and the ratio alone.
+//
+//   job bytes, ratio   each total, against the job byte cap or the ratio
+//                      over the bytes posted for the objects
+//   member bytes       one delivered file's extent; what waits for an
+//                      object is not under it
 //   entries            members of the live namespaces objects produced
 //   resident           what those namespaces keep in memory for their
 //                      members, against the memory limit
@@ -212,7 +219,7 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //                      for articles, a slot, memory or a thread is not
 //                      under it, nor are the posts' own writes
 //   disk reserve       the free space a write would leave, against the
-//                      reading the holds already take
+//                      reading of the device it lands on
 //   content policy     the operator's unacceptable extensions, on every
 //                      name a namespace places; a name placed while the
 //                      database could not be read waits, and is judged when
@@ -234,10 +241,14 @@ pub(crate) struct Caps {
     // when the job paused, while it is paused.
     excused: Duration,
     paused: Option<Duration>,
-    debits: CapacityDebits,
-    // How far each member an object produced is written.
-    extents: BTreeMap<(NodeId, MemberId), u64>,
-    written: u64,
+    // What was admitted against each device's latest reading, by `Device`.
+    debits: [CapacityDebits; 2],
+    // How far each member an object produced is written, and the level it
+    // counts at.
+    extents: BTreeMap<(NodeId, MemberId), (u64, usize)>,
+    // What each level holds, by `level`: the files the job delivers, then
+    // what waits for an object at each depth.
+    written: [u64; LEVELS],
     // Each live namespace an object produced, as last charged; with the
     // members they hold and the bytes they keep resident, all together.
     accounts: BTreeMap<NodeId, Account>,
@@ -267,6 +278,52 @@ pub(crate) fn known_policy(settings: PostProcessingSettings) -> PolicyRead {
 enum Policy {
     Known(Arc<PostProcessingSettings>),
     Unknown(String),
+}
+
+// The device a write lands on, each judged against its own reading: the
+// output directory's, where the files the job delivers lie, or the working
+// directory's, where what an object produced waits for the object that
+// reads it. One device when the two directories are one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Device {
+    Output = 0,
+    Working = 1,
+}
+
+// What a member's bytes are to the job: a file it delivers, or output that
+// waits for an object to read it, in that object's envelope or held until
+// its owner is known.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Output {
+    File,
+    Kept,
+}
+
+// The levels output counts at: the files, then one for each depth a
+// namespace may sit at below the root.
+const LEVELS: usize = NESTING as usize + 1;
+
+// The level a member of `node` counts at as `output`. A member another
+// object reads counts with the rest of its namespace's depth.
+fn level(tree: &Tree, node: NodeId, output: Output) -> usize {
+    match output {
+        Output::File => 0,
+        Output::Kept => (tree.depth(node) as usize).clamp(1, LEVELS - 1),
+    }
+}
+
+// What a member of `node` is to the job as the tree holds it now: read by
+// an object that is not recovery, or held while its owner is undecided, it
+// waits; otherwise it is a file.
+fn output_of(tree: &Tree, node: NodeId, member: MemberId) -> Output {
+    let read = tree
+        .child_of(node, member)
+        .is_some_and(|(child, _)| !tree.recovers(child));
+    if read || tree.is_undecided(node, member) {
+        Output::Kept
+    } else {
+        Output::File
+    }
 }
 
 // One namespace's charge: how many members it held, and what it kept
@@ -300,9 +357,9 @@ impl Caps {
             decoding: DecodeClock::default(),
             excused: Duration::ZERO,
             paused: None,
-            debits: CapacityDebits::default(),
+            debits: [CapacityDebits::default(); 2],
             extents: BTreeMap::new(),
-            written: 0,
+            written: [0; LEVELS],
             accounts: BTreeMap::new(),
             entries: 0,
             resident: 0,
@@ -504,33 +561,49 @@ impl Caps {
         }
     }
 
-    // Bytes up to `end` of a member of `node`, against the disk reading the
-    // holds take of the filesystem under `folder`. Only what an object
-    // produced counts.
+    // Bytes up to `end` of a member of `node`, which are `output` to the
+    // job, against the reading of the device under `folder`, which `device`
+    // names. Only what an object produced counts, wherever it waits: a
+    // member's file, the envelope of the object that reads the member, or
+    // the holds. A member that becomes a file, or starts to wait, takes what
+    // it holds to its new level.
     pub(crate) fn admit_write(
         &mut self,
         tree: &Tree,
         (node, member): (NodeId, MemberId),
         end: u64,
-        (folder, capacity): (&Path, Capacity),
+        output: Output,
+        (folder, capacity, device): (&Path, Capacity, Device),
     ) -> Result<(), ExtractionFailure> {
         self.check()?;
         self.extracting(tree, node)?;
         if !produced(tree, node) {
             return Ok(());
         }
-        let extent = self.extents.get(&(node, member)).copied().unwrap_or(0);
-        let Some(grown) = end.checked_sub(extent).filter(|grown| *grown > 0) else {
-            return Ok(());
+        let (extent, was) = self.extents.get(&(node, member)).copied().unwrap_or((0, 0));
+        let level = match (output, was) {
+            (Output::Kept, 1..) => was,
+            _ => level(tree, node, output),
         };
-        if end > self.limits.max_member_bytes {
+        let moved = if level == was { 0 } else { extent };
+        let grown = end.saturating_sub(extent);
+        if grown == 0 && moved == 0 {
+            return Ok(());
+        }
+        // Only a file is held to the member limit, at all it holds: one
+        // that was waiting brings what it already holds. What waits for an
+        // object is held to its level's limit alone.
+        let reach = extent.max(end);
+        if level == 0 && reach > self.limits.max_member_bytes {
             let detail = format!(
-                "member output would reach {end} bytes, limit is {}",
+                "member output would reach {reach} bytes, limit is {}",
                 self.limits.max_member_bytes
             );
             return Err(self.breach(ExtractionRejectionReason::MemberBytes, detail));
         }
-        let written = self.written.saturating_add(grown);
+        let written = self.written[level]
+            .saturating_add(moved)
+            .saturating_add(grown);
         // The limit only rises with what was posted, so the posts are read
         // once the output passes the least it can be.
         if written > self.limits.job_output_limit(0).0 {
@@ -542,7 +615,10 @@ impl Caps {
                 return Err(self.breach(reason, detail));
             }
         }
-        if let Some(reading) = self.debits.apply(capacity).reading() {
+        let device = device as usize;
+        if grown > 0
+            && let Some(reading) = self.debits[device].apply(capacity).reading()
+        {
             let remaining = reading.available_bytes.saturating_sub(grown);
             if remaining < self.limits.min_free_bytes && !reading.stale {
                 let detail = disk_full(
@@ -553,10 +629,12 @@ impl Caps {
                 );
                 return Err(self.breach(ExtractionRejectionReason::DiskReserve, detail));
             }
-            self.debits.debit(grown);
+            self.debits[device].debit(grown);
         }
-        self.extents.insert((node, member), end);
-        self.written = written;
+        self.written[was] = self.written[was].saturating_sub(moved);
+        self.written[level] = written;
+        self.extents
+            .insert((node, member), (extent.max(end), level));
         Ok(())
     }
 
@@ -569,13 +647,14 @@ impl Caps {
     }
 
     fn unwrite(&mut self, node: NodeId, member: MemberId) {
-        if let Some(extent) = self.extents.remove(&(node, member)) {
-            self.written = self.written.saturating_sub(extent);
+        if let Some((extent, level)) = self.extents.remove(&(node, member)) {
+            self.written[level] = self.written[level].saturating_sub(extent);
         }
     }
 
     // A member's file as a checkpoint left it, written as far as its
-    // namespace's coverage reaches.
+    // namespace's coverage reaches, at the level the tree now says it
+    // counts at.
     pub(crate) fn restore(&mut self, tree: &Tree, node: NodeId, member: MemberId) {
         if !produced(tree, node) {
             return;
@@ -587,16 +666,18 @@ impl Caps {
             .unwrap_or(0);
         self.unwrite(node, member);
         if extent > 0 {
-            self.extents.insert((node, member), extent);
-            self.written = self.written.saturating_add(extent);
+            let level = level(tree, node, output_of(tree, node, member));
+            self.extents.insert((node, member), (extent, level));
+            self.written[level] = self.written[level].saturating_add(extent);
         }
     }
 
     // The restored tree's members, each charged as the tree holds it: what
-    // a checkpoint brings back is counted from the tree, never stored. No
-    // checkpoint says which names a run before judged, so each waits to be
-    // judged again before the job delivers: a refusal here would stop the
-    // restore itself, and the job would never be failed for it.
+    // a checkpoint brings back is counted from the tree, never stored, and a
+    // member another object reads counts as far as it arrived, as a file
+    // does. No checkpoint says which names a run before judged, so each
+    // waits to be judged again before the job delivers: a refusal here would
+    // stop the restore itself, and the job would never be failed for it.
     pub(crate) fn restore_members(&mut self, tree: &Tree) {
         for node in tree.live() {
             let records: Vec<(MemberId, String)> = tree
@@ -613,6 +694,7 @@ impl Caps {
                     self.waiting.push(name);
                 }
                 self.charge(tree, node, member);
+                self.restore(tree, node, member);
             }
         }
     }

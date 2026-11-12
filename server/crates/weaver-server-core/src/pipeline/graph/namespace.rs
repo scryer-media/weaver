@@ -38,7 +38,7 @@ use weaver_graph::{
 use super::checkpoint::why_name;
 use super::envelope::{Envelopes, Shelf, Shelved};
 use super::leaf::{Leaf, LeafError};
-use super::limits::Caps;
+use super::limits::{Caps, Device, Output};
 use crate::operations::disk::CapacityReader;
 use crate::pipeline::extraction::ExtractionFailure;
 
@@ -1129,6 +1129,35 @@ impl NamespaceWriter {
         | Effect::Renamed { node, member, .. } = &effect
         {
             self.caps.admit_member(tree, *node, *member)?;
+        }
+        // Bytes an object produced that no member's file takes now are
+        // charged here, before they are kept: a member another object reads,
+        // but for a recovery volume, which is written to its own file, and a
+        // member whose owner its front has not yet decided. The posts are
+        // never charged.
+        match &effect {
+            Effect::Reached {
+                node,
+                member,
+                child,
+                offset,
+                bytes,
+                ..
+            } if *node != NodeId::ROOT && !tree.recovers(*child) => {
+                let end = offset.saturating_add(bytes.len() as u64);
+                self.admit_kept(tree, *node, *member, end)?;
+            }
+            Effect::WriteLeaf {
+                node,
+                member,
+                offset,
+                bytes,
+                ..
+            } if *node != NodeId::ROOT && tree.is_undecided(*node, *member) => {
+                let end = offset.saturating_add(bytes.len() as u64);
+                self.admit_kept(tree, *node, *member, end)?;
+            }
+            _ => {}
         }
         if let Effect::Again { node, .. } = &effect {
             if self.replaying.contains(node) && tree.again_waits(*node) {
@@ -2297,7 +2326,42 @@ impl NamespaceWriter {
             tree,
             (node, member),
             end,
-            (&self.output_dir, self.output_free_disk.current()),
+            Output::File,
+            (
+                &self.output_dir,
+                self.output_free_disk.current(),
+                Device::Output,
+            ),
+        )?;
+        Ok(())
+    }
+
+    // Bytes up to `end` of a member an object produced that wait in the
+    // working directory: in the envelope of the object that reads the
+    // member, or held until the member's place or owner is known. They are
+    // the producing object's output as much as a file is, so they count as
+    // one would, against the working directory's device, at the level of
+    // their depth: what the reading object makes of them counts again at
+    // its own level, never added to theirs.
+    fn admit_kept(
+        &mut self,
+        tree: &Tree,
+        node: NodeId,
+        member: MemberId,
+        end: u64,
+    ) -> Result<(), WriteError> {
+        let (reader, device) = if self.output_dir == self.working_dir {
+            (&self.output_free_disk, Device::Output)
+        } else {
+            (&self.free_disk, Device::Working)
+        };
+        let capacity = reader.current();
+        self.caps.admit_write(
+            tree,
+            (node, member),
+            end,
+            Output::Kept,
+            (&self.working_dir, capacity, device),
         )?;
         Ok(())
     }
