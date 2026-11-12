@@ -2169,6 +2169,8 @@ struct Inner {
     // What the last pass over the queue left at its end, written under
     // `live`'s lock: a torrent added goes there.
     queue_end: Mutex<QueueEnd>,
+    // The readings of every torrent's views their followers share.
+    readings: updates::Readings,
 }
 
 // A snapshot of the download queue's end from the last pass, extended by
@@ -2228,6 +2230,7 @@ impl TorrentService {
                     slots: status::Slots::new(max_active),
                     last: None,
                 }),
+                readings: updates::Readings::default(),
             }),
         }
     }

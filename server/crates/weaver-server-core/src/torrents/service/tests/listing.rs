@@ -51,7 +51,7 @@ async fn seeded(rig: &Rig, clock: &SetClock) -> Vec<JobId> {
 // Once each of `count` torrents is past checking what was saved of it, as
 // a follower of every torrent hears it: a view read before then can say
 // it is checking, and one read after says it is paused.
-async fn settled(service: &TorrentService, count: usize) {
+pub(super) async fn settled(service: &TorrentService, count: usize) {
     let mut updates = service.follow(Follow::Every, std::time::Duration::from_millis(10));
     let mut states = std::collections::HashMap::new();
     loop {

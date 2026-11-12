@@ -81,7 +81,7 @@ fn tracker(index: usize) -> TorrentTracker {
         last_announce_ms: Some(1_700_000_000_000 + index as i64),
         next_announce_ms: None,
         min_announce_ms: None,
-        message: (index % 2 == 0).then(|| "slow down".to_owned()),
+        message: index.is_multiple_of(2).then(|| "slow down".to_owned()),
         seeders: Some(index as u32 % 40),
         leechers: Some(index as u32 % 7),
         downloaded: None,
@@ -101,22 +101,22 @@ fn seeded_view(index: usize) -> TorrentView {
     view.name = format!("t{index}");
     view.infohash = format!("{:040X}", index + 1);
     view.magnet = format!("magnet:?xt=urn:btih:{:040x}", index + 1);
-    view.category = (index % 4 == 0).then(|| "tv".to_owned());
+    view.category = index.is_multiple_of(4).then(|| "tv".to_owned());
     view.tags = match index % 7 {
         0 => vec!["hd".to_owned()],
         3 => vec!["a".to_owned(), "hd".to_owned()],
         _ => Vec::new(),
     };
     view.download_bps = (index % 9) as u64 * 1000;
-    view.upload_bps = u64::from(index % 11 == 0) * 500;
-    view.completed_at_ms = (index % 3 == 0).then_some(1_700_000_100_000);
-    view.forced = index % 13 == 0;
+    view.upload_bps = u64::from(index.is_multiple_of(11)) * 500;
+    view.completed_at_ms = index.is_multiple_of(3).then_some(1_700_000_100_000);
+    view.forced = index.is_multiple_of(13);
     view.added_at_ms = 1_700_000_000_000 + (index % 997) as i64 * 1000;
     view.ratio = (index % 10) as f64 / 4.0;
     view.peers = (index % 23) as u32;
     view.downloaded_bytes = index as u64 * 1013;
     view.uploaded_bytes = index as u64 * 211;
-    view.pieces = (index % 6 != 0).then_some(TorrentPieces {
+    view.pieces = (!index.is_multiple_of(6)).then_some(TorrentPieces {
         count: 100,
         size: 16_384,
         have: (index % 100) as u32,
@@ -128,7 +128,7 @@ fn seeded_view(index: usize) -> TorrentView {
         1 => Some(4096),
         _ => None,
     };
-    view.upload_limit = (index % 19 == 0).then_some(0);
+    view.upload_limit = index.is_multiple_of(19).then_some(0);
     view.trackers = (0..index % 3).map(|tier| tracker(index + tier)).collect();
     let paths: Vec<String> = match index % 6 {
         0 => Vec::new(),
