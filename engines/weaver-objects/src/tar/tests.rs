@@ -757,3 +757,67 @@ fn a_seek_under_a_compressed_stream_is_unseekable() {
     );
     assert!(extents.is_empty());
 }
+
+// An empty file and the two end blocks, its volume said to run on to a
+// length nothing posted reaches, whether that length is said before or after
+// the bytes: the archive ends whole, and the tar holds no more than arrived.
+#[test]
+fn a_stated_length_far_past_the_end_blocks_holds_only_the_bytes_that_arrived() {
+    let mut writer = Writer::default();
+    writer.file("empty.bin", &[]);
+    writer.bytes.resize(writer.bytes.len() + 2 * BLOCK, 0);
+    let archive = writer.bytes;
+    let delivered = archive.len();
+    for stated in [u64::MAX, 500 << 30] {
+        for before in [true, false] {
+            for frame in [delivered, BLOCK, 1] {
+                let mut owner = Owner::new(archive.clone());
+                let mut out = Vec::new();
+                if before {
+                    owner.tar.sized(VolumeIndex(0), stated, &mut out);
+                }
+                owner.whole(frame);
+                if !before {
+                    owner.tar.sized(VolumeIndex(0), stated, &mut out);
+                }
+                owner.apply(out);
+                clean(&owner);
+                assert_eq!(owner.files(), [("empty.bin".to_string(), Vec::new())]);
+                assert_eq!(owner.posted().as_deref(), Some(archive.as_slice()));
+                let (held, allocated) = owner.tar.kept.held();
+                assert_eq!(held, delivered, "{stated} {before} {frame}");
+                assert!(allocated <= 2 * delivered, "{allocated} {stated} {frame}");
+            }
+        }
+    }
+}
+
+// Zeros far past the record GNU tar pads to, and bytes that are not zero
+// after the end blocks, are envelope the tar keeps whole and hands back,
+// holding one byte for each that arrived.
+#[test]
+fn long_zero_padding_and_bytes_after_the_end_blocks_are_kept_as_they_arrive() {
+    let mut zeros = Writer::default();
+    zeros.file("alpha.bin", &payload(1, 1_000));
+    let mut zeros = zeros.finish();
+    zeros.bytes.resize(zeros.bytes.len() + (4 << 20), 0);
+    let mut trailing = Writer::default();
+    trailing.file("alpha.bin", &payload(1, 1_000));
+    let mut trailing = trailing.finish();
+    trailing.bytes.extend_from_slice(&payload(7, 70_000));
+    for archive in [zeros.bytes, trailing.bytes] {
+        for frame in [archive.len(), 65_536, 4_096] {
+            let mut owner = Owner::new(archive.clone());
+            owner.whole(frame);
+            clean(&owner);
+            assert_eq!(
+                owner.files(),
+                [("alpha.bin".to_string(), payload(1, 1_000))]
+            );
+            assert_eq!(owner.posted().as_deref(), Some(archive.as_slice()));
+            let (held, allocated) = owner.tar.kept.held();
+            assert_eq!(held, archive.len() - 1_000, "frames of {frame}");
+            assert!(allocated <= 2 * held, "{allocated} frames of {frame}");
+        }
+    }
+}
