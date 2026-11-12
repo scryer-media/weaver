@@ -59,6 +59,16 @@ pub struct Ledbat {
     loss_gate: Option<SeqNr>,
     // Nor before this.
     next_cut: Option<Instant>,
+    // After a timer expiry, until the acknowledgement reaches this packet,
+    // the highest sent before the expiry, the window grows by at most one
+    // segment per ACK. ACKs in that time also report packets that arrived
+    // before the expiry; counting them all would let the window, and the
+    // resends behind it, leap far past what the path has shown it carries
+    // (RFC 3465 section 2.3, from memory: L = 1 SMSS in slow start after a
+    // retransmission timeout). libtorrent grows by every byte an ACK
+    // removes, SACKed ones included (v2.0.15 utp_stream.cpp:2741-2747,
+    // 3290).
+    regrow_until: Option<SeqNr>,
 }
 
 impl core::fmt::Debug for Ledbat {
@@ -85,6 +95,7 @@ impl Ledbat {
             rwnd: usize::MAX,
             loss_gate: None,
             next_cut: None,
+            regrow_until: None,
         };
         ledbat.floor();
         ledbat
@@ -151,7 +162,10 @@ impl Ledbat {
         // An ACK acknowledges no more than was in flight when it came, so
         // one stretched across a rewound or partly SACKed flight does not
         // count as more than a round trip of growth.
-        let acked = sample.acked_bytes.min(sample.in_flight_before) as i64;
+        let mut acked = sample.acked_bytes.min(sample.in_flight_before) as i64;
+        if self.regrow_until.is_some() {
+            acked = acked.min(self.mss as i64);
+        }
         let before = self.cwnd;
 
         let saturated = (sample.in_flight_after + sample.acked_bytes + sample.segment.max(self.mss))
@@ -193,6 +207,7 @@ impl Ledbat {
         self.slow_start = true;
         // What was in flight is counted lost already.
         self.loss_gate = Some(next_seq_nr);
+        self.regrow_until = Some(next_seq_nr - 1);
     }
 
     // An idle direction keeps two thirds of its window, then slow-starts.
@@ -217,6 +232,12 @@ impl Ledbat {
     }
 
     pub fn advance_loss_gate(&mut self, acknowledged: SeqNr) {
+        if self
+            .regrow_until
+            .is_some_and(|until| acknowledged.is_at_or_after(until))
+        {
+            self.regrow_until = None;
+        }
         if let Some(gate) = &mut self.loss_gate
             && acknowledged.is_after(*gate)
         {
@@ -448,11 +469,42 @@ mod tests {
         };
         l.on_delay_sample(stretched, &UtpStats::default());
         assert_eq!(l.window(), 2 * MSS);
+        l.advance_loss_gate(19.into());
         for round in 2..6 {
             let w = l.window();
             l.on_delay_sample(sample(10, w, w), &UtpStats::default());
             assert_eq!(l.window(), (1 << round) * MSS);
         }
+    }
+
+    // Until the acknowledgement reaches the highest packet sent before a
+    // timeout, an ACK grows the window by one segment however much it
+    // reports: one packet more per ACK, not a doubling.
+    #[test]
+    fn after_a_timeout_each_ack_grows_the_window_by_one_segment_until_the_old_flight_is_acked() {
+        let mut l = grown();
+        l.on_retransmission_timeout(Instant::now(), 20.into());
+        let mut windows = vec![l.window()];
+        for acknowledged in [10, 15, 18] {
+            let w = l.window();
+            l.on_delay_sample(sample(10, w, w), &UtpStats::default());
+            l.advance_loss_gate(acknowledged.into());
+            windows.push(l.window());
+        }
+        // The ACK of packet 19 is the last held to one segment.
+        let w = l.window();
+        l.on_delay_sample(sample(10, w, w), &UtpStats::default());
+        l.advance_loss_gate(19.into());
+        windows.push(l.window());
+        for _ in 0..2 {
+            let w = l.window();
+            l.on_delay_sample(sample(10, w, w), &UtpStats::default());
+            windows.push(l.window());
+        }
+        assert_eq!(
+            windows,
+            [1, 2, 3, 4, 5, 10, 20].map(|segments| segments * MSS)
+        );
     }
 
     // One ACK never grows the window past what was in flight plus what it

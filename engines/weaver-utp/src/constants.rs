@@ -60,6 +60,10 @@ pub const DEFAULT_FIN_RESENDS: usize = 2;
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub const SACK_DUP_THRESH: u8 = 3;
+// Packets resent on loss evidence for each packet received, oldest first:
+// libtorrent resends at most five per SACK, the first hole first
+// (v2.0.15 utp_stream.cpp:1228, 1234-1238, 1270).
+pub const FAST_RESENDS_PER_ACK: usize = 5;
 pub const SACK_DEPTH: usize = 64;
 
 pub fn calc_pipe_expiry(rtt: Duration) -> Duration {

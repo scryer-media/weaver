@@ -17,6 +17,7 @@ use crate::{
         tests::{calc_mtu_for_mss, make_test_vsock},
     },
     test_util::setup_test_logging,
+    traits::UtpEnvironment,
 };
 
 // (5.1) Every time a packet containing data is sent (including a
@@ -710,4 +711,97 @@ async fn fin_retransmit() {
             .iter()
             .all(|m| m.header.htype != Data && m.header.htype != Fin)
     );
+}
+
+// After a timer expiry the window is one packet: the head goes alone, and
+// nothing more leaves until an ACK comes. ACKs that also report packets
+// delivered before the expiry grow the window one packet each, so the
+// go-back resends leave one more per ACK, not twice as many. A go-back the
+// window does not allow is not a send.
+#[tokio::test]
+async fn after_a_timer_expiry_one_packet_leaves_and_each_ack_allows_one_more() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(5)),
+            ..Default::default()
+        },
+        false,
+    );
+    let rto = Duration::from_secs(1);
+    t.vsock.rtte.force_timeout(rto);
+    t.vsock.congestion_controller.set_window(4000);
+    let start = t.env.now();
+    let ack = |ack_nr: u16, sacked: &[usize], sent_us: u32| UtpHeader {
+        htype: State,
+        seq_nr: 0.into(),
+        ack_nr: ack_nr.into(),
+        wnd_size: 1 << 20,
+        // A peer that measures our delay: 10 ms, well under target, its
+        // clock running with ours.
+        timestamp_microseconds: sent_us,
+        timestamp_difference_microseconds: 10_000,
+        extensions: crate::raw::Extensions {
+            selective_ack: SelectiveAck::new_test(sacked.iter().copied()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    t.send_msg(ack(100, &[], 1), "");
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&[b'x'; 5 * 60])
+        .await
+        .unwrap();
+    // The pacer lets out a burst at a time.
+    let mut first = 0;
+    loop {
+        t.poll_once_assert_pending().await;
+        first += t.take_sent().len();
+        if first == 60 {
+            break;
+        }
+        t.env.increment_now(Duration::from_millis(1));
+    }
+
+    t.env.increment_now(rto);
+    t.poll_once_assert_pending().await;
+    let sent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+    assert_eq!(sent, vec![101]);
+    // No ACK, no send.
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
+    let send_counts: Vec<usize> = t
+        .vsock
+        .user_tx_segments
+        .iter_mut_for_sending(None)
+        .map(|s| s.send_count())
+        .collect();
+    assert_eq!(send_counts[0], 2);
+    assert!(send_counts[1..].iter().all(|c| *c == 1), "{send_counts:?}");
+
+    // 101 to 140 were lost, 141 to 160 arrived before the expiry. Each ACK
+    // acknowledges every resend so far and SACKs 141 to 160 (bits 39 to 58
+    // past the acknowledgement of 101; fewer bits as it moves on).
+    let mut acked: u16 = 101;
+    let mut per_ack = Vec::new();
+    for _ in 0..5 {
+        let sacked: Vec<usize> = (141 - acked as usize - 2..161 - acked as usize - 2).collect();
+        // Half the timer: the pacer refills a whole window, as the round
+        // trip it knows is the default second.
+        t.env.increment_now(rto / 2);
+        let sent_us = 1 + (t.env.now() - start).as_micros() as u32;
+        t.send_msg(ack(acked, &sacked, sent_us), "");
+        t.poll_once_assert_pending().await;
+        let sent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+        assert_eq!(
+            sent,
+            (acked + 1..acked + 1 + sent.len() as u16).collect::<Vec<_>>()
+        );
+        per_ack.push(sent.len());
+        acked += sent.len() as u16;
+    }
+    assert_eq!(per_ack, vec![2, 3, 4, 5, 6]);
+    assert_eq!(t.vsock.totals.packets_sent, 60 + 1 + 20);
 }

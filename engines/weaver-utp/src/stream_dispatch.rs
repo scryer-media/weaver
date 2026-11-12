@@ -25,8 +25,9 @@ use crate::{
     DatagramSend, Error,
     congestion::{DelaySample, ledbat::Ledbat},
     constants::{
-        ACK_DELAY, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL, RTTE_TRACING_LOG_LEVEL,
-        SEQUENCE_HALF_SPACE, SYNACK_RESEND_INTERNAL, UTP_HEADER, calc_pipe_expiry,
+        ACK_DELAY, FAST_RESENDS_PER_ACK, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL,
+        RTTE_TRACING_LOG_LEVEL, SEQUENCE_HALF_SPACE, SYNACK_RESEND_INTERNAL, UTP_HEADER,
+        calc_pipe_expiry,
     },
     delay::DelayTracker,
     ingress::{Event as IngressEvent, Receiver as IngressReceiver},
@@ -183,6 +184,11 @@ struct VirtualSocket<T, Env> {
     // timer path alone may send a packet again after that, and gives up
     // once a packet went out `num_resends` times.
     fast_resend_seq_nr: SeqNr,
+    // Resends on loss evidence the packets received last allow:
+    // `FAST_RESENDS_PER_ACK` for each, or for a reordering wait that ran
+    // out. What is left lost waits for the next ACK, which spaces the
+    // resends at the rate the peer's packets arrive.
+    fast_resend_budget: usize,
 
     // The remote has sent a packet other than its SYN: it is there, not a
     // spoofed address. A stream that is not fails on its first timeout.
@@ -680,6 +686,10 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         // packet resent once waits for evidence of its own, SACKs of packets
         // sent after the resend, before it counts lost again; libtorrent
         // leaves that to the retransmission timer.
+        // A packet known lost and not yet resent goes before anything sent
+        // after it: while one waits for the next ACK's resends, nothing else
+        // is sent.
+        let mut lost_left = false;
         if let Some(rec) = self.recovery.recovering_mut() {
             in_recovery = true;
             // A resend outrun by later deliveries may have waited long
@@ -695,6 +705,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     self.rtte.roundtrip_time(),
                     self.this_poll.now,
                 );
+                self.fast_resend_budget = self.fast_resend_budget.max(FAST_RESENDS_PER_ACK);
             }
             let sack_depth = self.user_tx_segments.sack_depth();
             let last_sent_seq_nr = self.last_sent_seq_nr;
@@ -710,7 +721,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             let mut sent = 0;
             let mss = self.segment_sizes.mss() as usize;
             let mut force_head = rec.total_retransmitted_segments() == 0;
-            while force_head || cwnd > mss {
+            while (force_head || cwnd > mss) && self.fast_resend_budget > 0 {
                 let mut seg = match it.next() {
                     Some(seg) => seg,
                     None => break,
@@ -767,6 +778,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         .recovery_retransmitted_segments_count
                         .increment(1);
                     self.totals.fast_resends += 1;
+                    self.fast_resend_budget -= 1;
                     rec.pipe_estimate.pipe += seg.payload_size();
                     cwnd = cwnd.saturating_sub(seg.payload_size());
                     self.pacer.charge(seg.payload_size());
@@ -774,6 +786,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 } else {
                     return Ok(());
                 }
+            }
+            if self.fast_resend_budget == 0 {
+                lost_left = it.any(|seg| seg.is_lost());
             }
             if let Some(at) = paced.and_then(|payload| self.pacer.ready_at(payload)) {
                 self.timers.pace.set(at);
@@ -842,6 +857,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         self.this_poll.now,
                     )
                     .reorder_at;
+                self.fast_resend_budget = self.fast_resend_budget.max(FAST_RESENDS_PER_ACK);
             }
             let sack_depth = self.user_tx_segments.sack_depth();
             let last_sent_seq_nr = self.last_sent_seq_nr;
@@ -852,7 +868,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .take(sack_depth + 1)
                 .take_while(|seg| seg.seq_nr().is_at_or_before(last_sent_seq_nr))
                 .filter(|seg| seg.send_count() > 0);
-            while let Some(mut seg) = it.next() {
+            while self.fast_resend_budget > 0
+                && let Some(mut seg) = it.next()
+            {
                 let is_oldest = std::mem::take(&mut oldest);
                 if !seg.is_lost() {
                     continue;
@@ -888,7 +906,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     .recovery_retransmitted_segments_count
                     .increment(1);
                 self.totals.fast_resends += 1;
+                self.fast_resend_budget -= 1;
                 self.pacer.charge(seg.payload_size());
+            }
+            if self.fast_resend_budget == 0 {
+                lost_left = it.any(|seg| seg.is_lost());
             }
         }
 
@@ -912,6 +934,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .min(self.last_remote_window as usize)
                 .saturating_sub(in_flight),
         };
+        if lost_left {
+            remaining_cwnd = 0;
+        }
 
         let mut sent_count = 0;
 
@@ -1341,7 +1366,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         remaining: &mut usize,
     ) -> crate::Result<()> {
         let mut result = ProcessIncomingMessageResult::default();
-        let mut processed = 0;
+        let mut processed: usize = 0;
 
         while *remaining > 0 {
             let Poll::Ready(msg) = self.rx.poll_recv(cx) else {
@@ -1437,6 +1462,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             trace!(?result.on_ack_result, "removed ACKed tx messages");
         }
 
+        if processed > 0 {
+            self.fast_resend_budget = processed.saturating_mul(FAST_RESENDS_PER_ACK);
+        }
         if let Some(rec) = self.recovery.recovering_mut() {
             rec.pipe_estimate = self.user_tx_segments.calc_pipe(
                 rec.high_rxt,
@@ -2444,6 +2472,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_sent_ack_nr,
             rto_retransmissions: 0,
             fast_resend_seq_nr: seq_nr,
+            fast_resend_budget: 0,
             confirmed: !matches!(
                 state,
                 VirtualSocketState::SynReceived | VirtualSocketState::SynAckSent { .. }
