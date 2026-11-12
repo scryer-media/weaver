@@ -27,7 +27,7 @@ pub(super) fn limits(edit: impl FnOnce(&mut ExtractionLimits)) -> ExtractionLimi
     let mut limits = ExtractionLimits {
         max_job_bytes: 2 * 1024 * GIB,
         max_member_bytes: 1024 * GIB,
-        max_entries: 100_000,
+        max_entries: 1_000_000,
         max_ratio: 100,
         ratio_floor_bytes: 1 << 30,
         max_seconds: 43_200,
