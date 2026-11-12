@@ -486,15 +486,40 @@ fn append_history_row_filter_predicates(
         );
     }
     if let Some(needle) = &filter.name_contains {
-        // `instr` and `strpos` find the text as it is: no LIKE wildcard in a
-        // search can widen it.
-        let name = history_order_expression(HistoryOrderKey::Name, engine);
-        sql.push_str(&match engine {
-            SqlEngine::Sqlite => format!(" AND instr({name}, {{}}) > 0"),
-            SqlEngine::Postgres => format!(" AND strpos({name}, {{}}) > 0"),
-        });
-        args.push(SqlArg::Text(needle.to_ascii_lowercase()));
+        // The search, normalized as each row's `search_key` is, found in it
+        // by LIKE: accents, case and separators aside, in any of the row's
+        // titles. A `%`, `_` or `\` in the search is escaped, so it matches
+        // only itself. Postgres also takes a close spelling through pg_trgm
+        // where migration 88 could install it.
+        let needle = super::normalize_history_search_text(needle);
+        match engine {
+            SqlEngine::Sqlite => {
+                sql.push_str(" AND h.search_key LIKE {} ESCAPE '\\'");
+                args.push(SqlArg::Text(history_like_pattern(&needle)));
+            }
+            SqlEngine::Postgres => {
+                sql.push_str(
+                    " AND (h.search_key LIKE {} ESCAPE '\\' OR weaver_history_fuzzy({}, h.search_key))",
+                );
+                args.push(SqlArg::Text(history_like_pattern(&needle)));
+                args.push(SqlArg::Text(needle));
+            }
+        }
     }
+}
+
+// The LIKE pattern that finds `needle` anywhere in a name.
+fn history_like_pattern(needle: &str) -> String {
+    let mut pattern = String::with_capacity(needle.len() + 2);
+    pattern.push('%');
+    for c in needle.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    pattern
 }
 
 // ASCII upper and lower case, for Postgres's `translate`. SQLite's LOWER

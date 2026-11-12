@@ -15,9 +15,8 @@ use crate::history::history_release_name;
 use crate::persistence::sql_runtime::{SqlArg, SqlConn};
 
 pub(crate) const HOOK_ID: &str = "fill_history_release_names_v87";
-// The schema that first stores a history row's full release name. A backup
-// taken below it restores rows without one.
-pub(crate) const SCHEMA_VERSION: i64 = 87;
+// A restore of an older bundle fills this column with the search key 88
+// stores, through `history_search_key_v88`.
 
 // Three binds a row in the update, well under either engine's bind limit.
 const PAGE_ROWS: i64 = 1_000;

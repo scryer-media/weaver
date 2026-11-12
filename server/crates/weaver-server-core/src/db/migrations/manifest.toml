@@ -1114,3 +1114,25 @@ kind = "sql"
 file = "migrations/0087_history_release_name/postgres_index.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 88
+description = "store the history search key; trigram matching on Postgres"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0088_history_search_key/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0088_history_search_key/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "fill_history_search_keys_v88"
+scope = "all"

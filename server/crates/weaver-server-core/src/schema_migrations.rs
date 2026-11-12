@@ -19,6 +19,7 @@ use crate::persistence::sql_runtime::SqlConn;
 
 pub(crate) mod egress_quotas_v53;
 pub(crate) mod history_release_name_v87;
+pub(crate) mod history_search_key_v88;
 pub(crate) mod nzb_tables_v85;
 pub(crate) mod proxy_resolver_v64;
 mod schedule_tracks_v55;
@@ -35,7 +36,7 @@ const MIGRATION_21_BASE_SCHEMA_SQL: &str =
 const MIGRATION_22_SCHEMA_SQL: &str =
     include_str!("db/migrations/0022_diagnostic_and_async_state/schema.sql");
 const LEGACY_SCHEMA_VERSION: i64 = 20;
-const CURRENT_SCHEMA_VERSION: i64 = 87;
+const CURRENT_SCHEMA_VERSION: i64 = 88;
 const WEAVER_SCHEMA_OBJECTS_SQL: &str = r#"
 SELECT COUNT(*)
   FROM sqlite_master
@@ -882,6 +883,10 @@ async fn run_rust_hook(
         }
         history_release_name_v87::HOOK_ID => {
             history_release_name_v87::fill_history_release_names(&mut SqlConn::Sqlite(tx)).await
+        }
+        history_search_key_v88::HOOK_ID => {
+            history_search_key_v88::fill_history_search_keys_and_fuzzy(&mut SqlConn::Sqlite(tx))
+                .await
         }
         other => Err(StateError::Database(format!(
             "unknown migration hook id '{other}'"

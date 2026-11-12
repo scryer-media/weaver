@@ -20,7 +20,7 @@ use super::catalog::{
 };
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
 use crate::schema_migrations::{
-    egress_quotas_v53, history_release_name_v87, proxy_resolver_v64, script_concurrency_v58,
+    egress_quotas_v53, history_search_key_v88, proxy_resolver_v64, script_concurrency_v58,
     script_instances_v55, unwanted_extensions_v56,
 };
 use crate::security::RuntimeSecurityConfig;
@@ -1089,15 +1089,15 @@ async fn name_older_proxy_resolvers(
     Ok(())
 }
 
-// A bundle written before a history row stored its full release name
-// restores rows with none. No migration runs over a restore, so the step that
-// fills it on an upgrade is run here instead.
+// A bundle written before a history row stored its full release name and
+// search key restores rows without them. No migration runs over a restore, so
+// the step that fills them on an upgrade is run here instead.
 async fn name_older_history_releases(
     conn: &mut SqlConn<'_>,
     source_schema_version: i64,
 ) -> Result<(), StateError> {
-    if source_schema_version < history_release_name_v87::SCHEMA_VERSION {
-        history_release_name_v87::fill_history_release_names(conn).await?;
+    if source_schema_version < history_search_key_v88::SCHEMA_VERSION {
+        history_search_key_v88::fill_history_search_columns(conn).await?;
     }
     Ok(())
 }
