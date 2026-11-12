@@ -33,10 +33,9 @@ pub fn archive_base_name(filename: &str, role: &FileRole) -> Option<String> {
                 } else {
                     Some(lower_stem.to_string())
                 }
-            } else if lower.len() >= 4 {
-                Some(lower[..lower.len() - 4].to_string())
             } else {
-                Some(lower)
+                let stem = lower.len().checked_sub(4).and_then(|at| lower.get(..at));
+                Some(stem.unwrap_or(&lower).to_string())
             }
         }
         FileRole::ZipArchive

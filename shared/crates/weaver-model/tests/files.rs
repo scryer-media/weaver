@@ -688,3 +688,18 @@ fn priority_ordering() {
     assert!(standalone.download_priority() < rar_second.download_priority());
     assert!(rar_second.download_priority() < par2_recovery.download_priority());
 }
+
+// A name whose last four bytes begin inside a longer character has no
+// old-style RAR extension, and one that ends in such an extension past a
+// longer character still does.
+#[test]
+fn a_name_ending_inside_a_longer_character_is_classified() {
+    for name in ["éabc", "日本", "aé", "é", "x.r0é"] {
+        assert_eq!(FileRole::from_filename(name), FileRole::Unknown, "{name}");
+    }
+    let role = FileRole::from_filename("é.r00");
+    assert_eq!(role, FileRole::RarVolume { volume_number: 1 });
+    assert_eq!(archive_base_name("é.r00", &role), Some("é".to_string()));
+    let other = FileRole::RarVolume { volume_number: 1 };
+    assert_eq!(archive_base_name("éabc", &other), Some("éabc".to_string()));
+}

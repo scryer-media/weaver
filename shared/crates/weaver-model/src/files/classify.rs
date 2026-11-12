@@ -269,13 +269,13 @@ fn parse_rar_volume(lower: &str) -> Option<u32> {
         return Some(0);
     }
 
-    if lower.len() >= 4 {
-        let ext = &lower[lower.len() - 4..];
-        if (ext.starts_with(".r") || ext.starts_with(".s"))
-            && let Ok(n) = ext[2..].parse::<u32>()
-        {
-            return Some(n + 1);
-        }
+    // The last four bytes, when they are characters of their own: a name
+    // may end inside a longer one.
+    if let Some(ext) = lower.len().checked_sub(4).and_then(|at| lower.get(at..))
+        && (ext.starts_with(".r") || ext.starts_with(".s"))
+        && let Ok(n) = ext[2..].parse::<u32>()
+    {
+        return Some(n + 1);
     }
 
     None
