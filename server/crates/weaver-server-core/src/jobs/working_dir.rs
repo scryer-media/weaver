@@ -532,6 +532,31 @@ pub(crate) fn make_job_staging_dir(staging: &Path, job_id: JobId) -> std::io::Re
     mark_open_working_dir(&dir, staging, job_id)
 }
 
+// Whether the job's staging directory holds anything besides its ownership
+// marker. A directory that is missing holds nothing; one reached through a
+// symbolic link is an error, and its target is never listed.
+pub(crate) fn job_staging_dir_holds_files(staging: &Path, job_id: JobId) -> std::io::Result<bool> {
+    let destination = staging_destination(staging, job_id)?;
+    let destination = match Dir::open_ambient_dir(destination, cap_std::ambient_authority()) {
+        Ok(destination) => destination,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let Some(parent) = open_child_dir(&destination, STAGING_DIR_NAME)? else {
+        return Ok(false);
+    };
+    let Some(dir) = open_child_dir(&parent, &job_id.0.to_string())? else {
+        return Ok(false);
+    };
+    for entry in dir.entries()? {
+        let name = entry?.file_name();
+        if name != WORKING_DIR_MARKER && name != WORKING_DIR_MARKER_UPGRADE {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 // Remove the job's staging directory, whatever it still holds, when it
 // carries this job's marker. One that was never marked goes only when it is
 // empty. A directory already gone is removed.
@@ -1028,7 +1053,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let staging = staging_under(temp.path(), JobId(31));
         make_job_staging_dir(&staging, JobId(31)).unwrap();
+        // The marker alone is not a delivered file.
+        assert!(!job_staging_dir_holds_files(&staging, JobId(31)).unwrap());
         std::fs::write(staging.join("payload"), b"staged").unwrap();
+        assert!(job_staging_dir_holds_files(&staging, JobId(31)).unwrap());
 
         assert_eq!(
             remove_job_staging_dir(&staging, JobId(31)).unwrap(),
@@ -1099,6 +1127,9 @@ mod tests {
         let error = remove_job_staging_dir(&staging, job_id).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(std::fs::read(victim_job.join("payload")).unwrap(), b"keep");
+        // Nor is what the link points at taken for the job's delivered files.
+        assert!(job_staging_dir_holds_files(&victim_job, job_id).unwrap());
+        assert!(job_staging_dir_holds_files(&staging, job_id).is_err());
         assert!(make_job_staging_dir(&staging, job_id).is_err());
     }
 
@@ -1116,6 +1147,7 @@ mod tests {
 
         let error = remove_job_staging_dir(&staging, job_id).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(job_staging_dir_holds_files(&staging, job_id).is_err());
         assert!(make_job_staging_dir(&staging, job_id).is_err());
         assert_eq!(std::fs::read(victim.join("payload")).unwrap(), b"keep");
         assert!(!victim.join(WORKING_DIR_MARKER).exists());
