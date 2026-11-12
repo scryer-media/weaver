@@ -204,7 +204,7 @@ impl NamespaceWriter {
                 set: node,
                 recovery: None,
                 defer_holds: true,
-                scratch_in_place: true,
+                scratch_read: None,
                 held_scratch: BTreeMap::new(),
                 internal: self.working_dir.join(weaver_graph::names::INTERNAL_DIR),
                 members: BTreeMap::new(),

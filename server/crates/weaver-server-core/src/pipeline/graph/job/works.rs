@@ -201,21 +201,25 @@ impl Works {
         let shutdown = self.hardware.shutdown().clone();
         tokio::task::spawn_blocking(move || {
             let _job = crate::runtime::panic_trap::JobScope::enter(crate::JobId(scope));
-            let tell = |piece, whole| {
+            let tell = |piece, whole, scratch| {
                 mail.blocking_send(Said {
                     scope,
                     node,
                     generation: serial,
-                    heard: Heard::Rewalked(Box::new(Rewalked { piece, whole })),
+                    heard: Heard::Rewalked(Box::new(Rewalked {
+                        piece,
+                        whole,
+                        scratch,
+                    })),
                 })
                 .is_ok()
             };
             // A closed channel means the pipeline is gone, or the loop let
             // the rewalk go, and no one is left to tell.
-            let whole = loan.run(&shutdown, &mut |volume, posted| {
-                tell(Some((volume, posted)), true) && hearing.recv().is_ok()
+            let whole = loan.run(&shutdown, &mut |volume, posted, scratch| {
+                tell(Some((volume, posted)), true, scratch) && hearing.recv().is_ok()
             });
-            tell(None, whole);
+            tell(None, whole, Default::default());
         });
     }
 

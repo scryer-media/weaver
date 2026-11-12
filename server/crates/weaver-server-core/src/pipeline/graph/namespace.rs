@@ -734,8 +734,17 @@ impl NamespaceWriter {
                 _ => None,
             })
             .collect();
+        // An object that gave a volume back may have gone with it. Once
+        // every volume given back in the batch has taken its envelope, what
+        // the gone object still kept is pruned, once for the batch.
+        let given_back = effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::GivenBack { .. }));
         for effect in effects.drain(..) {
             self.apply(tree, builder, segments, effect, write, out)?;
+        }
+        if given_back {
+            self.prune(tree)?;
         }
         for (node, member, child) in bound {
             self.hand_over(tree, builder, segments, (node, member), child, out)?;
