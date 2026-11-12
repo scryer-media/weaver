@@ -35,6 +35,11 @@ pub(super) struct Owner {
     pub pull: Pull,
     // Held pieces, with the bytes they arrived with.
     held: Vec<(VolumeIndex, ByteRange, Provenance, Vec<u8>)>,
+    // The store's placement number as of the last round, and the rounds
+    // that found it unmoved with bytes held: a namespace locates none of
+    // them then.
+    placement: Option<u64>,
+    pub skipped: usize,
     // What each volume was delivered, by provenance, as its member keeps it.
     delivered: BTreeMap<u32, Coverage>,
     bound: Vec<bool>,
@@ -64,6 +69,8 @@ impl Owner {
             seeks: Vec::new(),
             pull: Pull::Moved(1),
             held: Vec::new(),
+            placement: None,
+            skipped: 0,
             delivered: BTreeMap::new(),
             bound: vec![false; count],
             next: 0,
@@ -223,6 +230,10 @@ impl Owner {
                     self.push(seek.volume, seek.range, Provenance::Fresh, None);
                 }
             }
+            let number = self.object.placement();
+            let unmoved = number.is_some() && number == self.placement;
+            self.placement = number;
+            self.skipped += usize::from(unmoved && !self.held.is_empty());
             for (volume, range, provenance, bytes) in std::mem::take(&mut self.held) {
                 let mut placements = Vec::new();
                 self.object.locate(volume, range, &mut placements);
@@ -232,6 +243,10 @@ impl Owner {
                 {
                     self.held.push((volume, range, provenance, bytes));
                 } else {
+                    assert!(
+                        !unmoved,
+                        "{range:?} of {volume:?} placed with the placement number unmoved"
+                    );
                     changed = true;
                     self.push(volume, range, provenance, Some(&bytes));
                 }

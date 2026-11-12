@@ -167,6 +167,48 @@ fn bytes_ahead_of_the_tail_are_held_until_it_arrives() {
     streamed(&owner);
 }
 
+// Bytes ahead of the tail are held a piece per delivery, and the placement
+// number stands over them until the directory moves it: an owner that asks
+// only once it moves places every held piece as one that asks after every
+// delivery, and asks nothing while the body comes.
+#[test]
+fn held_pieces_place_the_same_asked_only_once_the_placement_number_moves() {
+    let big = payload(7, 300_000);
+    let bytes = write(&[Entry::File("big.bin", &big, stored())]);
+    let total = bytes.len() as u64;
+    // Short of the bytes the store reads for its tail: held, every one.
+    let body = total - records::TAIL - 4096;
+    let mut owner = Owner::single(Zip::new(), bytes);
+    owner.pull = Pull::Moved(0);
+    let mut asked = crate::testing::Asked::default();
+    let (mut pieces, mut saved) = (0, 0);
+    let mut standing = None;
+    for start in (0..body).step_by(1024) {
+        let range = ByteRange::new(start, (start + 1024).min(body));
+        owner.deliver(0, range);
+        asked.hold(&owner.object, VolumeIndex(0), range);
+        saved += asked.compare(&owner.object);
+        pieces += 1;
+        let number = owner.object.placement();
+        assert!(number.is_some(), "at {start}");
+        assert_eq!(*standing.get_or_insert(number), number, "at {start}");
+    }
+    assert!(asked.unplaced());
+    assert_eq!(owner.held(), pieces);
+    assert_eq!(saved, pieces * (pieces + 1) / 2);
+    assert!(owner.skipped > 0);
+
+    owner.deliver(0, ByteRange::new(body, total));
+    assert_eq!(asked.compare(&owner.object), 0, "the directory moved it");
+    assert!(!asked.unplaced());
+    owner.close(0);
+    no_trouble(&owner);
+    let got = owner.member("big.bin");
+    assert!(got.closed);
+    assert_eq!(got.bytes, big);
+    assert_eq!(owner.held(), 0);
+}
+
 #[test]
 fn a_parent_that_cannot_seek_has_the_local_headers_walked_from_the_front() {
     let mut owner = Owner::single(Zip::new(), archive());
