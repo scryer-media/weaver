@@ -736,9 +736,11 @@ impl NamespaceWriter {
             self.bind_recoveries(tree, builder, segments, node, out)?;
             let mut rewritten = std::collections::BTreeSet::new();
             // Whether every slice was turned away. A slice lands only where
-            // no repair wrote before it: a set that disagrees with another's
-            // repair loses there, so the two never rewrite each other in
-            // turn.
+            // no repair wrote before it, unless the set outranks every other
+            // set beside it: a set that disagrees with another's repair loses
+            // there to an equal or a higher one, so no two rewrite each other
+            // in turn.
+            let contested = true || !tree.outranks(node, set);
             let (mut offered, mut landed) = (false, false);
             for (member, offset, bytes) in repaired.slices() {
                 let bytes = bytes?;
@@ -752,7 +754,7 @@ impl NamespaceWriter {
                     provenance: Provenance::Repaired,
                 };
                 let write = Write::new(&arrival);
-                if self.place_as(tree, builder, segments, (arrival, true), write, out)? > 0 {
+                if self.place_as(tree, builder, segments, (arrival, contested), write, out)? > 0 {
                     landed = true;
                     rewritten.insert(member);
                 }

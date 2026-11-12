@@ -1033,6 +1033,12 @@ impl Recovery for Par2 {
         Some(outcome)
     }
 
+    // PAR2 ranks above every other format, for now: where a PAR2 set and
+    // another set disagree on a member, the PAR2 set's bytes are kept.
+    fn precedence(&self) -> u8 {
+        1
+    }
+
     fn sets(&self, out: &mut Vec<SetRuling>) {
         for &key in self.ordered() {
             let state = &self.sets[&key];
