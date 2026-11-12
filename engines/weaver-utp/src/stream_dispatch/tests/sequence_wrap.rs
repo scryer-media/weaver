@@ -88,6 +88,8 @@ async fn one_cumulative_ack_retires_a_wide_flight_across_sequence_wrap() {
     t.take_sent();
 
     stream.write_all(b"tail").await.unwrap();
+    // The window went out at once; let the pacer refill.
+    t.env.increment_now(std::time::Duration::from_millis(1));
     t.poll_once_assert_pending().await;
     let sent = t.take_sent();
     assert_eq!(sent.len(), 1);

@@ -404,6 +404,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .min(self.last_remote_window as usize),
             self.rtte.roundtrip_time(),
             usize::from(self.segment_sizes.mss()),
+            self.congestion_controller.is_slow_start(),
         );
         // The payload of the packet the pacer held back, if one was.
         let mut paced = None;

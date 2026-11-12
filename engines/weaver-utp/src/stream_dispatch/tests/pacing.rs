@@ -71,10 +71,10 @@ fn data_sent(t: &TestVsock) -> usize {
         .count()
 }
 
-// However short the path, one pass sends no more than the burst, and the
-// rest of the window follows as the bucket fills.
+// However short the path, one pass sends no more than half the window, and
+// the rest follows as the bucket fills.
 #[tokio::test]
-async fn a_short_path_sends_no_more_than_the_burst_in_one_pass() {
+async fn a_short_path_sends_no_more_than_half_the_window_in_one_pass() {
     for rtt in [
         Duration::ZERO,
         Duration::from_micros(100),
@@ -82,14 +82,14 @@ async fn a_short_path_sends_no_more_than_the_burst_in_one_pass() {
     ] {
         let mut t = sender(rtt).await;
         t.poll_once_assert_pending().await;
-        assert_eq!(data_sent(&t), PACE_BURST_PACKETS, "rtt {rtt:?}");
+        let mut sent = data_sent(&t);
+        assert_eq!(sent, WINDOW_PACKETS / 2, "rtt {rtt:?}");
 
-        let mut sent = PACE_BURST_PACKETS;
         while sent < WINDOW_PACKETS {
             t.env.increment_now(Duration::from_micros(10));
             t.poll_once_assert_pending().await;
             let pass = data_sent(&t);
-            assert!(pass <= PACE_BURST_PACKETS, "{pass} packets in one pass");
+            assert!(pass <= WINDOW_PACKETS / 2, "{pass} packets in one pass");
             sent += pass;
         }
         assert_eq!(sent, WINDOW_PACKETS);

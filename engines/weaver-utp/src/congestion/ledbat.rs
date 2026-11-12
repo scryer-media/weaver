@@ -108,8 +108,7 @@ impl Ledbat {
         self.slow_start = false;
     }
 
-    #[cfg(test)]
-    fn is_slow_start(&self) -> bool {
+    pub(crate) fn is_slow_start(&self) -> bool {
         self.slow_start
     }
 
