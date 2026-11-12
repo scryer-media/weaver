@@ -19,7 +19,9 @@
 //
 // The last segment MAY be an MTU probe, where we try to send a segment larger than
 // a known working size, in attempt to increase throughput. If it's not delivered in time,
-// it's removed and will need to be requeued again.
+// it stops being a probe and goes again whole under its own sequence number, as
+// ordinary data: the peer may hold it. One the host refused before it was ever sent
+// is removed and cut again smaller.
 //
 // The downside is no new segments can be enqueued while an MTU probe is outstanding.
 use std::{collections::VecDeque, time::Duration};
@@ -48,6 +50,9 @@ pub struct Segment {
     sent: SentStatus,
 
     is_mtu_probe: bool,
+    // A probe given up on as too large, resent whole as ordinary data. Its
+    // delivery proves no size: the ceiling is already below it.
+    size_given_up: bool,
     // Resends past the first that SACKs of later sends asked for.
     evidence_resends: usize,
     // Resends of the flight's tail as a tail-loss probe.
@@ -229,6 +234,7 @@ pub struct OnAckResult {
     // How many bytes we can remove from the beginning of TX queue.
     pub acked_bytes: usize,
 
+    // The largest payload acknowledged, a probe given up on left out.
     pub max_acked_payload_size: usize,
 
     // How many segments in TX queue were marked delivered by SACK.
@@ -279,7 +285,7 @@ impl std::fmt::Debug for Pipe {
 }
 
 #[derive(Debug)]
-pub enum PopExpiredProbe {
+pub enum ExpiredProbe {
     Expired {
         rewind_to: SeqNr,
         payload_size: usize,
@@ -409,6 +415,7 @@ impl Segments {
             payload_offset_absolute: self.offset,
             is_delivered: false,
             is_mtu_probe,
+            size_given_up: false,
             sent: SentStatus::NotSent,
             evidence_resends: 0,
             probe_resends: 0,
@@ -436,36 +443,32 @@ impl Segments {
         }
     }
 
-    /// Try to pop an MTU probe if it's expired.
-    pub fn pop_expired_mtu_probe(
+    /// Gives up on the MTU probe at the back once its timer has expired
+    /// often enough. A probe that was sent keeps its bytes and its sequence
+    /// number: the peer may hold it, and drops by sequence number alone
+    /// anything sent again under it. It stays as ordinary data, to be resent
+    /// whole, as libtorrent resends a timed-out probe (utp_stream.cpp
+    /// v2.0.15:1975-1984, 3412-3421).
+    pub fn expire_mtu_probe(
         &mut self,
         retransmit_timed_out: bool,
         max_probe_retransmissions: usize,
-    ) -> PopExpiredProbe {
-        match self.segments.pop_back() {
-            Some(s) => match (retransmit_timed_out, s.is_mtu_probe) {
-                (_, _) if s.is_delivered => {
-                    self.segments.push_back(s);
-                    PopExpiredProbe::Empty
+    ) -> ExpiredProbe {
+        let seq_nr = self.next_seq_nr() - 1;
+        match self.segments.back_mut() {
+            Some(s) if s.is_delivered || !s.is_mtu_probe => ExpiredProbe::Empty,
+            Some(s)
+                if retransmit_timed_out && s.retransmit_count() >= max_probe_retransmissions =>
+            {
+                s.is_mtu_probe = false;
+                s.size_given_up = true;
+                ExpiredProbe::Expired {
+                    payload_size: s.payload_size,
+                    rewind_to: seq_nr - 1,
                 }
-                (true, true) if s.retransmit_count() >= max_probe_retransmissions => {
-                    self.len_bytes -= s.payload_size;
-                    self.offset = s.payload_offset_absolute;
-                    PopExpiredProbe::Expired {
-                        payload_size: s.payload_size,
-                        rewind_to: self.snd_una + self.segments.len() as u16 - 1,
-                    }
-                }
-                (_, true) => {
-                    self.segments.push_back(s);
-                    PopExpiredProbe::NotExpired
-                }
-                (_, false) => {
-                    self.segments.push_back(s);
-                    PopExpiredProbe::Empty
-                }
-            },
-            None => PopExpiredProbe::Empty,
+            }
+            Some(_) => ExpiredProbe::NotExpired,
+            None => ExpiredProbe::Empty,
         }
     }
 
@@ -500,7 +503,9 @@ impl Segments {
                 payload_size += segment.payload_size;
                 self.snd_una += 1;
                 self.len_bytes -= segment.payload_size;
-                max_acked_payload_size = max_acked_payload_size.max(segment.payload_size);
+                if !segment.size_given_up {
+                    max_acked_payload_size = max_acked_payload_size.max(segment.payload_size);
+                }
             }
         }
 
@@ -517,7 +522,10 @@ impl Segments {
                         segment.is_delivered = true;
                         covers_resend |= segment.retransmit_count() > 0;
                         segment.update_rtt(now, &mut new_rtt);
-                        max_acked_payload_size = max_acked_payload_size.max(segment.payload_size);
+                        if !segment.size_given_up {
+                            max_acked_payload_size =
+                                max_acked_payload_size.max(segment.payload_size);
+                        }
                         newly_sacked_segment_count += 1;
                         newly_sacked_byte_count += segment.payload_size;
                     }

@@ -43,7 +43,7 @@ use crate::{
     stream::UtpStream,
     stream_rx::{AssemblerAddRemoveResult, UserRx},
     stream_tx::{UserTx, UtpStreamWriteHalf},
-    stream_tx_segments::{OnAckResult, PopExpiredProbe, Segments},
+    stream_tx_segments::{ExpiredProbe, OnAckResult, Segments},
     traits::{Transport, UtpEnvironment},
     utils::update_optional_waker,
 };
@@ -1247,13 +1247,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             return Ok(());
         }
 
-        match self.user_tx_segments.pop_expired_mtu_probe(
+        match self.user_tx_segments.expire_mtu_probe(
             self.timers.retransmit.expired(self.this_poll.now)
                 && self.user_tx_segments.sole_outstanding_is_mtu_probe()
                 && !(self.fin_sends > 0 && self.state.our_fin_if_unacked().is_some()),
             self.socket_opts.mtu_probe_max_retransmissions,
         ) {
-            PopExpiredProbe::Expired {
+            ExpiredProbe::Expired {
                 rewind_to,
                 payload_size,
             } => {
@@ -1266,16 +1266,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 self.timers.retransmit.turn_off("MTU probe is not real RTO");
                 self.rto_retransmissions = 0;
 
+                // The probe goes again whole, under its own sequence
+                // number, as ordinary data: the ceiling below lowers the
+                // segments cut after it, not the probe.
                 if self.last_sent_seq_nr.is_after(rewind_to) {
                     self.last_sent_seq_nr = rewind_to;
                 }
                 self.segment_sizes.on_probe_failed(payload_size);
             }
-            PopExpiredProbe::NotExpired => {
+            ExpiredProbe::NotExpired => {
                 trace!("MTU probe hasnt expired yet");
                 return Ok(());
             }
-            PopExpiredProbe::Empty => {}
+            ExpiredProbe::Empty => {}
         }
 
         let segmented_len = self.user_tx_segments.total_len_bytes();
