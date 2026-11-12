@@ -22,7 +22,7 @@ import {
 import { authHeaders } from "@/graphql/client";
 import { useTranslate } from "@/lib/context/translate-context";
 import { noteLoginEnabled } from "@/lib/login-required";
-import { takeApiKeyLink } from "@/lib/api-key-link";
+import { mintsOnArrival, takeApiKeyLink } from "@/lib/api-key-link";
 import { copyText } from "@/lib/clipboard";
 import { Square } from "../../../components/chrome";
 import { ConfirmDialog } from "../../../components/ConfirmDialog";
@@ -446,7 +446,7 @@ function SecurityPanelBody({
   const [keyOpen, setKeyOpen] = useState(false);
   const [keyForm, setKeyForm] = useState({ name: "", scope: "CONTROL" });
   const [keyError, setKeyError] = useState<string | null>(null);
-  const [createdKey, setCreatedKey] = useState<{ name: string; rawKey: string } | null>(null);
+  const [createdKey, setCreatedKey] = useState<{ name: string; scope: string; rawKey: string } | null>(null);
   const [copied, setCopied] = useState<"idle" | "copied" | "failed">("idle");
   const [removeKey, setRemoveKey] = useState<ApiKey | null>(null);
   const keyFieldRef = useRef<HTMLInputElement | null>(null);
@@ -545,7 +545,7 @@ function SecurityPanelBody({
       return "failed";
     }
     setKeyOpen(false);
-    setCreatedKey({ name: trimmed, rawKey: result.data.createApiKey.rawKey });
+    setCreatedKey({ name: trimmed, scope, rawKey: result.data.createApiKey.rawKey });
     setCopied("idle");
     setKeyForm({ name: "", scope: "CONTROL" });
     void refetchKeys({ requestPolicy: "network-only" });
@@ -561,6 +561,7 @@ function SecurityPanelBody({
   // selected, so whoever followed it lands on a key they can copy. The link is
   // consumed first: a reload must not quietly mint a second key. An install
   // that wants a recent password check asks for it here, then mints the key.
+  // A link asking for an Admin key only fills the form, which waits for a click.
   const keyLinkSpent = useRef(false);
   // The link is read once on arrival, with whatever the panel holds then.
   const takeKeyLink = useEffectEvent(() => {
@@ -575,6 +576,11 @@ function SecurityPanelBody({
     );
 
     setKeyError(null);
+    if (!mintsOnArrival(link)) {
+      setKeyForm({ name: link.name, scope: link.scope });
+      setKeyOpen(true);
+      return;
+    }
     void passwordCheck.run(async () => {
       const outcome = await mintKey(link.name, link.scope);
       if (outcome === "failed") {
@@ -1078,7 +1084,7 @@ function SecurityPanelBody({
         open={createdKey !== null}
         testId={testIds.dialog("key-created")}
         title={t("next.security.keyCreated")}
-        note={createdKey?.name}
+        note={createdKey ? `${createdKey.name} · ${scopeLabel(createdKey.scope)}` : undefined}
         width={560}
         onDismiss={() => setCreatedKey(null)}
         footer={
