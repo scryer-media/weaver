@@ -600,11 +600,14 @@ fn need(group: &str, action: &str) -> Option<Need> {
             "torrents",
             "count" | "info" | "properties" | "trackers" | "webseeds" | "files" | "pieceHashes"
             | "pieceStates" | "pieceAvailability" | "uploadLimit" | "downloadLimit" | "categories"
-            | "tags" | "export" | "SSLParameters" | "downloadFile",
+            | "tags" | "SSLParameters" | "downloadFile",
         ) => Read,
+        // The metainfo as added, with its trackers' URLs and any passkey
+        // in them.
         (
             "torrents",
-            "add"
+            "export"
+            | "add"
             | "addWebSeeds"
             | "editWebSeed"
             | "removeWebSeeds"

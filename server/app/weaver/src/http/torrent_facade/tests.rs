@@ -3531,6 +3531,47 @@ async fn a_read_key_sees_no_trackers_passkey() {
     assert_eq!(urls(ADMIN).await, [PRIVATE]);
 }
 
+// The exported metainfo carries its trackers' URLs as added, so only a key
+// that controls may have it.
+#[tokio::test]
+async fn only_a_key_that_controls_exports_the_metainfo() {
+    const ANNOUNCE: &[u8] = b"https://tracker.invalid/announce?passkey=export5ecret";
+    const CONTROLLER: &str = "facade-control-key";
+    let rig = rig().await;
+    rig.keys.upsert(ApiKeyAuthRow {
+        key_hash: hash_api_key(CONTROLLER),
+        id: 3,
+        scope: "control".to_owned(),
+    });
+    let plain = metainfo("one.mkv", 3000, true);
+    let mut torrent = b"d".to_vec();
+    bstr(&mut torrent, b"announce");
+    bstr(&mut torrent, ANNOUNCE);
+    torrent.extend_from_slice(&plain[1..]);
+    assert_eq!(rig.add_file(&torrent, &[]).await.status, StatusCode::OK);
+    let hash = rig.torrents().await[0]["hash"].as_str().unwrap().to_owned();
+    let export = |key: &'static str| {
+        let (rig, hash) = (&rig, &hash);
+        async move {
+            rig.send(
+                Request::get(format!("/api/v2/torrents/export?hash={hash}"))
+                    .header("x-api-key", key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    let refused = export(READER).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN);
+    assert!(!refused.body.contains("export5ecret"));
+    for key in [CONTROLLER, ADMIN] {
+        let exported = export(key).await;
+        assert_eq!(exported.status, StatusCode::OK, "{key}");
+        assert_eq!(exported.body.as_bytes(), torrent, "{key}");
+    }
+}
+
 // A request with the login cookie that changes anything must come from a
 // page of this listener, whatever its method; one that only reads, or one
 // carrying its key, need not.
