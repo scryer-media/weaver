@@ -153,17 +153,25 @@ impl Pipeline {
             .jobs
             .get_mut(&segment_id.file_id.job_id)
             .and_then(|state| {
-                state
+                let segment = state
                     .spec
                     .files
-                    .get_mut(segment_id.file_id.file_index as usize)
+                    .get_mut(segment_id.file_id.file_index as usize)?
+                    .segment_mut(segment_id.segment_number)?;
+                // A copy of the article still queued, which reads its id from
+                // the part when it is dispatched, keeps the id it was queued
+                // under.
+                if segment.message_ids.has_next()
+                    && let Some(active) = state.articles.active_mut()
+                {
+                    let in_use = segment.message_ids.in_use();
+                    let pin = || crate::jobs::ids::MessageId::new(in_use);
+                    active.download_queue.pin_message_id(segment_id, pin);
+                    active.recovery_queue.pin_message_id(segment_id, pin);
+                }
+                Some(segment.message_ids.spend())
             })
-            .and_then(|file| {
-                file.segments
-                    .iter_mut()
-                    .find(|segment| segment.ordinal == segment_id.segment_number)
-            })
-            .is_some_and(|segment| segment.message_ids.spend());
+            .unwrap_or(false);
         let Some(work) = moved
             .then(|| self.download_retry_work(segment_id, 0, Vec::new()))
             .flatten()
@@ -180,11 +188,7 @@ impl Pipeline {
         self.jobs
             .get(&segment_id.file_id.job_id)
             .and_then(|state| state.spec.files.get(segment_id.file_id.file_index as usize))
-            .and_then(|file| {
-                file.segments
-                    .iter()
-                    .find(|segment| segment.ordinal == segment_id.segment_number)
-            })
+            .and_then(|file| file.segment(segment_id.segment_number))
             .is_some_and(|segment| segment.message_ids.has_next())
     }
 
@@ -255,10 +259,7 @@ impl Pipeline {
         let completion_critical = self.segment_is_completion_critical(segment_id);
         let state = self.jobs.get(&job_id)?;
         let file_spec = state.spec.files.get(file_idx)?;
-        let seg_spec = file_spec
-            .segments
-            .iter()
-            .find(|seg| seg.ordinal == segment_id.segment_number)?;
+        let seg_spec = file_spec.segment(segment_id.segment_number)?;
         Some(DownloadWork {
             counters: None,
             segment_id,
@@ -1366,10 +1367,7 @@ impl Pipeline {
                     } else if let Some(state) = self.jobs.get(&job_id) {
                         let file_idx = seg_id.file_id.file_index as usize;
                         if let Some(file_spec) = state.spec.files.get(file_idx)
-                            && let Some(seg_spec) = file_spec
-                                .segments
-                                .iter()
-                                .find(|s| s.ordinal == seg_id.segment_number)
+                            && let Some(seg_spec) = file_spec.segment(seg_id.segment_number)
                         {
                             let priority = file_spec.role.download_priority();
                             let work = DownloadWork {

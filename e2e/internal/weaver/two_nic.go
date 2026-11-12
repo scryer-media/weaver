@@ -467,19 +467,44 @@ func runTwoNICPlaywright(ctx context.Context, cfg twoNICConfig, stage string) er
 }
 
 // twoNICControl serves the capture sidecar's API on Weaver's host:
-// POST /start {name}, POST /stop, GET /count?name&iface[&filter],
+// POST /start {name}, POST /stop (answers with the packets the kernel dropped
+// from the captures), GET /count?name&iface[&filter],
 // GET /interfaces, POST /link {iface, up}. Lane M captures and toggles Wi-Fi
 // locally; Lane L does both over SSH, and a link change there is one remote
 // command that brings the link back once Weaver reports the egress DOWN.
 type twoNICControl struct {
 	cfg      twoNICConfig
 	mu       sync.Mutex
-	captures map[string]*exec.Cmd
+	captures map[string]*twoNICCapture
 	name     string
 }
 
+// twoNICCapture is one running tcpdump and what it wrote to stderr after it
+// armed, which ends with its own count of dropped packets.
+type twoNICCapture struct {
+	cmd    *exec.Cmd
+	stderr strings.Builder
+	read   chan struct{}
+}
+
+// Only headers are kept, in a large buffer: every count reads addresses,
+// ports and flags, and whole data packets would fill the buffer and push the
+// packets a test counts out of it.
+var twoNICCaptureArgs = []string{"-s", "128", "-B", "16384"}
+
+var twoNICDroppedPattern = regexp.MustCompile(`(?m)^(\d+) packets dropped by kernel`)
+
+func twoNICDropped(stderr string) int {
+	dropped := 0
+	for _, match := range twoNICDroppedPattern.FindAllStringSubmatch(stderr, -1) {
+		count, _ := strconv.Atoi(match[1])
+		dropped += count
+	}
+	return dropped
+}
+
 func newTwoNICControl(cfg twoNICConfig) *twoNICControl {
-	return &twoNICControl{cfg: cfg, captures: map[string]*exec.Cmd{}}
+	return &twoNICControl{cfg: cfg, captures: map[string]*twoNICCapture{}}
 }
 
 func (c *twoNICControl) pcapPath(name, iface string) string {
@@ -519,8 +544,7 @@ func (c *twoNICControl) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		reply(http.StatusOK, map[string]any{"name": body.Name, "interfaces": c.cfg.CaptureIfaces})
 	case r.Method == http.MethodPost && r.URL.Path == "/stop":
-		c.stopAll()
-		reply(http.StatusOK, map[string]any{"stopped": true})
+		reply(http.StatusOK, map[string]any{"stopped": true, "dropped": c.stopAll()})
 	case r.Method == http.MethodGet && r.URL.Path == "/count":
 		name, iface, filter := r.URL.Query().Get("name"), r.URL.Query().Get("iface"), r.URL.Query().Get("filter")
 		if !twoNICNamePattern.MatchString(name) || !twoNICNamePattern.MatchString(iface) {
@@ -557,7 +581,8 @@ func (c *twoNICControl) start(name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for _, iface := range c.cfg.CaptureIfaces {
-		cmd := c.hostCommand("sudo", "-n", "tcpdump", "-i", iface, "-n", "-U", "-w", c.pcapPath(name, iface), "host", c.cfg.StackHost)
+		argv := append([]string{"sudo", "-n", "tcpdump", "-i", iface, "-n", "-U"}, twoNICCaptureArgs...)
+		cmd := c.hostCommand(append(argv, "-w", c.pcapPath(name, iface), "host", c.cfg.StackHost)...)
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
 			return err
@@ -579,33 +604,43 @@ func (c *twoNICControl) start(name string) error {
 			_ = cmd.Wait()
 			return fmt.Errorf("tcpdump on %s exited before listening", iface)
 		}
-		go func() { _, _ = bufio.NewReader(stderr).WriteTo(discard{}) }()
-		c.captures[iface] = cmd
+		capture := &twoNICCapture{cmd: cmd, read: make(chan struct{})}
+		go func() {
+			defer close(capture.read)
+			for scanner.Scan() {
+				capture.stderr.WriteString(scanner.Text() + "\n")
+			}
+		}()
+		c.captures[iface] = capture
 	}
 	c.name = name
 	return nil
 }
 
-type discard struct{}
-
-func (discard) Write(p []byte) (int, error) { return len(p), nil }
-
-func (c *twoNICControl) stopAll() {
+// stopAll stops every capture and returns how many packets the kernel
+// dropped from them.
+func (c *twoNICControl) stopAll() int {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for iface, cmd := range c.captures {
+	dropped := 0
+	for iface, capture := range c.captures {
+		cmd := capture.cmd
 		if c.cfg.Lane == twoNICLaneL {
 			_ = c.hostCommand("sudo", "-n", "pkill", "-INT", "-f", c.pcapPath(c.name, iface)).Run()
 		} else {
 			_ = cmd.Process.Signal(os.Interrupt)
 		}
+		// Stderr is read to its end before the wait closes the pipe.
+		<-capture.read
 		_ = cmd.Wait()
+		dropped += twoNICDropped(capture.stderr.String())
 		if c.cfg.Lane == twoNICLaneL {
 			_ = exec.Command("scp", c.cfg.Remote+":"+c.pcapPath(c.name, iface),
 				filepath.Join(c.cfg.RunDir, "captures", c.name+"-"+iface+".pcap")).Run()
 		}
 		delete(c.captures, iface)
 	}
+	return dropped
 }
 
 func (c *twoNICControl) count(name, iface, filter string) (int, error) {

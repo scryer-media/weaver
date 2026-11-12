@@ -62,6 +62,7 @@ import { eventTone, useStatusLabel } from "../data/status";
 import { buildTimelineView, downloadingMs, type JobTimelineData } from "../data/timeline";
 import { useNextData } from "../data/next-data";
 import { useSharedStructure } from "../data/share";
+import { usePageVisible } from "../data/timers";
 import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
 import { SupportReportActions } from "../features/SupportReportActions";
@@ -209,10 +210,13 @@ function JobDetailContent() {
     variables,
     pause: !Number.isFinite(jobId),
   });
+  // A background tab holds the last snapshot; on return the subscription
+  // starts again and its first push is the job as it is now.
+  const visible = usePageVisible();
   const [{ data: live }] = useSubscription<{ jobDetailUpdates: JobSnapshot }>({
     query: JOB_DETAIL_UPDATES_SUBSCRIPTION,
     variables,
-    pause: connection.isDisconnected || !Number.isFinite(jobId),
+    pause: connection.isDisconnected || !Number.isFinite(jobId) || !visible,
   });
   const [{ data: filesData }, refetchFiles] = useQuery<{
     jobOutputFiles: { outputDir: string | null; files: OutputFile[]; totalBytes: number } | null;

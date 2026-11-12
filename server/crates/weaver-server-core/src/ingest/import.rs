@@ -377,6 +377,40 @@ mod tests {
         assert_eq!(spec.total_bytes, 10);
     }
 
+    // Files with no subject and no poster are files of the job, each under a
+    // name of its own, as SABnzbd names them.
+    #[test]
+    fn files_without_a_subject_get_names_of_their_own() {
+        let xml = r#"<?xml version="1.0"?>
+<nzb>
+  <file date="0">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="10" number="1">a@example.invalid</segment></segments>
+  </file>
+  <file poster="p" date="0" subject="">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="20" number="1">b@example.invalid</segment></segments>
+  </file>
+</nzb>"#;
+        let spec = import_nzb(xml.as_bytes(), Path::new("slot.nzb")).unwrap().1;
+        assert_eq!(
+            spec.files
+                .iter()
+                .map(|file| file.filename.as_str())
+                .collect::<Vec<_>>(),
+            ["unknown", "unknown.duplicate1"]
+        );
+        assert_eq!(
+            spec.files[0].segments[0].message_ids.in_use(),
+            "a@example.invalid"
+        );
+        assert_eq!(
+            spec.files[1].segments[0].message_ids.in_use(),
+            "b@example.invalid"
+        );
+        assert_eq!(spec.total_bytes, 30);
+    }
+
     #[test]
     fn a_part_listed_once_holds_one_id() {
         let spec = spec_of(r#"<segment bytes="10" number="1">only@example.invalid</segment>"#);
@@ -406,7 +440,7 @@ mod tests {
         ] {
             assert!(is_password_protection_marker(marker), "{marker:?}");
         }
-        for password in [
+        for value in [
             "-10",
             "1abc",
             "true-story",
@@ -415,7 +449,7 @@ mod tests {
             "",
             "synthetic-key",
         ] {
-            assert!(!is_password_protection_marker(password), "{password:?}");
+            assert!(!is_password_protection_marker(value), "{value:?}");
         }
     }
 }

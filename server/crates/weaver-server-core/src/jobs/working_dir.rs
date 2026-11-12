@@ -11,6 +11,9 @@ use crate::jobs::ids::JobId;
 
 pub const WORKING_DIR_MARKER: &str = ".weaver-job-dir";
 pub const OUTPUT_DIR_MARKER: &str = ".weaver-output-dir";
+// The folder under a destination that holds each job's staging directory,
+// named by the job's id.
+pub(crate) const STAGING_DIR_NAME: &str = ".weaver-staging";
 
 pub fn sanitize_dirname(name: &str) -> String {
     weaver_model::files::sanitize_path_component(name)
@@ -451,12 +454,15 @@ pub fn mark_weaver_owned_working_dir(
     path: &Path,
     job_id: JobId,
 ) -> std::io::Result<()> {
-    let dir = open_working_directory(root, path)?;
-    match read_working_marker(&dir) {
+    mark_open_working_dir(&open_working_directory(root, path)?, path, job_id)
+}
+
+fn mark_open_working_dir(dir: &Dir, path: &Path, job_id: JobId) -> std::io::Result<()> {
+    match read_working_marker(dir) {
         Ok(stored) if marker_job_id(&stored) == Some(job_id) => {
-            match match_marker(&dir, path, &stored, job_id)? {
+            match match_marker(dir, path, &stored, job_id)? {
                 MarkerMatch::Current => return Ok(()),
-                MarkerMatch::Legacy => return upgrade_legacy_marker(&dir, path, job_id),
+                MarkerMatch::Legacy => return upgrade_legacy_marker(dir, path, job_id),
                 MarkerMatch::Mismatch => {
                     return Err(std::io::Error::other(
                         "refusing to replace a foreign working directory marker",
@@ -473,7 +479,132 @@ pub fn mark_weaver_owned_working_dir(
             ));
         }
     }
-    write_working_marker(&dir, &working_marker_value(&dir, path, job_id)?)
+    write_working_marker(dir, &working_marker_value(dir, path, job_id)?)
+}
+
+// A job's staging directory is `<destination>/.weaver-staging/<job id>`, and
+// the destination may be a folder other users can write to. Nothing under it
+// is reached through a symbolic link: each of the two steps down from the
+// destination is opened without following one, and what is then made, marked
+// or removed is the directory that was opened, never a path looked up again.
+fn staging_destination(staging: &Path, job_id: JobId) -> std::io::Result<&Path> {
+    let name = job_id.0.to_string();
+    staging
+        .parent()
+        .filter(|parent| {
+            staging.file_name() == Some(name.as_ref())
+                && parent.file_name() == Some(STAGING_DIR_NAME.as_ref())
+        })
+        .and_then(Path::parent)
+        .ok_or_else(|| std::io::Error::other("not a job's staging directory"))
+}
+
+// The directory `name` directly inside `parent`, or None when nothing is
+// there. A symbolic link in its place is an error, never followed.
+fn open_child_dir(parent: &Dir, name: &str) -> std::io::Result<Option<Dir>> {
+    match parent.symlink_metadata(name) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the job's staging directory is reached through a symbolic link",
+        )),
+        Ok(_) => parent.open_dir_nofollow(name).map(Some),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn make_child_dir(parent: &Dir, name: &str) -> std::io::Result<Dir> {
+    match parent.create_dir(name) {
+        Err(error) if error.kind() != std::io::ErrorKind::AlreadyExists => return Err(error),
+        _ => {}
+    }
+    open_child_dir(parent, name)?.ok_or_else(|| std::io::ErrorKind::NotFound.into())
+}
+
+// Make the job's staging directory and mark it the job's, as its working
+// directory is.
+pub(crate) fn make_job_staging_dir(staging: &Path, job_id: JobId) -> std::io::Result<()> {
+    let destination = staging_destination(staging, job_id)?;
+    std::fs::create_dir_all(destination)?;
+    let destination = Dir::open_ambient_dir(destination, cap_std::ambient_authority())?;
+    let parent = make_child_dir(&destination, STAGING_DIR_NAME)?;
+    let dir = make_child_dir(&parent, &job_id.0.to_string())?;
+    mark_open_working_dir(&dir, staging, job_id)
+}
+
+// Whether the job's staging directory holds anything besides its ownership
+// marker. A directory that is missing holds nothing; one reached through a
+// symbolic link is an error, and its target is never listed.
+pub(crate) fn job_staging_dir_holds_files(staging: &Path, job_id: JobId) -> std::io::Result<bool> {
+    let destination = staging_destination(staging, job_id)?;
+    let destination = match Dir::open_ambient_dir(destination, cap_std::ambient_authority()) {
+        Ok(destination) => destination,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let Some(parent) = open_child_dir(&destination, STAGING_DIR_NAME)? else {
+        return Ok(false);
+    };
+    let Some(dir) = open_child_dir(&parent, &job_id.0.to_string())? else {
+        return Ok(false);
+    };
+    for entry in dir.entries()? {
+        let name = entry?.file_name();
+        if name != WORKING_DIR_MARKER && name != WORKING_DIR_MARKER_UPGRADE {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// Remove the job's staging directory, whatever it still holds, when it
+// carries this job's marker. One that was never marked goes only when it is
+// empty. A directory already gone is removed.
+pub(crate) fn remove_job_staging_dir(
+    staging: &Path,
+    job_id: JobId,
+) -> std::io::Result<HistoryWorkingDir> {
+    let name = job_id.0.to_string();
+    let destination = staging_destination(staging, job_id)?;
+    let destination = match Dir::open_ambient_dir(destination, cap_std::ambient_authority()) {
+        Ok(destination) => destination,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(HistoryWorkingDir::Owned);
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(parent) = open_child_dir(&destination, STAGING_DIR_NAME)? else {
+        return Ok(HistoryWorkingDir::Owned);
+    };
+    let Some(dir) = open_child_dir(&parent, &name)? else {
+        return Ok(HistoryWorkingDir::Owned);
+    };
+    let stored = match read_working_marker(&dir) {
+        Ok(stored) => stored,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            drop(dir);
+            return Ok(match parent.remove_dir(&name) {
+                Ok(()) => HistoryWorkingDir::Owned,
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = job_id.0,
+                        dir = %staging.display(),
+                        %error,
+                        "a staging directory with no ownership marker is not empty; leaving it in place"
+                    );
+                    HistoryWorkingDir::LeftInPlace
+                }
+            });
+        }
+        Err(error) => return Err(error),
+    };
+    match judge_history_marker(&dir, staging, &stored, job_id)? {
+        HistoryWorkingDir::Owned => {
+            dir.remove_open_dir_all()?;
+            Ok(HistoryWorkingDir::Owned)
+        }
+        HistoryWorkingDir::LeftInPlace => Ok(HistoryWorkingDir::LeftInPlace),
+    }
 }
 
 pub fn remove_weaver_owned_working_dir(root: &Path, path: &Path) -> std::io::Result<()> {
@@ -909,6 +1040,117 @@ mod tests {
         );
         assert!(remove_job_working_dir(temp.path(), &path, JobId(24)).is_err());
         assert_eq!(std::fs::read(path.join("payload")).unwrap(), b"not yours");
+    }
+
+    fn staging_under(destination: &Path, job_id: JobId) -> PathBuf {
+        destination
+            .join(STAGING_DIR_NAME)
+            .join(job_id.0.to_string())
+    }
+
+    #[test]
+    fn a_job_s_staging_directory_is_removed_with_what_it_holds() {
+        let temp = tempfile::tempdir().unwrap();
+        let staging = staging_under(temp.path(), JobId(31));
+        make_job_staging_dir(&staging, JobId(31)).unwrap();
+        // The marker alone is not a delivered file.
+        assert!(!job_staging_dir_holds_files(&staging, JobId(31)).unwrap());
+        std::fs::write(staging.join("payload"), b"staged").unwrap();
+        assert!(job_staging_dir_holds_files(&staging, JobId(31)).unwrap());
+
+        assert_eq!(
+            remove_job_staging_dir(&staging, JobId(31)).unwrap(),
+            HistoryWorkingDir::Owned
+        );
+        assert!(!staging.exists());
+        // One already gone is removed.
+        assert_eq!(
+            remove_job_staging_dir(&staging, JobId(31)).unwrap(),
+            HistoryWorkingDir::Owned
+        );
+    }
+
+    #[test]
+    fn a_staging_directory_that_is_not_the_job_s_keeps_its_files() {
+        let temp = tempfile::tempdir().unwrap();
+        // Never marked, and holding a file.
+        let unmarked = staging_under(temp.path(), JobId(32));
+        std::fs::create_dir_all(&unmarked).unwrap();
+        std::fs::write(unmarked.join("payload"), b"not yours").unwrap();
+        assert_eq!(
+            remove_job_staging_dir(&unmarked, JobId(32)).unwrap(),
+            HistoryWorkingDir::LeftInPlace
+        );
+        assert_eq!(
+            std::fs::read(unmarked.join("payload")).unwrap(),
+            b"not yours"
+        );
+
+        // Never marked and empty: nothing is lost by taking it.
+        let empty = staging_under(temp.path(), JobId(33));
+        std::fs::create_dir_all(&empty).unwrap();
+        assert_eq!(
+            remove_job_staging_dir(&empty, JobId(33)).unwrap(),
+            HistoryWorkingDir::Owned
+        );
+        assert!(!empty.exists());
+
+        // A path that is not `<destination>/.weaver-staging/<job id>`.
+        let elsewhere = temp.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        assert!(remove_job_staging_dir(&elsewhere, JobId(34)).is_err());
+        assert!(make_job_staging_dir(&elsewhere, JobId(34)).is_err());
+        assert!(elsewhere.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_staging_parent_that_is_a_symbolic_link_is_never_followed() {
+        let temp = tempfile::tempdir().unwrap();
+        let job_id = JobId(35);
+        // Another location holds a directory named for the job, with this
+        // job's own valid marker inside it, and the staging parent is swapped
+        // for a link to that location.
+        let victim = temp.path().join("victim");
+        let victim_job = staging_under(&victim, job_id);
+        make_job_staging_dir(&victim_job, job_id).unwrap();
+        std::fs::write(victim_job.join("payload"), b"keep").unwrap();
+        let destination = temp.path().join("complete");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::os::unix::fs::symlink(
+            victim.join(STAGING_DIR_NAME),
+            destination.join(STAGING_DIR_NAME),
+        )
+        .unwrap();
+        let staging = staging_under(&destination, job_id);
+
+        let error = remove_job_staging_dir(&staging, job_id).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(std::fs::read(victim_job.join("payload")).unwrap(), b"keep");
+        // Nor is what the link points at taken for the job's delivered files.
+        assert!(job_staging_dir_holds_files(&victim_job, job_id).unwrap());
+        assert!(job_staging_dir_holds_files(&staging, job_id).is_err());
+        assert!(make_job_staging_dir(&staging, job_id).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_staging_directory_that_is_a_symbolic_link_is_never_followed() {
+        let temp = tempfile::tempdir().unwrap();
+        let job_id = JobId(36);
+        let victim = temp.path().join("victim");
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("payload"), b"keep").unwrap();
+        let staging = staging_under(temp.path(), job_id);
+        std::fs::create_dir_all(staging.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&victim, &staging).unwrap();
+
+        let error = remove_job_staging_dir(&staging, job_id).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(job_staging_dir_holds_files(&staging, job_id).is_err());
+        assert!(make_job_staging_dir(&staging, job_id).is_err());
+        assert_eq!(std::fs::read(victim.join("payload")).unwrap(), b"keep");
+        assert!(!victim.join(WORKING_DIR_MARKER).exists());
     }
 
     #[test]

@@ -45,6 +45,67 @@ pub enum SupportReportError {
     Task(String),
 }
 
+impl SupportReportError {
+    // The stable snake_case code a reader tells the failures apart by; the
+    // message is for people and can change.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => "job_not_found",
+            Self::NzbUnavailable(_) => "nzb_unavailable",
+            Self::Parse(_) => "nzb_unreadable",
+            Self::State(_) => "state_read_failed",
+            Self::Task(_) => "report_task_failed",
+        }
+    }
+}
+
+// Where a queued job stands for the reports the diagnostics package carries.
+// Only jobs Weaver has started work on qualify: a job that is merely queued,
+// waiting on its queue scripts, or paused does not, and neither does one that
+// finished well and is on its way to history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ActiveReportGroup {
+    // Verifying, repairing, extracting, moving or post-processing, or
+    // waiting in line for one of them. Listed first.
+    PostProcessing,
+    // Failed and still in the queue.
+    Failed,
+    // Downloading, or checking article availability before it does.
+    Downloading,
+}
+
+impl ActiveReportGroup {
+    pub fn of(status: &crate::JobStatus) -> Option<Self> {
+        use crate::JobStatus;
+        if status.past_download() {
+            Some(Self::PostProcessing)
+        } else {
+            match status {
+                JobStatus::Failed { .. } => Some(Self::Failed),
+                JobStatus::Downloading | JobStatus::Checking => Some(Self::Downloading),
+                _ => None,
+            }
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PostProcessing => "post_processing",
+            Self::Failed => "failed",
+            Self::Downloading => "downloading",
+        }
+    }
+}
+
+// The jobs chosen for reports, in report order, and how many qualified
+// before the cap.
+#[derive(Debug, Clone)]
+pub struct ActiveReportJobs {
+    pub qualified: usize,
+    pub jobs: Vec<(ActiveReportGroup, JobInfo)>,
+}
+
 // Where the report was made. Every field is a fixed name.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct ReportEnvironment {
@@ -123,7 +184,7 @@ pub fn build_job_support_report(
         },
     };
     let mut job = job;
-    job.apply_events(&db.get_job_events(job_id)?);
+    job.apply_event_kind_counts(&db.get_job_event_kind_counts(job_id)?);
     job.apply_support_facts(&db.load_job_support_facts(JobId(job_id))?, now_epoch_secs);
 
     let (path, compressed) = stored.ok_or(SupportReportError::NzbUnavailable(job_id))?;
@@ -650,26 +711,45 @@ impl JobSection {
     // kinds are read; their messages can name files.
     pub fn apply_events(&mut self, events: &[JobEvent]) {
         for event in events {
-            match event.kind.as_str() {
-                "JobVerificationComplete" | "Par3VerificationComplete" => {
-                    self.verification_runs += 1;
-                }
-                "RepairStarted" => self.repair = advance(self.repair, StageOutcome::Started),
-                "RepairComplete" => self.repair = advance(self.repair, StageOutcome::Complete),
-                "RepairFailed" => self.repair = advance(self.repair, StageOutcome::Failed),
-                "ExtractionReady" | "ExtractionMemberStarted" => {
-                    self.extraction = advance(self.extraction, StageOutcome::Started);
-                }
-                "ExtractionComplete" => {
-                    self.extraction = advance(self.extraction, StageOutcome::Complete);
-                }
-                "ExtractionFailed" => {
-                    self.extraction = advance(self.extraction, StageOutcome::Failed);
-                }
-                "ExtractionMemberFailed" => self.extraction_member_failures += 1,
-                "FileMissing" => self.files_reported_missing += 1,
-                _ => {}
+            self.apply_event_kind(&event.kind, 1);
+        }
+    }
+
+    // The same as applying the events counted, given each kind's count in
+    // the order of each kind's newest event: every outcome a stage takes is
+    // its newest event's, and the rest are counts.
+    pub fn apply_event_kind_counts(&mut self, counts: &[(String, u64, u64)]) {
+        for (kind, count, _) in counts {
+            self.apply_event_kind(kind, *count);
+        }
+    }
+
+    fn apply_event_kind(&mut self, kind: &str, count: u64) {
+        let count = u32::try_from(count).unwrap_or(u32::MAX);
+        match kind {
+            "JobVerificationComplete" | "Par3VerificationComplete" => {
+                self.verification_runs = self.verification_runs.saturating_add(count);
             }
+            "RepairStarted" => self.repair = advance(self.repair, StageOutcome::Started),
+            "RepairComplete" => self.repair = advance(self.repair, StageOutcome::Complete),
+            "RepairFailed" => self.repair = advance(self.repair, StageOutcome::Failed),
+            "ExtractionReady" | "ExtractionMemberStarted" => {
+                self.extraction = advance(self.extraction, StageOutcome::Started);
+            }
+            "ExtractionComplete" => {
+                self.extraction = advance(self.extraction, StageOutcome::Complete);
+            }
+            "ExtractionFailed" => {
+                self.extraction = advance(self.extraction, StageOutcome::Failed);
+            }
+            "ExtractionMemberFailed" => {
+                self.extraction_member_failures =
+                    self.extraction_member_failures.saturating_add(count);
+            }
+            "FileMissing" => {
+                self.files_reported_missing = self.files_reported_missing.saturating_add(count);
+            }
+            _ => {}
         }
     }
 

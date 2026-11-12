@@ -11,7 +11,6 @@ use crate::Database;
 use crate::ingest::submit_nzb_bytes;
 use crate::jobs::ids::MessageId;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
-use crate::runtime::buffers::{BufferPool, BufferPoolConfig};
 use crate::runtime::system_profile::{
     CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
     SystemProfile,
@@ -53,11 +52,14 @@ mod core;
 mod decode_stage;
 pub(in crate::pipeline) mod delivered_restore;
 pub(in crate::pipeline) mod direct_store;
+mod dispatch_order;
 mod download_dispatch;
 pub(in crate::pipeline) mod engines;
 mod full_file_names;
 mod hardware_profile;
 mod idle;
+mod memory_release;
+mod next_up_ring;
 mod nzb_admission;
 mod par2;
 mod par2_completion;
@@ -152,7 +154,6 @@ impl TestHarness {
             hardware_profile: None,
             intermediate_dir: Some(intermediate_dir.display().to_string()),
             complete_dir: Some(complete_dir.display().to_string()),
-            buffer_pool: None,
             servers: vec![],
             categories: vec![],
             retry: None,
@@ -205,16 +206,10 @@ impl TestHarness {
                 same_filesystem: true,
             },
         };
-        let buffers = BufferPool::new(BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        });
-
         let mut pipeline = Pipeline::new(
             event_tx,
             nntp,
-            buffers,
+            16 * 1024 * 1024,
             profile,
             data_dir.clone(),
             intermediate_dir,
@@ -460,8 +455,9 @@ fn insert_history_row_with_nzb_zstd(db: &Database, row: &crate::JobHistoryRow, n
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
             datastore.write_exec(),
-            "UPDATE job_history SET nzb_zstd = {} WHERE job_id = {}",
-            &[SqlArg::Bytes(nzb_zstd), SqlArg::I64(job_id)],
+            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES ({}, {})
+             ON CONFLICT(job_id) DO UPDATE SET nzb_zstd = excluded.nzb_zstd",
+            &[SqlArg::I64(job_id), SqlArg::Bytes(nzb_zstd)],
         )
         .await?;
         Ok(())
@@ -530,15 +526,15 @@ async fn settle_lane_dials(pipeline: &mut Pipeline) {
     }
 }
 
-pub(crate) async fn new_direct_pipeline_with_buffers(
+pub(crate) async fn new_direct_pipeline_with_backlog(
     temp_dir: &TempDir,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
 ) -> (Pipeline, PathBuf, PathBuf) {
-    new_direct_pipeline_with(temp_dir, buffer_config, total_connections, None).await
+    new_direct_pipeline_with(temp_dir, backlog_base_bytes, total_connections, None).await
 }
 
-// [`new_direct_pipeline_with_buffers`], plus the `[direct_store]` config table.
+// [`new_direct_pipeline_with_backlog`], plus the `[direct_store]` config table.
 //
 // Everything else in this module reaches for `set_gate`, which bypasses
 // configuration entirely. The tests that exist to prove the *config* is the
@@ -546,7 +542,7 @@ pub(crate) async fn new_direct_pipeline_with_buffers(
 // here instead.
 async fn new_direct_pipeline_with(
     temp_dir: &TempDir,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
 ) -> (Pipeline, PathBuf, PathBuf) {
@@ -555,7 +551,7 @@ async fn new_direct_pipeline_with(
         temp_dir.path().join("intermediate"),
         temp_dir.path().join("complete"),
         temp_dir.path().join("weaver.db"),
-        buffer_config,
+        backlog_base_bytes,
         total_connections,
         direct_store,
     )
@@ -575,7 +571,7 @@ async fn new_direct_pipeline_at_roots(
     intermediate_dir: PathBuf,
     complete_dir: PathBuf,
     db_path: PathBuf,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
 ) -> (Pipeline, PathBuf, PathBuf) {
@@ -584,7 +580,7 @@ async fn new_direct_pipeline_at_roots(
         intermediate_dir,
         complete_dir,
         db_path,
-        buffer_config,
+        backlog_base_bytes,
         total_connections,
         direct_store,
         SystemProfile {
@@ -620,7 +616,7 @@ async fn new_direct_pipeline_on_machine(
     intermediate_dir: PathBuf,
     complete_dir: PathBuf,
     db_path: PathBuf,
-    buffer_config: BufferPoolConfig,
+    backlog_base_bytes: usize,
     total_connections: usize,
     direct_store: Option<crate::settings::DirectStoreOverrides>,
     profile: SystemProfile,
@@ -638,7 +634,6 @@ async fn new_direct_pipeline_on_machine(
         hardware_profile: None,
         intermediate_dir: Some(intermediate_dir.display().to_string()),
         complete_dir: Some(complete_dir.display().to_string()),
-        buffer_pool: None,
         servers: vec![],
         categories: vec![],
         retry: None,
@@ -686,12 +681,10 @@ async fn new_direct_pipeline_on_machine(
         max_retries_per_server: 1,
         soft_timeout: Duration::from_secs(15),
     });
-    let buffers = BufferPool::new(buffer_config);
-
     let mut pipeline = Pipeline::new(
         event_tx,
         nntp,
-        buffers,
+        backlog_base_bytes,
         profile,
         data_dir,
         intermediate_dir.clone(),
@@ -731,16 +724,7 @@ async fn new_scheduler_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathB
 }
 
 pub(crate) async fn new_direct_pipeline(temp_dir: &TempDir) -> (Pipeline, PathBuf, PathBuf) {
-    new_direct_pipeline_with_buffers(
-        temp_dir,
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
-        0,
-    )
-    .await
+    new_direct_pipeline_with_backlog(temp_dir, 16 * 1024 * 1024, 0).await
 }
 
 // End a pipeline incarnation before the next one opens its database.
@@ -1579,7 +1563,11 @@ pub(super) fn build_test_par2_index_for_files(files: &[(&str, &[u8])], slice_siz
     stream
 }
 
-fn segmented_job_spec(name: &str, filename: &str, segment_sizes: &[u32]) -> JobSpec {
+pub(in crate::pipeline) fn segmented_job_spec(
+    name: &str,
+    filename: &str,
+    segment_sizes: &[u32],
+) -> JobSpec {
     JobSpec {
         name: name.to_string(),
         password: None,
@@ -1801,6 +1789,7 @@ pub(in crate::pipeline) async fn insert_delivered_job(
         .download_queue
         .pop()
         .unwrap();
+    let work = pipeline.dispatched(work);
     let segment_id = work.segment_id;
     let raw = encode_article_part(filename, payload, 1, 1, 1, payload.len() as u64);
     // Lane 0 holds the article, as a dispatched lease would book it.

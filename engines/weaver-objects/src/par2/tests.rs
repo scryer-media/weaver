@@ -4,6 +4,7 @@
 mod carriers;
 mod facts;
 mod per_call;
+mod range_names;
 mod recovery_contracts;
 
 use weaver_graph::recovery::RepairOutcome;

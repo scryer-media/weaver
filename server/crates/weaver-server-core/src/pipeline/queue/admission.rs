@@ -15,16 +15,21 @@ pub(crate) struct AdmissionResources {
     pub db: crate::Database,
     pub intermediate_dir: PathBuf,
     pub complete_dir: PathBuf,
+    pub config: crate::settings::SharedConfig,
+}
+
+impl AdmissionResources {
+    // Every directory a job's staging directory can lie under, as the
+    // categories stand now.
+    pub(crate) async fn staging_roots(&self) -> Vec<PathBuf> {
+        destination_roots(&self.complete_dir, &self.config.read().await.categories)
+    }
 }
 
 pub(crate) struct PreparedAdd {
     pub spec: JobSpec,
     pub options: AddJobOptions,
     pub working_dir: PathBuf,
-    // The job's staging directory on the complete device, where the files
-    // it delivers are written, when the intermediate directory is on
-    // another device.
-    pub staging_dir: Option<PathBuf>,
     pub nzb_hash: [u8; 32],
     pub nzb_password_candidates: Option<Vec<crate::jobs::ArchivePasswordCandidate>>,
     pub restart: Option<RestartAdmission>,
@@ -225,38 +230,62 @@ pub(super) fn initial_info(
     }
 }
 
-// Where a job writes the files it delivers when its intermediate and
-// complete directories lie on different devices: its staging directory on
-// the complete device, so finalize renames them into place there instead of
+// The directory a job's finished files are delivered under: its category's
+// folder, else the complete directory. A category whose folder cannot be
+// resolved stages under the complete directory; its move then says why it
+// cannot deliver.
+pub(crate) fn destination_root(
+    complete_dir: &Path,
+    categories: &[crate::categories::CategoryConfig],
+    category: Option<&str>,
+) -> PathBuf {
+    crate::categories::completion_parent(complete_dir, categories, category)
+        .unwrap_or_else(|_| complete_dir.to_path_buf())
+}
+
+// Where a job writes the files it delivers when its intermediate directory
+// and its destination lie on different devices: its staging directory on the
+// destination's device, so finalize renames them into place there instead of
 // copying every byte across. On one device nothing is staged.
 pub(crate) fn delivery_staging_dir(
     intermediate_dir: &Path,
-    complete_dir: &Path,
+    destination_root: &Path,
     job_id: JobId,
 ) -> Option<PathBuf> {
-    (!crate::runtime::fs::same_device(intermediate_dir, complete_dir))
-        .then(|| staging_dir_for(complete_dir, job_id))
+    (!crate::runtime::fs::same_device(intermediate_dir, destination_root))
+        .then(|| staging_dir_for(destination_root, job_id))
 }
 
-pub(crate) fn staging_dir_for(complete_dir: &Path, job_id: JobId) -> PathBuf {
-    complete_dir
-        .join(".weaver-staging")
+pub(crate) fn staging_dir_for(destination_root: &Path, job_id: JobId) -> PathBuf {
+    destination_root
+        .join(crate::jobs::working_dir::STAGING_DIR_NAME)
         .join(job_id.0.to_string())
 }
 
 // Make the job's staging directory and mark it the job's, as its working
-// directory is.
-pub(crate) fn make_staging_dir(
+// directory is. Nothing under the destination is reached through a symbolic
+// link.
+pub(crate) fn make_staging_dir(staging_dir: &Path, job_id: JobId) -> std::io::Result<()> {
+    crate::jobs::working_dir::make_job_staging_dir(staging_dir, job_id)
+}
+
+// Every directory a job's staging directory can lie under: the complete
+// directory and each category's folder.
+pub(crate) fn destination_roots(
     complete_dir: &Path,
-    staging_dir: &Path,
-    job_id: JobId,
-) -> std::io::Result<()> {
-    std::fs::create_dir_all(staging_dir)?;
-    crate::jobs::working_dir::mark_weaver_owned_working_dir(
-        &complete_dir.join(".weaver-staging"),
-        staging_dir,
-        job_id,
-    )
+    categories: &[crate::categories::CategoryConfig],
+) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    std::iter::once(complete_dir.to_path_buf())
+        .chain(categories.iter().map(|category| {
+            destination_root(
+                complete_dir,
+                std::slice::from_ref(category),
+                Some(&category.name),
+            )
+        }))
+        .filter(|root| seen.insert(root.clone()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -274,19 +303,76 @@ mod staging_tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn two_devices_stage_under_the_complete_directory() {
-        use std::os::unix::fs::MetadataExt;
+    fn two_devices_stage_under_the_destination() {
         let root = tempfile::tempdir().expect("temp dir");
-        let other = Path::new("/dev");
-        let ours = std::fs::metadata(root.path()).expect("meta").dev();
-        if std::fs::metadata(other).expect("meta").dev() == ours {
-            return;
-        }
+        let intermediate = root.path().join("intermediate");
+        let complete = root.path().join("complete");
+        crate::runtime::fs::test_devices::assign(&intermediate, 1);
+        crate::runtime::fs::test_devices::assign(&complete, 2);
         assert_eq!(
-            delivery_staging_dir(root.path(), other, JobId(7)),
-            Some(other.join(".weaver-staging").join("7"))
+            delivery_staging_dir(&intermediate, &complete, JobId(7)),
+            Some(complete.join(".weaver-staging").join("7"))
+        );
+    }
+
+    fn category(name: &str, dest_dir: Option<&Path>) -> crate::categories::CategoryConfig {
+        crate::categories::CategoryConfig {
+            id: 1,
+            name: name.to_string(),
+            dest_dir: dest_dir.map(|dir| dir.display().to_string()),
+            aliases: String::new(),
+        }
+    }
+
+    // A category with its own folder on another device stages there, never
+    // on the complete directory's device; one on the intermediate device
+    // stages nothing.
+    #[test]
+    fn a_category_folder_decides_where_the_job_stages() {
+        let root = tempfile::tempdir().expect("temp dir");
+        let intermediate = root.path().join("intermediate");
+        let complete = root.path().join("complete");
+        let movies = root.path().join("movies");
+        let beside = root.path().join("beside");
+        crate::runtime::fs::test_devices::assign(&intermediate, 1);
+        crate::runtime::fs::test_devices::assign(&complete, 2);
+        crate::runtime::fs::test_devices::assign(&movies, 3);
+        crate::runtime::fs::test_devices::assign(&beside, 1);
+        let categories = vec![
+            category("movies", Some(&movies)),
+            category("beside", Some(&beside)),
+            category("tv", None),
+        ];
+        let stage = |name: Option<&str>| {
+            delivery_staging_dir(
+                &intermediate,
+                &destination_root(&complete, &categories, name),
+                JobId(7),
+            )
+        };
+        assert_eq!(
+            stage(Some("movies")),
+            Some(movies.join(".weaver-staging").join("7"))
+        );
+        assert_eq!(stage(Some("beside")), None);
+        assert_eq!(
+            stage(Some("tv")),
+            Some(complete.join("tv").join(".weaver-staging").join("7"))
+        );
+        assert_eq!(
+            stage(None),
+            Some(complete.join(".weaver-staging").join("7"))
+        );
+        // A category that cannot be resolved stages under the complete
+        // directory.
+        assert_eq!(
+            stage(Some("../outside")),
+            Some(complete.join(".weaver-staging").join("7"))
+        );
+        assert_eq!(
+            destination_roots(&complete, &categories),
+            vec![complete.clone(), movies, beside, complete.join("tv")]
         );
     }
 
@@ -294,7 +380,7 @@ mod staging_tests {
     fn a_staging_directory_is_made_and_marked_the_job_s() {
         let complete = tempfile::tempdir().expect("temp dir");
         let staging = staging_dir_for(complete.path(), JobId(9));
-        make_staging_dir(complete.path(), &staging, JobId(9)).expect("staging");
+        make_staging_dir(&staging, JobId(9)).expect("staging");
         assert!(crate::jobs::working_dir::is_weaver_owned_working_dir(
             &staging
         ));

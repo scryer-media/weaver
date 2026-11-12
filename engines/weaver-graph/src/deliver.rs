@@ -246,6 +246,14 @@ impl Why {
         }
     }
 
+    // Whether a store that hands its volumes to an engine for this reason
+    // hands them over again after a repair of them: the archive's headers
+    // declare it, coders, a cipher, an entry that is no file body, and no
+    // password or repair changes what they declare.
+    pub fn outlasts_repair(self) -> bool {
+        matches!(self, Why::Compressed | Why::Encrypted | Why::NotAFile)
+    }
+
     // Whether an object that refused a member for this reason disclaims it:
     // not its to open, so the member is the posted file and is whole when
     // its bytes are. For any other reason the object's set failed with the

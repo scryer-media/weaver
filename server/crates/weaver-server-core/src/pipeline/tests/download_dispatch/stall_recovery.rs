@@ -14,16 +14,7 @@ use crate::pipeline::download::{
 // none open, which is the stall's shape. Its pool still has one server to
 // rank, so the stall is not the outage the watchdog leaves alone.
 async fn stalled_pipeline(temp_dir: &tempfile::TempDir) -> Pipeline {
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        temp_dir,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        0,
-    )
-    .await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_backlog(temp_dir, 6 * 1024 * 1024, 0).await;
     pipeline.nntp = Arc::new(weaver_nntp::NntpClient::new(
         weaver_nntp::client::NntpClientConfig::single(
             weaver_nntp::ServerConfig {
@@ -87,6 +78,7 @@ fn park_indefinite_infrastructure_retry(pipeline: &mut Pipeline, job_id: JobId) 
         .extract_matching(|work| work.segment_id.segment_number == 0)
         .pop()
         .expect("segment 0 is queued");
+    let work = pipeline.dispatched(work);
     pipeline.note_retry_scheduled(work.segment_id);
     let scheduled_pool_generation = pipeline.pool_generation;
     pipeline.schedule_infrastructure_retry(
@@ -549,16 +541,7 @@ fn stall_recovery_is_on_unless_the_variable_says_0_false_or_off() {
 // Regression fixtures use real dispatch gates and nonzero capacity. Aging
 // the watch tests the release decision, not elapsed provider retry history.
 async fn verification_pipeline(temp: &tempfile::TempDir, two_servers: bool) -> Pipeline {
-    let (mut pipeline, _, _) = new_direct_pipeline_with_buffers(
-        temp,
-        BufferPoolConfig {
-            small_count: 2,
-            medium_count: 1,
-            large_count: 1,
-        },
-        1,
-    )
-    .await;
+    let (mut pipeline, _, _) = new_direct_pipeline_with_backlog(temp, 6 * 1024 * 1024, 1).await;
     let mut config = weaver_nntp::client::NntpClientConfig::single(
         weaver_nntp::ServerConfig {
             host: "127.0.0.1".into(),

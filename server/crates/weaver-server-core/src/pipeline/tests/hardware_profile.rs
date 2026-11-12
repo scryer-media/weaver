@@ -42,11 +42,7 @@ async fn pipeline_on_twelve_cores(temp_dir: &TempDir) -> Pipeline {
         temp_dir.path().join("intermediate"),
         temp_dir.path().join("complete"),
         temp_dir.path().join("weaver.db"),
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
+        16 * 1024 * 1024,
         20,
         None,
         twelve_core_machine(),
@@ -424,6 +420,66 @@ async fn the_efficient_profile_holds_a_repair_to_its_cap() {
     );
     assert_eq!(grant.install(rayon::current_num_threads), 4);
     assert_eq!(balanced.install(rayon::current_num_threads), 6);
+    assert_eq!(grant.install_repair(rayon::current_num_threads), 4);
+    assert_eq!(balanced.install_repair(rayon::current_num_threads), 6);
+}
+
+// A repair runs inside a pool as wide as the threads its grant gives it,
+// on every profile: PAR2 spreads across the pool it runs in. The
+// performance profile grants a repair every core but one, wider than its
+// extract threads, and a profile back at the extract width repairs inside
+// the post-processing pool again. Twelve cores with 64 GiB, so every
+// profile is in reach.
+#[tokio::test]
+async fn a_repair_runs_inside_a_pool_as_wide_as_its_grant() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let mut machine = twelve_core_machine();
+    machine.memory.total_bytes = 64 * 1024 * 1024 * 1024;
+    machine.memory.available_bytes = 64 * 1024 * 1024 * 1024;
+    let (mut pipeline, _, _) = new_direct_pipeline_on_machine(
+        temp_dir.path().join("data"),
+        temp_dir.path().join("intermediate"),
+        temp_dir.path().join("complete"),
+        temp_dir.path().join("weaver.db"),
+        16 * 1024 * 1024,
+        20,
+        None,
+        machine,
+    )
+    .await;
+    for profile in [
+        HardwareProfile::Performance,
+        HardwareProfile::Efficient,
+        HardwareProfile::Balanced,
+        HardwareProfile::Performance,
+    ] {
+        choose(&mut pipeline, profile).await;
+        let grant = pipeline.graph_hardware.grant();
+        let expected = match profile {
+            HardwareProfile::Performance => 11,
+            HardwareProfile::Balanced => 6,
+            HardwareProfile::Efficient => 4,
+        };
+        assert_eq!(grant.repair.threads, expected, "{profile:?}");
+        assert_eq!(
+            grant.install_repair(rayon::current_num_threads),
+            expected,
+            "{profile:?}"
+        );
+        assert_eq!(
+            grant.install(rayon::current_num_threads),
+            pipeline.tuner.params().extract_thread_count,
+            "{profile:?}"
+        );
+        let shared = Arc::ptr_eq(
+            grant.repair_pool.as_ref().unwrap(),
+            grant.pool.as_ref().unwrap(),
+        );
+        assert_eq!(
+            shared,
+            expected == grant.install(rayon::current_num_threads)
+        );
+    }
 }
 
 // Only memory read from the machine is a hard stop for a run above the
@@ -446,11 +502,7 @@ async fn a_hard_stop_holds_only_to_memory_read_from_the_machine() {
         other.path().join("intermediate"),
         other.path().join("complete"),
         other.path().join("weaver.db"),
-        BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        },
+        16 * 1024 * 1024,
         20,
         None,
         guessed,

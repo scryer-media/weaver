@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+# Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
+
+# `weaver_yenc_bench` compiles weaver-yenc's per-tier decode entry points
+# (src/simd/bench.rs). Every function of the bench and of weaver-yenc starts
+# on a 64-byte boundary (LLVM's -align-all-functions takes log2), as in
+# encode-bench, so a tier's loops keep the same offset within a 64-byte line
+# whatever code is linked before them; rapidyenc's side is pinned the same
+# way (build.rs, pin_functions).
+[target.'cfg(any(target_arch = "x86_64", target_arch = "aarch64"))']
+rustflags = ["--cfg", "weaver_yenc_bench", "-C", "llvm-args=-align-all-functions=6"]

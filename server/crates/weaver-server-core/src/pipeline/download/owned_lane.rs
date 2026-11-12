@@ -1966,6 +1966,10 @@ fn run_owned_blocking_download_lane(cached_lane: &mut Option<CachedOwnedLane>, r
 
     if !keep_cached_lane {
         park_cached_lane(cached_lane);
+    } else if frees_read_buffers_after_park(park_reason)
+        && let Some(cached) = cached_lane.as_mut()
+    {
+        cached.lane.release_idle_buffers();
     }
     // The article buffers this thread allocated are freed by the decode and
     // writer threads, so under a per-thread-heap allocator their pages sit on
@@ -2031,6 +2035,16 @@ fn keep_cached_lane_after_park(reason: LaneParkReason) -> bool {
             | LaneParkReason::ProbeYield
             | LaneParkReason::ServerQuota
     )
+}
+
+// Whether a kept socket also gives up its read buffers until its next lease.
+//
+// Only when the lane has nothing to wait for but new work: no article left
+// for this server, or its quota spent. A pressure park or a probe yield
+// resumes within the same download, where freeing and reallocating the
+// buffers would be paid on the download path.
+fn frees_read_buffers_after_park(reason: LaneParkReason) -> bool {
+    matches!(reason, LaneParkReason::NoWork | LaneParkReason::ServerQuota)
 }
 
 fn stats_delta(

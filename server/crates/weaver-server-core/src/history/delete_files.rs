@@ -164,7 +164,7 @@ async fn cleanup_owned_output_dir(dir: Option<&std::path::Path>) {
 pub(crate) async fn delete_history_rows(
     db: &crate::Database,
     intermediate_dir: &std::path::Path,
-    complete_dir: &std::path::Path,
+    staging_roots: &[PathBuf],
     job_ids: BTreeSet<JobId>,
     delete_files: bool,
 ) -> (
@@ -304,7 +304,8 @@ pub(crate) async fn delete_history_rows(
                 // What the staging directory still holds is the rest of the
                 // delivery the working directory held, and goes the way it
                 // went, with or without the files.
-                let staged = crate::pipeline::queue::remove_job_staging(complete_dir, job_id).await;
+                let staged =
+                    crate::pipeline::queue::remove_job_staging(staging_roots, job_id).await;
                 deleted.insert(
                     job_id,
                     staged.map(|()| crate::HistoryDeleteOutcome { left_in_place }),
@@ -330,7 +331,7 @@ pub(crate) async fn delete_history_rows(
 pub(crate) async fn sweep_failed_job_files(
     db: &crate::Database,
     intermediate_dir: &std::path::Path,
-    complete_dir: &std::path::Path,
+    staging_roots: &[PathBuf],
     job_id: JobId,
     recorded: Option<PathBuf>,
     marked: Vec<PathBuf>,
@@ -363,10 +364,15 @@ pub(crate) async fn sweep_failed_job_files(
             "a failed job's working directory stopped matching its marker; housekeeping leaves it"
         );
     }
-    let staging = crate::pipeline::queue::staging_dir_for(complete_dir, job_id);
-    let staged = tokio::fs::symlink_metadata(&staging).await.is_ok();
-    crate::pipeline::queue::remove_job_staging(complete_dir, job_id).await?;
-    if staged {
+    let mut staged = Vec::new();
+    for root in staging_roots {
+        let staging = crate::pipeline::queue::staging_dir_for(root, job_id);
+        if tokio::fs::symlink_metadata(&staging).await.is_ok() {
+            staged.push(staging);
+        }
+    }
+    crate::pipeline::queue::remove_job_staging(staging_roots, job_id).await?;
+    for staging in staged {
         info!(dir = %staging.display(), "removed a failed job's staging directory");
     }
     Ok(())

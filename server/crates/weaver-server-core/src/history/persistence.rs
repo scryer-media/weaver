@@ -82,6 +82,10 @@ async fn bulk_insert_integration_events_tx(
     Ok(())
 }
 
+#[expect(
+    clippy::disallowed_methods,
+    reason = "writer gate: a batch on the transaction run_in_transaction opened under the gate; Postgres has no writer gate"
+)]
 pub(crate) async fn replace_job_history_attributes_tx(
     tx: &mut SqlTx<'_>,
     entry: &JobHistoryRow,
@@ -93,20 +97,57 @@ pub(crate) async fn replace_job_history_attributes_tx(
     .await?;
 
     let metadata = parse_history_metadata(entry.metadata.as_deref());
-    for (key, value) in public_history_attributes(&metadata) {
-        tx.execute(
-            "INSERT INTO job_history_attributes (job_id, key, value, completed_at)
-             VALUES ({}, {}, {}, {})
-             ON CONFLICT(job_id, key, value) DO UPDATE SET
-                completed_at = excluded.completed_at",
-            &[
-                SqlArg::I64(entry.job_id as i64),
-                SqlArg::Text(key),
-                SqlArg::Text(value),
-                SqlArg::I64(entry.completed_at),
-            ],
-        )
-        .await?;
+    // One row per pair: a statement may not update the same row twice.
+    let attributes: Vec<(String, String)> = public_history_attributes(&metadata)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if attributes.is_empty() {
+        return Ok(());
+    }
+
+    const INSERT: &str = "INSERT INTO job_history_attributes (job_id, key, value, completed_at) ";
+    const ON_CONFLICT: &str = " ON CONFLICT(job_id, key, value) DO UPDATE SET
+                completed_at = excluded.completed_at";
+    let job_id = entry.job_id as i64;
+    let completed_at = entry.completed_at;
+    let chunk_size = max_rows_for_tx(tx, 4);
+    match tx {
+        SqlTx::Sqlite(tx) => {
+            for chunk in attributes.chunks(chunk_size) {
+                let mut builder = QueryBuilder::<Sqlite>::new(INSERT);
+                builder.push_values(chunk, |mut row, (key, value)| {
+                    row.push_bind(job_id)
+                        .push_bind(key)
+                        .push_bind(value)
+                        .push_bind(completed_at);
+                });
+                builder.push(ON_CONFLICT);
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
+        SqlTx::Postgres(tx) => {
+            for chunk in attributes.chunks(chunk_size) {
+                let mut builder = QueryBuilder::<Postgres>::new(INSERT);
+                builder.push_values(chunk, |mut row, (key, value)| {
+                    row.push_bind(job_id)
+                        .push_bind(key)
+                        .push_bind(value)
+                        .push_bind(completed_at);
+                });
+                builder.push(ON_CONFLICT);
+                builder
+                    .build()
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(|error| StateError::Database(error.to_string()))?;
+            }
+        }
     }
 
     Ok(())
@@ -130,9 +171,10 @@ impl Database {
                         "INSERT INTO job_history
                             (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                              optional_recovery_bytes, optional_recovery_downloaded_bytes,
-                             failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
-                             created_at, completed_at, metadata, server_attribution)
-                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+                             failed_bytes, health, category, output_dir, nzb_path,
+                             created_at, completed_at, metadata, server_attribution, release_name,
+                             search_key)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
                          ON CONFLICT(job_id) DO UPDATE SET
                             job_hash = excluded.job_hash,
                             name = excluded.name,
@@ -147,10 +189,11 @@ impl Database {
                             category = excluded.category,
                             output_dir = excluded.output_dir,
                             nzb_path = excluded.nzb_path,
-                            nzb_zstd = COALESCE(excluded.nzb_zstd, job_history.nzb_zstd),
                             created_at = excluded.created_at,
                             completed_at = excluded.completed_at,
                             metadata = excluded.metadata,
+                            release_name = excluded.release_name,
+                            search_key = excluded.search_key,
                             server_attribution = COALESCE(excluded.server_attribution, job_history.server_attribution)",
                         &args,
                     )
@@ -372,12 +415,17 @@ pub(crate) async fn delete_job_history_bundles_tx(
             &args,
         )
         .await?;
+        // The stored NZB goes with the history row, unless the job is in the
+        // queue again.
+        crate::jobs::nzb_persistence::delete_unowned_job_nzbs_tx(tx, &present).await?;
         deleted.extend(present.into_iter().map(|id| JobId(id as u64)));
     }
     Ok(deleted)
 }
 
 fn job_history_args(entry: &JobHistoryRow) -> Vec<SqlArg> {
+    let (release_name, search_key) =
+        super::history_search_columns(&entry.name, entry.metadata.as_deref());
     vec![
         SqlArg::I64(entry.job_id as i64),
         SqlArg::OptBytes(entry.job_hash.clone()),
@@ -393,10 +441,11 @@ fn job_history_args(entry: &JobHistoryRow) -> Vec<SqlArg> {
         SqlArg::OptText(entry.category.clone()),
         SqlArg::OptText(entry.output_dir.clone()),
         SqlArg::OptText(entry.nzb_path.clone()),
-        SqlArg::OptBytes(None),
         SqlArg::I64(entry.created_at),
         SqlArg::I64(entry.completed_at),
         SqlArg::OptText(entry.metadata.clone()),
         SqlArg::OptText(entry.server_attribution.clone()),
+        SqlArg::Text(release_name),
+        SqlArg::Text(search_key),
     ]
 }

@@ -20,6 +20,7 @@ use weaver_server_core::operations::instrumentation::{
     ServerMetricsSnapshot,
 };
 use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
+use weaver_server_core::persistence::WalCheckpointMetricsSnapshot;
 use weaver_server_core::post_processing::executor::PostProcessingMetricsSnapshot;
 use weaver_server_core::post_processing::run_metrics::{
     RunStatus, ScriptMetrics, ScriptRunMetricsSnapshot,
@@ -91,12 +92,11 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) job_lifecycle: Option<&'a JobLifecycleMetricsSnapshot>,
     pub(crate) pipeline_histograms: Option<&'a PipelineHistogramsSnapshot>,
     pub(crate) db_runtime: Option<&'a DbRuntimeMetricsSnapshot>,
+    // `None` for every engine but a SQLite file database.
+    pub(crate) wal_checkpoint: Option<&'a WalCheckpointMetricsSnapshot>,
     pub(crate) process: Option<&'a ProcessMetricsSnapshot>,
     pub(crate) disk_space: &'a [DiskSpaceSnapshot],
     pub(crate) http_metrics: Option<&'a HttpMetricsSnapshot>,
-    // The article buffer pool's occupancy. Absent in the render tests that
-    // build no pool.
-    pub(crate) buffer_pool: Option<&'a weaver_server_core::runtime::buffers::BufferPoolMetrics>,
 }
 
 impl<'a> PrometheusRenderInput<'a> {
@@ -140,7 +140,7 @@ impl<'a> PrometheusRenderInput<'a> {
             job_lifecycle: None,
             pipeline_histograms: None,
             db_runtime: None,
-            buffer_pool: None,
+            wal_checkpoint: None,
             process: None,
             disk_space: &[],
             http_metrics: None,
@@ -197,10 +197,10 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         job_lifecycle,
         pipeline_histograms,
         db_runtime,
+        wal_checkpoint,
         process,
         disk_space,
         http_metrics,
-        buffer_pool,
     } = *input;
 
     let mut out = Encoder::new();
@@ -273,8 +273,8 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
     if let Some(db) = db_runtime {
         render_db_runtime(&mut out, db);
     }
-    if let Some(pool) = buffer_pool {
-        render_buffer_pool(&mut out, pool);
+    if let Some(wal) = wal_checkpoint {
+        render_wal_checkpoint(&mut out, wal);
     }
     if let Some(process) = process {
         render_process(&mut out, process, start_time_seconds);
@@ -1485,50 +1485,20 @@ fn render_db_runtime(out: &mut Encoder, db: &DbRuntimeMetricsSnapshot) {
     );
 }
 
-// The pre-allocated article buffer pool, in bytes rather than in buffers.
-//
-// Bytes, because the question this answers is how much of the process's
-// resident set the pool accounts for; the tiers have different buffer sizes,
-// so a count of buffers does not add up to anything.
-fn render_buffer_pool(
-    out: &mut Encoder,
-    pool: &weaver_server_core::runtime::buffers::BufferPoolMetrics,
-) {
-    use weaver_server_core::runtime::buffers::BufferTier;
-
-    for (tier, label, in_use, total) in [
-        (
-            BufferTier::Small,
-            "small",
-            pool.small_in_use,
-            pool.small_total,
-        ),
-        (
-            BufferTier::Medium,
-            "medium",
-            pool.medium_in_use,
-            pool.medium_total,
-        ),
-        (
-            BufferTier::Large,
-            "large",
-            pool.large_in_use,
-            pool.large_total,
-        ),
-    ] {
-        let size = tier.size_bytes();
-        out.sample(
-            &f::BUFFER_POOL_IN_USE_BYTES,
-            &[("tier", label)],
-            in_use.saturating_mul(size),
-        );
-        out.sample(
-            &f::BUFFER_POOL_TOTAL_BYTES,
-            &[("tier", label)],
-            total.saturating_mul(size),
-        );
-    }
-    out.sample(&f::BUFFER_POOL_WAITS, &[], pool.wait_count);
+fn render_wal_checkpoint(out: &mut Encoder, wal: &WalCheckpointMetricsSnapshot) {
+    out.sample(&f::DB_WAL_CHECKPOINT_PASSES, &[], wal.passes);
+    out.sample(
+        &f::DB_WAL_CHECKPOINT_PASSES_INCOMPLETE,
+        &[],
+        wal.passes_left_behind,
+    );
+    out.sample(&f::DB_WAL_CHECKPOINT_BUSY, &[], wal.busy_passes);
+    out.sample(&f::DB_WAL_RESTARTS, &[], wal.restarts);
+    render_histogram(out, &f::DB_WAL_CHECKPOINT_DURATION, &[], &wal.duration);
+    out.sample(&f::DB_WAL_LOG_FRAMES, &[], wal.log_frames);
+    out.sample(&f::DB_WAL_CHECKPOINTED_FRAMES, &[], wal.checkpointed_frames);
+    out.sample(&f::DB_WAL_CHECKPOINT_COPIED_FRAMES, &[], wal.copied_frames);
+    out.sample(&f::DB_WAL_BYTES, &[], wal.wal_bytes);
 }
 
 // Standard `process_*` collector series.

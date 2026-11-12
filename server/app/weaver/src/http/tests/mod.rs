@@ -213,7 +213,6 @@ fn test_config() -> SharedConfig {
         hardware_profile: None,
         intermediate_dir: None,
         complete_dir: None,
-        buffer_pool: None,
         servers: vec![],
         categories: vec![],
         retry: None,
@@ -1370,6 +1369,20 @@ fn sample_db_runtime() -> instr::DbRuntimeMetricsSnapshot {
     }
 }
 
+fn sample_wal_checkpoint() -> weaver_server_core::persistence::WalCheckpointMetricsSnapshot {
+    weaver_server_core::persistence::WalCheckpointMetricsSnapshot {
+        passes: 31,
+        passes_left_behind: 12,
+        busy_passes: 3,
+        restarts: 17,
+        duration: sample_histogram(),
+        log_frames: 785,
+        checkpointed_frames: 19,
+        copied_frames: 0,
+        wal_bytes: 3_218_032,
+    }
+}
+
 fn sample_process_metrics() -> instr::ProcessMetricsSnapshot {
     instr::ProcessMetricsSnapshot {
         cpu_seconds_total: Some(12.5),
@@ -1427,10 +1440,10 @@ struct CollectionFixtures {
     job_lifecycle: instr::JobLifecycleMetricsSnapshot,
     pipeline_histograms: instr::PipelineHistogramsSnapshot,
     db_runtime: instr::DbRuntimeMetricsSnapshot,
+    wal_checkpoint: weaver_server_core::persistence::WalCheckpointMetricsSnapshot,
     process: instr::ProcessMetricsSnapshot,
     disk_space: Vec<instr::DiskSpaceSnapshot>,
     http_metrics: instr::HttpMetricsSnapshot,
-    buffer_pool: weaver_server_core::runtime::buffers::BufferPoolMetrics,
 }
 
 impl CollectionFixtures {
@@ -1440,18 +1453,10 @@ impl CollectionFixtures {
             job_lifecycle: sample_job_lifecycle(),
             pipeline_histograms: sample_pipeline_histograms(),
             db_runtime: sample_db_runtime(),
+            wal_checkpoint: sample_wal_checkpoint(),
             process: sample_process_metrics(),
             disk_space: sample_disk_space(),
             http_metrics: sample_http_metrics(),
-            buffer_pool: weaver_server_core::runtime::buffers::BufferPoolMetrics {
-                small_in_use: 2,
-                small_total: 8,
-                medium_in_use: 1,
-                medium_total: 4,
-                large_in_use: 0,
-                large_total: 2,
-                wait_count: 9,
-            },
         }
     }
 
@@ -1462,10 +1467,10 @@ impl CollectionFixtures {
         input.job_lifecycle = Some(&self.job_lifecycle);
         input.pipeline_histograms = Some(&self.pipeline_histograms);
         input.db_runtime = Some(&self.db_runtime);
+        input.wal_checkpoint = Some(&self.wal_checkpoint);
         input.process = Some(&self.process);
         input.disk_space = &self.disk_space;
         input.http_metrics = Some(&self.http_metrics);
-        input.buffer_pool = Some(&self.buffer_pool);
     }
 }
 

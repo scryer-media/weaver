@@ -41,7 +41,7 @@ use crate::fused_yenc::{
 use crate::pool::{BlockingConnectionPermit, ServerId};
 use crate::response::parse_response;
 use crate::tls::{
-    NntpTlsBackend, RustlsSession, TLS_READ_BUFFER, TlsCipherPreference, TransportReadStats,
+    NntpTlsBackend, RustlsSession, TLS_RECORD_PLAINTEXT, TlsCipherPreference, TransportReadStats,
     build_tls_config_with_name_mismatch_certificate, make_server_name,
     selected_blocking_tls_backend, tls_backend_for_preference,
 };
@@ -203,7 +203,6 @@ pub struct BlockingNntpConnection {
     transport: BlockingTransport,
     codec: NntpCodec,
     read_buf: BytesMut,
-    read_scratch: Vec<u8>,
     buffer_profile: NntpBufferProfile,
     capabilities: Capabilities,
     // The configured endpoint, kept so a requirement learned here is
@@ -463,6 +462,16 @@ impl BlockingBodyLane {
             return idle >= Duration::from_secs(30);
         }
         !self.conn.read_buf.is_empty() || self.conn.transport.idle_terminal()
+    }
+
+    // Free the read buffers of a lane that is waiting for work, keeping the
+    // connection open. The next read allocates them again at their normal
+    // size. Does nothing while a response is owed or unread bytes are held.
+    pub fn release_idle_buffers(&mut self) {
+        if !self.ring.outstanding.is_empty() || self.conn.bodies_outstanding() {
+            return;
+        }
+        self.conn.release_idle_buffers();
     }
 
     pub fn socket_id(&self) -> u64 {
@@ -1277,7 +1286,7 @@ impl BlockingNntpConnection {
             BlockingTransport::Plain(tcp)
         };
 
-        let read_buf_capacity = config.buffer_profile.read_buf_capacity.max(64 * 1024);
+        let read_buf_capacity = config.buffer_profile.read_buf_capacity;
         let mut conn = Self {
             route_path: None,
             egress_control: None,
@@ -1285,7 +1294,6 @@ impl BlockingNntpConnection {
             transport,
             codec: NntpCodec::new(),
             read_buf: BytesMut::with_capacity(read_buf_capacity),
-            read_scratch: vec![0; config.buffer_profile.socket_read_size.max(64 * 1024)],
             buffer_profile: config.buffer_profile,
             capabilities: match config.pipelining {
                 crate::connection::PipeliningCapability::Probe => Capabilities::default(),
@@ -2422,22 +2430,31 @@ impl BlockingNntpConnection {
         self.read_into_buffer_with_stats_timeout(self.command_timeout)
     }
 
+    // Free the read buffers while nothing is waiting in them. A buffer
+    // holding unread bytes is kept.
+    fn release_idle_buffers(&mut self) {
+        if !self.read_buf.is_empty() {
+            return;
+        }
+        self.read_buf = BytesMut::new();
+        if let BlockingTransport::Rustls(inner) = &mut self.transport {
+            inner.read_buffer = Vec::new();
+        }
+    }
+
     fn read_into_buffer_with_stats_timeout(
         &mut self,
         timeout: Duration,
     ) -> Result<(usize, TransportReadStats)> {
-        let socket_read_size = self.buffer_profile.socket_read_size.max(64 * 1024);
-        if self.read_scratch.len() < socket_read_size {
-            self.read_scratch.resize(socket_read_size, 0);
+        // Freed while the lane waited for work: take the normal size back
+        // before the first read rather than growing into it.
+        if self.read_buf.capacity() == 0 {
+            self.read_buf.reserve(self.buffer_profile.read_buf_capacity);
         }
+        let socket_read_size = self.buffer_profile.socket_read_size;
         let (n, stats) = self
             .transport
-            .read_into_buf(
-                &mut self.read_buf,
-                &mut self.read_scratch,
-                socket_read_size,
-                timeout,
-            )
+            .read_into_buf(&mut self.read_buf, socket_read_size, timeout)
             .map_err(|error| {
                 if let Some(outcome) = &self.route_outcome {
                     outcome.failed();
@@ -2446,6 +2463,8 @@ impl BlockingNntpConnection {
                 self.current_group = None;
                 NntpError::Io(error)
             })?;
+        #[cfg(test)]
+        read_probe::transport_read(n, self.read_buf.len(), self.read_buf.capacity());
         if n == 0 {
             if let Some(outcome) = &self.route_outcome {
                 outcome.failed();
@@ -2487,6 +2506,11 @@ impl BlockingTransport {
                 }
                 let mut plaintext = BytesMut::new();
                 let mut remaining = 64 * 1024;
+                // An idle lane may have freed its read buffer; a zero-length
+                // read would look like the peer closing.
+                if inner.read_buffer.is_empty() {
+                    inner.read_buffer.resize(TLS_RECORD_PLAINTEXT, 0);
+                }
                 let closed = loop {
                     if inner.session.idle_terminal() {
                         break true;
@@ -2543,16 +2567,16 @@ impl BlockingTransport {
     fn read_into_buf(
         &mut self,
         dst: &mut BytesMut,
-        scratch: &mut [u8],
         target_read_size: usize,
         timeout: Duration,
     ) -> io::Result<(usize, TransportReadStats)> {
         match self {
             BlockingTransport::Plain(tcp) => {
                 tcp.set_read_timeout(Some(timeout))?;
-                let read_size = target_read_size.min(scratch.len()).max(1);
-                let n = tcp.read(&mut scratch[..read_size])?;
-                dst.extend_from_slice(&scratch[..n]);
+                // Straight into the connection's buffer: no staging copy.
+                let n = tcp.read_into(dst, target_read_size)?;
+                #[cfg(test)]
+                read_probe::socket_read(n, 0);
                 Ok((
                     n,
                     TransportReadStats {
@@ -2630,7 +2654,9 @@ impl BlockingManualTlsStream {
         let mut stream = Self {
             tcp,
             session,
-            read_buffer: vec![0u8; TLS_READ_BUFFER],
+            // One record's worth for the handshake; the first read sizes it
+            // to the profile.
+            read_buffer: vec![0u8; TLS_RECORD_PLAINTEXT],
             stats: BlockingLaneStats::default(),
         };
         stream.complete_handshake().map_err(NntpError::Io)?;
@@ -2681,14 +2707,21 @@ impl BlockingManualTlsStream {
         }
 
         self.tcp.set_read_timeout(Some(timeout))?;
-        let read_size = target_read_size.max(TLS_READ_BUFFER);
+        let read_size = target_read_size.max(1);
         if self.read_buffer.len() < read_size {
             self.read_buffer.resize(read_size, 0);
         }
+        // Room for everything one read can decrypt before reading: the read
+        // itself, a record held over from the last read, and one drain chunk
+        // of slack. Without it the drain's chunked reserves meet a nearly full
+        // buffer mid-read and double it.
+        dst.reserve(read_size + 2 * TLS_RECORD_PLAINTEXT);
 
         let started = Instant::now();
         loop {
             let n = self.tcp.read(&mut self.read_buffer[..read_size])?;
+            #[cfg(test)]
+            read_probe::socket_read(n, self.read_buffer.len());
             self.stats.socket_reads += 1;
             stats.try_read_calls += 1;
             if n == 0 {
@@ -2917,6 +2950,10 @@ impl BlockingS2nStream {
             };
             if n > 0 {
                 let n = n as usize;
+                // s2n reads the socket itself; this is what one receive
+                // call handed back.
+                #[cfg(test)]
+                read_probe::socket_read(n, 0);
                 unsafe { dst.advance_mut(n) };
                 total += n;
                 self.stats.tls_recv_calls += 1;
@@ -3346,6 +3383,63 @@ fn is_connection_error(err: &NntpError) -> bool {
             | NntpError::AccessDenied
             | NntpError::SoftTimeout(_)
     )
+}
+
+// Test-only record of how a connection uses its read buffers, for the
+// measurement in `tests::socket_use`. Off unless a test turns it on, and kept
+// per thread so recording never contends between lanes.
+#[cfg(test)]
+pub(crate) mod read_probe {
+    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    pub(crate) static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    #[derive(Debug, Default, Clone)]
+    pub(crate) struct Samples {
+        // Bytes each transport read added to `read_buf`.
+        pub(crate) added: Vec<u32>,
+        // Bytes each socket read returned, where this crate makes the read.
+        pub(crate) socket: Vec<u32>,
+        pub(crate) read_buf_len_max: usize,
+        pub(crate) read_buf_capacity_max: usize,
+        pub(crate) transport_buffer_max: usize,
+    }
+
+    thread_local! {
+        static SAMPLES: RefCell<Samples> = RefCell::new(Samples::default());
+    }
+
+    fn enabled() -> bool {
+        ENABLED.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn transport_read(added: usize, read_buf_len: usize, read_buf_capacity: usize) {
+        if !enabled() {
+            return;
+        }
+        SAMPLES.with(|samples| {
+            let mut samples = samples.borrow_mut();
+            samples.added.push(added as u32);
+            samples.read_buf_len_max = samples.read_buf_len_max.max(read_buf_len);
+            samples.read_buf_capacity_max = samples.read_buf_capacity_max.max(read_buf_capacity);
+        });
+    }
+
+    pub(crate) fn socket_read(bytes: usize, transport_buffer: usize) {
+        if !enabled() {
+            return;
+        }
+        SAMPLES.with(|samples| {
+            let mut samples = samples.borrow_mut();
+            samples.socket.push(bytes as u32);
+            samples.transport_buffer_max = samples.transport_buffer_max.max(transport_buffer);
+        });
+    }
+
+    pub(crate) fn take() -> Samples {
+        SAMPLES.with(|samples| std::mem::take(&mut *samples.borrow_mut()))
+    }
 }
 
 #[cfg(test)]

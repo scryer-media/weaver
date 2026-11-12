@@ -347,6 +347,34 @@ pub struct FileSpec {
     pub segments: Vec<SegmentSpec>,
 }
 
+impl FileSpec {
+    // The segment with `ordinal`. Ingest gives each segment its index as its
+    // ordinal, so the index is tried first, then a binary search over the
+    // sorted list, then a scan for a list that is not sorted.
+    pub fn segment(&self, ordinal: u32) -> Option<&SegmentSpec> {
+        segment_position(&self.segments, ordinal).map(|index| &self.segments[index])
+    }
+
+    pub fn segment_mut(&mut self, ordinal: u32) -> Option<&mut SegmentSpec> {
+        segment_position(&self.segments, ordinal).map(|index| &mut self.segments[index])
+    }
+}
+
+fn segment_position(segments: &[SegmentSpec], ordinal: u32) -> Option<usize> {
+    if segments
+        .get(ordinal as usize)
+        .is_some_and(|segment| segment.ordinal == ordinal)
+    {
+        return Some(ordinal as usize);
+    }
+    if let Ok(index) = segments.binary_search_by_key(&ordinal, |segment| segment.ordinal) {
+        return Some(index);
+    }
+    segments
+        .iter()
+        .position(|segment| segment.ordinal == ordinal)
+}
+
 // Specification for a single segment to download.
 #[derive(Clone)]
 pub struct SegmentSpec {
@@ -1107,6 +1135,56 @@ pub fn epoch_ms_now() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn file_with_ordinals(ordinals: &[u32]) -> FileSpec {
+        FileSpec {
+            filename: "file.bin".to_string(),
+            role: FileRole::from_filename("file.bin"),
+            groups: Vec::new(),
+            posted_at_epoch: None,
+            segments: ordinals
+                .iter()
+                .map(|&ordinal| SegmentSpec {
+                    ordinal,
+                    article_number: ordinal + 1,
+                    bytes: ordinal * 10,
+                    message_ids: MessageIds::new(vec![format!("id-{ordinal}")]),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn segment_lookup_matches_a_scan_by_ordinal() {
+        let layouts: [&[u32]; 6] = [
+            &[0, 1, 2, 3, 4, 5],
+            &[0, 2, 3, 7, 9],
+            &[1, 2, 3],
+            &[5, 3, 0, 4, 1],
+            &[],
+            &[4],
+        ];
+        for ordinals in layouts {
+            let mut file = file_with_ordinals(ordinals);
+            for ordinal in 0..12 {
+                let scanned = file
+                    .segments
+                    .iter()
+                    .find(|segment| segment.ordinal == ordinal)
+                    .map(|segment| segment.bytes);
+                assert_eq!(
+                    file.segment(ordinal).map(|segment| segment.bytes),
+                    scanned,
+                    "ordinals {ordinals:?}, lookup {ordinal}"
+                );
+                assert_eq!(
+                    file.segment_mut(ordinal).map(|segment| segment.bytes),
+                    scanned,
+                    "ordinals {ordinals:?}, mutable lookup {ordinal}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn persisted_status_parser_supports_moving() {

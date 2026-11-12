@@ -9,7 +9,6 @@ pub async fn idle_pipeline(
     db: crate::Database,
     config: crate::settings::SharedConfig,
 ) -> (Pipeline, crate::SchedulerHandle, crate::SharedPipelineState) {
-    use crate::runtime::buffers::BufferPoolConfig;
     use crate::runtime::system_profile::{
         CpuProfile, DiskProfile, FilesystemType, MemoryProfile, SimdSupport, StorageClass,
     };
@@ -36,11 +35,7 @@ pub async fn idle_pipeline(
             max_retries_per_server: 1,
             soft_timeout: Duration::from_secs(15),
         }),
-        BufferPool::new(BufferPoolConfig {
-            small_count: 8,
-            medium_count: 4,
-            large_count: 2,
-        }),
+        16 * 1024 * 1024,
         SystemProfile {
             cpu: CpuProfile {
                 physical_cores: 4,
@@ -144,5 +139,25 @@ pub(crate) fn admission_resources(
         db,
         intermediate_dir: root.join("intermediate"),
         complete_dir: root.join("complete"),
+        config: Arc::new(tokio::sync::RwLock::new(crate::settings::Config {
+            data_dir: root.display().to_string(),
+            hardware_profile: None,
+            intermediate_dir: None,
+            complete_dir: None,
+            servers: vec![],
+            categories: vec![],
+            retry: None,
+            max_download_speed: None,
+            propagation_delay_secs: None,
+            max_concurrent_nzbs: None,
+            cleanup_after_extract: None,
+            delete_failed_job_files: None,
+            watch_folder: Default::default(),
+            duplicate_policy: Default::default(),
+            direct_store: None,
+            delivery_naming: None,
+            metrics: Default::default(),
+            config_path: None,
+        })),
     }
 }

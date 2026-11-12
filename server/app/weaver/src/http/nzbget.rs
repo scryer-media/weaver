@@ -2163,19 +2163,13 @@ async fn history(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Val
     let is_hidden = |job_id: u64| facade_states.get(&job_id).is_some_and(|state| state.hidden);
     let db = ctx.db.clone();
     let history_job_ids = rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
-    let post_processing_results = tokio::task::spawn_blocking(move || {
-        let mut results = HashMap::new();
-        for job_id in history_job_ids {
-            let scripts = db.job_post_processing_results(job_id)?;
-            if !scripts.is_empty() {
-                results.insert(job_id, scripts);
-            }
-        }
-        Ok::<_, weaver_server_core::StateError>(results)
-    })
-    .await
-    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
-    .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?;
+    let post_processing_results =
+        tokio::task::spawn_blocking(move || db.job_post_processing_results_many(&history_job_ids))
+            .await
+            .map_err(|error| RpcError::invalid_parameter(format!("history unavailable: {error}")))?
+            .map_err(|error| {
+                RpcError::invalid_parameter(format!("history unavailable: {error}"))
+            })?;
     let ids: Vec<u64> = terminal_items
         .iter()
         .map(|(item, _, _)| item.id)
@@ -3892,11 +3886,15 @@ fn job_events_to_log_entries(
     entries
 }
 
+// The most entries one `log` call returns.
+const LOG_ENTRIES_MAX_LIMIT: usize = 1000;
+
 // Global message log assembled from the event tails of current queue jobs.
 async fn log_entries(ctx: &NzbgetFacadeContext, params: Option<Value>) -> Result<Value, RpcError> {
     let params = positional_params(params)?;
     let id_from = optional_i64_param(&params, 0)?.unwrap_or(0).max(0) as u64;
-    let limit = optional_i64_param(&params, 1)?.unwrap_or(0).max(0) as usize;
+    let limit =
+        (optional_i64_param(&params, 1)?.unwrap_or(0).max(0) as usize).min(LOG_ENTRIES_MAX_LIMIT);
 
     let history = ctx.queue.history_rows();
     let ids: Vec<u64> = ctx.queue.read_queue(|inner| {

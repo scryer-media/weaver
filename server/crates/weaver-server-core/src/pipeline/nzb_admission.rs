@@ -9,8 +9,8 @@ pub(crate) const NZB_SLOT_WAIT_REASON: &str = "nzb_slot";
 // One queue row as the admission pass sees it, copied out under the read lock.
 struct AdmissionRow {
     id: JobId,
-    position: usize,
-    priority: u8,
+    // Where the row stands in dispatch order.
+    key: crate::pipeline::queue::order::DispatchKey,
     paused: bool,
     // The row still carries an intake, a restore or a resume for the actor,
     // or its job is installed and waits for a slot to download.
@@ -54,25 +54,12 @@ impl QueueWalkMark {
     }
 }
 
-// A job's priority from its metadata: high 0, normal 1, low 2.
-pub(crate) fn metadata_priority(metadata: &[(String, String)]) -> u8 {
-    metadata
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case("priority"))
-        .map_or(1, |(_, value)| {
-            if value.eq_ignore_ascii_case("high") {
-                0
-            } else if value.eq_ignore_ascii_case("low") {
-                2
-            } else {
-                1
-            }
-        })
-}
-
 impl Pipeline {
     // Whether the row's job counts as paused for its slot.
-    fn admission_paused(&self, row: &crate::pipeline::queue::JobRow) -> bool {
+    pub(in crate::pipeline) fn admission_paused(
+        &self,
+        row: &crate::pipeline::queue::JobRow,
+    ) -> bool {
         row.intents.paused.unwrap_or_else(|| {
             row.admission
                 .as_ref()
@@ -101,16 +88,9 @@ impl Pipeline {
             || row.intents.paused == Some(false)
             || self.jobs.contains_key(&row.id)
             || self.window_parked(row.id);
-        // Only a pending edit can move the priority off the reported metadata.
-        let priority = if row.intents.update.is_some() {
-            metadata_priority(&row.info(globals).metadata)
-        } else {
-            metadata_priority(&row.report.job.metadata)
-        };
         AdmissionRow {
             id: row.id,
-            position,
-            priority,
+            key: crate::pipeline::queue::order::DispatchKey::of_row(row, position, globals),
             paused: self.admission_paused(row),
             pending,
             cancelled_or_retiring: row.intents.cancelled.is_some() || row.report.retiring,
@@ -126,6 +106,7 @@ impl Pipeline {
     // and restates each row's slot, runs when `walk` asks for it or a slot
     // was released this turn. Returns whether it walked.
     pub(crate) fn reconcile_nzb_admission(&mut self, walk: bool) -> bool {
+        self.recheck_retired_busy();
         // A crash between accepting pause and draining work must not turn
         // the interrupted pause into an automatic resume.
         if !self.nzb_pause_releases.is_empty() {
@@ -223,12 +204,10 @@ impl Pipeline {
         for id in retired {
             if self.nzb_work_in_flight(id) {
                 // Looked at again once its work drains.
-                self.queue_walk_due = true;
+                self.nzb_retired_busy.insert(id);
                 continue;
             }
-            self.nzb_seen.remove(&id);
-            self.nzb_pause_releases.remove(&id);
-            self.nzb_reprocess_pending.remove(&id);
+            self.forget_retired(id);
         }
         // A history retry can replace a canceled, unadmitted paused job
         // before this actor sees the old row disappear.
@@ -251,13 +230,16 @@ impl Pipeline {
                     && !self.nzb_admitted.contains(&row.id)
                     && !self.nzb_admitting.contains(&row.id)
             })
-            .map(|row| (row.priority, row.position, row.id))
+            .map(|row| row.key)
             .collect();
         drop(rows);
         candidates.sort_unstable();
         let propagating: HashSet<_> = candidates
             .iter()
-            .filter_map(|(_, _, id)| self.propagation_hold_until(*id).map(|_| *id))
+            .filter_map(|key| {
+                self.propagation_hold_until(key.job_id())
+                    .map(|_| key.job_id())
+            })
             .collect();
         // A hold that ran out on a job that is not a candidate, such as a
         // paused one, holds nothing. It goes once seen, so it never calls for
@@ -272,7 +254,7 @@ impl Pipeline {
         for id in expired {
             self.propagation_hold_until(id);
         }
-        for (_, _, id) in candidates {
+        for id in candidates.into_iter().map(|key| key.job_id()) {
             // A settings edit or global hold can arrive while the previous
             // acquisition awaits its durable commit. Re-read before admitting
             // the next job rather than using the pass's earlier snapshot.
@@ -313,6 +295,36 @@ impl Pipeline {
             }
         });
         true
+    }
+
+    fn forget_retired(&mut self, id: JobId) {
+        self.nzb_retired_busy.remove(&id);
+        self.nzb_seen.remove(&id);
+        self.nzb_pause_releases.remove(&id);
+        self.nzb_reprocess_pending.remove(&id);
+    }
+
+    // The retired ids whose work was in flight: one that came back to the
+    // queue or took a slot is no longer retired, and one whose work drained
+    // is forgotten, as the walk would have.
+    fn recheck_retired_busy(&mut self) {
+        if self.nzb_retired_busy.is_empty() {
+            return;
+        }
+        let busy: Vec<JobId> = self.nzb_retired_busy.iter().copied().collect();
+        let present: HashSet<JobId> = self.shared_state.queue.read(|inner| {
+            busy.iter()
+                .copied()
+                .filter(|id| inner.contains_job(*id))
+                .collect()
+        });
+        for id in busy {
+            if present.contains(&id) || self.nzb_admitted.contains(&id) {
+                self.nzb_retired_busy.remove(&id);
+            } else if !self.nzb_work_in_flight(id) {
+                self.forget_retired(id);
+            }
+        }
     }
 
     // The wait reason a queue row stores, the one answer every writer of the
@@ -445,6 +457,10 @@ impl Pipeline {
     }
 
     pub(crate) fn nzb_work_in_flight(&self, id: JobId) -> bool {
+        #[cfg(test)]
+        if self.job_has_queued_decode(id) {
+            return true;
+        }
         self.download_lane_owners.values().any(|lane| {
             lane.outstanding
                 .keys()
@@ -453,10 +469,6 @@ impl Pipeline {
             .active_decodes_by_job
             .get(&id)
             .is_some_and(|count| *count > 0)
-            || self
-                .pending_decode
-                .iter()
-                .any(|work| work.segment_id.file_id.job_id == id)
             || self
                 .pending_released_download_results_by_job
                 .get(&id)

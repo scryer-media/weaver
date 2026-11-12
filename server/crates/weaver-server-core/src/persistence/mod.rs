@@ -24,3 +24,4 @@ pub use setup::{
     bootstrap_encryption, finish_open_db_and_config, open_database, open_db_and_config,
     resolve_database_paths,
 };
+pub use wal_checkpoint::WalCheckpointMetricsSnapshot;

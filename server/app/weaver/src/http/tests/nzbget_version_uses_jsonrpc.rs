@@ -2989,6 +2989,48 @@ async fn nzbget_log_and_loadlog_expose_job_events() {
 }
 
 #[tokio::test]
+async fn nzbget_log_returns_at_most_its_cap_newest_entries() {
+    let db = Database::open_in_memory().unwrap();
+    let events: Vec<weaver_server_core::history::timeline::JobEvent> = (0..1_005)
+        .map(|n| weaver_server_core::JobEvent {
+            job_id: 42,
+            timestamp: 1_700_000_000 + n,
+            kind: "JobCreated".into(),
+            message: format!("event {n}"),
+            file_id: None,
+        })
+        .collect();
+    db.insert_job_events(&events).unwrap();
+    let job = nzbget_test_job(
+        42,
+        JobStatus::Downloading,
+        weaver_server_core::DownloadState::Downloading,
+        100,
+        10,
+        vec![],
+    );
+    let handle = scheduler_handle_with_jobs(vec![job]).await;
+    let app = nzbget_test_router(db, handle, test_config(), ApiKeyCache::default());
+
+    let (status, payload) = post_nzbget(
+        app,
+        serde_json::json!({"method": "log", "params": [0, 5_000], "id": "log"}),
+        "Bearer session-token",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let entries = payload["result"].as_array().unwrap();
+    assert_eq!(entries.len(), 1000);
+    assert!(entries[0]["Text"].as_str().unwrap().ends_with("event 5"));
+    assert!(
+        entries[999]["Text"]
+            .as_str()
+            .unwrap()
+            .ends_with("event 1004")
+    );
+}
+
+#[tokio::test]
 async fn nzbget_appendurl_validates_url_and_shape() {
     let db = Database::open_in_memory().unwrap();
     let handle = scheduler_handle_with_jobs(vec![]).await;

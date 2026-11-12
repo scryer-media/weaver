@@ -266,20 +266,14 @@ impl Pipeline {
             self.nzb_admitted
                 .iter()
                 .filter_map(|job_id| {
-                    let position = match inner.job_position(*job_id) {
-                        Some(position) => {
-                            let row = &inner.jobs[position];
-                            if row.intents.cancelled.is_some() || row.intents.paused == Some(true) {
-                                return None;
-                            }
-                            position
-                        }
-                        // A job installed without a queue row ranks after
-                        // every row, in install order.
-                        None => {
-                            inner.jobs.len() + self.job_order.iter().position(|id| id == job_id)?
-                        }
-                    };
+                    if let Some(row) = inner.job(*job_id)
+                        && (row.intents.cancelled.is_some() || row.intents.paused == Some(true))
+                    {
+                        return None;
+                    }
+                    // A job installed without a queue row ranks after every
+                    // row, in install order.
+                    let position = inner.dispatch_position(*job_id, &self.job_order)?;
                     Some((*job_id, position))
                 })
                 .collect()
@@ -291,11 +285,15 @@ impl Pipeline {
                 if !Self::has_dispatchable_work(state) || self.held_for_added_scripts(job_id) {
                     return None;
                 }
-                Some((Self::job_dispatch_priority(state), position, job_id))
+                Some(crate::pipeline::queue::order::DispatchKey::new(
+                    Self::job_dispatch_priority(state),
+                    position,
+                    job_id,
+                ))
             })
             .collect::<Vec<_>>();
         eligible.sort_unstable();
-        eligible.into_iter().map(|(_, _, job_id)| job_id).collect()
+        eligible.into_iter().map(|key| key.job_id()).collect()
     }
 
     // How many of one job's articles a single lane may hold at once.
@@ -479,11 +477,20 @@ impl Pipeline {
                 .articles
                 .download_queue_mut()
                 .and_then(|queue| queue.pop_first_matching(|work| filter.allows(work)));
-            let Some(work) = popped else {
+            let Some(item) = popped else {
                 self.metrics
                     .download_scheduler_scan_no_match_total
                     .fetch_add(1, Ordering::Relaxed);
                 break;
+            };
+            let segment_id = item.segment_id;
+            let Some(work) = item.into_work(&state.spec) else {
+                // The job's queue only holds parts of its own article list.
+                error!(
+                    segment = %segment_id,
+                    "queued article is not in its job's article list; dropping it"
+                );
+                continue;
             };
             filter.note_taken(&work);
             taken.push(work);

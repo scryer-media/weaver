@@ -1276,6 +1276,20 @@ impl Database {
         self.sql_worker.runtime_metrics().snapshot()
     }
 
+    // What the WAL checkpoint task's passes did; `None` for every engine but
+    // a SQLite file database. Read at scrape time: atomic loads plus one
+    // `Vec` for the histogram buckets.
+    pub fn wal_checkpoint_metrics_snapshot(
+        &self,
+    ) -> Option<crate::persistence::WalCheckpointMetricsSnapshot> {
+        match self.datastore() {
+            StoreDatastore::Sqlite { writer_gate, .. } => writer_gate
+                .wal()
+                .map(crate::persistence::wal_checkpoint::WalSignal::metrics_snapshot),
+            StoreDatastore::Postgres { .. } => None,
+        }
+    }
+
     // Open (or create) the database at `path`.
     // Runs schema migrations and configures SQLite pragmas.
     pub fn open(path: &Path) -> Result<Self, StateError> {
@@ -2223,6 +2237,139 @@ impl Database {
             Ok(())
         })
     }
+
+    // The sizes of a SQLite database's files, `None` on another engine. It
+    // touches no executor and no connection, only file metadata, so it
+    // answers while the database itself is stalled. It blocks on the file
+    // system, so it is called off the async runtime. Paths stay here; only
+    // sizes leave.
+    pub fn sqlite_file_sizes(&self) -> Option<SqliteFileSizes> {
+        if !matches!(self.datastore(), StoreDatastore::Sqlite { .. }) {
+            return None;
+        }
+        Some(match self.target.sqlite_path() {
+            Ok(Some(path)) => {
+                let sibling = |suffix: &str| {
+                    let mut name = path.clone().into_os_string();
+                    name.push(suffix);
+                    std::path::PathBuf::from(name)
+                };
+                SqliteFileSizes {
+                    database_file: SqliteFileSize::of(&path),
+                    wal_file: SqliteFileSize::of(&sibling("-wal")),
+                    shm_file: SqliteFileSize::of(&sibling("-shm")),
+                }
+            }
+            Ok(None) => SqliteFileSizes {
+                database_file: SqliteFileSize::Absent,
+                wal_file: SqliteFileSize::Absent,
+                shm_file: SqliteFileSize::Absent,
+            },
+            Err(error) => {
+                let error = error.to_string();
+                SqliteFileSizes {
+                    database_file: SqliteFileSize::Unreadable(error.clone()),
+                    wal_file: SqliteFileSize::Unreadable(error.clone()),
+                    shm_file: SqliteFileSize::Unreadable(error),
+                }
+            }
+        })
+    }
+
+    // How a SQLite database's pages are laid out, and its journal mode.
+    // `None` on another engine. The pragmas only read and run on the read
+    // executor (no writer gate, no checkpoint), and each value is read on its
+    // own, so one that fails leaves the others. It waits behind whatever the
+    // read executor is doing, so a caller that must not stall bounds its wait.
+    pub fn sqlite_page_facts(&self) -> Option<SqlitePageFacts> {
+        let datastore = self.datastore();
+        if !matches!(datastore, StoreDatastore::Sqlite { .. }) {
+            return None;
+        }
+        let pragmas = self.run_sql_blocking_read(async move {
+            Ok(SqlitePageFacts {
+                page_size: sqlite_pragma_u64(&datastore, "PRAGMA page_size").await,
+                page_count: sqlite_pragma_u64(&datastore, "PRAGMA page_count").await,
+                freelist_count: sqlite_pragma_u64(&datastore, "PRAGMA freelist_count").await,
+                journal_mode: sqlite_pragma_journal_mode(&datastore).await,
+            })
+        });
+        Some(pragmas.unwrap_or_else(|error| {
+            let error = error.to_string();
+            SqlitePageFacts {
+                page_size: Err(error.clone()),
+                page_count: Err(error.clone()),
+                freelist_count: Err(error.clone()),
+                journal_mode: Err(error),
+            }
+        }))
+    }
+}
+
+// The sizes of a SQLite database's files; see `Database::sqlite_file_sizes`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqliteFileSizes {
+    pub database_file: SqliteFileSize,
+    pub wal_file: SqliteFileSize,
+    pub shm_file: SqliteFileSize,
+}
+
+// A SQLite database's page layout; see `Database::sqlite_page_facts`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SqlitePageFacts {
+    pub page_size: Result<u64, String>,
+    pub page_count: Result<u64, String>,
+    pub freelist_count: Result<u64, String>,
+    pub journal_mode: Result<String, String>,
+}
+
+// The size of one of a SQLite database's files. A `-wal` or `-shm` file is
+// absent whenever SQLite has none open, which is not a failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SqliteFileSize {
+    Present(u64),
+    Absent,
+    Unreadable(String),
+}
+
+impl SqliteFileSize {
+    fn of(path: &Path) -> Self {
+        match std::fs::metadata(path) {
+            Ok(metadata) => Self::Present(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Self::Absent,
+            Err(error) => Self::Unreadable(error.to_string()),
+        }
+    }
+}
+
+async fn sqlite_pragma_u64(
+    datastore: &StoreDatastore,
+    pragma: &'static str,
+) -> Result<u64, String> {
+    let row = crate::persistence::sql_runtime::SqlRuntime::fetch_optional(
+        datastore.read_exec(),
+        pragma,
+        &[],
+    )
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| format!("{pragma} returned no rows"))?;
+    row.i64_at(0)
+        .map(|value| value.max(0) as u64)
+        .map_err(|error| error.to_string())
+}
+
+// `PRAGMA journal_mode` with no argument only reads the mode.
+async fn sqlite_pragma_journal_mode(datastore: &StoreDatastore) -> Result<String, String> {
+    let row = crate::persistence::sql_runtime::SqlRuntime::fetch_optional(
+        datastore.read_exec(),
+        "PRAGMA journal_mode",
+        &[],
+    )
+    .await
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "PRAGMA journal_mode returned no rows".to_string())?;
+    row.text("journal_mode").map_err(|error| error.to_string())
 }
 
 fn writer_queue_closed() -> StateError {

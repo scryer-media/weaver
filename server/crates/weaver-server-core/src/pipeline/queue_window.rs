@@ -32,25 +32,17 @@ pub(crate) fn waits_its_turn(status: &JobStatus, paused_resume_status: Option<&J
     }
 }
 
-// The row's priority in dispatch order, with an edit not yet applied in force.
-fn row_priority(row: &JobRow, globals: &crate::pipeline::queue::Globals) -> u8 {
-    if row.intents.update.is_some() {
-        crate::pipeline::nzb_admission::metadata_priority(&row.info(globals).metadata)
-    } else {
-        crate::pipeline::nzb_admission::metadata_priority(&row.report.job.metadata)
-    }
-}
-
 // What a window install reads of a job that is not installed: its active row
-// and the files of its stored NZB, as a restart reads it.
+// and its stored NZB outline, as a restart reads it.
 pub(crate) struct ParkedLoads {
     db: crate::Database,
     markers: Vec<(JobId, Result<tokio::sync::oneshot::Receiver<()>, String>)>,
 }
 
 impl ParkedLoads {
-    // Each job read back, in the order named, one parse of each stored NZB,
-    // spread over the cores.
+    // Each job read back, in the order named, from its row and outline,
+    // spread over the cores. A job with no outline yet reads its stored NZB
+    // once for one.
     pub(crate) async fn read(self) -> Vec<(JobId, Result<Option<RestoreJobRequest>, String>)> {
         let Self { db, markers } = self;
         if markers.is_empty() {
@@ -72,10 +64,41 @@ impl ParkedLoads {
         }
         tokio::task::spawn_blocking(move || {
             use rayon::prelude::*;
-            ids.into_par_iter()
-                .map(|id| match waited.get(&id) {
+            // The batch's outlines in one read, each handed to its job.
+            let reached: Vec<JobId> = ids
+                .iter()
+                .copied()
+                .filter(|id| !waited.contains_key(id))
+                .collect();
+            let outlines = if reached.is_empty() {
+                Ok(HashMap::new())
+            } else {
+                db.load_job_outlines(Some(&reached))
+                    .map_err(|error| error.to_string())
+            };
+            let mut outlines = match outlines {
+                Ok(outlines) => outlines,
+                Err(error) => {
+                    return ids
+                        .into_iter()
+                        .map(|id| match waited.get(&id) {
+                            Some(waited) => (id, Err(waited.clone())),
+                            None => (id, Err(error.clone())),
+                        })
+                        .collect();
+                }
+            };
+            let jobs: Vec<_> = ids
+                .into_iter()
+                .map(|id| {
+                    let outline = outlines.remove(&id);
+                    (id, outline)
+                })
+                .collect();
+            jobs.into_par_iter()
+                .map(|(id, outline)| match waited.get(&id) {
                     Some(error) => (id, Err(error.clone())),
-                    None => (id, load_parked_job(&db, id)),
+                    None => (id, load_parked_job(&db, id, outline)),
                 })
                 .collect()
         })
@@ -87,6 +110,7 @@ impl ParkedLoads {
 fn load_parked_job(
     db: &crate::Database,
     job_id: JobId,
+    outline: Option<crate::ingest::outline::NzbOutline>,
 ) -> Result<Option<RestoreJobRequest>, String> {
     let Some(recovered) = db
         .load_active_job_row(job_id)
@@ -94,7 +118,7 @@ fn load_parked_job(
     else {
         return Ok(None);
     };
-    let (spec, summaries) = crate::operations::read_stored_files(db, job_id, &recovered)
+    let (spec, summaries) = crate::operations::read_stored_files(db, job_id, &recovered, outline)
         .map_err(|error| error.to_string())?
         .map_err(|error| error.to_string())?;
     let mut request = crate::operations::restore_request(job_id, recovered, spec, summaries);
@@ -123,23 +147,14 @@ impl Pipeline {
                 .unwrap_or(crate::settings::model::DEFAULT_MAX_CONCURRENT_NZBS)
                 .get() as usize,
         );
-        let mut ranked: Vec<(u8, usize, JobId)> = inner
-            .jobs
-            .iter()
-            .enumerate()
-            .filter(|(_, row)| {
-                row.intents.cancelled.is_none()
-                    && !row.report.retiring
-                    && !self.blocked_restores.contains_key(&row.id)
-                    && !self.window_unreadable.contains(&row.id)
-            })
-            .map(|(position, row)| (row_priority(row, globals), position, row.id))
-            .collect();
-        if ranked.len() > size {
-            ranked.select_nth_unstable(size - 1);
-            ranked.truncate(size);
-        }
-        ranked.into_iter().map(|(_, _, id)| id).collect()
+        let mut ranked = inner.dispatch_keys(|row| {
+            row.intents.cancelled.is_none()
+                && !row.report.retiring
+                && !self.blocked_restores.contains_key(&row.id)
+                && !self.window_unreadable.contains(&row.id)
+        });
+        crate::pipeline::queue::order::keep_first(&mut ranked, size);
+        ranked.into_iter().map(|key| key.job_id()).collect()
     }
 
     // Whether the row's job does something its row cannot carry: it holds a

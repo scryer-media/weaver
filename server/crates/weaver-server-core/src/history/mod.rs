@@ -14,11 +14,15 @@ pub mod repository;
 pub mod timeline;
 
 pub use attributes::{
-    CLIENT_REQUEST_ID_ATTRIBUTE_KEY, is_public_history_attribute_key, parse_history_metadata,
+    CLIENT_REQUEST_ID_ATTRIBUTE_KEY, history_release_name, history_search_columns,
+    is_public_history_attribute_key, normalize_history_search_text, parse_history_metadata,
     public_history_attributes, split_history_metadata,
 };
 pub use failure_kind::HistoryFailureKind;
-pub use model::{HistoryFilter, HistoryMetadataEquals, HistoryRows};
+pub use model::{
+    HistoryEditFields, HistoryFilter, HistoryMetadataEquals, HistoryOrder, HistoryOrderKey,
+    HistoryRows,
+};
 pub use nzbget_state::{NzbgetHistoryState, NzbgetMarkStatus};
 pub use record::{IntegrationEventRow, JobHistoryRow};
 pub use timeline::JobEvent;

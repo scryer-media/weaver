@@ -7,19 +7,46 @@ use async_graphql::{Context, Error, ErrorExtensions, Guard, Result};
 use crate::auth::CallerIdentity;
 use weaver_server_core::auth::CallerScope;
 
-// The only general queries exposed to run credentials. The unguarded
-// `scriptRun` field separately checks the live run and scopes its callbacks.
+// The only general queries exposed to run credentials: the two lists, and
+// the details of the one job the run is about. The unguarded `scriptRun`
+// field separately checks the live run and scopes its callbacks.
 fn script_run_verdict(ctx: &Context<'_>) -> Result<()> {
-    if ctx.query_env.operation.node.ty != OperationType::Query
-        || !matches!(ctx.field().name(), "queueItems" | "historyItems")
-    {
+    let allowed = ctx.query_env.operation.node.ty == OperationType::Query
+        && match ctx.field().name() {
+            "queueItems" | "historyItems" => true,
+            "jobDetailSnapshot" | "jobTimeline" | "jobEvents" => asks_for_own_job(ctx),
+            _ => false,
+        };
+    if allowed {
+        Ok(())
+    } else {
         Err(graphql_error(
             "NOT_ALLOWED_FOR_SCRIPT_RUN",
-            "a script run's token may only read queueItems, historyItems and its own scriptRun",
+            "a script run's token may only read queueItems, historyItems, its own job's details and its own scriptRun",
         ))
-    } else {
-        Ok(())
     }
+}
+
+// Whether the field's `jobId` is the job the calling run is about. A run
+// about no job, or one that has ended, has no job of its own.
+fn asks_for_own_job(ctx: &Context<'_>) -> bool {
+    let Some(CallerIdentity::ScriptRun(run_id)) = ctx.data_opt::<CallerIdentity>() else {
+        return false;
+    };
+    let own = ctx
+        .data_opt::<weaver_server_core::Database>()
+        .and_then(|db| db.live_script_run(run_id))
+        .and_then(|run| run.job_id);
+    let asked = ctx.field().arguments().ok().and_then(|arguments| {
+        arguments
+            .into_iter()
+            .find(|(name, _)| name.as_str() == "jobId")
+            .and_then(|(_, value)| match value {
+                async_graphql::Value::Number(number) => number.as_u64(),
+                _ => None,
+            })
+    });
+    own.is_some() && own == asked
 }
 
 pub struct ReadGuard;

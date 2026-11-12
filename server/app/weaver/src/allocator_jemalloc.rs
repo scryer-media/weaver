@@ -31,9 +31,13 @@
 //   paid in resident pages. Arenas are created lazily, so the cap costs
 //   nothing on a small host and bounds the caches on a large one.
 //
-// Background purge threads are deliberately not requested: they are not
-// available on every target this binary builds for, and the two collections
-// below already cover the boundaries where a purge matters.
+// On glibc Linux, `background_thread` also asks jemalloc for its purge
+// threads (at most four), so freed pages decay back to the system on their
+// own between the boundaries the two collections below cover, even while no
+// thread is allocating. Every other target runs without them: Mach-O has no
+// background thread, and the allocator crate marks musl as unsupported. The
+// collections stay on every target; they purge at once at the boundary
+// instead of waiting for the decay clock.
 //
 // One build note that does not belong in a comment anywhere else: jemalloc
 // fixes its page size when it is compiled, and a binary built for a smaller
@@ -46,6 +50,13 @@ use std::alloc::{GlobalAlloc, Layout};
 use tikv_jemallocator::Jemalloc;
 
 // Read by jemalloc's constructor, before `main` runs.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: &[u8] =
+    b"dirty_decay_ms:3000,muzzy_decay_ms:0,narenas:16,background_thread:true\0";
+
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 #[allow(non_upper_case_globals)]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 pub static malloc_conf: &[u8] = b"dirty_decay_ms:3000,muzzy_decay_ms:0,narenas:16\0";
@@ -100,6 +111,98 @@ pub(crate) fn collect_after_job() {
     purge_all_arenas();
 }
 
+// SQLite's allocations, served by jemalloc on macOS.
+//
+// SQLite is compiled into the binary with its default allocator, the C
+// library's malloc. On macOS that heap keeps the pages its callers free, so a
+// start-up's or a restore's SQLite page cache and statements stay resident
+// long after they are freed, and asking the zone for relief returns none of
+// them. Served by jemalloc instead, those pages decay back with the rest and
+// go at once with every purge above.
+//
+// Must run before SQLite is first used: SQLite refuses a new allocator once
+// it is initialized, and then keeps its own.
+//
+// Only macOS. The Linux release builds link musl, whose allocator returns
+// freed memory on its own; Windows builds the other allocator module.
+#[cfg(target_os = "macos")]
+pub(crate) fn route_sqlite_allocations() {
+    use std::ffi::{c_int, c_void};
+
+    // `sqlite3_mem_methods`, field for field.
+    #[repr(C)]
+    struct MemMethods {
+        x_malloc: unsafe extern "C" fn(c_int) -> *mut c_void,
+        x_free: unsafe extern "C" fn(*mut c_void),
+        x_realloc: unsafe extern "C" fn(*mut c_void, c_int) -> *mut c_void,
+        x_size: unsafe extern "C" fn(*mut c_void) -> c_int,
+        x_roundup: unsafe extern "C" fn(c_int) -> c_int,
+        x_init: unsafe extern "C" fn(*mut c_void) -> c_int,
+        x_shutdown: unsafe extern "C" fn(*mut c_void),
+        app_data: *mut c_void,
+    }
+
+    const SQLITE_CONFIG_MALLOC: c_int = 4;
+
+    unsafe extern "C" {
+        // Linked from the SQLite the database layer bundles.
+        fn sqlite3_config(op: c_int, ...) -> c_int;
+    }
+
+    // SQLite asks only for positive sizes below `i32::MAX`; jemalloc may round
+    // the largest up past it, so a size reported back is capped there, which
+    // only understates the room SQLite has.
+    fn reported(size: usize) -> c_int {
+        c_int::try_from(size).unwrap_or(c_int::MAX)
+    }
+    unsafe extern "C" fn malloc(size: c_int) -> *mut c_void {
+        // SAFETY: plain allocation of a positive size.
+        unsafe { tikv_jemalloc_sys::malloc(size.max(1) as usize) }
+    }
+    unsafe extern "C" fn free(ptr: *mut c_void) {
+        // SAFETY: SQLite frees only what `malloc` or `realloc` above gave it.
+        unsafe { tikv_jemalloc_sys::free(ptr) }
+    }
+    unsafe extern "C" fn realloc(ptr: *mut c_void, size: c_int) -> *mut c_void {
+        // SAFETY: as `free`; the size is positive.
+        unsafe { tikv_jemalloc_sys::realloc(ptr, size.max(1) as usize) }
+    }
+    unsafe extern "C" fn size(ptr: *mut c_void) -> c_int {
+        if ptr.is_null() {
+            return 0;
+        }
+        // SAFETY: as `free`.
+        reported(unsafe { tikv_jemalloc_sys::malloc_usable_size(ptr) })
+    }
+    unsafe extern "C" fn roundup(size: c_int) -> c_int {
+        // SAFETY: a size query; it allocates nothing.
+        reported(unsafe { tikv_jemalloc_sys::nallocx(size.max(1) as usize, 0) })
+    }
+    unsafe extern "C" fn init(_: *mut c_void) -> c_int {
+        0
+    }
+    unsafe extern "C" fn shutdown(_: *mut c_void) {}
+
+    let methods = MemMethods {
+        x_malloc: malloc,
+        x_free: free,
+        x_realloc: realloc,
+        x_size: size,
+        x_roundup: roundup,
+        x_init: init,
+        x_shutdown: shutdown,
+        app_data: std::ptr::null_mut(),
+    };
+    // SAFETY: `SQLITE_CONFIG_MALLOC` takes one pointer to a
+    // `sqlite3_mem_methods` and copies it before returning. Called on the
+    // main thread before any other thread exists. If SQLite was somehow
+    // already initialized it refuses and keeps its own allocator, which is
+    // the behaviour without this call.
+    unsafe {
+        sqlite3_config(SQLITE_CONFIG_MALLOC, &raw const methods);
+    }
+}
+
 unsafe impl GlobalAlloc for ConfiguredJemalloc {
     #[inline]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -150,6 +253,35 @@ mod tests {
 
         assert_eq!(opt_ms(c"opt.dirty_decay_ms"), 3000);
         assert_eq!(opt_ms(c"opt.muzzy_decay_ms"), 0);
+    }
+
+    // Reads a boolean `mallctl` value.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    fn read_bool(name: &std::ffi::CStr) -> bool {
+        let mut value = false;
+        let mut len = std::mem::size_of::<bool>();
+        // SAFETY: both names below are documented as `bool`, the output
+        // buffer and its length match that type, and no input is given.
+        let rc = unsafe {
+            tikv_jemalloc_sys::mallctl(
+                name.as_ptr(),
+                std::ptr::from_mut(&mut value).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        assert_eq!(rc, 0, "mallctl read failed");
+        value
+    }
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn glibc_linux_runs_the_background_purge_threads() {
+        // `opt.background_thread` is what the configuration asked for;
+        // `background_thread` is whether jemalloc actually turned it on.
+        assert!(read_bool(c"opt.background_thread"));
+        assert!(read_bool(c"background_thread"));
     }
 
     #[test]

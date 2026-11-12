@@ -4,10 +4,12 @@
 use std::path::PathBuf;
 
 use crate::StateError;
-use crate::history::model::{HistoryFilter, HistoryRows};
+use crate::history::model::{
+    HistoryEditFields, HistoryFilter, HistoryOrder, HistoryOrderKey, HistoryRows,
+};
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::persistence::Database;
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime, max_rows_for_engine};
+use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRuntime, max_rows_for_engine};
 
 type PersistedNzbRecord = (PathBuf, Option<Vec<u8>>);
 
@@ -165,9 +167,7 @@ impl Database {
                         };
                         page.extend(fetch_history_rows(&datastore, &filter, rows).await?);
                     }
-                    page.sort_by(|a, b| {
-                        (b.completed_at, b.job_id).cmp(&(a.completed_at, a.job_id))
-                    });
+                    sort_history_rows(base.order, &mut page);
                     page
                 }
                 HistoryIdSplit::NotIn(excluded, _) => {
@@ -229,6 +229,54 @@ impl Database {
                 .filter(|(_, count)| *count > 0)
                 .map(|(category, count)| (category, count as u32))
                 .collect())
+        })
+    }
+
+    // The ids among `job_ids` that have a history row, hidden or not, in no
+    // particular order. Reads only the id column, through the primary key.
+    pub fn job_history_ids_among(&self, job_ids: &[u64]) -> Result<Vec<u64>, StateError> {
+        if job_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let datastore = self.datastore();
+        let job_ids = job_ids.to_vec();
+        self.run_sql_blocking_read(async move {
+            let mut found = Vec::new();
+            for chunk in job_ids.chunks(max_rows_for_engine(datastore.engine(), 1)) {
+                let placeholders = vec!["{}"; chunk.len()].join(", ");
+                let sql =
+                    format!("SELECT job_id FROM job_history WHERE job_id IN ({placeholders})");
+                let args: Vec<SqlArg> = chunk.iter().map(|id| SqlArg::I64(*id as i64)).collect();
+                for row in SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await? {
+                    found.push(row.i64("job_id")? as u64);
+                }
+            }
+            Ok(found)
+        })
+    }
+
+    // The name, category and metadata of `job_id`'s history row, the columns
+    // a history edit changes, or `None` when it has no row.
+    pub fn job_history_edit_fields(
+        &self,
+        job_id: u64,
+    ) -> Result<Option<HistoryEditFields>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT name, category, metadata FROM job_history WHERE job_id = {}",
+                &[SqlArg::I64(job_id as i64)],
+            )
+            .await?;
+            row.map(|row| {
+                Ok(HistoryEditFields {
+                    name: row.text("name")?,
+                    category: row.opt_text("category")?,
+                    metadata: row.opt_text("metadata")?,
+                })
+            })
+            .transpose()
         })
     }
 
@@ -319,9 +367,10 @@ impl Database {
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT nzb_path, nzb_zstd
-                   FROM job_history
-                  WHERE job_id = {}
+                "SELECT h.nzb_path, n.nzb_zstd
+                   FROM job_history AS h
+                   LEFT JOIN job_nzbs AS n ON n.job_id = h.job_id
+                  WHERE h.job_id = {}
                   LIMIT 1",
                 &[SqlArg::I64(job_id as i64)],
             )
@@ -382,6 +431,7 @@ fn append_history_row_filter_predicates(
     sql: &mut String,
     args: &mut Vec<SqlArg>,
     filter: &HistoryFilter,
+    engine: SqlEngine,
 ) {
     if let Some(statuses) = &filter.statuses {
         append_in_i64_or_text_filter(
@@ -427,6 +477,139 @@ fn append_history_row_filter_predicates(
         sql.push_str(" AND h.category = {}");
         args.push(SqlArg::Text(category.clone()));
     }
+    if let Some(categories) = &filter.categories_any {
+        append_in_i64_or_text_filter(
+            sql,
+            args,
+            "COALESCE(h.category, '')",
+            categories.iter().cloned().map(SqlArg::Text).collect(),
+        );
+    }
+    if let Some(needle) = &filter.name_contains {
+        // The search, normalized as each row's `search_key` is, found in it
+        // by LIKE: accents, case and separators aside, in any of the row's
+        // titles. A `%`, `_` or `\` in the search is escaped, so it matches
+        // only itself. Postgres also takes a close spelling through pg_trgm
+        // where migration 88 could install it.
+        let needle = super::normalize_history_search_text(needle);
+        match engine {
+            SqlEngine::Sqlite => {
+                sql.push_str(" AND h.search_key LIKE {} ESCAPE '\\'");
+                args.push(SqlArg::Text(history_like_pattern(&needle)));
+            }
+            SqlEngine::Postgres => {
+                sql.push_str(
+                    " AND (h.search_key LIKE {} ESCAPE '\\' OR weaver_history_fuzzy({}, h.search_key))",
+                );
+                args.push(SqlArg::Text(history_like_pattern(&needle)));
+                args.push(SqlArg::Text(needle));
+            }
+        }
+    }
+}
+
+// The LIKE pattern that finds `needle` anywhere in a name.
+fn history_like_pattern(needle: &str) -> String {
+    let mut pattern = String::with_capacity(needle.len() + 2);
+    pattern.push('%');
+    for c in needle.chars() {
+        if matches!(c, '%' | '_' | '\\') {
+            pattern.push('\\');
+        }
+        pattern.push(c);
+    }
+    pattern.push('%');
+    pattern
+}
+
+// ASCII upper and lower case, for Postgres's `translate`. SQLite's LOWER
+// folds ASCII letters alone, so both engines fold exactly these, and the
+// `C` collation makes Postgres compare bytes as SQLite does.
+const PG_ASCII_UPPER: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const PG_ASCII_LOWER: &str = "abcdefghijklmnopqrstuvwxyz";
+
+// The expression `key` orders rows by. Each is the expression of its history
+// index in migration 86, or 87 for the name, character for character, so the
+// index serves it. The name is the full release name.
+fn history_order_expression(key: HistoryOrderKey, engine: SqlEngine) -> String {
+    let fold = |column: &str| match engine {
+        SqlEngine::Sqlite => format!("LOWER({column})"),
+        SqlEngine::Postgres => {
+            format!("translate({column}, '{PG_ASCII_UPPER}', '{PG_ASCII_LOWER}') COLLATE \"C\"")
+        }
+    };
+    match key {
+        HistoryOrderKey::CompletedAt => "h.completed_at".to_string(),
+        HistoryOrderKey::TotalBytes => "h.total_bytes".to_string(),
+        HistoryOrderKey::Health => "h.health".to_string(),
+        HistoryOrderKey::Name => fold("h.release_name"),
+        HistoryOrderKey::Category => fold("COALESCE(h.category, '')"),
+        HistoryOrderKey::State => {
+            let status = match engine {
+                SqlEngine::Sqlite => "LOWER(h.status)".to_string(),
+                SqlEngine::Postgres => {
+                    format!("translate(h.status, '{PG_ASCII_UPPER}', '{PG_ASCII_LOWER}')")
+                }
+            };
+            format!("(CASE {status} WHEN 'complete' THEN 0 WHEN 'paused' THEN 2 ELSE 1 END)")
+        }
+    }
+}
+
+// The ORDER BY clause of `order`, served by the history index on its key.
+fn history_order_sql(order: HistoryOrder, engine: SqlEngine) -> String {
+    let direction = if order.descending { "DESC" } else { "ASC" };
+    format!(
+        " ORDER BY {} {direction}, h.job_id {direction}",
+        history_order_expression(order.key, engine)
+    )
+}
+
+// A row's place among the states `HistoryOrderKey::State` orders by.
+fn history_state_rank(status: &str) -> i64 {
+    match status.to_ascii_lowercase().as_str() {
+        "complete" => 0,
+        "paused" => 2,
+        _ => 1,
+    }
+}
+
+// Sorts `rows` into `order`, comparing the stored column values the way the
+// database orders them. Each row's key is built once, not per comparison.
+fn sort_history_rows(order: HistoryOrder, rows: &mut Vec<JobHistoryRow>) {
+    let value = |row: &JobHistoryRow| -> (i64, String) {
+        match order.key {
+            HistoryOrderKey::CompletedAt => (row.completed_at, String::new()),
+            HistoryOrderKey::TotalBytes => (row.total_bytes as i64, String::new()),
+            HistoryOrderKey::Health => (i64::from(row.health as i32), String::new()),
+            HistoryOrderKey::State => (history_state_rank(&row.status), String::new()),
+            HistoryOrderKey::Name => (
+                0,
+                super::history_release_name(&row.name, row.metadata.as_deref())
+                    .to_ascii_lowercase(),
+            ),
+            HistoryOrderKey::Category => (
+                0,
+                row.category
+                    .as_deref()
+                    .unwrap_or_default()
+                    .to_ascii_lowercase(),
+            ),
+        }
+    };
+    let mut keyed = rows
+        .drain(..)
+        .map(|row| (value(&row), row))
+        .collect::<Vec<_>>();
+    keyed.sort_by(|(a_key, a), (b_key, b)| {
+        let ascending = a_key.cmp(b_key).then_with(|| a.job_id.cmp(&b.job_id));
+        if order.descending {
+            ascending.reverse()
+        } else {
+            ascending
+        }
+    });
+    rows.extend(keyed.into_iter().map(|(_, row)| row));
 }
 
 fn append_in_i64_or_text_filter(
@@ -549,9 +732,9 @@ async fn fetch_history_rows(
     let mut args = Vec::new();
 
     append_history_from_clause(&mut sql, &mut args, filter);
-    append_history_row_filter_predicates(&mut sql, &mut args, filter);
+    append_history_row_filter_predicates(&mut sql, &mut args, filter, datastore.engine());
     append_history_visibility(&mut sql, rows);
-    sql.push_str(" ORDER BY h.completed_at DESC, h.job_id DESC");
+    sql.push_str(&history_order_sql(filter.order, datastore.engine()));
 
     append_history_pagination(&mut sql, &mut args, filter);
 
@@ -568,7 +751,7 @@ async fn count_history_rows(
     let mut args = Vec::new();
 
     append_history_from_clause(&mut sql, &mut args, filter);
-    append_history_row_filter_predicates(&mut sql, &mut args, filter);
+    append_history_row_filter_predicates(&mut sql, &mut args, filter, datastore.engine());
     append_history_visibility(&mut sql, rows);
 
     Ok(
@@ -590,7 +773,7 @@ async fn count_history_rows_by_category(
     let mut args = Vec::new();
 
     append_history_from_clause(&mut sql, &mut args, filter);
-    append_history_row_filter_predicates(&mut sql, &mut args, filter);
+    append_history_row_filter_predicates(&mut sql, &mut args, filter, datastore.engine());
     append_history_visibility(&mut sql, rows);
 
     sql.push_str(" GROUP BY COALESCE(h.category, '')");
@@ -651,4 +834,152 @@ pub(crate) fn job_history_row_from_sql(
         metadata: row.opt_text("metadata")?,
         server_attribution: row.opt_text("server_attribution")?,
     })
+}
+
+#[cfg(test)]
+mod order_index_tests {
+    use super::*;
+
+    // Every History page order is read through its index: SQLite walks the
+    // index in order instead of sorting the table in a temporary b-tree.
+    #[test]
+    fn every_history_order_is_served_by_an_index() {
+        let db = Database::open_in_memory().unwrap();
+        let keys = [
+            HistoryOrderKey::CompletedAt,
+            HistoryOrderKey::TotalBytes,
+            HistoryOrderKey::Health,
+            HistoryOrderKey::Name,
+            HistoryOrderKey::State,
+            HistoryOrderKey::Category,
+        ];
+        // A search is a substring of the name, which no index seeks, so a
+        // searched page walks its order's index and stops at the page.
+        for (key, search) in keys
+            .into_iter()
+            .flat_map(|key| [(key, None), (key, Some("release".to_string()))])
+        {
+            for descending in [true, false] {
+                let order = HistoryOrder { key, descending };
+                let filter = HistoryFilter {
+                    name_contains: search.clone(),
+                    ..Default::default()
+                };
+                let mut sql =
+                    String::from("EXPLAIN QUERY PLAN SELECT h.job_id FROM job_history h WHERE 1=1");
+                let mut args = Vec::new();
+                append_history_row_filter_predicates(
+                    &mut sql,
+                    &mut args,
+                    &filter,
+                    SqlEngine::Sqlite,
+                );
+                append_history_visibility(&mut sql, HistoryRows::Shown);
+                sql.push_str(&history_order_sql(order, SqlEngine::Sqlite));
+                sql.push_str(" LIMIT 25");
+                let datastore = db.datastore();
+                let detail = db
+                    .run_sql_blocking_read(async move {
+                        let rows =
+                            SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+                        rows.iter()
+                            .map(|row| row.text("detail"))
+                            .collect::<Result<Vec<_>, _>>()
+                    })
+                    .unwrap()
+                    .join("; ");
+                assert!(
+                    detail.contains("USING INDEX") || detail.contains("USING COVERING INDEX"),
+                    "{order:?} {search:?}: {detail}"
+                );
+                assert!(
+                    !detail.contains("TEMP B-TREE"),
+                    "{order:?} {search:?}: {detail}"
+                );
+            }
+        }
+    }
+
+    // The order the database returns is the order `sort_history_rows`
+    // gives, so pages merged from several statements stay in order.
+    #[test]
+    fn sort_history_rows_matches_the_database_order() {
+        let db = Database::open_in_memory().unwrap();
+        let names = [
+            "b.Release",
+            "B.release",
+            "a.Release",
+            "Ä.release",
+            "é",
+            "Z",
+            "z",
+            "",
+        ];
+        let statuses = [
+            "complete", "Paused", "failed", "COMPLETE", "partial", "weird",
+        ];
+        let categories = [
+            None,
+            Some(""),
+            Some("TV"),
+            Some("tv"),
+            Some("Ébc"),
+            Some("anime"),
+        ];
+        for job_id in 1..=48u64 {
+            db.insert_job_history(&JobHistoryRow {
+                job_id,
+                job_hash: None,
+                name: names[(job_id % 8) as usize].to_string(),
+                status: statuses[(job_id % 6) as usize].to_string(),
+                error_message: None,
+                total_bytes: job_id % 5,
+                downloaded_bytes: 0,
+                optional_recovery_bytes: 0,
+                optional_recovery_downloaded_bytes: 0,
+                failed_bytes: 0,
+                health: (job_id % 3) as u32,
+                category: categories[(job_id % 6) as usize].map(str::to_string),
+                output_dir: None,
+                nzb_path: None,
+                created_at: 1,
+                completed_at: (job_id % 7) as i64,
+                // The name sort is by the full release name, which the
+                // original or renamed title in the metadata can replace.
+                metadata: match job_id % 5 {
+                    1 => Some(r#"[["weaver.original_title","A.Full.Release.1080p"]]"#.into()),
+                    2 => Some(
+                        r#"[["weaver.original_title","Y.Full"],["weaver.renamed_title","m.Renamed"]]"#
+                            .into(),
+                    ),
+                    _ => None,
+                },
+                server_attribution: None,
+            })
+            .unwrap();
+        }
+        let keys = [
+            HistoryOrderKey::CompletedAt,
+            HistoryOrderKey::TotalBytes,
+            HistoryOrderKey::Health,
+            HistoryOrderKey::Name,
+            HistoryOrderKey::State,
+            HistoryOrderKey::Category,
+        ];
+        for key in keys {
+            for descending in [true, false] {
+                let order = HistoryOrder { key, descending };
+                let filter = HistoryFilter {
+                    order,
+                    ..Default::default()
+                };
+                let read = db.list_job_history(&filter, HistoryRows::All).unwrap();
+                let mut sorted = read.clone();
+                sort_history_rows(order, &mut sorted);
+                let ids =
+                    |rows: &[JobHistoryRow]| rows.iter().map(|row| row.job_id).collect::<Vec<_>>();
+                assert_eq!(ids(&read), ids(&sorted), "{order:?}");
+            }
+        }
+    }
 }

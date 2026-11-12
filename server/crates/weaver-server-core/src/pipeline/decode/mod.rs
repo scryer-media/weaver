@@ -31,6 +31,7 @@ impl ActiveDecodes {
         self.total
     }
 
+    #[cfg(test)]
     pub(in crate::pipeline) fn started(&mut self, job_id: JobId) {
         *self.by_job.entry(job_id).or_default() += 1;
         self.total += 1;

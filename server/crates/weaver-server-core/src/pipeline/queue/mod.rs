@@ -14,10 +14,11 @@ mod admission;
 mod counters;
 mod history;
 mod intents;
+pub(crate) mod order;
 pub mod paging;
 pub(crate) use admission::{
-    AdmissionResources, PreparedAdd, RestartAdmission, delivery_staging_dir, make_staging_dir,
-    staging_dir_for,
+    AdmissionResources, PreparedAdd, RestartAdmission, delivery_staging_dir, destination_root,
+    destination_roots, make_staging_dir, staging_dir_for,
 };
 #[cfg(test)]
 pub(crate) use counters::COUNTER_SAMPLES;
@@ -434,6 +435,7 @@ impl Queue {
         self.history.read().expect("history lock poisoned").clone()
     }
 
+    #[cfg(test)]
     pub(crate) fn job_counters(&self, id: JobId) -> Option<Arc<JobCounters>> {
         self.read(|inner| inner.job(id).map(|row| row.counters.clone()))
     }

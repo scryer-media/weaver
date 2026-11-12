@@ -85,6 +85,33 @@ async fn paused_reprocess_initialization_waits_for_resume_admission() {
     assert!(!pipeline.nzb_reprocess_pending.contains(&JobId(2)));
 }
 
+// An id gone from the queue while its work is in flight does not call for a
+// walk each turn: it is looked at alone, and forgotten once its work drains.
+#[tokio::test]
+async fn a_retired_id_with_work_in_flight_is_rechecked_without_a_walk() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let id = JobId(77);
+    pipeline.nzb_seen.insert(id);
+    pipeline.nzb_pause_releases.insert(id);
+    pipeline.inflight_moves.insert(id);
+
+    assert!(pipeline.reconcile_nzb_admission(true));
+    assert!(!pipeline.queue_walk_due);
+    assert!(pipeline.nzb_seen.contains(&id));
+    assert!(pipeline.nzb_retired_busy.contains(&id));
+
+    assert!(!pipeline.reconcile_nzb_admission(false));
+    assert!(!pipeline.queue_walk_due);
+    assert!(pipeline.nzb_seen.contains(&id));
+
+    pipeline.inflight_moves.remove(&id);
+    assert!(!pipeline.reconcile_nzb_admission(false));
+    assert!(!pipeline.nzb_seen.contains(&id));
+    assert!(!pipeline.nzb_pause_releases.contains(&id));
+    assert!(pipeline.nzb_retired_busy.is_empty());
+}
+
 #[tokio::test]
 async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
     let temp = tempfile::tempdir().unwrap();
@@ -164,6 +191,7 @@ async fn twenty_four_providers_cannot_admit_more_than_ten_of_124_nzbs() {
             .download_queue
             .pop()
             .unwrap();
+        let work = pipeline.dispatched(work);
         let segment_id = work.segment_id;
         pipeline
             .jobs

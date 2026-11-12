@@ -36,7 +36,6 @@ impl WriterGate {
         guard
     }
 
-    #[cfg(test)]
     pub(crate) fn wal(&self) -> Option<&'static WalSignal> {
         self.wal
     }

@@ -19,6 +19,9 @@ impl Http3TunnelProvider {
         Self(self.0.with_udp_factory(factory))
     }
     pub fn new(spec: Http3TunnelSpec) -> Result<Self, TunnelError> {
-        proxy_tunnels::Http3TunnelProvider::new(spec).map(Self)
+        Ok(Self(
+            proxy_tunnels::Http3TunnelProvider::new(spec)?
+                .with_endpoint_resolver(std::sync::Arc::new(crate::resolution::HostEndpoints)),
+        ))
     }
 }

@@ -252,6 +252,38 @@ fn par2_recovery_dash_format() {
     );
 }
 
+// A volume named by its first block and the one past its last declares the
+// blocks between; a range that does not move forward declares none and is
+// still a volume.
+#[test]
+fn par2_recovery_block_range_format() {
+    for (name, blocks) in [
+        ("fixture.release.vol000-001.par2", 1),
+        ("fixture.release.vol001-003.par2", 2),
+        ("fixture.release.vol063-105.par2", 42),
+        ("fixture.release-sample.vol00-01.par2", 1),
+        ("fixture.release-sample.vol31-58.par2", 27),
+        ("FIXTURE.RELEASE.VOL7-15.PAR2", 8),
+        ("fixture.release.vol15-07.par2", 0),
+    ] {
+        assert_eq!(
+            FileRole::from_filename(name),
+            FileRole::Par2 {
+                is_index: false,
+                recovery_block_count: blocks
+            },
+            "{name}"
+        );
+    }
+    assert_eq!(
+        FileRole::from_filename("fixture.release-sample.par2"),
+        FileRole::Par2 {
+            is_index: true,
+            recovery_block_count: 0
+        }
+    );
+}
+
 #[test]
 fn par2_case_insensitive() {
     assert_eq!(

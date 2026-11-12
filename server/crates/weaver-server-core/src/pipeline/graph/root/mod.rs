@@ -47,6 +47,8 @@ pub(crate) struct Ask {
 pub(crate) struct ArticleRoot {
     pub(crate) map: ArticleMap,
     pub(crate) window: Window,
+    // The waiting volumes of every set, which the bootstrap bids from.
+    pub(crate) leading: sample::Leading,
     checksums: Checksums,
     // Each file's name as the post lists it. A root member is the post's
     // file of its number whatever a recovery set renames it to, so this,
@@ -63,6 +65,7 @@ impl ArticleRoot {
         Self {
             map: ArticleMap::new(&volumes),
             window: Window::default(),
+            leading: sample::Leading::default(),
             checksums: Checksums::default(),
             posted: files.iter().map(|file| file.name.clone()).collect(),
             indexes: files
@@ -139,7 +142,12 @@ impl ArticleRoot {
                 });
             }
         }
-        let drawn = self.window.draw(queued);
+        let leading = &self.leading;
+        let drawn = self.window.draw(
+            queued,
+            |volume| leading.rank_of(volume),
+            |bid| leading.ready(bid),
+        );
         let mut applied = BTreeSet::new();
         let answers = asks
             .iter()

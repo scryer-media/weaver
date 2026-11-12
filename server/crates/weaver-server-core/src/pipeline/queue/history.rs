@@ -53,7 +53,7 @@ pub(crate) async fn clear_restart_artifacts(
         }
     }
     clear_left_working_dirs(&resources.intermediate_dir, id, working_dir).await?;
-    remove_job_staging(&resources.complete_dir, id).await
+    remove_job_staging(&resources.staging_roots().await, id).await
 }
 
 // A working directory that kept the job's marker for what its move could
@@ -79,22 +79,64 @@ pub(crate) async fn clear_left_working_dirs(
     Ok(())
 }
 
-// The job's staging directory under the complete directory, whatever it
-// still holds. A symbolic link in its place is never followed.
+// The job's staging directories under each of `roots`, whatever they still
+// hold. Only a directory carrying the job's marker goes, and no symbolic link
+// on the way down from a root is followed.
+//
+// `roots` is `destination_roots`: the complete folder first, then each
+// category's folder. A job's staging directory is under the complete folder
+// unless its category delivers elsewhere, and a history row does not say
+// which, so every root is swept. The complete folder must be reachable. A
+// category folder that cannot be opened is passed over with a warning, so
+// one unreachable category does not stop the cleanup of jobs that never
+// used it; whatever is found under a folder that opens is removed or fails
+// as before.
 pub(crate) async fn remove_job_staging(
-    complete_dir: &std::path::Path,
+    roots: &[std::path::PathBuf],
     id: JobId,
 ) -> Result<(), SchedulerError> {
-    let staging = super::staging_dir_for(complete_dir, id);
-    match tokio::fs::symlink_metadata(&staging).await {
-        Ok(meta) if meta.file_type().is_symlink() => Err(SchedulerError::Conflict(
-            "the job's staging directory is a symbolic link".into(),
-        )),
-        Ok(_) => match tokio::fs::remove_dir_all(staging).await {
-            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
-            _ => Ok(()),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+    for (index, root) in roots.iter().enumerate() {
+        if index > 0 && !staging_root_opens(root.clone(), id).await? {
+            continue;
+        }
+        remove_staging_dir(super::staging_dir_for(root, id), id).await?;
+    }
+    Ok(())
+}
+
+// Whether a category's destination folder can be opened. A folder that does
+// not exist opens, as it holds no staging directory to remove.
+async fn staging_root_opens(root: std::path::PathBuf, id: JobId) -> Result<bool, SchedulerError> {
+    tokio::task::spawn_blocking(move || {
+        match cap_std::fs::Dir::open_ambient_dir(&root, cap_std::ambient_authority()) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => {
+                tracing::warn!(
+                    job_id = id.0,
+                    dir = %root.display(),
+                    %error,
+                    "a category folder could not be opened; its staging directory for the job is not checked"
+                );
+                false
+            }
+        }
+    })
+    .await
+    .map_err(|error| SchedulerError::Internal(error.to_string()))
+}
+
+async fn remove_staging_dir(staging: std::path::PathBuf, id: JobId) -> Result<(), SchedulerError> {
+    let removed = tokio::task::spawn_blocking(move || {
+        crate::jobs::working_dir::remove_job_staging_dir(&staging, id)
+    })
+    .await
+    .map_err(|error| SchedulerError::Internal(error.to_string()))?;
+    match removed {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => {
+            Err(SchedulerError::Conflict(error.to_string()))
+        }
         Err(error) => Err(error.into()),
     }
 }
@@ -430,7 +472,7 @@ impl Queue {
             if let Err(error) = crate::history::delete_files::sweep_failed_job_files(
                 &resources.db,
                 &resources.intermediate_dir,
-                &resources.complete_dir,
+                &resources.staging_roots().await,
                 id,
                 recorded.map(std::path::PathBuf::from),
                 marked.remove(&id).unwrap_or_default(),
@@ -594,7 +636,7 @@ impl Queue {
             let (removed, result) = crate::history::delete_files::delete_history_rows(
                 &resources.db,
                 &resources.intermediate_dir,
-                &resources.complete_dir,
+                &resources.staging_roots().await,
                 accepted,
                 delete_files,
             )
@@ -618,5 +660,51 @@ impl Queue {
         .map_err(|error| {
             SchedulerError::Internal(format!("history delete worker failed: {error}"))
         })?
+    }
+}
+
+#[cfg(all(test, unix))]
+mod staging_root_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    // A category folder Weaver cannot open does not stop the cleanup: the
+    // job's staging directory under the complete folder still goes.
+    #[tokio::test]
+    async fn an_unreadable_category_folder_does_not_block_the_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let complete = temp.path().join("complete");
+        let category = temp.path().join("locked");
+        let job_id = JobId(41);
+        let staging = crate::pipeline::queue::staging_dir_for(&complete, job_id);
+        crate::jobs::working_dir::make_job_staging_dir(&staging, job_id).unwrap();
+        std::fs::write(staging.join("episode.mkv"), b"staged").unwrap();
+        std::fs::create_dir_all(&category).unwrap();
+        std::fs::set_permissions(&category, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = remove_job_staging(&[complete.clone(), category.clone()], job_id).await;
+        std::fs::set_permissions(&category, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        result.unwrap();
+        assert!(!staging.exists());
+    }
+
+    // The complete folder is where a job stages unless its category says
+    // otherwise, so it must be reachable.
+    #[tokio::test]
+    async fn an_unreadable_complete_folder_fails_the_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let complete = temp.path().join("complete");
+        std::fs::create_dir_all(&complete).unwrap();
+        std::fs::set_permissions(&complete, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let locked_out = std::fs::read_dir(&complete).is_err();
+
+        let result = remove_job_staging(std::slice::from_ref(&complete), JobId(42)).await;
+        std::fs::set_permissions(&complete, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A user the mode does not hold back (root) reaches it either way.
+        if locked_out {
+            assert!(result.is_err());
+        }
     }
 }

@@ -20,8 +20,8 @@ use super::catalog::{
 };
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
 use crate::schema_migrations::{
-    egress_quotas_v53, proxy_resolver_v64, script_concurrency_v58, script_instances_v55,
-    unwanted_extensions_v56,
+    egress_quotas_v53, history_search_key_v88, proxy_resolver_v64, script_concurrency_v58,
+    script_instances_v55, unwanted_extensions_v56,
 };
 use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
@@ -921,7 +921,8 @@ async fn import_sqlite(
         .await?;
         fill_older_unwanted_extensions(&mut SqlConn::Sqlite(&mut conn), source_schema_version)
             .await?;
-        name_older_proxy_resolvers(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await
+        name_older_proxy_resolvers(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await?;
+        name_older_history_releases(&mut SqlConn::Sqlite(&mut conn), source_schema_version).await
     }
     .await;
     match result {
@@ -1020,6 +1021,7 @@ async fn import_postgres(
     .await?;
     fill_older_unwanted_extensions(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     name_older_proxy_resolvers(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
+    name_older_history_releases(&mut SqlConn::Postgres(&mut tx), source_schema_version).await?;
     tx.commit().await.map_err(db_err)
 }
 
@@ -1083,6 +1085,19 @@ async fn name_older_proxy_resolvers(
 ) -> Result<(), StateError> {
     if source_schema_version < proxy_resolver_v64::SCHEMA_VERSION {
         proxy_resolver_v64::name_proxy_resolvers(conn).await?;
+    }
+    Ok(())
+}
+
+// A bundle written before a history row stored its full release name and
+// search key restores rows without them. No migration runs over a restore, so
+// the step that fills them on an upgrade is run here instead.
+async fn name_older_history_releases(
+    conn: &mut SqlConn<'_>,
+    source_schema_version: i64,
+) -> Result<(), StateError> {
+    if source_schema_version < history_search_key_v88::SCHEMA_VERSION {
+        history_search_key_v88::fill_history_search_columns(conn).await?;
     }
     Ok(())
 }
@@ -1154,10 +1169,12 @@ async fn import_sqlite_table(
         .iter()
         .map(|column| column.name.clone())
         .collect::<BTreeSet<_>>();
+    let history_nzbs = carries_history_nzbs(table, source);
     let unknown = source
         .columns
         .iter()
         .filter(|column| !target.contains(*column))
+        .filter(|column| !(history_nzbs && column.as_str() == HISTORY_NZB_COLUMN))
         .cloned()
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
@@ -1212,8 +1229,39 @@ async fn import_sqlite_table(
                 line_number + 1
             ))
         })?;
+        if let Some(nzb) = history_nzbs.then(|| history_nzb(&object)).flatten() {
+            let query = sqlx::query("INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES (?, ?)");
+            let query = bind_sqlite_value(query, object.get("job_id").unwrap_or(&JsonValue::Null))?;
+            bind_sqlite_value(query, nzb)?
+                .execute(&mut *conn)
+                .await
+                .map_err(|error| {
+                    StateError::Database(format!(
+                        "failed to import the stored NZB of backup row {table}:{}: {error}",
+                        line_number + 1
+                    ))
+                })?;
+        }
     }
     Ok(())
+}
+
+// A bundle written before a finished job's stored NZB had a table of its own
+// carries it on the history row; it is restored to `job_nzbs`.
+const HISTORY_NZB_COLUMN: &str = "nzb_zstd";
+
+fn carries_history_nzbs(table: &str, source: &TablePartMetadata) -> bool {
+    table == "job_history"
+        && source
+            .columns
+            .iter()
+            .any(|column| column == HISTORY_NZB_COLUMN)
+}
+
+fn history_nzb(object: &serde_json::Map<String, JsonValue>) -> Option<&JsonValue> {
+    object
+        .get(HISTORY_NZB_COLUMN)
+        .filter(|value| !value.is_null())
 }
 
 #[expect(
@@ -1232,10 +1280,12 @@ async fn import_postgres_table(
         .iter()
         .map(|column| column.name.as_str())
         .collect::<BTreeSet<_>>();
+    let history_nzbs = carries_history_nzbs(table, source);
     let unknown = source
         .columns
         .iter()
         .filter(|column| !target_names.contains(column.as_str()))
+        .filter(|column| !(history_nzbs && column.as_str() == HISTORY_NZB_COLUMN))
         .cloned()
         .collect::<Vec<_>>();
     if !unknown.is_empty() {
@@ -1300,6 +1350,24 @@ async fn import_postgres_table(
                 line_number + 1
             ))
         })?;
+        if let Some(nzb) = history_nzbs.then(|| history_nzb(&object)).flatten() {
+            let query =
+                sqlx::query("INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES ($1::bigint, $2)");
+            let query = bind_postgres_value(
+                query,
+                "int8",
+                object.get("job_id").unwrap_or(&JsonValue::Null),
+            )?;
+            bind_postgres_value(query, "bytea", nzb)?
+                .execute(&mut **tx)
+                .await
+                .map_err(|error| {
+                    StateError::Database(format!(
+                        "failed to import the stored NZB of backup row {table}:{}: {error}",
+                        line_number + 1
+                    ))
+                })?;
+        }
     }
     Ok(())
 }

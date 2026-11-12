@@ -21,6 +21,7 @@ fn lease_for(pipeline: &mut Pipeline, job_id: JobId) -> DownloadBatchLease {
         .unwrap()
         .download_queue
         .drain_all();
+    let works = pipeline.dispatched_all(works);
     assert!(!works.is_empty(), "the fixture job has queued work");
     let completion_critical = works.iter().any(|work| work.completion_critical);
     pipeline.hold_test_lane_works(works.clone(), false);

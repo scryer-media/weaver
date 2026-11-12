@@ -371,3 +371,104 @@ fn db_runtime_in_flight_is_released_when_the_guard_drops_early() {
     assert_eq!(metrics.snapshot().in_flight, 0);
     assert_eq!(metrics.snapshot().op_duration.count, 0);
 }
+
+// The stamp follows a turn through its work, its wait and its end: while it
+// works a reader sees what it is doing, once it ends the count has moved and
+// nothing is in progress.
+#[test]
+fn turn_stamp_follows_a_turn_from_start_to_end() {
+    let histogram = AtomicHistogram::new(TEST_BOUNDS);
+    let stamp = PipelineTurnStamp::new();
+    let before = stamp.read(stamp.origin());
+    assert_eq!(before.phase, PipelinePhase::BetweenTurns);
+    assert_eq!(before.busy_for, None);
+    assert_eq!(before.turns_completed, 0);
+    assert_eq!(before.since_last_turn_ended, None);
+    assert_eq!(before.installed_jobs, None);
+
+    {
+        let mut timer = TurnTimer::new(&histogram, &stamp);
+        let started = stamp.read(std::time::Instant::now());
+        assert_eq!(started.phase, PipelinePhase::QueueIntents);
+        assert!(started.phase.is_busy());
+        assert!(started.busy_for.is_some());
+        assert_eq!(started.turns_completed, 0);
+
+        timer.phase(PipelinePhase::Dispatch);
+        assert_eq!(
+            stamp.read(std::time::Instant::now()).phase,
+            PipelinePhase::Dispatch
+        );
+
+        timer.pause();
+        let waiting = stamp.read(std::time::Instant::now());
+        assert_eq!(waiting.phase, PipelinePhase::WaitingForWork);
+        assert_eq!(waiting.busy_for, None, "a wait is not work in progress");
+        assert_eq!(waiting.turns_completed, 0);
+
+        timer.resume(PipelinePhase::DecodeDone);
+        let handling = stamp.read(std::time::Instant::now());
+        assert_eq!(handling.phase, PipelinePhase::DecodeDone);
+        assert!(handling.busy_for.is_some());
+
+        timer.end_of_turn(7);
+        assert_eq!(
+            stamp.read(std::time::Instant::now()).phase,
+            PipelinePhase::EndOfTurn
+        );
+    }
+
+    let ended = stamp.read(std::time::Instant::now());
+    assert_eq!(ended.phase, PipelinePhase::BetweenTurns);
+    assert!(!ended.phase.is_busy());
+    assert_eq!(ended.busy_for, None);
+    assert_eq!(ended.turns_completed, 1);
+    assert!(ended.since_last_turn_ended.is_some());
+    assert_eq!(ended.installed_jobs, Some(7));
+    assert_eq!(histogram.snapshot().count, 1, "the turn is still observed");
+}
+
+// Durations come from the instants the stamp is given, so a reader's view is
+// exact for a given clock.
+#[test]
+fn turn_stamp_measures_against_the_reader_instant() {
+    let stamp = PipelineTurnStamp::new();
+    let origin = stamp.origin();
+    stamp.ended(origin + Duration::from_millis(400));
+    stamp.busy(
+        PipelinePhase::TerminalPostProcessing,
+        origin + Duration::from_secs(2),
+    );
+    let reading = stamp.read(origin + Duration::from_secs(65));
+    assert_eq!(reading.phase, PipelinePhase::TerminalPostProcessing);
+    assert_eq!(reading.busy_for, Some(Duration::from_secs(63)));
+    assert_eq!(reading.turns_completed, 1);
+    assert_eq!(
+        reading.since_last_turn_ended,
+        Some(Duration::from_millis(64_600))
+    );
+}
+
+// Every phase has its own code, and each code reads back as its phase.
+#[test]
+fn pipeline_phase_codes_are_distinct_and_round_trip() {
+    let mut codes = std::collections::HashSet::new();
+    for (index, phase) in PipelinePhase::ALL.iter().enumerate() {
+        assert_eq!(*phase as u8 as usize, index);
+        assert_eq!(PipelinePhase::from_code(*phase as u8), *phase);
+        let code = phase.as_str();
+        assert!(
+            code.chars()
+                .all(|character| character.is_ascii_lowercase() || character == '_'),
+            "{code}"
+        );
+        assert!(codes.insert(code), "{code} is used twice");
+    }
+    // Codes are stored in the stamp, so a new phase is appended and the
+    // existing numbers never move.
+    assert_eq!(PipelinePhase::ALL.len(), 38);
+    assert_eq!(PipelinePhase::Shutdown as u8, 36);
+    assert_eq!(PipelinePhase::GraphRun as u8, 37);
+    assert_eq!(PipelinePhase::GraphRun.as_str(), "graph_run");
+    assert!(PipelinePhase::GraphRun.is_busy());
+}

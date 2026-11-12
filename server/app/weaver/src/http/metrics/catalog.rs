@@ -569,14 +569,25 @@ metric_families! {
         "Database submissions that had to wait on a full executor queue.");
     DB_OP_DURATION = ("weaver_db_op_duration_seconds", Histogram, ["engine"],
         "Database operation latency, measured around the executor round-trip.");
-
-    // ---- buffer pool -----------------------------------------------------------------------
-    BUFFER_POOL_IN_USE_BYTES = ("weaver_runtime_buffer_pool_in_use_bytes", Gauge, ["tier"],
-        "Pre-allocated article buffer bytes currently checked out, by tier.");
-    BUFFER_POOL_TOTAL_BYTES = ("weaver_runtime_buffer_pool_total_bytes", Gauge, ["tier"],
-        "Pre-allocated article buffer bytes the pool owns, by tier.");
-    BUFFER_POOL_WAITS = ("weaver_runtime_buffer_pool_waits_total", Counter, [],
-        "Buffer acquisitions that had to wait for a buffer to come back.");
+    // SQLite file databases only; every value is from the WAL checkpoint task.
+    DB_WAL_CHECKPOINT_PASSES = ("weaver_db_wal_checkpoint_passes_total", Counter, [],
+        "WAL checkpoint passes run by the checkpoint task.");
+    DB_WAL_CHECKPOINT_PASSES_INCOMPLETE = ("weaver_db_wal_checkpoint_passes_incomplete_total", Counter, [],
+        "WAL checkpoint passes that left frames in the WAL because a read still needed them.");
+    DB_WAL_CHECKPOINT_BUSY = ("weaver_db_wal_checkpoint_busy_total", Counter, [],
+        "WAL checkpoint passes SQLite reported as busy.");
+    DB_WAL_RESTARTS = ("weaver_db_wal_restarts_total", Counter, [],
+        "Times a write restarted the WAL from its beginning after every frame had been copied.");
+    DB_WAL_CHECKPOINT_DURATION = ("weaver_db_wal_checkpoint_duration_seconds", Histogram, [],
+        "Duration of one WAL checkpoint pass.");
+    DB_WAL_LOG_FRAMES = ("weaver_db_wal_log_frames", Gauge, [],
+        "Frames in the WAL as the latest checkpoint pass saw it.");
+    DB_WAL_CHECKPOINTED_FRAMES = ("weaver_db_wal_checkpointed_frames", Gauge, [],
+        "Frames of the WAL copied into the database file as of the latest checkpoint pass.");
+    DB_WAL_CHECKPOINT_COPIED_FRAMES = ("weaver_db_wal_checkpoint_copied_frames", Gauge, [],
+        "Frames the latest checkpoint pass copied into the database file.");
+    DB_WAL_BYTES = ("weaver_db_wal_bytes", Gauge, [],
+        "Size of the WAL file after the latest checkpoint pass; it shrinks only when journal_size_limit trims it.");
 
     // ---- process ---------------------------------------------------------------------------
     // Standard process collector names, deliberately unprefixed so the usual

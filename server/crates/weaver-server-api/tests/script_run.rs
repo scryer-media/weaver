@@ -497,6 +497,33 @@ async fn a_script_run_reads_only_allowed_queries_and_changes_only_its_own_run() 
                 "NOT_ALLOWED_FOR_SCRIPT_RUN"
             );
         }
+
+        // The details of the job the run is about are its to read, by
+        // literal or by variable; another job's are not.
+        for query in [
+            "{ jobEvents(jobId: 7) { kind } }",
+            "{ jobTimeline(jobId: 7) { __typename } }",
+            "{ jobDetailSnapshot(jobId: 7) { __typename } }",
+        ] {
+            let response = as_run(&harness, run, query).await;
+            let errors = serde_json::to_string(&response.errors).unwrap();
+            assert!(
+                !errors.contains("NOT_ALLOWED_FOR_SCRIPT_RUN"),
+                "{run}: {query}: {errors}"
+            );
+        }
+        for query in [
+            "{ jobEvents(jobId: 8) { kind } }",
+            "{ jobTimeline(jobId: 8) { __typename } }",
+            "{ jobDetailSnapshot(jobId: 8) { __typename } }",
+            "{ jobEvents: jobEvents(jobId: 8) { kind } }",
+        ] {
+            assert_eq!(
+                refused(&as_run(&harness, run, query).await).0,
+                "NOT_ALLOWED_FOR_SCRIPT_RUN",
+                "{run}: {query}"
+            );
+        }
         let response = as_run(
             &harness,
             run,

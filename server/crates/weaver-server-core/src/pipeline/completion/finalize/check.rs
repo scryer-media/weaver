@@ -97,6 +97,10 @@ impl Pipeline {
     // the scheduler's backlog, not current transfer activity, and a started
     // job with only backlog still lists as Downloading on its own state.
     pub(crate) fn job_has_current_download_activity(&self, job_id: JobId) -> bool {
+        #[cfg(test)]
+        if self.job_has_queued_decode(job_id) {
+            return true;
+        }
         self.active_download_connections_by_job
             .get(&job_id)
             .copied()
@@ -120,10 +124,6 @@ impl Pipeline {
                 .copied()
                 .unwrap_or(0)
                 > 0
-            || self
-                .pending_decode
-                .iter()
-                .any(|work| work.segment_id.file_id.job_id == job_id)
     }
 
     // Everything the download stage still owes this job.
@@ -173,17 +173,15 @@ impl Pipeline {
             .copied()
             .unwrap_or(0)
             > 0;
-        let has_pending_decode = self
-            .pending_decode
-            .iter()
-            .any(|work| work.segment_id.file_id.job_id == job_id);
+        // Only tests queue undecoded bodies.
+        #[cfg(test)]
+        let has_inflight_decodes = has_inflight_decodes || self.job_has_queued_decode(job_id);
 
         has_queued_work
             || has_inflight_downloads
             || has_inflight_decodes
             || has_delayed_retries
             || has_released_download_results
-            || has_pending_decode
     }
 
     // The completion gate: an admitted job that is not retiring hands its

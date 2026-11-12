@@ -63,6 +63,7 @@ impl Pipeline {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn note_decode_started(&mut self, segment_id: SegmentId, raw_bytes: u64) {
         self.active_decode_bytes.insert(segment_id, raw_bytes);
         let job_id = segment_id.file_id.job_id;
@@ -87,6 +88,15 @@ impl Pipeline {
         self.publish_active_stage_metrics();
     }
 
+    // Whether an undecoded body of `job_id` waits for a decode slot. Only
+    // tests hand the pipeline undecoded bodies.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn job_has_queued_decode(&self, job_id: JobId) -> bool {
+        self.pending_decode
+            .iter()
+            .any(|work| work.segment_id.file_id.job_id == job_id)
+    }
+
     // Whether the decode stage holds nothing at all for `job_id`: no decode
     // running and none queued behind the decode semaphore.
     //
@@ -95,15 +105,15 @@ impl Pipeline {
     // only about the decode stage, and is the cheap gate that decides whether
     // a settling decode is worth re-running the download-drain sequence for.
     pub(in crate::pipeline) fn job_decode_stage_drained(&self, job_id: JobId) -> bool {
+        #[cfg(test)]
+        if self.job_has_queued_decode(job_id) {
+            return false;
+        }
         self.active_decodes_by_job
             .get(&job_id)
             .copied()
             .unwrap_or(0)
             == 0
-            && !self
-                .pending_decode
-                .iter()
-                .any(|work| work.segment_id.file_id.job_id == job_id)
     }
 
     pub(in crate::pipeline) fn decode_retry_exclude_servers(
@@ -154,6 +164,7 @@ impl Pipeline {
         // damaged bytes a parked part was waiting to start after.
         self.release_settled_unanchored_runs().await;
 
+        #[cfg(test)]
         self.pump_decode_queue();
 
         // The download-result path already ran the drain sequence for this
@@ -174,10 +185,19 @@ impl Pipeline {
         // `active_download_passes`), and its own `in_flight == 0 && no queued
         // work` gate makes this a no-op for every decode that is not the last.
         let job_id = segment_id.file_id.job_id;
-        if self.jobs.contains_key(&job_id) && self.job_decode_stage_drained(job_id) {
-            self.maybe_finish_download_pass(job_id);
+        if !self.jobs.contains_key(&job_id) {
+            return;
         }
-        self.report_job(job_id);
+        // A job's report walks its files, so it is not built for each
+        // article. The job's last decode changes what the report says of its
+        // stage and is published now; any other only moves its figures, which
+        // the snapshot tick publishes once for all that decoded since.
+        if self.job_decode_stage_drained(job_id) {
+            self.maybe_finish_download_pass(job_id);
+            self.report_job(job_id);
+        } else {
+            self.reports_due.insert(job_id);
+        }
     }
 
     // Whether a body that failed to decode is fetched again: the job still
@@ -286,10 +306,7 @@ impl Pipeline {
         if let Some(state) = self.jobs.get(&job_id) {
             let file_idx = segment_id.file_id.file_index as usize;
             if let Some(file_spec) = state.spec.files.get(file_idx)
-                && let Some(seg_spec) = file_spec
-                    .segments
-                    .iter()
-                    .find(|s| s.ordinal == segment_id.segment_number)
+                && let Some(seg_spec) = file_spec.segment(segment_id.segment_number)
             {
                 let work = DownloadWork {
                     counters: None,

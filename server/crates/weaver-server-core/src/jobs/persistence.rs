@@ -369,11 +369,12 @@ fn build_complete_files_pg_sql(row_count: usize) -> String {
 impl Database {
     pub fn create_active_job(&self, job: &ActiveJob) -> Result<(), StateError> {
         let datastore = self.datastore();
+        let job_id = job.job_id;
+        let nzb_zstd: std::sync::Arc<[u8]> = job.nzb_zstd.as_slice().into();
         let args = vec![
             SqlArg::I64(job.job_id.0 as i64),
             SqlArg::Bytes(job.nzb_hash.to_vec()),
             SqlArg::Text(job.nzb_path.to_str().unwrap_or("").to_string()),
-            SqlArg::Bytes(job.nzb_zstd.clone()),
             SqlArg::Text(job.output_dir.to_str().unwrap_or("").to_string()),
             SqlArg::Text(job.status.to_string()),
             SqlArg::Text(job.download_state.to_string()),
@@ -397,14 +398,16 @@ impl Database {
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(&datastore, "create_active_job", |tx| {
                 let args = args.clone();
+                let nzb_zstd = nzb_zstd.clone();
                 Box::pin(async move {
                     tx.execute(
                         "INSERT INTO active_jobs
-                         (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
-                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                         (job_id, nzb_hash, nzb_path, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                         &args,
                     )
                     .await?;
+                    super::nzb_persistence::write_active_job_nzb_tx(tx, job_id, &nzb_zstd).await?;
                     Ok(())
                 })
             })
@@ -421,11 +424,11 @@ impl Database {
         let datastore = self.datastore();
         let job_id = job.job_id;
         let identities = identities.to_vec();
+        let nzb_zstd: std::sync::Arc<[u8]> = job.nzb_zstd.as_slice().into();
         let args = vec![
             SqlArg::I64(job.job_id.0 as i64),
             SqlArg::Bytes(job.nzb_hash.to_vec()),
             SqlArg::Text(job.nzb_path.to_str().unwrap_or("").to_string()),
-            SqlArg::Bytes(job.nzb_zstd.clone()),
             SqlArg::Text(job.output_dir.to_str().unwrap_or("").to_string()),
             SqlArg::Text(job.status.to_string()),
             SqlArg::Text(job.download_state.to_string()),
@@ -453,14 +456,17 @@ impl Database {
                 |tx| {
                     let args = args.clone();
                     let identities = identities.clone();
+                    let nzb_zstd = nzb_zstd.clone();
                     Box::pin(async move {
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
-                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;
+                        super::nzb_persistence::write_active_job_nzb_tx(tx, job_id, &nzb_zstd)
+                            .await?;
                         bulk_upsert_file_identities_tx(tx, job_id, &identities).await?;
                         Ok(())
                     })
@@ -528,6 +534,7 @@ impl Database {
     // SCORE caller supplies the generation it received at admission; parking
     // or superseding that candidate invalidates the generation before any
     // stale request can create scheduler work.
+    #[cfg(test)]
     pub(crate) fn materialize_admission(
         &self,
         job: &ActiveJob,
@@ -536,15 +543,41 @@ impl Database {
         semantic_promotion_generation: Option<i64>,
         restart: bool,
     ) -> Result<bool, StateError> {
+        self.materialize_admission_with_outline(
+            job,
+            identities,
+            None,
+            semantic_materialization_generation,
+            semantic_promotion_generation,
+            restart,
+        )
+    }
+
+    // As `materialize_admission`, writing the job's NZB outline in the same
+    // transaction when it was read.
+    pub(crate) fn materialize_admission_with_outline(
+        &self,
+        job: &ActiveJob,
+        identities: &[ActiveFileIdentity],
+        outline: Option<&crate::ingest::outline::NzbOutline>,
+        semantic_materialization_generation: Option<i64>,
+        semantic_promotion_generation: Option<i64>,
+        restart: bool,
+    ) -> Result<bool, StateError> {
         let datastore = self.datastore();
         let job_id = job.job_id;
         let identities = identities.to_vec();
+        let nzb_zstd: std::sync::Arc<[u8]> = job.nzb_zstd.as_slice().into();
+        let outline = outline
+            .map(|outline| {
+                super::outline_persistence::OutlineHead::of(self.encryption_key(), outline)
+            })
+            .transpose()?;
         let now = (crate::jobs::epoch_ms_now() / 1_000.0) as i64;
         let args = vec![
             SqlArg::I64(job.job_id.0 as i64),
             SqlArg::Bytes(job.nzb_hash.to_vec()),
             SqlArg::Text(job.nzb_path.to_str().unwrap_or("").to_string()),
-            SqlArg::Bytes(job.nzb_zstd.clone()),
             SqlArg::Text(job.output_dir.to_str().unwrap_or("").to_string()),
             SqlArg::Text(job.status.to_string()),
             SqlArg::Text(job.download_state.to_string()),
@@ -572,6 +605,8 @@ impl Database {
                 |tx| {
                     let args = args.clone();
                     let identities = identities.clone();
+                    let nzb_zstd = nzb_zstd.clone();
+                    let outline = outline.clone();
                     Box::pin(async move {
                         if restart {
                             let deleted = crate::history::persistence::delete_job_history_bundles_tx(tx, &[job_id]).await?;
@@ -686,12 +721,17 @@ impl Database {
                         .await?;
                         tx.execute(
                             "INSERT INTO active_jobs
-                             (job_id, nzb_hash, nzb_path, nzb_zstd, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
-                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+                             (job_id, nzb_hash, nzb_path, output_dir, status, download_state, post_state, run_state, created_at, category, metadata, paused_resume_status, paused_resume_download_state, paused_resume_post_state, password, password_candidates)
+                             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
                             &args,
                         )
                         .await?;
+                        super::nzb_persistence::write_active_job_nzb_tx(tx, job_id, &nzb_zstd)
+                            .await?;
                         bulk_upsert_file_identities_tx(tx, job_id, &identities).await?;
+                        if let Some(head) = &outline {
+                            super::outline_persistence::write_outline_tx(tx, job_id, head).await?;
+                        }
                         Ok(true)
                     })
                 },
@@ -969,6 +1009,29 @@ impl Database {
         self.set_active_job_runtime(
             job_id, status, None, None, None, error, None, None, None, None, None,
         )
+    }
+
+    // Where the job stages the files it delivers; None when it stages
+    // nothing apart from its working directory.
+    pub(crate) fn set_active_job_staging_dir(
+        &self,
+        job_id: JobId,
+        staging_dir: Option<&std::path::Path>,
+    ) -> Result<(), StateError> {
+        let datastore = self.datastore();
+        let args = vec![
+            SqlArg::OptText(staging_dir.map(|dir| dir.to_string_lossy().into_owned())),
+            SqlArg::I64(job_id.0 as i64),
+        ];
+        self.run_sql_blocking(async move {
+            SqlRuntime::execute(
+                datastore.write_exec(),
+                "UPDATE active_jobs SET staging_dir = {} WHERE job_id = {}",
+                &args,
+            )
+            .await?;
+            Ok(())
+        })
     }
 
     #[expect(

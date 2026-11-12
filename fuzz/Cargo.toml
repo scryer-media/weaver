@@ -4,6 +4,11 @@ version = "0.0.0"
 publish = false
 edition = "2024"
 
+# Its own workspace, so cargo never adopts it into an enclosing one (a
+# checkout nested inside another checkout of the repository).
+[workspace]
+members = ["."]
+
 [package.metadata]
 cargo-fuzz = true
 
@@ -22,6 +27,27 @@ bench = false
 [[bin]]
 name = "yenc_article"
 path = "fuzz_targets/yenc_article.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yenc_decode_tiers"
+path = "fuzz_targets/yenc_decode_tiers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yenc_encode_tiers"
+path = "fuzz_targets/yenc_encode_tiers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "yenc_roundtrip"
+path = "fuzz_targets/yenc_roundtrip.rs"
 test = false
 doc = false
 bench = false

@@ -39,6 +39,7 @@ import { sameItems, shallowEqual, useSettled } from "./settled";
 import { withLiveConnections, type ProviderConnections } from "./provider-connections";
 import { useHistoryLiveRefresh } from "./use-history-live-refresh";
 import { useLiveQueue, type LiveQueue } from "./use-live-queue";
+import { useVisibleInterval } from "./timers";
 
 /**
  * Everything the Next chrome needs, resolved once above the router.
@@ -342,12 +343,9 @@ export function NextDataProvider({ children }: { children: ReactNode }) {
   }, [queueShape, reexecuteHistoryCount, reexecuteProviders]);
 
   // Providers drift on their own (latency, holdoffs) even with a still queue.
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      void reexecuteProviders({ requestPolicy: "network-only" });
-    }, 10_000);
-    return () => window.clearInterval(timer);
-  }, [reexecuteProviders]);
+  useVisibleInterval(() => {
+    void reexecuteProviders({ requestPolicy: "network-only" });
+  }, 10_000);
 
   const snapshot = polledMetrics
     ?? (connectionState.status === "connected" && !metricsSubscriptionError

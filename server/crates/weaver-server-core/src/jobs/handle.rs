@@ -210,6 +210,41 @@ impl SharedPipelineState {
         })
     }
 
+    // The queued jobs the diagnostics package reports on: those Weaver has
+    // started work on, post-processing first, then failed, then downloading,
+    // each group in queue order, at most `limit` of them. Every row is
+    // classified under the read lock without copying it; only the chosen
+    // rows are copied. A cancelled job, and one with a pause the pipeline has
+    // not applied yet, reads as the queue shows it and does not qualify.
+    pub fn active_report_jobs(&self, limit: usize) -> crate::support::ActiveReportJobs {
+        use crate::support::{ActiveReportGroup, ActiveReportJobs};
+        self.queue.read(|inner| {
+            let mut chosen: Vec<(ActiveReportGroup, usize)> = inner
+                .jobs
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.intents.cancelled.is_none())
+                .filter(|(_, row)| {
+                    !(row.intents.pause_seq > row.report.seen_intent_seq
+                        && row.intents.paused == Some(true))
+                })
+                .filter_map(|(position, row)| {
+                    ActiveReportGroup::of(&row.report.job.status).map(|group| (group, position))
+                })
+                .collect();
+            let qualified = chosen.len();
+            chosen.sort_unstable();
+            chosen.truncate(limit);
+            ActiveReportJobs {
+                qualified,
+                jobs: chosen
+                    .into_iter()
+                    .map(|(group, position)| (group, inner.jobs[position].info(&inner.globals)))
+                    .collect(),
+            }
+        })
+    }
+
     // The revision of the published job list; it moves on every publish.
     pub fn job_revision(&self) -> u64 {
         self.queue.revision()
@@ -811,6 +846,11 @@ pub struct RestartRead {
     // The job is entering the queue window again, not arriving: it raises
     // no creation event.
     pub(crate) reentry: bool,
+    // The job has no stored NZB outline yet: it holds no file, and its
+    // install reads its stored NZB once and stores the outline it reads. It
+    // installs wherever it stands, so its row says what it holds; one out
+    // of the window leaves it again once read.
+    pub(crate) outline_pending: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -1337,6 +1377,13 @@ impl SchedulerHandle {
         self.state.metrics_jobs(mode)
     }
 
+    // The queued jobs the diagnostics package reports on (reads from shared
+    // state, no channel round-trip). See
+    // [`SharedPipelineState::active_report_jobs`].
+    pub fn active_report_jobs(&self, limit: usize) -> crate::support::ActiveReportJobs {
+        self.state.active_report_jobs(limit)
+    }
+
     // The revision of the published job list; it moves on every publish.
     pub fn job_revision(&self) -> u64 {
         self.state.job_revision()
@@ -1853,6 +1900,23 @@ impl SchedulerHandle {
         // the pipeline reads.
         crate::e2e_failpoint::release_shutdown_holds();
         Ok(())
+    }
+
+    // What the diagnostics package can say about the pipeline when it does
+    // not answer: the queue's shared rows and the pipeline's turn stamp,
+    // read as of `now`. Nothing here waits on the pipeline.
+    pub fn pipeline_unanswered_state(
+        &self,
+        now: std::time::Instant,
+    ) -> (
+        crate::pipeline::diagnostics::QueueStateCounts,
+        crate::operations::instrumentation::PipelineTurnReading,
+    ) {
+        let queue = self
+            .state
+            .queue
+            .read(crate::pipeline::diagnostics::QueueStateCounts::read);
+        (queue, self.state.metrics().pipeline_turn.read(now))
     }
 }
 

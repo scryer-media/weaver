@@ -351,6 +351,28 @@ impl Database {
         })
     }
 
+    // Where the job's row says it stages the files it delivers: None when
+    // the row names no staging directory, or there is no row.
+    pub(crate) fn load_active_job_staging_dir(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<PathBuf>, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            Ok(SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT staging_dir FROM active_jobs WHERE job_id = {}",
+                &[SqlArg::I64(job_id.0 as i64)],
+            )
+            .await?
+            .map(|row| row.opt_text("staging_dir"))
+            .transpose()?
+            .flatten()
+            .filter(|dir| !dir.is_empty())
+            .map(PathBuf::from))
+        })
+    }
+
     pub fn load_active_job_persisted_nzb(
         &self,
         job_id: JobId,
@@ -359,9 +381,10 @@ impl Database {
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_optional(
                 datastore.read_exec(),
-                "SELECT nzb_path, nzb_zstd
-                 FROM active_jobs
-                 WHERE job_id = {}
+                "SELECT a.nzb_path, n.nzb_zstd
+                 FROM active_jobs AS a
+                 LEFT JOIN job_nzbs AS n ON n.job_id = a.job_id
+                 WHERE a.job_id = {}
                  LIMIT 1",
                 &[SqlArg::I64(job_id.0 as i64)],
             )
@@ -396,9 +419,10 @@ impl Database {
             .run_sql_blocking_read(async move {
                 SqlRuntime::fetch_optional(
                     datastore.read_exec(),
-                    "SELECT nzb_path, nzb_zstd, password_candidates
-                     FROM active_jobs
-                     WHERE job_id = {}
+                    "SELECT a.nzb_path, n.nzb_zstd, a.password_candidates
+                     FROM active_jobs AS a
+                     LEFT JOIN job_nzbs AS n ON n.job_id = a.job_id
+                     WHERE a.job_id = {}
                      LIMIT 1",
                     &[SqlArg::I64(job_id.0 as i64)],
                 )

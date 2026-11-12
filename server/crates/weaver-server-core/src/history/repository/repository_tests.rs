@@ -69,8 +69,8 @@ fn upsert_preserves_persisted_nzb_bytes_when_update_omits_them() {
     db.run_sql_blocking(async move {
         SqlRuntime::execute(
             datastore.write_exec(),
-            "UPDATE job_history SET nzb_zstd = {} WHERE job_id = {}",
-            &[SqlArg::Bytes(expected_for_update), SqlArg::I64(1)],
+            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES ({}, {})",
+            &[SqlArg::I64(1), SqlArg::Bytes(expected_for_update)],
         )
         .await?;
         Ok(())
@@ -457,6 +457,43 @@ fn history_attribute_filters_are_exact_and_indexed() {
             .unwrap(),
         1
     );
+}
+
+#[test]
+fn history_attributes_are_written_once_per_pair_and_replaced_on_rewrite() {
+    let db = Database::open_in_memory().unwrap();
+    let mut entry = sample_history();
+    entry.job_id = 5;
+    entry.metadata = Some(metadata_json(&[
+        ("*scryer_title_id", "title-a"),
+        ("*scryer_title_id", "title-a"),
+        ("*scryer_title_id", "title-b"),
+        ("tag", "x"),
+    ]));
+    db.insert_job_history(&entry).unwrap();
+
+    let matching = |key: &str, value: &str| {
+        db.count_job_history(
+            &HistoryFilter {
+                metadata_equals: Some(HistoryMetadataEquals {
+                    key: key.to_string(),
+                    value: value.to_string(),
+                }),
+                ..Default::default()
+            },
+            crate::HistoryRows::All,
+        )
+        .unwrap()
+    };
+    assert_eq!(matching("*scryer_title_id", "title-a"), 1);
+    assert_eq!(matching("*scryer_title_id", "title-b"), 1);
+    assert_eq!(matching("tag", "x"), 1);
+
+    entry.metadata = Some(metadata_json(&[("tag", "y")]));
+    db.insert_job_history(&entry).unwrap();
+    assert_eq!(matching("*scryer_title_id", "title-a"), 0);
+    assert_eq!(matching("tag", "x"), 0);
+    assert_eq!(matching("tag", "y"), 1);
 }
 
 #[test]

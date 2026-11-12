@@ -88,7 +88,7 @@ async fn delete_history_with_files_removes_a_failed_job_s_whole_working_dir() {
     let (mut pipeline, intermediate_dir, complete_dir) = new_direct_pipeline(&temp_dir).await;
     let job_id = JobId(30027);
     let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);
-    tokio::fs::create_dir_all(&staging).await.unwrap();
+    crate::pipeline::queue::make_staging_dir(&staging, job_id).unwrap();
     tokio::fs::write(staging.join("lantern.mkv"), b"staged")
         .await
         .unwrap();
@@ -174,7 +174,7 @@ async fn housekeeping_removes_an_old_failed_job_s_files_and_keeps_its_record() {
     let job_id = JobId(30041);
     let output_dir = marked_working_dir(&intermediate_dir, "housekeeping-failed", job_id).await;
     let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);
-    tokio::fs::create_dir_all(&staging).await.unwrap();
+    crate::pipeline::queue::make_staging_dir(&staging, job_id).unwrap();
     tokio::fs::write(staging.join("lantern.mkv"), b"staged")
         .await
         .unwrap();
@@ -1322,6 +1322,42 @@ async fn job_completed_event_publishes_after_history_archive_commits() {
     assert!(listed.iter().any(|row| row.job_id == job_id.0));
 }
 
+// A job restored in post-processing has its post-processing rows read with
+// the rest of its install, off the pipeline thread; any other job reads none.
+#[tokio::test]
+async fn an_install_read_carries_the_post_processing_rows_of_a_job_in_post_processing() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    for (job_id, status, carries) in [
+        (JobId(31210), JobStatus::PostProcessing, true),
+        (JobId(31211), JobStatus::QueuedPostProcessing, true),
+        (JobId(31212), JobStatus::Downloading, false),
+    ] {
+        let working_dir = temp_dir.path().join(format!("restore-read-{}", job_id.0));
+        tokio::fs::create_dir_all(&working_dir).await.unwrap();
+        let request = RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec: standalone_job_spec("Restore read", &[("sample.bin".to_string(), 100)]),
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            status,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+            restart: None,
+        };
+        let read = crate::jobs::service::read_install(pipeline.install_seat(job_id), request).await;
+        assert_eq!(read.carries_post_processing(), carries, "{job_id:?}");
+    }
+}
+
 #[tokio::test]
 async fn restore_job_rehydrates_existing_deterministic_staging_dir() {
     let temp_dir = tempfile::tempdir().unwrap();
@@ -1336,6 +1372,106 @@ async fn restore_job_rehydrates_existing_deterministic_staging_dir() {
     let staging_dir = pipeline.deterministic_extraction_staging_dir(job_id);
     tokio::fs::create_dir_all(&staging_dir).await.unwrap();
 
+    pipeline
+        .restore_job(RestoreJobRequest {
+            job_id,
+            job_hash: [0; 32],
+            spec,
+            detected_archives: HashMap::new(),
+            file_identities: HashMap::new(),
+            status: JobStatus::Downloading,
+            download_state: None,
+            post_state: None,
+            run_state: None,
+            queued_repair_at_epoch_ms: None,
+            queued_extract_at_epoch_ms: None,
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            working_dir,
+            restart: None,
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        pipeline
+            .jobs
+            .get(&job_id)
+            .and_then(|state| state.staging_dir.clone()),
+        Some(staging_dir)
+    );
+}
+
+// A job that began staging in its category's folder finds that staging
+// directory again after a restart, even with the category since deleted.
+#[tokio::test]
+async fn a_restart_finds_the_staging_directory_the_job_chose() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let roots = || {
+        (
+            temp_dir.path().join("data"),
+            temp_dir.path().join("intermediate"),
+            temp_dir.path().join("complete"),
+            temp_dir.path().join("weaver.db"),
+        )
+    };
+    let backlog_base_bytes = || 16 * 1024 * 1024;
+    let movies = temp_dir.path().join("movies");
+    let (data, intermediate, complete, db) = roots();
+    crate::runtime::fs::test_devices::assign(&intermediate, 1);
+    crate::runtime::fs::test_devices::assign(&complete, 2);
+    crate::runtime::fs::test_devices::assign(&movies, 3);
+    let (mut pipeline, _, _) = new_direct_pipeline_at_roots(
+        data,
+        intermediate,
+        complete,
+        db,
+        backlog_base_bytes(),
+        0,
+        None,
+    )
+    .await;
+    pipeline.config.write().await.categories = vec![crate::categories::CategoryConfig {
+        id: 0,
+        name: "movies".to_string(),
+        dest_dir: Some(movies.display().to_string()),
+        aliases: String::new(),
+    }];
+    let job_id = JobId(31208);
+    let mut spec = segmented_job_spec("Restart staged", "payload.bin", &[100]);
+    spec.category = Some("movies".to_string());
+    let nzb_zstd = nzb_zstd_for(&spec);
+    pipeline
+        .add_job(
+            job_id,
+            spec.clone(),
+            PathBuf::from("restart-staged.nzb"),
+            nzb_zstd,
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+    activate_job(&mut pipeline, job_id).await;
+    let staging_dir = crate::pipeline::queue::staging_dir_for(&movies, job_id);
+    assert_eq!(
+        pipeline.jobs.get(&job_id).unwrap().staging_dir,
+        Some(staging_dir.clone())
+    );
+    let working_dir = pipeline.jobs.get(&job_id).unwrap().working_dir.clone();
+    retire_pipeline_database(pipeline).await;
+
+    let (data, intermediate, complete, db) = roots();
+    let (mut pipeline, _, _) = new_direct_pipeline_at_roots(
+        data,
+        intermediate,
+        complete,
+        db,
+        backlog_base_bytes(),
+        0,
+        None,
+    )
+    .await;
     pipeline
         .restore_job(RestoreJobRequest {
             job_id,

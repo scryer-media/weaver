@@ -41,9 +41,11 @@ pub use auth::{ApiKeyRow, AuthCredentials};
 pub use bandwidth::rate_limiter::TokenBucket;
 pub use error::Error;
 pub use history::{
-    CLIENT_REQUEST_ID_ATTRIBUTE_KEY, HistoryFilter, HistoryMetadataEquals, HistoryRows,
-    IntegrationEventRow, JobEvent, JobHistoryRow, is_public_history_attribute_key,
-    parse_history_metadata, public_history_attributes, split_history_metadata,
+    CLIENT_REQUEST_ID_ATTRIBUTE_KEY, HistoryEditFields, HistoryFilter, HistoryMetadataEquals,
+    HistoryOrder, HistoryOrderKey, HistoryRows, IntegrationEventRow, JobEvent, JobHistoryRow,
+    history_release_name, history_search_columns, is_public_history_attribute_key,
+    normalize_history_search_text, parse_history_metadata, public_history_attributes,
+    split_history_metadata,
 };
 pub use jobs::{
     ActiveJob, CallerScopedIdempotency, CancelJobsOutcome, DownloadBlockKind, DownloadBlockState,

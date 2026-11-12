@@ -1057,7 +1057,12 @@ impl GraphJob {
     ) -> Result<Vec<Move>, GraphError> {
         let from = self.root.map.moves_pending();
         sample::indexes(&self.root.indexes, &self.root.map, &mut self.root.window);
-        sample::bootstrap(&self.tree, &self.root.map, &mut self.root.window);
+        sample::bootstrap(
+            &self.tree,
+            &mut self.root.map,
+            &mut self.root.leading,
+            &mut self.root.window,
+        );
         sample::fronts(&self.tree, &mut self.root.map);
         let mut wants = Vec::new();
         self.tree.collect_wants(&mut wants);
@@ -1096,6 +1101,12 @@ impl GraphJob {
             self.lend_work(limit)?;
         }
         Ok(self.root.map.take_moves())
+    }
+
+    // The volumes whose place in their set the rounds learned since the last
+    // call, each with the rank its articles are fetched at.
+    pub(crate) fn take_volume_ranks(&mut self) -> Vec<(VolumeIndex, u32)> {
+        self.root.leading.take_ranked()
     }
 
     // The phase, when it changed since the last call.

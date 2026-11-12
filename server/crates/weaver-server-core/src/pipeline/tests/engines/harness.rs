@@ -17,7 +17,7 @@ use weaver_graph::recovery::RepairOutcome;
 use weaver_model::files::FileRole;
 
 use super::super::{
-    checkpoint_plan, insert_active_job, job_status_for_assert, new_direct_pipeline_with_buffers,
+    checkpoint_plan, insert_active_job, job_status_for_assert, new_direct_pipeline_with_backlog,
     pump_pipeline_runtime_queues, retire_pipeline_database,
 };
 use crate::history::HistoryFailureKind;
@@ -216,6 +216,16 @@ pub(in crate::pipeline::tests) fn par3_set(
     files: &[(&str, &[u8])],
     blocks: u64,
 ) -> Vec<Post> {
+    par3_set_sized(base, files, ARTICLE as u64, blocks)
+}
+
+// The same, in blocks of `size` bytes.
+pub(in crate::pipeline::tests) fn par3_set_sized(
+    base: &str,
+    files: &[(&str, &[u8])],
+    size: u64,
+    blocks: u64,
+) -> Vec<Post> {
     let source = tempfile::tempdir().unwrap();
     let names: Vec<std::path::PathBuf> = files
         .iter()
@@ -229,7 +239,7 @@ pub(in crate::pipeline::tests) fn par3_set(
         &par3_rs::InputSpec::new(source.path(), &names),
         &out.path().join(base),
         &par3_rs::CreateOptions::default()
-            .with_block_size(ARTICLE as u64)
+            .with_block_size(size)
             .with_recovery(par3_rs::RecoveryAmount::Blocks(blocks)),
     )
     .unwrap();
@@ -559,6 +569,10 @@ pub(in crate::pipeline::tests) struct Scenario {
     pub(in crate::pipeline::tests) article: usize,
     // Every batch the download queue hands out is served last article first.
     pub(in crate::pipeline::tests) backwards: bool,
+    // Every handout is this many articles at once, served in the order the
+    // queue handed them out, as that many workers fetching side by side
+    // land; none is one at a time.
+    pub(in crate::pipeline::tests) batch: usize,
     // Every batch the download queue hands out is served as workers fetching
     // these posts at once: one article of each in turn, in this order.
     pub(in crate::pipeline::tests) together: Vec<u32>,
@@ -615,6 +629,7 @@ impl Scenario {
             global_passwords: Vec::new(),
             article: ARTICLE,
             backwards: false,
+            batch: 0,
             together: Vec::new(),
             reversed: Vec::new(),
             first: Vec::new(),
@@ -632,9 +647,7 @@ impl Scenario {
         }
     }
 
-    // Everything a run says is told to `heard` first. Only the rows that
-    // lend windows listen, and only where windows are mapped.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Everything a run says is told to `heard` first.
     pub(in crate::pipeline::tests) fn heard(
         mut self,
         heard: impl Fn(&crate::pipeline::graph::engine::Said) + Send + Sync + 'static,
@@ -760,6 +773,13 @@ impl Scenario {
     // Whatever the download queue hands out at once arrives in reverse.
     pub(in crate::pipeline::tests) fn backwards(mut self) -> Self {
         self.backwards = true;
+        self
+    }
+
+    // The queue hands out `articles` at a time, served in the order handed
+    // out.
+    pub(in crate::pipeline::tests) fn batched(mut self, articles: usize) -> Self {
+        self.batch = articles;
         self
     }
 
@@ -1095,13 +1115,9 @@ pub(in crate::pipeline::tests) async fn admit_with(
     let temp_dir = tempfile::tempdir().unwrap();
     // One server: an article it serves damaged has nowhere else to come
     // from, so the job gives it up for repair at once.
-    let buffers = crate::runtime::buffers::BufferPoolConfig {
-        small_count: 8,
-        medium_count: 4,
-        large_count: 2,
-    };
+    let backlog_base_bytes = 16 * 1024 * 1024;
     let (mut pipeline, _, complete_dir) =
-        new_direct_pipeline_with_buffers(&temp_dir, buffers, 1).await;
+        new_direct_pipeline_with_backlog(&temp_dir, backlog_base_bytes, 1).await;
     scenario.prepare(&mut pipeline);
     setup(&mut pipeline, temp_dir.path());
     insert_active_job(&mut pipeline, JOB, scenario.spec()).await;
@@ -1385,8 +1401,9 @@ pub(in crate::pipeline::tests) async fn run_unprompted(
     (outcomes, moved)
 }
 
-// The next articles the download queue hands out: one, or with `backwards`
-// every one it holds, last first, or with `together` every one it holds, a
+// The next articles the download queue hands out: one, or with `batched`
+// that many in the order handed out, or with `backwards` every one it
+// holds, last first, or with `together` every one it holds, a
 // turn of each named post at a time, or with `leased` the batch a lane
 // leases, last first, with the slice sizes it was leased under. `None` once
 // it is dry.
@@ -1410,28 +1427,36 @@ fn handed_out(
     {
         return None;
     }
-    let queue = &mut pipeline
-        .jobs
-        .get_mut(&JOB)?
-        .articles
-        .active_mut()
-        .unwrap()
-        .download_queue;
+    let crate::jobs::model::JobState { articles, spec, .. } = pipeline.jobs.get_mut(&JOB)?;
+    let queue = &mut articles.active_mut().unwrap().download_queue;
     let all = scenario.backwards || !scenario.together.is_empty();
     let mut batch = Vec::new();
+    if scenario.batch > 0 {
+        while batch.len() < scenario.batch
+            && let Some(work) = queue.pop()
+        {
+            batch.push(work.dispatched(spec));
+        }
+        return (!batch.is_empty()).then_some((batch, None));
+    }
     while let Some(work) = queue.pop() {
-        batch.push(work);
+        batch.push(work.dispatched(spec));
         if !all {
             break;
         }
     }
-    let reversed = |work: &DownloadWork| {
-        scenario
-            .reversed
-            .contains(&work.segment_id.file_id.file_index)
-    };
-    if !all && batch.first().is_some_and(reversed) {
-        batch.extend(queue.extract_matching(reversed));
+    let reversed = |file_index: u32| scenario.reversed.contains(&file_index);
+    if !all
+        && batch
+            .first()
+            .is_some_and(|work| reversed(work.segment_id.file_id.file_index))
+    {
+        batch.extend(
+            queue
+                .extract_matching(|work| reversed(work.segment_id.file_id.file_index))
+                .into_iter()
+                .map(|item| item.dispatched(spec)),
+        );
         batch.sort_by_key(|work| {
             std::cmp::Reverse((
                 work.segment_id.segment_number,
@@ -1908,11 +1933,10 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
         out: &mut Vec<DownloadWork>,
     ) {
         loop {
-            while let Some(work) = pipeline
-                .jobs
-                .get_mut(&JOB)
-                .and_then(|state| state.articles.active_mut().unwrap().download_queue.pop())
-            {
+            while let Some(work) = pipeline.jobs.get_mut(&JOB).and_then(|state| {
+                let item = state.articles.active_mut().unwrap().download_queue.pop()?;
+                Some(item.dispatched(&state.spec))
+            }) {
                 let article = (
                     work.segment_id.file_id.file_index,
                     work.segment_id.segment_number,

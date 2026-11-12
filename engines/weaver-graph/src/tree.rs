@@ -85,6 +85,16 @@ struct Binding {
     handed: Handed,
 }
 
+// An engine to bind again after a repair, in place of one that refused:
+// its kind, why its store handed the volumes over, the volumes, and what
+// each carried.
+struct Engaged {
+    kind: Kind,
+    why: Why,
+    volumes: BTreeMap<VolumeIndex, MemberId>,
+    carried: Vec<(MemberId, Carried)>,
+}
+
 struct Node {
     // `None` for the root, whose namespace is produced by the source, not
     // by an object.
@@ -106,6 +116,10 @@ struct Node {
     // place. It stays for as long as its node does, and the later volumes
     // of its set it still claims are refused with it.
     refused: Option<Why>,
+    // Why the store before it handed its volumes to this engine, when it is
+    // an engine bound in a store's place. A checkpoint does not keep it: an
+    // engine restored is one whose store is asked again after a repair.
+    engaged: Option<Why>,
     // The namespace a recovery object is bound in when that is not the one
     // its volumes are in: one bound below, where the member it names was
     // founded. Its volumes stay where they were posted.
@@ -125,6 +139,7 @@ impl Node {
             undecided: BTreeSet::new(),
             retired: false,
             refused: None,
+            engaged: None,
             covers_in: None,
             lent: None,
         }
@@ -1331,6 +1346,7 @@ impl Tree {
             return Vec::new();
         }
         let mut reopened = vec![member];
+        let mut engaged = Vec::new();
         for refuser in refusers {
             if let Some((_, volumes)) = self.volumes(refuser) {
                 for volume in volumes.values().copied() {
@@ -1339,11 +1355,15 @@ impl Tree {
                     }
                 }
             }
+            engaged.extend(self.engaged_over(refuser, member));
             self.drop_subtree(refuser, effects);
             self.remove_node(refuser, effects);
         }
         for volume in &reopened {
             self.nodes.unretire(&(node, *volume));
+        }
+        for again in engaged {
+            self.engage_again(node, again, builder, effects);
         }
         // The repaired member first: what it binds is offered the rest.
         reopened.sort_by_key(|volume| *volume != member);
@@ -1351,6 +1371,78 @@ impl Tree {
             self.identify_again(node, *volume, builder, effects);
         }
         reopened
+    }
+
+    // An engine that refused, holding `member`, bound in place of a store
+    // that handed its volumes over for a reason the repair of `member` does
+    // not change: its store would hand them to an engine again. What the
+    // engine takes from a store, each volume's facts, it gives back for the
+    // engine bound after it.
+    fn engaged_over(&mut self, refuser: NodeId, member: MemberId) -> Option<Engaged> {
+        let found = self.nodes.get_mut(&refuser)?;
+        let why = found.engaged.filter(|why| why.outlasts_repair())?;
+        let volumes = found
+            .binding
+            .as_ref()
+            .filter(|binding| binding.window.is_none())
+            .map(|binding| binding.volumes.clone())
+            .filter(|volumes| volumes.values().any(|held| *held == member))?;
+        let object = found.object.as_mut()?;
+        let carried = volumes
+            .iter()
+            .filter_map(|(volume, held)| Some((*held, object.give_back(*volume)?)))
+            .collect();
+        Some(Engaged {
+            kind: object.kind(),
+            why,
+            volumes,
+            carried,
+        })
+    }
+
+    // The engine bound again over the volumes of the one that refused, as
+    // the store's hand-over binds it, each volume adopting what it carried.
+    // Each volume is bound to it, and what it received before reaches it as
+    // a member bound does. Bound to nothing when no engine is built: its
+    // volumes are asked again who owns them.
+    fn engage_again(
+        &mut self,
+        node: NodeId,
+        engaged: Engaged,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) {
+        let Engaged {
+            kind,
+            why,
+            volumes,
+            carried,
+        } = engaged;
+        for (member, carried) in carried {
+            self.give((node, member), carried);
+        }
+        let attached = self
+            .attach(node, kind, |_, _| Some(volumes.clone()), builder)
+            .ok()
+            .flatten();
+        let Some(child) = attached else {
+            for member in volumes.values() {
+                self.take_given(&(node, *member));
+            }
+            return;
+        };
+        if let Some(mut members) = self.nodes.members_mut(node) {
+            for member in volumes.values() {
+                members.decide(*member);
+            }
+        }
+        if let Some(found) = self.nodes.get_mut(&child) {
+            found.engaged = Some(why);
+        }
+        for member in volumes.values() {
+            self.bound(node, *member, kind, child, effects);
+        }
+        self.offer_unowned(node, child, effects);
     }
 
     // What of a buried node stays: each member with a file of its own that
@@ -3801,6 +3893,9 @@ impl Tree {
                 }
                 attached
             });
+        if let Some(found) = engine.and_then(|engine| self.nodes.get_mut(&engine)) {
+            found.engaged = Some(why);
+        }
         for member in binding.volumes.into_values() {
             effects.push(match engine {
                 Some(_) => Effect::NeedsEngine {

@@ -20,6 +20,12 @@ pub(crate) enum DbReply {
     },
     // The reads for a batch of installs came back.
     Installs(Vec<crate::jobs::service::InstallEntry>),
+    // A next-up job's article lists, read ahead.
+    NextUp {
+        job_id: JobId,
+        read: u64,
+        lists: Result<crate::pipeline::next_up::HeldLists, String>,
+    },
 }
 
 impl Pipeline {
@@ -38,6 +44,11 @@ impl Pipeline {
                     self.resume_restored_move(job_id).await;
                 }
             }
+            DbReply::NextUp {
+                job_id,
+                read,
+                lists,
+            } => self.next_up_read(job_id, read, lists),
         }
     }
 

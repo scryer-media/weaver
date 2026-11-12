@@ -54,6 +54,7 @@ fn lease_slot(pipeline: &mut Pipeline, job_id: JobId) -> Vec<(String, Vec<usize>
     );
     leased
         .into_iter()
+        .map(|item| item.dispatched(&state.spec))
         .map(|work| (work.message_id.0.to_string(), work.exclude_servers))
         .collect()
 }

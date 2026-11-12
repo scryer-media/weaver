@@ -5,6 +5,8 @@ use crate::jobs::ids::{JobId, MessageId, NzbFileId, SegmentId};
 
 use super::*;
 
+mod equivalence;
+
 fn make_work(job_id: u64, file_index: u32, seg: u32, priority: u32) -> DownloadWork {
     DownloadWork {
         counters: None,

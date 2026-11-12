@@ -259,14 +259,19 @@ impl Database {
     ) -> Result<Vec<DiagnosticPersistedNzb>, StateError> {
         let datastore = self.datastore();
         let args = vec![SqlArg::I64(after_job_id as i64)];
-        let (table, only) = match source {
-            DiagnosticNzbSource::Active => ("active_jobs", "1 = 1".to_string()),
-            DiagnosticNzbSource::History => ("job_history", recent_history()),
+        let sql = match source {
+            DiagnosticNzbSource::Active => format!(
+                "SELECT a.job_id, a.nzb_path, n.nzb_zstd FROM active_jobs AS a
+                   LEFT JOIN job_nzbs AS n ON n.job_id = a.job_id
+                  WHERE a.job_id > {{}} ORDER BY a.job_id LIMIT {DIAGNOSTIC_NZB_PAGE}"
+            ),
+            DiagnosticNzbSource::History => format!(
+                "SELECT h.job_id, h.nzb_path, n.nzb_zstd FROM job_history AS h
+                   LEFT JOIN job_nzbs AS n ON n.job_id = h.job_id
+                  WHERE h.job_id > {{}} AND h.{} ORDER BY h.job_id LIMIT {DIAGNOSTIC_NZB_PAGE}",
+                recent_history()
+            ),
         };
-        let sql = format!(
-            "SELECT job_id, nzb_path, nzb_zstd FROM {table}
-              WHERE job_id > {{}} AND {only} ORDER BY job_id LIMIT {DIAGNOSTIC_NZB_PAGE}"
-        );
         self.run_sql_blocking_read(async move {
             SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args)
                 .await?

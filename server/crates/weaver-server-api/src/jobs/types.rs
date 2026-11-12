@@ -1609,6 +1609,32 @@ pub fn metrics_from_snapshot(snapshot: &MetricsSnapshot) -> Metrics {
     Metrics::from(snapshot)
 }
 
+// Whether a queue row's view passes `filter`, judged on the same facts its
+// queue item would be: the row is not copied, and its attributes are read only
+// when the filter names one.
+pub(crate) fn matches_view_filter_prepared(
+    view: &weaver_server_core::pipeline::queue::paging::JobView<'_>,
+    filter: Option<&PreparedQueueFilter>,
+) -> bool {
+    let Some(prepared) = filter else {
+        return true;
+    };
+    let job = view.job();
+    let attributes = if prepared.has_attribute_key.is_some() || prepared.attribute_equals.is_some()
+    {
+        split_attributes(&job.metadata).1
+    } else {
+        Vec::new()
+    };
+    matches_item_filter_prepared(
+        job.job_id.0,
+        queue_item_state(QueueStateFacts::of_view(view)),
+        job.category.as_ref(),
+        &attributes,
+        filter,
+    )
+}
+
 fn matches_item_filter_prepared(
     id: u64,
     state: QueueItemState,

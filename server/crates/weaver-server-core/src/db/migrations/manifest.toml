@@ -985,3 +985,154 @@ kind = "sql"
 file = "migrations/0080_graph_holds_on_file/postgres.sql"
 engine = "postgres"
 scope = "all"
+
+[[migration]]
+version = 81
+description = "index the history page's size, integrity and category reads"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0081_history_page_sort_indexes/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0081_history_page_sort_indexes/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 82
+description = "active job staging directory"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0082_active_job_staging_dir/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0082_active_job_staging_dir/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 83
+description = "active job NZB outline"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0083_active_job_nzb_outline/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0083_active_job_nzb_outline/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 84
+description = "job NZB and active job outline tables"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0084_active_job_nzb_tables/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0084_active_job_nzb_tables/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 85
+description = "job NZBs and active job outlines move to their tables"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "move_nzbs_and_outlines_v85"
+scope = "all"
+
+[[migration]]
+version = 86
+description = "index the history page's name, state and category sorts"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0086_history_page_text_sort_indexes/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0086_history_page_text_sort_indexes/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 87
+description = "store and index the history page's full release name"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_history_release_name/sqlite_column.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_history_release_name/postgres_column.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "fill_history_release_names_v87"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_history_release_name/sqlite_index.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0087_history_release_name/postgres_index.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration]]
+version = 88
+description = "store the history search key; trigram matching on Postgres"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0088_history_search_key/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0088_history_search_key/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "fill_history_search_keys_v88"
+scope = "all"

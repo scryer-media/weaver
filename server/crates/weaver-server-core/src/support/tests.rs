@@ -415,3 +415,114 @@ fn a_cached_finished_job_reports_from_history() {
     assert_eq!(json["job"]["source"], "history");
     assert_eq!(json["job"]["status"], "failed");
 }
+
+// Counting each kind in SQL gives the report what replaying every event
+// gives it, whatever order the stage outcomes came in.
+#[test]
+fn event_kind_counts_give_what_every_event_gives() {
+    let db = Database::open_in_memory().unwrap();
+    let sequences: [&[&str]; 4] = [
+        &[
+            "JobCreated",
+            "JobVerificationComplete",
+            "RepairStarted",
+            "RepairFailed",
+            "RepairStarted",
+            "RepairComplete",
+            "ExtractionReady",
+            "ExtractionMemberStarted",
+            "ExtractionMemberFailed",
+            "ExtractionMemberStarted",
+            "ExtractionMemberFailed",
+            "ExtractionComplete",
+            "Par3VerificationComplete",
+            "FileMissing",
+            "FileMissing",
+        ],
+        &[
+            "RepairComplete",
+            "RepairStarted",
+            "ExtractionFailed",
+            "ExtractionMemberStarted",
+            "ExtractionReady",
+        ],
+        &[
+            "RepairStarted",
+            "RepairComplete",
+            "RepairStarted",
+            "RepairFailed",
+        ],
+        &[],
+    ];
+    for (index, kinds) in sequences.iter().enumerate() {
+        let job_id = 900 + index as u64;
+        let events: Vec<JobEvent> = kinds
+            .iter()
+            .enumerate()
+            .map(|(at, kind)| JobEvent {
+                job_id,
+                timestamp: 1_000 + at as i64,
+                kind: (*kind).to_string(),
+                message: String::new(),
+                file_id: None,
+            })
+            .collect();
+        db.insert_job_events(&events).unwrap();
+        let row = history_row(job_id, "complete");
+        let mut every = JobSection::from_history(&row);
+        every.apply_events(&db.get_job_events(job_id).unwrap());
+        let mut counted = JobSection::from_history(&row);
+        counted.apply_event_kind_counts(&db.get_job_event_kind_counts(job_id).unwrap());
+        assert_eq!(format!("{counted:?}"), format!("{every:?}"), "{kinds:?}");
+    }
+}
+
+// Jobs Weaver has started work on qualify, post-processing first, then
+// failed, then downloading, each in queue order; queued, paused, waiting on
+// queue scripts and finished jobs do not.
+#[test]
+fn active_report_jobs_choose_started_work_in_report_order() {
+    let at = |id: u64, status: JobStatus| JobInfo {
+        status,
+        ..live_info(id)
+    };
+    let state = crate::SharedPipelineState::new(crate::PipelineMetrics::new(), Vec::new());
+    state.publish_jobs(vec![
+        at(1, JobStatus::Downloading),
+        at(2, JobStatus::Queued),
+        at(
+            3,
+            JobStatus::Failed {
+                error: "repair failed".to_string(),
+            },
+        ),
+        at(4, JobStatus::Paused),
+        at(5, JobStatus::QueuedRepair),
+        at(6, JobStatus::Complete),
+        at(7, JobStatus::Checking),
+        at(8, JobStatus::AwaitingQueueScripts),
+        at(9, JobStatus::Extracting),
+    ]);
+
+    let chosen = state.active_report_jobs(25);
+    let order: Vec<(u64, ActiveReportGroup)> = chosen
+        .jobs
+        .iter()
+        .map(|(group, job)| (job.job_id.0, *group))
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            (5, ActiveReportGroup::PostProcessing),
+            (9, ActiveReportGroup::PostProcessing),
+            (3, ActiveReportGroup::Failed),
+            (1, ActiveReportGroup::Downloading),
+            (7, ActiveReportGroup::Downloading),
+        ]
+    );
+    assert_eq!(chosen.qualified, 5);
+
+    let capped = state.active_report_jobs(2);
+    assert_eq!(capped.qualified, 5);
+    assert_eq!(capped.jobs.len(), 2);
+}

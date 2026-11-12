@@ -42,7 +42,6 @@ fn fixture(execution_enabled: bool) -> Fixture {
         data_dir: data.path().to_string_lossy().into_owned(),
         intermediate_dir: None,
         complete_dir: None,
-        buffer_pool: None,
         servers: vec![],
         categories: vec![],
         retry: None,

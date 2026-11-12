@@ -157,7 +157,7 @@ version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -168,7 +168,7 @@ checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
 dependencies = [
  "anstyle",
  "once_cell_polyfill",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -905,9 +905,9 @@ dependencies = [
 
 [[package]]
 name = "bzip2-turbo"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dea2375497e8f23dc1c0e6c23088a2c6e025707ab9a362973a5d2d64785b8ae6"
+checksum = "5ed830082c672beeca7b4d081c50c2381d3a0aea3be179451fa39cda45840718"
 dependencies = [
  "crc-turbo",
 ]
@@ -921,7 +921,7 @@ dependencies = [
  "cap-primitives",
  "cap-std",
  "io-lifetimes 3.0.1",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -938,7 +938,7 @@ dependencies = [
  "maybe-owned",
  "rustix",
  "rustix-linux-procfs",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "winx",
 ]
 
@@ -1793,7 +1793,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2179,7 +2179,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "typed-builder",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
  "x25519-dalek",
  "zerocopy",
 ]
@@ -2187,7 +2187,7 @@ dependencies = [
 [[package]]
 name = "h3"
 version = "0.0.8"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.3.0#c467e8952f29940c4f07d9f57adbff981d990a88"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.4.3#5deed1204f11ee216f41dc066e08102f555cb9f9"
 dependencies = [
  "bytes",
  "fastrand",
@@ -2200,7 +2200,7 @@ dependencies = [
 [[package]]
 name = "h3-quinn"
 version = "0.0.10"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.3.0#c467e8952f29940c4f07d9f57adbff981d990a88"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.4.3#5deed1204f11ee216f41dc066e08102f555cb9f9"
 dependencies = [
  "bytes",
  "futures",
@@ -3127,7 +3127,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -3718,8 +3718,8 @@ dependencies = [
 
 [[package]]
 name = "proxy-tunnels"
-version = "0.3.0"
-source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.3.0#c467e8952f29940c4f07d9f57adbff981d990a88"
+version = "0.4.3"
+source = "git+https://github.com/scryer-media/proxy-tunnels.git?tag=v0.4.3#5deed1204f11ee216f41dc066e08102f555cb9f9"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -3813,7 +3813,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4207,7 +4207,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4275,7 +4275,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4584,9 +4584,9 @@ dependencies = [
 
 [[package]]
 name = "sevenz-turbo"
-version = "0.30.0"
+version = "0.30.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "77115826704970f720f0e09cf37bd3ed269044bed9223e3e87ba83c849b95f6b"
+checksum = "7737abec9967c66dde8305e31f7f9476d13977f41b82a593929e86f4928e9584"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -4762,7 +4762,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5037,7 +5037,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -5170,7 +5170,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5724,7 +5724,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -6005,7 +6005,7 @@ dependencies = [
 
 [[package]]
 name = "weaver"
-version = "0.16.13"
+version = "0.16.14"
 dependencies = [
  "aho-corasick",
  "application-updater",
@@ -6067,7 +6067,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-graph"
-version = "0.16.13"
+version = "0.16.14"
 dependencies = [
  "bytes",
  "crc-turbo",
@@ -6080,14 +6080,14 @@ dependencies = [
 
 [[package]]
 name = "weaver-model"
-version = "0.16.13"
+version = "0.16.14"
 dependencies = [
  "serde",
 ]
 
 [[package]]
 name = "weaver-nntp"
-version = "0.16.13"
+version = "0.16.14"
 dependencies = [
  "async-trait",
  "bytes",
@@ -6116,7 +6116,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-nzb"
-version = "0.16.13"
+version = "0.16.14"
 dependencies = [
  "blake3",
  "html-escape 0.3.0",
@@ -6130,7 +6130,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-objects"
-version = "0.16.13"
+version = "0.16.14"
 dependencies = [
  "aws-lc-rs",
  "brotli",
@@ -6155,7 +6155,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-api"
-version = "0.16.13"
+version = "0.16.14"
 dependencies = [
  "async-graphql",
  "async-stream",
@@ -6186,7 +6186,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-server-core"
-version = "0.16.13"
+version = "0.16.14"
 dependencies = [
  "aes-gcm",
  "application-updater",
@@ -6263,7 +6263,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-tunnel"
-version = "0.16.13"
+version = "0.16.14"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -6286,7 +6286,7 @@ dependencies = [
 
 [[package]]
 name = "weaver-yenc"
-version = "0.16.13"
+version = "0.16.14"
 dependencies = [
  "cc",
  "crc-turbo",
@@ -6397,7 +6397,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6710,7 +6710,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -12,6 +12,8 @@ pub(crate) mod graph_checkpoint;
 pub mod handle;
 pub mod ids;
 pub mod model;
+pub(crate) mod nzb_persistence;
+pub(crate) mod outline_persistence;
 pub mod persistence;
 pub mod phase_progress;
 pub mod queries;

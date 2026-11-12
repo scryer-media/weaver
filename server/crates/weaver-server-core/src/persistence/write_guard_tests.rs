@@ -43,7 +43,7 @@ const BANNED: &[&str] = &[
 const LIFTED: &[(&str, usize)] = &[
     (
         "server/crates/weaver-server-core/src/history/persistence.rs",
-        1,
+        2,
     ),
     (
         "server/crates/weaver-server-core/src/history/timeline.rs",
@@ -63,7 +63,7 @@ const LIFTED: &[(&str, usize)] = &[
     ),
     (
         "server/crates/weaver-server-core/src/operations/backup.rs",
-        9,
+        10,
     ),
     (
         "server/crates/weaver-server-core/src/operations/backup/logical.rs",
@@ -94,12 +94,12 @@ const LIFTED: &[(&str, usize)] = &[
         1,
     ),
     (
-        "server/crates/weaver-server-core/src/persistence/wal_checkpoint.rs",
-        1,
-    ),
-    (
         "server/crates/weaver-server-core/src/schema_migrations.rs",
         12,
+    ),
+    (
+        "server/crates/weaver-server-core/src/schema_migrations/nzb_tables_v85.rs",
+        1,
     ),
     (
         "server/crates/weaver-server-core/tests/browser_session_contract.rs",

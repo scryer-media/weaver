@@ -40,6 +40,77 @@ pub(crate) struct ReadArticles {
     // The job's graph rebuilt from its checkpoint, and the articles that
     // checkpoint has in hand; none for a job never checkpointed.
     restored: Option<GraphRestore>,
+    // The staging directory a job starting afresh delivers into, chosen for
+    // where it delivers now: None when it stages nothing. A job its
+    // checkpoint brings back keeps the one it has.
+    staging: Option<Option<PathBuf>>,
+}
+
+// Where a job delivers as its articles are read, so a job starting afresh
+// stages on its destination's device.
+struct StagingChoice {
+    current: Option<PathBuf>,
+    intermediate_dir: PathBuf,
+    complete_dir: PathBuf,
+    config: crate::settings::SharedConfig,
+    category: Option<String>,
+}
+
+impl StagingChoice {
+    // The staging directory for the job's destination, made and marked the
+    // job's, and the one it had gone when that is another. One that cannot
+    // be made leaves the job delivering from its working directory. A staging
+    // directory that already holds delivered files is kept: the final move
+    // carries them to wherever the job then delivers.
+    fn choose(
+        self,
+        job_id: JobId,
+        categories: &[crate::categories::CategoryConfig],
+    ) -> Option<PathBuf> {
+        // Read without following a symbolic link: a staging directory swapped
+        // for a link holds nothing of the job's, and is not delivered into.
+        if let Some(current) = self.current.as_ref() {
+            match crate::jobs::working_dir::job_staging_dir_holds_files(current, job_id) {
+                Ok(true) => return self.current,
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(job_id = job_id.0, dir = %current.display(), %error, "could not read the job's staging directory; it is not delivered into");
+                }
+            }
+        }
+        let root = crate::pipeline::queue::destination_root(
+            &self.complete_dir,
+            categories,
+            self.category.as_deref(),
+        );
+        let wanted =
+            crate::pipeline::queue::delivery_staging_dir(&self.intermediate_dir, &root, job_id);
+        if let Some(current) = self
+            .current
+            .as_ref()
+            .filter(|dir| Some(*dir) != wanted.as_ref())
+            && let Err(error) = crate::jobs::working_dir::remove_job_staging_dir(current, job_id)
+        {
+            warn!(job_id = job_id.0, dir = %current.display(), %error, "could not remove a staging directory the job no longer delivers into");
+        }
+        let staging = wanted.filter(|staging| {
+            crate::pipeline::queue::make_staging_dir(staging, job_id)
+                .inspect_err(|error| {
+                    warn!(job_id = job_id.0, dir = %staging.display(), %error, "could not make the staging directory; the job delivers from its working directory");
+                })
+                .is_ok()
+        });
+        let output_root = staging
+            .clone()
+            .unwrap_or_else(|| self.intermediate_dir.clone());
+        info!(
+            job_id = job_id.0,
+            storage = crate::runtime::storage_kind::storage_kind(&output_root).as_str(),
+            split = staging.is_some(),
+            "output storage"
+        );
+        staging
+    }
 }
 
 impl Pipeline {
@@ -76,6 +147,19 @@ impl Pipeline {
         let staging_dir = state.staging_dir.clone();
         let spec_password = state.spec.password.clone();
         let expected = summaries.clone();
+        // Lists read ahead are taken with the job's files, to be checked
+        // as any read is. They are unpacked on the read's blocking thread.
+        let ahead = self
+            .next_up
+            .take(job_id)
+            .map(|held| (state.spec.clone(), held));
+        let staging = StagingChoice {
+            current: staging_dir.clone(),
+            intermediate_dir: self.intermediate_dir.clone(),
+            complete_dir: self.complete_dir.clone(),
+            config: Arc::clone(&self.config),
+            category: category.clone(),
+        };
         state.articles = JobArticles::Activating(summaries, activation);
         let seat = self
             .graph_restore_seat(None, &working_dir)
@@ -98,8 +182,17 @@ impl Pipeline {
         let tx = self.job_activated_tx.clone();
         tokio::spawn(async move {
             let _ = written_rx.await;
+            let categories = staging.config.read().await.categories.clone();
             let result = tokio::task::spawn_blocking(move || {
-                read_job_articles(&db, job_id, category, metadata, &expected, memory, seat)
+                read_job_articles(
+                    &db, job_id, category, metadata, &expected, ahead, memory, seat,
+                )
+                .map(|mut read| {
+                    if read.restored.is_none() {
+                        read.staging = Some(staging.choose(job_id, &categories));
+                    }
+                    read
+                })
             })
             .await
             .unwrap_or_else(|error| Err(format!("article read worker failed: {error}")));
@@ -133,6 +226,18 @@ impl Pipeline {
                 if let Some(state) = self.jobs.get_mut(&job_id) {
                     for (file, list) in state.spec.files.iter_mut().zip(read.lists) {
                         file.segments = list;
+                    }
+                    if let Some(staging) = read.staging
+                        && staging != state.staging_dir
+                    {
+                        state.staging_dir = staging.clone();
+                        if let Err(error) = self.db.try_queue_job_write(
+                            job_id,
+                            "set_active_job_staging_dir",
+                            move |db| db.set_active_job_staging_dir(job_id, staging.as_deref()),
+                        ) {
+                            warn!(job_id = job_id.0, error = %error, "could not record the job's staging directory");
+                        }
                     }
                 }
                 let (graph, skip, held) = match read.restored {
@@ -382,6 +487,10 @@ impl Pipeline {
     // its volumes, without which its root would say less than it did, or an
     // object out for its work, without which no checkpoint can be taken.
     fn job_has_results_out(&self, job_id: JobId) -> bool {
+        #[cfg(test)]
+        if self.job_has_queued_decode(job_id) {
+            return true;
+        }
         let counted = |counts: &HashMap<JobId, usize>| counts.get(&job_id).is_some_and(|n| *n > 0);
         self.graph_jobs
             .get(&job_id)
@@ -392,10 +501,6 @@ impl Pipeline {
                 .active_decodes_by_job
                 .get(&job_id)
                 .is_some_and(|n| *n > 0)
-            || self
-                .pending_decode
-                .iter()
-                .any(|work| work.segment_id.file_id.job_id == job_id)
     }
 
     // Stop the job's graph runtime. One with nothing out on a thread goes at
@@ -431,6 +536,22 @@ impl Pipeline {
     }
 }
 
+// One job's spec read back from its stored NZB, every article list in it,
+// streamed from the stored bytes, with its password candidates and outline.
+pub(crate) fn read_stored_lists(
+    db: &crate::Database,
+    job_id: JobId,
+) -> Result<(PathBuf, crate::ingest::outline::StoredRead), String> {
+    let (nzb_path, nzb_zstd) = db
+        .load_active_job_persisted_nzb(job_id)
+        .map_err(|error| format!("stored NZB could not be loaded: {error}"))?
+        .ok_or_else(|| "the job has no stored row".to_string())?;
+    let nzb_zstd = nzb_zstd.ok_or_else(|| "the job has no stored NZB".to_string())?;
+    let read = crate::ingest::outline::read_stored_lists(&nzb_zstd, &nzb_path)
+        .map_err(|error| format!("stored NZB could not be parsed: {error}"))?;
+    Ok((nzb_path, read))
+}
+
 // One job's spec read back from its stored NZB, every article list in it.
 pub(crate) fn read_stored_spec(
     db: &crate::Database,
@@ -438,17 +559,8 @@ pub(crate) fn read_stored_spec(
     category: Option<String>,
     metadata: Vec<(String, String)>,
 ) -> Result<JobSpec, String> {
-    let (nzb_path, nzb_zstd) = db
-        .load_active_job_persisted_nzb(job_id)
-        .map_err(|error| format!("stored NZB could not be loaded: {error}"))?
-        .ok_or_else(|| "the job has no stored row".to_string())?;
-    let nzb_zstd = nzb_zstd.ok_or_else(|| "the job has no stored NZB".to_string())?;
-    let nzb = crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd)
-        .map_err(|error| format!("stored NZB could not be parsed: {error}"))?;
-    drop(nzb_zstd);
-    Ok(crate::ingest::nzb_to_spec(
-        &nzb, &nzb_path, category, metadata,
-    ))
+    let (nzb_path, mut read) = read_stored_lists(db, job_id)?;
+    Ok(read.spec(&nzb_path, category, metadata))
 }
 
 // As `read_stored_spec`, with the password candidates the job carries taken
@@ -466,37 +578,51 @@ pub(crate) fn read_stored_spec_and_passwords(
     let ((nzb_path, nzb_zstd), supplied) =
         sources.ok_or_else(|| "the job has no stored row".to_string())?;
     let nzb_zstd = nzb_zstd.ok_or_else(|| "the job has no stored NZB".to_string())?;
-    let nzb = crate::ingest::parse_persisted_nzb_bytes(&nzb_zstd)
+    let mut read = crate::ingest::outline::read_stored_lists(&nzb_zstd, &nzb_path)
         .map_err(|error| format!("stored NZB could not be parsed: {error}"))?;
     drop(nzb_zstd);
     let passwords = crate::pipeline::job_carried_password_candidates(
         &supplied,
-        crate::ingest::nzb_password_candidates(&nzb, &nzb_path, None),
+        std::mem::take(&mut read.passwords),
     );
-    let spec = crate::ingest::nzb_to_spec(&nzb, &nzb_path, category, metadata);
+    let spec = read.spec(&nzb_path, category, metadata);
     Ok((spec, Some(passwords)))
 }
 
 // Read one job's article lists back from its stored NZB, check they are the
 // ones the job was admitted with, and rebuild its graph from its checkpoint
-// when it has one.
+// when it has one. Lists read ahead are used when they still match.
+#[allow(clippy::too_many_arguments)]
 fn read_job_articles(
     db: &crate::Database,
     job_id: JobId,
     category: Option<String>,
     metadata: Vec<(String, String)>,
     expected: &FileSummaries,
+    ahead: Option<(JobSpec, crate::pipeline::next_up::HeldLists)>,
     memory: Arc<ProcessMemoryBudget>,
     seat: RestoreSeat,
 ) -> Result<ReadArticles, String> {
-    let spec = read_stored_spec(db, job_id, category, metadata)?;
-    let read: Vec<FileSummary> = spec.files.iter().map(FileSummary::of).collect();
-    if read.len() != expected.0.len()
-        || !read
-            .iter()
-            .zip(&expected.0)
-            .all(|(read, expected)| read.same_list(expected))
-    {
+    let matches = |spec: &JobSpec| {
+        spec.files.len() == expected.0.len()
+            && spec
+                .files
+                .iter()
+                .zip(&expected.0)
+                .all(|(file, expected)| FileSummary::of(file).same_list(expected))
+    };
+    let ahead = ahead.map(|(mut spec, held)| {
+        for (file, list) in spec.files.iter_mut().zip(held.unpack()) {
+            file.segments = list;
+        }
+        spec
+    });
+    // Lists read ahead that no longer match are read again.
+    let spec = match ahead.filter(|spec| matches(spec)) {
+        Some(spec) => spec,
+        None => read_stored_spec(db, job_id, category, metadata)?,
+    };
+    if !matches(&spec) {
         return Err("stored NZB no longer matches the job's files".to_string());
     }
     let repeated = RepeatedArticles::new(&spec, seat.working_dir(), memory)?;
@@ -510,5 +636,6 @@ fn read_job_articles(
         lists,
         repeated,
         restored,
+        staging: None,
     })
 }
