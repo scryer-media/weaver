@@ -58,6 +58,99 @@ async fn no_probe_where_datagrams_may_be_fragmented() {
     assert_eq!(new_streams_max_ss(&t), 528);
 }
 
+// The largest payload `t` sends of 16 KiB written now, in `rounds` rounds,
+// each acked whole by a peer whose last packet was `peer_seq_nr`.
+async fn largest_sent_over(t: &mut super::TestVsock, peer_seq_nr: u16, rounds: usize) -> usize {
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&[0u8; 16 * 1024])
+        .await
+        .unwrap();
+    let mut largest = 0;
+    for _ in 0..rounds {
+        t.env.increment_now(Duration::from_millis(10));
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        if sent.iter().all(|msg| msg.payload().is_empty()) {
+            continue;
+        }
+        for msg in sent {
+            largest = largest.max(msg.payload().len());
+        }
+        t.send_msg(
+            UtpHeader {
+                htype: State,
+                seq_nr: peer_seq_nr.into(),
+                ack_nr: t.vsock.last_sent_seq_nr,
+                wnd_size: 1024 * 1024,
+                ..Default::default()
+            },
+            "",
+        );
+    }
+    largest
+}
+
+// A socket that cannot forbid fragmenting, as a dual-stack socket at the
+// unspecified IPv6 address reports, holds its streams at the IPv4 floor
+// on a path that carries 1500-byte packets. Only the size of the peer's
+// own data packets raises it, so the size a stream reaches depends on
+// what the peer happens to send.
+#[tokio::test]
+async fn where_datagrams_may_fragment_only_the_peers_data_raises_the_size() {
+    setup_test_logging();
+    let env = MockUtpEnvironment::new();
+    let transport = RememberingTransport::new(ADDR_1);
+    transport.set_fragments();
+    let args = test_stream_args(&env, false);
+    let mut t = make_test_vsock_on(
+        transport,
+        SocketOpts {
+            remote_inactivity_timeout: Some(Duration::from_secs(60)),
+            vsock_tx_bufsize_bytes_initial: Some(non_zero_const!(1024 * 1024)),
+            ..Default::default()
+        },
+        args,
+        env,
+    );
+    assert_eq!(largest_sent_over(&mut t, 1, 64).await, 528, "the floor");
+
+    // The peer's small packets, as requests are, leave it there.
+    t.send_msg(
+        UtpHeader {
+            htype: Data,
+            seq_nr: 1.into(),
+            ack_nr: t.vsock.last_sent_seq_nr,
+            wnd_size: 1024 * 1024,
+            ..Default::default()
+        },
+        &"r".repeat(17 * 8),
+    );
+    assert_eq!(
+        largest_sent_over(&mut t, 2, 64).await,
+        528,
+        "still the floor"
+    );
+
+    // One large packet from the peer, and every packet is that large.
+    t.send_msg(
+        UtpHeader {
+            htype: Data,
+            seq_nr: 2.into(),
+            ack_nr: t.vsock.last_sent_seq_nr,
+            wnd_size: 1024 * 1024,
+            ..Default::default()
+        },
+        &"r".repeat(1354),
+    );
+    assert_eq!(
+        largest_sent_over(&mut t, 3, 64).await,
+        1354,
+        "the peer's size"
+    );
+}
+
 #[tokio::test]
 async fn no_packet_outgrows_a_1280_byte_tunnel() {
     setup_test_logging();

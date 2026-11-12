@@ -55,8 +55,7 @@ async fn one_cumulative_ack_retires_a_wide_flight_across_sequence_wrap() {
     stream.write_all(&payload).await.unwrap();
     assert!(stream.flush().now_or_never().is_none());
 
-    t.poll_once_assert_pending().await;
-    let sent = t.take_sent();
+    let sent = t.poll_until_sent(PACKETS).await;
     assert_eq!(sent.len(), PACKETS);
     for (index, packet) in sent.iter().enumerate() {
         assert_eq!(packet.header.htype, Data);
@@ -89,6 +88,8 @@ async fn one_cumulative_ack_retires_a_wide_flight_across_sequence_wrap() {
     t.take_sent();
 
     stream.write_all(b"tail").await.unwrap();
+    // The window went out at once; let the pacer refill.
+    t.env.increment_now(std::time::Duration::from_millis(1));
     t.poll_once_assert_pending().await;
     let sent = t.take_sent();
     assert_eq!(sent.len(), 1);
@@ -237,8 +238,7 @@ async fn a_full_reservation_window_resumes_after_ack_before_sending_fin() {
         },
         "",
     );
-    t.poll_once_assert_pending().await;
-    sent.extend(t.take_sent());
+    sent.extend(t.poll_until_sent(total - sent.len()).await);
     assert_eq!(t.vsock.this_poll.unsegmented_data, 0);
     assert_eq!(sent.len(), total);
     for (index, packet) in sent.iter().enumerate() {

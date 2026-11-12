@@ -352,3 +352,69 @@ async fn a_packet_the_go_back_resent_is_not_fast_resent() {
         .unwrap();
     assert_eq!(most, 2, "go-back {go_back:?} resent {resent:?}");
 }
+
+// One SACK can show many packets lost at once. At most five are resent for
+// it, the oldest first, as libtorrent does; each later ACK resends the next
+// five. Nothing new is sent while a lost packet waits.
+#[tokio::test]
+async fn one_sack_showing_forty_holes_resends_five_oldest_first() {
+    setup_test_logging();
+    let mut t = make_test_vsock(
+        SocketOpts {
+            link_mtu: Some(calc_mtu_for_mss(5)),
+            ..Default::default()
+        },
+        false,
+    );
+    t.vsock.rtte.force_timeout(Duration::from_secs(10));
+    t.vsock.congestion_controller.set_window(4000);
+    let ack = |sacked: &[usize]| UtpHeader {
+        htype: State,
+        seq_nr: 0.into(),
+        ack_nr: 100.into(),
+        wnd_size: 1 << 20,
+        extensions: crate::raw::Extensions {
+            selective_ack: SelectiveAck::new_test(sacked.iter().copied()),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    t.send_msg(ack(&[]), "");
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&[b'x'; 5 * 100])
+        .await
+        .unwrap();
+    // The pacer lets out a burst at a time.
+    let mut first = 0;
+    loop {
+        t.poll_once_assert_pending().await;
+        first += t.take_sent().len();
+        if first == 100 {
+            break;
+        }
+        t.env.increment_now(Duration::from_millis(1));
+    }
+
+    // Bit i of the SACK is packet 102 + i. 101 and every other packet from
+    // 102 to 178 are lost, 40 in all; the rest up to 182 arrived.
+    let sacked: Vec<usize> = (1..78).step_by(2).chain(78..81).collect();
+    let holes: Vec<u16> = std::iter::once(101)
+        .chain((0..78).step_by(2).map(|i| 102 + i as u16))
+        .collect();
+    assert_eq!(holes.len(), 40);
+
+    let mut resent = Vec::new();
+    for round in 0..8 {
+        // Long enough for the pacer to refill, short of any timer.
+        t.env.increment_now(Duration::from_millis(100));
+        t.send_msg(ack(&sacked), "");
+        t.poll_once_assert_pending().await;
+        let sent: Vec<u16> = t.take_sent().iter().map(|p| p.header.seq_nr.0).collect();
+        assert_eq!(sent, holes[round * 5..round * 5 + 5], "round {round}");
+        resent.extend(sent);
+    }
+    assert_eq!(resent, holes);
+    assert_eq!(t.vsock.totals.fast_resends, 40);
+}

@@ -11,6 +11,7 @@ mod delayed_ack;
 mod fast_retransmit;
 mod fin_half_close;
 mod flow_control;
+mod full_receiver;
 mod guards;
 mod inactivity_timeout;
 mod ingress_limits;
@@ -20,12 +21,14 @@ mod nagle;
 mod pacing;
 mod packet_validation;
 mod probe_payload;
+mod refused_sends;
 mod retransmit_timer;
 mod rtte;
 mod sequence_wrap;
 mod shutdown;
 mod small_window;
 mod stream_api;
+mod tail_probe;
 mod timeouts;
 
 use std::{
@@ -140,6 +143,20 @@ impl TestVsock {
                 panic!("poll returned Ready, but expected Pending");
             }
         };
+    }
+
+    /// Polls, stepping the clock between passes, until `packets` have been
+    /// sent: the pacer lets at most a burst out per pass.
+    async fn poll_until_sent(&mut self, packets: usize) -> Vec<UtpMessage> {
+        let mut sent = Vec::new();
+        loop {
+            self.poll_once_assert_pending().await;
+            sent.extend(self.take_sent());
+            if sent.len() >= packets {
+                return sent;
+            }
+            self.env.increment_now(Duration::from_micros(10));
+        }
     }
 
     async fn poll_once_assert_ready(&mut self) -> crate::Result<()> {

@@ -491,3 +491,63 @@ async fn probe_retry_if_emsgsize() {
         }
     }
 }
+
+// A full send buffer refilled by each ACK hands the stream one packet's
+// worth at a time, so each pass cuts one full segment and holds a part-filled
+// rest. The probe that falls due waits for written data enough to fill it,
+// and full segments go out meanwhile; a pass that cuts no probe leaves it
+// due. Counted: probes sent, and the segment size they raise.
+#[tokio::test]
+async fn a_probe_waits_for_written_data_enough_to_fill_it() {
+    let mut t = make_test_vsock(SocketOpts::default(), false);
+    let floor = usize::from(t.vsock.segment_sizes.mss());
+    let w = t.stream.as_mut().unwrap();
+    w.write_all(&vec![7; floor + 100]).await.unwrap();
+    let mut probes = 0;
+    let mut sent_packets = 0;
+    // Each round ACKs what went out the round before, so data stays in
+    // flight and a short tail waits for more.
+    let mut acked = None;
+    let mut to_ack = None;
+    for _ in 0..64 {
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        sent_packets += sent.len();
+        probes += sent
+            .iter()
+            .filter(|m| m.header.get_type() == Data && m.payload().len() > floor)
+            .count();
+        if let Some(ack_nr) = to_ack.filter(|&a| Some(a) != acked) {
+            let timestamp_microseconds = t.vsock.timestamp_microseconds();
+            t.send_msg(
+                UtpHeader {
+                    htype: State,
+                    seq_nr: 1.into(),
+                    ack_nr,
+                    timestamp_microseconds,
+                    wnd_size: 1024 * 1024,
+                    ..Default::default()
+                },
+                "",
+            );
+            acked = Some(ack_nr);
+        }
+        to_ack = Some(t.vsock.last_sent_seq_nr);
+        t.env.increment_now(Duration::from_millis(50));
+        t.stream
+            .as_mut()
+            .unwrap()
+            .write_all(&vec![7; floor])
+            .await
+            .unwrap();
+    }
+    // A tail too short to fill a segment waits a round for the next write,
+    // so a packet goes out every other round.
+    assert!(sent_packets >= 30, "{sent_packets} packets sent");
+    assert!(probes >= 3, "{probes} probes in {sent_packets} packets");
+    assert!(
+        usize::from(t.vsock.segment_sizes.mss()) > floor + floor / 2,
+        "the segment size stayed at {}",
+        t.vsock.segment_sizes.mss()
+    );
+}

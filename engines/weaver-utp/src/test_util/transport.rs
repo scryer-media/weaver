@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-12.
 
 use std::{
     collections::HashMap,
@@ -148,6 +148,9 @@ struct RememberingTransportLocked {
     link_mtu: Option<u16>,
     fragments: bool,
     poll_send_pending: bool,
+    // Woken when sends are taken again, as a socket's writable wake.
+    send_waker: Option<std::task::Waker>,
+    refused: usize,
 }
 
 #[derive(Clone)]
@@ -166,9 +169,34 @@ impl RememberingTransport {
         }
     }
 
-    // Tests that poll the stream themselves control when sends become writable.
+    // Tests that poll the stream themselves control when sends become
+    // writable. Becoming writable wakes the last waker a refused send left,
+    // as a kernel socket does.
     pub fn set_poll_send_pending(&self, pending: bool) {
-        self.locked.lock().poll_send_pending = pending;
+        let waker = {
+            let mut g = self.locked.lock();
+            g.poll_send_pending = pending;
+            if pending { None } else { g.send_waker.take() }
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    // How many sends the transport refused.
+    pub fn refused(&self) -> usize {
+        self.locked.lock().refused
+    }
+
+    // Refuses a send, keeping the waker it was polled with.
+    fn refuse(&self, cx: &std::task::Context<'_>) -> bool {
+        let mut g = self.locked.lock();
+        if !g.poll_send_pending {
+            return false;
+        }
+        g.refused += 1;
+        g.send_waker = Some(cx.waker().clone());
+        true
     }
 
     pub fn set_link_mtu(&self, mtu: u16) {
@@ -239,11 +267,11 @@ impl Transport for RememberingTransport {
 
     fn poll_send_to(
         &self,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
         buf: &[u8],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>> {
-        if self.locked.lock().poll_send_pending {
+        if self.refuse(cx) {
             return Poll::Pending;
         }
         self.send(target, buf)?;
@@ -266,11 +294,11 @@ impl Transport for RememberingTransport {
 impl PollSendToVectored for RememberingTransport {
     fn poll_send_to_vectored(
         &self,
-        _cx: &mut std::task::Context<'_>,
+        cx: &mut std::task::Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
         target: SocketAddr,
     ) -> Poll<std::io::Result<usize>> {
-        if self.locked.lock().poll_send_pending {
+        if self.refuse(cx) {
             return Poll::Pending;
         }
         let mut buf = Vec::new();

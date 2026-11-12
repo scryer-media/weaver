@@ -1,25 +1,33 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-// Spreads a stream's data packets across the round trip. The congestion
-// window still decides how much may be in flight; the pacer only decides
-// when it goes out, so a window that opens all at once does not land in
-// the receiver's socket queue as one burst.
+// Decides when a stream's data goes out; the congestion window still
+// decides how much may be in flight.
 //
-// A token bucket fills at twice the window per smoothed round trip, so a
-// window that doubles each round trip in slow start is never held back. It
-// holds at most a small burst: sixteen packets, or one timer tick of the
-// rate when that is larger, so a stream woken once per tick still sends at
-// the full rate. Each packet costs at least one segment, as a receiver's
-// queue counts datagrams, not bytes.
+// A token bucket fills at a rate set from the window: twice the window per
+// smoothed round trip in slow start, five quarters of it after. ACKs wake
+// the stream; what each wake sends is what the bucket holds, so data leaves
+// at the window's rate whether an ACK, a timer or the writer woke it. The
+// bucket holds what the rate adds in one millisecond, the timer's step, so
+// a stream woken no more often than its timer still sends at that rate; it
+// holds no less than sixteen packets and no more than half the window, so
+// no instant sends the whole window at once.
+//
+// libtorrent v2.0.15 does not pace: each ACK runs `while (send_pkt());`
+// (utp_stream.cpp:3023) and a write does the same (757, 779), so one pass
+// sends all the window has room for, in slow start what the ACK freed and
+// as much again (3290-3308). A receiver that drains its queue in lumps
+// then gets the window in lumps, which the bucket here spreads out.
 
 use std::time::Duration;
 
 use tokio::time::Instant;
 
-// The bucket fills at this multiple of window per round trip.
-const PACE_GAIN: u128 = 2;
-// Packets the bucket holds at least.
+// The bucket fills at these multiples of the window per round trip, in
+// eighths.
+const SLOW_START_GAIN_8THS: u128 = 16;
+const AVOIDANCE_GAIN_8THS: u128 = 10;
+// The least packets the bucket holds.
 pub(crate) const PACE_BURST_PACKETS: usize = 16;
 // The coarsest step at which the stream's timer wakes it.
 const PACE_TICK: Duration = Duration::from_millis(1);
@@ -31,10 +39,10 @@ pub(crate) struct Pacer {
     // When the budget was last brought up to date; none before the first
     // send.
     refilled_at: Option<Instant>,
-    // The rate the last refill used, in bytes per round trip, and the
-    // round trip itself.
+    // The window, round trip and gain the last refill used.
     window: usize,
     srtt: Duration,
+    gain_8ths: u128,
     mss: usize,
 }
 
@@ -45,20 +53,33 @@ impl Pacer {
 
     // The bytes the bucket fills by in `elapsed`.
     fn fill(&self, elapsed: Duration) -> u128 {
-        elapsed.as_nanos() * PACE_GAIN * self.window as u128 / self.srtt_nanos()
+        elapsed.as_nanos() * self.gain_8ths * self.window as u128 / (8 * self.srtt_nanos())
     }
 
-    fn capacity(&self) -> usize {
+    pub(crate) fn capacity(&self) -> usize {
         let tick = usize::try_from(self.fill(PACE_TICK)).unwrap_or(usize::MAX);
-        tick.max(PACE_BURST_PACKETS.saturating_mul(self.mss))
+        let floor = PACE_BURST_PACKETS.saturating_mul(self.mss);
+        tick.min(self.window / 2).max(floor)
     }
 
     /// Brings the budget up to `now` for a window of `window` bytes per
-    /// round trip of `srtt`.
-    pub fn refill(&mut self, now: Instant, window: usize, srtt: Duration, mss: usize) {
+    /// round trip of `srtt`, faster while the window is in slow start.
+    pub fn refill(
+        &mut self,
+        now: Instant,
+        window: usize,
+        srtt: Duration,
+        mss: usize,
+        slow_start: bool,
+    ) {
         self.window = window.max(mss);
         self.srtt = srtt;
         self.mss = mss.max(1);
+        self.gain_8ths = if slow_start {
+            SLOW_START_GAIN_8THS
+        } else {
+            AVOIDANCE_GAIN_8THS
+        };
         let capacity = self.capacity();
         let Some(at) = self.refilled_at else {
             self.budget = capacity;
@@ -94,8 +115,8 @@ impl Pacer {
     pub fn ready_at(&self, payload: usize) -> Option<Instant> {
         let at = self.refilled_at?;
         let short = self.cost(payload).saturating_sub(self.budget) as u128;
-        let per = PACE_GAIN * self.window as u128;
-        let nanos = (short * self.srtt_nanos()).div_ceil(per);
+        let per = (self.gain_8ths * self.window as u128).max(1);
+        let nanos = (short * 8 * self.srtt_nanos()).div_ceil(per);
         let wait = Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX));
         Some(at + wait)
     }
@@ -107,73 +128,93 @@ mod tests {
 
     const MSS: usize = 1000;
 
-    fn pacer(now: Instant, window: usize, srtt: Duration) -> Pacer {
+    fn pacer(now: Instant, window: usize, srtt: Duration, slow_start: bool) -> Pacer {
         let mut pacer = Pacer::default();
-        pacer.refill(now, window, srtt, MSS);
+        pacer.refill(now, window, srtt, MSS, slow_start);
         pacer
     }
 
-    #[test]
-    fn a_fresh_bucket_holds_the_burst_allowance() {
-        let now = Instant::now();
-        let mut pacer = pacer(now, 1000 * MSS, Duration::from_secs(1));
+    fn drain(pacer: &mut Pacer) -> usize {
         let mut sent = 0;
         while pacer.allows(MSS) {
             pacer.charge(MSS);
             sent += 1;
         }
-        assert_eq!(sent, PACE_BURST_PACKETS);
+        sent
     }
 
     #[test]
-    fn the_bucket_fills_at_twice_the_window_per_round_trip() {
+    fn a_small_window_holds_the_burst_floor() {
+        let now = Instant::now();
+        let mut pacer = pacer(now, 10 * MSS, Duration::from_millis(100), true);
+        assert_eq!(drain(&mut pacer), PACE_BURST_PACKETS);
+    }
+
+    #[test]
+    fn slow_start_fills_at_twice_the_window_per_round_trip() {
         let now = Instant::now();
         let srtt = Duration::from_millis(100);
-        let mut pacer = pacer(now, 100 * MSS, srtt);
-        pacer.charge(PACE_BURST_PACKETS * MSS);
+        let mut pacer = pacer(now, 100 * MSS, srtt, true);
+        drain(&mut pacer);
         assert!(!pacer.allows(MSS));
         // Two packets per millisecond: the next is ready in half of one.
         assert_eq!(pacer.ready_at(MSS), Some(now + Duration::from_micros(500)));
-        pacer.refill(now + Duration::from_millis(5), 100 * MSS, srtt, MSS);
-        let mut sent = 0;
-        while pacer.allows(MSS) {
-            pacer.charge(MSS);
-            sent += 1;
-        }
-        assert_eq!(sent, 10);
+        pacer.refill(now + Duration::from_millis(5), 100 * MSS, srtt, MSS, true);
+        assert_eq!(drain(&mut pacer), 10);
+    }
+
+    #[test]
+    fn after_slow_start_it_fills_at_five_quarters_of_the_window() {
+        let now = Instant::now();
+        // A hundred packets a millisecond.
+        let srtt = Duration::from_millis(10);
+        let mut pacer = pacer(now, 800 * MSS, srtt, false);
+        drain(&mut pacer);
+        pacer.refill(
+            now + Duration::from_micros(400),
+            800 * MSS,
+            srtt,
+            MSS,
+            false,
+        );
+        assert_eq!(drain(&mut pacer), 40);
     }
 
     #[test]
     fn an_idle_bucket_never_holds_more_than_its_capacity() {
         let now = Instant::now();
         let srtt = Duration::from_millis(100);
-        let mut pacer = pacer(now, 100 * MSS, srtt);
-        pacer.refill(now + Duration::from_secs(60), 100 * MSS, srtt, MSS);
-        let mut sent = 0;
-        while pacer.allows(MSS) {
-            pacer.charge(MSS);
-            sent += 1;
-        }
-        assert_eq!(sent, PACE_BURST_PACKETS);
+        let mut pacer = pacer(now, 100 * MSS, srtt, true);
+        pacer.refill(now + Duration::from_secs(60), 100 * MSS, srtt, MSS, true);
+        assert_eq!(drain(&mut pacer), PACE_BURST_PACKETS);
     }
 
-    // At a rate past one burst per timer tick the bucket holds a tick of it.
+    // On a short round trip the bucket holds a millisecond of the rate, so
+    // a stream woken once a millisecond keeps it; never more than half the
+    // window.
     #[test]
-    fn a_fast_path_holds_one_tick_of_its_rate() {
+    fn a_fast_path_holds_a_tick_of_the_rate_up_to_half_the_window() {
         let now = Instant::now();
-        let mut pacer = pacer(now, 1000 * MSS, Duration::from_micros(100));
-        let mut sent = 0;
-        while pacer.allows(MSS) {
-            pacer.charge(MSS);
-            sent += 1;
+        // 2000 packets per 10 ms in slow start: 400 a millisecond.
+        let srtt = Duration::from_millis(10);
+        let mut slower = pacer(now, 2000 * MSS, srtt, true);
+        slower.refill(now + Duration::from_millis(5), 2000 * MSS, srtt, MSS, true);
+        assert_eq!(drain(&mut slower), 400);
+        for srtt in [
+            Duration::from_millis(1),
+            Duration::from_micros(100),
+            Duration::ZERO,
+        ] {
+            let mut fast = pacer(now, 1000 * MSS, srtt, true);
+            fast.refill(now + Duration::from_millis(1), 1000 * MSS, srtt, MSS, true);
+            assert_eq!(drain(&mut fast), 500, "srtt {srtt:?}");
         }
-        assert_eq!(sent, 20_000);
     }
 
     #[test]
     fn small_packets_cost_a_segment() {
         let now = Instant::now();
-        let mut pacer = pacer(now, 1000 * MSS, Duration::from_secs(1));
+        let mut pacer = pacer(now, 10 * MSS, Duration::from_secs(1), true);
         let mut sent = 0;
         while pacer.allows(1) {
             pacer.charge(1);

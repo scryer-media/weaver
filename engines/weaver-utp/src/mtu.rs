@@ -120,13 +120,26 @@ impl SegmentSizes {
         self.max_ss
     }
 
-    pub fn next_segment_size(&mut self) -> u16 {
+    // The size of the next segment: the probe's once the cooldown has run
+    // out. A probe stays due until a segment is cut, as libtorrent v2.0.15
+    // keeps one due until a packet goes out (utp_stream.cpp:1528-1532).
+    pub fn next_segment_size(&self) -> u16 {
         if self.cooldown_remaining_packets == 0 {
-            self.cooldown_remaining_packets = self.cooldown_max_packets;
-            return self.next_probe();
+            self.next_probe()
+        } else {
+            self.min_ss
         }
-        self.cooldown_remaining_packets = self.cooldown_remaining_packets.saturating_sub(1);
-        self.min_ss
+    }
+
+    // Counts a segment cut at the size `next_segment_size` gave. Only cut
+    // segments run the cooldown down, so a pass that cuts nothing, or cuts
+    // a short tail, leaves a due probe due.
+    pub fn on_segmented(&mut self, probe: bool) {
+        if probe {
+            self.cooldown_remaining_packets = self.cooldown_max_packets;
+        } else {
+            self.cooldown_remaining_packets = self.cooldown_remaining_packets.saturating_sub(1);
+        }
     }
 
     #[cfg(test)]
