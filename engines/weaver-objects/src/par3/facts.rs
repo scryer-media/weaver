@@ -112,7 +112,7 @@ pub(super) fn par3(facts: &Facts) -> Result<Par3, RestoreError> {
             name: volume.name,
         })
         .collect();
-    par3.bound = kept.bound;
+    par3.set_bound(kept.bound);
     par3.unnamed = kept.unnamed;
     par3.described = kept.described;
     par3.identified = kept.identified;

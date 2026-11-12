@@ -3,6 +3,8 @@
 
 mod elimination;
 mod facts;
+mod indexes;
+mod readback;
 mod recovery_contracts;
 
 #[test]
