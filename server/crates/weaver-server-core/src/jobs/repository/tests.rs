@@ -515,6 +515,130 @@ fn archive_job_conflict_preserves_persisted_nzb_bytes_when_active_row_is_gone() 
     assert!(db.get_job_history(1).unwrap().unwrap().nzb_path.is_none());
 }
 
+fn finished(job_id: u64) -> JobHistoryRow {
+    JobHistoryRow {
+        job_id,
+        job_hash: None,
+        name: format!("job-{job_id}.nzb"),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 1_000,
+        downloaded_bytes: 1_000,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1,
+        completed_at: 2,
+        metadata: None,
+        server_attribution: None,
+    }
+}
+
+fn stored_nzbs(db: &Database, job_id: u64) -> i64 {
+    fetch_i64(
+        db,
+        "SELECT COUNT(*) FROM job_nzbs WHERE job_id = {}",
+        vec![SqlArg::I64(job_id as i64)],
+    )
+}
+
+// Finishing a job keeps its stored NZB where it is, for its history to read;
+// deleting the history row removes it.
+#[test]
+fn a_finished_jobs_stored_nzb_stays_until_its_history_goes() {
+    let db = Database::open_in_memory().unwrap();
+    for id in [1, 2] {
+        db.create_active_job(&sample_job(id)).unwrap();
+        db.archive_job(JobId(id), &finished(id)).unwrap();
+        assert_eq!(stored_nzbs(&db, id), 1);
+        let (_, nzb) = db.load_history_job_persisted_nzb(id).unwrap().unwrap();
+        assert_eq!(nzb, Some(sample_nzb_zstd()));
+    }
+    assert!(db.delete_job_history(1).unwrap());
+    assert_eq!(stored_nzbs(&db, 1), 0);
+    assert_eq!(stored_nzbs(&db, 2), 1);
+    // A history row with no stored NZB reads none, as before.
+    db.insert_job_history(&finished(3)).unwrap();
+    let (_, nzb) = db.load_history_job_persisted_nzb(3).unwrap().unwrap();
+    assert_eq!(nzb, None);
+}
+
+// Retention and the operator's history delete take the stored NZBs of the
+// jobs they remove, a whole set in one transaction, and leave the rest.
+#[test]
+fn a_history_delete_takes_the_stored_nzbs_of_the_jobs_it_removes() {
+    let db = Database::open_in_memory().unwrap();
+    for id in 1..=5 {
+        db.create_active_job(&sample_job(id)).unwrap();
+        db.archive_job(JobId(id), &finished(id)).unwrap();
+    }
+    let deleted = db
+        .delete_job_histories_and_forget_duplicate_identities(&[JobId(1), JobId(3), JobId(4)])
+        .unwrap();
+    assert_eq!(deleted.len(), 3);
+    for (id, kept) in [(1, 0), (2, 1), (3, 0), (4, 0), (5, 1)] {
+        assert_eq!(stored_nzbs(&db, id), kept, "job {id}");
+    }
+}
+
+// A job deleted from the queue takes its stored NZB, unless a history row of
+// the same id still owns it; that row's delete then takes it.
+#[test]
+fn deleting_an_active_job_takes_its_stored_nzb_unless_its_history_keeps_it() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    db.delete_active_job(JobId(1)).unwrap();
+    assert_eq!(stored_nzbs(&db, 1), 0);
+
+    db.insert_job_history(&finished(2)).unwrap();
+    db.create_active_job(&sample_job(2)).unwrap();
+    db.delete_active_job(JobId(2)).unwrap();
+    assert_eq!(stored_nzbs(&db, 2), 1);
+    let (_, nzb) = db.load_history_job_persisted_nzb(2).unwrap().unwrap();
+    assert_eq!(nzb, Some(sample_nzb_zstd()));
+    assert!(db.delete_job_history(2).unwrap());
+    assert_eq!(stored_nzbs(&db, 2), 0);
+}
+
+// The start-up sweep removes stored NZBs that neither a queued nor a finished
+// job owns, more than one chunk of them, and keeps every other.
+#[test]
+fn the_orphan_sweep_keeps_the_stored_nzbs_a_job_owns() {
+    let db = Database::open_in_memory().unwrap();
+    db.create_active_job(&sample_job(1)).unwrap();
+    db.create_active_job(&sample_job(2)).unwrap();
+    db.archive_job(JobId(2), &finished(2)).unwrap();
+    for id in 100..200 {
+        execute_sql(
+            &db,
+            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES ({}, x'01')",
+            vec![SqlArg::I64(id)],
+        );
+    }
+    execute_sql(
+        &db,
+        "INSERT INTO active_file_progress (job_id, file_index, coverage) VALUES (150, 0, x'00')",
+        vec![],
+    );
+    let counts = db.prune_orphan_active_state(JobId(1000)).unwrap();
+    assert_eq!(counts.job_nzbs, 100);
+    assert_eq!(counts.active_file_progress, 1);
+    assert_eq!(counts.total_removed(), 101);
+    assert_eq!(stored_nzbs(&db, 1), 1);
+    assert_eq!(stored_nzbs(&db, 2), 1);
+    assert_eq!(fetch_i64(&db, "SELECT COUNT(*) FROM job_nzbs", vec![]), 2);
+    assert_eq!(
+        db.prune_orphan_active_state(JobId(1000))
+            .unwrap()
+            .total_removed(),
+        0
+    );
+}
+
 #[test]
 fn delete_active_job_cleans_all() {
     let db = Database::open_in_memory().unwrap();

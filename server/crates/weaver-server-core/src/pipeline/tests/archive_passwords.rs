@@ -45,12 +45,12 @@ async fn set_persisted_nzb(temp_dir: &tempfile::TempDir, job_id: JobId, nzb_zstd
     let pool = database(temp_dir).await;
     let updated = match nzb_zstd {
         Some(nzb_zstd) => sqlx::query(
-            "INSERT INTO active_job_nzbs (job_id, nzb_zstd) VALUES (?, ?)
+            "INSERT INTO job_nzbs (job_id, nzb_zstd) VALUES (?, ?)
              ON CONFLICT(job_id) DO UPDATE SET nzb_zstd = excluded.nzb_zstd",
         )
         .bind(job_id.0 as i64)
         .bind(nzb_zstd),
-        None => sqlx::query("DELETE FROM active_job_nzbs WHERE job_id = ?").bind(job_id.0 as i64),
+        None => sqlx::query("DELETE FROM job_nzbs WHERE job_id = ?").bind(job_id.0 as i64),
     }
     .execute(&pool)
     .await

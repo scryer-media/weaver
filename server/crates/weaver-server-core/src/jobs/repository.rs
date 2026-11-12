@@ -16,7 +16,8 @@ pub struct OrphanActiveStateCounts {
     pub active_file_identities: usize,
     pub active_extracted: usize,
     pub active_detected_archives: usize,
-    pub active_job_nzbs: usize,
+    // Stored NZBs of jobs in neither the queue nor the history.
+    pub job_nzbs: usize,
     pub active_job_outlines: usize,
     // Every graph checkpoint table together.
     pub graph_checkpoint: usize,
@@ -29,19 +30,20 @@ impl OrphanActiveStateCounts {
             + self.active_file_identities
             + self.active_extracted
             + self.active_detected_archives
-            + self.active_job_nzbs
+            + self.job_nzbs
             + self.active_job_outlines
             + self.graph_checkpoint
     }
 }
 
-const ACTIVE_JOB_CHILD_TABLES: [&str; 16] = [
+// The stored NZB is not among them: it stays while the job's history row
+// does, and goes by `delete_unowned_job_nzbs_tx`.
+const ACTIVE_JOB_CHILD_TABLES: [&str; 15] = [
     "active_file_progress",
     "active_files",
     "active_file_identities",
     "active_extracted",
     "active_detected_archives",
-    "active_job_nzbs",
     "active_job_outlines",
     "graph_nodes",
     "graph_members",
@@ -54,20 +56,24 @@ const ACTIVE_JOB_CHILD_TABLES: [&str; 16] = [
     "graph_held_parts",
 ];
 
+// Deletes the rows these jobs left in `table`, for each job that has no
+// active row. One statement for the whole chunk.
 async fn delete_orphan_rows(
     tx: &mut SqlTx<'_>,
     table: &'static str,
-    job_id: i64,
+    job_ids: &[i64],
 ) -> Result<usize, StateError> {
+    let placeholders = vec!["{}"; job_ids.len()].join(", ");
+    let args = job_ids.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
     let deleted = tx
         .execute(
             &format!(
                 "DELETE FROM {table}
-                 WHERE job_id = {{}} AND NOT EXISTS (
-                     SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {{}}
+                 WHERE job_id IN ({placeholders}) AND NOT EXISTS (
+                     SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {table}.job_id
                  )"
             ),
-            &[SqlArg::I64(job_id), SqlArg::I64(job_id)],
+            &args,
         )
         .await?;
     Ok(deleted as usize)
@@ -102,14 +108,19 @@ async fn delete_job_rows(tx: &mut SqlTx<'_>, tables: &[&str], id: i64) -> Result
     Ok(())
 }
 
+// Deletes a job's active rows, and its stored NZB unless its history row
+// keeps it.
 async fn delete_active_job_rows(tx: &mut SqlTx<'_>, id: i64) -> Result<(), StateError> {
     let mut tables = ACTIVE_JOB_CHILD_TABLES.to_vec();
     tables.push("active_jobs");
-    delete_job_rows(tx, &tables, id).await
+    delete_job_rows(tx, &tables, id).await?;
+    super::nzb_persistence::delete_unowned_job_nzbs_tx(tx, &[id]).await?;
+    Ok(())
 }
 
 // Clears what an earlier run of this job id left in the child tables, so a
-// job written again under the same id starts with none of it.
+// job written again under the same id starts with none of it. Its stored NZB
+// is written over by the caller.
 pub(crate) async fn delete_active_job_child_rows_tx(
     tx: &mut SqlTx<'_>,
     job_id: JobId,
@@ -134,7 +145,6 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
         SqlArg::OptText(history.category.clone()),
         SqlArg::OptText(history.output_dir.clone()),
         SqlArg::OptText(history.nzb_path.clone()),
-        SqlArg::I64(job_id.0 as i64),
         SqlArg::I64(job_id.0 as i64),
         SqlArg::I64(history.created_at),
         SqlArg::I64(history.completed_at),
@@ -198,13 +208,12 @@ async fn archive_job_sql(
                 "INSERT INTO job_history
                  (job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                   optional_recovery_bytes, optional_recovery_downloaded_bytes,
-                  failed_bytes, health, category, output_dir, nzb_path, nzb_zstd,
+                  failed_bytes, health, category, output_dir, nzb_path,
                   created_at, completed_at, metadata,
                   post_processing_summary, script_results_json, server_attribution, support_facts)
                  VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
                          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                          COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
-                         (SELECT nzb_zstd FROM active_job_nzbs WHERE job_id = {}),
                          {}, {}, {},
                          COALESCE((SELECT post_processing_summary FROM active_jobs WHERE job_id = {}), 'not_run'),
                          (SELECT script_results_json FROM active_jobs WHERE job_id = {}),
@@ -224,7 +233,6 @@ async fn archive_job_sql(
                     category = excluded.category,
                     output_dir = excluded.output_dir,
                     nzb_path = excluded.nzb_path,
-                    nzb_zstd = COALESCE(excluded.nzb_zstd, job_history.nzb_zstd),
                     created_at = excluded.created_at,
                     completed_at = excluded.completed_at,
                     metadata = excluded.metadata,
@@ -267,6 +275,7 @@ async fn archive_job_sql(
                 )
                 .await?;
             }
+            // The job's stored NZB stays with its history row.
             delete_active_job_rows(tx, job_id.0 as i64).await?;
             Ok(archived)
         })
@@ -318,36 +327,50 @@ impl Database {
     }
 
     // Removes the rows a job left in the active tables after its own row
-    // went, for jobs numbered below `below`: the jobs that existed when the
-    // caller took that number, so a job created since is never looked at.
-    // The orphans are found by reads, and each job's rows then go in a
-    // transaction of their own, so the writer is never held across a table.
+    // went, and the stored NZBs of jobs in neither the queue nor the history,
+    // for jobs numbered below `below`: the jobs that existed when the caller
+    // took that number, so a job created since is never looked at. The
+    // orphans are found by reads, and then go a chunk of jobs at a time, one
+    // statement per table and one transaction per chunk, so the writer is
+    // never held for long.
     pub fn prune_orphan_active_state(
         &self,
         below: JobId,
     ) -> Result<OrphanActiveStateCounts, StateError> {
-        const ACTIVE_TABLES: [&str; 7] = [
+        const ACTIVE_TABLES: [&str; 6] = [
             "active_file_progress",
             "active_files",
             "active_file_identities",
             "active_extracted",
             "active_detected_archives",
-            "active_job_nzbs",
             "active_job_outlines",
         ];
+        // Jobs whose rows go in one transaction.
+        const ORPHAN_CHUNK: usize = 32;
         let below = i64::try_from(below.0).unwrap_or(i64::MAX);
         let mut orphans = std::collections::BTreeSet::new();
-        for table in ACTIVE_TABLES
+        let finders = ACTIVE_TABLES
             .into_iter()
             .chain(crate::jobs::graph_checkpoint::TABLES)
-        {
+            .map(|table| {
+                format!(
+                    "SELECT DISTINCT job_id FROM {table}
+                     WHERE job_id < {{}} AND NOT EXISTS (
+                         SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {table}.job_id
+                     )"
+                )
+            })
+            .chain(std::iter::once(
+                "SELECT job_id FROM job_nzbs
+                  WHERE job_id < {} AND NOT EXISTS (
+                      SELECT 1 FROM active_jobs WHERE active_jobs.job_id = job_nzbs.job_id
+                  ) AND NOT EXISTS (
+                      SELECT 1 FROM job_history WHERE job_history.job_id = job_nzbs.job_id
+                  )"
+                .to_string(),
+            ));
+        for sql in finders {
             let datastore = self.datastore();
-            let sql = format!(
-                "SELECT DISTINCT job_id FROM {table}
-                 WHERE job_id < {{}} AND NOT EXISTS (
-                     SELECT 1 FROM active_jobs WHERE active_jobs.job_id = {table}.job_id
-                 )"
-            );
             let ids = self.run_sql_blocking_read(async move {
                 SqlRuntime::fetch_all(datastore.read_exec(), &sql, &[SqlArg::I64(below)])
                     .await?
@@ -358,20 +381,25 @@ impl Database {
             orphans.extend(ids);
         }
 
+        let orphans = orphans.into_iter().collect::<Vec<_>>();
         let mut counts = OrphanActiveStateCounts::default();
-        for job_id in orphans {
+        for chunk in orphans.chunks(ORPHAN_CHUNK) {
             let datastore = self.datastore();
-            let removed = self.run_sql_blocking(async move {
+            let chunk = chunk.to_vec();
+            let (removed, nzbs) = self.run_sql_blocking(async move {
                 SqlRuntime::run_in_transaction(&datastore, "prune_orphan_active_state", |tx| {
+                    let chunk = chunk.clone();
                     Box::pin(async move {
                         let mut removed = Vec::new();
                         for table in ACTIVE_TABLES
                             .into_iter()
                             .chain(crate::jobs::graph_checkpoint::TABLES)
                         {
-                            removed.push(delete_orphan_rows(tx, table, job_id).await?);
+                            removed.push(delete_orphan_rows(tx, table, &chunk).await?);
                         }
-                        Ok(removed)
+                        let nzbs =
+                            super::nzb_persistence::delete_unowned_job_nzbs_tx(tx, &chunk).await?;
+                        Ok((removed, nzbs))
                     })
                 })
                 .await
@@ -381,9 +409,9 @@ impl Database {
             counts.active_file_identities += removed[2];
             counts.active_extracted += removed[3];
             counts.active_detected_archives += removed[4];
-            counts.active_job_nzbs += removed[5];
-            counts.active_job_outlines += removed[6];
-            counts.graph_checkpoint += removed[7..].iter().sum::<usize>();
+            counts.active_job_outlines += removed[5];
+            counts.graph_checkpoint += removed[6..].iter().sum::<usize>();
+            counts.job_nzbs += nzbs;
         }
         Ok(counts)
     }
