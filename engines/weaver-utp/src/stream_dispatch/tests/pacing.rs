@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::{num::NonZeroUsize, time::Duration};
+use std::{
+    num::NonZeroUsize,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    task::{Context, Poll, Wake, Waker},
+    time::Duration,
+};
 
 use futures::FutureExt;
 use tokio::io::AsyncWriteExt;
@@ -11,7 +19,7 @@ use crate::{
     SocketOpts,
     pacer::PACE_BURST_PACKETS,
     raw::{Type::*, UtpHeader},
-    stream_dispatch::StreamArgs,
+    stream_dispatch::{SEND_RETRY, StreamArgs},
     test_util::env::MockUtpEnvironment,
     traits::UtpEnvironment,
 };
@@ -93,4 +101,72 @@ async fn a_paced_window_goes_out_within_one_round_trip() {
         sent += pass;
     }
     assert_eq!(sent, WINDOW_PACKETS);
+}
+
+// Records whether the stream asked to be polled again.
+#[derive(Default)]
+struct Woken(AtomicBool);
+
+impl Wake for Woken {
+    fn wake(self: Arc<Self>) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+impl Woken {
+    fn take(&self) -> bool {
+        self.0.swap(false, Ordering::SeqCst)
+    }
+}
+
+fn poll_with(t: &mut TestVsock, woken: &Arc<Woken>) -> Poll<crate::Result<()>> {
+    let waker = Waker::from(woken.clone());
+    t.vsock.poll_unpin(&mut Context::from_waker(&waker))
+}
+
+// The pace timer wakes a stream with nothing in flight, and its socket is
+// full. The socket never wakes it, as when another task polled the socket
+// full after it; no ACK is coming either. The stream still tries again.
+#[tokio::test(start_paused = true)]
+async fn a_full_socket_with_nothing_in_flight_does_not_strand_the_stream() {
+    let rtt = Duration::from_millis(100);
+    let mut t = sender(rtt).await;
+    let woken = Arc::new(Woken::default());
+
+    // The first pass sends one burst; the pacer holds the rest.
+    assert!(poll_with(&mut t, &woken).is_pending());
+    assert_eq!(data_sent(&t), PACE_BURST_PACKETS);
+
+    // Everything sent is acknowledged, so nothing is in flight.
+    let last_sent = t.vsock.last_sent_seq_nr;
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 1.into(),
+            ack_nr: last_sent,
+            wnd_size: 1024 * 1024,
+            ..Default::default()
+        },
+        "",
+    );
+
+    // The pace timer fires.
+    t.env.increment_now(rtt);
+    tokio::time::advance(rtt).await;
+    assert!(woken.take());
+
+    // That pass finds the socket full.
+    t.transport.set_poll_send_pending(true);
+    assert!(poll_with(&mut t, &woken).is_pending());
+    assert_eq!(data_sent(&t), 0);
+    assert!(!woken.take());
+
+    t.env.increment_now(SEND_RETRY);
+    tokio::time::advance(SEND_RETRY).await;
+    assert!(woken.take(), "nothing woke the stream after a full socket");
+
+    // Once the socket takes datagrams, the data goes.
+    t.transport.set_poll_send_pending(false);
+    assert!(poll_with(&mut t, &woken).is_pending());
+    assert!(data_sent(&t) > 0);
 }

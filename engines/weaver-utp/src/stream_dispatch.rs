@@ -1601,9 +1601,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
     // When do we need to poll next time based on timers expiring
     fn next_timer_to_poll(&mut self) -> Option<Instant> {
-        // No reason to repoll if we can't send anything. We'll get polled when the socket is cleared.
+        // A send waits on the transport: try it again after SEND_RETRY at the
+        // latest, as the transport's own wake may never come.
         if self.this_poll.transport_pending {
-            return self.timers.remote_inactivity_timer.poll_at();
+            let retry = self.this_poll.now + SEND_RETRY;
+            return Some(
+                self.timers
+                    .remote_inactivity_timer
+                    .poll_at()
+                    .map_or(retry, |at| at.min(retry)),
+            );
         }
 
         // Wait for the earliest of our timers to fire.
@@ -1694,6 +1701,19 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .any(|s| s.send_count() == 0)
     }
 
+    /// Arms the timer for the earliest timer-driven poll. Every return of
+    /// Pending calls this, a send the transport could not take included.
+    fn arm_next_poll(&mut self, cx: &mut std::task::Context<'_>) {
+        if let Some(instant) = self.next_timer_to_poll() {
+            let duration = instant - self.this_poll.now;
+            trace!(?duration, "will repoll in");
+            if !self.timers.arm_in(cx, duration) {
+                trace!(deadline = ?duration, "failed arming poll timer, waking to repoll");
+                cx.waker().wake_by_ref();
+            }
+        }
+    }
+
     fn poll(&mut self, cx: &mut std::task::Context<'_>) -> Poll<crate::Result<()>> {
         const INGRESS_BATCH: usize = 64;
         let mut ingress_remaining = INGRESS_BATCH;
@@ -1718,6 +1738,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             ($e:expr) => {{
                 bail_if_err!($e);
                 if self.this_poll.transport_pending {
+                    self.arm_next_poll(cx);
                     return Poll::Pending;
                 }
                 if self.this_poll.restart {
@@ -1806,15 +1827,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 );
             }
 
-            // If there's a timer-based next poll to run, arm the timer.
-            if let Some(instant) = self.next_timer_to_poll() {
-                let duration = instant - self.this_poll.now;
-                trace!(?duration, "will repoll in");
-                if !self.timers.arm_in(cx, duration) {
-                    trace!(deadline = ?duration, "failed arming poll timer, waking to repoll");
-                    cx.waker().wake_by_ref();
-                }
-            }
+            self.arm_next_poll(cx);
 
             if ingress_remaining == 0 {
                 cx.waker().wake_by_ref();
@@ -2131,6 +2144,14 @@ const IDLE_DECAYS_MAX: u128 = 64;
 
 const TIMER_SYN_ACK_RESEND: u8 = 4;
 const TIMER_PACE: u8 = 5;
+
+/// A send the transport could not take is tried again after this, whether
+/// or not the transport wakes the stream first. A kernel datagram socket
+/// wakes only the last task that found it full (tokio 1.54.1
+/// `ScheduledIo` keeps one writer waker, scheduled_io.rs:119), and every
+/// stream on the socket and the socket's own dispatcher send through it, so
+/// that wake can go to another task.
+pub(crate) const SEND_RETRY: Duration = Duration::from_millis(1);
 
 #[derive(Default, Debug, Clone, Copy, PartialEq)]
 enum Timer<const NAME: u8> {
