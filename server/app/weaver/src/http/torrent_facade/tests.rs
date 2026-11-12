@@ -3840,6 +3840,66 @@ async fn rss_feeds_are_added_listed_renamed_and_removed() {
     assert_eq!(rig.get("/api/v2/rss/items").await.json(), json!({}));
 }
 
+// A feed's or a blocklist's URL can carry a passkey: a key that only reads
+// sees its scheme, host and port, one that controls sees it whole. A
+// blocklist path reads as it is.
+#[tokio::test]
+async fn a_read_key_sees_no_feed_or_blocklist_passkey() {
+    const FEED: &str = "https://user:pw@feeds.invalid/rss?passkey=feed5ecret";
+    const LIST: &str = "https://lists.invalid:8443/level1.gz?token=list5ecret";
+    const PATH: &str = "/var/lib/weaver/level1.p2p";
+    const PREFERENCES: &str = "/api/v2/app/preferences";
+    let rig = rig().await;
+    let added = rig
+        .post(
+            "/api/v2/rss/addFeed",
+            &format!("url={}&path=one", url_encode(FEED)),
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    let read = |path: &'static str, key: &'static str| {
+        let rig = &rig;
+        async move {
+            rig.send(
+                Request::get(path)
+                    .header("x-api-key", key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    for path in ["/api/v2/rss/items", "/api/v2/rss/items?withData=true"] {
+        let reader = read(path, READER).await;
+        assert!(!reader.body.contains("5ecret"), "{path}");
+        assert_eq!(reader.json()["one"]["url"], "https://feeds.invalid:443/…");
+        assert_eq!(read(path, ADMIN).await.json()["one"]["url"], FEED);
+    }
+    let reader = read(PREFERENCES, READER).await.json();
+    let admin = read(PREFERENCES, ADMIN).await.json();
+    assert_eq!(reader, admin);
+
+    let json = format!(r#"{{"ip_filter_path":"{LIST}"}}"#);
+    assert_eq!(rig.set_preferences(&json).await, StatusCode::OK);
+    let reader = read(PREFERENCES, READER).await;
+    assert!(!reader.body.contains("5ecret"));
+    let mut reader = reader.json();
+    assert_eq!(reader["ip_filter_path"], "https://lists.invalid:8443/…");
+    let mut admin = read(PREFERENCES, ADMIN).await.json();
+    assert_eq!(admin["ip_filter_path"], LIST);
+    // Nothing else differs.
+    reader["ip_filter_path"].take();
+    admin["ip_filter_path"].take();
+    assert_eq!(reader, admin);
+
+    let json = format!(r#"{{"ip_filter_path":"{PATH}"}}"#);
+    assert_eq!(rig.set_preferences(&json).await, StatusCode::OK);
+    assert_eq!(
+        read(PREFERENCES, READER).await.json()["ip_filter_path"],
+        PATH
+    );
+}
+
 // A category's save path and share limits are set where it is created and
 // edited, and read back as the client reads them.
 #[tokio::test]

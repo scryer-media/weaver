@@ -38,8 +38,8 @@ use weaver_server_core::rss::RssService;
 use weaver_server_core::security::RuntimeSecurityConfig;
 use weaver_server_core::settings::model::{Config, SharedConfig};
 use weaver_server_core::settings::{
-    Leaf, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy, TorrentConfig,
-    TorrentEncryption, TorrentLimit, TorrentPeerProtocol,
+    BlocklistSource, Leaf, SeedTimeCounting, SeedingAction, SeedingGoalMode, SeedingPolicy,
+    TorrentConfig, TorrentEncryption, TorrentLimit, TorrentPeerProtocol,
 };
 use weaver_server_core::tags::{TagSnapshot, split_tags};
 use weaver_server_core::torrents::model::{file_priority_number, file_priority_of};
@@ -739,12 +739,12 @@ async fn handle(
         Err(response) => return response,
     };
     match group.as_str() {
-        "app" => app(&ctx, &action, &params).await,
+        "app" => app(&ctx, &action, &params, scope).await,
         "torrents" => torrents(&ctx, &action, params, scope).await,
         "transfer" => transfer_action(&ctx, &action, &params).await,
         "sync" if action == "maindata" => maindata(&ctx, scope, client, &params).await,
         "sync" => torrent_peers(&ctx, &params).await,
-        "rss" => rss(&ctx, &action, &params).await,
+        "rss" => rss(&ctx, &action, &params, scope).await,
         // Weaver keeps no log the client's shape fits.
         "log" => axum::Json(json!([])).into_response(),
         // Nothing of the client's WebUI is kept.
@@ -818,7 +818,12 @@ async fn login(
 }
 
 // The `app` group (qBittorrent `AppController`).
-async fn app(ctx: &TorrentFacadeContext, action: &str, params: &Params) -> Response {
+async fn app(
+    ctx: &TorrentFacadeContext,
+    action: &str,
+    params: &Params,
+    scope: CallerScope,
+) -> Response {
     match action {
         "version" => text(StatusCode::OK, QBT_VERSION),
         "webapiVersion" => text(StatusCode::OK, ctx.api().version()),
@@ -845,7 +850,16 @@ async fn app(ctx: &TorrentFacadeContext, action: &str, params: &Params) -> Respo
                     }
                 }
             }
-            axum::Json(preferences(&config, dht)).into_response()
+            let mut preferences = preferences(&config, dht);
+            // A blocklist URL can carry a token; a caller that cannot
+            // control reads only its scheme, host and port.
+            if !scope.can_control()
+                && let Some(Value::String(path)) = preferences.get_mut("ip_filter_path")
+                && matches!(BlocklistSource::of(path), BlocklistSource::Http(_))
+            {
+                *path = redacted_tracker_url(path);
+            }
+            axum::Json(preferences).into_response()
         }
         "setPreferences" => set_preferences(ctx, params).await,
         "defaultSavePath" => text(StatusCode::OK, ctx.inner.config.read().await.complete_dir()),
@@ -3905,7 +3919,12 @@ const RSS_REFRESH_SECS: u32 = 900;
 // flat list: a feed's path is its name, and there are no folders. A feed's
 // articles are the items Weaver has seen, each already acted on, so each
 // reads as read.
-async fn rss(ctx: &TorrentFacadeContext, action: &str, params: &Params) -> Response {
+async fn rss(
+    ctx: &TorrentFacadeContext,
+    action: &str,
+    params: &Params,
+    scope: CallerScope,
+) -> Response {
     let required: &[&str] = match action {
         "addFolder" | "removeItem" => &["path"],
         "addFeed" | "setFeedURL" => &["url", "path"],
@@ -3919,7 +3938,7 @@ async fn rss(ctx: &TorrentFacadeContext, action: &str, params: &Params) -> Respo
     }
     let get = |name: &str| params.get(name).unwrap_or_default();
     match action {
-        "items" => rss_items(ctx, params.flag("withData").unwrap_or(false)).await,
+        "items" => rss_items(ctx, params.flag("withData").unwrap_or(false), scope).await,
         "addFolder" => unavailable("RSS folders"),
         "addFeed" => add_feed(ctx, get("url"), get("path"), get("refreshInterval")).await,
         "setFeedURL" => {
@@ -4014,7 +4033,9 @@ async fn feed_by_name(
 }
 
 // qBittorrent `itemsAction`: the root folder, each feed by its name.
-async fn rss_items(ctx: &TorrentFacadeContext, with_data: bool) -> Response {
+// A feed's URL can carry the indexer's passkey; a caller that cannot
+// control reads only its scheme, host and port.
+async fn rss_items(ctx: &TorrentFacadeContext, with_data: bool, scope: CallerScope) -> Response {
     let feeds = match feeds(ctx).await {
         Ok(feeds) => feeds,
         Err(response) => return response,
@@ -4023,7 +4044,12 @@ async fn rss_items(ctx: &TorrentFacadeContext, with_data: bool) -> Response {
     for feed in feeds {
         let mut item = Map::new();
         item.insert("uid".to_owned(), json!(feed_uid(feed.id)));
-        item.insert("url".to_owned(), json!(feed.url));
+        let url = if scope.can_control() {
+            feed.url.clone()
+        } else {
+            redacted_tracker_url(&feed.url)
+        };
+        item.insert("url".to_owned(), json!(url));
         item.insert("refreshInterval".to_owned(), json!(feed.poll_interval_secs));
         if with_data {
             let db = ctx.inner.db.clone();
