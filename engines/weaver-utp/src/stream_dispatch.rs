@@ -1298,11 +1298,43 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.last_remote_window
         );
 
+        // A probe is cut only while the congestion window holds more than
+        // three packets of the proven size, header included, so packets
+        // that are no probes go around it and its loss tells of its size,
+        // not of congestion (libtorrent v2.0.15 utp_stream.cpp:1522-1530,
+        // `(m_cwnd >> 16) > m_mtu_floor * 3`). The window does not change
+        // while this pass cuts.
+        let min_ss = self.segment_sizes.mss();
+        let probe_room = self.congestion_controller.cwnd_bytes()
+            > 3 * usize::from(min_ss.saturating_add(UTP_HEADER));
+        // While a probe is due and the window is too small for it, no more
+        // is cut than may be in flight, so the probe is cut once the window
+        // has grown, not after everything written. Segments a SACK reported
+        // delivered are out of the network and do not count. A stream with
+        // no probe due cuts as far ahead as before.
+        let mut hold = (!probe_room).then(|| {
+            (
+                self.congestion_controller.window(),
+                self.user_tx_segments.undelivered_bytes(),
+            )
+        });
+
         // Whether the loop stopped for want of written data.
         let mut starved = remaining == 0;
         while remaining > 0 && remote_window_remaining > 0 {
-            let ss = self.segment_sizes.next_segment_size();
-            let min_ss = self.segment_sizes.mss();
+            if let Some((window, undelivered)) = hold
+                && self.segment_sizes.probe_due()
+                && undelivered >= window
+            {
+                trace!(window, "probe due, window too small: segmenting no further");
+                starved = false;
+                break;
+            }
+            let ss = if probe_room {
+                self.segment_sizes.next_segment_size()
+            } else {
+                min_ss
+            };
             let max_payload_size = (ss as usize).min(remote_window_remaining);
             let payload_size = max_payload_size.min(remaining);
 
@@ -1324,6 +1356,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 break;
             }
             self.segment_sizes.on_segmented(is_mtu_probe);
+            if let Some((_, undelivered)) = hold.as_mut() {
+                *undelivered += payload_size;
+            }
             remaining -= payload_size;
             remote_window_remaining -= payload_size;
             starved = remaining == 0;

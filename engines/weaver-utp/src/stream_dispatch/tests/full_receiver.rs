@@ -30,7 +30,10 @@ use crate::{
     traits::UtpEnvironment,
 };
 
-const MSS: usize = 1000;
+// The floor payload of an IPv4 path, 576 bytes on the link: a link no
+// larger leaves nothing to probe, so every packet is ordinary data and
+// what is lost is lost to the path, never to its size.
+const MSS: usize = 528;
 const ONE_WAY: Duration = Duration::from_micros(500);
 const STEP: Duration = Duration::from_micros(100);
 const MIN_TIMEOUT: Duration = Duration::from_millis(500);
@@ -204,6 +207,7 @@ async fn stream_to(peer: &mut Peer, bytes: usize, rtt_sample: Duration) -> Run {
     t.vsock.rtte = RttEstimator::new(MIN_TIMEOUT);
     t.vsock.rtte.confirm();
     t.vsock.rtte.sample(rtt_sample);
+    assert!(!t.vsock.segment_sizes.is_probing());
     t.stream
         .as_mut()
         .unwrap()
@@ -308,10 +312,11 @@ async fn a_peer_that_loses_the_head_three_times_ends_the_stream() {
     assert_eq!(run.peer.dropped_full, 0, "{run:?}");
     assert_eq!(run.peer.delivered, 8 * MSS, "{run:?}");
     assert_eq!(run.first_sends.len(), 3, "{run:?}");
+    // Eight first sends and the first packet's two resends.
     assert_eq!(
         run.totals,
         SendTotals {
-            packets_sent: 12,
+            packets_sent: 10,
             fast_resends: 1,
             tail_probes: 0,
             timer_expiries: 1,
@@ -333,26 +338,28 @@ async fn a_peer_that_loses_the_head_three_times_ends_the_stream() {
     assert_eq!(
         run.totals,
         SendTotals {
-            packets_sent: 7,
+            packets_sent: 6,
             fast_resends: 1,
             tail_probes: 0,
             timer_expiries: 2,
         },
         "{run:?}"
     );
+    // The last ACK, for the fourth packet, and the fast resend it draws
+    // come 2 ms in; the timer runs 500 ms from there.
     assert_eq!(
         run.first_sends,
         [
             Duration::ZERO,
             Duration::from_millis(2),
-            Duration::from_millis(503)
+            Duration::from_millis(502)
         ],
         "{run:?}"
     );
     // The timer that found the third send unanswered: 1.5 s after it.
     assert_eq!(
         run.took,
-        Duration::from_millis(503) + Duration::from_millis(1500),
+        Duration::from_millis(502) + Duration::from_millis(1500),
         "{run:?}"
     );
 }
@@ -374,26 +381,26 @@ async fn a_sender_inside_the_advertised_window_is_never_dropped_for_room() {
     assert_eq!(run.peer.dropped_full, 0, "{run:?}");
     // Every resend that a later send's delivery outran goes again a round
     // trip and a quarter on, without the timer; one timeout is left.
-    assert_eq!(run.totals.fast_resends, 265, "{run:?}");
+    assert_eq!(run.totals.fast_resends, 529, "{run:?}");
     assert_eq!(run.totals.timer_expiries, 1, "{run:?}");
 }
 
-// 8000 bytes leave in ten packets, 101 to 110: slow start cuts the first
-// ones short. The last is lost once on the way. Nothing sent after it can
+// Eight packets leave, 101 to 108. The last is lost once on the way. Nothing sent after it can
 // draw duplicate ACKs, so two round trips on, the tail goes again as a
 // probe, and the stream ends with no timer expiry and no fast resend.
 #[tokio::test]
 async fn a_lost_tail_is_resent_by_one_probe() {
     let mut peer = Peer::new(64 * 1024);
-    peer.drop = (FIRST + 9, 1);
+    peer.drop = (FIRST + 7, 1);
     let run = stream_to(&mut peer, 8 * MSS, Duration::from_millis(1)).await;
     eprintln!("tail lost once: {run:?}");
     assert!(run.error.is_none(), "{run:?}");
     assert_eq!(run.peer.delivered, 8 * MSS, "{run:?}");
+    // Eight first sends and the probe.
     assert_eq!(
         run.totals,
         SendTotals {
-            packets_sent: 11,
+            packets_sent: 9,
             fast_resends: 0,
             tail_probes: 1,
             timer_expiries: 0,
@@ -413,7 +420,7 @@ async fn a_lost_tail_is_resent_by_one_probe() {
 #[tokio::test]
 async fn a_hole_with_two_packets_behind_it_waits_for_the_timer() {
     let mut peer = Peer::new(64 * 1024);
-    peer.drop = (FIRST + 7, 1);
+    peer.drop = (FIRST + 5, 1);
     let run = stream_to(&mut peer, 8 * MSS, Duration::from_millis(1)).await;
     eprintln!("third from last lost once: {run:?}");
     assert!(run.error.is_none(), "{run:?}");

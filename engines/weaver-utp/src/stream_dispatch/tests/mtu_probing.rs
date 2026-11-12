@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-12.
 
 use std::time::Duration;
 
@@ -11,7 +11,7 @@ use crate::{
     SocketOpts,
     constants::{IPV4_HEADER, UDP_HEADER, UTP_HEADER},
     raw::{Type::*, UtpHeader},
-    stream_dispatch::tests::make_test_vsock,
+    stream_dispatch::tests::{PROBE_WINDOW, make_test_vsock},
     test_util::{cmphead::CmpUtpHeader, setup_test_logging},
 };
 
@@ -38,6 +38,8 @@ async fn abandoning_a_probe_counts_its_last_timeout_without_backoff() {
             },
             false,
         );
+        // A window above three floor packets: the second packet is a probe.
+        t.vsock.congestion_controller.set_window(PROBE_WINDOW);
         let floor = usize::from(t.vsock.segment_sizes.mss());
         let probe = usize::from(t.vsock.segment_sizes.probe_size());
         t.stream
@@ -48,8 +50,8 @@ async fn abandoning_a_probe_counts_its_last_timeout_without_backoff() {
             .unwrap();
         t.poll_once_assert_pending().await;
         let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].payload().len(), floor);
+        let sizes: Vec<usize> = sent.iter().map(|m| m.payload().len()).collect();
+        assert_eq!(sizes, [floor, probe]);
         t.send_msg(
             UtpHeader {
                 htype: State,
@@ -61,9 +63,7 @@ async fn abandoning_a_probe_counts_its_last_timeout_without_backoff() {
             "",
         );
         t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        assert_eq!(sent.len(), 1);
-        assert_eq!(sent[0].payload().len(), probe);
+        t.assert_sent_empty();
         let window = t.vsock.congestion_controller.window();
 
         for expiry in 1..=retries + 1 {
@@ -104,6 +104,8 @@ async fn probe_in_flight(
     if let Some(rto) = forced_rto {
         t.vsock.rtte.force_timeout(rto);
     }
+    // A window above three floor packets: the second packet is a probe.
+    t.vsock.congestion_controller.set_window(PROBE_WINDOW);
     let floor = usize::from(t.vsock.segment_sizes.mss());
     let probe = usize::from(t.vsock.segment_sizes.probe_size());
     let extra = if queued_data { floor } else { 0 };
@@ -115,8 +117,9 @@ async fn probe_in_flight(
         .unwrap();
     t.poll_once_assert_pending().await;
     let sent = t.take_sent();
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].payload().len(), floor);
+    let sizes: Vec<usize> = sent.iter().map(|m| m.payload().len()).collect();
+    assert_eq!(sizes, [floor, probe]);
+    assert_eq!(sent[1].header.seq_nr, 102.into());
     t.send_msg(
         UtpHeader {
             htype: State,
@@ -128,10 +131,7 @@ async fn probe_in_flight(
         "",
     );
     t.poll_once_assert_pending().await;
-    let sent = t.take_sent();
-    assert_eq!(sent.len(), 1);
-    assert_eq!(sent[0].payload().len(), probe);
-    assert_eq!(sent[0].header.seq_nr, 102.into());
+    t.assert_sent_empty();
     (t, floor)
 }
 
@@ -151,16 +151,38 @@ async fn an_unsent_probe_does_not_hide_the_data_timeout() {
         },
         false,
     );
+    // A window above three floor packets lets the probe be cut. The floor
+    // goes first; the peer then shrinks its window below the floor and the
+    // probe together, so the probe is cut and waits unsent.
+    t.vsock.congestion_controller.set_window(PROBE_WINDOW);
     let floor = usize::from(t.vsock.segment_sizes.mss());
     let probe = usize::from(t.vsock.segment_sizes.probe_size());
     t.stream
         .as_mut()
         .unwrap()
-        .write_all(&vec![7; floor + probe])
+        .write_all(&vec![7; floor])
         .await
         .unwrap();
     t.poll_once_assert_pending().await;
     assert_eq!(t.take_sent().len(), 1);
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 1.into(),
+            ack_nr: 100.into(),
+            wnd_size: (floor + probe - 1) as u32,
+            ..Default::default()
+        },
+        "",
+    );
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&vec![7; probe])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    t.assert_sent_empty();
     assert_eq!(t.vsock.user_tx_segments.total_len_packets(), 2);
     assert_eq!(t.vsock.user_tx_segments.outstanding_packets(), 1);
     expire_retransmit(&mut t);
@@ -500,6 +522,10 @@ async fn probe_retry_if_emsgsize() {
 #[tokio::test]
 async fn a_probe_waits_for_written_data_enough_to_fill_it() {
     let mut t = make_test_vsock(SocketOpts::default(), false);
+    // A packet or two in flight never fills the window, so it never grows
+    // (libtorrent v2.0.15 utp_stream.cpp:3286-3288 grows only a saturated
+    // window). It is set above three floor packets, where probes may go.
+    t.vsock.congestion_controller.set_window(PROBE_WINDOW);
     let floor = usize::from(t.vsock.segment_sizes.mss());
     let w = t.stream.as_mut().unwrap();
     w.write_all(&vec![7; floor + 100]).await.unwrap();

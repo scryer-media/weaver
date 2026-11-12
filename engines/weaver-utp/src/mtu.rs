@@ -177,6 +177,11 @@ impl SegmentSizes {
         self.next_probe() > self.min_ss
     }
 
+    // Whether the next segment cut would be a probe.
+    pub fn probe_due(&self) -> bool {
+        self.cooldown_remaining_packets == 0 && self.is_probing()
+    }
+
     pub fn on_probe_failed(&mut self, size: usize) {
         self.max_ss = self
             .max_ss

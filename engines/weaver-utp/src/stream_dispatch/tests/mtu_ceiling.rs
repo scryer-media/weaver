@@ -58,6 +58,10 @@ async fn a_new_stream_probes_up_to_the_link() {
     assert_eq!(new_streams_max_ss(&t), 1452);
 }
 
+// The one-way delay a test peer reports for the stream's packets. Below
+// the delay target, so the congestion window grows.
+const PATH_DELAY_US: u32 = 10_000;
+
 // A stream sending 512 KiB over a path that carries payloads of up to
 // `passes` bytes and drops larger ones whole. The peer acks, 10 ms after
 // each send, everything before the first packet the path dropped; when
@@ -105,6 +109,7 @@ async fn over_a_path(passes: usize) -> (super::TestVsock, Vec<usize>) {
                         seq_nr: 1.into(),
                         ack_nr,
                         timestamp_microseconds,
+                        timestamp_difference_microseconds: PATH_DELAY_US,
                         wnd_size: 1024 * 1024,
                         ..Default::default()
                     },
@@ -247,6 +252,7 @@ impl Peer {
                     seq_nr: 1.into(),
                     ack_nr: self.ack_nr.into(),
                     timestamp_microseconds,
+                    timestamp_difference_microseconds: PATH_DELAY_US,
                     wnd_size: 1024 * 1024,
                     ..Default::default()
                 },
@@ -359,6 +365,56 @@ async fn a_refused_resend_waits_as_a_lost_one() {
     assert!(usize::from(t.vsock.segment_sizes.max_ss()) < 1452);
 }
 
+// A probe goes only while the congestion window holds more than three
+// packets of the proven size: 528 bytes of payload and the 20-byte uTP
+// header, 3 * 548 = 1644 bytes, as libtorrent compares its window with
+// three floor packets (utp_stream.cpp v2.0.15:1528-1530). The window starts
+// at 1500 bytes, so the first packets are all floor-sized; acks that report
+// a delay under the target grow it, and the first packet cut once it holds
+// more than 1644 bytes is the probe, halfway from 528 to 1452: 991 bytes.
+#[tokio::test]
+async fn a_probe_waits_for_a_window_above_three_floor_packets() {
+    setup_test_logging();
+    let env = MockUtpEnvironment::new();
+    let args = test_stream_args(&env, false);
+    let mut t = make_test_vsock_on(
+        RememberingTransport::new(ADDR_1),
+        SocketOpts {
+            remote_inactivity_timeout: Some(Duration::from_secs(60)),
+            ..Default::default()
+        },
+        args,
+        env,
+    );
+    let gate = 3 * (528 + 20);
+    assert_eq!(t.vsock.congestion_controller.cwnd_bytes(), 1500);
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&[0u8; 16 * 1024])
+        .await
+        .unwrap();
+    let mut peer = Peer::new();
+    let mut floor_packets = 0;
+    loop {
+        let tried = peer.tried.len();
+        peer.round(&mut t).await;
+        // The window the pass cut with: the peer's ack goes in after it.
+        let cwnd = t.vsock.congestion_controller.cwnd_bytes();
+        let sizes: Vec<usize> = peer.tried[tried..].iter().map(|&(_, len, _)| len).collect();
+        if let Some(&probe) = sizes.iter().find(|&&len| len > 528) {
+            assert!(cwnd > gate, "a probe at a window of {cwnd} bytes");
+            assert_eq!(probe, 991);
+            break;
+        }
+        assert!(sizes.iter().all(|&len| len == 528), "{sizes:?}");
+        floor_packets += sizes.len();
+    }
+    // The first window holds two floor packets, 1056 bytes; a third would
+    // pass 1500. Before, the second packet was the probe.
+    assert_eq!(floor_packets, 2, "floor packets first");
+}
+
 #[tokio::test]
 async fn no_packet_outgrows_a_1280_byte_tunnel() {
     setup_test_logging();
@@ -390,11 +446,16 @@ async fn no_packet_outgrows_a_1280_byte_tunnel() {
             largest = largest.max(msg.payload().len());
             ack_nr = ack_nr.max(msg.header.seq_nr.0);
         }
+        t.env.increment_now(Duration::from_millis(10));
+        let timestamp_microseconds = t.vsock.timestamp_microseconds();
         t.send_msg(
             UtpHeader {
                 htype: State,
                 seq_nr: 1.into(),
                 ack_nr: ack_nr.into(),
+                timestamp_microseconds,
+                // The window grows past three floor packets, so probes go.
+                timestamp_difference_microseconds: PATH_DELAY_US,
                 wnd_size: 1024 * 1024,
                 ..Default::default()
             },
@@ -437,9 +498,16 @@ async fn a_stream_that_dies_on_a_probe_lowers_the_ceiling() {
         .write_all(&[0u8; 2000])
         .await
         .unwrap();
+    // A window above three floor packets: the second packet is a probe.
+    t.vsock
+        .congestion_controller
+        .set_window(super::PROBE_WINDOW);
     t.poll_once_assert_pending().await;
     let sent = t.take_sent();
     assert_eq!(sent[0].payload().len(), 528, "the floor");
+    assert_eq!(sent[1].header.seq_nr, 102.into());
+    let probe = sent[1].payload().len();
+    assert!(probe > 528, "a probe");
 
     t.send_msg(
         UtpHeader {
@@ -452,10 +520,7 @@ async fn a_stream_that_dies_on_a_probe_lowers_the_ceiling() {
         "",
     );
     t.poll_once_assert_pending().await;
-    let sent = t.take_sent();
-    assert_eq!(sent[0].header.seq_nr, 102.into());
-    let probe = sent[0].payload().len();
-    assert!(probe > 528, "a probe");
+    t.assert_sent_empty();
     let died = loop {
         t.env.increment_now(t.vsock.rtte.retransmission_timeout());
         match t.poll_once().await {

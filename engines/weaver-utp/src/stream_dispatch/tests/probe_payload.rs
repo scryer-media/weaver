@@ -4,7 +4,7 @@
 use futures::FutureExt;
 use tokio::io::AsyncWriteExt;
 
-use super::make_test_vsock;
+use super::{PROBE_WINDOW, make_test_vsock};
 use crate::{
     SocketOpts,
     constants::UTP_HEADER,
@@ -27,42 +27,44 @@ async fn transfer_after_removing_a_probe(removal: Removal) {
         },
         false,
     );
+    // A window above three floor packets: the second packet is a probe.
+    t.vsock.congestion_controller.set_window(PROBE_WINDOW);
     let floor = usize::from(t.vsock.segment_sizes.mss());
     let probe = usize::from(t.vsock.segment_sizes.probe_size());
     let payload: Vec<u8> = (0..floor + probe)
         .map(|index| b'a' + (index % 26) as u8)
         .collect();
+    if matches!(removal, Removal::TooLarge) {
+        t.transport
+            .set_max_payload_len(usize::from(UTP_HEADER) + floor);
+    }
     let mut writer = t.stream.take().unwrap();
     writer.write_all(&payload).await.unwrap();
     let mut flushing = Box::pin(writer.flush());
     assert!(flushing.as_mut().now_or_never().is_none());
 
     t.poll_once_assert_pending().await;
-    let sent = t.take_sent();
-    assert_eq!(sent.len(), 1);
+    let mut sent = t.take_sent();
     assert_eq!(sent[0].payload(), &payload[..floor]);
     let first_seq_nr = sent[0].header.seq_nr;
-    let mut reconstructed = sent[0].payload().to_vec();
-    if matches!(removal, Removal::TooLarge) {
-        t.transport
-            .set_max_payload_len(usize::from(UTP_HEADER) + floor);
-    }
-    t.send_msg(
-        UtpHeader {
-            htype: State,
-            seq_nr: 1.into(),
-            ack_nr: first_seq_nr,
-            wnd_size: 1024 * 1024,
-            ..Default::default()
-        },
-        "",
-    );
-    t.poll_once_assert_pending().await;
+    let mut reconstructed = sent.remove(0).payload().to_vec();
 
     if matches!(removal, Removal::Expired) {
-        let probe_sent = t.take_sent();
-        assert_eq!(probe_sent.len(), 1);
-        assert_eq!(probe_sent[0].payload(), &payload[floor..]);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].payload(), &payload[floor..]);
+        sent.clear();
+        t.send_msg(
+            UtpHeader {
+                htype: State,
+                seq_nr: 1.into(),
+                ack_nr: first_seq_nr,
+                wnd_size: 1024 * 1024,
+                ..Default::default()
+            },
+            "",
+        );
+        t.poll_once_assert_pending().await;
+        t.assert_sent_empty();
         let expiry = t.vsock.timers.retransmit.poll_at().unwrap();
         t.env
             .increment_now(expiry.saturating_duration_since(t.env.now()));
@@ -76,9 +78,9 @@ async fn transfer_after_removing_a_probe(removal: Removal) {
             result.unwrap();
             break;
         }
-        let sent = t.take_sent();
+        sent.extend(t.take_sent());
         let mut last_ack = None;
-        for message in sent {
+        for message in sent.drain(..) {
             assert_eq!(message.header.htype, Data);
             if matches!(removal, Removal::TooLarge) && message.payload().len() > floor {
                 saw_rejected_probe = true;

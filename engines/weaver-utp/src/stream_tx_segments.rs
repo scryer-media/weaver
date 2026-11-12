@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-10.
+// Modified by the Weaver authors, 2026-11-12.
 
 // uTP doesn't resegment, so we pre-segment TX once.
 // We also store the delivered state of the segments here.
@@ -375,6 +375,18 @@ impl Segments {
 
     pub fn total_len_bytes(&self) -> usize {
         self.len_bytes
+    }
+
+    // The bytes of segments not yet delivered, sent or not: those a SACK
+    // reported delivered are out of the network.
+    pub fn undelivered_bytes(&self) -> usize {
+        self.len_bytes
+            - self
+                .segments
+                .iter()
+                .filter(|s| s.is_delivered)
+                .map(|s| s.payload_size)
+                .sum::<usize>()
     }
 
     pub fn sack_depth(&self) -> usize {
