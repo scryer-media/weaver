@@ -1853,6 +1853,110 @@ fn a_packet_that_was_none_reads_again_only_where_a_packet_can_begin() {
     assert_eq!(walker.front(), volume.len() as u64);
 }
 
+// A volume of `fakes` recovery headers one after another, each claiming to
+// end where the valid packet after them ends, each hash wrong: each is read
+// as a packet that was none, and the walk starts again at the next. The
+// range of the valid packet.
+fn nested_fakes(fakes: usize) -> (Vec<u8>, ByteRange) {
+    let valid = recovery_packet(1, &payload(56, 4000));
+    let stride = recovery_packet(2, &[]).len();
+    let end = (fakes * stride + valid.len()) as u64;
+    let mut volume = Vec::with_capacity(end as usize);
+    for at in 0..fakes {
+        let mut fake = recovery_packet(2, &[]);
+        let length = end - (at * stride) as u64;
+        fake[8..16].copy_from_slice(&length.to_le_bytes());
+        volume.extend_from_slice(&fake);
+    }
+    let copy = ByteRange::at(volume.len() as u64, valid.len() as u64);
+    volume.extend_from_slice(&valid);
+    (volume, copy)
+}
+
+// The volume delivered whole, then each range the object asks for again
+// said again as the tree says it, until it asks for none: how many it
+// asked for.
+fn walk_asked_again(object: &mut Par2, volume: &[u8]) -> usize {
+    use weaver_graph::{Delivery, Emit, Evidenced};
+
+    let deliver = |object: &mut Par2, offset: u64, bytes: &[u8], out: &mut Vec<Emit>| {
+        object.deliver(
+            Delivery {
+                volume: VolumeIndex(0),
+                offset,
+                bytes: &Evidenced::from(bytes.to_vec()),
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            out,
+        );
+    };
+    let mut out = Vec::new();
+    deliver(object, 0, volume, &mut out);
+    let mut asked = 0;
+    while let Some(at) = out
+        .iter()
+        .position(|emit| matches!(emit, Emit::Again { .. }))
+    {
+        let Emit::Again {
+            volume: index,
+            range,
+        } = out.remove(at)
+        else {
+            unreachable!();
+        };
+        asked += 1;
+        object.unposted(index, range);
+        deliver(
+            object,
+            range.start,
+            &volume[range.start as usize..range.end as usize],
+            &mut out,
+        );
+    }
+    asked
+}
+
+// Each packet that was none is examined, and charged as one: a volume of
+// nested fakes costs a packet for each, and the valid packet they all claim
+// to hold is still found.
+#[test]
+fn a_packet_that_was_none_is_charged_as_examined() {
+    const FAKES: usize = 64;
+    let (volume, copy) = nested_fakes(FAKES);
+    let mut object = Par2::new(OWN);
+    let asked = walk_asked_again(&mut object, &volume);
+    assert_eq!(asked, FAKES);
+    assert!(!object.refused);
+    assert_eq!(object.meter.examined(), FAKES as u64 + 1);
+    assert_eq!(object.volumes[0].walked_blocks, 1);
+    let found: Vec<ByteRange> = object
+        .sets
+        .values()
+        .flat_map(|set| set.recovery.values().map(|at| at.range))
+        .collect();
+    assert_eq!(found, vec![copy]);
+}
+
+// Nested fakes past the examined limit refuse the object, as too many
+// packets do, and it asks for nothing more once refused.
+#[test]
+fn nested_packets_that_were_none_refuse_past_the_examined_limit() {
+    const LEFT: u64 = 10;
+    let (volume, _) = nested_fakes(64);
+    let mut object = Par2::new(OWN);
+    let most = super::walker::MAX_EXAMINED;
+    object.meter = super::walker::Meter::spent(most - LEFT);
+    let asked = walk_asked_again(&mut object, &volume);
+    assert!(object.refused);
+    assert_eq!(
+        asked as u64, LEFT,
+        "each fake within the limit was read again"
+    );
+    assert_eq!(object.meter.examined(), most + 1);
+    assert_eq!(object.volumes[0].walked_blocks, 0);
+}
+
 // A refused slice is held only by a twin that is neither refused nor came
 // damaged: the first two slices of one file came damaged and the other
 // file was refused whole, so four slices lack their bytes and the one

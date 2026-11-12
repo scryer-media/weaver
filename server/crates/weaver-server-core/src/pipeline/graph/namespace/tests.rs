@@ -14,6 +14,7 @@ use weaver_graph::{
 use super::*;
 use crate::pipeline::graph::lines::Lines;
 
+mod again;
 mod recovery;
 mod recovery_contracts;
 mod replay;
