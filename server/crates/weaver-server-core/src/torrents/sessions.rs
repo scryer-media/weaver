@@ -1350,6 +1350,21 @@ impl Sessions {
         }
     }
 
+    /// The open session of `plan`'s route while it runs, taken at once: none
+    /// while the route is opening, held or not asked to open, and nothing is
+    /// built for it.
+    pub async fn running_session(&self, plan: &RoutePlan) -> Option<Arc<Session>> {
+        let running = self
+            .slots
+            .lock()
+            .await
+            .get(&plan.key)
+            .and_then(Slot::running)
+            .cloned()?;
+        self.joined(plan);
+        Some(running)
+    }
+
     /// The open session of `plan`'s route, built when it is not open yet. A
     /// route that is down holds closed. A session built here names itself as
     /// the client of `opener`, the torrent that opens it, wherever it names a
@@ -1359,15 +1374,7 @@ impl Sessions {
         plan: &RoutePlan,
         opener: &Identity,
     ) -> Result<Arc<Session>, SessionError> {
-        let running = self
-            .slots
-            .lock()
-            .await
-            .get(&plan.key)
-            .and_then(Slot::running)
-            .cloned();
-        if let Some(session) = running {
-            self.joined(plan);
+        if let Some(session) = self.running_session(plan).await {
             return Ok(session);
         }
         // The slot is marked as opening and the lock let go while the

@@ -21,7 +21,7 @@ async fn one_view() -> TorrentView {
     rig.service.open().await.unwrap();
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("copied", 3))))
+        .add_opened(request(AddSource::Metainfo(plain("copied", 3))))
         .await
         .unwrap();
     let view = rig.service.torrent(job_id).await.unwrap();
@@ -192,7 +192,7 @@ async fn twenty_followers_hear_a_change_from_one_reading() {
     for (name, seed) in [("one", 1), ("two", 2), ("three", 3)] {
         let job_id = rig
             .service
-            .add(AddRequest {
+            .add_opened(AddRequest {
                 paused: true,
                 ..request(AddSource::Metainfo(plain(name, seed)))
             })

@@ -1303,6 +1303,32 @@ enum Resolving {
     Paused,
 }
 
+// What a torrent joins its route's session with, read before the session is
+// asked for, and the plan of that route.
+struct Joining {
+    plan: RoutePlan,
+    scope: TorrentScope,
+    bytes: Bytes,
+    layout: Arc<PieceLayout>,
+    intake: Arc<Intake>,
+    dir: String,
+    paused: bool,
+    ratelimits: LimitsConfig,
+    have: (
+        Option<bitvec::boxed::BitBox<u8, bitvec::order::Msb0>>,
+        bool,
+        Arc<TorrentStore>,
+    ),
+    identity: Identity,
+    totals: TorrentTotals,
+    terms: PeerTerms,
+    ssl: Option<TrackerCertificate>,
+    picking: (Vec<FilePriority>, bool, bool),
+    saved: ResumePeers,
+    listed: Arc<[TrackerEntry]>,
+    verified: Option<Option<Vec<u8>>>,
+}
+
 // What the service keeps of each torrent while it lives.
 struct Live {
     record: TorrentRecord,
@@ -1338,6 +1364,9 @@ struct Live {
     fetching: Option<weaver_torrent::MetadataFetch>,
     // A magnet's metadata fetch, until it ends.
     resolving: Option<Resolving>,
+    // Its wait for its route's session to open, off the add or action that
+    // asked for it, until the wait ends.
+    attaching: Option<tokio::task::AbortHandle>,
     route: Option<RouteKey>,
     held: Option<Held>,
     about: About,
@@ -1515,6 +1544,7 @@ impl Live {
             attached: None,
             fetching: None,
             resolving: None,
+            attaching: None,
             route: None,
             held: None,
             about: About::default(),
@@ -2163,6 +2193,9 @@ struct Inner {
     crash_marks: Mutex<crate::runtime::panic_trap::CrashMarks>,
     signal: Arc<Signal>,
     ticks: watch::Sender<u64>,
+    // Counts the waits for a route's session to open, begun off an add or
+    // an action, that have ended.
+    attaches: watch::Sender<u64>,
     retired: watch::Sender<u64>,
     written: watch::Sender<Written>,
     queue: Mutex<Option<SchedulerHandle>>,
@@ -2231,6 +2264,7 @@ impl TorrentService {
                 crash_marks: Mutex::default(),
                 signal: Arc::new(Signal::default()),
                 ticks: watch::channel(0).0,
+                attaches: watch::channel(0).0,
                 retired: watch::channel(0).0,
                 written: watch::channel(Written::default()).0,
                 queue: Mutex::new(None),
@@ -2546,6 +2580,11 @@ impl TorrentService {
         for task in tasks {
             task.abort();
         }
+        for torrent in self.inner.live.lock().await.values_mut() {
+            if let Some(attaching) = torrent.attaching.take() {
+                attaching.abort();
+            }
+        }
         self.stop_tick();
         // The last reading of every torrent, and what of its ledger and
         // peers changed since the last write, before the sessions close
@@ -2606,6 +2645,24 @@ impl TorrentService {
     /// Counts the ticks run so far.
     pub fn ticks(&self) -> watch::Receiver<u64> {
         self.inner.ticks.subscribe()
+    }
+
+    /// Counts the waits for a route's session to open, begun off an add or
+    /// an action, that have ended: the torrent is in its session then, or
+    /// held for why the session did not open.
+    pub fn attaches(&self) -> watch::Receiver<u64> {
+        self.inner.attaches.subscribe()
+    }
+
+    /// Whether `job_id` waits on its route's session to open, off the add
+    /// or action that asked for it.
+    pub async fn attaching(&self, job_id: JobId) -> bool {
+        self.inner
+            .live
+            .lock()
+            .await
+            .get(&job_id)
+            .is_some_and(|torrent| torrent.attaching.is_some())
     }
 
     /// Counts the torrents whose jobs went to history.
@@ -3967,8 +4024,10 @@ impl TorrentService {
                 // `torrentAdded` from `addTorrent_impl` alone).
                 self.raise_script_event(&torrent, QueueEvent::TorrentAdded, &[]);
                 self.enqueue(torrent).await;
+                // Answered without waiting on its route: it reads as opening
+                // until its route's session is open, then goes on by itself.
                 match made {
-                    Ok(()) => self.attach(job_id, None).await,
+                    Ok(()) => self.spawn_attach(job_id).await,
                     Err(error) => self.fail(job_id, error).await,
                 }
                 self.inner.counters.event(TorrentEvent::Added);
@@ -4591,7 +4650,91 @@ impl TorrentService {
     // now, on the fetch's session under the identity the fetch announced, so
     // they hear one torrent; otherwise the fetch's trackers are let go,
     // which sends them `stopped`, and the run starts its own.
-    async fn attach(&self, job_id: JobId, fetched: Option<Fetched>) {
+    // Returns the route whose session did not open for it, and why.
+    async fn attach(&self, job_id: JobId, fetched: Option<Fetched>) -> Option<(RouteKey, Held)> {
+        let joining = self.joining(job_id).await?;
+        let session = match self.open_session(&joining.plan, &joining.identity).await {
+            Ok(session) => session,
+            Err(error) => {
+                let held = held_by(error);
+                self.held(job_id, Some(joining.plan.key.clone()), held.clone())
+                    .await;
+                return Some((joining.plan.key, held));
+            }
+        };
+        self.join(job_id, joining, session, fetched).await;
+        None
+    }
+
+    // `attach`, answered at once: a torrent whose route's session runs
+    // joins it now, and one whose route must open first waits for it off
+    // the caller, reading as opening meanwhile, and goes on by itself once
+    // the open ends, in the session or held for why it did not open. Nothing
+    // of it reaches the route before its session is open. A torrent already
+    // waiting on its route's open is left to that wait.
+    async fn spawn_attach(&self, job_id: JobId) {
+        if self
+            .inner
+            .live
+            .lock()
+            .await
+            .get(&job_id)
+            .is_none_or(|torrent| torrent.attaching.is_some())
+        {
+            return;
+        }
+        let Some(joining) = self.joining(job_id).await else {
+            return;
+        };
+        if let Some(session) = self.inner.sessions.running_session(&joining.plan).await {
+            self.read_sessions().await;
+            return self.join(job_id, joining, session, None).await;
+        }
+        // A route its plan holds down builds nothing, so it says why at
+        // once.
+        if joining.plan.down.is_some() {
+            return match self.open_session(&joining.plan, &joining.identity).await {
+                Ok(session) => self.join(job_id, joining, session, None).await,
+                Err(error) => {
+                    self.held(job_id, Some(joining.plan.key), held_by(error))
+                        .await;
+                }
+            };
+        }
+        let service = self.clone();
+        let mut live = self.inner.live.lock().await;
+        let Some(torrent) = live.get_mut(&job_id) else {
+            return;
+        };
+        if torrent.attaching.is_some() {
+            return;
+        }
+        // The task takes this lock before it touches the torrent, so the
+        // handle is the torrent's before the task lets it go.
+        let task = tokio::spawn(async move {
+            let session = service.open_session(&joining.plan, &joining.identity).await;
+            match session {
+                Ok(session) => service.join(job_id, joining, session, None).await,
+                Err(error) => {
+                    service
+                        .held(job_id, Some(joining.plan.key), held_by(error))
+                        .await;
+                }
+            }
+            if let Some(torrent) = service.inner.live.lock().await.get_mut(&job_id) {
+                torrent.attaching = None;
+            }
+            service.publish_job(job_id).await;
+            service.inner.attaches.send_modify(|ended| *ended += 1);
+        });
+        torrent.attaching = Some(task.abort_handle());
+    }
+
+    // What a torrent joins its route's session with, read as it stands, and
+    // the plan of the route it joins: none when it is gone, in a session
+    // already, has no metainfo yet, or its files are missing. From here it
+    // reads as its route does while it waits for the route's session.
+    async fn joining(&self, job_id: JobId) -> Option<Joining> {
         let settings = self.settings();
         let rules = self.rules();
         let now = self.inner.clock.now_ms();
@@ -4614,13 +4757,11 @@ impl TorrentService {
             verified,
         ) = {
             let mut live = self.inner.live.lock().await;
-            let Some(torrent) = live.get_mut(&job_id) else {
-                return;
-            };
+            let torrent = live.get_mut(&job_id)?;
             // One whose files are missing joins no session: it would claim
             // pieces it cannot read and write where its files are not.
             if torrent.attached.is_some() || torrent.files_missing {
-                return;
+                return None;
             }
             let (Some(bytes), Some(layout), Some(intake), Some(store)) = (
                 torrent.record.metainfo.clone(),
@@ -4628,7 +4769,7 @@ impl TorrentService {
                 torrent.intake.clone(),
                 torrent.store.clone(),
             ) else {
-                return;
+                return None;
             };
             let rule = torrent.rule(&rules);
             let ratelimits =
@@ -4682,13 +4823,55 @@ impl TorrentService {
             torrent.route = Some(plan.key.clone());
             torrent.held = Some(Held::Session(OPENING));
         }
-        let session = match self.open_session(&plan, &identity).await {
-            Ok(session) => session,
-            Err(error) => {
-                self.held(job_id, Some(plan.key), held_by(error)).await;
-                return;
-            }
-        };
+        Some(Joining {
+            plan,
+            scope,
+            bytes,
+            layout,
+            intake,
+            dir,
+            paused,
+            ratelimits,
+            have,
+            identity,
+            totals,
+            terms,
+            ssl,
+            picking,
+            saved,
+            listed,
+            verified,
+        })
+    }
+
+    // Put a torrent in `session`, its route's, with what `joining` read of
+    // it.
+    async fn join(
+        &self,
+        job_id: JobId,
+        joining: Joining,
+        session: Arc<Session>,
+        fetched: Option<Fetched>,
+    ) {
+        let Joining {
+            plan,
+            scope,
+            bytes,
+            layout,
+            intake,
+            dir,
+            paused,
+            ratelimits,
+            have,
+            identity,
+            totals,
+            terms,
+            ssl,
+            picking,
+            saved,
+            listed,
+            verified,
+        } = joining;
         // The session takes it only while it is still here: a remove made
         // while the route's session opened has deleted its files, and the
         // session would make them again. A remove made from here on waits
@@ -6473,6 +6656,9 @@ impl TorrentService {
                     torrent.engine = Engine::Absent;
                     torrent.route = Some(plan.key);
                     torrent.held = Some(Held::RouteDown(reason.clone()));
+                } else if torrent.attaching.is_some() {
+                    // Its route's session is being opened for it already:
+                    // the pass after that wait ends looks at it again.
                 } else if torrent.route.as_ref() != Some(&plan.key)
                     || outdated.contains(&plan.key)
                     || torrent.attached.as_ref().is_none_or(|attached| {
@@ -6504,8 +6690,24 @@ impl TorrentService {
         for (key, reason) in down {
             self.inner.sessions.hold(&key, reason).await;
         }
+        // A route whose session did not open in this pass is not opened
+        // again in it for each torrent on it: they are held for the same,
+        // and the next pass opens it once more.
+        let mut failed: HashMap<RouteKey, Held> = HashMap::new();
         for job_id in reattach {
-            self.attach(job_id, None).await;
+            if !failed.is_empty() {
+                let mut live = self.inner.live.lock().await;
+                if let Some(torrent) = live.get_mut(&job_id)
+                    && let Some(held) = torrent.route.as_ref().and_then(|key| failed.get(key))
+                {
+                    torrent.settle(self.inner.clock.now_ms());
+                    torrent.held = Some(held.clone());
+                    continue;
+                }
+            }
+            if let Some((key, held)) = self.attach(job_id, None).await {
+                failed.insert(key, held);
+            }
         }
         for job_id in unresolved {
             self.resolve(job_id).await;
