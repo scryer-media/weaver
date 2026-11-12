@@ -165,10 +165,208 @@ impl Unnamed {
             Length::AtMost(self.length)
         }
     }
+}
 
-    // Whether the member could be a described file of `long` bytes.
-    fn fits(self, long: u64) -> bool {
-        self.bound().fits(long)
+// What a group of unnamed members could be by length: the exact lengths
+// of those with a checked byte, and the longest bound of the rest. Any of
+// them fits a file exactly when the group does.
+#[derive(Debug, Default)]
+struct Fitting {
+    exact: BTreeSet<u64>,
+    at_most: Option<u64>,
+}
+
+impl Fitting {
+    fn add(&mut self, unnamed: Unnamed) {
+        match unnamed.bound() {
+            Length::Exact(length) => {
+                self.exact.insert(length);
+            }
+            Length::AtMost(bound) => {
+                self.at_most = Some(self.at_most.map_or(bound, |was| was.max(bound)));
+            }
+        }
+    }
+
+    // Whether any member of the group could be a described file of `long`.
+    fn fits(&self, long: u64) -> bool {
+        self.exact.contains(&long) || self.at_most.is_some_and(|bound| long <= bound)
+    }
+}
+
+// The lengths of a group of described files. A member fits one of them
+// exactly when it fits the group.
+#[derive(Debug, Default)]
+struct Lengths(BTreeSet<u64>);
+
+impl Lengths {
+    fn fitted_by(&self, unnamed: Unnamed) -> bool {
+        match unnamed.bound() {
+            Length::Exact(length) => self.0.contains(&length),
+            Length::AtMost(bound) => self.0.range(..=bound).next().is_some(),
+        }
+    }
+}
+
+// Of `files`, each described path and size in order, those `missing` says
+// no member carries or is bound to and no unnamed member may yet turn out
+// to be, onto `out` once each. An unnamed member a readback identified may
+// be only that file; one not identified may be any it fits. Each file and
+// each unnamed member is looked at a bounded number of times, each look
+// counted in `work`.
+fn absent<'f>(
+    files: impl Iterator<Item = (&'f str, u64)>,
+    (unnamed, identified): (&BTreeMap<MemberId, Unnamed>, &BTreeMap<MemberId, String>),
+    missing: impl Fn(&str) -> bool,
+    out: &mut Vec<(String, u64)>,
+    work: &mut u64,
+) {
+    let mut anything = Fitting::default();
+    let mut only: BTreeMap<&str, Fitting> = BTreeMap::new();
+    for (member, unnamed) in unnamed {
+        *work += 1;
+        match identified.get(member) {
+            None => anything.add(*unnamed),
+            Some(path) => only.entry(path).or_default().add(*unnamed),
+        }
+    }
+    let mut listed: BTreeSet<(String, u64)> = out.iter().cloned().collect();
+    for (path, size) in files {
+        *work += 1;
+        let maybe = anything.fits(size) || only.get(path).is_some_and(|group| group.fits(size));
+        if missing(path) && !maybe {
+            let named = (path.to_owned(), size);
+            if !listed.contains(&named) {
+                listed.insert(named.clone());
+                out.push(named);
+            }
+        }
+    }
+}
+
+// A described file as binding by name sees it.
+#[derive(Clone, Copy, Debug)]
+struct Described<'f> {
+    path: &'f str,
+    name: &'f str,
+    size: u64,
+}
+
+impl<'f> Described<'f> {
+    fn of(file: &'f par3_rs::Par3File) -> Self {
+        Self {
+            path: file.path(),
+            name: file.name(),
+            size: file.size(),
+        }
+    }
+}
+
+// The members' names, each with the first member that carries it and how
+// many do. A described file is answered to by the members carrying its
+// path or its bare name.
+struct Names<'n>(BTreeMap<&'n str, (MemberId, usize)>);
+
+impl<'n> Names<'n> {
+    fn of(members: impl Iterator<Item = (&'n str, MemberId)>, work: &mut u64) -> Self {
+        let mut names: BTreeMap<&'n str, (MemberId, usize)> = BTreeMap::new();
+        for (name, member) in members {
+            *work += 1;
+            names.entry(name).or_insert((member, 0)).1 += 1;
+        }
+        Self(names)
+    }
+
+    // The names the file answers to that members carry, each once.
+    fn answering(&self, file: Described<'_>) -> impl Iterator<Item = (MemberId, usize)> {
+        let path = self.0.get(file.path);
+        let name = (file.name != file.path)
+            .then(|| self.0.get(file.name))
+            .flatten();
+        path.into_iter().chain(name).copied()
+    }
+
+    // The one member that answers to the file, when only one does.
+    fn only(&self, file: Described<'_>) -> Option<MemberId> {
+        let mut answering = self.answering(file);
+        match (answering.next(), answering.next()) {
+            (Some((member, 1)), None) => Some(member),
+            _ => None,
+        }
+    }
+
+    // Whether any member answers to the file.
+    fn carried(&self, file: Described<'_>) -> bool {
+        self.answering(file).next().is_some()
+    }
+}
+
+// What the members' names say of the described files.
+struct ByName<'f> {
+    // Each path exactly one member answers to, and that member.
+    bound: BTreeMap<String, MemberId>,
+    // Every described path, and whether a member answers to it.
+    described: BTreeMap<String, bool>,
+    // The members no described file answers to whose length fits a file
+    // none does.
+    unnamed: BTreeMap<MemberId, Unnamed>,
+    // The length of each described path, as the first file of it says.
+    lengths: BTreeMap<&'f str, u64>,
+}
+
+// Binding by name over `files`, every file the sets describe in order, and
+// `others`, the namespace's members the object does not own. Each file and
+// each member is looked at a bounded number of times, each look counted in
+// `work`.
+fn by_name<'f, 'm, I>(files: &[Described<'f>], others: impl Fn() -> I, work: &mut u64) -> ByName<'f>
+where
+    I: Iterator<Item = &'m Member>,
+{
+    let names = Names::of(
+        others().map(|member| (member.name.as_str(), member.id)),
+        work,
+    );
+    let mut bound = BTreeMap::new();
+    let mut described = BTreeMap::new();
+    // Every path and bare name a described file answers to, and the length
+    // of each path.
+    let mut answered: BTreeSet<&str> = BTreeSet::new();
+    let mut lengths: BTreeMap<&'f str, u64> = BTreeMap::new();
+    for &file in files {
+        *work += 1;
+        if let Some(member) = names.only(file) {
+            bound.insert(file.path.to_owned(), member);
+        }
+        described.insert(file.path.to_owned(), names.carried(file));
+        answered.insert(file.path);
+        answered.insert(file.name);
+        lengths.entry(file.path).or_insert(file.size);
+    }
+    // The lengths of the files no member answers to.
+    let free = Lengths(
+        files
+            .iter()
+            .filter(|file| described.get(file.path) == Some(&false))
+            .map(|file| file.size)
+            .collect(),
+    );
+    let unnamed = others()
+        .filter(|member| {
+            *work += 1;
+            !answered.contains(member.name.as_str())
+        })
+        .filter_map(|member| {
+            Some((
+                member.id,
+                Unnamed::of(member).filter(|u| free.fitted_by(*u))?,
+            ))
+        })
+        .collect();
+    ByName {
+        bound,
+        described,
+        unnamed,
+        lengths,
     }
 }
 
@@ -193,6 +391,8 @@ pub struct Par3 {
     volumes: Vec<Volume>,
     // Described paths and the member each is bound to.
     bound: BTreeMap<String, MemberId>,
+    // The members `bound` names, each once.
+    covered: BTreeSet<MemberId>,
     // Members that may be a free described file. Those complete are what a
     // repair reads back to identify.
     unnamed: BTreeMap<MemberId, Unnamed>,
@@ -229,6 +429,7 @@ impl Par3 {
             id,
             volumes: Vec::new(),
             bound: BTreeMap::new(),
+            covered: BTreeSet::new(),
             unnamed: BTreeMap::new(),
             described: BTreeMap::new(),
             identified: BTreeMap::new(),
@@ -241,6 +442,13 @@ impl Par3 {
             shown: Shown::default(),
             refused_blocks: 0,
         }
+    }
+
+    // The described paths and the members they are bound to, with the
+    // members they name.
+    fn set_bound(&mut self, bound: BTreeMap<String, MemberId>) {
+        self.covered = bound.values().copied().collect();
+        self.bound = bound;
     }
 
     fn volume(&mut self, index: VolumeIndex) -> &mut Volume {
@@ -464,22 +672,29 @@ impl Par3 {
         for (path, member) in by_elimination(&free, &blank, &mut work) {
             self.identified.insert(member, path);
         }
-        let found = self.by_content();
-        self.bound.extend(found);
+        let mut bound = std::mem::take(&mut self.bound);
+        bound.extend(self.by_content());
+        self.set_bound(bound);
     }
 
     // A free file of the set that a member still arriving may turn out to
     // be is not missing yet: the set waits for that member, and asks for no
     // recovery on its account.
-    fn identifying(&self, set: &Par3Set) -> bool {
+    fn identifying(&self, set: &Par3Set, arriving: &Fitting) -> bool {
         set.files().iter().any(|file| {
             !self.bound.contains_key(file.path())
                 && self.free(file.path())
-                && self
-                    .unnamed
-                    .values()
-                    .any(|member| !member.complete && member.fits(file.size()))
+                && arriving.fits(file.size())
         })
+    }
+
+    // The unnamed members still arriving, which `identifying` asks of.
+    fn arriving(&self) -> Fitting {
+        let mut arriving = Fitting::default();
+        for member in self.unnamed.values().filter(|member| !member.complete) {
+            arriving.add(*member);
+        }
+        arriving
     }
 }
 
@@ -684,35 +899,26 @@ impl Recovery for Par3 {
             self.damage_shown();
         }
         let sets = self.front_sets();
-        let files = || sets.iter().flat_map(Par3Set::files);
-        let answers =
-            |name: &str, file: &par3_rs::Par3File| name == file.path() || name == file.name();
-        let others = || {
-            namespace
-                .members()
-                .filter(|member| member.bound_to != Some(self.id))
-        };
-        let mut bound = BTreeMap::new();
-        for file in files() {
-            let mut matches = others().filter(|member| answers(&member.name, file));
-            if let (Some(member), None) = (matches.next(), matches.next()) {
-                bound.insert(file.path().to_owned(), member.id);
-            }
-        }
-        let described: BTreeMap<String, bool> = files()
-            .map(|file| {
-                let carried = others().any(|member| answers(&member.name, file));
-                (file.path().to_owned(), carried)
-            })
+        let files: Vec<Described<'_>> = sets
+            .iter()
+            .flat_map(Par3Set::files)
+            .map(Described::of)
             .collect();
-        let fits_free = |unnamed: Unnamed| {
-            files()
-                .any(|file| unnamed.fits(file.size()) && described.get(file.path()) == Some(&false))
-        };
-        let unnamed: BTreeMap<MemberId, Unnamed> = others()
-            .filter(|member| !files().any(|file| answers(&member.name, file)))
-            .filter_map(|member| Some((member.id, Unnamed::of(member).filter(|u| fits_free(*u))?)))
-            .collect();
+        let id = self.id;
+        let ByName {
+            mut bound,
+            described,
+            unnamed,
+            lengths,
+        } = by_name(
+            &files,
+            || {
+                namespace
+                    .members()
+                    .filter(move |member| member.bound_to != Some(id))
+            },
+            &mut 0,
+        );
         // A verdict stands on what the object could bind when it ruled: the
         // files described, the members bound, and the members it may yet
         // identify once it is complete. A rename only moves a member from
@@ -728,10 +934,7 @@ impl Recovery for Par3 {
         self.identified
             .retain(|member, _| unnamed.contains_key(member));
         for (path, member) in self.by_content() {
-            let Some(length) = files()
-                .find(|file| file.path() == path)
-                .map(|file| file.size())
-            else {
+            let Some(&length) = lengths.get(path.as_str()) else {
                 continue;
             };
             if namespace.recognise(member, &path, length).is_some() {
@@ -749,10 +952,7 @@ impl Recovery for Par3 {
             ))
         );
         for (path, member) in &bound {
-            let Some(size) = files()
-                .find(|file| file.path() == path)
-                .map(|file| file.size())
-            else {
+            let Some(&size) = lengths.get(path.as_str()) else {
                 continue;
             };
             if namespace.take_described(*member, size, verified) {
@@ -762,7 +962,7 @@ impl Recovery for Par3 {
         if learned || bound != self.bound {
             self.last = None;
         }
-        self.bound = bound;
+        self.set_bound(bound);
         self.count_refused(&sets);
     }
 
@@ -771,23 +971,18 @@ impl Recovery for Par3 {
     // file's size that no described name answers to may be it until a
     // readback says what it is.
     fn absent(&self, out: &mut Vec<(String, u64)>) {
-        for set in self.front_sets() {
-            for file in set.files() {
-                let path = file.path();
-                let maybe = self.unnamed.iter().any(|(member, unnamed)| {
-                    unnamed.fits(file.size())
-                        && self.identified.get(member).is_none_or(|was| was == path)
-                });
-                let named = (path.to_owned(), file.size());
-                if self.free(path)
-                    && !self.bound.contains_key(path)
-                    && !maybe
-                    && !out.contains(&named)
-                {
-                    out.push(named);
-                }
-            }
-        }
+        let sets = self.front_sets();
+        let files = sets
+            .iter()
+            .flat_map(Par3Set::files)
+            .map(|file| (file.path(), file.size()));
+        absent(
+            files,
+            (&self.unnamed, &self.identified),
+            |path| self.free(path) && !self.bound.contains_key(path),
+            out,
+            &mut 0,
+        );
     }
 
     // No front read so far describes a file: the description is in a volume
@@ -797,7 +992,7 @@ impl Recovery for Par3 {
     }
 
     fn covers(&self, member: MemberId) -> bool {
-        self.bound.values().any(|bound| *bound == member)
+        self.covered.contains(&member)
     }
 
     fn feed(&mut self, member: MemberId, segments: &[Segment]) {
@@ -919,6 +1114,7 @@ impl Recovery for Par3 {
         let mut outcome = RepairOutcome::Unread;
         let mut waiting = 0;
         self.ruled.clear();
+        let arriving = self.arriving();
         for set in sets {
             // The digest of the set's root packet, which its recovery packets
             // name it by.
@@ -937,7 +1133,7 @@ impl Recovery for Par3 {
                 outcome = combine(outcome, settled.outcome);
                 continue;
             }
-            let result = if self.identifying(&set) {
+            let result = if self.identifying(&set, &arriving) {
                 rebuild::SetRepair {
                     outcome: RepairOutcome::Waiting,
                     lost: 0,

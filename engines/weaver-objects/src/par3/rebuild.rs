@@ -29,7 +29,7 @@ use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{Budget, ByteRange, MemberId};
 
 // How much of a member one verification read takes.
-const READ: u64 = 1 << 20;
+pub(super) const READ: u64 = 1 << 20;
 
 pub(super) struct SetRepair {
     pub(super) outcome: RepairOutcome,
