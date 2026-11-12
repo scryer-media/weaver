@@ -28,6 +28,8 @@ pub(super) struct Lent {
     facts: Option<Facts>,
     // The members of its namespace it covered when it left.
     covers: Vec<MemberId>,
+    // Its `Recovery::precedence` when it left.
+    precedence: u8,
     waiting: Vec<Waiting>,
     // Members that could not be asked whether they are its volumes, in the
     // order they asked.
@@ -113,7 +115,7 @@ impl Tree {
     // Lend the recovery object at `node` out of the tree. `None` when the
     // node holds no recovery object.
     pub fn lend(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
-        self.recovery(node)?;
+        let precedence = self.recovery(node)?.precedence();
         let covers = self
             .consult_recovery(node, |recovery, namespace| {
                 namespace
@@ -129,6 +131,7 @@ impl Tree {
             kind: object.kind(),
             facts: Some(object.facts()),
             covers,
+            precedence,
             waiting: Vec::new(),
             queued: Vec::new(),
             work: false,
@@ -177,12 +180,16 @@ impl Tree {
 
     // Out of its node as if for its work, whatever it holds.
     fn lend_out(&mut self, node: NodeId) -> Option<Box<dyn Object>> {
+        let precedence = self
+            .recovery(node)
+            .map_or(0, |recovery| recovery.precedence());
         let found = self.nodes.get_mut(&node)?;
         let object = found.object.take()?;
         found.lent = Some(Lent {
             kind: object.kind(),
             facts: None,
             covers: Vec::new(),
+            precedence,
             waiting: Vec::new(),
             queued: Vec::new(),
             work: true,
@@ -223,6 +230,30 @@ impl Tree {
             .get(&node)
             .and_then(|found| found.lent.as_ref())
             .is_some_and(|lent| !lent.covers.is_empty())
+    }
+
+    // The set's `Recovery::precedence`, as it left when it is out.
+    fn precedence(&self, set: NodeId) -> u8 {
+        match self.recovery(set) {
+            Some(recovery) => recovery.precedence(),
+            None => self
+                .nodes
+                .get(&set)
+                .and_then(|found| found.lent.as_ref())
+                .map_or(0, |lent| lent.precedence),
+        }
+    }
+
+    // Whether the set ranks above every other set homed in `node`: its
+    // returned repair may rewrite bytes an earlier repair wrote. A set of
+    // the lowest rank outranks nothing, and asks no other set.
+    pub fn outranks(&self, node: NodeId, set: NodeId) -> bool {
+        let rank = self.precedence(set);
+        rank > 0
+            && self
+                .sets
+                .range((node, NodeId(0))..=(node, NodeId(u32::MAX)))
+                .all(|&(_, other)| other == set || self.precedence(other) < rank)
     }
 
     pub(super) fn lent_kind(&self, node: NodeId) -> Option<Kind> {

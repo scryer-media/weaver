@@ -222,4 +222,12 @@ pub trait Recovery {
     // Each set the object holds, in the order it repairs them. An object
     // with no sets of its own to name says nothing.
     fn sets(&self, _out: &mut Vec<SetRuling>) {}
+
+    // How this object's repair ranks against another's over the same
+    // bytes. A returned repair rewrites bytes an earlier repair wrote only
+    // when its object ranks above every other set of its namespace; between
+    // equals the first repair stands. Most objects rank alike.
+    fn precedence(&self) -> u8 {
+        0
+    }
 }
