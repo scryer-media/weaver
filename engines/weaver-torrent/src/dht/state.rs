@@ -134,6 +134,12 @@ const EARLY_SEARCH_MIN: Duration = Duration::from_secs(30);
 // table grows: a growth wakes the torrents waiting on it, and this many
 // search; the rest wait for the next growth.
 const EARLY_SEARCHES_PER_GROWTH: usize = WALKS_AT_ONCE;
+// The least time between two growths that nodes entering the table make:
+// the first node to enter makes one at once, and the nodes that enter in
+// the next GROWTH_SPACING make one between them as it ends. libtorrent
+// looks at its table on a 5 s tick (dht_tracker.cpp:268-283, v2.0.15), as
+// BOOTSTRAP_RETRY_MIN does here.
+const GROWTH_SPACING: Duration = BOOTSTRAP_RETRY_MIN;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateState {
@@ -928,13 +934,17 @@ impl DhtState {
         }
     }
 
-    // The `is_v4` table has grown: a self-refresh round ended with nodes
-    // that answered entering it, or with the table turned deep. Torrents
-    // whose search fell short before this may search again, at most
-    // EARLY_SEARCHES_PER_GROWTH of them until the next growth: the early
-    // turns are topped up to that, never added up, so ten thousand short
-    // torrents are woken but search EARLY_SEARCHES_PER_GROWTH at a time, one
-    // batch per growth, and growths come no closer than self-refresh rounds.
+    // The `is_v4` table has grown: nodes that answered have entered it (see
+    // `watch_growth`), or a self-refresh round ended with the table turned
+    // deep. Torrents whose search fell short before this may search again,
+    // at most EARLY_SEARCHES_PER_GROWTH of them until the next growth: the
+    // early turns are topped up to that, never added up, so ten thousand
+    // short torrents are woken but search EARLY_SEARCHES_PER_GROWTH at a
+    // time, one batch per growth. Nodes entering grow the table at most once
+    // every GROWTH_SPACING, however many enter; a table turning deep, at most
+    // once a self-refresh round. So a family starts at most
+    // EARLY_SEARCHES_PER_GROWTH early searches every GROWTH_SPACING, and one
+    // more batch as its table turns deep.
     fn grow(&self, is_v4: bool) {
         let growth = self.growth(is_v4);
         growth.generation.fetch_add(1, Ordering::Release);
@@ -971,9 +981,47 @@ impl DhtState {
     // few datagrams a round, a round every SELF_REFRESH_INTERVAL at most.
     // A round that had no one to ask waits for a node to enter the table or
     // a router to become known, and a new router also ends a backoff early.
-    // A round after which nodes that answered have entered the table, or the
-    // table has turned deep, is a growth (see `grow`).
+    // Beside the rounds, nodes that answered entering the table are a
+    // growth as they enter, not only as the round that met them ends (see
+    // `watch_growth`); a round after which the table has turned deep is one
+    // too (see `grow`).
     async fn refresh_self(self: Arc<Self>, is_v4: bool) -> crate::dht::Result<()> {
+        tokio::select! {
+            done = self.clone().refresh_self_rounds(is_v4) => done,
+            never = self.watch_growth(is_v4) => match never {},
+        }
+    }
+
+    // The table grows as nodes that answered enter it: the first entry
+    // after the last growth is a growth at once, and the entries made in
+    // the GROWTH_SPACING after a growth are one more as it ends. A round of
+    // our own id on a tunnel can take a minute while the nodes that answer
+    // it enter in its first seconds; a torrent's search that fell short
+    // need not wait for the round's end. libtorrent searches again only at
+    // a torrent's next turn (see `request_peers_forever`); the spacing is
+    // its node tick (dht_tracker.cpp:268-283, v2.0.15). Woken by the
+    // table's `entered`, never by a timer while nothing enters, and only the
+    // entry count is read per wake.
+    async fn watch_growth(&self, is_v4: bool) -> std::convert::Infallible {
+        let (entered, mut grown) = {
+            let table = self.table(is_v4).read();
+            (table.entered(), table.entries())
+        };
+        loop {
+            let mut next_entered = std::pin::pin!(entered.notified());
+            next_entered.as_mut().enable();
+            let entries = self.table(is_v4).read().entries();
+            if entries == grown {
+                next_entered.await;
+                continue;
+            }
+            grown = entries;
+            self.grow(is_v4);
+            tokio::time::sleep(GROWTH_SPACING).await;
+        }
+    }
+
+    async fn refresh_self_rounds(self: Arc<Self>, is_v4: bool) -> crate::dht::Result<()> {
         let entered = self.table(is_v4).read().entered();
         let mut retry = BOOTSTRAP_RETRY_MIN;
         let mut deep = false;
@@ -996,8 +1044,8 @@ impl DhtState {
                 (table.len(), table.entries(), table.depth(now()))
             };
             let added = entries > before;
-            let deepened = depth >= SHALLOW_DEPTH && !deep;
-            if added || deepened {
+            // The nodes that entered grew the table as they entered.
+            if depth >= SHALLOW_DEPTH && !deep {
                 self.grow(is_v4);
             }
             debug!(
@@ -3960,6 +4008,269 @@ mod tests {
                 (second_growth, 20 - EARLY_SEARCHES_PER_GROWTH),
             ])
         );
+    }
+
+    // A self-refresh round that walks for a minute, as one over a tunnel
+    // does: the router names two nodes near our id that answer at once and
+    // forty farther ones that never answer. The torrent's first search,
+    // asked only of the router, times out. The two nodes enter the table in
+    // the round's first moment, and the torrent searches again
+    // EARLY_SEARCH_MIN after its first search ended, from them, while the
+    // round is still asking the silent nodes.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_short_search_searches_again_before_the_round_that_grew_the_table_ends() {
+        use super::EARLY_SEARCH_MIN;
+        use crate::core::hash_id::Id20;
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::collections::BTreeMap;
+
+        let (dht, mut sent) = fixture_dht();
+        let router = SocketAddr::from(ROUTER);
+        dht.add_routers(&[router]);
+        let answering: Vec<(Id20, std::net::SocketAddrV4)> = (1..=2u8)
+            .map(|i| {
+                let mut id = dht.id.0;
+                id[19] ^= i;
+                (
+                    Id20::new(id),
+                    std::net::SocketAddrV4::new([10, 0, i, 1].into(), 6881),
+                )
+            })
+            .collect();
+        let silent: Vec<(Id20, std::net::SocketAddrV4)> = (1..=40u8)
+            .map(|i| {
+                let mut id = [0xc0; 20];
+                id[19] = i;
+                (
+                    Id20::new(id),
+                    std::net::SocketAddrV4::new([10, 1, i, 1].into(), 6881),
+                )
+            })
+            .collect();
+        let named: Vec<_> = answering.iter().chain(&silent).copied().collect();
+        let id_of = |addr: SocketAddr| {
+            answering
+                .iter()
+                .find(|n| SocketAddr::from(n.1) == addr)
+                .map(|n| n.0)
+        };
+        let peer = SocketAddr::from(([10, 9, 9, 9], 51413));
+        let info_hash = Id20::new([0x22; 20]);
+        let (peer_tx, mut peers) = tokio::sync::mpsc::unbounded_channel();
+        let req = Arc::new(super::RecursiveRequest::get_peers(
+            dht.clone(),
+            info_hash,
+            None,
+            peer_tx,
+        ));
+        let start = tokio::time::Instant::now();
+        let refresh = tokio::spawn(dht.clone().refresh_self(true));
+        let task = req.request_peers_forever(true);
+
+        // Nothing answers until both have asked the router: the torrent's
+        // search has started before the table grows.
+        let mut first = Vec::new();
+        while first.len() < 2 {
+            let request = sent.recv().await.unwrap();
+            assert_eq!(request.addr, router);
+            first.push(request);
+        }
+        let mut first = first.into_iter();
+        let mut searched = BTreeMap::<Duration, usize>::new();
+        let mut silent_asked = 0;
+        let (found, found_at) = loop {
+            let request = match first.next() {
+                Some(request) => request,
+                None => tokio::select! {
+                    biased;
+                    found = peers.recv() => {
+                        break (found.unwrap(), tokio::time::Instant::now() - start);
+                    }
+                    request = sent.recv() => request.unwrap(),
+                },
+            };
+            match request.message.kind {
+                MessageKind::FindNodeRequest(_) if request.addr == router => {
+                    reply(&dht, &request, Id20::new([0x99; 20]), &named, &[]);
+                }
+                MessageKind::FindNodeRequest(_) => match id_of(request.addr) {
+                    Some(id) => reply(&dht, &request, id, &[], &[]),
+                    None => silent_asked += 1,
+                },
+                MessageKind::GetPeersRequest(_) => {
+                    if request.addr == router {
+                        *searched
+                            .entry(tokio::time::Instant::now() - start)
+                            .or_default() += 1;
+                    } else {
+                        let id = id_of(request.addr).unwrap();
+                        reply(&dht, &request, id, &[], &[peer]);
+                    }
+                }
+                ref kind => panic!("unexpected {kind:?}"),
+            }
+        };
+        task.abort();
+        refresh.abort();
+
+        let again = RESPONSE_TIMEOUT + EARLY_SEARCH_MIN;
+        assert_eq!(found, peer);
+        assert_eq!(found_at, again);
+        assert_eq!(searched, BTreeMap::from([(Duration::ZERO, 1), (again, 1)]));
+        // The round has silent nodes left to ask: it has not ended.
+        assert!(silent_asked < silent.len(), "{silent_asked}");
+        assert_eq!(dht.routing_table_v4.read().len(), answering.len());
+    }
+
+    // Many nodes entering at once are one growth, and the nodes that enter
+    // in the GROWTH_SPACING after it one more as it ends: the early turns
+    // are topped up to EARLY_SEARCHES_PER_GROWTH each time, never added up.
+    // A table nothing enters does not grow.
+    #[tokio::test(start_paused = true)]
+    async fn test_nodes_entering_grow_the_table_at_most_once_a_spacing() {
+        use super::{EARLY_SEARCHES_PER_GROWTH, GROWTH_SPACING};
+        use std::sync::atomic::Ordering;
+
+        let (dht, _sent) = fixture_dht();
+        let growth = dht.growth(true);
+        let mut watch = std::pin::pin!(dht.watch_growth(true));
+        assert!(futures::poll!(watch.as_mut()).is_pending());
+        let start = tokio::time::Instant::now();
+
+        // Waits for the next growth while the watch runs; when it came.
+        macro_rules! next_growth {
+            () => {{
+                let grew = growth.grew.notified();
+                let mut grew = std::pin::pin!(grew);
+                grew.as_mut().enable();
+                tokio::select! {
+                    never = watch.as_mut() => match never {},
+                    () = grew => tokio::time::Instant::now() - start,
+                }
+            }};
+        }
+        macro_rules! run_until {
+            ($at:expr) => {
+                tokio::select! {
+                    never = watch.as_mut() => match never {},
+                    () = tokio::time::sleep_until(start + $at) => {}
+                }
+            };
+        }
+        let enter = |bit: u8, n: u8| {
+            let id = id_in_bucket(dht.id, bit, n);
+            let mut table = dht.routing_table_v4.write();
+            table.add_node(id, SocketAddr::from(([10, bit + 1, n + 1, 1], 6881)));
+            table.mark_response(&id, std::time::Instant::now());
+        };
+
+        // Forty-eight nodes enter at once.
+        let at = {
+            let grew = growth.grew.notified();
+            let mut grew = std::pin::pin!(grew);
+            grew.as_mut().enable();
+            fill_deep_table(&dht, 5);
+            tokio::select! {
+                never = watch.as_mut() => match never {},
+                () = grew => tokio::time::Instant::now() - start,
+            }
+        };
+        assert_eq!(dht.routing_table_v4.read().entries(), 48);
+        assert_eq!(at, Duration::ZERO);
+        assert_eq!(growth.generation.load(Ordering::Acquire), 1);
+        assert_eq!(growth.turns.available_permits(), EARLY_SEARCHES_PER_GROWTH);
+
+        // More enter one and two seconds later: one growth between them,
+        // as the spacing ends.
+        for (second, bit) in [(1, 6), (2, 7)] {
+            run_until!(Duration::from_secs(second));
+            for n in 0..4 {
+                enter(bit, n);
+            }
+        }
+        assert_eq!(dht.routing_table_v4.read().entries(), 56);
+        assert_eq!(growth.generation.load(Ordering::Acquire), 1);
+        assert_eq!(next_growth!(), GROWTH_SPACING);
+        assert_eq!(growth.generation.load(Ordering::Acquire), 2);
+        assert_eq!(growth.turns.available_permits(), EARLY_SEARCHES_PER_GROWTH);
+
+        // Nothing enters for a minute: no growth.
+        run_until!(Duration::from_secs(60));
+        assert_eq!(growth.generation.load(Ordering::Acquire), 2);
+
+        // The next node to enter is a growth at once.
+        enter(8, 0);
+        assert_eq!(next_growth!(), Duration::from_secs(60));
+        assert_eq!(growth.generation.load(Ordering::Acquire), 3);
+    }
+
+    // A short search whose table grows before every early search still
+    // waits EARLY_SEARCH_MIN after its first, doubling, and searches at its
+    // turn: the table's growth never brings it sooner.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_short_search_backs_off_however_often_the_table_grows() {
+        use super::EARLY_SEARCH_MIN;
+        use crate::core::hash_id::Id20;
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::sync::atomic::Ordering;
+
+        let (dht, mut sent) = fixture_dht();
+        dht.add_routers(&[SocketAddr::from(ROUTER)]);
+        let info_hash = Id20::new([0xf0; 20]);
+        let slot = super::announce_slot(&info_hash);
+        let req = Arc::new(super::RecursiveRequest::get_peers(
+            dht.clone(),
+            info_hash,
+            None,
+            tokio::sync::mpsc::unbounded_channel().0,
+        ));
+        let mut watch = std::pin::pin!(dht.watch_growth(true));
+        assert!(futures::poll!(watch.as_mut()).is_pending());
+        let start = tokio::time::Instant::now();
+        let task = req.request_peers_forever(true);
+
+        // Nothing answers, so each search lasts RESPONSE_TIMEOUT; each asks
+        // at most five, all as it starts. As each starts, a node that
+        // answered enters the table.
+        let due = RESPONSE_TIMEOUT + slot;
+        let mut searched = Vec::new();
+        loop {
+            let request = tokio::select! {
+                never = watch.as_mut() => match never {},
+                request = sent.recv() => request.unwrap(),
+            };
+            assert!(matches!(
+                request.message.kind,
+                MessageKind::GetPeersRequest(_)
+            ));
+            let at = tokio::time::Instant::now() - start;
+            if searched.last() == Some(&at) {
+                continue;
+            }
+            searched.push(at);
+            if at >= due {
+                break;
+            }
+            let n = u8::try_from(searched.len()).unwrap();
+            let id = id_in_bucket(dht.id, n, 0);
+            let mut table = dht.routing_table_v4.write();
+            table.add_node(id, SocketAddr::from(([10, n, 1, 1], 6881)));
+            table.mark_response(&id, std::time::Instant::now());
+        }
+        task.abort();
+
+        let mut want = vec![Duration::ZERO];
+        let (mut end, mut early) = (RESPONSE_TIMEOUT, EARLY_SEARCH_MIN);
+        while end + early < due {
+            want.push(end + early);
+            end += early + RESPONSE_TIMEOUT;
+            early *= 2;
+        }
+        want.push(due);
+        // Four early searches: 30, 60, 120 and 240 s after the one before.
+        assert_eq!(want.len(), 6);
+        assert_eq!(searched, want);
+        assert!(dht.growth(true).generation.load(Ordering::Acquire) >= 5);
     }
 
     // A search that reached k nodes is not made again ahead of its turn,
