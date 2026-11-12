@@ -260,6 +260,7 @@ fn visit_nzb_files<R: BufRead>(
     let mut meta_title: Option<String> = None;
     let mut meta_password: Option<String> = None;
     let mut meta_passwords = Vec::new();
+    let mut seen_passwords = HashSet::<String>::new();
     let mut meta_tags: Vec<(String, String)> = Vec::new();
 
     // File accumulation
@@ -431,9 +432,12 @@ fn visit_nzb_files<R: BufRead>(
                             if key.eq_ignore_ascii_case("title") {
                                 meta_title = Some(text_buf.trim().to_owned());
                             } else if key.eq_ignore_ascii_case("password") {
+                                #[cfg(test)]
+                                tests::PASSWORD_PROBES.with(|n| n.set(n.get() + 1));
                                 if !text_buf.trim().is_empty()
-                                    && !meta_passwords.contains(&text_buf)
+                                    && !seen_passwords.contains(text_buf.as_str())
                                 {
+                                    seen_passwords.insert(text_buf.clone());
                                     if meta_password.is_none() {
                                         meta_password = Some(text_buf.clone());
                                     }
@@ -976,6 +980,91 @@ mod tests {
         assert_eq!(nzb.meta.password.as_deref(), Some("1"));
         assert_eq!(nzb.meta.passwords, ["1", "true", "  synthetic & <key> Ω  "]);
         assert!(!format!("{:?}", nzb.meta).contains("synthetic"));
+    }
+
+    thread_local! {
+        /// Password elements the parser checked against the passwords it
+        /// already holds, one set probe each.
+        pub(super) static PASSWORD_PROBES: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
+    }
+
+    /// The pairwise deduplication the parser used before the set: each
+    /// password is compared with every kept one. Returns the first password,
+    /// the list and the string comparisons made.
+    fn reference_password_dedup(texts: &[String]) -> (Option<String>, Vec<String>, usize) {
+        let mut first = None;
+        let mut list: Vec<String> = Vec::new();
+        let mut comparisons = 0usize;
+        for text in texts {
+            if text.trim().is_empty() {
+                continue;
+            }
+            let mut found = false;
+            for kept in &list {
+                comparisons += 1;
+                if kept == text {
+                    found = true;
+                    break;
+                }
+            }
+            if !found {
+                if first.is_none() {
+                    first = Some(text.clone());
+                }
+                list.push(text.clone());
+            }
+        }
+        (first, list, comparisons)
+    }
+
+    fn nzb_with_passwords(texts: &[String]) -> String {
+        let mut head = String::from("  <head>\n");
+        for text in texts {
+            writeln!(head, "    <meta type=\"password\">{text}</meta>").unwrap();
+        }
+        head.push_str("  </head><file");
+        std::str::from_utf8(MINIMAL_NZB)
+            .unwrap()
+            .replace("  <file", &head)
+    }
+
+    #[test]
+    fn password_dedup_matches_pairwise_reference_with_one_probe_each() {
+        // Seeded inputs: repeats, whitespace-only entries, entries that differ
+        // only by surrounding whitespace, and many distinct entries.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..8 {
+            let count = 50 + round * 40;
+            let texts: Vec<String> = (0..count)
+                .map(|_| match next() % 6 {
+                    0 => "   ".to_owned(),
+                    1 => format!(" pw{} ", next() % 16),
+                    _ => format!("pw{}", next() % 64),
+                })
+                .collect();
+            let (first, list, _) = reference_password_dedup(&texts);
+            let nzb = parse_nzb(nzb_with_passwords(&texts).as_bytes()).unwrap();
+            assert_eq!(nzb.meta.password, first, "round {round}");
+            assert_eq!(nzb.meta.passwords, list, "round {round}");
+        }
+
+        // Many distinct passwords: the pairwise reference compares each with
+        // every earlier one; the parser probes its set once per element.
+        let distinct: Vec<String> = (0..2_000).map(|i| format!("pw{i}")).collect();
+        let (first, list, comparisons) = reference_password_dedup(&distinct);
+        assert_eq!(comparisons, 2_000 * 1_999 / 2);
+        PASSWORD_PROBES.with(|n| n.set(0));
+        let nzb = parse_nzb(nzb_with_passwords(&distinct).as_bytes()).unwrap();
+        assert_eq!(PASSWORD_PROBES.with(std::cell::Cell::get), 2_000);
+        assert_eq!(nzb.meta.password, first);
+        assert_eq!(nzb.meta.passwords, list);
     }
 
     #[test]

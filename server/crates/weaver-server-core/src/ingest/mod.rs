@@ -16,6 +16,7 @@ pub use import::{
     integration_archive_password_candidates, normalize_archive_password_candidate,
     nzb_password_candidates, nzb_to_spec,
 };
+pub(crate) use metadata::full_file_name_never_kept;
 pub use metadata::{
     FULL_FILE_NAMES_METADATA_KEY, FileRename, FullFileName, ORIGINAL_TITLE_METADATA_KEY,
     RENAMED_TITLE_METADATA_KEY, append_full_file_names_metadata, append_original_title_metadata,

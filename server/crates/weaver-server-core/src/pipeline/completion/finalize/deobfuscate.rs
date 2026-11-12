@@ -129,6 +129,10 @@ pub(super) async fn rename_obfuscated_members(
             content_extension: *extension,
         })
         .collect();
+    // A full name too long for the record of full file names is not copied
+    // into each rename: the record would drop it, and with it every entry
+    // after it, so those renames record no full name.
+    let mut full_name_never_kept = false;
     let mut renames = match weaver_nzb::select_rename_candidate(&entries, |name| {
         policy.unacceptable_extension_match(name).is_some()
     }) {
@@ -136,7 +140,13 @@ pub(super) async fn rename_obfuscated_members(
             let candidate_path = entries[candidate].relative_path;
             match resolve_target_name(job_id, candidate_path, plan).await {
                 Some((target_stem, full_stem)) => {
-                    weaver_nzb::plan_renames(&entries, candidate, &target_stem, &full_stem)
+                    full_name_never_kept = crate::ingest::full_file_name_never_kept(&full_stem);
+                    let full_stem = if full_name_never_kept {
+                        target_stem.as_str()
+                    } else {
+                        full_stem.as_str()
+                    };
+                    weaver_nzb::plan_renames(&entries, candidate, &target_stem, full_stem)
                 }
                 None => Vec::new(),
             }
@@ -161,6 +171,11 @@ pub(super) async fn rename_obfuscated_members(
         );
         renames.clear();
     }
+    let unkept_full_names = if full_name_never_kept {
+        renames.len()
+    } else {
+        0
+    };
     let named_by_content = weaver_nzb::plan_content_extensions(&entries, &renames)
         .into_iter()
         .filter(|rename| {
@@ -181,8 +196,10 @@ pub(super) async fn rename_obfuscated_members(
     }
 
     let root = root.to_path_buf();
-    match crate::runtime::panic_trap::spawn_blocking(move || apply_renames(job_id, &root, renames))
-        .await
+    match crate::runtime::panic_trap::spawn_blocking(move || {
+        apply_renames(job_id, &root, renames, unkept_full_names)
+    })
+    .await
     {
         Ok(renamed) => renamed,
         Err(error) => {
@@ -554,9 +571,18 @@ fn content_extension(root: &Path, relative_path: &str) -> Option<&'static str> {
     weaver_nzb::sniff_extension(&head)
 }
 
-fn apply_renames(job_id: JobId, root: &Path, renames: Vec<PlannedRename>) -> Vec<FileRename> {
+// The first `unkept_full_names` renames carry a full name the record of full
+// file names cannot keep. Once one of them is applied, the record ends there,
+// so it and every rename after it record no full name.
+fn apply_renames(
+    job_id: JobId,
+    root: &Path,
+    renames: Vec<PlannedRename>,
+    unkept_full_names: usize,
+) -> Vec<FileRename> {
     let mut applied = Vec::new();
-    for rename in renames {
+    let mut record_ended = false;
+    for (index, rename) in renames.into_iter().enumerate() {
         let from = root.join(&rename.from);
         let to = root.join(&rename.to);
         // The plan reserved this name, but the directory is on a filesystem
@@ -578,10 +604,15 @@ fn apply_renames(job_id: JobId, root: &Path, renames: Vec<PlannedRename>) -> Vec
                     to = %rename.to,
                     "renamed a delivered member"
                 );
+                record_ended |= index < unkept_full_names;
                 applied.push(FileRename {
                     from: rename.from,
                     to: rename.to,
-                    full_name: rename.full_to,
+                    full_name: if record_ended {
+                        String::new()
+                    } else {
+                        rename.full_to
+                    },
                 });
             }
             Err(error) => warn!(
@@ -811,6 +842,112 @@ mod tests {
             delivered_names(root.path()),
             vec!["Silver Horizon_ Part 2.mkv".to_string()]
         );
+    }
+
+    // The renames the pass applied before a full name over the record's cap
+    // stopped being copied into each one: the plan built with the job's full
+    // name, every rename carrying its `full_to`.
+    fn reference_renames(root: &Path, job_display_name: &str) -> Vec<FileRename> {
+        let files = scan_delivery(root);
+        let extensions: Vec<_> = files
+            .iter()
+            .map(|(relative_path, _)| content_extension(root, relative_path))
+            .collect();
+        let entries: Vec<DeliveredFile<'_>> = files
+            .iter()
+            .zip(&extensions)
+            .map(|((relative_path, bytes), extension)| DeliveredFile {
+                relative_path,
+                bytes: *bytes,
+                content_extension: *extension,
+            })
+            .collect();
+        let candidate = weaver_nzb::select_rename_candidate(&entries, |_| false).unwrap();
+        let target = crate::jobs::working_dir::sanitize_dirname(job_display_name);
+        let mut renames =
+            weaver_nzb::plan_renames(&entries, candidate, &target, job_display_name.trim());
+        renames.extend(weaver_nzb::plan_content_extensions(&entries, &renames));
+        renames
+            .into_iter()
+            .map(|rename| FileRename {
+                from: rename.from,
+                to: rename.to,
+                full_name: rename.full_to,
+            })
+            .collect()
+    }
+
+    fn lay_out_full_name_delivery(root: &Path) {
+        write_file(root, "Yb5drZSkNi20UCMkb.mkv", 64 * MIB);
+        write_file(root, "Yb5drZSkNi20UCMkb-sample.mkv", 2 * MIB);
+        write_file(root, "Yb5drZSkNi20UCMkb.dut.srt", 4096);
+        // An extensionless member whose content name is taken, so its rename
+        // is numbered and records a full name of its own.
+        write_file(root, "extras/Quiet Harbour.mkv", 4096);
+        write_file_with_head(root, "extras/Quiet Harbour", 2 * MIB, MATROSKA_HEAD);
+    }
+
+    #[tokio::test]
+    async fn full_names_record_as_before_and_an_over_cap_title_is_not_copied_per_file() {
+        let over_cap = "Silver Horizon ".repeat(70 * 1024 / 15);
+        for title in ["Silver Horizon: Part 2", over_cap.as_str()] {
+            let expected_root = tempfile::tempdir().unwrap();
+            lay_out_full_name_delivery(expected_root.path());
+            let expected = reference_renames(expected_root.path(), title);
+
+            let root = tempfile::tempdir().unwrap();
+            lay_out_full_name_delivery(root.path());
+            let renamed = rename_obfuscated_members(
+                JobId(31),
+                root.path(),
+                &plan(title),
+                &PostProcessingSettings::default(),
+            )
+            .await;
+
+            let moves = |renames: &[FileRename]| {
+                renames
+                    .iter()
+                    .map(|rename| (rename.from.clone(), rename.to.clone()))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(moves(&renamed), moves(&expected));
+            assert_eq!(renamed.len(), 4);
+
+            // The record a job holds afterwards is the same, byte for byte,
+            // starting from a record that already holds an entry.
+            let seeded = crate::ingest::append_full_file_names_metadata(
+                Vec::new(),
+                [("Notes: Part 2.nfo", "Notes_ Part 2.nfo")],
+            );
+            let mut expected_metadata = seeded.clone();
+            crate::ingest::record_file_renames(&mut expected_metadata, &expected);
+            let mut metadata = seeded.clone();
+            crate::ingest::record_file_renames(&mut metadata, &renamed);
+            assert_eq!(metadata, expected_metadata);
+
+            let full_name_bytes = |renames: &[FileRename]| {
+                renames
+                    .iter()
+                    .map(|rename| rename.full_name.len())
+                    .sum::<usize>()
+            };
+            if title.len() > 64 * 1024 {
+                // The over-cap title was copied into each of the three renames
+                // named after the job; now none holds it.
+                assert!(full_name_bytes(&expected) > 3 * title.len());
+                assert_eq!(full_name_bytes(&renamed), 0);
+                assert_eq!(
+                    crate::ingest::full_file_names(&metadata),
+                    crate::ingest::full_file_names(&seeded)
+                );
+            } else {
+                assert_eq!(renamed, expected);
+                // The seeded entry, the three renames named after the job and
+                // the numbered content rename.
+                assert_eq!(crate::ingest::full_file_names(&metadata).len(), 5);
+            }
+        }
     }
 
     #[tokio::test]
