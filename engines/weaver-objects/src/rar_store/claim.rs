@@ -497,8 +497,13 @@ pub(crate) fn place(facts: &RarVolumeFacts, held: &impl Holds) -> Option<VolumeI
     // A stated position is judged by what the neighbours' headers say, and
     // a neighbour none of whose headers were read yet says nothing against
     // it, on either side. A position with no place after it is none a set
-    // has.
+    // has, and one the volume's own headers rule out places it nowhere, as
+    // they hold it nowhere settled: a first volume that opens on a member
+    // begun before it.
     if let Some(stated) = this.position() {
+        if misplaced(VolumeIndex(stated), facts) {
+            return None;
+        }
         let following = stated.checked_add(1)?;
         let before = stated
             .checked_sub(1)

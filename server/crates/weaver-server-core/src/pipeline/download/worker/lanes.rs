@@ -143,6 +143,8 @@ impl Pipeline {
                     })
             })
             .give_up(seg_id, Some(terminal_state), declared_bytes);
+        #[cfg(test)]
+        crate::pipeline::post_health::note_booked(seg_id, terminal_state);
         self.note_gap_support_fact(seg_id, terminal_state);
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.failed_bytes = state.failed_bytes.saturating_add(declared_bytes);

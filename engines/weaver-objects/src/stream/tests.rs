@@ -478,7 +478,7 @@ fn reserve<D: Decoder>(bytes: &[u8]) -> u64 {
         );
     }
     assert!(out.is_empty());
-    D::window(&stream.first, &stream.budget)
+    D::window(&stream.first, stream.length, &stream.budget)
 }
 
 #[test]
@@ -613,15 +613,15 @@ fn declaring(mut bytes: Vec<u8>, property: u8) -> Vec<u8> {
 fn each_profiles_window_reaches_the_xz_decoder() {
     let declared = xz_declaring(36);
     let [efficient, balanced, performance] = profiles();
-    assert_eq!(Xz::window(&declared, &efficient), 256 * MIB);
-    assert_eq!(Xz::window(&declared, &balanced), GIB);
-    assert_eq!(Xz::window(&declared, &performance), {
+    assert_eq!(Xz::window(&declared, None, &efficient), 256 * MIB);
+    assert_eq!(Xz::window(&declared, None, &balanced), GIB);
+    assert_eq!(Xz::window(&declared, None, &performance), {
         lzma_turbo::Lzma2Reader::<io::Empty>::memory_required(36).unwrap()
     });
-    let fits = profiles().map(|budget| Xz::window(&declared, &budget) >= GIB);
+    let fits = profiles().map(|budget| Xz::window(&declared, None, &budget) >= GIB);
     assert_eq!(fits, [false, true, true]);
     for budget in profiles() {
-        assert_eq!(Xz::window(&[], &budget), 128 * MIB);
+        assert_eq!(Xz::window(&[], None, &budget), 128 * MIB);
     }
 }
 
@@ -636,7 +636,7 @@ fn zstd_header(log: u8) -> Vec<u8> {
 // Efficient. A frame at or below the decoder's own 128 MiB reserves that.
 #[test]
 fn each_profiles_window_reaches_the_zstd_decoder() {
-    let window = |log, budget: &weaver_graph::Budget| Zstd::window(&zstd_header(log), budget);
+    let window = |log, budget: &weaver_graph::Budget| Zstd::window(&zstd_header(log), None, budget);
     let [efficient, balanced, performance] = profiles();
     assert_eq!(window(30, &efficient), 256 * MIB);
     assert_eq!(window(30, &balanced), GIB);
@@ -645,7 +645,7 @@ fn each_profiles_window_reaches_the_zstd_decoder() {
     assert_eq!(fits, [false, true, true]);
     assert_eq!(window(31, &performance), 2 * GIB);
     for budget in profiles() {
-        assert_eq!(Zstd::window(&[], &budget), 128 * MIB);
+        assert_eq!(Zstd::window(&[], None, &budget), 128 * MIB);
     }
     assert_eq!(window(20, &performance), 128 * MIB);
     assert_eq!(window(28, &balanced), 256 * MIB);
@@ -993,9 +993,9 @@ fn budget(memory_bytes: u64, threads: usize) -> weaver_graph::Budget {
 }
 
 // A closed xz of several blocks decodes alike on one thread and on four,
-// and on four it is the run's budget that holds the decoder: one too small
-// for any block's buffers fails it, where the front-to-back decoder on one
-// thread holds only the window it reserved.
+// and on four it is the window the stream reserved that holds the decoder:
+// a window too small for two blocks' buffers is read from the front within
+// it, as on one thread.
 #[test]
 fn a_closed_multiblock_xz_decodes_its_blocks_side_by_side_within_the_budget() {
     let plain: Vec<u8> = (0..(1024 * 1024))
@@ -1020,11 +1020,37 @@ fn a_closed_multiblock_xz_decodes_its_blocks_side_by_side_within_the_budget() {
         bytes.clone(),
         budget(1, 4),
     );
-    // The decoder states the sizes it refused: the stream's index, 28
-    // bytes, against the one byte granted.
-    too_large(&held, Some(28), Some(1));
+    assert_eq!(held, one);
     let sequential = closed_run(&mut stream::<Xz>("ember.bin.xz"), bytes, budget(1, 1));
     assert_eq!(sequential, decoded("ember.bin", plain));
+}
+
+// An xz whose first block is small and whose later blocks are wide, as a
+// stream written side by side never is, decodes whole on four threads within
+// the window its front reserved.
+#[test]
+fn an_xz_whose_later_blocks_outgrow_the_first_decodes_within_its_reservation() {
+    let plain: Vec<u8> = (0..(1024 * 1024))
+        .map(|index| (index % 251) as u8)
+        .collect();
+    let properties = lzma_turbo::LzmaEncProps::xz_preset(0, false).unwrap();
+    let mut encoder = lzma_turbo::XzWriter::new(Vec::new(), &properties).unwrap();
+    encoder.set_threads(2);
+    encoder.set_block_size(4 << 10);
+    encoder.write_all(&plain[..4 << 10]).unwrap();
+    encoder.set_block_size(256 << 10);
+    encoder.write_all(&plain[4 << 10..]).unwrap();
+    let bytes = encoder.finish().unwrap();
+    let granted = weaver_graph::Budget {
+        window_bytes: Some(128 * MIB),
+        threads: 4,
+        ..Default::default()
+    };
+    let mut stream = stream::<Xz>("ember.bin.xz").within(granted.clone());
+    assert_eq!(
+        closed_run(&mut stream, bytes, granted),
+        decoded("ember.bin", plain)
+    );
 }
 
 // A run granted less than the 128 MiB an xz decoder may hold sizes its
@@ -1033,9 +1059,9 @@ fn a_closed_multiblock_xz_decodes_its_blocks_side_by_side_within_the_budget() {
 // dictionary the grant cannot hold is refused rather than decoded past it.
 #[test]
 fn an_xz_window_is_no_larger_than_the_memory_granted() {
-    let window = |bytes: &[u8], granted: u64| Xz::window(bytes, &budget(granted, 1));
+    let window = |bytes: &[u8], granted: u64| Xz::window(bytes, None, &budget(granted, 1));
     let declared = xz_at(&first_payload(), 1 << 20);
-    let needs = Xz::window(&declared, &weaver_graph::Budget::default());
+    let needs = Xz::window(&declared, None, &weaver_graph::Budget::default());
     assert_eq!(window(&[], 64 << 20), 64 << 20);
     assert_eq!(window(&declared, 64 << 20), needs);
     assert_eq!(window(&declared, needs / 2), needs / 2);

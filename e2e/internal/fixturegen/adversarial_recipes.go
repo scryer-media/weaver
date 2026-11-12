@@ -170,7 +170,7 @@ func AdversarialRecipes() []Recipe {
 		},
 		{
 			Slug: "adv-zip-directory-memory", Family: "adversarial", ByteReproducible: true,
-			Notes: "A valid zip with a central directory over eight MiB, built from large per-entry comments. Its tiny empty members must not make the directory allocation escape the run's memory reservation.",
+			Notes: "A valid zip with a central directory over eight MiB, built from large per-entry comments. The directory is read a piece at a time and every one of its empty members is delivered.",
 			Build: writeAdversarialZip("directory.zip", oversizedDirectoryEntries()),
 		},
 		{

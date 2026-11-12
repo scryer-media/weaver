@@ -345,7 +345,14 @@ impl Repaired {
                 self.written = at.end;
                 self.runs.push((member, offset, at));
             }
-            Err(error) => self.failed = Some(error),
+            // Nothing staged is applied once a write is refused, so what
+            // the output holds goes now, not when the return is heard. A
+            // file that will not go is tried again then.
+            Err(error) => {
+                self.output.release_handle();
+                let _ = std::fs::remove_file(self.output.path());
+                self.failed = Some(error);
+            }
         }
     }
 

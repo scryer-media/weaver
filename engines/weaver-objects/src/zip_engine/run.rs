@@ -44,11 +44,11 @@ impl Extraction for Run {
         self: Box<Self>,
         volumes: Arc<dyn Volumes>,
         sink: &mut Sink<'_>,
-        budget: weaver_graph::Budget,
+        _: weaver_graph::Budget,
     ) {
         let joined = Joined::new(volumes);
         let failed = joined.failure();
-        let image = match Image::open(joined, &budget) {
+        let image = match Image::open(joined) {
             Ok(image) => image,
             Err(Unopened::Refused(why)) if !failed.load(Ordering::Acquire) => {
                 sink(Emit::Refuse(why));

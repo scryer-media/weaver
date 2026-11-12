@@ -25,9 +25,13 @@
 // magic and resyncs from there, as the next packet may begin anywhere in
 // what was read as its body. Those bytes have left the hold, so the walk
 // asks for them again, and reads them as they come back: from the first
-// magic they held, as no byte before it can begin a packet.
+// magic they held, as no byte before it can begin a packet. A volume reads
+// again only so much (`REREAD_VOLUMES`); past that the walk goes on from
+// where the packet was read to.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -47,6 +51,15 @@ const UNICODE_FILENAME_BODY_CAP: u64 = 16 + 2 * 100_000;
 // Bytes ahead of the front a volume may hold. Past it, deliveries wait in
 // the volume's file until the front reaches them, and are read from there.
 const HOLD_CAP: usize = 8 * 1024 * 1024;
+// What a volume may read again because packets in it were none, in lengths
+// of the volume. Damage reads little again: a packet with no magic in it
+// reads again at most its last seven bytes, and one whose length field is
+// wrong at most the rest of the volume. Sixteen whole volumes is far past
+// what damage produces, and holds a volume of nested false headers, which
+// would read nearly the whole volume again for each, to sixteen volumes of
+// extra hashing. Past it a packet that was none is read past, as if it held
+// no packet; nothing is refused.
+pub(super) const REREAD_VOLUMES: u64 = 16;
 
 // What the walker found at one place in the volume.
 #[derive(Debug)]
@@ -64,6 +77,10 @@ pub(super) enum Found {
     },
     // A packet that passed its hash and is of no use.
     Unused,
+    // A packet that failed its hash or ran past the volume's end: examined,
+    // and no packet. What it read past is read again (`Again`), while the
+    // volume may read bytes again.
+    Failed,
     // Bytes the walk read past as a packet that was none, which it reads
     // again from the volume.
     Again(ByteRange),
@@ -135,6 +152,12 @@ pub(super) struct Walker {
     // Ranges that arrived past the hold, in offset order and apart: in the
     // volume's file, not yet walked.
     unheld: Vec<ByteRange>,
+    // Bytes the volume has read again because packets in it were none,
+    // shared by its walk and every walk of its own: see `REREAD_VOLUMES`.
+    reread: Arc<AtomicU64>,
+    // How far the walk that made this walk of its own had reached: the
+    // volume is at least this long.
+    reached: u64,
 }
 
 impl Walker {
@@ -152,9 +175,11 @@ impl Walker {
 
     // A walk of a range that comes again: it ends at the range's end, as at
     // a loss, and a packet the end cuts is dropped.
-    fn bounded(range: ByteRange, length: Option<u64>) -> Self {
+    fn bounded(range: ByteRange, of: &Self) -> Self {
         Self {
-            length,
+            length: of.length,
+            reread: Arc::clone(&of.reread),
+            reached: of.next.max(of.reached),
             ..Self::resumed(range.start, vec![ByteRange::new(range.end, u64::MAX)])
         }
     }
@@ -343,23 +368,49 @@ impl Walker {
         for (bound, _) in &self.again {
             parts = parts.iter().flat_map(|part| minus(*part, *bound)).collect();
         }
-        let length = self.length;
-        self.again.extend(
-            parts
-                .into_iter()
-                .map(|part| (part, Self::bounded(part, length))),
-        );
+        let walks: Vec<(ByteRange, Self)> = parts
+            .into_iter()
+            .map(|part| (part, Self::bounded(part, self)))
+            .collect();
+        self.again.extend(walks);
         self.again.sort_by_key(|(bound, _)| bound.start);
     }
 
     // The packet being streamed was none. The walk starts again from `from`,
     // the first magic past its own, and what it read of the packet from
-    // there, which has left the hold, comes again from the volume.
+    // there, which has left the hold, comes again from the volume. Once the
+    // volume has read again all it may, the walk goes on from where the
+    // packet was read to instead, as if those bytes held no packet.
     fn read_again(&mut self, from: u64, found: &mut Vec<Found>) {
         let range = ByteRange::new(from, self.next);
         self.streamed = None;
+        if !self.spend_reread(range.len()) {
+            found.push(Found::Failed);
+            return;
+        }
         self.unposted(range, found);
+        found.push(Found::Failed);
         found.push(Found::Again(range));
+    }
+
+    // Whether the volume may read this many bytes again, which it then has.
+    // A volume whose length is not yet known is at least as long as the
+    // furthest any of its walks has reached.
+    fn spend_reread(&self, bytes: u64) -> bool {
+        let length = self.length.unwrap_or(0).max(self.next).max(self.reached);
+        let budget = length.saturating_mul(REREAD_VOLUMES);
+        let spent = self.reread.load(Ordering::Relaxed);
+        let fits = spent.saturating_add(bytes) <= budget;
+        if fits {
+            self.reread.store(spent + bytes, Ordering::Relaxed);
+        }
+        fits
+    }
+
+    // The bytes the volume has read again because packets in it were none.
+    #[cfg(test)]
+    pub(super) fn reread(&self) -> u64 {
+        self.reread.load(Ordering::Relaxed)
     }
 
     // A walk of a range walked again ends sooner.
@@ -612,7 +663,7 @@ fn find_magic(bytes: &[u8]) -> Option<u64> {
 // What one job's packets may cost across every volume, by par2-rs's three
 // scan meters. Its budget keeps them in cells, which an object shared across
 // threads cannot hold, so they are counted here the same way.
-const MAX_EXAMINED: u64 = 1_048_576;
+pub(super) const MAX_EXAMINED: u64 = 1_048_576;
 const MAX_RETAINED: usize = 262_144;
 const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
 
@@ -624,13 +675,28 @@ pub(super) struct Meter {
 }
 
 impl Meter {
-    // Charge one packet the walk found; false once a limit is passed.
+    // A meter that has examined this many packets.
+    #[cfg(test)]
+    pub(super) fn spent(examined: u64) -> Self {
+        Self {
+            examined,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn examined(&self) -> u64 {
+        self.examined
+    }
+
+    // Charge one packet the walk found, or read as one and found none;
+    // false once a limit is passed.
     // Variable metadata plus container and allocation overhead; recovery
     // payloads stay in the volume and cost nothing here.
     pub(super) fn charge(&mut self, found: &Found) -> bool {
         self.examined += 1;
         let variable = match found {
-            Found::Unused | Found::Again(_) => None,
+            Found::Unused | Found::Failed | Found::Again(_) => None,
             Found::Recovery { .. } => Some(0),
             Found::Metadata { packet, .. } => Some(match packet {
                 Packet::Main(main) => (main.recovery_file_ids.len()

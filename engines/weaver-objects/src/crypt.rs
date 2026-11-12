@@ -27,6 +27,11 @@ pub const BLOCK: u64 = 16;
 // Checkpoint spacing inside a run: the most a ranged seal re-enciphers.
 pub const STRIDE: u64 = 4 * 1024 * 1024;
 
+// The most plaintext a seal reads and enciphers at once: the piece a range
+// said again is read back in, whole blocks.
+const SEAL_PIECE: u64 = weaver_graph::AGAIN_PIECE;
+const _: () = assert!(SEAL_PIECE.is_multiple_of(BLOCK) && SEAL_PIECE > 0);
+
 // The block-aligned offset at or below `offset`.
 pub fn block_floor(offset: u64) -> u64 {
     offset & !(BLOCK - 1)
@@ -1203,30 +1208,38 @@ impl Chain {
             }
             // The plaintext behind `[cursor, stop)`: the owner's below the
             // payload's end, the padding above it. Refused whenever a byte of
-            // it is not really there.
+            // it is not really there. It is read and enciphered a
+            // `SEAL_PIECE` at a time, each piece chained on from the last,
+            // so however far behind the range its seed lies no more than a
+            // piece of it is in hand at once.
             seen.came_out(ByteRange::new(cursor, stop))?;
-            let mut buffer = Vec::with_capacity((stop - cursor) as usize);
-            let on_disk = ByteRange::new(cursor, stop.min(self.plain_len).max(cursor));
-            if !on_disk.is_empty() && !plain(on_disk, &mut buffer) {
-                return None;
+            let mut buffer = Vec::with_capacity((stop - cursor).min(SEAL_PIECE) as usize);
+            while cursor < stop {
+                let end = stop.min(cursor.saturating_add(SEAL_PIECE));
+                buffer.clear();
+                let on_disk = ByteRange::new(cursor, end.min(self.plain_len).max(cursor));
+                if !on_disk.is_empty() && !plain(on_disk, &mut buffer) {
+                    return None;
+                }
+                (buffer.len() as u64 == on_disk.len()).then_some(())?;
+                if end > self.plain_len {
+                    let from = (cursor.max(self.plain_len) - self.plain_len) as usize;
+                    let to = (end - self.plain_len) as usize;
+                    buffer.extend_from_slice(seen.padding.tail_plain.get(from..to)?);
+                }
+                key.encrypt_range(&preceding?, &mut buffer).ok()?;
+                #[cfg(test)]
+                SEALED.with(|sealed| sealed.set(sealed.get() + buffer.len() as u64));
+                trail = match buffer.len().checked_sub(2 * BLOCK as usize) {
+                    Some(at) => buffer[at..].first_chunk::<16>().copied(),
+                    None => preceding,
+                };
+                preceding = buffer.last_chunk::<16>().copied();
+                if cursor >= block_start {
+                    posted.extend_from_slice(&buffer);
+                }
+                cursor = end;
             }
-            (buffer.len() as u64 == on_disk.len()).then_some(())?;
-            if stop > self.plain_len {
-                let take = (stop - self.plain_len) as usize;
-                buffer.extend_from_slice(seen.padding.tail_plain.get(..take)?);
-            }
-            key.encrypt_range(&preceding?, &mut buffer).ok()?;
-            #[cfg(test)]
-            SEALED.with(|sealed| sealed.set(sealed.get() + buffer.len() as u64));
-            trail = match buffer.len().checked_sub(2 * BLOCK as usize) {
-                Some(at) => buffer[at..].first_chunk::<16>().copied(),
-                None => preceding,
-            };
-            preceding = buffer.last_chunk::<16>().copied();
-            if cursor >= block_start {
-                posted.extend_from_slice(&buffer);
-            }
-            cursor = stop;
         }
         let from = (range.start - block_start) as usize;
         into.extend_from_slice(&posted[from..from + range.len() as usize]);

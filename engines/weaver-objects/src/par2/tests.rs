@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 mod carriers;
+mod cross_sets;
 mod facts;
 mod per_call;
 mod range_names;
@@ -1853,6 +1854,210 @@ fn a_packet_that_was_none_reads_again_only_where_a_packet_can_begin() {
     assert_eq!(walker.front(), volume.len() as u64);
 }
 
+// A volume of `fakes` recovery headers one after another, each claiming to
+// end where the valid packet after them ends, each hash wrong: each is read
+// as a packet that was none, and the walk starts again at the next. The
+// range of the valid packet.
+fn nested_fakes(fakes: usize) -> (Vec<u8>, ByteRange) {
+    let valid = recovery_packet(1, &payload(56, 4000));
+    let stride = recovery_packet(2, &[]).len();
+    let end = (fakes * stride + valid.len()) as u64;
+    let mut volume = Vec::with_capacity(end as usize);
+    for at in 0..fakes {
+        let mut fake = recovery_packet(2, &[]);
+        let length = end - (at * stride) as u64;
+        fake[8..16].copy_from_slice(&length.to_le_bytes());
+        volume.extend_from_slice(&fake);
+    }
+    let copy = ByteRange::at(volume.len() as u64, valid.len() as u64);
+    volume.extend_from_slice(&valid);
+    (volume, copy)
+}
+
+// The volume delivered whole, then each range the object asks for again
+// said again as the tree says it, until it asks for none: how many it
+// asked for.
+fn walk_asked_again(object: &mut Par2, volume: &[u8]) -> usize {
+    use weaver_graph::{Delivery, Emit, Evidenced};
+
+    let deliver = |object: &mut Par2, offset: u64, bytes: &[u8], out: &mut Vec<Emit>| {
+        object.deliver(
+            Delivery {
+                volume: VolumeIndex(0),
+                offset,
+                bytes: &Evidenced::from(bytes.to_vec()),
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            out,
+        );
+    };
+    let mut out = Vec::new();
+    deliver(object, 0, volume, &mut out);
+    let mut asked = 0;
+    while let Some(at) = out
+        .iter()
+        .position(|emit| matches!(emit, Emit::Again { .. }))
+    {
+        let Emit::Again {
+            volume: index,
+            range,
+        } = out.remove(at)
+        else {
+            unreachable!();
+        };
+        asked += 1;
+        object.unposted(index, range);
+        deliver(
+            object,
+            range.start,
+            &volume[range.start as usize..range.end as usize],
+            &mut out,
+        );
+    }
+    asked
+}
+
+// Each packet that was none is examined, and charged as one: a volume of
+// nested fakes costs a packet for each, and the valid packet they all claim
+// to hold is still found.
+#[test]
+fn a_packet_that_was_none_is_charged_as_examined() {
+    const FAKES: usize = 16;
+    let (volume, copy) = nested_fakes(FAKES);
+    let mut object = Par2::new(OWN);
+    let asked = walk_asked_again(&mut object, &volume);
+    assert_eq!(asked, FAKES);
+    assert!(!object.refused);
+    assert_eq!(object.meter.examined(), FAKES as u64 + 1);
+    assert_eq!(object.volumes[0].walked_blocks, 1);
+    let found: Vec<ByteRange> = object
+        .sets
+        .values()
+        .flat_map(|set| set.recovery.values().map(|at| at.range))
+        .collect();
+    assert_eq!(found, vec![copy]);
+}
+
+// Nested fakes past the examined limit refuse the object, as too many
+// packets do, and it asks for nothing more once refused.
+#[test]
+fn nested_packets_that_were_none_refuse_past_the_examined_limit() {
+    const LEFT: u64 = 10;
+    let (volume, _) = nested_fakes(64);
+    let mut object = Par2::new(OWN);
+    let most = super::walker::MAX_EXAMINED;
+    object.meter = super::walker::Meter::spent(most - LEFT);
+    let asked = walk_asked_again(&mut object, &volume);
+    assert!(object.refused);
+    assert_eq!(
+        asked as u64, LEFT,
+        "each fake within the limit was read again"
+    );
+    assert_eq!(object.meter.examined(), most + 1);
+    assert_eq!(object.volumes[0].walked_blocks, 0);
+}
+
+fn found_ranges(object: &Par2) -> Vec<(u32, ByteRange)> {
+    let mut found: Vec<(u32, ByteRange)> = object
+        .sets
+        .values()
+        .flat_map(|set| {
+            set.recovery
+                .iter()
+                .map(|(exponent, at)| (*exponent, at.range))
+        })
+        .collect();
+    found.sort_by_key(|(_, range)| range.start);
+    found
+}
+
+// Nested fakes whose spans are most of the volume read again only what the
+// volume may: then a fake is read past as holding no packet, the walk
+// reaches the volume's end, the valid packet past every fake's span is
+// found, and nothing is refused.
+#[test]
+fn a_volume_reads_again_no_more_than_its_budget() {
+    const FAKES: usize = 64;
+    let stride = recovery_packet(2, &[]).len();
+    // Bytes inside every fake's span with no magic in them.
+    let filler = payload(57, 60_000);
+    let span_end = (FAKES * stride + filler.len()) as u64;
+    let mut volume = Vec::new();
+    for at in 0..FAKES {
+        let mut fake = recovery_packet(2, &[]);
+        let length = span_end - (at * stride) as u64;
+        fake[8..16].copy_from_slice(&length.to_le_bytes());
+        volume.extend_from_slice(&fake);
+    }
+    volume.extend_from_slice(&filler);
+    let after = recovery_packet(1, &payload(58, 4000));
+    let copy = ByteRange::at(volume.len() as u64, after.len() as u64);
+    volume.extend_from_slice(&after);
+    let length = volume.len() as u64;
+    let budget = super::walker::REREAD_VOLUMES * length;
+
+    let mut object = Par2::new(OWN);
+    object.sized(VolumeIndex(0), length, &mut Vec::new());
+    let asked = walk_asked_again(&mut object, &volume);
+    let reread = object.volumes[0].walker.reread();
+    // The fake after the last one read again is read past: its span did not
+    // fit what was left.
+    let next_span = span_end - ((asked + 1) * stride) as u64;
+    assert!(asked > 0 && asked < FAKES, "{asked}");
+    assert!(reread <= budget, "{reread} > {budget}");
+    assert!(reread + next_span > budget, "{reread} + {next_span}");
+    assert_eq!(object.volumes[0].walker.front(), length);
+    assert_eq!(found_ranges(&object), vec![(1, copy)]);
+    assert!(!object.refused);
+    // Every fake walked is charged, the one read past as well.
+    assert_eq!(object.meter.examined(), asked as u64 + 1 + 1);
+}
+
+// Damage reads again what it does today, far inside the budget: a packet
+// whose payload is wrong reads again only its tail, and one whose length
+// field claims the next two packets reads them again and finds them. Both
+// with the volume's length known before the bytes and not.
+#[test]
+fn a_damaged_volume_finds_what_it_did_inside_its_budget() {
+    let packets: Vec<Vec<u8>> = (0..6)
+        .map(|exponent| recovery_packet(exponent, &payload(60 + u64::from(exponent), 1000)))
+        .collect();
+    let size = packets[0].len();
+    let mut volume: Vec<u8> = packets.concat();
+    // A payload byte of the second packet.
+    volume[size + 500] ^= 0x01;
+    // The fourth packet's length claims the fifth and sixth as well.
+    let claimed = (3 * size) as u64;
+    volume[3 * size + 8..3 * size + 16].copy_from_slice(&claimed.to_le_bytes());
+    let length = volume.len() as u64;
+    let at = |index: usize| ByteRange::at((index * size) as u64, size as u64);
+    for sized_first in [true, false] {
+        let mut object = Par2::new(OWN);
+        if sized_first {
+            object.sized(VolumeIndex(0), length, &mut Vec::new());
+        }
+        let asked = walk_asked_again(&mut object, &volume);
+        assert_eq!(asked, 2, "sized_first={sized_first}");
+        assert_eq!(
+            found_ranges(&object),
+            vec![(0, at(0)), (2, at(2)), (4, at(4)), (5, at(5))],
+            "sized_first={sized_first}"
+        );
+        let reread = object.volumes[0].walker.reread();
+        assert_eq!(
+            reread,
+            (MAGIC_TAIL + 2 * size) as u64,
+            "sized_first={sized_first}"
+        );
+        assert!(reread < length, "sized_first={sized_first}");
+        assert!(!object.refused);
+    }
+}
+
+// The bytes short of a whole magic a packet with none in it reads again.
+const MAGIC_TAIL: usize = par2_rs::packet::MAGIC.len() - 1;
+
 // A refused slice is held only by a twin that is neither refused nor came
 // damaged: the first two slices of one file came damaged and the other
 // file was refused whole, so four slices lack their bytes and the one
@@ -1985,6 +2190,59 @@ fn a_repair_reads_another_block_when_those_read_do_not_rebuild() {
         RepairOutcome::Repaired { slices: 2 }
     );
     assert!(job.store.members[&member] == data);
+}
+
+// Blocks 0, 4369, 8738 and 13107 all fail to tell slices 0 and 8 apart, so
+// the repair reads five blocks to rebuild two. Under a memory limit no
+// larger than those two, it holds the payloads of four, lets the fifth go
+// once it is counted, and reads it again when the plan chooses it: the same
+// repair, with one more volume read.
+#[test]
+fn a_block_read_past_what_the_repair_holds_is_read_again_when_chosen() {
+    // Large enough for the repair's own workspace under the tight limit.
+    const SLICE: u64 = 16 * 1024;
+    let constants = par2_rs::input_slice_constants(9);
+    for exponent in [8738, 13107] {
+        assert_eq!(
+            par2_rs::gf_pow(constants[0], exponent),
+            par2_rs::gf_pow(constants[8], exponent)
+        );
+    }
+    let data = payload(45, 9 * SLICE as usize);
+    let described = [("payload.bin", data.as_slice())];
+    let mut files = par2_set_from("set", &described, SLICE, 0, 1, 1);
+    for (first, count) in [(4369, 1), (8738, 1), (13107, 2)] {
+        files.push(par2_set_from("set", &described, SLICE, first, count, 1)[1].clone());
+    }
+    let mut wrong = data.clone();
+    for slice in [0, 8] {
+        wrong[(slice * SLICE) as usize] ^= 0x5A;
+    }
+    let repaired = |budget: weaver_graph::Budget| {
+        let mut job = job(&files);
+        let member = job.member("payload.bin", &wrong);
+        for slice in [0, 8] {
+            let at = slice * SLICE / ARTICLE * ARTICLE;
+            let article = ByteRange::new(at, (at + ARTICLE).min(data.len() as u64));
+            job.arrive(
+                member,
+                article.start,
+                &wrong[article.start as usize..article.end as usize],
+                Provenance::Damaged,
+            );
+        }
+        bind(&mut job);
+        let outcome = job.object.repair(&mut job.store, budget);
+        assert!(job.store.members[&member] == data, "{outcome:?}");
+        (outcome, job.store.volume_reads)
+    };
+    let (outcome, reads) = repaired(weaver_graph::Budget::default());
+    assert_eq!(outcome, RepairOutcome::Repaired { slices: 2 });
+    let tight = weaver_graph::Budget {
+        memory_bytes: Some(2 * SLICE),
+        ..weaver_graph::Budget::default()
+    };
+    assert_eq!(repaired(tight), (outcome, reads + 1));
 }
 
 // A file refused whole beside another the set describes with the same

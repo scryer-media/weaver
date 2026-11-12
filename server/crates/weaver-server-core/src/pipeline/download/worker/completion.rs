@@ -264,7 +264,9 @@ impl Pipeline {
             counters: None,
             segment_id,
             message_id: crate::jobs::ids::MessageId::new(seg_spec.message_ids.in_use()),
-            groups: std::sync::Arc::from(file_spec.groups.as_slice()),
+            groups: state
+                .articles
+                .file_groups(segment_id.file_id, &file_spec.groups),
             priority: file_spec.role.download_priority(),
             byte_estimate: seg_spec.bytes,
             retry_count,
@@ -1376,7 +1378,9 @@ impl Pipeline {
                                 message_id: crate::jobs::ids::MessageId::new(
                                     seg_spec.message_ids.in_use(),
                                 ),
-                                groups: std::sync::Arc::from(file_spec.groups.as_slice()),
+                                groups: state
+                                    .articles
+                                    .file_groups(seg_id.file_id, &file_spec.groups),
                                 priority,
                                 byte_estimate: seg_spec.bytes,
                                 retry_count: next_retry,

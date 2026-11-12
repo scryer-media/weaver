@@ -20,11 +20,37 @@ use ::zip::read::{ArchiveOffset, Config, ZipFileEntry};
 use ::zip::result::{ZipError, ZipResult};
 use weaver_graph::{VolumeIndex, Why};
 
-use super::{MAX_DIRECTORY_BYTES, MAX_DIRECTORY_ENTRIES};
 use crate::engine::Joined;
 use crate::zip::records::{
-    self, END, END_LEN, END64, END64_LEN, End, Grow, LOCATOR, LOCATOR_LEN, TAIL,
+    self, CENTRAL_LEN, END, END_LEN, END64, END64_LEN, End, Grow, LOCATOR, LOCATOR_LEN, TAIL,
 };
+
+// The directory is read this many bytes at a time, each entry rewritten as
+// soon as it is whole: what the run holds grows with the bytes really read,
+// never with the size or the count the end records state.
+const PIECE: usize = 1 << 20;
+// The longest entry a directory holds: its fixed part, then a name, an extra
+// field and a comment, each as long as its two-byte length allows.
+const LONGEST_ENTRY: usize = CENTRAL_LEN + 3 * u16::MAX as usize;
+
+// The most this thread held at once reading a directory, for a test.
+#[cfg(test)]
+pub(super) mod peak {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PEAK: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub(crate) fn note(bytes: usize) {
+        PEAK.with(|peak| peak.set(peak.get().max(bytes)));
+    }
+
+    // The peak since the last take, which starts the count over.
+    pub(crate) fn take() -> usize {
+        PEAK.with(|peak| peak.replace(0))
+    }
+}
 
 // Why the set is not an image: the owner failed a read, which it already
 // knows, or the shape is one no image is made of.
@@ -52,7 +78,7 @@ pub(super) struct Disks {
 }
 
 impl Disks {
-    fn new(joined: &Joined, disks: Vec<(VolumeIndex, u64)>) -> Self {
+    pub(super) fn new(joined: &Joined, disks: Vec<(VolumeIndex, u64)>) -> Self {
         Self {
             joined: joined.clone(),
             disks: disks.into(),
@@ -142,7 +168,7 @@ impl Image {
     // last volume's own tail, where its declared length puts it, and says
     // how many disks come before it; every place in a spanned set is the
     // length of the disks before it. No volume needs to close first.
-    pub(super) fn open(joined: Joined, budget: &weaver_graph::Budget) -> Result<Image, Unopened> {
+    pub(super) fn open(joined: Joined) -> Result<Image, Unopened> {
         let (last, length, start, found) = loop {
             let bound = joined.bound()?;
             let Some(&last) = bound.last() else {
@@ -207,20 +233,14 @@ impl Image {
         }
         lengths.push((last, length));
         let disks = Disks::new(&joined, lengths);
-        match Self::shaped(disks.clone(), disk, start, found, budget) {
+        match Self::shaped(disks.clone(), disk, start, found) {
             Err(Unopened::Refused(why)) => Err(refused(why, &disks)),
             shaped => shaped,
         }
     }
 
     // The image of the disks, the end record found at `start` of the last.
-    fn shaped(
-        disks: Disks,
-        last: u32,
-        start: u64,
-        found: End,
-        budget: &weaver_graph::Budget,
-    ) -> Result<Image, Unopened> {
+    fn shaped(disks: Disks, last: u32, start: u64, found: End) -> Result<Image, Unopened> {
         let base = |disk: u32| disks.base(disk);
         // Where the records after the directory start.
         let mut after = base(last)
@@ -250,14 +270,6 @@ impl Image {
         if end.this_disk != last {
             return Err(Unopened::Refused(Why::Unsupported));
         }
-        let directory_limit = budget
-            .memory_or(MAX_DIRECTORY_BYTES * 8)
-            .checked_div(8)
-            .unwrap_or(0)
-            .min(MAX_DIRECTORY_BYTES);
-        if end.size > directory_limit || end.entries > MAX_DIRECTORY_ENTRIES {
-            return Err(Unopened::Refused(Why::Unsupported));
-        }
         // A directory runs no further than the records after it.
         let directory = base(end.directory_disk)
             .and_then(|base| base.checked_add(end.offset))
@@ -268,9 +280,7 @@ impl Image {
             });
         let mut rest = match directory {
             Some(directory) => {
-                let mut bytes = vec![0u8; end.size as usize];
-                disks.read_exact(directory, &mut bytes)?;
-                rewrite(&bytes, &end, directory, &base).map(|rest| (directory, rest))
+                read_rewritten(&disks, directory, &end, &base)?.map(|rest| (directory, rest))
             }
             None => None,
         };
@@ -287,11 +297,9 @@ impl Image {
                     .map(|shift| (directory, shift))
             })
         {
-            let mut bytes = vec![0u8; end.size as usize];
-            disks.read_exact(directory, &mut bytes)?;
-            rest = rewrite(&bytes, &end, directory, &|disk| {
+            rest = read_rewritten(&disks, directory, &end, &|disk| {
                 (disk == 0).then_some(shift)
-            })
+            })?
             .map(|rest| (directory, rest));
         }
         match rest {
@@ -433,18 +441,93 @@ fn seek(position: u64, len: u64, to: SeekFrom) -> io::Result<u64> {
     .ok_or_else(|| io::Error::from(io::ErrorKind::InvalidInput))
 }
 
-// The directory on disk zero at its place in the whole, followed by the
-// records that end it. An entry whose place in the whole no longer fits its
-// narrow field gets it in its zip64 field. `None` when an entry cannot.
+// The directory, already in hand, rewritten as `read_rewritten` rewrites it.
+#[cfg(test)]
 pub(super) fn rewrite(
     directory: &[u8],
     end: &End,
     start: u64,
     base: &dyn Fn(u32) -> Option<u64>,
 ) -> Option<Vec<u8>> {
-    let entries = records::directory(directory, end.entries)?;
-    let mut rest = Vec::with_capacity(directory.len());
-    for entry in &entries {
+    let mut rewritten = Rewritten::default();
+    let mut at = 0;
+    while at < directory.len() {
+        at = rewritten.entry(directory, at, end, base)?;
+    }
+    rewritten.ended(end, start)
+}
+
+// The directory on disk zero at its place in the whole, followed by the
+// records that end it. An entry whose place in the whole no longer fits its
+// narrow field gets it in its zip64 field. `None` when an entry cannot.
+// It is read from the disks at `start` a piece at a time: each entry is
+// rewritten as soon as it is whole, and the bytes it was read from are let
+// go once the next piece is read. A stated size is read only as far as the
+// entries hold: the first that is not one ends the read. An error when the
+// disks end short of a piece.
+pub(super) fn read_rewritten(
+    disks: &Disks,
+    start: u64,
+    end: &End,
+    base: &dyn Fn(u32) -> Option<u64>,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut held = Vec::with_capacity(
+        usize::try_from(end.size).map_or(PIECE + LONGEST_ENTRY, |size| {
+            size.min(PIECE + LONGEST_ENTRY)
+        }),
+    );
+    let mut rewritten = Rewritten::default();
+    // The next entry in what is held, and how much of the directory was read.
+    let mut at = 0;
+    let mut read = 0u64;
+    loop {
+        // Hold a whole entry ahead, or the rest of the directory.
+        if held.len() - at < LONGEST_ENTRY && read < end.size {
+            held.drain(..at);
+            at = 0;
+            let piece = usize::try_from(end.size - read).map_or(PIECE, |rest| rest.min(PIECE));
+            let filled = held.len();
+            held.resize(filled + piece, 0);
+            disks.read_exact(start + read, &mut held[filled..])?;
+            read += piece as u64;
+            #[cfg(test)]
+            peak::note(held.capacity() + rewritten.rest.capacity());
+            continue;
+        }
+        if at == held.len() {
+            break;
+        }
+        match rewritten.entry(&held, at, end, base) {
+            Some(next) => at = next,
+            None => return Ok(None),
+        }
+        #[cfg(test)]
+        peak::note(held.capacity() + rewritten.rest.capacity());
+    }
+    Ok(rewritten.ended(end, start))
+}
+
+// The directory as far as it is rewritten, and how many entries it holds.
+#[derive(Default)]
+struct Rewritten {
+    rest: Vec<u8>,
+    entries: u64,
+}
+
+impl Rewritten {
+    // The entry at `at` of `directory` rewritten onto the rest, and where
+    // the next starts. `None` when it is no entry, or one past the count.
+    fn entry(
+        &mut self,
+        directory: &[u8],
+        at: usize,
+        end: &End,
+        base: &dyn Fn(u32) -> Option<u64>,
+    ) -> Option<usize> {
+        if self.entries == end.entries {
+            return None;
+        }
+        let (entry, next) = records::central(directory, at)?;
         let offset = base(entry.disk)?.checked_add(entry.offset)?;
         let mut bytes = directory.get(entry.span.clone())?.to_vec();
         let within = |(at, wide): (usize, bool)| (at - entry.span.start, wide);
@@ -455,8 +538,21 @@ pub(super) fn rewrite(
         } else {
             widen(&mut bytes, entry.grow, entry.span.start, offset)?;
         }
-        rest.extend(bytes);
+        self.rest.extend(bytes);
+        self.entries += 1;
+        Some(next)
     }
+
+    // The rewritten directory and the records that end it, once it holds
+    // every entry its end records count.
+    fn ended(self, end: &End, start: u64) -> Option<Vec<u8>> {
+        (self.entries == end.entries).then_some(())?;
+        Some(close(self.rest, end, start))
+    }
+}
+
+// The records that end a rewritten directory at `start`, after it.
+fn close(mut rest: Vec<u8>, end: &End, start: u64) -> Vec<u8> {
     let size = rest.len() as u64;
     let wide = end.entries >= u64::from(u16::MAX)
         || size >= u64::from(u32::MAX)
@@ -495,7 +591,7 @@ pub(super) fn rewrite(
     rest.extend(narrow32(size).to_le_bytes());
     rest.extend(narrow32(start).to_le_bytes());
     rest.extend(0u16.to_le_bytes());
-    Some(rest)
+    rest
 }
 
 // Write a field where the directory has it: the narrow one, whose all-ones

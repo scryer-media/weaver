@@ -290,6 +290,15 @@ pub(crate) struct NamespaceWriter {
     // Where the time a member write takes on disk is published, when the
     // job runs in a pipeline.
     metrics: Option<Arc<crate::operations::metrics::PipelineMetrics>>,
+    // The nodes whose bytes are being said again, and the requests their
+    // objects raised meanwhile that wait for that replay to end
+    // (`Object::again_waits`), in the order raised.
+    replaying: BTreeSet<NodeId>,
+    again_held: Vec<Effect>,
+    // How many requests are being answered at once, and the most there
+    // ever were.
+    #[cfg(test)]
+    answering: (u32, u32),
 }
 
 // A cipher's tail read back before the ranges that fed its keys are
@@ -350,6 +359,10 @@ impl NamespaceWriter {
             placements: Vec::new(),
             asked: BTreeMap::new(),
             metrics: None,
+            replaying: BTreeSet::new(),
+            again_held: Vec::new(),
+            #[cfg(test)]
+            answering: (0, 0),
         }
     }
 
@@ -919,22 +932,50 @@ impl NamespaceWriter {
         write: Write,
         out: &mut Vec<Effect>,
     ) -> Result<(), WriteError> {
+        self.place_as(tree, builder, segments, (arrival, false), write, out)
+            .map(|_| ())
+    }
+
+    // `place`, for a set's own repair as it comes back when `repair` says
+    // so: bytes a repair already wrote stand against it. Returns how many of
+    // the bytes the member took.
+    fn place_as(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (arrival, repair): (Arrival, bool),
+        write: Write,
+        out: &mut Vec<Effect>,
+    ) -> Result<u64, WriteError> {
         let (node, member) = (arrival.node, arrival.member);
         // Every article routes through here, so its effects go in the room
         // the writer keeps. A delivery that routes again while this one
         // applies finds the room taken and uses a list of its own.
         let mut effects = std::mem::take(&mut self.effects);
-        tree.deliver(
-            node,
-            member,
-            Posted {
-                offset: arrival.offset,
-                bytes: arrival.bytes.clone(),
-                provenance: arrival.provenance,
-            },
-            &mut self.placing(builder),
-            &mut effects,
-        );
+        let posted = Posted {
+            offset: arrival.offset,
+            bytes: arrival.bytes.clone(),
+            provenance: arrival.provenance,
+        };
+        let took = if repair {
+            tree.deliver_repair(
+                node,
+                member,
+                posted,
+                &mut self.placing(builder),
+                &mut effects,
+            )
+        } else {
+            tree.deliver(
+                node,
+                member,
+                posted,
+                &mut self.placing(builder),
+                &mut effects,
+            );
+            arrival.range().len()
+        };
         let recovery_volume = tree
             .child_of(node, member)
             .is_some_and(|(child, _)| tree.recovers(child));
@@ -952,7 +993,7 @@ impl NamespaceWriter {
         if recovery_volume || front || complete {
             self.bind_recoveries(tree, builder, segments, node, out)?;
         }
-        Ok(())
+        Ok(took)
     }
 
     // The bytes a bound member's object kept for no member of its own: its
@@ -1009,21 +1050,36 @@ impl NamespaceWriter {
 
     // What the object at `child` kept in its envelope of its volume, the
     // member, and now places elsewhere: read back from where it was kept,
-    // and held for the member until the object places it again.
+    // a `READ_BACK` at a time, and each piece held for the member until the
+    // object places it again. Nothing is held when any byte of the range was
+    // never kept; a piece that does not read ends it, the pieces before it
+    // held.
     fn unkept(
         &mut self,
         (node, member, child): (NodeId, MemberId, NodeId),
         (range, envelope, at): (ByteRange, u32, u64),
     ) -> Result<(), WriteError> {
-        let mut bytes = Vec::new();
         if !self
             .envelopes
-            .read(child, envelope, ByteRange::at(at, range.len()), &mut bytes)
+            .keeps(child, envelope, ByteRange::at(at, range.len()))
         {
             return Ok(());
         }
-        let held = vec![(range.start, Bytes::from(bytes).into())];
-        self.hold_for((node, member), held)
+        let mut done = 0;
+        while done < range.len() {
+            let take = (range.len() - done).min(READ_BACK);
+            let mut bytes = Vec::new();
+            if !self
+                .envelopes
+                .read(child, envelope, ByteRange::at(at + done, take), &mut bytes)
+            {
+                return Ok(());
+            }
+            let held = vec![(range.start + done, Bytes::from(bytes).into())];
+            self.hold_for((node, member), held)?;
+            done += take;
+        }
+        Ok(())
     }
 
     // Bytes of a bound member, held until its object places them, as any
@@ -1073,6 +1129,13 @@ impl NamespaceWriter {
         | Effect::Renamed { node, member, .. } = &effect
         {
             self.caps.admit_member(tree, *node, *member)?;
+        }
+        if let Effect::Again { node, .. } = &effect {
+            if self.replaying.contains(node) && tree.again_waits(*node) {
+                self.again_held.push(effect);
+                return Ok(());
+            }
+            return self.answer_again(tree, builder, segments, effect, out);
         }
         match &effect {
             Effect::WriteLeaf {
@@ -1278,54 +1341,130 @@ impl NamespaceWriter {
             }
             Effect::Renamed { .. } => self.moved(tree, std::slice::from_ref(&effect))?,
             Effect::NeedsPassword { .. } => {}
-            // Every effect before it is applied, so what the object reads
-            // back of its members is on disk. Each run's effects are
-            // applied before the next run goes, as each delivery's are.
-            // What it reads back is staged on disk a piece at a time, and
-            // read from there a piece at a time as it is said again.
-            Effect::Again { node, ranges } => {
-                let mut staged = loan::Repaired::again(&self.working_dir, *node)?;
-                let mut sources = Vec::new();
-                let serial = tree.again_read(
-                    *node,
-                    ranges,
-                    &self.placing(builder),
-                    &mut |volume, posted| {
-                        staged.write(MemberId(volume.0), posted.offset, &posted.bytes);
-                        sources.push(posted.provenance);
-                    },
-                );
-                let replayed = match staged.failed() {
-                    Some(error) => Err(WriteError::from(error)),
-                    None => self
-                        .again_staged(
-                            tree,
-                            builder,
-                            segments,
-                            (serial, *node),
-                            &staged,
-                            sources,
-                            out,
-                        )
-                        .and_then(|()| {
-                            let mut effects = Vec::new();
-                            tree.again_closed(
-                                *node,
-                                ranges,
-                                &mut self.placing(builder),
-                                &mut effects,
-                            );
-                            self.apply_each(tree, builder, segments, effects, Write::Again, out)
-                        }),
-                };
-                tree.again_done();
-                let removed = staged.discard();
-                replayed?;
-                removed?;
-            }
+            // Answered above.
+            Effect::Again { .. } => {}
         }
         out.push(effect);
         Ok(())
+    }
+
+    // Every effect before it is applied, so what the object reads back of
+    // its members is on disk. Each run's effects are applied before the
+    // next run goes, as each delivery's are. What it reads back is staged
+    // on disk a piece at a time, and read from there a piece at a time as
+    // it is said again.
+    //
+    // A request the object raises while its bytes are said again, when it
+    // may wait, is answered here once the pieces of the one before it have
+    // gone and before that one's close is told again, as it would have
+    // been inside it: the closes go last first. However many requests
+    // follow one another, none is answered inside another.
+    fn answer_again(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        effect: Effect,
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let Effect::Again { node, .. } = &effect else {
+            return Ok(());
+        };
+        let node = *node;
+        let outermost = self.replaying.insert(node);
+        #[cfg(test)]
+        {
+            self.answering.0 += 1;
+            self.answering.1 = self.answering.1.max(self.answering.0);
+        }
+        let mut said: Vec<Effect> = Vec::new();
+        let mut next = Some(effect);
+        let answered = loop {
+            if next.is_none() && outermost {
+                next = self
+                    .again_held
+                    .iter()
+                    .position(|held| matches!(held, Effect::Again { node: at, .. } if *at == node))
+                    .map(|at| self.again_held.remove(at));
+            }
+            if let Some(effect) = next.take() {
+                let Effect::Again { ranges, .. } = &effect else {
+                    continue;
+                };
+                match self.say_again(tree, builder, segments, (node, ranges), out) {
+                    Ok(()) => said.push(effect),
+                    Err(error) => break Err(error),
+                }
+                continue;
+            }
+            let Some(effect) = said.pop() else {
+                break Ok(());
+            };
+            let Effect::Again { ranges, .. } = &effect else {
+                continue;
+            };
+            let mut effects = Vec::new();
+            tree.again_closed(node, ranges, &mut self.placing(builder), &mut effects);
+            let closed = self.apply_each(tree, builder, segments, effects, Write::Again, out);
+            tree.again_done();
+            if let Err(error) = closed {
+                break Err(error);
+            }
+            out.push(effect);
+        };
+        if answered.is_err() {
+            for _ in said.drain(..) {
+                tree.again_done();
+            }
+        }
+        if outermost {
+            self.replaying.remove(&node);
+            self.again_held
+                .retain(|held| !matches!(held, Effect::Again { node: at, .. } if *at == node));
+        }
+        #[cfg(test)]
+        {
+            self.answering.0 -= 1;
+        }
+        answered
+    }
+
+    // The pieces of one request said again. The staging they were read
+    // into goes as soon as they are said: requests that follow one another
+    // never hold more than one on disk.
+    fn say_again(
+        &mut self,
+        tree: &mut Tree,
+        builder: &mut dyn Builder,
+        segments: &dyn Segments,
+        (node, ranges): (NodeId, &[(VolumeIndex, ByteRange)]),
+        out: &mut Vec<Effect>,
+    ) -> Result<(), WriteError> {
+        let mut staged = loan::Repaired::again(&self.working_dir, node)?;
+        let mut sources = Vec::new();
+        let serial = tree.again_read(
+            node,
+            ranges,
+            &self.placing(builder),
+            &mut |volume, posted| {
+                staged.write(MemberId(volume.0), posted.offset, &posted.bytes);
+                sources.push(posted.provenance);
+            },
+        );
+        let replayed = match staged.failed() {
+            Some(error) => Err(WriteError::from(error)),
+            None => self.again_staged(
+                tree,
+                builder,
+                segments,
+                (serial, node),
+                &staged,
+                sources,
+                out,
+            ),
+        };
+        let removed = staged.discard().map_err(WriteError::from);
+        replayed.and(removed).inspect_err(|_| tree.again_done())
     }
 
     // Each staged piece of an `Effect::Again`, said again in the order it

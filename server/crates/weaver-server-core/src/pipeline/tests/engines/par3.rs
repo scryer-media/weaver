@@ -443,6 +443,128 @@ async fn a_member_a_par2_and_a_par3_set_describe_is_repaired_once() {
     );
 }
 
+// `ember.bin` as a PAR2 set describes it, and the same name and length
+// with its second slice different, as a PAR3 set describes it.
+fn disagreeing() -> (Vec<u8>, Vec<u8>) {
+    let par2 = payload(3 * ARTICLE, 69);
+    let mut par3 = par2.clone();
+    par3[ARTICLE..2 * ARTICLE].copy_from_slice(&payload(ARTICLE, 70));
+    (par2, par3)
+}
+
+// `posted` as `ember.bin`, then a PAR2 set over `par2` and a PAR3 set over
+// `par3`, each of `blocks` recovery blocks, the PAR3 set first when
+// `par3_first` says so.
+fn both_sets(
+    posted: &[u8],
+    (par2, par2_blocks): (&[u8], u32),
+    (par3, par3_blocks): (&[u8], u64),
+    par3_first: bool,
+) -> Vec<Post> {
+    let mut sets = vec![
+        par2_set("lantern", &[("ember.bin", par2)], par2_blocks),
+        par3_set("beacon", &[("ember.bin", par3)], par3_blocks),
+    ];
+    if par3_first {
+        sets.reverse();
+    }
+    let mut posts = vec![Post::plain("ember.bin", posted.to_vec())];
+    posts.extend(sets.into_iter().flatten());
+    posts
+}
+
+fn assert_completes(graph: &Outcome) {
+    assert!(
+        graph.completed(),
+        "{:?} {:?} {:?}",
+        graph.status,
+        graph.graph().outcomes,
+        repair_and_terminal_events(graph)
+    );
+}
+
+// Posted as the PAR2 set describes it. The PAR3 set rewrites the slice it
+// disagrees on, the PAR2 set rewrites it back once, and the PAR3 set's
+// next repair loses to it: the member ends as the PAR2 set describes it,
+// whichever set is posted first.
+#[tokio::test]
+async fn a_par3_set_disagreeing_with_a_posted_file_par2_holds_whole_loses_to_it() {
+    let (par2, par3) = disagreeing();
+    for par3_first in [false, true] {
+        let posts = both_sets(&par2, (&par2, 2), (&par3, 2), par3_first);
+        let graph = run(&Scenario::new(posts)).await;
+        assert_fetched_once(&graph);
+        assert_completes(&graph);
+        assert_eq!(
+            repair_and_terminal_events(&graph),
+            ["RepairComplete 1", "RepairComplete 1", "JobCompleted"],
+            "PAR3 first: {par3_first}"
+        );
+        assert_delivers(&graph, &[("ember.bin", &par2)]);
+    }
+}
+
+// Posted as the PAR3 set describes it, the PAR2 set able to rebuild its own
+// version: the PAR2 set rewrites the slice once and stands.
+#[tokio::test]
+async fn a_posted_file_par3_holds_whole_ends_as_the_par2_set_describes_it() {
+    let (par2, par3) = disagreeing();
+    for par3_first in [false, true] {
+        let posts = both_sets(&par3, (&par2, 2), (&par3, 2), par3_first);
+        let graph = run(&Scenario::new(posts)).await;
+        assert_fetched_once(&graph);
+        assert_completes(&graph);
+        assert_eq!(
+            repair_and_terminal_events(&graph),
+            ["RepairComplete 1", "JobCompleted"],
+            "PAR3 first: {par3_first}"
+        );
+        assert_delivers(&graph, &[("ember.bin", &par2)]);
+    }
+}
+
+// The slice the sets disagree on arrives damaged, and each set can rebuild
+// it its own way: the member ends as the PAR2 set describes it.
+#[tokio::test]
+async fn a_damaged_slice_two_sets_rebuild_differently_ends_as_the_par2_set_describes_it() {
+    let (par2, par3) = disagreeing();
+    for par3_first in [false, true] {
+        let posts = both_sets(&par2, (&par2, 2), (&par3, 2), par3_first);
+        let graph = run(&Scenario::new(posts).damaged(0, 1)).await;
+        assert_fetched_once(&graph);
+        assert_completes(&graph);
+        assert_eq!(
+            repair_and_terminal_events(&graph),
+            ["RepairComplete 1", "JobCompleted"],
+            "PAR3 first: {par3_first}"
+        );
+        assert_delivers(&graph, &[("ember.bin", &par2)]);
+    }
+}
+
+// The PAR2 set disagrees on two slices and holds one recovery block, so it
+// cannot make its version; the PAR3 set repairs the damaged first slice they
+// agree on. The member ends as the PAR3 set describes it and the job
+// completes.
+#[tokio::test]
+async fn a_par2_set_short_of_its_version_leaves_the_par3_repair_standing() {
+    let par3 = payload(3 * ARTICLE, 69);
+    let mut par2 = par3.clone();
+    par2[ARTICLE..].copy_from_slice(&payload(2 * ARTICLE, 70));
+    for par3_first in [false, true] {
+        let posts = both_sets(&par3, (&par2, 1), (&par3, 2), par3_first);
+        let graph = run(&Scenario::new(posts).damaged(0, 0)).await;
+        assert_fetched_once(&graph);
+        assert_completes(&graph);
+        assert_eq!(
+            repair_and_terminal_events(&graph),
+            ["RepairComplete 1", "JobCompleted"],
+            "PAR3 first: {par3_first}"
+        );
+        assert_delivers(&graph, &[("ember.bin", &par3)]);
+    }
+}
+
 // `beacon.bin` takes two damaged slices against one recovery block;
 // `lantern.bin` beside it arrives whole. The partial-delivery invariant
 // (2026-10-18) keeps the whole member delivered and ends the job Partial,

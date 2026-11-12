@@ -477,6 +477,12 @@ impl DownloadQueue {
             .reserve_exact((segments as usize).saturating_sub(slots.dense.len()));
     }
 
+    // The newsgroups this queue shares among a file's items, once it has
+    // queued one of them.
+    pub(crate) fn file_groups(&self, file_id: NzbFileId) -> Option<&Arc<[String]>> {
+        self.files.get(&file_id)?.groups.as_ref()
+    }
+
     // Queues an article of the job as its article list gives it: fetched by
     // the id its part has in use when it is dispatched, from `groups`, never
     // tried, steered nowhere.

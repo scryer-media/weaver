@@ -54,6 +54,12 @@ thread_local! {
     static FRONT_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// How many members founding by name looked at, for the tests that count it.
+#[cfg(test)]
+thread_local! {
+    static NAMED_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
 
@@ -645,6 +651,12 @@ impl Tree {
 
     pub fn reads_in_order(&self, node: NodeId) -> bool {
         self.object(node).is_some_and(Object::reads_in_order)
+    }
+
+    // Whether what the object at `node` asks for again during a replay of
+    // its bytes may wait for that replay to end: see `Object::again_waits`.
+    pub fn again_waits(&self, node: NodeId) -> bool {
+        self.object(node).is_some_and(Object::again_waits)
     }
 
     // The recovery face of the object at `node`, if it has one and is in
@@ -2240,6 +2252,33 @@ impl Tree {
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        self.deliver_as(node, posting, arrival, false, builder, effects);
+    }
+
+    // A set's own repair of a member, as it comes back: delivered as any
+    // repair, except that bytes a repair already wrote stand against it
+    // (`Namespace::arrive_repair`). Returns how many of its bytes the member
+    // took.
+    pub fn deliver_repair(
+        &mut self,
+        node: NodeId,
+        posting: MemberId,
+        arrival: Posted,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) -> u64 {
+        self.deliver_as(node, posting, arrival, true, builder, effects)
+    }
+
+    fn deliver_as(
+        &mut self,
+        node: NodeId,
+        posting: MemberId,
+        arrival: Posted,
+        repair: bool,
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) -> u64 {
         let Posted {
             offset,
             bytes,
@@ -2247,15 +2286,22 @@ impl Tree {
         } = arrival;
         let range = ByteRange::at(offset, bytes.len() as u64);
         let Some(namespace) = self.nodes.namespace_mut(node) else {
-            return;
+            return 0;
         };
-        let (member, taken) = namespace.arrive(posting, range, provenance);
+        let (member, taken) = if repair {
+            namespace.arrive_repair(posting, range)
+        } else {
+            namespace.arrive(posting, range, provenance)
+        };
+        let mut took = 0;
         for (part, landed) in taken {
+            took += part.len();
             let from = (part.start - offset) as usize;
             let piece = bytes.slice(from..from + part.len() as usize);
             let arrived = (part.start, piece, landed);
             self.take(node, member, arrived, builder, effects);
         }
+        took
     }
 
     // What a member took of a delivery: kept at its front, handed to its
@@ -2704,16 +2750,31 @@ impl Tree {
         node: NodeId,
         member: MemberId,
         kind: Kind,
-        (name, prefix, length): (&str, &[u8], Option<u64>),
+        front: (&str, &[u8], Option<u64>),
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
+        if self.found_one(node, member, kind, front, builder, effects) {
+            self.found_by_name(node, builder, effects);
+        }
+    }
+
+    // [`Self::found`] for the one member: whether it founded an object.
+    fn found_one(
+        &mut self,
+        node: NodeId,
+        member: MemberId,
+        kind: Kind,
+        (name, prefix, length): (&str, &[u8], Option<u64>),
+        builder: &mut dyn Builder,
+        effects: &mut Vec<Effect>,
+    ) -> bool {
         if let Some(mut members) = self.nodes.members_mut(node) {
             members.decide(member);
         }
         if self.refuted_with_its_set(node, member, kind, (name, prefix, length), builder) {
             self.claim_as_said(node, member, builder, effects);
-            return;
+            return false;
         }
         let volumes = |object: &mut dyn Object, given: &Given| {
             let volume = match given.get(&(node, member)) {
@@ -2729,10 +2790,13 @@ impl Tree {
                 if matches!(signed(prefix, length), Sniff::Object(_)) {
                     self.take_claimed(node, child, effects);
                 }
-                self.found_by_name(node, builder, effects);
+                true
             }
-            Ok(None) => {}
-            Err(why) => effects.push(Effect::Refused { node, member, why }),
+            Ok(None) => false,
+            Err(why) => {
+                effects.push(Effect::Refused { node, member, why });
+                false
+            }
         }
     }
 
@@ -2803,24 +2867,47 @@ impl Tree {
     // own front comes and signs another kind, the member leaves the set and
     // its bytes say what it is; otherwise an object another member's bytes
     // found takes it where its own claim places it, as from any object
-    // founded on names.
+    // founded on names. Each set so founded is followed by the next, one
+    // after another and never one inside another, however many sets the
+    // post names. The members are looked over once: founding a set only
+    // takes members, so one that an earlier set took is passed over when
+    // its turn comes.
     fn found_by_name(
         &mut self,
         node: NodeId,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        let named = self.namespace(node).and_then(|namespace| {
-            namespace
-                .members()
-                .filter(|record| self.undecided_recovery(node, record.id))
-                .find_map(|record| {
-                    let kind = crate::sniff::recovery_by_name(&record.name)?;
-                    Some((record.id, record.name.clone(), record.length, kind))
-                })
-        });
-        if let Some((member, name, length, kind)) = named {
-            self.found(node, member, kind, (&name, &[], length), builder, effects);
+        let named: Vec<(MemberId, Kind)> = self
+            .namespace(node)
+            .map(|namespace| {
+                namespace
+                    .members()
+                    .filter(|record| {
+                        #[cfg(test)]
+                        NAMED_CANDIDATES.with(|seen| seen.set(seen.get() + 1));
+                        self.undecided_recovery(node, record.id)
+                    })
+                    .filter_map(|record| {
+                        Some((record.id, crate::sniff::recovery_by_name(&record.name)?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (member, kind) in named {
+            if !self.undecided_recovery(node, member) {
+                continue;
+            }
+            let Some((name, length)) = self
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .map(|record| (record.name.clone(), record.length))
+            else {
+                continue;
+            };
+            if !self.found_one(node, member, kind, (&name, &[], length), builder, effects) {
+                return;
+            }
         }
     }
 
@@ -5615,6 +5702,118 @@ mod tests {
             child: store
         }));
         assert!(tree.namespace(named).is_none(), "an empty set goes");
+    }
+
+    // A pretend recovery set that takes no volume but the one that founds
+    // it, as a set does of a volume named for another set.
+    struct Lone;
+
+    impl Object for Lone {
+        fn unposted(&mut self, _: crate::VolumeIndex, _: crate::ByteRange) {}
+
+        fn kind(&self) -> Kind {
+            Kind::RarRecovery
+        }
+        fn deliver(
+            &mut self,
+            _: Delivery<'_>,
+            _: &mut dyn FnMut(&Placement, &mut Vec<u8>) -> bool,
+            _: &mut Vec<Emit>,
+        ) {
+        }
+        fn volume_closed(&mut self, _: VolumeIndex, _: &mut Vec<Emit>) {}
+        fn volume_lost(&mut self, _: VolumeIndex, _: ByteRange, _: &mut Vec<Emit>) {}
+        fn wants(&self, _: &mut Vec<Seek>) {}
+        fn pulled(&mut self, _: Seek, _: Pull, _: &mut Vec<Emit>) {}
+        fn locate(&self, volume: VolumeIndex, range: ByteRange, out: &mut Vec<Placement>) {
+            out.push(Placement::Envelope {
+                envelope: volume.0,
+                range,
+            });
+        }
+        fn extent(&self, _: MemberId, _: ByteRange, _: &mut Vec<Extent>) -> Located {
+            Located::Never
+        }
+        fn envelope(&self, _: u32, _: ByteRange) -> Option<Bytes> {
+            None
+        }
+        fn bound(&mut self, _: VolumeIndex, _: &str, _: &[u8], _: Option<u64>) {}
+        fn claim(&mut self, _: &str, _: &[u8], _: Option<u64>) -> Claim {
+            std::iter::empty().collect()
+        }
+        fn taken(&mut self, _: VolumeIndex) {}
+    }
+
+    // Builds as `Build` does, and a lone recovery set besides, noting where
+    // on the stack each of those is built.
+    struct Depths(Vec<usize>);
+
+    impl Builder for Depths {
+        fn build(&mut self, kind: Kind, id: ObjectId) -> Option<Box<dyn Object>> {
+            if kind != Kind::RarRecovery {
+                return Build.build(kind, id);
+            }
+            let here = 0u8;
+            self.0.push(std::hint::black_box(&raw const here) as usize);
+            Some(Box::new(Lone))
+        }
+        fn read(
+            &self,
+            _: &Tree,
+            _: NodeId,
+            _: VolumeIndex,
+            _: &Placement,
+            _: &mut Vec<u8>,
+        ) -> bool {
+            false
+        }
+    }
+
+    // A post that names many recovery sets, each by one volume whose bytes
+    // have not come: the store the first signed member founds is followed
+    // by every one of them, each founded in turn at the same depth of the
+    // stack, however many there are.
+    #[test]
+    fn the_sets_a_post_names_are_founded_one_after_another() {
+        const SETS: usize = 300;
+        let mut tree = Tree::new();
+        let named: Vec<MemberId> = (0..SETS)
+            .map(|set| tree.announce_root(&format!("set{set}.rev"), Some(100), &mut Vec::new()))
+            .collect();
+        let first = tree.announce_root("show.rar", None, &mut Vec::new());
+        let mut bytes = SIGNATURE.to_vec();
+        bytes.extend_from_slice(b"hello");
+        let mut build = Depths(Vec::new());
+        let before = NAMED_CANDIDATES.with(std::cell::Cell::get);
+        tree.deliver(
+            NodeId::ROOT,
+            first,
+            Posted {
+                offset: 0,
+                bytes: bytes.into(),
+                provenance: Provenance::Fresh,
+            },
+            &mut build,
+            &mut Vec::new(),
+        );
+        let looked = NAMED_CANDIDATES.with(std::cell::Cell::get) - before;
+        assert_eq!(
+            looked,
+            SETS + 1,
+            "the members are looked over once, not once for each set"
+        );
+        let store = tree.child_of(NodeId::ROOT, first).expect("bound").0;
+        let sets: BTreeSet<NodeId> = named
+            .iter()
+            .map(|member| tree.child_of(NodeId::ROOT, *member).expect("founded").0)
+            .collect();
+        assert_eq!(sets.len(), SETS, "each names a set of its own");
+        assert!(!sets.contains(&store));
+        assert_eq!(build.0.len(), SETS);
+        assert!(
+            build.0.iter().all(|depth| *depth == build.0[0]),
+            "no set is founded inside another's founding"
+        );
     }
 
     // A member whose front stopped at a lost slice, 66 bytes in, cannot yet
