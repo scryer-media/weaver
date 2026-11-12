@@ -2630,3 +2630,37 @@ fn an_unchanged_seek_is_answered_without_mapping_its_range_again() {
     root.map.seek(VolumeIndex(0), whole, critical);
     assert_eq!(SEEK_MAPPED.with(std::cell::Cell::get), 1);
 }
+
+// A round of seeks over many gaps, asked again with nothing changed, is told
+// the same answers in the same order and maps none of them again. Each memo
+// answer is also checked against a fresh mapping inside `seek`.
+#[test]
+fn a_repeated_round_over_many_gaps_is_answered_from_the_memo() {
+    let mut root = ArticleRoot::new(&[file("volume.vol", &[100; 64])]);
+    for ordinal in (1..64).step_by(2) {
+        root.map.lost(VolumeIndex(0), ordinal);
+    }
+    let asks: Vec<(ByteRange, Option<Class>)> = (1..64u64)
+        .step_by(2)
+        .flat_map(|ordinal| {
+            let gap = ByteRange::new(ordinal * 100, ordinal * 100 + 100);
+            [(gap, None), (gap, Some(Class::Critical))]
+        })
+        .collect();
+    let round = |root: &mut ArticleRoot| -> Vec<Pull> {
+        asks.iter()
+            .map(|(range, class)| root.map.seek(VolumeIndex(0), *range, *class))
+            .collect()
+    };
+    // The first round raises what can still come; the second settles.
+    round(&mut root);
+    let settled = round(&mut root);
+    SEEK_MAPPED.with(|calls| calls.set(0));
+    for _ in 0..3 {
+        assert_eq!(round(&mut root), settled);
+    }
+    assert_eq!(SEEK_MAPPED.with(std::cell::Cell::get), 0);
+    root.map.lost(VolumeIndex(0), 0);
+    round(&mut root);
+    assert!(SEEK_MAPPED.with(std::cell::Cell::get) > 0);
+}

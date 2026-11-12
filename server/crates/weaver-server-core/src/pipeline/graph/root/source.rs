@@ -214,7 +214,7 @@ struct Volume {
     // class, a boundary, the order the volume is placed in.
     changes: u64,
     // The seeks answered since the last change, and what each was told.
-    answered: Vec<(ByteRange, Option<Class>, Pull)>,
+    answered: HashMap<(ByteRange, Option<Class>), Pull>,
 }
 
 impl Volume {
@@ -253,7 +253,7 @@ impl Volume {
             cuts: Vec::new(),
             marks: Marks::default(),
             changes: 0,
-            answered: Vec::new(),
+            answered: HashMap::new(),
         }
     }
 
@@ -1046,10 +1046,7 @@ impl ArticleMap {
         // what it was, without mapping its range again: one that moved
         // articles changed them, so only an answer that moved none stands.
         if let Some(found) = self.volumes.get(volume.0 as usize)
-            && let Some(&(_, _, pull)) = found
-                .answered
-                .iter()
-                .find(|(asked, of, _)| *asked == range && *of == class)
+            && let Some(&pull) = found.answered.get(&(range, class))
         {
             #[cfg(test)]
             {
@@ -1069,7 +1066,7 @@ impl ArticleMap {
         if let Some(found) = self.volumes.get_mut(volume.0 as usize)
             && Some(found.changes) == changes
         {
-            found.answered.push((range, class, pull));
+            found.answered.insert((range, class), pull);
         }
         pull
     }
