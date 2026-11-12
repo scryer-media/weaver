@@ -3958,6 +3958,124 @@ async fn a_read_key_sees_no_feed_or_blocklist_passkey() {
     );
 }
 
+// An article's link is its download link, which can carry an indexer's key
+// or a tracker's passkey: a key that only reads sees its scheme, host and
+// port, and of a magnet only its scheme. One that controls sees it whole.
+#[tokio::test]
+async fn a_read_key_sees_no_article_link_passkey() {
+    const INDEXER: &str = "https://indexer.invalid/api?t=get&id=1&apikey=item5ecret";
+    const MAGNET: &str = "magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567\
+        &tr=https%3A%2F%2Ftracker.invalid%2Fmagnet5ecret%2Fannounce";
+    const PATH: &str = "/api/v2/rss/items?withData=true";
+    let rig = rig().await;
+    let added = rig
+        .post(
+            "/api/v2/rss/addFeed",
+            &format!("url={}&path=one", url_encode("https://feeds.invalid/rss")),
+        )
+        .await;
+    assert_eq!(added.status, StatusCode::OK);
+    let feed = rig.db.list_rss_feeds().unwrap().remove(0);
+    for (seen_at, (item_id, url)) in [("indexer", INDEXER), ("magnet", MAGNET)]
+        .into_iter()
+        .enumerate()
+    {
+        rig.db
+            .insert_rss_seen_item(&weaver_server_core::RssSeenItemRow {
+                feed_id: feed.id,
+                item_id: item_id.to_owned(),
+                item_title: item_id.to_owned(),
+                published_at: None,
+                size_bytes: None,
+                decision: "accepted".to_owned(),
+                seen_at: 1_700_000_000 + seen_at as i64,
+                job_id: None,
+                item_url: Some(url.to_owned()),
+                error: None,
+            })
+            .unwrap();
+    }
+    let read = |key: &'static str| {
+        let rig = &rig;
+        async move {
+            rig.send(
+                Request::get(PATH)
+                    .header("x-api-key", key)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+        }
+    };
+    let links = |body: &Value| -> Vec<(String, Value, Value)> {
+        body["one"]["articles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|article| {
+                (
+                    article["id"].as_str().unwrap().to_owned(),
+                    article["torrentURL"].clone(),
+                    article["link"].clone(),
+                )
+            })
+            .collect()
+    };
+
+    let reader = read(READER).await;
+    assert!(!reader.body.contains("5ecret"), "{}", reader.body);
+    assert!(!reader.body.contains("tr="), "{}", reader.body);
+    let mut shown = links(&reader.json());
+    shown.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        shown,
+        vec![
+            (
+                "indexer".to_owned(),
+                json!("https://indexer.invalid:443/…"),
+                json!("https://indexer.invalid:443/…"),
+            ),
+            ("magnet".to_owned(), json!("magnet:…"), json!("magnet:…")),
+        ]
+    );
+
+    let admin = read(ADMIN).await;
+    let mut shown = links(&admin.json());
+    shown.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        shown,
+        vec![
+            ("indexer".to_owned(), json!(INDEXER), json!(INDEXER)),
+            ("magnet".to_owned(), json!(MAGNET), json!(MAGNET)),
+        ]
+    );
+}
+
+// The client's RSS rule reads a read key may call are not offered, so they
+// carry no link or URL to either key.
+#[tokio::test]
+async fn rss_rule_reads_carry_no_link() {
+    let rig = rig().await;
+    for path in [
+        "/api/v2/rss/rules",
+        "/api/v2/rss/matchingArticles?ruleName=any",
+        "/api/v2/rss/exportRules",
+    ] {
+        for key in [READER, ADMIN] {
+            let answer = rig
+                .send(
+                    Request::get(path)
+                        .header("x-api-key", key)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await;
+            assert_ne!(answer.status, StatusCode::OK, "{path}");
+            assert!(!answer.body.contains("://"), "{path}: {}", answer.body);
+        }
+    }
+}
+
 // A category's save path and share limits are set where it is created and
 // edited, and read back as the client reads them.
 #[tokio::test]

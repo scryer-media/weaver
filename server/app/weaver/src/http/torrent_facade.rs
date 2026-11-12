@@ -4121,9 +4121,20 @@ async fn feed_by_name(
     Ok(feeds(ctx).await?.into_iter().find(|feed| feed.name == name))
 }
 
+// An article's link as a caller that cannot control reads it: the scheme,
+// host and port of a link to a host, and only the scheme of one without a
+// host, such as a magnet, whose trackers can carry a passkey.
+fn redacted_article_link(link: &str) -> String {
+    match reqwest::Url::parse(link) {
+        Ok(url) if url.host_str().is_none() => format!("{}:…", url.scheme()),
+        _ => redacted_tracker_url(link),
+    }
+}
+
 // qBittorrent `itemsAction`: the root folder, each feed by its name.
-// A feed's URL can carry the indexer's passkey; a caller that cannot
-// control reads only its scheme, host and port.
+// A feed's URL, and each article's link, which is its download link, can
+// carry the indexer's key or a tracker's passkey; a caller that cannot
+// control reads only their scheme, host and port.
 async fn rss_items(ctx: &TorrentFacadeContext, with_data: bool, scope: CallerScope) -> Response {
     let feeds = match feeds(ctx).await {
         Ok(feeds) => feeds,
@@ -4171,7 +4182,11 @@ async fn rss_items(ctx: &TorrentFacadeContext, with_data: bool, scope: CallerSco
                     )
                     .map(|date| date.to_rfc2822())
                     .unwrap_or_default();
-                    let url = article.item_url.clone().unwrap_or_default();
+                    let url = match &article.item_url {
+                        Some(url) if scope.can_control() => url.clone(),
+                        Some(url) => redacted_article_link(url),
+                        None => String::new(),
+                    };
                     json!({
                         "id": article.item_id,
                         "date": date,
