@@ -445,9 +445,15 @@ fn visit_nzb_files<R: BufRead>(
                         }
                     }
                     "group" if current_file.is_some() => {
+                        // A group name is one word on the command line it is
+                        // sent in, so whitespace or a control character inside
+                        // one is no group, as an empty one is.
                         let group = text_buf.trim();
                         if let Some(ref mut f) = current_file
                             && !group.is_empty()
+                            && !group
+                                .bytes()
+                                .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
                         {
                             f.groups.push(group.to_owned());
                         }
@@ -947,6 +953,12 @@ impl SegmentBuilder {
 
         if message_id.is_empty() {
             return Some("missing message id");
+        }
+
+        // A message-ID is written into a command line, so a line break or any
+        // other control character inside one makes it no message-ID.
+        if message_id.bytes().any(|byte| byte.is_ascii_control()) {
+            return Some("control character in message id");
         }
 
         None
@@ -1765,6 +1777,194 @@ mod tests {
         assert_eq!(segments[1].message_ids, ["second"]);
         assert_eq!(diagnostics.files[0].duplicate_segment_numbers, 2);
     }
+
+    #[test]
+    fn command_breaking_groups_are_no_groups() {
+        let xml = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="s">
+    <groups>
+      <group>alt.binaries.test&#13;&#10;QUIT</group>
+      <group>alt.binaries.a&#10;b</group>
+      <group>alt.binaries.a&#13;b</group>
+      <group>alt.binaries.a&#9;b</group>
+      <group>alt.binaries.a b</group>
+      <group>alt.binaries.a&#127;b</group>
+      <group>  alt.binaries.kept  </group>
+      <group>alt.binaries&nbsp;caf&eacute;</group>
+    </groups>
+    <segments>
+      <segment bytes="1" number="1">a@host</segment>
+    </segments>
+  </file>
+  <file poster="p" date="0" subject="t">
+    <groups><group>g&#13;&#10;ARTICLE &lt;x@y&gt;</group></groups>
+    <segments>
+      <segment bytes="1" number="1">b@host</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let nzb = parse_nzb(xml).unwrap();
+        assert_eq!(
+            nzb.files[0].groups,
+            ["alt.binaries.kept", "alt.binaries\u{a0}caf\u{e9}"]
+        );
+        // A file whose only group breaks the command line is a file with no
+        // group, as a file whose only group is empty is.
+        assert!(nzb.files[1].groups.is_empty());
+        assert_eq!(nzb.files[1].segments.len(), 1);
+    }
+
+    #[test]
+    fn command_breaking_message_ids_are_malformed_segments() {
+        let xml = "<?xml version=\"1.0\"?>
+<nzb>
+  <file poster=\"p\" date=\"0\" subject=\"s\">
+    <groups><group>g</group></groups>
+    <segments>
+      <segment bytes=\"1\" number=\"1\">a@host&#13;&#10;QUIT</segment>
+      <segment bytes=\"1\" number=\"2\">&lt;b@host&gt;&#13;&#10;GROUP x</segment>
+      <segment bytes=\"1\" number=\"3\">c@ho&#10;st</segment>
+      <segment bytes=\"1\" number=\"4\">d@ho&#13;st</segment>
+      <segment bytes=\"1\" number=\"5\">e@ho&#9;st</segment>
+      <segment bytes=\"1\" number=\"6\">f@ho\tst</segment>
+      <segment bytes=\"1\" number=\"7\">g@ho&#127;st</segment>
+      <segment bytes=\"1\" number=\"8\">  &lt;kept@host&gt;  </segment>
+      <segment bytes=\"1\" number=\"9\">with space@host</segment>
+      <segment bytes=\"1\" number=\"10\">caf\u{e9}@h\u{f4}st</segment>
+    </segments>
+  </file>
+</nzb>";
+        let (nzb, diagnostics) = parse_nzb_with_diagnostics(xml.as_bytes()).unwrap();
+        let file = &nzb.files[0];
+        assert_eq!(
+            file.segments
+                .iter()
+                .map(|segment| (segment.number, segment.message_id()))
+                .collect::<Vec<_>>(),
+            [
+                (8, "kept@host"),
+                (9, "with space@host"),
+                (10, "caf\u{e9}@h\u{f4}st")
+            ]
+        );
+        assert_eq!(diagnostics.files[0].malformed_segments, 7);
+    }
+
+    // What a parse produced, as plain values: per file, its groups and, per
+    // segment, its number, size and message-IDs.
+    fn parse_summary(xml: &[u8]) -> String {
+        let (nzb, diagnostics) = parse_nzb_with_diagnostics(xml).unwrap();
+        let mut out = String::new();
+        for (file, notes) in nzb.files.iter().zip(&diagnostics.files) {
+            write!(
+                out,
+                "{:?}|{:?}|{}|",
+                file.subject, file.groups, notes.malformed_segments
+            )
+            .unwrap();
+            for segment in &file.segments {
+                write!(
+                    out,
+                    "{}:{}:{:?},",
+                    segment.number, segment.bytes, segment.message_ids
+                )
+                .unwrap();
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn ordinary_nzbs_parse_as_before() {
+        let entities: &[u8] = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p&amp;q" date="0" subject="Title &amp; More - &quot;file.rar&quot; yEnc (1/1)">
+    <groups><group>alt.binaries.test</group></groups>
+    <segments><segment bytes="1" number="1">&lt;abc@host&gt;</segment></segments>
+  </file>
+</nzb>"#;
+        let namespaced: &[u8] = br#"<?xml version="1.0"?>
+<n:nzb xmlns:n="http://www.newzbin.com/DTD/2003/nzb">
+  <n:file poster="p" date="0" subject="namespaced.bin">
+    <n:groups><n:group>alt.binaries.test</n:group></n:groups>
+    <n:segments><n:segment bytes="1" number="1">id@example</n:segment></n:segments>
+  </n:file>
+</n:nzb>"#;
+        let malformed: &[u8] = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="mixed-segments.bin">
+    <groups><group>g</group></groups>
+    <segments>
+      <segment bytes="bad" number="1">bad-bytes</segment>
+      <segment bytes="1" number="bad">bad-number</segment>
+      <segment bytes="0" number="2">zero-bytes</segment>
+      <segment bytes="1" number="0">zero-number</segment>
+      <segment bytes="33554433" number="3">too-large</segment>
+      <segment bytes="1">missing-number</segment>
+      <segment number="4">missing-bytes</segment>
+      <segment bytes="1" number="5"></segment>
+      <segment bytes="42" number="6">valid</segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let duplicates: &[u8] = br#"<?xml version="1.0"?>
+<nzb>
+  <file poster="p" date="0" subject="duplicates.bin">
+    <groups>
+      <group>g</group>
+      <group>  alt.binaries&nbsp;caf&eacute;  </group>
+      <group>   </group>
+    </groups>
+    <segments>
+      <segment bytes="3" number="3">third</segment>
+      <segment bytes="1" number="1">same-id</segment>
+      <segment bytes="2" number="1">duplicate-number</segment>
+      <segment bytes="2" number="2">same-id</segment>
+      <segment bytes="100" number="100">
+        &lt;sparse@host&gt;
+      </segment>
+    </segments>
+  </file>
+</nzb>"#;
+        let fixtures: [(&str, &[u8]); 6] = [
+            ("minimal", MINIMAL_NZB),
+            ("full", FULL_NZB),
+            ("entities", entities),
+            ("namespaced", namespaced),
+            ("malformed", malformed),
+            ("duplicates", duplicates),
+        ];
+        let mut all = String::new();
+        for (name, xml) in fixtures {
+            writeln!(all, "== {name}").unwrap();
+            all.push_str(&parse_summary(xml));
+        }
+        assert_eq!(all, ORDINARY_NZB_SUMMARY);
+    }
+
+    // The parse of the ordinary NZBs above.
+    const ORDINARY_NZB_SUMMARY: &str = concat!(
+        "== minimal\n",
+        "\"test file - \\\"movie.part01.rar\\\" yEnc (1/5)\"|[\"alt.binaries.test\"]|0|",
+        "1:500000:[\"abc123@example.com\"],\n",
+        "== full\n",
+        "\"Title - [01/10] - \\\"file.rar\\\" yEnc (1/5)\"|[\"alt.binaries.test\"]|0|",
+        "1:500000:[\"abc123@example.com\"],2:500000:[\"def456@example.com\"],\n",
+        "\"Title - [02/10] - \\\"file.r00\\\" yEnc (1/3)\"|",
+        "[\"alt.binaries.test\", \"alt.binaries.misc\"]|0|1:300000:[\"ghi789@example.com\"],\n",
+        "== entities\n",
+        "\"Title & More - \\\"file.rar\\\" yEnc (1/1)\"|[\"alt.binaries.test\"]|0|",
+        "1:1:[\"abc@host\"],\n",
+        "== namespaced\n",
+        "\"namespaced.bin\"|[\"alt.binaries.test\"]|0|1:1:[\"id@example\"],\n",
+        "== malformed\n",
+        "\"mixed-segments.bin\"|[\"g\"]|7|0:1:[\"zero-number\"],6:42:[\"valid\"],\n",
+        "== duplicates\n",
+        "\"duplicates.bin\"|[\"g\", \"alt.binaries\\u{a0}café\"]|0|",
+        "1:1:[\"same-id\", \"duplicate-number\"],3:3:[\"third\"],100:100:[\"sparse@host\"],\n",
+    );
 
     #[test]
     fn duplicate_segment_message_ids_are_skipped() {

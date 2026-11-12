@@ -606,3 +606,142 @@ fn name_classes() {
     assert_eq!(stem_class("Invented.Title.2031"), StemClass::Readable);
     assert_eq!(stem_class("plainlowercasewordsonly"), StemClass::Readable);
 }
+
+// The answer `classify_name` gave before it read the extension by bytes.
+// Only valid for ASCII names, where every byte offset is a boundary.
+fn classify_name_ascii_reference(name: &str) -> NameShape {
+    let lower = name.to_ascii_lowercase();
+    if let Some(stem) = lower.strip_suffix(".par2") {
+        return if reference_volume_suffix(stem) {
+            NameShape::Par2Volume
+        } else {
+            NameShape::Par2Index
+        };
+    }
+    if let Some(stem) = lower.strip_suffix(".par3") {
+        return if reference_volume_suffix(stem) {
+            NameShape::Par3Volume
+        } else {
+            NameShape::Par3Index
+        };
+    }
+    if let Some(stem) = lower.strip_suffix(".rar") {
+        return match stem.rsplit_once(".part") {
+            Some((_, number))
+                if !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit()) =>
+            {
+                NameShape::PartNn
+            }
+            _ => NameShape::Rar,
+        };
+    }
+    if lower.ends_with(".7z") {
+        return NameShape::SevenZ;
+    }
+    let Some((stem, ext)) = lower.rsplit_once('.') else {
+        return NameShape::Bare;
+    };
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    if ext.len() == 3 && digits(ext) {
+        return if stem.ends_with(".7z") {
+            NameShape::SevenZNnn
+        } else {
+            NameShape::Nnn
+        };
+    }
+    if ext.len() == 3 && digits(&ext[1..]) {
+        match ext.as_bytes()[0] {
+            b'r' => return NameShape::RNn,
+            b's' => return NameShape::SNn,
+            _ => {}
+        }
+    }
+    if ext.is_empty() {
+        NameShape::Bare
+    } else {
+        NameShape::Plain
+    }
+}
+
+#[test]
+fn name_classes_take_multibyte_extensions() {
+    // One character of 1, 2, 3 and 4 bytes, alone and next to ASCII.
+    let cases = [
+        ("x.a", NameShape::Plain),
+        ("x.é", NameShape::Plain),
+        ("x.€", NameShape::Plain),
+        ("x.𝄞", NameShape::Plain),
+        ("x.é1", NameShape::Plain),
+        ("x.1é", NameShape::Plain),
+        ("x.r€", NameShape::Plain),
+        ("x.€01", NameShape::Plain),
+        ("x.𝄞1", NameShape::Plain),
+        ("€.r01", NameShape::RNn),
+        ("€", NameShape::Bare),
+        ("x.", NameShape::Bare),
+    ];
+    for (name, expected) in cases {
+        assert_eq!(classify_name(name), expected, "{name}");
+        // The extension reader beside it answers too.
+        let _ = file_ext(name);
+    }
+}
+
+#[test]
+fn name_classes_for_ascii_names_are_unchanged() {
+    let stems = ["a", "a.7z", "a.part01", "a.vol0+1", "A.Title.2031", ""];
+    let alphabet = ["", "r", "s", "R", "S", "0", "1", "9", "a", "z", "7"];
+    let mut checked = 0usize;
+    for stem in stems {
+        for one in alphabet {
+            for two in alphabet {
+                for three in alphabet {
+                    for four in ["", "0", "x"] {
+                        let ext = format!("{one}{two}{three}{four}");
+                        for name in [format!("{stem}.{ext}"), format!("{stem}{ext}")] {
+                            assert_eq!(
+                                classify_name(&name),
+                                classify_name_ascii_reference(&name),
+                                "{name}"
+                            );
+                            checked += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for name in [
+        "a.part007.rar",
+        "a.rar",
+        "a.r17",
+        "a.s02",
+        "a.7z",
+        "a.7z.004",
+        "a.004",
+        "a.vol03+04.par2",
+        "a.PAR2",
+        "a.vol0+1.par3",
+        "a.mkv",
+        "abc",
+        "A.S01",
+        "a.t01",
+    ] {
+        assert_eq!(
+            classify_name(name),
+            classify_name_ascii_reference(name),
+            "{name}"
+        );
+        checked += 1;
+    }
+    assert!(checked > 10_000);
+}
+
+fn reference_volume_suffix(stem: &str) -> bool {
+    let digits = |text: &str| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit());
+    stem.rsplit_once(".vol").is_some_and(|(_, suffix)| {
+        suffix
+            .split_once(['+', '-'])
+            .is_some_and(|(start, count)| digits(start) && digits(count))
+    })
+}
