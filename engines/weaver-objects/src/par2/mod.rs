@@ -840,9 +840,20 @@ impl Recovery for Par2 {
     }
 
     // A slice is proven by checksums cut at its boundaries; the whole
-    // member's CRC folds from any.
+    // member's CRC folds from any. Each size once, however many sets share
+    // it.
     fn block_sizes(&self, out: &mut Vec<u64>) {
+        let from = out.len();
         out.extend(self.slice_sizes());
+        out[from..].sort_unstable();
+        let mut kept = from;
+        for at in from..out.len() {
+            if kept == from || out[kept - 1] != out[at] {
+                out[kept] = out[at];
+                kept += 1;
+            }
+        }
+        out.truncate(kept);
     }
 
     fn verdicts(&self, member: MemberId, out: &mut Vec<SliceVerdict>) {
