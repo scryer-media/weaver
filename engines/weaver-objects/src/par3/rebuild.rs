@@ -240,7 +240,8 @@ pub(super) fn repair_set(
         }
         rewrite.insert(index);
     }
-    let copied = copy_held(&held, &unproven, access);
+    let memory = budget.memory_or(super::REPAIR_MEMORY_LIMIT);
+    let copied = copy_held(&held, &unproven, memory.max(READ), access);
     proven.retain(|(member, range)| !copied.contains(&(*member, range.start, range.end)));
     let lost: BTreeSet<u64> = unproven
         .iter()
@@ -291,7 +292,7 @@ pub(super) fn repair_set(
         carried: &carried,
         lost: &lost,
         rows,
-        limits: CodecLimits::new(budget.memory_or(super::REPAIR_MEMORY_LIMIT)),
+        limits: CodecLimits::new(memory),
     };
     solve.write_carried(access);
     let solved = match &matrix {
@@ -330,12 +331,17 @@ fn sum(extent: &FileExtent) -> Option<(par3_rs::Fingerprint, u64)> {
 
 // An extent is its bytes: one a member did not prove whose fingerprint an
 // extent another member proved carries is those bytes, copied from it, and
-// costs no recovery block. Each copied, as its member and range.
+// costs no recovery block. Each copied, as its member and range. It is
+// copied a piece of at most `piece` bytes at a time, so an extent no longer
+// than a piece is one read and one write; one whose piece does not read is
+// not copied, and the pieces before it are written by then.
 fn copy_held(
     held: &BTreeMap<(par3_rs::Fingerprint, u64), (MemberId, Range<u64>)>,
     unproven: &[(Option<MemberId>, FileExtent)],
+    piece: u64,
     access: &mut dyn MemberAccess,
 ) -> BTreeSet<(MemberId, u64, u64)> {
+    let piece = piece.max(1);
     let mut copied = BTreeSet::new();
     let mut bytes = Vec::new();
     for (member, extent) in unproven {
@@ -344,10 +350,21 @@ fn copy_held(
         else {
             continue;
         };
-        let from = ByteRange::new(from.start, from.end);
-        bytes.clear();
-        if access.read(*holder, from, &mut bytes) && bytes.len() as u64 == from.len() {
-            access.write_repaired(*into, extent.range.start, &bytes);
+        let mut at = from.start;
+        let whole = loop {
+            let end = from.end.min(at.saturating_add(piece));
+            let range = ByteRange::new(at, end);
+            bytes.clear();
+            if !access.read(*holder, range, &mut bytes) || bytes.len() as u64 != range.len() {
+                break false;
+            }
+            access.write_repaired(*into, extent.range.start + (at - from.start), &bytes);
+            at = end;
+            if at >= from.end {
+                break true;
+            }
+        };
+        if whole {
             copied.insert((*into, extent.range.start, extent.range.end));
         }
     }
@@ -765,5 +782,91 @@ impl AnyDecoder {
             Self::Gf8(decoder) => decoder.solve().ok(),
             Self::Gf16(decoder) => decoder.solve().ok(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // An extent copied a piece at a time writes the bytes a copy taken whole
+    // writes, at the same offsets, reading every byte of the holder's once;
+    // no read or write is longer than a piece, and an extent no longer than
+    // one is one read and one write. A piece that does not read leaves the
+    // extent not copied.
+    #[test]
+    fn a_held_extent_is_copied_a_piece_at_a_time() {
+        struct Pieces {
+            bytes: Vec<u8>,
+            fail_from: u64,
+            reads: Vec<ByteRange>,
+            writes: Vec<(u64, Vec<u8>)>,
+        }
+        impl MemberAccess for Pieces {
+            fn read(&mut self, _: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+                self.reads.push(range);
+                if range.end > self.fail_from {
+                    return false;
+                }
+                into.extend_from_slice(&self.bytes[range.start as usize..range.end as usize]);
+                true
+            }
+            fn write_repaired(&mut self, _: MemberId, offset: u64, bytes: &[u8]) {
+                self.writes.push((offset, bytes.to_vec()));
+            }
+            fn length(&self, _: MemberId) -> Option<u64> {
+                Some(self.bytes.len() as u64)
+            }
+        }
+        let bytes: Vec<u8> = (0..64u8).map(|byte| byte.wrapping_mul(37) ^ 0x5A).collect();
+        let (holder, into) = (MemberId(1), MemberId(2));
+        let fingerprint = par3_rs::Fingerprint::default();
+        let extent = FileExtent {
+            range: 100..123,
+            kind: ExtentKind::Block {
+                index: 0,
+                offset: 0,
+                fingerprint: Some(fingerprint),
+                rolling_hash: None,
+            },
+        };
+        let mut held = BTreeMap::new();
+        held.insert((fingerprint, 23), (holder, 10..33));
+        let unproven = [(Some(into), extent)];
+        for piece in [1, 4, 7, u64::MAX] {
+            let mut access = Pieces {
+                bytes: bytes.clone(),
+                fail_from: u64::MAX,
+                reads: Vec::new(),
+                writes: Vec::new(),
+            };
+            let copied = copy_held(&held, &unproven, piece, &mut access);
+            assert_eq!(copied, BTreeSet::from([(into, 100, 123)]));
+            let mut written = Vec::new();
+            for (offset, piece_bytes) in &access.writes {
+                assert_eq!(*offset, 100 + written.len() as u64);
+                assert!(piece_bytes.len() as u64 <= piece);
+                written.extend_from_slice(piece_bytes);
+            }
+            assert_eq!(written, bytes[10..33]);
+            let mut next = 10;
+            for read in &access.reads {
+                assert_eq!(read.start, next);
+                assert!(read.len() <= piece);
+                next = read.end;
+            }
+            assert_eq!(next, 33);
+            if piece == u64::MAX {
+                assert_eq!((access.reads.len(), access.writes.len()), (1, 1));
+            }
+        }
+        let mut access = Pieces {
+            bytes,
+            fail_from: 18,
+            reads: Vec::new(),
+            writes: Vec::new(),
+        };
+        assert!(copy_held(&held, &unproven, 4, &mut access).is_empty());
+        assert_eq!(access.writes.len(), 2);
     }
 }

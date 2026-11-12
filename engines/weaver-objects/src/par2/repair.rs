@@ -11,14 +11,14 @@
 
 use std::cell::RefCell;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 
 use par2_rs::verify::FileAccess;
 use par2_rs::{
     FileHashState, FileId, FileStatus, FileVerification, Packet, Par2Error, Par2FileSet,
-    RecoverySlice, RepairOptions, Repairability, SliceChecksumState, VerificationResult,
-    execute_repair_with_options, parse_packet, plan_repair_with_memory_limit,
+    RecoverySlice, RecoverySliceData, RepairOptions, Repairability, SliceChecksumState,
+    VerificationResult, execute_repair_with_options, parse_packet, plan_repair_with_memory_limit,
 };
 use weaver_graph::recovery::{MemberAccess, RepairOutcome};
 use weaver_graph::{ByteRange, MemberId, SliceVerdict};
@@ -26,6 +26,10 @@ use weaver_graph::{ByteRange, MemberId, SliceVerdict};
 use super::evidence::Evidence;
 use super::sets::{Length, SetState};
 use crate::grid::Grid;
+
+// The piece a sweep reads at a time when it holds nothing whole, and the
+// least a copy reads at a time.
+const CHUNK: u64 = 1 << 20;
 
 // What one set's repair came to.
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
@@ -116,7 +120,14 @@ pub(super) fn repair_set(
         })
         .collect();
     let mut donors = BTreeMap::new();
-    let copied = copy_held(state, index, &mut validity, access, &mut donors);
+    let copied = copy_held(
+        state,
+        index,
+        &mut validity,
+        memory_limit,
+        access,
+        &mut donors,
+    );
     proven.retain(|(member, range)| {
         !copied.iter().any(|(into, slice)| {
             into == member && slice.start <= range.start && range.end <= slice.end
@@ -174,15 +185,34 @@ pub(super) fn repair_set(
     // As many blocks as slices are damaged, and more while those read do
     // not solve for them: not every choice of blocks does.
     let mut wanted = damaged;
+    let mut held = Held::new(damaged, slice_size, memory_limit);
     let plan = loop {
-        spend(state, slice_size, wanted, &mut set.recovery_slices, access);
+        spend(
+            state,
+            slice_size,
+            wanted,
+            &mut set.recovery_slices,
+            &mut held,
+            access,
+        );
         let available = set.recovery_slices.len() as u64;
         if available < wanted {
             return short(available, access);
         }
         let verification = verification(&set, &validity, damaged);
         match plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) {
-            Ok(plan) => break plan,
+            Ok(plan) => {
+                if fill(
+                    state,
+                    slice_size,
+                    &plan.recovery_exponents,
+                    &mut set.recovery_slices,
+                    &mut held,
+                    access,
+                ) {
+                    break plan;
+                }
+            }
             Err(Par2Error::InsufficientRecoveryData { deficit, .. }) => {
                 wanted = available + u64::from(deficit);
             }
@@ -197,6 +227,13 @@ pub(super) fn repair_set(
         }
     };
     let available = set.recovery_slices.len() as u64;
+    // The blocks the plan did not choose are not spent: their payloads go
+    // before the repair runs.
+    if set.recovery_slices.len() > plan.recovery_exponents.len() {
+        let chosen: BTreeSet<u32> = plan.recovery_exponents.iter().copied().collect();
+        set.recovery_slices
+            .retain(|exponent, _| chosen.contains(exponent));
+    }
     let members: BTreeMap<FileId, MemberId> = state.members().clone();
     let mut files = Files {
         access: RefCell::new(access),
@@ -236,6 +273,7 @@ fn copy_held(
     state: &SetState,
     index: &Par2FileSet,
     validity: &mut [(FileId, Vec<bool>)],
+    memory_limit: usize,
     access: &mut dyn MemberAccess,
     donors: &mut BTreeMap<(FileId, u64), (MemberId, ByteRange)>,
 ) -> Vec<(MemberId, ByteRange)> {
@@ -267,6 +305,7 @@ fn copy_held(
         .collect();
     let mut copied = Vec::new();
     let mut buffer = Vec::new();
+    let piece = (memory_limit as u64).max(CHUNK);
     for (at, slice, from, from_slice) in held {
         let file = validity[at].0;
         let (Some(&into), Some(&holder), Some(target), Some(source)) = (
@@ -277,12 +316,9 @@ fn copy_held(
         ) else {
             continue;
         };
-        buffer.clear();
-        if !access.read(holder, source, &mut buffer) || buffer.len() as u64 != source.len() {
+        if !copy_slice(access, (holder, source), (into, target), piece, &mut buffer) {
             continue;
         }
-        buffer.resize(target.len() as usize, 0);
-        access.write_repaired(into, target.start, &buffer);
         validity[at].1[slice as usize] = true;
         // The destination remains staged until acknowledgment. Keep the
         // original verified source for any later Reed-Solomon reads.
@@ -290,6 +326,43 @@ fn copy_held(
         copied.push((into, target));
     }
     copied
+}
+
+// Copy the source range over the target range, a piece of at most `piece`
+// bytes at a time: the source's bytes, then zeros to the target's length,
+// cut at its end. A slice no longer than a piece is one read and one write.
+// Every byte of the source is read, as a copy taken whole reads them, and
+// the copy fails when any piece does not read; the pieces before it are
+// written by then.
+fn copy_slice(
+    access: &mut dyn MemberAccess,
+    (holder, source): (MemberId, ByteRange),
+    (into, target): (MemberId, ByteRange),
+    piece: u64,
+    buffer: &mut Vec<u8>,
+) -> bool {
+    let piece = piece.max(1);
+    let span = source.len().max(target.len());
+    let mut at = 0;
+    while at < span {
+        let end = (at + piece).min(span);
+        buffer.clear();
+        let from = ByteRange::new(
+            source.start + at.min(source.len()),
+            source.start + end.min(source.len()),
+        );
+        if !from.is_empty()
+            && (!access.read(holder, from, buffer) || buffer.len() as u64 != from.len())
+        {
+            return false;
+        }
+        if at < target.len() {
+            buffer.resize((end.min(target.len()) - at) as usize, 0);
+            access.write_repaired(into, target.start + at, buffer);
+        }
+        at = end;
+    }
+    true
 }
 
 // One slice's share of the described file.
@@ -484,7 +557,6 @@ fn whole_file_matches(
     access: &mut dyn MemberAccess,
     kept: &mut Kept,
 ) -> Option<bool> {
-    const CHUNK: u64 = 1 << 20;
     let description = index.file_description(&file)?;
     if access.length(member) != Some(description.length) {
         return None;
@@ -626,12 +698,14 @@ fn read_slice(
 // Read recovery packets back from the volumes, in exponent order, until
 // `wanted` pass their hash, on from the last already read. The scan checked it;
 // the volume is read again here, so it is checked again. One that fails is
-// forgotten.
+// forgotten. One that passes past what `held` allows is counted, and its
+// payload let go.
 fn spend(
     state: &mut SetState,
     slice_size: u64,
     wanted: u64,
     slices: &mut BTreeMap<u32, RecoverySlice>,
+    held: &mut Held,
     access: &mut dyn MemberAccess,
 ) {
     let mut bad = Vec::new();
@@ -647,6 +721,7 @@ fn spend(
         let read = access.read_volume(location.volume, location.range, &mut buffer);
         match read.then(|| recovery_slice(&buffer, slice_size)).flatten() {
             Some(data) => {
+                let data = held.hold(exponent, data);
                 slices.insert(exponent, RecoverySlice { exponent, data });
             }
             None => bad.push(exponent),
@@ -654,6 +729,83 @@ fn spend(
     }
     for exponent in bad {
         state.recovery.remove(&exponent);
+    }
+}
+
+// Read back the payloads of the blocks the plan chose that were counted but
+// not held, as `spend` read them. One that no longer passes is forgotten,
+// and the plan is made again: false.
+fn fill(
+    state: &mut SetState,
+    slice_size: u64,
+    chosen: &[u32],
+    slices: &mut BTreeMap<u32, RecoverySlice>,
+    held: &mut Held,
+    access: &mut dyn MemberAccess,
+) -> bool {
+    if held.unheld.is_empty() {
+        return true;
+    }
+    let mut buffer = Vec::new();
+    let mut whole = true;
+    for &exponent in chosen {
+        if !held.unheld.remove(&exponent) {
+            continue;
+        }
+        let data = state.recovery.get(&exponent).and_then(|location| {
+            buffer.clear();
+            access
+                .read_volume(location.volume, location.range, &mut buffer)
+                .then(|| recovery_slice(&buffer, slice_size))
+                .flatten()
+        });
+        match data {
+            Some(data) => {
+                held.bytes = held.bytes.saturating_add(data.len() as u64);
+                slices.insert(exponent, RecoverySlice { exponent, data });
+            }
+            None => {
+                slices.remove(&exponent);
+                state.recovery.remove(&exponent);
+                whole = false;
+            }
+        }
+    }
+    whole
+}
+
+// The recovery payloads a repair holds while it plans. The planner reads a
+// block's exponent, not its bytes, so a block read only to be counted need
+// not be held: the blocks as many as the damaged slices are held always, as
+// those the repair spends, and those read past them while the plan does not
+// solve are held as long as the payloads together are no more than those
+// blocks and as much again, or those blocks and the repair memory limit if
+// that is more. Past that, a block's payload is let go and read again only
+// when the plan chooses it.
+struct Held {
+    bytes: u64,
+    limit: u64,
+    unheld: BTreeSet<u32>,
+}
+
+impl Held {
+    fn new(damaged: u64, slice_size: u64, memory_limit: usize) -> Self {
+        let spent = damaged.saturating_mul(slice_size);
+        Self {
+            bytes: 0,
+            limit: spent.saturating_add(spent.max(memory_limit as u64)),
+            unheld: BTreeSet::new(),
+        }
+    }
+
+    fn hold(&mut self, exponent: u32, data: RecoverySliceData) -> RecoverySliceData {
+        let len = data.len() as u64;
+        if self.bytes.saturating_add(len) <= self.limit {
+            self.bytes += len;
+            return data;
+        }
+        self.unheld.insert(exponent);
+        RecoverySliceData::from(Vec::new())
     }
 }
 
@@ -822,6 +974,92 @@ mod tests {
 
     const BLOCK: u64 = 512;
 
+    // A held slice copied a piece at a time writes the bytes a copy taken
+    // whole writes, the source's then zeros, cut at the target's end, and
+    // reads every byte of the source once; no read or write is longer than
+    // a piece, and a slice no longer than one is one read and one write.
+    #[test]
+    fn a_held_slice_is_copied_a_piece_at_a_time() {
+        struct Pieces {
+            bytes: Vec<u8>,
+            fail_from: u64,
+            reads: Vec<ByteRange>,
+            writes: Vec<(u64, Vec<u8>)>,
+        }
+        impl MemberAccess for Pieces {
+            fn read(&mut self, _: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+                self.reads.push(range);
+                if range.end > self.fail_from {
+                    return false;
+                }
+                into.extend_from_slice(&self.bytes[range.start as usize..range.end as usize]);
+                true
+            }
+            fn write_repaired(&mut self, _: MemberId, offset: u64, bytes: &[u8]) {
+                self.writes.push((offset, bytes.to_vec()));
+            }
+            fn length(&self, _: MemberId) -> Option<u64> {
+                Some(self.bytes.len() as u64)
+            }
+        }
+        let bytes = payload(98, 64);
+        let (holder, into) = (MemberId(1), MemberId(2));
+        for (source_len, target_len) in [(5, 23), (23, 23), (23, 5)] {
+            let source = ByteRange::new(10, 10 + source_len);
+            let target = ByteRange::new(100, 100 + target_len);
+            let mut whole = bytes[10..(10 + source_len) as usize].to_vec();
+            whole.resize(target_len as usize, 0);
+            for piece in [1, 4, 7, u64::MAX] {
+                let mut access = Pieces {
+                    bytes: bytes.clone(),
+                    fail_from: u64::MAX,
+                    reads: Vec::new(),
+                    writes: Vec::new(),
+                };
+                let mut buffer = Vec::new();
+                assert!(copy_slice(
+                    &mut access,
+                    (holder, source),
+                    (into, target),
+                    piece,
+                    &mut buffer
+                ));
+                let mut written = Vec::new();
+                for (offset, piece_bytes) in &access.writes {
+                    assert_eq!(*offset, target.start + written.len() as u64);
+                    assert!(piece_bytes.len() as u64 <= piece);
+                    written.extend_from_slice(piece_bytes);
+                }
+                assert_eq!(written, whole);
+                let mut next = source.start;
+                for read in &access.reads {
+                    assert_eq!(read.start, next);
+                    assert!(read.len() <= piece);
+                    next = read.end;
+                }
+                assert_eq!(next, source.end);
+                if piece == u64::MAX {
+                    assert_eq!((access.reads.len(), access.writes.len()), (1, 1));
+                }
+            }
+        }
+        // A piece that does not read fails the copy.
+        let mut access = Pieces {
+            bytes,
+            fail_from: 18,
+            reads: Vec::new(),
+            writes: Vec::new(),
+        };
+        assert!(!copy_slice(
+            &mut access,
+            (holder, ByteRange::new(10, 33)),
+            (into, ByteRange::new(100, 123)),
+            4,
+            &mut Vec::new()
+        ));
+        assert_eq!(access.writes.len(), 2);
+    }
+
     struct Staged {
         original: Store,
         writes: Vec<(MemberId, u64, Vec<u8>)>,
@@ -944,7 +1182,14 @@ mod tests {
             assert_eq!(valid, [true, false, false]);
             let mut validity = vec![(file, valid)];
             let mut donors = BTreeMap::new();
-            let copied = copy_held(state, &index, &mut validity, &mut access, &mut donors);
+            let copied = copy_held(
+                state,
+                &index,
+                &mut validity,
+                usize::MAX,
+                &mut access,
+                &mut donors,
+            );
             assert_eq!(copied, [(member, ByteRange::new(BLOCK, 2 * BLOCK))]);
             assert_eq!(validity[0].1, [true, true, false]);
             let mut old_target = Vec::new();
@@ -955,7 +1200,14 @@ mod tests {
             );
             let mut set = index;
             set.recovery_slices.clear();
-            spend(state, BLOCK, 1, &mut set.recovery_slices, &mut access);
+            spend(
+                state,
+                BLOCK,
+                1,
+                &mut set.recovery_slices,
+                &mut Held::new(1, BLOCK, usize::MAX),
+                &mut access,
+            );
             assert_eq!(set.recovery_slices.len(), 1);
             let verified = verification(&set, &validity, 1);
             let plan = plan_repair_with_memory_limit(&set, &verified, None).unwrap();
