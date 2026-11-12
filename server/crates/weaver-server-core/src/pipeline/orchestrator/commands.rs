@@ -409,7 +409,6 @@ impl Pipeline {
     // The archive did not commit, so future work belongs to a live job again.
     // Tokens already handed to workers stay cancelled.
     fn restore_after_failed_cancellation(&mut self, job_id: JobId, checkpoint_order_drained: bool) {
-        self.shared_state.clear_job_cancellations(job_id);
         if !self.retiring_graph_jobs.contains_key(&job_id)
             && let Some(super::super::health::PendingGraphTerminal::Failed(failure)) =
                 self.pending_graph_terminals.remove(&job_id)
@@ -446,8 +445,6 @@ impl Pipeline {
         }
         self.db.cancel_event_scripts(job_id.0);
         if origin.is_user() {
-            // Reassert after any earlier failed cancellation withdrew its signal.
-            self.shared_state.cancel_active_job_work(job_id);
             self.raise_queue_script_event(
                 job_id,
                 crate::post_processing::model::QueueEvent::NzbDeleted,
@@ -559,9 +556,6 @@ impl Pipeline {
             .map(PathBuf::from)
             .ok_or(crate::SchedulerError::JobNotFound(job_id))?;
         self.db.cancel_event_scripts(job_id.0);
-        if origin.is_user() {
-            self.shared_state.cancel_active_job_work(job_id);
-        }
         let row = crate::JobHistoryRow {
             job_id: job_id.0,
             job_hash: info.job_hash.map(|hash| hash.to_vec()),

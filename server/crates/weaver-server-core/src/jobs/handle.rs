@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::broadcast;
 
@@ -21,49 +21,6 @@ use crate::pipeline::queue::{Change, Queue};
 
 pub const FINISHED_JOBS_RUNTIME_CAP: usize = 1_000;
 pub const PROPAGATION_WAIT_REASON: &str = "propagation_delay";
-
-type JobCancellationCallback = Arc<dyn Fn() + Send + Sync>;
-
-// Signals active job work without waiting for the single-threaded scheduler
-// loop. This lets a user cancellation interrupt a repair that currently owns
-// that loop before the queued cancellation command is handled.
-#[derive(Clone, Default)]
-struct JobCancellationRegistry {
-    state: Arc<Mutex<JobCancellationState>>,
-}
-
-#[derive(Default)]
-struct JobCancellationState {
-    callbacks: HashMap<JobId, Vec<JobCancellationCallback>>,
-    requested: HashSet<JobId>,
-}
-
-impl JobCancellationRegistry {
-    fn cancel(&self, job_id: JobId) -> bool {
-        let callbacks = {
-            let mut state = self
-                .state
-                .lock()
-                .expect("job cancellation registry poisoned");
-            state.requested.insert(job_id);
-            state.callbacks.get(&job_id).cloned().unwrap_or_default()
-        };
-        let cancelled = !callbacks.is_empty();
-        for callback in callbacks {
-            callback();
-        }
-        cancelled
-    }
-
-    fn clear(&self, job_id: JobId) {
-        let mut state = self
-            .state
-            .lock()
-            .expect("job cancellation registry poisoned");
-        state.callbacks.remove(&job_id);
-        state.requested.remove(&job_id);
-    }
-}
 
 #[derive(Clone)]
 pub struct SharedPipelineState {
@@ -99,7 +56,6 @@ pub struct SharedPipelineState {
     // profile put in force now reaches the next extraction. `u64::MAX` means no profile cap, and
     // the extraction ceiling alone bounds the decoder.
     sevenz_decode_memory_bytes: Arc<AtomicU64>,
-    job_cancellations: JobCancellationRegistry,
     // The per-article stream (`ArticleDownloaded`, `SegmentDecoded`, ...),
     // kept off the job-level broadcast: a download emits several of these
     // per article, and every always-on job-level subscriber (event
@@ -139,7 +95,6 @@ impl SharedPipelineState {
             download_transport: Arc::new(RwLock::new(Vec::new())),
             server_probe_latency: Arc::new(RwLock::new(HashMap::new())),
             sevenz_decode_memory_bytes: Arc::new(AtomicU64::new(u64::MAX)),
-            job_cancellations: JobCancellationRegistry::default(),
             segment_events,
             speed_test: Arc::new(std::sync::Mutex::new(std::sync::Weak::new())),
         }
@@ -343,14 +298,6 @@ impl SharedPipelineState {
 
     pub fn raw_metrics_snapshot(&self) -> MetricsSnapshot {
         self.metrics.raw_snapshot()
-    }
-
-    pub(crate) fn cancel_active_job_work(&self, job_id: JobId) -> bool {
-        self.job_cancellations.cancel(job_id)
-    }
-
-    pub(crate) fn clear_job_cancellations(&self, job_id: JobId) {
-        self.job_cancellations.clear(job_id);
     }
 
     pub fn metrics(&self) -> &Arc<PipelineMetrics> {

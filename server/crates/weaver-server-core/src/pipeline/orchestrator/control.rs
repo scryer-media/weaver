@@ -298,9 +298,6 @@ impl Pipeline {
                     .then_some(*id)
                 })
                 .collect();
-            for id in &ids {
-                self.shared_state.cancel_active_job_work(*id);
-            }
             if !ids.is_empty() {
                 self.start_cancel_jobs(ids, origin);
             }
