@@ -13,7 +13,7 @@ use std::{
     io::{self, IoSlice},
     net::{Ipv4Addr, SocketAddr},
     num::NonZeroUsize,
-    sync::Arc,
+    sync::{Arc, atomic::Ordering},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -26,10 +26,7 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
-use crate::{
-    PollSendToVectored, SocketOpts, Transport, UtpSocket, pacer::PACE_BURST_PACKETS,
-    traits::DefaultUtpEnvironment,
-};
+use crate::{PollSendToVectored, SocketOpts, Transport, UtpSocket, traits::DefaultUtpEnvironment};
 
 #[derive(Clone, Copy)]
 struct Shallow {
@@ -51,6 +48,14 @@ struct Counters {
     // The most data datagrams one endpoint sent at one instant: on the
     // paused clock, every pass of a stream at that instant together.
     peak_data_burst: usize,
+    // Drain intervals that passed before the receiver had everything.
+    drains: u64,
+    // The sender's retransmission timeouts, packets it resent on SACK
+    // evidence, and times it entered recovery.
+    rtos: u64,
+    fast_resends: u64,
+    recoveries: u64,
+    max_cwnd: u64,
 }
 
 struct Endpoint {
@@ -90,6 +95,7 @@ impl Model {
             match (self.next_drain, delivery) {
                 (Some(drain), _) if drain <= now && delivery.is_none_or(|at| drain <= at) => {
                     let mut every = None;
+                    self.counters.drains += 1;
                     for endpoint in self.endpoints.values_mut() {
                         let Some(shallow) = endpoint.shallow else {
                             continue;
@@ -201,8 +207,17 @@ impl Network {
         Ok(len)
     }
 
+    // Brought up to now first, so drains that are due are counted.
     fn counters(&self) -> Counters {
-        self.model.lock().counters
+        let (counters, wakes) = {
+            let mut model = self.model.lock();
+            let wakes = model.advance(Instant::now());
+            (model.counters, wakes)
+        };
+        for waker in wakes {
+            waker.wake();
+        }
+        counters
     }
 
     async fn run(self: Arc<Self>, stop: CancellationToken) {
@@ -307,7 +322,14 @@ fn payload(bytes: usize) -> Vec<u8> {
 // behind `shallow`, and returns what the network counted. The send buffer
 // starts at a megabyte, so the window, not the buffer, bounds the flight.
 async fn transfer(bytes: usize, one_way: Duration, shallow: Option<Shallow>) -> Counters {
-    transfer_in_rounds(bytes, one_way, shallow, None).await
+    transfer_in_rounds(
+        bytes,
+        one_way,
+        shallow,
+        None,
+        NonZeroUsize::new(1024 * 1024),
+    )
+    .await
 }
 
 // [`transfer`], with the writer handing the stream `per_round` bytes at the
@@ -318,6 +340,7 @@ async fn transfer_in_rounds(
     one_way: Duration,
     shallow: Option<Shallow>,
     rounds: Option<(usize, Duration)>,
+    tx_buffer_initial: Option<NonZeroUsize>,
 ) -> Counters {
     let network = Network::new(one_way);
     let stop = CancellationToken::new();
@@ -327,7 +350,7 @@ async fn transfer_in_rounds(
             DefaultUtpEnvironment {},
             SocketOpts {
                 cancellation_token: stop.clone(),
-                vsock_tx_bufsize_bytes_initial: NonZeroUsize::new(1024 * 1024),
+                vsock_tx_bufsize_bytes_initial: tx_buffer_initial,
                 ..Default::default()
             },
         )
@@ -357,11 +380,22 @@ async fn transfer_in_rounds(
         let mut stream = receiver.accept().await.unwrap();
         let mut received = vec![0; bytes];
         stream.read_exact(&mut received).await.unwrap();
+        let drains = network.counters().drains;
         assert!(received == payload(bytes), "the payload arrived intact");
-        stream
+        (stream, drains)
     };
-    let _streams = tokio::join!(send, receive);
-    let counters = network.counters();
+    let (_sent, (_received, drains)) = tokio::join!(send, receive);
+    let stats = sender.stats();
+    let counters = Counters {
+        drains,
+        rtos: stats.rto_timeouts_count.load(Ordering::Relaxed),
+        fast_resends: stats
+            .recovery_retransmitted_segments_count
+            .load(Ordering::Relaxed),
+        recoveries: stats.packets_lost.load(Ordering::Relaxed),
+        max_cwnd: stats.max_congestion_window_bytes.load(Ordering::Relaxed),
+        ..network.counters()
+    };
     sender.shutdown().await.unwrap();
     receiver.shutdown().await.unwrap();
     stop.cancel();
@@ -380,6 +414,7 @@ async fn a_receiver_holding_48_datagrams_per_drain_loses_none() {
         drain_every: Duration::from_millis(1),
     };
     let counters = transfer(4 * 1024 * 1024, Duration::from_millis(50), Some(shallow)).await;
+    report("50 ms", &counters);
     assert!(counters.data_sent > 2800, "{counters:?}");
     // The window opened past what the queue holds.
     assert!(counters.peak_in_flight > 48, "{counters:?}");
@@ -387,52 +422,112 @@ async fn a_receiver_holding_48_datagrams_per_drain_loses_none() {
     assert_eq!(counters.dropped, 0, "{counters:?}");
 }
 
-// The same receiver 1 ms and 0.1 ms away, where a bucket sized by its rate
-// would hold the whole window: no instant sees more than the burst leave,
-// and the upload completes.
+// Payload bytes in one full data packet on the test links' 1500-byte MTU.
+const PACKET_PAYLOAD: usize = 1452;
+
+fn report(case: &str, counters: &Counters) {
+    eprintln!(
+        "{case}: lost {} of {} data packets ({:.1}%), {} resent on SACK evidence, {} timeouts, {} recoveries, window at most {} bytes; {counters:?}",
+        counters.dropped,
+        counters.data_sent,
+        counters.dropped as f64 * 100.0 / counters.data_sent.max(1) as f64,
+        counters.fast_resends,
+        counters.rtos,
+        counters.recoveries,
+        counters.max_cwnd,
+    );
+}
+
+// The same receiver 1 ms and 0.1 ms away. The window overflows the queue
+// and packets are lost, as they are for libtorrent there; every hole is
+// resent on SACK evidence, so no retransmission timer fires, and the
+// receiver gets at least half of what it can drain: 24 full packets for
+// every millisecond it reads.
 #[tokio::test(start_paused = true)]
-async fn a_short_path_never_sends_more_than_the_burst_at_once() {
+async fn a_short_path_recovers_its_losses_without_timeouts() {
+    const BYTES: usize = 4 * 1024 * 1024;
     let shallow = Shallow {
         queue_packets: 48,
         drain_every: Duration::from_millis(1),
     };
     for one_way in [Duration::from_micros(500), Duration::from_micros(50)] {
-        let started = Instant::now();
-        let counters = transfer(4 * 1024 * 1024, one_way, Some(shallow)).await;
-        eprintln!(
-            "one way {one_way:?}: {counters:?} in {:?} of the paused clock",
-            started.elapsed()
-        );
+        let counters = transfer(BYTES, one_way, Some(shallow)).await;
+        report(&format!("one way {one_way:?}"), &counters);
         assert!(counters.data_sent > 2800, "{counters:?}");
+        assert_eq!(counters.rtos, 0, "{one_way:?}: {counters:?}");
+        assert!(counters.fast_resends >= counters.dropped, "{counters:?}");
         assert!(
-            counters.peak_data_burst <= PACE_BURST_PACKETS + 1,
+            BYTES / PACKET_PAYLOAD >= 24 * counters.drains as usize,
             "{one_way:?}: {counters:?}"
         );
     }
 }
 
 // An upload capped at 5 MB/s, 1 ms away: each half-second round hands the
-// stream 2.5 MB at once after an idle gap, and still no instant sees more
-// than the burst leave and nothing is lost.
+// stream 2.5 MB at once after an idle gap. Holes inside a lump are resent
+// on SACK evidence. A hole in the last packets of a lump has nothing sent
+// after it to show it lost, so only the retransmission timer finds it, as
+// it does for libtorrent: at most one timeout per lump.
 #[tokio::test(start_paused = true)]
-async fn a_capped_upload_hands_over_lumps_that_leave_in_bursts_of_sixteen() {
+async fn a_capped_upload_times_out_only_on_the_tail_of_a_lump() {
+    const BYTES: usize = 8 * 1024 * 1024;
+    const LUMP: usize = 2_500_000;
     let shallow = Shallow {
         queue_packets: 48,
         drain_every: Duration::from_millis(1),
     };
-    let rounds = Some((2_500_000, Duration::from_millis(500)));
+    let rounds = Some((LUMP, Duration::from_millis(500)));
     let counters = transfer_in_rounds(
-        8 * 1024 * 1024,
+        BYTES,
         Duration::from_micros(500),
         Some(shallow),
         rounds,
+        NonZeroUsize::new(1024 * 1024),
     )
     .await;
-    eprintln!("capped: {counters:?}");
+    report("capped", &counters);
     assert!(counters.data_sent > 5700, "{counters:?}");
-    assert!(
-        counters.peak_data_burst <= PACE_BURST_PACKETS + 1,
-        "{counters:?}"
+    assert!(counters.rtos <= BYTES.div_ceil(LUMP) as u64, "{counters:?}");
+}
+
+// A receiver with an ample queue 1 ms and 0.1 ms away: the window, not the
+// pacer, sets the rate. ACKs release what they report delivered, so the
+// flight grows past anything one burst a wake allows.
+#[tokio::test(start_paused = true)]
+async fn a_deep_receiver_is_fed_at_the_rate_of_the_window() {
+    const BYTES: usize = 64 * 1024 * 1024;
+    for one_way in [Duration::from_micros(500), Duration::from_micros(50)] {
+        let started = Instant::now();
+        let counters = transfer(BYTES, one_way, None).await;
+        let elapsed = started.elapsed();
+        eprintln!(
+            "deep, one way {one_way:?}: {counters:?}, {:.0} MB/s of the paused clock",
+            BYTES as f64 / elapsed.as_secs_f64() / 1e6
+        );
+        assert_eq!(counters.dropped, 0, "{counters:?}");
+        // More in flight at once than sixteen packets a millisecond allows
+        // over the round trip.
+        assert!(counters.peak_in_flight > 64, "{one_way:?}: {counters:?}");
+    }
+}
+
+// The same deep receiver from a send buffer that starts at its default
+// 32 KiB: the buffer grows with the window, so the flight reaches what the
+// megabyte buffer allows.
+#[tokio::test(start_paused = true)]
+async fn the_default_send_buffer_grows_to_the_window() {
+    const BYTES: usize = 64 * 1024 * 1024;
+    let one_way = Duration::from_micros(500);
+    let started = Instant::now();
+    let grown = transfer_in_rounds(BYTES, one_way, None, None, None).await;
+    eprintln!(
+        "deep from the default buffer: {grown:?}, {:.0} MB/s of the paused clock",
+        BYTES as f64 / started.elapsed().as_secs_f64() / 1e6
     );
-    assert_eq!(counters.dropped, 0, "{counters:?}");
+    let full = transfer(BYTES, one_way, None).await;
+    assert_eq!(grown.dropped, 0, "{grown:?}");
+    assert!(
+        grown.peak_in_flight * 10 >= full.peak_in_flight * 9,
+        "{grown:?} against {full:?}"
+    );
 }
