@@ -15,6 +15,8 @@ pub enum Error {
     BadTorrentBothSingleAndMultiFile,
     #[error("path traversal detected, \"..\" in filename")]
     BadTorrentPathTraversal,
+    #[error("file path nested too deep")]
+    BadTorrentPathTooDeep,
     #[error("suspicious separator in filename")]
     BadTorrentSeparatorInName,
     #[error("torrent with 0 length is useless")]
@@ -67,4 +69,6 @@ pub enum Error {
     InvalidPieceHashes { expected: usize, got: usize },
     #[error("too many 16 KiB blocks in torrent")]
     TooManyChunks,
+    #[error("torrent file is too large")]
+    TorrentTooLarge,
 }

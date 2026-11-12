@@ -64,6 +64,7 @@ tokio-rustls = { workspace = true }
 tokio-stream = { workspace = true, features = ["sync"] }
 tokio-util = { workspace = true, features = ["io", "rt"] }
 tracing = { workspace = true, features = ["attributes"] }
+unicode-normalization = { workspace = true }
 url = { workspace = true, features = ["serde"] }
 uuid = { workspace = true, features = ["v4"] }
 walkdir = { workspace = true }

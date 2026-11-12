@@ -439,13 +439,27 @@ async fn reach(
 /// The most redirects one GET follows.
 const MAX_REDIRECTS: usize = 5;
 
+/// Whether a redirect came from a tracker at a public address, reached at
+/// one of `addrs` and answering from `endpoint`: the address it connected
+/// to, when it is one of those, decides; otherwise every address must be
+/// public, as the client may have picked any. With no address the name was
+/// resolved where the session's network exits, and nothing is known.
+fn moved_by_a_public_tracker(endpoint: Option<IpAddr>, addrs: &[IpAddr]) -> bool {
+    let reached = endpoint.filter(|ip| addrs.iter().any(|a| a.to_canonical() == ip.to_canonical()));
+    match reached {
+        Some(ip) => is_public(ip),
+        None => !addrs.is_empty() && addrs.iter().all(|a| is_public(*a)),
+    }
+}
+
 /// The body of a tracker's answer to a GET for `ask` of `tracker`, named by
 /// `named_by`, with `query` added ahead of the URL's own. The GET is not
 /// sent when the URL's own query already names an announce argument, and
 /// goes only where [`reach`] lets it. A redirect is a GET of where it
 /// points, reached the same way before it is sent, at most
 /// [`MAX_REDIRECTS`] of them; past that the redirect is the answer. A hop
-/// asked only at public addresses moves the GET to public addresses only,
+/// answered at a public address (see [`moved_by_a_public_tracker`]) moves
+/// the GET to public addresses only,
 /// as a tracker that came with the torrent is held, whoever named the
 /// first. The answer fails when the tracker sends nothing for
 /// [`RECEIVE_TIMEOUT`], the status is not a success, or the body passes
@@ -493,7 +507,8 @@ pub(crate) async fn get(
         url = url
             .join(location)
             .context("the tracker redirected to no URL")?;
-        if !addrs.is_empty() && addrs.iter().all(|a| is_public(*a)) {
+        let endpoint = response.remote_addr().map(|a| a.ip());
+        if moved_by_a_public_tracker(endpoint, &addrs) {
             named_by = NamedBy::Torrent;
         }
         redirects += 1;
@@ -1468,6 +1483,43 @@ mod tests {
         // Elsewhere any path is asked.
         for a in [lan, global] {
             assert_eq!(ssrf_refusal(&url("http://h/x"), Ask::Announce, &[a]), None);
+        }
+    }
+
+    #[test]
+    fn a_redirect_is_trusted_as_the_address_that_answered_it() {
+        let public: IpAddr = "93.184.216.34".parse().unwrap();
+        let lan: IpAddr = "192.168.1.2".parse().unwrap();
+        let loopback: IpAddr = "127.0.0.1".parse().unwrap();
+        let proxy: IpAddr = "10.9.9.9".parse().unwrap();
+        // A name found at one public and one local address: the one that
+        // answered decides, whichever was found first.
+        for local in [lan, loopback] {
+            for found in [[public, local], [local, public]] {
+                assert!(moved_by_a_public_tracker(Some(public), &found), "{found:?}");
+                assert!(!moved_by_a_public_tracker(Some(local), &found), "{found:?}");
+                // Written as v6, the same address.
+                let mapped = match public {
+                    IpAddr::V4(v4) => IpAddr::V6(v4.to_ipv6_mapped()),
+                    v6 => v6,
+                };
+                assert!(moved_by_a_public_tracker(Some(mapped), &found));
+                // Unknown, or an address it was not reached at (a proxy's):
+                // any of them may have answered, so not every one is public.
+                for endpoint in [None, Some(proxy)] {
+                    assert!(!moved_by_a_public_tracker(endpoint, &found), "{endpoint:?}");
+                }
+            }
+        }
+        // Every address public: public whatever the endpoint says.
+        let both = [public, "8.8.8.8".parse().unwrap()];
+        for endpoint in [None, Some(public), Some(loopback), Some(proxy)] {
+            assert!(moved_by_a_public_tracker(endpoint, &both), "{endpoint:?}");
+        }
+        // Every address local, and none at all: never.
+        for endpoint in [None, Some(lan), Some(public)] {
+            assert!(!moved_by_a_public_tracker(endpoint, &[lan, loopback]));
+            assert!(!moved_by_a_public_tracker(endpoint, &[]));
         }
     }
 

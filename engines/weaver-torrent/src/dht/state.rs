@@ -741,7 +741,7 @@ pub struct DhtState {
 
     pub(crate) peer_store: PeerStore,
 
-    // Which sources have sent too many queries to be answered.
+    // Which sources have sent too many datagrams to be read.
     query_limiter: parking_lot::Mutex<QueryLimiter>,
 
     // The bytes the DHT may send: every packet spends it, and a query that
@@ -946,6 +946,32 @@ impl DhtState {
         CompactNodeInfo::new_from_iter(it)
     }
 
+    /// The message in a datagram from `addr`, or none for a datagram that is
+    /// not one, or that comes from a source sending too many. As libtorrent's
+    /// `dht_tracker::incoming_packet` (dht_tracker.cpp:512-548, v2.0.15), the
+    /// source is counted for every datagram shaped like a dictionary, answers
+    /// to our own queries too, before a byte of it is parsed.
+    fn read_datagram(&self, buf: &[u8], addr: SocketAddr) -> Option<Message<ByteBufOwned>> {
+        if buf.len() <= 20 || buf.first() != Some(&b'd') || buf.last() != Some(&b'e') {
+            return None;
+        }
+        if !self
+            .query_limiter
+            .lock()
+            .admit(addr.ip(), tokio::time::Instant::now())
+        {
+            trace!("ignoring a datagram from {addr}: it sends too many");
+            return None;
+        }
+        match bprotocol::deserialize_message::<ByteBufOwned>(buf) {
+            Ok(message) => Some(message),
+            Err(e) => {
+                trace!("{addr}: error deserializing incoming message: {e:#}");
+                None
+            }
+        }
+    }
+
     fn on_received_message(
         self: &Arc<Self>,
         msg: Message<ByteBufOwned>,
@@ -988,15 +1014,6 @@ impl DhtState {
             }
             _ => {}
         };
-
-        if !self
-            .query_limiter
-            .lock()
-            .admit(addr.ip(), tokio::time::Instant::now())
-        {
-            trace!("ignoring a query from {addr}: it sends too many");
-            return Ok(());
-        }
 
         // libtorrent node.cpp:324-328, v2.0.15: no budget, no answer.
         if !self
@@ -1447,12 +1464,10 @@ impl DhtWorker {
                     }
                     Err(e) => return Err(Error::Recv(e)),
                 };
-                match bprotocol::deserialize_message::<ByteBufOwned>(&buf[..size]) {
-                    Ok(msg) => match output_tx.send((msg, addr)).await {
-                        Ok(_) => {}
-                        Err(_) => return Err(Error::DhtDead),
-                    },
-                    Err(e) => debug!("{}: error deserializing incoming message: {}", addr, e),
+                if let Some(msg) = self.dht.read_datagram(&buf[..size], addr)
+                    && output_tx.send((msg, addr)).await.is_err()
+                {
+                    return Err(Error::DhtDead);
                 }
             }
         };
@@ -2288,18 +2303,9 @@ mod tests {
         let quiet = SocketAddr::from(([10, 0, 0, 2], 6881));
         // `from` pings us; whether it was answered.
         let mut ping = |from: SocketAddr| {
-            dht.on_received_message(
-                bprotocol::Message {
-                    kind: MessageKind::PingRequest(bprotocol::PingRequest {
-                        id: crate::core::hash_id::Id20::new([0x33; 20]),
-                    }),
-                    transaction_id: ByteBufOwned::from(&b"aa"[..]),
-                    version: None,
-                    ip: None,
-                },
-                from,
-            )
-            .unwrap();
+            if let Some(message) = dht.read_datagram(PING, from) {
+                dht.on_received_message(message, from).unwrap();
+            }
             match sent.try_recv() {
                 Ok(reply) => {
                     assert_eq!(reply.addr, from);
@@ -2333,6 +2339,93 @@ mod tests {
         // Once it lapses the source is answered again.
         tokio::time::advance(Duration::from_secs(1)).await;
         assert!(ping(flooder));
+    }
+
+    const PING: &[u8] = b"d1:ad2:id20:abcdefghij0123456789e1:q4:ping1:t2:aa1:y1:qe";
+
+    // An answer to `request`, as the bytes a node sends.
+    fn answer_datagram(request: &super::WorkerSendRequest) -> Vec<u8> {
+        let mut buf = Vec::new();
+        bprotocol::serialize_message(
+            &mut buf,
+            request.message.transaction_id.clone(),
+            None,
+            None,
+            MessageKind::Response(bprotocol::Response {
+                id: crate::core::hash_id::Id20::new([0x33; 20]),
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        buf
+    }
+
+    // libtorrent dht_tracker.cpp:538-548, v2.0.15: the source is counted
+    // before the datagram is parsed, so datagrams that do not parse count.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_source_is_counted_for_datagrams_that_do_not_parse() {
+        use crate::dht::query_limiter::QUERY_LIMIT;
+
+        let (dht, mut sent) = fixture_dht();
+        let mut ping = |from: SocketAddr| {
+            if let Some(message) = dht.read_datagram(PING, from) {
+                dht.on_received_message(message, from).unwrap();
+            }
+            sent.try_recv().is_ok()
+        };
+        // A dictionary, but no KRPC message.
+        let junk = b"d1:wi1e1:xi2e1:yi3e1:zi4ee";
+        let flooder = SocketAddr::from(([10, 0, 0, 1], 6881));
+        let under = SocketAddr::from(([10, 0, 0, 2], 6881));
+        for _ in 1..QUERY_LIMIT {
+            assert!(dht.read_datagram(junk, flooder).is_none());
+        }
+        for _ in 2..QUERY_LIMIT {
+            assert!(dht.read_datagram(junk, under).is_none());
+        }
+        // The datagram that reaches the limit is not read; one short of it is.
+        assert!(!ping(flooder));
+        assert!(ping(under));
+
+        // A datagram that is not shaped like a dictionary is not counted.
+        let stranger = SocketAddr::from(([10, 0, 0, 3], 6881));
+        for _ in 0..2 * QUERY_LIMIT {
+            assert!(
+                dht.read_datagram(b"not bencode, not counted", stranger)
+                    .is_none()
+            );
+            assert!(dht.read_datagram(b"d1:xi1ee", stranger).is_none());
+        }
+        assert!(ping(stranger));
+    }
+
+    // A node that answers every query we send it, as fast as a busy DHT asks
+    // one node, keeps being heard: its answers are counted, and they stay
+    // under the limit.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_node_answering_our_queries_is_never_ignored() {
+        use crate::dht::query_limiter::{QUERY_LIMIT, WINDOW};
+        use std::task::Poll;
+
+        let (dht, mut sent) = fixture_dht();
+        let node = SocketAddr::from(([10, 0, 0, 1], 6881));
+        // Four a second, 40 of the 50 a window allows, for ten windows.
+        let per_window = 40;
+        assert!(per_window < QUERY_LIMIT);
+        for _ in 0..10 * per_window {
+            let mut asked = std::pin::pin!(dht.request(super::Request::Ping, node));
+            assert!(matches!(futures::poll!(asked.as_mut()), Poll::Pending));
+            let request = sent.try_recv().unwrap();
+            let message = dht
+                .read_datagram(&answer_datagram(&request), node)
+                .expect("an answer was not read");
+            dht.on_received_message(message, node).unwrap();
+            assert!(matches!(
+                futures::poll!(asked.as_mut()),
+                Poll::Ready(Ok(super::ResponseOrError::Response(_)))
+            ));
+            tokio::time::advance(WINDOW / per_window).await;
+        }
     }
 
     // Answers `request`, a get_peers a search sent, as the node `id`, with

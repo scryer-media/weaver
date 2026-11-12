@@ -86,7 +86,7 @@ use crate::peer_protocol::{
         handshake::ExtendedHandshake,
         ut_holepunch::{self, UtHolepunch},
         ut_metadata::{UtMetadata, UtMetadataData},
-        ut_pex::{PexPeerInfo, UtPex},
+        ut_pex::{MAX_PEX_MESSAGE_LEN, PexPeerInfo, UtPex},
     },
 };
 use anyhow::Context;
@@ -2255,10 +2255,6 @@ fn pex_interval(period: Duration) -> tokio::time::Interval {
     interval
 }
 
-// libtorrent `ut_pex_peer_plugin::on_extended`: the longest PEX message a
-// peer may send (`pex_message_too_large`).
-const MAX_PEX_MESSAGE_LEN: usize = 500 * 1024;
-
 // libtorrent `settings_pack::max_out_request_queue`: the most requests
 // outstanding to a peer, however fast it delivers.
 const DEFAULT_PEER_REQUEST_WINDOW: usize = 500;
@@ -2471,25 +2467,23 @@ impl PeerConnectionHandler for &'_ PeerHandler {
             Message::Extended(ExtendedMessage::WrongSize(id)) => {
                 trace!(id, "ignoring an extended message of the wrong size");
             }
+            Message::Extended(ExtendedMessage::NotAdvertised(id)) => {
+                trace!(id, "ignoring an extended message we did not advertise");
+            }
             Message::Extended(ExtendedMessage::UtPex(pex)) => {
                 if self.state.pex {
                     self.on_pex_message(pex)?;
                 } else {
-                    warn!(
-                        id = self.state.shared.id,
-                        info_hash = ?self.state.shared.info_hash,
-                        "received a PEX message from {} we did not advertise, ignoring",
+                    trace!(
+                        "ignoring a PEX message from {}: we did not advertise it",
                         self.addr
                     );
                 }
             }
-            message => {
-                warn!(
-                    id = self.state.shared.id,
-                    info_hash = ?self.state.shared.info_hash,
-                    "received unsupported message {:?}, ignoring", message
-                );
-            }
+            // A metadata piece or reject we did not ask for (libtorrent
+            // `ut_metadata_peer_plugin::on_extended` logs an unwanted piece
+            // and reads on). Its payload is not logged.
+            _ => trace!("ignoring a message from {} we did not ask for", self.addr),
         };
         // A seed that has sent us data is a complete copy seen now; one that
         // has not may only say it is a seed (libtorrent

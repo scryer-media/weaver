@@ -7,7 +7,6 @@
 
 use std::io::Cursor;
 
-use crate::bencode::BencodeValue;
 use crate::bencode::bencode_serialize_to_writer;
 use crate::buffers::ByteBuf;
 use crate::buffers::ByteBufT;
@@ -91,6 +90,26 @@ impl PeerExtendedMessageIds {
         }
     }
 
+    /// Every extension we advertise to some peer, each under our id.
+    pub fn ours() -> Self {
+        Self {
+            ut_holepunch: Some(MY_EXTENDED_UT_HOLEPUNCH),
+            ..Self::my()
+        }
+    }
+
+    /// Whether one of these extensions goes by `id`.
+    pub fn names(&self, id: u8) -> bool {
+        [
+            self.ut_metadata,
+            self.ut_pex,
+            self.ut_holepunch,
+            self.upload_only,
+            self.lt_donthave,
+        ]
+        .contains(&Some(id))
+    }
+
     /// The ids the peer names once its extended handshake's `m` is taken
     /// over these, the ones it named before (BEP 10): an id it names
     /// replaces the one held, an id of 0 says it does not, or no longer
@@ -132,7 +151,10 @@ pub enum ExtendedMessage<ByteBuf: ByteBufT> {
     /// not that message's: it says nothing, and is ignored (libtorrent
     /// `bt_peer_connection::on_extended` logs it and reads on).
     WrongSize(u8),
-    Dyn(u8, BencodeValue<ByteBuf>),
+    /// A message under the id of one of our extensions that we did not
+    /// advertise on this connection: it is ignored, unread, as libtorrent
+    /// ignores PEX on a torrent without it (ut_pex.cpp:270, v2.0.15).
+    NotAdvertised(u8),
 }
 
 impl<'a> ExtendedMessage<ByteBuf<'a>> {
@@ -143,10 +165,6 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
     ) -> Result<usize, SerializeError> {
         let mut out = Cursor::new(out);
         match self {
-            ExtendedMessage::Dyn(msg_id, v) => {
-                out.write_u8(*msg_id)?;
-                bencode_serialize_to_writer(v, &mut out)?;
-            }
             ExtendedMessage::Handshake(h) => {
                 out.write_u8(0)?;
                 bencode_serialize_to_writer(h, &mut out)?;
@@ -187,14 +205,29 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 out.write_u32::<BE>(*index)?;
             }
             // The id alone, which reads back as of the wrong size.
-            ExtendedMessage::WrongSize(msg_id) => out.write_u8(*msg_id)?,
+            ExtendedMessage::WrongSize(msg_id) | ExtendedMessage::NotAdvertised(msg_id) => {
+                out.write_u8(*msg_id)?
+            }
         }
         Ok(usize::try_from(out.position()).expect("the cursor stays within its buffer"))
     }
 
-    /// The extended message whose payload, whole, is `buf`. A payload with
-    /// no extended message id is not one.
-    pub fn deserialize(mut buf: DoubleBufHelper<'a>) -> Result<Self, MessageDeserializeError> {
+    /// The extended message whose payload, whole, is `buf`, on a connection
+    /// we advertised every one of our extensions on.
+    pub fn deserialize(buf: DoubleBufHelper<'a>) -> Result<Self, MessageDeserializeError> {
+        Self::deserialize_advertised(buf, &PeerExtendedMessageIds::ours())
+    }
+
+    /// The extended message whose payload, whole, is `buf`, on a connection
+    /// we advertised `advertised` on. A payload with no extended message id
+    /// is not one. The id decides before a byte of the rest is read: one of
+    /// ours not advertised here is ignored, and one that is none of ours
+    /// ends the connection (libtorrent `bt_peer_connection::on_extended`,
+    /// bt_peer_connection.cpp:1980-1988, v2.0.15, when no extension takes it).
+    pub fn deserialize_advertised(
+        mut buf: DoubleBufHelper<'a>,
+        advertised: &PeerExtendedMessageIds,
+    ) -> Result<Self, MessageDeserializeError> {
         let msg_id = crate::peer_protocol::MsgIdDebug(MSGID_EXTENDED);
         let emsg_id = buf
             .read_u8()
@@ -217,10 +250,21 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
             })
         }
 
+        if emsg_id != 0 && !advertised.names(emsg_id) {
+            return match PeerExtendedMessageIds::ours().names(emsg_id) {
+                true => Ok(ExtendedMessage::NotAdvertised(emsg_id)),
+                false => Err(MessageDeserializeError::UnknownExtendedId(emsg_id)),
+            };
+        }
         match emsg_id {
             0 => Ok(ExtendedMessage::Handshake(from_bytes_contig(&buf)?)),
             MY_EXTENDED_UT_METADATA => {
                 Ok(ExtendedMessage::UtMetadata(UtMetadata::deserialize(buf)?))
+            }
+            // Its length is judged before it is read (libtorrent
+            // `ut_pex_peer_plugin::on_extended`, ut_pex.cpp:272-276, v2.0.15).
+            MY_EXTENDED_UT_PEX if buf.len() > ut_pex::MAX_PEX_MESSAGE_LEN => {
+                Err(MessageDeserializeError::PexTooLarge(buf.len()))
             }
             MY_EXTENDED_UT_PEX => Ok(ExtendedMessage::UtPex(from_bytes_contig(&buf)?)),
             MY_EXTENDED_UT_HOLEPUNCH => {
@@ -242,7 +286,7 @@ impl<'a> ExtendedMessage<ByteBuf<'a>> {
                 }
                 _ => Ok(ExtendedMessage::WrongSize(emsg_id)),
             },
-            _ => Ok(ExtendedMessage::Dyn(emsg_id, from_bytes_contig(&buf)?)),
+            _ => Err(MessageDeserializeError::UnknownExtendedId(emsg_id)),
         }
     }
 }
@@ -556,5 +600,137 @@ mod tests {
                 _ => panic!("bad msg"),
             }
         }
+    }
+
+    // A frame carrying the extended message `id` with `payload`.
+    fn extended_frame(id: u8, payload: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(2 + payload.len()).unwrap();
+        let mut frame = len.to_be_bytes().to_vec();
+        frame.extend_from_slice(&[crate::peer_protocol::MSGID_EXTENDED, id]);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    // libtorrent bt_peer_connection.cpp:1980-1988, v2.0.15: an id no
+    // extension of ours takes ends the connection, its payload unread.
+    #[test]
+    fn an_id_that_is_none_of_ours_is_refused_unread() {
+        use crate::peer_protocol::Message;
+        let ours = PeerExtendedMessageIds::ours();
+        let unknown = (1..=u8::MAX).filter(|id| !ours.names(*id));
+        for id in unknown {
+            // A well-formed dictionary, and bytes that are no bencode.
+            for payload in [&b"d1:xi1ee"[..], b"\xff\xff"] {
+                let frame = extended_frame(id, payload);
+                assert!(
+                    matches!(
+                        Message::deserialize(&frame, &[], None),
+                        Err(MessageDeserializeError::UnknownExtendedId(got)) if got == id
+                    ),
+                    "id {id}"
+                );
+            }
+        }
+    }
+
+    // Every id we advertise is read as its extension; one of ours this
+    // connection was not told is ignored unread, as libtorrent ignores PEX
+    // on a torrent without it (ut_pex.cpp:270, v2.0.15).
+    #[test]
+    fn an_id_of_ours_is_read_only_where_we_advertised_it() {
+        use crate::peer_protocol::{MY_EXTENDED_UT_METADATA, MY_EXTENDED_UT_PEX, Message};
+        fn read<'a>(
+            frame: &'a [u8],
+            advertised: &PeerExtendedMessageIds,
+        ) -> Result<ExtendedMessage<ByteBuf<'a>>, MessageDeserializeError> {
+            Message::deserialize_advertised(frame, &[], None, advertised).map(|(m, _)| match m {
+                Message::Extended(e) => e,
+                other => panic!("{other:?}"),
+            })
+        }
+        let pex = extended_frame(MY_EXTENDED_UT_PEX, b"d5:added6:\x0a\x00\x00\x01\x1a\xe1e");
+        let all = PeerExtendedMessageIds::ours();
+        assert!(matches!(read(&pex, &all), Ok(ExtendedMessage::UtPex(_))));
+        let without_pex = PeerExtendedMessageIds {
+            ut_pex: None,
+            ..all
+        };
+        assert!(matches!(
+            read(&pex, &without_pex),
+            Ok(ExtendedMessage::NotAdvertised(MY_EXTENDED_UT_PEX))
+        ));
+        // Unread: neither its bytes nor its length are judged.
+        for payload in [
+            &b"\xff"[..],
+            &vec![b'x'; super::ut_pex::MAX_PEX_MESSAGE_LEN + 1],
+        ] {
+            assert!(matches!(
+                read(&extended_frame(MY_EXTENDED_UT_PEX, payload), &without_pex),
+                Ok(ExtendedMessage::NotAdvertised(MY_EXTENDED_UT_PEX))
+            ));
+        }
+        // The handshake is read on every connection.
+        let handshake = extended_frame(0, b"d1:md6:ut_pexi1eee");
+        let none = PeerExtendedMessageIds::default();
+        assert!(matches!(
+            read(&handshake, &none),
+            Ok(ExtendedMessage::Handshake(_))
+        ));
+        let metadata = extended_frame(MY_EXTENDED_UT_METADATA, b"d8:msg_typei0e5:piecei0ee");
+        assert!(matches!(
+            read(&metadata, &none),
+            Ok(ExtendedMessage::NotAdvertised(MY_EXTENDED_UT_METADATA))
+        ));
+        assert!(matches!(
+            read(&metadata, &all),
+            Ok(ExtendedMessage::UtMetadata(UtMetadata::Request(0)))
+        ));
+    }
+
+    // A PEX payload of `len` bytes: a dictionary whose one key, unknown,
+    // holds a string that pads it out.
+    fn padded_pex(len: usize) -> Vec<u8> {
+        let digits = (1..10)
+            .find(|d| (len - 6 - d).to_string().len() == *d)
+            .unwrap();
+        let n = len - 6 - digits;
+        let mut payload = format!("d1:x{n}:").into_bytes();
+        payload.extend(std::iter::repeat_n(b'a', n));
+        payload.push(b'e');
+        assert_eq!(payload.len(), len);
+        payload
+    }
+
+    // libtorrent `ut_pex_peer_plugin::on_extended`, ut_pex.cpp:272-276,
+    // v2.0.15: a PEX message is judged by its length before it is decoded,
+    // whatever keys it holds; a short one with keys we do not know is read.
+    #[test]
+    fn a_pex_message_is_judged_by_its_length_before_it_is_read() {
+        use crate::peer_protocol::{MY_EXTENDED_UT_PEX, Message};
+        // The peers a PEX message adds, or why it was refused.
+        let read = |payload: &[u8]| {
+            let frame = extended_frame(MY_EXTENDED_UT_PEX, payload);
+            Message::deserialize(&frame, &[], None).map(|(m, _)| match m {
+                Message::Extended(ExtendedMessage::UtPex(pex)) => pex.added_peers().count(),
+                other => panic!("{other:?}"),
+            })
+        };
+        let limit = super::ut_pex::MAX_PEX_MESSAGE_LEN;
+        assert!(matches!(read(&padded_pex(limit)), Ok(0)));
+        assert!(matches!(
+            read(&padded_pex(limit + 1)),
+            Err(MessageDeserializeError::PexTooLarge(len)) if len == limit + 1
+        ));
+        // Near the longest frame, of unknown keys only.
+        let frame_limit = crate::peer_protocol::MAX_PACKET_LEN - 2;
+        assert!(matches!(
+            read(&padded_pex(frame_limit)),
+            Err(MessageDeserializeError::PexTooLarge(_))
+        ));
+        // Small, with keys we do not know beside the peers.
+        assert!(matches!(
+            read(b"d5:added6:\x0a\x00\x00\x01\x1a\xe17:unknowni1e1:x3:abce"),
+            Ok(1)
+        ));
     }
 }

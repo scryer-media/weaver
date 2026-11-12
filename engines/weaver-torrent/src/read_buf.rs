@@ -7,7 +7,9 @@
 
 use std::{io::IoSliceMut, time::Duration};
 
-use crate::peer_protocol::{Handshake, Message, MessageDeserializeError, PartialBlock};
+use crate::peer_protocol::{
+    Handshake, Message, MessageDeserializeError, PartialBlock, extended::PeerExtendedMessageIds,
+};
 use crate::{Error, Result};
 use crate::{
     peer_connection::with_timeout, type_aliases::BoxAsyncReadVectored,
@@ -42,6 +44,9 @@ pub struct ReadBuf {
     // The size the reads so far ask the buffer to be, from BUFLEN to
     // GROWN_MAX; it takes it between messages, once what it holds fits.
     wanted: usize,
+    // The extensions we advertised on the connection: a message under the id
+    // of another is not read (see `ExtendedMessage::deserialize_advertised`).
+    advertised: PeerExtendedMessageIds,
 }
 
 /// How much a read may take off the socket: as much as the connection holds
@@ -90,7 +95,14 @@ impl ReadBuf {
             len: 0,
             consumed: 0,
             wanted: BUFLEN,
+            advertised: PeerExtendedMessageIds::ours(),
         }
+    }
+
+    /// The extensions we advertised on the connection, in our extended
+    /// handshake's `m`; every one of ours until then.
+    pub fn set_advertised(&mut self, advertised: PeerExtendedMessageIds) {
+        self.advertised = advertised;
     }
 
     /// Bytes received and not yet read as a message.
@@ -252,7 +264,7 @@ impl ReadBuf {
                 // Run with `cargo +nightly miri test -p librqbit --features miri test_read_buf_miri -- --nocapture --ignore`
                 let this = unsafe { &mut *(self as *mut Self) };
                 let (first, second) = as_slices!(this);
-                match Message::deserialize(first, second, num_pieces) {
+                match Message::deserialize_advertised(first, second, num_pieces, &this.advertised) {
                     Ok((msg, size)) => {
                         advance!(this, size);
                         this.consumed += size as u64;

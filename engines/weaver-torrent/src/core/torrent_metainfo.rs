@@ -20,6 +20,7 @@ use std::{
     path::PathBuf,
 };
 use tracing::debug;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::core::{
     Error, Id32, InfoHashes,
@@ -27,7 +28,8 @@ use crate::core::{
     lengths::{Lengths, MAX_NUM_PIECES, ValidPieceIndex},
     merkle::{self, BLOCK_SIZE},
     v2_tree::{
-        FileTree, NameRules, sanitize_component, sanitize_component_with, sanitize_name_with,
+        FileTree, MAX_DIRECTORY_DEPTH, NameRules, sanitize_component, sanitize_component_with,
+        sanitize_name_with,
     },
 };
 
@@ -42,14 +44,32 @@ pub struct ParsedTorrent<BufType> {
     pub info_bytes: BufType,
 }
 
+/// The largest .torrent file read, from any source (qBittorrent
+/// `Preferences::getTorrentFileSizeLimit`, preferences.cpp:325, 5.3.0,
+/// passed to libtorrent as `load_torrent_limits::max_buffer_size`,
+/// torrentdescriptor.cpp:86).
+pub const MAX_TORRENT_FILE_BYTES: usize = 100 * 1024 * 1024;
+
+/// The most bencode tokens a .torrent file or a torrent's metadata may hold
+/// (qBittorrent `Preferences::getBdecodeTokenLimit`, preferences.cpp:351,
+/// 5.3.0, passed to libtorrent as `load_torrent_limits::max_decode_tokens`,
+/// torrentdescriptor.cpp:88, and as `settings_pack::metadata_token_limit`,
+/// sessionimpl.cpp:2098).
+pub const MAX_TORRENT_TOKENS: usize = 10_000_000;
+
 /// Parse torrent metainfo from bytes, with its info hashes. Bytes past the
 /// torrent's dict are ignored, as libtorrent's `bdecode` ignores them. A v2
 /// torrent's info and piece layers are checked here, as libtorrent loads
-/// them (`parse_torrent_file`).
+/// them (`parse_torrent_file`). A buffer over [`MAX_TORRENT_FILE_BYTES`], or
+/// a torrent of more than [`MAX_TORRENT_TOKENS`] tokens, is refused.
 pub fn torrent_from_bytes<'de>(buf: &'de [u8]) -> crate::core::Result<TorrentMetaV1<ByteBuf<'de>>> {
-    let (mut t, _): (TorrentMetaV1<ByteBuf<'_>>, _) = crate::bencode::from_bytes_with_rest(buf)
-        .inspect_err(|e| tracing::trace!("error deserializing torrent: {e:#}"))
-        .map_err(|e| e.into_kind())?;
+    if buf.len() > MAX_TORRENT_FILE_BYTES {
+        return Err(Error::TorrentTooLarge);
+    }
+    let (mut t, _): (TorrentMetaV1<ByteBuf<'_>>, _) =
+        crate::bencode::from_bytes_with_rest_limited(buf, MAX_TORRENT_TOKENS)
+            .inspect_err(|e| tracing::trace!("error deserializing torrent: {e:#}"))
+            .map_err(|e| e.into_kind())?;
     t.info_hashes = t.info.data.check_info_bytes(t.info.raw_bytes.as_ref())?;
     t.info_hash = t.info_hashes.best();
     if t.info.data.meta_version() >= 2 {
@@ -958,20 +978,7 @@ impl<BufType: AsRef<[u8]>> TorrentMetaV1Info<BufType> {
         let mut paths = Vec::new();
         let mut files = Vec::new();
         for (filename, len, padding) in listing {
-            let mut seen_a_bit = false;
-            for bit in filename.iter_components_bytes() {
-                seen_a_bit = true;
-                if bit == b".." {
-                    return Err(Error::BadTorrentPathTraversal);
-                }
-                use memchr::memchr;
-                if memchr(b'/', bit).is_some() || memchr(b'\\', bit).is_some() {
-                    return Err(Error::BadTorrentSeparatorInName);
-                }
-            }
-            if !seen_a_bit {
-                return Err(Error::BadTorrentFileNoName);
-            }
+            check_components(filename.iter_components_bytes())?;
             paths.push(clean_path(&filename, NameRules::HOST)?);
             files.push((len, padding));
         }
@@ -1219,6 +1226,31 @@ fn reconcile_hybrid<'a, B: AsRef<[u8]> + 'a>(
     Ok(v2)
 }
 
+/// Checks the elements of a listed path: there is at least one, none is
+/// `..` or holds a separator, and the path has no more directories than a
+/// v2 file tree may nest. A path past that depth is refused once the first
+/// element over it is read.
+fn check_components<'a>(elements: impl Iterator<Item = &'a [u8]>) -> crate::core::Result<()> {
+    let mut count = 0usize;
+    for bit in elements {
+        count += 1;
+        if count > MAX_DIRECTORY_DEPTH + 1 {
+            return Err(Error::BadTorrentPathTooDeep);
+        }
+        if bit == b".." {
+            return Err(Error::BadTorrentPathTraversal);
+        }
+        use memchr::memchr;
+        if memchr(b'/', bit).is_some() || memchr(b'\\', bit).is_some() {
+            return Err(Error::BadTorrentSeparatorInName);
+        }
+    }
+    if count == 0 {
+        return Err(Error::BadTorrentFileNoName);
+    }
+    Ok(())
+}
+
 /// A file's path cleaned under `rules` (libtorrent
 /// `sanitize_append_path_element`, torrent_info.cpp:183-345, v2.0.15):
 /// every element of a listed path is forced, so it is never dropped; the
@@ -1256,11 +1288,18 @@ fn clean_path<B: AsRef<[u8]>>(
 /// torrent_info.cpp:806-905, v2.0.15). `files` holds each file's length and
 /// whether it is padding. libtorrent folds ASCII case alone; this folds
 /// every letter, as the case-insensitive filesystems of Windows and macOS
-/// do. Each path keeps the next number to try, so many files of one name
-/// are renamed in linear time: a number below it is taken already.
+/// do, and compares names in their canonical decomposition, as APFS does,
+/// so an NFC `é` and an NFD `e` with a combining acute are one name, on
+/// every platform. Each path keeps the next number to try, so many files of
+/// one name are renamed in linear time: a number below it is taken already.
 fn rename_duplicates(paths: &mut [Vec<String>], files: &[(u64, bool)]) {
     fn key(parts: &[String]) -> String {
-        parts.join("/").to_lowercase()
+        fold(&parts.join("/"))
+    }
+    // Case folded, then canonically decomposed, so names a filesystem
+    // takes as one file share a key.
+    fn fold(text: &str) -> String {
+        text.to_lowercase().nfd().collect()
     }
     // A path and the file that has it, or none for a directory.
     let mut taken = HashMap::<String, Option<usize>>::new();
@@ -1271,7 +1310,7 @@ fn rename_duplicates(paths: &mut [Vec<String>], files: &[(u64, bool)]) {
             if !directory.is_empty() {
                 directory.push('/');
             }
-            directory.push_str(&part.to_lowercase());
+            directory.push_str(&fold(part));
             if directories.insert(directory.clone()) {
                 taken.insert(directory.clone(), None);
             }
@@ -1309,7 +1348,7 @@ fn rename_duplicates(paths: &mut [Vec<String>], files: &[(u64, bool)]) {
         let renamed = loop {
             let candidate = format!("{base}.{number}{extension}");
             number += 1;
-            let candidate_key = format!("{prefix}{}", candidate.to_lowercase());
+            let candidate_key = format!("{prefix}{}", fold(&candidate));
             if let std::collections::hash_map::Entry::Vacant(free) = taken.entry(candidate_key) {
                 free.insert(Some(index));
                 break candidate;
@@ -1441,6 +1480,44 @@ mod tests {
             torrent.info_hash.as_string(),
             "64a980abe6e448226bb930ba061592e44c3781a1"
         );
+    }
+
+    #[test]
+    fn a_torrent_file_past_the_byte_limit_is_refused() {
+        // Bytes past the dict are not read, so a real torrent padded to the
+        // limit loads, and one byte more is refused before any is read.
+        let mut padded = TORRENT_BYTES.to_vec();
+        padded.resize(MAX_TORRENT_FILE_BYTES, 0);
+        assert!(torrent_from_bytes(&padded).is_ok());
+        padded.push(0);
+        assert!(matches!(
+            torrent_from_bytes(&padded),
+            Err(Error::TorrentTooLarge)
+        ));
+    }
+
+    #[test]
+    fn a_torrent_file_past_the_token_limit_is_refused() {
+        // A real torrent with a last key the reader ignores, a list of
+        // `strings` empty strings: its key, the list, the strings and the
+        // list's end are each a token.
+        fn with_padding(strings: usize) -> Vec<u8> {
+            let (end, dict) = TORRENT_BYTES.split_last().unwrap();
+            assert_eq!(*end, b'e');
+            [dict, b"4:zzzzl", &b"0:".repeat(strings), b"ee"].concat()
+        }
+        let own = (1..)
+            .find(|&n| {
+                crate::bencode::from_bytes_limited::<TorrentMetaV1Borrowed>(TORRENT_BYTES, n)
+                    .is_ok()
+            })
+            .unwrap();
+        let fits = MAX_TORRENT_TOKENS - own - 3;
+        assert!(torrent_from_bytes(&with_padding(fits)).is_ok());
+        assert!(matches!(
+            torrent_from_bytes(&with_padding(fits + 1)),
+            Err(Error::Bencode(crate::bencode::DeserializeError::TokenLimit))
+        ));
     }
 
     #[test]
@@ -1643,6 +1720,70 @@ mod tests {
     }
 
     #[test]
+    fn names_that_differ_only_by_normalization_are_renamed() {
+        // NFC `é` (U+00E9) and NFD `e` + combining acute (U+0301) are one
+        // name on APFS.
+        let nfc = "caf\u{e9}";
+        let nfd = "cafe\u{301}";
+        let files = vec![
+            file(&[&format!("{nfc}.txt")], 1, None),
+            file(&[&format!("{nfd}.txt")], 1, None),
+            // With case on top.
+            file(&["CAFE\u{301}.TXT"], 1, None),
+            // A directory in one form, a file in the other.
+            file(&[nfc, "a.txt"], 1, None),
+            file(&[nfd], 1, None),
+            file(&[nfd, "A.txt"], 1, None),
+            // A rename's own name in the other form is taken too.
+            file(&[&format!("{nfd}.1.txt")], 1, None),
+        ];
+        assert_eq!(
+            clean_paths(multi_file_info(files)),
+            [
+                format!("{nfc}.txt"),
+                format!("{nfd}.1.txt"),
+                "CAFE\u{301}.2.TXT".to_owned(),
+                format!("{nfc}/a.txt"),
+                format!("{nfd}.1"),
+                format!("{nfd}/A.1.txt"),
+                format!("{nfd}.1.1.txt"),
+            ]
+        );
+        // Names with no twin in another form keep what they had.
+        let alone = vec![
+            file(&[&format!("{nfc}.txt")], 1, None),
+            file(&[&format!("{nfd}.mkv")], 1, None),
+            file(&["\u{212b}"], 1, None),
+        ];
+        assert_eq!(
+            clean_paths(multi_file_info(alone)),
+            [
+                format!("{nfc}.txt"),
+                format!("{nfd}.mkv"),
+                "\u{212b}".to_owned()
+            ]
+        );
+    }
+
+    #[test]
+    fn many_files_of_one_name_in_two_forms_are_each_renamed_once() {
+        let files = (0..2000)
+            .map(|i| match i % 2 {
+                0 => file(&["caf\u{e9}.bin"], 1, None),
+                _ => file(&["cafe\u{301}.bin"], 1, None),
+            })
+            .collect();
+        let names = clean_paths(multi_file_info(files));
+        for (index, name) in names.iter().enumerate().skip(1) {
+            let base = match index % 2 {
+                0 => "caf\u{e9}",
+                _ => "cafe\u{301}",
+            };
+            assert_eq!(name, &format!("{base}.{index}.bin"));
+        }
+    }
+
+    #[test]
     fn many_files_of_one_name_are_each_renamed_once() {
         let files = (0..2000).map(|_| file(&["same.bin"], 1, None)).collect();
         let names = clean_paths(multi_file_info(files));
@@ -1650,6 +1791,42 @@ mod tests {
         for (index, name) in names.iter().enumerate().skip(1) {
             assert_eq!(name, &format!("same.{index}.bin"));
         }
+    }
+
+    #[test]
+    fn a_listed_path_nested_past_the_limit_is_refused() {
+        // `directories` directories deep, then a file: the depth a v2 file
+        // tree may nest.
+        fn nested(directories: usize) -> TorrentMetaV1Info<ByteBufOwned> {
+            let mut parts = vec!["d"; directories];
+            parts.push("f.bin");
+            multi_file_info(vec![file(&parts, 100, None)])
+        }
+        let names = clean_paths(nested(MAX_DIRECTORY_DEPTH));
+        assert_eq!(names[0].matches('/').count(), MAX_DIRECTORY_DEPTH);
+        assert!(matches!(
+            nested(MAX_DIRECTORY_DEPTH + 1).validate(),
+            Err(Error::BadTorrentPathTooDeep)
+        ));
+    }
+
+    #[test]
+    fn a_deep_path_is_refused_after_reading_only_the_limit() {
+        // A path a million elements deep is refused once one element past
+        // the limit is read, so no work grows with its depth.
+        let read = std::cell::Cell::new(0usize);
+        let deep = std::iter::repeat_n(&b"d"[..], 1_000_000).inspect(|_| read.set(read.get() + 1));
+        assert!(matches!(
+            check_components(deep),
+            Err(Error::BadTorrentPathTooDeep)
+        ));
+        assert_eq!(read.get(), MAX_DIRECTORY_DEPTH + 2);
+        // One just inside the limit is read whole and taken.
+        read.set(0);
+        let inside = std::iter::repeat_n(&b"d"[..], MAX_DIRECTORY_DEPTH + 1)
+            .inspect(|_| read.set(read.get() + 1));
+        assert!(check_components(inside).is_ok());
+        assert_eq!(read.get(), MAX_DIRECTORY_DEPTH + 1);
     }
 
     #[test]

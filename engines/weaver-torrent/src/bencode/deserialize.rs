@@ -35,6 +35,7 @@ pub struct BencodeDeserializer<'de> {
     parsing_key: bool,
     depth: usize,
     max_depth: usize,
+    tokens_left: usize,
 }
 
 impl<'de> BencodeDeserializer<'de> {
@@ -46,6 +47,7 @@ impl<'de> BencodeDeserializer<'de> {
             parsing_key: false,
             depth: 0,
             max_depth: DEFAULT_MAX_DEPTH,
+            tokens_left: usize::MAX,
         }
     }
 
@@ -58,6 +60,26 @@ impl<'de> BencodeDeserializer<'de> {
     pub fn with_max_depth(mut self, max_depth: usize) -> Self {
         self.max_depth = max_depth;
         self
+    }
+
+    /// Bound the tokens read (libtorrent `bdecode`'s `token_limit`): each
+    /// dict, list, integer and string is one, and so is the `e` that ends a
+    /// dict or a list. Unbounded by default.
+    pub fn with_max_tokens(mut self, max_tokens: usize) -> Self {
+        self.tokens_left = max_tokens;
+        self
+    }
+
+    /// Takes one token from the budget.
+    #[inline]
+    fn token(&mut self) -> Result<(), Error> {
+        match self.tokens_left.checked_sub(1) {
+            Some(left) => {
+                self.tokens_left = left;
+                Ok(())
+            }
+            None => Err(Error::TokenLimit),
+        }
     }
 
     pub fn into_remaining(self) -> &'de [u8] {
@@ -82,6 +104,7 @@ impl<'de> BencodeDeserializer<'de> {
         &mut self,
         atoi: impl Fn(&'de [u8]) -> (Option<I>, usize),
     ) -> Result<I, Error> {
+        self.token()?;
         self.parse_first_byte(b'i', Error::InvalidValue)?;
         match atoi(self.buf) {
             (Some(v), len) if len > 0 && self.buf.get(len) == Some(&b'e') => {
@@ -93,6 +116,7 @@ impl<'de> BencodeDeserializer<'de> {
     }
 
     fn parse_bytes(&mut self) -> Result<&'de [u8], Error> {
+        self.token()?;
         let b = match usize::from_radix_10(self.buf) {
             (v, len) if len > 0 && self.buf.get(len) == Some(&b':') => {
                 self.buf = unsafe { self.buf.get_unchecked(len + 1..) };
@@ -116,6 +140,7 @@ impl<'de> BencodeDeserializer<'de> {
         if self.depth >= self.max_depth {
             return Err(Error::DepthLimit(self.max_depth));
         }
+        self.token()?;
         self.depth += 1;
         Ok(())
     }
@@ -126,7 +151,19 @@ pub fn from_bytes<'a, T>(buf: &'a [u8]) -> Result<T, ErrorWithContext<'a>>
 where
     T: serde::de::Deserialize<'a>,
 {
-    let (v, rest) = from_bytes_with_rest(buf)?;
+    from_bytes_limited(buf, usize::MAX)
+}
+
+/// [`from_bytes`] reading at most `max_tokens` tokens
+/// ([`BencodeDeserializer::with_max_tokens`]).
+pub fn from_bytes_limited<'a, T>(
+    buf: &'a [u8],
+    max_tokens: usize,
+) -> Result<T, ErrorWithContext<'a>>
+where
+    T: serde::de::Deserialize<'a>,
+{
+    let (v, rest) = from_bytes_with_rest_limited(buf, max_tokens)?;
     if !rest.is_empty() {
         return Err(ErrorWithContext {
             kind: Error::BytesRemaining(rest.len()),
@@ -141,7 +178,19 @@ pub fn from_bytes_with_rest<'a, T>(buf: &'a [u8]) -> Result<(T, &'a [u8]), Error
 where
     T: serde::de::Deserialize<'a>,
 {
-    let mut de = BencodeDeserializer::new_from_buf(buf);
+    from_bytes_with_rest_limited(buf, usize::MAX)
+}
+
+/// [`from_bytes_with_rest`] reading at most `max_tokens` tokens
+/// ([`BencodeDeserializer::with_max_tokens`]).
+pub fn from_bytes_with_rest_limited<'a, T>(
+    buf: &'a [u8],
+    max_tokens: usize,
+) -> Result<(T, &'a [u8]), ErrorWithContext<'a>>
+where
+    T: serde::de::Deserialize<'a>,
+{
+    let mut de = BencodeDeserializer::new_from_buf(buf).with_max_tokens(max_tokens);
     let v = match T::deserialize(&mut de) {
         Ok(v) => v,
         Err(e) => {
@@ -174,6 +223,8 @@ pub enum Error {
     InvalidUtf8,
     #[error("nesting depth exceeds the limit ({0})")]
     DepthLimit(usize),
+    #[error("more tokens than the limit")]
+    TokenLimit,
     #[error("eof")]
     Eof,
 }
@@ -242,11 +293,12 @@ impl<'de> serde::de::Deserializer<'de> for &mut BencodeDeserializer<'de> {
             Some(b'd') => self.deserialize_map(visitor),
             Some(b'i') => {
                 // One past i64 is still an integer, read as u64.
-                let buf = self.buf;
+                let (buf, tokens_left) = (self.buf, self.tokens_left);
                 match self.parse_integer(i64::from_radix_10_signed_checked) {
                     Ok(v) => visitor.visit_i64(v),
                     Err(_) => {
                         self.buf = buf;
+                        self.tokens_left = tokens_left;
                         visitor.visit_u64(self.parse_integer(u64::from_radix_10_checked)?)
                     }
                 }
@@ -514,6 +566,7 @@ impl<'de> serde::de::MapAccess<'de> for MapAccess<'_, 'de> {
         K: serde::de::DeserializeSeed<'de>,
     {
         if self.de.buf.starts_with(b"e") {
+            self.de.token()?;
             self.de.buf = &self.de.buf[1..];
             return Ok(None);
         }
@@ -545,6 +598,7 @@ impl<'de> serde::de::SeqAccess<'de> for SeqAccess<'_, 'de> {
         T: serde::de::DeserializeSeed<'de>,
     {
         if self.de.buf.starts_with(b"e") {
+            self.de.token()?;
             self.de.buf = &self.de.buf[1..];
             return Ok(None);
         }
@@ -901,6 +955,31 @@ mod tests {
         let mut de = BencodeDeserializer::new_from_buf(&buf).with_max_depth(usize::MAX);
         let v: BencodeValue<ByteBufOwned> = serde::Deserialize::deserialize(&mut de).unwrap();
         drop(v);
+    }
+
+    #[test]
+    fn tokens_are_counted_as_libtorrent_counts_them() {
+        // `d`, `1:a`, `i1e`, `1:b`, `l`, `0:`, `e`, `e`: eight tokens.
+        let buf = b"d1:ai1e1:bl0:ee";
+        let read = |max_tokens| {
+            let mut de = BencodeDeserializer::new_from_buf(buf).with_max_tokens(max_tokens);
+            BencodeValue::<ByteBufOwned>::deserialize(&mut de)
+        };
+        assert!(read(8).is_ok());
+        assert!(matches!(read(7), Err(Error::TokenLimit)));
+        // An integer past i64, read again as u64, is one token.
+        let buf = b"i18446744073709551615e";
+        let mut de = BencodeDeserializer::new_from_buf(buf).with_max_tokens(1);
+        assert!(serde::de::IgnoredAny::deserialize(&mut de).is_ok());
+        // Unbounded by default.
+        let many = [&b"l"[..], &b"0:".repeat(100_000), b"e"].concat();
+        assert!(from_bytes::<BencodeValue<ByteBufOwned>>(&many).is_ok());
+        assert!(matches!(
+            super::from_bytes_limited::<BencodeValue<ByteBufOwned>>(&many, 100_001)
+                .map_err(|e| e.into_kind()),
+            Err(Error::TokenLimit)
+        ));
+        assert!(super::from_bytes_limited::<BencodeValue<ByteBufOwned>>(&many, 100_002).is_ok());
     }
 
     #[test]

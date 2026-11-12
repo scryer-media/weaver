@@ -1015,3 +1015,31 @@ async fn a_metadata_fetch_offers_the_dht_only_once_it_looks_for_peers_there() {
         .unwrap();
     assert_eq!(*no_dht.dht_node_named.lock(), None);
 }
+
+#[test]
+fn metadata_past_the_token_limit_is_refused() {
+    // An info dict with a last key the reader ignores, a list of `strings`
+    // empty strings: its key, the list, the strings and its end are each a
+    // token.
+    fn with_padding(strings: usize) -> Bytes {
+        let info = info_bytes(1);
+        let (end, dict) = info.split_last().unwrap();
+        assert_eq!(*end, b'e');
+        Bytes::from([dict, b"4:zzzzl", &b"0:".repeat(strings), b"ee"].concat())
+    }
+    let info = info_bytes(1);
+    let own = (1..)
+        .find(|&n| {
+            crate::bencode::from_bytes_limited::<
+                crate::core::torrent_metainfo::TorrentMetaV1Info<ByteBuf>,
+            >(&info, n)
+            .is_ok()
+        })
+        .unwrap();
+    let fits = super::MAX_TORRENT_TOKENS - own - 3;
+    assert!(super::decode_info(with_padding(fits)).is_ok());
+    assert!(matches!(
+        super::decode_info(with_padding(fits + 1)),
+        Err(crate::bencode::DeserializeError::TokenLimit)
+    ));
+}

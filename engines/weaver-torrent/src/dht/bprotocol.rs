@@ -502,17 +502,34 @@ pub fn serialize_message<'a, W: Write, BufT: ByteBufT + From<&'a [u8]>>(
     }
 }
 
+// libtorrent reads a datagram with `bdecode(.., 10, 500)` (dht_tracker.cpp:548,
+// v2.0.15). It checks the depth before every token (bdecode.cpp:839), so nine
+// nested containers are the most that parse.
+pub(crate) const MAX_DATAGRAM_DEPTH: usize = 9;
+pub(crate) const MAX_DATAGRAM_TOKENS: usize = 500;
+
+fn from_datagram<'de, T: Deserialize<'de>>(buf: &'de [u8]) -> anyhow::Result<T> {
+    let mut de = crate::bencode::BencodeDeserializer::new_from_buf(buf)
+        .with_max_depth(MAX_DATAGRAM_DEPTH)
+        .with_max_tokens(MAX_DATAGRAM_TOKENS);
+    let value = T::deserialize(&mut de)?;
+    let rest = de.into_remaining().len();
+    if rest > 0 {
+        anyhow::bail!("{rest} bytes after the message");
+    }
+    Ok(value)
+}
+
 pub fn deserialize_message<'de, BufT>(buf: &'de [u8]) -> anyhow::Result<Message<BufT>>
 where
     BufT: ByteBufT + Deserialize<'de>,
 {
-    let de: RawMessage<ByteBuf> = crate::bencode::from_bytes(buf).map_err(|e| e.into_anyhow())?;
+    let de: RawMessage<ByteBuf> = from_datagram(buf)?;
     match de.message_type {
         MessageType::Request => match (&de.arguments, &de.method_name, &de.response, &de.error) {
             (Some(_), Some(method_name), None, None) => match method_name.as_ref() {
                 b"find_node" => {
-                    let de: RawMessage<BufT, FindNodeRequest> =
-                        crate::bencode::from_bytes(buf).map_err(|e| e.into_anyhow())?;
+                    let de: RawMessage<BufT, FindNodeRequest> = from_datagram(buf)?;
                     Ok(Message {
                         transaction_id: de.transaction_id,
                         version: de.version,
@@ -521,8 +538,7 @@ where
                     })
                 }
                 b"get_peers" => {
-                    let de: RawMessage<BufT, GetPeersRequest> =
-                        crate::bencode::from_bytes(buf).map_err(|e| e.into_anyhow())?;
+                    let de: RawMessage<BufT, GetPeersRequest> = from_datagram(buf)?;
                     Ok(Message {
                         transaction_id: de.transaction_id,
                         version: de.version,
@@ -531,8 +547,7 @@ where
                     })
                 }
                 b"ping" => {
-                    let de: RawMessage<BufT, PingRequest> =
-                        crate::bencode::from_bytes(buf).map_err(|e| e.into_anyhow())?;
+                    let de: RawMessage<BufT, PingRequest> = from_datagram(buf)?;
                     Ok(Message {
                         transaction_id: de.transaction_id,
                         version: de.version,
@@ -541,8 +556,7 @@ where
                     })
                 }
                 b"announce_peer" => {
-                    let de: RawMessage<BufT, AnnouncePeer<BufT>> =
-                        crate::bencode::from_bytes(buf).map_err(|e| e.into_anyhow())?;
+                    let de: RawMessage<BufT, AnnouncePeer<BufT>> = from_datagram(buf)?;
                     Ok(Message {
                         transaction_id: de.transaction_id,
                         version: de.version,
@@ -560,8 +574,7 @@ where
         MessageType::Response => match (&de.arguments, &de.method_name, &de.response, &de.error) {
             // some peers are sending method name against the protocol, so ignore it.
             (None, _, Some(_), None) => {
-                let de: RawMessage<BufT, IgnoredAny, Response<BufT>> =
-                    crate::bencode::from_bytes(buf).map_err(|e| e.into_anyhow())?;
+                let de: RawMessage<BufT, IgnoredAny, Response<BufT>> = from_datagram(buf)?;
                 Ok(Message {
                     transaction_id: de.transaction_id,
                     version: de.version,
@@ -577,8 +590,7 @@ where
         MessageType::Error => match (&de.arguments, &de.method_name, &de.response, &de.error) {
             // some peers are sending method name against the protocol, so ignore it.
             (None, _, None, Some(_)) => {
-                let de: RawMessage<BufT, IgnoredAny, Response<BufT>> =
-                    crate::bencode::from_bytes(buf).map_err(|e| e.into_anyhow())?;
+                let de: RawMessage<BufT, IgnoredAny, Response<BufT>> = from_datagram(buf)?;
                 Ok(Message {
                     transaction_id: de.transaction_id,
                     version: de.version,
@@ -614,6 +626,38 @@ mod tests {
         include_bytes!("../../resources/test/dht/find_node_response_2.bin");
     const FIND_NODE_RESPONSE_3: &[u8] =
         include_bytes!("../../resources/test/dht/find_node_response_3.bin");
+
+    // A ping carrying an extra argument `x`, written as `extra`.
+    fn ping_with(extra: &[u8]) -> Vec<u8> {
+        let mut buf = b"d1:ad2:id20:abcdefghij01234567891:x".to_vec();
+        buf.extend_from_slice(extra);
+        buf.extend_from_slice(b"e1:q4:ping1:t2:aa1:y1:qe");
+        buf
+    }
+
+    #[test]
+    fn a_datagram_is_read_within_libtorrents_depth_and_token_limits() {
+        use super::{MAX_DATAGRAM_DEPTH, MAX_DATAGRAM_TOKENS};
+        let parses = |buf: &[u8]| bprotocol::deserialize_message::<ByteBuf>(buf).is_ok();
+        let nested = |lists: usize| {
+            let mut extra = vec![b'l'; lists];
+            extra.extend(std::iter::repeat_n(b'e', lists));
+            ping_with(&extra)
+        };
+        // The message and its arguments are two containers.
+        assert!(parses(&nested(MAX_DATAGRAM_DEPTH - 2)));
+        assert!(!parses(&nested(MAX_DATAGRAM_DEPTH - 1)));
+
+        // The ping is 13 tokens; `x` with a list of n integers adds n + 3.
+        let integers = |n: usize| {
+            let mut extra = b"l".to_vec();
+            extra.extend(std::iter::repeat_n(&b"i1e"[..], n).flatten());
+            extra.push(b'e');
+            ping_with(&extra)
+        };
+        assert!(parses(&integers(MAX_DATAGRAM_TOKENS - 16)));
+        assert!(!parses(&integers(MAX_DATAGRAM_TOKENS - 15)));
+    }
 
     fn write(filename: &str, data: &[u8]) {
         let full = format!("/tmp/{filename}.bin");

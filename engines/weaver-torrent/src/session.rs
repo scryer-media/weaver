@@ -560,7 +560,7 @@ async fn torrent_from_url(
     clients: &dyn HttpClients,
     url: &str,
 ) -> anyhow::Result<ParsedTorrentFile> {
-    let response = clients
+    let mut response = clients
         .client(None, &ClientShape::FETCH)
         .context("error building HTTP(S) client")?
         .get(url)
@@ -570,11 +570,25 @@ async fn torrent_from_url(
     if !response.status().is_success() {
         bail!("GET {} returned {}", url, response.status())
     }
-    let b = response
-        .bytes()
+    let limit = crate::core::torrent_metainfo::MAX_TORRENT_FILE_BYTES;
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        bail!("torrent at {url} is larger than {limit} bytes");
+    }
+    let mut b = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
         .await
-        .with_context(|| format!("error reading response body from {url}"))?;
-    torrent_from_bytes(b).context("error decoding torrent")
+        .with_context(|| format!("error reading response body from {url}"))?
+    {
+        if b.len() + chunk.len() > limit {
+            bail!("torrent at {url} is larger than {limit} bytes");
+        }
+        b.extend_from_slice(&chunk);
+    }
+    torrent_from_bytes(Bytes::from(b)).context("error decoding torrent")
 }
 
 fn compute_only_files_regex<ByteBuf: AsRef<[u8]>>(
@@ -2138,14 +2152,12 @@ impl Session {
                 let sni = incoming
                     .server_name()
                     .context("the TLS connection names no torrent")?;
-                let (id, config) = self
-                    .db
-                    .read()
-                    .torrents
-                    .iter()
-                    .find_map(|(id, t)| {
+                let (id, config) = crate::ssl::SslTorrent::hash_named(&sni)
+                    .and_then(|hash| {
+                        let db = self.db.read();
+                        let (id, t) = db.by_hash(hash)?;
                         let ssl = t.shared().ssl.as_ref()?;
-                        ssl.answers_to(&sni).then(|| (*id, ssl.server_config()))
+                        ssl.answers_to(&sni).then(|| (id, ssl.server_config()))
                     })
                     .with_context(|| format!("no SSL torrent is named {sni}"))?;
                 let config =
@@ -5562,6 +5574,70 @@ mod tests {
         );
         assert!(!text.contains("s3cret"), "{text}");
         assert!(!text.contains("0123passkey"), "{text}");
+    }
+
+    // Serves `head` and then `body` to the first request at a loopback URL.
+    async fn serve_once(head: String, body: Bytes) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..read]);
+            }
+            stream.write_all(head.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        format!("http://{addr}/a.torrent")
+    }
+
+    #[tokio::test]
+    async fn a_torrent_url_past_the_byte_limit_is_refused() {
+        let clients = crate::test_support::loopback();
+        let limit = crate::core::torrent_metainfo::MAX_TORRENT_FILE_BYTES;
+        // Said by its length.
+        let url = serve_once(
+            format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", limit + 1),
+            Bytes::new(),
+        )
+        .await;
+        let error = super::torrent_from_url(clients.as_ref(), &url)
+            .await
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("larger than"), "{error:#}");
+        // Found as it is read, with no length given.
+        let url = serve_once(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".into(),
+            Bytes::from(vec![b'x'; limit + 1]),
+        )
+        .await;
+        let error = super::torrent_from_url(clients.as_ref(), &url)
+            .await
+            .err()
+            .unwrap();
+        assert!(format!("{error:#}").contains("larger than"), "{error:#}");
+        // A torrent within it loads.
+        let torrent = torrent_bytes("x", false);
+        let url = serve_once(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                torrent.len()
+            ),
+            torrent.clone(),
+        )
+        .await;
+        let parsed = super::torrent_from_url(clients.as_ref(), &url)
+            .await
+            .unwrap();
+        assert_eq!(parsed.torrent_bytes, torrent);
     }
 
     #[test]
