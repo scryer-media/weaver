@@ -296,10 +296,6 @@ impl DatagramSocket for SharedDhtSocket {
     fn link_mtu(&self) -> Option<u16> {
         self.socket.link_mtu()
     }
-
-    fn dont_fragment(&self) -> bool {
-        self.socket.dont_fragment()
-    }
 }
 
 impl PollSendToVectored for DatagramTransport {
@@ -355,10 +351,6 @@ impl Transport for DatagramTransport {
 
     fn link_mtu(&self) -> Option<u16> {
         self.0.link_mtu()
-    }
-
-    fn dont_fragment(&self) -> bool {
-        self.0.dont_fragment()
     }
 }
 
@@ -425,14 +417,11 @@ impl KernelSockets {
         )]
         let (socket, dual_stack) = self.egress.bind_udp_reusing(addr)?;
         let socket = tokio::net::UdpSocket::from_std(socket)?;
-        let mut socket = KernelUdp {
+        Ok(KernelUdp {
             local: socket.local_addr()?,
             socket,
             dual_stack,
-            dont_fragment: false,
-        };
-        socket.cache_dont_fragment();
-        Ok(socket)
+        })
     }
 
     // The datagram sockets at `addr`, each set for uTP with a receive buffer
@@ -442,10 +431,9 @@ impl KernelSockets {
         addr: SocketAddr,
         utp: Option<usize>,
     ) -> io::Result<Arc<dyn DatagramSocket>> {
-        let set = |mut socket: KernelUdp, at: SocketAddr| {
+        let set = |socket: KernelUdp, at: SocketAddr| {
             if let Some(receive_buffer) = utp {
                 crate::udp_options::set_for_utp(&socket.socket, at, receive_buffer);
-                socket.cache_dont_fragment();
             }
             socket
         };
@@ -644,10 +632,6 @@ impl PairedUdp {
 }
 
 impl DatagramSocket for PairedUdp {
-    fn dont_fragment(&self) -> bool {
-        self.v6.dont_fragment() && self.v4.dont_fragment()
-    }
-
     fn bind_addr(&self) -> SocketAddr {
         self.v6.bind_addr()
     }
@@ -701,29 +685,15 @@ impl DatagramSocket for PairedUdp {
     }
 }
 
-/// A kernel datagram socket: the address it is bound at, whether it takes
-/// IPv4 as well as IPv6, and whether its datagrams are never fragmented.
+/// A kernel datagram socket: the address it is bound at, and whether it
+/// takes IPv4 as well as IPv6.
 pub(crate) struct KernelUdp {
     socket: tokio::net::UdpSocket,
     local: SocketAddr,
     dual_stack: bool,
-    dont_fragment: bool,
 }
 
 impl KernelUdp {
-    fn cache_dont_fragment(&mut self) {
-        let family = if self.local.is_ipv4() {
-            crate::udp_options::Family::V4
-        } else {
-            crate::udp_options::Family::V6
-        };
-        self.dont_fragment = crate::udp_options::dont_fragment(&self.socket, family)
-            .unwrap_or(false)
-            && (!self.dual_stack
-                || crate::udp_options::dont_fragment(&self.socket, crate::udp_options::Family::V4)
-                    .unwrap_or(false));
-    }
-
     // `target` as the socket names it: an IPv4 one by its IPv4-mapped IPv6
     // address on a socket that takes both families.
     fn toward(&self, target: SocketAddr) -> SocketAddr {
@@ -761,9 +731,8 @@ impl KernelSockets {
         addr: SocketAddr,
         receive_buffer: usize,
     ) -> io::Result<Arc<KernelUdp>> {
-        let mut socket = self.kernel_udp(addr)?;
+        let socket = self.kernel_udp(addr)?;
         crate::udp_options::set_for_utp(&socket.socket, addr, receive_buffer);
-        socket.cache_dont_fragment();
         Ok(Arc::new(socket))
     }
 }
@@ -782,10 +751,6 @@ impl KernelUdp {
 }
 
 impl DatagramSocket for KernelUdp {
-    fn dont_fragment(&self) -> bool {
-        self.dont_fragment
-    }
-
     fn bind_addr(&self) -> SocketAddr {
         self.local
     }

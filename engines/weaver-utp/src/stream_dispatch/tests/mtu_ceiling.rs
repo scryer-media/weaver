@@ -49,63 +49,25 @@ async fn a_tunnels_mtu_caps_the_probe_ceiling() {
     assert_eq!(new_streams_max_ss(&t), 1280 - 48);
 }
 
+// A stream on a socket at the unspecified IPv6 address, which may not
+// forbid fragmenting its IPv4 datagrams, probes all the same.
 #[tokio::test]
-async fn no_probe_where_datagrams_may_be_fragmented() {
+async fn a_new_stream_probes_up_to_the_link() {
     setup_test_logging();
     let t = make_test_vsock(Default::default(), false);
-    t.transport.set_fragments();
-    // The IPv4 floor, 576, less IPv4, UDP and uTP headers.
-    assert_eq!(new_streams_max_ss(&t), 528);
+    assert_eq!(new_streams_max_ss(&t), 1452);
 }
 
-// The largest payload `t` sends of 16 KiB written now, in `rounds` rounds,
-// each acked whole by a peer whose last packet was `peer_seq_nr`.
-async fn largest_sent_over(t: &mut super::TestVsock, peer_seq_nr: u16, rounds: usize) -> usize {
-    t.stream
-        .as_mut()
-        .unwrap()
-        .write_all(&[0u8; 16 * 1024])
-        .await
-        .unwrap();
-    let mut largest = 0;
-    for _ in 0..rounds {
-        t.env.increment_now(Duration::from_millis(10));
-        t.poll_once_assert_pending().await;
-        let sent = t.take_sent();
-        if sent.iter().all(|msg| msg.payload().is_empty()) {
-            continue;
-        }
-        for msg in sent {
-            largest = largest.max(msg.payload().len());
-        }
-        t.send_msg(
-            UtpHeader {
-                htype: State,
-                seq_nr: peer_seq_nr.into(),
-                ack_nr: t.vsock.last_sent_seq_nr,
-                wnd_size: 1024 * 1024,
-                ..Default::default()
-            },
-            "",
-        );
-    }
-    largest
-}
-
-// A socket that cannot forbid fragmenting, as a dual-stack socket at the
-// unspecified IPv6 address reports, holds its streams at the IPv4 floor
-// on a path that carries 1500-byte packets. Only the size of the peer's
-// own data packets raises it, so the size a stream reaches depends on
-// what the peer happens to send.
-#[tokio::test]
-async fn where_datagrams_may_fragment_only_the_peers_data_raises_the_size() {
-    setup_test_logging();
+// A stream sending 512 KiB over a path that carries payloads of up to
+// `passes` bytes and drops larger ones whole. The peer acks, 10 ms after
+// each send, everything before the first packet the path dropped; when
+// nothing new arrived, the clock steps a millisecond, the pacer's tick.
+// The payloads sent, in order.
+async fn over_a_path(passes: usize) -> (super::TestVsock, Vec<usize>) {
     let env = MockUtpEnvironment::new();
-    let transport = RememberingTransport::new(ADDR_1);
-    transport.set_fragments();
     let args = test_stream_args(&env, false);
     let mut t = make_test_vsock_on(
-        transport,
+        RememberingTransport::new(ADDR_1),
         SocketOpts {
             remote_inactivity_timeout: Some(Duration::from_secs(60)),
             vsock_tx_bufsize_bytes_initial: Some(non_zero_const!(1024 * 1024)),
@@ -114,41 +76,287 @@ async fn where_datagrams_may_fragment_only_the_peers_data_raises_the_size() {
         args,
         env,
     );
-    assert_eq!(largest_sent_over(&mut t, 1, 64).await, 528, "the floor");
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&[0u8; 512 * 1024])
+        .await
+        .unwrap();
+    let mut sizes = Vec::new();
+    for _ in 0..20_000 {
+        // Each round runs on a fresh task budget: past tokio's 128 receives
+        // in one task poll, the stream's inbox reads as empty.
+        tokio::task::yield_now().await;
+        t.poll_once_assert_pending().await;
+        let sent = t.take_sent();
+        let data = sent.iter().filter(|msg| msg.header.get_type() == Data);
+        sizes.extend(data.clone().map(|msg| msg.payload().len()));
+        let arrived = data
+            .take_while(|msg| msg.payload().len() <= passes)
+            .last()
+            .map(|msg| msg.header.seq_nr);
+        match arrived {
+            Some(ack_nr) => {
+                t.env.increment_now(Duration::from_millis(10));
+                let timestamp_microseconds = t.vsock.timestamp_microseconds();
+                t.send_msg(
+                    UtpHeader {
+                        htype: State,
+                        seq_nr: 1.into(),
+                        ack_nr,
+                        timestamp_microseconds,
+                        wnd_size: 1024 * 1024,
+                        ..Default::default()
+                    },
+                    "",
+                );
+            }
+            None => t.env.increment_now(Duration::from_millis(1)),
+        }
+    }
+    (t, sizes)
+}
 
-    // The peer's small packets, as requests are, leave it there.
-    t.send_msg(
-        UtpHeader {
-            htype: Data,
-            seq_nr: 1.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
-            wnd_size: 1024 * 1024,
+// On a path that carries 1500-byte packets, each acked probe raises the
+// size until the stream sends full-size segments: 1500 less IPv4, UDP and
+// uTP headers.
+#[tokio::test]
+async fn a_stream_probes_up_to_full_size_segments() {
+    setup_test_logging();
+    let (t, sizes) = over_a_path(usize::MAX).await;
+    assert_eq!(sizes[0], 528, "the floor first");
+    assert_eq!(t.vsock.segment_sizes.mss(), 1452);
+    assert_eq!(sizes.iter().max(), Some(&1452));
+    let full = sizes.iter().filter(|&&size| size == 1452).count();
+    assert!(full >= 300, "{full} full-size segments");
+}
+
+// A path that drops every packet larger than 1000 bytes, as a link that
+// may not fragment does: each probe past it is lost and lowers the
+// ceiling, and its data goes again at a size proven or probed lower. The
+// stream settles at the largest payload that passes, 1000 less IPv4, UDP
+// and uTP headers, and sends the rest at it.
+#[tokio::test]
+async fn a_stream_settles_at_the_largest_size_the_path_passes() {
+    setup_test_logging();
+    const PASSES: usize = 1000 - 48;
+    let (t, sizes) = over_a_path(PASSES).await;
+    assert!(sizes.iter().any(|&size| size > PASSES), "a probe was lost");
+    assert_eq!(usize::from(t.vsock.segment_sizes.mss()), PASSES);
+    assert!(
+        !t.vsock.segment_sizes.is_probing(),
+        "the ceiling met the floor"
+    );
+    let found = sizes.iter().position(|&size| size == PASSES).unwrap();
+    let after = &sizes[found..];
+    assert!(after.iter().all(|&size| size <= PASSES));
+    assert!(after.len() >= 300, "{} sent at the size found", after.len());
+}
+
+// A peer's large DATA proves the path toward us, not the path toward it:
+// only an acked probe raises the size, as in libtorrent (utp_stream.cpp
+// 2184-2189).
+#[tokio::test]
+async fn the_peers_large_data_does_not_raise_the_size() {
+    setup_test_logging();
+    let mut t = make_test_vsock(Default::default(), false);
+    t.send_data(1, 100, &"x".repeat(1354));
+    t.poll_once_assert_pending().await;
+    t.take_sent();
+    assert_eq!(t.vsock.segment_sizes.mss(), 528);
+
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&[0u8; 2000])
+        .await
+        .unwrap();
+    t.poll_once_assert_pending().await;
+    let data: Vec<_> = t
+        .take_sent()
+        .into_iter()
+        .filter(|msg| msg.header.get_type() == Data)
+        .collect();
+    assert_eq!(data[0].payload().len(), 528, "the floor");
+}
+
+// A peer behind a path whose limit the test sets. The transport refuses a
+// datagram larger than the limit, as a host whose path MTU shrank does;
+// the peer holds what arrives and acks, 10 ms after each send, every byte
+// it holds in order. When nothing new arrived, the clock steps a
+// millisecond, the pacer's tick.
+struct Peer {
+    // The largest payload the path passes.
+    passes: usize,
+    // Whether arrivals are acked.
+    acks: bool,
+    ack_nr: u16,
+    held: std::collections::BTreeMap<u16, Vec<u8>>,
+    received: Vec<u8>,
+    // Every DATA payload the stream tried, with whether the path took it.
+    tried: Vec<(u16, usize, bool)>,
+}
+
+impl Peer {
+    fn new() -> Self {
+        Self {
+            passes: usize::MAX,
+            acks: true,
+            ack_nr: 100,
+            held: Default::default(),
+            received: Vec::new(),
+            tried: Vec::new(),
+        }
+    }
+
+    // The path carries IP packets of up to `mtu` bytes: payloads of up to
+    // `mtu` less IPv4, UDP and uTP headers.
+    fn set_mtu(&mut self, t: &mut super::TestVsock, mtu: usize) {
+        self.passes = mtu - 48;
+        t.transport.set_max_payload_len(mtu - 28);
+    }
+
+    async fn round(&mut self, t: &mut super::TestVsock) {
+        // Each round runs on a fresh task budget: past tokio's 128 receives
+        // in one task poll, the stream's inbox reads as empty.
+        tokio::task::yield_now().await;
+        t.poll_once_assert_pending().await;
+        let mut arrived = false;
+        for msg in t.take_sent() {
+            if msg.header.get_type() != Data {
+                continue;
+            }
+            let (seq_nr, len) = (msg.header.seq_nr.0, msg.payload().len());
+            let taken = len <= self.passes;
+            self.tried.push((seq_nr, len, taken));
+            if taken {
+                self.held.insert(seq_nr, msg.payload().to_vec());
+                arrived = true;
+            }
+        }
+        while let Some(payload) = self.held.remove(&self.ack_nr.wrapping_add(1)) {
+            self.received.extend_from_slice(&payload);
+            self.ack_nr = self.ack_nr.wrapping_add(1);
+        }
+        if arrived && self.acks {
+            t.env.increment_now(Duration::from_millis(10));
+            let timestamp_microseconds = t.vsock.timestamp_microseconds();
+            t.send_msg(
+                UtpHeader {
+                    htype: State,
+                    seq_nr: 1.into(),
+                    ack_nr: self.ack_nr.into(),
+                    timestamp_microseconds,
+                    wnd_size: 1024 * 1024,
+                    ..Default::default()
+                },
+                "",
+            );
+        } else {
+            t.env.increment_now(Duration::from_millis(1));
+        }
+    }
+}
+
+// A stream with 1 MiB written, of bytes that each say where they belong,
+// run until it sends full-size segments.
+async fn settled_at_full_size(peer: &mut Peer) -> (super::TestVsock, Vec<u8>) {
+    let env = MockUtpEnvironment::new();
+    let args = test_stream_args(&env, false);
+    let mut t = make_test_vsock_on(
+        RememberingTransport::new(ADDR_1),
+        SocketOpts {
+            remote_inactivity_timeout: Some(Duration::from_secs(60)),
+            vsock_tx_bufsize_bytes_initial: Some(non_zero_const!(1024 * 1024)),
             ..Default::default()
         },
-        &"r".repeat(17 * 8),
+        args,
+        env,
     );
-    assert_eq!(
-        largest_sent_over(&mut t, 2, 64).await,
-        528,
-        "still the floor"
-    );
+    let written: Vec<u8> = (0..1024 * 1024).map(|i: u32| (i % 251) as u8).collect();
+    t.stream
+        .as_mut()
+        .unwrap()
+        .write_all(&written)
+        .await
+        .unwrap();
+    while t.vsock.segment_sizes.mss() < 1452 {
+        peer.round(&mut t).await;
+    }
+    (t, written)
+}
 
-    // One large packet from the peer, and every packet is that large.
-    t.send_msg(
-        UtpHeader {
-            htype: Data,
-            seq_nr: 2.into(),
-            ack_nr: t.vsock.last_sent_seq_nr,
-            wnd_size: 1024 * 1024,
-            ..Default::default()
-        },
-        &"r".repeat(1354),
+// The path's MTU drops from 1500 to 1000 under a stream sending full-size
+// segments. The host refuses each larger packet the stream has cut and not
+// sent; the stream cuts them again smaller, sends every byte in order, and
+// settles at the largest payload the path passes.
+#[tokio::test]
+async fn a_stream_lives_through_its_path_shrinking() {
+    setup_test_logging();
+    let mut peer = Peer::new();
+    let (mut t, written) = settled_at_full_size(&mut peer).await;
+    peer.set_mtu(&mut t, 1000);
+    let drop_at = peer.tried.len();
+    while peer.received.len() < written.len() {
+        peer.round(&mut t).await;
+    }
+    assert!(peer.received == written, "every byte arrived, in order");
+
+    let after = &peer.tried[drop_at..];
+    let refused: Vec<usize> = after
+        .iter()
+        .filter(|(_, _, taken)| !taken)
+        .map(|&(_, len, _)| len)
+        .collect();
+    assert!(refused.contains(&1452), "a full-size segment was refused");
+    // Each refused size is tried once: the next is smaller.
+    assert!(
+        refused.windows(2).all(|w| w[1] < w[0]),
+        "refused: {refused:?}"
     );
-    assert_eq!(
-        largest_sent_over(&mut t, 3, 64).await,
-        1354,
-        "the peer's size"
+    assert_eq!(usize::from(t.vsock.segment_sizes.mss()), 1000 - 48);
+    let at_limit = after.iter().filter(|&&(_, len, _)| len == 952).count();
+    assert!(at_limit >= 300, "{at_limit} sent at the size found");
+}
+
+// Full-size packets in flight when the path shrinks are lost with it. The
+// host refuses their resends as too large; a packet sent before cannot be
+// cut again, so each refused resend counts as one the path dropped and the
+// stream waits on. Once the path takes the packet again, it goes, and every
+// byte arrives in order. Nothing cut after the refusal is as large.
+#[tokio::test]
+async fn a_refused_resend_waits_as_a_lost_one() {
+    setup_test_logging();
+    let mut peer = Peer::new();
+    let (mut t, written) = settled_at_full_size(&mut peer).await;
+    // What is in flight now never arrives.
+    peer.acks = false;
+    peer.passes = 0;
+    peer.round(&mut t).await;
+    let lost_from = peer.ack_nr.wrapping_add(1);
+    peer.acks = true;
+    peer.set_mtu(&mut t, 1000);
+    let shrunk_at = peer.tried.len();
+    while !peer.tried[shrunk_at..]
+        .iter()
+        .any(|&(seq_nr, len, taken)| seq_nr == lost_from && len == 1452 && !taken)
+    {
+        peer.round(&mut t).await;
+    }
+    let refused_at = peer.tried.len();
+    // The path takes 1500-byte packets again.
+    peer.set_mtu(&mut t, 1500);
+    while peer.received.len() < written.len() {
+        peer.round(&mut t).await;
+    }
+    assert!(peer.received == written, "every byte arrived, in order");
+    assert!(
+        peer.tried[refused_at..]
+            .iter()
+            .any(|&(seq_nr, len, taken)| seq_nr == lost_from && len == 1452 && taken),
+        "the refused packet went whole"
     );
+    assert!(usize::from(t.vsock.segment_sizes.max_ss()) < 1452);
 }
 
 #[tokio::test]

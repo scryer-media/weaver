@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-12.
 
 // Calculations for payload sizes that we should be sending, based on MTU and successfully
 // delivered payloads so far. Binary searches (probes) the payload size until convergence.
@@ -44,12 +44,6 @@ pub(crate) fn packet_mtu(payload: usize, is_ipv4: bool) -> u16 {
         .saturating_add(ip + UDP_HEADER + UTP_HEADER)
 }
 
-// The packet every path carries: a stream starts its segments here, and
-// probes no higher where datagrams may be fragmented.
-pub(crate) fn floor_mtu(is_ipv4: bool) -> u16 {
-    if is_ipv4 { 576 } else { 1280 }
-}
-
 #[derive(Clone, Copy, Debug)]
 pub struct SegmentSizes {
     // The minimum uTP payload size that we know can go through the link.
@@ -57,6 +51,9 @@ pub struct SegmentSizes {
     // The maximum uTP payload size to probe for. Calculated from link MTU
     // (default 1500, ethernet)
     max_ss: u16,
+    // The payload size every path carries: where a stream starts, and
+    // where it falls back to when the host refuses a size it had proven.
+    floor_ss: u16,
 
     cooldown_remaining_packets: u16,
     cooldown_max_packets: u16,
@@ -85,7 +82,7 @@ impl SegmentSizes {
         } else {
             IPV6_HEADER
         };
-        let default_min_mtu = floor_mtu(config.is_ipv4);
+        let default_min_mtu = if config.is_ipv4 { 576 } else { 1280 };
 
         let calc = |mtu: u16| mtu - ip_header_size - UTP_HEADER - UDP_HEADER;
 
@@ -101,15 +98,35 @@ impl SegmentSizes {
         Self {
             min_ss,
             max_ss,
+            floor_ss: min_ss,
             cooldown_remaining_packets: 1,
             cooldown_max_packets: config.probe_expiry_cooldown_packets,
         }
     }
 
+    // A delivered payload proves its size, unless the host has since
+    // refused a packet that large: a segment sent before the refusal and
+    // acknowledged after it does not raise the size again.
     pub fn on_payload_delivered(&mut self, payload_size: usize) {
         let payload_size = payload_size.min(u16::MAX as usize) as u16;
-        self.min_ss = self.min_ss.max(payload_size);
-        self.max_ss = self.max_ss.max(self.min_ss);
+        if payload_size <= self.max_ss {
+            self.min_ss = self.min_ss.max(payload_size);
+        }
+    }
+
+    // The host refused a packet of `size` payload bytes as larger than its
+    // path carries now. No segment that large is cut again. A size proven
+    // earlier that the refusal disproves falls back to the floor, and
+    // probing searches upward from there, below the refused size.
+    pub fn on_send_too_large(&mut self, size: usize) {
+        let below = u16::try_from(size)
+            .unwrap_or(u16::MAX)
+            .saturating_sub(1)
+            .max(1);
+        if self.min_ss > below {
+            self.min_ss = self.floor_ss.min(below);
+        }
+        self.max_ss = self.max_ss.min(below).max(self.min_ss);
     }
 
     pub fn mss(&self) -> u16 {

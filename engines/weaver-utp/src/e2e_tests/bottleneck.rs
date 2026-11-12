@@ -542,9 +542,6 @@ impl Transport for ModelTransport {
     fn link_mtu(&self) -> Option<u16> {
         Some(PATH_MTU as u16)
     }
-    fn dont_fragment(&self) -> bool {
-        true
-    }
 }
 
 impl PollSendToVectored for ModelTransport {

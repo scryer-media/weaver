@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-03.
+// Modified by the Weaver authors, 2026-11-12.
 
 use std::{
     future::Future,
@@ -81,12 +81,6 @@ pub trait Transport: PollSendToVectored + Send + Sync + Unpin + 'static {
     /// it, such as a tunnel's MTU; no uTP packet is larger.
     fn link_mtu(&self) -> Option<u16> {
         None
-    }
-
-    /// Whether the transport's datagrams leave with don't-fragment set, so
-    /// an MTU probe too large for the path is lost rather than split.
-    fn dont_fragment(&self) -> bool {
-        false
     }
 }
 

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-10.
+// Modified by the Weaver authors, 2026-11-12.
 
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
@@ -43,10 +43,6 @@ pub enum Error {
     BugAssemblerMissingSlot(usize),
     #[error("bug: can't enqueue next segment")]
     BugCantEnqueue,
-    #[error(
-        "bug: got EMSGSIZE error, but the last message was not a matching MTU probe that we could pop."
-    )]
-    BugEmsgSizeNoProbe,
     #[error("bug: received a packet in Closed state, we shouldn't have reached here")]
     BugRecvInClosed,
     #[error("bug: unexpected packet in SynReceived state. We should have sent the SYN-ACK first.")]

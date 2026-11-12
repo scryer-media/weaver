@@ -61,9 +61,6 @@ impl DatagramSocket for Watched {
     fn link_mtu(&self) -> Option<u16> {
         self.0.link_mtu()
     }
-    fn dont_fragment(&self) -> bool {
-        self.0.dont_fragment()
-    }
     fn shutdown(&self) -> BoxFuture<'_, io::Result<()>> {
         self.0.shutdown()
     }
