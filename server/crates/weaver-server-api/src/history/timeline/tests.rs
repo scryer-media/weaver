@@ -998,3 +998,92 @@ fn extracting_lane_joins_member_activity_and_the_extracting_status() {
     assert_eq!(lane.spans[1].ended_at, Some(8_000.0));
     assert_eq!(lane.spans[1].state, TimelineSpanState::Failed);
 }
+
+// A large archive job: its download, verify and repair spans and its first
+// members all happen before the newest 2,000 events, and script output is
+// interleaved throughout. The timeline built from the timeline kinds alone
+// equals the one built from the whole log, and a newest-2,000 window does not.
+#[test]
+fn timeline_from_its_kinds_equals_the_full_log_timeline() {
+    let mut log = Vec::new();
+    let mut at = 1_000;
+    let mut push = |kind: &str, file_id: Option<String>, log: &mut Vec<StoredJobEvent>| {
+        at += 10;
+        log.push(event(kind, at, file_id, kind));
+    };
+    push("JobCreated", None, &mut log);
+    push("DownloadStarted", None, &mut log);
+    push("JobPaused", None, &mut log);
+    push("ScriptOutput", None, &mut log);
+    push("JobResumed", None, &mut log);
+    push(
+        "DownloadFinished",
+        Some(crate::history::types::DOWNLOAD_FINALIZATION_MARKER.to_string()),
+        &mut log,
+    );
+    push("DownloadPipelineDrained", None, &mut log);
+    push("JobVerificationStarted", None, &mut log);
+    push("JobVerificationComplete", None, &mut log);
+    push("RepairStarted", None, &mut log);
+    push("RepairFailed", None, &mut log);
+    push("RepairComplete", None, &mut log);
+    push("ExtractionReady", None, &mut log);
+    for index in 0..800 {
+        let member = crate::history::types::encode_timeline_member_subject(
+            "set",
+            &format!("member{index:04}.bin"),
+            None,
+        );
+        let waiting = crate::history::types::encode_timeline_member_subject(
+            "set",
+            &format!("member{index:04}.bin"),
+            Some(index % 7),
+        );
+        push("ExtractionMemberStarted", member.clone(), &mut log);
+        push("ScriptDetail", None, &mut log);
+        push("ExtractionMemberWaitingStarted", waiting.clone(), &mut log);
+        push("ExtractionMemberWaitingFinished", waiting, &mut log);
+        push("PostProcessingScript", None, &mut log);
+        if index % 50 == 49 {
+            push("ExtractionMemberFailed", member, &mut log);
+        } else {
+            push("ExtractionMemberFinished", member, &mut log);
+        }
+    }
+    push("ExtractionComplete", None, &mut log);
+    push("MoveToCompleteStarted", None, &mut log);
+    push("MoveToCompleteFinished", None, &mut log);
+    push("JobCompleted", None, &mut log);
+    assert!(log.len() > 2 * 2000);
+
+    let job = job(JobStatus::Complete);
+    let history = history(1, at / 1000 + 1);
+    let full = build_job_timeline(&job, Some(&history), &log);
+    let kinds: Vec<StoredJobEvent> = log
+        .iter()
+        .filter(|event| TIMELINE_EVENT_KINDS.contains(&event.kind.as_str()))
+        .cloned()
+        .collect();
+    assert!(kinds.len() < log.len());
+    let from_kinds = build_job_timeline(&job, Some(&history), &kinds);
+    assert_eq!(
+        serde_json::to_value(&from_kinds).unwrap(),
+        serde_json::to_value(&full).unwrap()
+    );
+
+    let window = &log[log.len() - 2000..];
+    let from_window = build_job_timeline(&job, Some(&history), window);
+    assert_ne!(
+        serde_json::to_value(&from_window).unwrap(),
+        serde_json::to_value(&full).unwrap()
+    );
+    assert_eq!(full.extraction_groups[0].members.len(), 800);
+}
+
+// Every kind a timeline arm names is read for the timeline.
+#[test]
+fn timeline_kinds_name_real_event_kinds() {
+    for kind in TIMELINE_EVENT_KINDS {
+        assert!(kind.parse::<EventKind>().is_ok(), "{kind}");
+    }
+}

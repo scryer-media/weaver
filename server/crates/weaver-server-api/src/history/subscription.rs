@@ -84,12 +84,12 @@ impl HistorySubscription {
 
             while let Some(trigger) = triggers.next().await {
                 let heartbeat = matches!(trigger, JobDetailTrigger::Heartbeat);
-                // A terminal (archived) job's event log and history are
-                // immutable, so the fast per-tab heartbeat need not re-read the
-                // database. But DB-only changes that emit no pipeline event
-                // (e.g. a background history-delete) must still surface, so a
+                // A terminal (archived) job's event log is immutable, so the
+                // fast per-tab heartbeat need not re-read the database. But
+                // DB-only changes that emit no pipeline event (a background
+                // history delete, a history edit) must still surface, so a
                 // terminal job is checked at a slow cadence, and rebuilt only
-                // when its history row or delete state moved.
+                // when its history row, edited columns or delete state moved.
                 if heartbeat && terminal_settled {
                     if last_terminal_reload.elapsed() < JOB_DETAIL_TERMINAL_HEARTBEAT {
                         continue;
@@ -181,11 +181,12 @@ fn live_fingerprint(handle: &SchedulerHandle, job_id: u64) -> Option<Vec<u8>> {
     serde_json::to_vec(&info).ok()
 }
 
-// What a terminal job's snapshot can still change by: whether its history row
-// exists, and its delete state.
+// What a terminal job's snapshot can still change by: its history row, or
+// its absence, with the columns a history edit changes, and its delete
+// state. A history edit emits no pipeline event, so only this mark shows it.
 #[derive(Debug, PartialEq, Eq)]
 struct TerminalMark {
-    archived: bool,
+    history: Option<weaver_server_core::HistoryEditFields>,
     delete_state: Option<weaver_server_core::HistoryDeleteRowState>,
 }
 
@@ -194,12 +195,12 @@ async fn terminal_mark(
     job_id: u64,
 ) -> Result<TerminalMark, weaver_server_core::StateError> {
     tokio::task::spawn_blocking(move || {
-        let archived = !db.job_history_ids_among(&[job_id])?.is_empty();
+        let history = db.job_history_edit_fields(job_id)?;
         let delete_state = db
             .list_history_delete_row_states(&[job_id])?
             .remove(&job_id);
         Ok(TerminalMark {
-            archived,
+            history,
             delete_state,
         })
     })
@@ -323,9 +324,31 @@ mod tests {
         assert!(gate.terminal_moved(terminal_mark(db.clone(), 7).await.unwrap()));
         assert!(!gate.terminal_moved(terminal_mark(db.clone(), 7).await.unwrap()));
 
+        // A history edit (NZBGet's HistorySetName, HistorySetCategory or
+        // HistorySetParameter) emits no event; the mark alone shows it.
+        let edits = [
+            weaver_server_core::JobUpdate {
+                name: Some("renamed".into()),
+                ..Default::default()
+            },
+            weaver_server_core::JobUpdate {
+                category: weaver_server_core::FieldUpdate::Set("tv".into()),
+                ..Default::default()
+            },
+            weaver_server_core::JobUpdate {
+                metadata_edits: vec![("key".into(), Some("value".into()))],
+                ..Default::default()
+            },
+        ];
+        for edit in edits {
+            assert!(db.update_job_history_fields(7, &edit).unwrap());
+            assert!(gate.terminal_moved(terminal_mark(db.clone(), 7).await.unwrap()));
+            assert!(!gate.terminal_moved(terminal_mark(db.clone(), 7).await.unwrap()));
+        }
+
         db.delete_job_history(7).unwrap();
         let gone = terminal_mark(db.clone(), 7).await.unwrap();
-        assert!(!gone.archived);
+        assert!(gone.history.is_none());
         assert!(gate.terminal_moved(gone));
         assert!(!gate.terminal_moved(terminal_mark(db, 7).await.unwrap()));
     }

@@ -19,7 +19,8 @@ pub use attributes::{
 };
 pub use failure_kind::HistoryFailureKind;
 pub use model::{
-    HistoryFilter, HistoryKeyRow, HistoryMetadataEquals, HistoryOrder, HistoryOrderKey, HistoryRows,
+    HistoryEditFields, HistoryFilter, HistoryKeyRow, HistoryMetadataEquals, HistoryOrder,
+    HistoryOrderKey, HistoryRows,
 };
 pub use nzbget_state::{NzbgetHistoryState, NzbgetMarkStatus};
 pub use record::{IntegrationEventRow, JobHistoryRow};

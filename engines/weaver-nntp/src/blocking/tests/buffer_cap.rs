@@ -152,7 +152,19 @@ fn full_rustls_reads_never_grow_the_read_buffer() {
         }
     });
 
-    let tcp = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    // Each read waits for a whole chunk to be queued, so the socket must
+    // hold one: Linux's default loopback receive buffer holds less than a
+    // 128 KiB chunk, and the wait would never end.
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    socket.set_recv_buffer_size(4 * read_size).unwrap();
+    assert!(
+        socket.recv_buffer_size().unwrap() >= 2 * read_size,
+        "the kernel refused a receive buffer of two chunks"
+    );
+    socket
+        .connect(&std::net::SocketAddr::from(([127, 0, 0, 1], port)).into())
+        .unwrap();
+    let tcp: TcpStream = socket.into();
     let watch = tcp.try_clone().unwrap();
     let mut stream = BlockingManualTlsStream::connect(
         tcp,
