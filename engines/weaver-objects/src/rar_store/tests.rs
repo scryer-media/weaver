@@ -5,6 +5,7 @@ mod contested;
 mod contradicted;
 mod facts;
 mod owner;
+mod placement;
 mod recovery_contracts;
 mod settle;
 pub(crate) mod writer;
