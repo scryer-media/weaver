@@ -2432,6 +2432,7 @@ impl TorrentService {
         queue.state().seat_owner(seat.clone());
         queue.state().seat_torrent_rate(seat);
         let mut hold = queue.state().subscribe_holds();
+        let mut starts = queue.state().subscribe_starts();
         *self
             .inner
             .queue
@@ -2442,6 +2443,15 @@ impl TorrentService {
             while hold.changed().await.is_ok() {
                 service.apply_queue().await;
                 service.publish().await;
+            }
+        }));
+        // A start of every torrent looks again at those held for their
+        // files, as a start of one does. Starts asked for while a look runs
+        // are one more look, after it.
+        let service = self.clone();
+        self.keep(tokio::spawn(async move {
+            while starts.changed().await.is_ok() {
+                service.look_again_held().await;
             }
         }));
     }
@@ -5486,6 +5496,50 @@ impl TorrentService {
         true
     }
 
+    // Every torrent held for its files that its own intent would run looks
+    // at them again, RESTORES_AT_ONCE at a time, as a start of every torrent
+    // asks (qBittorrent `torrents/start` with `all` calls `TorrentImpl::start`
+    // on each). One its own pause stops stays as it is, as the start leaves
+    // it. Those let go join their sessions once every look is done.
+    async fn look_again_held(&self) {
+        let held: Vec<JobId> = self
+            .inner
+            .live
+            .lock()
+            .await
+            .values()
+            .filter(|torrent| torrent.files_missing && torrent.resumed())
+            .map(|torrent| torrent.record.job_id)
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        let mut looking = tokio::task::JoinSet::new();
+        let mut found = Vec::new();
+        for job_id in held {
+            if looking.len() >= RESTORES_AT_ONCE
+                && let Some(Ok(Some(job_id))) = looking.join_next().await
+            {
+                found.push(job_id);
+            }
+            let service = self.clone();
+            looking.spawn(async move { service.look_again(job_id).await.then_some(job_id) });
+        }
+        while let Some(looked) = looking.join_next().await {
+            if let Ok(Some(job_id)) = looked {
+                found.push(job_id);
+            }
+        }
+        if found.is_empty() {
+            return;
+        }
+        self.apply_queue().await;
+        for job_id in found {
+            self.attach(job_id, None).await;
+        }
+        self.publish().await;
+    }
+
     pub async fn set_forced(&self, job_id: JobId, forced: bool) -> Result<(), ActionError> {
         self.with_torrent(job_id, |torrent| {
             self.inner
@@ -5538,7 +5592,7 @@ impl TorrentService {
                 "the location must be an absolute path".to_owned(),
             ));
         }
-        let (store, from, placed) = self
+        let (store, from, placed, held) = self
             .with_torrent(job_id, |torrent| {
                 if torrent.moving.is_some() {
                     return Err(ActionError::Invalid(
@@ -5550,6 +5604,7 @@ impl TorrentService {
                         store,
                         PathBuf::from(dir),
                         torrent.record.files_dir.clone().map(PathBuf::from),
+                        torrent.files_missing,
                     )),
                     _ => Err(ActionError::Invalid(
                         "the torrent has no files to move yet".to_owned(),
@@ -5569,6 +5624,9 @@ impl TorrentService {
             .file_name()
             .and_then(|name| name.to_str())
             .ok_or_else(|| ActionError::State("the torrent's directory has no name".to_owned()))?;
+        if held {
+            return self.place_held(job_id, &store, parent.join(name)).await;
+        }
         // A location the torrent's directory cannot be made under is the
         // caller's to fix (qBittorrent `TorrentsController::setLocationAction`
         // answers "Cannot make save path" as a conflict).
@@ -5609,6 +5667,60 @@ impl TorrentService {
         let moved = self.moved(job_id, outcome).await;
         self.publish().await;
         moved
+    }
+
+    // A torrent held for its files has none to move: its directory's name
+    // under the new location becomes its directory, unclaimed and as it is,
+    // and its files are looked for there. It runs if they are there and
+    // stays held if not; nothing is made or moved at either place
+    // (libtorrent `move_storage` passes over a file that is not there,
+    // storage_utils.cpp:236-239 at v2.0.15, and qBittorrent
+    // `TorrentImpl::handleMoveStorageJobFinished` looks again from the new
+    // path, torrentimpl.cpp:2140-2146).
+    async fn place_held(
+        &self,
+        job_id: JobId,
+        store: &Arc<TorrentStore>,
+        to: PathBuf,
+    ) -> Result<(), ActionError> {
+        let dir = to.to_string_lossy().into_owned();
+        self.with_torrent(job_id, |torrent| {
+            if torrent.moving.is_some() {
+                return Err(ActionError::Invalid(
+                    "the torrent is already moving".to_owned(),
+                ));
+            }
+            let still_held = torrent.files_missing
+                && torrent
+                    .store
+                    .as_ref()
+                    .is_some_and(|held| Arc::ptr_eq(held, store));
+            if !still_held {
+                return Err(ActionError::Invalid(
+                    "the torrent's files were found while it was moved; move it again".to_owned(),
+                ));
+            }
+            self.inner
+                .db
+                .set_torrent_storage_dir(job_id, &dir)
+                .map_err(|error| ActionError::State(state_error(error)))?;
+            match store
+                .files()
+                .relocate(|_| Ok::<_, std::convert::Infallible>((to.clone(), ())))
+            {
+                Ok(()) => {}
+                Err(never) => match never {},
+            }
+            torrent.record.storage_dir = Some(dir.clone());
+            Ok(())
+        })
+        .await?;
+        if self.look_again(job_id).await {
+            self.apply_queue().await;
+            self.attach(job_id, None).await;
+        }
+        self.publish().await;
+        Ok(())
     }
 
     // Move a torrent's files placed in `from`, outside its directory, to

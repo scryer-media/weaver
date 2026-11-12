@@ -1884,12 +1884,17 @@ fn files_under(dir: &Path) -> Vec<PathBuf> {
 
 // A torrent with every piece in its files, and the folder they are in.
 async fn with_every_piece(rig: &Rig) -> (JobId, PathBuf) {
+    with_every_piece_of(rig, "set", 1).await
+}
+
+// `with_every_piece` for the torrent `plain(name, seed)` makes.
+async fn with_every_piece_of(rig: &Rig, name: &str, seed: u8) -> (JobId, PathBuf) {
     let job_id = rig
         .service
-        .add(request(AddSource::Metainfo(plain("set", 1))))
+        .add(request(AddSource::Metainfo(plain(name, seed))))
         .await
         .unwrap();
-    fetch_every_piece(&rig.service, job_id, &[1; 3000]).await;
+    fetch_every_piece(&rig.service, job_id, &[seed; 3000]).await;
     let dir = PathBuf::from(
         rig.service
             .torrent(job_id)
@@ -3329,6 +3334,136 @@ async fn a_recheck_lets_go_of_a_torrent_held_for_its_files() {
     std::fs::rename(&away, &dir).unwrap();
     again.recheck(job_id).await.unwrap();
     runs_with_every_piece(&again, job_id).await;
+    again.stop().await;
+}
+
+// A start of every torrent looks again at each one held for its files, as a
+// start of one does (qBittorrent `torrents/start` with `all` starts each
+// torrent, `TorrentImpl::start`, torrentimpl.cpp:2048-2053): one whose files
+// are back runs with every piece, one whose files are still gone stays held,
+// and one the hold over every torrent stopped starts as before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_start_of_every_torrent_looks_again_at_those_held_for_their_files() {
+    let rig = rig(set_clock());
+    rig.service.open().await.unwrap();
+    let (back, back_dir) = with_every_piece_of(&rig, "back", 1).await;
+    let (gone, gone_dir) = with_every_piece_of(&rig, "gone", 2).await;
+    let stopped = rig
+        .service
+        .add(request(AddSource::Metainfo(plain("stopped", 3))))
+        .await
+        .unwrap();
+    rig.service.stop().await;
+    rig.db.prune_orphan_active_state(JobId(u64::MAX)).unwrap();
+    let back_away = back_dir.with_extension("away");
+    std::fs::rename(&back_dir, &back_away).unwrap();
+    std::fs::rename(&gone_dir, gone_dir.with_extension("away")).unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    let queue = queue();
+    queue.pause_torrents().await.unwrap();
+    again.publish_to(queue.clone());
+    reopen(&again).await;
+    held_for_its_files(&again, back, &back_dir).await;
+    held_for_its_files(&again, gone, &gone_dir).await;
+    assert_eq!(paused_by(&again, stopped).await, Some(HoldOrigin::Manual));
+
+    std::fs::rename(&back_away, &back_dir).unwrap();
+    let mut published = queue.state().subscribe_job_changes();
+    queue.resume_torrents().await.unwrap();
+    // The torrents held for their files are all looked at before any of
+    // them joins a session, so the one that runs says the other was looked
+    // at too.
+    loop {
+        published.borrow_and_update();
+        let running = again.inner.live.lock().await[&back].attached.is_some();
+        if running && paused_by(&again, stopped).await.is_none() {
+            break;
+        }
+        published.changed().await.unwrap();
+    }
+    runs_with_every_piece(&again, back).await;
+    held_for_its_files(&again, gone, &gone_dir).await;
+    assert!(again.inner.live.lock().await[&stopped].attached.is_some());
+    assert_ne!(
+        again.torrent(stopped).await.unwrap().state,
+        TorrentState::Paused
+    );
+    again.stop().await;
+}
+
+// A torrent held for its files moved to where they are now takes that
+// place as its own: nothing is moved or made, and it runs with every piece
+// (qBittorrent `TorrentImpl::handleMoveStorageJobFinished`,
+// torrentimpl.cpp:2140-2146; libtorrent `move_storage` passes over a file
+// that is not there, storage_utils.cpp:236-239 at v2.0.15).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_held_for_its_files_moved_to_where_they_are_runs() {
+    let rig = rig(set_clock());
+    let (job_id, dir, away) = gone_at_restart(&rig).await;
+    let elsewhere = rig.dir.path().join("elsewhere");
+    std::fs::create_dir(&elsewhere).unwrap();
+    let there = elsewhere.join(dir.file_name().unwrap());
+    std::fs::rename(&away, &there).unwrap();
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    held_for_its_files(&again, job_id, &dir).await;
+
+    again
+        .set_location(job_id, elsewhere.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    runs_with_every_piece(&again, job_id).await;
+    assert_eq!(
+        again.torrent(job_id).await.unwrap().storage_dir.as_deref(),
+        there.to_str()
+    );
+    assert_eq!(
+        rig.db
+            .get_torrent(job_id)
+            .unwrap()
+            .unwrap()
+            .storage_dir
+            .as_deref(),
+        there.to_str()
+    );
+    assert!(!dir.exists());
+    assert_eq!(
+        std::fs::read_dir(&elsewhere)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect::<Vec<_>>(),
+        [there]
+    );
+    again.stop().await;
+}
+
+// A torrent held for its files moved to a place they are not either stays
+// held there with every piece kept, and nothing is made at either place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_torrent_held_for_its_files_moved_to_an_empty_place_stays_held() {
+    let rig = rig(set_clock());
+    let (job_id, dir, _away) = gone_at_restart(&rig).await;
+    let empty = rig.dir.path().join("empty");
+    std::fs::create_dir(&empty).unwrap();
+    let there = empty.join(dir.file_name().unwrap());
+
+    let again = service_on(&rig.db, rig.dir.path(), &rig.routes, job_env(), set_clock());
+    reopen(&again).await;
+    held_for_its_files(&again, job_id, &dir).await;
+
+    again
+        .set_location(job_id, empty.to_string_lossy().into_owned())
+        .await
+        .unwrap();
+    held_for_its_files(&again, job_id, &there).await;
+    assert_eq!(
+        again.torrent(job_id).await.unwrap().storage_dir.as_deref(),
+        there.to_str()
+    );
+    assert!(!dir.exists());
+    assert_eq!(std::fs::read_dir(&empty).unwrap().count(), 0);
     again.stop().await;
 }
 

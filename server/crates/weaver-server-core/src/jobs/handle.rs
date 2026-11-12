@@ -73,6 +73,10 @@ pub struct SharedPipelineState {
     // The holds in force, as the queue records them, for every owner of
     // queue items to follow.
     holds: tokio::sync::watch::Sender<HoldSet>,
+    // How many starts of every item the operator or the schedule has asked
+    // for, held or not, for every owner of queue items to look again at what
+    // it keeps from running.
+    starts: tokio::sync::watch::Sender<u64>,
     // The torrent side of the global download limit, once torrents run.
     torrent_rate: Arc<RwLock<Option<Arc<dyn TorrentRate>>>>,
     // How the global download limit is shared out, as last put in force.
@@ -136,6 +140,7 @@ impl SharedPipelineState {
             queue,
             owner: Arc::new(RwLock::new(None)),
             holds: tokio::sync::watch::channel(HoldSet::default()).0,
+            starts: tokio::sync::watch::channel(0).0,
             torrent_rate: Arc::new(RwLock::new(None)),
             bandwidth_split: Arc::new(RwLock::new(crate::bandwidth::SplitState::default())),
             metrics,
@@ -314,6 +319,18 @@ impl SharedPipelineState {
     // Wakes on each change of the holds.
     pub fn subscribe_holds(&self) -> tokio::sync::watch::Receiver<HoldSet> {
         self.holds.subscribe()
+    }
+
+    // Wakes on each start of every item, whether it lifted a hold or not.
+    pub fn subscribe_starts(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.starts.subscribe()
+    }
+
+    // A start of every item was asked for: after its release of the holds,
+    // so an owner that wakes on it sees them lifted.
+    fn started(&self) {
+        self.starts
+            .send_modify(|starts| *starts = starts.wrapping_add(1));
     }
 
     pub(crate) fn schedule_replay_paused(&self) -> bool {
@@ -1987,8 +2004,12 @@ impl SchedulerHandle {
         self.pause(Hold::manual(HoldOwner::All)).await
     }
 
+    // The operator's start of the whole queue, which also looks again at
+    // what each owner keeps from running.
     pub async fn resume_all(&self) -> Result<(), SchedulerError> {
-        self.resume(HoldOrigin::Manual, HoldOwner::All).await
+        self.resume(HoldOrigin::Manual, HoldOwner::All).await?;
+        self.state.started();
+        Ok(())
     }
 
     // The operator's pause of every torrent, as one hold.
@@ -1996,8 +2017,11 @@ impl SchedulerHandle {
         self.pause(Hold::manual(HoldOwner::Torrents)).await
     }
 
+    // The operator's start of every torrent, as `resume_all` starts them.
     pub async fn resume_torrents(&self) -> Result<(), SchedulerError> {
-        self.resume(HoldOrigin::Manual, HoldOwner::Torrents).await
+        self.resume(HoldOrigin::Manual, HoldOwner::Torrents).await?;
+        self.state.started();
+        Ok(())
     }
 
     pub async fn pause_post_processing(&self) -> Result<(), SchedulerError> {
@@ -2170,6 +2194,7 @@ impl SchedulerHandle {
                     _ => HoldOwner::Torrents,
                 };
                 self.state.release(HoldOrigin::Scheduled, owner);
+                self.state.started();
                 tracing::info!(?owner, "schedule: resumed");
                 return Ok(());
             }
