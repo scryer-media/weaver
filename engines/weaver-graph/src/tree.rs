@@ -54,6 +54,12 @@ thread_local! {
     static FRONT_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+// How many members founding by name looked at, for the tests that count it.
+#[cfg(test)]
+thread_local! {
+    static NAMED_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(pub u32);
 
@@ -2863,25 +2869,41 @@ impl Tree {
     // found takes it where its own claim places it, as from any object
     // founded on names. Each set so founded is followed by the next, one
     // after another and never one inside another, however many sets the
-    // post names.
+    // post names. The members are looked over once: founding a set only
+    // takes members, so one that an earlier set took is passed over when
+    // its turn comes.
     fn found_by_name(
         &mut self,
         node: NodeId,
         builder: &mut dyn Builder,
         effects: &mut Vec<Effect>,
     ) {
-        loop {
-            let named = self.namespace(node).and_then(|namespace| {
+        let named: Vec<(MemberId, Kind)> = self
+            .namespace(node)
+            .map(|namespace| {
                 namespace
                     .members()
-                    .filter(|record| self.undecided_recovery(node, record.id))
-                    .find_map(|record| {
-                        let kind = crate::sniff::recovery_by_name(&record.name)?;
-                        Some((record.id, record.name.clone(), record.length, kind))
+                    .filter(|record| {
+                        #[cfg(test)]
+                        NAMED_CANDIDATES.with(|seen| seen.set(seen.get() + 1));
+                        self.undecided_recovery(node, record.id)
                     })
-            });
-            let Some((member, name, length, kind)) = named else {
-                return;
+                    .filter_map(|record| {
+                        Some((record.id, crate::sniff::recovery_by_name(&record.name)?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        for (member, kind) in named {
+            if !self.undecided_recovery(node, member) {
+                continue;
+            }
+            let Some((name, length)) = self
+                .namespace(node)
+                .and_then(|namespace| namespace.get(member))
+                .map(|record| (record.name.clone(), record.length))
+            else {
+                continue;
             };
             if !self.found_one(node, member, kind, (&name, &[], length), builder, effects) {
                 return;
@@ -5762,6 +5784,7 @@ mod tests {
         let mut bytes = SIGNATURE.to_vec();
         bytes.extend_from_slice(b"hello");
         let mut build = Depths(Vec::new());
+        let before = NAMED_CANDIDATES.with(std::cell::Cell::get);
         tree.deliver(
             NodeId::ROOT,
             first,
@@ -5772,6 +5795,12 @@ mod tests {
             },
             &mut build,
             &mut Vec::new(),
+        );
+        let looked = NAMED_CANDIDATES.with(std::cell::Cell::get) - before;
+        assert_eq!(
+            looked,
+            SETS + 1,
+            "the members are looked over once, not once for each set"
         );
         let store = tree.child_of(NodeId::ROOT, first).expect("bound").0;
         let sets: BTreeSet<NodeId> = named
