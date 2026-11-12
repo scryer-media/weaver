@@ -9,6 +9,8 @@
 // member does not hide what it is. A match proposes a name only; the set
 // still verifies and repairs the member as any other it binds.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use par3_rs::Fingerprint;
 use par3_rs::hash::FingerprintHasher;
 use par3_rs::layout::{ExtentKind, FileLayout};
@@ -19,27 +21,62 @@ use weaver_graph::{ByteRange, MemberId};
 const READ_LIMIT: u64 = 1 << 30;
 const CHUNK: u64 = 64 << 10;
 
-// The described path the member of `len` bytes is, among `files` (every
-// file the sets describe), where `free` says which paths no member carries.
-pub(super) fn identify<'a>(
-    files: &[&'a FileLayout],
-    free: impl Fn(&str) -> bool,
+// What a member can be identified as among every file the sets describe,
+// gathered once for all the members a repair reads back.
+pub(super) struct Candidates<'a> {
+    // The free files a member can be identified as, by length, each length's
+    // in the sets' order.
+    eligible: BTreeMap<u64, Vec<&'a FileLayout>>,
+    // The whole-file fingerprint of every described file, free or not.
+    fingerprints: BTreeSet<Fingerprint>,
+}
+
+impl<'a> Candidates<'a> {
+    // Over `files`, every file the sets describe, where `free` says which
+    // paths no member carries.
+    pub(super) fn new(files: &[&'a FileLayout], free: impl Fn(&str) -> bool) -> Self {
+        let mut by_length: BTreeMap<u64, Vec<&'a FileLayout>> = BTreeMap::new();
+        for &file in files {
+            if eligible(file, file.len) && free(&file.path) {
+                by_length.entry(file.len).or_default().push(file);
+            }
+        }
+        let fingerprints = files.iter().map(|file| file.fingerprint).collect();
+        Self {
+            eligible: by_length,
+            fingerprints,
+        }
+    }
+
+    // The described path the member of `len` bytes is.
+    pub(super) fn identify(
+        &self,
+        access: &mut dyn MemberAccess,
+        member: MemberId,
+        len: u64,
+        read: &mut u64,
+    ) -> Option<&'a str> {
+        let eligible = self.eligible.get(&len)?;
+        identify(eligible, &self.fingerprints, access, member, len, read)
+    }
+}
+
+// The one of `eligible`, the free files of the member's length it can be
+// identified as, that the member is.
+fn identify<'a>(
+    eligible: &[&'a FileLayout],
+    fingerprints: &BTreeSet<Fingerprint>,
     access: &mut dyn MemberAccess,
     member: MemberId,
     len: u64,
     read: &mut u64,
 ) -> Option<&'a str> {
-    let eligible: Vec<&FileLayout> = files
-        .iter()
-        .copied()
-        .filter(|file| free(&file.path) && eligible(file, len))
-        .collect();
     if eligible.is_empty() {
         return None;
     }
     let whole = fingerprint(access, member, ByteRange::new(0, len), read);
     let matched: Vec<&FileLayout> = match whole {
-        Some(whole) if files.iter().any(|file| file.fingerprint == whole) => eligible
+        Some(whole) if fingerprints.contains(&whole) => eligible
             .iter()
             .copied()
             .filter(|file| file.fingerprint == whole)
