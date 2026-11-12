@@ -711,6 +711,17 @@ fn transports(torrent: &TorrentConfig, shape: Shape) -> (Option<ListenerMode>, b
     (mode.filter(|_| shape.listen), protocol.tcp(), utp)
 }
 
+/// The peer transports a session uses, as its opening line names them: TCP
+/// when its settings ask for it, uTP when it holds a uTP socket.
+fn transport_names(tcp: bool, utp: bool) -> &'static str {
+    match (tcp, utp) {
+        (true, true) => "tcp+utp",
+        (true, false) => "tcp",
+        (false, true) => "utp",
+        (false, false) => "none",
+    }
+}
+
 /// The limits `torrent` holds a session to, no limit as libtorrent counts
 /// it: connections within the files that may be open, less twenty kept for
 /// files and four in five of the rest (libtorrent `session_impl` sets
@@ -1314,7 +1325,8 @@ impl Sessions {
             } = slot
             {
                 let ports = held_ports(&session, maps);
-                self.closing.stop(&key, session, leg, ports);
+                let moved = moved_off(leg.as_deref());
+                self.closing.stop(&key, session, leg, ports, moved);
             }
         }
     }
@@ -1466,13 +1478,15 @@ impl Sessions {
                     self.watch(&plan.key, leg, &session);
                 }
                 // The port it announces to trackers, 0 for none, and the
-                // address it takes peers in on, or none when it takes none.
+                // address it takes peers in on, or none when it takes none,
+                // and the transports it takes and reaches peers over.
                 let listen = session.listen_addr().map(|addr| addr.to_string());
                 tracing::info!(
                     route = plan.key.as_str(),
                     port,
                     announced_port = session.announce_port().unwrap_or(0),
                     listens = listen.as_deref().unwrap_or("no"),
+                    transports = transport_names(opening.tcp, session.uses_utp()),
                     "a route's session opened"
                 );
                 slots.insert(
@@ -1559,6 +1573,9 @@ impl Sessions {
         std::fs::create_dir_all(&dir).map_err(|error| {
             RouteFailure::with_detail(TorrentRouteReason::StateDirectoryFailed, error.to_string())
         })?;
+        // A session closing because its route's path changed lets its leg
+        // go before this one's leg dials.
+        self.closing.moved_released(plan).await;
         let leg = self.routes.open(plan, peers).await.map_err(|detail| {
             RouteFailure::with_detail(TorrentRouteReason::LegOpenFailed, detail)
         })?;
@@ -2111,7 +2128,16 @@ fn held_ports(session: &Session, maps: Option<u16>) -> Vec<u16> {
 struct Stopping {
     route: RouteKey,
     ports: Vec<u16>,
+    // Its leg was revoked: the route's path changed under it, and a session
+    // opening now opens on the path as it stands.
+    moved: bool,
     stopped: tokio::sync::watch::Receiver<bool>,
+}
+
+// Whether a session on `leg` closes because its route's path changed under
+// it: the route revokes a leg as the leg changes.
+fn moved_off(leg: Option<&TorrentLeg>) -> bool {
+    leg.is_some_and(|leg| leg.stage.is_revoked())
 }
 
 impl Closing {
@@ -2124,27 +2150,31 @@ impl Closing {
         maps: Option<u16>,
     ) {
         let ports = held_ports(&session, maps);
+        let moved = moved_off(leg.as_deref());
         tracing::info!(
             route = key.as_str(),
             ?ports,
+            moved,
             "a route's session closes off the open path; the route may open again at once"
         );
-        self.stop(key, session, leg, ports);
+        self.stop(key, session, leg, ports, moved);
     }
 
     // Stop `session`, which holds `ports`, in the background: each of them
-    // is held until it has stopped.
+    // is held until it has stopped. `moved` when its leg was revoked.
     fn stop(
         &self,
         key: &RouteKey,
         session: Arc<Session>,
         leg: Option<Arc<TorrentLeg>>,
         ports: Vec<u16>,
+        moved: bool,
     ) {
         let (stopped, waiting) = tokio::sync::watch::channel(false);
         self.lock().push(Stopping {
             route: key.clone(),
             ports,
+            moved,
             stopped: waiting,
         });
         let closing = self.clone();
@@ -2180,6 +2210,29 @@ impl Closing {
                 holder = holder.as_str(),
                 "the stopping session released the port"
             );
+        }
+    }
+
+    // Resolves once no session whose route's path changed under it is still
+    // stopping: its peer streams, listeners and sockets are closed, and its
+    // leg let go. Until then the old path's tunnels are in use, and a tunnel
+    // the new path brings up with the same key would take the server's
+    // session for that key from under them, or wait on it. The wait is on
+    // each session's own stop, with no lock held.
+    async fn moved_released(&self, plan: &RoutePlan) {
+        let holding: Vec<_> = self
+            .lock()
+            .iter()
+            .filter(|stopping| stopping.moved)
+            .map(|stopping| (stopping.route.clone(), stopping.stopped.clone()))
+            .collect();
+        for (holder, mut stopped) in holding {
+            tracing::info!(
+                route = plan.key.as_str(),
+                holder = holder.as_str(),
+                "a route's session waits on a session whose path changed to let its leg go"
+            );
+            let _ = stopped.wait_for(|stopped| *stopped).await;
         }
     }
 
