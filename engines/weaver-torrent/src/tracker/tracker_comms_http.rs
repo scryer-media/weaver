@@ -9,7 +9,8 @@ use crate::EncryptionPolicy;
 use crate::bencode::BencodeValue;
 use crate::buffers::ByteBuf;
 use crate::core::net::{
-    ClientShape, ClientUse, HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_public,
+    ClientShape, ClientUse, HttpClients, HttpTarget, NamedBy, Resolved, Resolver, is_idna,
+    is_public,
 };
 use crate::tracker::ScrapeOk;
 use crate::tracker::shape::AnnounceShape;
@@ -478,6 +479,7 @@ pub(crate) async fn get(
     query: &str,
     user_agent: &str,
     shape: &AnnounceShape,
+    allow_idna: bool,
 ) -> anyhow::Result<Answer> {
     let mut url = tracker.clone();
     if tracker.query().is_some_and(has_tracker_query) {
@@ -486,6 +488,12 @@ pub(crate) async fn get(
     shape.place_query(&mut url, tracker.query(), query);
     let mut redirects = 0;
     let response = loop {
+        // Every hop, before its name is looked up (libtorrent
+        // `http_tracker_connection::on_filter_hostname`, which
+        // `http_connection::get` runs on the first URL and each redirect).
+        if !allow_idna && url.host_str().is_some_and(is_idna) {
+            anyhow::bail!("blocked by IDNA: the tracker's host has an internationalized name");
+        }
         let (client, addrs) = reach(
             clients, &url, named_by, ask, family, resolver, reachable, shape,
         )
@@ -1093,6 +1101,7 @@ mod tests {
             query,
             user_agent,
             shape,
+            false,
         )
         .await
         .unwrap();
@@ -1583,5 +1592,150 @@ mod tests {
                     .unwrap()
             ]
         );
+    }
+
+    // The one address [`refusing`] answers, which the session refuses.
+    const REFUSED: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 9));
+
+    // A GET of `tracker` for an announce, named by the operator, through
+    // `resolver`; every address but [`REFUSED`] may be reached.
+    async fn announce_at(
+        tracker: &url::Url,
+        resolver: &dyn Resolver,
+        allow_idna: bool,
+    ) -> anyhow::Result<Answer> {
+        let reachable: Reachable = std::sync::Arc::new(|ip| {
+            if ip == REFUSED {
+                Err(crate::tracker::tracker_comms::Unreachable::Filtered)
+            } else {
+                Ok(())
+            }
+        });
+        get(
+            &Held,
+            resolver,
+            &reachable,
+            tracker,
+            NamedBy::Operator,
+            Ask::Announce,
+            None,
+            "info_hash=x",
+            "Weaver",
+            &AnnounceShape::WEAVER,
+            allow_idna,
+        )
+        .await
+    }
+
+    // Clients held to their target, as the session's are: each follows no
+    // redirect, so every hop comes back to the engine.
+    struct Held;
+
+    impl HttpClients for Held {
+        fn client(
+            &self,
+            target: Option<HttpTarget<'_>>,
+            shape: &ClientShape,
+        ) -> anyhow::Result<reqwest::Client> {
+            crate::test_support::client(reqwest::Client::builder().no_proxy(), target, shape)
+        }
+    }
+
+    // A resolver that answers every name with [`REFUSED`], so a GET past
+    // the name rule fails at the address with nothing sent.
+    fn refusing() -> Answering {
+        Answering {
+            answer: Resolved::Addresses(vec![SocketAddr::new(REFUSED, 80)]),
+            asked: Default::default(),
+        }
+    }
+
+    // A tracker whose host has an internationalized label, written as such
+    // or in Unicode, is refused before its name is looked up, unless the
+    // session allows such names (libtorrent `allow_idna`, off by default).
+    #[tokio::test]
+    async fn a_tracker_at_an_internationalized_name_is_refused_unlooked_up() {
+        for tracker in [
+            "http://xn--bcher-kva.example/announce",
+            "http://b\u{fc}cher.example/announce",
+            "https://tracker.XN--bcher-kva.example:8443/announce",
+        ] {
+            let tracker = url::Url::parse(tracker).unwrap();
+            let resolver = refusing();
+            let refused = announce_at(&tracker, &resolver, false).await.err().unwrap();
+            assert!(
+                format!("{refused:#}").contains("IDNA"),
+                "{tracker}: {refused:#}"
+            );
+            assert_eq!(resolver.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+            let resolver = refusing();
+            let failed = announce_at(&tracker, &resolver, true).await.err().unwrap();
+            assert!(
+                !format!("{failed:#}").contains("IDNA"),
+                "{tracker}: {failed:#}"
+            );
+            assert_eq!(resolver.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+        // A plain name is looked up.
+        let resolver = refusing();
+        let plain = url::Url::parse("http://tracker.example/announce").unwrap();
+        assert!(announce_at(&plain, &resolver, false).await.is_err());
+        assert_eq!(resolver.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    // A tracker that redirects to an internationalized name is refused at
+    // the redirect, before the name is looked up.
+    #[tokio::test]
+    async fn a_redirect_to_an_internationalized_name_is_refused() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0u8; 1];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    head.push(byte[0]);
+                }
+                socket
+                    .write_all(
+                        b"HTTP/1.1 302 Found\r\n\
+                          Location: http://xn--bcher-kva.example/announce\r\n\
+                          Content-Length: 0\r\nConnection: close\r\n\r\n",
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let tracker = url::Url::parse(&format!("http://127.0.0.1:{port}/announce")).unwrap();
+        let resolver = refusing();
+        let refused = announce_at(&tracker, &resolver, false).await.err().unwrap();
+        assert!(format!("{refused:#}").contains("IDNA"), "{refused:#}");
+        assert_eq!(resolver.asked.load(std::sync::atomic::Ordering::SeqCst), 0);
+        // Allowed, the redirect's name is looked up.
+        let resolver = refusing();
+        let followed = announce_at(&tracker, &resolver, true).await;
+        assert!(followed.is_err());
+        assert_eq!(resolver.asked.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn an_internationalized_label_is_one_starting_xn_dash_dash() {
+        for host in ["xn--bcher-kva.example", "a.XN--x.example", "a.b.xn--"] {
+            assert!(is_idna(host), "{host}");
+        }
+        for host in [
+            "example.com",
+            "xn-.example",
+            "axn--b.example",
+            "x",
+            "",
+            "\u{fc}.de",
+        ] {
+            assert!(!is_idna(host), "{host}");
+        }
     }
 }

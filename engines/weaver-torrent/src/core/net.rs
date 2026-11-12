@@ -172,6 +172,19 @@ pub(crate) fn is_public(ip: IpAddr) -> bool {
     crate::torrent_state::live::peers::holepunch::is_global(ip) && !documentation
 }
 
+/// Whether `host` has an internationalized (IDNA) label: one that starts
+/// `xn--`, in any case. A URL writes a Unicode host in that form, so this
+/// catches both spellings (libtorrent `is_idna`, src/parse_url.cpp:203-218
+/// at v2.0.15).
+pub(crate) fn is_idna(host: &str) -> bool {
+    host.split('.').any(|label| {
+        label
+            .as_bytes()
+            .get(..4)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(b"xn--"))
+    })
+}
+
 /// What a name resolves to on the session's network.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Resolved {

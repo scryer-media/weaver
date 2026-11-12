@@ -523,6 +523,8 @@ pub struct Session {
     // Read by every torrent's peer list at each judgment; changed by
     // `set_allow_multiple_connections_per_ip`.
     pub(crate) allow_multiple_connections_per_ip: Arc<AtomicBool>,
+    // `SessionOptions::allow_idna`.
+    pub(crate) allow_idna: bool,
     // The addresses banned for bad data sent to any torrent, refused by
     // every torrent's peer list and at every incoming connection while the
     // session runs.
@@ -1285,6 +1287,13 @@ pub struct SessionOptions {
     /// connection per address.
     pub allow_multiple_connections_per_ip: bool,
 
+    /// Whether a tracker or a web seed whose host has an internationalized
+    /// (IDNA, `xn--`) label may be asked, on its first hop and on every
+    /// redirect (libtorrent `allow_idna`, off by default, which checks HTTP
+    /// trackers and web seeds; UDP trackers are not checked). Off by
+    /// default: such a host is refused before its name is looked up.
+    pub allow_idna: bool,
+
     /// Where the session also sends each report its port mappers make, as
     /// they make it.
     pub port_map_events: Option<PortMapEvents>,
@@ -1335,6 +1344,7 @@ impl SessionOptions {
             http_client: None,
             encryption: crate::mse::EncryptionPolicy::Disabled,
             allow_multiple_connections_per_ip: false,
+            allow_idna: false,
             port_map_events: None,
             trackers_changed: None,
         }
@@ -2007,6 +2017,7 @@ impl Session {
                 allow_multiple_connections_per_ip: Arc::new(AtomicBool::new(
                     opts.allow_multiple_connections_per_ip,
                 )),
+                allow_idna: opts.allow_idna,
                 bad_data_bans: Default::default(),
                 ip_filter: RwLock::new(opts.ip_filter),
                 allowlist,
@@ -3768,6 +3779,7 @@ impl Session {
             self.udp_tracker_client.clone(),
             self.stopped_announces.clone(),
             self.http_announces.clone(),
+            self.allow_idna,
         );
         // The table rings the session's watcher at each change, until the
         // table is gone.
