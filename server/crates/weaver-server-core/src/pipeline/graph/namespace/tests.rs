@@ -2904,7 +2904,7 @@ fn give_back_retains_the_unreplayed_leaf_without_adopting_sparse_holes() {
         };
         job.writer
             .write_file(
-                &job.tree,
+                &mut job.tree,
                 NodeId::ROOT,
                 member,
                 offset,
@@ -2970,7 +2970,7 @@ fn give_back_does_not_retain_a_truncated_leaf_tail() {
     let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
     job.writer
         .write_file(
-            &job.tree,
+            &mut job.tree,
             NodeId::ROOT,
             member,
             0,
@@ -3024,7 +3024,7 @@ fn give_back_reports_a_missing_recorded_leaf_without_discarding_the_source_recor
     let owner = job.tree.child_of(NodeId::ROOT, member).unwrap();
     job.writer
         .write_file(
-            &job.tree,
+            &mut job.tree,
             NodeId::ROOT,
             member,
             0,
@@ -4838,4 +4838,32 @@ fn a_give_up_keeps_a_directory_held_under_another_case() {
     store_says(&mut job, lower, vec![Emit::Refuse(Why::Compressed)]);
     commit_or_error(&mut job).expect("give-up commit");
     assert!(job.dir.path().join("folder").is_dir());
+}
+
+// A member whose name the file system refuses is skipped, and its damage
+// is applied as a failed checksum's is: the owner hears it once, over the
+// whole member, and the bytes that come after it raise nothing more.
+#[test]
+fn a_refused_name_reaches_the_owner_as_damage_once() {
+    let mut job = Job::new(PLENTY);
+    // One part of 300 bytes, past the 255 a part may hold.
+    let name = format!("{}.bin", "a".repeat(296));
+    let member = job.member(&name, Some(8));
+    job.send(member, 0, b"abcd", Provenance::Fresh);
+    job.send(member, 4, b"efgh", Provenance::Fresh);
+    job.close(member);
+    assert!(job.writer.unnamable(NodeId::ROOT, member));
+    let whole = ByteRange::new(0, 8);
+    let damaged: Vec<&Effect> = job
+        .out
+        .iter()
+        .filter(|effect| matches!(effect, Effect::Damaged { member: of, .. } if *of == member))
+        .collect();
+    assert!(
+        matches!(damaged[..], [Effect::Damaged { node, range, .. }]
+            if *node == NodeId::ROOT && *range == whole),
+        "{damaged:?}"
+    );
+    assert!(job.root().get(member).unwrap().coverage.damaged(whole));
+    assert_eq!(std::fs::read_dir(job.dir.path()).unwrap().count(), 0);
 }

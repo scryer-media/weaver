@@ -402,7 +402,7 @@ fn failed_pending_custody_cannot_fall_back_to_an_older_derived_copy() {
         .write(ByteRange::new(0, body().len()), Provenance::Fresh);
     job.writer
         .write_file(
-            &job.tree,
+            &mut job.tree,
             child,
             MemberId(0),
             0,
