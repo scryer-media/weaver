@@ -928,6 +928,16 @@ impl FileSummaries {
             .map(|(_, summary)| summary.bytes)
             .sum()
     }
+
+    // As `JobSpec::wanted_bytes`, for the spec whose lists these summarise.
+    pub fn wanted_bytes(&self, spec: &JobSpec) -> u64 {
+        spec.files
+            .iter()
+            .zip(&self.0)
+            .filter(|(file, _)| !file.role.is_recovery())
+            .map(|(_, summary)| summary.bytes)
+            .sum()
+    }
 }
 
 // Everything a job holds per article, built in one place when the job is

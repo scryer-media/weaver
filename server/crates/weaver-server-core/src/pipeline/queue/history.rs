@@ -301,6 +301,7 @@ impl Queue {
             let info = super::admission::initial_info(
                 id,
                 &prepared.spec,
+                prepared.summaries.wanted_bytes(&prepared.spec),
                 prepared.nzb_hash,
                 &prepared.working_dir,
                 false,

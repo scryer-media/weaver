@@ -898,3 +898,122 @@ async fn restart_under_global_pause_installs_every_restored_job_and_resume_admit
     assert!(eligible.contains(&JobId(1)));
     assert!(!eligible.contains(&JobId(2)));
 }
+
+// A job's article lists, file by file, as (ordinal, article number, bytes,
+// message ids).
+fn article_lists(spec: &JobSpec) -> Vec<Vec<(u32, u32, u32, crate::jobs::MessageIds)>> {
+    spec.files
+        .iter()
+        .map(|file| {
+            file.segments
+                .iter()
+                .map(|segment| {
+                    (
+                        segment.ordinal,
+                        segment.article_number,
+                        segment.bytes,
+                        segment.message_ids.clone(),
+                    )
+                })
+                .collect()
+        })
+        .collect()
+}
+
+// A payload of eight articles with a PAR2 index and a recovery volume, its
+// article numbers as its stored NZB gives them.
+fn payload_with_recovery(name: &str) -> JobSpec {
+    let mut spec = segmented_job_spec(name, "payload.bin", &[512; 8]);
+    spec.files.extend(
+        standalone_with_par2_job_spec(name, 1, 64)
+            .files
+            .into_iter()
+            .skip(1),
+    );
+    for segment in spec.files.iter_mut().flat_map(|file| &mut file.segments) {
+        segment.article_number = segment.ordinal + 1;
+    }
+    spec.total_bytes = spec
+        .files
+        .iter()
+        .flat_map(|file| &file.segments)
+        .map(|segment| u64::from(segment.bytes))
+        .sum();
+    spec
+}
+
+// An add waiting in a paused queue holds no article list, neither before it
+// is installed nor after, and its row and its job say what the lists held,
+// as the full lists would.
+#[tokio::test]
+async fn an_add_waiting_in_a_paused_queue_holds_no_article_list() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    handle(&pipeline).pause_all().await.unwrap();
+    let spec = payload_with_recovery("Paused NZB");
+    let summaries = crate::jobs::model::FileSummaries(
+        spec.files
+            .iter()
+            .map(crate::jobs::model::FileSummary::of)
+            .collect(),
+    );
+    pipeline
+        .shared_state
+        .queue
+        .clone()
+        .add(
+            JobId(1),
+            spec.clone(),
+            PathBuf::from("paused.nzb"),
+            nzb_zstd_for(&spec),
+            crate::jobs::AddJobOptions::default(),
+            pipeline.event_tx.clone(),
+        )
+        .await
+        .unwrap();
+    pipeline.shared_state.queue.read(|inner| {
+        let row = inner.job(JobId(1)).unwrap();
+        let add = row.admission.as_ref().unwrap();
+        assert_eq!(add.spec.files.len(), spec.files.len());
+        assert!(add.spec.files.iter().all(|file| file.segments.is_empty()));
+        assert_eq!(add.summaries, summaries);
+        assert_eq!(row.report.job.wanted_bytes, spec.wanted_bytes());
+        assert_eq!(row.report.job.remaining_bytes, spec.wanted_bytes());
+        assert_eq!(row.report.job.total_bytes, spec.total_bytes);
+        assert_eq!(row.report.job.total_files, spec.files.len() as u32);
+    });
+    pipeline.apply_queue_intents().await;
+    assert!(pipeline.nzb_admitted.is_empty());
+    let state = &pipeline.jobs[&JobId(1)];
+    assert!(state.spec.files.iter().all(|file| file.segments.is_empty()));
+    assert!(matches!(
+        &state.articles,
+        crate::jobs::model::JobArticles::Queued(held) if *held == summaries
+    ));
+    assert_eq!(state.par2_bytes, spec.par2_bytes());
+}
+
+// A job whose lists were let go when its NZB was stored fetches, once it is
+// handed work, the very articles it was added with, file by file.
+#[tokio::test]
+async fn a_job_added_without_its_lists_runs_the_articles_it_was_added_with() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp).await;
+    let spec = payload_with_recovery("Lean NZB");
+    pipeline
+        .add_job(
+            JobId(1),
+            spec.clone(),
+            PathBuf::from("lean.nzb"),
+            nzb_zstd_for(&spec),
+            crate::jobs::AddJobOptions::default(),
+        )
+        .await
+        .unwrap();
+    assert!(pipeline.nzb_admitted.contains(&JobId(1)));
+    activate_job(&mut pipeline, JobId(1)).await;
+    let state = &pipeline.jobs[&JobId(1)];
+    assert!(state.articles.active().is_some());
+    assert_eq!(article_lists(&state.spec), article_lists(&spec));
+    assert_eq!(state.par2_bytes, spec.par2_bytes());
+}

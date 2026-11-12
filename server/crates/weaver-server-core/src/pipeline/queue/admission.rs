@@ -27,7 +27,11 @@ impl AdmissionResources {
 }
 
 pub(crate) struct PreparedAdd {
+    // The job's files, with their article lists let go once its NZB is
+    // stored: an add waiting to be installed holds nothing per article.
     pub spec: JobSpec,
+    // What the lists held, in the spec's file order.
+    pub summaries: crate::jobs::model::FileSummaries,
     pub options: AddJobOptions,
     pub working_dir: PathBuf,
     pub nzb_hash: [u8; 32],
@@ -72,6 +76,7 @@ impl Queue {
             let mut info = initial_info(
                 id,
                 &request.spec,
+                request.spec.wanted_bytes(),
                 request.job_hash,
                 &request.working_dir,
                 request.status == JobStatus::Paused,
@@ -169,6 +174,7 @@ impl PreparedAdd {
         initial_info(
             id,
             &self.spec,
+            self.summaries.wanted_bytes(&self.spec),
             self.nzb_hash,
             &self.working_dir,
             self.options.initially_paused,
@@ -179,11 +185,11 @@ impl PreparedAdd {
 pub(super) fn initial_info(
     id: JobId,
     spec: &JobSpec,
+    wanted_bytes: u64,
     hash: [u8; 32],
     working_dir: &std::path::Path,
     initially_paused: bool,
 ) -> JobInfo {
-    let wanted_bytes = spec.wanted_bytes();
     JobInfo {
         job_id: id,
         job_hash: Some(hash),
