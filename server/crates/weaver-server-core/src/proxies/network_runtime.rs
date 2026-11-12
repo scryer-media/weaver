@@ -1241,6 +1241,31 @@ impl NetworkRuntime {
     pub fn reloads(&self) -> tokio::sync::watch::Receiver<u64> {
         self.reloads.subscribe()
     }
+    /// Whether proxy `profile` carries a usenet server's route as loaded: a
+    /// leg of it names the proxy, a chain through it, or a pool it is a
+    /// member of.
+    pub fn feeds_servers(&self, profile: u32) -> bool {
+        let config = self.configuration.read().expect("network configuration");
+        let names = |rung: &Rung| match rung {
+            Rung::Proxy { id } => *id == profile,
+            Rung::Chain { ids } => ids.contains(&profile),
+            Rung::Pool { id } => config
+                .pools
+                .get(id)
+                .is_some_and(|pool| pool.member_ids.contains(&profile)),
+        };
+        config
+            .consumer_labels
+            .iter()
+            .filter(|(consumer, ..)| matches!(consumer, Consumer::Server(_)))
+            .filter_map(|(consumer, ..)| config.policies.get(&consumer.key()))
+            .any(|policy| {
+                policy.route().legs.iter().any(|leg| match &leg.path {
+                    LegPath::Direct => false,
+                    LegPath::Ladder { rungs, .. } => rungs.iter().any(names),
+                })
+            })
+    }
     fn apply_configuration(&self, next: Configuration) -> Result<(), String> {
         // Route lookups must see configuration and compiled paths from the same reload.
         let mut configuration = self.configuration.write().expect("network configuration");

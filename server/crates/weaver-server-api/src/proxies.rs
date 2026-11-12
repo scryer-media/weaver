@@ -331,13 +331,20 @@ pub(crate) fn refresh<'a>(
         Ok(())
     })
 }
-fn refresh_nntp<'a>(
+// Take a saved change to proxy `profile`: the routes reload, and the usenet
+// servers' connections are rebuilt only when a server's route goes through
+// the proxy. A proxy no server route names feeds no usenet connection.
+fn refresh_profile<'a>(
     ctx: &'a Context<'_>,
+    profile: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
     Box::pin(async move {
         refresh(ctx).await?;
         let handle = ctx.data::<SchedulerHandle>()?;
-        if handle.server_transfer_policy().is_some() {
+        let feeds_servers = handle
+            .proxy_runtime()
+            .is_some_and(|runtime| runtime.network.feeds_servers(profile));
+        if feeds_servers && handle.server_transfer_policy().is_some() {
             weaver_server_core::runtime::rebuild_nntp_from_config(ctx.data()?, handle)
                 .await
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?;
@@ -411,10 +418,15 @@ impl ProxiesMutation {
                 .ok_or("proxy IDs exhausted")?,
         );
         let profile = input.profile(id, existing)?;
+        // A save that changes nothing keeps the revision, and everything
+        // built from the profile is keyed by it: nothing is rebuilt.
+        let unchanged = existing.is_some_and(|existing| existing.revision == profile.revision);
         let saved = profile.clone();
         let profile =
             spawn_blocking_db("proxies.save", move || db.save_proxy_profile(&saved)).await?;
-        refresh_nntp(ctx).await?;
+        if !unchanged {
+            refresh_profile(ctx, id).await?;
+        }
         Ok(profile.into())
     }
     #[graphql(guard = "AdminGuard")]
@@ -423,7 +435,7 @@ impl ProxiesMutation {
         let _guard = runtime.mutations.lock().await;
         let db = ctx.data::<Database>()?.clone();
         spawn_blocking_db("proxies.delete", move || db.delete_proxy_profile(id)).await?;
-        refresh_nntp(ctx).await?;
+        refresh_profile(ctx, id).await?;
         Ok(true)
     }
     #[graphql(guard = "AdminGuard")]
@@ -450,7 +462,7 @@ impl ProxiesMutation {
             db.reset_proxy_host_key(&saved)
         })
         .await?;
-        refresh_nntp(ctx).await?;
+        refresh_profile(ctx, id).await?;
         Ok(profile.into())
     }
     // A test names the route it goes through; this one names none, so it is

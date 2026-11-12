@@ -665,6 +665,18 @@ impl<C: Candidate> CandidatePlan<C> {
         }
         self.candidates = unique;
     }
+    // Drop what the plan learnt of `candidate`: it stands for something
+    // else now, untried. It stays a candidate, and the pin if it was one.
+    pub fn forget(&mut self, candidate: C) {
+        self.per_addr.remove(&candidate.key());
+        if self.delivery_leader == Some(candidate) {
+            self.delivery_leader = None;
+        }
+        if self.shadow_owed == Some(candidate) {
+            self.shadow_owed = None;
+            self.idle_shadows = 0;
+        }
+    }
     pub fn replan(&mut self) {
         self.racing = false;
         self.generation = self.generation.wrapping_add(1);

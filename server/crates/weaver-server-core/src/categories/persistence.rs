@@ -6,6 +6,7 @@ use crate::categories::CategoryConfig;
 use crate::categories::record::{CATEGORY_COLUMNS, CategoryRecord};
 use crate::persistence::Database;
 use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::proxies::{Consumer, TorrentScope};
 
 impl Database {
     pub fn insert_category(&self, category: &CategoryConfig) -> Result<(), StateError> {
@@ -42,16 +43,30 @@ impl Database {
         })
     }
 
+    // Returns whether the category existed. Its torrent route goes with it,
+    // so a category given its id later starts on the default route.
     pub fn delete_category(&self, id: u32) -> Result<bool, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking(async move {
-            let changed = SqlRuntime::execute(
-                datastore.write_exec(),
-                "DELETE FROM categories WHERE id = {}",
-                &[SqlArg::I64(i64::from(id))],
-            )
-            .await?;
-            Ok(changed > 0)
+            SqlRuntime::run_in_transaction(&datastore, "delete_category", |tx| {
+                Box::pin(async move {
+                    let changed = tx
+                        .execute(
+                            "DELETE FROM categories WHERE id = {}",
+                            &[SqlArg::I64(i64::from(id))],
+                        )
+                        .await?;
+                    tx.execute(
+                        "DELETE FROM proxy_routes WHERE consumer = {}",
+                        &[SqlArg::Text(
+                            Consumer::Torrent(TorrentScope::Category(id)).key(),
+                        )],
+                    )
+                    .await?;
+                    Ok(changed > 0)
+                })
+            })
+            .await
         })
     }
 }
