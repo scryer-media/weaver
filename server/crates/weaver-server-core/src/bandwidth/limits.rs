@@ -455,13 +455,20 @@ mod tests {
     }
 
     // Usenet held to its rate by a bucket of a quarter second's capacity, as
-    // the usenet `TokenBucket` is, and torrents by a session's quota, filled
-    // with half a second of their rate each half-second round with what the
-    // last round left dropped, as `weaver_torrent::limits` fills it; each
-    // side moves what it wants up to what it holds. The clock is mocked: a
-    // split tick is ten steps of a tenth of a second, and at each tick the
-    // split shares the cap out again from the bytes each side moved over it,
-    // and a cut rate clamps what each side holds to its new rate's worth.
+    // the usenet `TokenBucket` is, and torrents by a session's quota as
+    // `weaver_torrent::limits` keeps it. Each half-second round in which
+    // torrents want bytes adds half a second of their rate, rounded to the
+    // byte, to what they hold, and what they hold past three seconds' worth
+    // goes back to three seconds' worth (`Budget::round`). The real channel
+    // fills only in a round with a request waiting; here every round in
+    // which torrents want anything fills, the most they can keep. A change
+    // of the torrents' rate by the split holds what they keep to one round
+    // of the new rate (`Limit::set`, called only when the rate changes);
+    // an unchanged rate keeps it. Each side moves what it wants up to what
+    // it holds. The clock is mocked: a split tick is ten steps of a tenth of
+    // a second, and at each tick the split shares the cap out again from the
+    // bytes each side moved over it, and usenet's bucket is clamped to a
+    // quarter second of its new rate.
     struct Sim {
         cap: u64,
         split: Option<BandwidthSplit>,
@@ -479,13 +486,10 @@ mod tests {
             }
         }
 
-        // What a side may hold at `rate`: a quarter second of usenet's, a
-        // round of torrents'.
-        fn holds(side: usize, rate: u64) -> u64 {
-            match side {
-                0 => rate / 4,
-                _ => rate / 2,
-            }
+        // One torrent round's fill at `rate`: half a second of it, rounded
+        // to the byte (`Budget::round_quota`).
+        fn round_quota(rate: u64) -> u64 {
+            (rate * 500 + 500) / 1000
         }
 
         // One split tick in which each side wants `want` bytes a second:
@@ -499,9 +503,14 @@ mod tests {
             let mut moved = [0u64; 2];
             for step in 0..STEPS {
                 let usenet = &mut self.tokens[0];
-                *usenet = (*usenet + limits[0] / STEPS).min(Self::holds(0, limits[0]));
-                if step % 5 == 0 {
-                    self.tokens[1] = Self::holds(1, limits[1]);
+                *usenet = (*usenet + limits[0] / STEPS).min(limits[0] / 4);
+                if step % 5 == 0 && wants[1] > 0 {
+                    let kept = self.tokens[1] + Self::round_quota(limits[1]);
+                    self.tokens[1] = if kept / 3 > limits[1] {
+                        3 * limits[1]
+                    } else {
+                        kept
+                    };
                 }
                 for side in 0..2 {
                     let took = self.tokens[side].min(wants[side] / STEPS);
@@ -511,25 +520,51 @@ mod tests {
             }
             let used = both(moved[0], moved[1]);
             self.rates = split_rates(Some(self.cap), self.split, given, used);
-            let rates = [self.rates.usenet.unwrap(), self.rates.torrent.unwrap()];
-            for (side, rate) in rates.into_iter().enumerate() {
-                self.tokens[side] = self.tokens[side].min(Self::holds(side, rate));
+            let [usenet, torrent] = [self.rates.usenet.unwrap(), self.rates.torrent.unwrap()];
+            self.tokens[0] = self.tokens[0].min(usenet / 4);
+            if torrent != limits[1] {
+                self.tokens[1] = self.tokens[1].min(Self::round_quota(torrent));
             }
             (used, self.rates)
         }
     }
 
-    // What both sides moved over every five seconds of `ticks` stays within
-    // 1.05 of the cap.
-    fn assert_windows_hold(cap: u64, ticks: &[(SplitUse, SplitRates)], what: &str) {
+    // The most both sides can move over the five ticks after rates
+    // `before` were put in force. The rates the split gives add up to the
+    // cap every tick, so the two sides fill with five seconds of the cap
+    // over the five ticks, give or take a byte a torrent round of rounding.
+    // On top of that each side spends what it held when the window opened:
+    // usenet a quarter second of its rate at most, which is within 0.05 of
+    // five seconds of the cap; torrents three seconds of the rate `before`
+    // gave them at most, and two bytes more, since a round keeps up to three
+    // seconds' worth and what a third rounds away. So the bound is 1.05 of
+    // five seconds of the cap, three seconds of the torrents' rate when the
+    // window opened, and seven bytes.
+    fn window_bound(cap: u64, before: SplitRates) -> u64 {
+        5 * cap * 105 / 100 + 3 * before.torrent.unwrap() + 7
+    }
+
+    // What both sides moved over every five seconds of `ticks`, run from
+    // rates `start`, stays within `window_bound`.
+    fn assert_windows_hold(
+        cap: u64,
+        start: SplitRates,
+        ticks: &[(SplitUse, SplitRates)],
+        what: &str,
+    ) {
         for (tick, window) in ticks.windows(5).enumerate() {
             let moved: u64 = window
                 .iter()
                 .map(|(moved, _)| moved.usenet + moved.torrent)
                 .sum();
+            let before = match tick {
+                0 => start,
+                _ => ticks[tick - 1].1,
+            };
+            let bound = window_bound(cap, before);
             assert!(
-                moved * 100 <= 5 * cap * 105,
-                "{what}: window from {tick}: {moved}"
+                moved <= bound,
+                "{what}: window from {tick}: {moved} past {bound}"
             );
         }
     }
@@ -706,15 +741,16 @@ mod tests {
         }
         for pct in [None, split(30), split(50), split(70)] {
             let mut sim = Sim::new(cap, pct);
+            let start = sim.rates;
             let ticks: Vec<_> = script.iter().map(|&want| sim.tick(want)).collect();
 
             // The limits never add up past the cap, and what both moved
-            // over every five seconds stays within 1.05 of it.
+            // over every five seconds stays within the window bound.
             for (tick, (_, given)) in ticks.iter().enumerate() {
                 let sum = given.usenet.unwrap() + given.torrent.unwrap();
                 assert!(sum <= cap, "{pct:?} tick {tick}: {sum}");
             }
-            assert_windows_hold(cap, &ticks, &format!("{pct:?}"));
+            assert_windows_hold(cap, start, &ticks, &format!("{pct:?}"));
 
             // A lone active side has 0.98 of the cap or more from the first
             // tick that measures it.
@@ -737,10 +773,10 @@ mod tests {
         }
     }
 
-    // A side moving part of its share banks nothing to spike with: torrents,
-    // or usenet, moving a fraction of the cap beside the other side pressing
-    // it, then pressing it themselves, hold every five seconds within 1.05
-    // of the cap.
+    // A side moving part of its share, then pressing it, holds every five
+    // seconds within the window bound: torrents, or usenet, moving a
+    // fraction of the cap beside the other side pressing it, then pressing
+    // it themselves.
     #[test]
     fn a_side_moving_part_of_its_share_then_pressing_holds_the_cap() {
         let cap = 8 * MIB;
@@ -751,10 +787,47 @@ mod tests {
                     let mut script = vec![before; 10];
                     script.extend(vec![both(MAX, MAX); 10]);
                     let mut sim = Sim::new(cap, pct);
+                    let start = sim.rates;
                     let ticks: Vec<_> = script.iter().map(|&want| sim.tick(want)).collect();
-                    assert_windows_hold(cap, &ticks, &format!("{pct:?} {what} at {part}"));
+                    assert_windows_hold(cap, start, &ticks, &format!("{pct:?} {what} at {part}"));
                 }
             }
+        }
+    }
+
+    // What torrents kept while moving part of their rate is spent once:
+    // a 30% usenet split, torrents moving 45% of the cap beside usenet
+    // pressing, then both pressing. The window that spends what torrents
+    // kept passes 1.05 of five seconds of the cap; every window that opens
+    // once torrents hold no more than a round of their rate is back within
+    // 1.05 of it.
+    #[test]
+    fn what_torrents_kept_is_spent_once_and_later_windows_hold_the_cap() {
+        let cap = 8 * MIB;
+        let mut script = vec![both(MAX, cap * 45 / 100); 10];
+        script.extend(vec![both(MAX, MAX); 20]);
+        let mut sim = Sim::new(cap, split(30));
+        let mut ticks = Vec::new();
+        let mut spent = None;
+        for (tick, &want) in script.iter().enumerate() {
+            ticks.push(sim.tick(want));
+            let round = Sim::round_quota(sim.rates.torrent.unwrap());
+            if spent.is_none() && want.torrent == MAX && sim.tokens[1] <= round {
+                spent = Some(tick + 1);
+            }
+        }
+        let spent = spent.expect("torrents spend what they kept");
+        let moved = |window: &[(SplitUse, SplitRates)]| -> u64 {
+            window.iter().map(|(m, _)| m.usenet + m.torrent).sum()
+        };
+        let past: Vec<_> = ticks.windows(5).map(moved).collect();
+        assert!(
+            past[..spent].iter().any(|&m| m * 100 > 5 * cap * 105),
+            "no window spent a kept quota: {past:?}"
+        );
+        assert!(spent + 5 <= ticks.len(), "spent at {spent}");
+        for (tick, &m) in past.iter().enumerate().skip(spent) {
+            assert!(m * 100 <= 5 * cap * 105, "window from {tick}: {m}");
         }
     }
 

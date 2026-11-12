@@ -116,11 +116,12 @@ impl Request {
 // waiting on it (`bandwidth_manager::m_queue`).
 struct Budget {
     kind: LimitKind,
-    // Bytes the channel may still grant; below zero once more was granted
-    // than it was filled with.
+    // Bytes the channel may still grant, kept from round to round up to
+    // three seconds' worth; below zero once more was granted than it was
+    // filled with.
     quota_left: i64,
-    // The last round, or when the first request of a queue arrived: quota
-    // fills only while requests wait (`update_quotas` returns early on an
+    // The last round. Rounds fall every `ROUND` from it while requests
+    // wait; quota fills only then (`update_quotas` returns early on an
     // empty queue).
     last_round: Instant,
     // By id, so a waiter finds, settles and leaves its request without
@@ -134,11 +135,13 @@ struct Budget {
 impl Budget {
     // What the channel can grant a request of `want` at once, without
     // queueing it: all of it while unlimited, nothing while closed, and
-    // under a rate what the last round left, up to `want`, while no request
+    // under a rate what the channel keeps, up to `want`, while no request
     // waits for its share. libtorrent `bandwidth_channel::need_queueing`
-    // grants at once only past a second's worth held back, out of up to
-    // three seconds banked; a channel here holds at most a round, so a
-    // request takes what the round left instead.
+    // grants at once only a whole request, and only while a second's worth
+    // stays kept after it; here a request takes what is kept down to
+    // nothing, so a lone peer writing between rounds moves all of each
+    // round. Either way the most taken at once is what is kept, at most
+    // three seconds' worth.
     fn at_once(&self, want: u64) -> u64 {
         match self.kind {
             LimitKind::Unlimited => want,
@@ -154,9 +157,20 @@ impl Budget {
         (i64::from(limit.get()) * round_ms + 500) / 1000
     }
 
-    fn enqueue(&mut self, want: u64) -> u64 {
+    // A request joins the queue at `now`. Rounds keep the clock of a fixed
+    // tick (libtorrent `session_impl::on_tick` every
+    // `settings_pack::tick_interval`): a queue that begins waits for the
+    // next tick after the last round, not a whole round from now, and the
+    // ticks that passed with nothing waiting filled nothing
+    // (`update_quotas` returns early on an empty queue). So a peer that
+    // writes between rounds loses none of the round to its writing. No
+    // timer runs while nothing waits: the tick is reckoned from the last
+    // round when a queue begins.
+    fn enqueue(&mut self, want: u64, now: Instant) -> u64 {
         if self.queue.is_empty() {
-            self.last_round = Instant::now();
+            let since = now.saturating_duration_since(self.last_round);
+            let into_tick = since.as_nanos() % ROUND.as_nanos();
+            self.last_round = now - Duration::from_nanos(u64::try_from(into_tick).unwrap_or(0));
         }
         let id = self.next_id;
         self.next_id += 1;
@@ -250,10 +264,14 @@ impl Budget {
     // and each waiting request is offered an equal share of what it holds,
     // never more than it still wants (libtorrent
     // `bandwidth_channel::update_quota`, `bw_request::assign_bandwidth`).
-    // What the last round left untaken is dropped, and a debt carried: the
-    // channel never holds more than the round it just filled, so a side of
-    // the bandwidth split that moved less than its rate has nothing banked
-    // to spike past it with. libtorrent keeps up to three seconds' worth.
+    // What a round leaves untaken is kept for the next, and a debt carried,
+    // up to three seconds' worth of the rate (`update_quota`: `if
+    // (m_quota_left / 3 > m_limit) m_quota_left = m_limit * 3`). Quota
+    // fills only while requests wait, so what is kept is what waiting
+    // requests left: a side of the bandwidth split whose peers waited and
+    // took less than the rounds offered can then move up to three seconds'
+    // worth past its rate. A change of its rate holds what is kept to a
+    // round of the new rate (`Limit::set`).
     fn round(&mut self, now: Instant) {
         let gap = (now - self.last_round).min(MAX_ROUND_GAP);
         self.last_round = now;
@@ -262,7 +280,12 @@ impl Budget {
         };
         let limit = i64::from(limit.get());
         let gap_ms = i64::try_from(gap.as_millis()).unwrap_or(i64::MAX);
-        self.quota_left = self.quota_left.min(0) + (limit * gap_ms + 500) / 1000;
+        self.quota_left = self
+            .quota_left
+            .saturating_add((limit * gap_ms + 500) / 1000);
+        if self.quota_left / 3 > limit {
+            self.quota_left = limit * 3;
+        }
         let share = u64::try_from(self.quota_left).unwrap_or(0) / self.queue.len().max(1) as u64;
         for request in self.queue.values_mut() {
             request.rounds_left = request.rounds_left.saturating_sub(1);
@@ -332,7 +355,9 @@ async fn acquire(limits: [Option<&Limit>; 2], want: u64) -> u64 {
         return at_once;
     }
     let waiting = Waiting {
-        on: limits.map(|limit| limit.map(|limit| (limit, limit.budget.lock().enqueue(want)))),
+        on: limits.map(|limit| {
+            limit.map(|limit| (limit, limit.budget.lock().enqueue(want, Instant::now())))
+        }),
     };
     loop {
         let [first, second] = waiting
@@ -698,13 +723,12 @@ mod tests {
         );
     }
 
-    // A channel holds at most the round it last filled: what a round leaves
-    // untaken is granted at once to the next request while none waits, and
-    // dropped at the next round, so however long a channel idles, a request
-    // is granted no more than a round's worth at once. libtorrent banks up
-    // to three seconds (`bandwidth_channel::update_quota`).
+    // A channel fills only while requests wait (libtorrent
+    // `bandwidth_manager::update_quotas` returns early on an empty queue):
+    // what a round leaves untaken is granted at once to the next request
+    // while none waits, and a minute of idling adds nothing to it.
     #[tokio::test(start_paused = true)]
-    async fn a_channel_banks_no_more_than_a_round() {
+    async fn an_idle_channel_fills_nothing() {
         let limits = down(bps(1000));
         // A round fills 500; the request takes 100 and 400 are left.
         assert_eq!(limits.request(Channel::Download, 100).await, 100);
@@ -714,7 +738,7 @@ mod tests {
             Some(400)
         );
         // Then a round's worth each round. A request that waits takes a
-        // part of what the round filled; what it leaves is dropped.
+        // part of what the round filled; the next takes the rest at once.
         let start = Instant::now();
         assert_eq!(limits.request(Channel::Download, 10_000).await, 20 * 500);
         assert_eq!(start.elapsed(), 20 * ROUND);
@@ -727,6 +751,105 @@ mod tests {
         );
         assert_eq!(limits.request(Channel::Download, 100).now_or_never(), None);
         assert_eq!(*limits.watch_download_granted().borrow(), 11_000);
+    }
+
+    fn up(kind: LimitKind) -> Limits {
+        Limits::new(LimitsConfig {
+            upload_bps: kind,
+            download_bps: LimitKind::Unlimited,
+        })
+    }
+
+    // A peer's writer pays for a batch of 32 blocks at a time, 524,704
+    // bytes with their frames.
+    const BATCH: u64 = 524_704;
+
+    // libtorrent `bandwidth_channel::update_quota` keeps what a round leaves.
+    // Five writers under 5,000,000 B/s: each round fills 2,500,000 and
+    // offers each 500,000, short of a batch, so each batch takes two
+    // rounds; the second's 2,376,480 left over is kept and offered with
+    // the next. From the third round on each writer takes a batch a round,
+    // 2,623,520 together, 123,520 more than the round fills, out of what
+    // is kept: 2,252,960 after the third round, 153,120 after the
+    // twentieth. Over ten seconds twenty rounds fill 50,000,000; the
+    // writers took 49,846,880 and 153,120 is kept, none lost.
+    #[tokio::test(start_paused = true)]
+    async fn waiting_writers_move_the_whole_rate() {
+        let limits = up(bps(5_000_000));
+        let start = Instant::now();
+        let writer = || async {
+            while start.elapsed() < Duration::from_secs(10) {
+                limits.request(Channel::Upload, BATCH).await;
+            }
+        };
+        tokio::join!(writer(), writer(), writer(), writer(), writer());
+        assert_eq!(start.elapsed(), 20 * ROUND);
+        let granted = *limits.watch_upload_granted().borrow();
+        assert_eq!(granted, 49_846_880);
+        let kept = limits.limit(Channel::Upload).budget.lock().quota_left;
+        assert_eq!(kept, 153_120);
+        assert_eq!(granted + u64::try_from(kept).unwrap(), 20 * 2_500_000);
+    }
+
+    // libtorrent's rounds fall on a fixed tick (`session_impl::on_tick`).
+    // One writer under 20,000,000 B/s, each grant written at 40,000,000
+    // B/s before it asks again: each round fills 10,000,000, the writer
+    // takes a batch at the round and the rest at once as it writes, then
+    // waits for the next tick. Every half second from the first round
+    // moves the round's 10,000,000 whole: 190,000,000 from 0.5 s to 10 s.
+    #[tokio::test(start_paused = true)]
+    async fn a_lone_writer_moves_the_whole_rate() {
+        const LINK: u64 = 40_000_000;
+        let limits = up(bps(20_000_000));
+        let start = Instant::now();
+        let mut by_half_second = [0u64; 21];
+        while start.elapsed() < Duration::from_secs(10) {
+            let granted = limits.request(Channel::Upload, BATCH).await;
+            let at = start.elapsed().as_nanos() / ROUND.as_nanos();
+            by_half_second[usize::try_from(at).unwrap()] += granted;
+            tokio::time::advance(Duration::from_nanos(granted * 1_000_000_000 / LINK)).await;
+        }
+        let mut each = vec![10_000_000; 20];
+        each[0] = 0;
+        assert_eq!(by_half_second[..20], each);
+        assert_eq!(by_half_second[..20].iter().sum::<u64>(), 190_000_000);
+    }
+
+    // A channel keeps what waiting requests leave, three seconds' worth at
+    // most (`bandwidth_channel::update_quota`). A peer of a torrent limited
+    // to 1000 B/s waits ten seconds on a closed session, taking nothing of
+    // the 500 each round offers: twenty rounds fill 10,000, and the channel
+    // keeps 3,000. The peer goes, the channel idles a minute and fills
+    // nothing; a request then takes the 3,000 at once and no more, and the
+    // next waits for a round.
+    #[tokio::test(start_paused = true)]
+    async fn a_channel_keeps_three_seconds_at_most() {
+        let session = down(LimitKind::Closed);
+        let torrent = down(bps(1000));
+        {
+            let mut waiting =
+                std::pin::pin!(torrent.request_within(Some(&session), Channel::Download, 500));
+            assert!((&mut waiting).now_or_never().is_none());
+            for _ in 0..20 {
+                tokio::time::advance(ROUND).await;
+                assert!((&mut waiting).now_or_never().is_none());
+            }
+            assert_eq!(
+                torrent.limit(Channel::Download).budget.lock().quota_left,
+                3000
+            );
+        }
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            torrent.request(Channel::Download, 10_000).now_or_never(),
+            Some(3000)
+        );
+        assert_eq!(torrent.request(Channel::Download, 1).now_or_never(), None);
+        let start = Instant::now();
+        assert_eq!(torrent.request(Channel::Download, 500).await, 500);
+        assert_eq!(start.elapsed(), ROUND);
+        assert_eq!(*torrent.watch_download_granted().borrow(), 3500);
+        assert_eq!(*session.watch_download_granted().borrow(), 0);
     }
 
     // A peer of a torrent asking `ask` bytes at a time through its
@@ -921,7 +1044,11 @@ mod tests {
         }
         fn enqueue(&mut self, want: u64, now: Instant) -> u64 {
             if self.queue.is_empty() {
-                self.last_round = now;
+                // The last tick at or before `now`, ticks falling every
+                // round from the last round.
+                while self.last_round + ROUND <= now {
+                    self.last_round += ROUND;
+                }
             }
             let id = self.next_id;
             self.next_id += 1;
@@ -978,7 +1105,12 @@ mod tests {
             };
             let limit = i64::from(limit.get());
             let gap_ms = i64::try_from(gap.as_millis()).unwrap();
-            self.quota_left = self.quota_left.min(0) + (limit * gap_ms + 500) / 1000;
+            self.quota_left += (limit * gap_ms + 500) / 1000;
+            // Past three seconds' worth and what a third rounds away, back
+            // to three seconds' worth.
+            if self.quota_left > 3 * limit + 2 {
+                self.quota_left = 3 * limit;
+            }
             let share =
                 u64::try_from(self.quota_left).unwrap_or(0) / self.queue.len().max(1) as u64;
             for (_, request) in &mut self.queue {
@@ -991,8 +1123,9 @@ mod tests {
     // A channel keeping its requests by id assigns every request the same
     // shares, settles the same ones and leaves the same quota as the list
     // walked for each request, over seeded runs of requests arriving,
-    // taking their offers, settling, going and rounds passing, at a rate,
-    // unlimited and closed.
+    // taking their offers, settling, going, rounds passing and time passing
+    // between them, at a rate, unlimited and closed. Both keep the same
+    // round clock and what the rounds leave, up to three seconds' worth.
     #[test]
     fn requests_kept_by_id_get_the_shares_a_walked_list_gives() {
         let mut rng = 0x6a09_e667_f3bc_c908u64;
@@ -1027,14 +1160,7 @@ mod tests {
                 match r % 7 {
                     0 | 1 => {
                         let want = 1 + (r >> 20) % 4000;
-                        // The channel reads the clock as a queue begins.
-                        let id = if by_id.queue.is_empty() {
-                            let id = by_id.enqueue(want);
-                            by_id.last_round = now;
-                            id
-                        } else {
-                            by_id.enqueue(want)
-                        };
+                        let id = by_id.enqueue(want, now);
                         assert_eq!(id, list.enqueue(want, now), "step {step}");
                         ids.push(id);
                     }
@@ -1060,12 +1186,16 @@ mod tests {
                             ids.retain(|at| *at != id);
                         }
                     }
-                    _ => {
+                    5 => {
                         now += ROUND + Duration::from_millis((r >> 24) % 50);
                         by_id.round(now);
                         list.round(now);
                     }
+                    // Time passes with no round: a peer writing what it
+                    // was granted, or the channel idle.
+                    _ => now += Duration::from_millis((r >> 24) % 1700),
                 }
+                assert_eq!(by_id.last_round, list.last_round, "step {step}");
                 assert_eq!(by_id.quota_left, list.quota_left, "step {step}");
                 assert_eq!(by_id.queue.len(), list.queue.len(), "step {step}");
                 for (id, request) in &list.queue {
