@@ -13,6 +13,11 @@ use crate::core::compact_ip::{
 };
 use serde_derive::{Deserialize, Serialize};
 
+/// The longest PEX message a peer may send, its bytes after the extended id
+/// (libtorrent `ut_pex_peer_plugin::on_extended`, ut_pex.cpp:272,
+/// `pex_message_too_large`).
+pub const MAX_PEX_MESSAGE_LEN: usize = 500 * 1024;
+
 // libtorrent `pex_flags.hpp`: what a PEX message says of a peer it adds.
 /// Our connection to the peer is encrypted (libtorrent `pex_encryption`).
 pub const PEX_ENCRYPTION: u8 = 0x01;

@@ -840,6 +840,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             self.handler
                 .update_my_extended_handshake(&mut my_extended)
                 .map_err(Error::Anyhow)?;
+            unread.buf.set_advertised(my_extended.m);
             let my_extended = Message::Extended(ExtendedMessage::Handshake(my_extended));
             trace!("sending extended handshake: {:?}", &my_extended);
             let esz = my_extended.serialize(&mut write_buf, &Default::default)?;
@@ -1567,6 +1568,114 @@ mod tests {
         assert!(meter.sent() > 68 + 9);
         assert_eq!(load(&ledger.paid[1]), meter.sent());
         assert_eq!(load(&ledger.protocol[1]), meter.sent());
+    }
+
+    /// Advertises every extension of ours but ut_pex, and keeps the
+    /// extended messages it is handed.
+    #[derive(Default)]
+    struct WithoutPex {
+        read: tokio::sync::watch::Sender<Vec<String>>,
+    }
+
+    impl PeerConnectionHandler for &WithoutPex {
+        fn should_send_bitfield(&self) -> bool {
+            false
+        }
+        fn serialize_bitfield_message_to_buf(&self, _: &mut [u8]) -> anyhow::Result<usize> {
+            Ok(0)
+        }
+        fn on_handshake(&self, _: Handshake, _: ConnectionKind, _: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn on_extended_handshake(&self, _: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn update_my_extended_handshake(
+            &self,
+            handshake: &mut ExtendedHandshake<ByteBuf>,
+        ) -> anyhow::Result<()> {
+            handshake.m.ut_pex = None;
+            Ok(())
+        }
+        async fn on_received_message(&self, msg: Message<'_>) -> anyhow::Result<()> {
+            if let Message::Extended(e) = msg {
+                self.read.send_modify(|read| read.push(format!("{e:?}")));
+            }
+            Ok(())
+        }
+        fn on_uploaded_bytes(&self, _: u32) {}
+        fn read_chunk(&self, _: &ChunkInfo, _: &mut [u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    // A connection reads a message under one of our ids only where it
+    // advertised that id: PEX on a connection that did not advertise it is
+    // handed on unread, and an id that is none of ours ends the connection
+    // (libtorrent bt_peer_connection.cpp:1980-1988, ut_pex.cpp:270, v2.0.15).
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_reads_only_the_extensions_it_advertised() {
+        use crate::peer_protocol::MY_EXTENDED_UT_PEX;
+        // BEP 10's message id.
+        const MSGID_EXTENDED: u8 = 20;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let handler = WithoutPex::default();
+        let (connection, _dialed) = connection(EncryptionPolicy::Disabled).await;
+        let connection = PeerConnection::new(
+            connection.addr,
+            connection.info_hashes,
+            connection.peer_id,
+            &handler,
+            Some(connection.options),
+            BlockingSpawner::new(1),
+            connection.connector,
+        );
+        let (ours, mut theirs) = tokio::io::duplex(1 << 16);
+        let (reader, writer) = halves(ours);
+        let (meter, reader, writer) = Meter::wrap(reader, writer);
+        let incoming = CheckedIncomingConnection {
+            kind: ConnectionKind::Tcp,
+            addr: "127.0.0.1:6881".parse().unwrap(),
+            reader,
+            writer: writer.into(),
+            read_buf: ReadBuf::new(),
+            handshake: Handshake::new(Id20::new(HASH), Id20::new([2; 20])),
+            encryption: crate::mse::Encryption::None,
+            meter,
+        };
+        let (_tx, rx) = mpsc::unbounded_channel();
+        let extended = |id: u8, payload: &[u8]| {
+            let mut frame = u32::try_from(2 + payload.len())
+                .unwrap()
+                .to_be_bytes()
+                .to_vec();
+            frame.extend_from_slice(&[MSGID_EXTENDED, id]);
+            frame.extend_from_slice(payload);
+            frame
+        };
+        let peer = async {
+            let mut handshake = [0; 68];
+            theirs.read_exact(&mut handshake).await.unwrap();
+            // A PEX message no reader of PEX would take, then an id that is
+            // none of ours.
+            let mut frames = extended(MY_EXTENDED_UT_PEX, b"\xff");
+            frames.extend(extended(9, b"d1:xi1ee"));
+            theirs.write_all(&frames).await.unwrap();
+        };
+        let (result, ()) = tokio::join!(connection.manage_peer_incoming(rx, incoming), peer);
+        assert_eq!(
+            *handler.read.borrow(),
+            [format!("NotAdvertised({MY_EXTENDED_UT_PEX})")]
+        );
+        assert!(
+            matches!(
+                result,
+                Err(Error::Deserialize(
+                    crate::peer_protocol::MessageDeserializeError::UnknownExtendedId(9)
+                ))
+            ),
+            "{result:?}"
+        );
     }
 
     /// Answers every Have with 512 hashes, about 16 KiB, as a peer's hash

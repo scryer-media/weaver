@@ -206,6 +206,10 @@ pub enum MessageDeserializeError {
     },
     #[error("ut_holepunch: malformed message")]
     UtHolepunchInvalid,
+    #[error("extended message id {0} names none of our extensions")]
+    UnknownExtendedId(u8),
+    #[error("PEX message of {0} bytes, past {limit}", limit = extended::ut_pex::MAX_PEX_MESSAGE_LEN)]
+    PexTooLarge(usize),
     #[error("pstr doesn't match {PSTR_BT1:?}")]
     HandshakePstrWrongContent,
     #[error("pstr should be 19 bytes long but got {0}")]
@@ -681,13 +685,25 @@ impl Message<'_> {
         Some(rule)
     }
 
-    /// The first message in `buf` then `buf2`, and the bytes it takes. A
-    /// frame past [`MAX_PACKET_LEN`] or its message's length rule is
-    /// refused on its header, before its payload is read.
+    /// [`Message::deserialize_advertised`] on a connection we advertised
+    /// every one of our extensions on.
     pub fn deserialize<'a>(
         buf: &'a [u8],
         buf2: &'a [u8],
         num_pieces: Option<u32>,
+    ) -> Result<(Message<'a>, usize), MessageDeserializeError> {
+        Self::deserialize_advertised(buf, buf2, num_pieces, &PeerExtendedMessageIds::ours())
+    }
+
+    /// The first message in `buf` then `buf2`, and the bytes it takes, on a
+    /// connection we advertised the extensions `advertised` on. A frame past
+    /// [`MAX_PACKET_LEN`] or its message's length rule is refused on its
+    /// header, before its payload is read.
+    pub fn deserialize_advertised<'a>(
+        buf: &'a [u8],
+        buf2: &'a [u8],
+        num_pieces: Option<u32>,
+        advertised: &PeerExtendedMessageIds,
     ) -> Result<(Message<'a>, usize), MessageDeserializeError> {
         let mut buf = DoubleBufHelper::new(buf, buf2);
         let len_prefix = buf
@@ -783,7 +799,10 @@ impl Message<'_> {
                 ))
             }
             MSGID_EXTENDED => Ok((
-                Message::Extended(ExtendedMessage::deserialize(buf.with_max_len(msg_len))?),
+                Message::Extended(ExtendedMessage::deserialize_advertised(
+                    buf.with_max_len(msg_len),
+                    advertised,
+                )?),
                 PREAMBLE_LEN + msg_len,
             )),
             MSGID_HASH_REQUEST | MSGID_HASH_REJECT => {
