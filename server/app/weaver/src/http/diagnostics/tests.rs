@@ -1187,8 +1187,8 @@ async fn graphql_fields_that_do_not_answer_in_time_are_recorded_as_timed_out() {
     };
     let timed_out = Some(bounded::REASON_TIMED_OUT.to_string());
     assert!(reason_of("answered.json").is_empty());
-    assert_eq!(reason_of("partial.json"), [timed_out.clone()]);
-    assert_eq!(reason_of("stalled.json"), [timed_out.clone()]);
+    assert_eq!(reason_of("partial.json"), std::slice::from_ref(&timed_out));
+    assert_eq!(reason_of("stalled.json"), std::slice::from_ref(&timed_out));
     assert_eq!(reason_of(SERVICE_LOG_FILE), [timed_out]);
     for name in ["stalled.json", SERVICE_LOG_FILE] {
         assert!(
