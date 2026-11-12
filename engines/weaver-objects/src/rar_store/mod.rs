@@ -114,6 +114,15 @@ impl Volume {
             .or(self.front.as_ref())
     }
 
+    // Whether what the volume's headers have stated says it is not at
+    // `index`. The one judgement of a volume's place: where the store
+    // claims a volume, holds one, and gives one back, so it never claims a
+    // volume where it would give it back.
+    fn misplaced(&self, index: VolumeIndex) -> bool {
+        self.stated()
+            .is_some_and(|facts| claim::misplaced(index, facts))
+    }
+
     fn name_as(&mut self, name: &str) {
         self.numbered = numbering(name);
         self.name = Some(name.to_owned());
@@ -627,14 +636,10 @@ impl RarStore {
     // never that set, and each volume it took goes back with it, read to its
     // close, for the store that holds their first volume to claim.
     fn give_back_misplaced(&mut self, volume: VolumeIndex, out: &mut Vec<Emit>) {
-        let misplaced = self.volumes.get(&volume).is_some_and(|found| {
-            found.closed
-                && found
-                    .walk
-                    .facts
-                    .as_ref()
-                    .is_some_and(|facts| claim::misplaced(volume, facts))
-        });
+        let misplaced = self
+            .volumes
+            .get(&volume)
+            .is_some_and(|found| found.closed && found.misplaced(volume));
         if !misplaced {
             return;
         }
