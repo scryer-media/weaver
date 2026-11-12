@@ -2432,6 +2432,7 @@ impl TorrentService {
         queue.state().seat_owner(seat.clone());
         queue.state().seat_torrent_rate(seat);
         let mut hold = queue.state().subscribe_holds();
+        let mut starts = queue.state().subscribe_starts();
         *self
             .inner
             .queue
@@ -2442,6 +2443,15 @@ impl TorrentService {
             while hold.changed().await.is_ok() {
                 service.apply_queue().await;
                 service.publish().await;
+            }
+        }));
+        // A start of every torrent looks again at those held for their
+        // files, as a start of one does. Starts asked for while a look runs
+        // are one more look, after it.
+        let service = self.clone();
+        self.keep(tokio::spawn(async move {
+            while starts.changed().await.is_ok() {
+                service.look_again_held().await;
             }
         }));
     }
@@ -5484,6 +5494,50 @@ impl TorrentService {
         torrent.files_missing = false;
         torrent.file_have = store.file_have();
         true
+    }
+
+    // Every torrent held for its files that its own intent would run looks
+    // at them again, RESTORES_AT_ONCE at a time, as a start of every torrent
+    // asks (qBittorrent `torrents/start` with `all` calls `TorrentImpl::start`
+    // on each). One its own pause stops stays as it is, as the start leaves
+    // it. Those let go join their sessions once every look is done.
+    async fn look_again_held(&self) {
+        let held: Vec<JobId> = self
+            .inner
+            .live
+            .lock()
+            .await
+            .values()
+            .filter(|torrent| torrent.files_missing && torrent.resumed())
+            .map(|torrent| torrent.record.job_id)
+            .collect();
+        if held.is_empty() {
+            return;
+        }
+        let mut looking = tokio::task::JoinSet::new();
+        let mut found = Vec::new();
+        for job_id in held {
+            if looking.len() >= RESTORES_AT_ONCE
+                && let Some(Ok(Some(job_id))) = looking.join_next().await
+            {
+                found.push(job_id);
+            }
+            let service = self.clone();
+            looking.spawn(async move { service.look_again(job_id).await.then_some(job_id) });
+        }
+        while let Some(looked) = looking.join_next().await {
+            if let Ok(Some(job_id)) = looked {
+                found.push(job_id);
+            }
+        }
+        if found.is_empty() {
+            return;
+        }
+        self.apply_queue().await;
+        for job_id in found {
+            self.attach(job_id, None).await;
+        }
+        self.publish().await;
     }
 
     pub async fn set_forced(&self, job_id: JobId, forced: bool) -> Result<(), ActionError> {
