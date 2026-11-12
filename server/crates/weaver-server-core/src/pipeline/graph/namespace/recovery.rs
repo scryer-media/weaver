@@ -12,8 +12,8 @@
 // what, is decided here, by the same rules at every depth.
 
 use std::cmp::Reverse;
-use std::collections::BTreeSet;
 use std::collections::binary_heap::{BinaryHeap, PeekMut};
+use std::collections::{BTreeSet, HashSet};
 
 use bytes::Bytes;
 use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling};
@@ -582,7 +582,10 @@ impl NamespaceWriter {
         }
         // A name some posting already has is its member's, bound or not.
         if let Some(namespace) = tree.namespace(node) {
-            absent.retain(|(name, _)| namespace.records().all(|member| member.name != *name));
+            unposted(
+                &mut absent,
+                namespace.records().map(|member| member.name.as_str()),
+            );
         }
         for (name, length) in absent {
             let mut effects = Vec::new();
@@ -1479,13 +1482,16 @@ fn follow_founded(tree: &mut Tree, node: NodeId, sets: Vec<NodeId>) -> Vec<NodeI
         }
         let mut named = Vec::new();
         recovery.absent(&mut named);
+        if named.is_empty() {
+            continue;
+        }
+        let named = folded(&named);
+        let mut name = String::new();
         let founded = tree.namespaces_below(node).into_iter().find(|below| {
             tree.namespace(*below).is_some_and(|namespace| {
-                namespace.members().any(|member| {
-                    named
-                        .iter()
-                        .any(|(name, _)| name.eq_ignore_ascii_case(&member.name))
-                })
+                namespace
+                    .members()
+                    .any(|member| names(&named, &member.name, &mut name))
             })
         });
         if let Some(into) = founded {
@@ -1494,6 +1500,33 @@ fn follow_founded(tree: &mut Tree, node: NodeId, sets: Vec<NodeId>) -> Vec<NodeI
         }
     }
     moved
+}
+
+// Leave out of `absent` every name some posting has.
+fn unposted<'a>(absent: &mut Vec<(String, u64)>, posted: impl Iterator<Item = &'a str>) {
+    if absent.is_empty() {
+        return;
+    }
+    let posted: HashSet<&str> = posted.collect();
+    absent.retain(|(name, _)| !posted.contains(name.as_str()));
+}
+
+// The names, each in ASCII lower case, so a name is looked up regardless
+// of ASCII case.
+fn folded(named: &[(String, u64)]) -> HashSet<String> {
+    named
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect()
+}
+
+// Whether `name` is one of the folded names regardless of ASCII case,
+// folded into `buffer`.
+fn names(folded: &HashSet<String>, name: &str, buffer: &mut String) -> bool {
+    buffer.clear();
+    buffer.push_str(name);
+    buffer.make_ascii_lowercase();
+    folded.contains(buffer.as_str())
 }
 
 // Where, inside `range`, a block of any of `sizes` begins: the cuts a
@@ -1547,4 +1580,56 @@ pub(super) fn block_cuts(range: ByteRange, sizes: &mut [u64]) -> Vec<u64> {
         }
     }
     cuts
+}
+
+#[cfg(test)]
+mod name_sets {
+    use super::{folded, names, unposted};
+
+    // Names drawn from a small alphabet that mixes ASCII case and a letter
+    // outside ASCII, so many collide only by case and some not at all.
+    fn names_of(seed: &mut u64, count: usize) -> Vec<String> {
+        const LETTERS: [&str; 7] = ["a", "A", "b", "B", ".", "é", "É"];
+        (0..count)
+            .map(|_| {
+                let mut name = String::new();
+                for _ in 0..3 {
+                    *seed = seed
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    name.push_str(LETTERS[(*seed >> 33) as usize % LETTERS.len()]);
+                }
+                name
+            })
+            .collect()
+    }
+
+    // The set lookups answer what comparing every pair of the two lists
+    // answered.
+    #[test]
+    fn a_name_set_answers_as_every_pair_compared() {
+        let mut seed = 7;
+        for round in 0..64 {
+            let absent: Vec<(String, u64)> = names_of(&mut seed, round % 9)
+                .into_iter()
+                .zip(0..)
+                .collect();
+            let posted = names_of(&mut seed, round % 13);
+
+            let mut kept = absent.clone();
+            kept.retain(|(name, _)| posted.iter().all(|member| member != name));
+            let mut found = absent.clone();
+            unposted(&mut found, posted.iter().map(String::as_str));
+            assert_eq!(found, kept);
+
+            let set = folded(&absent);
+            let mut buffer = String::new();
+            for member in &posted {
+                let before = absent
+                    .iter()
+                    .any(|(name, _)| name.eq_ignore_ascii_case(member));
+                assert_eq!(names(&set, member, &mut buffer), before, "{member}");
+            }
+        }
+    }
 }
