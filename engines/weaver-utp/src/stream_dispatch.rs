@@ -927,11 +927,17 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
             // Grow the send buffer if it's approaching limits.
             // The 0.9 value found empirically.
-
+            //
+            // The buffer holds what is in flight as well as what waits, and
+            // the window grows only while the flight fills it, so a buffer
+            // no larger than the window would pin the window where the
+            // buffer stopped. It grows to a window in flight and a window
+            // waiting.
             let grow_limit = self
                 .congestion_controller
                 .window()
                 .min(self.last_remote_window as usize)
+                .saturating_mul(2)
                 .min(self.socket.opts().vsock_tx_bufsize_bytes_max.get());
             let cap = c.capacity();
             let full_ratio = tx_len as f64 / cap as f64;
@@ -1013,6 +1019,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.last_remote_window
         );
 
+        // Whether the loop stopped for want of written data.
+        let mut starved = remaining == 0;
         while remaining > 0 && remote_window_remaining > 0 {
             let ss = self.segment_sizes.next_segment_size();
             let min_ss = self.segment_sizes.mss();
@@ -1026,6 +1034,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                 if self.socket_opts.nagle && !can_send_full_payload && data_in_flight {
                     trace!(max_payload_size, "nagle: buffering more data");
+                    starved = true;
                     break;
                 }
             }
@@ -1037,6 +1046,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             }
             remaining -= payload_size;
             remote_window_remaining -= payload_size;
+            starved = remaining == 0;
             trace!(bytes = payload_size, "segmented");
 
             if is_mtu_probe {
@@ -1055,6 +1065,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         );
 
         self.this_poll.unsegmented_data = remaining;
+
+        // Everything written is segmented: the next write wakes the stream,
+        // so what the writer adds goes out without waiting for an ACK. A
+        // send buffer smaller than the flight is otherwise refilled once per
+        // ACK, and never seen full enough to grow.
+        if starved {
+            update_optional_waker(&mut self.user_tx.locked.write().dispatcher_waker, cx);
+        }
 
         Ok(())
     }
