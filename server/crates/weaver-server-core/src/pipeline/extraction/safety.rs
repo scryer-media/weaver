@@ -15,6 +15,10 @@ const TIB: u64 = 1024 * GIB;
 const MIN_MEMORY_LIMIT: u64 = 64 * MIB;
 const MAX_MEMORY_LIMIT: u64 = 64 * GIB;
 const MAX_MEMORY_ENV: &str = "WEAVER_EXTRACTION_MAX_MEMORY_BYTES";
+// The records a job's archives may hold, the most the 7z reader parses from
+// one end header: a header the reader takes whole is never refused for its
+// count. The memory limit bounds what many records cost.
+const DEFAULT_MAX_ENTRIES: u64 = 1_000_000;
 
 #[derive(Debug, Clone)]
 pub(crate) struct ExtractionLimits {
@@ -86,7 +90,7 @@ impl ExtractionLimits {
         Ok(Self {
             max_job_bytes: parse_positive_u64("WEAVER_EXTRACTION_MAX_JOB_BYTES", 2 * TIB)?,
             max_member_bytes: parse_positive_u64("WEAVER_EXTRACTION_MAX_MEMBER_BYTES", TIB)?,
-            max_entries: parse_positive_u64("WEAVER_EXTRACTION_MAX_ENTRIES", 100_000)?,
+            max_entries: parse_positive_u64("WEAVER_EXTRACTION_MAX_ENTRIES", DEFAULT_MAX_ENTRIES)?,
             max_ratio: parse_positive_u64("WEAVER_EXTRACTION_MAX_RATIO", 100)?,
             ratio_floor_bytes: parse_positive_u64("WEAVER_EXTRACTION_RATIO_FLOOR_BYTES", GIB)?,
             max_seconds: parse_positive_u64("WEAVER_EXTRACTION_MAX_SECONDS", 43_200)?,
@@ -376,6 +380,17 @@ mod tests {
             min_free_bytes: 1,
             max_memory_bytes: 64 * MIB,
         }
+    }
+
+    // The default entry cap is the 7z reader's own: every end header it
+    // parses is under the cap.
+    #[test]
+    fn the_default_entry_cap_is_the_7z_readers_own() {
+        assert_eq!(DEFAULT_MAX_ENTRIES, 1_000_000);
+        assert_eq!(
+            DEFAULT_MAX_ENTRIES,
+            sevenz_turbo::ArchiveLimits::default().max_entries
+        );
     }
 
     #[test]
