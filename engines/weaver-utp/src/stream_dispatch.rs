@@ -215,7 +215,11 @@ struct VirtualSocket<T, Env> {
     // The packet resent as this flight's tail-loss probe, until it is
     // acknowledged. One probe per flight.
     tail_probe_seq_nr: Option<SeqNr>,
-    // What this stream sent, logged when it ends.
+    // How the stream ended, for the line logged when it is dropped: a
+    // stream still open when its socket shuts down has neither.
+    closed: bool,
+    close_error: Option<String>,
+    // What this stream sent, logged when it is dropped.
     totals: SendTotals,
 
     // Last remote sequence number that we fully processed.
@@ -1328,15 +1332,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         } else {
             trace!("just_before_death: no error");
         }
-        let totals = self.totals;
-        debug!(
-            packets_sent = totals.packets_sent,
-            fast_resends = totals.fast_resends,
-            tail_probes = totals.tail_probes,
-            timer_expiries = totals.timer_expiries,
-            error = error.map(tracing::field::display),
-            "stream closed"
-        );
+        self.closed = true;
+        self.close_error = error.map(|e| e.to_string());
 
         if let Some(e) = error {
             self.user_rx.enqueue_error(format!("{e:#}"));
@@ -2248,6 +2245,18 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
 impl<T, E> Drop for VirtualSocket<T, E> {
     fn drop(&mut self) {
+        // Every stream ends here, also one still open when its socket shuts
+        // down.
+        let totals = self.totals;
+        debug!(
+            packets_sent = totals.packets_sent,
+            fast_resends = totals.fast_resends,
+            tail_probes = totals.tail_probes,
+            timer_expiries = totals.timer_expiries,
+            open = !self.closed,
+            error = self.close_error.as_deref().map(tracing::field::display),
+            "stream closed"
+        );
         self.socket.stats.live_virtual_sockets.decrement(1);
         self.user_tx.mark_vsock_closed();
         self.user_rx.mark_vsock_closed();
@@ -2477,6 +2486,8 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_sent_seq_nr,
             highest_sent_seq_nr: last_sent_seq_nr,
             tail_probe_seq_nr: None,
+            closed: false,
+            close_error: None,
             totals: SendTotals::default(),
             last_consumed_remote_seq_nr,
             last_sent_ack_nr,
