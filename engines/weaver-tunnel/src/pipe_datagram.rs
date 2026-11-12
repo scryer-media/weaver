@@ -55,8 +55,14 @@ impl DatagramTransport for SessionDatagrams {
                 session.id
             )));
         };
-        let activity = session.activity.clone().read_owned().await;
-        let capacity = session.capacity.acquire().map_err(tunnel_error)?;
+        let (provider, activity, capacity) = match super::identity::claim(session).await {
+            Some(lent) => (lent.resolver, lent.activity, None),
+            None => (
+                provider.clone(),
+                session.activity.clone().read_owned().await,
+                session.capacity.acquire().map_err(tunnel_error)?,
+            ),
+        };
         let share = session
             .sockets
             .take(SocketClass::ReserveCore)

@@ -93,7 +93,12 @@ fn tunnel_error(error: DialError) -> TunnelError {
 }
 
 // Listen inside the session's tunnel, retiring it when it cannot come up.
-async fn listen_in(session: &SessionHop, port: u16) -> Result<WgTcpListener, TunnelError> {
+// A probe lent another session's tunnel listens in that one, and gets back
+// the guard that holds the lender busy.
+async fn listen_in(
+    session: &SessionHop,
+    port: u16,
+) -> Result<(WgTcpListener, Option<OwnedRwLockReadGuard<()>>), TunnelError> {
     let Some(provider) = session.resolver.as_ref() else {
         return Err(TunnelError::Engine(format!(
             "proxy {} cannot accept connections",
@@ -101,8 +106,12 @@ async fn listen_in(session: &SessionHop, port: u16) -> Result<WgTcpListener, Tun
         )));
     };
     session.prepare_carrier().await.map_err(tunnel_error)?;
+    let (provider, lent) = match super::identity::claim(session).await {
+        Some(lent) => (lent.resolver, Some(lent.activity)),
+        None => (provider.clone(), None),
+    };
     match provider.listen(port, BACKLOG).await {
-        Ok(listener) => Ok(listener),
+        Ok(listener) => Ok((listener, lent)),
         // A tunnel that could not come up to listen is the hop's fault, as
         // one that could not come up to dial is.
         Err(error) => {
@@ -139,13 +148,18 @@ impl Inbound for SessionInbound {
             PortForwarding::Fixed(forwarded) => forwarded,
             PortForwarding::None | PortForwarding::NatPmp { .. } => port,
         };
-        let listener = listen_in(&session, port).await?;
-        let activity = session.activity.clone().read_owned().await;
-        let capacity = match session.capacity.acquire() {
-            Ok(capacity) => capacity,
-            Err(error) => {
-                drop(activity);
-                return Err(tunnel_error(error));
+        let (listener, lent) = listen_in(&session, port).await?;
+        let (activity, capacity) = match lent {
+            Some(activity) => (activity, None),
+            None => {
+                let activity = session.activity.clone().read_owned().await;
+                match session.capacity.acquire() {
+                    Ok(capacity) => (activity, capacity),
+                    Err(error) => {
+                        drop(activity);
+                        return Err(tunnel_error(error));
+                    }
+                }
             }
         };
         let (mapping, keeper) = match forwarding {
@@ -242,7 +256,9 @@ impl InboundListener for SessionListener {
             let current = match listener.as_mut() {
                 Some(current) => current,
                 None => {
-                    let fresh = listen_in(&self.session, port).await?;
+                    // The listener already holds the session it listens in
+                    // busy.
+                    let (fresh, _) = listen_in(&self.session, port).await?;
                     *self.local.lock().unwrap_or_else(PoisonError::into_inner) = fresh.local_addr();
                     listener.insert(fresh)
                 }
