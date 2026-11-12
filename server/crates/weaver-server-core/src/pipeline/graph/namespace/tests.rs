@@ -18,6 +18,7 @@ mod again;
 mod held_release;
 mod recovery;
 mod recovery_contracts;
+mod refusal;
 mod replay;
 mod split;
 mod store_proof;
