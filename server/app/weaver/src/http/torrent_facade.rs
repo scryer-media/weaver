@@ -689,6 +689,124 @@ fn need(group: &str, action: &str) -> Option<Need> {
     })
 }
 
+// Every action qBittorrent 5.3.0 takes only as a POST
+// (`WebApplication::m_allowedMethod`, src/webui/webapplication.h:153-238):
+// the ones that change something.
+fn post_only(group: &str, action: &str) -> bool {
+    matches!(
+        (group, action),
+        (
+            "app",
+            "deleteAPIKey"
+                | "rotateAPIKey"
+                | "sendTestEmail"
+                | "setCookies"
+                | "setPreferences"
+                | "shutdown"
+        ) | ("auth", "login" | "logout")
+            | ("clientdata", "store")
+            | (
+                "rss",
+                "addFeed"
+                    | "addFolder"
+                    | "cloneRule"
+                    | "importRules"
+                    | "markAsRead"
+                    | "moveItem"
+                    | "refreshItem"
+                    | "removeItem"
+                    | "removeRule"
+                    | "renameRule"
+                    | "setFeedRefreshInterval"
+                    | "setFeedURL"
+                    | "setRule"
+            )
+            | (
+                "search",
+                "delete"
+                    | "downloadTorrent"
+                    | "enablePlugin"
+                    | "installPlugin"
+                    | "start"
+                    | "stop"
+                    | "uninstallPlugin"
+                    | "updatePlugins"
+            )
+            | ("torrentcreator", "addTask" | "deleteTask")
+            | (
+                "torrents",
+                "add"
+                    | "addPeers"
+                    | "addTags"
+                    | "addTrackers"
+                    | "addWebSeeds"
+                    | "bottomPrio"
+                    | "createCategory"
+                    | "createTags"
+                    | "decreasePrio"
+                    | "delete"
+                    | "deleteTags"
+                    | "editCategory"
+                    | "editTracker"
+                    | "editWebSeed"
+                    | "fetchMetadata"
+                    | "filePrio"
+                    | "increasePrio"
+                    | "parseMetadata"
+                    | "reannounce"
+                    | "recheck"
+                    | "removeCategories"
+                    | "removeTags"
+                    | "removeTrackers"
+                    | "removeWebSeeds"
+                    | "rename"
+                    | "renameFile"
+                    | "renameFolder"
+                    | "setAutoManagement"
+                    | "setCategory"
+                    | "setComment"
+                    | "setDownloadLimit"
+                    | "setDownloadPath"
+                    | "setForceStart"
+                    | "setLocation"
+                    | "setSavePath"
+                    | "setShareLimits"
+                    | "setSSLParameters"
+                    | "setSuperSeeding"
+                    | "setTags"
+                    | "setUploadLimit"
+                    | "start"
+                    | "stop"
+                    | "toggleFirstLastPiecePrio"
+                    | "toggleSequentialDownload"
+                    | "topPrio"
+            )
+            | (
+                "transfer",
+                "banPeers"
+                    | "pauseSession"
+                    | "resumeSession"
+                    | "setDownloadLimit"
+                    | "setSpeedLimits"
+                    | "setSpeedLimitsMode"
+                    | "setUploadLimit"
+                    | "toggleSpeedLimitsMode"
+            )
+    )
+}
+
+// Whether `method` may ask for the action: a POST for one that changes
+// something, and a GET, a POST or a HEAD for any other (qBittorrent
+// `WebApplication::processRequest`, src/webui/webapplication.cpp:344-359).
+// A change by GET could come from a page's image or link, which carries no
+// header that shows where it came from.
+fn method_allowed(method: &Method, group: &str, action: &str) -> bool {
+    if post_only(group, action) {
+        return method == Method::POST;
+    }
+    matches!(*method, Method::GET | Method::POST | Method::HEAD)
+}
+
 // An action qBittorrent does not have: an unknown group is the server's
 // 404, an unknown action in a known group the API's.
 fn no_endpoint(api: Api, group: &str) -> Response {
@@ -706,6 +824,9 @@ async fn handle(
     axum::extract::Path((group, action)): axum::extract::Path<(String, String)>,
     request: Request,
 ) -> Response {
+    if !method_allowed(request.method(), &group, &action) {
+        return text(StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed");
+    }
     if group == "auth" {
         // A request sent with an API key may not log in or out (qBittorrent
         // `WebApplication::processRequest`).
