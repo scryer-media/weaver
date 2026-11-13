@@ -28,6 +28,8 @@ use crate::{JobId, SchedulerHandle};
 
 const RESERVE: u64 = 1 << 30;
 const PLENTY: u64 = 1 << 30;
+// The room value at which a look at the disk fails.
+const UNREADABLE: u64 = u64::MAX;
 const NEVER: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
 
 fn handle(pipeline: &Pipeline) -> SchedulerHandle {
@@ -59,11 +61,12 @@ fn on_disk_posting(room: &Arc<AtomicU64>, posts: Vec<Post>) -> Scenario {
                 pipeline.complete_dir.clone(),
             ];
             let room = Arc::clone(&room);
-            let probe = Arc::new(move |_: &Path| {
-                Ok(DiskSpace {
+            let probe = Arc::new(move |_: &Path| match room.load(Ordering::Acquire) {
+                UNREADABLE => Err(crate::operations::disk::DiskProbeError::InvalidPath),
+                room => Ok(DiskSpace {
                     total_bytes: RESERVE * 8,
-                    available_bytes: RESERVE + room.load(Ordering::Acquire),
-                })
+                    available_bytes: RESERVE + room,
+                }),
             });
             let capacity = StorageCapacity::with_probe(roots, NEVER, probe);
             for root in StorageRoot::ALL {
@@ -788,7 +791,49 @@ async fn until_full(pipeline: &mut Pipeline, scenario: &Scenario) {
         matches!(pipeline.jobs[&JOB].articles, JobArticles::Queued(_)),
         "it parked"
     );
+    old_graph_heard(pipeline).await;
     assert_full_disk_held(pipeline);
+}
+
+// What the job's old graph still had out on a thread is heard, as the loop
+// hears it.
+async fn old_graph_heard(pipeline: &mut Pipeline) {
+    while pipeline.retiring_graph_jobs.contains_key(&JOB) {
+        let said = pipeline
+            .graph_runs
+            .recv()
+            .await
+            .expect("the retiring graph's runs answer");
+        pipeline.graph_run_said(said);
+    }
+}
+
+// `root` is looked at afresh, by a probe begun after this call, reading
+// `value` bytes over the reserve, and the loop hears that reading.
+fn hears(pipeline: &mut Pipeline, room: &AtomicU64, root: StorageRoot, value: u64) {
+    room.store(value, Ordering::Release);
+    let begun = pipeline.storage_capacity.probes_begun(root);
+    pipeline.storage_capacity.request_refresh(root);
+    pipeline
+        .storage_capacity
+        .wait_for_reading_begun_after(root, begun);
+    pipeline.disk_reading();
+}
+
+// The job let go reads its articles back and restores its graph: its
+// release asked for that itself, with no lane asking for work.
+async fn restarts(pipeline: &mut Pipeline) {
+    assert!(!pipeline.held_for_full_disk(JOB), "the job was let go");
+    assert!(
+        matches!(pipeline.jobs[&JOB].articles, JobArticles::Activating(..)),
+        "its release asked for its articles"
+    );
+    let done = pipeline
+        .job_activated_rx
+        .recv()
+        .await
+        .expect("the activation channel stays open");
+    pipeline.handle_job_activated(done);
 }
 
 fn assert_full_disk_held(pipeline: &Pipeline) {
@@ -820,18 +865,20 @@ fn assert_full_disk_held(pipeline: &Pipeline) {
 // the disk has room, a reading lets it go, it reads its articles back,
 // restored from its last checkpoint, and completes.
 async fn full_disk_freed(pipeline: &mut Pipeline, scenario: &Scenario, room: &AtomicU64) {
-    reading_of(pipeline, room, 0).await;
+    hears(pipeline, room, StorageRoot::Intermediate, 0);
     assert_full_disk_held(pipeline);
 
     fill_after(None);
-    room_freed(pipeline, room).await;
+    hears(pipeline, room, StorageRoot::Intermediate, 2 * PLENTY);
+    // A job whose old graph still has something out goes on once that is
+    // heard, not before.
+    old_graph_heard(pipeline).await;
     assert!(!pipeline.held_for_full_disk(JOB));
     assert!(!pipeline.waits_for_disk_room());
     assert!(!working(pipeline).waited_on(), "no one waits on the disk");
     assert_eq!(pipeline.dispatch_wait_reason(JOB), None);
-    assert_eq!(pipeline.download_scheduler_eligible_jobs(), vec![JOB]);
 
-    crate::pipeline::tests::activate_job(pipeline, JOB).await;
+    restarts(pipeline).await;
     drive(pipeline, scenario, JOB, |_| false).await;
     assert_eq!(
         job_status_for_assert(pipeline, JOB),
@@ -1093,31 +1140,172 @@ async fn a_job_delivering_outside_the_complete_folder_waits_on_the_disk_its_writ
     );
     pipeline.park_drained_jobs();
 
-    // The working disk reads room: the job's own disk has said nothing.
-    room.store(PLENTY + 1, Ordering::Release);
-    pipeline
-        .storage_capacity
-        .request_refresh(StorageRoot::Intermediate);
-    pipeline
-        .storage_capacity
-        .wait_for_reading(StorageRoot::Intermediate, |reading| {
-            reading.available_bytes == RESERVE + PLENTY + 1
-        });
-    pipeline.disk_reading();
+    old_graph_heard(&mut pipeline).await;
+
+    // The working disk reads room made: the job's own disk has said nothing
+    // of more room.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 0);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 2 * PLENTY);
     assert!(
         pipeline.held_for_full_disk(JOB),
         "its own disk has not read"
     );
 
-    pipeline
-        .storage_capacity
-        .request_refresh(StorageRoot::Complete);
-    pipeline
-        .storage_capacity
-        .wait_for_reading(StorageRoot::Complete, |reading| {
-            reading.available_bytes == RESERVE + PLENTY + 1
-        });
-    pipeline.disk_reading();
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
     assert!(!pipeline.held_for_full_disk(JOB), "its disk has room");
     assert!(!output.waited_on());
+}
+
+// A job let go that finds its disk full again, having saved nothing new,
+// waits for more room than its disk has yet shown: readings that never
+// change, as of a disk whose free space is not what stops the write, do not
+// send it round. A resume by its user lets it try once, whatever they say.
+#[tokio::test]
+async fn a_job_let_go_that_fails_again_waits_for_more_room_than_its_disk_has_shown() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let body = payload(4 * ARTICLE, 113);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let complete_dir = pipeline.complete_dir.clone();
+
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    until_full(&mut pipeline, &scenario).await;
+
+    // The disk reads the same room at every look: none was made.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    assert_full_disk_held(&pipeline);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    assert_full_disk_held(&pipeline);
+    assert!(
+        matches!(pipeline.jobs[&JOB].articles, JobArticles::Queued(_)),
+        "no reading without more room restarts it"
+    );
+
+    // Its user resumes it: it tries once, and the write fails again.
+    fill_after(Some(0));
+    pipeline.resume_job_runtime(JOB).unwrap();
+    restarts(&mut pipeline).await;
+    room.store(PLENTY - 1, Ordering::Release);
+    until_full(&mut pipeline, &scenario).await;
+
+    // It saved nothing new, so it still waits for more than the disk showed
+    // before it was let go, not only for more than it shows now.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY - 1);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
+    assert_full_disk_held(&pipeline);
+
+    // More room than it has ever shown: room was made.
+    fill_after(None);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 1);
+    restarts(&mut pipeline).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
+    );
+    assert!(
+        pipeline.full_disk_highs.is_empty(),
+        "a job that ran on keeps nothing of its wait"
+    );
+}
+
+// A disk that cannot be read, or whose last good reading is stale, lets no
+// held job go: the job waits, shown waiting for disk space, until a good
+// reading shows room was made.
+#[tokio::test]
+async fn a_job_held_for_a_full_disk_waits_on_while_its_disk_cannot_be_read() {
+    let room = Arc::new(AtomicU64::new(UNREADABLE));
+    let body = payload(4 * ARTICLE, 127);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let complete_dir = pipeline.complete_dir.clone();
+
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    until_full(&mut pipeline, &scenario).await;
+
+    // No reading at all.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, UNREADABLE);
+    assert!(
+        pipeline
+            .storage_capacity
+            .current(StorageRoot::Intermediate)
+            .reading()
+            .is_none()
+    );
+    assert_full_disk_held(&pipeline);
+
+    // A good reading, then looks that fail: the reading kept is stale.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+    assert_full_disk_held(&pipeline);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, UNREADABLE);
+    assert!(
+        pipeline
+            .storage_capacity
+            .current(StorageRoot::Intermediate)
+            .reading()
+            .is_some_and(|reading| reading.stale)
+    );
+    assert_full_disk_held(&pipeline);
+
+    fill_after(None);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 2 * PLENTY);
+    restarts(&mut pipeline).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
+    );
+}
+
+// A job held for a full disk with every article already in, its stream
+// still being decoded: nothing of it is left to fetch, so no lane would ever
+// ask for it. Its release restarts it itself, and it completes.
+#[tokio::test]
+async fn a_job_held_for_a_full_disk_after_its_download_restarts_with_nothing_to_fetch() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let scenario = on_disk(&room);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let complete_dir = pipeline.complete_dir.clone();
+
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.awaits_mail())
+    })
+    .await;
+    assert!(
+        pipeline.jobs[&JOB]
+            .articles
+            .active()
+            .is_some_and(|articles| articles.download_queue.is_empty()),
+        "every article is in"
+    );
+    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate);
+    pipeline.park_drained_jobs();
+    old_graph_heard(&mut pipeline).await;
+    assert_full_disk_held(&pipeline);
+
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+    assert_full_disk_held(&pipeline);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 2 * PLENTY);
+    restarts(&mut pipeline).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        payload(3 * ARTICLE + 7, 91).as_slice()
+    );
 }

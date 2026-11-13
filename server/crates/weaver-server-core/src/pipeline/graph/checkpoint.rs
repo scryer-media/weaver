@@ -657,6 +657,11 @@ impl Pending {
         self.slot().stepped.is_some()
     }
 
+    // Whether a step wrote coverage no checkpoint holds yet.
+    pub(in crate::pipeline) fn unsaved(&self) -> bool {
+        self.slot().dirty_bytes > 0
+    }
+
     // A step wrote `bytes` of the job's coverage.
     pub(in crate::pipeline) fn delivered(&self, bytes: u64) {
         let mut slot = self.slot();
@@ -889,6 +894,9 @@ impl Pipeline {
         if let Some(state) = self.jobs.get_mut(&job_id) {
             state.checkpointed_download_bytes = state.downloaded_bytes;
         }
+        if !self.full_disk_highs.is_empty() && pending.unsaved() {
+            self.full_disk_highs.remove(&job_id);
+        }
         pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
         let stamp = pending.stamp();
         graph.recorded(stamp);
@@ -991,6 +999,10 @@ impl Pipeline {
             // What the job counted downloaded is what this checkpoint holds.
             if let Some(state) = self.jobs.get_mut(&job_id) {
                 state.checkpointed_download_bytes = state.downloaded_bytes;
+            }
+            // A job that saves something new is past its last full disk.
+            if !self.full_disk_highs.is_empty() && pending.unsaved() {
+                self.full_disk_highs.remove(&job_id);
             }
             pending.put_with_feed(graph, held, self.post_probes.verdicts.get(&job_id));
             graph.recorded(pending.stamp());

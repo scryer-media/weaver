@@ -515,6 +515,11 @@ impl Pipeline {
                 "placement recovery must succeed before resume".into(),
             ));
         }
+        // A job held for a full disk tries its disk again when resumed.
+        if self.held_for_full_disk(job_id) {
+            self.try_full_disk_now(job_id);
+            self.wake_full_disk();
+        }
         let (resume_status, resume_download_state, resume_post_state) =
             match self.jobs.get_mut(&job_id) {
                 Some(state) => {
@@ -579,6 +584,7 @@ impl Pipeline {
         ) {
             self.schedule_job_completion_check(job_id);
         }
+        self.wake_full_disk();
         Ok(())
     }
 

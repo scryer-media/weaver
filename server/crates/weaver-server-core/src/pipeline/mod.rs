@@ -1589,6 +1589,10 @@ pub struct Pipeline {
     // a reading taken since shows room, and then runs on from its last
     // checkpoint.
     pub(super) full_disk: std::collections::BTreeMap<JobId, full_disk::FullDisk>,
+    // The most free bytes each job held for a full disk has seen its disk
+    // show since it last saved anything new: it outlives the hold, so a job
+    // let go that fails again waits for more than this.
+    pub(super) full_disk_highs: std::collections::BTreeMap<JobId, u64>,
     // The removals of spool files a held job no longer reads, for a test to
     // wait on.
     #[cfg(test)]

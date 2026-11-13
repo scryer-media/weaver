@@ -7,35 +7,42 @@
 // files hold, so the graph goes at once, with no checkpoint taken of it. The
 // job keeps its slot and fetches nothing more; once nothing of it is out it
 // parks as a paused job does, and waits, shown waiting for disk space, on
-// the same ledger, readings and wake as a job the reserve holds. A reading
-// taken since the write failed that shows room over the reserve lets it go:
-// the scheduler reads its articles back, its graph is restored from its last
-// checkpoint, as after a restart, and what that checkpoint does not hold is
-// written or fetched again.
+// the same ledger and readings as a job the reserve holds. Only a reading
+// whose probe began after the write failed counts. The first one that counts
+// only says how much the disk had free as the write failed; a later one that
+// shows more than that, and more than the reserve, shows room was made, and
+// lets the job go, as a resume of the job by its user does at once. Its
+// articles are read back, its graph is restored from its last checkpoint, as
+// after a restart, and what that checkpoint does not hold is written or
+// fetched again. A job let go that fails again before it saved anything new
+// waits for more room than it has yet seen, so a disk whose readings never
+// change cannot send it round. A disk with no good reading keeps it waiting.
 //
 // Nothing here runs unless a write failed for want of room: every check on
 // a path that runs often is one test of an empty map.
 
 use std::collections::HashSet;
+use std::collections::btree_map::Entry;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
-use std::time::Instant;
 
 use tracing::{info, warn};
 
 use super::graph::limits::Device;
 use super::{ParkedBytes, Pipeline};
 use crate::jobs::ids::JobId;
-use crate::jobs::model::JobArticles;
+use crate::jobs::model::{JobArticles, RunState};
 use crate::operations::StorageRoot;
 
-// What a job waits for: room on the disk its write failed on, read after
-// that write.
+// What a job waits for: room made on the disk its write failed on.
 pub(crate) struct FullDisk {
     root: StorageRoot,
-    // When the reading cached as the write failed was taken: it may predate
-    // what filled the disk, so it says nothing of room.
-    reading: Option<Instant>,
+    // The last of the disk's probes this wait has counted, by the disk's own
+    // count of the probes it began: at first the count as the write failed,
+    // so a probe already running then is never counted.
+    counted: u64,
+    // Room was made, or the user asked: the job goes on once it has parked.
+    go: bool,
     // The spool files of the held parts the job's last checkpoint names:
     // the ones its restore reads back, so the ones that stay on disk.
     named: HashSet<PathBuf>,
@@ -96,17 +103,14 @@ impl Pipeline {
                 .collect();
         }
         self.retire_graph_job(job_id);
-        let reading = self
-            .storage_capacity
-            .current(root)
-            .reading()
-            .map(|reading| reading.sampled_at);
+        let counted = self.storage_capacity.probes_begun(root);
         self.storage_capacity.ledger(root).wait();
         self.full_disk.insert(
             job_id,
             FullDisk {
                 root,
-                reading,
+                counted,
+                go: false,
                 named,
             },
         );
@@ -164,51 +168,84 @@ impl Pipeline {
         drop(sweep);
     }
 
-    // A reading came, or a held job parked: each parked job held for a full
-    // disk whose disk now reads room over the reserve, in a good reading
-    // taken since its write failed, goes on. The scheduler reads its
-    // articles back from there.
+    // A reading came, a held job parked, or its old graph's last mail was
+    // heard. Each held job counts its disk's reading when it is one it has
+    // not counted and its probe began after the write failed: the first sets
+    // the most the disk has shown free; a later good one that shows more,
+    // and more than the reserve, shows room was made. A job with room made,
+    // or told to try by its user, goes on once it has parked, is not paused
+    // and nothing of its old graph is out: its activation is asked for here,
+    // so a job with nothing left to fetch runs on with no lane asking.
     pub(in crate::pipeline) fn wake_full_disk(&mut self) {
         if self.full_disk.is_empty() {
             return;
         }
         let reserve = self.extraction_limits.min_free_bytes;
-        let woken: Vec<JobId> = self
-            .full_disk
-            .iter()
-            .filter(|(job_id, hold)| {
-                let parked = !self.parking_jobs.contains(job_id)
-                    && self
-                        .jobs
-                        .get(job_id)
-                        .is_none_or(|state| !matches!(state.articles, JobArticles::Active(_)));
-                parked && self.room_since(hold, reserve)
-            })
-            .map(|(job_id, _)| *job_id)
-            .collect();
+        let mut woken = Vec::new();
+        for (job_id, hold) in &mut self.full_disk {
+            if let Some((probe, reading)) = self
+                .storage_capacity
+                .reading_begun_after(hold.root, hold.counted)
+            {
+                hold.counted = probe;
+                let free = self
+                    .storage_capacity
+                    .free(hold.root)
+                    .filter(|free| !free.stale && !reading.stale);
+                if let Some(free) = free {
+                    match self.full_disk_highs.entry(*job_id) {
+                        Entry::Vacant(high) => {
+                            high.insert(reading.available_bytes);
+                        }
+                        Entry::Occupied(mut high) => {
+                            if reading.available_bytes > *high.get() {
+                                high.insert(reading.available_bytes);
+                                hold.go |= free.bytes > reserve;
+                            }
+                        }
+                    }
+                }
+            }
+            let parked = !self.parking_jobs.contains(job_id)
+                && !self.retiring_graph_jobs.contains_key(job_id)
+                && self.jobs.get(job_id).is_none_or(|state| {
+                    !matches!(state.articles, JobArticles::Active(_))
+                        && state.run_state != RunState::Paused
+                });
+            if hold.go && parked {
+                woken.push(*job_id);
+            }
+        }
         for job_id in woken {
             info!(
                 job_id = job_id.0,
-                "the disk has room again; the job runs on from its last checkpoint"
+                "the job held for a full disk runs on from its last checkpoint"
             );
             self.drop_full_disk_hold(job_id);
+            self.request_job_activation(job_id);
             self.download_dispatch_wake = true;
             self.report_job(job_id);
         }
     }
 
-    // Whether the disk has room over the reserve in a good reading taken
-    // since the write failed.
-    fn room_since(&self, hold: &FullDisk, reserve: u64) -> bool {
-        let Some(reading) = self.storage_capacity.current(hold.root).reading() else {
-            return false;
-        };
-        if reading.stale || Some(reading.sampled_at) == hold.reading {
-            return false;
+    // The user resumed the job: it tries its disk again now, once, whatever
+    // the readings say. A write that fails again holds it again, against the
+    // same high.
+    pub(in crate::pipeline) fn try_full_disk_now(&mut self, job_id: JobId) {
+        if self.full_disk.is_empty() {
+            return;
         }
-        self.storage_capacity
-            .free(hold.root)
-            .is_some_and(|free| !free.stale && free.bytes > reserve)
+        if let Some(hold) = self.full_disk.get_mut(&job_id) {
+            hold.go = true;
+        }
+    }
+
+    // The job saved something new, or left: what its disk showed free
+    // before says nothing of its next wait.
+    pub(in crate::pipeline) fn full_disk_progress(&mut self, job_id: JobId) {
+        if !self.full_disk_highs.is_empty() {
+            self.full_disk_highs.remove(&job_id);
+        }
     }
 
     // The job no longer waits for room after a full disk: it went on, or

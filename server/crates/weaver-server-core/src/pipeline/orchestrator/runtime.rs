@@ -320,6 +320,7 @@ impl Pipeline {
             admission_disk_held: false,
             disk_unadmitted: std::collections::BTreeSet::new(),
             full_disk: std::collections::BTreeMap::new(),
+            full_disk_highs: std::collections::BTreeMap::new(),
             #[cfg(test)]
             full_disk_sweeps: Vec::new(),
             nntp_handoff_draining: false,
@@ -738,6 +739,7 @@ impl Pipeline {
         self.released_remaining.remove(&job_id);
         self.propagation_ready_at.remove(&job_id);
         self.drop_full_disk_hold(job_id);
+        self.full_disk_progress(job_id);
     }
 
     pub(crate) fn note_download_activity(&mut self, job_id: JobId) {

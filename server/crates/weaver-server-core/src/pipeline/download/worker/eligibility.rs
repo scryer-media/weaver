@@ -32,10 +32,12 @@ impl Pipeline {
     }
 
     // The articles `has_dispatchable_work` counts, across the jobs holding a
-    // slot: only those can dispatch.
+    // slot: only those can dispatch. A job held for a full disk dispatches
+    // nothing, so none of its articles count.
     pub(in crate::pipeline::download) fn dispatchable_queue_depth(&self) -> usize {
         self.nzb_admitted
             .iter()
+            .filter(|job_id| !self.held_for_full_disk(**job_id))
             .filter_map(|job_id| self.jobs.get(job_id))
             .filter(|state| Self::has_dispatchable_work(state))
             .map(|state| state.articles.queued_download_len())

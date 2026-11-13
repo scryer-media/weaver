@@ -1077,6 +1077,9 @@ struct RootState {
     stopped: bool,
     begun_probes: u64,
     completed_probes: u64,
+    // Which probe, by its count among those begun, took the reading now
+    // published: 0 while there is none.
+    published_probe: u64,
     // A probe of `path` finished, and why the latest failed while it fails.
     // A retarget clears both.
     probed: bool,
@@ -1655,6 +1658,7 @@ impl StorageCapacity {
                         stopped: false,
                         begun_probes: 0,
                         completed_probes: 0,
+                        published_probe: 0,
                         probed: false,
                         error: None,
                         device: None,
@@ -2080,6 +2084,29 @@ impl StorageCapacity {
         }
     }
 
+    // How many probes `root` has begun. A reading whose probe is counted
+    // after this one began after this call, whatever was running then.
+    pub(crate) fn probes_begun(&self, root: StorageRoot) -> u64 {
+        self.slot(root).lock().begun_probes
+    }
+
+    // `root`'s reading and the count of the probe that took it, when that
+    // probe began after `begun` probes had: a reading whose probe was
+    // already running then says nothing of what happened since.
+    pub(crate) fn reading_begun_after(
+        &self,
+        root: StorageRoot,
+        begun: u64,
+    ) -> Option<(u64, CapacityReading)> {
+        let slot = self.slot(root);
+        let state = slot.lock();
+        let probe = state.published_probe;
+        (probe > begun)
+            .then(|| slot.capacity.read().reading())
+            .flatten()
+            .map(|reading| (probe, reading))
+    }
+
     // Ask `root`'s thread to probe again without waiting out its interval.
     // A request made while a probe is running is served after it finishes.
     pub fn request_refresh(&self, root: StorageRoot) {
@@ -2127,6 +2154,19 @@ impl StorageCapacity {
                         .reading()
                         .is_some_and(|reading| ready(&reading))
                 })
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+    }
+
+    // Block until `root` publishes a reading whose probe began after `begun`
+    // probes had.
+    #[cfg(test)]
+    pub(crate) fn wait_for_reading_begun_after(&self, root: StorageRoot, begun: u64) {
+        let slot = self.slot(root);
+        let state = slot.lock();
+        drop(
+            slot.wake
+                .wait_while(state, |state| state.published_probe <= begun)
                 .unwrap_or_else(|poisoned| poisoned.into_inner()),
         );
     }
@@ -2234,6 +2274,7 @@ fn run_root_sampler(
         if state.path == path {
             slot.capacity.publish(capacity);
             slot.ledger.published(mark, capacity);
+            state.published_probe = state.begun_probes;
             state.probed = true;
             state.device = Some(device);
             if kind.is_some() {

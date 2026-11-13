@@ -379,6 +379,9 @@ impl Pipeline {
                 if let Some(ticket) = graph.as_mut().and_then(GraphJob::forget_slot) {
                     self.graph_status.repairs.release(ticket);
                 }
+                // A job held for a full disk may go on now its old graph has
+                // nothing out.
+                self.wake_full_disk();
                 match self.pending_graph_terminals.remove(&job_id) {
                     Some(crate::pipeline::health::PendingGraphTerminal::Failed(failure)) => {
                         let cancelling = self.shared_state.queue.read(|inner| {
