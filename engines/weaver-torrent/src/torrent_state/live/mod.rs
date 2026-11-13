@@ -4801,7 +4801,6 @@ fn check_landed_piece(
                 .lock_write("mark_piece_downloaded")
                 .get_pieces_mut()?
                 .mark_piece_hash_ok(piece_index);
-            stats.piece_verified();
             // Every peer that sent a block of it earns a point and
             // leaves parole (libtorrent `torrent::piece_passed`).
             for peer in senders.participants() {
@@ -4847,7 +4846,6 @@ fn check_landed_piece(
             state.update_interest_of_holders(chunk_info.piece_index);
         }
         Verdict::Failed => {
-            stats.piece_failed();
             warn!(
                 id = state.shared.id,
                 info_hash = ?state.shared.info_hash,

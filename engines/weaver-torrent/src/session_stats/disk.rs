@@ -113,20 +113,16 @@ pub struct DiskOpSnapshot {
 #[derive(Debug, Default)]
 struct SocketCounters {
     receive_calls: AtomicU64,
-    receive_bytes: AtomicU64,
     send_calls: AtomicU64,
-    send_bytes: AtomicU64,
 }
 
-/// What the peers' sockets of one transport carried.
+/// The calls the peers' sockets of one transport took.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct SocketSnapshot {
-    /// Reads that returned bytes, and the bytes.
+    /// Reads that returned bytes.
     pub receive_calls: u64,
-    pub receive_bytes: u64,
-    /// Buffers handed to the socket to be written whole, and their bytes.
+    /// Buffers handed to the socket to be written whole.
     pub send_calls: u64,
-    pub send_bytes: u64,
 }
 
 /// A session's disk and socket counters.
@@ -142,9 +138,9 @@ pub struct DiskStats {
     peers_resumed: AtomicU64,
     check_waits: AtomicU64,
     check_wait_nanos: AtomicU64,
-    pieces_verified: AtomicU64,
-    pieces_failed: AtomicU64,
     read_buffer_growths: AtomicU64,
+    // Writers holding a batch buffer.
+    batch_buffers: AtomicU64,
     read_seeks: AtomicU64,
     write_seeks: AtomicU64,
 }
@@ -180,10 +176,10 @@ pub struct DiskStatsSnapshot {
     /// and the time waited.
     pub check_waits: u64,
     pub check_wait_nanos: u64,
-    pub pieces_verified: u64,
-    pub pieces_failed: u64,
     /// Times a connection's read buffer was made larger.
     pub read_buffer_growths: u64,
+    /// Peer writers holding a batch buffer for runs of blocks.
+    pub batch_buffers: u64,
     /// File reads and writes that did not start where the last one of the
     /// same file ended.
     pub read_seeks: u64,
@@ -238,18 +234,18 @@ impl DiskStats {
         self.upload_read_blocks[transport.index()].fetch_add(blocks, Relaxed);
     }
 
-    /// `calls` reads of a peer's socket returned `bytes`.
-    pub fn received(&self, transport: Transport, calls: u64, bytes: u64) {
-        let socket = &self.sockets[transport.index()];
-        socket.receive_calls.fetch_add(calls, Relaxed);
-        socket.receive_bytes.fetch_add(bytes, Relaxed);
+    /// `calls` reads of a peer's socket returned bytes.
+    pub fn received(&self, transport: Transport, calls: u64) {
+        self.sockets[transport.index()]
+            .receive_calls
+            .fetch_add(calls, Relaxed);
     }
 
-    /// One buffer of `bytes` was written to a peer's socket.
-    pub fn sent(&self, transport: Transport, bytes: u64) {
-        let socket = &self.sockets[transport.index()];
-        socket.send_calls.fetch_add(1, Relaxed);
-        socket.send_bytes.fetch_add(bytes, Relaxed);
+    /// One buffer was written to a peer's socket.
+    pub fn sent(&self, transport: Transport) {
+        self.sockets[transport.index()]
+            .send_calls
+            .fetch_add(1, Relaxed);
     }
 
     /// A blocking permit was taken at once.
@@ -278,16 +274,16 @@ impl DiskStats {
         self.check_wait_nanos.fetch_add(nanos_since(since), Relaxed);
     }
 
-    pub fn piece_verified(&self) {
-        self.pieces_verified.fetch_add(1, Relaxed);
-    }
-
-    pub fn piece_failed(&self) {
-        self.pieces_failed.fetch_add(1, Relaxed);
-    }
-
     pub fn read_buffers_grew(&self, times: u64) {
         self.read_buffer_growths.fetch_add(times, Relaxed);
+    }
+
+    pub fn batch_buffer_made(&self) {
+        self.batch_buffers.fetch_add(1, Relaxed);
+    }
+
+    pub fn batch_buffer_let_go(&self) {
+        self.batch_buffers.fetch_sub(1, Relaxed);
     }
 
     /// A read of `len` bytes at `offset` of a file whose last read ended at
@@ -323,9 +319,7 @@ impl DiskStats {
                 let socket = &self.sockets[i];
                 SocketSnapshot {
                     receive_calls: socket.receive_calls.load(Relaxed),
-                    receive_bytes: socket.receive_bytes.load(Relaxed),
                     send_calls: socket.send_calls.load(Relaxed),
-                    send_bytes: socket.send_bytes.load(Relaxed),
                 }
             }),
             upload_read_blocks: std::array::from_fn(|i| self.upload_read_blocks[i].load(Relaxed)),
@@ -336,9 +330,8 @@ impl DiskStats {
             peers_resumed: self.peers_resumed.load(Relaxed),
             check_waits: self.check_waits.load(Relaxed),
             check_wait_nanos: self.check_wait_nanos.load(Relaxed),
-            pieces_verified: self.pieces_verified.load(Relaxed),
-            pieces_failed: self.pieces_failed.load(Relaxed),
             read_buffer_growths: self.read_buffer_growths.load(Relaxed),
+            batch_buffers: self.batch_buffers.load(Relaxed),
             read_seeks: self.read_seeks.load(Relaxed),
             write_seeks: self.write_seeks.load(Relaxed),
             ..Default::default()

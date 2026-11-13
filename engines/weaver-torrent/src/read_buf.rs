@@ -56,12 +56,11 @@ pub struct ReadBuf {
     socket: SocketReads,
 }
 
-/// What a connection's socket reads did: how many returned bytes, the
-/// bytes, and how many times the buffer was made larger for one.
+/// What a connection's socket reads did: how many returned bytes, and how
+/// many times the buffer was made larger for one.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct SocketReads {
     pub calls: u64,
-    pub bytes: u64,
     pub growths: u64,
 }
 
@@ -456,7 +455,6 @@ impl ReadBuf {
                 self.wanted = (self.buf.len() / 2).max(BUFLEN);
             }
             self.socket.calls += 1;
-            self.socket.bytes += size as u64;
             self.len += size;
             need_additional_bytes = need_additional_bytes.saturating_sub(size)
         }
@@ -675,7 +673,6 @@ impl ReadBuf {
             return Err(Error::PeerDisconnected);
         }
         self.socket.calls += 1;
-        self.socket.bytes += size as u64;
         self.take_read(
             lead,
             &offered[..slots.min(MOST_SLOTS)],

@@ -1285,7 +1285,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         rwtimeout,
                     )
                     .await?;
-                    stats.sent(transport, filled as u64);
+                    stats.sent(transport);
                 }
                 if let Some(answers) = self.handler.answers() {
                     answers.written(answered);
@@ -1338,7 +1338,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 // read of the socket carries many messages, and is counted
                 // once.
                 if let Some(reads) = reading.take_socket_reads() {
-                    stats.received(transport, reads.calls, reads.bytes);
+                    stats.received(transport, reads.calls);
                     if reads.growths > 0 {
                         stats.read_buffers_grew(reads.growths);
                     }
