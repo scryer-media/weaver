@@ -179,6 +179,15 @@ pub(crate) struct FileOps<'a> {
 }
 
 impl<'a> FileOps<'a> {
+    // Checks, in debug builds and tests, that a storage that reaches the
+    // disk is not reached from a uTP thread.
+    #[track_caller]
+    fn on_disk(&self) {
+        if !self.files.writes_to_memory() {
+            crate::spawn_utils::no_block_on_utp_thread();
+        }
+    }
+
     /// `disable_v1_hashes` is [`AddTorrentOptions::disable_v1_hashes`](crate::AddTorrentOptions::disable_v1_hashes).
     pub fn new(
         metadata: &'a TorrentMetadata,
@@ -435,6 +444,7 @@ impl<'a> FileOps<'a> {
     /// when v1 fails, so that a torrent whose hashes disagree stops
     /// (libtorrent `torrent::on_piece_verified`).
     pub fn check_piece(&self, piece_index: ValidPieceIndex) -> anyhow::Result<Verdict> {
+        self.on_disk();
         let mut h = self.digest(piece_index);
         if !self
             .files
@@ -521,6 +531,7 @@ impl<'a> FileOps<'a> {
         chunk_info: &ChunkInfo,
         result_buf: &mut [u8],
     ) -> anyhow::Result<()> {
+        self.on_disk();
         if result_buf.len() < chunk_info.size as usize {
             anyhow::bail!("read_chunk(): not enough capacity in the provided buffer")
         }
@@ -574,6 +585,7 @@ impl<'a> FileOps<'a> {
         chunks: &[ChunkInfo],
         bufs: &mut [&mut [u8]],
     ) -> Result<(), (usize, anyhow::Error)> {
+        self.on_disk();
         let lengths = self.torrent.lengths();
         let mut i = 0;
         while i < chunks.len() {
@@ -633,6 +645,7 @@ impl<'a> FileOps<'a> {
         data: &Piece<ByteBuf<'a>>,
         chunk_info: &ChunkInfo,
     ) -> anyhow::Result<()> {
+        self.on_disk();
         let mut absolute_offset = self.torrent.lengths().chunk_absolute_offset(chunk_info);
         let mut data = DoubleBufHelper::new(data.data().0, data.data().1);
 

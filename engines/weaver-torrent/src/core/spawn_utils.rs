@@ -17,6 +17,17 @@ pub fn spawn<E: Display + Send + 'static>(
     name: impl Into<Cow<'static, str>>,
     fut: impl std::future::Future<Output = Result<(), E>> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
+    spawn_on(None, span, name, fut)
+}
+
+/// As [`spawn`], on `on`'s runtime when given, the caller's otherwise.
+#[track_caller]
+pub fn spawn_on<E: Display + Send + 'static>(
+    on: Option<&tokio::runtime::Handle>,
+    span: tracing::Span,
+    name: impl Into<Cow<'static, str>>,
+    fut: impl std::future::Future<Output = Result<(), E>> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
     let name = name.into();
     #[cfg(test)]
     let task = polls::task(&name);
@@ -36,7 +47,10 @@ pub fn spawn<E: Display + Send + 'static>(
     .instrument(span);
     #[cfg(test)]
     let fut = polls::Counted::new(fut, task);
-    tokio::task::spawn(fut)
+    match on {
+        Some(handle) => handle.spawn(fut),
+        None => tokio::task::spawn(fut),
+    }
 }
 
 #[track_caller]
@@ -46,7 +60,19 @@ pub fn spawn_with_cancel<E: Display + Send + 'static>(
     cancellation_token: CancellationToken,
     fut: impl std::future::Future<Output = Result<(), E>> + Send + 'static,
 ) -> tokio::task::JoinHandle<()> {
-    spawn(span, name, async move {
+    spawn_with_cancel_on(None, span, name, cancellation_token, fut)
+}
+
+/// As [`spawn_with_cancel`], on `on`'s runtime when given.
+#[track_caller]
+pub fn spawn_with_cancel_on<E: Display + Send + 'static>(
+    on: Option<&tokio::runtime::Handle>,
+    span: tracing::Span,
+    name: impl Into<Cow<'static, str>>,
+    cancellation_token: CancellationToken,
+    fut: impl std::future::Future<Output = Result<(), E>> + Send + 'static,
+) -> tokio::task::JoinHandle<()> {
+    spawn_on(on, span, name, async move {
         tokio::select! {
             _ = cancellation_token.cancelled() => {
                 debug!("task cancelled");

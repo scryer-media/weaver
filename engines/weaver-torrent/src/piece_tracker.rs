@@ -231,15 +231,15 @@ impl PieceTracker {
         &self.chunks
     }
 
-    /// Consume the PieceTracker, requeuing any in-flight pieces.
+    /// Consume the PieceTracker, requeuing every piece taken and not had.
     ///
-    /// This is used when pausing a torrent - any pieces that were being downloaded
-    /// need to be put back in the queue so they can be re-downloaded on resume.
+    /// This is used when pausing a torrent: a piece a peer was fetching, and
+    /// one whose hash check is still queued or running (no longer in
+    /// flight, still taken), goes back to the queue to be fetched again on
+    /// resume. A check that finishes after the pause finds the torrent
+    /// gone and changes nothing.
     pub fn into_chunks(mut self) -> ChunkTracker {
-        // Requeue all in-flight pieces so they'll be re-downloaded on resume
-        for piece in self.inflight.into_keys() {
-            self.chunks.mark_piece_broken_if_not_have(piece);
-        }
+        self.chunks.release_taken();
         self.chunks
     }
 

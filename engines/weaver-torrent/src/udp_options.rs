@@ -12,6 +12,20 @@ use std::{io, net::SocketAddr};
 
 use tracing::{debug, warn};
 
+/// A datagram socket the options are read and set on: one registered with
+/// a runtime or one not yet.
+#[cfg(unix)]
+pub(crate) trait AsSocket: std::os::fd::AsFd + std::os::fd::AsRawFd {}
+#[cfg(unix)]
+impl<T: std::os::fd::AsFd + std::os::fd::AsRawFd> AsSocket for T {}
+#[cfg(windows)]
+pub(crate) trait AsSocket:
+    std::os::windows::io::AsSocket + std::os::windows::io::AsRawSocket
+{
+}
+#[cfg(windows)]
+impl<T: std::os::windows::io::AsSocket + std::os::windows::io::AsRawSocket> AsSocket for T {}
+
 /// The receive window each uTP stream is given.
 pub(crate) const STREAM_WINDOW: usize = 1024 * 1024;
 
@@ -27,11 +41,7 @@ pub(crate) fn receive_buffer_for(connections_limit: usize) -> usize {
 /// Set `socket`, asked for at `requested`, for uTP, with a receive buffer of
 /// `receive_buffer` bytes. Neither setting is needed for the socket to work:
 /// one the host refuses is logged, and the socket is used as it is.
-pub(crate) fn set_for_utp(
-    socket: &tokio::net::UdpSocket,
-    requested: SocketAddr,
-    receive_buffer: usize,
-) {
+pub(crate) fn set_for_utp(socket: &impl AsSocket, requested: SocketAddr, receive_buffer: usize) {
     if requested.is_ipv4() {
         if let Err(error) = set_dont_fragment(socket, Family::V4) {
             warn!(%requested, %error, "the socket's IPv4 datagrams may be fragmented");
@@ -103,27 +113,24 @@ pub(crate) enum Family {
 }
 
 // Whether `socket`, an IPv6 one, takes IPv4 peers too.
-fn takes_ipv4(socket: &tokio::net::UdpSocket) -> bool {
+pub(crate) fn takes_ipv4(socket: &impl AsSocket) -> bool {
     socket2::SockRef::from(socket)
         .only_v6()
         .is_ok_and(|only_v6| !only_v6)
 }
 
 /// Forbid fragmenting `socket`'s datagrams of `family`.
-pub(crate) fn set_dont_fragment(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+pub(crate) fn set_dont_fragment(socket: &impl AsSocket, family: Family) -> io::Result<()> {
     sys::set(socket, family)
 }
 
 /// Whether `socket`'s datagrams of `family` are never fragmented.
-pub(crate) fn dont_fragment(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
+pub(crate) fn dont_fragment(socket: &impl AsSocket, family: Family) -> io::Result<bool> {
     sys::get(socket, family)
 }
 
 /// Allow fragmenting `socket`'s datagrams of `family`.
-pub(crate) fn clear_dont_fragment(
-    socket: &tokio::net::UdpSocket,
-    family: Family,
-) -> io::Result<()> {
+pub(crate) fn clear_dont_fragment(socket: &impl AsSocket, family: Family) -> io::Result<()> {
     sys::clear(socket, family)
 }
 
@@ -135,7 +142,7 @@ pub(crate) fn clear_dont_fragment(
 /// that test the path's size, so no probe goes out while it is allowed.
 /// Where the option cannot be switched off the datagram goes as any other.
 pub(crate) fn send_fragmenting(
-    socket: &tokio::net::UdpSocket,
+    socket: &impl AsSocket,
     family: Family,
     send: impl FnOnce() -> io::Result<usize>,
 ) -> io::Result<usize> {
@@ -156,7 +163,7 @@ pub(crate) fn send_fragmenting(
 // Linux asks for path-MTU discovery that never fragments.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 mod sys {
-    use std::{io, os::fd::AsRawFd};
+    use std::io;
 
     use nix::libc;
 
@@ -177,14 +184,14 @@ mod sys {
         }
     }
 
-    pub(super) fn set(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn set(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         let (level, name, value) = option(family);
         super::unix::set_int(socket.as_raw_fd(), level, name, value)
     }
 
     // Never set don't-fragment, as libtorrent switches it off
     // (socket.hpp v2.0.15:248-249).
-    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn clear(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         let (level, name, _) = option(family);
         let value = match family {
             Family::V4 => libc::IP_PMTUDISC_DONT,
@@ -193,7 +200,7 @@ mod sys {
         super::unix::set_int(socket.as_raw_fd(), level, name, value)
     }
 
-    pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
+    pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         let (level, name, value) = option(family);
         Ok(super::unix::get_int(socket.as_raw_fd(), level, name)? == value)
     }
@@ -202,7 +209,7 @@ mod sys {
 // Apple's systems and FreeBSD carry a flag for it.
 #[cfg(any(target_vendor = "apple", target_os = "freebsd"))]
 mod sys {
-    use std::{io, os::fd::AsRawFd};
+    use std::io;
 
     use nix::libc;
 
@@ -215,17 +222,17 @@ mod sys {
         }
     }
 
-    pub(super) fn set(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn set(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         let (level, name) = option(family);
         super::unix::set_int(socket.as_raw_fd(), level, name, 1)
     }
 
-    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn clear(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         let (level, name) = option(family);
         super::unix::set_int(socket.as_raw_fd(), level, name, 0)
     }
 
-    pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
+    pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         let (level, name) = option(family);
         Ok(super::unix::get_int(socket.as_raw_fd(), level, name)? != 0)
     }
@@ -233,7 +240,7 @@ mod sys {
 
 #[cfg(windows)]
 mod sys {
-    use std::{io, os::windows::io::AsRawSocket};
+    use std::io;
 
     use windows::Win32::Networking::WinSock::{
         IP_DONTFRAGMENT, IPPROTO_IP, IPPROTO_IPV6, IPV6_DONTFRAG, SOCKET, WSAGetLastError,
@@ -254,15 +261,15 @@ mod sys {
         io::Error::from_raw_os_error(unsafe { WSAGetLastError() }.0)
     }
 
-    pub(super) fn set(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn set(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         set_to(socket, family, 1)
     }
 
-    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn clear(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         set_to(socket, family, 0)
     }
 
-    fn set_to(socket: &tokio::net::UdpSocket, family: Family, value: i32) -> io::Result<()> {
+    fn set_to(socket: &impl super::AsSocket, family: Family, value: i32) -> io::Result<()> {
         let (level, name) = option(family);
         let value = value.to_ne_bytes();
         // SAFETY: the socket is open for as long as `socket` is borrowed, and
@@ -278,7 +285,7 @@ mod sys {
         if done == 0 { Ok(()) } else { Err(last_error()) }
     }
 
-    pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
+    pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         let (level, name) = option(family);
         let mut value = [0u8; 4];
         let mut len = value.len() as i32;
@@ -313,18 +320,18 @@ mod sys {
 
     use super::Family;
 
-    pub(super) fn set(_: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn set(_: &impl super::AsSocket, family: Family) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!("this host has no option to forbid fragmenting {family:?} datagrams"),
         ))
     }
 
-    pub(super) fn clear(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<()> {
+    pub(super) fn clear(socket: &impl super::AsSocket, family: Family) -> io::Result<()> {
         set(socket, family)
     }
 
-    pub(super) fn get(socket: &tokio::net::UdpSocket, family: Family) -> io::Result<bool> {
+    pub(super) fn get(socket: &impl super::AsSocket, family: Family) -> io::Result<bool> {
         set(socket, family).map(|()| false)
     }
 }

@@ -4,7 +4,10 @@
 
 use std::{net::SocketAddr, pin::Pin, task::Poll};
 
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::{
+    io::{AsyncRead, AsyncWrite},
+    runtime::Handle,
+};
 
 use crate::{stream_rx::UtpStreamReadHalf, stream_tx::UtpStreamWriteHalf};
 
@@ -12,6 +15,8 @@ pub struct UtpStream {
     reader: UtpStreamReadHalf,
     writer: UtpStreamWriteHalf,
     remote_addr: SocketAddr,
+    // The uTP thread the stream's task runs on, when it has one.
+    home: Option<Handle>,
 }
 
 impl UtpStream {
@@ -24,11 +29,23 @@ impl UtpStream {
             reader,
             writer,
             remote_addr,
+            home: None,
         }
     }
 
     pub fn remote_addr(&self) -> SocketAddr {
         self.remote_addr
+    }
+
+    /// The uTP thread the stream's task runs on, when it has one: a task
+    /// that reads and writes the stream there hands it bytes without
+    /// waking another thread.
+    pub fn home(&self) -> Option<&Handle> {
+        self.home.as_ref()
+    }
+
+    pub(crate) fn set_home(&mut self, home: Option<Handle>) {
+        self.home = home;
     }
 
     pub fn split(self) -> (UtpStreamReadHalf, UtpStreamWriteHalf) {

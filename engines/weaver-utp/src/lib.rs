@@ -22,7 +22,9 @@ pub mod raw;
 mod recovery;
 mod rtte;
 mod runtime;
+mod rx_buf;
 mod seq_nr;
+mod shard;
 mod socket;
 mod spawn_utils;
 mod stats;
@@ -40,6 +42,7 @@ mod utils;
 pub use addr::{canonical_ip_addr, canonical_socket_addr};
 pub use congestion::ledbat::LedbatParams;
 pub use error::{Error, Result};
+pub use shard::{Shards, on_shard_thread};
 pub use socket::{SocketOpts, UtpSocket};
 pub use stats::{UtpStats, UtpStatsSnapshot};
 pub use stream::UtpStream;
@@ -50,4 +53,4 @@ pub use traits::{
 };
 pub use udp_error::{is_message_size_error, message_size_error};
 
-type Payload = Vec<u8>;
+use rx_buf::Payload;

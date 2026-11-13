@@ -307,11 +307,13 @@ impl LegSockets {
                         "the leg binds no socket of its own",
                     ))
                 })?;
-                let socket = tokio::net::UdpSocket::from_std(socket)?;
-                if let Some(receive_buffer) = utp {
-                    weaver_torrent::network::set_for_utp(&socket, requested, receive_buffer);
+                match utp {
+                    Some(receive_buffer) => {
+                        weaver_torrent::network::utp_datagrams(socket, requested, receive_buffer)
+                    }
+                    None => Ok(Arc::new(tokio::net::UdpSocket::from_std(socket)?)
+                        as Arc<dyn DatagramSocket>),
                 }
-                Ok(Arc::new(socket) as Arc<dyn DatagramSocket>)
             });
         }
         let Some(carrier) = self.carrier() else {

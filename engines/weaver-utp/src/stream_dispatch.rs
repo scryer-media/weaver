@@ -2615,7 +2615,7 @@ pub(crate) struct UtpStreamStarter<T, E> {
 impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
     pub fn start(self) -> crate::Result<UtpStream> {
         let Self {
-            stream,
+            mut stream,
             mut vsock,
             cancellation_token,
         } = self;
@@ -2627,11 +2627,12 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             .runtime
             .upgrade()
             .ok_or(Error::DispatcherDead)?;
-        runtime.register(move |transport| {
+        let home = runtime.register_stream(move |transport| {
             vsock.sender = transport.sender();
             vsock.transport = Some(transport);
             task_with_cancel(span, cancellation_token, vsock.run_forever())
         })?;
+        stream.set_home(home);
         Ok(stream)
     }
 

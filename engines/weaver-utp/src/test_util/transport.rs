@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 // Lifted from librqbit-utp 0.7.0 (Apache-2.0), Copyright (c) the librqbit authors.
-// Modified by the Weaver authors, 2026-11-12.
+// Modified by the Weaver authors, 2026-11-13.
 
 use std::{
     collections::HashMap,
@@ -27,6 +27,13 @@ type Msg = (SocketAddr, Vec<u8>);
 pub struct MockInterface {
     sockets: Mutex<HashMap<SocketAddr, UnboundedSender<Msg>>>,
     pub env: MockUtpEnvironment,
+    // The threads datagrams were sent from, by name; size probes and
+    // packets given up on as too large apart.
+    pub sending_threads: Mutex<std::collections::BTreeSet<Option<String>>>,
+    pub fragmenting_threads: Mutex<std::collections::BTreeSet<Option<String>>>,
+    pub fragmenting_sends: std::sync::atomic::AtomicUsize,
+    // The kind of runtime each transport was registered with.
+    pub registered_on: Mutex<Vec<Option<tokio::runtime::RuntimeFlavor>>>,
 }
 
 impl MockInterface {
@@ -34,19 +41,26 @@ impl MockInterface {
         Arc::new(Self {
             sockets: Default::default(),
             env: MockUtpEnvironment::new(),
+            sending_threads: Default::default(),
+            fragmenting_threads: Default::default(),
+            fragmenting_sends: Default::default(),
+            registered_on: Default::default(),
         })
     }
 
     pub fn create_socket(self: &Arc<Self>, bind_addr: SocketAddr) -> Arc<MockUtpSocket> {
-        MockUtpSocket::new_with_opts(
-            self.transport(bind_addr),
-            self.env.clone(),
-            SocketOpts::default(),
-        )
-        .unwrap()
+        self.create_socket_with_opts(bind_addr, SocketOpts::default())
     }
 
-    fn transport(self: &Arc<Self>, bind_addr: SocketAddr) -> MockUtpTransport {
+    pub fn create_socket_with_opts(
+        self: &Arc<Self>,
+        bind_addr: SocketAddr,
+        opts: SocketOpts,
+    ) -> Arc<MockUtpSocket> {
+        MockUtpSocket::new_with_opts(self.transport(bind_addr), self.env.clone(), opts).unwrap()
+    }
+
+    pub fn transport(self: &Arc<Self>, bind_addr: SocketAddr) -> MockUtpTransport {
         let (tx, rx) = unbounded_channel();
         if self.sockets.lock().insert(bind_addr, tx).is_some() {
             panic!("socket with {} already existed", bind_addr)
@@ -69,6 +83,13 @@ struct MockUtpTransportInner {
 pub struct MockUtpTransport {
     inner: Arc<MockUtpTransportInner>,
     bind_addr: SocketAddr,
+    // Streams hand their datagrams to the socket's I/O task, as over a
+    // kernel socket.
+    one_task: bool,
+    // Streams may run on other uTP threads than the I/O task's.
+    spreads: bool,
+    // Its registration fails.
+    refuses_registration: bool,
 }
 
 impl MockUtpTransport {
@@ -83,10 +104,40 @@ impl MockUtpTransport {
                 interface,
             }),
             bind_addr,
+            one_task: false,
+            spreads: false,
+            refuses_registration: false,
         }
     }
 
+    pub fn refusing_registration(mut self) -> Self {
+        self.refuses_registration = true;
+        self
+    }
+
+    pub fn sending_from_one_task(mut self) -> Self {
+        self.one_task = true;
+        self
+    }
+
+    pub fn spreading_streams(mut self) -> Self {
+        self.spreads = true;
+        self
+    }
+
     pub fn send(&self, buf: &[u8], target: SocketAddr) -> std::io::Result<usize> {
+        self.deliver(buf, target, &self.inner.interface.sending_threads)
+    }
+
+    fn deliver(
+        &self,
+        buf: &[u8],
+        target: SocketAddr,
+        threads: &Mutex<std::collections::BTreeSet<Option<String>>>,
+    ) -> std::io::Result<usize> {
+        threads
+            .lock()
+            .insert(std::thread::current().name().map(str::to_owned));
         match self.inner.interface.sockets.lock().get(&target) {
             Some(tx) => match tx.send((self.bind_addr, buf.to_owned())) {
                 Ok(_) => {}
@@ -100,6 +151,25 @@ impl MockUtpTransport {
 }
 
 impl Transport for MockUtpTransport {
+    fn register_io(&self) -> std::io::Result<()> {
+        if self.refuses_registration {
+            return Err(std::io::Error::other("registration refused"));
+        }
+        let flavor = tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|handle| handle.runtime_flavor());
+        self.inner.interface.registered_on.lock().push(flavor);
+        Ok(())
+    }
+
+    fn sends_from_one_task(&self) -> bool {
+        self.one_task
+    }
+
+    fn spreads_streams(&self) -> bool {
+        self.spreads
+    }
+
     async fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         let f = poll_fn(|cx| self.inner.locked.lock().rx.poll_recv(cx));
         let (addr, data) = f.await.unwrap();
@@ -123,6 +193,22 @@ impl Transport for MockUtpTransport {
 
     fn bind_addr(&self) -> SocketAddr {
         self.bind_addr
+    }
+
+    fn poll_send_to_vectored_fragmenting(
+        &self,
+        _cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+        target: SocketAddr,
+        _fragmenting: Fragmenting,
+    ) -> Poll<std::io::Result<usize>> {
+        let mut buf = Vec::new();
+        bufs.iter().for_each(|b| buf.extend_from_slice(b.as_ref()));
+        self.inner
+            .interface
+            .fragmenting_sends
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Poll::Ready(self.deliver(&buf, target, &self.inner.interface.fragmenting_threads))
     }
 }
 
