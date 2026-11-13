@@ -227,7 +227,7 @@ impl Harness {
         let counters = self
             .live
             .peers
-            .add_incoming(addr, Id20::default(), tx.clone(), ConnectionKind::Tcp, 6881)
+            .add_incoming(addr, client_id(addr), tx.clone(), ConnectionKind::Tcp, 6881)
             .unwrap();
         let handler = PeerHandler {
             addr,
@@ -4521,6 +4521,15 @@ fn sock(addr: &str) -> SocketAddr {
     addr.parse().unwrap()
 }
 
+/// The peer id of the client at `addr`: each address is another client.
+fn client_id(addr: SocketAddr) -> Id20 {
+    let mut peer_id = [7; 20];
+    for (at, byte) in peer_id.iter_mut().zip(addr.to_string().bytes()) {
+        *at ^= byte;
+    }
+    Id20::new(peer_id)
+}
+
 /// An address on 127.0.0.1 nothing listens on, so a connection to it fails.
 fn closed_port() -> SocketAddr {
     std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
@@ -5190,9 +5199,23 @@ impl Harness {
 
     /// A connection from `addr` the listener took and checked, for this
     /// torrent, with its place under the session's cap; and our end of it.
+    /// Each address is another client, with a peer id of its own.
     fn incoming(
         &self,
         addr: &str,
+    ) -> (
+        CheckedIncomingConnection,
+        crate::connection_slots::ConnectionSlot,
+        tokio::io::DuplexStream,
+    ) {
+        self.incoming_as(addr, client_id(sock(addr)))
+    }
+
+    /// [`Harness::incoming`], from the client whose peer id is `peer_id`.
+    fn incoming_as(
+        &self,
+        addr: &str,
+        peer_id: Id20,
     ) -> (
         CheckedIncomingConnection,
         crate::connection_slots::ConnectionSlot,
@@ -5206,7 +5229,7 @@ impl Harness {
             reader,
             writer: writer.into(),
             read_buf: crate::read_buf::ReadBuf::new(),
-            handshake: Handshake::new(self.shared.info_hash, Id20::new([7; 20])),
+            handshake: Handshake::new(self.shared.info_hash, peer_id),
             encryption: crate::mse::Encryption::None,
             meter: Default::default(),
         };
@@ -7355,4 +7378,150 @@ async fn a_file_whole_at_the_start_is_never_told() {
 
     h.complete(&peer, 2).await;
     assert_eq!(storage.log.completed_files(), vec![1]);
+}
+
+/// A torrent of no piece whose connections never time out a quiet peer
+/// and send a keepalive each minute, so a connection closes only when the
+/// torrent closes it.
+async fn quiet_peers_harness(name: &str) -> Harness {
+    let opts = SessionOptions {
+        connect: Some(crate::stream_connect::ConnectionOptions {
+            enable_tcp: true,
+            enable_utp: None,
+            peer_opts: Some(crate::PeerConnectionOptions {
+                read_write_timeout: Some(Duration::from_secs(3600)),
+                keep_alive_interval: Some(Duration::from_secs(60)),
+                ..Default::default()
+            }),
+        }),
+        ..isolated_session_opts(false)
+    };
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        ..Default::default()
+    };
+    Harness::build_added(name, PIECES, 0x00, opts, add).await
+}
+
+/// A connection from `addr`, of the client whose peer id is `peer_id`,
+/// past its handshake: our handshake and the first frame after it, which
+/// is written once the connection has told the torrent how the peer
+/// greeted, have reached the peer. Returns the peer's end.
+async fn handshaken_as(h: &Harness, addr: &str, peer_id: Id20) -> tokio::io::DuplexStream {
+    use tokio::io::AsyncReadExt;
+    let (checked, slot, mut theirs) = h.incoming_as(addr, peer_id);
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(added, AddIncomingPeerResult::Added));
+    let mut handshake = [0; 68];
+    theirs.read_exact(&mut handshake).await.unwrap();
+    let len = theirs.read_u32().await.unwrap();
+    theirs.read_exact(&mut vec![0; len as usize]).await.unwrap();
+    theirs
+}
+
+/// Reads the frames we send on `end` until a keepalive, which says the
+/// connection stays open with nothing more to say, or until it closes:
+/// true for the keepalive.
+async fn stays_open(end: &mut tokio::io::DuplexStream) -> bool {
+    use tokio::io::AsyncReadExt;
+    loop {
+        match end.read_u32().await {
+            Ok(0) => return true,
+            Ok(len) => {
+                end.read_exact(&mut vec![0; len as usize]).await.unwrap();
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return false,
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+// libtorrent `bt_peer_connection::on_receive`, "read_peer_id", with
+// `allow_multiple_connections_per_pid` off (`settings_pack.cpp`): a
+// connection that sends the peer id of a connected peer is the same client
+// at another address, and one of the two closes. The end with the greater
+// id keeps the connection it made, so both ends close the same one. Here
+// the client's id is below ours: it keeps no connection it made to us, so
+// its second is closed right after our handshake, and the first stays.
+#[tokio::test(start_paused = true)]
+async fn a_second_connection_from_a_client_whose_id_is_below_ours_is_closed() {
+    use tokio::io::AsyncReadExt;
+    let h = quiet_peers_harness("duplicate_peer_id_below").await;
+    let client = Id20::new([0; 20]);
+    assert!(client < h.shared.peer_id);
+    let mut first = handshaken_as(&h, "192.0.2.1:6881", client).await;
+
+    let (checked, slot, mut second) = h.incoming_as("[2001:db8::1]:6881", client);
+    let added = h.live.add_incoming_peer(checked, slot).unwrap();
+    assert!(matches!(added, AddIncomingPeerResult::Added));
+    let mut written = Vec::new();
+    second.read_to_end(&mut written).await.unwrap();
+    // Our handshake, and nothing after it.
+    assert_eq!(written.len(), 68);
+    assert!(stays_open(&mut first).await);
+}
+
+// As above, a client whose id is above ours keeps the connection it made
+// to us last: its first connection closes, the second stays.
+#[tokio::test(start_paused = true)]
+async fn a_client_whose_id_is_above_ours_keeps_its_second_connection_and_loses_the_first() {
+    let h = quiet_peers_harness("duplicate_peer_id_above").await;
+    let client = Id20::new([0xff; 20]);
+    assert!(client > h.shared.peer_id);
+    let mut first = handshaken_as(&h, "192.0.2.1:6881", client).await;
+    let mut second = handshaken_as(&h, "[2001:db8::1]:6881", client).await;
+
+    assert!(!stays_open(&mut first).await);
+    assert!(stays_open(&mut second).await);
+}
+
+// libtorrent `peer_connection::disconnect`: a connection that reaches
+// ourselves bans the peer it was made to, "don't try to connect to ourself
+// again" (`bt_peer_connection::on_receive` knows it by the peer id it
+// reads). The torrent dials its own address: the far end answers with our
+// own peer id and is closed, the torrent's one connection goes to another
+// peer next, and the address is no connect candidate at any time after.
+#[tokio::test(start_paused = true)]
+async fn a_connection_to_ourselves_is_closed_and_its_address_never_dialed_again() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (tx, mut dialed) = unbounded_channel();
+    let opts = SessionOptions {
+        socket_factory: Arc::new(DialedTcp(crate::peer_info_reader::tests::Dialed(tx))),
+        connect: Some(crate::stream_connect::ConnectionOptions {
+            enable_tcp: true,
+            enable_utp: None,
+            peer_opts: None,
+        }),
+        ..isolated_session_opts(false)
+    };
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        initial_peers: Some(vec![sock("127.0.0.1:6881")]),
+        peer_limit: Some(1),
+        ..Default::default()
+    };
+    let h = Harness::build_added("self_connection", PIECES, 0x00, opts, add).await;
+    let (addr, mut ourselves) = dialed.recv().await.unwrap();
+    assert_eq!(addr, sock("127.0.0.1:6881"));
+    let mut greeting = [0; 68];
+    ourselves.read_exact(&mut greeting).await.unwrap();
+    let mut answer = [0; 68];
+    let len =
+        Handshake::new(h.shared.info_hash, h.shared.peer_id).serialize_unchecked_len(&mut answer);
+    ourselves.write_all(&answer[..len]).await.unwrap();
+    let mut rest = Vec::new();
+    ourselves.read_to_end(&mut rest).await.unwrap();
+    assert!(rest.is_empty());
+
+    // The torrent holds one connection, so the next is made only once the
+    // one to ourselves has settled.
+    h.peers
+        .add_peer(sock("127.0.0.2:6881"), PeerSourceFlag::Tracker);
+    let (next, _other) = dialed.recv().await.unwrap();
+    assert_eq!(next, sock("127.0.0.2:6881"));
+    assert!(h.peers.is_banned(addr.ip()));
+    assert_eq!(
+        h.peers.next_candidate(tokio::time::Instant::now()),
+        peers::NextCandidate::None
+    );
 }

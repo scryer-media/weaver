@@ -1188,6 +1188,11 @@ impl LivePeerState {
         }
     }
 
+    /// The peer id the peer sent in its handshake.
+    pub(crate) fn peer_id(&self) -> Id20 {
+        self.peer_id
+    }
+
     /// The connection's rates take what moved over it by `now`, given the
     /// peer's `counters`.
     pub(crate) fn sample_rates(&self, counters: &PeerCountersAtomic, now: std::time::Instant) {
