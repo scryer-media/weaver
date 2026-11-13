@@ -1080,6 +1080,11 @@ struct RootState {
     // Which probe, by its count among those begun, took the reading now
     // published: 0 while there is none.
     published_probe: u64,
+    // Each write failure met while a probe was running, by that probe's
+    // count, and the free bytes that probe went on to publish in a good
+    // reading: a reading begun before the failure though published after
+    // it. Empty unless someone waits on a failed write.
+    straddling: Vec<(u64, Option<u64>)>,
     // A probe of `path` finished, and why the latest failed while it fails.
     // A retarget clears both.
     probed: bool,
@@ -1659,6 +1664,7 @@ impl StorageCapacity {
                         begun_probes: 0,
                         completed_probes: 0,
                         published_probe: 0,
+                        straddling: Vec::new(),
                         probed: false,
                         error: None,
                         device: None,
@@ -2090,6 +2096,50 @@ impl StorageCapacity {
         self.slot(root).lock().begun_probes
     }
 
+    // A write on `root` failed now. The count of the probes begun so far,
+    // which every later probe is counted after, and the free bytes of the
+    // good reading published now: what the disk showed before the failure.
+    // A probe running now began before the failure too, and what it goes on
+    // to publish is kept for `straddled` until `failure_forgotten`.
+    pub(crate) fn failed_at(&self, root: StorageRoot) -> (u64, Option<u64>) {
+        let slot = self.slot(root);
+        let mut state = slot.lock();
+        let begun = state.begun_probes;
+        if state.published_probe < begun {
+            state.straddling.push((begun, None));
+        }
+        let shown = slot
+            .capacity
+            .read()
+            .reading()
+            .filter(|reading| !reading.stale)
+            .map(|reading| reading.available_bytes);
+        (begun, shown)
+    }
+
+    // The free bytes a probe running as a write failed, at the count
+    // `failed_at` gave, has published since in a good reading.
+    pub(crate) fn straddled(&self, root: StorageRoot, begun: u64) -> Option<u64> {
+        let state = self.slot(root).lock();
+        state
+            .straddling
+            .iter()
+            .find(|(running, _)| *running == begun)
+            .and_then(|(_, figure)| *figure)
+    }
+
+    // No one waits any longer on the failure `failed_at` counted at `begun`.
+    pub(crate) fn failure_forgotten(&self, root: StorageRoot, begun: u64) {
+        let mut state = self.slot(root).lock();
+        if let Some(at) = state
+            .straddling
+            .iter()
+            .position(|(running, _)| *running == begun)
+        {
+            state.straddling.swap_remove(at);
+        }
+    }
+
     // `root`'s reading and the count of the probe that took it, when that
     // probe began after `begun` probes had: a reading whose probe was
     // already running then says nothing of what happened since.
@@ -2275,6 +2325,20 @@ fn run_root_sampler(
             slot.capacity.publish(capacity);
             slot.ledger.published(mark, capacity);
             state.published_probe = state.begun_probes;
+            if !state.straddling.is_empty() {
+                let probe = state.begun_probes;
+                let shown = slot
+                    .capacity
+                    .read()
+                    .reading()
+                    .filter(|reading| !reading.stale)
+                    .map(|reading| reading.available_bytes);
+                for (running, figure) in &mut state.straddling {
+                    if *running == probe {
+                        *figure = shown;
+                    }
+                }
+            }
             state.probed = true;
             state.device = Some(device);
             if kind.is_some() {

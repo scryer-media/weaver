@@ -1190,7 +1190,7 @@ async fn a_job_let_go_that_fails_again_waits_for_more_room_than_its_disk_has_sho
     fill_after(Some(0));
     pipeline.resume_job_runtime(JOB).unwrap();
     restarts(&mut pipeline).await;
-    room.store(PLENTY - 1, Ordering::Release);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY - 1);
     until_full(&mut pipeline, &scenario).await;
 
     // It saved nothing new, so it still waits for more than the disk showed
@@ -1199,9 +1199,23 @@ async fn a_job_let_go_that_fails_again_waits_for_more_room_than_its_disk_has_sho
     hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
     assert_full_disk_held(&pipeline);
 
-    // More room than it has ever shown: room was made.
-    fill_after(None);
+    // More room than it has ever shown lets it go, once. The write fails
+    // again with nothing new saved: the same reading does not let it go a
+    // second time.
     hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 1);
+    restarts(&mut pipeline).await;
+    until_full(&mut pipeline, &scenario).await;
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 1);
+    assert_full_disk_held(&pipeline);
+    assert_eq!(
+        pipeline.full_disk_highs.get(&JOB),
+        Some(&(RESERVE + PLENTY + 1)),
+        "it waits for more than the most its disk has shown"
+    );
+
+    // More again: room was made, and this time the write lands.
+    fill_after(None);
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY + 2);
     restarts(&mut pipeline).await;
     drive(&mut pipeline, &scenario, JOB, |_| false).await;
     assert_eq!(
@@ -1316,5 +1330,152 @@ async fn a_job_held_for_a_full_disk_after_its_download_restarts_with_nothing_to_
     assert_eq!(
         file_named(&delivered(&complete_dir), "ember.bin"),
         payload(3 * ARTICLE + 7, 91).as_slice()
+    );
+}
+
+// Room freed between the failed write and the next look at the disk: the
+// first reading taken since the failure shows more than the disk showed
+// before it, and lets the job go.
+#[tokio::test]
+async fn room_made_before_the_first_reading_since_the_failure_lets_the_job_go() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let body = payload(4 * ARTICLE, 131);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let complete_dir = pipeline.complete_dir.clone();
+
+    // The disk shows nothing over the reserve before the write fails.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    assert_eq!(
+        pipeline.full_disk_highs.get(&JOB),
+        Some(&RESERVE),
+        "held, it has what its disk showed before the write failed to beat"
+    );
+
+    // Room is made before the disk is looked at again.
+    fill_after(None);
+    room.store(2 * PLENTY, Ordering::Release);
+    pipeline.park_drained_jobs();
+    old_graph_heard(&mut pipeline).await;
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 2 * PLENTY);
+    restarts(&mut pipeline).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
+    );
+}
+
+// A look at the disk that can be held open: armed, the next probe says it
+// began and waits to be let on before it reads the room.
+struct Gate {
+    armed: std::sync::atomic::AtomicBool,
+    began: std::sync::Mutex<std::sync::mpsc::Sender<()>>,
+    go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+// A probe already running as the write fails began before the failure: the
+// high figure it publishes afterwards raises what the job waits to see
+// beaten, and neither it nor a later reading of the same figure lets the
+// job go.
+#[tokio::test]
+async fn a_probe_running_as_the_write_fails_does_not_let_the_job_go() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let body = payload(4 * ARTICLE, 137);
+    let (began_tx, began_rx) = std::sync::mpsc::channel();
+    let (go_tx, go_rx) = std::sync::mpsc::channel();
+    let gate = Arc::new(Gate {
+        armed: std::sync::atomic::AtomicBool::new(false),
+        began: std::sync::Mutex::new(began_tx),
+        go: std::sync::Mutex::new(go_rx),
+    });
+    let scenario = {
+        let room = Arc::clone(&room);
+        let gate = Arc::clone(&gate);
+        Scenario::new(vec![Post::plain("ember.bin", body.clone())])
+            .limits(super::caps::limits(|limits| {
+                limits.min_free_bytes = RESERVE
+            }))
+            .setup(move |pipeline| {
+                let roots = [
+                    pipeline.script_data_dir.clone(),
+                    pipeline.intermediate_dir.clone(),
+                    pipeline.complete_dir.clone(),
+                ];
+                let room = Arc::clone(&room);
+                let gate = Arc::clone(&gate);
+                let probe = Arc::new(move |_: &Path| {
+                    if gate.armed.swap(false, Ordering::AcqRel) {
+                        gate.began.lock().unwrap().send(()).unwrap();
+                        gate.go.lock().unwrap().recv().unwrap();
+                    }
+                    Ok(DiskSpace {
+                        total_bytes: RESERVE * 8,
+                        available_bytes: RESERVE + room.load(Ordering::Acquire),
+                    })
+                });
+                let capacity = StorageCapacity::with_probe(roots, NEVER, probe);
+                for root in StorageRoot::ALL {
+                    capacity.wait_for_probes(root, 1);
+                }
+                pipeline.storage_capacity = Arc::new(capacity);
+            })
+    };
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+    let complete_dir = pipeline.complete_dir.clone();
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
+
+    // A probe begins and is held open; the write fails while it runs.
+    gate.armed.store(true, Ordering::Release);
+    pipeline
+        .storage_capacity
+        .request_refresh(StorageRoot::Intermediate);
+    began_rx.recv().unwrap();
+    let running = pipeline
+        .storage_capacity
+        .probes_begun(StorageRoot::Intermediate);
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    until_full(&mut pipeline, &scenario).await;
+
+    // The probe held open reads room and publishes it; the look the wait
+    // asked for follows it and reads the same.
+    room.store(2 * PLENTY, Ordering::Release);
+    go_tx.send(()).unwrap();
+    pipeline
+        .storage_capacity
+        .wait_for_reading_begun_after(StorageRoot::Intermediate, running);
+    pipeline.disk_reading();
+    assert_full_disk_held(&pipeline);
+    assert_eq!(
+        pipeline.full_disk_highs.get(&JOB),
+        Some(&(RESERVE + 2 * PLENTY)),
+        "what the probe begun before the failure showed is what has to be beaten"
+    );
+
+    fill_after(None);
+    hears(
+        &mut pipeline,
+        &room,
+        StorageRoot::Intermediate,
+        2 * PLENTY + 1,
+    );
+    restarts(&mut pipeline).await;
+    drive(&mut pipeline, &scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(&pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    assert_eq!(
+        file_named(&delivered(&complete_dir), "ember.bin"),
+        body.as_slice()
     );
 }

@@ -8,10 +8,10 @@
 // job keeps its slot and fetches nothing more; once nothing of it is out it
 // parks as a paused job does, and waits, shown waiting for disk space, on
 // the same ledger and readings as a job the reserve holds. Only a reading
-// whose probe began after the write failed counts. The first one that counts
-// only says how much the disk had free as the write failed; a later one that
-// shows more than that, and more than the reserve, shows room was made, and
-// lets the job go, as a resume of the job by its user does at once. Its
+// whose probe began after the write failed counts. One that shows more than
+// the disk showed before the write failed, and more than the reserve, shows
+// room was made, and lets the job go, as a resume of the job by its user
+// does at once. Its
 // articles are read back, its graph is restored from its last checkpoint, as
 // after a restart, and what that checkpoint does not hold is written or
 // fetched again. A job let go that fails again before it saved anything new
@@ -37,9 +37,11 @@ use crate::operations::StorageRoot;
 // What a job waits for: room made on the disk its write failed on.
 pub(crate) struct FullDisk {
     root: StorageRoot,
-    // The last of the disk's probes this wait has counted, by the disk's own
-    // count of the probes it began: at first the count as the write failed,
-    // so a probe already running then is never counted.
+    // The disk's count of the probes it had begun as the write failed: only
+    // a later probe's reading can show room made since.
+    since: u64,
+    // The last of the disk's probes this wait has counted: at first `since`,
+    // so a probe already running as the write failed is never counted.
     counted: u64,
     // Room was made, or the user asked: the job goes on once it has parked.
     go: bool,
@@ -122,13 +124,20 @@ impl Pipeline {
                 .collect();
         }
         self.retire_graph_job(job_id);
-        let counted = self.storage_capacity.probes_begun(root);
+        // What the disk showed free before the write failed is what a later
+        // reading has to beat. It never lowers what an earlier wait left.
+        let (since, shown) = self.storage_capacity.failed_at(root);
+        if let Some(shown) = shown {
+            let high = self.full_disk_highs.entry(job_id).or_insert(shown);
+            *high = (*high).max(shown);
+        }
         self.storage_capacity.ledger(root).wait();
         self.full_disk.insert(
             job_id,
             FullDisk {
                 root,
-                counted,
+                since,
+                counted: since,
                 go: false,
                 left,
                 named,
@@ -189,10 +198,14 @@ impl Pipeline {
     }
 
     // A reading came, a held job parked, or its old graph's last mail was
-    // heard. Each held job counts its disk's reading when it is one it has
-    // not counted and its probe began after the write failed: the first sets
-    // the most the disk has shown free; a later good one that shows more,
-    // and more than the reserve, shows room was made. A job with room made,
+    // heard. Each held job has a high: the most its disk has shown free, in
+    // the reading published as its write failed, in one a probe running
+    // then published after, and in every reading since. It counts its
+    // disk's reading when it is one it has not counted and its probe began
+    // after the write failed: a good one that shows more than the high, and
+    // more than the reserve, shows room was made. With no high yet, nothing
+    // was shown before to compare with, and the reading only sets it. The
+    // high never falls while the job saves nothing new. A job with room made,
     // or told to try by its user, goes on once it has parked, is not paused
     // and nothing of its old graph is out: its activation is asked for here,
     // so a job with nothing left to fetch runs on with no lane asking.
@@ -203,6 +216,12 @@ impl Pipeline {
         let reserve = self.extraction_limits.min_free_bytes;
         let mut woken = Vec::new();
         for (job_id, hold) in &mut self.full_disk {
+            // A probe running as the write failed began before it: what it
+            // published can raise the high, never let the job go.
+            if let Some(before) = self.storage_capacity.straddled(hold.root, hold.since) {
+                let high = self.full_disk_highs.entry(*job_id).or_insert(before);
+                *high = (*high).max(before);
+            }
             if let Some((probe, reading)) = self
                 .storage_capacity
                 .reading_begun_after(hold.root, hold.counted)
@@ -294,6 +313,8 @@ impl Pipeline {
         }
         if let Some(hold) = self.full_disk.remove(&job_id) {
             self.storage_capacity.ledger(hold.root).unwait();
+            self.storage_capacity
+                .failure_forgotten(hold.root, hold.since);
         }
     }
 }
