@@ -1079,7 +1079,7 @@ export const SERVER_HEALTH_QUERY = gql`
       connectionsConfigured
       capacityPenaltyUntilEpochMs
       runtimeGeneration
-      latencyMs
+      measuredLatencyMs
       bodyLatencyMs
       bodyTransferMs
       bodyLatencyBand
