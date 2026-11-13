@@ -53,13 +53,10 @@ impl NamespaceWriter {
         // A member can have both: a file a refusal read it back into, and
         // holds for what came after an object took it again. What the holds
         // carry never reached the file, so it goes on from the holds, and
-        // the file is read only around them.
+        // the file is read only around them, and around what the delivery
+        // that bound the member gave its object, which no file holds either.
         self.share_file(tree, node, member, said);
-        let held = self
-            .files
-            .get(&node)
-            .map(|files| files.holds.held_ranges(super::held_volume(member)))
-            .unwrap_or_default();
+        let held = self.not_in_file(node, member);
         let owner = tree.child_of(node, member);
         let mut at = 0;
         while tree.child_of(node, member) == owner
@@ -151,7 +148,7 @@ impl NamespaceWriter {
         let Some(leaf) = files.leaves.get(&member) else {
             return;
         };
-        let held = files.holds.held_ranges(super::held_volume(member));
+        let held = self.not_in_file(node, member);
         let ranges: Vec<ByteRange> = coverage
             .runs()
             .flat_map(|run| outside(run.range, &held))
