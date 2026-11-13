@@ -1241,7 +1241,8 @@ pub struct ConfiguredStorage {
     pub error: Option<String>,
 }
 
-/// One volume as the operating system presents it, with its live write rate.
+/// One volume as the operating system presents it: what it takes and what
+/// is being written to it now.
 #[derive(Debug, Clone, PartialEq, SimpleObject)]
 pub struct StorageVolumeWriteRate {
     /// The mount path or drive root.
@@ -1250,6 +1251,10 @@ pub struct StorageVolumeWriteRate {
     pub storage_kind: String,
     /// What the volume takes, in bytes per second; null until measured.
     pub write_rate_bytes_per_second: Option<u64>,
+    /// What Weaver wrote to the volume over the last window, in bytes per
+    /// second, whether or not the volume was the limit; null when nothing
+    /// was written.
+    pub throughput_bytes_per_second: Option<u64>,
     /// Bytes waiting in memory to be written to the volume.
     pub buffered_bytes: u64,
 }
@@ -1271,7 +1276,8 @@ pub struct SystemInfo {
 
 #[ComplexObject]
 impl SystemInfo {
-    /// Every volume Weaver writes to, each with its live write rate. Read
+    /// Every volume Weaver writes to, each with what it takes and what is
+    /// being written to it. Read
     /// from what the disk owner holds; asks no disk.
     async fn volumes(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<StorageVolumeWriteRate>> {
         let storage = ctx
@@ -1285,6 +1291,7 @@ impl SystemInfo {
                 label: volume.label,
                 storage_kind: volume.storage_kind.to_string(),
                 write_rate_bytes_per_second: volume.write_rate,
+                throughput_bytes_per_second: volume.throughput,
                 buffered_bytes: volume.buffered_bytes,
             })
             .collect())

@@ -39,6 +39,7 @@ const SYSTEM_INFO_QUERY: &str = r#"
       label
       storageKind
       writeRateBytesPerSecond
+      throughputBytesPerSecond
       bufferedBytes
     }
     configuredStorage {
@@ -61,7 +62,8 @@ async fn system_info_exposes_safe_runtime_profile_to_read_scope() {
     assert!(!info["version"].as_str().unwrap().is_empty());
     assert!(info["uptimeSeconds"].as_f64().unwrap() >= 0.0);
     // The per-volume list is present and is a list, and each row has the
-    // four fields with their types; a rate is null until measured.
+    // five fields with their types; a rate is null until measured and a
+    // throughput is null while nothing is written.
     // The non-empty case is covered once the volume registry lands.
     let volumes = info
         .get("volumes")
@@ -72,6 +74,8 @@ async fn system_info_exposes_safe_runtime_profile_to_read_scope() {
         assert!(volume["storageKind"].is_string());
         let rate = &volume["writeRateBytesPerSecond"];
         assert!(rate.is_null() || rate.is_u64());
+        let throughput = &volume["throughputBytesPerSecond"];
+        assert!(throughput.is_null() || throughput.is_u64());
         assert!(volume["bufferedBytes"].is_u64());
     }
     assert!(matches!(

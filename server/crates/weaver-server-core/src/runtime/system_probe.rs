@@ -578,7 +578,7 @@ const DISK_PROBE_FALLBACK_IOPS: f64 = 10_000.0;
 
 // The write phase writes this buffer repeatedly, then the read phase reads
 // back from what it laid down.
-const PROBE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+pub(crate) const PROBE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 // How many buffers each successive write chunk holds: 16, 64, 144, 256 MiB.
 // Growing chunks give a fast disk a file too large for the reads to cluster
 // in or for the drive's own cache to hold, while a slow one stops early.
@@ -692,7 +692,7 @@ fn parse_startup_iops(raw: Option<&str>) -> Option<f64> {
 }
 
 // Removes the probe's scratch file however the probe ends.
-struct ProbeFileGuard(PathBuf);
+pub(crate) struct ProbeFileGuard(pub(crate) PathBuf);
 
 impl Drop for ProbeFileGuard {
     fn drop(&mut self) {
@@ -729,8 +729,27 @@ fn probe_write_buffer() -> Vec<u8> {
 
 // Writes the file the read phase reads from, through to the device, and
 // returns its length. The time each chunk takes only decides whether another
-// follows; no write speed is taken from it.
+// follows; the read measurement takes no write speed from it.
 fn lay_down_probe_file(path: &Path) -> Option<u64> {
+    synced_probe_write(path).map(|write| write.bytes)
+}
+
+// What a probe file took to write: its length, and the time spent writing
+// and syncing its chunks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProbeWrite {
+    pub(crate) bytes: u64,
+    pub(crate) elapsed: Duration,
+}
+
+// Write a probe file at `path` through to the device: growing chunks of
+// random bytes, each followed by a sync, until the chunk schedule ends or
+// the write time passes [`PROBE_WRITE_BUDGET`]. The file is left in place;
+// the caller removes it. `None` when the file cannot be made or a write
+// fails. The start-up read probe and the per-volume write probe both lay
+// their file down here. This blocks for about a second: never call it on
+// the pipeline loop or the async runtime.
+pub(crate) fn synced_probe_write(path: &Path) -> Option<ProbeWrite> {
     use std::io::Write;
 
     let buffer = probe_write_buffer();
@@ -749,17 +768,19 @@ fn lay_down_probe_file(path: &Path) -> Option<u64> {
 // [`PROBE_WRITE_REPEATS`] buffers, stopping before the next chunk once the
 // chunks written have taken [`PROBE_WRITE_BUDGET`]. `write_chunk` writes that
 // many buffers and answers how long it took, or `None` when it failed.
-fn probe_file_bytes(mut write_chunk: impl FnMut(usize) -> Option<Duration>) -> Option<u64> {
-    let mut written: u64 = 0;
-    let mut measured = Duration::ZERO;
+pub(crate) fn probe_file_bytes(
+    mut write_chunk: impl FnMut(usize) -> Option<Duration>,
+) -> Option<ProbeWrite> {
+    let mut bytes: u64 = 0;
+    let mut elapsed = Duration::ZERO;
     for repeats in PROBE_WRITE_REPEATS {
-        if measured >= PROBE_WRITE_BUDGET {
+        if elapsed >= PROBE_WRITE_BUDGET {
             break;
         }
-        measured += write_chunk(repeats)?;
-        written += (repeats * PROBE_CHUNK_BYTES) as u64;
+        elapsed += write_chunk(repeats)?;
+        bytes += (repeats * PROBE_CHUNK_BYTES) as u64;
     }
-    Some(written)
+    Some(ProbeWrite { bytes, elapsed })
 }
 
 #[cfg(unix)]

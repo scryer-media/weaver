@@ -258,6 +258,7 @@ impl PrometheusMetricsExporter {
         // slow mount cannot hold it.
         // Each volume's write counters where they stand: atomic reads.
         let volumes = disk_space.volume_snapshots();
+        let volume_rates = disk_space.volume_write_rates();
         let disk_space = disk_space.snapshots();
 
         let server_metrics = self.handle.server_metrics_snapshot();
@@ -307,6 +308,7 @@ impl PrometheusMetricsExporter {
         input.process = Some(&process);
         input.disk_space = &disk_space;
         input.volumes = &volumes;
+        input.volume_rates = &volume_rates;
         input.http_metrics = Some(&http_metrics);
         render::render_prometheus_metrics_input(&input)
     }

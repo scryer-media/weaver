@@ -37,6 +37,7 @@ interface VolumeWriteRate {
   storageKind: string;
   /** Bytes per second; null until the volume has been measured. */
   writeRateBytesPerSecond: number | null;
+  throughputBytesPerSecond: number | null;
   bufferedBytes: number;
 }
 
@@ -137,7 +138,11 @@ function reportText(info: SystemInfo, cacheBytes: number, cacheLimit: number): s
         `Volume ${index + 1}: ${volume.storageKind} · ${
           volume.writeRateBytesPerSecond == null
             ? "write rate not measured"
-            : `${formatRate(volume.writeRateBytesPerSecond)} write`
+            : `takes ${formatRate(volume.writeRateBytesPerSecond)}`
+        } · ${
+          volume.throughputBytesPerSecond == null
+            ? "not writing"
+            : `writing ${formatRate(volume.throughputBytesPerSecond)}`
         } · ${formatSize(volume.bufferedBytes)} buffered`,
     ),
     ...info.compute.kernels.map((entry) => {
@@ -372,7 +377,10 @@ export function SystemInfoPage() {
                       volume.storageKind,
                       volume.writeRateBytesPerSecond == null
                         ? t("next.system.volumeNotMeasured")
-                        : formatRate(volume.writeRateBytesPerSecond),
+                        : t("next.system.volumeTakes", { rate: formatRate(volume.writeRateBytesPerSecond) }),
+                      volume.throughputBytesPerSecond == null
+                        ? t("next.system.volumeNotWriting")
+                        : t("next.system.volumeWriting", { rate: formatRate(volume.throughputBytesPerSecond) }),
                       t("next.system.volumeBuffered", { size: formatSize(volume.bufferedBytes) }),
                     ].join(" · ")}
                   />

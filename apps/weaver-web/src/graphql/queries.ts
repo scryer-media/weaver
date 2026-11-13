@@ -1037,6 +1037,7 @@ export const SYSTEM_INFO_QUERY = gql`
         label
         storageKind
         writeRateBytesPerSecond
+        throughputBytesPerSecond
         bufferedBytes
       }
       configuredStorage {
