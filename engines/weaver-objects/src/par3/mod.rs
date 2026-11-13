@@ -598,6 +598,60 @@ impl Par3 {
         (damaged > reachable).then_some(RepairOutcome::Impossible { damaged, reachable })
     }
 
+    // Whether the refusals show the object will be short before any repair
+    // has said so: whole blocks of bound files will never come, no repair
+    // has ruled since what it binds last changed, none has settled a set,
+    // and the blocks its volumes can bring are known and may cover them.
+    // Its first repair then finds the blocks in hand rather than waiting on
+    // them; a repair's ruling takes over from there.
+    fn refused_wanting(&self) -> bool {
+        self.refused_blocks > 0
+            && self.last.is_none()
+            && self.settled.is_empty()
+            && self
+                .reach()
+                .is_some_and(|reach| self.refused_blocks <= reach)
+    }
+
+    // The volumes wanted whole now, by index. While the last repair waits
+    // on damaged blocks, every open one. While only the refusals show the
+    // object will be short, the fewest that bring the refused blocks past
+    // those the closed volumes hold, fewest blocks first: the order a
+    // shortfall reads them in, so none is fetched that the repair would not
+    // have asked for. Otherwise none.
+    fn raised(&self) -> Vec<bool> {
+        if self.needed > 0 {
+            return vec![true; self.volumes.len()];
+        }
+        let mut raised = vec![false; self.volumes.len()];
+        if !self.refused_wanting() {
+            return raised;
+        }
+        let held: u64 = self
+            .volumes
+            .iter()
+            .filter(|volume| volume.closed)
+            .filter_map(|volume| volume.named_blocks)
+            .sum();
+        let mut shortfall = self.refused_blocks.saturating_sub(held);
+        let mut order: Vec<usize> = (0..self.volumes.len())
+            .filter(|index| !self.volumes[*index].closed)
+            .collect();
+        order.sort_by_key(|index| (self.volumes[*index].named_blocks, *index));
+        for index in order {
+            if shortfall == 0 {
+                break;
+            }
+            let blocks = self.volumes[index].named_blocks.unwrap_or(0);
+            if blocks == 0 {
+                continue;
+            }
+            shortfall = shortfall.saturating_sub(blocks);
+            raised[index] = true;
+        }
+        raised
+    }
+
     // Whether the namespace shows damage the sets not yet read may cover: a
     // member, none of the object's own volumes, held damaged or refused,
     // that no described file is bound to. Only then is a volume read for
@@ -1076,11 +1130,14 @@ impl Recovery for Par3 {
     // volume that may describe them is, all of it, then the next once that
     // one is read through without one. Otherwise every volume whose head
     // shows it carries recovery is deferred: the rest waits until a repair
-    // is short. Nothing of the deferral is kept: the same fronts say it
-    // again on every round.
+    // is short, or until a refusal shows it will be, and then only the
+    // volumes that cover the refused blocks are (`raised`). Nothing of the
+    // deferral is kept: the same fronts say it again on every round.
     fn wants(&self, out: &mut Vec<Seek>) {
         let describing = self.describing();
+        let raised = self.raised();
         for (index, volume) in self.volumes.iter().enumerate() {
+            let short = raised[index];
             if volume.closed {
                 continue;
             }
@@ -1094,7 +1151,7 @@ impl Recovery for Par3 {
                 });
                 continue;
             }
-            if self.needed == 0 {
+            if !short {
                 if volume.shows_recovery() {
                     recovery_volume::gaps(&volume.arrived, |range| {
                         out.push(Seek::deferred(VolumeIndex(index as u32), range))
