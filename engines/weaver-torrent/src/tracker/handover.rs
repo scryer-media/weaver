@@ -45,6 +45,11 @@ impl TrackerHandover {
         }
     }
 
+    /// The held task's announce table.
+    pub(crate) fn status(&self) -> &TrackerStatus {
+        &self.status
+    }
+
     /// The held task as the fetch reads it: its announce table, and the
     /// peers it finds until a run takes it over. Dropping this sends
     /// nothing; the holder decides.

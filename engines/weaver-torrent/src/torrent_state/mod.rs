@@ -1031,6 +1031,11 @@ impl ManagedTorrent {
                             now.follow(before);
                         }
                         spawn_peer_adder(&live, peer_rx.peers);
+                        if let Some(trackers) = &peer_rx.trackers
+                            && live.owes_untracked()
+                        {
+                            spawn_untracked_drop(&live, trackers.subscribe());
+                        }
                         g.trackers = peer_rx.trackers;
                     }
                     Ok(())
@@ -1551,6 +1556,34 @@ fn spawn_peer_adder(live: &Arc<TorrentStateLive>, mut peer_rx: PeerStream) {
                     live.add_peer(peer, source);
                 }
                 debug!("peer_rx closed, closing peer adder");
+                Ok(())
+            }
+        },
+    );
+}
+
+/// Waits for the first tracker of `table` to answer an announce, then drops
+/// the run's peers that no tracker named ([`TorrentStateLive::tracker_answered`]).
+/// Ends with the run, or when the table can no longer change.
+fn spawn_untracked_drop(
+    live: &Arc<TorrentStateLive>,
+    mut table: tokio::sync::watch::Receiver<Vec<crate::tracker::TrackerAnnounce>>,
+) {
+    live.spawn(
+        debug_span!(parent: live.torrent().span.clone(), "untracked_drop"),
+        format!("[{}]untracked_drop", live.shared.id),
+        {
+            let live = Arc::downgrade(live);
+            async move {
+                while !crate::session::a_tracker_answered(&table.borrow_and_update()) {
+                    if table.changed().await.is_err() {
+                        return Ok(());
+                    }
+                }
+                if let Some(live) = live.upgrade() {
+                    debug!("a tracker answered: dropping the peers no tracker named");
+                    live.tracker_answered();
+                }
                 Ok(())
             }
         },
