@@ -2194,12 +2194,11 @@ fn a_repair_reads_another_block_when_those_read_do_not_rebuild() {
 }
 
 // Blocks 0, 4369, 8738 and 13107 all fail to tell slices 0 and 8 apart, so
-// the repair reads five blocks to rebuild two. Under a memory limit no
-// larger than those two, it holds the payloads of four, lets the fifth go
-// once it is counted, and reads it again when the plan chooses it: the same
-// repair, with one more volume read.
+// the repair checks five blocks to rebuild two. It holds none of their
+// payloads, so a memory limit no larger than the two slices makes the same
+// repair, reading the payloads in smaller pieces.
 #[test]
-fn a_block_read_past_what_the_repair_holds_is_read_again_when_chosen() {
+fn blocks_checked_past_those_spent_make_the_same_repair_under_a_tight_limit() {
     // Large enough for the repair's own workspace under the tight limit.
     const SLICE: u64 = 16 * 1024;
     let constants = par2_rs::input_slice_constants(9);
@@ -2235,15 +2234,15 @@ fn a_block_read_past_what_the_repair_holds_is_read_again_when_chosen() {
         bind(&mut job);
         let outcome = job.object.repair(&mut job.store, budget);
         assert!(job.store.members[&member] == data, "{outcome:?}");
-        (outcome, job.store.volume_reads)
+        outcome
     };
-    let (outcome, reads) = repaired(weaver_graph::Budget::default());
+    let outcome = repaired(weaver_graph::Budget::default());
     assert_eq!(outcome, RepairOutcome::Repaired { slices: 2 });
     let tight = weaver_graph::Budget {
         memory_bytes: Some(2 * SLICE),
         ..weaver_graph::Budget::default()
     };
-    assert_eq!(repaired(tight), (outcome, reads + 1));
+    assert_eq!(repaired(tight), outcome);
 }
 
 // A file refused whole beside another the set describes with the same
