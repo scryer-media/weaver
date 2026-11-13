@@ -862,17 +862,25 @@ impl FollowedDir {
 // the one it has is this job's own and holds nothing but its marker, or is
 // gone, folder or root: a job that never started left nothing there. One
 // that is another's or holds anything else is left as it is, and the job
-// keeps it: None. A directory already under `root` is kept. Nothing is
-// removed here: the caller records the new directory, then leaves the old.
+// keeps it: None. A directory already under `root` is kept while it is
+// there, and claimed again when it is gone. Nothing is removed here: the
+// caller records the new directory, then leaves the old.
 pub(crate) fn follow_intermediate_dir(
     root: &Path,
     current: &Path,
     job_id: JobId,
     name: &str,
 ) -> std::io::Result<Option<FollowedDir>> {
-    let Some(old_root) = current.parent().filter(|parent| *parent != root) else {
+    let Some(old_root) = current.parent() else {
         return Ok(None);
     };
+    // Under `root` already: one existence check, and the directory is kept
+    // unless it is gone.
+    if old_root == root
+        && !matches!(std::fs::symlink_metadata(current), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    {
+        return Ok(None);
+    }
     let old = match open_working_directory(old_root, current) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),

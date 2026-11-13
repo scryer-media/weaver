@@ -267,10 +267,10 @@ impl Pipeline {
             category: category.clone(),
             storage: Arc::clone(&self.storage_capacity),
         };
-        // A job that never started follows the intermediate folder set now;
-        // one that started keeps the working directory it has.
-        let follow = (working_dir.parent() != Some(self.intermediate_dir.as_path()))
-            .then(|| (self.intermediate_dir.clone(), state.spec.name.clone()));
+        // A job that never started follows the intermediate folder set now,
+        // and is given a working directory there again when the one it had
+        // is gone; one that started keeps the working directory it has.
+        let follow = Some((self.intermediate_dir.clone(), state.spec.name.clone()));
         state.articles = JobArticles::Activating(summaries, activation);
         let follow = follow.filter(|_| {
             !self

@@ -88,6 +88,10 @@ pub struct QueueInner {
     pub history_summary: crate::operations::metrics_store::JobStatusCounts,
     pub(crate) admissions: std::collections::HashSet<JobId>,
     pub(crate) history_operations: std::collections::HashSet<JobId>,
+    // The failed jobs the housekeeping sweep read as due and has not yet
+    // held. An admission of one takes it out, so the sweep never acts on a
+    // reading older than a retry. Empty except while a page is swept.
+    pub(crate) sweep_listed: std::collections::HashSet<JobId>,
     pub(crate) pending_cleanup: std::collections::HashSet<JobId>,
     pub(crate) nntp: Option<(u64, weaver_nntp::client::NntpClient, usize)>,
     // The endpoint's request count and the pipeline's latest answer, tagged

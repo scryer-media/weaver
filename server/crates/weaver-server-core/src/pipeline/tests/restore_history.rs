@@ -247,6 +247,82 @@ async fn housekeeping_leaves_an_unmarked_recorded_folder_and_lists_its_job_once(
     retire_pipeline_database(pipeline).await;
 }
 
+// The sweep's step for one job holds that job alone and lets it go as it
+// returns: with one job of a page swept, a delete of another job of the
+// page, not yet swept, is accepted. The page's stamp then takes only what
+// is still the failure listed: not a job gone since, not one that failed
+// again after the sweep's bound, not one that is no longer failed.
+#[tokio::test]
+async fn a_swept_job_holds_no_other_job_of_its_page_and_the_stamp_takes_only_listed_failures() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, intermediate_dir, _) = new_direct_pipeline(&temp_dir).await;
+    let (first, second, again, done) = (JobId(30080), JobId(30081), JobId(30082), JobId(30083));
+    let first_dir = marked_working_dir(&intermediate_dir, "step-first", first).await;
+    let second_dir = marked_working_dir(&intermediate_dir, "step-second", second).await;
+    for (id, status, dir, finished) in [
+        (first, "failed", first_dir.clone(), 2),
+        (second, "failed", second_dir.clone(), 2),
+        (again, "failed", intermediate_dir.join("step-again"), 500),
+        (done, "complete", intermediate_dir.join("step-done"), 2),
+    ] {
+        pipeline
+            .db
+            .insert_job_history(&history_row_finished_at(id, status, dir, finished))
+            .unwrap();
+    }
+    pipeline.report_all_for_test();
+    let queue = pipeline.shared_state.queue.clone();
+    let resources = queue.resources.get().cloned().unwrap();
+    // The page lists both as due, as its reading of their rows does.
+    queue.write(|inner| {
+        inner.sweep_listed.extend([first, second]);
+        crate::pipeline::queue::Change::unchanged(())
+    });
+
+    let swept = queue
+        .sweep_failed_job(
+            &resources,
+            &[],
+            first,
+            Some(first_dir.clone()),
+            vec![first_dir.clone()],
+        )
+        .await;
+
+    assert_eq!(swept, Some(first));
+    assert!(!first_dir.exists());
+    assert!(queue.read(|inner| inner.history_operations.is_empty()));
+    // The second job, listed and not yet swept, is free to be deleted.
+    let outcome = delete_history_batch(&mut pipeline, &[second], false).await;
+    assert!(outcome.refused.is_empty());
+    assert!(pipeline.db.get_job_history(second.0).unwrap().is_none());
+
+    pipeline
+        .db
+        .stamp_history_swept(&[first, second, again, done], 900, 100)
+        .unwrap();
+    assert_eq!(swept_at(&pipeline, first).await, Some(900));
+    assert_eq!(swept_at(&pipeline, again).await, None);
+    assert_eq!(swept_at(&pipeline, done).await, None);
+
+    // A job admitted after the page read it is no longer listed, and its
+    // hold is refused: nothing of it is touched.
+    let late = JobId(30084);
+    let late_dir = marked_working_dir(&intermediate_dir, "step-late", late).await;
+    let swept = queue
+        .sweep_failed_job(
+            &resources,
+            &[],
+            late,
+            Some(late_dir.clone()),
+            vec![late_dir.clone()],
+        )
+        .await;
+    assert_eq!(swept, None);
+    assert!(late_dir.exists());
+    retire_pipeline_database(pipeline).await;
+}
+
 // One page of the sweep works from the reading of the intermediate root it
 // is given, and reads no root of its own: a job the reading names gives up
 // its folder and is stamped, and a job whose marked folder the reading does

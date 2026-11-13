@@ -124,6 +124,7 @@ impl Queue {
             if inner.contains_job(id) || !inner.admissions.insert(id) {
                 return Change::unchanged(Err(SchedulerError::JobExists(id)));
             }
+            inner.sweep_listed.remove(&id);
             Change::unchanged(Ok(()))
         })?;
         let reservation = Reservation {

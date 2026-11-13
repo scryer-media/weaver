@@ -179,6 +179,24 @@ impl Drop for HistoryOperation {
     }
 }
 
+// The ids of one page of the failed-job sweep, listed as due while the page
+// is swept and unlisted when it ends, however it ends.
+struct SweepListing {
+    queue: Arc<Queue>,
+    ids: Vec<JobId>,
+}
+
+impl Drop for SweepListing {
+    fn drop(&mut self) {
+        self.queue.write(|inner| {
+            for id in &self.ids {
+                inner.sweep_listed.remove(id);
+            }
+            Change::unchanged(())
+        });
+    }
+}
+
 impl Queue {
     pub(super) async fn wait_for_cleanup(&self, ids: &BTreeSet<JobId>) {
         let mut revision = self.subscribe();
@@ -222,6 +240,7 @@ impl Queue {
                 )));
             }
             inner.admissions.insert(id);
+            inner.sweep_listed.remove(&id);
             Change::unchanged(Ok(()))
         })?;
         let guard = HistoryOperation {
@@ -477,6 +496,56 @@ impl Queue {
         }
     }
 
+    // One job of a page: held, swept and released, with its id back when
+    // the sweep has done all it ever will for it and it is to be stamped.
+    // The hold is refused for a job the page no longer lists as due (it was
+    // admitted since the page's reading), one in the queue or being
+    // admitted, and one another history operation holds; it is gone when
+    // this returns, so no other job waits on this one's files.
+    pub(crate) async fn sweep_failed_job(
+        self: &Arc<Self>,
+        resources: &super::AdmissionResources,
+        staging_roots: &[std::path::PathBuf],
+        id: JobId,
+        recorded: Option<std::path::PathBuf>,
+        marked: Vec<std::path::PathBuf>,
+    ) -> Option<JobId> {
+        let held = self.write(|inner| {
+            Change::unchanged(
+                inner.sweep_listed.remove(&id)
+                    && !inner.contains_job(id)
+                    && !inner.admissions.contains(&id)
+                    && inner.history_operations.insert(id),
+            )
+        });
+        if !held {
+            return None;
+        }
+        let _guard = HistoryOperation {
+            queue: self.clone(),
+            ids: BTreeSet::from([id]),
+        };
+        match crate::history::delete_files::sweep_failed_job_files(
+            &resources.intermediate_dir,
+            staging_roots,
+            id,
+            recorded,
+            marked,
+        )
+        .await
+        {
+            Ok(swept) => swept.then_some(id),
+            Err(error) => {
+                tracing::warn!(
+                    job_id = id.0,
+                    error = %error,
+                    "could not remove a failed job's files; the next housekeeping sweep tries again"
+                );
+                None
+            }
+        }
+    }
+
     // One page of the failed-job sweep. Three reads serve the whole page:
     // which of its jobs are still the failures listed, which still have a
     // script out, and which name a folder that cannot be judged now. The
@@ -495,6 +564,18 @@ impl Queue {
     ) -> bool {
         let db = resources.db.clone();
         let ids: Vec<JobId> = page.iter().map(|(id, _)| *id).collect();
+        // Listed before the read below: a job admitted from here on is
+        // unlisted by its admission, and its hold is then refused, so each
+        // job is swept only while the page's reading of its row still
+        // stands. No job's row is read again under its hold.
+        self.write(|inner| {
+            inner.sweep_listed.extend(ids.iter().copied());
+            Change::unchanged(())
+        });
+        let _listing = SweepListing {
+            queue: self.clone(),
+            ids: ids.clone(),
+        };
         let recorded: Vec<Option<std::path::PathBuf>> =
             page.iter().map(|(_, recorded)| recorded.clone()).collect();
         // A job retried or deleted since the listing, one whose scripts
@@ -564,38 +645,12 @@ impl Queue {
             if !ready.contains(&id) {
                 continue;
             }
-            let held = self.write(|inner| {
-                Change::unchanged(
-                    !inner.contains_job(id)
-                        && !inner.admissions.contains(&id)
-                        && inner.history_operations.insert(id),
-                )
-            });
-            if !held {
-                continue;
-            }
-            let _guard = HistoryOperation {
-                queue: self.clone(),
-                ids: BTreeSet::from([id]),
-            };
-            match crate::history::delete_files::sweep_failed_job_files(
-                &resources.intermediate_dir,
-                staging_roots,
-                id,
-                recorded,
-                marked.remove(&id).unwrap_or_default(),
-            )
-            .await
+            let marked = marked.remove(&id).unwrap_or_default();
+            if let Some(id) = self
+                .sweep_failed_job(resources, staging_roots, id, recorded, marked)
+                .await
             {
-                Ok(true) => swept.push(id),
-                Ok(false) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        job_id = id.0,
-                        error = %error,
-                        "could not remove a failed job's files; the next housekeeping sweep tries again"
-                    );
-                }
+                swept.push(id);
             }
         }
         if !swept.is_empty() {
