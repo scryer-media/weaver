@@ -365,7 +365,7 @@ impl NamespaceWriter {
                 }
             }
             self.files_mut(node).leaves.insert(member, leaf);
-            self.caps.restore(tree, node, member);
+            self.caps.restore(tree, node, member, self.kept_device());
         }
         if let Some(why) = state.refused {
             self.files_mut(node).refuse(member, why);
@@ -429,7 +429,7 @@ impl NamespaceWriter {
     // The restored tree's members, counted and charged against the job's
     // budget as the tree holds them.
     pub(crate) fn restore_members(&mut self, tree: &Tree) {
-        self.caps.restore_members(tree);
+        self.caps.restore_members(tree, self.kept_device());
     }
 
     // A member whose front a restore read again keeps it in memory: the

@@ -19,6 +19,8 @@ pub(crate) mod intake;
 pub(crate) mod phase;
 pub(crate) mod sample;
 mod seams;
+#[cfg(test)]
+pub(crate) use seams::DISK_WAIT_LOOKS;
 pub(crate) mod source;
 pub(crate) mod window;
 

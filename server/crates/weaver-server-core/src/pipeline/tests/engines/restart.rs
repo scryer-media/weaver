@@ -326,7 +326,7 @@ async fn shut_down(pipeline: &mut Pipeline) {
 
 // The pipeline goes down with what it held in memory, and a new one restores
 // the job from what reached the database.
-async fn restart(
+pub(in crate::pipeline::tests) async fn restart(
     temp_dir: &tempfile::TempDir,
     pipeline: Pipeline,
     scenario: &Scenario,

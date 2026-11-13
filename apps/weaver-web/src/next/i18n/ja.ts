@@ -666,6 +666,7 @@ export const nextJa: LocaleDictionary = {
   "next.general.maxConcurrentNzbs": "最大同時 NZB 数",
   "next.general.maxConcurrentNzbsHelp": "開始から修復、展開、最終完了までの Usenet NZB 数を制限します。すべてのプロバイダーで共有されます。",
   "next.status.wait.nzb_slot": "NZB の空き枠を待機中",
+  "next.status.wait.disk_space": "ディスク容量不足",
   "next.general.propagationDelayHelp": "すべての記事がサーバーに届くよう、新しい NZB の開始をこの時間だけ保留します。",
   "next.general.seconds": "秒",
   "next.general.srrdb": "SRRDB リリース検索",

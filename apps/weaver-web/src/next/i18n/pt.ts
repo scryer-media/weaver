@@ -666,6 +666,7 @@ export const nextPt: LocaleDictionary = {
   "next.general.maxConcurrentNzbs": "Máximo de NZBs simultâneos",
   "next.general.maxConcurrentNzbsHelp": "Limita os NZBs Usenet do início à conclusão, incluindo reparação e extração. O limite é partilhado por todos os fornecedores.",
   "next.status.wait.nzb_slot": "A aguardar uma vaga para NZB",
+  "next.status.wait.disk_space": "Pouco espaço em disco",
   "next.general.propagationDelayHelp": "Segurar um NZB novo por este tempo antes de começar, para que todos os artigos tenham chegado aos servidores.",
   "next.general.seconds": "segundos",
   "next.general.srrdb": "Consulta de lançamentos no SRRDB",

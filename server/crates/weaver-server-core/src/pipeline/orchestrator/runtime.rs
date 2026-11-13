@@ -312,6 +312,12 @@ impl Pipeline {
             download_lane_runtime: DownloadLaneRuntimeState::default(),
             held_download_refills: Vec::new(),
             download_dispatch_wake: false,
+            disk_waiting: std::collections::BTreeSet::new(),
+            disk_tickets_seen: [0; 2],
+            disk_rings_seen: 0,
+            disk_idle: std::collections::BTreeSet::new(),
+            admission_disk_held: false,
+            disk_unadmitted: std::collections::BTreeSet::new(),
             nntp_handoff_draining: false,
             active_download_passes: HashSet::new(),
             jobs_finalizing_download: HashSet::new(),
@@ -1204,7 +1210,11 @@ impl Pipeline {
                 )
                 .await;
             turn_active |= processed_results > 0;
-            if processed_results == 0 {
+            if processed_results > 0 {
+                // A busy turn skips the wait below: it hears a reading, room
+                // given back or a waiter left idle as the wait would.
+                self.hear_disk_on_busy_turn();
+            } else {
                 // Set by the periodic arms that found nothing to do; every
                 // other arm is an event.
                 let mut idle_tick = false;
@@ -1216,6 +1226,11 @@ impl Pipeline {
                 // A batch out is waited on as any answer is.
                 let restoring = self.restores_waiting;
                 let next_batch = restoring && self.installing.is_empty();
+                // A job that waits for room on a disk wakes on a reading of
+                // a disk someone waits on, never on a timer of its own.
+                let disk_readings = self.storage_capacity.readings();
+                self.reconcile_disk_waits();
+                let disk_waiting = self.waits_for_disk_room();
                 turn_timer.pause();
                 macro_rules! turn_select {
                     ($($biased:tt)?) => {
@@ -1262,6 +1277,10 @@ impl Pipeline {
                             Some(mail) = self.post_probes.recv() => {
                                 turn_timer.resume(PipelinePhase::PostProbe);
                                 self.post_probe_mail(mail);
+                            }
+                            _ = disk_readings.notified(), if disk_waiting => {
+                                turn_timer.resume(PipelinePhase::GraphRun);
+                                self.disk_reading();
                             }
                             Some(result) = self.decode_done_rx.recv() => {
                                 turn_timer.resume(PipelinePhase::DecodeDone);

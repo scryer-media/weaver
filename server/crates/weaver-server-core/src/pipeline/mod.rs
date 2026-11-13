@@ -1479,6 +1479,27 @@ pub struct Pipeline {
     // freed connection was handed back out. Setting this makes the park
     // itself the wake, with no timer to poll.
     pub(super) download_dispatch_wake: bool,
+    // The graph jobs that wait for room on a disk, which a reading of a disk
+    // anyone waits on wakes in the order they began to wait.
+    pub(super) disk_waiting: std::collections::BTreeSet<JobId>,
+    // How many times a writer had begun to wait on the output and working
+    // ledgers when the loop last looked: a count that moved means a job may
+    // have begun to wait since.
+    pub(super) disk_tickets_seen: [u64; 2],
+    // How many times a disk anyone waits on had rung when the loop last
+    // heard it: a count that moved means a reading came, or room was given
+    // back, since.
+    pub(super) disk_rings_seen: u64,
+    // The jobs among `disk_waiting` a step left owing nothing with no run
+    // live: they wake on the next turn whatever the disk reads. A turn
+    // with none of them looks at no job.
+    pub(super) disk_idle: std::collections::BTreeSet<JobId>,
+    // The working disk had no room over its reserve when a job that never
+    // downloaded was to start: no such job starts until a good reading shows
+    // room. A job that started fetches on.
+    pub(super) admission_disk_held: bool,
+    // The jobs the last walk would have started but for that.
+    pub(super) disk_unadmitted: std::collections::BTreeSet<JobId>,
     // A `RebuildNntp` has activated a new pool whose predecessor still holds
     // sockets at the provider. Fresh dials wait until the old generation has
     // drained: the provider counts both generations against one allowance,

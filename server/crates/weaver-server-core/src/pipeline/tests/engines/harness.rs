@@ -1214,6 +1214,15 @@ async fn try_run_then(
             observe(&pipeline, &mut graph, &mut reads);
             continue;
         }
+        // A job that waits for room on a disk goes on at a reading, as the
+        // orchestrator hears one, after it reconciles the waits begun.
+        pipeline.reconcile_disk_waits();
+        if pipeline.waits_for_disk_room() {
+            pipeline.storage_capacity.readings().notified().await;
+            pipeline.disk_reading();
+            observe(&pipeline, &mut graph, &mut reads);
+            continue;
+        }
         if take_retry(&mut pipeline).await {
             continue;
         }

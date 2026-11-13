@@ -122,12 +122,12 @@ impl ExtractionLimits {
 }
 
 // The free space a filesystem of `total_filesystem_bytes` should keep: a
-// twentieth of it, between 512 MiB and 20 GiB, and 512 MiB when the size is
+// twentieth of it, between 512 MiB and 5 GiB, and 512 MiB when the size is
 // unknown. The extractor's default output reserve, and the same rule the
 // direct-store holds scratch keeps for the working directory.
 pub(crate) fn default_disk_reserve_bytes(total_filesystem_bytes: Option<u64>) -> u64 {
     total_filesystem_bytes
-        .map(|total| (total / 20).clamp(512 * MIB, 20 * GIB))
+        .map(|total| (total / 20).clamp(512 * MIB, 5 * GIB))
         .unwrap_or(512 * MIB)
 }
 
@@ -157,7 +157,6 @@ pub(crate) enum ExtractionRejectionReason {
     Entries,
     Deadline,
     Memory,
-    DiskReserve,
     ContentPolicy,
 }
 
@@ -170,7 +169,6 @@ impl ExtractionRejectionReason {
             Self::Entries => "entries",
             Self::Deadline => "deadline",
             Self::Memory => "memory",
-            Self::DiskReserve => "disk_reserve",
             Self::ContentPolicy => "content_policy",
         }
     }
@@ -380,6 +378,24 @@ mod tests {
             min_free_bytes: 1,
             max_memory_bytes: 64 * MIB,
         }
+    }
+
+    // The default reserve is a twentieth of the filesystem, never under
+    // 512 MiB and never over 5 GiB, and 512 MiB when the size is unknown.
+    #[test]
+    fn the_default_disk_reserve_is_a_twentieth_between_512_mib_and_5_gib() {
+        assert_eq!(default_disk_reserve_bytes(None), 512 * MIB);
+        assert_eq!(default_disk_reserve_bytes(Some(0)), 512 * MIB);
+        assert_eq!(
+            default_disk_reserve_bytes(Some(20 * 512 * MIB - 1)),
+            512 * MIB
+        );
+        assert_eq!(default_disk_reserve_bytes(Some(20 * 512 * MIB)), 512 * MIB);
+        assert_eq!(default_disk_reserve_bytes(Some(20 * GIB)), GIB);
+        assert_eq!(default_disk_reserve_bytes(Some(100 * GIB)), 5 * GIB);
+        assert_eq!(default_disk_reserve_bytes(Some(100 * GIB + 20)), 5 * GIB);
+        assert_eq!(default_disk_reserve_bytes(Some(4 * TIB)), 5 * GIB);
+        assert_eq!(default_disk_reserve_bytes(Some(u64::MAX)), 5 * GIB);
     }
 
     // The default entry cap is the 7z reader's own: every end header it

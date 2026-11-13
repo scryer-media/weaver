@@ -666,6 +666,7 @@ export const nextDe: LocaleDictionary = {
   "next.general.maxConcurrentNzbs": "Maximal gleichzeitige NZBs",
   "next.general.maxConcurrentNzbsHelp": "Begrenzt Usenet-NZBs vom Start bis zum Abschluss einschließlich Reparatur und Entpacken. Gilt für alle Anbieter gemeinsam.",
   "next.status.wait.nzb_slot": "Warten auf einen freien NZB-Platz",
+  "next.status.wait.disk_space": "Wenig Speicherplatz",
   "next.general.propagationDelayHelp": "Eine neue NZB so lange zurückhalten, bis jeder Artikel die Server erreicht hat.",
   "next.general.seconds": "Sekunden",
   "next.general.srrdb": "SRRDB-Release-Suche",
