@@ -31,7 +31,7 @@ use crate::{
     peer_protocol::{Message, extended::ExtendedMessage},
     stream_connect::ConnectionKind,
     torrent_state::utils::{TimedExistence, atomic_inc},
-    type_aliases::{BF, PeerHandle, PeerSourceFlag},
+    type_aliases::{BF, PeerHandle, PeerSourceFlag, PeerSources},
 };
 
 use self::{
@@ -195,6 +195,22 @@ pub(crate) struct PeerStates {
     // shared by every connection's message until the version moves on.
     // Never taken while an entry of `states` is held.
     pex_cache: Mutex<Option<(u64, PexListed)>>,
+    // Whether the peers neither a tracker nor the operator named are still
+    // to leave the list once a tracker answers; see
+    // [`PeerList::taking_trackers_alone`].
+    untracked_owed: AtomicBool,
+    // The peers asked to close because neither a tracker nor the operator
+    // named them: each leaves the list when its connection has closed.
+    // Held for no longer than a look or a change, never while an entry of
+    // `states` is held.
+    untracked_leaving: Mutex<HashSet<PeerHandle>>,
+}
+
+// Whether a peer named by `sources` stays on a private torrent's list once
+// its trackers answer: a tracker named it, or the operator did (the peers
+// the torrent was added with, which come back as its resume data).
+fn tracker_or_operator_named(sources: PeerSources) -> bool {
+    sources.contains(PeerSourceFlag::Tracker) || sources.contains(PeerSourceFlag::ResumeData)
 }
 
 /// The peers our PEX messages list, each where it listens, with what the
@@ -212,6 +228,8 @@ pub(crate) struct PeerList {
     peers: Vec<Peer>,
     banned: HashSet<IpAddr>,
     smart_ban: SmartBan,
+    // See [`Self::taking_trackers_alone`].
+    untracked_owed: bool,
 }
 
 impl PeerList {
@@ -249,6 +267,41 @@ impl PeerList {
     /// `peer_list::ban_peer`).
     pub fn ban(&mut self, ip: IpAddr) {
         self.banned.insert(ip);
+    }
+
+    /// The list of a private torrent whose metadata a magnet's fetch found:
+    /// its peers that neither a tracker nor the operator named (the DHT's,
+    /// local discovery's, incoming ones) leave it once a tracker has
+    /// answered an announce of the torrent, at once when one already has,
+    /// else when the first does. Until then they stay, so a torrent whose
+    /// trackers never answer still downloads from them.
+    pub fn taking_trackers_alone(mut self, answered: bool) -> Self {
+        if !answered {
+            self.untracked_owed = true;
+            return self;
+        }
+        let smart_ban = &mut self.smart_ban;
+        self.peers.retain(|peer| {
+            let kept = tracker_or_operator_named(peer.sources());
+            if !kept {
+                smart_ban.forget(peer.addr);
+            }
+            kept
+        });
+        self
+    }
+
+    /// Whether the peers no tracker named are still to leave once a tracker
+    /// answers; see [`Self::taking_trackers_alone`].
+    #[cfg(test)]
+    pub(crate) fn owes_untracked(&self) -> bool {
+        self.untracked_owed
+    }
+
+    /// The addresses of the peers on the list.
+    #[cfg(test)]
+    pub(crate) fn addrs(&self) -> Vec<SocketAddr> {
+        self.peers.iter().map(|peer| peer.addr).collect()
     }
 }
 
@@ -436,6 +489,8 @@ impl PeerStates {
             live: Default::default(),
             pex_version: AtomicU64::new(0),
             pex_cache: Mutex::new(None),
+            untracked_owed: AtomicBool::new(list.untracked_owed),
+            untracked_leaving: Mutex::default(),
         };
         for mut peer in list.peers {
             peer.rejoin(&peers);
@@ -506,9 +561,10 @@ impl PeerStates {
     /// [`Peer::idle`].
     pub fn idle_list(&self) -> PeerList {
         let mut smart_ban = self.smart_ban.lock().clone();
+        let leaving = self.untracked_leaving.lock().clone();
         let mut ranked = Vec::new();
         for e in self.states.iter() {
-            if is_web_seed(*e.key()) {
+            if is_web_seed(*e.key()) || self.leaves_untracked(&leaving, *e.key(), e.value()) {
                 smart_ban.forget(*e.key());
             } else {
                 ranked.push(((erase_rank(e.value()), *e.key()), e.value().idle()));
@@ -523,16 +579,83 @@ impl PeerStates {
             peers: ranked.into_iter().map(|(_, peer)| peer).collect(),
             banned: self.banned.read().clone(),
             smart_ban,
+            untracked_owed: self.untracked_owed.load(Ordering::Relaxed),
+        }
+    }
+
+    // Whether `peer`, at `handle`, was asked to close because neither a
+    // tracker nor the operator named it, and none has since: it leaves the
+    // list once its connection has closed, so no later list keeps it.
+    fn leaves_untracked(
+        &self,
+        leaving: &HashSet<PeerHandle>,
+        handle: PeerHandle,
+        peer: &Peer,
+    ) -> bool {
+        leaving.contains(&handle) && !tracker_or_operator_named(peer.sources())
+    }
+
+    /// Whether the peers neither a tracker nor the operator named are still
+    /// to leave once a tracker answers; see [`PeerList::taking_trackers_alone`].
+    pub fn owes_untracked(&self) -> bool {
+        self.untracked_owed.load(Ordering::Relaxed)
+    }
+
+    /// A tracker answered an announce of the torrent: when
+    /// [`Self::owes_untracked`], every peer on the list that neither a
+    /// tracker nor the operator named leaves it, one with no connection at
+    /// once, one with a connection when its connection, asked to close, has
+    /// closed ([`Self::untracked_closed`]). Runs once.
+    pub fn drop_untracked(&self) {
+        if !self.untracked_owed.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let _admission = self.admission.lock();
+        let named: Vec<PeerHandle> = self
+            .states
+            .iter()
+            .filter(|e| !is_web_seed(*e.key()) && !tracker_or_operator_named(e.value().sources()))
+            .map(|e| *e.key())
+            .collect();
+        for handle in named {
+            match self
+                .states
+                .remove_if(&handle, |_, peer| peer.connected_out().is_none())
+            {
+                Some((_, peer)) => self.erased(handle, &peer),
+                None => {
+                    self.untracked_leaving.lock().insert(handle);
+                    self.with_peer(handle, Peer::disconnect);
+                }
+            }
+        }
+    }
+
+    /// The connection of the peer at `handle` has closed: one asked to close
+    /// by [`Self::drop_untracked`] leaves the list now, unless a tracker or
+    /// the operator named it since.
+    pub fn untracked_closed(&self, handle: PeerHandle) {
+        if !self.untracked_leaving.lock().remove(&handle) {
+            return;
+        }
+        let _admission = self.admission.lock();
+        if let Some((_, peer)) = self.states.remove_if(&handle, |_, peer| {
+            peer.connected_out().is_none() && !tracker_or_operator_named(peer.sources())
+        }) {
+            self.erased(handle, &peer);
         }
     }
 
     /// The peers and bans a restart is to begin with; see [`ResumePeers`].
     /// A web seed is on no list, and is not saved.
     pub fn resume_peers(&self) -> ResumePeers {
+        let leaving = self.untracked_leaving.lock().clone();
         let entries: Vec<_> = self
             .states
             .iter()
-            .filter(|e| !is_web_seed(*e.key()))
+            .filter(|e| {
+                !is_web_seed(*e.key()) && !self.leaves_untracked(&leaving, *e.key(), e.value())
+            })
             .map(|e| resume_entry(e.value()))
             .collect();
         ResumePeers::of(entries.into_iter(), &self.banned.read())
@@ -3063,6 +3186,124 @@ mod tests {
         peers.refuse_at(other, refused);
         assert_eq!(state_of(&peers, other), Some("queued"));
         assert_eq!(peers.stats().live, 0);
+    }
+
+    // A private torrent's list, once a tracker answers, keeps the peers a
+    // tracker or the operator named, whoever else named them too; the
+    // DHT's, local discovery's, PEX's and incoming ones leave, an idle one
+    // at once, a connected one once its connection, asked to close, has
+    // closed. It happens once.
+    #[test]
+    fn a_trackers_answer_drops_the_peers_no_tracker_or_operator_named() {
+        let operator = peer_addr(1);
+        let peers = PeerStates::founded_on(
+            PeerList::resumed([operator], []).taking_trackers_alone(false),
+            Default::default(),
+            u32::try_from(TOTAL_PIECES).unwrap(),
+        );
+        let (tracker, dht, lsd, pex, both) = (
+            peer_addr(2),
+            peer_addr(3),
+            peer_addr(4),
+            peer_addr(5),
+            peer_addr(6),
+        );
+        peers.add_peer(tracker, PeerSourceFlag::Tracker);
+        peers.add_peer(dht, PeerSourceFlag::Dht);
+        peers.add_peer(lsd, PeerSourceFlag::Lsd);
+        peers.add_peer(pex, PeerSourceFlag::Pex);
+        peers.add_peer(both, PeerSourceFlag::Dht);
+        peers.add_peer(both, PeerSourceFlag::Tracker);
+        let (incoming, mut incoming_rx) = add_live_peer(&peers, "10.0.1.1:50000");
+        assert!(peers.owes_untracked());
+
+        peers.drop_untracked();
+        assert!(!peers.owes_untracked());
+        for gone in [dht, lsd, pex] {
+            assert_eq!(state_of(&peers, gone), None, "{gone}");
+        }
+        for kept in [operator, tracker, both] {
+            assert_eq!(state_of(&peers, kept), Some("queued"), "{kept}");
+        }
+        assert_eq!(state_of(&peers, incoming), Some("live"));
+        assert!(matches!(
+            incoming_rx.try_recv(),
+            Ok(WriterRequest::Disconnect(Ok(())))
+        ));
+        // Neither the next run's list nor a restart's keeps it meanwhile.
+        assert!(!peers.idle_list().addrs().contains(&incoming));
+        assert!(!peers.resume_peers().peers.contains(&incoming));
+
+        // Its connection closed, the incoming peer goes too.
+        peers
+            .with_peer_mut(incoming, "test", |peer| {
+                peer.take_state(&peers);
+                peers.connection_closed(peer, Instant::now(), false, false);
+            })
+            .unwrap();
+        peers.untracked_closed(incoming);
+        assert_eq!(state_of(&peers, incoming), None);
+
+        // Once only: a peer the DHT names later is not dropped by a second
+        // answer.
+        peers.add_peer(dht, PeerSourceFlag::Dht);
+        peers.drop_untracked();
+        assert_eq!(state_of(&peers, dht), Some("queued"));
+        assert!(!peers.idle_list().owes_untracked());
+    }
+
+    // A connected peer asked to close because no tracker named it stays
+    // when a tracker names it before the connection has closed.
+    #[test]
+    fn a_peer_a_tracker_names_while_it_closes_stays() {
+        let peers = PeerStates::founded_on(
+            PeerList::default().taking_trackers_alone(false),
+            Default::default(),
+            u32::try_from(TOTAL_PIECES).unwrap(),
+        );
+        let (incoming, _incoming_rx) = add_live_peer(&peers, "10.0.1.1:50000");
+        peers.drop_untracked();
+        peers.add_peer(incoming, PeerSourceFlag::Tracker);
+        peers
+            .with_peer_mut(incoming, "test", |peer| {
+                peer.take_state(&peers);
+                peers.connection_closed(peer, Instant::now(), false, false);
+            })
+            .unwrap();
+        peers.untracked_closed(incoming);
+        assert!(state_of(&peers, incoming).is_some());
+    }
+
+    // The list a private magnet's fetch leaves: when a tracker has answered
+    // already, the peers neither a tracker nor the operator named leave it
+    // now; when none has, all stay, owed to leave at the first answer. The
+    // owed drop crosses a pause.
+    #[test]
+    fn a_fetched_list_takes_trackers_alone_now_or_at_the_first_answer() {
+        let fetched = || {
+            let peers = PeerStates::founded_on(
+                PeerList::resumed([peer_addr(1)], []),
+                Default::default(),
+                0,
+            );
+            peers.add_peer(peer_addr(2), PeerSourceFlag::Tracker);
+            peers.add_peer(peer_addr(3), PeerSourceFlag::Dht);
+            peers.add_peer(peer_addr(4), PeerSourceFlag::Lsd);
+            peers.idle_list()
+        };
+        let mut now = fetched().taking_trackers_alone(true).addrs();
+        now.sort();
+        assert_eq!(now, [peer_addr(1), peer_addr(2)]);
+        assert!(!fetched().taking_trackers_alone(true).owes_untracked());
+
+        let later = fetched().taking_trackers_alone(false);
+        assert_eq!(later.addrs().len(), 4);
+        let paused = PeerStates::founded_on(later, Default::default(), 0).idle_list();
+        assert!(paused.owes_untracked());
+        let next = PeerStates::founded_on(paused, Default::default(), 0);
+        next.drop_untracked();
+        assert_eq!(state_of(&next, peer_addr(3)), None);
+        assert_eq!(state_of(&next, peer_addr(2)), Some("queued"));
     }
 
     #[test]

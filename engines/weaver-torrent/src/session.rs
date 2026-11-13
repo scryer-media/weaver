@@ -1537,6 +1537,14 @@ impl FetchPhase {
     }
 }
 
+/// Whether a tracker of `table` stands answered: its last announce was
+/// accepted, whatever peers it named.
+pub(crate) fn a_tracker_answered(table: &[TrackerAnnounce]) -> bool {
+    table
+        .iter()
+        .any(|t| matches!(t.last.as_ref().map(|l| &l.result), Some(Ok(_))))
+}
+
 impl std::fmt::Display for FetchPhase {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
@@ -3319,8 +3327,21 @@ impl Session {
                 // on into the run.
                 drop(resolved_magnet.peer_rx);
                 // The peers the fetch found stay on the list it wrote
-                // into, with what their connections left there.
-                (resolved_magnet.metadata, resolved_magnet.peers)
+                // into, with what their connections left there. A private
+                // torrent's keeps those a tracker or the operator named;
+                // the others (the DHT's, local discovery's) leave once a
+                // tracker has answered, now when one already has, else at
+                // the first answer. While none has, they stay, so a torrent
+                // whose trackers never answer still downloads.
+                let peers = if resolved_magnet.metadata.info.info().private {
+                    let answered = handover
+                        .as_ref()
+                        .is_some_and(|h| a_tracker_answered(&h.status().announces()));
+                    resolved_magnet.peers.taking_trackers_alone(answered)
+                } else {
+                    resolved_magnet.peers
+                };
+                (resolved_magnet.metadata, peers)
             }
         };
 

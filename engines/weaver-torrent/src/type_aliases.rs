@@ -35,8 +35,9 @@ pub enum PeerSourceFlag {
     Pex,
     /// Local service discovery.
     Lsd,
-    /// The torrent's own list: the peers it was added with, and those a
-    /// magnet's metadata fetch already took.
+    /// The torrent's own list: the peers it was added with, the operator's
+    /// or those a restart saved. The peers a magnet's metadata fetch took
+    /// keep the sources that named them.
     ResumeData,
     /// The peer connected to us.
     Incoming,

@@ -1214,6 +1214,19 @@ impl TorrentStateLive {
         self.peers.refuse(|addr| self.refuses(addr));
     }
 
+    /// Whether the peers of a private magnet that no tracker named still
+    /// wait for a tracker's answer to leave the list; see
+    /// [`PeerStates::drop_untracked`].
+    pub(crate) fn owes_untracked(&self) -> bool {
+        self.peers.owes_untracked()
+    }
+
+    /// A tracker answered an announce of the torrent; see
+    /// [`PeerStates::drop_untracked`].
+    pub(crate) fn tracker_answered(&self) {
+        self.peers.drop_untracked();
+    }
+
     /// The session's `allow_multiple_connections_per_ip` changed: the
     /// connect loop looks again at the peers it held back.
     pub(crate) fn connections_per_ip_changed(&self) {
@@ -3118,6 +3131,9 @@ impl PeerHandler {
         // A peer the IP filter came to refuse while it was connected leaves
         // the list now its connection is gone.
         peers.refuse_at(handle, |addr| self.state.refuses(addr));
+        // So does a private torrent's peer no tracker named, asked to close
+        // once a tracker answered.
+        peers.untracked_closed(handle);
         if rendezvous && let Some(introducer) = peers.introducer(handle) {
             let _ = introducer.send(WriterRequest::Message(Message::Extended(
                 ExtendedMessage::UtHolepunch(UtHolepunch::Rendezvous(handle)),
