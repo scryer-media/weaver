@@ -650,6 +650,9 @@ impl Pipeline {
         for (server_idx, stable_id, supports_pipelining, proven_depth, latency, transfer) in seeds {
             let mut explorer = ServerPipelineExplorer::seeded(proven_depth, latency, transfer);
             explorer.note_supports_pipelining(supports_pipelining);
+            if let Some(prior) = stable_id.and_then(|stable_id| carried.get(&stable_id)) {
+                explorer.carry_pipelining_verdict(prior);
+            }
             self.download_lane_runtime
                 .servers
                 .insert(server_idx, explorer);

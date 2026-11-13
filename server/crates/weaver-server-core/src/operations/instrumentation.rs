@@ -631,6 +631,23 @@ impl ServerCounters {
         self.article_latency.observe(elapsed);
     }
 
+    // How many article requests this server answered with the article and
+    // how many with "no such article", over both queues. Read-time only: four
+    // `Relaxed` loads of the cells [`Self::note_attempt`] already keeps.
+    pub fn article_outcomes(&self) -> ServerArticleOutcomes {
+        let count = |outcome: ServerAttemptOutcomeKind| {
+            self.attempts[outcome.index()]
+                .iter()
+                .map(|cell| cell.load(Ordering::Relaxed))
+                .sum()
+        };
+        ServerArticleOutcomes {
+            stable_server_id: self.stable_server_id,
+            found: count(ServerAttemptOutcomeKind::Success),
+            not_found: count(ServerAttemptOutcomeKind::NotFound),
+        }
+    }
+
     // Copy this server's counters out. Scrape-time only.
     pub fn snapshot(&self, server_idx: usize) -> ServerMetricsSnapshot {
         let mut attempts = Vec::with_capacity(ServerAttemptOutcomeKind::ALL.len() * 2);
@@ -651,6 +668,16 @@ impl ServerCounters {
             article_latency: self.article_latency.snapshot(),
         }
     }
+}
+
+// What one server answered to the article requests it was sent: see
+// [`ServerCounters::article_outcomes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerArticleOutcomes {
+    // Durable database identity; survives reorder and client rebuilds.
+    pub stable_server_id: u32,
+    pub found: u64,
+    pub not_found: u64,
 }
 
 // One `(outcome, recovery)` attempt cell for a server.
@@ -724,6 +751,19 @@ impl ServerMetricsRegistry {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = counters.clone();
         counters
+    }
+
+    // Every server of the active generation, in pool order, with what it
+    // answered to article requests. Each entry names its stable id, so a
+    // reader holding another generation's pool matches by identity, never
+    // by position.
+    pub fn article_outcomes(&self) -> Vec<ServerArticleOutcomes> {
+        self.active
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .map(|counters| counters.article_outcomes())
+            .collect()
     }
 
     // Snapshot every server of the active generation. Scrape-time only.

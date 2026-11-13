@@ -415,6 +415,20 @@ impl ServerPipelineExplorer {
         }
     }
 
+    // Carry what `prior`, this server's explorer in the pool this one
+    // replaces, had ruled about pipelining: a server pinned sequential stays
+    // pinned and at depth 1, and a hold after an unclean batch keeps running,
+    // so a rebuilt pool neither pipelines to a server that failed it twice
+    // nor shows a depth the lanes are held off.
+    pub(super) fn carry_pipelining_verdict(&mut self, prior: &Self) {
+        self.last_unclean_at = prior.last_unclean_at;
+        self.hold_until = prior.hold_until;
+        if prior.pinned_sequential {
+            self.pinned_sequential = true;
+            self.current_depth = 1;
+        }
+    }
+
     // The depth to write through, if the proven rung has moved since the last
     // write. Consumed, so a rung held across many windows writes once.
     pub(super) fn take_persist_request(&mut self) -> Option<u8> {
@@ -850,7 +864,7 @@ impl ServerPipelineExplorer {
     // A rung opened on the probe's guess and not yet measured is the
     // exception: it drops a rung with no hold and is not counted toward the
     // pin, and the first climb back is judged by a trial.
-    pub(super) fn note_unclean_batch(&mut self, now: Instant) -> Option<RungChange> {
+    pub(in crate::pipeline) fn note_unclean_batch(&mut self, now: Instant) -> Option<RungChange> {
         if self.pinned_sequential {
             return None;
         }

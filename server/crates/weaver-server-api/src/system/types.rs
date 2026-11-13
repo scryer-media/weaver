@@ -158,6 +158,9 @@ pub struct Metrics {
     /// Articles still to fetch across every queued job, recovery articles
     /// and jobs outside the queue window included; not connections or jobs.
     pub download_queue_depth: u32,
+    /// Articles the download lanes hold right now: being fetched, or handed
+    /// to a lane and waiting their turn on its connection. Not connections;
+    /// a pipelining lane holds several, so this can pass the connection count.
     pub active_downloads: u32,
     pub active_decodes: u32,
     pub decode_pending: u32,
@@ -1294,7 +1297,8 @@ pub struct ServerHealth {
     pub port: u16,
     /// `host:port` label.
     pub label: String,
-    /// "PRIMARY" for the highest-priority server, "BACKUP" otherwise.
+    /// "PRIMARY" for every fill server on the top priority level, "BACKUP"
+    /// for every other server (lower levels and backfill servers).
     pub tier: String,
     /// One of "healthy", "degraded", "cooling_down", "disabled".
     pub state: String,
@@ -1323,8 +1327,13 @@ pub struct ServerHealth {
     pub capacity_penalty_until_epoch_ms: Option<u64>,
     /// Active NNTP runtime generation.
     pub runtime_generation: u64,
-    /// EWMA request latency in milliseconds.
+    /// EWMA request latency in milliseconds. Reads 50.0, the figure server
+    /// ranking starts from, until a first request has been timed; use
+    /// `measuredLatencyMs` to tell a measurement from that start value.
     pub latency_ms: f64,
+    /// EWMA request latency in milliseconds, absent until a first request
+    /// to this server has been timed.
+    pub measured_latency_ms: Option<f64>,
     /// EWMA command-to-status-line wait for BODY fetches, in milliseconds.
     /// Absent until the download lanes have taken an unbiased sample.
     pub body_latency_ms: Option<f64>,
@@ -1333,13 +1342,26 @@ pub struct ServerHealth {
     pub body_transfer_ms: Option<f64>,
     /// "good", "moderate" or "slow" for `bodyLatencyMs`.
     pub body_latency_band: Option<String>,
-    /// BODY pipelining depth the lanes currently run at; 1 is sequential.
+    /// BODY pipelining depth the lanes currently run at; 1 is sequential,
+    /// and a server pinned sequential always reads 1.
     pub body_pipeline_depth: u32,
     /// Set once the server has twice failed to answer a pipelined batch
-    /// cleanly, which holds it sequential for the rest of the process.
+    /// cleanly, which holds it sequential for the rest of the process,
+    /// through any change to the server list.
     pub body_pipelining_pinned_sequential: bool,
+    /// Requests the connection answered, whatever the answer: a server
+    /// that says "no such article" is a working connection and counts here.
+    /// What it had is in `articlesFound` and `articlesNotFound`.
     pub success_count: u64,
+    /// Requests the connection failed: refused, timed out, dropped or
+    /// answered out of protocol. A "no such article" answer is not one.
     pub failure_count: u64,
+    /// Article requests this server answered with the article, since the
+    /// process started.
+    pub articles_found: u64,
+    /// Article requests this server answered "no such article", since the
+    /// process started; the article may still have come from another server.
+    pub articles_not_found: u64,
     pub consecutive_failures: u32,
     /// Connections that died before reaching a healthy age, recently.
     pub premature_deaths: u32,

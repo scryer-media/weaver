@@ -447,6 +447,10 @@ pub struct PipelineMetrics {
     pub segments_downloaded: AtomicU64,
     pub segments_decoded: AtomicU64,
     pub segments_committed: AtomicU64,
+    // Articles booked missing: every server that could answer was asked and
+    // none had it. One per article, never one per server asked; a single
+    // server's "no such article" answer is `download_failures_article_not_found`
+    // and that server's `not_found` attempt count.
     pub articles_not_found: AtomicU64,
     // Articles booked missing because a 430 taught the retry nothing: the
     // exclusion set came back the same size it went out. Every increment is

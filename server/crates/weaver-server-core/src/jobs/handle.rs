@@ -1630,6 +1630,14 @@ impl SchedulerHandle {
         self.state.metrics().server_metrics.snapshot()
     }
 
+    // What each server of the active generation answered to article
+    // requests: found and not found. Read on demand, like the snapshot above.
+    pub fn server_article_outcomes(
+        &self,
+    ) -> Vec<crate::operations::instrumentation::ServerArticleOutcomes> {
+        self.state.metrics().server_metrics.article_outcomes()
+    }
+
     // Job lifecycle counters and duration histograms. Read on demand; see
     // [`Self::server_metrics_snapshot`] for why this is not in the tick.
     pub fn job_lifecycle_metrics_snapshot(

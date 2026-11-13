@@ -125,7 +125,7 @@ metric_families! {
     DOWNLOAD_QUEUE_DEPTH = ("weaver_pipeline_download_queue_depth", Gauge, [],
         "Articles still to fetch across every queued job, recovery articles and jobs outside the queue window included; not connections or jobs.");
     ACTIVE_DOWNLOADS = ("weaver_pipeline_active_downloads", Gauge, [],
-        "Active article downloads.");
+        "Articles the download lanes hold right now: being fetched, or handed to a lane and waiting their turn on its connection. Not connections; a pipelining lane holds several.");
     ACTIVE_DECODES = ("weaver_pipeline_active_decodes", Gauge, [],
         "Active decode tasks.");
     DECODE_PENDING = ("weaver_pipeline_decode_pending", Gauge, [],
@@ -524,7 +524,7 @@ metric_families! {
         ["server_id", "server", "outcome", "recovery"],
         "Article fetch attempts per server by outcome, split by whether the attempt came from the recovery (PAR2 top-up) queue. Every combination is emitted, so the series pre-exist at zero.");
     SERVER_ARTICLE_LATENCY = ("weaver_server_article_latency_seconds", Histogram,
-        ["server_id", "server"], "Per-server article fetch latency.");
+        ["server_id", "server"], "How long each article request took on its connection, per server, timed by the download lane itself: for a lone request from sending the command to the end of the answer, for a pipelined one from the lane turning to that answer to its end. A not-found answer is timed the same way. Time the pipeline spent before handing the article out is not in it.");
 
     // ---- job lifecycle --------------------------------------------------------------
     JOBS_SUBMITTED = ("weaver_jobs_submitted_total", Counter, ["origin", "category"],

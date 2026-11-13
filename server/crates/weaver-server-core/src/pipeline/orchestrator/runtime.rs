@@ -1396,7 +1396,7 @@ impl Pipeline {
                                 if tracing::enabled!(tracing::Level::DEBUG) {
                                 let live = self.pipeline_is_live();
                                 let snapshot = self.metrics.raw_snapshot();
-                                let not_found = snapshot.articles_not_found;
+                                let articles_not_found = snapshot.articles_not_found;
                                 // Folded over every job, so only while something
                                 // is moving; an idle pipeline's health is unchanged.
                                 let min_health: Option<u32> = live.then(|| self.jobs.values()
@@ -1418,7 +1418,8 @@ impl Pipeline {
                                     pressure_state = snapshot.download_pressure_state.as_str(),
                                     pressure_reason = snapshot.download_pressure_reason.as_str(),
                                     direct_write_evictions = snapshot.direct_write_evictions,
-                                    not_found,
+                                    articles_not_found,
+                                    not_found_answers = snapshot.download_failures_article_not_found,
                                     health = min_health.map(|h| format!("{:.1}%", h as f64 / 10.0)).unwrap_or_default(),
                                     "pipeline tick"
                                 );

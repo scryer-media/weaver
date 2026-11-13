@@ -333,10 +333,15 @@ impl SystemQuery {
             });
         match live_pool.or(fallback_pool) {
             Some(pool) => {
-                Ok(
-                    collect_server_health(&pool, runtime_generation, &transport, work_waiting)
-                        .await,
+                let article_outcomes = handle.server_article_outcomes();
+                Ok(collect_server_health(
+                    &pool,
+                    runtime_generation,
+                    &transport,
+                    &article_outcomes,
+                    work_waiting,
                 )
+                .await)
             }
             None => Ok(Vec::new()),
         }
@@ -643,12 +648,13 @@ pub(crate) fn server_socket_counts(pool: &NntpPool, idx: usize) -> (u32, u32) {
 
 // Snapshot per-server health from the live NNTP pool. Mirrors the per-server fields
 // emitted by the Prometheus exporter (`collect_server_health` in the app binary), shaped
-// for the GraphQL monitoring API. The connection pool orders servers by priority, so the
-// first entry is the primary and the rest are backups.
+// for the GraphQL monitoring API. Every fill server on the top priority level is a
+// primary, however many there are; every other server is a backup.
 async fn collect_server_health(
     pool: &NntpPool,
     runtime_generation: u64,
     transport: &[weaver_server_core::ServerTransportHealth],
+    article_outcomes: &[weaver_server_core::ServerArticleOutcomes],
     work_waiting: bool,
 ) -> Vec<ServerHealth> {
     struct ServerLoadSnapshot {
@@ -663,6 +669,15 @@ async fn collect_server_health(
     }
 
     let configs = pool.server_configs();
+    let tiers = server_tiers(pool.server_groups(), pool.server_backfill_flags());
+    // The counters follow the active pool; a reader still holding the pool
+    // before a rebuild takes a position only when it names the same server.
+    let outcomes_for = |idx: usize| {
+        let stable_id = pool.stable_server_id(weaver_nntp::ServerId(idx))?;
+        article_outcomes
+            .get(idx)
+            .filter(|outcomes| outcomes.stable_server_id == stable_id.0)
+    };
     // Read connection load outside the health lock.
     let pre: Vec<ServerLoadSnapshot> = configs
         .iter()
@@ -675,7 +690,7 @@ async fn collect_server_health(
                 .unwrap_or(max_connections);
             let penalty_until = pool.over_limit_until_epoch_ms(weaver_nntp::ServerId(idx));
             let (open, busy) = server_socket_counts(pool, idx);
-            let tier = if idx == 0 { "PRIMARY" } else { "BACKUP" };
+            let tier = tiers[idx];
             ServerLoadSnapshot {
                 host: cfg.host.clone(),
                 port: cfg.port,
@@ -755,6 +770,7 @@ async fn collect_server_health(
                 capacity_penalty_until_epoch_ms: snapshot.penalty_until,
                 runtime_generation,
                 latency_ms: health.latency_ms(idx),
+                measured_latency_ms: health.measured_latency_ms(idx),
                 body_latency_ms: body.and_then(|entry| entry.latency_ms),
                 body_transfer_ms: body.and_then(|entry| entry.transfer_ms),
                 body_latency_band: body.and_then(|entry| entry.latency_band.clone()),
@@ -765,9 +781,35 @@ async fn collect_server_health(
                     .is_some_and(|entry| entry.pinned_sequential),
                 success_count: srv.success_count,
                 failure_count: srv.failure_count,
+                articles_found: outcomes_for(idx).map_or(0, |outcomes| outcomes.found),
+                articles_not_found: outcomes_for(idx).map_or(0, |outcomes| outcomes.not_found),
                 consecutive_failures: srv.consecutive_failures,
                 premature_deaths: health.recent_premature_deaths(idx) as u32,
                 pool_index: idx,
+            }
+        })
+        .collect()
+}
+
+// "PRIMARY" for every fill server on the top priority level (the lowest
+// priority number any fill server has), "BACKUP" for every other server:
+// lower levels and backfill servers. One pass for the level, one for the
+// labels, whatever the number of servers and levels.
+fn server_tiers(groups: &[u32], backfill: &[bool]) -> Vec<&'static str> {
+    let top = groups
+        .iter()
+        .zip(backfill)
+        .filter(|(_, backfill)| !**backfill)
+        .map(|(group, _)| *group)
+        .min();
+    groups
+        .iter()
+        .zip(backfill)
+        .map(|(group, backfill)| {
+            if !backfill && Some(*group) == top {
+                "PRIMARY"
+            } else {
+                "BACKUP"
             }
         })
         .collect()
@@ -779,5 +821,36 @@ fn absolutize_default_browse_path(path: String) -> std::io::Result<std::path::Pa
         Ok(path)
     } else {
         std::env::current_dir().map(|cwd| cwd.join(path))
+    }
+}
+
+#[cfg(test)]
+mod server_tier_tests {
+    use super::server_tiers;
+
+    // Thirteen servers over five levels, three of them on the top level and
+    // one a backfill server placed on it: all three fill servers are
+    // primaries, and nothing else is.
+    #[test]
+    fn every_fill_server_on_the_top_level_is_a_primary() {
+        let groups = [0, 0, 0, 0, 1, 1, 2, 2, 2, 3, 3, 4, 4];
+        let mut backfill = [false; 13];
+        backfill[3] = true;
+        backfill[12] = true;
+        let tiers = server_tiers(&groups, &backfill);
+        assert_eq!(tiers[..3], ["PRIMARY"; 3]);
+        assert!(tiers[3..].iter().all(|tier| *tier == "BACKUP"), "{tiers:?}");
+    }
+
+    // The top level is the lowest priority number in use, not zero, and a
+    // pool of backfill servers alone has no primary.
+    #[test]
+    fn the_top_level_is_the_lowest_number_a_fill_server_has() {
+        assert_eq!(
+            server_tiers(&[0, 5, 5, 9], &[true, false, false, false]),
+            ["BACKUP", "PRIMARY", "PRIMARY", "BACKUP"]
+        );
+        assert_eq!(server_tiers(&[0, 1], &[true, true]), ["BACKUP", "BACKUP"]);
+        assert!(server_tiers(&[], &[]).is_empty());
     }
 }

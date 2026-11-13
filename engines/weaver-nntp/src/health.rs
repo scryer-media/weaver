@@ -428,6 +428,12 @@ impl ServerHealth {
         self.latency_samples += 1;
     }
 
+    // The EWMA latency in milliseconds once a request has been timed; a
+    // server nothing has been asked of has no figure.
+    pub fn measured_latency_ms(&self) -> Option<f64> {
+        (self.latency_samples > 0).then(|| self.latency_ewma_us / 1_000.0)
+    }
+
     // Returns the EWMA latency in milliseconds, or 50.0 if no samples have
     // been recorded yet (cold start default).
     pub fn latency_ms(&self) -> f64 {
@@ -805,6 +811,10 @@ impl HealthTracker {
     }
 
     // Returns the EWMA latency in milliseconds for the given server.
+    pub fn measured_latency_ms(&self, server_idx: usize) -> Option<f64> {
+        self.servers[server_idx].measured_latency_ms()
+    }
+
     pub fn latency_ms(&self, server_idx: usize) -> f64 {
         self.servers[server_idx].latency_ms()
     }
@@ -1387,6 +1397,18 @@ mod tests {
         // EWMA = 0.2 * 200 + 0.8 * 120 = 40 + 96 = 136ms
         health.record_latency(Duration::from_millis(200));
         assert!((health.latency_ms() - 136.0).abs() < 0.01);
+    }
+
+    // A server nothing has been timed on has no measured latency, whatever
+    // start value ranking uses for it.
+    #[test]
+    fn measured_latency_is_absent_until_a_request_is_timed() {
+        let mut tracker = HealthTracker::new(2, test_config());
+        assert_eq!(tracker.measured_latency_ms(0), None);
+        assert!((tracker.latency_ms(0) - 50.0).abs() < f64::EPSILON);
+        tracker.record_latency(0, Duration::from_millis(80));
+        assert!((tracker.measured_latency_ms(0).unwrap() - 80.0).abs() < 0.01);
+        assert_eq!(tracker.measured_latency_ms(1), None);
     }
 
     #[test]

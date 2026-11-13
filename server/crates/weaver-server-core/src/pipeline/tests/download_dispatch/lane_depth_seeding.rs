@@ -192,3 +192,61 @@ async fn reseeding_carries_a_surviving_servers_measurements_across() {
         "the newcomer has measured nothing and starts at the shallowest rung"
     );
 }
+
+// A server pinned to sequential fetch stays pinned through a pool rebuild.
+//
+// The rebuild used to seed a fresh explorer for every server, so a server
+// that had twice failed a pipelined batch came back at depth 2 and unpinned:
+// the lanes pipelined to it again, and its health card showed a depth the
+// log had just said was given up.
+#[tokio::test]
+async fn a_pinned_server_stays_sequential_across_a_pool_rebuild() {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let (mut pipeline, _, _) = new_direct_pipeline(&temp_dir).await;
+    let with_id = |host: &str, id: u32| {
+        let mut config = server(host, weaver_nntp::PipeliningCapability::Known(true), Some(4));
+        config.stable_id = weaver_nntp::transfer::StableServerId(id);
+        config
+    };
+
+    pipeline.nntp = std::sync::Arc::new(pool_with(vec![
+        with_id("pinned.example.invalid", 7),
+        with_id("clean.example.invalid", 8),
+    ]));
+    pipeline.seed_download_lane_explorers();
+    let now = std::time::Instant::now();
+    let explorer = pipeline
+        .download_lane_runtime
+        .servers
+        .get_mut(&0)
+        .expect("the first server is seeded");
+    explorer.note_unclean_batch(now);
+    explorer.note_unclean_batch(now);
+    assert!(explorer.pinned_sequential());
+
+    // The rebuild swaps the two positions.
+    pipeline.nntp = std::sync::Arc::new(pool_with(vec![
+        with_id("clean.example.invalid", 8),
+        with_id("pinned.example.invalid", 7),
+    ]));
+    pipeline.seed_download_lane_explorers();
+    let pressure = pipeline.refresh_download_pressure();
+
+    assert_eq!(
+        pipeline.download_lane_mode_for_server(1, pressure, true),
+        DownloadLaneMode::Sequential
+    );
+    assert_eq!(
+        pipeline.download_lane_mode_for_server(0, pressure, true),
+        DownloadLaneMode::Pipelined { depth: 4 }
+    );
+    pipeline.publish_download_transport_health();
+    let shown = pipeline.shared_state.download_transport_health();
+    assert_eq!(
+        shown
+            .iter()
+            .map(|entry| (entry.server_idx, entry.pipeline_depth, entry.pinned_sequential))
+            .collect::<Vec<_>>(),
+        vec![(0, 4, false), (1, 1, true)]
+    );
+}
