@@ -703,3 +703,26 @@ async fn a_zip_with_a_drive_letter_member_delivers_every_member() {
 async fn a_tar_with_a_drive_letter_member_delivers_every_member() {
     a_drive_letter_member_beside_a_plain_one_delivers_both("lantern.tar", tar).await;
 }
+
+// An xz in a stored zip, big enough that the zip places the stream's tail
+// in the member's own file before its front binds it: the bytes that bound
+// it went to the stream, not to the file, and the hand-over that follows
+// reads the file only around them, so the stream decodes its own front.
+#[tokio::test]
+async fn an_xz_in_a_stored_zip_bound_after_its_tail_delivers() {
+    let held = noise(900_000, 41);
+    let scenario = Scenario::new(vec![Post::plain(
+        "lantern.zip",
+        zip(&[("ember.bin.xz", xz(&held))]),
+    )]);
+    let (lines, guard) = Lines::capture();
+    let graph = run(&scenario).await;
+    drop(guard);
+    assert!(
+        lines.of("object refused").is_empty(),
+        "{:?}",
+        lines.of("object refused")
+    );
+    assert_eq!(summary(&graph), "Some(Complete) [ember.bin]", "graph");
+    assert!(graph.files[&delivered("ember.bin")] == held, "the bytes");
+}
