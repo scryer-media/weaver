@@ -5873,7 +5873,8 @@ impl TorrentService {
     // at them again, RESTORES_AT_ONCE at a time, as a start of every torrent
     // asks (qBittorrent `torrents/start` with `all` calls `TorrentImpl::start`
     // on each). One its own pause stops stays as it is, as the start leaves
-    // it. Those let go join their sessions once every look is done.
+    // it. Those let go join their sessions once every look is done, without
+    // the start waiting on their routes, as a start of one does not.
     async fn look_again_held(&self) {
         let held: Vec<JobId> = self
             .inner
@@ -5908,7 +5909,7 @@ impl TorrentService {
         }
         self.apply_queue().await;
         for job_id in found {
-            self.attach(job_id, None).await;
+            self.spawn_attach(job_id).await;
         }
         self.publish().await;
     }
