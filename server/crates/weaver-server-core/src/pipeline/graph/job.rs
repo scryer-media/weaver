@@ -936,6 +936,36 @@ impl GraphJob {
         self.runs.wakeable()
     }
 
+    // Whether the job waits for room on a disk, and its place among the
+    // jobs that wait.
+    pub(crate) fn disk_held(&self) -> bool {
+        self.writer.disk_held()
+    }
+
+    pub(crate) fn disk_ticket(&self) -> Option<u64> {
+        self.writer.disk_ticket()
+    }
+
+    // A reading came: whether the job has room again. If it has, what it
+    // owes is promised again, and the runs parked for room, queued again,
+    // start on the next step. A job that waits idle wakes whatever the
+    // disk reads.
+    pub(crate) fn wake_disk(&mut self) -> bool {
+        if self.disk_idle() {
+            return self.writer.wake_idle();
+        }
+        self.writer.wake_disk()
+    }
+
+    // Whether the job waits for room though nothing of it would take any:
+    // it owes nothing, has nothing to write again, and no run of it is
+    // running or waits to. Its last write crossed the reserve and closed,
+    // and it wakes on the next turn. A run still live could write again,
+    // and keeps the job waiting for a reading with room.
+    pub(crate) fn disk_idle(&self) -> bool {
+        self.writer.disk_held() && self.writer.owes_nothing() && !self.runs.live()
+    }
+
     // `limit` is the slot limit the pipeline reads now, which every step
     // that asks or frees a run follows, and a repair the step lends asks
     // `slots` under it. The runs step before the lend, so a run the step

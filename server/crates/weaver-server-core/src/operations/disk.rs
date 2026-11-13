@@ -74,6 +74,8 @@ impl std::error::Error for DiskProbeError {}
 // error carries the operating-system reason so callers can log it and decide
 // between failing open, holding a stale reading, and refusing.
 pub fn probe_disk_space(path: &Path) -> Result<DiskSpace, DiskProbeError> {
+    #[cfg(test)]
+    count_disk_look();
     #[cfg(target_vendor = "apple")]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -516,13 +518,352 @@ impl StorageRoot {
     }
 }
 
-// A non-blocking view of one filesystem's latest capacity reading.
+// What every writer on one filesystem has promised to write there and not
+// yet written, shared by all of them, so two cannot each spend the same free
+// space. A member's file takes its whole length on its first write, but the
+// file is sparse and fills only as its bytes land: what was promised stays
+// promised across readings until it lands, or until the writer lets it go.
+//
+// Each storage root has a ledger, and the ledgers of roots whose directories
+// lie on one filesystem count together: a root's free space is its reading
+// less what was promised on every root of its filesystem, and less what
+// landed on any of them since the reading. A root whose filesystem is not
+// known yet counts alone.
+//
+// What landed is subtracted from a reading taken before it landed: a reading
+// counts the bytes from the one it follows, so each starts that count again.
+// Every count is an atomic; nothing here takes a lock. A count read while
+// another writer moves it errs on the side of less free space.
+pub struct DiskLedger {
+    counts: Arc<Counts>,
+    // This ledger's root among `counts`.
+    index: usize,
+    // `basis` keeps a reading's `sampled_at` as its distance from this
+    // instant, plus one, so that zero means no reading yet.
+    base: Instant,
+    // The reading the count of what landed since starts from, and what
+    // landed on the filesystem stood at just before it was probed. A sampler
+    // publishing to the ledger is the only writer of both; a ledger no
+    // sampler publishes to sets them from the first reader that sees a new
+    // reading.
+    basis: AtomicU64,
+    baseline: AtomicU64,
+    sampled: bool,
+    // The order writers began to wait for room here in.
+    tickets: AtomicU64,
+    // Rung on each reading published while anyone waits.
+    readings: Arc<tokio::sync::Notify>,
+    // Asks the filesystem's sampler for a reading without waiting out its
+    // interval.
+    refresh: Box<dyn Fn() + Send + Sync>,
+}
+
+// What anything but a sampler asked of the disk itself, on any thread, so
+// a test can pin that a path reads only the sampler's cached reading: each
+// capacity probe and each look at the filesystem a path lies on, and each
+// time an early reading was asked of a sampler. A test runs in a process
+// of its own, so the counts are its own.
+#[cfg(test)]
+pub(crate) static DISK_LOOKS: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static REFRESH_ASKS: AtomicU64 = AtomicU64::new(0);
+
+// The name each sampler's thread begins with.
+const SAMPLER_THREAD: &str = "weaver-capacity-";
+
+#[cfg(test)]
+pub(crate) fn count_disk_look() {
+    let sampler = std::thread::current()
+        .name()
+        .is_some_and(|name| name.starts_with(SAMPLER_THREAD));
+    if !sampler {
+        DISK_LOOKS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+// How many ledgers count together at most: one per storage root.
+const LEDGERS: usize = 3;
+
+// The counts of every root's ledger, by root.
+#[derive(Debug, Default)]
+struct Counts {
+    promised: [AtomicU64; LEDGERS],
+    // Every byte that landed against the ledger, ever.
+    landed: [AtomicU64; LEDGERS],
+    // Writers waiting for room on the ledger's root.
+    waiters: [AtomicU64; LEDGERS],
+    // The filesystem the root's directory lies on as its sampler last found
+    // it, plus one: zero while it is not known.
+    device: [AtomicU64; LEDGERS],
+    // How many times any of the ledgers rang those waiting for room.
+    rings: AtomicU64,
+}
+
+impl fmt::Debug for DiskLedger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let index = self.index;
+        f.debug_struct("DiskLedger")
+            .field(
+                "promised",
+                &self.counts.promised[index].load(Ordering::Relaxed),
+            )
+            .field("landed", &self.counts.landed[index].load(Ordering::Relaxed))
+            .field(
+                "waiters",
+                &self.counts.waiters[index].load(Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
+// The free space a reading leaves once the ledger is taken from it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Free {
+    pub(crate) bytes: u64,
+    // The reading is the last good one, held across a failed probe.
+    pub(crate) stale: bool,
+}
+
+fn saturating_take(count: &AtomicU64, bytes: u64) {
+    if bytes > 0 {
+        let _ = count.fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+            Some(held.saturating_sub(bytes))
+        });
+    }
+}
+
+impl DiskLedger {
+    fn new(
+        (counts, index): (Arc<Counts>, usize),
+        readings: Arc<tokio::sync::Notify>,
+        refresh: Box<dyn Fn() + Send + Sync>,
+        sampled: bool,
+    ) -> Self {
+        Self {
+            counts,
+            index,
+            base: Instant::now(),
+            basis: AtomicU64::new(0),
+            baseline: AtomicU64::new(0),
+            sampled,
+            tickets: AtomicU64::new(0),
+            readings,
+            refresh,
+        }
+    }
+
+    // A ledger of its own, for a reader no sampler publishes to.
+    pub(crate) fn standalone() -> Self {
+        Self::new((Arc::default(), 0), Arc::default(), Box::new(|| {}), false)
+    }
+
+    // The ledgers that count with this one: those of the roots on its
+    // filesystem, or itself alone while that is not known.
+    fn peers(&self) -> [bool; LEDGERS] {
+        let device = self.counts.device[self.index].load(Ordering::Acquire);
+        std::array::from_fn(|index| {
+            index == self.index
+                || (device != 0 && self.counts.device[index].load(Ordering::Acquire) == device)
+        })
+    }
+
+    // A count summed over the ledgers that count with this one.
+    fn summed(&self, count: &[AtomicU64; LEDGERS]) -> u64 {
+        self.peers()
+            .iter()
+            .zip(count)
+            .filter(|(peer, _)| **peer)
+            .fold(0u64, |sum, (_, count)| {
+                sum.saturating_add(count.load(Ordering::Acquire))
+            })
+    }
+
+    // Whether `other` counts with this ledger: one ledger, or the ledgers
+    // of two roots on one filesystem.
+    pub(crate) fn same_disk(&self, other: &DiskLedger) -> bool {
+        Arc::ptr_eq(&self.counts, &other.counts) && self.peers()[other.index]
+    }
+
+    // The filesystem the root's directory lies on, as its sampler found it
+    // before a probe: `None` when it could not tell, which keeps the one it
+    // last found. Only a filesystem found moves the root to other peers.
+    fn on_device(&self, device: Option<u64>) {
+        if let Some(device) = device {
+            self.counts.device[self.index].store(device.wrapping_add(1), Ordering::Release);
+        }
+    }
+
+    // The root's directory changed: the filesystem it lies on is not known
+    // until its sampler finds it.
+    fn moved(&self) {
+        self.counts.device[self.index].store(0, Ordering::Release);
+    }
+
+    // What `capacity` leaves free less everything promised, and less what
+    // landed since it was read. `None` without a reading.
+    #[cfg(test)]
+    pub(crate) fn free(&self, capacity: Capacity) -> Option<Free> {
+        self.free_with(|| capacity)
+    }
+
+    // [`Self::free`] of the reading `read` gives.
+    //
+    // On a sampled ledger this only reads, and reads the baseline before the
+    // reading: the sampler publishes a reading before it moves the baseline
+    // to that reading's mark, so a baseline read first is never newer than
+    // the reading read after it. A reader between the two counts from the
+    // older baseline: more landed, less free.
+    pub(crate) fn free_with(&self, read: impl FnOnce() -> Capacity) -> Option<Free> {
+        let sampled_baseline = self.baseline.load(Ordering::Acquire);
+        let reading = read().reading()?;
+        let landed = self.summed(&self.counts.landed);
+        let baseline = if self.sampled {
+            sampled_baseline
+        } else {
+            let key = self.key(reading);
+            let basis = self.basis.load(Ordering::Acquire);
+            if basis != key
+                && self
+                    .basis
+                    .compare_exchange(basis, key, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+            {
+                self.baseline.store(landed, Ordering::Release);
+            }
+            self.baseline.load(Ordering::Acquire)
+        };
+        let since = landed.saturating_sub(baseline);
+        Some(Free {
+            bytes: reading
+                .available_bytes
+                .saturating_sub(since)
+                .saturating_sub(self.summed(&self.counts.promised)),
+            stale: reading.stale,
+        })
+    }
+
+    // `bytes` more are promised.
+    pub(crate) fn promise(&self, bytes: u64) {
+        if bytes > 0 {
+            self.counts.promised[self.index].fetch_add(bytes, Ordering::AcqRel);
+        }
+    }
+
+    // A promise that will not land, or not here. The room it gives back
+    // rings as a reading does, so those waiting are judged again.
+    pub(crate) fn release(&self, bytes: u64) {
+        if bytes > 0 {
+            saturating_take(&self.counts.promised[self.index], bytes);
+            self.rang();
+        }
+    }
+
+    // `promised` bytes of a promise landed, and `unpromised` bytes nobody
+    // promised first.
+    pub(crate) fn landed(&self, promised: u64, unpromised: u64) {
+        saturating_take(&self.counts.promised[self.index], promised);
+        let landed = promised.saturating_add(unpromised);
+        if landed > 0 {
+            self.counts.landed[self.index].fetch_add(landed, Ordering::AcqRel);
+        }
+    }
+
+    // A writer begins to wait for room: the sampler is asked for a reading
+    // now, and every reading from here rings until it stops waiting. The
+    // ticket orders the writers waiting.
+    pub(crate) fn wait(&self) -> u64 {
+        self.counts.waiters[self.index].fetch_add(1, Ordering::AcqRel);
+        (self.refresh)();
+        self.tickets.fetch_add(1, Ordering::AcqRel)
+    }
+
+    // A writer no longer waits.
+    pub(crate) fn unwait(&self) {
+        saturating_take(&self.counts.waiters[self.index], 1);
+    }
+
+    // How many times a writer began to wait here: a count that moved since
+    // a look means someone began to wait since.
+    pub(crate) fn tickets(&self) -> u64 {
+        self.tickets.load(Ordering::Acquire)
+    }
+
+    // Whether anyone waits for room here.
+    #[cfg(test)]
+    pub(crate) fn waited_on(&self) -> bool {
+        self.counts.waiters[self.index].load(Ordering::Acquire) > 0
+    }
+
+    // A reading's key: its `sampled_at` as its distance from `base`, plus
+    // one.
+    fn key(&self, reading: CapacityReading) -> u64 {
+        u64::try_from(
+            reading
+                .sampled_at
+                .saturating_duration_since(self.base)
+                .as_nanos(),
+        )
+        .unwrap_or(u64::MAX - 1)
+            + 1
+    }
+
+    // What landed on the filesystem so far, taken just before a probe:
+    // every byte counted after it is one the probe may not have seen.
+    fn mark(&self) -> u64 {
+        self.summed(&self.counts.landed)
+    }
+
+    // The probe that followed `mark` published `capacity`: what landed is
+    // counted from the mark, and whoever waits for room hears it. A failed
+    // probe republishes the last good reading under its old time; what
+    // landed is still counted from that reading's mark.
+    fn published(&self, mark: u64, capacity: Capacity) {
+        if let Some(reading) = capacity.reading() {
+            let key = self.key(reading);
+            if self.basis.load(Ordering::Acquire) != key {
+                self.baseline.store(mark, Ordering::Release);
+                self.basis.store(key, Ordering::Release);
+            }
+        }
+        self.rang();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sampled_for_test() -> Self {
+        Self::new((Arc::default(), 0), Arc::default(), Box::new(|| {}), true)
+    }
+
+    // Whoever waits for room on the filesystem hears that its reading or
+    // what is promised on it changed.
+    fn rang(&self) {
+        let waited = self
+            .peers()
+            .iter()
+            .zip(&self.counts.waiters)
+            .any(|(peer, waiters)| *peer && waiters.load(Ordering::Acquire) > 0);
+        if waited {
+            self.counts.rings.fetch_add(1, Ordering::Release);
+            self.readings.notify_one();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn promised(&self) -> u64 {
+        self.counts.promised[self.index].load(Ordering::Acquire)
+    }
+}
+
+// A non-blocking view of one filesystem's latest capacity reading, with the
+// ledger every writer on that filesystem spends from.
 //
 // Reading it never touches the filesystem unless it was built with
-// [`Self::probing`]. Consumers that spend against the reading between
-// refreshes keep their own [`CapacityDebits`].
+// [`Self::probing`]. Clones share the ledger; a reader built from a function
+// has a ledger of its own.
 #[derive(Clone)]
-pub struct CapacityReader(Arc<dyn Fn() -> Capacity + Send + Sync>);
+pub struct CapacityReader {
+    read: Arc<dyn Fn() -> Capacity + Send + Sync>,
+    ledger: Arc<DiskLedger>,
+}
 
 impl fmt::Debug for CapacityReader {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -535,7 +876,15 @@ impl fmt::Debug for CapacityReader {
 impl CapacityReader {
     // A reader backed by `read`. Tests inject readings through it.
     pub fn from_fn(read: impl Fn() -> Capacity + Send + Sync + 'static) -> Self {
-        Self(Arc::new(read))
+        Self {
+            read: Arc::new(read),
+            ledger: Arc::new(DiskLedger::standalone()),
+        }
+    }
+
+    // The ledger every writer through this reader spends from.
+    pub(crate) fn ledger(&self) -> &Arc<DiskLedger> {
+        &self.ledger
     }
 
     // A reader with no reading, which every consumer treats as a failed
@@ -558,7 +907,7 @@ impl CapacityReader {
     }
 
     pub fn current(&self) -> Capacity {
-        (self.0)()
+        (self.read)()
     }
 }
 
@@ -718,6 +1067,8 @@ struct RootSlot {
     root: StorageRoot,
     state: Mutex<RootState>,
     capacity: PublishedCapacity,
+    // What every writer on the root has promised it.
+    ledger: Arc<DiskLedger>,
     wake: Condvar,
     #[cfg(test)]
     locks: AtomicU64,
@@ -730,6 +1081,13 @@ impl RootSlot {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn request_refresh(&self) {
+        #[cfg(test)]
+        REFRESH_ASKS.fetch_add(1, Ordering::Relaxed);
+        self.lock().refresh_requested = true;
+        self.wake.notify_all();
     }
 }
 
@@ -745,6 +1103,8 @@ impl RootSlot {
 // returns.
 pub struct StorageCapacity {
     slots: [Arc<RootSlot>; 3],
+    // Rung on a reading of any root that someone waits on for room.
+    readings: Arc<tokio::sync::Notify>,
 }
 
 impl fmt::Debug for StorageCapacity {
@@ -791,19 +1151,36 @@ impl StorageCapacity {
         startup_disk_work: StartupDiskGate,
     ) -> Self {
         let base = Instant::now();
+        let readings = Arc::new(tokio::sync::Notify::new());
+        // The roots' ledgers count together where they share a filesystem.
+        let counts = Arc::new(Counts::default());
         let slots = StorageRoot::ALL.map(|root| {
-            Arc::new(RootSlot {
-                root,
-                state: Mutex::new(RootState {
-                    path: roots[root.index()].clone(),
-                    refresh_requested: false,
-                    stopped: false,
-                    completed_probes: 0,
-                }),
-                capacity: PublishedCapacity::unknown(base),
-                wake: Condvar::new(),
-                #[cfg(test)]
-                locks: AtomicU64::new(0),
+            Arc::new_cyclic(|slot: &std::sync::Weak<RootSlot>| {
+                let slot = slot.clone();
+                let refresh = Box::new(move || {
+                    if let Some(slot) = slot.upgrade() {
+                        slot.request_refresh();
+                    }
+                });
+                RootSlot {
+                    root,
+                    state: Mutex::new(RootState {
+                        path: roots[root.index()].clone(),
+                        refresh_requested: false,
+                        stopped: false,
+                        completed_probes: 0,
+                    }),
+                    capacity: PublishedCapacity::unknown(base),
+                    ledger: Arc::new(DiskLedger::new(
+                        (Arc::clone(&counts), root.index()),
+                        Arc::clone(&readings),
+                        refresh,
+                        true,
+                    )),
+                    wake: Condvar::new(),
+                    #[cfg(test)]
+                    locks: AtomicU64::new(0),
+                }
             })
         });
         for slot in &slots {
@@ -818,7 +1195,7 @@ impl StorageCapacity {
             let thread_probe = Arc::clone(&probe);
             let thread_gate = startup_disk_work.clone();
             let spawned = std::thread::Builder::new()
-                .name(format!("weaver-capacity-{}", slot.root.label()))
+                .name(format!("{SAMPLER_THREAD}{}", slot.root.label()))
                 .spawn(move || {
                     run_root_sampler(&thread_slot, interval, thread_probe, &thread_gate)
                 });
@@ -830,7 +1207,18 @@ impl StorageCapacity {
                 );
             }
         }
-        Self { slots }
+        Self { slots, readings }
+    }
+
+    // Rung when a root that someone waits on for room has a new reading.
+    pub(crate) fn readings(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.readings)
+    }
+
+    // How many times it was rung: a count that moved since a look means it
+    // rang since, heard by a turn that does not wait on it.
+    pub(crate) fn rings(&self) -> u64 {
+        self.slots[0].ledger.counts.rings.load(Ordering::Acquire)
     }
 
     fn slot(&self, root: StorageRoot) -> &Arc<RootSlot> {
@@ -847,7 +1235,23 @@ impl StorageCapacity {
     // lock, so a per-article admission check never waits on the sampler.
     pub fn reader(&self, root: StorageRoot) -> CapacityReader {
         let slot = Arc::clone(self.slot(root));
-        CapacityReader::from_fn(move || slot.capacity.read())
+        let ledger = Arc::clone(&slot.ledger);
+        CapacityReader {
+            read: Arc::new(move || slot.capacity.read()),
+            ledger,
+        }
+    }
+
+    // What `root`'s latest reading leaves free less its ledger, read in
+    // place: no reader is built, and nothing is allocated.
+    pub(crate) fn free(&self, root: StorageRoot) -> Option<Free> {
+        let slot = self.slot(root);
+        slot.ledger.free_with(|| slot.capacity.read())
+    }
+
+    // The ledger every writer on `root`'s filesystem spends from.
+    pub(crate) fn ledger(&self, root: StorageRoot) -> &DiskLedger {
+        &self.slot(root).ledger
     }
 
     // Point `root` at a new directory. The old directory's reading is
@@ -860,6 +1264,8 @@ impl StorageCapacity {
         }
         state.path = path;
         slot.capacity.publish(Capacity::Unknown);
+        slot.ledger.moved();
+        slot.ledger.rang();
         state.refresh_requested = true;
         slot.wake.notify_all();
     }
@@ -867,9 +1273,7 @@ impl StorageCapacity {
     // Ask `root`'s thread to probe again without waiting out its interval.
     // A request made while a probe is running is served after it finishes.
     pub fn request_refresh(&self, root: StorageRoot) {
-        let slot = self.slot(root);
-        slot.lock().refresh_requested = true;
-        slot.wake.notify_all();
+        self.slot(root).request_refresh();
     }
 
     // One row per root with a reading, fresh or held from the last good
@@ -891,6 +1295,30 @@ impl StorageCapacity {
                     })
             })
             .collect()
+    }
+
+    // Block until `root`'s published reading is one `ready` accepts. A
+    // reading is published under the slot's lock, and the waiter is woken
+    // after, so none is missed.
+    #[cfg(test)]
+    pub(crate) fn wait_for_reading(
+        &self,
+        root: StorageRoot,
+        ready: impl Fn(&CapacityReading) -> bool,
+    ) {
+        let slot = self.slot(root);
+        let state = slot.lock();
+        drop(
+            slot.wake
+                .wait_while(state, |_| {
+                    !slot
+                        .capacity
+                        .read()
+                        .reading()
+                        .is_some_and(|reading| ready(&reading))
+                })
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
     }
 
     // Block until `root` has completed at least `probes` probes.
@@ -956,6 +1384,11 @@ fn run_root_sampler(
                 Box::new(move |path| probe(path)),
             ));
         }
+        // The filesystem is found again before each probe, so a root moved
+        // to another one counts with its new peers from its next reading.
+        slot.ledger
+            .on_device(crate::runtime::fs::nearest_device(&path));
+        let mark = slot.ledger.mark();
         let capacity = sampler
             .as_mut()
             .expect("a sampler for the current path")
@@ -965,6 +1398,7 @@ fn run_root_sampler(
         // directory's; the thread probes the new one straight away.
         if state.path == path {
             slot.capacity.publish(capacity);
+            slot.ledger.published(mark, capacity);
         }
         state.completed_probes += 1;
         slot.wake.notify_all();
@@ -983,6 +1417,37 @@ fn run_root_sampler(
 
 #[cfg(test)]
 mod tests {
+    // Two roots found on one filesystem count together, and go on doing so
+    // across a failed look: only a filesystem found otherwise, or a new
+    // directory, parts them.
+    #[test]
+    fn a_failed_look_at_a_roots_filesystem_keeps_it_with_its_peers() {
+        let counts = Arc::new(Counts::default());
+        let ledger = |index| {
+            DiskLedger::new(
+                (Arc::clone(&counts), index),
+                Arc::default(),
+                Box::new(|| {}),
+                true,
+            )
+        };
+        let (output, working) = (ledger(0), ledger(1));
+        assert!(!output.same_disk(&working), "nothing known yet");
+        output.on_device(Some(7));
+        working.on_device(Some(7));
+        assert!(output.same_disk(&working));
+        working.on_device(None);
+        assert!(output.same_disk(&working), "a failed look keeps the disk");
+        working.on_device(Some(8));
+        assert!(!output.same_disk(&working), "another disk found parts them");
+        working.on_device(Some(7));
+        assert!(output.same_disk(&working));
+        working.moved();
+        assert!(!output.same_disk(&working), "a new directory is not known");
+        working.on_device(None);
+        assert!(!output.same_disk(&working), "nor after a failed look");
+    }
+
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -1547,6 +2012,68 @@ mod tests {
         assert_eq!(
             debits.apply(reading(1000, next)).best_available_bytes(),
             Some(1000)
+        );
+    }
+
+    fn known(available_bytes: u64, sampled_at: Instant, stale: bool) -> Capacity {
+        Capacity::Known(CapacityReading {
+            available_bytes,
+            total_bytes: 10_000,
+            sampled_at,
+            stale,
+        })
+    }
+
+    // A failed probe republishes the last good reading under its old time.
+    // What landed since that reading is still taken from it, at each failed
+    // interval, until a good probe reads the disk again.
+    #[test]
+    fn a_failed_probe_keeps_counting_what_landed_since_the_last_good_reading() {
+        let ledger = DiskLedger::sampled_for_test();
+        let taken = Instant::now();
+        let good = known(1000, taken, false);
+        let mark = ledger.mark();
+        ledger.published(mark, good);
+        ledger.landed(0, 300);
+        let held = known(1000, taken, true);
+        for _ in 0..3 {
+            let mark = ledger.mark();
+            ledger.published(mark, held);
+            assert_eq!(
+                ledger.free(held).map(|free| free.bytes),
+                Some(700),
+                "the bytes landed since the good reading stay counted"
+            );
+        }
+        let mark = ledger.mark();
+        let next = known(700, taken + Duration::from_secs(5), false);
+        ledger.published(mark, next);
+        assert_eq!(ledger.free(next).map(|free| free.bytes), Some(700));
+    }
+
+    // The sampler publishes the reading and then its mark. A reader between
+    // the two must not move the baseline past the mark: bytes that landed
+    // while the probe ran are ones the reading may not have seen.
+    #[test]
+    fn a_reader_between_a_reading_and_its_mark_does_not_lose_what_landed_during_the_probe() {
+        let ledger = DiskLedger::sampled_for_test();
+        let taken = Instant::now();
+        let first = known(1000, taken, false);
+        let mark = ledger.mark();
+        ledger.published(mark, first);
+        let mark = ledger.mark();
+        ledger.landed(0, 200);
+        let next = known(1000, taken + Duration::from_secs(5), false);
+        assert_eq!(
+            ledger.free(next).map(|free| free.bytes),
+            Some(800),
+            "a reader before the mark counts from the older baseline"
+        );
+        ledger.published(mark, next);
+        assert_eq!(
+            ledger.free(next).map(|free| free.bytes),
+            Some(800),
+            "what landed during the probe is still taken from the reading"
         );
     }
 }

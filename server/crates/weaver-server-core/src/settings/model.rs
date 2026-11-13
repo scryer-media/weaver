@@ -270,7 +270,7 @@ pub struct DirectStoreOverrides {
     pub holds_scratch_total_bytes: Option<u64>,
     // Free space the working directory's filesystem must keep, in bytes. A
     // spill that would leave less demotes the set that asked. Defaults to a
-    // twentieth of the filesystem, between 512 MiB and 20 GiB; zero disables
+    // twentieth of the filesystem, between 512 MiB and 5 GiB; zero disables
     // the check.
     pub holds_disk_reserve_bytes: Option<u64>,
 }

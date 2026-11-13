@@ -316,7 +316,6 @@ fn a_file_a_stream_below_delivers_past_the_member_limit_is_refused() {
 // judged at everything it holds, as a file written to that length is.
 #[test]
 fn a_member_that_waited_past_the_member_limit_is_refused_once_it_is_a_file() {
-    use crate::operations::disk::Capacity;
     use crate::pipeline::extraction::ExtractionRejectionReason;
     use crate::pipeline::graph::limits::{Device, Output};
 
@@ -324,14 +323,14 @@ fn a_member_that_waited_past_the_member_limit_is_refused_once_it_is_a_file() {
     let mut job = Job::new(PLENTY);
     let node = stream(&mut job);
     let mut caps = caps(|limits| limits.max_member_bytes = LIMIT);
-    let folder = job.dir.path().to_path_buf();
+    let unknown = CapacityReader::unknown();
     let mut admit = |end: u64, output: Output| {
         caps.admit_write(
             &job.tree,
             (node, MemberId(5)),
             end,
-            output,
-            (&folder, Capacity::Unknown, Device::Output),
+            (output, 0),
+            (&unknown, Device::Output),
         )
     };
     assert!(admit(LIMIT + 1, Output::Kept).is_ok());
@@ -469,7 +468,6 @@ fn a_nest_whose_inner_level_grows_past_the_ratio_is_refused_there() {
 // second byte is refused.
 #[test]
 fn a_restored_job_counts_each_level_once() {
-    use crate::operations::disk::Capacity;
     use crate::pipeline::extraction::ExtractionRejectionReason;
     use crate::pipeline::graph::limits::{Device, Output};
 
@@ -481,15 +479,15 @@ fn a_restored_job_counts_each_level_once() {
     assert!(job.writer.refusal().is_none());
 
     let mut restored = ratio_caps(LIMIT + 1);
-    restored.restore_members(&job.tree);
-    let folder = job.dir.path().to_path_buf();
+    restored.restore_members(&job.tree, Device::Output);
+    let unknown = CapacityReader::unknown();
     let mut admit = |at: (NodeId, u32), end: u64, output: Output| {
         restored.admit_write(
             &job.tree,
             (at.0, MemberId(at.1)),
             end,
-            output,
-            (&folder, Capacity::Unknown, Device::Output),
+            (output, 0),
+            (&unknown, Device::Output),
         )
     };
     assert!(admit((node, 7), 1, Output::Kept).is_ok());
@@ -554,11 +552,12 @@ fn a_member_held_undecided_is_not_held_to_the_member_limit() {
 // Where the job's working folder is on a device of its own, what waits
 // there is held to the reserve against that device's reading, and what is
 // delivered against the output's. Exactly the free space over the reserve
-// is kept; a byte more is refused, worded for the working folder.
+// is kept before the job waits; a byte more lands, and the job then waits
+// for room on the working folder's device, which its own reading alone
+// wakes.
 #[test]
 fn what_waits_in_the_working_folder_is_held_to_the_reserve_of_its_device() {
     use crate::operations::disk::{Capacity, CapacityReading};
-    use crate::pipeline::extraction::ExtractionRejectionReason;
 
     const RESERVE: u64 = 1024;
     const ROOM: u64 = 64;
@@ -589,12 +588,17 @@ fn what_waits_in_the_working_folder_is_held_to_the_reserve_of_its_device() {
     assert!(job.writer.refusal().is_none());
     assert_eq!(job.kept(child), ROOM);
 
-    assert!(job.try_bytes(node, 0, ROOM, &[7]).is_err());
-    assert_eq!(reason(&job), ExtractionRejectionReason::DiskReserve);
-    let failure = job.writer.refusal().unwrap().job_failure_reason();
+    assert!(!job.writer.disk_held());
+
+    assert!(job.try_bytes(node, 0, ROOM, &[7]).is_ok());
     assert!(
-        failure.contains(&format!("the disk holding {} ", job.dir.path().display())),
-        "{failure}"
+        job.writer.refusal().is_none(),
+        "the reserve refuses nothing"
     );
-    assert_eq!(job.kept(child), ROOM);
+    assert_eq!(job.kept(child), ROOM + 1, "the byte lands");
+    assert!(job.writer.disk_held(), "the job waits for room");
+    assert!(
+        !job.writer.wake_disk(),
+        "the working folder's device has none"
+    );
 }

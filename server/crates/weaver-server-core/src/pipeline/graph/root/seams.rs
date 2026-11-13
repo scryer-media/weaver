@@ -30,6 +30,13 @@ use crate::pipeline::{DecodedChunk, Pipeline};
 // neutral priority.
 const WINDOW_PRIORITY: u32 = 3;
 
+// How many jobs the loop looked at for a wait for room, on this thread, so
+// a test can pin that a turn with nothing changed looks at none.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static DISK_WAIT_LOOKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 impl Pipeline {
     // Give a job admitted, or restored with no checkpoint, its graph
     // runtime. The job's state must already be in place: what its queues
@@ -469,7 +476,9 @@ impl Pipeline {
 
     // How many runs and repairs the job may hold now: the pipeline's limit,
     // and none while the job is not admitted or is paused, so each of those
-    // holds its extraction and repair and nothing else.
+    // holds its extraction and repair and nothing else. A job that waits
+    // for room on a disk holds its slots, and the job itself holds back the
+    // work that writes: what writes nothing goes on.
     pub(in crate::pipeline) fn graph_job_slot_limit(&self, job_id: JobId) -> usize {
         if self.nzb_admitted.contains(&job_id)
             && self
@@ -497,6 +506,18 @@ impl Pipeline {
         job_id: JobId,
         result: Result<(), GraphError>,
     ) {
+        // Every step of a job ends here: one that left a job waiting for
+        // room owing nothing, with no run live, has it woken on the next
+        // turn. With no job waiting this is one test of an empty set.
+        if !self.disk_waiting.is_empty()
+            && self.disk_waiting.contains(&job_id)
+            && self
+                .graph_jobs
+                .get(&job_id)
+                .is_some_and(GraphJob::disk_idle)
+        {
+            self.disk_idle.insert(job_id);
+        }
         if self.job_failure_started(job_id) {
             return;
         }
@@ -521,6 +542,151 @@ impl Pipeline {
         // The step's bytes are written: the checkpoint can say so.
         self.step_graph_checkpoint(job_id);
         self.wake_memory_waiters();
+    }
+
+    // Whether the job's graph waits for room on a disk, read from the job
+    // itself.
+    #[cfg(test)]
+    pub(in crate::pipeline) fn graph_disk_held(&self, job_id: JobId) -> bool {
+        self.graph_jobs
+            .get(&job_id)
+            .is_some_and(GraphJob::disk_held)
+    }
+
+    // Every job that began to wait for room is listed among those a reading
+    // wakes, and shown waiting. A job begins to wait only by taking a ticket
+    // from the ledger of the disk it waits on, so the jobs are looked over
+    // only when a count moved since the last look: once per wait begun, not
+    // per turn. A job that waits and owes nothing, its last write landed
+    // and closed, wakes here whatever the disk reads. It is found idle as
+    // it begins to wait, or by the step that left it so: a turn with no
+    // wait begun and no step leaving a job idle looks at no job.
+    pub(in crate::pipeline) fn reconcile_disk_waits(&mut self) {
+        let tickets = self.disk_tickets();
+        if tickets != self.disk_tickets_seen {
+            self.disk_tickets_seen = tickets;
+            let began: Vec<JobId> = self
+                .graph_jobs
+                .iter()
+                .filter(|(job_id, graph)| graph.disk_held() && !self.disk_waiting.contains(job_id))
+                .map(|(job_id, _)| *job_id)
+                .collect();
+            for job_id in began {
+                #[cfg(test)]
+                DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
+                self.disk_waiting.insert(job_id);
+                if self
+                    .graph_jobs
+                    .get(&job_id)
+                    .is_some_and(GraphJob::disk_idle)
+                {
+                    self.disk_idle.insert(job_id);
+                }
+                self.report_job(job_id);
+            }
+        }
+        if self.disk_idle.is_empty() {
+            return;
+        }
+        let idle: Vec<JobId> = std::mem::take(&mut self.disk_idle)
+            .into_iter()
+            .filter(|job_id| {
+                #[cfg(test)]
+                DISK_WAIT_LOOKS.with(|looks| looks.set(looks.get() + 1));
+                self.disk_waiting.contains(job_id)
+                    && self
+                        .graph_jobs
+                        .get(job_id)
+                        .is_none_or(|graph| !graph.disk_held() || graph.disk_idle())
+            })
+            .collect();
+        for job_id in idle {
+            if self
+                .graph_jobs
+                .get_mut(&job_id)
+                .is_none_or(GraphJob::wake_disk)
+            {
+                self.disk_woke(job_id);
+            }
+        }
+    }
+
+    // The tickets the output and working ledgers have given out.
+    fn disk_tickets(&self) -> [u64; 2] {
+        [
+            crate::operations::StorageRoot::Complete,
+            crate::operations::StorageRoot::Intermediate,
+        ]
+        .map(|root| self.storage_capacity.ledger(root).tickets())
+    }
+
+    // Whether a job waits for room on a disk, or a job is kept from
+    // starting for it, so the loop listens for the next reading. The loop
+    // reconciles the waits just before it asks.
+    pub(in crate::pipeline) fn waits_for_disk_room(&self) -> bool {
+        !self.disk_waiting.is_empty() || self.admission_disk_held
+    }
+
+    // A turn busy with results, which does not wait on the next event: a
+    // disk that rang since the last turn heard it is heard now, as the
+    // wait would hear it, and a waiter a step left idle wakes. With no job
+    // waiting and no ring, it is one look at a count and one at a set.
+    pub(in crate::pipeline) fn hear_disk_on_busy_turn(&mut self) {
+        if self.storage_capacity.rings() != self.disk_rings_seen {
+            self.disk_reading();
+        } else if !self.disk_idle.is_empty() {
+            self.reconcile_disk_waits();
+        }
+    }
+
+    // A disk has a new reading, or gave back room, while jobs wait for room
+    // or are kept from starting.
+    pub(in crate::pipeline) fn disk_reading(&mut self) {
+        self.disk_rings_seen = self.storage_capacity.rings();
+        self.reconcile_disk_waits();
+        self.wake_disk_waiters();
+        self.release_admission_disk_hold();
+    }
+
+    // A disk someone waits on has a new reading: each job that waits is
+    // woken, in the order they began to wait, if the disk has room for all
+    // it owes beside what those woken before it promised. A job woken goes
+    // on; the rest wait for the next reading. A job no longer here is no
+    // longer waited on.
+    pub(in crate::pipeline) fn wake_disk_waiters(&mut self) {
+        let mut waiting: Vec<(u64, JobId)> = self
+            .disk_waiting
+            .iter()
+            .map(|job_id| {
+                let ticket = self
+                    .graph_jobs
+                    .get(job_id)
+                    .and_then(GraphJob::disk_ticket)
+                    .unwrap_or(0);
+                (ticket, *job_id)
+            })
+            .collect();
+        waiting.sort_unstable();
+        for (_, job_id) in waiting {
+            let woke = self
+                .graph_jobs
+                .get_mut(&job_id)
+                .is_none_or(GraphJob::wake_disk);
+            if woke {
+                self.disk_woke(job_id);
+            }
+        }
+    }
+
+    // The job has room again, or owes nothing: it no longer waits, says so,
+    // and its runs and repairs go on.
+    fn disk_woke(&mut self, job_id: JobId) {
+        self.disk_waiting.remove(&job_id);
+        self.disk_idle.remove(&job_id);
+        self.download_dispatch_wake = true;
+        self.report_job(job_id);
+        self.resume_graph_work(job_id);
+        self.lend_graph_repairs(job_id);
     }
 
     // Decode memory a step, a retired job or a new profile freed goes to the

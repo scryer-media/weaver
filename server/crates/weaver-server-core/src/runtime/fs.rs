@@ -454,7 +454,11 @@ pub(crate) fn same_device(a: &Path, b: &Path) -> bool {
     }
 }
 
-fn nearest_device(path: &Path) -> Option<u64> {
+// The device `path` lies on, read at the nearest of its ancestors that
+// exists. `None` when it cannot be read, or the platform has none to read.
+pub(crate) fn nearest_device(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    crate::operations::disk::count_disk_look();
     #[cfg(test)]
     if let Some(device) = test_devices::of(path) {
         return Some(device);

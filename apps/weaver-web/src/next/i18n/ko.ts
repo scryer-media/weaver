@@ -722,6 +722,7 @@ export const nextKo: LocaleDictionary = {
   "next.general.maxConcurrentNzbs": "최대 동시 NZB 수",
   "next.general.maxConcurrentNzbsHelp": "시작부터 복구, 압축 해제 및 최종 완료까지 Usenet NZB 수를 제한합니다. 모든 제공업체에 공통으로 적용됩니다.",
   "next.status.wait.nzb_slot": "NZB 슬롯 대기 중",
+  "next.status.wait.disk_space": "디스크 공간 부족",
   "next.general.propagationDelayHelp": "모든 기사가 서버에 도달하도록 새 NZB의 시작을 이 시간만큼 보류합니다.",
   "next.general.seconds": "초",
   "next.general.srrdb": "SRRDB 릴리스 조회",

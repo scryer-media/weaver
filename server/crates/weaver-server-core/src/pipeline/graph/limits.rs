@@ -7,7 +7,6 @@
 // the same limits here.
 
 use std::collections::BTreeMap;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,7 +15,7 @@ use weaver_graph::holds::HoldBudgets;
 use weaver_graph::{MemberId, NodeId, Tree};
 
 use crate::RuntimeTuner;
-use crate::operations::disk::{Capacity, CapacityDebits};
+use crate::operations::disk::{CapacityReader, DiskLedger};
 use crate::pipeline::completion::finalize::MAX_GRAPH_NESTING_DEPTH;
 use crate::pipeline::extraction::{ExtractionFailure, ExtractionLimits, ExtractionRejectionReason};
 use crate::pipeline::graph::decoding::DecodeClock;
@@ -216,11 +215,18 @@ pub(crate) const NESTING: u32 = MAX_GRAPH_NESTING_DEPTH;
 //                      members, and the job's name ledger for the parts
 //                      of its paths, against the memory limit
 //   deadline           the time the job's decoders spent executing, less
-//                      what they spent while the job was paused; waiting
+//                      what they spent while the job was paused, and less
+//                      the part of it each run stopped for room took
+//                      before it stopped, which runs again; waiting
 //                      for articles, a slot, memory or a thread is not
 //                      under it, nor are the posts' own writes
 //   disk reserve       the free space a write would leave, against the
-//                      reading of the device it lands on
+//                      reading of the device it lands on less what every
+//                      writer promised it; a write that would leave less
+//                      lands, and the job then waits, its writing work
+//                      held, until a reading shows room for all it owes,
+//                      or it owes nothing. The
+//                      reserve never fails the job
 //   content policy     the operator's unacceptable extensions, on every
 //                      name a namespace places; a name placed while the
 //                      database could not be read waits, and is judged when
@@ -242,11 +248,16 @@ pub(crate) struct Caps {
     // when the job paused, while it is paused.
     excused: Duration,
     paused: Option<Duration>,
-    // What was admitted against each device's latest reading, by `Device`.
-    debits: [CapacityDebits; 2],
-    // How far each member an object produced is written, and the level it
-    // counts at.
-    extents: BTreeMap<(NodeId, MemberId), (u64, usize)>,
+    // What the job owes each device, by `Device`, and whether it waits
+    // for room on either.
+    spend: [Spend; 2],
+    // Set while a run stopped for room takes back what it built: each
+    // member that goes, its own or one buried under it, is written again
+    // when the run runs again.
+    rewriting: bool,
+    // How far each member an object produced is written, the level it
+    // counts at, and what of it is owed to its device.
+    extents: BTreeMap<(NodeId, MemberId), Extent>,
     // What each level holds, by `level`: the files the job delivers, then
     // what waits for an object at each depth.
     written: [u64; LEVELS],
@@ -339,6 +350,265 @@ struct Account {
     resident: BTreeMap<MemberId, u64>,
 }
 
+// How far a member is written, the level it counts at, and what of it is
+// owed to the device it lands on.
+#[derive(Debug, Clone, Copy)]
+struct Extent {
+    end: u64,
+    level: usize,
+    owed: u64,
+    device: Device,
+}
+
+// How much is promised from a device beyond what a write needs when the
+// ledger is asked, so that most writes touch nothing shared, and how much
+// that was promised may land before the ledger hears of it.
+const SLAB_BYTES: u64 = 64 * 1024 * 1024;
+
+// The room above `reserve` a good reading of `reader` leaves on its
+// ledger: every byte with no reserve, no reading, or a stale one, which
+// checks nothing.
+fn checked_room(ledger: &DiskLedger, reader: &CapacityReader, reserve: u64) -> u64 {
+    match ledger.free_with(|| reader.current()) {
+        Some(free) if reserve > 0 && !free.stale => free.bytes.saturating_sub(reserve),
+        _ => u64::MAX,
+    }
+}
+
+// What the job owes one device: the bytes its members took and have not
+// written yet, and how much of that the device's ledger holds promised for
+// it. While the job waits for room on the device, nothing it owes there is
+// promised, so a job that waits holds no room another could use.
+#[derive(Debug, Default)]
+struct Spend {
+    ledger: Option<Arc<DiskLedger>>,
+    // Taken for members, not landed yet.
+    owed: u64,
+    // Of `owed`, what is not promised: all of it while the job waits.
+    unbooked: u64,
+    // What a repair the job holds back until there is room would write:
+    // promised in hand when the job wakes, for the repair to spend.
+    wanted: u64,
+    // What members removed while the job waits held: the runs that built
+    // them write them again once it wakes, so it is promised then, to spend
+    // as they write.
+    again: u64,
+    // Promised beyond what is owed, spent before the ledger is asked again.
+    slab: u64,
+    // Of `slab`, what was promised for a held repair when the job woke and
+    // no repair has taken yet.
+    in_hand: u64,
+    // What landed since the ledger last heard: of what was promised, and of
+    // what was not.
+    landed: u64,
+    landed_unbooked: u64,
+    // The job's place among those waiting for room on the device.
+    waiting: Option<u64>,
+}
+
+impl Spend {
+    // The ledger of the device `reader` reads, kept from the first use.
+    fn bind(&mut self, reader: &CapacityReader) -> Arc<DiskLedger> {
+        Arc::clone(
+            self.ledger
+                .get_or_insert_with(|| Arc::clone(reader.ledger())),
+        )
+    }
+
+    // The ledger hears what landed.
+    fn settle(&mut self) {
+        if let Some(ledger) = &self.ledger {
+            ledger.landed(self.landed, self.landed_unbooked);
+        }
+        self.landed = 0;
+        self.landed_unbooked = 0;
+    }
+
+    // `bytes` of what is owed landed: what was not promised first. The
+    // ledger hears of it once a slab's worth has landed, or sooner when it
+    // is next asked.
+    fn land(&mut self, bytes: u64) {
+        let unbooked = bytes.min(self.unbooked);
+        self.unbooked -= unbooked;
+        self.owed = self.owed.saturating_sub(bytes);
+        self.landed += bytes - unbooked;
+        self.landed_unbooked += unbooked;
+        if self.landed >= SLAB_BYTES {
+            self.settle();
+        }
+    }
+
+    // `bytes` that were owed will not land.
+    fn forgo(&mut self, bytes: u64) {
+        let unbooked = bytes.min(self.unbooked);
+        self.unbooked -= unbooked;
+        self.owed = self.owed.saturating_sub(bytes);
+        if let Some(ledger) = &self.ledger {
+            ledger.release(bytes - unbooked);
+        }
+    }
+
+    // `bytes` more are owed to the device `reader` reads: promised from
+    // what is in hand, or from the ledger while the device has room for
+    // them above `reserve`, with up to a slab more. When it has not, the
+    // job begins to wait for room and gives back all it promised here;
+    // what it owes is promised again when it wakes. A device with no
+    // reading, or only the last good one held across a failed probe, or a
+    // job with no reserve, is not checked: only a good reading begins a
+    // wait.
+    fn book(&mut self, bytes: u64, reader: &CapacityReader, reserve: u64) {
+        if bytes == 0 {
+            return;
+        }
+        self.owed += bytes;
+        if self.waiting.is_some() {
+            self.unbooked += bytes;
+            return;
+        }
+        if bytes <= self.slab {
+            self.slab -= bytes;
+            self.in_hand = self.in_hand.min(self.slab);
+            return;
+        }
+        self.in_hand = 0;
+        let ledger = self.bind(reader);
+        self.settle();
+        let need = bytes - self.slab;
+        let room = checked_room(&ledger, reader, reserve);
+        if need <= room {
+            let extra = SLAB_BYTES.min(room - need);
+            ledger.promise(need + extra);
+            self.slab = extra;
+            return;
+        }
+        self.hold(&ledger, self.owed - bytes);
+    }
+
+    // The job begins to wait: all it promised here is given back, and all
+    // it owes is unbooked until it wakes. `promised` is what of `owed` was
+    // promised.
+    fn hold(&mut self, ledger: &DiskLedger, promised: u64) {
+        ledger.release(self.slab + promised.saturating_sub(self.unbooked));
+        self.slab = 0;
+        self.in_hand = 0;
+        self.unbooked = self.owed;
+        self.waiting = Some(ledger.wait());
+    }
+
+    // A repair would write `bytes` on the device `reader` reads before it
+    // can start. Whether it may: the bytes are then promised in hand for
+    // it. When the device has no room for them above `reserve`, the job
+    // begins to wait, as it does for a write, and the repair waits with it;
+    // what it would write is promised in hand when the job wakes. Each
+    // repair that goes out is promised its own bytes: from what was put in
+    // hand for a held one, else from the ledger, so two cannot go out on
+    // one promise.
+    fn want(&mut self, bytes: u64, reader: &CapacityReader, reserve: u64) -> bool {
+        if self.waiting.is_some() {
+            self.wanted = self.wanted.max(bytes);
+            return false;
+        }
+        if bytes == 0 {
+            return true;
+        }
+        if bytes <= self.in_hand {
+            self.in_hand -= bytes;
+            return true;
+        }
+        let ledger = self.bind(reader);
+        self.settle();
+        let need = bytes - self.in_hand;
+        let room = checked_room(&ledger, reader, reserve);
+        if need <= room {
+            ledger.promise(need);
+            self.slab = self.slab.saturating_add(need);
+            self.in_hand = 0;
+            return true;
+        }
+        self.hold(&ledger, self.owed);
+        self.wanted = bytes;
+        false
+    }
+
+    // What `want` may take from what this holds: given back with
+    // `give_back` should the repair not go out after all.
+    fn taking(&self) -> (u64, u64) {
+        (self.slab, self.in_hand)
+    }
+
+    // A `want` since `taken` is undone: what it promised is given back.
+    fn give_back(&mut self, (slab, in_hand): (u64, u64)) {
+        let promised = self.slab.saturating_sub(slab);
+        if promised > 0
+            && let Some(ledger) = &self.ledger
+        {
+            ledger.release(promised);
+        }
+        self.slab = slab;
+        self.in_hand = in_hand;
+    }
+
+    // A repair that would write `bytes` here waits with the job: if the job
+    // waits here already, for those bytes too; else it begins to, for them.
+    fn wait_for(&mut self, bytes: u64, reader: &CapacityReader) {
+        if self.waiting.is_some() {
+            self.wanted = self.wanted.max(bytes);
+            return;
+        }
+        if bytes == 0 {
+            return;
+        }
+        let ledger = self.bind(reader);
+        self.settle();
+        self.hold(&ledger, self.owed);
+        self.wanted = bytes;
+    }
+
+    // What the device must have room for before the job wakes.
+    fn needed(&self) -> u64 {
+        self.unbooked
+            .saturating_add(self.wanted)
+            .saturating_add(self.again)
+    }
+
+    // The job has room again: all it owes is promised, what a held repair
+    // would write is promised in hand for it, and it no longer waits.
+    fn rebook(&mut self) {
+        let Some(ledger) = &self.ledger else {
+            return;
+        };
+        if self.waiting.take().is_some() {
+            ledger.promise(self.needed());
+            self.slab = self
+                .slab
+                .saturating_add(self.wanted)
+                .saturating_add(self.again);
+            self.in_hand = self.wanted;
+            self.unbooked = 0;
+            self.wanted = 0;
+            self.again = 0;
+            ledger.unwait();
+        }
+    }
+
+    // All that was promised is given back, and the job no longer waits.
+    fn release_all(&mut self) {
+        self.settle();
+        if let Some(ledger) = &self.ledger {
+            ledger.release(self.slab + (self.owed - self.unbooked));
+            if self.waiting.take().is_some() {
+                ledger.unwait();
+            }
+        }
+        self.owed = 0;
+        self.unbooked = 0;
+        self.wanted = 0;
+        self.again = 0;
+        self.slab = 0;
+        self.in_hand = 0;
+    }
+}
+
 impl Caps {
     // The policy is read once here; a read that fails is tried again.
     pub(crate) fn new(
@@ -362,7 +632,8 @@ impl Caps {
             decoding: DecodeClock::default(),
             excused: Duration::ZERO,
             paused: None,
-            debits: [CapacityDebits::default(); 2],
+            spend: [Spend::default(), Spend::default()],
+            rewriting: false,
             extents: BTreeMap::new(),
             written: [0; LEVELS],
             accounts: BTreeMap::new(),
@@ -412,11 +683,7 @@ impl Caps {
         if !produced(tree, node) {
             return Ok(());
         }
-        let spent = self
-            .paused
-            .unwrap_or_else(|| self.decoding.spent())
-            .saturating_sub(self.excused);
-        if spent > Duration::from_secs(self.limits.max_seconds) {
+        if self.deadline_spent() > Duration::from_secs(self.limits.max_seconds) {
             let detail = format!(
                 "extraction exceeded the {} second deadline",
                 self.limits.max_seconds
@@ -426,9 +693,20 @@ impl Caps {
         Ok(())
     }
 
+    // The time counted against the deadline: what the job's decoders
+    // spent, less what they spent while it was paused and what runs thrown
+    // away took.
+    pub(crate) fn deadline_spent(&self) -> Duration {
+        self.paused
+            .unwrap_or_else(|| self.decoding.spent())
+            .saturating_sub(self.excused)
+            .saturating_sub(self.decoding.discarded())
+    }
+
     // The job paused or resumed. What its decoders spend while it is
     // paused is not counted: on resume it is excused.
     pub(crate) fn hold_clock(&mut self, paused: bool) {
+        self.decoding.hold(paused);
         match (paused, self.paused) {
             (true, None) => self.paused = Some(self.decoding.spent()),
             (false, Some(at)) => {
@@ -573,34 +851,54 @@ impl Caps {
     }
 
     // Bytes up to `end` of a member of `node`, which are `output` to the
-    // job, against the reading of the device under `folder`, which `device`
-    // names. Only what an object produced counts, wherever it waits: a
-    // member's file, the envelope of the object that reads the member, or
-    // the holds. A member that becomes a file, or starts to wait, takes what
-    // it holds to its new level.
+    // job, `landing` of them written now, against the device `reader`
+    // reads, which `device` names. Only what an object produced counts,
+    // wherever it waits: a member's file, the envelope of the object that
+    // reads the member, or the holds. A member that becomes a file, or
+    // starts to wait, takes what it holds to its new level.
+    //
+    // What a member grows by is owed to its device until it lands: a file
+    // takes its whole length at its first write and fills as its bytes
+    // land; what waits for an object lands as it is admitted. A write the
+    // device has no room for above the reserve lands all the same, and the
+    // job waits for room: see `Spend::book`.
     pub(crate) fn admit_write(
         &mut self,
         tree: &Tree,
         (node, member): (NodeId, MemberId),
         end: u64,
-        output: Output,
-        (folder, capacity, device): (&Path, Capacity, Device),
+        (output, landing): (Output, u64),
+        (reader, device): (&CapacityReader, Device),
     ) -> Result<(), ExtractionFailure> {
         self.check()?;
         self.extracting(tree, node)?;
         if !produced(tree, node) {
             return Ok(());
         }
-        let (extent, was) = self.extents.get(&(node, member)).copied().unwrap_or((0, 0));
-        let level = match (output, was) {
+        let key = (node, member);
+        let at = level(tree, node, output);
+        let fixed = |output: Output, was: usize| match (output, was) {
             (Output::Kept, 1..) => was,
-            _ => level(tree, node, output),
+            _ => at,
         };
-        let moved = if level == was { 0 } else { extent };
-        let grown = end.saturating_sub(extent);
-        if grown == 0 && moved == 0 {
+        // A write within what the member already took: what it lands is no
+        // longer owed.
+        if let Some(entry) = self.extents.get_mut(&key)
+            && fixed(output, entry.level) == entry.level
+            && end <= entry.end
+        {
+            let landed = landing.min(entry.owed);
+            if landed > 0 {
+                entry.owed -= landed;
+                self.spend[entry.device as usize].land(landed);
+            }
             return Ok(());
         }
+        let entry = self.extents.get(&key).copied();
+        let (extent, was) = entry.map_or((0, 0), |entry| (entry.end, entry.level));
+        let level = fixed(output, was);
+        let moved = if level == was { 0 } else { extent };
+        let grown = end.saturating_sub(extent);
         // Only a file is held to the member limit, at all it holds: one
         // that was waiting brings what it already holds. What waits for an
         // object is held to its level's limit alone.
@@ -626,67 +924,213 @@ impl Caps {
                 return Err(self.breach(reason, detail));
             }
         }
-        self.reserve(grown, (folder, capacity, device))?;
+        // What the member still owes another device is counted as landed
+        // there: it is owed here from now on.
+        let mut owed = 0;
+        if let Some(entry) = entry {
+            match entry.device == device {
+                true => owed = entry.owed,
+                false => owed = self.carry(entry.device, entry.owed, (reader, device)),
+            }
+        }
+        self.book(device, grown, reader);
+        owed += grown;
+        let landed = match output {
+            Output::Kept => grown,
+            Output::File => landing,
+        }
+        .min(owed);
+        owed -= landed;
+        self.spend[device as usize].land(landed);
         self.written[was] = self.written[was].saturating_sub(moved);
         self.written[level] = written;
-        self.extents
-            .insert((node, member), (extent.max(end), level));
+        self.extents.insert(
+            key,
+            Extent {
+                end: reach,
+                level,
+                owed,
+                device,
+            },
+        );
         Ok(())
     }
 
     // Bytes a repair writes into the posts. The posts are under none of the
     // job's limits, but what a repair writes into them takes room on their
-    // disk as any output does, so it is held to the reserve.
+    // disk as any output does, so it is owed to the reserve as any output
+    // is, and counted as landed once admitted.
     pub(crate) fn admit_repaired(
         &mut self,
         bytes: u64,
-        (folder, capacity, device): (&Path, Capacity, Device),
+        (reader, device): (&CapacityReader, Device),
     ) -> Result<(), ExtractionFailure> {
         if bytes == 0 {
             return Ok(());
         }
         self.check()?;
-        self.reserve(bytes, (folder, capacity, device))
-    }
-
-    // How many bytes the device `device` names can take before less than
-    // the reserve is left free, against its latest reading less what was
-    // admitted since. `None` when no reading holds it to the reserve: none
-    // was taken, or the last is stale, and a write is then never refused.
-    pub(crate) fn room(&mut self, (capacity, device): (Capacity, Device)) -> Option<u64> {
-        let reading = self.debits[device as usize].apply(capacity).reading()?;
-        (!reading.stale).then(|| {
-            reading
-                .available_bytes
-                .saturating_sub(self.limits.min_free_bytes)
-        })
-    }
-
-    // `grown` more bytes on the device under `folder`, which `device`
-    // names, against its latest reading less what was admitted since: a
-    // write that would leave less than the reserve free is refused.
-    fn reserve(
-        &mut self,
-        grown: u64,
-        (folder, capacity, device): (&Path, Capacity, Device),
-    ) -> Result<(), ExtractionFailure> {
-        let device = device as usize;
-        if grown > 0
-            && let Some(reading) = self.debits[device].apply(capacity).reading()
-        {
-            let remaining = reading.available_bytes.saturating_sub(grown);
-            if remaining < self.limits.min_free_bytes && !reading.stale {
-                let detail = disk_full(
-                    folder,
-                    reading.available_bytes,
-                    grown,
-                    self.limits.min_free_bytes,
-                );
-                return Err(self.breach(ExtractionRejectionReason::DiskReserve, detail));
-            }
-            self.debits[device].debit(grown);
-        }
+        self.book(device, bytes, reader);
+        self.spend[device as usize].land(bytes);
         Ok(())
+    }
+
+    // A member that owed `owed` bytes to `from` moves to the device `reader`
+    // reads: they are counted as landed on `from`, and owed to the new one,
+    // which is what this returns.
+    fn carry(&mut self, from: Device, owed: u64, (reader, to): (&CapacityReader, Device)) -> u64 {
+        self.spend[from as usize].land(owed);
+        self.book(to, owed, reader);
+        owed
+    }
+
+    // `bytes` more owed to `device`. Should the job begin to wait for room
+    // on it, its writing work is held.
+    fn book(&mut self, device: Device, bytes: u64, reader: &CapacityReader) {
+        self.spend[device as usize].book(bytes, reader, self.limits.min_free_bytes);
+    }
+
+    // A repair would write `output` bytes on the output device and
+    // `working` on the working one before it can start, each read through
+    // its reader: whether it may, on both at once. When either has no room,
+    // nothing stays promised for the repair on the other, and the job waits
+    // for room for its part on each, so one wake judges the two together.
+    pub(crate) fn want_both(
+        &mut self,
+        (output, output_reader): (u64, &CapacityReader),
+        (working, working_reader): (u64, &CapacityReader),
+    ) -> bool {
+        let reserve = self.limits.min_free_bytes;
+        let [first, second] = &mut self.spend;
+        let taken = first.taking();
+        let first_may = first.want(output, output_reader, reserve);
+        if first_may && second.want(working, working_reader, reserve) {
+            return true;
+        }
+        if first_may {
+            first.give_back(taken);
+        }
+        first.wait_for(output, output_reader);
+        second.wait_for(working, working_reader);
+        false
+    }
+
+    // What the job waits for on its repairs' behalf is asked again: each
+    // repair that would still write wants its bytes anew.
+    pub(crate) fn rewant(&mut self) {
+        for spend in &mut self.spend {
+            spend.wanted = 0;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wanted(&self) -> u64 {
+        self.spend.iter().map(|spend| spend.wanted).sum()
+    }
+
+    // The free space every disk the job writes keeps.
+    pub(crate) fn reserve(&self) -> u64 {
+        self.limits.min_free_bytes
+    }
+
+    // Whether the job waits for room on a device: its runs decode nothing
+    // until it has room again.
+    pub(crate) fn disk_held(&self) -> bool {
+        self.spend.iter().any(|spend| spend.waiting.is_some())
+    }
+
+    // The job's place among those waiting for room: the first device it
+    // began to wait on.
+    pub(crate) fn disk_ticket(&self) -> Option<u64> {
+        self.spend.iter().filter_map(|spend| spend.waiting).min()
+    }
+
+    // The job's place on each device it waits on: a wait begun anew takes
+    // a new one.
+    pub(crate) fn disk_tickets(&self) -> [Option<u64>; 2] {
+        [self.spend[0].waiting, self.spend[1].waiting]
+    }
+
+    // A reading came: whether every device the job waits on, `output` read
+    // through `output` and the working one through `working`, has room above
+    // the reserve for all the job owes it. If so, all of it is promised
+    // again and the job no longer waits. One filesystem under both is
+    // judged once, for both together. Only a good reading shows room: a
+    // stale one is the last good one held across a failed probe, and the
+    // job goes on waiting; with no reading at all nothing is checked.
+    pub(crate) fn wake_disk(&mut self, output: &CapacityReader, working: &CapacityReader) -> bool {
+        if !self.disk_held() {
+            return true;
+        }
+        let reserve = self.limits.min_free_bytes;
+        let readers = [output, working];
+        let mut rooms = [None::<(Arc<DiskLedger>, Option<u64>)>, None];
+        let mut good = true;
+        for (index, spend) in self.spend.iter_mut().enumerate() {
+            if spend.waiting.is_none() {
+                continue;
+            }
+            let ledger = spend.bind(readers[index]);
+            spend.settle();
+            let room = match ledger.free_with(|| readers[index].current()) {
+                None => None,
+                Some(free) if free.stale => {
+                    good = false;
+                    Some(0)
+                }
+                Some(free) => Some(free.bytes.saturating_sub(reserve)),
+            };
+            // A disk at or under its reserve wakes no one, though the job
+            // owes it nothing: what it writes next would not fit.
+            good &= room != Some(0);
+            rooms[index] = Some((ledger, room));
+        }
+        let need = |index: usize| self.spend[index].needed();
+        let fits = match (&rooms[0], &rooms[1]) {
+            (Some((one, room)), Some((other, _))) if one.same_disk(other) => {
+                room.is_none_or(|room| need(0).saturating_add(need(1)) <= room)
+            }
+            _ => rooms.iter().enumerate().all(|(index, room)| {
+                room.as_ref()
+                    .is_none_or(|(_, room)| room.is_none_or(|room| need(index) <= room))
+            }),
+        };
+        if !good || !fits {
+            return false;
+        }
+        for spend in &mut self.spend {
+            spend.rebook();
+        }
+        true
+    }
+
+    // Whether the job owes nothing and has nothing to write again.
+    pub(crate) fn owes_nothing(&self) -> bool {
+        self.spend.iter().all(|spend| spend.needed() == 0)
+    }
+
+    // The job waits for room though it owes nothing, has nothing to write
+    // again, and nothing of it is left that would write: it no longer
+    // waits, whatever the disk reads. Whether it waited.
+    pub(crate) fn wake_idle(&mut self) -> bool {
+        let held = self.disk_held();
+        if held && self.owes_nothing() {
+            for spend in &mut self.spend {
+                spend.rebook();
+            }
+        }
+        held && !self.disk_held()
+    }
+
+    // The member's file was closed: what it still owes is counted as
+    // landed. A file closed short keeps holes that never fill, which the
+    // next reading shows the disk without.
+    pub(crate) fn closed(&mut self, node: NodeId, member: MemberId) {
+        if let Some(entry) = self.extents.get_mut(&(node, member))
+            && entry.owed > 0
+        {
+            self.spend[entry.device as usize].land(entry.owed);
+            entry.owed = 0;
+        }
     }
 
     // The member's file was emptied or removed, and its record started
@@ -697,16 +1141,32 @@ impl Caps {
         self.charge(tree, node, member);
     }
 
+    // A run stopped for room takes back what it built, or has done: each
+    // member that goes meanwhile, the run's own or one buried under it, is
+    // written again when the run runs again. The job wakes only when its
+    // device has room for those bytes too, or it would fill the disk, stop
+    // and free them over and over.
+    pub(crate) fn rewriting(&mut self, rewriting: bool) {
+        self.rewriting = rewriting;
+    }
+
     fn unwrite(&mut self, node: NodeId, member: MemberId) {
-        if let Some((extent, level)) = self.extents.remove(&(node, member)) {
-            self.written[level] = self.written[level].saturating_sub(extent);
+        if let Some(entry) = self.extents.remove(&(node, member)) {
+            self.written[entry.level] = self.written[entry.level].saturating_sub(entry.end);
+            let spend = &mut self.spend[entry.device as usize];
+            spend.forgo(entry.owed);
+            if self.rewriting && spend.waiting.is_some() {
+                spend.again = spend.again.saturating_add(entry.end);
+            }
         }
     }
 
     // A member's file as a checkpoint left it, written as far as its
     // namespace's coverage reaches, at the level the tree now says it
-    // counts at.
-    pub(crate) fn restore(&mut self, tree: &Tree, node: NodeId, member: MemberId) {
+    // counts at, on the device it lies on: the output one for a file, and
+    // `kept` for a member that waits. What it has yet to write past that
+    // is owed when it next grows.
+    pub(crate) fn restore(&mut self, tree: &Tree, node: NodeId, member: MemberId, kept: Device) {
         if !produced(tree, node) {
             return;
         }
@@ -717,8 +1177,21 @@ impl Caps {
             .unwrap_or(0);
         self.unwrite(node, member);
         if extent > 0 {
-            let level = level(tree, node, output_of(tree, node, member));
-            self.extents.insert((node, member), (extent, level));
+            let output = output_of(tree, node, member);
+            let level = level(tree, node, output);
+            let device = match output {
+                Output::File => Device::Output,
+                Output::Kept => kept,
+            };
+            self.extents.insert(
+                (node, member),
+                Extent {
+                    end: extent,
+                    level,
+                    owed: 0,
+                    device,
+                },
+            );
             self.written[level] = self.written[level].saturating_add(extent);
         }
     }
@@ -729,7 +1202,7 @@ impl Caps {
     // does. No checkpoint says which names a run before judged, so each
     // waits to be judged again before the job delivers: a refusal here would
     // stop the restore itself, and the job would never be failed for it.
-    pub(crate) fn restore_members(&mut self, tree: &Tree) {
+    pub(crate) fn restore_members(&mut self, tree: &Tree, kept: Device) {
         for node in tree.live() {
             let records: Vec<(MemberId, String)> = tree
                 .namespace(node)
@@ -745,7 +1218,7 @@ impl Caps {
                     self.waiting.push(name);
                 }
                 self.charge(tree, node, member);
-                self.restore(tree, node, member);
+                self.restore(tree, node, member, kept);
             }
         }
     }
@@ -772,18 +1245,14 @@ impl Caps {
     }
 }
 
-// A disk reserve breach as the operator reads it: the disk is out of space,
-// where, and by how much.
-fn disk_full(folder: &Path, free: u64, writing: u64, reserve: u64) -> String {
-    use crate::support::human_bytes;
-    format!(
-        "out of disk space: the disk holding {} has {} free, writing {} more would leave {}, and {} must stay free",
-        folder.display(),
-        human_bytes(free),
-        human_bytes(writing),
-        human_bytes(free.saturating_sub(writing)),
-        human_bytes(reserve),
-    )
+// A job that ends, is cancelled or is dropped gives back all it promised,
+// and no longer waits for room.
+impl Drop for Caps {
+    fn drop(&mut self) {
+        for spend in &mut self.spend {
+            spend.release_all();
+        }
+    }
 }
 
 // Whether a post is recovery data: a recovery object holds it or gave it
@@ -840,4 +1309,272 @@ pub(in crate::pipeline::graph) fn caps_for(
         })
         .collect();
     Caps::new(Arc::clone(extraction_limits), policy, declared)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    use super::*;
+    use crate::operations::disk::{Capacity, CapacityReading};
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn free(available_bytes: u64) -> CapacityReader {
+        CapacityReader::from_fn(move || {
+            Capacity::Known(CapacityReading {
+                available_bytes,
+                total_bytes: u64::MAX,
+                sampled_at: Instant::now(),
+                stale: false,
+            })
+        })
+    }
+
+    // Two repairs due in one walk are each promised their own bytes: the
+    // second does not go out on what the first was promised.
+    #[test]
+    fn each_repair_that_goes_out_is_promised_its_own_bytes() {
+        let reader = free(10 * 1024 * MIB);
+        let mut spend = Spend::default();
+        assert!(spend.want(100 * MIB, &reader, MIB));
+        assert!(spend.want(50 * MIB, &reader, MIB));
+        assert_eq!(reader.ledger().promised(), 150 * MIB);
+    }
+
+    // A repair held while the job waited is promised in hand when it wakes,
+    // and takes that promise when it goes out; another is promised afresh.
+    #[test]
+    fn a_held_repair_takes_what_was_put_in_hand_for_it_and_no_more() {
+        let short = Arc::new(std::sync::atomic::AtomicU64::new(10 * MIB));
+        let reader = {
+            let short = Arc::clone(&short);
+            CapacityReader::from_fn(move || {
+                Capacity::Known(CapacityReading {
+                    available_bytes: short.load(Ordering::SeqCst),
+                    total_bytes: u64::MAX,
+                    sampled_at: Instant::now(),
+                    stale: false,
+                })
+            })
+        };
+        let mut spend = Spend::default();
+        assert!(
+            !spend.want(100 * MIB, &reader, MIB),
+            "no room: the job waits"
+        );
+        assert_eq!(reader.ledger().promised(), 0);
+        short.store(10 * 1024 * MIB, Ordering::SeqCst);
+        spend.rebook();
+        assert_eq!(reader.ledger().promised(), 100 * MIB, "promised in hand");
+        assert!(spend.want(100 * MIB, &reader, MIB));
+        assert_eq!(reader.ledger().promised(), 100 * MIB, "taken from hand");
+        assert!(spend.want(30 * MIB, &reader, MIB));
+        assert_eq!(reader.ledger().promised(), 130 * MIB, "the next is its own");
+    }
+
+    // A member that moves to another device brings what it still owes: it
+    // is promised on the new device, where it lands from now on.
+    #[test]
+    fn a_member_that_moves_device_is_owed_on_the_new_one() {
+        let (output, working) = (free(10 * 1024 * MIB), free(10 * 1024 * MIB));
+        let mut caps = Caps::unbounded();
+        caps.book(Device::Output, 10 * MIB, &output);
+        let owed = caps.carry(Device::Output, 10 * MIB, (&working, Device::Working));
+        assert_eq!(owed, 10 * MIB);
+        assert_eq!(caps.spend[Device::Working as usize].owed, 10 * MIB);
+        assert_eq!(caps.spend[Device::Output as usize].owed, 0);
+        assert!(working.ledger().promised() >= 10 * MIB);
+    }
+
+    // A member taken back while the job waits, by a run stopped for room,
+    // is written again once the run goes on: the job wakes only when the
+    // disk has room for it as well as for what it owes, and what it is
+    // promised then covers both, so the run that writes it again does not
+    // fill the disk and stop once more.
+    #[test]
+    fn a_member_retracted_while_the_job_waits_is_room_the_job_needs_to_wake() {
+        let available = Arc::new(std::sync::atomic::AtomicU64::new(10 * MIB));
+        let working = {
+            let available = Arc::clone(&available);
+            CapacityReader::from_fn(move || {
+                Capacity::Known(CapacityReading {
+                    available_bytes: available.load(Ordering::SeqCst),
+                    total_bytes: u64::MAX,
+                    sampled_at: Instant::now(),
+                    stale: false,
+                })
+            })
+        };
+        let output = free(10 * 1024 * MIB);
+        let mut caps = Caps::unbounded();
+        Arc::make_mut(&mut caps.limits).min_free_bytes = MIB;
+        let member = (NodeId(1), MemberId(0));
+        caps.extents.insert(
+            member,
+            Extent {
+                end: 40 * MIB,
+                level: 0,
+                owed: 0,
+                device: Device::Working,
+            },
+        );
+        caps.written[0] = 40 * MIB;
+        caps.book(Device::Working, 100 * MIB, &working);
+        assert!(caps.disk_held(), "no room for what it owes: the job waits");
+
+        caps.rewriting(true);
+        caps.forget(&Tree::new(), member.0, member.1);
+        caps.rewriting(false);
+        available.store(MIB + 120 * MIB, Ordering::SeqCst);
+        assert!(
+            !caps.wake_disk(&output, &working),
+            "room for what it owes, not for the member it writes again"
+        );
+        available.store(MIB + 140 * MIB, Ordering::SeqCst);
+        assert!(caps.wake_disk(&output, &working));
+        assert_eq!(working.ledger().promised(), 140 * MIB);
+        caps.book(Device::Working, 40 * MIB, &working);
+        assert!(!caps.disk_held());
+        assert_eq!(
+            working.ledger().promised(),
+            140 * MIB,
+            "the member written again spends what was promised for it"
+        );
+    }
+
+    fn reading(available: &Arc<AtomicU64>, stale: bool) -> CapacityReader {
+        let available = Arc::clone(available);
+        CapacityReader::from_fn(move || {
+            Capacity::Known(CapacityReading {
+                available_bytes: available.load(Ordering::SeqCst),
+                total_bytes: u64::MAX,
+                sampled_at: Instant::now(),
+                stale,
+            })
+        })
+    }
+
+    fn member(caps: &mut Caps, member: (NodeId, MemberId), end: u64, device: Device) {
+        caps.extents.insert(
+            member,
+            Extent {
+                end,
+                level: 0,
+                owed: 0,
+                device,
+            },
+        );
+        caps.written[0] += end;
+    }
+
+    // Every member that goes while a run stopped for room takes back what
+    // it built is written again, the run's own and those buried under them
+    // alike; one that goes for any other reason while the job waits is not,
+    // and asks for no room.
+    #[test]
+    fn only_what_a_stopped_run_takes_back_is_room_the_job_needs_again() {
+        let available = Arc::new(AtomicU64::new(10 * MIB));
+        let working = reading(&available, false);
+        let output = free(10 * 1024 * MIB);
+        let mut caps = Caps::unbounded();
+        Arc::make_mut(&mut caps.limits).min_free_bytes = MIB;
+        let (own, buried, refused) = (
+            (NodeId(1), MemberId(0)),
+            (NodeId(2), MemberId(0)),
+            (NodeId(3), MemberId(0)),
+        );
+        member(&mut caps, own, 30 * MIB, Device::Working);
+        member(&mut caps, buried, 20 * MIB, Device::Working);
+        member(&mut caps, refused, 70 * MIB, Device::Working);
+        caps.book(Device::Working, 100 * MIB, &working);
+        assert!(caps.disk_held());
+
+        caps.forget(&Tree::new(), refused.0, refused.1);
+        caps.rewriting(true);
+        caps.forget(&Tree::new(), own.0, own.1);
+        caps.forget(&Tree::new(), buried.0, buried.1);
+        caps.rewriting(false);
+        available.store(MIB + 149 * MIB, Ordering::SeqCst);
+        assert!(
+            !caps.wake_disk(&output, &working),
+            "a byte short of what it owes and both members it writes again"
+        );
+        available.store(MIB + 150 * MIB, Ordering::SeqCst);
+        assert!(caps.wake_disk(&output, &working));
+        assert_eq!(working.ledger().promised(), 150 * MIB);
+    }
+
+    // A job that waits, owes nothing and has nothing to write again wakes
+    // idle whatever the reading: holding it would hold back nothing that
+    // takes room. A reading under the reserve still wakes no one.
+    #[test]
+    fn a_job_that_owes_nothing_wakes_idle_whatever_the_reading() {
+        let available = Arc::new(AtomicU64::new(0));
+        let working = reading(&available, false);
+        let output = free(10 * 1024 * MIB);
+        let mut caps = Caps::unbounded();
+        Arc::make_mut(&mut caps.limits).min_free_bytes = 5 * 1024 * MIB;
+        let file = (NodeId(1), MemberId(0));
+        member(&mut caps, file, 0, Device::Working);
+        caps.extents.get_mut(&file).unwrap().owed = 40 * MIB;
+        caps.book(Device::Working, 40 * MIB, &working);
+        assert!(caps.disk_held(), "the disk is under its reserve");
+        assert!(
+            !caps.wake_disk(&output, &working),
+            "it still owes what it took"
+        );
+        assert!(!caps.wake_idle(), "nor does it wake idle");
+        caps.closed(file.0, file.1);
+        assert!(caps.owes_nothing());
+        assert!(
+            !caps.wake_disk(&output, &working),
+            "the disk is still under its reserve"
+        );
+        assert!(caps.wake_idle(), "it owes nothing now");
+        assert!(!caps.disk_held());
+        assert_eq!(working.ledger().promised(), 0);
+    }
+
+    // A stale reading is the last good one held across a failed probe: it
+    // begins no wait, as no reading begins none.
+    #[test]
+    fn a_stale_reading_begins_no_wait() {
+        let available = Arc::new(AtomicU64::new(0));
+        let stale = reading(&available, true);
+        let mut caps = Caps::unbounded();
+        Arc::make_mut(&mut caps.limits).min_free_bytes = MIB;
+        caps.book(Device::Output, 100 * MIB, &stale);
+        assert!(!caps.disk_held());
+        assert!(caps.want_both((10 * MIB, &stale), (10 * MIB, &stale)));
+        assert!(!caps.disk_held());
+    }
+
+    // A repair that writes on both devices goes out on both or on neither:
+    // when the second has no room, nothing stays promised on the first, and
+    // the job waits for its part on each.
+    #[test]
+    fn a_repair_held_on_one_device_holds_no_room_on_the_other() {
+        let roomy = free(10 * 1024 * MIB);
+        let available = Arc::new(AtomicU64::new(10 * MIB));
+        let short = reading(&available, false);
+        let mut caps = Caps::unbounded();
+        Arc::make_mut(&mut caps.limits).min_free_bytes = MIB;
+        assert!(!caps.want_both((100 * MIB, &roomy), (100 * MIB, &short)));
+        assert_eq!(roomy.ledger().promised(), 0, "nothing kept on the first");
+        assert_eq!(short.ledger().promised(), 0);
+        assert!(caps.disk_held());
+        available.store(MIB + 100 * MIB, Ordering::SeqCst);
+        assert!(caps.wake_disk(&roomy, &short));
+        assert_eq!(roomy.ledger().promised(), 100 * MIB);
+        assert_eq!(short.ledger().promised(), 100 * MIB);
+        assert!(caps.want_both((100 * MIB, &roomy), (100 * MIB, &short)));
+        assert_eq!(
+            roomy.ledger().promised(),
+            100 * MIB,
+            "the repair takes what was put in hand on the first"
+        );
+        assert_eq!(short.ledger().promised(), 100 * MIB, "and on the second");
+    }
 }

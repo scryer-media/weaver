@@ -18,14 +18,21 @@ use std::collections::{BTreeSet, HashSet};
 use bytes::Bytes;
 use weaver_graph::recovery::{Recovery, RepairOutcome, SetRuling};
 use weaver_graph::{
-    Algorithm, Builder, ByteRange, Effect, Handed, Kind, MemberId, NodeId, Provenance,
+    Algorithm, Builder, ByteRange, Effect, Handed, Kind, MemberId, Namespace, NodeId, Provenance,
     RecoveryKind, Restore, Segment, Tree, VolumeIndex,
 };
 
 use super::{
-    Acknowledging, Arrival, Loan, NamespaceWriter, READ_BACK, Returned, Segments, Write,
-    WriteError, in_own_file, index,
+    Acknowledging, Arrival, HeldWant, Loan, NamespaceWriter, READ_BACK, Returned, Segments, Write,
+    WriteError, absent_from_posts, in_own_file, index,
 };
+
+// How many times a job waiting for room asked again what its due sets
+// would rebuild.
+#[cfg(test)]
+thread_local! {
+    pub(super) static HELD_RECHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 // Who a due set's repair is lent to, to run off the loop. One goes out at a
 // time, under a repair slot; its return comes back to `returned`.
@@ -605,8 +612,13 @@ impl NamespaceWriter {
     // and its verdict stands. Each goes out of the tree with what its reads
     // reach, so it repairs off the loop while the tree goes on; a due check
     // meanwhile finds it out and does not take it again. A PAR3 set over
-    // the posts goes without the files that never arrived the disk has no
-    // room to rebuild.
+    // the posts goes without the files that never arrived a disk of its
+    // size could never hold, and waits, with the job, until the disks have
+    // room for the rest. While the job waits for room no repair goes out,
+    // and what the job waits for on the sets' behalf follows what they
+    // would write now: a file that arrived since is no longer theirs to
+    // rebuild, and a set no longer due wants nothing. That is asked again
+    // only once something it rests on changed, not on every walk.
     pub(super) fn repair(
         &mut self,
         tree: &mut Tree,
@@ -614,13 +626,43 @@ impl NamespaceWriter {
         due: &[NodeId],
         lender: &mut dyn Lender,
     ) -> Result<(), WriteError> {
+        if node == NodeId::ROOT {
+            if !self.caps.disk_held() {
+                self.held_want = None;
+            } else {
+                if !self.held_want_stands(tree, due) {
+                    #[cfg(test)]
+                    HELD_RECHECKS.with(|rechecks| rechecks.set(rechecks.get() + 1));
+                    self.caps.rewant();
+                    let mut absent = BTreeSet::new();
+                    for &set in due {
+                        let _ = self.withheld(tree, set, Some(&mut absent));
+                    }
+                    self.held_want = Some(HeldWant {
+                        due: due.to_vec(),
+                        tickets: self.caps.disk_tickets(),
+                        sizes: self.disk_sizes(),
+                        at: tree
+                            .namespace(NodeId::ROOT)
+                            .map_or(0, Namespace::generation),
+                        absent,
+                    });
+                }
+                return Ok(());
+            }
+        }
         for &set in due {
-            if !lender.admit() {
+            // A repair writes what it rebuilds: none goes out while the job
+            // waits for room.
+            if self.caps.disk_held() || !lender.admit() {
                 break;
             }
             let withheld = match node == NodeId::ROOT {
-                true => self.withheld(tree, set),
-                false => BTreeSet::new(),
+                true => self.withheld(tree, set, None),
+                false => Some(BTreeSet::new()),
+            };
+            let Some(withheld) = withheld else {
+                continue;
             };
             if let Some(mut loan) = self.lend(tree, node, set)? {
                 loan.withhold(withheld);
@@ -628,6 +670,44 @@ impl NamespaceWriter {
             }
         }
         Ok(())
+    }
+
+    // Whether what the job waiting for room last found its due sets would
+    // rebuild still holds: the same sets, the same wait, the same disks,
+    // and no file of the posts marked since has come to arrive, been lost,
+    // or come to be wanted. Only the files marked since are looked at.
+    fn held_want_stands(&mut self, tree: &Tree, due: &[NodeId]) -> bool {
+        let tickets = self.caps.disk_tickets();
+        let sizes = self.disk_sizes();
+        let Some(held) = self.held_want.as_mut() else {
+            return false;
+        };
+        if held.due != due || held.tickets != tickets || held.sizes != sizes {
+            return false;
+        }
+        let Some(posts) = tree.namespace(NodeId::ROOT) else {
+            return false;
+        };
+        let at = posts.generation();
+        if at == held.at {
+            return true;
+        }
+        let stands = posts.changed_since(held.at).all(|member| {
+            let absent = posts.get(member).is_some_and(|record| {
+                absent_from_posts(record)
+                    && due.iter().any(|&set| {
+                        tree.kind(set) == Some(Kind::Par3)
+                            && tree
+                                .recovery(set)
+                                .is_some_and(|recovery| recovery.covers(member))
+                    })
+            });
+            absent == held.absent.contains(&member)
+        });
+        if stands {
+            held.at = at;
+        }
+        stands
     }
 
     // A lent repair came back. The object takes its node again and hears
@@ -1289,7 +1369,7 @@ impl NamespaceWriter {
                 .get(&node)
                 .is_some_and(|files| files.leaves.contains_key(member));
             if let Some(length) = length.filter(|_| has_file) {
-                self.admit_file(tree, node, *member, length)?;
+                self.admit_file(tree, node, *member, length, 0)?;
                 if let Some(leaf) = self
                     .files
                     .get_mut(&node)

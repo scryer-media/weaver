@@ -642,6 +642,259 @@ async fn a_run_starved_of_memory_spends_nothing() {
     assert_eq!(clock.spent(), Duration::ZERO);
 }
 
+// A run that says one thing each time it is told to, and tells whether it
+// may still speak, until it is told no more.
+struct Speaks {
+    speak: std::sync::mpsc::Receiver<()>,
+    spoke: std::sync::mpsc::Sender<bool>,
+}
+
+impl Extraction for Speaks {
+    fn run(self: Box<Self>, _: Arc<dyn Volumes>, sink: &mut Sink<'_>, _: weaver_graph::Budget) {
+        while self.speak.recv().is_ok() {
+            let _ = self.spoke.send(sink(weaver_graph::Emit::Pending));
+        }
+    }
+}
+
+// A run its job parks, as it wrote while the job waited for room on a disk,
+// stops: nothing it says from there is heard, its thread returns, and once
+// it ended it holds no slot and no memory, which go to the run waiting
+// behind it. It spends nothing of the job's deadline while it waits, and
+// runs again, from the start, once a slot comes back to it.
+#[tokio::test(start_paused = true)]
+async fn a_parked_run_gives_back_its_slot_and_memory_and_runs_again() {
+    use crate::pipeline::graph::decoding::DecodeClock;
+    use std::time::Duration;
+
+    const WINDOW: u64 = 1 << 20;
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let mut mail = RunMail::default();
+    let clock = DecodeClock::default();
+    let mut runs =
+        Runs::new(1, 1, mail.sender(), bounded(WINDOW + RUN_OVERHEAD)).timed(clock.clone());
+    let (node, other) = (NodeId(1), NodeId(2));
+    assert_eq!(runs.ask(node, 1), vec![node]);
+    assert!(
+        runs.ask(other, 1).is_empty(),
+        "the other waits for the slot"
+    );
+    assert_eq!(runs.reserve(node, WINDOW), Reservation::Granted);
+    let (tell, speak) = std::sync::mpsc::channel();
+    let (spoke, heard) = std::sync::mpsc::channel();
+    runs.start(
+        node,
+        Box::new(Speaks { speak, spoke }),
+        envelopes.shelf(node),
+    );
+
+    tell.send(()).unwrap();
+    assert!(heard.recv().unwrap(), "before it is parked it speaks");
+    let said = mail.recv().await.unwrap();
+    assert!(matches!(
+        said.heard,
+        Heard::Emit(weaver_graph::Emit::Pending)
+    ));
+    runs.park(node);
+    assert!(runs.parked(node));
+    tell.send(()).unwrap();
+    assert!(!heard.recv().unwrap(), "parked, it says nothing");
+    drop(tell);
+    let said = mail.recv().await.unwrap();
+    assert!(
+        matches!(said.heard, Heard::Ended),
+        "nothing it said once parked was sent: its end comes next"
+    );
+    assert!(runs.parked(node));
+    assert_eq!(runs.ended(node, said.generation, 1), vec![other]);
+    assert!(!runs.parked(node));
+    assert_eq!(runs.holding(), vec![other], "its slot went to the other");
+    assert_eq!(runs.reserved(node), 0, "its memory was given back");
+    assert!(runs.reading(node), "it waits to run again");
+    assert_eq!(
+        runs.reserve(other, WINDOW),
+        Reservation::Granted,
+        "the memory it gave back is the other's to take"
+    );
+    tokio::time::advance(Duration::from_secs(100)).await;
+    assert_eq!(clock.spent(), Duration::ZERO, "waiting spends nothing");
+
+    runs.start(other, Box::new(Quiet), envelopes.shelf(other));
+    let said = mail.recv().await.unwrap();
+    assert_eq!(said.node, other);
+    assert_eq!(
+        runs.ended(other, said.generation, 1),
+        vec![node],
+        "the slot comes back to it"
+    );
+    assert_eq!(runs.reserve(node, WINDOW), Reservation::Granted);
+    let (tell, speak) = std::sync::mpsc::channel();
+    let (spoke, heard) = std::sync::mpsc::channel();
+    runs.start(
+        node,
+        Box::new(Speaks { speak, spoke }),
+        envelopes.shelf(node),
+    );
+    tell.send(()).unwrap();
+    assert!(heard.recv().unwrap(), "run again, it speaks");
+    let said = mail.recv().await.unwrap();
+    assert!(matches!(
+        said.heard,
+        Heard::Emit(weaver_graph::Emit::Pending)
+    ));
+    drop(tell);
+    let said = mail.recv().await.unwrap();
+    assert!(matches!(said.heard, Heard::Ended));
+    assert!(runs.ended(node, said.generation, 1).is_empty());
+    assert!(!runs.live());
+}
+
+// `count` runs of nodes from 1 on, each executing once it spoke once, and
+// the sender each speaks on.
+async fn speaking(
+    runs: &mut Runs,
+    mail: &mut RunMail,
+    envelopes: &mut Envelopes,
+    count: u32,
+    window: u64,
+) -> Vec<(NodeId, std::sync::mpsc::Sender<()>)> {
+    let mut started = Vec::new();
+    for index in 1..=count {
+        let node = NodeId(index);
+        assert_eq!(runs.ask(node, count as usize), vec![node]);
+        assert_eq!(runs.reserve(node, window), Reservation::Granted);
+        let (tell, speak) = std::sync::mpsc::channel();
+        let (spoke, heard) = std::sync::mpsc::channel();
+        runs.start(
+            node,
+            Box::new(Speaks { speak, spoke }),
+            envelopes.shelf(node),
+        );
+        tell.send(()).unwrap();
+        assert!(heard.recv().unwrap());
+        let said = mail.recv().await.unwrap();
+        assert!(matches!(said.heard, Heard::Emit(_)));
+        // It goes on executing, the whole of what it said heard.
+        drop(heard);
+        started.push((node, tell));
+    }
+    started
+}
+
+// The node's run ends, as its job hears it.
+async fn ends(runs: &mut Runs, mail: &mut RunMail, tell: std::sync::mpsc::Sender<()>) {
+    drop(tell);
+    let said = mail.recv().await.unwrap();
+    assert!(matches!(said.heard, Heard::Ended));
+    runs.ended(said.node, said.generation, 0);
+}
+
+// Runs thrown away for room give back the part of the job's decoding clock
+// they took, and only that: eight runs at once for ten minutes, all parked,
+// give back the ten minutes, not eighty, so nothing is left over to carry
+// into what decodes after. A run parked beside one that goes on gives back
+// its half; the one that goes on is under the deadline for the rest. Time
+// a pause excused is not given back again by the run that executed in it.
+#[tokio::test(start_paused = true)]
+async fn parked_runs_give_back_their_part_of_the_deadline_and_no_more() {
+    use crate::pipeline::extraction::ExtractionLimits;
+    use crate::pipeline::graph::limits::{Caps, known_policy};
+    use std::time::Duration;
+
+    const WINDOW: u64 = 1 << 20;
+    const MINUTE: Duration = Duration::from_secs(60);
+    let limits = Arc::new(ExtractionLimits {
+        max_job_bytes: u64::MAX,
+        max_member_bytes: u64::MAX,
+        max_entries: u64::MAX,
+        max_ratio: u64::MAX,
+        ratio_floor_bytes: u64::MAX,
+        max_seconds: 15 * 60,
+        min_free_bytes: 0,
+        max_memory_bytes: u64::MAX,
+    });
+    let fresh = || {
+        let caps = Caps::new(
+            Arc::clone(&limits),
+            known_policy(crate::post_processing::model::PostProcessingSettings::default()),
+            Vec::new(),
+        );
+        let mail = RunMail::default();
+        let runs = Runs::new(1, 8, mail.sender(), bounded(8 * (WINDOW + RUN_OVERHEAD)))
+            .timed(caps.decode_clock());
+        (caps, mail, runs)
+    };
+    let dir = tempfile::tempdir().unwrap();
+
+    // Eight at once, all parked.
+    let (caps, mut mail, mut runs) = fresh();
+    let mut envelopes = Envelopes::new(dir.path().join("eight"));
+    let started = speaking(&mut runs, &mut mail, &mut envelopes, 8, WINDOW).await;
+    tokio::time::advance(10 * MINUTE).await;
+    for (node, _) in &started {
+        runs.park(*node);
+    }
+    for (_, tell) in started {
+        ends(&mut runs, &mut mail, tell).await;
+    }
+    let clock = caps.decode_clock();
+    assert_eq!(clock.spent(), 10 * MINUTE);
+    assert_eq!(clock.discarded(), 10 * MINUTE, "ten minutes, not eighty");
+    assert_eq!(caps.deadline_spent(), Duration::ZERO);
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 8, mail.sender(), bounded(8 * (WINDOW + RUN_OVERHEAD)))
+        .timed(caps.decode_clock());
+    let mut envelopes = Envelopes::new(dir.path().join("after"));
+    let (_, last) = speaking(&mut runs, &mut mail, &mut envelopes, 1, WINDOW)
+        .await
+        .pop()
+        .unwrap();
+    tokio::time::advance(5 * MINUTE).await;
+    ends(&mut runs, &mut mail, last).await;
+    assert_eq!(
+        caps.deadline_spent(),
+        5 * MINUTE,
+        "nothing given back is left over for the run after"
+    );
+
+    // Two at once, one parked.
+    let (caps, mut mail, mut runs) = fresh();
+    let mut envelopes = Envelopes::new(dir.path().join("two"));
+    let mut started = speaking(&mut runs, &mut mail, &mut envelopes, 2, WINDOW).await;
+    tokio::time::advance(10 * MINUTE).await;
+    let (kept, going_on) = started.pop().unwrap();
+    let (parked, stopped) = started.pop().unwrap();
+    runs.park(parked);
+    ends(&mut runs, &mut mail, stopped).await;
+    assert_eq!(caps.decode_clock().discarded(), 5 * MINUTE);
+    assert_eq!(caps.deadline_spent(), 5 * MINUTE);
+    assert!(runs.has(kept));
+    ends(&mut runs, &mut mail, going_on).await;
+
+    // One parked after a pause it executed through.
+    let (mut caps, mut mail, mut runs) = fresh();
+    let mut envelopes = Envelopes::new(dir.path().join("paused"));
+    let (node, tell) = speaking(&mut runs, &mut mail, &mut envelopes, 1, WINDOW)
+        .await
+        .pop()
+        .unwrap();
+    tokio::time::advance(2 * MINUTE).await;
+    caps.hold_clock(true);
+    tokio::time::advance(5 * MINUTE).await;
+    caps.hold_clock(false);
+    tokio::time::advance(MINUTE).await;
+    runs.park(node);
+    ends(&mut runs, &mut mail, tell).await;
+    assert_eq!(caps.decode_clock().spent(), 8 * MINUTE);
+    assert_eq!(
+        caps.decode_clock().discarded(),
+        3 * MINUTE,
+        "the pause's five minutes are not given back again"
+    );
+    assert_eq!(caps.deadline_spent(), Duration::ZERO);
+}
+
 // A run stopped as the job goes down keeps the generation it ran under, so
 // no run starts on its node under that generation again: what its thread
 // says once stopped, its end included, is not heard as any run's. It gives
@@ -1540,6 +1793,49 @@ async fn a_run_widened_above_the_ceiling_is_held_to_it_once_the_policy_fails() {
     assert!(!runs.widen(node, None, Some(WIDE)), "nothing wider to give");
     let said = mail.recv().await.unwrap();
     runs.ended(node, said.generation, 1);
+    assert_eq!(pool.room().reserved, 0);
+}
+
+// A run widened while its job waits for room is parked as well: as it ends
+// it gives back its slot and its memory under the job's limit of none,
+// rather than start again under the slot it held, and once the job has
+// room it starts again at the wider window.
+#[tokio::test]
+async fn a_run_widened_while_its_job_waits_for_room_gives_back_its_slot() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut envelopes = Envelopes::new(dir.path().to_path_buf());
+    let pool = profile_pool();
+    let mut mail = RunMail::default();
+    let mut runs = Runs::new(1, 1, mail.sender(), Arc::clone(&pool))
+        .on(over_limit(crate::runtime::OverLimit::ScratchThenFail));
+    let node = NodeId(1);
+    assert_eq!(runs.ask(node, 1), vec![node]);
+    assert_eq!(runs.reserve(node, 1 << 10), Reservation::Granted);
+    runs.start(node, Box::new(Quiet), envelopes.shelf(node));
+    assert!(runs.widen(node, Some(1 << 19), None));
+    runs.park(node);
+    let said = mail.recv().await.unwrap();
+    assert!(runs.parked(node));
+    assert!(
+        runs.ended(node, said.generation, 0).is_empty(),
+        "it does not start"
+    );
+    assert!(runs.holding().is_empty(), "its slot was given back");
+    assert_eq!(pool.room().reserved, 0, "and its memory");
+    assert!(runs.reading(node), "it waits to run again");
+    assert!(runs.live());
+
+    assert_eq!(runs.ask(node, 1), vec![node], "the job has room again");
+    assert_eq!(runs.reserve(node, 1 << 10), Reservation::Granted);
+    assert_eq!(
+        runs.reserved(node),
+        (1 << 19) + RUN_OVERHEAD,
+        "at the wider window"
+    );
+    runs.start(node, Box::new(Quiet), envelopes.shelf(node));
+    let said = mail.recv().await.unwrap();
+    runs.ended(node, said.generation, 1);
+    assert!(!runs.live());
     assert_eq!(pool.room().reserved, 0);
 }
 

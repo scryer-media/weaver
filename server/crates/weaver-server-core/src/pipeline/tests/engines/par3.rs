@@ -723,11 +723,19 @@ async fn a_file_a_par3_set_describes_and_the_post_withholds_is_rebuilt() {
     assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 2 }], 2);
 }
 
-// Every disk the job reads at `RESERVE` and `room` bytes over it, the
-// job held to keep `RESERVE` free.
-fn disk_with_room(posts: Vec<Post>, room: u64) -> Scenario {
+// Every disk the job reads at `RESERVE` and `room` bytes over it on its
+// first reading, and `then` bytes over it on every reading after, the job
+// held to keep `RESERVE` free. A reading after the first is one a job
+// waiting for room asked for; `readings` counts them all.
+fn disk_with_room(
+    posts: Vec<Post>,
+    room: u64,
+    then: u64,
+    readings: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+) -> Scenario {
     use std::path::Path;
     use std::sync::Arc;
+    use std::sync::atomic::Ordering;
 
     use crate::operations::{DiskSpace, StorageCapacity, StorageRoot};
 
@@ -743,10 +751,17 @@ fn disk_with_room(posts: Vec<Post>, room: u64) -> Scenario {
                 pipeline.intermediate_dir.clone(),
                 pipeline.complete_dir.clone(),
             ];
+            let first = roots.len();
+            let readings = Arc::clone(&readings);
             let probe = Arc::new(move |_: &Path| {
+                let over = if readings.fetch_add(1, Ordering::AcqRel) < first {
+                    room
+                } else {
+                    then
+                };
                 Ok(DiskSpace {
                     total_bytes: RESERVE * 8,
-                    available_bytes: RESERVE + room,
+                    available_bytes: RESERVE + over,
                 })
             });
             let capacity = StorageCapacity::with_probe(roots, NEVER, probe);
@@ -760,12 +775,16 @@ fn disk_with_room(posts: Vec<Post>, room: u64) -> Scenario {
 // `beacon.mkv` is described by the set and never posted, and `lantern.mkv`
 // arrives with an article damaged; the set holds blocks enough for both.
 // With room on the disk for `beacon.mkv` the set rebuilds it and repairs
-// `lantern.mkv`, and the job completes. Without room, the set goes out
-// without it: it repairs `lantern.mkv`, writes nothing of `beacon.mkv`, and
-// says it could not repair what it covers; it is not run again, and the job
-// ends Partial with `lantern.mkv` delivered whole.
+// `lantern.mkv`, and the job completes. On a disk with no room over its
+// reserve the job fails nothing: it waits and asks for a reading, and once
+// one shows room it goes on, rebuilds `beacon.mkv`, repairs `lantern.mkv`
+// and completes the same.
 #[tokio::test]
-async fn a_never_posted_file_the_disk_has_no_room_for_is_withheld_and_the_job_ends_partial() {
+async fn a_job_on_a_disk_with_no_room_waits_and_completes_once_a_reading_shows_room() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const PLENTY: u64 = 1 << 30;
     let lantern = payload(3 * ARTICLE, 85);
     let beacon = payload(2 * ARTICLE, 86);
     let posts = || {
@@ -778,48 +797,28 @@ async fn a_never_posted_file_the_disk_has_no_room_for_is_withheld_and_the_job_en
         posts
     };
 
-    let room = disk_with_room(posts(), beacon.len() as u64).damaged(0, 1);
+    let readings = Arc::new(AtomicUsize::new(0));
+    let room = disk_with_room(posts(), PLENTY, PLENTY, Arc::clone(&readings)).damaged(0, 1);
     let graph = run(&room).await;
     assert_delivers(
         &graph,
         &[("lantern.mkv", &lantern), ("beacon.mkv", &beacon)],
     );
     assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 3 }], 3);
+    assert_eq!(readings.load(Ordering::Acquire), 3, "no job waited");
 
-    let short = disk_with_room(posts(), beacon.len() as u64 - 1).damaged(0, 1);
+    let readings = Arc::new(AtomicUsize::new(0));
+    let short = disk_with_room(posts(), 0, PLENTY, Arc::clone(&readings)).damaged(0, 1);
     let graph = run(&short).await;
-    assert_eq!(
-        graph.status,
-        Some(JobStatus::Partial),
-        "{:?} {:?} {:?} {:?}",
-        graph.failure,
-        repair_and_terminal_events(&graph),
-        graph.claims,
-        graph.files.keys().collect::<Vec<_>>()
-    );
-    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
     assert!(
-        graph.files[&delivered("lantern.mkv")] == lantern,
-        "{:?}",
-        graph.files.keys()
+        readings.load(Ordering::Acquire) > 3,
+        "the job waited and asked for a reading"
     );
-    for files in [&graph.files, &graph.retained_files] {
-        assert!(
-            !files.keys().any(|name| name.ends_with("beacon.mkv")),
-            "{:?}",
-            files.keys()
-        );
-    }
-    let outcomes = &graph.graph().outcomes;
-    assert!(
-        matches!(
-            outcomes.as_slice(),
-            [Some(RepairOutcome::Impossible { .. })]
-        ),
-        "{outcomes:?}"
+    assert_delivers(
+        &graph,
+        &[("lantern.mkv", &lantern), ("beacon.mkv", &beacon)],
     );
-    // No repair is announced, and the job ends once.
-    assert_eq!(repair_and_terminal_events(&graph), ["JobCompleted"]);
+    assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 3 }], 3);
 }
 
 // A set written under FFT Reed-Solomon, one cohort, two adjacent articles

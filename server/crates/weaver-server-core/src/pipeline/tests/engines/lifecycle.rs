@@ -40,7 +40,7 @@ fn ended(pipeline: &Pipeline, job: JobId) -> bool {
 // Plays the server for `job` and runs its completion gate, a run's mail and
 // the moves it starts, as the orchestrator does, until `until` holds or the
 // job has ended. A round that changes nothing twice over is a stall.
-async fn drive(
+pub(super) async fn drive(
     pipeline: &mut Pipeline,
     scenario: &Scenario,
     job: JobId,

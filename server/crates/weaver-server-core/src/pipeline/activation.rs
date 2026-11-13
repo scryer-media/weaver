@@ -508,6 +508,8 @@ impl Pipeline {
     // that serve jobs, until the last of its mail is heard.
     pub(in crate::pipeline) fn retire_graph_job(&mut self, job_id: JobId) {
         self.forget_graph_repair(job_id);
+        self.disk_waiting.remove(&job_id);
+        self.disk_idle.remove(&job_id);
         let Some(mut graph) = self.graph_jobs.remove(&job_id) else {
             return;
         };

@@ -300,10 +300,36 @@ pub(crate) struct NamespaceWriter {
     // (`Object::again_waits`), in the order raised.
     replaying: BTreeSet<NodeId>,
     again_held: Vec<Effect>,
+    // What the job, waiting for room, last found its due recovery sets would
+    // rebuild: asked again only once something it rests on changed.
+    held_want: Option<HeldWant>,
+    // The files each recovery set was last said to withhold, so the same
+    // ones are said once.
+    withheld_said: BTreeMap<NodeId, BTreeSet<MemberId>>,
     // How many requests are being answered at once, and the most there
     // ever were.
     #[cfg(test)]
     answering: (u32, u32),
+}
+
+// A file of the posts with a length, none of whose bytes arrived: what a
+// recovery set over it would rebuild whole.
+pub(super) fn absent_from_posts(record: &weaver_graph::Member) -> bool {
+    record.length.is_some_and(|length| length > 0)
+        && !record.coverage.runs().any(|run| run.provenance.arrived())
+}
+
+// What a job waiting for room found its due recovery sets would rebuild,
+// and what that rests on: the sets, the wait it was found in, the sizes of
+// the disks, the posts as marked then, and the files none of whose bytes
+// had arrived that a set covers.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct HeldWant {
+    pub(super) due: Vec<NodeId>,
+    pub(super) tickets: [Option<u64>; 2],
+    pub(super) sizes: (Option<u64>, Option<u64>),
+    pub(super) at: u64,
+    pub(super) absent: BTreeSet<MemberId>,
 }
 
 // A cipher's tail read back before the ranges that fed its keys are
@@ -368,6 +394,8 @@ impl NamespaceWriter {
             metrics: None,
             replaying: BTreeSet::new(),
             again_held: Vec::new(),
+            held_want: None,
+            withheld_said: BTreeMap::new(),
             #[cfg(test)]
             answering: (0, 0),
         }
@@ -440,6 +468,46 @@ impl NamespaceWriter {
 
     pub(crate) fn decode_clock(&self) -> super::decoding::DecodeClock {
         self.caps.decode_clock()
+    }
+
+    // Whether the job waits for room on a disk, and its place among those
+    // that wait.
+    pub(crate) fn disk_held(&self) -> bool {
+        self.caps.disk_held()
+    }
+
+    pub(crate) fn disk_ticket(&self) -> Option<u64> {
+        self.caps.disk_ticket()
+    }
+
+    // A reading came: whether the job has room again on every disk it
+    // waits on. If it has, all it owes is promised again and its runs may
+    // decode.
+    pub(crate) fn wake_disk(&mut self) -> bool {
+        self.caps.wake_disk(&self.output_free_disk, &self.free_disk)
+    }
+
+    // Whether the job owes nothing and has nothing to write again.
+    pub(crate) fn owes_nothing(&self) -> bool {
+        self.caps.owes_nothing()
+    }
+
+    // The job waits though nothing of it is left that would write: see
+    // `Caps::wake_idle`. Whether it woke.
+    pub(crate) fn wake_idle(&mut self) -> bool {
+        self.caps.wake_idle()
+    }
+
+    // A run stopped for room takes back what it built while this is set:
+    // see `Caps::rewriting`.
+    pub(crate) fn rewriting(&mut self, rewriting: bool) {
+        self.caps.rewriting(rewriting);
+    }
+
+    // What the job waits for on its repairs' behalf, on both disks.
+    #[cfg(test)]
+    pub(crate) fn wanted(&self) -> u64 {
+        self.caps.wanted()
     }
 
     #[cfg(test)]
@@ -2241,7 +2309,7 @@ impl NamespaceWriter {
         let end = offset
             .saturating_add(bytes.len() as u64)
             .max(record.length.unwrap_or(0));
-        self.admit_file(tree, node, member, end)?;
+        self.admit_file(tree, node, member, end, bytes.len() as u64)?;
         let leaf = self.leaf(tree, node, member)?;
         let started = std::time::Instant::now();
         // The leaf folds the digest the member's stated check needs, from
@@ -2266,6 +2334,7 @@ impl NamespaceWriter {
         if let Some(length) = record.length.filter(|_| record.is_complete()) {
             let reached = record.coverage.runs().last().map_or(0, |run| run.range.end);
             leaf.close(length.max(reached))?;
+            self.caps.closed(node, member);
         }
         if let Some(metrics) = &self.metrics {
             metrics.disk_write_latency_us.store(
@@ -2310,8 +2379,9 @@ impl NamespaceWriter {
         if length > 0 && !written {
             return Ok(());
         }
-        self.admit_file(tree, node, member, length)?;
+        self.admit_file(tree, node, member, length, 0)?;
         self.leaf(tree, node, member)?.close(length)?;
+        self.caps.closed(node, member);
         Ok(())
     }
 
@@ -2446,26 +2516,24 @@ impl NamespaceWriter {
         }
     }
 
-    // The member's file reaches `end`, by a write or by taking its length.
-    // Only what an object produces counts against the disk, and that is
-    // delivered, so it is judged against the output directory's device.
+    // The member's file reaches `end`, by a write of `landing` bytes or by
+    // taking its length. Only what an object produces counts against the
+    // disk, and that is delivered, so it is judged against the output
+    // directory's device.
     fn admit_file(
         &mut self,
         tree: &Tree,
         node: NodeId,
         member: MemberId,
         end: u64,
+        landing: u64,
     ) -> Result<(), WriteError> {
         self.caps.admit_write(
             tree,
             (node, member),
             end,
-            Output::File,
-            (
-                &self.output_dir,
-                self.output_free_disk.current(),
-                Device::Output,
-            ),
+            (Output::File, landing),
+            (&self.output_free_disk, Device::Output),
         )?;
         Ok(())
     }
@@ -2484,20 +2552,29 @@ impl NamespaceWriter {
         member: MemberId,
         end: u64,
     ) -> Result<(), WriteError> {
-        let (reader, device) = if self.output_dir == self.working_dir {
-            (&self.output_free_disk, Device::Output)
-        } else {
-            (&self.free_disk, Device::Working)
+        let device = self.kept_device();
+        let reader = match device {
+            Device::Output => &self.output_free_disk,
+            Device::Working => &self.free_disk,
         };
-        let capacity = reader.current();
         self.caps.admit_write(
             tree,
             (node, member),
             end,
-            Output::Kept,
-            (&self.working_dir, capacity, device),
+            (Output::Kept, 0),
+            (reader, device),
         )?;
         Ok(())
+    }
+
+    // The device a member that waits lies on: the working directory's,
+    // unless that is the output directory.
+    pub(super) fn kept_device(&self) -> Device {
+        if self.output_dir == self.working_dir {
+            Device::Output
+        } else {
+            Device::Working
+        }
     }
 
     // What a repair wrote into the posts, before any of it lands, each run
@@ -2529,55 +2606,58 @@ impl NamespaceWriter {
             output = output.saturating_add(working);
             working = 0;
         }
-        let capacity = self.output_free_disk.current();
         self.caps
-            .admit_repaired(output, (&self.output_dir, capacity, Device::Output))?;
-        let capacity = self.free_disk.current();
+            .admit_repaired(output, (&self.output_free_disk, Device::Output))?;
         self.caps
-            .admit_repaired(working, (&self.working_dir, capacity, Device::Working))?;
+            .admit_repaired(working, (&self.free_disk, Device::Working))?;
         Ok(())
     }
 
     // Before a PAR3 set over the posts goes out: the files it describes
     // none of whose bytes arrived, at the lengths they declare, are what its
     // rebuild would add to the disk, as the file under the post's directory
-    // and as the repair's staged output under the working directory. Those
-    // that fit within what either can take before the reserve, smallest
-    // first so the most fit, are rebuilt however the set describes them;
-    // the rest are withheld, and the set writes nothing into them. Only a
-    // PAR3 set can name one block in many places of a file; any other set
-    // writes no more than the recovery it received, and is not judged here.
-    pub(super) fn withheld(&mut self, tree: &Tree, set: NodeId) -> BTreeSet<MemberId> {
+    // and as the repair's staged output under the working directory. Taken
+    // smallest first, a file that with those taken before it would leave
+    // less than the reserve free on a disk of its size even empty can never
+    // be rebuilt here with them: it is withheld, and the set writes nothing
+    // into it. The rest are rebuilt however the set describes them,
+    // once the disks have room for them all above the reserve: until then
+    // the set does not go out, and the job waits for room, as it does for a
+    // write. `None` while it waits. Only a PAR3 set can name one block in
+    // many places of a file; any other set writes no more than the recovery
+    // it received, and is not judged here.
+    // `noted`, when given, gains each file found absent.
+    pub(super) fn withheld(
+        &mut self,
+        tree: &Tree,
+        set: NodeId,
+        noted: Option<&mut BTreeSet<MemberId>>,
+    ) -> Option<BTreeSet<MemberId>> {
         let mut withheld = BTreeSet::new();
         if tree.kind(set) != Some(Kind::Par3) {
-            return withheld;
+            return Some(withheld);
         }
         let (Some(recovery), Some(posts)) = (tree.recovery(set), tree.namespace(NodeId::ROOT))
         else {
-            return withheld;
+            return Some(withheld);
         };
         let mut absent: Vec<(u64, MemberId)> = posts
             .members()
-            .filter_map(|record| Some((record.length?, record)))
-            .filter(|(length, record)| {
-                *length > 0
-                    && !record.coverage.runs().any(|run| run.provenance.arrived())
-                    && recovery.covers(record.id)
-            })
-            .map(|(length, record)| (length, record.id))
+            .filter(|record| absent_from_posts(record) && recovery.covers(record.id))
+            .filter_map(|record| Some((record.length?, record.id)))
             .collect();
-        if absent.is_empty() {
-            return withheld;
+        if let Some(noted) = noted {
+            noted.extend(absent.iter().map(|&(_, member)| member));
         }
+        if absent.is_empty() {
+            return Some(withheld);
+        }
+        // Smallest first: as many files as fit the disk together are
+        // rebuilt, and the rest are withheld.
         absent.sort_unstable();
         let shared = self.output_dir == self.working_dir;
-        let output_room = self
-            .caps
-            .room((self.output_free_disk.current(), Device::Output));
-        let working_room = match shared {
-            true => None,
-            false => self.caps.room((self.free_disk.current(), Device::Working)),
-        };
+        let reserve = self.caps.reserve();
+        let (output_size, working_size) = self.disk_sizes();
         let (mut output, mut working) = (0u64, 0u64);
         let mut held = 0u64;
         for (length, member) in absent {
@@ -2589,29 +2669,56 @@ impl NamespaceWriter {
                 }
                 false => (0, length),
             };
-            let fits = |used: u64, more: u64, room: Option<u64>| {
-                room.is_none_or(|room| used.saturating_add(more) <= room)
+            // The files taken so far and this one could never fit the disk
+            // together, however much is freed on it.
+            let never = |used: u64, more: u64, size: Option<u64>| {
+                reserve > 0
+                    && more > 0
+                    && size.is_some_and(|size| {
+                        used.saturating_add(more).saturating_add(reserve) > size
+                    })
             };
-            if fits(output, onto_output, output_room) && fits(working, onto_working, working_room) {
-                output = output.saturating_add(onto_output);
-                working = working.saturating_add(onto_working);
-            } else {
+            if never(output, onto_output, output_size) || never(working, onto_working, working_size)
+            {
                 withheld.insert(member);
                 held = held.saturating_add(length);
+            } else {
+                output = output.saturating_add(onto_output);
+                working = working.saturating_add(onto_working);
             }
         }
-        if !withheld.is_empty() {
+        // Said once for each change of what the set withholds.
+        if !withheld.is_empty() && self.withheld_said.get(&set) != Some(&withheld) {
+            self.withheld_said.insert(set, withheld.clone());
             tracing::info!(
                 set = set.0,
                 withheld = withheld.len(),
                 withheld_bytes = held,
                 rebuilt_bytes = output.max(working),
-                output_room = ?output_room,
-                working_room = ?working_room,
-                "files a recovery set would rebuild are withheld: the disk has no room for them"
+                output_size = ?output_size,
+                working_size = ?working_size,
+                "files a recovery set would rebuild are withheld: the disk is too small for them"
             );
         }
-        withheld
+        self.caps
+            .want_both((output, &self.output_free_disk), (working, &self.free_disk))
+            .then_some(withheld)
+    }
+
+    // The size of the output disk, and of the working one when it is
+    // another directory, as last read.
+    pub(super) fn disk_sizes(&self) -> (Option<u64>, Option<u64>) {
+        let size = |reader: &CapacityReader| {
+            reader
+                .current()
+                .reading()
+                .map(|reading| reading.total_bytes)
+        };
+        let working = match self.output_dir == self.working_dir {
+            true => None,
+            false => size(&self.free_disk),
+        };
+        (size(&self.output_free_disk), working)
     }
 
     fn retract(&mut self, tree: &Tree, node: NodeId, member: MemberId) -> Result<(), WriteError> {

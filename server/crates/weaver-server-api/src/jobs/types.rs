@@ -165,6 +165,8 @@ pub enum QueueWaitReason {
     RepairCapacity,
     ExtractionCapacity,
     PostProcessingCapacity,
+    // The job waits for room on a disk, in whatever phase it is in.
+    DiskSpace,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, SimpleObject)]
@@ -1374,7 +1376,7 @@ fn queue_item_from_display(
         state,
         download_state: QueueDownloadState::from(info.download_state),
         post_state: QueuePostState::from(info.post_state),
-        wait_reason: wait_reason_for_post_state(info.post_state),
+        wait_reason: wait_reason_for(info),
         download_wait_reason: info.download_wait_reason.clone(),
         download_retry_at_epoch_ms: info.download_retry_at_epoch_ms,
         error: info.error.clone(),
@@ -1730,10 +1732,15 @@ fn ms_to_datetime(ms: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(ms).unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
 }
 
-fn wait_reason_for_post_state(
-    post_state: weaver_server_core::PostState,
-) -> Option<QueueWaitReason> {
-    match post_state {
+// What the job waits for: room on a disk, which holds it in any phase,
+// else the capacity its post-processing state queues it for.
+fn wait_reason_for(info: &weaver_server_core::JobInfo) -> Option<QueueWaitReason> {
+    if info.download_wait_reason.as_deref()
+        == Some(weaver_server_core::jobs::handle::DISK_SPACE_WAIT_REASON)
+    {
+        return Some(QueueWaitReason::DiskSpace);
+    }
+    match info.post_state {
         weaver_server_core::PostState::QueuedRepair => Some(QueueWaitReason::RepairCapacity),
         weaver_server_core::PostState::QueuedExtract => Some(QueueWaitReason::ExtractionCapacity),
         weaver_server_core::PostState::QueuedPostProcessing => {
