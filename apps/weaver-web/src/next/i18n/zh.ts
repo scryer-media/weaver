@@ -628,7 +628,7 @@ export const nextZh: LocaleDictionary = {
   "next.system.storageClass": "存储类型",
   "next.system.randomRead": "随机读取基准",
   "next.system.volumes": "卷",
-  "next.system.volumesNote": "实时写入速率",
+  "next.system.volumesNote": "页面加载时的写入速率",
   "next.system.volumeNotMeasured": "未测量",
   "next.system.volumeBuffered": "缓冲 {{size}}",
   "next.system.noVolumes": "尚未写入任何内容。",

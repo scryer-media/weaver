@@ -576,8 +576,16 @@ const DISK_PROBE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 // Used when the probe cannot run at all: SSD-class reads.
 const DISK_PROBE_FALLBACK_IOPS: f64 = 10_000.0;
 
-// The probe lays down one buffer of this size, then reads back from it.
-const PROBE_FILE_BYTES: usize = 16 * 1024 * 1024;
+// The write phase writes this buffer repeatedly, then the read phase reads
+// back from what it laid down.
+const PROBE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
+// How many buffers each successive write chunk holds: 16, 64, 144, 256 MiB.
+// Growing chunks give a fast disk a file too large for the reads to cluster
+// in or for the drive's own cache to hold, while a slow one stops early.
+const PROBE_WRITE_REPEATS: [usize; 4] = [1, 4, 9, 16];
+// The write phase stops before the next chunk once this much write-and-sync
+// time has passed.
+const PROBE_WRITE_BUDGET: Duration = Duration::from_secs(1);
 const PROBE_READ_SIZE: usize = 4096;
 const PROBE_READ_COUNT: usize = 200;
 
@@ -706,9 +714,9 @@ pub fn measure_disk_profile(dir: &Path) -> Option<DiskMeasurement> {
 }
 
 // Random bytes, so a compressing filesystem or drive firmware cannot shrink
-// the file.
-fn probe_file_buffer() -> Vec<u8> {
-    let mut buffer = vec![0u8; PROBE_FILE_BYTES];
+// the writes. Prepared before any timing starts.
+fn probe_write_buffer() -> Vec<u8> {
+    let mut buffer = vec![0u8; PROBE_CHUNK_BYTES];
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     for word in buffer.chunks_exact_mut(8) {
         state ^= state << 13;
@@ -720,15 +728,38 @@ fn probe_file_buffer() -> Vec<u8> {
 }
 
 // Writes the file the read phase reads from, through to the device, and
-// returns its length. The write is not timed.
+// returns its length. The time each chunk takes only decides whether another
+// follows; no write speed is taken from it.
 fn lay_down_probe_file(path: &Path) -> Option<u64> {
     use std::io::Write;
 
-    let buffer = probe_file_buffer();
+    let buffer = probe_write_buffer();
     let mut file = open_write_through(path).ok()?;
-    file.write_all(&buffer).ok()?;
-    file.sync_data().ok()?;
-    Some(buffer.len() as u64)
+    probe_file_bytes(|repeats| {
+        let started = Instant::now();
+        for _ in 0..repeats {
+            file.write_all(&buffer).ok()?;
+        }
+        file.sync_data().ok()?;
+        Some(started.elapsed())
+    })
+}
+
+// How large the probe file grows: successive chunks of
+// [`PROBE_WRITE_REPEATS`] buffers, stopping before the next chunk once the
+// chunks written have taken [`PROBE_WRITE_BUDGET`]. `write_chunk` writes that
+// many buffers and answers how long it took, or `None` when it failed.
+fn probe_file_bytes(mut write_chunk: impl FnMut(usize) -> Option<Duration>) -> Option<u64> {
+    let mut written: u64 = 0;
+    let mut measured = Duration::ZERO;
+    for repeats in PROBE_WRITE_REPEATS {
+        if measured >= PROBE_WRITE_BUDGET {
+            break;
+        }
+        measured += write_chunk(repeats)?;
+        written += (repeats * PROBE_CHUNK_BYTES) as u64;
+    }
+    Some(written)
 }
 
 #[cfg(unix)]

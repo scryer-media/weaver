@@ -628,7 +628,7 @@ export const nextJa: LocaleDictionary = {
   "next.system.storageClass": "ストレージ種別",
   "next.system.randomRead": "ランダム読み取りベンチマーク",
   "next.system.volumes": "ボリューム",
-  "next.system.volumesNote": "現在の書き込み速度",
+  "next.system.volumesNote": "ページ読み込み時の書き込み速度",
   "next.system.volumeNotMeasured": "未計測",
   "next.system.volumeBuffered": "バッファ {{size}}",
   "next.system.noVolumes": "まだ何も書き込まれていません。",

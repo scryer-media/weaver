@@ -628,7 +628,7 @@ export const nextDe: LocaleDictionary = {
   "next.system.storageClass": "Speicherklasse",
   "next.system.randomRead": "Zufallslese-Benchmark",
   "next.system.volumes": "Datenträger",
-  "next.system.volumesNote": "Live-Schreibrate",
+  "next.system.volumesNote": "Schreibrate beim Laden der Seite",
   "next.system.volumeNotMeasured": "nicht gemessen",
   "next.system.volumeBuffered": "{{size}} gepuffert",
   "next.system.noVolumes": "Es wurde noch nichts geschrieben.",

@@ -628,7 +628,7 @@ export const nextPt: LocaleDictionary = {
   "next.system.storageClass": "Classe de armazenamento",
   "next.system.randomRead": "Teste de leitura aleatória",
   "next.system.volumes": "Volumes",
-  "next.system.volumesNote": "taxa de gravação em tempo real",
+  "next.system.volumesNote": "taxa de gravação ao carregar a página",
   "next.system.volumeNotMeasured": "não medida",
   "next.system.volumeBuffered": "{{size}} em buffer",
   "next.system.noVolumes": "Nada foi gravado ainda.",

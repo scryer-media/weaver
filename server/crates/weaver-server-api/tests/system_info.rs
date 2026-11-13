@@ -60,11 +60,18 @@ async fn system_info_exposes_safe_runtime_profile_to_read_scope() {
 
     assert!(!info["version"].as_str().unwrap().is_empty());
     assert!(info["uptimeSeconds"].as_f64().unwrap() >= 0.0);
-    // Every row of the per-volume list carries a label and a kind; a rate
-    // is null until the volume has been measured.
-    for volume in info["volumes"].as_array().unwrap() {
+    // The per-volume list is present and is a list, and each row has the
+    // four fields with their types; a rate is null until measured.
+    // The non-empty case is covered once the volume registry lands.
+    let volumes = info
+        .get("volumes")
+        .and_then(|volumes| volumes.as_array())
+        .expect("systemInfo.volumes is a list");
+    for volume in volumes {
         assert!(volume["label"].is_string());
         assert!(volume["storageKind"].is_string());
+        let rate = &volume["writeRateBytesPerSecond"];
+        assert!(rate.is_null() || rate.is_u64());
         assert!(volume["bufferedBytes"].is_u64());
     }
     assert!(matches!(
