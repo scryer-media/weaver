@@ -1038,6 +1038,90 @@ pub(super) struct UnanchoredPart {
     pub(super) source: SegmentSource,
 }
 
+// Every article held for the ordinal before it, by file, with how many are
+// held across every file. Parts go in and come out only through these
+// methods, so the count is always the number held, in memory or spilled,
+// and is never recounted. A file that holds nothing has no entry.
+#[derive(Default)]
+pub(super) struct UnanchoredPark {
+    files: HashMap<NzbFileId, BTreeMap<u32, UnanchoredPart>>,
+    parts: usize,
+}
+
+impl UnanchoredPark {
+    pub(super) fn parts(&self) -> usize {
+        self.parts
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.files.is_empty()
+    }
+
+    pub(super) fn contains_key(&self, file_id: &NzbFileId) -> bool {
+        self.files.contains_key(file_id)
+    }
+
+    pub(super) fn get(&self, file_id: &NzbFileId) -> Option<&BTreeMap<u32, UnanchoredPart>> {
+        self.files.get(file_id)
+    }
+
+    pub(super) fn iter(
+        &self,
+    ) -> std::collections::hash_map::Iter<'_, NzbFileId, BTreeMap<u32, UnanchoredPart>> {
+        self.files.iter()
+    }
+
+    pub(super) fn keys(
+        &self,
+    ) -> std::collections::hash_map::Keys<'_, NzbFileId, BTreeMap<u32, UnanchoredPart>> {
+        self.files.keys()
+    }
+
+    // Hold a part, returning the one it replaced at the same ordinal.
+    pub(super) fn insert(
+        &mut self,
+        file_id: NzbFileId,
+        ordinal: u32,
+        part: UnanchoredPart,
+    ) -> Option<UnanchoredPart> {
+        let replaced = self.files.entry(file_id).or_default().insert(ordinal, part);
+        if replaced.is_none() {
+            self.parts += 1;
+        }
+        replaced
+    }
+
+    pub(super) fn remove(&mut self, file_id: NzbFileId, ordinal: u32) -> Option<UnanchoredPart> {
+        let parked = self.files.get_mut(&file_id)?;
+        let part = parked.remove(&ordinal)?;
+        if parked.is_empty() {
+            self.files.remove(&file_id);
+        }
+        debug_assert!(self.parts > 0, "unanchored park over-release");
+        self.parts = self.parts.saturating_sub(1);
+        Some(part)
+    }
+
+    // Every part the file holds.
+    pub(super) fn remove_file(
+        &mut self,
+        file_id: NzbFileId,
+    ) -> Option<BTreeMap<u32, UnanchoredPart>> {
+        let parked = self.files.remove(&file_id)?;
+        debug_assert!(self.parts >= parked.len(), "unanchored park over-release");
+        self.parts = self.parts.saturating_sub(parked.len());
+        Some(parked)
+    }
+}
+
+impl std::ops::Index<&NzbFileId> for UnanchoredPark {
+    type Output = BTreeMap<u32, UnanchoredPart>;
+
+    fn index(&self, file_id: &NzbFileId) -> &Self::Output {
+        &self.files[file_id]
+    }
+}
+
 // Sequential-assembly state for one uuencode file.
 //
 // A uuencode part's position is the cumulative *decoded* length of every part
@@ -1834,7 +1918,12 @@ pub struct Pipeline {
     // they follow, held decoded until that ordinal is placed. Their bytes are
     // charged to the write-buffer ledger while they wait in memory, and to
     // the spool's once their paused job spills them.
-    pub(super) unanchored_parked: HashMap<NzbFileId, BTreeMap<u32, UnanchoredPart>>,
+    pub(super) unanchored_parked: UnanchoredPark,
+    // Aggregate bound on the articles held above, in memory or spilled. Bytes
+    // alone do not bound it: an article can decode to almost nothing, and
+    // each held one keeps its decode result. It is the uuencode park's
+    // aggregate entry bound, kept apart from it and from the write backlog.
+    pub(super) unanchored_park_max_parts: usize,
     // How often each article that declared no usable start has been sent back
     // for the ordinal before it because the park above had no room for it,
     // paired with how many ordinals of its file were placed when that count
