@@ -48,14 +48,58 @@ impl SparseMarker for PlatformMarker {
 // A marking failure keeps the open file, including any pre-existing bytes.
 // Only an actual open failure prevents the caller from using it.
 pub(crate) fn create_sparse<M: SparseMarker>(path: &Path, marker: &M) -> io::Result<File> {
+    create_sized_with(path, marker, None, PRESIZES)
+}
+
+// Whether a file marked sparse takes its declared length when it is made.
+// On Windows a file that grows write by write across scattered offsets
+// keeps moving its end of file, and NTFS keeps the cached pages of such a
+// file out of the standby list, so the first read of a finished output goes
+// to disk; one set to its length first is written into holes inside it. On
+// Unix nothing is gained: a write past the end makes a hole as cheaply, and
+// the length stays the reach of the bytes written.
+pub(crate) const PRESIZES: bool = cfg!(windows);
+
+// Creates `path` as `create_sparse` does and, where the platform presizes,
+// gives it `length`. Only a file the mark took is sized: on a mount that
+// refuses the mark the length would be zero-filled space for bytes never
+// written. Only an empty file is sized: one that already holds bytes is a
+// restart's, whose length the restore reads as how far its bytes reach.
+pub(crate) fn create_sized<M: SparseMarker>(
+    path: &Path,
+    marker: &M,
+    length: Option<u64>,
+) -> io::Result<File> {
+    create_sized_with(path, marker, length, PRESIZES)
+}
+
+fn create_sized_with<M: SparseMarker>(
+    path: &Path,
+    marker: &M,
+    length: Option<u64>,
+    presizes: bool,
+) -> io::Result<File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
         .open(path)?;
-    if marker.mark_sparse(&file).is_err() {
+    let marked = marker.mark_sparse(&file).is_ok();
+    if !marked {
         crate::runtime::perf_probe::record_value("graph.sparse.mark_failed", 1);
+    }
+    let Some(length) = length.filter(|length| presizes && marked && *length > 0) else {
+        return Ok(file);
+    };
+    // Sizing is an allocation hint like the mark: a file it fails on stays
+    // usable and grows by its writes.
+    let sized = file.metadata().and_then(|metadata| match metadata.len() {
+        0 => file.set_len(length),
+        _ => Ok(()),
+    });
+    if sized.is_err() {
+        crate::runtime::perf_probe::record_value("graph.sparse.presize_failed", 1);
     }
     Ok(file)
 }
@@ -143,5 +187,71 @@ mod tests {
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"routed");
+    }
+
+    // A filesystem that takes the sparse attribute.
+    struct Taking;
+
+    impl SparseMarker for Taking {
+        fn mark_sparse(&self, _file: &File) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn sized(
+        marker: &impl SparseMarker,
+        held: Option<&[u8]>,
+        length: Option<u64>,
+        presizes: bool,
+    ) -> Vec<u8> {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("ember.bin");
+        if let Some(held) = held {
+            std::fs::write(&path, held).unwrap();
+        }
+        let mut file = create_sized_with(&path, marker, length, presizes).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        bytes
+    }
+
+    // Where the platform presizes, a new file the mark took reaches its
+    // declared length from the start, every byte of it a hole.
+    #[test]
+    fn a_marked_new_file_takes_its_declared_length() {
+        assert_eq!(sized(&Taking, None, Some(4096), true), vec![0; 4096]);
+    }
+
+    // A mount that refuses the mark gets no length: it would be zero-filled
+    // space for bytes never written.
+    #[test]
+    fn a_refused_mark_leaves_the_file_unsized() {
+        assert!(sized(&Refusing, None, Some(4096), true).is_empty());
+    }
+
+    // Where the platform does not presize, the file stays as long as what is
+    // written to it.
+    #[test]
+    fn a_platform_that_does_not_presize_leaves_the_file_unsized() {
+        assert!(sized(&Taking, None, Some(4096), false).is_empty());
+    }
+
+    // A file that already holds bytes, a restart's, keeps its length: the
+    // restore reads it as how far its bytes reach.
+    #[test]
+    fn a_file_holding_bytes_keeps_its_length() {
+        assert_eq!(sized(&Taking, Some(b"routed"), Some(4096), true), b"routed");
+    }
+
+    // No declared length, nothing to size.
+    #[test]
+    fn a_file_with_no_declared_length_stays_unsized() {
+        assert!(sized(&Taking, None, None, true).is_empty());
+    }
+
+    // Only Windows presizes.
+    #[test]
+    fn only_windows_presizes() {
+        assert_eq!(PRESIZES, cfg!(windows));
     }
 }

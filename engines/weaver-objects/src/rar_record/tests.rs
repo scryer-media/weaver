@@ -568,3 +568,19 @@ fn what_the_record_said_survives_a_restore() {
     assert_eq!(recovery.outcome(), Some(ruled));
     assert!(recovery.covers(member));
 }
+
+// The record sits inside the very volume it protects: there is no volume of
+// its own to fetch early. A range of the volume refused while it downloads,
+// or bytes of it that came damaged, raise nothing; the ruling reads the
+// record from the volume once it closes.
+#[test]
+fn a_refusal_raises_nothing_for_a_record_inside_its_volume() {
+    let volume = rar5_volume(&payload(12, 5000), 4);
+    let (mut job, member) = job(&volume);
+    job.store.members.get_mut(&member).unwrap()[100] ^= 1;
+    Recovery::refused(&mut job.object, member, ByteRange::new(0, 64));
+    let mut wanted = Vec::new();
+    Recovery::wants(&job.object, &mut wanted);
+    Object::wants(&job.object, &mut wanted);
+    assert!(wanted.is_empty(), "{wanted:?}");
+}
