@@ -2509,3 +2509,163 @@ async fn test_a_moved_torrent_announces_on_from_where_it_stood() -> anyhow::Resu
     respond(conn, ANSWER).await?;
     Ok(())
 }
+
+/// The name of a tracker on both loopbacks.
+const DUAL_STACK: &str = "dual.invalid";
+
+/// Resolves [`DUAL_STACK`] to 127.0.0.1 and ::1, and no other name.
+struct DualStack;
+
+impl crate::core::net::Resolver for DualStack {
+    fn resolve<'a>(
+        &'a self,
+        host: &'a str,
+        port: u16,
+    ) -> crate::core::net::BoxFuture<'a, std::io::Result<crate::core::net::Resolved>> {
+        let found = (host == DUAL_STACK).then(|| {
+            vec![
+                SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+                SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+            ]
+        });
+        Box::pin(async move {
+            found
+                .map(crate::core::net::Resolved::Addresses)
+                .ok_or_else(|| std::io::ErrorKind::NotFound.into())
+        })
+    }
+}
+
+/// One family of a dual-stack tracker: every announce it hears is handed
+/// on, in the order heard, before it is answered, so an announce whose
+/// answer came is always listed. It refuses `started` when `refuse_started`,
+/// and accepts everything else.
+fn hear(
+    listener: TcpListener,
+    refuse_started: bool,
+) -> (
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let serve = tokio::spawn(async move {
+        loop {
+            let (conn, query) = read_announce_query(&listener).await?;
+            let started = param(&query, "event") == Some("started");
+            tx.send(query)?;
+            let body = if started && refuse_started {
+                REFUSED
+            } else {
+                ANSWER
+            };
+            respond(conn, body).await?;
+        }
+    });
+    (serve, rx)
+}
+
+/// The event of the next announce `heard` lists.
+async fn next_event(
+    heard: &mut tokio::sync::mpsc::UnboundedReceiver<String>,
+) -> anyhow::Result<Option<String>> {
+    let query = heard.recv().await.context("the tracker stopped hearing")?;
+    Ok(param(&query, "event").map(str::to_owned))
+}
+
+/// Whether `heard` lists no announce it has not handed on.
+fn heard_nothing_more(heard: &mut tokio::sync::mpsc::UnboundedReceiver<String>) -> bool {
+    matches!(
+        heard.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    )
+}
+
+// A tracker hears each family's announces as a peer of its own, and
+// libtorrent keeps `start_sent` per endpoint (torrent.cpp:3323-3331,
+// 3605-3606, v2.0.15): a family whose `started` was refused is sent
+// `started` again, and no `stopped` (torrent.cpp:3279-3282), while the
+// family that accepted one goes on with plain announces and its `stopped`.
+// A route move carries each family's state across.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_family_whose_started_was_refused_is_sent_started_again_and_no_stopped()
+-> anyhow::Result<()> {
+    setup_test_logging();
+    let t = TestTorrent::new("test_family_started", 2048, 1024).await?;
+    let v6 = TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).await?;
+    let port = v6.local_addr()?.port();
+    let v4 = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
+    let url = format!("http://{DUAL_STACK}:{port}/announce");
+    let (serve4, mut heard4) = hear(v4, false);
+    let (serve6, mut heard6) = hear(v6, true);
+    let opts = || -> anyhow::Result<SessionOptions> {
+        Ok(SessionOptions {
+            resolver: Some(std::sync::Arc::new(DualStack)),
+            ..tracker_session_opts()?
+        })
+    };
+    let out = TempDir::with_prefix("test_family_started_out")?;
+    let output_folder = out.path().to_str().context("utf-8 path")?.to_owned();
+    let add = |identity: Option<crate::Identity>, totals: crate::TorrentTotals| AddTorrentOptions {
+        output_folder: Some(output_folder.clone()),
+        overwrite: true,
+        trackers: Some(vec![url.clone()]),
+        identity,
+        totals,
+        ..Default::default()
+    };
+
+    let session = Session::new_with_opts(out.path().into(), opts()?).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(add(None, Default::default())),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+
+    // Both families hear `started`; IPv4 accepts it, IPv6 refuses it.
+    assert_eq!(next_event(&mut heard4).await?.as_deref(), Some("started"));
+    assert_eq!(next_event(&mut heard6).await?.as_deref(), Some("started"));
+    announce_ended(&handle, |l| l.result.is_ok()).await?;
+
+    // The next announce is plain over IPv4 and `started` again over IPv6.
+    handle.force_reannounce(Duration::ZERO, None, true);
+    assert_eq!(next_event(&mut heard4).await?, None);
+    assert_eq!(next_event(&mut heard6).await?.as_deref(), Some("started"));
+    announce_ended(&handle, |l| l.result.is_ok()).await?;
+
+    // The move sends neither family `stopped`.
+    let identity = handle.shared().identity();
+    let totals = handle.totals();
+    handle.hand_over();
+    session
+        .delete(crate::api::TorrentIdOrHash::Id(handle.id()), false)
+        .await?;
+    session.stopped_announces().wait_idle().await;
+    assert!(heard_nothing_more(&mut heard4));
+    assert!(heard_nothing_more(&mut heard6));
+
+    // The session it joins goes on: plain over IPv4, `started` over IPv6.
+    let next = Session::new_with_opts(out.path().into(), opts()?).await?;
+    let moved = next
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(add(Some(identity), totals)),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    assert_eq!(next_event(&mut heard4).await?, None);
+    assert_eq!(next_event(&mut heard6).await?.as_deref(), Some("started"));
+    announce_ended(&moved, |l| l.result.is_ok()).await?;
+
+    // A pause sends `stopped` over IPv4 alone.
+    next.pause(&moved).await?;
+    assert_eq!(next_event(&mut heard4).await?.as_deref(), Some("stopped"));
+    next.stopped_announces().wait_idle().await;
+    assert!(heard_nothing_more(&mut heard6));
+    serve4.abort();
+    serve6.abort();
+    Ok(())
+}
