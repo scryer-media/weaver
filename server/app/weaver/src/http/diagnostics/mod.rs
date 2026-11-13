@@ -268,15 +268,13 @@ async fn collect_components(
         intermediate_dir.clone(),
         complete_dir.clone(),
     ];
+    let host_asks = [
+        (data_dir.clone(), Reach::Exact),
+        (intermediate_dir.clone(), Reach::Exact),
+        (complete_dir.clone(), Reach::Exact),
+    ];
     let (host_spaces, host_classes) = tokio::join!(
-        StorageCapacity::spaces(
-            Some(disk_space.as_ref()),
-            &[
-                (data_dir.clone(), Reach::Exact),
-                (intermediate_dir.clone(), Reach::Exact),
-                (complete_dir.clone(), Reach::Exact),
-            ],
-        ),
+        StorageCapacity::spaces(Some(disk_space.as_ref()), &host_asks),
         disk_space.classifications(&host_paths),
     );
     let host = tokio::task::spawn_blocking(move || {
