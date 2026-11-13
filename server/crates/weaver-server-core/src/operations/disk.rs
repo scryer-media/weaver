@@ -2092,6 +2092,7 @@ impl StorageCapacity {
 
     // How many probes `root` has begun. A reading whose probe is counted
     // after this one began after this call, whatever was running then.
+    #[cfg(test)]
     pub(crate) fn probes_begun(&self, root: StorageRoot) -> u64 {
         self.slot(root).lock().begun_probes
     }
