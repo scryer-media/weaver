@@ -146,6 +146,17 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
     for directory in [&data_dir, &complete_dir, &intermediate_dir, &category_dir] {
         std::fs::create_dir_all(directory).unwrap();
     }
+    // The folders are set as a settings change sets them, and the answer is
+    // the samplers' reading of them.
+    h.handle
+        .update_runtime_paths(
+            data_dir.clone(),
+            intermediate_dir.clone(),
+            complete_dir.clone(),
+        )
+        .await
+        .unwrap();
+    wait_for_storage_readings(&h, &data_dir, &intermediate_dir, &complete_dir).await;
 
     let response = h.execute(SYSTEM_INFO_QUERY).await;
     assert_no_errors(&response);
@@ -176,6 +187,213 @@ async fn configured_storage_merges_equal_paths_and_keeps_unavailable_paths() {
         .unwrap();
     assert!(missing["capacity"].is_null());
     assert!(missing["error"].as_str().unwrap().contains("unavailable"));
+}
+
+// Block, off the runtime, until each root is read at its directory.
+async fn wait_for_storage_readings(
+    h: &TestHarness,
+    data_dir: &std::path::Path,
+    intermediate_dir: &std::path::Path,
+    complete_dir: &std::path::Path,
+) {
+    use weaver_server_core::operations::StorageRoot;
+    let storage = h
+        .shared_state
+        .storage_capacity()
+        .expect("the pipeline's samplers");
+    let dirs = [
+        (StorageRoot::Data, data_dir.to_path_buf()),
+        (StorageRoot::Intermediate, intermediate_dir.to_path_buf()),
+        (StorageRoot::Complete, complete_dir.to_path_buf()),
+    ];
+    tokio::task::spawn_blocking(move || {
+        for (root, dir) in &dirs {
+            storage.wait_for_root_read(*root, dir);
+        }
+    })
+    .await
+    .unwrap();
+}
+
+// A root's directory is answered from its sampler's reading, with no look
+// on the request; any other configured folder is looked at on demand. The
+// numbers are each folder's filesystem's.
+#[tokio::test]
+async fn storage_queries_answer_configured_folders_from_the_cache() {
+    use weaver_server_core::operations::disk::disk_looks_for_test;
+    let h = TestHarness::new().await;
+    let (data_dir, intermediate_dir, complete_dir, category_dir) = {
+        let mut config = h.config.write().await;
+        let data_dir = std::path::PathBuf::from(&config.data_dir);
+        let complete_dir = std::path::PathBuf::from(config.complete_dir());
+        config.categories = vec![CategoryConfig {
+            id: 1,
+            name: "TV".to_string(),
+            dest_dir: None,
+            aliases: String::new(),
+        }];
+        (
+            data_dir,
+            std::path::PathBuf::from(config.intermediate_dir()),
+            complete_dir.clone(),
+            complete_dir.join("TV"),
+        )
+    };
+    std::fs::create_dir_all(&category_dir).unwrap();
+    wait_for_storage_readings(&h, &data_dir, &intermediate_dir, &complete_dir).await;
+    // The roots' readings stay current however slowly the test runs.
+    h.shared_state
+        .storage_capacity()
+        .expect("the pipeline's samplers")
+        .stop_clock_for_test();
+
+    let mut variables = async_graphql::Variables::default();
+    variables.insert(
+        async_graphql::Name::new("path"),
+        async_graphql::Value::String(complete_dir.display().to_string()),
+    );
+    let looks = disk_looks_for_test();
+    let usage = h
+        .execute("{ diskUsage { label path totalBytes usedBytes freeBytes } }")
+        .await;
+    let picked = h
+        .execute_with_variables(
+            "query($path: String!) { pathStorage(path: $path) { path error capacity { totalBytes usedBytes freeBytes } } }",
+            variables,
+        )
+        .await;
+    assert_eq!(
+        disk_looks_for_test(),
+        looks,
+        "the roots are answered with no look"
+    );
+    let info = h.execute(SYSTEM_INFO_QUERY).await;
+    assert!(
+        disk_looks_for_test() > looks,
+        "the category folder is looked at on demand"
+    );
+    for response in [&info, &usage, &picked] {
+        assert_no_errors(response);
+    }
+
+    let direct_total = |path: &std::path::Path| {
+        weaver_server_core::operations::disk::read_space_for_test(path)
+            .unwrap()
+            .total_bytes
+    };
+    let info = response_data(&info);
+    let storage = info["systemInfo"]["configuredStorage"].as_array().unwrap();
+    for dir in [&data_dir, &intermediate_dir, &complete_dir, &category_dir] {
+        let row = storage
+            .iter()
+            .find(|row| row["path"].as_str() == dir.to_str())
+            .unwrap_or_else(|| panic!("a row for {}", dir.display()));
+        assert!(row["error"].is_null(), "{row}");
+        let capacity = &row["capacity"];
+        let total = capacity["totalBytes"].as_u64().unwrap();
+        assert_eq!(total, direct_total(dir), "{row}");
+        assert_eq!(
+            capacity["usedBytes"].as_u64().unwrap() + capacity["freeBytes"].as_u64().unwrap(),
+            total
+        );
+    }
+    let usage = response_data(&usage);
+    let rows = usage["diskUsage"].as_array().unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|row| row["label"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["Data", "Intermediate downloads", "Complete library"]
+    );
+    for row in rows {
+        let total = row["totalBytes"].as_u64().unwrap();
+        let path = std::path::PathBuf::from(row["path"].as_str().unwrap());
+        assert_eq!(total, direct_total(&path), "{row}");
+        assert_eq!(
+            row["usedBytes"].as_u64().unwrap() + row["freeBytes"].as_u64().unwrap(),
+            total
+        );
+    }
+    let picked = response_data(&picked);
+    let picked = &picked["pathStorage"];
+    assert_eq!(picked["path"].as_str(), complete_dir.to_str());
+    assert!(picked["error"].is_null(), "{picked}");
+    assert_eq!(
+        picked["capacity"]["totalBytes"].as_u64().unwrap(),
+        direct_total(&complete_dir)
+    );
+}
+
+// A configured folder that does not exist yet: `systemInfo` reports its
+// latest look failed, and `pathStorage` reports the disk it would be
+// created on, its nearest existing parent's, as each always did.
+#[tokio::test]
+async fn a_configured_folder_not_made_yet_answers_as_before() {
+    let h = TestHarness::new().await;
+    let (data_dir, intermediate_dir, complete_dir, missing) = {
+        let mut config = h.config.write().await;
+        let data_dir = std::path::PathBuf::from(&config.data_dir);
+        let missing = data_dir.join("not-made");
+        config.categories = vec![CategoryConfig {
+            id: 1,
+            name: "Later".to_string(),
+            dest_dir: Some(missing.display().to_string()),
+            aliases: String::new(),
+        }];
+        (
+            data_dir,
+            std::path::PathBuf::from(config.intermediate_dir()),
+            std::path::PathBuf::from(config.complete_dir()),
+            missing,
+        )
+    };
+    for dir in [&data_dir, &intermediate_dir, &complete_dir] {
+        std::fs::create_dir_all(dir).unwrap();
+    }
+    wait_for_storage_readings(&h, &data_dir, &intermediate_dir, &complete_dir).await;
+
+    let info = h.execute(SYSTEM_INFO_QUERY).await;
+    assert_no_errors(&info);
+    let info = response_data(&info);
+    let row = info["systemInfo"]["configuredStorage"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"].as_str() == missing.to_str())
+        .expect("a row for the folder")
+        .clone();
+    assert_eq!(row["labels"].as_array().unwrap(), &["Category: Later"]);
+    assert!(row["capacity"].is_null(), "{row}");
+    assert!(
+        row["error"]
+            .as_str()
+            .unwrap()
+            .starts_with("Filesystem capacity is unavailable for this path: "),
+        "{row}"
+    );
+
+    let mut variables = async_graphql::Variables::default();
+    variables.insert(
+        async_graphql::Name::new("path"),
+        async_graphql::Value::String(missing.display().to_string()),
+    );
+    let picked = h
+        .execute_with_variables(
+            "query($path: String!) { pathStorage(path: $path) { path error capacity { totalBytes usedBytes freeBytes } } }",
+            variables,
+        )
+        .await;
+    assert_no_errors(&picked);
+    let picked = response_data(&picked);
+    let picked = &picked["pathStorage"];
+    assert_eq!(picked["path"].as_str(), missing.to_str());
+    assert!(picked["error"].is_null(), "{picked}");
+    assert_eq!(
+        picked["capacity"]["totalBytes"].as_u64().unwrap(),
+        weaver_server_core::operations::disk::read_space_for_test(&data_dir)
+            .unwrap()
+            .total_bytes
+    );
 }
 
 #[tokio::test]

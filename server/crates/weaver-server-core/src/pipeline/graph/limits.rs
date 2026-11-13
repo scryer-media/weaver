@@ -99,8 +99,9 @@ impl HostFacts {
         working_dir: &std::path::Path,
         resident_default_cap_bytes: Option<u64>,
     ) -> Self {
-        let working_fs_total_bytes = match crate::operations::probe_nearest_disk_space(working_dir)
-        {
+        let working_fs_total_bytes = match crate::operations::StorageCapacity::read_nearest_now(
+            working_dir,
+        ) {
             Ok(space) => Some(space.total_bytes),
             Err(error) => {
                 warn!(

@@ -252,14 +252,31 @@ pub(crate) fn destination_root(
 // Where a job writes the files it delivers when its intermediate directory
 // and its destination lie on different devices: its staging directory on the
 // destination's device, so finalize renames them into place there instead of
-// copying every byte across. On one device nothing is staged.
+// copying every byte across. On one device nothing is staged. Whether they
+// share a device is the disk owner's answer,
+// [`crate::operations::StorageCapacity::same_filesystem`].
+pub(crate) fn staging_dir_on(
+    one_device: bool,
+    destination_root: &Path,
+    job_id: JobId,
+) -> Option<PathBuf> {
+    (!one_device).then(|| staging_dir_for(destination_root, job_id))
+}
+
+// [`staging_dir_on`] with the devices read on the spot, as the choice was
+// made before the disk owner answered it: what a test compares the owner's
+// choice with.
+#[cfg(test)]
 pub(crate) fn delivery_staging_dir(
     intermediate_dir: &Path,
     destination_root: &Path,
     job_id: JobId,
 ) -> Option<PathBuf> {
-    (!crate::runtime::fs::same_device(intermediate_dir, destination_root))
-        .then(|| staging_dir_for(destination_root, job_id))
+    staging_dir_on(
+        crate::runtime::fs::same_device(intermediate_dir, destination_root),
+        destination_root,
+        job_id,
+    )
 }
 
 pub(crate) fn staging_dir_for(destination_root: &Path, job_id: JobId) -> PathBuf {
