@@ -11,7 +11,13 @@ use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRow, SqlRuntime, Sql
 use crate::{Database, StateError};
 
 const HISTORY_DELETE_KIND: &str = "history_delete";
+// Removing an entry's files and keeping the entry: the same queue, targets
+// and worker as a delete, one operation kind more.
+const HISTORY_FILES_REMOVAL_KIND: &str = "history_files_removal";
 const HISTORY_JOB_TARGET_KIND: &str = "history_job";
+// The outcome a queued files removal ends with when a delete of the same
+// entry is accepted first.
+const SUPERSEDED_OUTCOME: &str = "superseded";
 
 // Per-dialect bind budgets for chunking large `IN (…)` id lists. A delete-all
 // over a very large history table can produce far more ids than sqlite's
@@ -86,10 +92,39 @@ impl AsyncOperationTargetState {
     }
 }
 
+// What a history operation does with its entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryOperationAction {
+    // Deletes the entries, with or without their files.
+    Delete,
+    // Removes the entries' files and keeps the entries.
+    RemoveFiles,
+}
+
+impl HistoryOperationAction {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Delete => HISTORY_DELETE_KIND,
+            Self::RemoveFiles => HISTORY_FILES_REMOVAL_KIND,
+        }
+    }
+
+    fn from_kind(kind: &str) -> Result<Self, StateError> {
+        match kind {
+            HISTORY_DELETE_KIND => Ok(Self::Delete),
+            HISTORY_FILES_REMOVAL_KIND => Ok(Self::RemoveFiles),
+            other => Err(StateError::Database(format!(
+                "invalid history operation kind `{other}`"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistoryDeleteOperationRow {
     pub id: u64,
     pub state: AsyncOperationState,
+    pub action: HistoryOperationAction,
     pub delete_files: bool,
     pub file_delete_authorized: bool,
 }
@@ -107,8 +142,46 @@ pub struct HistoryDeleteRowState {
     pub operation_id: u64,
     pub state: AsyncOperationTargetState,
     pub locked: bool,
+    pub action: HistoryOperationAction,
     pub delete_files: bool,
     pub error_message: Option<String>,
+    // How a files removal ended, once it has; `None` for a delete.
+    pub files_removal_outcome: Option<crate::HistoryFilesRemovalOutcome>,
+}
+
+// What a files removal request answers for one id when it is accepted or
+// refused, before any disk work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryFilesRemovalAcceptOutcome {
+    // Queued: the worker removes the files later.
+    Accepted,
+    // There is no history entry and no job with this id.
+    NotFound,
+    // Another history operation holds the entry, or the job is in the queue
+    // again.
+    Busy,
+    // The job is in the queue and has not finished.
+    NotFinished,
+    // The entry already says its files were removed.
+    AlreadyRemoved,
+}
+
+// The answer to a files removal request: the operation that holds the
+// accepted ids, when any was, and one outcome per distinct id in the order
+// given.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryFilesRemovalAcceptance {
+    pub operation_id: Option<u64>,
+    pub results: Vec<(u64, HistoryFilesRemovalAcceptOutcome)>,
+}
+
+// How the worker settles one target of a files removal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HistoryFilesRemovalSettlement {
+    pub target_id: u64,
+    pub state: AsyncOperationTargetState,
+    pub outcome: crate::HistoryFilesRemovalOutcome,
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -214,6 +287,175 @@ fn id_chunk_size(bind_budget: usize, fixed_binds: usize) -> usize {
     bind_budget.saturating_sub(fixed_binds).max(1)
 }
 
+// The history ids of `count` id binds, then a target kind bind, that no
+// history operation holds. Served by the primary key and the target state
+// index.
+fn unclaimed_history_ids_sql(count: usize) -> String {
+    format!(
+        "SELECT job_id FROM job_history
+          WHERE job_id IN ({}) AND NOT EXISTS (
+              SELECT 1 FROM async_operation_targets
+               WHERE target_kind = {{}} AND target_id = job_history.job_id
+                 AND state IN ('queued', 'running'))",
+        placeholders(count),
+    )
+}
+
+// One delete operation for every id of `ids` that is still a history entry
+// and no history operation holds; `None` when there is none.
+async fn insert_unclaimed_history_delete_operation_tx(
+    tx: &mut SqlTx<'_>,
+    ids: &[u64],
+    delete_files: bool,
+) -> Result<Option<u64>, StateError> {
+    let mut available = Vec::new();
+    for chunk in ids.chunks(id_chunk_size(bind_budget_for_tx(tx), 1)) {
+        let mut args = id_args(chunk);
+        args.push(SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()));
+        let present: HashSet<_> = tx
+            .fetch_all(&unclaimed_history_ids_sql(chunk.len()), &args)
+            .await?
+            .into_iter()
+            .map(|row| row.i64("job_id").map(|id| id as u64))
+            .collect::<Result<_, _>>()?;
+        available.extend(chunk.iter().copied().filter(|id| present.contains(id)));
+    }
+    if available.is_empty() {
+        return Ok(None);
+    }
+    insert_history_delete_operation_tx(tx, &available, delete_files, delete_files)
+        .await
+        .map(Some)
+}
+
+// What retention does with one due entry, by the latest operation that
+// targeted it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RetentionStep {
+    // An operation holds it: this pass leaves it.
+    Held,
+    // Its latest target is a finished delete of the same file policy that
+    // refused it: that target is queued again.
+    Rearm,
+    // Nothing holds it: it joins a new delete operation.
+    Queue,
+}
+
+// Per due entry, whether any operation holds it, and the state, kind,
+// payload and operation state of its latest target. One bind for each
+// target kind, then the ids. Served by the primary key and the target state
+// index.
+fn retention_probe_sql(count: usize) -> String {
+    format!(
+        "SELECT h.job_id,
+                CAST(CASE WHEN EXISTS (
+                    SELECT 1 FROM async_operation_targets l
+                     WHERE l.target_kind = {{}} AND l.target_id = h.job_id
+                       AND l.state IN ('queued', 'running'))
+                     THEN 1 ELSE 0 END AS BIGINT) AS held,
+                t.state AS target_state,
+                o.kind,
+                o.state AS operation_state,
+                o.payload_json
+           FROM job_history h
+           LEFT JOIN async_operation_targets t
+             ON t.target_kind = {{}} AND t.target_id = h.job_id
+            AND t.operation_id = (
+                SELECT MAX(t2.operation_id) FROM async_operation_targets t2
+                 WHERE t2.target_kind = {{}} AND t2.target_id = h.job_id)
+           LEFT JOIN async_operations o ON o.id = t.operation_id
+          WHERE h.job_id IN ({})",
+        placeholders(count)
+    )
+}
+
+fn retention_step(row: &SqlRow, delete_files: bool) -> Result<RetentionStep, StateError> {
+    if row.i64("held")? != 0 {
+        return Ok(RetentionStep::Held);
+    }
+    let refused = row.opt_text("target_state")?.as_deref() == Some("failed")
+        && row.opt_text("kind")?.as_deref() == Some(HISTORY_DELETE_KIND)
+        && matches!(
+            row.opt_text("operation_state")?.as_deref(),
+            Some("completed" | "completed_with_errors")
+        );
+    if !refused {
+        return Ok(RetentionStep::Queue);
+    }
+    let same_policy = row
+        .opt_text("payload_json")?
+        .map(|raw| parse_payload(&raw))
+        .transpose()?
+        .is_some_and(|payload| payload.delete_files == delete_files);
+    Ok(if same_policy {
+        RetentionStep::Rearm
+    } else {
+        RetentionStep::Queue
+    })
+}
+
+// Queues the refused latest delete target of each of `ids` again, with the
+// operation that holds it, when nothing holds the entry since and that
+// operation has finished. Returns how many targets it queued.
+async fn rearm_refused_history_deletes_tx(
+    tx: &mut SqlTx<'_>,
+    ids: &[u64],
+) -> Result<usize, StateError> {
+    let mut operations = BTreeSet::new();
+    let mut rearmed = 0;
+    for chunk in ids.chunks(id_chunk_size(bind_budget_for_tx(tx), 4)) {
+        let sql = format!(
+            "UPDATE async_operation_targets
+                SET state = 'queued', error_message = NULL, outcome = NULL
+              WHERE target_kind = {{}}
+                AND state = 'failed'
+                AND target_id IN ({})
+                AND operation_id = (
+                    SELECT MAX(t2.operation_id) FROM async_operation_targets t2
+                     WHERE t2.target_kind = async_operation_targets.target_kind
+                       AND t2.target_id = async_operation_targets.target_id)
+                AND NOT EXISTS (
+                    SELECT 1 FROM async_operation_targets l
+                     WHERE l.target_kind = async_operation_targets.target_kind
+                       AND l.target_id = async_operation_targets.target_id
+                       AND l.state IN ('queued', 'running'))
+                AND operation_id IN (
+                    SELECT id FROM async_operations
+                     WHERE id = async_operation_targets.operation_id
+                       AND kind = {{}}
+                       AND state IN ({{}}, {{}}))
+              RETURNING operation_id",
+            placeholders(chunk.len())
+        );
+        let mut args = vec![SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())];
+        args.extend(id_args(chunk));
+        args.push(SqlArg::Text(HISTORY_DELETE_KIND.to_string()));
+        args.push(SqlArg::Text(
+            AsyncOperationState::Completed.as_str().to_string(),
+        ));
+        args.push(SqlArg::Text(
+            AsyncOperationState::CompletedWithErrors
+                .as_str()
+                .to_string(),
+        ));
+        for row in tx.fetch_all(&sql, &args).await? {
+            rearmed += 1;
+            operations.insert(row.i64("operation_id")? as u64);
+        }
+    }
+    let operations = operations.into_iter().collect::<Vec<_>>();
+    for chunk in operations.chunks(id_chunk_size(bind_budget_for_tx(tx), 0)) {
+        let sql = format!(
+            "UPDATE async_operations
+                SET state = 'queued', finished_at = NULL
+              WHERE id IN ({})",
+            placeholders(chunk.len())
+        );
+        tx.execute(&sql, &id_args(chunk)).await?;
+    }
+    Ok(rearmed)
+}
+
 fn payload_json(delete_files: bool, file_delete_authorized: bool) -> Result<String, StateError> {
     serde_json::to_string(&HistoryDeleteOperationPayload {
         delete_files,
@@ -242,26 +484,31 @@ async fn count_existing_history_rows(tx: &mut SqlTx<'_>, ids: &[u64]) -> Result<
     Ok(total.max(0) as usize)
 }
 
+// How many of `ids` another delete holds. A files removal does not hold an
+// entry against a delete: the delete supersedes it.
 async fn count_locked_history_delete_targets(
     tx: &mut SqlTx<'_>,
     ids: &[u64],
 ) -> Result<usize, StateError> {
-    // One fixed bind (`target_kind`) per chunk. `ids` is deduped and chunks are
-    // disjoint, so `COUNT(DISTINCT target_id)` per chunk sums to the exact total
-    // (no target_id can span two chunks).
-    let chunk_size = id_chunk_size(bind_budget_for_tx(tx), 1);
+    // Two fixed binds (`target_kind`, `kind`) per chunk. `ids` is deduped and
+    // chunks are disjoint, so `COUNT(DISTINCT target_id)` per chunk sums to the
+    // exact total (no target_id can span two chunks).
+    let chunk_size = id_chunk_size(bind_budget_for_tx(tx), 2);
     let mut total = 0i64;
     for chunk in ids.chunks(chunk_size) {
         let sql = format!(
-            "SELECT COUNT(DISTINCT target_id) AS count
-             FROM async_operation_targets
-             WHERE target_kind = {{}}
-               AND state IN ('queued', 'running')
-               AND target_id IN ({})",
+            "SELECT COUNT(DISTINCT t.target_id) AS count
+             FROM async_operation_targets t
+             INNER JOIN async_operations o ON o.id = t.operation_id
+             WHERE t.target_kind = {{}}
+               AND t.state IN ('queued', 'running')
+               AND t.target_id IN ({})
+               AND o.kind = {{}}",
             placeholders(chunk.len())
         );
         let mut args = vec![SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())];
         args.extend(id_args(chunk));
+        args.push(SqlArg::Text(HISTORY_DELETE_KIND.to_string()));
         let row = tx.fetch_optional(&sql, &args).await?;
         total += row.map(|row| row.i64("count")).transpose()?.unwrap_or(0);
     }
@@ -282,22 +529,88 @@ async fn list_all_history_job_ids_tx(tx: &mut SqlTx<'_>) -> Result<Vec<u64>, Sta
         .collect()
 }
 
+// Whether another delete holds any entry. Served by the operation kind and
+// state index, then each active operation's targets.
 async fn has_locked_history_delete_targets_tx(tx: &mut SqlTx<'_>) -> Result<bool, StateError> {
     Ok(tx
         .fetch_optional(
             "SELECT 1
-             FROM async_operation_targets
-             WHERE target_kind = {}
-               AND state IN ('queued', 'running')
+             FROM async_operations o
+             INNER JOIN async_operation_targets t ON t.operation_id = o.id
+             WHERE o.kind = {}
+               AND o.state IN ('queued', 'running')
+               AND t.target_kind = {}
+               AND t.state IN ('queued', 'running')
              LIMIT 1",
-            &[SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())],
+            &[
+                SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
+            ],
         )
         .await?
         .is_some())
 }
 
+// A delete accepted for entries a files removal still waits on wins: the
+// queued removal targets of those entries end, superseded, so the removal
+// never runs for them. A removal already running finishes first, as the
+// worker runs one operation at a time. `ids` `None` supersedes every queued
+// removal target.
+async fn supersede_queued_history_files_removals_tx(
+    tx: &mut SqlTx<'_>,
+    ids: Option<&[u64]>,
+) -> Result<(), StateError> {
+    let update = "UPDATE async_operation_targets
+                     SET state = 'completed',
+                         outcome = {},
+                         error_message = NULL
+                   WHERE target_kind = {}
+                     AND state = 'queued'
+                     AND operation_id IN (
+                         SELECT id FROM async_operations
+                          WHERE kind = {} AND state = 'queued')";
+    let fixed = || {
+        vec![
+            SqlArg::Text(SUPERSEDED_OUTCOME.to_string()),
+            SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
+            SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
+        ]
+    };
+    match ids {
+        None => {
+            tx.execute(update, &fixed()).await?;
+        }
+        Some(ids) => {
+            for chunk in ids.chunks(id_chunk_size(bind_budget_for_tx(tx), 3)) {
+                let sql = format!("{update} AND target_id IN ({})", placeholders(chunk.len()));
+                let mut args = fixed();
+                args.extend(id_args(chunk));
+                tx.execute(&sql, &args).await?;
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn insert_history_delete_operation_tx(
     tx: &mut SqlTx<'_>,
+    ids: &[u64],
+    delete_files: bool,
+    file_delete_authorized: bool,
+) -> Result<u64, StateError> {
+    insert_history_operation_tx(
+        tx,
+        HistoryOperationAction::Delete,
+        ids,
+        delete_files,
+        file_delete_authorized,
+    )
+    .await
+}
+
+async fn insert_history_operation_tx(
+    tx: &mut SqlTx<'_>,
+    action: HistoryOperationAction,
     ids: &[u64],
     delete_files: bool,
     file_delete_authorized: bool,
@@ -312,7 +625,7 @@ async fn insert_history_delete_operation_tx(
              VALUES ({}, {}, {}, {}, NULL, NULL)
              RETURNING id",
             &[
-                SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                SqlArg::Text(action.kind().to_string()),
                 SqlArg::Text(AsyncOperationState::Queued.as_str().to_string()),
                 SqlArg::Text(payload_json),
                 SqlArg::I64(now),
@@ -507,6 +820,7 @@ impl Database {
                     if locked_count > 0 {
                         return Ok(Err(HistoryDeleteOperationInsertError::LockedTargets));
                     }
+                    supersede_queued_history_files_removals_tx(tx, Some(&ids)).await?;
 
                     let operation_id = insert_history_delete_operation_tx(
                         tx,
@@ -522,6 +836,7 @@ impl Database {
         })?
     }
 
+    #[cfg(test)]
     pub(crate) fn insert_available_history_delete_operation(
         &self,
         ids: &[u64],
@@ -536,38 +851,250 @@ impl Database {
                 |tx| {
                     let ids = ids.clone();
                     Box::pin(async move {
-                        let mut available = Vec::new();
-                        for chunk in ids.chunks(id_chunk_size(bind_budget_for_tx(tx), 1)) {
-                            let sql = format!(
-                                "SELECT job_id FROM job_history
-                             WHERE job_id IN ({}) AND NOT EXISTS (
-                                 SELECT 1 FROM async_operation_targets
-                                 WHERE target_kind = {{}} AND target_id = job_history.job_id
-                                   AND state IN ('queued', 'running'))",
-                                placeholders(chunk.len())
+                        insert_unclaimed_history_delete_operation_tx(tx, &ids, delete_files).await
+                    })
+                },
+            )
+            .await
+        })
+    }
+
+    // Retention's deletes for the due entries `ids`, with or without their
+    // files. An entry another operation holds is left for a later pass. An
+    // entry whose latest delete of the same file policy refused it is
+    // retried: that target and its operation are queued again, so no new
+    // operation is added for it pass after pass. Every other entry joins
+    // one new operation. The entries are read first outside any
+    // transaction: a pass with nothing to queue or retry writes nothing.
+    // Returns whether anything was queued; the caller rings the worker.
+    pub(crate) fn queue_retention_history_deletes(
+        &self,
+        ids: &[u64],
+        delete_files: bool,
+    ) -> Result<bool, StateError> {
+        let ids = dedupe_ids(ids);
+        if ids.is_empty() {
+            return Ok(false);
+        }
+        let datastore = self.datastore();
+        let probe = ids.clone();
+        let (rearm, queue) = self.run_sql_blocking_read(async move {
+            let chunk_size = id_chunk_size(bind_budget_for_engine(datastore.engine()), 3);
+            let mut rearm = Vec::new();
+            let mut queue = Vec::new();
+            for chunk in probe.chunks(chunk_size) {
+                let mut args = vec![
+                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()),
+                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()),
+                    SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()),
+                ];
+                args.extend(id_args(chunk));
+                let rows = SqlRuntime::fetch_all(
+                    datastore.read_exec(),
+                    &retention_probe_sql(chunk.len()),
+                    &args,
+                )
+                .await?;
+                let mut steps = HashMap::with_capacity(rows.len());
+                for row in rows {
+                    steps.insert(
+                        row.i64("job_id")? as u64,
+                        retention_step(&row, delete_files)?,
+                    );
+                }
+                for id in chunk {
+                    match steps.get(id) {
+                        Some(RetentionStep::Rearm) => rearm.push(*id),
+                        Some(RetentionStep::Queue) => queue.push(*id),
+                        Some(RetentionStep::Held) | None => {}
+                    }
+                }
+            }
+            Ok::<_, StateError>((rearm, queue))
+        })?;
+        if rearm.is_empty() && queue.is_empty() {
+            return Ok(false);
+        }
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "queue_retention_history_deletes", |tx| {
+                let rearm = rearm.clone();
+                let queue = queue.clone();
+                Box::pin(async move {
+                    let rearmed = rearm_refused_history_deletes_tx(tx, &rearm).await?;
+                    let inserted =
+                        insert_unclaimed_history_delete_operation_tx(tx, &queue, delete_files)
+                            .await?;
+                    Ok(rearmed > 0 || inserted.is_some())
+                })
+            })
+            .await
+        })
+    }
+
+    // Accepts the removal of the files of `ids`, keeping the entries: one
+    // transaction reads, per id, whether it is an entry, a job still in the
+    // queue, held by another history operation, or already without its
+    // files, then queues one operation for the accepted ids. Nothing is
+    // written when none is accepted. The worker is rung; no disk is touched.
+    pub fn accept_history_files_removal(
+        &self,
+        ids: &[u64],
+    ) -> Result<HistoryFilesRemovalAcceptance, StateError> {
+        let ids = dedupe_ids(ids);
+        if ids.is_empty() {
+            return Ok(HistoryFilesRemovalAcceptance {
+                operation_id: None,
+                results: Vec::new(),
+            });
+        }
+        let datastore = self.datastore();
+        let acceptance = self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "accept_history_files_removal", |tx| {
+                let ids = ids.clone();
+                Box::pin(async move {
+                    let chunk_size = id_chunk_size(bind_budget_for_tx(tx), 1);
+                    let mut entries = HashMap::new();
+                    let mut active = HashSet::new();
+                    for chunk in ids.chunks(chunk_size) {
+                        let sql = format!(
+                            "SELECT h.job_id, h.files_removed_at,
+                                    CAST(CASE WHEN EXISTS (
+                                        SELECT 1 FROM async_operation_targets t
+                                         WHERE t.target_kind = {{}}
+                                           AND t.target_id = h.job_id
+                                           AND t.state IN ('queued', 'running'))
+                                         THEN 1 ELSE 0 END AS BIGINT) AS held
+                               FROM job_history h
+                              WHERE h.job_id IN ({})",
+                            placeholders(chunk.len())
+                        );
+                        let mut args = vec![SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string())];
+                        args.extend(id_args(chunk));
+                        for row in tx.fetch_all(&sql, &args).await? {
+                            entries.insert(
+                                row.i64("job_id")? as u64,
+                                (
+                                    row.opt_i64("files_removed_at")?.is_some(),
+                                    row.i64("held")? != 0,
+                                ),
                             );
-                            let mut args = id_args(chunk);
-                            args.push(SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_owned()));
-                            let present: HashSet<_> = tx
-                                .fetch_all(&sql, &args)
-                                .await?
-                                .into_iter()
-                                .map(|row| row.i64("job_id").map(|id| id as u64))
-                                .collect::<Result<_, _>>()?;
-                            available
-                                .extend(chunk.iter().copied().filter(|id| present.contains(id)));
                         }
-                        if available.is_empty() {
-                            return Ok(None);
+                        let sql = format!(
+                            "SELECT job_id FROM active_jobs WHERE job_id IN ({})",
+                            placeholders(chunk.len())
+                        );
+                        for row in tx.fetch_all(&sql, &id_args(chunk)).await? {
+                            active.insert(row.i64("job_id")? as u64);
                         }
-                        insert_history_delete_operation_tx(
-                            tx,
-                            &available,
-                            delete_files,
-                            delete_files,
+                    }
+                    let results = ids
+                        .iter()
+                        .map(|id| {
+                            let outcome = match (entries.get(id), active.contains(id)) {
+                                (None, true) => HistoryFilesRemovalAcceptOutcome::NotFinished,
+                                (None, false) => HistoryFilesRemovalAcceptOutcome::NotFound,
+                                (Some((true, _)), _) => {
+                                    HistoryFilesRemovalAcceptOutcome::AlreadyRemoved
+                                }
+                                (Some((false, held)), in_queue) if *held || in_queue => {
+                                    HistoryFilesRemovalAcceptOutcome::Busy
+                                }
+                                (Some(_), _) => HistoryFilesRemovalAcceptOutcome::Accepted,
+                            };
+                            (*id, outcome)
+                        })
+                        .collect::<Vec<_>>();
+                    let accepted = results
+                        .iter()
+                        .filter(|(_, outcome)| {
+                            *outcome == HistoryFilesRemovalAcceptOutcome::Accepted
+                        })
+                        .map(|(id, _)| *id)
+                        .collect::<Vec<_>>();
+                    let operation_id = if accepted.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            insert_history_operation_tx(
+                                tx,
+                                HistoryOperationAction::RemoveFiles,
+                                &accepted,
+                                true,
+                                false,
+                            )
+                            .await?,
                         )
-                        .await
-                        .map(Some)
+                    };
+                    Ok(HistoryFilesRemovalAcceptance {
+                        operation_id,
+                        results,
+                    })
+                })
+            })
+            .await
+        })?;
+        if acceptance.operation_id.is_some() {
+            self.history_delete_wake.notify_one();
+        }
+        Ok(acceptance)
+    }
+
+    // Settles the targets of one files removal operation, each with its
+    // state, outcome and message, in one transaction of one statement per
+    // bind-sized chunk.
+    pub fn settle_history_files_removal_targets(
+        &self,
+        operation_id: u64,
+        settled: &[HistoryFilesRemovalSettlement],
+    ) -> Result<(), StateError> {
+        if settled.is_empty() {
+            return Ok(());
+        }
+        let settled = settled.to_vec();
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(
+                &datastore,
+                "settle_history_files_removal_targets",
+                |tx| {
+                    let settled = settled.clone();
+                    Box::pin(async move {
+                        const BINDS_PER_ROW: usize = 4;
+                        let rows = (bind_budget_for_tx(tx).saturating_sub(2) / BINDS_PER_ROW).max(1);
+                        for chunk in settled.chunks(rows) {
+                            let values = vec![
+                                "(CAST({} AS BIGINT), CAST({} AS TEXT), CAST({} AS TEXT), CAST({} AS TEXT))";
+                                chunk.len()
+                            ]
+                            .join(", ");
+                            let mut args = Vec::with_capacity(chunk.len() * BINDS_PER_ROW + 2);
+                            for settlement in chunk {
+                                args.push(SqlArg::I64(settlement.target_id as i64));
+                                args.push(SqlArg::Text(settlement.state.as_str().to_string()));
+                                args.push(SqlArg::Text(settlement.outcome.as_str().to_string()));
+                                args.push(SqlArg::OptText(settlement.message.clone()));
+                            }
+                            args.push(SqlArg::I64(operation_id as i64));
+                            args.push(SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()));
+                            tx.execute(
+                                &format!(
+                                    "WITH settled (settled_id, settled_state, settled_outcome, settled_message)
+                                       AS (VALUES {values})
+                                     UPDATE async_operation_targets
+                                        SET state = settled.settled_state,
+                                            outcome = settled.settled_outcome,
+                                            error_message = settled.settled_message
+                                       FROM settled
+                                      WHERE async_operation_targets.operation_id = {{}}
+                                        AND async_operation_targets.target_kind = {{}}
+                                        AND async_operation_targets.target_id = settled.settled_id"
+                                ),
+                                &args,
+                            )
+                            .await?;
+                        }
+                        Ok(())
                     })
                 },
             )
@@ -595,6 +1122,7 @@ impl Database {
                         if has_locked_history_delete_targets_tx(tx).await? {
                             return Ok(Err(HistoryDeleteOperationInsertError::LockedTargets));
                         }
+                        supersede_queued_history_files_removals_tx(tx, None).await?;
 
                         let operation_id = insert_history_delete_operation_tx(
                             tx,
@@ -628,12 +1156,13 @@ impl Database {
                            AND operation_id IN (
                              SELECT id
                              FROM async_operations
-                             WHERE kind = {}
+                             WHERE kind IN ({}, {})
                                AND state = 'running'
                            )",
                             &[
                                 SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
                                 SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                                SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
                             ],
                         )
                         .await?;
@@ -641,9 +1170,12 @@ impl Database {
                             "UPDATE async_operations
                          SET state = 'queued',
                              finished_at = NULL
-                         WHERE kind = {}
+                         WHERE kind IN ({}, {})
                            AND state = 'running'",
-                            &[SqlArg::Text(HISTORY_DELETE_KIND.to_string())],
+                            &[
+                                SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                                SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
+                            ],
                         )
                         .await?;
                         Ok(())
@@ -677,11 +1209,12 @@ impl Database {
                          SET state = 'queued',
                              finished_at = NULL
                          WHERE id = {}
-                           AND kind = {}
+                           AND kind IN ({}, {})
                            AND state = 'running'",
                         &[
                             SqlArg::I64(operation_id as i64),
                             SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                            SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
                         ],
                     )
                     .await?;
@@ -701,19 +1234,23 @@ impl Database {
                 Box::pin(async move {
                     let row = tx
                         .fetch_optional(
-                            "SELECT id, payload_json
+                            "SELECT id, kind, payload_json
                              FROM async_operations
-                             WHERE kind = {}
+                             WHERE kind IN ({}, {})
                                AND state = 'queued'
                              ORDER BY requested_at ASC, id ASC
                              LIMIT 1",
-                            &[SqlArg::Text(HISTORY_DELETE_KIND.to_string())],
+                            &[
+                                SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                                SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
+                            ],
                         )
                         .await?;
                     let Some(row) = row else {
                         return Ok(None);
                     };
                     let operation_id = row.i64("id")? as u64;
+                    let action = HistoryOperationAction::from_kind(&row.text("kind")?)?;
                     let payload = parse_payload(&row.text("payload_json")?)?;
 
                     let updated = tx
@@ -738,6 +1275,7 @@ impl Database {
                     Ok(Some(HistoryDeleteOperationRow {
                         id: operation_id,
                         state: AsyncOperationState::Running,
+                        action,
                         delete_files: payload.delete_files,
                         file_delete_authorized: payload.file_delete_authorized,
                     }))
@@ -914,11 +1452,16 @@ impl Database {
 
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
+            // A delete's state is its latest target that has not completed;
+            // a files removal's is its latest target, shown only while it has
+            // not completed, so a removal that later succeeds clears an older
+            // failure. Every target here belongs to one of the two kinds.
             let sql = format!(
-                "SELECT t.target_id, t.operation_id, t.state, t.error_message, o.payload_json
+                "SELECT t.target_id, t.operation_id, t.state, t.error_message, t.outcome,
+                        o.kind, o.payload_json
                  FROM async_operation_targets t
                  INNER JOIN async_operations o ON o.id = t.operation_id
-                 WHERE o.kind = {{}}
+                 WHERE o.kind IN ({{}}, {{}})
                    AND t.target_kind = {{}}
                    AND t.state != 'completed'
                    AND t.target_id IN ({})
@@ -926,10 +1469,9 @@ impl Database {
                      SELECT t2.operation_id
                      FROM async_operation_targets t2
                      INNER JOIN async_operations o2 ON o2.id = t2.operation_id
-                     WHERE o2.kind = {{}}
-                       AND t2.target_kind = {{}}
+                     WHERE t2.target_kind = {{}}
                        AND t2.target_id = t.target_id
-                       AND t2.state != 'completed'
+                       AND ((o2.kind = {{}} AND t2.state != 'completed') OR o2.kind = {{}})
                      ORDER BY t2.operation_id DESC
                      LIMIT 1
                    )",
@@ -937,11 +1479,13 @@ impl Database {
             );
             let mut args = vec![
                 SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
+                SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
                 SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
             ];
             args.extend(id_args(&ids));
-            args.push(SqlArg::Text(HISTORY_DELETE_KIND.to_string()));
             args.push(SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()));
+            args.push(SqlArg::Text(HISTORY_DELETE_KIND.to_string()));
+            args.push(SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()));
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
             let mut out = HashMap::new();
             for row in rows {
@@ -1003,8 +1547,13 @@ fn history_delete_row_state_from_row(row: SqlRow) -> Result<HistoryDeleteRowStat
         operation_id: row.i64("operation_id")? as u64,
         state,
         locked: state.locked(),
+        action: HistoryOperationAction::from_kind(&row.text("kind")?)?,
         delete_files: parse_payload(&row.text("payload_json")?)?.delete_files,
         error_message: row.opt_text("error_message")?,
+        files_removal_outcome: row
+            .opt_text("outcome")?
+            .as_deref()
+            .and_then(crate::HistoryFilesRemovalOutcome::parse),
     })
 }
 
@@ -1049,6 +1598,7 @@ mod tests {
             completed_at,
             metadata: None,
             server_attribution: None,
+            files_removed_at: None,
         }
     }
 
@@ -1418,5 +1968,378 @@ mod tests {
             error,
             HistoryDeleteOperationInsertError::LockedTargets
         ));
+    }
+
+    fn active(job_id: u64) -> crate::ActiveJob {
+        crate::ActiveJob {
+            job_id: crate::JobId(job_id),
+            nzb_hash: [0xBC; 32],
+            nzb_path: std::path::PathBuf::from(format!("/invented/job-{job_id}.nzb")),
+            nzb_zstd: Vec::new(),
+            output_dir: std::path::PathBuf::from(format!("/invented/job-{job_id}")),
+            created_at: 1_700_000_000,
+            category: None,
+            metadata: Vec::new(),
+            status: "queued",
+            download_state: "queued",
+            post_state: "idle",
+            run_state: "active",
+            paused_resume_status: None,
+            paused_resume_download_state: None,
+            paused_resume_post_state: None,
+            password_override: None,
+            supplied_password_candidates: Vec::new(),
+        }
+    }
+
+    fn settle(
+        db: &Database,
+        operation_id: u64,
+        target_id: u64,
+        outcome: crate::HistoryFilesRemovalOutcome,
+        message: Option<&str>,
+    ) {
+        db.settle_history_files_removal_targets(
+            operation_id,
+            &[HistoryFilesRemovalSettlement {
+                target_id,
+                state: if outcome.settles() {
+                    AsyncOperationTargetState::Completed
+                } else {
+                    AsyncOperationTargetState::Failed
+                },
+                outcome,
+                message: message.map(str::to_string),
+            }],
+        )
+        .unwrap();
+    }
+
+    // Each distinct id gets its answer in the order given, and only the
+    // accepted ones are queued, as one files removal operation.
+    #[test]
+    fn a_files_removal_accept_answers_each_id_and_queues_the_accepted() {
+        use HistoryFilesRemovalAcceptOutcome as Accept;
+        let db = Database::open_in_memory().unwrap();
+        for id in [10, 11, 12, 14] {
+            db.insert_job_history(&history(id, 100 + id as i64))
+                .unwrap();
+        }
+        crate::pipeline::test_support::stamp_files_removed(
+            &db,
+            crate::JobId(11),
+            Default::default(),
+            1_700_000_000,
+        );
+        db.insert_history_delete_operation(&[12], false, false)
+            .unwrap();
+        db.create_active_job(&active(13)).unwrap();
+        db.create_active_job(&active(14)).unwrap();
+        let delete = db.next_history_delete_operation().unwrap().unwrap();
+        db.recover_running_history_delete_operations().unwrap();
+
+        let acceptance = db
+            .accept_history_files_removal(&[13, 10, 99, 11, 10, 12, 14])
+            .unwrap();
+
+        assert_eq!(
+            acceptance.results,
+            vec![
+                (13, Accept::NotFinished),
+                (10, Accept::Accepted),
+                (99, Accept::NotFound),
+                (11, Accept::AlreadyRemoved),
+                (12, Accept::Busy),
+                (14, Accept::Busy),
+            ]
+        );
+        let operation_id = acceptance.operation_id.unwrap();
+        assert_ne!(operation_id, delete.id);
+        let targets = db
+            .list_history_delete_operation_targets(operation_id, true)
+            .unwrap();
+        assert_eq!(
+            targets.iter().map(|t| t.target_id).collect::<Vec<_>>(),
+            [10]
+        );
+        let state = db.list_history_delete_row_states(&[10]).unwrap()[&10].clone();
+        assert_eq!(state.action, HistoryOperationAction::RemoveFiles);
+        assert_eq!(state.state, AsyncOperationTargetState::Queued);
+        assert!(state.locked);
+        assert_eq!(state.files_removal_outcome, None);
+
+        // A request with nothing to accept writes nothing.
+        let refused = db.accept_history_files_removal(&[10, 99]).unwrap();
+        assert_eq!(refused.operation_id, None);
+        assert_eq!(
+            refused.results,
+            vec![(10, Accept::Busy), (99, Accept::NotFound)]
+        );
+    }
+
+    // A removal the worker could not finish shows on its entry with its
+    // outcome and message, and holds nothing; a later removal that succeeds
+    // clears it.
+    #[test]
+    fn a_failed_files_removal_shows_until_a_later_one_succeeds() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_history(&history(10, 100)).unwrap();
+        let first = db.accept_history_files_removal(&[10]).unwrap();
+        let first = first.operation_id.unwrap();
+        let claimed = db.next_history_delete_operation().unwrap().unwrap();
+        assert_eq!(
+            (claimed.id, claimed.action),
+            (first, HistoryOperationAction::RemoveFiles)
+        );
+        settle(
+            &db,
+            first,
+            10,
+            crate::HistoryFilesRemovalOutcome::NotManaged,
+            Some("left /x: not managed by Weaver"),
+        );
+        assert_eq!(
+            db.finalize_history_delete_operation(first).unwrap(),
+            AsyncOperationState::CompletedWithErrors
+        );
+
+        let state = db.list_history_delete_row_states(&[10]).unwrap()[&10].clone();
+        assert_eq!(state.operation_id, first);
+        assert_eq!(state.state, AsyncOperationTargetState::Failed);
+        assert!(!state.locked);
+        assert_eq!(state.action, HistoryOperationAction::RemoveFiles);
+        assert_eq!(
+            state.files_removal_outcome,
+            Some(crate::HistoryFilesRemovalOutcome::NotManaged)
+        );
+        assert_eq!(
+            state.error_message.as_deref(),
+            Some("left /x: not managed by Weaver")
+        );
+
+        let second = db.accept_history_files_removal(&[10]).unwrap();
+        let second = second.operation_id.unwrap();
+        db.next_history_delete_operation().unwrap().unwrap();
+        settle(
+            &db,
+            second,
+            10,
+            crate::HistoryFilesRemovalOutcome::Removed,
+            None,
+        );
+        db.finalize_history_delete_operation(second).unwrap();
+        assert!(db.list_history_delete_row_states(&[10]).unwrap().is_empty());
+    }
+
+    // The delete operation list shows deletes only: a waiting and a failed
+    // files removal are seen on their rows, not in the list.
+    #[test]
+    fn the_delete_operation_list_leaves_out_files_removals() {
+        let db = Database::open_in_memory().unwrap();
+        for id in [10, 11, 12] {
+            db.insert_job_history(&history(id, 100 + id as i64))
+                .unwrap();
+        }
+        let failed = db
+            .accept_history_files_removal(&[10])
+            .unwrap()
+            .operation_id
+            .unwrap();
+        db.next_history_delete_operation().unwrap().unwrap();
+        settle(
+            &db,
+            failed,
+            10,
+            crate::HistoryFilesRemovalOutcome::Failed,
+            Some("disk unreachable"),
+        );
+        db.finalize_history_delete_operation(failed).unwrap();
+        let pending = db
+            .accept_history_files_removal(&[11])
+            .unwrap()
+            .operation_id
+            .unwrap();
+        let delete = db
+            .insert_history_delete_operation(&[12], false, false)
+            .unwrap();
+
+        for active_only in [true, false] {
+            let listed = db
+                .list_history_delete_operations(active_only)
+                .unwrap()
+                .into_iter()
+                .map(|summary| summary.id)
+                .collect::<Vec<_>>();
+            assert_eq!(listed, [delete], "active_only {active_only}");
+        }
+        let states = db.list_history_delete_row_states(&[10, 11, 12]).unwrap();
+        assert_eq!(states[&10].operation_id, failed);
+        assert_eq!(states[&10].state, AsyncOperationTargetState::Failed);
+        assert_eq!(states[&11].operation_id, pending);
+        assert_eq!(states[&11].action, HistoryOperationAction::RemoveFiles);
+        assert_eq!(states[&12].action, HistoryOperationAction::Delete);
+    }
+
+    // A delete for an entry whose files removal is running is accepted. The
+    // removal is not superseded: it finishes, then the delete runs.
+    #[test]
+    fn a_delete_is_accepted_while_a_files_removal_runs() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_history(&history(10, 100)).unwrap();
+        let removal = db
+            .accept_history_files_removal(&[10])
+            .unwrap()
+            .operation_id
+            .unwrap();
+        assert_eq!(
+            db.next_history_delete_operation().unwrap().unwrap().id,
+            removal
+        );
+
+        let delete = db
+            .insert_history_delete_operation(&[10], false, false)
+            .unwrap();
+
+        let removal_targets = db
+            .list_history_delete_operation_targets(removal, true)
+            .unwrap();
+        assert_eq!(removal_targets.len(), 1);
+        assert_eq!(
+            db.list_history_delete_row_states(&[10]).unwrap()[&10].operation_id,
+            delete
+        );
+        settle(
+            &db,
+            removal,
+            10,
+            crate::HistoryFilesRemovalOutcome::Removed,
+            None,
+        );
+        db.finalize_history_delete_operation(removal).unwrap();
+        assert_eq!(
+            db.next_history_delete_operation().unwrap().unwrap().id,
+            delete
+        );
+    }
+
+    // A files removal the worker had claimed when the process stopped is
+    // queued again at start-up, with its targets, as a delete is.
+    #[test]
+    fn a_claimed_files_removal_is_queued_again_after_a_restart() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_history(&history(10, 100)).unwrap();
+        let operation_id = db
+            .accept_history_files_removal(&[10])
+            .unwrap()
+            .operation_id
+            .unwrap();
+        db.next_history_delete_operation().unwrap().unwrap();
+        db.mark_history_delete_targets_state(
+            operation_id,
+            &[10],
+            AsyncOperationTargetState::Running,
+            None,
+        )
+        .unwrap();
+        assert!(db.next_history_delete_operation().unwrap().is_none());
+
+        db.recover_running_history_delete_operations().unwrap();
+
+        let claimed = db.next_history_delete_operation().unwrap().unwrap();
+        assert_eq!(claimed.id, operation_id);
+        assert_eq!(claimed.action, HistoryOperationAction::RemoveFiles);
+        let targets = db
+            .list_history_delete_operation_targets(operation_id, true)
+            .unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].state, AsyncOperationTargetState::Queued);
+    }
+
+    // A delete accepted while a files removal of the same entry still waits
+    // wins: the removal's target ends superseded and only the delete holds
+    // the entry; the removal's other entries still wait for it.
+    #[test]
+    fn a_delete_accepted_after_a_waiting_files_removal_supersedes_it() {
+        let db = Database::open_in_memory().unwrap();
+        for id in [10, 11, 12] {
+            db.insert_job_history(&history(id, 100 + id as i64))
+                .unwrap();
+        }
+        let removal = db
+            .accept_history_files_removal(&[10, 11])
+            .unwrap()
+            .operation_id
+            .unwrap();
+
+        let delete = db
+            .insert_history_delete_operation(&[10], true, true)
+            .unwrap();
+
+        let state = db.list_history_delete_row_states(&[10, 11]).unwrap();
+        assert_eq!(state[&10].operation_id, delete);
+        assert_eq!(state[&10].action, HistoryOperationAction::Delete);
+        assert_eq!(state[&11].operation_id, removal);
+        let waiting = db
+            .list_history_delete_operation_targets(removal, true)
+            .unwrap();
+        assert_eq!(
+            waiting.iter().map(|t| t.target_id).collect::<Vec<_>>(),
+            [11]
+        );
+
+        // A delete of all history supersedes every waiting removal.
+        db.insert_job_history(&history(13, 113)).unwrap();
+        let later = db
+            .accept_history_files_removal(&[13])
+            .unwrap()
+            .operation_id
+            .unwrap();
+        // The earlier delete still holds 10, so a delete of all is refused
+        // until it finishes; it then supersedes the rest.
+        assert!(matches!(
+            db.insert_all_history_delete_operation(false, false),
+            Err(HistoryDeleteOperationInsertError::LockedTargets)
+        ));
+        db.mark_history_delete_target_state(delete, 10, AsyncOperationTargetState::Completed, None)
+            .unwrap();
+        db.finalize_history_delete_operation(delete).unwrap();
+        db.insert_all_history_delete_operation(false, false)
+            .unwrap();
+        for operation in [removal, later] {
+            assert!(
+                db.list_history_delete_operation_targets(operation, true)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    // Retention deletes an entry whose files removal failed, in a new
+    // operation, as the removal holds nothing once it has ended.
+    #[test]
+    fn retention_deletes_an_entry_whose_files_removal_failed() {
+        let db = Database::open_in_memory().unwrap();
+        db.insert_job_history(&history(10, 100)).unwrap();
+        let removal = db
+            .accept_history_files_removal(&[10])
+            .unwrap()
+            .operation_id
+            .unwrap();
+        // Held while the removal waits.
+        assert!(!db.queue_retention_history_deletes(&[10], false).unwrap());
+        db.next_history_delete_operation().unwrap().unwrap();
+        settle(
+            &db,
+            removal,
+            10,
+            crate::HistoryFilesRemovalOutcome::Failed,
+            Some("disk error"),
+        );
+        db.finalize_history_delete_operation(removal).unwrap();
+
+        assert!(db.queue_retention_history_deletes(&[10], false).unwrap());
+        let state = db.list_history_delete_row_states(&[10]).unwrap()[&10].clone();
+        assert_eq!(state.action, HistoryOperationAction::Delete);
+        assert_eq!(state.state, AsyncOperationTargetState::Queued);
     }
 }

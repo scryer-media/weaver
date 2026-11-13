@@ -173,6 +173,7 @@ async fn job_detail_snapshot_names_the_servers_that_served_an_archived_job() {
         server_attribution: Some(format!(
             r#"[{{"s":{stale_server_id},"a":2,"b":2048}},{{"s":{server_id},"a":7,"b":7168}}]"#
         )),
+        files_removed_at: None,
     });
 
     let resp = h
@@ -282,6 +283,7 @@ async fn job_events_return_the_newest_window_and_page_back_from_it() {
     let expected =
         |from: i64, to: i64| (from..to).map(|n| format!("event {n}")).collect::<Vec<_>>();
 
+    // The newest 2000 when no size is named, as before the log was paged.
     let latest = messages(format!("{{ jobEvents(jobId: {job_id}) {{ message }} }}")).await;
     assert_eq!(latest, expected(5, 2_005));
 
@@ -307,4 +309,151 @@ async fn job_events_return_the_newest_window_and_page_back_from_it() {
         .execute(&format!("{{ jobTimeline(jobId: {job_id}) {{ outcome }} }}"))
         .await;
     assert_no_errors(&resp);
+}
+
+fn stored_events(job_id: u64, range: std::ops::Range<i64>) -> Vec<weaver_server_core::JobEvent> {
+    range
+        .map(|n| weaver_server_core::JobEvent {
+            job_id,
+            timestamp: 1_000 + n,
+            kind: "JobCreated".to_string(),
+            message: format!("event {n}"),
+            file_id: None,
+        })
+        .collect()
+}
+
+async fn event_page(h: &TestHarness, query: String) -> Vec<(String, String)> {
+    let resp = h.execute(&query).await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    data["jobEvents"]
+        .as_array()
+        .or_else(|| data["jobDetailSnapshot"]["jobEvents"].as_array())
+        .unwrap()
+        .iter()
+        .map(|event| {
+            (
+                event["message"].as_str().unwrap().to_string(),
+                event["cursor"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+// Paging back by cursor gives each event once, oldest first within a page,
+// however many events arrive between pages.
+#[tokio::test]
+async fn job_events_page_back_by_cursor_while_events_arrive() {
+    let h = TestHarness::new().await;
+    let job_id = 4_343;
+    h.db.insert_job_events(&stored_events(job_id, 0..250))
+        .unwrap();
+
+    let newest = event_page(
+        &h,
+        format!("{{ jobEvents(jobId: {job_id}, limit: 100) {{ message cursor }} }}"),
+    )
+    .await;
+    assert_eq!(newest.len(), 100);
+    let mut seen: Vec<String> = newest.iter().map(|(message, _)| message.clone()).collect();
+    let mut before = newest[0].1.clone();
+
+    // Events arrive between pages; the pages behind the cursor do not move.
+    h.db.insert_job_events(&stored_events(job_id, 250..400))
+        .unwrap();
+    loop {
+        let page = event_page(
+            &h,
+            format!(
+                "{{ jobEvents(jobId: {job_id}, before: \"{before}\", limit: 100) {{ message cursor }} }}"
+            ),
+        )
+        .await;
+        let Some((_, oldest)) = page.first() else {
+            break;
+        };
+        before = oldest.clone();
+        let mut older: Vec<String> = page.into_iter().map(|(message, _)| message).collect();
+        older.extend(seen);
+        seen = older;
+    }
+    let expected: Vec<String> = (0..250).map(|n| format!("event {n}")).collect();
+    assert_eq!(seen, expected);
+
+    // A page is at most 2000.
+    h.db.insert_job_events(&stored_events(job_id, 400..2_500))
+        .unwrap();
+    let largest = event_page(
+        &h,
+        format!("{{ jobEvents(jobId: {job_id}, limit: 5000) {{ message cursor }} }}"),
+    )
+    .await;
+    assert_eq!(largest.len(), 2_000);
+}
+
+// The detail snapshot carries the newest 100 events, with the count of all.
+#[tokio::test]
+async fn job_detail_snapshot_carries_the_newest_100_events_and_the_count() {
+    let h = TestHarness::new().await;
+    let job_id = 4_444;
+    let mut row = JobHistoryRow {
+        job_id,
+        job_hash: None,
+        name: "Windowed".to_string(),
+        status: "complete".to_string(),
+        error_message: None,
+        total_bytes: 1,
+        downloaded_bytes: 1,
+        optional_recovery_bytes: 0,
+        optional_recovery_downloaded_bytes: 0,
+        failed_bytes: 0,
+        health: 1000,
+        category: None,
+        output_dir: None,
+        nzb_path: None,
+        created_at: 1_000,
+        completed_at: 2_000,
+        metadata: None,
+        server_attribution: None,
+        files_removed_at: None,
+    };
+    h.insert_history_row(&row);
+    h.db.insert_job_events(&stored_events(job_id, 0..101))
+        .unwrap();
+
+    let query = format!(
+        "{{ jobDetailSnapshot(jobId: {job_id}) {{ jobEventCount jobEvents {{ message cursor }} }} }}"
+    );
+    let events = event_page(&h, query.clone()).await;
+    let messages: Vec<String> = events.into_iter().map(|(message, _)| message).collect();
+    let expected: Vec<String> = (1..101).map(|n| format!("event {n}")).collect();
+    assert_eq!(messages, expected);
+    let resp = h.execute(&query).await;
+    assert_eq!(
+        response_data(&resp)["jobDetailSnapshot"]["jobEventCount"].as_u64(),
+        Some(101)
+    );
+
+    // Exactly 100 is the whole log.
+    row.job_id = 4_445;
+    h.insert_history_row(&row);
+    h.db.insert_job_events(&stored_events(4_445, 0..100))
+        .unwrap();
+    let resp = h
+        .execute("{ jobDetailSnapshot(jobId: 4445) { jobEventCount jobEvents { message } } }")
+        .await;
+    assert_no_errors(&resp);
+    let data = response_data(&resp);
+    assert_eq!(
+        data["jobDetailSnapshot"]["jobEventCount"].as_u64(),
+        Some(100)
+    );
+    assert_eq!(
+        data["jobDetailSnapshot"]["jobEvents"]
+            .as_array()
+            .unwrap()
+            .len(),
+        100
+    );
 }

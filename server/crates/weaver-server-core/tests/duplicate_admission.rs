@@ -111,6 +111,7 @@ fn history(job_id: u64, status: &str) -> JobHistoryRow {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     }
 }
 

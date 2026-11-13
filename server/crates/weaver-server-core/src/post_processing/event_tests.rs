@@ -255,6 +255,7 @@ fn history(db: &Database, job_id: u64) {
         completed_at: 1,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     })
     .unwrap();
 }

@@ -304,8 +304,11 @@ fn validate_postprocessing_directory(
     context: &JobExecutionContext,
     path: &Path,
 ) -> Result<PathBuf, String> {
-    let relocated =
-        crate::jobs::working_dir::is_relocated_output_dir(path, &context.working_directory);
+    let relocated = crate::jobs::working_dir::is_relocated_output_dir(
+        path,
+        &context.working_directory,
+        crate::JobId(context.job_id),
+    );
     let path = validate_directory_owner(db, context, path, relocated)?;
     if context.working_directory.canonicalize().ok().as_ref() != Some(&path) && !relocated {
         return Err(
@@ -313,7 +316,7 @@ fn validate_postprocessing_directory(
         );
     }
     if relocated {
-        crate::jobs::working_dir::mark_weaver_owned_output_dir(&path)
+        crate::jobs::working_dir::mark_weaver_owned_output_dir(&path, crate::JobId(context.job_id))
             .map_err(|error| error.to_string())?;
     }
     Ok(path)
@@ -479,7 +482,7 @@ mod tests {
         let relocated = category.join("relocated-job");
         std::fs::create_dir(&current).unwrap();
         std::fs::write(current.join("job.bin"), b"job").unwrap();
-        crate::jobs::working_dir::mark_weaver_owned_output_dir(&current).unwrap();
+        crate::jobs::working_dir::mark_weaver_owned_output_dir(&current, crate::JobId(1)).unwrap();
         let mut context = context;
         context.working_directory = current.clone();
         context.final_directory = current.clone();
@@ -510,9 +513,12 @@ mod tests {
             validate_postprocessing_directory(&db, &context, &relocated).unwrap(),
             relocated.canonicalize().unwrap()
         );
-        assert!(crate::jobs::working_dir::is_weaver_owned_output_dir(
-            &relocated
-        ));
+        assert_eq!(
+            crate::jobs::working_dir::output_dir_owner(&relocated),
+            Some(crate::jobs::working_dir::OutputDirOwner::Job(crate::JobId(
+                1
+            )))
+        );
         assert_eq!(std::fs::read(relocated.join("job.bin")).unwrap(), b"job");
     }
 }

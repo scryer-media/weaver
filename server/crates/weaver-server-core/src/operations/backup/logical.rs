@@ -20,8 +20,8 @@ use super::catalog::{
 };
 use crate::persistence::sql_runtime::{SqlConn, StoreDatastore};
 use crate::schema_migrations::{
-    egress_quotas_v53, history_search_key_v88, proxy_resolver_v64, script_concurrency_v58,
-    script_instances_v55, unwanted_extensions_v56,
+    egress_quotas_v53, history_retention_v89, history_search_key_v88, proxy_resolver_v64,
+    script_concurrency_v58, script_instances_v55, unwanted_extensions_v56,
 };
 use crate::security::RuntimeSecurityConfig;
 use crate::{Database, StateError};
@@ -1098,6 +1098,11 @@ async fn name_older_history_releases(
 ) -> Result<(), StateError> {
     if source_schema_version < history_search_key_v88::SCHEMA_VERSION {
         history_search_key_v88::fill_history_search_columns(conn).await?;
+    }
+    // A bundle written before history was pruned by age restores history
+    // that was never pruned, which keeps all of it as an upgrade does.
+    if source_schema_version < history_retention_v89::SCHEMA_VERSION {
+        history_retention_v89::seed_history_retention(conn).await?;
     }
     Ok(())
 }
@@ -2442,5 +2447,115 @@ mod logical_reader_tests {
             .await
             .unwrap();
         assert_eq!(next, 8);
+    }
+
+    // A bundle carries a files removal (stamp, totals and the record of the
+    // files) and a finished job's download summary, and an import restores
+    // them as they were.
+    #[test]
+    fn a_files_removal_and_a_download_summary_round_trip_through_a_bundle() {
+        use crate::history::output_files::{OutputFile, OutputFileListing};
+        use crate::jobs::download_summary::{DOWNLOAD_SUMMARY_VERSION, DownloadSummary, Layout};
+        use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+        use crate::{JobHistoryRow, JobId};
+
+        let source = Database::open_in_memory().unwrap();
+        source
+            .insert_job_history(&JobHistoryRow {
+                job_id: 77,
+                job_hash: None,
+                name: "lantern".into(),
+                status: "complete".into(),
+                error_message: None,
+                total_bytes: 30,
+                downloaded_bytes: 30,
+                optional_recovery_bytes: 0,
+                optional_recovery_downloaded_bytes: 0,
+                failed_bytes: 0,
+                health: 1000,
+                category: None,
+                output_dir: Some("/data/complete/lantern".into()),
+                nzb_path: None,
+                created_at: 1,
+                completed_at: 2,
+                metadata: None,
+                server_attribution: None,
+                files_removed_at: None,
+            })
+            .unwrap();
+        let summary = DownloadSummary {
+            version: DOWNLOAD_SUMMARY_VERSION,
+            layout: Some(Layout::Plain),
+            ..DownloadSummary::default()
+        };
+        let json = summary.to_storage_json().unwrap();
+        let datastore = source.datastore();
+        source
+            .run_sql_blocking(async move {
+                SqlRuntime::run_in_transaction(&datastore, "test_history_summary", |tx| {
+                    let json = json.clone();
+                    Box::pin(async move {
+                        tx.execute(
+                            "UPDATE job_history SET download_summary = {} WHERE job_id = 77",
+                            &[SqlArg::Text(json)],
+                        )
+                        .await?;
+                        Ok(())
+                    })
+                })
+                .await
+            })
+            .unwrap();
+        let listing = OutputFileListing {
+            files: vec![
+                OutputFile {
+                    rel_path: "lantern.mkv".into(),
+                    name: "lantern.mkv".into(),
+                    size_bytes: 20,
+                },
+                OutputFile {
+                    rel_path: "Sample/sample.mkv".into(),
+                    name: "sample.mkv".into(),
+                    size_bytes: 6,
+                },
+            ],
+            total_count: 3,
+            total_bytes: 30,
+        };
+        source
+            .record_history_removed_files(&[(JobId(77), listing)])
+            .unwrap();
+        source
+            .stamp_history_files_removed(&[JobId(77)], 1_800_000_000)
+            .unwrap();
+
+        let archive = source.export_logical_backup().unwrap();
+        let tables = archive.staging.path().join("tables");
+        assert_eq!(archive.tables["job_history_removed_files"].rows, 2);
+
+        let target = Database::open_in_memory().unwrap();
+        target
+            .import_logical_backup(&tables, &archive.tables, archive.schema_version)
+            .unwrap();
+        let state = target
+            .list_job_history_file_states(&[JobId(77)])
+            .unwrap()
+            .remove(&JobId(77))
+            .unwrap();
+        assert_eq!(state.files_removed_at, Some(1_800_000_000));
+        assert_eq!(state.removed_file_count, Some(3));
+        assert_eq!(state.removed_file_bytes, Some(30));
+        assert_eq!(
+            target.list_history_removed_files(77, 0, 10).unwrap(),
+            source.list_history_removed_files(77, 0, 10).unwrap()
+        );
+        assert_eq!(
+            target.list_history_removed_files(77, 0, 10).unwrap().len(),
+            2
+        );
+        assert_eq!(
+            target.history_download_summary(JobId(77)).unwrap(),
+            Some(summary)
+        );
     }
 }

@@ -65,6 +65,9 @@ pub(crate) const BACKUP_TABLE_CATALOG: &[BackupTableCatalogEntry] = &[
     table!("job_history", Export, RequireEmpty),
     table!("job_history_attributes", Export, RequireEmpty),
     table!("job_events", Export, RequireEmpty),
+    // The record of the files a history entry's removal took travels with
+    // the entry.
+    table!("job_history_removed_files", Export, RequireEmpty),
     // Finished jobs' stored NZBs travel with their history; an active job's
     // goes with the rest of its active rows.
     table!("job_nzbs", Export, RequireEmpty),
@@ -141,7 +144,7 @@ pub(crate) fn export_query(table: &str, columns: &[String]) -> String {
         .join(", ");
     let predicate = match table {
         "settings" => "key <> 'nzbget.scheduled_resume_at'",
-        "job_history_attributes" | "job_events" | "job_nzbs" => {
+        "job_history_attributes" | "job_events" | "job_nzbs" | "job_history_removed_files" => {
             "job_id IN (SELECT job_id FROM job_history)"
         }
         "duplicate_job_snapshots" => "lifecycle IN ('succeeded', 'failed', 'cancelled')",

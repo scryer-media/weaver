@@ -9,6 +9,7 @@ use crate::jobs::types::{
     DuplicateIdentitySnapshotInfo, DuplicateSummaryInfo, PreparedQueueFilter,
     load_duplicate_summaries_chunked, queue_table_item_from_job,
 };
+use crate::jobs::types::{JobOutputSource, encode_offset_cursor};
 use crate::observability::with_timed_config_read;
 
 // The most rows `queueItems` and `jobs` return when the caller names a size.
@@ -19,16 +20,6 @@ pub(crate) struct JobsQuery;
 
 #[Object]
 impl JobsQuery {
-    #[graphql(guard = "crate::auth::AdminGuard")]
-    async fn validated_archive_password(
-        &self,
-        ctx: &Context<'_>,
-        id: u64,
-    ) -> Result<Option<String>> {
-        let db = ctx.data::<Database>()?.clone();
-        Ok(tokio::task::spawn_blocking(move || db.validated_archive_password(id)).await??)
-    }
-
     /// A report on a queued or finished job's NZB and how the job went, with
     /// every name, path, host and password left out so it can be shared.
     #[graphql(guard = "ReadGuard")]
@@ -299,66 +290,188 @@ impl JobsQuery {
             semantic.as_ref(),
         )))
     }
-    /// List files in a completed job's output directory.
+    /// List one page of the files in a job's output directory, in file name
+    /// order, with the totals of all of them. Once the files were removed,
+    /// the list is the record kept of them and `removed` is true.
     async fn job_output_files(
         &self,
         ctx: &Context<'_>,
         job_id: u64,
+        #[graphql(desc = "Files per page: 100 when absent, at most 1000.")] first: Option<u32>,
+        #[graphql(desc = "The `nextCursor` of the page before.")] after: Option<String>,
     ) -> Result<Option<JobOutputResult>> {
-        let handle = ctx.data::<SchedulerHandle>()?;
-        let output_dir = match handle.get_job(weaver_server_core::jobs::ids::JobId(job_id)) {
-            Ok(info) => info.output_dir.clone(),
-            Err(weaver_server_core::SchedulerError::JobNotFound(_)) => {
-                let db = ctx.data::<Database>()?.clone();
-                tokio::task::spawn_blocking(move || {
-                    db.get_job_history_profiled(
-                        job_id,
-                        "db.get_job_history.api_job_output_dir_fallback",
-                    )
-                })
-                .await
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?
-                .map_err(|e| async_graphql::Error::new(e.to_string()))?
-                .and_then(|row| row.output_dir)
+        let offset = decode_offset_cursor(after.as_deref())
+            .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
+        let limit = first
+            .unwrap_or(JOB_OUTPUT_FILES_DEFAULT_FIRST)
+            .min(JOB_OUTPUT_FILES_MAX_FIRST) as usize;
+        let id = weaver_server_core::jobs::ids::JobId(job_id);
+        // A job in the queue lists its live directory; a finished one reads
+        // what its history entry says of its files.
+        let state = ctx.data::<weaver_server_core::SharedPipelineState>()?;
+        let output_dir = if let Some(info) = read_row(state, id) {
+            info.output_dir
+        } else {
+            let db = ctx.data::<Database>()?.clone();
+            let entry = tokio::task::spawn_blocking(move || {
+                db.list_job_history_file_states(&[id])
+                    .map(|mut states| states.remove(&id))
+            })
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+            match entry {
+                Some(entry) if entry.files_removed_at.is_some() => {
+                    let Some(output_dir) = entry.output_dir else {
+                        return Ok(None);
+                    };
+                    let total_count = entry.removed_file_count.unwrap_or(0);
+                    // The record keeps at most a capped number of files while
+                    // the totals count them all: more remain only if the
+                    // record holds the next one.
+                    let mut next_cursor = next_output_cursor(offset, limit, total_count);
+                    if next_cursor.is_some() {
+                        let db = ctx.data::<Database>()?.clone();
+                        let next = offset.saturating_add(limit) as u64;
+                        let kept = tokio::task::spawn_blocking(move || {
+                            db.has_history_removed_file(job_id, next)
+                        })
+                        .await
+                        .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                        .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                        if !kept {
+                            next_cursor = None;
+                        }
+                    }
+                    return Ok(Some(JobOutputResult {
+                        output_dir,
+                        total_bytes: entry.removed_file_bytes.unwrap_or(0),
+                        total_count,
+                        removed: true,
+                        next_cursor,
+                        source: JobOutputSource::Removed {
+                            job_id,
+                            offset: offset as u64,
+                            limit,
+                        },
+                    }));
+                }
+                Some(entry) => entry.output_dir,
+                // Not yet written to history: what the pipeline holds.
+                None => match ctx.data::<SchedulerHandle>()?.get_job(id) {
+                    Ok(info) => info.output_dir,
+                    Err(weaver_server_core::SchedulerError::JobNotFound(_)) => None,
+                    Err(e) => return Err(e.into()),
+                },
             }
-            Err(e) => return Err(e.into()),
         };
         let Some(output_dir) = output_dir else {
             return Ok(None);
         };
 
         let dir_path = PathBuf::from(&output_dir);
-        let result = tokio::task::spawn_blocking(move || list_output_files(&dir_path))
-            .await
-            .map_err(|e| async_graphql::Error::new(e.to_string()))??;
+        let result =
+            tokio::task::spawn_blocking(move || list_output_files(&dir_path, offset, limit))
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))??;
         Ok(Some(result))
     }
 }
 
-fn list_output_files(dir: &std::path::Path) -> Result<JobOutputResult> {
+// The page `jobOutputFiles` returns when the caller names no size, and the
+// largest it returns when one does.
+const JOB_OUTPUT_FILES_DEFAULT_FIRST: u32 = 100;
+const JOB_OUTPUT_FILES_MAX_FIRST: u32 = 1000;
+
+fn next_output_cursor(offset: usize, limit: usize, total: u64) -> Option<String> {
+    let next = offset.saturating_add(limit);
+    (limit > 0 && (next as u64) < total).then(|| encode_offset_cursor(next))
+}
+
+#[async_graphql::ComplexObject]
+impl JobOutputResult {
+    /// This page of the files, in file name order.
+    async fn files(&self, ctx: &Context<'_>) -> Result<Vec<JobOutputFile>> {
+        match &self.source {
+            JobOutputSource::Disk(files) => Ok(files.clone()),
+            JobOutputSource::Removed {
+                job_id,
+                offset,
+                limit,
+            } => {
+                let db = ctx.data::<Database>()?.clone();
+                let (job_id, offset, limit) = (*job_id, *offset, *limit);
+                let rows = tokio::task::spawn_blocking(move || {
+                    db.list_history_removed_files(job_id, offset, limit)
+                })
+                .await
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?
+                .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+                let root = PathBuf::from(&self.output_dir);
+                Ok(rows
+                    .into_iter()
+                    .map(|(rel_path, size_bytes)| {
+                        let path = root.join(&rel_path);
+                        JobOutputFile {
+                            name: path
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default(),
+                            path: path.to_string_lossy().into_owned(),
+                            size_bytes,
+                        }
+                    })
+                    .collect())
+            }
+        }
+    }
+}
+
+// One page of the files on disk under `dir`, from `offset`, in file name
+// order, with the totals of every file. Symbolic links are skipped, as the
+// record a files removal keeps skips them, so the list reads the same before
+// and after a removal.
+fn list_output_files(
+    dir: &std::path::Path,
+    offset: usize,
+    limit: usize,
+) -> Result<JobOutputResult> {
     let output_dir = dir.to_string_lossy().into_owned();
 
     if !dir.is_dir() {
         return Ok(JobOutputResult {
             output_dir,
-            files: Vec::new(),
             total_bytes: 0,
+            total_count: 0,
+            removed: false,
+            next_cursor: None,
+            source: JobOutputSource::Disk(Vec::new()),
         });
     }
 
-    let mut files = Vec::new();
-    collect_files_recursive(dir, &mut files)?;
-    files.sort_by(|a, b| {
-        a.name
-            .to_ascii_lowercase()
-            .cmp(&b.name.to_ascii_lowercase())
-    });
-    let total_bytes = files.iter().map(|f| f.size_bytes).sum();
+    let listing = weaver_server_core::history::output_files::list_output_files(
+        dir,
+        offset.saturating_add(limit),
+    )
+    .map_err(|e| async_graphql::Error::new(format!("failed to read directory: {e}")))?;
+    let files = listing
+        .files
+        .into_iter()
+        .skip(offset)
+        .map(|file| JobOutputFile {
+            path: dir.join(&file.rel_path).to_string_lossy().into_owned(),
+            name: file.name,
+            size_bytes: file.size_bytes,
+        })
+        .collect();
 
     Ok(JobOutputResult {
         output_dir,
-        files,
-        total_bytes,
+        total_bytes: listing.total_bytes,
+        total_count: listing.total_count,
+        removed: false,
+        next_cursor: next_output_cursor(offset, limit, listing.total_count),
+        source: JobOutputSource::Disk(files),
     })
 }
 
@@ -486,31 +599,6 @@ async fn attach_duplicate_summaries(db: Database, items: &mut [QueueItem]) -> Re
     for item in items {
         if let Some(summary) = summaries.get(&weaver_server_core::jobs::ids::JobId(item.id)) {
             item.duplicate_summary = Some(DuplicateSummaryInfo::from_summary(summary));
-        }
-    }
-    Ok(())
-}
-
-fn collect_files_recursive(dir: &std::path::Path, out: &mut Vec<JobOutputFile>) -> Result<()> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| async_graphql::Error::new(format!("failed to read directory: {e}")))?;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let meta = match std::fs::metadata(&path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.is_dir() {
-            collect_files_recursive(&path, out)?;
-        } else {
-            out.push(JobOutputFile {
-                name: path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default(),
-                path: path.to_string_lossy().into_owned(),
-                size_bytes: meta.len(),
-            });
         }
     }
     Ok(())

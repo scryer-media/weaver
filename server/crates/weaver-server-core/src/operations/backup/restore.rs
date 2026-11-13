@@ -934,6 +934,7 @@ mod tests {
             completed_at: 2,
             metadata: None,
             server_attribution: None,
+            files_removed_at: None,
         });
         assert_eq!(repairing.status, crate::JobStatus::Repairing);
         assert_eq!(repairing.download_state, crate::DownloadState::Complete);
@@ -958,6 +959,7 @@ mod tests {
             completed_at: 2,
             metadata: None,
             server_attribution: None,
+            files_removed_at: None,
         });
         assert_eq!(moving.status, crate::JobStatus::Moving);
         assert_eq!(moving.download_state, crate::DownloadState::Complete);

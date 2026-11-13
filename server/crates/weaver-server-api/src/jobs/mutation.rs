@@ -8,8 +8,9 @@ use base64::Engine;
 
 use crate::auth::{CallerIdentity, ControlGuard, ReadGuard, graphql_error};
 use crate::history::types::{
-    AcceptHistoryDeleteInput, HistoryCommandResult, HistoryDeleteAcceptance, HistoryItem,
-    history_delete_row_state_from_core, history_item_from_row,
+    AcceptHistoryDeleteInput, HistoryCommandResult, HistoryDeleteAcceptance,
+    HistoryFilesRemovalAcceptance, HistoryItem, history_delete_row_state_from_core,
+    history_item_from_row,
 };
 use crate::jobs::batch::{QueueBatchOp, batch_result};
 use crate::jobs::staging::{StagedUploadManager, normalize_uploaded_nzb_reader};
@@ -42,6 +43,15 @@ use weaver_server_core::{
 
 /// Longest timed pause, matching NZBGet's `scheduleresume` bound.
 const MAX_RESUME_AFTER_SECS: u64 = 60 * 60 * 24 * 30;
+
+/// Most history ids one `removeHistoryFiles` call takes.
+const MAX_HISTORY_FILES_REMOVAL_IDS: usize = 100;
+
+/// `ids` without repeats, each where it first appears.
+fn distinct_in_order(ids: Vec<u64>) -> Vec<u64> {
+    let mut seen = HashSet::with_capacity(ids.len());
+    ids.into_iter().filter(|id| seen.insert(*id)).collect()
+}
 
 #[derive(Default)]
 pub(crate) struct JobsMutation;
@@ -580,6 +590,32 @@ impl JobsMutation {
         let db = ctx.data::<Database>()?.clone();
         delete_history_ids(handle, replay, ids, delete_files).await?;
         history_items_from_db(db, crate::history::query::live_job_ids(handle)).await
+    }
+    /// Remove the files of up to 100 history entries and keep the entries
+    /// and their stored NZBs. Only folders Weaver manages are removed. The
+    /// request only queues the work and answers one result per distinct id,
+    /// in the order given; the files go in the background. Each accepted
+    /// entry then shows `filesRemovedAt`, or a failed `deleteOperation`
+    /// with `action: REMOVE_FILES`, its `filesRemovalOutcome` and message.
+    #[graphql(guard = "ControlGuard")]
+    async fn remove_history_files(
+        &self,
+        ctx: &Context<'_>,
+        ids: Vec<u64>,
+    ) -> Result<HistoryFilesRemovalAcceptance> {
+        let ids = distinct_in_order(ids);
+        if ids.is_empty() || ids.len() > MAX_HISTORY_FILES_REMOVAL_IDS {
+            return Err(graphql_error(
+                "INVALID_INPUT",
+                format!("give between 1 and {MAX_HISTORY_FILES_REMOVAL_IDS} history ids"),
+            ));
+        }
+        let db = ctx.data::<Database>()?.clone();
+        let acceptance = tokio::task::spawn_blocking(move || db.accept_history_files_removal(&ids))
+            .await
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
+            .map_err(|error| graphql_error("INTERNAL", error.to_string()))?;
+        Ok(HistoryFilesRemovalAcceptance::from_core(acceptance))
     }
     /// Delete all completed/failed/cancelled jobs from history.
     /// Integration (control) scope may also delete completed output with `deleteFiles: true`.
@@ -1564,6 +1600,7 @@ mod tests {
             completed_at: 2,
             metadata: None,
             server_attribution: None,
+            files_removed_at: None,
         }
     }
 

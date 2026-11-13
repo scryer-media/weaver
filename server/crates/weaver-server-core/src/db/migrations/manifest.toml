@@ -1136,3 +1136,25 @@ scope = "all"
 kind = "rust"
 hook_id = "fill_history_search_keys_v88"
 scope = "all"
+
+[[migration]]
+version = 89
+description = "a history entry keeps when its files were removed; existing history upgrades with age retention off"
+checksum_algo = "blake3"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0089_history_files_removed/sqlite.sql"
+engine = "sqlite"
+scope = "all"
+
+[[migration.steps]]
+kind = "sql"
+file = "migrations/0089_history_files_removed/postgres.sql"
+engine = "postgres"
+scope = "all"
+
+[[migration.steps]]
+kind = "rust"
+hook_id = "seed_history_retention_v89"
+scope = "all"

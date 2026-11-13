@@ -182,8 +182,9 @@ fn live_fingerprint(handle: &SchedulerHandle, job_id: u64) -> Option<Vec<u8>> {
 }
 
 // What a terminal job's snapshot can still change by: its history row, or
-// its absence, with the columns a history edit changes, and its delete
-// state. A history edit emits no pipeline event, so only this mark shows it.
+// its absence, with the columns a history edit changes and its files
+// removal time, and its delete state. A history edit or a files removal
+// emits no pipeline event, so only this mark shows it.
 #[derive(Debug, PartialEq, Eq)]
 struct TerminalMark {
     history: Option<weaver_server_core::HistoryEditFields>,
@@ -288,6 +289,7 @@ mod tests {
             completed_at: 200,
             metadata: None,
             server_attribution: None,
+            files_removed_at: None,
         }
     }
 
@@ -345,6 +347,21 @@ mod tests {
             assert!(gate.terminal_moved(terminal_mark(db.clone(), 7).await.unwrap()));
             assert!(!gate.terminal_moved(terminal_mark(db.clone(), 7).await.unwrap()));
         }
+
+        // A files removal stamps the row and emits no event either.
+        weaver_server_core::pipeline::test_support::stamp_files_removed(
+            &db,
+            JobId(7),
+            weaver_server_core::history::output_files::OutputFileListing::default(),
+            1_800_000_000,
+        );
+        let stamped = terminal_mark(db.clone(), 7).await.unwrap();
+        assert_eq!(
+            stamped.history.as_ref().unwrap().files_removed_at,
+            Some(1_800_000_000)
+        );
+        assert!(gate.terminal_moved(stamped));
+        assert!(!gate.terminal_moved(terminal_mark(db.clone(), 7).await.unwrap()));
 
         db.delete_job_history(7).unwrap();
         let gone = terminal_mark(db.clone(), 7).await.unwrap();

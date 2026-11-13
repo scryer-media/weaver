@@ -31,6 +31,7 @@ pub fn spawn_maintenance_worker(
         startup_disk_work.wait().await;
         run_maintenance_pass(db.clone(), staging_roots(&complete_dir, &config).await).await;
         run_job_files_sweep(&handle, &config).await;
+        run_history_retention(&db, &config).await;
 
         let mut interval = tokio::time::interval_at(
             tokio::time::Instant::now() + MAINTENANCE_INTERVAL,
@@ -42,8 +43,38 @@ pub fn spawn_maintenance_worker(
             interval.tick().await;
             run_maintenance_pass(db.clone(), staging_roots(&complete_dir, &config).await).await;
             run_job_files_sweep(&handle, &config).await;
+            run_history_retention(&db, &config).await;
         }
     })
+}
+
+// History entries older than the retention setting go to the durable delete
+// queue, without their files.
+async fn run_history_retention(db: &Database, config: &SharedConfig) {
+    let days = config.read().await.history_retention_days();
+    if days == 0 {
+        return;
+    }
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64);
+    let db = db.clone();
+    match tokio::task::spawn_blocking(move || db.prune_history_by_age(days, now)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(queued)) => {
+            tracing::info!(
+                days,
+                queued,
+                "queued history past its retention for deletion"
+            );
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(error = %error, "history retention pass failed");
+        }
+        Err(error) => {
+            tracing::warn!(error = %error, "history retention worker panicked");
+        }
+    }
 }
 
 // Every directory a job stages under: the complete directory and each

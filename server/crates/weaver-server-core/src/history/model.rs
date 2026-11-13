@@ -80,10 +80,12 @@ pub struct HistoryFilter {
     pub offset: Option<u32>,
 }
 
-// The columns of a history row that a history edit changes.
+// The columns of a history row that a history edit changes, and when its
+// files were removed, which a files removal changes the same quiet way.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HistoryEditFields {
     pub name: String,
     pub category: Option<String>,
     pub metadata: Option<String>,
+    pub files_removed_at: Option<i64>,
 }

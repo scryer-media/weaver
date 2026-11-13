@@ -1024,11 +1024,35 @@ pub struct JobOutputFile {
     pub size_bytes: u64,
 }
 
+/// One page of a job's output files, and the totals of all of them.
 #[derive(Debug, Clone, SimpleObject)]
+#[graphql(complex)]
 pub struct JobOutputResult {
     pub output_dir: String,
-    pub files: Vec<JobOutputFile>,
+    /// The bytes of every file, not only of this page.
     pub total_bytes: u64,
+    /// How many files there are in all.
+    pub total_count: u64,
+    /// True when the files were removed and this is the record kept of them.
+    pub removed: bool,
+    /// The `after` that asks for the next page; null on the last page.
+    pub next_cursor: Option<String>,
+    #[graphql(skip)]
+    pub(crate) source: JobOutputSource,
+}
+
+/// Where a job's output files are read from: loaded only when `files` is
+/// selected.
+#[derive(Debug, Clone)]
+pub(crate) enum JobOutputSource {
+    /// Read from disk with the totals; this page is already in hand.
+    Disk(Vec<JobOutputFile>),
+    /// The record a files removal kept, read from `offset` on.
+    Removed {
+        job_id: u64,
+        offset: u64,
+        limit: usize,
+    },
 }
 
 #[derive(Debug, Clone, SimpleObject)]

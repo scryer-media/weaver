@@ -57,6 +57,7 @@ mod download_dispatch;
 pub(in crate::pipeline) mod engines;
 mod full_file_names;
 mod hardware_profile;
+mod history_files_removal;
 mod idle;
 mod memory_release;
 mod next_up_ring;
@@ -162,6 +163,7 @@ impl TestHarness {
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             delete_failed_job_files: None,
+            history_retention_days: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: Some(crate::settings::DirectStoreOverrides {
@@ -444,6 +446,7 @@ fn history_row_with_output_dir(
         completed_at: 2,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     }
 }
 
@@ -642,6 +645,7 @@ async fn new_direct_pipeline_on_machine(
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         delete_failed_job_files: None,
+        history_retention_days: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: Some(direct_store),

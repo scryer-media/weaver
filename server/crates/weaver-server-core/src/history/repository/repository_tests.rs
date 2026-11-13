@@ -27,6 +27,7 @@ fn sample_history() -> JobHistoryRow {
         completed_at: 1700001000,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     }
 }
 

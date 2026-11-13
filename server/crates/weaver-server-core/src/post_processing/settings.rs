@@ -701,6 +701,7 @@ mod tests {
             completed_at: 2,
             metadata: None,
             server_attribution: None,
+            files_removed_at: None,
         }
     }
 

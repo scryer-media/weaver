@@ -591,6 +591,7 @@ fn try_archive_unfinished_terminal_job(
         completed_at,
         metadata: crate::jobs::persistence::metadata_json(&recovered.metadata).unwrap_or(None),
         server_attribution: None,
+        files_removed_at: None,
     };
     db.archive_job(job_id, &row)?;
     info!(
@@ -920,6 +921,7 @@ mod tests {
             completed_at: 1_700_000_100,
             metadata: None,
             server_attribution: None,
+            files_removed_at: None,
         })
         .unwrap();
 
@@ -969,6 +971,7 @@ mod tests {
             completed_at: 2,
             metadata: None,
             server_attribution: None,
+            files_removed_at: None,
         })
         .unwrap();
         execute_sql(
@@ -1206,6 +1209,7 @@ mod tests {
             completed_at: 1_700_000_100,
             metadata: None,
             server_attribution: None,
+            files_removed_at: None,
         })
         .unwrap();
 

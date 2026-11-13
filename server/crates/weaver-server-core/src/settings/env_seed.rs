@@ -1149,6 +1149,7 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             delete_failed_job_files: None,
+            history_retention_days: None,
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),

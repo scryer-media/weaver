@@ -151,6 +151,25 @@ impl SettingsMutation {
         let normalized_complete_dir = normalize_settings_path_update(&input.complete_dir);
         let cleanup_after_extract = input.cleanup_after_extract;
         let delete_failed_job_files = input.delete_failed_job_files;
+        let history_retention_days = input
+            .history_retention_days
+            .map(|days| {
+                u32::try_from(days)
+                    .ok()
+                    .filter(|days| {
+                        *days <= weaver_server_core::settings::MAX_HISTORY_RETENTION_DAYS
+                    })
+                    .ok_or_else(|| {
+                        crate::auth::graphql_error(
+                            "INVALID_INPUT",
+                            format!(
+                                "historyRetentionDays must be between 0 and {}",
+                                weaver_server_core::settings::MAX_HISTORY_RETENTION_DAYS
+                            ),
+                        )
+                    })
+            })
+            .transpose()?;
         let max_download_speed = input.max_download_speed;
         let max_retries = input.max_retries;
         let propagation_delay_secs = input.propagation_delay_secs;
@@ -188,6 +207,7 @@ impl SettingsMutation {
             propagation_delay_secs,
             max_concurrent_nzbs,
             delete_failed_job_files,
+            history_retention_days,
         );
         let settings_persist = {
             let db = db.clone();
@@ -298,6 +318,9 @@ impl SettingsMutation {
                         if let Some(delete) = persist_input.10 {
                             db.set_setting("delete_failed_job_files", &delete.to_string())?;
                         }
+                        if let Some(days) = persist_input.11 {
+                            db.set_setting("history_retention_days", &days.to_string())?;
+                        }
                         Ok(())
                     },
                 )
@@ -329,6 +352,9 @@ impl SettingsMutation {
                 }
                 if let Some(delete) = delete_failed_job_files {
                     cfg.delete_failed_job_files = Some(delete);
+                }
+                if let Some(days) = history_retention_days {
+                    cfg.history_retention_days = Some(days);
                 }
                 if let Some(speed) = max_download_speed {
                     cfg.max_download_speed = Some(speed);
@@ -374,6 +400,7 @@ impl SettingsMutation {
                     complete_dir: cfg.complete_dir(),
                     cleanup_after_extract: cfg.cleanup_after_extract(),
                     delete_failed_job_files: cfg.delete_failed_job_files(),
+                    history_retention_days: cfg.history_retention_days(),
                     max_download_speed: cfg.max_download_speed.unwrap_or(0),
                     propagation_delay_secs: cfg.propagation_delay_secs(),
                     max_concurrent_nzbs: cfg.max_concurrent_nzbs(),
@@ -702,6 +729,7 @@ mod tests {
             max_download_speed: None,
             cleanup_after_extract: None,
             delete_failed_job_files: None,
+            history_retention_days: None,
             propagation_delay_secs: None,
             max_concurrent_nzbs: None,
             watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),

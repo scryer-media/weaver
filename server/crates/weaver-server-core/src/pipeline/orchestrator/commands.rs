@@ -478,6 +478,7 @@ impl Pipeline {
         }
         // Ahead of the archive, which copies them from the active row: a job
         // write that the batch's archive, queued after it, waits out.
+        self.persist_download_summary_before_archive(job_id);
         self.persist_support_facts_before_archive(job_id);
         let state = self
             .jobs
@@ -520,6 +521,7 @@ impl Pipeline {
             // before the cancel: the servers did the work, and the
             // row is the only place left to say so.
             server_attribution: state.server_attribution.to_storage_json(),
+            files_removed_at: None,
         };
         Ok((
             row,
@@ -581,6 +583,7 @@ impl Pipeline {
                 serde_json::to_string(&info.metadata).ok()
             },
             server_attribution: None,
+            files_removed_at: None,
         };
         Ok((
             row,

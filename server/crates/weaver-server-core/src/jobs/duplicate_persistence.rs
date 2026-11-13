@@ -36,13 +36,34 @@ pub struct DuplicateAdmissionRequest {
     pub policy: DuplicatePolicy,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Its `Debug` never shows the archive password.
+#[derive(Clone, PartialEq, Eq)]
 pub struct SemanticCandidateSource {
     pub nzb_zstd: Vec<u8>,
     pub filename: Option<String>,
     pub password: Option<String>,
     pub category: Option<String>,
     pub metadata: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for SemanticCandidateSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Destructured whole, so a new field is a compile error here.
+        let Self {
+            nzb_zstd,
+            filename,
+            password,
+            category,
+            metadata,
+        } = self;
+        f.debug_struct("SemanticCandidateSource")
+            .field("nzb_zstd", nzb_zstd)
+            .field("filename", filename)
+            .field("password", &password.as_ref().map(|_| "[REDACTED]"))
+            .field("category", category)
+            .field("metadata", metadata)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

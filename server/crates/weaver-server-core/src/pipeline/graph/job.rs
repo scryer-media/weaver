@@ -98,8 +98,9 @@ pub(crate) struct Storage {
     pub(crate) free_disk: CapacityReader,
     pub(crate) slots: usize,
     pub(crate) mail: mpsc::Sender<Said>,
-    // The job's password candidates, in the order they are tried.
-    pub(crate) passwords: Vec<String>,
+    // The job's password candidates, in the order they are tried, each with
+    // where it came from.
+    pub(crate) passwords: Vec<crate::jobs::ArchivePasswordCandidate>,
     // The job's extraction budget.
     pub(crate) caps: Caps,
     // How deep the job's namespaces may nest, the root's being 0.
@@ -212,7 +213,7 @@ impl GraphJob {
             runs,
             storage.nesting,
         )
-        .offering(storage.passwords)
+        .offering_candidates(storage.passwords)
     }
 
     pub(crate) fn new(
@@ -288,8 +289,19 @@ impl GraphJob {
     }
 
     // The candidates offered to an object that asks for a password.
+    #[cfg(test)]
     pub(crate) fn offering(mut self, candidates: Vec<String>) -> Self {
         self.passwords = Passwords::new(candidates);
+        self
+    }
+
+    // The candidates offered to an object that asks for a password, each
+    // with its source, which the download summary reads back.
+    pub(crate) fn offering_candidates(
+        mut self,
+        candidates: Vec<crate::jobs::ArchivePasswordCandidate>,
+    ) -> Self {
+        self.passwords = Passwords::from_candidates(candidates);
         self
     }
 
