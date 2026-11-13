@@ -5112,10 +5112,15 @@ impl Drop for PieceCheck {
         }
     }
 }
+    // Each piece is checked by itself, so a torrent whose checks wait takes
+    // every hashing thread: one thread reads back and hashes no faster
+    // than its core does, and a torrent that receives faster than that is
+    // held to it. Two checks share nothing but the torrent's lock, taken
+    // for the verdict.
 
 impl DiskJob for HashJob {
     fn key(&self) -> usize {
-        Arc::as_ptr(&self.state) as usize
+        (Arc::as_ptr(&self.state) as usize).wrapping_add(self.chunk.piece_index.get() as usize)
     }
 
     fn run(self) {

@@ -8268,3 +8268,47 @@ async fn a_landed_piece_dropped_before_its_check_goes_back_to_the_queue() {
         (0..CHUNKS_PER_PIECE).collect::<Vec<_>>()
     );
 }
+
+// The check of piece 0 is reading the piece back when the last block of
+// piece 1 is written. Piece 1 does not wait behind it: a second hashing
+// thread is started for its check, which passes while piece 0's is still
+// held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_piece_is_checked_while_another_of_the_torrent_is() {
+    let storage = ReadGatedStorageFactory::default();
+    let h = Harness::build_on(
+        "two_checks",
+        0x00,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    let (peer, _rx) = h.peer("127.0.0.1:6881");
+    // Both pieces, in whichever order they are picked.
+    peer.on_i_am_unchoked();
+    for _ in 0..PIECES {
+        assert!(peer.acquire_next_piece().unwrap().piece().is_some());
+    }
+    let spawner = &h.live.shared.spawner;
+    let (mut entered, release) = storage.gate.arm();
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send_block(&peer, (0, chunk)).await;
+    }
+    entered.recv().await.unwrap();
+    assert_eq!(spawner.hash().wakes(), 1);
+
+    for chunk in 0..CHUNKS_PER_PIECE {
+        h.send_block(&peer, (1, chunk)).await;
+    }
+    // Every write is done, so the check of piece 1 is queued or running.
+    spawner.disk().idle().await;
+    assert_eq!(spawner.hash().wakes(), 2);
+    while !h.have(1) {
+        tokio::task::yield_now().await;
+    }
+    assert!(!h.have(0));
+
+    release.send(()).unwrap();
+    spawner.hash().idle().await;
+    assert!(h.have(0));
+}
