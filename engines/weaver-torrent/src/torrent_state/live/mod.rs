@@ -112,7 +112,7 @@ use crate::{
     piece_priority::{FilePriority, PiecePriority},
     piece_tracker::{AcquireRequest, AcquireResult, Arrival, PickOptions, PieceTracker},
     session::CheckedIncomingConnection,
-    session_stats::SessionStats,
+    session_stats::{SessionStats, disk::DiskOp},
     stream_connect::ConnectionKind,
     torrent_state::utils::atomic_inc,
     type_aliases::{FileStorage, PeerHandle, PeerSourceFlag},
@@ -2573,6 +2573,7 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     async fn disk_room(&self) {
         if self.disk.blocked() {
             self.disk.room(self.state.shared.spawner.pool()).await;
+            self.state.shared.spawner.stats().peer_resumed();
         }
     }
 
@@ -2872,7 +2873,11 @@ impl PeerConnectionHandler for &'_ PeerHandler {
         self.state
             .shared
             .spawner
-            .spawn_blocking_with_permit(move || state.check_seeded(piece))
+            .spawn_blocking_with_permit(move || {
+                let call = state.shared.spawner.stats().call(DiskOp::SeedCheck);
+                call.bytes(u64::from(state.lengths.piece_length(piece)));
+                state.check_seeded(piece)
+            })
             .await
             .context("the session ended before a seed-mode check ran")?
     }
@@ -4323,7 +4328,9 @@ impl PeerHandler {
             return self.land_here(&block.piece(), chunk_info).await;
         }
         let pool = block.buf_mut().pool().clone();
-        self.disk.queued(pool.charge(block.buf_mut()));
+        if self.disk.queued(pool.charge(block.buf_mut())) {
+            self.state.shared.spawner.stats().peer_stopped();
+        }
         self.state.shared.spawner.disk().push(WriteJob {
             state: self.state.clone(),
             tx: self.tx.clone(),
@@ -4381,9 +4388,10 @@ impl PeerHandler {
             };
             // On the session's runtime, which may block in place: from a uTP
             // thread, `tokio::task::spawn` would run it on that thread.
-            spawner
-                .spawn(check.in_current_span())
-                .await
+            let since = std::time::Instant::now();
+            let checked = spawner.spawn(check.in_current_span()).await;
+            spawner.stats().check_waited(since);
+            checked
                 .context("the piece check ended")?
                 .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
         }
@@ -4736,11 +4744,19 @@ fn check_landed_piece(
         state.file_ops().read_chunk(who, chunk, buf)
     };
 
-    match state
-        .file_ops()
-        .check_piece(chunk_info.piece_index)
-        .with_context(|| format!("error checking piece={index}"))?
-    {
+    let stats = state.shared.spawner.stats();
+    let piece_len = u64::from(state.lengths.piece_length(piece_index));
+    let from_memory = state.files.writes_to_memory();
+    let verdict = {
+        let call = stats.call(if from_memory {
+            DiskOp::HashMemory
+        } else {
+            DiskOp::HashFiles
+        });
+        call.bytes(piece_len);
+        state.file_ops().check_piece(chunk_info.piece_index)
+    };
+    match verdict.with_context(|| format!("error checking piece={index}"))? {
         Verdict::Inconsistent => {
             return state.on_fatal_error(inconsistent_hashes(chunk_info.piece_index));
         }
@@ -4761,7 +4777,18 @@ fn check_landed_piece(
             // `piece_passed` nor `piece_failed`. A refusal for want
             // of room puts the torrent in upload mode
             // (`torrent::handle_disk_error`).
-            if let Err(e) = state.files.on_piece_completed(piece_index) {
+            // A storage that held the piece in memory writes it whole
+            // here; one that wrote its blocks as they came has nothing
+            // left to write.
+            let written = {
+                let _call = from_memory.then(|| {
+                    let call = stats.call(DiskOp::PieceWrite);
+                    call.bytes(piece_len);
+                    call
+                });
+                state.files.on_piece_completed(piece_index)
+            };
+            if let Err(e) = written {
                 warn!(
                     id = state.shared.id,
                     info_hash = ?state.shared.info_hash,
@@ -4774,6 +4801,7 @@ fn check_landed_piece(
                 .lock_write("mark_piece_downloaded")
                 .get_pieces_mut()?
                 .mark_piece_hash_ok(piece_index);
+            stats.piece_verified();
             // Every peer that sent a block of it earns a point and
             // leaves parole (libtorrent `torrent::piece_passed`).
             for peer in senders.participants() {
@@ -4819,6 +4847,7 @@ fn check_landed_piece(
             state.update_interest_of_holders(chunk_info.piece_index);
         }
         Verdict::Failed => {
+            stats.piece_failed();
             warn!(
                 id = state.shared.id,
                 info_hash = ?state.shared.info_hash,
@@ -4979,6 +5008,8 @@ impl DiskJob for WriteJob {
             }
             landed.clear();
             {
+                let call = state.shared.spawner.stats().call(DiskOp::BlockWrite);
+                call.bytes(jobs.iter().map(|job| u64::from(job.chunk.size)).sum());
                 let pieces: Vec<_> = jobs.iter().map(|job| job.block.piece()).collect();
                 let blocks: Vec<_> = jobs
                     .iter()

@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 use crate::disk::{BlockPool, DiskQueue, MAX_QUEUED_DISK_BYTES};
+use crate::session_stats::disk::{DiskStats, DiskStatsSnapshot};
 use crate::torrent_state::{HashJob, WriteJob};
 
 /// Threads that check pieces. libtorrent's default is one
@@ -51,6 +52,8 @@ pub struct BlockingSpawner {
     hash: DiskQueue<HashJob>,
     // The threads that read the blocks peers on uTP threads upload.
     reads: DiskQueue<crate::off_shard::ReadJob>,
+    // What the session's disk calls, permits and peer sockets did.
+    stats: Arc<DiskStats>,
 }
 
 // A queue of `threads` disk threads, counted against `permits` when the
@@ -105,7 +108,40 @@ impl BlockingSpawner {
             reads: read_queue,
             concurrent_block_in_place_semaphore: semaphore,
             handle,
+            stats: Arc::default(),
         }
+    }
+
+    /// The session's disk and socket counters.
+    pub fn stats(&self) -> &Arc<DiskStats> {
+        &self.stats
+    }
+
+    /// The counters now, with the gauges the permits, the queues and the
+    /// block buffers keep. Takes no lock.
+    pub fn disk_snapshot(&self) -> DiskStatsSnapshot {
+        let mut snapshot = self.stats.snapshot();
+        let free = self.concurrent_block_in_place_semaphore.available_permits();
+        snapshot.permits = self.permits as u64;
+        snapshot.permits_in_use = self.permits.saturating_sub(free) as u64;
+        snapshot.write_jobs_queued = self.disk.waiting();
+        snapshot.hash_jobs_queued = self.hash.waiting();
+        snapshot.read_jobs_queued = self.reads.waiting();
+        snapshot.queued_write_bytes = self.pool.queued_bytes();
+        snapshot
+    }
+
+    // A blocking permit, its wait timed only when it has to wait.
+    async fn permit(&self) -> tokio::sync::SemaphorePermit<'_> {
+        let semaphore = &self.concurrent_block_in_place_semaphore;
+        if let Ok(permit) = semaphore.try_acquire() {
+            self.stats.permit_taken();
+            return permit;
+        }
+        let since = std::time::Instant::now();
+        let permit = semaphore.acquire().await.unwrap();
+        self.stats.permit_waited(since);
+        permit
     }
 
     /// The session's block buffers.
@@ -138,11 +174,7 @@ impl BlockingSpawner {
     pub async fn block_in_place_with_semaphore<F: FnOnce() -> R, R>(&self, f: F) -> R {
         no_block_on_utp_thread();
         if self.allow_block_in_place {
-            let _permit = self
-                .concurrent_block_in_place_semaphore
-                .acquire()
-                .await
-                .unwrap();
+            let _permit = self.permit().await;
             return tokio::task::block_in_place(f);
         }
 
@@ -159,7 +191,7 @@ impl BlockingSpawner {
     ) -> R {
         no_block_on_utp_thread();
         let semaphore = &self.concurrent_block_in_place_semaphore;
-        let mut permits = vec![semaphore.acquire().await.unwrap()];
+        let mut permits = vec![self.permit().await];
         while permits.len() < most
             && let Ok(permit) = semaphore.try_acquire()
         {
@@ -196,10 +228,19 @@ impl BlockingSpawner {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let permit = Arc::clone(&self.concurrent_block_in_place_semaphore)
-            .acquire_owned()
-            .await
-            .ok()?;
+        let semaphore = &self.concurrent_block_in_place_semaphore;
+        let permit = match Arc::clone(semaphore).try_acquire_owned() {
+            Ok(permit) => {
+                self.stats.permit_taken();
+                permit
+            }
+            Err(_) => {
+                let since = std::time::Instant::now();
+                let permit = Arc::clone(semaphore).acquire_owned().await.ok()?;
+                self.stats.permit_waited(since);
+                permit
+            }
+        };
         self.handle
             .spawn_blocking(move || {
                 let _permit = permit;

@@ -26,6 +26,8 @@ pub struct SessionStatsSnapshot {
     pub connections: ConnectStatsSnapshot,
     #[serde(with = "SerializedUtpStatsSnapshot")]
     pub utp: UtpStatsSnapshot,
+    /// The session's disk calls, blocking permits and peer sockets.
+    pub disk: super::disk::DiskStatsSnapshot,
 }
 
 impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
@@ -38,6 +40,7 @@ impl From<(&SessionStats, ConnectStatsSnapshot)> for SessionStatsSnapshot {
             uptime_seconds: s.startup_time.elapsed().as_secs(),
             connections: c,
             utp: Default::default(),
+            disk: Default::default(),
         }
     }
 }

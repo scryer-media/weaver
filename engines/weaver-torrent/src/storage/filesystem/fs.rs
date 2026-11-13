@@ -11,8 +11,12 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use std::sync::Arc;
+
 use anyhow::Context;
 use tracing::warn;
+
+use crate::session_stats::disk::{DiskStats, FileEnds};
 
 use crate::{
     storage::{StorageFactoryExt, filesystem::opened_file::OurFileExt},
@@ -37,6 +41,8 @@ impl StorageFactory for FilesystemStorageFactory {
         Ok(FilesystemStorage {
             output_folder: shared.options.output_folder.clone(),
             opened_files: Default::default(),
+            stats: shared.spawner.stats().clone(),
+            ends: Default::default(),
         })
     }
 
@@ -48,6 +54,10 @@ impl StorageFactory for FilesystemStorageFactory {
 pub struct FilesystemStorage {
     pub(crate) output_folder: PathBuf,
     pub(crate) opened_files: Vec<OpenedFile>,
+    // The session's disk counters, and where each file's last read and
+    // write ended: a call that starts anywhere else is counted.
+    pub(crate) stats: Arc<DiskStats>,
+    pub(crate) ends: Vec<FileEnds>,
 }
 
 impl FilesystemStorage {
@@ -60,12 +70,31 @@ impl FilesystemStorage {
                 .map(|f| f.take_clone())
                 .collect::<anyhow::Result<Vec<_>>>()?,
             output_folder: self.output_folder.clone(),
+            stats: self.stats.clone(),
+            ends: self.fresh_ends(),
         })
+    }
+
+    fn fresh_ends(&self) -> Vec<FileEnds> {
+        self.opened_files.iter().map(|_| FileEnds::default()).collect()
+    }
+
+    fn read_at(&self, file_id: usize, offset: u64, len: usize) {
+        if let Some(ends) = self.ends.get(file_id) {
+            self.stats.file_read(&ends.read, offset, len as u64);
+        }
+    }
+
+    fn written_at(&self, file_id: usize, offset: u64, len: usize) {
+        if let Some(ends) = self.ends.get(file_id) {
+            self.stats.file_written(&ends.write, offset, len as u64);
+        }
     }
 }
 
 impl TorrentStorage for FilesystemStorage {
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
+        self.read_at(file_id, offset, buf.len());
         self.opened_files
             .get(file_id)
             .context("no such file")?
@@ -81,6 +110,7 @@ impl TorrentStorage for FilesystemStorage {
         offset: u64,
         bufs: &mut [&mut [u8]],
     ) -> anyhow::Result<()> {
+        self.read_at(file_id, offset, bufs.iter().map(|buf| buf.len()).sum());
         let file = self
             .opened_files
             .get(file_id)
@@ -92,6 +122,7 @@ impl TorrentStorage for FilesystemStorage {
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
+        self.written_at(file_id, offset, buf.len());
         let of = self.opened_files.get(file_id).context("no such file")?;
         #[cfg(windows)]
         return of.try_mark_sparse()?.pwrite_all(offset, buf);
@@ -105,6 +136,7 @@ impl TorrentStorage for FilesystemStorage {
         offset: u64,
         bufs: [IoSlice<'_>; 2],
     ) -> anyhow::Result<usize> {
+        self.written_at(file_id, offset, bufs[0].len() + bufs[1].len());
         let of = self.opened_files.get(file_id).context("no such file")?;
         #[cfg(windows)]
         return of.try_mark_sparse()?.pwrite_all_vectored(offset, bufs);
@@ -131,6 +163,8 @@ impl TorrentStorage for FilesystemStorage {
                 .map(|f| f.take_clone())
                 .collect::<anyhow::Result<Vec<_>>>()?,
             output_folder: self.output_folder.clone(),
+            stats: self.stats.clone(),
+            ends: self.fresh_ends(),
         }))
     }
 
@@ -202,6 +236,7 @@ impl TorrentStorage for FilesystemStorage {
         }
 
         self.opened_files = files;
+        self.ends = self.fresh_ends();
         Ok(())
     }
 }
@@ -228,6 +263,8 @@ mod tests {
                 path.clone(),
                 std::fs::File::open(&path).unwrap(),
             )],
+            stats: Default::default(),
+            ends: vec![Default::default()],
         };
         let lens = [16384usize, 16384, 1, 0, 30_000];
         let offset = 5_000u64;

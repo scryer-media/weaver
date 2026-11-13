@@ -44,6 +44,7 @@ use tokio::time::timeout;
 use tracing::{Instrument, debug, trace, trace_span};
 
 use crate::mse::{Encryption, EncryptionPolicy};
+use crate::session_stats::disk::{DiskOp, Transport};
 use crate::{
     read_buf::ReadBuf,
     spawn_utils::BlockingSpawner,
@@ -671,6 +672,11 @@ fn payloads_in<'a>(buf: &'a mut [u8], spans: &[(usize, usize)]) -> Vec<&'a mut [
     payloads
 }
 
+// The bytes an upload read of `chunks` reads.
+fn read_len(chunks: &[ChunkInfo]) -> u64 {
+    chunks.iter().map(|chunk| u64::from(chunk.size)).sum()
+}
+
 /// Writes `buf` once its bytes are paid for. The timeout runs only while the
 /// socket is written, not while the quota is waited for.
 async fn send<H: PeerConnectionHandler>(
@@ -1003,11 +1009,19 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
         // session's disk threads, its buffer handed there and back: nothing
         // that blocks runs on a uTP thread. Its reads run in order under a
         // key of its own.
-        let upload_reader = if weaver_utp::on_shard_thread() {
+        let on_utp = weaver_utp::on_shard_thread();
+        let upload_reader = if on_utp {
             self.handler.chunk_reader()
         } else {
             None
         };
+        let transport = if on_utp {
+            Transport::Utp
+        } else {
+            Transport::Tcp
+        };
+        let stats = self.spawner.stats().clone();
+        let stats = &*stats;
         let read_key = crate::off_shard::reader_key();
 
         let writer = async move {
@@ -1216,12 +1230,17 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                                 None => (std::mem::take(&mut write_buf), false),
                             };
                             let reader = reader.clone();
+                            let stats = self.spawner.stats().clone();
                             let (owned, read) = self
                                 .spawner
                                 .read_off_shard(read_key, move || {
                                     let (mut buf, was_lent) = owned;
                                     let mut payloads = payloads_in(&mut buf, &spans);
+                                    let call = stats.call(DiskOp::UploadReadUtp);
+                                    call.bytes(read_len(&chunks));
+                                    stats.upload_read(Transport::Utp, chunks.len() as u64);
                                     let read = reader.read_chunks(&chunks, &mut payloads);
+                                    drop(call);
                                     drop(payloads);
                                     ((buf, was_lent), read)
                                 })
@@ -1237,6 +1256,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                             let mut payloads = payloads_in(buf, &spans);
                             self.spawner
                                 .block_in_place_with_semaphore(|| {
+                                    let call = stats.call(DiskOp::UploadReadTcp);
+                                    call.bytes(read_len(&chunks));
+                                    stats.upload_read(Transport::Tcp, chunks.len() as u64);
                                     self.handler.read_chunks(&chunks, &mut payloads)
                                 })
                                 .await
@@ -1263,6 +1285,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         rwtimeout,
                     )
                     .await?;
+                    stats.sent(transport, filled as u64);
                 }
                 if let Some(answers) = self.handler.answers() {
                     answers.written(answered);
@@ -1311,6 +1334,15 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                 }
                 // A connection the disk is behind waits for it first.
                 self.handler.disk_room().await;
+                // What the socket reads behind the last message did: one
+                // read of the socket carries many messages, and is counted
+                // once.
+                if let Some(reads) = reading.take_socket_reads() {
+                    stats.received(transport, reads.calls, reads.bytes);
+                    if reads.growths > 0 {
+                        stats.read_buffers_grew(reads.growths);
+                    }
+                }
                 let read_before = reading.consumed();
                 let message = match reading
                     .read_next(&mut read, rwtimeout, num_pieces, &mut down)

@@ -52,6 +52,17 @@ pub struct ReadBuf {
     // Where the blocks of Piece messages are received, when they are taken
     // apart from the other messages.
     blocks: Option<Box<Blocks>>,
+    // The socket reads since they were last taken.
+    socket: SocketReads,
+}
+
+/// What a connection's socket reads did: how many returned bytes, the
+/// bytes, and how many times the buffer was made larger for one.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct SocketReads {
+    pub calls: u64,
+    pub bytes: u64,
+    pub growths: u64,
 }
 
 /// A Piece message's header: length, id, index and begin.
@@ -173,7 +184,15 @@ impl ReadBuf {
             wanted: BUFLEN,
             advertised: PeerExtendedMessageIds::ours(),
             blocks: None,
+            socket: SocketReads::default(),
         }
+    }
+
+    /// The socket reads since the last call, when there were any: the
+    /// connection adds them to the session's counters once per read of
+    /// the socket, not once per message.
+    pub fn take_socket_reads(&mut self) -> Option<SocketReads> {
+        (self.socket.calls > 0).then(|| std::mem::take(&mut self.socket))
     }
 
     /// The blocks of Piece messages are received into buffers of `pool`'s,
@@ -298,6 +317,9 @@ impl ReadBuf {
 
     /// Moves the unread bytes to the start of a buffer of `size` bytes.
     fn relocate(&mut self, size: usize) {
+        if size > self.buf.len() {
+            self.socket.growths += 1;
+        }
         let mut new = vec![0u8; size].into_boxed_slice();
         let (first, second) = as_slices!(self);
         new[..first.len()].copy_from_slice(first);
@@ -433,6 +455,8 @@ impl ReadBuf {
             } else if size <= self.buf.len() / 4 {
                 self.wanted = (self.buf.len() / 2).max(BUFLEN);
             }
+            self.socket.calls += 1;
+            self.socket.bytes += size as u64;
             self.len += size;
             need_additional_bytes = need_additional_bytes.saturating_sub(size)
         }
@@ -650,6 +674,8 @@ impl ReadBuf {
         if size == 0 {
             return Err(Error::PeerDisconnected);
         }
+        self.socket.calls += 1;
+        self.socket.bytes += size as u64;
         self.take_read(
             lead,
             &offered[..slots.min(MOST_SLOTS)],

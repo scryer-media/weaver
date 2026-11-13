@@ -17,6 +17,7 @@ use tracing::debug_span;
 
 use crate::{Session, torrent_state::peers::stats::AggregatePeerStatsAtomic};
 
+pub mod disk;
 pub mod snapshot;
 
 gen_stats!(SessionCountersAtomic SessionCountersSnapshot, [
@@ -96,6 +97,7 @@ impl Session {
     pub fn stats_snapshot(&self) -> SessionStatsSnapshot {
         let mut snapshot =
             SessionStatsSnapshot::from((&*self.stats, self.connector.stats().snapshot()));
+        snapshot.disk = self.spawner.disk_snapshot();
         for socket in &self.utp_sockets {
             snapshot.utp += socket.0.stats().snapshot();
         }

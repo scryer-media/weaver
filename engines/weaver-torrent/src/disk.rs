@@ -57,6 +57,9 @@ struct PoolInner {
     below: Notify,
     // Buffers ever allocated, for the steady-state check.
     allocated: AtomicUsize,
+    // Blocks queued for the disk now, as `PoolState::in_use` counts them:
+    // kept apart so a scrape reads it without the pool's lock.
+    queued: AtomicUsize,
 }
 
 struct PoolState {
@@ -93,6 +96,7 @@ impl BlockPool {
             kept: max_use * 2,
             below: Notify::new(),
             allocated: AtomicUsize::new(0),
+            queued: AtomicUsize::new(0),
         }))
     }
 
@@ -137,6 +141,7 @@ impl BlockPool {
         debug_assert!(!block.charged);
         block.charged = true;
         let inner = &*self.0;
+        inner.queued.fetch_add(1, Ordering::Relaxed);
         let mut state = inner.state.lock();
         state.in_use += 1;
         if state.in_use >= inner.low_watermark + (inner.max_use - inner.low_watermark) / 2 {
@@ -164,6 +169,7 @@ impl BlockPool {
         let mut state = inner.state.lock();
         let mut fell = false;
         if charged {
+            inner.queued.fetch_sub(1, Ordering::Relaxed);
             state.in_use -= 1;
             if state.exceeded && state.in_use <= inner.low_watermark {
                 state.exceeded = false;
@@ -178,6 +184,11 @@ impl BlockPool {
         if fell {
             inner.below.notify_waiters();
         }
+    }
+
+    /// Bytes of blocks queued for the disk now, read without a lock.
+    pub(crate) fn queued_bytes(&self) -> u64 {
+        (self.0.queued.load(Ordering::Relaxed) * BLOCK_LEN) as u64
     }
 
     /// Blocks queued for the disk now.
@@ -299,12 +310,16 @@ impl PeerDisk {
     /// `charge`. Every peer may have one write outstanding whatever the
     /// pool says: one that had one already stops reading when the pool is
     /// exceeded (libtorrent `peer_connection::incoming_piece`).
-    pub(crate) fn queued(&self, charge: Charge) {
+    ///
+    /// True when the connection stops reading for it.
+    pub(crate) fn queued(&self, charge: Charge) -> bool {
         let before = self.outstanding.fetch_add(1, Ordering::AcqRel);
-        if charge.exceeded && before > 0 {
+        let stops = charge.exceeded && before > 0;
+        if stops {
             self.generation.store(charge.generation, Ordering::Release);
             self.blocked.store(true, Ordering::Release);
         }
+        stops
     }
 
     /// A write of the connection's is done, or dropped (libtorrent
@@ -405,6 +420,9 @@ struct QueueInner<J> {
     // Rung when the last thread finds the queue empty.
     idle: Notify,
     wakes: AtomicUsize,
+    // Jobs waiting for a thread, as `Jobs::queued` counts them: kept apart
+    // so a scrape reads it without the queue's lock.
+    waiting: AtomicUsize,
 }
 
 // One key's jobs, in the order queued.
@@ -517,11 +535,13 @@ impl<J: DiskJob> DiskQueue<J> {
                 shared,
                 idle: Notify::new(),
                 wakes: AtomicUsize::new(0),
+                waiting: AtomicUsize::new(0),
             }),
         }
     }
 
     pub(crate) fn push(&self, job: J) {
+        self.inner.waiting.fetch_add(1, Ordering::Relaxed);
         let mut jobs = self.inner.jobs.lock();
         // A thread is started when none is looking for work, and this job's
         // key has no thread on it nor jobs already waiting for one.
@@ -533,6 +553,11 @@ impl<J: DiskJob> DiskQueue<J> {
         if start {
             spawn_drain(&self.inner);
         }
+    }
+
+    /// Jobs waiting for a thread now, read without a lock.
+    pub(crate) fn waiting(&self) -> u64 {
+        self.inner.waiting.load(Ordering::Relaxed) as u64
     }
 
     /// Times a disk thread was woken.
@@ -669,6 +694,7 @@ impl<J: DiskJob> Drain<J> {
                     jobs.release(key);
                 }
                 self.key = jobs.take(&mut batch);
+                inner.waiting.fetch_sub(batch.len(), Ordering::Relaxed);
                 if self.key.is_none() {
                     self.inner = None;
                     jobs.running -= 1;
@@ -727,6 +753,7 @@ impl<J: DiskJob> Drop for Drain<J> {
             } else {
                 if jobs.running == 0 {
                     jobs.ready.clear();
+                    inner.waiting.fetch_sub(jobs.queued, Ordering::Relaxed);
                     jobs.queued = 0;
                     dropped.extend(jobs.lanes.drain().map(|(_, lane)| lane.jobs));
                 }
