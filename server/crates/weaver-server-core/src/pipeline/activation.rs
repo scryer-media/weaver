@@ -457,6 +457,7 @@ impl Pipeline {
             if full_disk {
                 self.forget_parts_past_checkpoint(job_id);
                 self.park_drained_job(job_id);
+                self.settle_held_summaries(job_id);
                 self.wake_full_disk();
                 continue;
             }

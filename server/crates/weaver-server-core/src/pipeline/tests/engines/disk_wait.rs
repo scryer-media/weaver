@@ -1171,6 +1171,10 @@ async fn a_job_let_go_that_fails_again_waits_for_more_room_than_its_disk_has_sho
 
     fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
     until_full(&mut pipeline, &scenario).await;
+    // Parked, it counts as left to fetch what its graph had not settled,
+    // not every article: the figure a job put out of the window is rowed by.
+    let left = pipeline.jobs[&JOB].articles.queued_download_len();
+    assert!((1..4).contains(&left), "{left} of 4 articles are left");
 
     // The disk reads the same room at every look: none was made.
     hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
@@ -1294,6 +1298,11 @@ async fn a_job_held_for_a_full_disk_after_its_download_restarts_with_nothing_to_
     pipeline.park_drained_jobs();
     old_graph_heard(&mut pipeline).await;
     assert_full_disk_held(&pipeline);
+    assert_eq!(
+        pipeline.jobs[&JOB].articles.queued_download_len(),
+        0,
+        "parked with every article in, it counts none as left to fetch"
+    );
 
     hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
     assert_full_disk_held(&pipeline);

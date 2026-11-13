@@ -31,7 +31,7 @@ use tracing::{info, warn};
 use super::graph::limits::Device;
 use super::{ParkedBytes, Pipeline};
 use crate::jobs::ids::JobId;
-use crate::jobs::model::{JobArticles, RunState};
+use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, RunState};
 use crate::operations::StorageRoot;
 
 // What a job waits for: room made on the disk its write failed on.
@@ -43,6 +43,9 @@ pub(crate) struct FullDisk {
     counted: u64,
     // Room was made, or the user asked: the job goes on once it has parked.
     go: bool,
+    // What the job's graph said was left to fetch, taken before it went:
+    // what the job's summaries say once it parks, with no graph to ask.
+    left: Option<FileSummaries>,
     // The spool files of the held parts the job's last checkpoint names:
     // the ones its restore reads back, so the ones that stay on disk.
     named: HashSet<PathBuf>,
@@ -92,7 +95,23 @@ impl Pipeline {
             });
         }
         let mut named = HashSet::new();
+        let mut left = None;
         if let Some(graph) = self.graph_jobs.get(&job_id) {
+            if matches!(state.articles, JobArticles::Active(_)) {
+                left = Some(FileSummaries(
+                    state
+                        .spec
+                        .files
+                        .iter()
+                        .zip(0u32..)
+                        .map(|(file, index)| {
+                            FileSummary::left(file, |ordinal| {
+                                graph.article_settled(weaver_graph::VolumeIndex(index), ordinal)
+                            })
+                        })
+                        .collect(),
+                ));
+            }
             let figures = Self::graph_remaining(graph, &state.spec);
             self.released_remaining.insert(job_id, figures);
             named = graph
@@ -111,6 +130,7 @@ impl Pipeline {
                 root,
                 counted,
                 go: false,
+                left,
                 named,
             },
         );
@@ -225,6 +245,24 @@ impl Pipeline {
             self.request_job_activation(job_id);
             self.download_dispatch_wake = true;
             self.report_job(job_id);
+        }
+    }
+
+    // The held job parked with no graph to say what it has in hand: its
+    // summaries are what its graph said was left as it went.
+    pub(in crate::pipeline) fn settle_held_summaries(&mut self, job_id: JobId) {
+        let Some(left) = self
+            .full_disk
+            .get_mut(&job_id)
+            .and_then(|hold| hold.left.take())
+        else {
+            return;
+        };
+        if let Some(state) = self.jobs.get_mut(&job_id)
+            && let JobArticles::Queued(summaries) = &mut state.articles
+            && summaries.0.len() == left.0.len()
+        {
+            *summaries = left;
         }
     }
 
