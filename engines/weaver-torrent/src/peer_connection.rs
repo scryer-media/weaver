@@ -628,31 +628,71 @@ const BATCH_BLOCKS: usize = 32;
 const BATCH_LEN: usize = BATCH_BLOCKS * PIECE_MESSAGE_DEFAULT_LEN;
 
 /// A writer's batch buffer. It is made at the writer's first run of blocks
-/// and kept while the writer has something to send within every keep-alive
-/// interval, so a write allocates nothing however many peers are served; a
-/// writer with nothing to send for a whole interval lets it go. The memory
-/// is 512 KiB for each connection that sent a run of blocks within the last
-/// interval, which is what libtorrent holds for each peer it uploads to (a
-/// send buffer filled to `send_buffer_watermark`, 500 KiB by default).
-#[derive(Default)]
-struct BatchBuf(Option<Box<[u8]>>);
+/// and kept while the writer sends such a run within every keep-alive
+/// interval, so a write allocates nothing however many peers are served. A
+/// writer that has sent none for a whole interval lets it go, whatever else
+/// it sent meanwhile: the haves and keep-alives of an idle connection do
+/// not hold it. The memory is 512 KiB for each connection that sent a run
+/// of blocks within the last interval, which is what libtorrent holds for
+/// each peer it uploads to (a send buffer filled to
+/// `send_buffer_watermark`, 500 KiB by default).
+struct BatchBuf {
+    buf: Option<Box<[u8]>>,
+    // The writer has a buffer, held here or lent.
+    made: bool,
+    stats: Arc<crate::session_stats::disk::DiskStats>,
+    // When the buffer was last lent.
+    lent: tokio::time::Instant,
+    // How long it is kept unlent.
+    kept_for: Duration,
+}
 
 impl BatchBuf {
+    fn new(kept_for: Duration, stats: Arc<crate::session_stats::disk::DiskStats>) -> Self {
+        Self {
+            buf: None,
+            made: false,
+            stats,
+            lent: tokio::time::Instant::now(),
+            kept_for,
+        }
+    }
+
     /// The buffer, for one write: it leaves the writer while its blocks are
     /// read, and comes back with [`Self::keep`].
     fn lend(&mut self) -> Box<[u8]> {
-        self.0
-            .take()
-            .unwrap_or_else(|| vec![0u8; BATCH_LEN].into_boxed_slice())
+        self.lent = tokio::time::Instant::now();
+        self.buf.take().unwrap_or_else(|| {
+            self.made = true;
+            self.stats.batch_buffer_made();
+            vec![0u8; BATCH_LEN].into_boxed_slice()
+        })
     }
 
     fn keep(&mut self, buf: Box<[u8]>) {
-        self.0 = Some(buf);
+        self.buf = Some(buf);
     }
 
-    /// The writer had nothing to send for a keep-alive interval.
-    fn rest(&mut self) {
-        self.0 = None;
+    /// The writer sends something that is not a run of blocks: the buffer
+    /// goes once it has not been lent for the time it is kept. The clock is
+    /// read only while there is a buffer to let go.
+    fn unlent(&mut self) {
+        if self.buf.is_some() && self.lent.elapsed() >= self.kept_for {
+            self.buf = None;
+            self.let_go();
+        }
+    }
+
+    fn let_go(&mut self) {
+        if std::mem::take(&mut self.made) {
+            self.stats.batch_buffer_let_go();
+        }
+    }
+}
+
+impl Drop for BatchBuf {
+    fn drop(&mut self) {
+        self.let_go();
     }
 }
 
@@ -1052,7 +1092,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
             let mut carried: Option<WriterRequest> = None;
             let mut batch: Vec<Framed> = Vec::new();
             let mut sent: Vec<ChunkInfo> = Vec::new();
-            let mut batch_buf = BatchBuf::default();
+            let mut batch_buf = BatchBuf::new(keep_alive_interval, self.spawner.stats().clone());
             loop {
                 let first = match carried.take() {
                     Some(req) => req,
@@ -1061,10 +1101,7 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                         Ok(None) => {
                             return Err(Error::TorrentIsNotLive);
                         }
-                        Err(_) => {
-                            batch_buf.rest();
-                            WriterRequest::Message(Message::KeepAlive)
-                        }
+                        Err(_) => WriterRequest::Message(Message::KeepAlive),
                     },
                 };
 
@@ -1086,6 +1123,9 @@ impl<H: PeerConnectionHandler> PeerConnection<H> {
                     && outgoing_chan.len() >= 2
                     && BATCH_LEN > write_buf.len())
                 .then(|| batch_buf.lend());
+                if lent.is_none() {
+                    batch_buf.unlent();
+                }
                 let buf: &mut [u8] = match &mut lent {
                     Some(lent) => lent,
                     None => &mut write_buf,
@@ -2674,11 +2714,17 @@ mod tests {
     }
 
     // A writer's batch buffer is made once and lent again for every write,
-    // however many writers hold one at the same time, and a writer at rest
-    // holds none.
-    #[test]
-    fn a_writer_lends_the_same_batch_buffer_for_every_write() {
-        let mut writers: Vec<super::BatchBuf> = (0..64).map(|_| Default::default()).collect();
+    // however many writers hold one at the same time. A writer that goes on
+    // sending, but no run of blocks, for the time the buffer is kept holds
+    // none; one that lends it again within that time keeps it.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_lends_the_same_batch_buffer_for_every_write() {
+        let kept_for = Duration::from_secs(60);
+        let stats = Arc::new(crate::session_stats::disk::DiskStats::default());
+        let batch_buffers = || stats.snapshot().batch_buffers;
+        let mut writers: Vec<super::BatchBuf> = (0..64)
+            .map(|_| super::BatchBuf::new(kept_for, stats.clone()))
+            .collect();
         let lent: Vec<Box<[u8]>> = writers.iter_mut().map(super::BatchBuf::lend).collect();
         let made: Vec<*const u8> = lent.iter().map(|buf| buf.as_ptr()).collect();
         assert!(lent.iter().all(|buf| buf.len() == super::BATCH_LEN));
@@ -2692,10 +2738,29 @@ mod tests {
                 writer.keep(buf);
             }
         }
-        for writer in &mut writers {
-            writer.rest();
-            assert!(writer.0.is_none());
+
+        // Haves go out every third of the time; the first writer also
+        // sends a run of blocks with each.
+        let held = |writers: &[super::BatchBuf]| writers.iter().filter(|w| w.buf.is_some()).count();
+        for _ in 0..2 {
+            tokio::time::advance(kept_for / 3).await;
+            let buf = writers[0].lend();
+            writers[0].keep(buf);
+            writers[1..].iter_mut().for_each(super::BatchBuf::unlent);
+            assert_eq!(held(&writers), 64);
+            assert_eq!(batch_buffers(), 64);
         }
+        tokio::time::advance(kept_for / 3).await;
+        writers.iter_mut().for_each(super::BatchBuf::unlent);
+        assert_eq!(held(&writers), 1);
+        assert_eq!(writers[0].buf.as_ref().unwrap().as_ptr(), made[0]);
+        // The session counts the writers that hold one, a writer that ends
+        // while its buffer is lent among those that let theirs go.
+        assert_eq!(batch_buffers(), 1);
+        let lent = writers[0].lend();
+        drop(writers);
+        assert_eq!(batch_buffers(), 0);
+        drop(lent);
     }
 
     // A run of blocks queued together goes out in writes of at most
