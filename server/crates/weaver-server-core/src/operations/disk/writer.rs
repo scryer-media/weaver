@@ -59,10 +59,20 @@ type Then = Box<dyn FnOnce() + Send>;
 pub(crate) struct VolumeWriters {
     lanes: Mutex<Vec<(usize, Weak<Lane>)>>,
     report: Arc<ReportFn>,
+    #[cfg(test)]
+    mode: Mode,
+}
+
+// How a test's writers run.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Threads,
     // No threads: each operation runs as it is submitted, on the thread
     // that submits it.
-    #[cfg(test)]
-    inline: bool,
+    Inline,
+    // No thread can be started.
+    NoThread,
 }
 
 impl VolumeWriters {
@@ -72,7 +82,16 @@ impl VolumeWriters {
             lanes: Mutex::default(),
             report: Arc::new(report),
             #[cfg(test)]
-            inline: false,
+            mode: Mode::Threads,
+        }
+    }
+
+    // Writers on a machine that will not start another thread.
+    #[cfg(test)]
+    pub(crate) fn threadless(report: impl Fn(Report) + Send + Sync + 'static) -> Self {
+        Self {
+            mode: Mode::NoThread,
+            ..Self::new(report)
         }
     }
 
@@ -82,7 +101,7 @@ impl VolumeWriters {
     #[cfg(test)]
     pub(crate) fn inline(report: impl Fn(Report) + Send + Sync + 'static) -> Self {
         Self {
-            inline: true,
+            mode: Mode::Inline,
             ..Self::new(report)
         }
     }
@@ -112,10 +131,16 @@ impl VolumeWriters {
             .and_then(|(_, lane)| lane.upgrade())
             .unwrap_or_else(|| {
                 #[cfg(test)]
-                let inline = self.inline;
+                let (inline, threadless) =
+                    (self.mode == Mode::Inline, self.mode == Mode::NoThread);
                 #[cfg(not(test))]
-                let inline = false;
-                let lane = Lane::start(Arc::clone(volume), Arc::clone(&self.report), inline);
+                let (inline, threadless) = (false, false);
+                let lane = Lane::start(
+                    Arc::clone(volume),
+                    Arc::clone(&self.report),
+                    inline,
+                    threadless,
+                );
                 lanes.push((at, Arc::downgrade(&lane)));
                 lane
             })
@@ -132,7 +157,12 @@ impl VolumeWriters {
             .collect();
         for lane in lanes {
             let seq = lane.send.lock().unwrap_or_else(PoisonError::into_inner).0;
+            if lane.state.returned.load(Ordering::SeqCst) >= seq {
+                continue;
+            }
+            let began = Instant::now();
             lane.state.wait(seq);
+            lane.state.waited(began);
         }
     }
 
@@ -247,15 +277,18 @@ impl Submitter {
     // submitted before. The caller waits for the answer.
     pub(crate) fn read(&self, path: PathBuf, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let (reply, answer) = mpsc::sync_channel(1);
+        let began = Instant::now();
         self.submit(Op::Read {
             path,
             offset,
             len,
             reply,
         });
-        answer
+        let read = answer
             .recv()
-            .unwrap_or_else(|_| Err(io::Error::other("the volume's writer is gone")))
+            .unwrap_or_else(|_| Err(io::Error::other("the volume's writer is gone")));
+        self.lane.state.waited(began);
+        read
     }
 
     // Everything submitted under the key so far.
@@ -318,8 +351,25 @@ impl Submitter {
                     .buffered_bytes
                     .fetch_sub(bytes.len() as u64, Ordering::Relaxed);
             }
-            self.key.failed.store(true, Ordering::Release);
+            let counts = &self.lane.state.volume.writer;
+            counts.failed_operations.fetch_add(1, Ordering::Relaxed);
+            let first = !self.key.failed.swap(true, Ordering::AcqRel);
             self.lane.state.returned(seq);
+            // The caller hears of it once, as it hears of any failure.
+            if first
+                && !self.key.abandoned.load(Ordering::Acquire)
+                && !matches!(unsent.op, Op::Forget | Op::Release { .. })
+            {
+                (self.lane.report)(Report {
+                    failures: vec![Failure {
+                        key: self.key.id,
+                        file: unsent.op.file(),
+                        path: unsent.op.path(),
+                        error: io::Error::other("the volume's writer thread is gone"),
+                        creating: false,
+                    }],
+                });
+            }
         }
         if let Some(inline) = &self.lane.inline {
             let mut inline = inline.lock().unwrap_or_else(PoisonError::into_inner);
@@ -366,8 +416,20 @@ impl Barrier {
     }
 
     // Wait until everything behind the barrier has returned, failed or not.
-    // For a thread that may wait on the disk.
+    // A wait that stops here is counted against the pipeline loop: this is
+    // the wait of the loop, and of a thread the loop itself waits for.
     pub(crate) fn wait(&self) {
+        if self.returned() {
+            return;
+        }
+        let began = Instant::now();
+        self.lane.wait(self.seq);
+        self.lane.waited(began);
+    }
+
+    // The same wait for a thread the loop does not wait for, which is not
+    // counted.
+    pub(crate) fn wait_aside(&self) {
         self.lane.wait(self.seq);
     }
 
@@ -405,6 +467,7 @@ impl std::fmt::Debug for Submitter {
 
 struct Lane {
     state: Arc<LaneState>,
+    report: Arc<ReportFn>,
     // The number of the last operation sent, and the way to the thread.
     // Numbering and sending are one step, so the thread sees every number
     // in order.
@@ -432,6 +495,15 @@ struct LaneState {
 }
 
 impl LaneState {
+    // The pipeline loop stood still for the writer since `began`.
+    fn waited(&self, began: Instant) {
+        let counts = &self.volume.writer;
+        counts.loop_waits.fetch_add(1, Ordering::Relaxed);
+        counts
+            .loop_wait_nanos
+            .fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
     fn returned(&self, seq: u64) {
         self.returned.fetch_max(seq, Ordering::SeqCst);
         if self.waiters.load(Ordering::SeqCst) > 0 {
@@ -495,7 +567,12 @@ impl LaneState {
 }
 
 impl Lane {
-    fn start(volume: Arc<Volume>, report: Arc<ReportFn>, inline: bool) -> Arc<Self> {
+    fn start(
+        volume: Arc<Volume>,
+        report: Arc<ReportFn>,
+        inline: bool,
+        threadless: bool,
+    ) -> Arc<Self> {
         let (send, queued) = mpsc::channel();
         let state = Arc::new(LaneState {
             volume,
@@ -513,20 +590,26 @@ impl Lane {
         if inline {
             return Arc::new(Self {
                 state: Arc::clone(&state),
+                report: Arc::clone(&report),
                 send: Mutex::new((0, send)),
                 inline: Some(Mutex::new((Thread::new(state, report), queued))),
             });
         }
         let lane = Arc::new(Self {
             state: Arc::clone(&state),
+            report: Arc::clone(&report),
             send: Mutex::new((0, send)),
             inline: None,
         });
         let name = format!("volume-writer {}", state.volume.label);
         let thread_state = Arc::clone(&state);
-        let spawned = std::thread::Builder::new()
-            .name(name)
-            .spawn(move || Thread::new(thread_state, report).run(queued));
+        let run = move || Thread::new(thread_state, report).run(queued);
+        let spawned = if threadless {
+            drop(run);
+            Err(io::Error::other("no thread to be had"))
+        } else {
+            std::thread::Builder::new().name(name).spawn(run).map(drop)
+        };
         if let Err(error) = spawned {
             // With no thread the receiver is gone, and every submission
             // fails its key at once instead of waiting forever.
@@ -586,6 +669,19 @@ impl Op {
             Op::Run { .. } | Op::Read { .. } | Op::Forget => None,
         }
     }
+
+    // The path the operation is about, to name a failure.
+    fn path(&self) -> PathBuf {
+        match self {
+            Op::Write { create, .. } => create
+                .as_ref()
+                .map(|create| create.path.clone())
+                .unwrap_or_default(),
+            Op::Truncate { create, .. } | Op::Close { create, .. } => create.path.clone(),
+            Op::Run { path, .. } | Op::Read { path, .. } => path.clone(),
+            Op::Release { .. } | Op::Forget => PathBuf::new(),
+        }
+    }
 }
 
 struct Open {
@@ -593,6 +689,19 @@ struct Open {
     // Where it was opened, to name a failure.
     path: PathBuf,
     key: u64,
+    // Where the last write to it ended; `None` before its first.
+    end: Option<u64>,
+}
+
+// What one batch adds to its volume's counters.
+#[derive(Default)]
+struct Tally {
+    written: u64,
+    nanos: u64,
+    calls: u64,
+    seeks: u64,
+    operations: u64,
+    abandoned: u64,
 }
 
 // Where an operation of a batch runs: batches part at every operation that
@@ -618,6 +727,8 @@ struct Thread {
     order: Vec<Place>,
     done: Vec<bool>,
     files: HashMap<u64, (u32, u32, u32)>,
+    // The thread found nothing waiting and has not written since.
+    idle: bool,
 }
 
 impl Thread {
@@ -631,11 +742,27 @@ impl Thread {
             order: Vec::new(),
             done: Vec::new(),
             files: HashMap::new(),
+            idle: false,
         }
     }
 
     fn run(mut self, queued: mpsc::Receiver<Queued>) {
-        while let Ok(first) = queued.recv() {
+        loop {
+            let first = match queued.try_recv() {
+                Ok(first) => first,
+                Err(mpsc::TryRecvError::Disconnected) => return,
+                Err(mpsc::TryRecvError::Empty) => {
+                    self.state
+                        .volume
+                        .idle_turns
+                        .fetch_add(1, Ordering::Relaxed);
+                    self.idle = true;
+                    match queued.recv() {
+                        Ok(first) => first,
+                        Err(_) => return,
+                    }
+                }
+            };
             self.batch(first, &queued);
         }
     }
@@ -650,7 +777,7 @@ impl Thread {
             }
             self.arrange();
             let mut failures = Vec::new();
-            let (mut written, mut nanos) = (0u64, 0u64);
+            let mut tally = Tally::default();
             self.done.clear();
             self.done.resize(self.batch.len(), false);
             let mut returned = 0;
@@ -661,7 +788,7 @@ impl Thread {
                 let forced = self.pass_gate();
                 #[cfg(not(test))]
                 let forced = None;
-                self.perform(queued, forced, &mut failures, &mut written, &mut nanos);
+                self.perform(queued, forced, &mut failures, &mut tally);
                 self.done[at] = true;
                 let before = returned;
                 while returned < self.done.len() && self.done[returned] {
@@ -673,8 +800,27 @@ impl Thread {
             }
             self.batch.clear();
             let volume = &self.state.volume;
-            volume.written_bytes.fetch_add(written, Ordering::Relaxed);
-            volume.write_nanos.fetch_add(nanos, Ordering::Relaxed);
+            let counts = &volume.writer;
+            counts.batches.fetch_add(1, Ordering::Relaxed);
+            counts.operations.fetch_add(tally.operations, Ordering::Relaxed);
+            if tally.abandoned > 0 {
+                counts
+                    .abandoned_operations
+                    .fetch_add(tally.abandoned, Ordering::Relaxed);
+            }
+            if !failures.is_empty() {
+                counts
+                    .failed_operations
+                    .fetch_add(failures.len() as u64, Ordering::Relaxed);
+            }
+            if tally.calls > 0 {
+                // The bytes first and the time last, released: whoever
+                // reads the time first never sees time without its bytes.
+                volume.written_bytes.fetch_add(tally.written, Ordering::Relaxed);
+                volume.write_calls.fetch_add(tally.calls, Ordering::Relaxed);
+                volume.write_seeks.fetch_add(tally.seeks, Ordering::Relaxed);
+                volume.write_nanos.fetch_add(tally.nanos, Ordering::Release);
+            }
             (self.report)(Report { failures });
         }
     }
@@ -765,8 +911,7 @@ impl Thread {
         queued: Queued,
         forced: Option<io::Error>,
         failures: &mut Vec<Failure>,
-        written: &mut u64,
-        nanos: &mut u64,
+        tally: &mut Tally,
     ) {
         let Queued { key, op, .. } = queued;
         let waiting = match &op {
@@ -775,6 +920,13 @@ impl Thread {
         };
         let skip = key.abandoned.load(Ordering::Acquire) || key.failed.load(Ordering::Acquire);
         let file = op.file();
+        match &op {
+            Op::Forget | Op::Release { .. } => {}
+            Op::Read { .. } if skip => tally.abandoned += 1,
+            Op::Read { .. } => tally.operations += 1,
+            _ if skip => tally.abandoned += 1,
+            _ => tally.operations += 1,
+        }
         let mut creating = false;
         let mut failed_at = PathBuf::new();
         let result = match op {
@@ -816,17 +968,26 @@ impl Thread {
                 if let Some(create) = &create {
                     failed_at.clone_from(&create.path);
                 }
+                if self.idle {
+                    // SEAM: ring the rate sampler's wake()
+                    self.idle = false;
+                }
                 match self.opened(file, key.id, create.as_deref(), &mut creating) {
                     Ok(Some(open)) => {
+                        tally.calls += 1;
+                        if open.end.is_some_and(|end| end != offset) {
+                            tally.seeks += 1;
+                        }
                         let started = Instant::now();
                         let wrote = write_all_at(&open.file, offset, &bytes);
                         if wrote.is_err() {
                             failed_at.clone_from(&open.path);
                         }
-                        *nanos += started.elapsed().as_nanos() as u64;
+                        tally.nanos += started.elapsed().as_nanos() as u64;
                         if wrote.is_ok() {
-                            *written += bytes.len() as u64;
+                            tally.written += bytes.len() as u64;
                         }
+                        open.end = Some(offset + bytes.len() as u64);
                         wrote
                     }
                     Ok(None) => Ok(()),
@@ -900,7 +1061,7 @@ impl Thread {
         key: u64,
         create: Option<&Create>,
         creating: &mut bool,
-    ) -> io::Result<Option<&Open>> {
+    ) -> io::Result<Option<&mut Open>> {
         if !self.open.contains_key(&file) {
             let Some(create) = create else {
                 return Ok(None);
@@ -917,10 +1078,11 @@ impl Thread {
                     file: opened,
                     path: create.path.clone(),
                     key,
+                    end: None,
                 },
             );
         }
-        Ok(self.open.get(&file))
+        Ok(self.open.get_mut(&file))
     }
 
     #[cfg(test)]
