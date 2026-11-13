@@ -1171,10 +1171,10 @@ async fn a_job_let_go_that_fails_again_waits_for_more_room_than_its_disk_has_sho
 
     fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
     until_full(&mut pipeline, &scenario).await;
-    // Parked, it counts as left to fetch what its graph had not settled,
-    // not every article: the figure a job put out of the window is rowed by.
+    // Parked, it counts as left to fetch every article its last checkpoint
+    // does not hold: what it fetches when it goes on.
     let left = pipeline.jobs[&JOB].articles.queued_download_len();
-    assert!((1..4).contains(&left), "{left} of 4 articles are left");
+    assert!((1..=4).contains(&left), "{left} of 4 articles are left");
 
     // The disk reads the same room at every look: none was made.
     hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
@@ -1192,11 +1192,20 @@ async fn a_job_let_go_that_fails_again_waits_for_more_room_than_its_disk_has_sho
         "it waits for more than its disk showed as the write failed"
     );
 
-    // Its user resumes it: it tries once, and the write fails again with
-    // the disk showing what it showed.
+    // Its user resumes it, though it is not paused: it tries once, and the
+    // write fails again with the disk showing what it showed.
     fill_after(Some(0));
-    pipeline.resume_job_runtime(JOB).unwrap();
+    handle(&pipeline).resume_job(JOB).await.unwrap();
+    pipeline.apply_queue_intents().await;
     restarts(&mut pipeline).await;
+    assert_eq!(
+        pipeline.jobs[&JOB]
+            .articles
+            .active()
+            .map(|articles| articles.download_queue.len()),
+        Some(left),
+        "restored, it has left to fetch what it showed left while it waited"
+    );
     until_full(&mut pipeline, &scenario).await;
     hears(&mut pipeline, &room, StorageRoot::Intermediate, PLENTY);
     assert_full_disk_held(&pipeline);
@@ -1447,10 +1456,11 @@ async fn a_job_held_for_a_full_disk_waits_on_while_its_disk_cannot_be_read() {
 }
 
 // A job held for a full disk with every article already in, its stream
-// still being decoded: nothing of it is left to fetch, so no lane would ever
-// ask for it. Its release restarts it itself, and it completes.
+// still being decoded: it counts as left every article past its last
+// checkpoint, and is not taken for a job whose download is done. Its
+// release restarts it itself, it fetches those again, and it completes.
 #[tokio::test]
-async fn a_job_held_for_a_full_disk_after_its_download_restarts_with_nothing_to_fetch() {
+async fn a_job_held_for_a_full_disk_at_its_end_counts_what_is_past_its_checkpoint_as_left() {
     let room = Arc::new(AtomicU64::new(PLENTY));
     let scenario = on_disk(&room);
     let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
@@ -1470,20 +1480,65 @@ async fn a_job_held_for_a_full_disk_after_its_download_restarts_with_nothing_to_
             .is_some_and(|articles| articles.download_queue.is_empty()),
         "every article is in"
     );
+    let mut events = pipeline.event_tx.subscribe();
+    let checkpointed = {
+        let pending = pipeline.graph_jobs[&JOB].pending();
+        let file = &pipeline.jobs[&JOB].spec.files[0];
+        file.segments
+            .iter()
+            .filter(|segment| pending.checkpoint_settled(0).contains(&segment.ordinal))
+            .count()
+    };
+    let articles = pipeline.jobs[&JOB].spec.files[0].segments.len();
+    assert!(
+        checkpointed < articles,
+        "the graph is ahead of its last checkpoint"
+    );
     pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate);
+    // Held with nothing queued and nothing out, it is not taken for a job
+    // whose download is done.
+    pipeline.maybe_finish_download_pass(JOB);
+    pipeline.reconcile_candidate_jobs().await;
     pipeline.park_drained_jobs();
     old_graph_heard(&mut pipeline).await;
+    pipeline.maybe_finish_download_pass(JOB);
+    pipeline.reconcile_candidate_jobs().await;
     assert_full_disk_held(&pipeline);
+    let left = pipeline.jobs[&JOB].articles.queued_download_len();
     assert_eq!(
-        pipeline.jobs[&JOB].articles.queued_download_len(),
-        0,
-        "parked with every article in, it counts none as left to fetch"
+        left,
+        articles - checkpointed,
+        "parked, it counts as left every article its last checkpoint does not hold"
+    );
+    assert!(
+        pipeline.pending_completion_checks.is_empty(),
+        "no completion check is asked of a held job"
     );
 
     hears(&mut pipeline, &room, StorageRoot::Intermediate, 0);
     assert_full_disk_held(&pipeline);
+    let mut heard = Vec::new();
+    while let Ok(event) = events.try_recv() {
+        heard.push(event);
+    }
+    assert!(
+        heard.iter().all(|event| !matches!(
+            event,
+            crate::pipeline::PipelineEvent::DownloadFinished { .. }
+                | crate::pipeline::PipelineEvent::DownloadPipelineDrained { .. }
+        )),
+        "held, its download is neither finished nor drained: {heard:?}"
+    );
     hears(&mut pipeline, &room, StorageRoot::Intermediate, 2 * PLENTY);
     restarts(&mut pipeline).await;
+    assert_eq!(
+        pipeline.jobs[&JOB]
+            .articles
+            .active()
+            .map(|articles| articles.download_queue.len()),
+        Some(left),
+        "restored, it fetches what it showed left"
+    );
     drive(&mut pipeline, &scenario, JOB, |_| false).await;
     assert_eq!(
         job_status_for_assert(&pipeline, JOB),
@@ -1493,6 +1548,83 @@ async fn a_job_held_for_a_full_disk_after_its_download_restarts_with_nothing_to_
         file_named(&delivered(&complete_dir), "ember.bin"),
         payload(3 * ARTICLE + 7, 91).as_slice()
     );
+}
+
+// A held job's old graph, still to hear its mail, says more than the job's
+// files hold: a cancel handed back for want of its archive takes no
+// checkpoint of it.
+#[tokio::test]
+async fn a_cancel_handed_back_takes_no_checkpoint_of_a_held_jobs_old_graph() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let scenario = on_disk(&room);
+    let (_temp_dir, mut pipeline, _) = admit(&scenario).await;
+
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline
+            .graph_jobs
+            .get(&JOB)
+            .is_some_and(|job| job.awaits_mail())
+    })
+    .await;
+    pipeline.hold_job_for_full_disk(JOB, StorageRoot::Intermediate);
+    assert!(
+        pipeline.retiring_graph_jobs.contains_key(&JOB),
+        "the old graph still has something out"
+    );
+    let taken = pipeline.retiring_graph_jobs[&JOB].pending().tally();
+
+    pipeline.recover_cancelled_graph_checkpoint(JOB);
+    assert_eq!(
+        pipeline.retiring_graph_jobs[&JOB].pending().tally(),
+        taken,
+        "no checkpoint is taken of the graph the job was held away from"
+    );
+    old_graph_heard(&mut pipeline).await;
+    assert!(pipeline.held_for_full_disk(JOB));
+}
+
+// The root a held job waits on is pointed at another directory: the job
+// keeps waiting on the disk its write failed on, read from then as a path
+// of its own, and goes on when that disk shows room made.
+#[tokio::test]
+async fn a_root_pointed_elsewhere_leaves_the_held_job_waiting_on_the_disk_that_failed() {
+    let room = Arc::new(AtomicU64::new(0));
+    let body = payload(4 * ARTICLE, 163);
+    let scenario = on_disk_posting(&room, vec![Post::plain("ember.bin", body.clone())]);
+    let (temp_dir, mut pipeline, _) = admit(&scenario).await;
+
+    fill_after(Some(ARTICLE as u64 + ARTICLE as u64 / 2));
+    until_full(&mut pipeline, &scenario).await;
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+
+    let elsewhere = temp_dir.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    pipeline
+        .storage_capacity
+        .retarget(StorageRoot::Intermediate, elsewhere);
+    pipeline.disk_reading();
+    assert!(pipeline.held_for_full_disk(JOB), "the job still waits");
+    assert_eq!(
+        pipeline.storage_capacity.waited_paths(),
+        1,
+        "the disk that failed is read as a path of its own"
+    );
+    assert!(
+        !working(&pipeline).waited_on(),
+        "the root pointed elsewhere is no longer waited on"
+    );
+    assert_eq!(pipeline.full_disk_mark(JOB), Some(RESERVE), "its mark stands");
+
+    // The disk that failed reads no more room, then room made.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 0);
+    assert!(pipeline.held_for_full_disk(JOB));
+    fill_after(None);
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    assert!(
+        !pipeline.held_for_full_disk(JOB),
+        "room on the disk that failed lets it go"
+    );
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
 }
 
 // Room freed between the failed write and the next look at the disk: the

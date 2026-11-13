@@ -234,6 +234,11 @@ impl Pipeline {
         ) {
             return;
         }
+        // A job held for a full disk has nothing to judge: it goes on from
+        // its checkpoint once there is room.
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         if !self.pending_completion_checks.contains(&job_id) {
             self.pending_completion_checks.push_back(job_id);
         }

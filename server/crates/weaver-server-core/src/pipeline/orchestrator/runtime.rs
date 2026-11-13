@@ -747,6 +747,11 @@ impl Pipeline {
     }
 
     pub(crate) fn emit_download_finished_if_active(&mut self, job_id: JobId) {
+        // A job held for a full disk fetches again what it lost: its
+        // download is not finished while it waits.
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         if self.active_download_passes.remove(&job_id) {
             self.phase_end(job_id, JobPhase::Downloading);
             let finalization_pending = self.job_has_pending_download_pipeline_work(job_id);
@@ -763,6 +768,9 @@ impl Pipeline {
     }
 
     pub(crate) fn emit_download_pipeline_drained_if_pending(&mut self, job_id: JobId) {
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         if self.jobs_finalizing_download.remove(&job_id) {
             self.emit_job_event(PipelineEvent::DownloadPipelineDrained { job_id });
         }

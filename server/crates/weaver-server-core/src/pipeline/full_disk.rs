@@ -67,8 +67,11 @@ pub(crate) struct FullDisk {
     // A probe was running as the write failed: it began before the failure,
     // so the figure it publishes takes the mark's place, once.
     running: bool,
-    // How many times the root waited on had been pointed elsewhere.
+    // How many times the root waited on had been pointed elsewhere, and the
+    // directory it was pointed at as the write failed: when the root is
+    // pointed elsewhere, the wait goes on reading that directory's disk.
     moved: u64,
+    dir: PathBuf,
     // Room was made, or the user asked: the job goes on once it has parked.
     go: bool,
     // What the job's graph said was left to fetch, taken before it went:
@@ -90,6 +93,14 @@ impl Pipeline {
                 StorageRoot::Complete
             }
             _ => StorageRoot::Intermediate,
+        }
+    }
+
+    // The directory `root` is pointed at.
+    fn root_dir(&self, root: StorageRoot) -> PathBuf {
+        match root {
+            StorageRoot::Complete => self.complete_dir.clone(),
+            _ => self.intermediate_dir.clone(),
         }
     }
 
@@ -125,7 +136,12 @@ impl Pipeline {
         let mut named = HashSet::new();
         let mut left = None;
         if let Some(graph) = self.graph_jobs.get(&job_id) {
+            // The job has in hand only what its last checkpoint holds: a
+            // part its graph settled since is fetched again, so it counts
+            // as left, in the parts and in the bytes the job shows.
+            let mut past = 0u64;
             if matches!(state.articles, JobArticles::Active(_)) {
+                let pending = graph.pending();
                 left = Some(FileSummaries(
                     state
                         .spec
@@ -133,14 +149,26 @@ impl Pipeline {
                         .iter()
                         .zip(0u32..)
                         .map(|(file, index)| {
+                            let saved = pending.checkpoint_settled(index as usize);
+                            let volume = weaver_graph::VolumeIndex(index);
+                            past += file
+                                .segments
+                                .iter()
+                                .filter(|segment| {
+                                    !saved.contains(&segment.ordinal)
+                                        && graph.article_settled(volume, segment.ordinal)
+                                })
+                                .map(|segment| u64::from(segment.bytes))
+                                .sum::<u64>();
                             FileSummary::left(file, |ordinal| {
-                                graph.article_settled(weaver_graph::VolumeIndex(index), ordinal)
+                                saved.contains(&ordinal) && graph.article_settled(volume, ordinal)
                             })
                         })
                         .collect(),
                 ));
             }
-            let figures = Self::graph_remaining(graph, &state.spec);
+            let (remaining, wanted) = Self::graph_remaining(graph, &state.spec);
+            let figures = (remaining.saturating_add(past).min(wanted), wanted);
             self.released_remaining.insert(job_id, figures);
             named = graph
                 .pending()
@@ -163,6 +191,7 @@ impl Pipeline {
                 mark: look.shown,
                 running: look.probe < look.begun,
                 moved: look.moved,
+                dir: self.root_dir(root),
                 go: false,
                 left,
                 named,
@@ -240,11 +269,24 @@ impl Pipeline {
         let reserve = self.extraction_limits.min_free_bytes;
         let mut woken = Vec::new();
         for (job_id, hold) in &mut self.full_disk {
-            // A probe running as the write failed began before it: what it
-            // published can raise the high, never let the job go.
+            let capacity = &self.storage_capacity;
+            // The root waited on was pointed at another directory: the wait
+            // stays on the disk that failed, read from here as a path of
+            // its own. Its mark stands, and readings count from now.
+            let repointed = match &hold.disk {
+                Disk::Root(root) if capacity.look(*root).moved != hold.moved => Some(*root),
+                _ => None,
+            };
+            if let Some(root) = repointed {
+                capacity.ledger(root).unwait();
+                let look = capacity.hold_path(&hold.dir);
+                hold.disk = Disk::Path(hold.dir.clone());
+                hold.since = look.begun;
+                hold.running = false;
+                hold.moved = look.moved;
+            }
             // What the disk shows now, and what is free on it to spend: for
             // a root, less what is promised on it.
-            let capacity = &self.storage_capacity;
             let (look, spendable) = match &hold.disk {
                 Disk::Root(root) => (
                     Some(capacity.look(*root)),
@@ -259,12 +301,6 @@ impl Pipeline {
                 }
             };
             if let Some(look) = look {
-                // The root was pointed at another directory: the disk that
-                // failed is no longer the one read, so the job tries once.
-                if look.moved != hold.moved {
-                    hold.moved = look.moved;
-                    hold.go = true;
-                }
                 // A probe running as the write failed began before it:
                 // what it published is the newest figure from before the
                 // failure, and takes the mark's place.
@@ -366,13 +402,13 @@ impl Pipeline {
             }
         }
         let disk = disk.unwrap_or_else(|| Disk::Path(path.to_path_buf()));
-        let look = match &disk {
+        let (look, dir) = match &disk {
             Disk::Root(root) => {
                 let look = self.storage_capacity.look(*root);
                 self.storage_capacity.ledger(*root).wait();
-                look
+                (look, self.root_dir(*root))
             }
-            Disk::Path(path) => self.storage_capacity.hold_path(path),
+            Disk::Path(path) => (self.storage_capacity.hold_path(path), path.clone()),
         };
         self.full_disk.insert(
             job_id,
@@ -383,6 +419,7 @@ impl Pipeline {
                 mark: look.shown,
                 running: look.probe < look.begun,
                 moved: look.moved,
+                dir,
                 go: false,
                 left: None,
                 named: HashSet::new(),
@@ -426,8 +463,8 @@ impl Pipeline {
     }
 
     // The user resumed the job: it tries its disk again now, once, whatever
-    // the readings say. A write that fails again holds it again, against the
-    // same high.
+    // the readings say. A write that fails again holds it again, with a mark
+    // of its own.
     pub(in crate::pipeline) fn try_full_disk_now(&mut self, job_id: JobId) {
         if self.full_disk.is_empty() {
             return;

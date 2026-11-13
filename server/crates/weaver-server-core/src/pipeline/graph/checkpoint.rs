@@ -842,6 +842,20 @@ impl Pending {
             .map_or(0, |held| held.settled_bytes)
     }
 
+    // The ordinals of `volume`'s articles the last checkpoint taken from
+    // the job says are not fetched again: what a restore has in hand. None
+    // while no checkpoint was taken from the job.
+    pub(in crate::pipeline) fn checkpoint_settled(
+        &self,
+        volume: usize,
+    ) -> std::collections::HashSet<u32> {
+        let slot = self.slot();
+        if slot.held.is_none() {
+            return std::collections::HashSet::new();
+        }
+        slot.root.settled(volume)
+    }
+
     // The spool files of the held parts the last checkpoint taken names,
     // each as its row names it, under the job's working directory.
     pub(in crate::pipeline) fn held_spools(&self) -> Vec<String> {
@@ -873,6 +887,12 @@ impl Pipeline {
     // Called only after the ordered archive command answered: every old
     // checkpoint and its completion callback has relinquished this job.
     pub(in crate::pipeline) fn recover_cancelled_graph_checkpoint(&mut self, job_id: JobId) {
+        // A job held for a full disk has only a graph that says more than
+        // its files hold, still to hear its mail: no checkpoint is taken of
+        // it. The job goes on from the checkpoint it was held at.
+        if self.held_for_full_disk(job_id) {
+            return;
+        }
         let held = self.held_part_rows(job_id);
         let Some(graph) = self
             .graph_jobs
