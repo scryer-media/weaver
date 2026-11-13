@@ -179,9 +179,19 @@ fn read_bootstrap_password_file(path: &Path) -> Result<String, BootstrapLoginErr
     Ok(password)
 }
 
-pub(crate) fn open_database(config_path: &Path) -> Result<Database, Box<dyn std::error::Error>> {
+pub(crate) const PENDING_DOWNLOAD_ROOT: &str = "bootstrap.pending_download_root";
+
+pub(crate) fn open_database(
+    config_path: &Path,
+    implicit_download_root: Option<&Path>,
+) -> Result<(Database, Option<PathBuf>), Box<dyn std::error::Error>> {
     let db = weaver_server_core::persistence::open_database(config_path)?;
     if db.pre_migration_schema_version().is_none() {
+        // Keep initialization eligible after a failed first boot. In particular,
+        // environment validation and encryption bootstrap happen after DB creation.
+        if let Some(root) = implicit_download_root {
+            db.set_setting(PENDING_DOWNLOAD_ROOT, &root.to_string_lossy())?;
+        }
         // Record generation before deployment/bootstrap validation can fail.
         // A retry of a new install must not become a legacy no-code wizard.
         db.set_setting(
@@ -189,7 +199,12 @@ pub(crate) fn open_database(config_path: &Path) -> Result<Database, Box<dyn std:
             weaver_server_core::security::AUTHENTICATED_INSTALL_GENERATION,
         )?;
     }
-    Ok(db)
+    let pending_root = if implicit_download_root.is_some() {
+        db.get_setting(PENDING_DOWNLOAD_ROOT)?.map(PathBuf::from)
+    } else {
+        None
+    };
+    Ok((db, pending_root))
 }
 
 pub(crate) fn finish_open_db_and_config(
@@ -211,6 +226,32 @@ pub(crate) fn reset_login_if_requested(db: &mut Database) {
 
 pub(crate) fn parse_env_seed_from_process() -> Result<EnvSeedConfig, EnvSeedError> {
     weaver_server_core::settings::env_seed::parse_env_seed(std::env::vars())
+}
+
+// Persist platform defaults through the same missing-setting seed as explicit
+// environment values. Existing profiles and explicit data roots keep their layout.
+pub(crate) fn seed_implicit_download_defaults(
+    seed: &mut EnvSeedConfig,
+    config: &Config,
+    new_profile: bool,
+    download_root: Option<&Path>,
+    profile_data_dir: &Path,
+) {
+    // The data root may already have been persisted before an interrupted seed.
+    let custom_data_root =
+        !config.data_dir.is_empty() && Path::new(&config.data_dir) != profile_data_dir;
+    if !new_profile || custom_data_root || seed.core.data_dir.is_some() {
+        return;
+    }
+    let Some(root) = download_root else {
+        return;
+    };
+    seed.core
+        .intermediate_dir
+        .get_or_insert_with(|| root.join("incomplete").to_string_lossy().into_owned());
+    seed.core
+        .complete_dir
+        .get_or_insert_with(|| root.join("complete").to_string_lossy().into_owned());
 }
 
 pub(crate) fn apply_core_env_seed(
@@ -420,6 +461,160 @@ mod tests {
         default_data_dir_from_config_path(&config_path, &mut config);
 
         assert_eq!(config.data_dir, ".");
+    }
+
+    #[test]
+    fn fresh_platform_download_defaults_survive_config_reload() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = empty_config();
+        let mut seed = EnvSeedConfig::default();
+        let home = tempfile::tempdir().unwrap();
+        let downloads = home.path().join("Downloads");
+        seed_implicit_download_defaults(&mut seed, &config, true, Some(&downloads), home.path());
+        apply_core_env_seed(&db, &mut config, &seed).unwrap();
+        let reloaded = db.load_config().unwrap();
+        assert_eq!(
+            PathBuf::from(reloaded.intermediate_dir()),
+            downloads.join("incomplete")
+        );
+        assert_eq!(
+            PathBuf::from(reloaded.complete_dir()),
+            downloads.join("complete")
+        );
+        assert!(!downloads.exists());
+    }
+
+    #[test]
+    fn failed_first_boot_retries_platform_defaults_after_database_reopen() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = home.path().join("profile");
+        let downloads = home.path().join("Downloads");
+        let (db, root) = open_database(&profile, Some(&downloads)).unwrap();
+        assert_eq!(root.as_deref(), Some(downloads.as_path()));
+        assert!(
+            weaver_server_core::settings::env_seed::parse_env_seed([(
+                "WEAVER_MAX_DOWNLOAD_SPEED".to_string(),
+                "invalid".to_string()
+            )])
+            .is_err()
+        );
+        drop(db);
+
+        let (db, root) = open_database(&profile, Some(&downloads)).unwrap();
+        assert!(db.pre_migration_schema_version().is_some());
+        let mut config = db.load_config().unwrap();
+        let mut seed = EnvSeedConfig::default();
+        seed_implicit_download_defaults(
+            &mut seed,
+            &config,
+            root.is_some(),
+            root.as_deref(),
+            &profile,
+        );
+        apply_core_env_seed(&db, &mut config, &seed).unwrap();
+        db.delete_setting(PENDING_DOWNLOAD_ROOT).unwrap();
+        drop(db);
+
+        let (db, root) = open_database(&profile, Some(&downloads)).unwrap();
+        assert_eq!(root, None);
+        let config = db.load_config().unwrap();
+        assert_eq!(
+            PathBuf::from(config.intermediate_dir()),
+            downloads.join("incomplete")
+        );
+        assert_eq!(
+            PathBuf::from(config.complete_dir()),
+            downloads.join("complete")
+        );
+    }
+
+    #[test]
+    fn interrupted_core_seed_resumes_missing_paths_without_overwriting_saved_paths() {
+        let home = tempfile::tempdir().unwrap();
+        let profile = home.path().join("profile");
+        let downloads = home.path().join("Downloads");
+        let (db, _) = open_database(&profile, Some(&downloads)).unwrap();
+        db.set_setting("data_dir", &profile.to_string_lossy())
+            .unwrap();
+        db.set_setting("intermediate_dir", "chosen-incomplete")
+            .unwrap();
+        drop(db);
+
+        let (db, root) = open_database(&profile, Some(&downloads)).unwrap();
+        let mut config = db.load_config().unwrap();
+        let mut seed = EnvSeedConfig::default();
+        seed_implicit_download_defaults(
+            &mut seed,
+            &config,
+            root.is_some(),
+            root.as_deref(),
+            &profile,
+        );
+        apply_core_env_seed(&db, &mut config, &seed).unwrap();
+        let reloaded = db.load_config().unwrap();
+        assert_eq!(reloaded.intermediate_dir(), "chosen-incomplete");
+        assert_eq!(
+            PathBuf::from(reloaded.complete_dir()),
+            downloads.join("complete")
+        );
+    }
+
+    #[test]
+    fn existing_database_without_pending_initialization_keeps_its_layout() {
+        let profile = tempfile::tempdir().unwrap();
+        let (db, root) = open_database(profile.path(), None).unwrap();
+        assert_eq!(root, None);
+        drop(db);
+        let (db, root) = open_database(profile.path(), Some(Path::new("Downloads"))).unwrap();
+        assert_eq!(root, None);
+        assert_eq!(db.get_setting(PENDING_DOWNLOAD_ROOT).unwrap(), None);
+    }
+
+    #[test]
+    fn platform_defaults_preserve_existing_profiles_and_explicit_data_roots() {
+        for (new_profile, configured_data, env_data, root) in [
+            (false, "", None, Some(Path::new("Downloads"))),
+            (true, "existing-data", None, Some(Path::new("Downloads"))),
+            (true, "", Some("custom-data"), Some(Path::new("Downloads"))),
+            (true, "", None, None),
+        ] {
+            let mut config = empty_config();
+            config.data_dir = configured_data.into();
+            let mut seed = EnvSeedConfig::default();
+            seed.core.data_dir = env_data.map(str::to_owned);
+            seed_implicit_download_defaults(
+                &mut seed,
+                &config,
+                new_profile,
+                root,
+                Path::new("profile"),
+            );
+            assert_eq!(seed.core.intermediate_dir, None);
+            assert_eq!(seed.core.complete_dir, None);
+        }
+    }
+
+    #[test]
+    fn platform_defaults_preserve_environment_and_saved_download_paths() {
+        let db = Database::open_in_memory().unwrap();
+        let mut config = empty_config();
+        config.complete_dir = Some("saved-complete".into());
+        db.set_setting("complete_dir", "saved-complete").unwrap();
+        let mut seed = EnvSeedConfig::default();
+        seed.core.intermediate_dir = Some("env-incomplete".into());
+        seed.core.complete_dir = Some("env-complete".into());
+        seed_implicit_download_defaults(
+            &mut seed,
+            &config,
+            true,
+            Some(Path::new("Downloads")),
+            Path::new("profile"),
+        );
+        assert_eq!(seed.core.complete_dir.as_deref(), Some("env-complete"));
+        apply_core_env_seed(&db, &mut config, &seed).unwrap();
+        let reloaded = db.load_config().unwrap();
+        assert_eq!(reloaded.intermediate_dir(), "env-incomplete");
+        assert_eq!(reloaded.complete_dir(), "saved-complete");
     }
 
     #[test]

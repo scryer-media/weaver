@@ -146,6 +146,7 @@ fn main() {
 async fn async_main() {
     let cli = Cli::parse();
     let config_path = cli.resolved_config_path();
+    let implicit_download_root = cli.implicit_download_root(&config_path);
     let Cli {
         log_file: log_file_override,
         log_format: log_format_override,
@@ -349,14 +350,15 @@ async fn async_main() {
             );
         }
     }
-    let db = match bootstrap::open_database(&config_path) {
-        Ok(db) => db,
-        Err(error) => {
-            error!("failed to open database: {error}");
-            drop(log_guards.take());
-            std::process::exit(1);
-        }
-    };
+    let (db, pending_download_root) =
+        match bootstrap::open_database(&config_path, implicit_download_root.as_deref()) {
+            Ok(db) => db,
+            Err(error) => {
+                error!("failed to open database: {error}");
+                drop(log_guards.take());
+                std::process::exit(1);
+            }
+        };
     let (db, restore_outcome) =
         match weaver_server_core::operations::apply_pending_restore(db, &restore_locator_dir) {
             Ok(result) => result,
@@ -378,6 +380,7 @@ async fn async_main() {
     if let Some(splash) = upgrade_splash {
         splash.stop().await;
     }
+    let initialize_download_defaults = pending_download_root.is_some() && restore_outcome.is_none();
     let (mut db, mut config) = if let Some(outcome) = restore_outcome {
         tracing::info!(
             restore_id = %outcome.restore_id,
@@ -411,6 +414,13 @@ async fn async_main() {
         }
     };
 
+    bootstrap::seed_implicit_download_defaults(
+        &mut env_seed,
+        &config,
+        initialize_download_defaults,
+        pending_download_root.as_deref(),
+        &restore_locator_dir,
+    );
     bootstrap::default_data_dir_from_config_path(&config_path, &mut config);
     let data_dir = PathBuf::from(&config.data_dir);
     if let Err(error) = bootstrap::bootstrap_encryption(&data_dir, &mut db, &mut config) {
@@ -419,7 +429,12 @@ async fn async_main() {
         std::process::exit(1);
     }
     bootstrap::reset_login_if_requested(&mut db);
-    if let Err(error) = bootstrap::apply_core_env_seed(&db, &mut config, &env_seed) {
+    if let Err(error) = bootstrap::apply_core_env_seed(&db, &mut config, &env_seed).and_then(|_| {
+        if initialize_download_defaults {
+            db.delete_setting(bootstrap::PENDING_DOWNLOAD_ROOT)?;
+        }
+        Ok(())
+    }) {
         error!("failed to seed config settings from environment: {error}");
         drop(log_guards.take());
         std::process::exit(1);

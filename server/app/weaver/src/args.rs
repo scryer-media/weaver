@@ -60,6 +60,19 @@ impl Cli {
             .clone()
             .unwrap_or_else(default_implicit_config_path)
     }
+
+    pub(crate) fn implicit_download_root(&self, config_path: &std::path::Path) -> Option<PathBuf> {
+        #[cfg(target_os = "macos")]
+        if self.config.is_none() && config_path != std::path::Path::new(DEFAULT_CONFIG_FILE) {
+            return std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .filter(|home| home.is_absolute())
+                .map(|home| home.join("Downloads"));
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = config_path;
+        None
+    }
 }
 
 fn default_implicit_config_path() -> PathBuf {
@@ -73,10 +86,33 @@ fn default_implicit_config_path() -> PathBuf {
         )
     }
 
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        macos_implicit_config_path(
+            PathBuf::from(DEFAULT_CONFIG_FILE).exists(),
+            PathBuf::from("weaver.db").exists(),
+            std::env::var_os("HOME").map(PathBuf::from),
+        )
+    }
+
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         PathBuf::from(DEFAULT_CONFIG_FILE)
     }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_implicit_config_path(
+    local_config_exists: bool,
+    local_db_exists: bool,
+    home: Option<PathBuf>,
+) -> PathBuf {
+    if local_config_exists || local_db_exists {
+        return PathBuf::from(DEFAULT_CONFIG_FILE);
+    }
+    home.filter(|home| home.is_absolute())
+        .map(|home| home.join("Library/Application Support/ScryerMedia/Weaver"))
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_FILE))
 }
 
 #[cfg(windows)]
@@ -387,7 +423,7 @@ mod tests {
         }
     }
 
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "macos")))]
     #[test]
     fn implicit_non_windows_config_path_stays_current_directory_toml() {
         let cli = Cli::parse_from(["weaver"]);
@@ -395,6 +431,58 @@ mod tests {
         assert_eq!(
             cli.resolved_config_path(),
             PathBuf::from(DEFAULT_CONFIG_FILE)
+        );
+    }
+
+    #[test]
+    fn macos_fresh_profile_uses_application_support() {
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(
+            super::macos_implicit_config_path(false, false, Some(home.path().to_path_buf())),
+            home.path()
+                .join("Library/Application Support/ScryerMedia/Weaver"),
+        );
+    }
+
+    #[test]
+    fn macos_preserves_each_kind_of_local_profile() {
+        let home = tempfile::tempdir().unwrap();
+        for (config_exists, db_exists) in [(true, false), (false, true), (true, true)] {
+            assert_eq!(
+                super::macos_implicit_config_path(
+                    config_exists,
+                    db_exists,
+                    Some(home.path().to_path_buf()),
+                ),
+                PathBuf::from(DEFAULT_CONFIG_FILE),
+            );
+        }
+    }
+
+    #[test]
+    fn macos_without_absolute_home_keeps_legacy_fallback() {
+        for home in [None, Some(PathBuf::new()), Some(PathBuf::from("relative"))] {
+            assert_eq!(
+                super::macos_implicit_config_path(false, false, home),
+                PathBuf::from(DEFAULT_CONFIG_FILE),
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_profiles_never_select_platform_download_defaults() {
+        for path in ["custom-weaver.toml", "custom-profile"] {
+            let cli = Cli::parse_from(["weaver", "--config", path]);
+            assert_eq!(cli.resolved_config_path(), PathBuf::from(path));
+            assert_eq!(
+                cli.implicit_download_root(&cli.resolved_config_path()),
+                None
+            );
+        }
+        let cli = Cli::parse_from(["weaver"]);
+        assert_eq!(
+            cli.implicit_download_root(std::path::Path::new(DEFAULT_CONFIG_FILE)),
+            None
         );
     }
 
