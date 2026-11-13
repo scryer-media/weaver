@@ -844,14 +844,12 @@ impl NamespaceWriter {
                     offset,
                     bytes,
                     ..
-                } if bound.contains(&(*node, *member, *child)) => {
-                    Some((
-                        *node,
-                        *member,
-                        *child,
-                        ByteRange::at(*offset, bytes.len() as u64),
-                    ))
-                }
+                } if bound.contains(&(*node, *member, *child)) => Some((
+                    *node,
+                    *member,
+                    *child,
+                    ByteRange::at(*offset, bytes.len() as u64),
+                )),
                 _ => None,
             })
             .collect();
@@ -2122,9 +2120,7 @@ impl NamespaceWriter {
         ranges.extend(
             self.reached_now
                 .iter()
-                .filter(|(at, of, child, _)| {
-                    *at == node && *of == member && owner == Some(*child)
-                })
+                .filter(|(at, of, child, _)| *at == node && *of == member && owner == Some(*child))
                 .map(|(_, _, _, range)| *range),
         );
         ranges.sort_by_key(|range| range.start);
