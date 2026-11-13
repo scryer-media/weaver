@@ -1241,7 +1241,21 @@ pub struct ConfiguredStorage {
     pub error: Option<String>,
 }
 
+/// One volume as the operating system presents it, with its live write rate.
 #[derive(Debug, Clone, PartialEq, SimpleObject)]
+pub struct StorageVolumeWriteRate {
+    /// The mount path or drive root.
+    pub label: String,
+    /// "ssd", "platter", "network" or "unknown".
+    pub storage_kind: String,
+    /// What the volume takes, in bytes per second; null until measured.
+    pub write_rate_bytes_per_second: Option<u64>,
+    /// Bytes waiting in memory to be written to the volume.
+    pub buffered_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, SimpleObject)]
+#[graphql(complex)]
 pub struct SystemInfo {
     pub version: String,
     pub uptime_seconds: f64,
@@ -1253,6 +1267,28 @@ pub struct SystemInfo {
     pub memory: SystemMemoryInfo,
     pub primary_storage: SystemStorageProfile,
     pub configured_storage: Vec<ConfiguredStorage>,
+}
+
+#[ComplexObject]
+impl SystemInfo {
+    /// Every volume Weaver writes to, each with its live write rate. Read
+    /// from what the disk owner holds; asks no disk.
+    async fn volumes(&self, ctx: &Context<'_>) -> async_graphql::Result<Vec<StorageVolumeWriteRate>> {
+        let storage = ctx
+            .data::<weaver_server_core::SharedPipelineState>()?
+            .storage_capacity();
+        Ok(storage
+            .map(|storage| storage.volume_write_rates())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|volume| StorageVolumeWriteRate {
+                label: volume.label,
+                storage_kind: volume.storage_kind.to_string(),
+                write_rate_bytes_per_second: volume.write_rate,
+                buffered_bytes: volume.buffered_bytes,
+            })
+            .collect())
+    }
 }
 
 /// Whether this deployment can restart Weaver from the browser.

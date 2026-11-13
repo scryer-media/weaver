@@ -26,7 +26,6 @@ use tracing::{debug, info, warn};
 pub fn detect(output_dir: &Path) -> SystemProfile {
     let mut profile = detect_startup_profile(output_dir);
     let measured = startup_disk_measurement(output_dir);
-    profile.disk.sequential_write_mbps = measured.sequential_write_mbps;
     profile.disk.random_read_iops = measured.random_read_iops;
     profile
 }
@@ -52,10 +51,11 @@ pub fn detect_cpu_and_memory() -> (CpuProfile, MemoryProfile) {
 
 // Collect the fast system facts needed to start the runtime.
 //
-// Random-read IOPS and sequential write throughput are intentionally left at
-// zero until [`startup_disk_measurement`] runs. Zero IOPS is conservative:
-// the tuner admits only one extraction until the measured values are
-// applied. Zero write throughput reads as "not measured".
+// Random-read IOPS are intentionally left at zero until
+// [`startup_disk_measurement`] runs. Zero IOPS is conservative: the tuner
+// admits only one extraction until the measured value is applied. Write
+// throughput is zero, "not measured", until the pipeline applies the live
+// write rate of the working directory's volume.
 pub fn detect_startup_profile(output_dir: &Path) -> SystemProfile {
     let (cpu, memory) = detect_cpu_and_memory();
     let (storage_class, filesystem) = detect_disk_info(output_dir);
@@ -548,20 +548,19 @@ fn parse_cgroup_memory_limit(value: &str) -> Option<u64> {
 // Disk
 // ---------------------------------------------------------------------------
 
-// What the startup disk probe measured: sequential write-through throughput
-// and random 4 KiB read IOPS on the data directory's filesystem. A zero
-// `sequential_write_mbps` means it was not measured.
+// What the startup disk probe measured: random 4 KiB read IOPS on the data
+// directory's filesystem. Write speed is not measured at startup: each
+// volume carries a live write rate instead.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DiskMeasurement {
-    pub sequential_write_mbps: f64,
     pub random_read_iops: f64,
 }
 
-// The measurement kept between starts, with the time it was taken.
+// The measurement kept between starts, with the time it was taken. A record
+// an earlier version stored also holds a write throughput; it is not read.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 struct StoredDiskMeasurement {
     measured_at: u64,
-    sequential_write_mbps: f64,
     random_read_iops: f64,
 }
 
@@ -574,19 +573,11 @@ const DISK_PROBE_FILE: &str = "weaver-disk-probe.txt";
 // A stored measurement older than this is taken again. The disk under a data
 // directory rarely changes, and the probe is the disk work a start can skip.
 const DISK_PROBE_MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-// Used when the probe cannot run at all: SSD-class reads, writes unmeasured.
+// Used when the probe cannot run at all: SSD-class reads.
 const DISK_PROBE_FALLBACK_IOPS: f64 = 10_000.0;
 
-// The write phase writes this buffer repeatedly, then the read phase reads
-// back from what it laid down.
-const PROBE_CHUNK_BYTES: usize = 16 * 1024 * 1024;
-// How many buffers each successive write chunk holds: 16, 64, 144, 256 MiB.
-// Growing chunks keep a fast disk from finishing inside timer noise while a
-// slow one stops after the first.
-const PROBE_WRITE_REPEATS: [usize; 4] = [1, 4, 9, 16];
-// The write phase stops before the next chunk once this much write-and-sync
-// time has been measured.
-const PROBE_WRITE_BUDGET: Duration = Duration::from_secs(1);
+// The probe lays down one buffer of this size, then reads back from it.
+const PROBE_FILE_BYTES: usize = 16 * 1024 * 1024;
 const PROBE_READ_SIZE: usize = 4096;
 const PROBE_READ_COUNT: usize = 200;
 
@@ -600,7 +591,6 @@ pub fn startup_disk_measurement(dir: &Path) -> DiskMeasurement {
     if let Some(pinned) = startup_iops_override() {
         debug!(iops = pinned, "disk probe skipped: WEAVER_STARTUP_IOPS");
         return DiskMeasurement {
-            sequential_write_mbps: 0.0,
             random_read_iops: pinned,
         };
     }
@@ -622,12 +612,10 @@ fn stored_or_measured_disk_profile(
     {
         info!(
             age_days = age / (24 * 60 * 60),
-            write_mbps = format!("{:.0}", stored.sequential_write_mbps),
             iops = format!("{:.0}", stored.random_read_iops),
             "using stored disk measurement"
         );
         return DiskMeasurement {
-            sequential_write_mbps: stored.sequential_write_mbps,
             random_read_iops: stored.random_read_iops,
         };
     }
@@ -637,22 +625,19 @@ fn stored_or_measured_disk_profile(
         // Nothing is stored, so the next start tries again.
         warn!(
             dir = %dir.display(),
-            "disk probe could not run; assuming fast reads and unmeasured writes"
+            "disk probe could not run; assuming fast reads"
         );
         return DiskMeasurement {
-            sequential_write_mbps: 0.0,
             random_read_iops: DISK_PROBE_FALLBACK_IOPS,
         };
     };
     info!(
-        write_mbps = format!("{:.0}", measured.sequential_write_mbps),
         iops = format!("{:.0}", measured.random_read_iops),
         elapsed_ms = started.elapsed().as_millis() as u64,
         "measured disk"
     );
     let stored = StoredDiskMeasurement {
         measured_at: unix_seconds(now()),
-        sequential_write_mbps: measured.sequential_write_mbps,
         random_read_iops: measured.random_read_iops,
     };
     if let Err(error) = write_stored_disk_measurement(&record, &stored) {
@@ -674,11 +659,7 @@ fn unix_seconds(at: SystemTime) -> u64 {
 fn read_stored_disk_measurement(path: &Path) -> Option<StoredDiskMeasurement> {
     let bytes = std::fs::read(path).ok()?;
     let stored: StoredDiskMeasurement = serde_json::from_slice(&bytes).ok()?;
-    let usable = |value: f64| value.is_finite() && value >= 0.0;
-    (usable(stored.sequential_write_mbps)
-        && usable(stored.random_read_iops)
-        && stored.random_read_iops > 0.0)
-        .then_some(stored)
+    (stored.random_read_iops.is_finite() && stored.random_read_iops > 0.0).then_some(stored)
 }
 
 fn write_stored_disk_measurement(
@@ -711,27 +692,23 @@ impl Drop for ProbeFileGuard {
     }
 }
 
-// Measure sequential write-through throughput, then random 4 KiB reads on
-// the file the writes laid down, in the given directory.
+// Measure random 4 KiB reads on a file laid down in the given directory.
 //
-// The writes go through the cache to the device and the reads bypass it
-// where the platform allows, so neither figure is the page cache's. `None`
-// when the directory cannot hold the probe file or any I/O fails.
+// The file goes through the cache to the device and the reads bypass the
+// cache where the platform allows, so the figure is not the page cache's.
+// `None` when the directory cannot hold the probe file or any I/O fails.
 pub fn measure_disk_profile(dir: &Path) -> Option<DiskMeasurement> {
     let path = dir.join(DISK_PROBE_FILE);
     let _guard = ProbeFileGuard(path.clone());
-    let (written, sequential_write_mbps) = measure_sequential_write(&path)?;
+    let written = lay_down_probe_file(&path)?;
     let random_read_iops = measure_random_read(&path, written)?;
-    Some(DiskMeasurement {
-        sequential_write_mbps,
-        random_read_iops,
-    })
+    Some(DiskMeasurement { random_read_iops })
 }
 
 // Random bytes, so a compressing filesystem or drive firmware cannot shrink
-// the writes. Prepared before any timing starts.
-fn probe_write_buffer() -> Vec<u8> {
-    let mut buffer = vec![0u8; PROBE_CHUNK_BYTES];
+// the file.
+fn probe_file_buffer() -> Vec<u8> {
+    let mut buffer = vec![0u8; PROBE_FILE_BYTES];
     let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
     for word in buffer.chunks_exact_mut(8) {
         state ^= state << 13;
@@ -742,35 +719,16 @@ fn probe_write_buffer() -> Vec<u8> {
     buffer
 }
 
-// Returns the bytes written and the throughput in MB/s (10^6 bytes).
-fn measure_sequential_write(path: &Path) -> Option<(u64, f64)> {
+// Writes the file the read phase reads from, through to the device, and
+// returns its length. The write is not timed.
+fn lay_down_probe_file(path: &Path) -> Option<u64> {
     use std::io::Write;
 
-    let buffer = probe_write_buffer();
+    let buffer = probe_file_buffer();
     let mut file = open_write_through(path).ok()?;
-    let mut written: u64 = 0;
-    let mut measured = Duration::ZERO;
-    for repeats in PROBE_WRITE_REPEATS {
-        if measured >= PROBE_WRITE_BUDGET {
-            break;
-        }
-        let started = Instant::now();
-        for _ in 0..repeats {
-            file.write_all(&buffer).ok()?;
-        }
-        file.sync_data().ok()?;
-        measured += started.elapsed();
-        written += (repeats * PROBE_CHUNK_BYTES) as u64;
-    }
-    let seconds = measured.as_secs_f64();
-    let mbps = if seconds > 0.0 {
-        written as f64 / seconds / 1_000_000.0
-    } else {
-        // Sub-resolution timing: as if it took a microsecond, faster than
-        // anything the tuner tells apart.
-        written as f64
-    };
-    Some((written, mbps))
+    file.write_all(&buffer).ok()?;
+    file.sync_data().ok()?;
+    Some(buffer.len() as u64)
 }
 
 #[cfg(unix)]
