@@ -1033,6 +1033,12 @@ export const SYSTEM_INFO_QUERY = gql`
         filesystem
         startupRandomReadIops
       }
+      volumes {
+        label
+        storageKind
+        writeRateBytesPerSecond
+        bufferedBytes
+      }
       configuredStorage {
         labels
         path
