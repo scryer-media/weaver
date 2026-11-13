@@ -1035,8 +1035,9 @@ pub struct JobOutputResult {
     pub total_bytes: u64,
     /// How many files there are in all.
     pub total_count: u64,
-    /// True when the files were removed and this is the record kept of them.
-    pub removed: bool,
+    /// True when the entry was archived and this is the record kept of its
+    /// files.
+    pub archived: bool,
     /// The `after` that asks for the next page; null on the last page.
     pub next_cursor: Option<String>,
     #[graphql(skip)]
@@ -1049,8 +1050,8 @@ pub struct JobOutputResult {
 pub(crate) enum JobOutputSource {
     /// Read from disk with the totals; this page is already in hand.
     Disk(Vec<JobOutputFile>),
-    /// The record a files removal kept, read from `offset` on.
-    Removed {
+    /// The record an archive kept, read from `offset` on.
+    Archived {
         job_id: u64,
         offset: u64,
         limit: usize,

@@ -35,8 +35,8 @@ export interface DeleteLock {
 export interface RowDeleteOperation {
   state: string;
   locked: boolean;
-  /** A row's operation may be a files removal, which is no delete. */
-  action: "DELETE" | "REMOVE_FILES";
+  /** A row's operation may be an archive, which is no delete. */
+  action: "DELETE" | "ARCHIVE";
 }
 
 /** Whether the server already reports a delete on this row. */
@@ -55,7 +55,7 @@ export interface DeleteProgress {
 /**
  * Rows as they should be drawn: one this screen has handed over reads as
  * queued for deletion until the server's own page shows the delete. A failed
- * files removal the row still carries is replaced, as the delete replaces it.
+ * archive the row still carries is replaced, as the delete replaces it.
  */
 export function withDeleteLocks<T extends { id: number; deleteOperation: RowDeleteOperation | null }>(
   rows: readonly T[],

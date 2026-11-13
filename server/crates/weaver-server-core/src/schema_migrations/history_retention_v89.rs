@@ -154,7 +154,7 @@ mod tests {
     async fn the_upgrade_adds_an_empty_stamp_and_keeps_existing_history() {
         let pool = upgraded_from_88(true).await;
         let stamp: Option<i64> =
-            sqlx::query_scalar("SELECT files_removed_at FROM job_history WHERE job_id = 7")
+            sqlx::query_scalar("SELECT archived_at FROM job_history WHERE job_id = 7")
                 .fetch_one(&pool)
                 .await
                 .unwrap();

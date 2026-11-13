@@ -13,10 +13,10 @@ pub mod metrics_store;
 pub mod recovery;
 
 pub use async_ops::{
+    ArchiveHistoryAcceptOutcome, ArchiveHistoryAcceptance, ArchiveHistorySettlement,
     AsyncOperationState, AsyncOperationTargetState, HistoryDeleteOperationInsertError,
     HistoryDeleteOperationPayload, HistoryDeleteOperationRow, HistoryDeleteOperationSummary,
-    HistoryDeleteRowState, HistoryDeleteTargetWork, HistoryFilesRemovalAcceptOutcome,
-    HistoryFilesRemovalAcceptance, HistoryFilesRemovalSettlement, HistoryOperationAction,
+    HistoryDeleteRowState, HistoryDeleteTargetWork, HistoryOperationAction,
 };
 pub use backup::{
     BackupArtifact, BackupInspectResult, BackupManifest, BackupService, BackupServiceError,

@@ -11,11 +11,11 @@ use crate::persistence::sql_runtime::{SqlArg, SqlEngine, SqlRow, SqlRuntime, Sql
 use crate::{Database, StateError};
 
 const HISTORY_DELETE_KIND: &str = "history_delete";
-// Removing an entry's files and keeping the entry: the same queue, targets
-// and worker as a delete, one operation kind more.
-const HISTORY_FILES_REMOVAL_KIND: &str = "history_files_removal";
+// Archiving an entry, which removes its files and keeps the entry: the same
+// queue, targets and worker as a delete, one operation kind more.
+const ARCHIVE_HISTORY_KIND: &str = "history_archive";
 const HISTORY_JOB_TARGET_KIND: &str = "history_job";
-// The outcome a queued files removal ends with when a delete of the same
+// The outcome a queued archive ends with when a delete of the same
 // entry is accepted first.
 const SUPERSEDED_OUTCOME: &str = "superseded";
 
@@ -98,21 +98,21 @@ pub enum HistoryOperationAction {
     // Deletes the entries, with or without their files.
     Delete,
     // Removes the entries' files and keeps the entries.
-    RemoveFiles,
+    Archive,
 }
 
 impl HistoryOperationAction {
     fn kind(self) -> &'static str {
         match self {
             Self::Delete => HISTORY_DELETE_KIND,
-            Self::RemoveFiles => HISTORY_FILES_REMOVAL_KIND,
+            Self::Archive => ARCHIVE_HISTORY_KIND,
         }
     }
 
     fn from_kind(kind: &str) -> Result<Self, StateError> {
         match kind {
             HISTORY_DELETE_KIND => Ok(Self::Delete),
-            HISTORY_FILES_REMOVAL_KIND => Ok(Self::RemoveFiles),
+            ARCHIVE_HISTORY_KIND => Ok(Self::Archive),
             other => Err(StateError::Database(format!(
                 "invalid history operation kind `{other}`"
             ))),
@@ -145,14 +145,14 @@ pub struct HistoryDeleteRowState {
     pub action: HistoryOperationAction,
     pub delete_files: bool,
     pub error_message: Option<String>,
-    // How a files removal ended, once it has; `None` for a delete.
-    pub files_removal_outcome: Option<crate::HistoryFilesRemovalOutcome>,
+    // How an archive ended, once it has; `None` for a delete.
+    pub archive_outcome: Option<crate::ArchiveHistoryOutcome>,
 }
 
-// What a files removal request answers for one id when it is accepted or
+// What an archive request answers for one id when it is accepted or
 // refused, before any disk work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HistoryFilesRemovalAcceptOutcome {
+pub enum ArchiveHistoryAcceptOutcome {
     // Queued: the worker removes the files later.
     Accepted,
     // There is no history entry and no job with this id.
@@ -163,24 +163,24 @@ pub enum HistoryFilesRemovalAcceptOutcome {
     // The job is in the queue and has not finished.
     NotFinished,
     // The entry already says its files were removed.
-    AlreadyRemoved,
+    AlreadyArchived,
 }
 
-// The answer to a files removal request: the operation that holds the
+// The answer to an archive request: the operation that holds the
 // accepted ids, when any was, and one outcome per distinct id in the order
 // given.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryFilesRemovalAcceptance {
+pub struct ArchiveHistoryAcceptance {
     pub operation_id: Option<u64>,
-    pub results: Vec<(u64, HistoryFilesRemovalAcceptOutcome)>,
+    pub results: Vec<(u64, ArchiveHistoryAcceptOutcome)>,
 }
 
-// How the worker settles one target of a files removal.
+// How the worker settles one target of an archive.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryFilesRemovalSettlement {
+pub struct ArchiveHistorySettlement {
     pub target_id: u64,
     pub state: AsyncOperationTargetState,
-    pub outcome: crate::HistoryFilesRemovalOutcome,
+    pub outcome: crate::ArchiveHistoryOutcome,
     pub message: Option<String>,
 }
 
@@ -484,7 +484,7 @@ async fn count_existing_history_rows(tx: &mut SqlTx<'_>, ids: &[u64]) -> Result<
     Ok(total.max(0) as usize)
 }
 
-// How many of `ids` another delete holds. A files removal does not hold an
+// How many of `ids` another delete holds. An archive does not hold an
 // entry against a delete: the delete supersedes it.
 async fn count_locked_history_delete_targets(
     tx: &mut SqlTx<'_>,
@@ -551,12 +551,12 @@ async fn has_locked_history_delete_targets_tx(tx: &mut SqlTx<'_>) -> Result<bool
         .is_some())
 }
 
-// A delete accepted for entries a files removal still waits on wins: the
+// A delete accepted for entries an archive still waits on wins: the
 // queued removal targets of those entries end, superseded, so the removal
 // never runs for them. A removal already running finishes first, as the
 // worker runs one operation at a time. `ids` `None` supersedes every queued
 // removal target.
-async fn supersede_queued_history_files_removals_tx(
+async fn supersede_queued_archive_history_tx(
     tx: &mut SqlTx<'_>,
     ids: Option<&[u64]>,
 ) -> Result<(), StateError> {
@@ -573,7 +573,7 @@ async fn supersede_queued_history_files_removals_tx(
         vec![
             SqlArg::Text(SUPERSEDED_OUTCOME.to_string()),
             SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
-            SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
+            SqlArg::Text(ARCHIVE_HISTORY_KIND.to_string()),
         ]
     };
     match ids {
@@ -820,7 +820,7 @@ impl Database {
                     if locked_count > 0 {
                         return Ok(Err(HistoryDeleteOperationInsertError::LockedTargets));
                     }
-                    supersede_queued_history_files_removals_tx(tx, Some(&ids)).await?;
+                    supersede_queued_archive_history_tx(tx, Some(&ids)).await?;
 
                     let operation_id = insert_history_delete_operation_tx(
                         tx,
@@ -937,20 +937,20 @@ impl Database {
     // queue, held by another history operation, or already without its
     // files, then queues one operation for the accepted ids. Nothing is
     // written when none is accepted. The worker is rung; no disk is touched.
-    pub fn accept_history_files_removal(
+    pub fn accept_archive_history(
         &self,
         ids: &[u64],
-    ) -> Result<HistoryFilesRemovalAcceptance, StateError> {
+    ) -> Result<ArchiveHistoryAcceptance, StateError> {
         let ids = dedupe_ids(ids);
         if ids.is_empty() {
-            return Ok(HistoryFilesRemovalAcceptance {
+            return Ok(ArchiveHistoryAcceptance {
                 operation_id: None,
                 results: Vec::new(),
             });
         }
         let datastore = self.datastore();
         let acceptance = self.run_sql_blocking(async move {
-            SqlRuntime::run_in_transaction(&datastore, "accept_history_files_removal", |tx| {
+            SqlRuntime::run_in_transaction(&datastore, "accept_archive_history", |tx| {
                 let ids = ids.clone();
                 Box::pin(async move {
                     let chunk_size = id_chunk_size(bind_budget_for_tx(tx), 1);
@@ -958,7 +958,7 @@ impl Database {
                     let mut active = HashSet::new();
                     for chunk in ids.chunks(chunk_size) {
                         let sql = format!(
-                            "SELECT h.job_id, h.files_removed_at,
+                            "SELECT h.job_id, h.archived_at,
                                     CAST(CASE WHEN EXISTS (
                                         SELECT 1 FROM async_operation_targets t
                                          WHERE t.target_kind = {{}}
@@ -974,10 +974,7 @@ impl Database {
                         for row in tx.fetch_all(&sql, &args).await? {
                             entries.insert(
                                 row.i64("job_id")? as u64,
-                                (
-                                    row.opt_i64("files_removed_at")?.is_some(),
-                                    row.i64("held")? != 0,
-                                ),
+                                (row.opt_i64("archived_at")?.is_some(), row.i64("held")? != 0),
                             );
                         }
                         let sql = format!(
@@ -992,24 +989,22 @@ impl Database {
                         .iter()
                         .map(|id| {
                             let outcome = match (entries.get(id), active.contains(id)) {
-                                (None, true) => HistoryFilesRemovalAcceptOutcome::NotFinished,
-                                (None, false) => HistoryFilesRemovalAcceptOutcome::NotFound,
+                                (None, true) => ArchiveHistoryAcceptOutcome::NotFinished,
+                                (None, false) => ArchiveHistoryAcceptOutcome::NotFound,
                                 (Some((true, _)), _) => {
-                                    HistoryFilesRemovalAcceptOutcome::AlreadyRemoved
+                                    ArchiveHistoryAcceptOutcome::AlreadyArchived
                                 }
                                 (Some((false, held)), in_queue) if *held || in_queue => {
-                                    HistoryFilesRemovalAcceptOutcome::Busy
+                                    ArchiveHistoryAcceptOutcome::Busy
                                 }
-                                (Some(_), _) => HistoryFilesRemovalAcceptOutcome::Accepted,
+                                (Some(_), _) => ArchiveHistoryAcceptOutcome::Accepted,
                             };
                             (*id, outcome)
                         })
                         .collect::<Vec<_>>();
                     let accepted = results
                         .iter()
-                        .filter(|(_, outcome)| {
-                            *outcome == HistoryFilesRemovalAcceptOutcome::Accepted
-                        })
+                        .filter(|(_, outcome)| *outcome == ArchiveHistoryAcceptOutcome::Accepted)
                         .map(|(id, _)| *id)
                         .collect::<Vec<_>>();
                     let operation_id = if accepted.is_empty() {
@@ -1018,7 +1013,7 @@ impl Database {
                         Some(
                             insert_history_operation_tx(
                                 tx,
-                                HistoryOperationAction::RemoveFiles,
+                                HistoryOperationAction::Archive,
                                 &accepted,
                                 true,
                                 false,
@@ -1026,7 +1021,7 @@ impl Database {
                             .await?,
                         )
                     };
-                    Ok(HistoryFilesRemovalAcceptance {
+                    Ok(ArchiveHistoryAcceptance {
                         operation_id,
                         results,
                     })
@@ -1040,13 +1035,13 @@ impl Database {
         Ok(acceptance)
     }
 
-    // Settles the targets of one files removal operation, each with its
+    // Settles the targets of one archive operation, each with its
     // state, outcome and message, in one transaction of one statement per
     // bind-sized chunk.
-    pub fn settle_history_files_removal_targets(
+    pub fn settle_archive_history_targets(
         &self,
         operation_id: u64,
-        settled: &[HistoryFilesRemovalSettlement],
+        settled: &[ArchiveHistorySettlement],
     ) -> Result<(), StateError> {
         if settled.is_empty() {
             return Ok(());
@@ -1056,7 +1051,7 @@ impl Database {
         self.run_sql_blocking(async move {
             SqlRuntime::run_in_transaction(
                 &datastore,
-                "settle_history_files_removal_targets",
+                "settle_archive_history_targets",
                 |tx| {
                     let settled = settled.clone();
                     Box::pin(async move {
@@ -1122,7 +1117,7 @@ impl Database {
                         if has_locked_history_delete_targets_tx(tx).await? {
                             return Ok(Err(HistoryDeleteOperationInsertError::LockedTargets));
                         }
-                        supersede_queued_history_files_removals_tx(tx, None).await?;
+                        supersede_queued_archive_history_tx(tx, None).await?;
 
                         let operation_id = insert_history_delete_operation_tx(
                             tx,
@@ -1162,7 +1157,7 @@ impl Database {
                             &[
                                 SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
                                 SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
-                                SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
+                                SqlArg::Text(ARCHIVE_HISTORY_KIND.to_string()),
                             ],
                         )
                         .await?;
@@ -1174,7 +1169,7 @@ impl Database {
                            AND state = 'running'",
                             &[
                                 SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
-                                SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
+                                SqlArg::Text(ARCHIVE_HISTORY_KIND.to_string()),
                             ],
                         )
                         .await?;
@@ -1214,7 +1209,7 @@ impl Database {
                         &[
                             SqlArg::I64(operation_id as i64),
                             SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
-                            SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
+                            SqlArg::Text(ARCHIVE_HISTORY_KIND.to_string()),
                         ],
                     )
                     .await?;
@@ -1242,7 +1237,7 @@ impl Database {
                              LIMIT 1",
                             &[
                                 SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
-                                SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
+                                SqlArg::Text(ARCHIVE_HISTORY_KIND.to_string()),
                             ],
                         )
                         .await?;
@@ -1453,7 +1448,7 @@ impl Database {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
             // A delete's state is its latest target that has not completed;
-            // a files removal's is its latest target, shown only while it has
+            // an archive's is its latest target, shown only while it has
             // not completed, so a removal that later succeeds clears an older
             // failure. Every target here belongs to one of the two kinds.
             let sql = format!(
@@ -1479,13 +1474,13 @@ impl Database {
             );
             let mut args = vec![
                 SqlArg::Text(HISTORY_DELETE_KIND.to_string()),
-                SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()),
+                SqlArg::Text(ARCHIVE_HISTORY_KIND.to_string()),
                 SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()),
             ];
             args.extend(id_args(&ids));
             args.push(SqlArg::Text(HISTORY_JOB_TARGET_KIND.to_string()));
             args.push(SqlArg::Text(HISTORY_DELETE_KIND.to_string()));
-            args.push(SqlArg::Text(HISTORY_FILES_REMOVAL_KIND.to_string()));
+            args.push(SqlArg::Text(ARCHIVE_HISTORY_KIND.to_string()));
             let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
             let mut out = HashMap::new();
             for row in rows {
@@ -1550,10 +1545,10 @@ fn history_delete_row_state_from_row(row: SqlRow) -> Result<HistoryDeleteRowStat
         action: HistoryOperationAction::from_kind(&row.text("kind")?)?,
         delete_files: parse_payload(&row.text("payload_json")?)?.delete_files,
         error_message: row.opt_text("error_message")?,
-        files_removal_outcome: row
+        archive_outcome: row
             .opt_text("outcome")?
             .as_deref()
-            .and_then(crate::HistoryFilesRemovalOutcome::parse),
+            .and_then(crate::ArchiveHistoryOutcome::parse),
     })
 }
 
@@ -1598,7 +1593,7 @@ mod tests {
             completed_at,
             metadata: None,
             server_attribution: None,
-            files_removed_at: None,
+            archived_at: None,
         }
     }
 
@@ -1996,12 +1991,12 @@ mod tests {
         db: &Database,
         operation_id: u64,
         target_id: u64,
-        outcome: crate::HistoryFilesRemovalOutcome,
+        outcome: crate::ArchiveHistoryOutcome,
         message: Option<&str>,
     ) {
-        db.settle_history_files_removal_targets(
+        db.settle_archive_history_targets(
             operation_id,
-            &[HistoryFilesRemovalSettlement {
+            &[ArchiveHistorySettlement {
                 target_id,
                 state: if outcome.settles() {
                     AsyncOperationTargetState::Completed
@@ -2016,16 +2011,16 @@ mod tests {
     }
 
     // Each distinct id gets its answer in the order given, and only the
-    // accepted ones are queued, as one files removal operation.
+    // accepted ones are queued, as one archive operation.
     #[test]
-    fn a_files_removal_accept_answers_each_id_and_queues_the_accepted() {
-        use HistoryFilesRemovalAcceptOutcome as Accept;
+    fn an_archive_accept_answers_each_id_and_queues_the_accepted() {
+        use ArchiveHistoryAcceptOutcome as Accept;
         let db = Database::open_in_memory().unwrap();
         for id in [10, 11, 12, 14] {
             db.insert_job_history(&history(id, 100 + id as i64))
                 .unwrap();
         }
-        crate::pipeline::test_support::stamp_files_removed(
+        crate::pipeline::test_support::mark_entry_archived(
             &db,
             crate::JobId(11),
             Default::default(),
@@ -2039,7 +2034,7 @@ mod tests {
         db.recover_running_history_delete_operations().unwrap();
 
         let acceptance = db
-            .accept_history_files_removal(&[13, 10, 99, 11, 10, 12, 14])
+            .accept_archive_history(&[13, 10, 99, 11, 10, 12, 14])
             .unwrap();
 
         assert_eq!(
@@ -2048,7 +2043,7 @@ mod tests {
                 (13, Accept::NotFinished),
                 (10, Accept::Accepted),
                 (99, Accept::NotFound),
-                (11, Accept::AlreadyRemoved),
+                (11, Accept::AlreadyArchived),
                 (12, Accept::Busy),
                 (14, Accept::Busy),
             ]
@@ -2063,13 +2058,13 @@ mod tests {
             [10]
         );
         let state = db.list_history_delete_row_states(&[10]).unwrap()[&10].clone();
-        assert_eq!(state.action, HistoryOperationAction::RemoveFiles);
+        assert_eq!(state.action, HistoryOperationAction::Archive);
         assert_eq!(state.state, AsyncOperationTargetState::Queued);
         assert!(state.locked);
-        assert_eq!(state.files_removal_outcome, None);
+        assert_eq!(state.archive_outcome, None);
 
         // A request with nothing to accept writes nothing.
-        let refused = db.accept_history_files_removal(&[10, 99]).unwrap();
+        let refused = db.accept_archive_history(&[10, 99]).unwrap();
         assert_eq!(refused.operation_id, None);
         assert_eq!(
             refused.results,
@@ -2081,21 +2076,21 @@ mod tests {
     // outcome and message, and holds nothing; a later removal that succeeds
     // clears it.
     #[test]
-    fn a_failed_files_removal_shows_until_a_later_one_succeeds() {
+    fn a_failed_archive_shows_until_a_later_one_succeeds() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history(10, 100)).unwrap();
-        let first = db.accept_history_files_removal(&[10]).unwrap();
+        let first = db.accept_archive_history(&[10]).unwrap();
         let first = first.operation_id.unwrap();
         let claimed = db.next_history_delete_operation().unwrap().unwrap();
         assert_eq!(
             (claimed.id, claimed.action),
-            (first, HistoryOperationAction::RemoveFiles)
+            (first, HistoryOperationAction::Archive)
         );
         settle(
             &db,
             first,
             10,
-            crate::HistoryFilesRemovalOutcome::NotManaged,
+            crate::ArchiveHistoryOutcome::NotManaged,
             Some("left /x: not managed by Weaver"),
         );
         assert_eq!(
@@ -2107,24 +2102,24 @@ mod tests {
         assert_eq!(state.operation_id, first);
         assert_eq!(state.state, AsyncOperationTargetState::Failed);
         assert!(!state.locked);
-        assert_eq!(state.action, HistoryOperationAction::RemoveFiles);
+        assert_eq!(state.action, HistoryOperationAction::Archive);
         assert_eq!(
-            state.files_removal_outcome,
-            Some(crate::HistoryFilesRemovalOutcome::NotManaged)
+            state.archive_outcome,
+            Some(crate::ArchiveHistoryOutcome::NotManaged)
         );
         assert_eq!(
             state.error_message.as_deref(),
             Some("left /x: not managed by Weaver")
         );
 
-        let second = db.accept_history_files_removal(&[10]).unwrap();
+        let second = db.accept_archive_history(&[10]).unwrap();
         let second = second.operation_id.unwrap();
         db.next_history_delete_operation().unwrap().unwrap();
         settle(
             &db,
             second,
             10,
-            crate::HistoryFilesRemovalOutcome::Removed,
+            crate::ArchiveHistoryOutcome::Archived,
             None,
         );
         db.finalize_history_delete_operation(second).unwrap();
@@ -2132,16 +2127,16 @@ mod tests {
     }
 
     // The delete operation list shows deletes only: a waiting and a failed
-    // files removal are seen on their rows, not in the list.
+    // archive are seen on their rows, not in the list.
     #[test]
-    fn the_delete_operation_list_leaves_out_files_removals() {
+    fn the_delete_operation_list_leaves_out_archives() {
         let db = Database::open_in_memory().unwrap();
         for id in [10, 11, 12] {
             db.insert_job_history(&history(id, 100 + id as i64))
                 .unwrap();
         }
         let failed = db
-            .accept_history_files_removal(&[10])
+            .accept_archive_history(&[10])
             .unwrap()
             .operation_id
             .unwrap();
@@ -2150,12 +2145,12 @@ mod tests {
             &db,
             failed,
             10,
-            crate::HistoryFilesRemovalOutcome::Failed,
+            crate::ArchiveHistoryOutcome::Failed,
             Some("disk unreachable"),
         );
         db.finalize_history_delete_operation(failed).unwrap();
         let pending = db
-            .accept_history_files_removal(&[11])
+            .accept_archive_history(&[11])
             .unwrap()
             .operation_id
             .unwrap();
@@ -2176,18 +2171,18 @@ mod tests {
         assert_eq!(states[&10].operation_id, failed);
         assert_eq!(states[&10].state, AsyncOperationTargetState::Failed);
         assert_eq!(states[&11].operation_id, pending);
-        assert_eq!(states[&11].action, HistoryOperationAction::RemoveFiles);
+        assert_eq!(states[&11].action, HistoryOperationAction::Archive);
         assert_eq!(states[&12].action, HistoryOperationAction::Delete);
     }
 
-    // A delete for an entry whose files removal is running is accepted. The
+    // A delete for an entry whose archive is running is accepted. The
     // removal is not superseded: it finishes, then the delete runs.
     #[test]
-    fn a_delete_is_accepted_while_a_files_removal_runs() {
+    fn a_delete_is_accepted_while_a_archive_runs() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history(10, 100)).unwrap();
         let removal = db
-            .accept_history_files_removal(&[10])
+            .accept_archive_history(&[10])
             .unwrap()
             .operation_id
             .unwrap();
@@ -2212,7 +2207,7 @@ mod tests {
             &db,
             removal,
             10,
-            crate::HistoryFilesRemovalOutcome::Removed,
+            crate::ArchiveHistoryOutcome::Archived,
             None,
         );
         db.finalize_history_delete_operation(removal).unwrap();
@@ -2222,14 +2217,14 @@ mod tests {
         );
     }
 
-    // A files removal the worker had claimed when the process stopped is
+    // An archive the worker had claimed when the process stopped is
     // queued again at start-up, with its targets, as a delete is.
     #[test]
-    fn a_claimed_files_removal_is_queued_again_after_a_restart() {
+    fn a_claimed_archive_is_queued_again_after_a_restart() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history(10, 100)).unwrap();
         let operation_id = db
-            .accept_history_files_removal(&[10])
+            .accept_archive_history(&[10])
             .unwrap()
             .operation_id
             .unwrap();
@@ -2247,7 +2242,7 @@ mod tests {
 
         let claimed = db.next_history_delete_operation().unwrap().unwrap();
         assert_eq!(claimed.id, operation_id);
-        assert_eq!(claimed.action, HistoryOperationAction::RemoveFiles);
+        assert_eq!(claimed.action, HistoryOperationAction::Archive);
         let targets = db
             .list_history_delete_operation_targets(operation_id, true)
             .unwrap();
@@ -2255,18 +2250,18 @@ mod tests {
         assert_eq!(targets[0].state, AsyncOperationTargetState::Queued);
     }
 
-    // A delete accepted while a files removal of the same entry still waits
+    // A delete accepted while an archive of the same entry still waits
     // wins: the removal's target ends superseded and only the delete holds
     // the entry; the removal's other entries still wait for it.
     #[test]
-    fn a_delete_accepted_after_a_waiting_files_removal_supersedes_it() {
+    fn a_delete_accepted_after_a_waiting_archive_supersedes_it() {
         let db = Database::open_in_memory().unwrap();
         for id in [10, 11, 12] {
             db.insert_job_history(&history(id, 100 + id as i64))
                 .unwrap();
         }
         let removal = db
-            .accept_history_files_removal(&[10, 11])
+            .accept_archive_history(&[10, 11])
             .unwrap()
             .operation_id
             .unwrap();
@@ -2290,7 +2285,7 @@ mod tests {
         // A delete of all history supersedes every waiting removal.
         db.insert_job_history(&history(13, 113)).unwrap();
         let later = db
-            .accept_history_files_removal(&[13])
+            .accept_archive_history(&[13])
             .unwrap()
             .operation_id
             .unwrap();
@@ -2314,14 +2309,14 @@ mod tests {
         }
     }
 
-    // Retention deletes an entry whose files removal failed, in a new
+    // Retention deletes an entry whose archive failed, in a new
     // operation, as the removal holds nothing once it has ended.
     #[test]
-    fn retention_deletes_an_entry_whose_files_removal_failed() {
+    fn retention_deletes_an_entry_whose_archive_failed() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history(10, 100)).unwrap();
         let removal = db
-            .accept_history_files_removal(&[10])
+            .accept_archive_history(&[10])
             .unwrap()
             .operation_id
             .unwrap();
@@ -2332,7 +2327,7 @@ mod tests {
             &db,
             removal,
             10,
-            crate::HistoryFilesRemovalOutcome::Failed,
+            crate::ArchiveHistoryOutcome::Failed,
             Some("disk error"),
         );
         db.finalize_history_delete_operation(removal).unwrap();

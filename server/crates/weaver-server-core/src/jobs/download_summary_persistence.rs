@@ -103,7 +103,7 @@ mod tests {
             completed_at: 1_767_000_090,
             metadata: None,
             server_attribution: None,
-            files_removed_at: None,
+            archived_at: None,
         }
     }
 

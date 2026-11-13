@@ -28,7 +28,7 @@ fn sample_history_row(job_id: u64, name: &str) -> JobHistoryRow {
         completed_at: 1_717_171_760,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     }
 }
 
@@ -503,14 +503,14 @@ async fn auth_control_scope_can_delete_history() {
 }
 
 #[tokio::test]
-async fn auth_read_scope_cannot_remove_history_files() {
+async fn auth_read_scope_cannot_archive_history() {
     let h = TestHarness::new().await;
-    h.insert_history_row(&sample_history_row(73, "read-remove-files-denied"));
+    h.insert_history_row(&sample_history_row(73, "read-archive-denied"));
 
     let resp = h
         .execute_as(
             r#"mutation {
-                removeHistoryFiles(ids: [73]) {
+                archiveHistory(ids: [73]) {
                     results { id outcome }
                 }
             }"#,
@@ -530,10 +530,7 @@ async fn auth_read_scope_cannot_remove_history_files() {
             }),
         Some("FORBIDDEN")
     );
-    assert_eq!(
-        h.db.get_job_history(73).unwrap().unwrap().files_removed_at,
-        None
-    );
+    assert_eq!(h.db.get_job_history(73).unwrap().unwrap().archived_at, None);
 }
 
 #[tokio::test]

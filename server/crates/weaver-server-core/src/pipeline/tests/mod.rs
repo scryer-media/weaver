@@ -43,6 +43,7 @@ macro_rules! segment_spec {
     };
 }
 
+mod archive_history;
 mod archive_output_contract;
 mod archive_passwords;
 mod archive_topology;
@@ -57,7 +58,6 @@ mod download_dispatch;
 pub(in crate::pipeline) mod engines;
 mod full_file_names;
 mod hardware_profile;
-mod history_files_removal;
 mod idle;
 mod memory_release;
 mod next_up_ring;
@@ -446,7 +446,7 @@ fn history_row_with_output_dir(
         completed_at: 2,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     }
 }
 

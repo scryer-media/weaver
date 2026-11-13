@@ -34,7 +34,7 @@ fn sample_history_row(job_id: u64, name: &str, status: &str, completed_at: i64) 
         completed_at,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     }
 }
 
@@ -1822,7 +1822,7 @@ async fn a_job_past_the_queue_window_answers_from_its_row_and_installs_nothing()
 }
 
 // ---------------------------------------------------------------------------
-// Remove history files
+// Archive history
 // ---------------------------------------------------------------------------
 
 fn error_code(resp: &async_graphql::Response) -> Option<String> {
@@ -1837,11 +1837,11 @@ fn error_code(resp: &async_graphql::Response) -> Option<String> {
         })
 }
 
-// A files removal emits no pipeline event and runs on the background
-// worker; an open job page still shows the entry's removal time once the
-// files are gone.
+// An archive emits no pipeline event and runs on the background worker;
+// an open job page still shows the entry's archive time once the files
+// are gone.
 #[tokio::test(start_paused = true)]
-async fn an_open_job_page_sees_the_files_removed() {
+async fn an_open_job_page_sees_the_entry_archived() {
     use tokio_stream::StreamExt;
 
     let h = TestHarness::new().await;
@@ -1859,21 +1859,21 @@ async fn an_open_job_page_sees_the_files_removed() {
     h.insert_history_row(&row);
 
     let request = async_graphql::Request::new(
-        "subscription { jobDetailUpdates(jobId: 1) { historyItem { id filesRemovedAt } } }",
+        "subscription { jobDetailUpdates(jobId: 1) { historyItem { id archivedAt } } }",
     )
     .data(weaver_server_api::auth::CallerScope::Read);
     let mut stream = h.schema.execute_stream(request);
     let first = stream.next().await.expect("stream should stay open");
     assert!(first.errors.is_empty(), "{:?}", first.errors);
     let first = first.data.into_json().unwrap();
-    assert!(first["jobDetailUpdates"]["historyItem"]["filesRemovedAt"].is_null());
+    assert!(first["jobDetailUpdates"]["historyItem"]["archivedAt"].is_null());
 
     let resp = h
-        .execute("mutation { removeHistoryFiles(ids: [1]) { results { id outcome } } }")
+        .execute("mutation { archiveHistory(ids: [1]) { results { id outcome } } }")
         .await;
     assert_no_errors(&resp);
     assert_eq!(
-        response_data(&resp)["removeHistoryFiles"]["results"][0]["outcome"].as_str(),
+        response_data(&resp)["archiveHistory"]["results"][0]["outcome"].as_str(),
         Some("ACCEPTED")
     );
 
@@ -1882,7 +1882,7 @@ async fn an_open_job_page_sees_the_files_removed() {
         let next = stream.next().await.expect("stream should stay open");
         assert!(next.errors.is_empty(), "{:?}", next.errors);
         let next = next.data.into_json().unwrap();
-        if next["jobDetailUpdates"]["historyItem"]["filesRemovedAt"].is_string() {
+        if next["jobDetailUpdates"]["historyItem"]["archivedAt"].is_string() {
             break;
         }
     }
@@ -1891,9 +1891,9 @@ async fn an_open_job_page_sees_the_files_removed() {
 
 // The request only queues the work: each distinct id is answered in the
 // order given, nothing on disk is touched before the worker runs, and the
-// accepted entries show the queued removal.
+// accepted entries show the queued archive.
 #[tokio::test]
-async fn remove_history_files_answers_each_id_once_in_the_order_given() {
+async fn archive_history_answers_each_id_once_in_the_order_given() {
     let h = TestHarness::new_without_history_delete_worker().await;
     let temp = tempfile::tempdir().unwrap();
     let owned = temp.path().join("Owned.Release");
@@ -1913,7 +1913,7 @@ async fn remove_history_files_answers_each_id_once_in_the_order_given() {
         "failed",
         1_700_000_002,
     ));
-    weaver_server_core::pipeline::test_support::stamp_files_removed(
+    weaver_server_core::pipeline::test_support::mark_entry_archived(
         &h.db,
         weaver_server_core::JobId(2),
         Default::default(),
@@ -1931,7 +1931,7 @@ async fn remove_history_files_answers_each_id_once_in_the_order_given() {
     let resp = h
         .execute(
             r#"mutation {
-                removeHistoryFiles(ids: [3, 99, 1, 3, 2, 1]) {
+                archiveHistory(ids: [3, 99, 1, 3, 2, 1]) {
                     operationId
                     acceptedIds
                     totalTargets
@@ -1941,7 +1941,7 @@ async fn remove_history_files_answers_each_id_once_in_the_order_given() {
         )
         .await;
     assert_no_errors(&resp);
-    let answer = response_data(&resp)["removeHistoryFiles"].clone();
+    let answer = response_data(&resp)["archiveHistory"].clone();
     let answered: Vec<(u64, &str)> = answer["results"]
         .as_array()
         .unwrap()
@@ -1959,7 +1959,7 @@ async fn remove_history_files_answers_each_id_once_in_the_order_given() {
             (3, "BUSY"),
             (99, "NOT_FOUND"),
             (1, "ACCEPTED"),
-            (2, "ALREADY_REMOVED"),
+            (2, "ALREADY_ARCHIVED"),
         ]
     );
     assert!(answer["operationId"].is_u64());
@@ -1971,29 +1971,29 @@ async fn remove_history_files_answers_each_id_once_in_the_order_given() {
         .execute(
             r#"{
               historyItem(id: 1) {
-                filesRemovedAt
-                deleteOperation { state locked action filesRemovalOutcome errorMessage }
+                archivedAt
+                deleteOperation { state locked action archiveOutcome errorMessage }
               }
             }"#,
         )
         .await;
     assert_no_errors(&resp);
     let item = response_data(&resp)["historyItem"].clone();
-    assert!(item["filesRemovedAt"].is_null());
+    assert!(item["archivedAt"].is_null());
     assert_eq!(
         item["deleteOperation"],
         serde_json::json!({
             "state": "QUEUED",
             "locked": true,
-            "action": "REMOVE_FILES",
-            "filesRemovalOutcome": null,
+            "action": "ARCHIVE",
+            "archiveOutcome": null,
             "errorMessage": null,
         })
     );
 }
 
 #[tokio::test]
-async fn remove_history_files_takes_one_to_a_hundred_distinct_ids() {
+async fn archive_history_takes_one_to_a_hundred_distinct_ids() {
     let h = TestHarness::new().await;
     let too_many = (1..=101)
         .map(|id| id.to_string())
@@ -2002,7 +2002,7 @@ async fn remove_history_files_takes_one_to_a_hundred_distinct_ids() {
     for ids in [String::new(), too_many] {
         let resp = h
             .execute(&format!(
-                "mutation {{ removeHistoryFiles(ids: [{ids}]) {{ operationId }} }}"
+                "mutation {{ archiveHistory(ids: [{ids}]) {{ operationId }} }}"
             ))
             .await;
         assert_has_errors(&resp);
@@ -2016,11 +2016,11 @@ async fn remove_history_files_takes_one_to_a_hundred_distinct_ids() {
         .join(", ");
     let resp = h
         .execute(&format!(
-            "mutation {{ removeHistoryFiles(ids: [{hundred}]) {{ results {{ id outcome }} }} }}"
+            "mutation {{ archiveHistory(ids: [{hundred}]) {{ results {{ id outcome }} }} }}"
         ))
         .await;
     assert_no_errors(&resp);
-    let results = response_data(&resp)["removeHistoryFiles"]["results"]
+    let results = response_data(&resp)["archiveHistory"]["results"]
         .as_array()
         .cloned()
         .unwrap();
@@ -2063,7 +2063,7 @@ fn unpaged_listing(dir: &std::path::Path) -> Vec<(String, String, u64)> {
 async fn output_files_page(h: &TestHarness, job_id: u64, args: &str) -> serde_json::Value {
     let resp = h
         .execute(&format!(
-            "{{ jobOutputFiles(jobId: {job_id}{args}) {{ outputDir totalBytes totalCount removed nextCursor files {{ name path sizeBytes }} }} }}"
+            "{{ jobOutputFiles(jobId: {job_id}{args}) {{ outputDir totalBytes totalCount archived nextCursor files {{ name path sizeBytes }} }} }}"
         ))
         .await;
     assert_no_errors(&resp);
@@ -2113,7 +2113,7 @@ async fn output_files_page_through_the_folder_on_disk() {
     assert_eq!(page_files(&first), unpaged[..100]);
     assert_eq!(first["totalCount"].as_u64(), Some(1_005));
     assert_eq!(first["totalBytes"].as_u64(), Some(total_bytes));
-    assert_eq!(first["removed"].as_bool(), Some(false));
+    assert_eq!(first["archived"].as_bool(), Some(false));
 
     // Every page after it, to the end: each file once, in order.
     let mut listed = page_files(&first);
@@ -2135,11 +2135,11 @@ async fn output_files_page_through_the_folder_on_disk() {
     assert_eq!(page_files(&exact).len(), 1_000);
 }
 
-// Once the files were removed the answer is the record kept of them: the
-// same paging, absolute paths under the folder, the totals of the whole
+// Once the entry was archived the answer is the record kept of its files:
+// the same paging, absolute paths under the folder, the totals of the whole
 // folder, and no page past the last file kept.
 #[tokio::test]
-async fn output_files_of_removed_files_page_through_the_record() {
+async fn output_files_of_an_archived_entry_page_through_the_record() {
     use weaver_server_core::history::output_files::{OutputFile, OutputFileListing};
     let h = TestHarness::new().await;
     let dir = tempfile::tempdir().unwrap();
@@ -2148,7 +2148,7 @@ async fn output_files_of_removed_files_page_through_the_record() {
     row.output_dir = Some(gone.to_string_lossy().into_owned());
     h.insert_history_row(&row);
     let kept = ["a.nfo", "Sub/b.mkv", "c.srt"];
-    weaver_server_core::pipeline::test_support::stamp_files_removed(
+    weaver_server_core::pipeline::test_support::mark_entry_archived(
         &h.db,
         weaver_server_core::JobId(7_102),
         OutputFileListing {
@@ -2169,7 +2169,7 @@ async fn output_files_of_removed_files_page_through_the_record() {
     );
 
     let first = output_files_page(&h, 7_102, ", first: 2").await;
-    assert_eq!(first["removed"].as_bool(), Some(true));
+    assert_eq!(first["archived"].as_bool(), Some(true));
     assert_eq!(first["totalCount"].as_u64(), Some(5));
     assert_eq!(first["totalBytes"].as_u64(), Some(40));
     assert_eq!(
@@ -2199,7 +2199,7 @@ async fn output_files_of_removed_files_page_through_the_record() {
 
     // The totals alone read no file.
     let resp = h
-        .execute("{ jobOutputFiles(jobId: 7102) { totalCount removed nextCursor } }")
+        .execute("{ jobOutputFiles(jobId: 7102) { totalCount archived nextCursor } }")
         .await;
     assert_no_errors(&resp);
     assert_eq!(
@@ -2223,7 +2223,7 @@ async fn output_files_refuse_a_bad_cursor() {
 }
 
 // The folder on disk lists no link and walks no linked folder, as the record
-// a files removal keeps does not.
+// an archive keeps does not.
 #[cfg(unix)]
 #[tokio::test]
 async fn output_files_on_disk_skip_symbolic_links() {

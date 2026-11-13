@@ -242,7 +242,7 @@ fn archive_job_moves_to_history() {
             .unwrap(),
         ),
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     };
     db.archive_job(JobId(1), &history).unwrap();
 
@@ -457,7 +457,7 @@ fn cancellation_archive_preserves_directives_newer_than_the_runtime_snapshot() {
         completed_at: 2,
         metadata: Some(r#"[["chain","stale"],["keep","input"]]"#.into()),
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     };
     let effects = JobScriptEffects {
         parameters: [("chain".into(), "emitted".into())].into_iter().collect(),
@@ -502,7 +502,7 @@ fn archive_job_conflict_preserves_persisted_nzb_bytes_when_active_row_is_gone() 
         completed_at: 1_700_000_010,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     };
     db.archive_job(JobId(1), &history).unwrap();
     let (_, expected_nzb_zstd) = db.load_history_job_persisted_nzb(1).unwrap().unwrap();
@@ -538,7 +538,7 @@ fn finished(job_id: u64) -> JobHistoryRow {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     }
 }
 
@@ -679,7 +679,7 @@ fn max_job_id_all_spans_both_tables() {
         completed_at: 0,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     };
     db.insert_job_history(&history).unwrap();
 
@@ -829,7 +829,7 @@ fn archive_job_uses_requested_job_id_for_history_row() {
             completed_at: 1_700_000_010,
             metadata: None,
             server_attribution: None,
-            files_removed_at: None,
+            archived_at: None,
         },
     )
     .unwrap();
@@ -866,7 +866,7 @@ fn late_active_state_writes_noop_after_archive() {
             completed_at: 1_700_000_010,
             metadata: None,
             server_attribution: None,
-            files_removed_at: None,
+            archived_at: None,
         },
     )
     .unwrap();
@@ -1151,7 +1151,7 @@ fn archive_job_records_that_the_job_had_a_submitted_password() {
                 serde_json::to_string(&vec![("Origin".to_string(), "e2e".to_string())]).unwrap(),
             ),
             server_attribution: None,
-            files_removed_at: None,
+            archived_at: None,
         };
         db.archive_job(JobId(job_id), &history).unwrap();
     }

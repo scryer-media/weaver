@@ -291,8 +291,8 @@ impl JobsQuery {
         )))
     }
     /// List one page of the files in a job's output directory, in file name
-    /// order, with the totals of all of them. Once the files were removed,
-    /// the list is the record kept of them and `removed` is true.
+    /// order, with the totals of all of them. Once the entry was archived,
+    /// the list is the record kept of its files and `archived` is true.
     async fn job_output_files(
         &self,
         ctx: &Context<'_>,
@@ -321,11 +321,11 @@ impl JobsQuery {
             .map_err(|e| async_graphql::Error::new(e.to_string()))?
             .map_err(|e| async_graphql::Error::new(e.to_string()))?;
             match entry {
-                Some(entry) if entry.files_removed_at.is_some() => {
+                Some(entry) if entry.archived_at.is_some() => {
                     let Some(output_dir) = entry.output_dir else {
                         return Ok(None);
                     };
-                    let total_count = entry.removed_file_count.unwrap_or(0);
+                    let total_count = entry.archived_file_count.unwrap_or(0);
                     // The record keeps at most a capped number of files while
                     // the totals count them all: more remain only if the
                     // record holds the next one.
@@ -334,7 +334,7 @@ impl JobsQuery {
                         let db = ctx.data::<Database>()?.clone();
                         let next = offset.saturating_add(limit) as u64;
                         let kept = tokio::task::spawn_blocking(move || {
-                            db.has_history_removed_file(job_id, next)
+                            db.has_archived_history_file(job_id, next)
                         })
                         .await
                         .map_err(|e| async_graphql::Error::new(e.to_string()))?
@@ -345,11 +345,11 @@ impl JobsQuery {
                     }
                     return Ok(Some(JobOutputResult {
                         output_dir,
-                        total_bytes: entry.removed_file_bytes.unwrap_or(0),
+                        total_bytes: entry.archived_file_bytes.unwrap_or(0),
                         total_count,
-                        removed: true,
+                        archived: true,
                         next_cursor,
-                        source: JobOutputSource::Removed {
+                        source: JobOutputSource::Archived {
                             job_id,
                             offset: offset as u64,
                             limit,
@@ -394,7 +394,7 @@ impl JobOutputResult {
     async fn files(&self, ctx: &Context<'_>) -> Result<Vec<JobOutputFile>> {
         match &self.source {
             JobOutputSource::Disk(files) => Ok(files.clone()),
-            JobOutputSource::Removed {
+            JobOutputSource::Archived {
                 job_id,
                 offset,
                 limit,
@@ -402,7 +402,7 @@ impl JobOutputResult {
                 let db = ctx.data::<Database>()?.clone();
                 let (job_id, offset, limit) = (*job_id, *offset, *limit);
                 let rows = tokio::task::spawn_blocking(move || {
-                    db.list_history_removed_files(job_id, offset, limit)
+                    db.list_archived_history_files(job_id, offset, limit)
                 })
                 .await
                 .map_err(|e| async_graphql::Error::new(e.to_string()))?
@@ -429,8 +429,8 @@ impl JobOutputResult {
 
 // One page of the files on disk under `dir`, from `offset`, in file name
 // order, with the totals of every file. Symbolic links are skipped, as the
-// record a files removal keeps skips them, so the list reads the same before
-// and after a removal.
+// record an archive keeps skips them, so the list reads the same before
+// and after an archive.
 fn list_output_files(
     dir: &std::path::Path,
     offset: usize,
@@ -443,7 +443,7 @@ fn list_output_files(
             output_dir,
             total_bytes: 0,
             total_count: 0,
-            removed: false,
+            archived: false,
             next_cursor: None,
             source: JobOutputSource::Disk(Vec::new()),
         });
@@ -469,7 +469,7 @@ fn list_output_files(
         output_dir,
         total_bytes: listing.total_bytes,
         total_count: listing.total_count,
-        removed: false,
+        archived: false,
         next_cursor: next_output_cursor(offset, limit, listing.total_count),
         source: JobOutputSource::Disk(files),
     })

@@ -438,7 +438,7 @@ export const JOB_OUTPUT_FILES_QUERY = gql`
       }
       totalBytes
       totalCount
-      removed
+      archived
       nextCursor
     }
   }
@@ -824,10 +824,10 @@ export const JOB_QUERY = gql`
         ...FacadeHistoryItemFields
         error
         failedForMemory
-        filesRemovedAt
+        archivedAt
         deleteOperation {
           action
-          filesRemovalOutcome
+          archiveOutcome
         }
       }
       jobTimeline {
@@ -922,10 +922,10 @@ export const JOB_DETAIL_UPDATES_SUBSCRIPTION = gql`
         ...FacadeHistoryItemFields
         error
         failedForMemory
-        filesRemovedAt
+        archivedAt
         deleteOperation {
           action
-          filesRemovalOutcome
+          archiveOutcome
         }
       }
       jobTimeline {
@@ -1178,9 +1178,9 @@ export const ACCEPT_HISTORY_DELETE_MUTATION = gql`
   }
 `;
 
-export const REMOVE_HISTORY_FILES_MUTATION = gql`
-  mutation RemoveHistoryFiles($ids: [Int!]!) {
-    removeHistoryFiles(ids: $ids) {
+export const ARCHIVE_HISTORY_MUTATION = gql`
+  mutation ArchiveHistory($ids: [Int!]!) {
+    archiveHistory(ids: $ids) {
       results {
         id
         outcome
