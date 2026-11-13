@@ -2,12 +2,12 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // The policy for the per-volume write buffer: how many decoded bytes may wait
-// for the volume writers in total, how that room is shared between volumes,
-// and how fast articles may be sent towards a volume given how full its
-// share is.
+// for one volume's writer, how that room is shared once more volumes are
+// written to than the pool holds full shares for, and how fast articles may
+// be sent towards a volume given how full its share is.
 //
 // Every function here is pure: numbers in, numbers out, no clock and no
-// pipeline state. The total is a cap on what may wait, not memory taken up
+// pipeline state. Each limit is a cap on what may wait, not memory taken up
 // front.
 
 // Nothing calls this module yet; the wiring into dispatch follows.
@@ -42,6 +42,20 @@ const VOLUME_BUFFER_IN_FLIGHT_MULTIPLE: u64 = 4;
 // write backlog limit was held to before this buffer.
 const VOLUME_BUFFER_MEMORY_DIVISOR: u64 = 8;
 
+// The pool every volume's buffer is drawn from, in full figures. Up to this
+// many volumes each get the full figure; more share the pool. Ruled by the
+// operator: "full figure up to 2x then shared".
+const VOLUME_BUFFER_POOL_FIGURES: u64 = 2;
+
+// The most the pool may be, as a divisor of the memory ceiling: a quarter,
+// which is what two figures of an eighth each come to.
+const VOLUME_BUFFER_POOL_MEMORY_DIVISOR: u64 = 4;
+
+// The figure's own ceiling keeps the pool within its share of memory.
+const _: () = assert!(
+    VOLUME_BUFFER_MEMORY_DIVISOR >= VOLUME_BUFFER_POOL_FIGURES * VOLUME_BUFFER_POOL_MEMORY_DIVISOR
+);
+
 // Past the soft limit, dispatch into a volume starts at this share of its
 // measured write rate, so the buffer drains instead of holding level.
 const PACE_MEASURED_RATE_PERCENT: u64 = 90;
@@ -50,8 +64,8 @@ const PACE_MEASURED_RATE_PERCENT: u64 = 90;
 // filled no faster than over this many seconds.
 const PACE_UNMEASURED_ROOM_FILL_SECS: u64 = 1;
 
-// The decoded bytes that may wait for the volume writers, all volumes
-// together.
+// The figure: the decoded bytes that may wait for one volume's writer when
+// the volume has a full share (see `volume_limits`).
 //
 // The profile gives the target, the load gives a floor and memory gives a
 // ceiling. `memory_ceiling_bytes` is the memory the backlogs are carved
@@ -75,7 +89,7 @@ pub(in crate::pipeline) fn total_buffer_budget_bytes(
 }
 
 // What every connection holds when each carries one typical article.
-fn in_flight_bytes(connections: usize, typical_article_bytes: u64) -> u64 {
+pub(in crate::pipeline) fn in_flight_bytes(connections: usize, typical_article_bytes: u64) -> u64 {
     (connections as u64).saturating_mul(typical_article_bytes)
 }
 
@@ -88,24 +102,129 @@ pub(in crate::pipeline) struct VolumeLimits {
     pub(in crate::pipeline) hard_bytes: u64,
 }
 
-// The limits of each volume that has jobs writing to it.
-//
-// The total is split evenly, so a slow volume that fills its share leaves
-// every other volume's share untouched. No volumes reads as one. The soft
-// limit sits at the same share of the hard limit as the pipeline's other
-// pressure limits. Neither limit is ever zero.
-pub(in crate::pipeline) fn volume_limits(
-    total_budget_bytes: u64,
-    writing_volumes: usize,
-) -> VolumeLimits {
-    let hard_bytes = (total_budget_bytes / (writing_volumes.max(1) as u64)).max(1);
-    let soft_bytes = (hard_bytes.saturating_mul(DOWNLOAD_PRESSURE_SOFT_PERCENT) / 100)
-        .max(1)
-        .min(hard_bytes);
-    VolumeLimits {
-        soft_bytes,
-        hard_bytes,
+impl VolumeLimits {
+    // The limits of a volume whose buffer may hold `hard_bytes`. The soft
+    // limit sits at the same share of the hard limit as the pipeline's other
+    // pressure limits. Neither limit is ever zero.
+    fn with_hard(hard_bytes: u64) -> Self {
+        let hard_bytes = hard_bytes.max(1);
+        let soft = u128::from(hard_bytes) * u128::from(DOWNLOAD_PRESSURE_SOFT_PERCENT) / 100;
+        let soft_bytes = u64::try_from(soft)
+            .unwrap_or(u64::MAX)
+            .max(1)
+            .min(hard_bytes);
+        Self {
+            soft_bytes,
+            hard_bytes,
+        }
     }
+}
+
+// The limits of each volume that has jobs writing to it, in the order of
+// `measured_write_bytes_per_sec`, which holds one measured write rate per
+// such volume (zero = not measured).
+//
+// `figure_bytes` is what `total_buffer_budget_bytes` gives. One or two
+// volumes each get the full figure. Three or more share a pool of two
+// figures by slowness: a volume's share is in proportion to one over its
+// write rate, so the slowest volume gets the most room and the fastest the
+// least. No volume gets more than the figure; what a slow volume cannot
+// take goes to the others in the same proportions. No volume gets less than
+// `in_flight_bytes` (connections x typical article size), so a fast volume
+// is not stopped by a limit smaller than a burst. When that minimum cannot
+// be given to every volume the pool is split evenly instead.
+//
+// An unmeasured volume counts as one of mean slowness among the measured
+// ones; with none measured the shares are equal.
+//
+// The hard limits never add up to more than the pool, except that no limit
+// is ever zero: a pool of fewer bytes than there are volumes still gives
+// each volume one byte.
+//
+// This runs when pressure is refreshed, not once per article. It allocates
+// the result and nothing else.
+pub(in crate::pipeline) fn volume_limits(
+    figure_bytes: u64,
+    in_flight_bytes: u64,
+    measured_write_bytes_per_sec: &[u64],
+) -> Vec<VolumeLimits> {
+    let rates = measured_write_bytes_per_sec;
+    let figure = figure_bytes.max(1);
+    if rates.len() as u64 <= VOLUME_BUFFER_POOL_FIGURES {
+        return rates
+            .iter()
+            .map(|_| VolumeLimits::with_hard(figure))
+            .collect();
+    }
+
+    let volumes = rates.len() as u128;
+    let pool = u128::from(figure) * u128::from(VOLUME_BUFFER_POOL_FIGURES);
+    let least = in_flight_bytes.max(1);
+    if u128::from(least) * volumes > pool {
+        let even = u64::try_from(pool / volumes).unwrap_or(u64::MAX);
+        return rates.iter().map(|_| VolumeLimits::with_hard(even)).collect();
+    }
+
+    // Here three or more volumes share the pool and `least` fits for each,
+    // which also puts `least` below the figure.
+    let stand_in = unmeasured_stand_in_rate(rates);
+    let rate_of = |rate: u64| if rate == 0 { stand_in } else { rate };
+    // A volume's share at a given level is the level over its rate, held
+    // between the minimum and the figure. Every share rises with the level,
+    // so the level that uses up the pool is found by halving.
+    let share = |level: u128, rate: u64| {
+        u64::try_from(level / u128::from(rate_of(rate)))
+            .unwrap_or(u64::MAX)
+            .clamp(least, figure)
+    };
+    let shares_fit = |level: u128| {
+        rates
+            .iter()
+            .map(|&rate| u128::from(share(level, rate)))
+            .sum::<u128>()
+            <= pool
+    };
+
+    // At level zero every volume holds the minimum, which fits. At the top
+    // level every volume holds the figure, which is more than the pool.
+    let fastest = rates.iter().map(|&rate| rate_of(rate)).max().unwrap_or(1);
+    let mut fits: u128 = 0;
+    let mut too_much = u128::from(figure) * u128::from(fastest);
+    while too_much - fits > 1 {
+        let level = fits + (too_much - fits) / 2;
+        if shares_fit(level) {
+            fits = level;
+        } else {
+            too_much = level;
+        }
+    }
+
+    rates
+        .iter()
+        .map(|&rate| VolumeLimits::with_hard(share(fits, rate)))
+        .collect()
+}
+
+// The write rate an unmeasured volume is counted at: the rate whose
+// slowness (one over the rate) is the mean slowness of the measured
+// volumes. With none measured every volume counts the same.
+fn unmeasured_stand_in_rate(rates: &[u64]) -> u64 {
+    // One over a rate, as a whole number.
+    const ONE: u128 = 1 << 62;
+    let mut measured: u128 = 0;
+    let mut slowness: u128 = 0;
+    for &rate in rates {
+        if rate != 0 {
+            measured += 1;
+            slowness += ONE / u128::from(rate);
+        }
+    }
+    if measured == 0 {
+        return 1;
+    }
+    u64::try_from(measured * ONE / slowness.max(1))
+        .unwrap_or(u64::MAX)
+        .max(1)
 }
 
 // How fast articles may be sent towards one volume.
@@ -186,6 +305,22 @@ mod tests {
     // The reference load: 70 connections of 0.8 MB articles.
     const REFERENCE_CONNECTIONS: usize = 70;
     const REFERENCE_ARTICLE_BYTES: u64 = 800_000;
+
+    // The Performance figure, and the write rates of a network share, a
+    // USB disk and an SSD.
+    const FIGURE: u64 = 256 * MIB;
+    const MB: u64 = 1_000_000;
+    const NAS: u64 = 60 * MB;
+    const USB: u64 = 100 * MB;
+    const SSD: u64 = 400 * MB;
+
+    fn hard_bytes(volumes: &[VolumeLimits]) -> Vec<u64> {
+        volumes.iter().map(|volume| volume.hard_bytes).collect()
+    }
+
+    fn hard_sum(volumes: &[VolumeLimits]) -> u64 {
+        volumes.iter().map(|volume| volume.hard_bytes).sum()
+    }
 
     fn limits(soft_bytes: u64, hard_bytes: u64) -> VolumeLimits {
         VolumeLimits {
@@ -297,38 +432,244 @@ mod tests {
     }
 
     #[test]
-    fn volume_pace_one_volume_takes_the_whole_budget() {
-        let total = 256 * MIB;
-        let one = volume_limits(total, 1);
-        assert_eq!(one.hard_bytes, total);
-        assert_eq!(one.soft_bytes, total * 70 / 100);
-        // No volume yet reads as one.
-        assert_eq!(volume_limits(total, 0), one);
+    fn volume_pace_one_or_two_volumes_each_get_the_full_figure() {
+        let full = limits(FIGURE * 70 / 100, FIGURE);
+        // Whatever the rates and whatever is in flight.
+        assert_eq!(volume_limits(FIGURE, MIB, &[NAS]), vec![full]);
+        assert_eq!(volume_limits(FIGURE, MIB, &[0]), vec![full]);
+        assert_eq!(volume_limits(FIGURE, MIB, &[NAS, SSD]), vec![full, full]);
+        assert_eq!(volume_limits(FIGURE, FIGURE, &[SSD, 0]), vec![full, full]);
+        assert!(volume_limits(FIGURE, MIB, &[]).is_empty());
     }
 
     #[test]
-    fn volume_pace_volumes_split_the_budget_evenly() {
-        let total = 256 * MIB;
-        for volumes in [2_usize, 5] {
-            let each = volume_limits(total, volumes);
-            assert_eq!(each.hard_bytes, total / volumes as u64, "{volumes} volumes");
-            assert_eq!(
-                each.soft_bytes,
-                each.hard_bytes * 70 / 100,
-                "{volumes} volumes"
+    fn volume_pace_three_volumes_share_two_figures_by_slowness() {
+        // A network share at 60 MB/s, a USB disk at 100 MB/s, an SSD at
+        // 400 MB/s. By slowness alone the network share would take about
+        // 293 MiB; it is held to the figure, and the other 256 MiB goes
+        // four parts to the USB disk and one to the SSD.
+        let shared = volume_limits(FIGURE, MIB, &[NAS, USB, SSD]);
+        assert_eq!(shared[0].hard_bytes, FIGURE);
+        assert!(shared[1].hard_bytes.abs_diff(FIGURE * 4 / 5) <= 3);
+        assert!(shared[2].hard_bytes.abs_diff(FIGURE / 5) <= 3);
+        for volume in &shared {
+            assert_eq!(volume.soft_bytes, volume.hard_bytes * 70 / 100);
+        }
+        // The pool is used up to within a byte per volume.
+        assert!(2 * FIGURE - hard_sum(&shared) < 3);
+
+        // The order of the answer is the order of the rates.
+        let reversed = volume_limits(FIGURE, MIB, &[SSD, USB, NAS]);
+        assert_eq!(reversed, vec![shared[2], shared[1], shared[0]]);
+    }
+
+    #[test]
+    fn volume_pace_uncapped_shares_follow_one_over_the_rate() {
+        // Rates of 100, 200 and 200 weigh 2 : 1 : 1; no share reaches the
+        // figure, so the pool of two figures splits a half and two quarters.
+        let shared = volume_limits(FIGURE, MIB, &[100, 200, 200]);
+        assert!(shared[0].hard_bytes.abs_diff(FIGURE) <= 3);
+        assert!(shared[1].hard_bytes.abs_diff(FIGURE / 2) <= 3);
+        assert_eq!(shared[1], shared[2]);
+    }
+
+    #[test]
+    fn volume_pace_five_volumes_share_two_figures_by_slowness() {
+        // Two very slow volumes would take the whole pool between them; the
+        // three fast ones keep the minimum, which comes out of the slow
+        // volumes' shares evenly.
+        let slow = volume_limits(FIGURE, MIB, &[1, 1, SSD, SSD, SSD]);
+        let most = FIGURE - 3 * MIB / 2;
+        assert_eq!(hard_bytes(&slow), [most, most, MIB, MIB, MIB]);
+
+        // Five alike: a fifth of the pool each.
+        let alike = volume_limits(FIGURE, MIB, &[USB; 5]);
+        assert_eq!(hard_bytes(&alike), [2 * FIGURE / 5; 5]);
+
+        // The reference load in flight still fits five times in the pool.
+        let in_flight = in_flight_bytes(REFERENCE_CONNECTIONS, REFERENCE_ARTICLE_BYTES);
+        let loaded = volume_limits(FIGURE, in_flight, &[NAS, USB, USB, SSD, SSD]);
+        assert!(hard_sum(&loaded) <= 2 * FIGURE);
+        assert!(loaded.iter().all(|volume| volume.hard_bytes >= in_flight));
+        assert_eq!(loaded[3].hard_bytes, in_flight);
+        assert!(loaded[0].hard_bytes > loaded[1].hard_bytes);
+    }
+
+    #[test]
+    fn volume_pace_excess_over_the_figure_goes_to_the_other_volumes() {
+        // The first volume is so slow that its share alone would be nearly
+        // the whole pool. It keeps one figure; the other figure is split
+        // between the rest in proportion to their own slowness, 3 : 1.
+        let shared = volume_limits(FIGURE, 1, &[1, 100 * MB, 300 * MB]);
+        assert_eq!(shared[0].hard_bytes, FIGURE);
+        assert!(shared[1].hard_bytes.abs_diff(FIGURE * 3 / 4) <= 3);
+        assert!(shared[2].hard_bytes.abs_diff(FIGURE / 4) <= 3);
+    }
+
+    #[test]
+    fn volume_pace_unmeasured_volumes_share_evenly() {
+        for volumes in [3_usize, 4, 5, 8] {
+            let shared = volume_limits(FIGURE, MIB, &vec![0; volumes]);
+            let each = 2 * FIGURE / volumes as u64;
+            assert!(
+                shared.iter().all(|volume| volume.hard_bytes == each),
+                "{volumes} volumes: {shared:?}"
             );
-            // Every volume full at once stays within the total, so one full
-            // volume takes nothing from another.
-            assert!(each.hard_bytes * volumes as u64 <= total);
         }
     }
 
     #[test]
+    fn volume_pace_unmeasured_volume_counts_as_mean_slowness() {
+        // The mean of one over 60 and one over 400 is one over about 104.3.
+        let shared = volume_limits(FIGURE, MIB, &[NAS, 0, SSD]);
+        let stated = volume_limits(FIGURE, MIB, &[NAS, 104_347_826, SSD]);
+        for (got, want) in shared.iter().zip(&stated) {
+            assert!(got.hard_bytes.abs_diff(want.hard_bytes) <= 16);
+        }
+        assert!(shared[0].hard_bytes > shared[1].hard_bytes);
+        assert!(shared[1].hard_bytes > shared[2].hard_bytes);
+
+        // Beside volumes that are all alike it is one more of the same.
+        let alike = volume_limits(FIGURE, MIB, &[USB, 0, USB, USB]);
+        assert_eq!(hard_bytes(&alike), [FIGURE / 2; 4]);
+    }
+
+    #[test]
+    fn volume_pace_minimum_holds_a_fast_volume_above_what_is_in_flight() {
+        // By slowness the SSD would get about 51 MiB; 60 MiB is in flight.
+        let in_flight = 60 * MIB;
+        let shared = volume_limits(FIGURE, in_flight, &[NAS, USB, SSD]);
+        assert_eq!(shared[0].hard_bytes, FIGURE);
+        assert_eq!(shared[2].hard_bytes, in_flight);
+        // The USB disk gives up what the SSD gained.
+        assert!(shared[1].hard_bytes.abs_diff(2 * FIGURE - FIGURE - in_flight) <= 3);
+        assert!(hard_sum(&shared) <= 2 * FIGURE);
+    }
+
+    #[test]
+    fn volume_pace_minimums_that_do_not_fit_give_an_even_split() {
+        // Three times 200 MiB is more than the pool of 512 MiB.
+        let shared = volume_limits(FIGURE, 200 * MIB, &[NAS, USB, SSD]);
+        assert_eq!(hard_bytes(&shared), [2 * FIGURE / 3; 3]);
+        assert!(hard_sum(&shared) <= 2 * FIGURE);
+
+        // The minimum fitting exactly is still shared by slowness: every
+        // volume gets exactly the minimum.
+        let exact = volume_limits(FIGURE, 2 * FIGURE / 4, &[NAS, USB, SSD, SSD]);
+        assert_eq!(hard_bytes(&exact), [FIGURE / 2; 4]);
+    }
+
+    #[test]
     fn volume_pace_limits_are_never_zero() {
-        let each = volume_limits(3, 5);
-        assert_eq!(each, limits(1, 1));
-        let none = volume_limits(0, 1);
-        assert_eq!(none, limits(1, 1));
+        for rates in [&[0_u64][..], &[0, 0], &[0, 0, 0], &[1, u64::MAX, 7, 0, 3]] {
+            for figure in [0, 1, 2, 3] {
+                for in_flight in [0, 1, u64::MAX] {
+                    for volume in volume_limits(figure, in_flight, rates) {
+                        assert!(volume.hard_bytes >= 1);
+                        assert!(volume.soft_bytes >= 1);
+                        assert!(volume.soft_bytes <= volume.hard_bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn volume_pace_pool_stays_within_a_quarter_of_the_memory_ceiling() {
+        let rates = [NAS, USB, SSD, 0, SSD, USB];
+        for profile in HardwareProfile::ALL {
+            for ceiling in [256 * MIB, GIB, 3 * GIB, 16 * GIB, 64 * GIB] {
+                for connections in [1_usize, 10, 70, 400] {
+                    let figure = total_buffer_budget_bytes(profile, ceiling, connections, 800_000);
+                    let in_flight = in_flight_bytes(connections, 800_000);
+                    for count in 1..=rates.len() {
+                        let shared = volume_limits(figure, in_flight, &rates[..count]);
+                        assert!(
+                            hard_sum(&shared) <= ceiling / 4,
+                            "{profile:?}, ceiling {ceiling}, {connections} connections, {count} volumes"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn volume_pace_shares_hold_their_rules_across_rates_and_counts() {
+        // A fixed sequence of rates: unmeasured, crawling, ordinary, absurd.
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut next_rate = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let pick = state >> 33;
+            match pick % 8 {
+                0 => 0,
+                1 => 1 + pick % 1_000,
+                2 => u64::MAX - pick % 1_000,
+                3 => 100 * MB,
+                _ => MB + pick % (2_000 * MB),
+            }
+        };
+        let figures = [64, 1_000, 64 * MIB, FIGURE, 4 * GIB, u64::MAX];
+        let in_flights = [0, 1, 20, 8 * MIB, 56_000_000, 200 * MIB, u64::MAX];
+
+        for count in 1..=12_usize {
+            for _ in 0..40 {
+                let rates: Vec<u64> = (0..count).map(|_| next_rate()).collect();
+                for figure in figures {
+                    for in_flight in in_flights {
+                        let shared = volume_limits(figure, in_flight, &rates);
+                        let context = format!(
+                            "figure {figure}, in flight {in_flight}, rates {rates:?}: {shared:?}"
+                        );
+                        assert_eq!(shared.len(), count, "{context}");
+
+                        let pool = 2 * u128::from(figure);
+                        let sum: u128 = shared.iter().map(|v| u128::from(v.hard_bytes)).sum();
+                        assert!(sum <= pool, "{context}");
+
+                        for volume in &shared {
+                            assert!(volume.hard_bytes >= 1, "{context}");
+                            assert!(volume.hard_bytes <= figure, "{context}");
+                            assert_eq!(
+                                u128::from(volume.soft_bytes),
+                                (u128::from(volume.hard_bytes) * 70 / 100).max(1),
+                                "{context}"
+                            );
+                        }
+
+                        // A slower volume never gets less than a faster one.
+                        for (i, slow) in rates.iter().enumerate() {
+                            for (j, fast) in rates.iter().enumerate() {
+                                if *slow != 0 && *fast != 0 && slow <= fast {
+                                    assert!(
+                                        shared[i].hard_bytes >= shared[j].hard_bytes,
+                                        "{context}"
+                                    );
+                                }
+                            }
+                        }
+
+                        if count <= 2 {
+                            assert!(shared.iter().all(|v| v.hard_bytes == figure), "{context}");
+                        } else if u128::from(in_flight.max(1)) * count as u128 <= pool {
+                            // Shared by slowness: nobody is below the
+                            // minimum and the pool is used up to within a
+                            // byte per volume.
+                            assert!(
+                                shared.iter().all(|v| v.hard_bytes >= in_flight),
+                                "{context}"
+                            );
+                            assert!(pool - sum < count as u128, "{context}");
+                        } else {
+                            let even = u64::try_from(pool / count as u128).unwrap();
+                            assert!(shared.iter().all(|v| v.hard_bytes == even), "{context}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -413,8 +754,8 @@ mod tests {
     #[test]
     fn volume_pace_allowance_never_rises_with_fill() {
         let shapes = [
-            volume_limits(256 * MIB, 1),
-            volume_limits(256 * MIB, 5),
+            VolumeLimits::with_hard(256 * MIB),
+            VolumeLimits::with_hard(2 * 256 * MIB / 5),
             limits(700, 1000),
             limits(1, 1),
             limits(1, 2),
