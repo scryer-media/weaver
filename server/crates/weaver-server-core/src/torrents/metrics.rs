@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use weaver_torrent::session_stats::snapshot::UtpStatsSnapshot;
+pub use weaver_torrent::session_stats::swarm;
 use weaver_torrent::{FetchPhase, Session};
 
 use crate::jobs::JobId;
@@ -391,6 +392,24 @@ pub struct SessionSeries {
     /// Its DHT, while it runs one: nodes in the v4 and v6 routing tables,
     /// and requests waiting for an answer.
     pub dht: Option<(usize, usize, usize)>,
+    /// What its peer connections did, counted since it opened.
+    pub swarm: swarm::SwarmSnapshot,
+    /// Its connected peers over TCP, then over uTP, and how many of them
+    /// are seeds.
+    pub connected: ConnectedPeers,
+    /// Pieces its connections took from slower peers.
+    pub piece_steals: u64,
+    /// Its outgoing handshakes by encryption: sent plain, tried encrypted,
+    /// then of those tried: RC4, header only, failed.
+    pub outgoing_encryption: [u64; 5],
+}
+
+/// A session's connected peers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConnectedPeers {
+    pub tcp: u32,
+    pub utp: u32,
+    pub seeders: u32,
 }
 
 /// The states a session's peers are counted in.
@@ -461,6 +480,23 @@ impl SessionSeries {
                     dht.outstanding_requests,
                 )
             }),
+            connected: ConnectedPeers {
+                tcp: peers.live_tcp,
+                utp: peers.live_utp,
+                seeders: peers.live_seeders,
+            },
+            piece_steals: peers.steals.into(),
+            outgoing_encryption: {
+                let encryption = &connections.encryption;
+                [
+                    encryption.plaintext,
+                    encryption.attempts,
+                    encryption.rc4,
+                    encryption.header_only,
+                    encryption.failures,
+                ]
+            },
+            swarm: stats.swarm,
         }
     }
 }

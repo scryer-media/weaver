@@ -2895,4 +2895,5 @@ fn render_torrent_sessions(out: &mut Encoder, routes: &[SessionSeries]) {
             );
         }
     }
+    super::torrent_swarm::render(out, routes);
 }

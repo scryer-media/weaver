@@ -1494,6 +1494,32 @@ fn sample_speed_tests() -> weaver_server_core::speed_test::SpeedTestMetricsSnaps
 // Two torrents on one route: a seeding one with every figure, two trackers
 // and a seeding policy, and a magnet still fetching its metadata; one open
 // session with a DHT and one held route.
+/// A session's connection counts with a figure of its own in each family.
+fn sample_swarm() -> weaver_server_core::torrents::metrics::swarm::SwarmSnapshot {
+    use weaver_server_core::torrents::metrics::swarm::{
+        BlockArrival, ByteKind, ClosePhase, CloseReason, Direction, Encryption, MessageKind,
+        PeerSource, PieceCheck, PiecePick, RequestEvent, SwarmSnapshot, Transport, Waste,
+    };
+    let mut swarm = SwarmSnapshot::default();
+    swarm.messages[Direction::In as usize][MessageKind::Have as usize] = 410;
+    swarm.messages[Direction::In as usize][MessageKind::Piece as usize] = 4100;
+    swarm.messages[Direction::Out as usize][MessageKind::Request as usize] = 4200;
+    swarm.messages[Direction::Out as usize][MessageKind::Pex as usize] = 7;
+    swarm.handshakes[Transport::Utp as usize][Direction::In as usize][Encryption::Rc4 as usize] =
+        51;
+    swarm.closes[ClosePhase::Live as usize][CloseReason::PeerClosed as usize] = 52;
+    swarm.closes[ClosePhase::Connecting as usize][CloseReason::Timeout as usize] = 53;
+    swarm.bytes[Transport::Tcp as usize][Direction::In as usize][ByteKind::Payload as usize] = 5400;
+    swarm.bytes[Transport::Utp as usize][Direction::Out as usize][ByteKind::Protocol as usize] = 55;
+    swarm.request_events[RequestEvent::TimedOut as usize] = 56;
+    swarm.blocks[BlockArrival::Unrequested as usize] = 57;
+    swarm.piece_checks[PieceCheck::Failed as usize] = 58;
+    swarm.piece_picks[PiecePick::EndGame as usize] = 59;
+    swarm.wasted_bytes[Waste::CutShort as usize] = 60;
+    swarm.peers_named[PeerSource::Dht as usize] = 61;
+    swarm
+}
+
 fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMetrics {
     use weaver_server_core::torrents::metrics::{
         FetchOutcome, Published, SeedingGoal, SeedingSeries, SessionSeries, TorrentEvent,
@@ -1625,6 +1651,8 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             receive_drains: 30,
             stream_switch_marks: 31,
             drain_marks_with_packets_queued: 32,
+            syn_flood_dropped: 33,
+            syn_rst: 34,
             ..Default::default()
         },
         peers: vec![
@@ -1641,6 +1669,14 @@ fn sample_torrent_metrics() -> weaver_server_core::torrents::metrics::TorrentMet
             ("utp", "v6", [0, 0, 0, 0, 0]),
         ],
         dht: Some((150, 20, 6)),
+        swarm: sample_swarm(),
+        connected: weaver_server_core::torrents::metrics::ConnectedPeers {
+            tcp: 4,
+            utp: 2,
+            seeders: 3,
+        },
+        piece_steals: 8,
+        outgoing_encryption: [50, 40, 30, 6, 4],
     };
     let held = SessionSeries {
         route: "ff00ee11dd22cc33".into(),

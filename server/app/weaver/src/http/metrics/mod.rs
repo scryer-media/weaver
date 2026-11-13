@@ -19,6 +19,7 @@
 pub(super) mod catalog;
 pub(super) mod encode;
 mod render;
+mod torrent_swarm;
 
 use std::sync::Arc;
 use std::sync::OnceLock;

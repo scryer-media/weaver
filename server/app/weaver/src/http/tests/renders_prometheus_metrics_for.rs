@@ -1191,6 +1191,62 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!(r#"weaver_torrent_dht_nodes{{{ROUTE},family="v4"}} 150"#),
         format!(r#"weaver_torrent_dht_nodes{{{ROUTE},family="v6"}} 20"#),
         format!("weaver_torrent_dht_outstanding_requests{{{ROUTE}}} 6"),
+        format!(r#"weaver_torrent_peer_messages_total{{{ROUTE},direction="in",type="have"}} 410"#),
+        format!(
+            r#"weaver_torrent_peer_messages_total{{{ROUTE},direction="in",type="piece"}} 4100"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_messages_total{{{ROUTE},direction="out",type="request"}} 4200"#
+        ),
+        format!(r#"weaver_torrent_peer_messages_total{{{ROUTE},direction="out",type="pex"}} 7"#),
+        format!(
+            r#"weaver_torrent_peer_messages_total{{{ROUTE},direction="out",type="keep_alive"}} 0"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_handshakes_total{{{ROUTE},transport="utp",direction="in",encryption="rc4"}} 51"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_handshakes_total{{{ROUTE},transport="tcp",direction="out",encryption="plaintext"}} 0"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_disconnects_total{{{ROUTE},phase="live",reason="peer_closed"}} 52"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_disconnects_total{{{ROUTE},phase="connecting",reason="timeout"}} 53"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_bytes_total{{{ROUTE},transport="tcp",direction="in",kind="payload"}} 5400"#
+        ),
+        format!(
+            r#"weaver_torrent_peer_bytes_total{{{ROUTE},transport="utp",direction="out",kind="protocol"}} 55"#
+        ),
+        format!(r#"weaver_torrent_peer_request_events_total{{{ROUTE},event="timed_out"}} 56"#),
+        format!(r#"weaver_torrent_peer_request_events_total{{{ROUTE},event="invalid"}} 0"#),
+        format!(r#"weaver_torrent_peer_blocks_received_total{{{ROUTE},request="unrequested"}} 57"#),
+        format!(r#"weaver_torrent_piece_checks_total{{{ROUTE},result="failed"}} 58"#),
+        format!(r#"weaver_torrent_piece_checks_total{{{ROUTE},result="passed"}} 0"#),
+        format!(r#"weaver_torrent_piece_picks_total{{{ROUTE},result="end_game"}} 59"#),
+        format!(r#"weaver_torrent_session_wasted_bytes_total{{{ROUTE},reason="cut_short"}} 60"#),
+        format!(r#"weaver_torrent_session_peers_named_total{{{ROUTE},source="dht"}} 61"#),
+        format!(r#"weaver_torrent_session_connected_peers{{{ROUTE},transport="tcp"}} 4"#),
+        format!(r#"weaver_torrent_session_connected_peers{{{ROUTE},transport="utp"}} 2"#),
+        format!("weaver_torrent_session_connected_seeders{{{ROUTE}}} 3"),
+        format!("weaver_torrent_session_piece_steals_total{{{ROUTE}}} 8"),
+        format!(
+            r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="plaintext"}} 50"#
+        ),
+        format!(
+            r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="attempted"}} 40"#
+        ),
+        format!(r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="rc4"}} 30"#),
+        format!(
+            r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="header_only"}} 6"#
+        ),
+        format!(
+            r#"weaver_torrent_session_outgoing_encryption_total{{{ROUTE},outcome="failed"}} 4"#
+        ),
+        format!("weaver_torrent_utp_syn_flood_dropped_total{{{ROUTE}}} 33"),
+        format!("weaver_torrent_utp_syn_resets_total{{{ROUTE}}} 34"),
         r#"weaver_torrent_lifecycle_events_total{event="added"} 5"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="completed"} 3"#.to_owned(),
         r#"weaver_torrent_lifecycle_events_total{event="removed"} 1"#.to_owned(),
@@ -1220,6 +1276,9 @@ fn renders_prometheus_metrics_for_torrents_trackers_and_sessions() {
         format!("weaver_torrent_utp_packets_lost_total{{{HELD}}}"),
         format!("weaver_torrent_dht_nodes{{{HELD}"),
         format!("weaver_torrent_dht_outstanding_requests{{{HELD}}}"),
+        format!("weaver_torrent_peer_messages_total{{{HELD}"),
+        format!("weaver_torrent_peer_disconnects_total{{{HELD}"),
+        format!("weaver_torrent_session_connected_seeders{{{HELD}}}"),
         format!("weaver_torrent_tracker_last_announce_timestamp_seconds{{{BACKUP}}}"),
         format!("weaver_torrent_tracker_announce_interval_seconds{{{BACKUP}}}"),
         format!("weaver_torrent_tracker_swarm_peers{{{BACKUP}"),
