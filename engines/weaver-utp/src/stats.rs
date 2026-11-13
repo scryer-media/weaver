@@ -46,8 +46,28 @@ pub struct UtpStats {
     pub send_poll_pending: AtomicU64,
     pub send_window_exhausted: AtomicU64,
     pub max_retransmissions_reached: AtomicU64,
+    /// Streams ended because their packets went unanswered: a packet
+    /// resent the most times allowed, the timeouts in a row used up, or
+    /// the FIN never acknowledged.
+    pub streams_given_up: AtomicU64,
+    /// Reads of the socket that ended with it empty after taking packets
+    /// for a stream, each marking that stream's packets as drained.
+    pub receive_drains: AtomicU64,
+    /// Marks made because the next packet read was for another stream.
+    pub stream_switch_marks: AtomicU64,
+    /// Drain marks a stream reached with more of its packets already
+    /// queued behind the mark.
+    pub drain_marks_with_packets_queued: AtomicU64,
     pub sent_bytes: AtomicU64,
     pub sent_control_packets: AtomicU64,
+    /// ACKs sent because the reader freed receive window.
+    pub window_update_acks: AtomicU64,
+    /// Every ACK packet sent on its own (not carried by a data packet).
+    pub ack_packets_sent: AtomicU64,
+    /// ST_DATA packets received, valid and in window, in order or not.
+    pub data_packets_received: AtomicU64,
+    /// ST_DATA packets the socket took to send, resends included.
+    pub data_packets_sent: AtomicU64,
     pub unsent_control_packets: AtomicU64,
     pub incoming_already_acked_data_packets: AtomicU64,
     pub recovery_retransmitted_segments_count: AtomicU64,
@@ -69,6 +89,21 @@ pub struct UtpStatsSnapshot {
     pub syn_flood_dropped: u64,
     pub syn_rst: u64,
     pub max_congestion_window_bytes: u64,
+    pub immediate_acks: u64,
+    pub delayed_acks: u64,
+    pub window_update_acks: u64,
+    pub ack_packets_sent: u64,
+    pub data_packets_received: u64,
+    pub data_packets_sent: u64,
+    pub sent_control_packets: u64,
+    pub send_window_exhausted: u64,
+    pub data_retransmissions: u64,
+    pub duplicate_acks_received: u64,
+    pub out_of_order_packets: u64,
+    pub streams_given_up: u64,
+    pub receive_drains: u64,
+    pub stream_switch_marks: u64,
+    pub drain_marks_with_packets_queued: u64,
 }
 
 impl UtpStats {
@@ -83,6 +118,23 @@ impl UtpStats {
             syn_flood_dropped: self.syn_flood_dropped.load(Ordering::Relaxed),
             syn_rst: self.syn_rst.load(Ordering::Relaxed),
             max_congestion_window_bytes: self.max_congestion_window_bytes.load(Ordering::Relaxed),
+            immediate_acks: self.immediate_acks.load(Ordering::Relaxed),
+            delayed_acks: self.delayed_acks.load(Ordering::Relaxed),
+            window_update_acks: self.window_update_acks.load(Ordering::Relaxed),
+            ack_packets_sent: self.ack_packets_sent.load(Ordering::Relaxed),
+            data_packets_received: self.data_packets_received.load(Ordering::Relaxed),
+            data_packets_sent: self.data_packets_sent.load(Ordering::Relaxed),
+            sent_control_packets: self.sent_control_packets.load(Ordering::Relaxed),
+            send_window_exhausted: self.send_window_exhausted.load(Ordering::Relaxed),
+            data_retransmissions: self.data_retransmissions.load(Ordering::Relaxed),
+            duplicate_acks_received: self.duplicate_acks_received.load(Ordering::Relaxed),
+            out_of_order_packets: self.out_of_order_packets.load(Ordering::Relaxed),
+            streams_given_up: self.streams_given_up.load(Ordering::Relaxed),
+            receive_drains: self.receive_drains.load(Ordering::Relaxed),
+            stream_switch_marks: self.stream_switch_marks.load(Ordering::Relaxed),
+            drain_marks_with_packets_queued: self
+                .drain_marks_with_packets_queued
+                .load(Ordering::Relaxed),
         }
     }
 }
@@ -108,6 +160,41 @@ impl std::ops::AddAssign for UtpStatsSnapshot {
         self.max_congestion_window_bytes = self
             .max_congestion_window_bytes
             .max(other.max_congestion_window_bytes);
+        self.immediate_acks = self.immediate_acks.saturating_add(other.immediate_acks);
+        self.delayed_acks = self.delayed_acks.saturating_add(other.delayed_acks);
+        self.window_update_acks = self
+            .window_update_acks
+            .saturating_add(other.window_update_acks);
+        self.ack_packets_sent = self.ack_packets_sent.saturating_add(other.ack_packets_sent);
+        self.data_packets_received = self
+            .data_packets_received
+            .saturating_add(other.data_packets_received);
+        self.data_packets_sent = self
+            .data_packets_sent
+            .saturating_add(other.data_packets_sent);
+        self.sent_control_packets = self
+            .sent_control_packets
+            .saturating_add(other.sent_control_packets);
+        self.send_window_exhausted = self
+            .send_window_exhausted
+            .saturating_add(other.send_window_exhausted);
+        self.data_retransmissions = self
+            .data_retransmissions
+            .saturating_add(other.data_retransmissions);
+        self.duplicate_acks_received = self
+            .duplicate_acks_received
+            .saturating_add(other.duplicate_acks_received);
+        self.out_of_order_packets = self
+            .out_of_order_packets
+            .saturating_add(other.out_of_order_packets);
+        self.streams_given_up = self.streams_given_up.saturating_add(other.streams_given_up);
+        self.receive_drains = self.receive_drains.saturating_add(other.receive_drains);
+        self.stream_switch_marks = self
+            .stream_switch_marks
+            .saturating_add(other.stream_switch_marks);
+        self.drain_marks_with_packets_queued = self
+            .drain_marks_with_packets_queued
+            .saturating_add(other.drain_marks_with_packets_queued);
     }
 }
 

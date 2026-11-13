@@ -152,6 +152,8 @@ struct RememberingTransportLocked {
     // Woken when sends are taken again, as a socket's writable wake.
     send_waker: Option<std::task::Waker>,
     refused: usize,
+    // The socket's streams queue their datagrams for its dispatcher.
+    sends_from_one_task: bool,
 }
 
 #[derive(Clone)]
@@ -189,6 +191,12 @@ impl RememberingTransport {
         self.locked.lock().refused
     }
 
+    // Sockets built on the transport from now on send from their
+    // dispatcher, as a kernel socket's do.
+    pub fn set_sends_from_one_task(&self) {
+        self.locked.lock().sends_from_one_task = true;
+    }
+
     // Refuses a send, keeping the waker it was polled with.
     fn refuse(&self, cx: &std::task::Context<'_>) -> bool {
         let mut g = self.locked.lock();
@@ -197,7 +205,25 @@ impl RememberingTransport {
         }
         g.refused += 1;
         g.send_waker = Some(cx.waker().clone());
+        drop(g);
+        self.sent.notify_waiters();
         true
+    }
+
+    // Waits until `done` holds of the datagrams sent and the sends refused.
+    pub async fn wait_until(&self, done: impl Fn(&[Msg], usize) -> bool) {
+        loop {
+            let sent = self.sent.notified();
+            tokio::pin!(sent);
+            sent.as_mut().enable();
+            {
+                let g = self.locked.lock();
+                if done(&g.messages, g.refused) {
+                    return;
+                }
+            }
+            sent.await;
+        }
     }
 
     pub fn set_link_mtu(&self, mtu: u16) {
@@ -284,6 +310,10 @@ impl RememberingTransport {
 }
 
 impl Transport for RememberingTransport {
+    fn sends_from_one_task(&self) -> bool {
+        self.locked.lock().sends_from_one_task
+    }
+
     fn recv_from<'a>(
         &'a self,
         _buf: &'a mut [u8],

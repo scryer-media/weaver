@@ -987,8 +987,10 @@ async fn test_window_update_ack_after_read_with_waking() {
     tokio::spawn(t.vsock);
 
     // Fill up the receive buffer
-    t.tx.send(make_msg(1.into(), "aaaaa")).unwrap();
-    t.tx.send(make_msg(2.into(), "bbbbb")).unwrap();
+    // Both arrive in one socket read, so one ACK answers them.
+    t.tx.push(make_msg(1.into(), "aaaaa")).unwrap();
+    t.tx.push(make_msg(2.into(), "bbbbb")).unwrap();
+    t.tx.flush();
 
     t.transport
         .wait_for_sent(|header| {

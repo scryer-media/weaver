@@ -126,7 +126,10 @@ mod msgq {
 use crate::{
     Error, Payload,
     message::UtpMessage,
-    raw::{Type, selective_ack::SelectiveAck},
+    raw::{
+        Type,
+        selective_ack::{SACK_SENT_MAX_BITS, SelectiveAck},
+    },
     utils::update_optional_waker,
 };
 
@@ -531,6 +534,8 @@ pub(crate) fn reorder_capacity(max_rx_bytes: NonZeroUsize) -> NonZeroUsize {
 pub struct OutOfOrderQueue {
     data: VecDeque<OoqMessage>,
     filled_front: usize,
+    // The payload of the `filled_front` packets, kept as they come and go.
+    filled_front_bytes: usize,
     len: usize,
     len_bytes: usize,
     capacity: usize,
@@ -558,6 +563,7 @@ impl OutOfOrderQueue {
         Self {
             data: VecDeque::from(vec![Default::default(); capacity.get()]),
             filled_front: 0,
+            filled_front_bytes: 0,
             len: 0,
             len_bytes: 0,
             capacity: capacity.get(),
@@ -565,11 +571,16 @@ impl OutOfOrderQueue {
     }
 
     fn filled_front_bytes(&self) -> usize {
-        self.data
-            .iter()
-            .take(self.filled_front)
-            .map(|m| m.len_bytes())
-            .sum()
+        #[cfg(test)]
+        assert_eq!(
+            self.filled_front_bytes,
+            self.data
+                .iter()
+                .take(self.filled_front)
+                .map(|m| m.len_bytes())
+                .sum::<usize>()
+        );
+        self.filled_front_bytes
     }
 
     fn send_front_if_fits(
@@ -593,6 +604,7 @@ impl OutOfOrderQueue {
             }
         }
         self.filled_front -= 1;
+        self.filled_front_bytes -= len;
         self.len -= 1;
         self.len_bytes -= len;
         self.data.push_back(Default::default());
@@ -656,9 +668,13 @@ impl OutOfOrderQueue {
         if start >= self.data.len() {
             return None;
         }
+        // Only the slots a SACK can carry are read, and none past the last
+        // packet held: every packet held lies after the first hole.
+        let end = self.data.len().min(start + SACK_SENT_MAX_BITS);
+        let held = self.len - self.filled_front;
         let unacked = self
             .data
-            .range(start..)
+            .range(start..end)
             .enumerate()
             .filter_map(|(idx, data)| {
                 if ooq_slot_is_default(data) {
@@ -666,9 +682,24 @@ impl OutOfOrderQueue {
                 } else {
                     Some(idx)
                 }
-            });
+            })
+            .take(held);
+        let sack = SelectiveAck::new(unacked);
 
-        Some(SelectiveAck::new(unacked))
+        #[cfg(test)]
+        assert_eq!(
+            sack,
+            SelectiveAck::new(
+                self.data
+                    .range(start..)
+                    .enumerate()
+                    .filter(|(_, data)| !ooq_slot_is_default(data))
+                    .map(|(idx, _)| idx)
+            ),
+            "the SACK read to the queue's end"
+        );
+
+        Some(sack)
     }
 
     pub fn add_remove(
@@ -722,6 +753,7 @@ impl OutOfOrderQueue {
                 state
             });
         self.filled_front += consumed_segments;
+        self.filled_front_bytes += consumed_bytes;
         Ok(AssemblerAddRemoveResult::Consumed {
             sequence_numbers: consumed_segments,
             bytes: consumed_bytes,

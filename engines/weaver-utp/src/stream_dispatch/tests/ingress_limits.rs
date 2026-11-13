@@ -213,17 +213,21 @@ async fn an_exact_ingress_batch_repolls_to_register_for_the_next_packet() {
     for sequence in 1..=64 {
         t.send_data(sequence, 100, "a");
     }
+    t.tx.flush();
     assert!(t.vsock.poll_unpin(&mut cx).is_pending());
     assert_eq!(t.vsock.last_consumed_remote_seq_nr, 64.into());
-    assert!(t.vsock.rx.is_empty());
+    assert_eq!(t.vsock.rx.len(), 0, "every packet of the batch is taken");
     assert!(
         wakes.0.swap(0, Ordering::Relaxed) > 0,
         "the exhausted batch schedules an empty repoll"
     );
 
+    // The repoll takes the read's drain mark and sends the one ACK it owes.
     assert!(t.vsock.poll_unpin(&mut cx).is_pending());
+    assert!(t.vsock.rx.is_empty());
     assert_eq!(wakes.0.load(Ordering::Relaxed), 0);
     t.send_data(65, 100, "b");
+    t.tx.flush();
     assert!(
         wakes.0.load(Ordering::Relaxed) > 0,
         "the empty repoll registers for subsequent ingress"

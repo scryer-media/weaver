@@ -615,6 +615,38 @@ metric_families! {
         ["route"], "uTP packets rejected by parsing or validation since the session opened.");
     TORRENT_UTP_REDUNDANT_PACKETS = ("weaver_torrent_utp_redundant_packets_total", Counter,
         ["route"], "Already acknowledged uTP data packets received since the session opened.");
+    TORRENT_UTP_IMMEDIATE_ACKS = ("weaver_torrent_utp_immediate_acks_total", Counter,
+        ["route"], "uTP ACKs sent when a read of the UDP socket drained, since the session opened.");
+    TORRENT_UTP_DELAYED_ACKS = ("weaver_torrent_utp_delayed_acks_total", Counter,
+        ["route"], "uTP ACKs sent by the delayed-ACK timer since the session opened.");
+    TORRENT_UTP_WINDOW_UPDATE_ACKS = ("weaver_torrent_utp_window_update_acks_total", Counter,
+        ["route"], "uTP ACKs sent because the reader freed receive window, since the session opened.");
+    TORRENT_UTP_ACK_PACKETS_SENT = ("weaver_torrent_utp_ack_packets_sent_total", Counter,
+        ["route"], "uTP ACK packets sent on their own, not carried by data, since the session opened.");
+    TORRENT_UTP_DATA_PACKETS_RECEIVED = ("weaver_torrent_utp_data_packets_received_total", Counter,
+        ["route"], "uTP data packets received in window since the session opened.");
+    TORRENT_UTP_DATA_PACKETS_SENT = ("weaver_torrent_utp_data_packets_sent_total", Counter,
+        ["route"], "uTP data packets sent, resends included, since the session opened.");
+    TORRENT_UTP_CONTROL_PACKETS_SENT = ("weaver_torrent_utp_control_packets_sent_total", Counter,
+        ["route"], "uTP control packets (ACK, SYN-ACK, FIN, reset) sent since the session opened.");
+    TORRENT_UTP_SEND_WINDOW_EXHAUSTED = ("weaver_torrent_utp_send_window_exhausted_total", Counter,
+        ["route"], "Times a uTP stream had data to send but no window left, since the session opened.");
+    TORRENT_UTP_DATA_RETRANSMISSIONS = ("weaver_torrent_utp_data_retransmissions_total", Counter,
+        ["route"], "uTP data packets sent again since the session opened.");
+    TORRENT_UTP_DUPLICATE_ACKS = ("weaver_torrent_utp_duplicate_acks_received_total", Counter,
+        ["route"], "Duplicate uTP ACKs received since the session opened.");
+    TORRENT_UTP_OUT_OF_ORDER_PACKETS = ("weaver_torrent_utp_out_of_order_packets_total", Counter,
+        ["route"], "uTP data packets received ahead of a hole since the session opened.");
+    TORRENT_UTP_STREAMS_GIVEN_UP = ("weaver_torrent_utp_streams_given_up_total", Counter,
+        ["route"], "uTP streams ended because their packets went unanswered (resends or timeouts used up, or FIN never acknowledged), since the session opened.");
+    TORRENT_UTP_RECEIVE_DRAINS = ("weaver_torrent_utp_receive_drains_total", Counter,
+        ["route"], "Reads of the uTP socket that ended with it empty after taking packets for a stream, since the session opened.");
+    TORRENT_UTP_STREAM_SWITCH_MARKS = ("weaver_torrent_utp_stream_switch_marks_total", Counter,
+        ["route"], "uTP packets read for another stream than the packet before, since the session opened.");
+    TORRENT_UTP_DRAIN_MARKS_WITH_PACKETS_QUEUED = ("weaver_torrent_utp_drain_marks_with_packets_queued_total", Counter,
+        ["route"], "Times a uTP stream owed an ACK at the end of a read while more of its packets were already queued, since the session opened.");
+    TORRENT_UTP_MAX_CWND = ("weaver_torrent_utp_max_congestion_window_bytes", Gauge,
+        ["route"], "Largest uTP congestion window any stream of the session reached, in bytes.");
     TORRENT_SESSION_PEERS = ("weaver_torrent_session_peers", Gauge, ["route", "state"],
         "Peers of every torrent on the session, by state.");
     TORRENT_SESSION_CONNECT_ATTEMPTS = ("weaver_torrent_session_connect_attempts_total", Counter,

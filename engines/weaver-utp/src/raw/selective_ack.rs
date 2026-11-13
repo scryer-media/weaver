@@ -15,7 +15,7 @@ pub const SACK_MAX_BYTES: usize = u8::MAX as usize;
 
 // The most bits Weaver sends: the whole four-byte words the length byte
 // allows.
-const SACK_SENT_MAX_BITS: usize = SACK_MAX_BYTES / 4 * 4 * 8;
+pub(crate) const SACK_SENT_MAX_BITS: usize = SACK_MAX_BYTES / 4 * 4 * 8;
 
 type SelectiveAckData = BitArr!(for SACK_MAX_BYTES * 8, in u8, Lsb0);
 

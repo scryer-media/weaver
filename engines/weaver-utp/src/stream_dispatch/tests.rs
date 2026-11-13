@@ -18,6 +18,7 @@ mod ingress_limits;
 mod mtu_ceiling;
 mod mtu_probing;
 mod nagle;
+mod outbox;
 mod pacing;
 mod packet_validation;
 mod probe_payload;
@@ -77,7 +78,9 @@ impl TestVsock {
     fn send_msg(&mut self, header: UtpHeader, payload: &str) {
         let mut message = make_msg(header, payload);
         message.received = self.env.now();
-        self.tx.send(message).unwrap()
+        // Like one socket read: the packets queued before the next poll
+        // form one drain.
+        self.tx.push(message).unwrap()
     }
 
     fn send_data(&mut self, seq_nr: impl Into<SeqNr>, ack_nr: impl Into<SeqNr>, payload: &str) {
@@ -119,6 +122,7 @@ impl TestVsock {
     }
 
     async fn process_all_available_incoming(&mut self) {
+        self.tx.flush();
         std::future::poll_fn(|cx| {
             if self.vsock.rx.is_empty() {
                 return Poll::Ready(());
@@ -137,6 +141,7 @@ impl TestVsock {
     }
 
     async fn poll_once(&mut self) -> Poll<crate::Result<()>> {
+        self.tx.flush();
         std::future::poll_fn(|cx| {
             let res = self.vsock.poll_unpin(cx);
             Poll::Ready(res)
@@ -155,12 +160,26 @@ impl TestVsock {
         };
     }
 
+    /// On a socket whose dispatcher sends for its streams, lets it send
+    /// every datagram queued so far. The runtime has one thread: the
+    /// dispatcher runs only when the test yields to it.
+    async fn send_queued(&self) {
+        let Some(outbox) = self._socket.state.outbox.as_ref() else {
+            return;
+        };
+        let queued = outbox.queued();
+        while outbox.sent() < queued {
+            tokio::task::yield_now().await;
+        }
+    }
+
     /// Polls, stepping the clock between passes, until `packets` have been
     /// sent: the pacer lets at most a burst out per pass.
     async fn poll_until_sent(&mut self, packets: usize) -> Vec<UtpMessage> {
         let mut sent = Vec::new();
         loop {
             self.poll_once_assert_pending().await;
+            self.send_queued().await;
             sent.extend(self.take_sent());
             if sent.len() >= packets {
                 return sent;
