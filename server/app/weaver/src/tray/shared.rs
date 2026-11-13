@@ -37,14 +37,10 @@ pub(crate) const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 // How long a stop waits after asking the server to exit — `SIGTERM` on Unix,
 // a console Ctrl+C on Windows — before it kills the process. The server's own
 // graceful teardown is what needs the time here; a process that ignores the
-// request must not be able to strand the wrapper.
-#[cfg(unix)]
-const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(10);
-// Shorter on Windows, where the stop also runs inside the installer's
-// shutdown command and while the session ends, and both of those are bounded
-// by someone else.
-#[cfg(windows)]
-const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+// request must not be able to strand the wrapper. One minute on every
+// platform, so the server's drain and database flush finish before a kill.
+#[cfg(any(unix, windows))]
+pub(crate) const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(60);
 
 // The names the wrapper and the server are installed under. Both binaries
 // ship in the same directory, which is what lets the wrapper find the server

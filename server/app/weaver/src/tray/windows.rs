@@ -117,13 +117,15 @@ const SERVER_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 // `--shutdown` runs before the installer checks for files in use, and the
 // upgrade helper runs it before the installer; both wait on it, so it finishes
 // on its own clock whatever it finds: at most `SHUTDOWN_TRAY_EXIT_WAIT` for
-// the running tray, then `SHUTDOWN_STOP_POLICY`'s budget for whatever is left,
-// nineteen seconds in all.
+// the running tray, then `SHUTDOWN_STOP_POLICY`'s budget for whatever is left.
 //
-// The running tray's own exit stops its server graceful-first within
-// `shared::GRACEFUL_STOP_TIMEOUT`, then an adopted one within
-// `EXIT_STOP_POLICY`'s budget, which this wait covers with time to spare.
-const SHUTDOWN_TRAY_EXIT_WAIT: Duration = Duration::from_secs(13);
+// The running tray's own exit gives its server the full
+// `shared::GRACEFUL_STOP_TIMEOUT` to stop, then stops an adopted one within
+// `EXIT_STOP_POLICY`'s three seconds. This wait is that minute plus eight
+// seconds, so the sweep below never ends a server the tray is still waiting
+// on.
+const SHUTDOWN_TRAY_EXIT_WAIT: Duration =
+    shared::GRACEFUL_STOP_TIMEOUT.saturating_add(Duration::from_secs(8));
 // Ask whatever is still running from the installation to exit, poll eight
 // times half a second apart, then terminate it and give that two seconds.
 const SHUTDOWN_STOP_POLICY: StopPolicy = StopPolicy {
