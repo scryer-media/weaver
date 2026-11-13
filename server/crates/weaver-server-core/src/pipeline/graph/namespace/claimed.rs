@@ -56,7 +56,7 @@ impl NamespaceWriter {
         // the file is read only around them, and around what the delivery
         // that bound the member gave its object, which no file holds either.
         self.share_file(tree, node, member, said);
-        let held = self.not_in_file(node, member);
+        let held = self.not_in_file(tree, node, member);
         let owner = tree.child_of(node, member);
         let mut at = 0;
         while tree.child_of(node, member) == owner
@@ -148,7 +148,7 @@ impl NamespaceWriter {
         let Some(leaf) = files.leaves.get(&member) else {
             return;
         };
-        let held = self.not_in_file(node, member);
+        let held = self.not_in_file(tree, node, member);
         let ranges: Vec<ByteRange> = coverage
             .runs()
             .flat_map(|run| outside(run.range, &held))
