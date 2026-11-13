@@ -9,7 +9,7 @@
 // through par2-rs under the repair memory limit. Nothing here touches a
 // file: every byte goes through the namespace's access.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io;
 
@@ -188,50 +188,61 @@ pub(super) fn repair_set(
     // As many blocks as slices are damaged, and more while those read do
     // not solve for them: not every choice of blocks does.
     let mut wanted = damaged;
-    let plan = loop {
-        spend(state, slice_size, wanted, &mut set.recovery_slices, access);
-        let available = set.recovery_slices.len() as u64;
-        if available < wanted {
-            return short(available, access);
-        }
-        let verification = verification(&set, &validity, damaged);
-        match plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) {
-            Ok(plan) => break plan,
-            Err(Par2Error::InsufficientRecoveryData { deficit, .. }) => {
-                wanted = available + u64::from(deficit);
-            }
-            Err(error) => {
-                access.repair_error(
-                    "plan repair",
-                    &format!("{:02x?}", set.recovery_set_id),
-                    &error,
-                );
-                return short(available, access);
-            }
-        }
-    };
-    let available = set.recovery_slices.len() as u64;
     let members: BTreeMap<FileId, MemberId> = state.members().clone();
-    let mut files = Files {
-        access: RefCell::new(access),
-        members: &members,
-        set: &set,
-        donors: &donors,
-        kept: &kept,
-        recovery: &state.recovery,
-        piece: RefCell::new(Vec::new()),
-    };
     let options = RepairOptions {
         memory_limit: Some(memory_limit),
         ..Default::default()
     };
-    if let Err(error) = execute_repair_with_options(&plan, &set, &mut files, &options) {
-        files.access.get_mut().repair_error(
+    // A block whose payload does not read while the repair spends it is
+    // forgotten, as one that fails its check is, and the plan made again
+    // from the blocks left: each time round there is one block fewer.
+    loop {
+        let plan = loop {
+            spend(state, slice_size, wanted, &mut set.recovery_slices, access);
+            let available = set.recovery_slices.len() as u64;
+            if available < wanted {
+                return short(available, access);
+            }
+            let verification = verification(&set, &validity, damaged);
+            match plan_repair_with_memory_limit(&set, &verification, Some(memory_limit)) {
+                Ok(plan) => break plan,
+                Err(Par2Error::InsufficientRecoveryData { deficit, .. }) => {
+                    wanted = available + u64::from(deficit);
+                }
+                Err(error) => {
+                    access.repair_error(
+                        "plan repair",
+                        &format!("{:02x?}", set.recovery_set_id),
+                        &error,
+                    );
+                    return short(available, access);
+                }
+            }
+        };
+        let mut files = Files {
+            access: RefCell::new(&mut *access),
+            members: &members,
+            set: &set,
+            donors: &donors,
+            kept: &kept,
+            recovery: &state.recovery,
+            piece: RefCell::new(Vec::new()),
+            unread: Cell::new(None),
+        };
+        let Err(error) = execute_repair_with_options(&plan, &set, &mut files, &options) else {
+            break;
+        };
+        let unread = files.unread.take();
+        access.repair_error(
             "execute repair",
             &format!("{:02x?}", set.recovery_set_id),
             &error,
         );
-        return short(available, files.access.into_inner());
+        let Some(exponent) = unread else {
+            return short(set.recovery_slices.len() as u64, access);
+        };
+        state.recovery.remove(&exponent);
+        set.recovery_slices.remove(&exponent);
     }
     SetRepair {
         outcome: RepairOutcome::Repaired {
@@ -785,6 +796,8 @@ struct Files<'a> {
     // piece at a time into `piece` as the repair asks for it.
     recovery: &'a BTreeMap<u32, Location>,
     piece: RefCell<Vec<u8>>,
+    // The recovery block whose payload did not read, if one did not.
+    unread: Cell<Option<u32>>,
 }
 
 impl Files<'_> {
@@ -913,6 +926,7 @@ impl FileAccess for Files<'_> {
                 &mut piece,
             ) || piece.len() != dst.len()
             {
+                self.unread.set(Some(exponent));
                 return Err(io::Error::other("the namespace could not read the volume"));
             }
             dst.copy_from_slice(&piece);
@@ -1330,6 +1344,7 @@ mod tests {
                 kept: &Kept::new(0),
                 recovery: &BTreeMap::new(),
                 piece: RefCell::new(Vec::new()),
+                unread: Cell::new(None),
             }
             .read_file_range(&file, offset, end - offset)
             .unwrap();
@@ -1411,6 +1426,7 @@ mod tests {
                     kept: &Kept::new(0),
                     recovery: &state.recovery,
                     piece: RefCell::new(Vec::new()),
+                    unread: Cell::new(None),
                 };
                 execute_repair_with_options(&plan, &set, &mut view, &RepairOptions::default())
             };
@@ -2203,6 +2219,149 @@ mod tests {
         // Checked once whole, then read again whole as it was spent.
         let read: u64 = access.reads.iter().map(ByteRange::len).sum();
         assert!(read >= 2 * slice, "{read}");
+    }
+
+    // The store with every read of a member or a volume written down, and
+    // the volume reads it refuses: one that lies wholly in a refused range.
+    struct Watched {
+        store: Store,
+        members: Vec<ByteRange>,
+        volumes: Vec<(VolumeIndex, ByteRange)>,
+        refused: Vec<(VolumeIndex, ByteRange)>,
+        errors: Vec<String>,
+    }
+
+    impl Watched {
+        fn over(store: Store) -> Self {
+            Self {
+                store,
+                members: Vec::new(),
+                volumes: Vec::new(),
+                refused: Vec::new(),
+                errors: Vec::new(),
+            }
+        }
+
+        // The volume reads that lie wholly in `range` of `volume`.
+        fn within(&self, (volume, range): (VolumeIndex, ByteRange)) -> usize {
+            self.volumes
+                .iter()
+                .filter(|(of, read)| {
+                    *of == volume && range.start <= read.start && read.end <= range.end
+                })
+                .count()
+        }
+    }
+
+    impl MemberAccess for Watched {
+        fn repair_error(&mut self, operation: &str, _: &str, _: &dyn std::error::Error) {
+            self.errors.push(operation.to_string());
+        }
+        fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
+            self.members.push(range);
+            self.store.read(member, range, into)
+        }
+        fn write_repaired(&mut self, member: MemberId, offset: u64, bytes: &[u8]) {
+            self.store.write_repaired(member, offset, bytes);
+        }
+        fn length(&self, member: MemberId) -> Option<u64> {
+            self.store.length(member)
+        }
+        fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {
+            self.store.arrived(member, range, out);
+        }
+        fn read_volume(
+            &mut self,
+            volume: VolumeIndex,
+            range: ByteRange,
+            into: &mut Vec<u8>,
+        ) -> bool {
+            self.volumes.push((volume, range));
+            let refused = self.refused.iter().any(|(of, refused)| {
+                *of == volume && refused.start <= range.start && range.end <= refused.end
+            });
+            !refused && self.store.read_volume(volume, range, into)
+        }
+    }
+
+    // One file of `slices` slices of `slice` bytes with a byte wrong in its
+    // fourth, nothing of it settled by evidence, and `recovery` blocks.
+    fn one_bad_slice(slice: u64, slices: u64, recovery: u32) -> (Job<Par2>, MemberId, Vec<u8>) {
+        let data = payload(93, (slices * slice) as usize);
+        let files = par2_set("set", &[("payload.bin", &data)], slice, recovery, 1);
+        let mut wrong = data.clone();
+        wrong[(3 * slice + 17) as usize] ^= 0x5A;
+        let (mut job, member) = fixture(&files, &wrong);
+        job.store.holes.clear();
+        (job, member, data)
+    }
+
+    // Where a recovery block's payload lies: its packet past the header and
+    // the exponent. The check of a packet reads from its start, so only the
+    // repair's own reads lie wholly in this.
+    fn payload_of(state: &SetState, exponent: u32) -> (VolumeIndex, ByteRange) {
+        let at = state.recovery[&exponent];
+        let range = ByteRange::new(at.range.start + PAYLOAD as u64, at.range.end);
+        (at.volume, range)
+    }
+
+    // A block that passed its check and then does not read while the repair
+    // spends it is forgotten, and the repair is made again with the blocks
+    // left, checking another: one block lost, or two, the set still repairs,
+    // and no block that did not read is in it.
+    #[test]
+    fn a_block_that_does_not_read_as_it_is_spent_is_forgotten_and_another_spent() {
+        for lost in [1u32, 2] {
+            let (mut job, member, data) = one_bad_slice(BLOCK, 8, 3);
+            let state = job.object.sets.values_mut().next().unwrap();
+            let payloads: Vec<_> = (0..3).map(|block| payload_of(state, block)).collect();
+            let mut access = Watched::over(std::mem::take(&mut job.store));
+            access.refused = payloads[..lost as usize].to_vec();
+            let result = repair_set(state, &job.object.grid, 0, 1 << 20, &mut access);
+            assert_eq!(result.outcome, RepairOutcome::Repaired { slices: 1 });
+            assert!(access.store.members[&member] == data);
+            let left: Vec<u32> = state.recovery.keys().copied().collect();
+            assert_eq!(left, (lost..3).collect::<Vec<_>>());
+            // Each lost block was asked for once and not again; the block
+            // that rebuilt the slice is the first that read; one past it
+            // was never read.
+            for (block, payload) in payloads.iter().enumerate() {
+                let reads = access.within(*payload);
+                match (block as u32).cmp(&lost) {
+                    std::cmp::Ordering::Less => assert_eq!(reads, 1, "block {block}"),
+                    std::cmp::Ordering::Equal => assert!(reads > 0, "block {block}"),
+                    std::cmp::Ordering::Greater => assert_eq!(reads, 0, "block {block}"),
+                }
+            }
+            assert_eq!(access.errors, vec!["execute repair"; lost as usize]);
+        }
+    }
+
+    // With no block left to take the place of the one that did not read,
+    // the set is short by the loop's own rule: waiting while more is coming,
+    // impossible when none is.
+    #[test]
+    fn a_block_that_does_not_read_with_none_to_spare_leaves_the_set_short() {
+        for (coming, expected) in [
+            (
+                0,
+                RepairOutcome::Impossible {
+                    damaged: 1,
+                    reachable: 0,
+                },
+            ),
+            (1, RepairOutcome::Waiting),
+        ] {
+            let (mut job, _, _) = one_bad_slice(BLOCK, 8, 1);
+            let state = job.object.sets.values_mut().next().unwrap();
+            let mut access = Watched::over(std::mem::take(&mut job.store));
+            access.refused = vec![payload_of(state, 0)];
+            let result = repair_set(state, &job.object.grid, coming, 1 << 20, &mut access);
+            assert_eq!(result.outcome, expected);
+            assert_eq!(result.damaged, 1);
+            assert!(state.recovery.is_empty());
+            assert_eq!(access.errors, ["execute repair"]);
+        }
     }
 
     // A set without slice checksums proves a volume by hashing it whole:
