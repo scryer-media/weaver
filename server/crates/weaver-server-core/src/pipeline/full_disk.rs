@@ -35,8 +35,27 @@ use crate::jobs::model::{FileSummaries, FileSummary, JobArticles, RunState};
 use crate::operations::StorageRoot;
 
 // What a job waits for: room made on the disk its write failed on.
+// The disk a held job waits on: a root's, or the disk of a path that lies
+// on none of theirs.
+enum Disk {
+    Root(StorageRoot),
+    Path(PathBuf),
+}
+
+// What the job was doing when its write failed, which is what it goes back
+// to when let go, the way a restart takes a job stored in that stage.
+pub(in crate::pipeline) enum Stage {
+    // Fetching, verifying, repairing or unpacking: its graph is restored
+    // from its last checkpoint.
+    Graph,
+    // Its final move, into this destination: the move goes on from what the
+    // failed attempt left.
+    Moving(PathBuf),
+}
+
 pub(crate) struct FullDisk {
-    root: StorageRoot,
+    disk: Disk,
+    stage: Stage,
     // The disk's count of the probes it had begun as the write failed: only
     // a later probe's reading can show room made since.
     since: u64,
@@ -135,7 +154,8 @@ impl Pipeline {
         self.full_disk.insert(
             job_id,
             FullDisk {
-                root,
+                disk: Disk::Root(root),
+                stage: Stage::Graph,
                 since,
                 counted: since,
                 go: false,
@@ -218,52 +238,165 @@ impl Pipeline {
         for (job_id, hold) in &mut self.full_disk {
             // A probe running as the write failed began before it: what it
             // published can raise the high, never let the job go.
-            if let Some(before) = self.storage_capacity.straddled(hold.root, hold.since) {
+            // What a probe running as the write failed has published, and
+            // the disk's next uncounted reading: its probe's count, and from
+            // a good one what it shows free and what is free to spend.
+            let capacity = &self.storage_capacity;
+            let (before, reading) = match &hold.disk {
+                Disk::Root(root) => (
+                    capacity.straddled(*root, hold.since),
+                    capacity
+                        .reading_begun_after(*root, hold.counted)
+                        .map(|(probe, reading)| {
+                            let free = capacity
+                                .free(*root)
+                                .filter(|free| !free.stale && !reading.stale)
+                                .map(|free| (reading.available_bytes, free.bytes));
+                            (probe, free)
+                        }),
+                ),
+                Disk::Path(path) => (
+                    capacity.path_straddled(path, hold.since),
+                    capacity
+                        .path_reading_after(path, hold.counted)
+                        .map(|(probe, free)| (probe, free.map(|free| (free, free)))),
+                ),
+            };
+            if let Some(before) = before {
                 let high = self.full_disk_highs.entry(*job_id).or_insert(before);
                 *high = (*high).max(before);
             }
-            if let Some((probe, reading)) = self
-                .storage_capacity
-                .reading_begun_after(hold.root, hold.counted)
-            {
+            if let Some((probe, free)) = reading {
                 hold.counted = probe;
-                let free = self
-                    .storage_capacity
-                    .free(hold.root)
-                    .filter(|free| !free.stale && !reading.stale);
-                if let Some(free) = free {
+                if let Some((shown, spendable)) = free {
                     match self.full_disk_highs.entry(*job_id) {
                         Entry::Vacant(high) => {
-                            high.insert(reading.available_bytes);
+                            high.insert(shown);
                         }
                         Entry::Occupied(mut high) => {
-                            if reading.available_bytes > *high.get() {
-                                high.insert(reading.available_bytes);
-                                hold.go |= free.bytes > reserve;
+                            if shown > *high.get() {
+                                high.insert(shown);
+                                hold.go |= spendable > reserve;
                             }
                         }
                     }
                 }
             }
-            let parked = !self.parking_jobs.contains(job_id)
-                && !self.retiring_graph_jobs.contains_key(job_id)
-                && self.jobs.get(job_id).is_none_or(|state| {
-                    !matches!(state.articles, JobArticles::Active(_))
-                        && state.run_state != RunState::Paused
-                });
+            let paused = self
+                .jobs
+                .get(job_id)
+                .is_some_and(|state| state.run_state == RunState::Paused);
+            let parked = !paused
+                && match hold.stage {
+                    Stage::Graph => {
+                        !self.parking_jobs.contains(job_id)
+                            && !self.retiring_graph_jobs.contains_key(job_id)
+                            && self.jobs.get(job_id).is_none_or(|state| {
+                                !matches!(state.articles, JobArticles::Active(_))
+                            })
+                    }
+                    Stage::Moving(_) => true,
+                };
             if hold.go && parked {
                 woken.push(*job_id);
             }
         }
         for job_id in woken {
-            info!(
-                job_id = job_id.0,
-                "the job held for a full disk runs on from its last checkpoint"
-            );
-            self.drop_full_disk_hold(job_id);
-            self.request_job_activation(job_id);
-            self.download_dispatch_wake = true;
+            match self.drop_full_disk_hold(job_id) {
+                Some(Stage::Moving(dest)) => {
+                    info!(
+                        job_id = job_id.0,
+                        "the job held for a full disk goes on with its final move"
+                    );
+                    self.full_disk_moves.push((job_id, dest));
+                }
+                _ => {
+                    info!(
+                        job_id = job_id.0,
+                        "the job held for a full disk runs on from its last checkpoint"
+                    );
+                    self.request_job_activation(job_id);
+                    self.download_dispatch_wake = true;
+                }
+            }
             self.report_job(job_id);
+        }
+    }
+
+    // The final move of a job found its destination full: the job waits
+    // for room on the destination's disk, shown as any job held for a full
+    // disk, and nothing of it is failed. What the move delivered stays in
+    // the destination and what it did not stays where it was. The disk is a
+    // root's when the destination lies on one, by the devices the capacity
+    // cache already holds, and else the destination's own, read while a job
+    // waits on it.
+    pub(in crate::pipeline) async fn hold_move_for_full_disk(
+        &mut self,
+        job_id: JobId,
+        dest: PathBuf,
+        path: &std::path::Path,
+        message: &str,
+    ) {
+        if !self.jobs.contains_key(&job_id) || self.full_disk.contains_key(&job_id) {
+            return;
+        }
+        warn!(
+            job_id = job_id.0,
+            path = %path.display(),
+            error = message,
+            "the final move found the disk full; the job waits for room"
+        );
+        let mut disk = None;
+        for (root, dir) in [
+            (StorageRoot::Complete, self.complete_dir.clone()),
+            (StorageRoot::Intermediate, self.intermediate_dir.clone()),
+        ] {
+            if self.storage_capacity.same_filesystem(path, &dir).await {
+                disk = Some(Disk::Root(root));
+                break;
+            }
+        }
+        let disk = disk.unwrap_or_else(|| Disk::Path(path.to_path_buf()));
+        let (since, shown) = match &disk {
+            Disk::Root(root) => {
+                let failed = self.storage_capacity.failed_at(*root);
+                self.storage_capacity.ledger(*root).wait();
+                failed
+            }
+            Disk::Path(path) => self.storage_capacity.hold_path(path),
+        };
+        if let Some(shown) = shown {
+            let high = self.full_disk_highs.entry(job_id).or_insert(shown);
+            *high = (*high).max(shown);
+        }
+        self.full_disk.insert(
+            job_id,
+            FullDisk {
+                disk,
+                stage: Stage::Moving(dest),
+                since,
+                counted: since,
+                go: false,
+                left: None,
+                named: HashSet::new(),
+            },
+        );
+        self.report_job(job_id);
+    }
+
+    // The final moves of the jobs let go start here, at the top of a turn,
+    // the way a restart starts a move it found interrupted: the job's row
+    // names the destination, and the move goes on into it.
+    pub(in crate::pipeline) async fn resume_full_disk_moves(&mut self) {
+        if self.full_disk_moves.is_empty() {
+            return;
+        }
+        for (job_id, dest) in std::mem::take(&mut self.full_disk_moves) {
+            let Some(state) = self.jobs.get_mut(&job_id) else {
+                continue;
+            };
+            state.working_dir = dest;
+            self.resume_restored_move(job_id).await;
         }
     }
 
@@ -307,14 +440,18 @@ impl Pipeline {
 
     // The job no longer waits for room after a full disk: it went on, or
     // left the pipeline.
-    pub(in crate::pipeline) fn drop_full_disk_hold(&mut self, job_id: JobId) {
+    pub(in crate::pipeline) fn drop_full_disk_hold(&mut self, job_id: JobId) -> Option<Stage> {
         if self.full_disk.is_empty() {
-            return;
+            return None;
         }
-        if let Some(hold) = self.full_disk.remove(&job_id) {
-            self.storage_capacity.ledger(hold.root).unwait();
-            self.storage_capacity
-                .failure_forgotten(hold.root, hold.since);
+        let hold = self.full_disk.remove(&job_id)?;
+        match &hold.disk {
+            Disk::Root(root) => {
+                self.storage_capacity.ledger(*root).unwait();
+                self.storage_capacity.failure_forgotten(*root, hold.since);
+            }
+            Disk::Path(path) => self.storage_capacity.release_path(path, hold.since),
         }
+        Some(hold.stage)
     }
 }

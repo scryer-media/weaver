@@ -31,7 +31,7 @@ pub(in crate::pipeline) struct SegmentWriteError {
 }
 
 impl SegmentWriteError {
-    fn new(file_id: NzbFileId, source: io::Error) -> Self {
+    pub(in crate::pipeline) fn new(file_id: NzbFileId, source: io::Error) -> Self {
         Self { file_id, source }
     }
 }
@@ -1707,19 +1707,25 @@ impl Pipeline {
             self.hold_job_for_full_disk(job_id, crate::operations::StorageRoot::Intermediate);
             return;
         }
-        let message = if out_of_space {
-            format!(
-                "{context} for {}: filesystem out of space or over quota ({})",
-                error.file_id, error.source
-            )
-        } else {
-            format!("{context} for {}: {}", error.file_id, error.source)
-        };
+        // No room for a part of a job that no longer fetches: it has ended,
+        // or its final move has begun and chosen what it delivers, so the
+        // part is one nothing will read. The write is dropped, and the job
+        // is not failed for it.
+        if out_of_space {
+            warn!(
+                job_id = job_id.0,
+                file_id = %error.file_id,
+                error = %error.source,
+                context,
+                "disk write found no room for a job that no longer fetches; the part is dropped"
+            );
+            return;
+        }
+        let message = format!("{context} for {}: {}", error.file_id, error.source);
         error!(
             job_id = job_id.0,
             file_id = %error.file_id,
             error = %error.source,
-            out_of_space,
             context,
             "disk write failed; failing job"
         );

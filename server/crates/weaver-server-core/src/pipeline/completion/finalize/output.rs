@@ -464,6 +464,12 @@ fn merge_delivered_dir(
     Ok(true)
 }
 
+// Whether an entry's move failed because its destination had no room, in
+// the rename or in the copy that stood in for it.
+fn entry_found_no_room(rename_err: &std::io::Error, copy_err: &std::io::Error) -> bool {
+    crate::operations::is_out_of_space(rename_err) || crate::operations::is_out_of_space(copy_err)
+}
+
 fn move_delivered_entry(
     src: &std::path::Path,
     dst: &std::path::Path,
@@ -471,6 +477,23 @@ fn move_delivered_entry(
     phase_counters: Arc<PhaseCounters>,
     resumed: bool,
 ) -> Result<(), (std::io::Error, std::io::Error)> {
+    #[cfg(test)]
+    {
+        let mut room = DESTINATION_ROOM.lock().unwrap();
+        match room.as_mut() {
+            Some(0) => {
+                if let Ok(bytes) = std::fs::read(src) {
+                    let _ = std::fs::write(dst, &bytes[..bytes.len() / 2]);
+                }
+                return Err((
+                    std::io::Error::from(std::io::ErrorKind::CrossesDevices),
+                    std::io::Error::from(std::io::ErrorKind::StorageFull),
+                ));
+            }
+            Some(left) => *left -= 1,
+            None => {}
+        }
+    }
     let interrupted = resumed
         && std::fs::symlink_metadata(dst).is_ok()
         && !runtime_fs::paths_equivalent_for_placement(src, dst);
@@ -570,8 +593,14 @@ pub(crate) type MoveHook = Box<dyn FnOnce(JobId) + Send>;
 pub(crate) static BEFORE_FIRST_MOVE: std::sync::Mutex<Option<MoveHook>> =
     std::sync::Mutex::new(None);
 
+// A destination that fills: how many more entries it has room for. Each
+// entry past that leaves half of itself there, as a copy cut short does,
+// and finds no room.
 #[cfg(test)]
-pub(crate) type SpentHook = Box<dyn FnOnce(&[PathBuf]) + Send>;
+pub(crate) static DESTINATION_ROOM: std::sync::Mutex<Option<u32>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) type SpentHook =Box<dyn FnOnce(&[PathBuf]) + Send>;
 
 // Runs with the consumed inputs once their handles are released and before
 // they are removed.
@@ -631,7 +660,11 @@ async fn run_move_to_complete(
         left_behind,
     )
     .await;
-    if result.is_err() {
+    // A move that waits for room goes on into its claim, even an empty one.
+    if result
+        .as_ref()
+        .is_err_and(|error| !matches!(error, MoveToCompleteFailure::OutOfSpace { .. }))
+    {
         // The actor exclusively created this directory before launching the
         // worker. Remove the abandoned claim only when it is still empty;
         // partial output is deliberately retained for diagnosis and retry.
@@ -734,6 +767,8 @@ async fn run_move_to_claimed_destination(
 
     let mut moved = 0u32;
     let mut failures = Vec::new();
+    // Whether an entry failed for want of room at the destination.
+    let mut full = false;
 
     if let Some(ref staging) = staging_dir
         && let Ok(mut entries) = tokio::fs::read_dir(staging).await
@@ -772,6 +807,7 @@ async fn run_move_to_claimed_destination(
                     moved += 1;
                 }
                 Ok(Err((rename_err, copy_err))) => {
+                    full |= entry_found_no_room(&rename_err, &copy_err);
                     failures.push(format!(
                         "{}: rename failed: {}; fallback failed: {}",
                         file_name.to_string_lossy(),
@@ -819,12 +855,15 @@ async fn run_move_to_claimed_destination(
                 {
                     Ok(Ok(true)) => moved += 1,
                     Ok(Ok(false)) => {}
-                    Ok(Err((rename_err, copy_err))) => failures.push(format!(
-                        "{}: rename failed: {}; fallback failed: {}",
-                        file_name.to_string_lossy(),
-                        rename_err,
-                        copy_err
-                    )),
+                    Ok(Err((rename_err, copy_err))) => {
+                        full |= entry_found_no_room(&rename_err, &copy_err);
+                        failures.push(format!(
+                            "{}: rename failed: {}; fallback failed: {}",
+                            file_name.to_string_lossy(),
+                            rename_err,
+                            copy_err
+                        ));
+                    }
                     Err(join_err) => failures.push(format!(
                         "{}: move task failed: {}",
                         file_name.to_string_lossy(),
@@ -846,6 +885,7 @@ async fn run_move_to_claimed_destination(
                     moved += 1;
                 }
                 Ok(Err((rename_err, copy_err))) => {
+                    full |= entry_found_no_room(&rename_err, &copy_err);
                     failures.push(format!(
                         "{}: rename failed: {}; fallback failed: {}",
                         file_name.to_string_lossy(),
@@ -868,12 +908,22 @@ async fn run_move_to_claimed_destination(
         for failure in &failures {
             warn!(job_id = job_id.0, error = %failure, "failed to move entry to complete directory");
         }
-        return Err(MoveToCompleteFailure::Operational(format!(
+        let message = format!(
             "failed to move {} entr{} to complete directory: {}",
             failures.len(),
             if failures.len() == 1 { "y" } else { "ies" },
             failures[0]
-        )));
+        );
+        // An entry the destination had no room for: the job waits for room
+        // on the destination's disk, and the move goes on from what it left.
+        return Err(if full {
+            MoveToCompleteFailure::OutOfSpace {
+                path: dest,
+                message,
+            }
+        } else {
+            MoveToCompleteFailure::Operational(message)
+        });
     }
 
     // Both delivery routes have landed in `dest` and nothing else will be added
@@ -1768,6 +1818,10 @@ impl Pipeline {
                 self.fail_delivery_security_check(job_id, error);
             }
             Err(MoveToCompleteFailure::Operational(error)) => self.fail_job(job_id, error),
+            Err(MoveToCompleteFailure::OutOfSpace { path, message }) => {
+                self.hold_move_for_full_disk(job_id, dest, &path, &message)
+                    .await;
+            }
         }
     }
 

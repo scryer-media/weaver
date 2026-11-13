@@ -5,6 +5,8 @@ use super::*;
 
 mod layout;
 mod worker;
+#[cfg(test)]
+pub(in crate::pipeline) use worker::SegmentWriteError;
 
 // In-flight decode task count per job, with their sum kept beside them so the
 // stage gauge reads one number instead of walking every job on each decode.

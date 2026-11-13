@@ -844,12 +844,17 @@ pub(super) struct MoveToCompleteResult {
 pub(super) enum MoveToCompleteFailure {
     Security(String),
     Operational(String),
+    // An operational failure whose cause is known: the disk `path` lies on
+    // had no room for an entry. The job waits for room there.
+    OutOfSpace { path: PathBuf, message: String },
 }
 
 impl std::fmt::Display for MoveToCompleteFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Security(message) | Self::Operational(message) => formatter.write_str(message),
+            Self::Security(message)
+            | Self::Operational(message)
+            | Self::OutOfSpace { message, .. } => formatter.write_str(message),
         }
     }
 }
@@ -1593,6 +1598,9 @@ pub struct Pipeline {
     // show since it last saved anything new: it outlives the hold, so a job
     // let go that fails again waits for more than this.
     pub(super) full_disk_highs: std::collections::BTreeMap<JobId, u64>,
+    // The jobs let go whose final move goes on into the destination named,
+    // started at the top of the next turn as a restart starts one.
+    pub(super) full_disk_moves: Vec<(JobId, PathBuf)>,
     // The removals of spool files a held job no longer reads, for a test to
     // wait on.
     #[cfg(test)]

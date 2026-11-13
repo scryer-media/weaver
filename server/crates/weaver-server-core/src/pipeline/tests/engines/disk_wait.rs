@@ -1479,3 +1479,234 @@ async fn a_probe_running_as_the_write_fails_does_not_let_the_job_go() {
         body.as_slice()
     );
 }
+
+// Twelve plain files, each of one article.
+fn twelve() -> Vec<(String, Vec<u8>)> {
+    (0..12u8)
+        .map(|n| (format!("harbor{n:02}.bin"), payload(ARTICLE, 50 + n)))
+        .collect()
+}
+
+fn destination_room(room: Option<u32>) {
+    *crate::pipeline::completion::finalize::DESTINATION_ROOM
+        .lock()
+        .unwrap() = room;
+}
+
+// The job's final move found its destination full: it waits, not failed,
+// shown waiting for disk space, with no move running.
+fn assert_move_held(pipeline: &Pipeline) {
+    assert!(pipeline.held_for_full_disk(JOB));
+    assert!(
+        !matches!(
+            job_status_for_assert(pipeline, JOB),
+            Some(JobStatus::Failed { .. })
+        ),
+        "the job is not failed"
+    );
+    assert!(pipeline.waits_for_disk_room());
+    assert!(!pipeline.inflight_moves.contains(&JOB));
+    assert_eq!(
+        pipeline.dispatch_wait_reason(JOB),
+        Some(crate::jobs::handle::DISK_SPACE_WAIT_REASON)
+    );
+}
+
+// The job let go starts its move again at the top of the loop's next turn,
+// and runs to its end: every file is delivered once, whole, into `under`,
+// and nothing is left where it was worked on.
+async fn move_goes_on(
+    pipeline: &mut Pipeline,
+    scenario: &Scenario,
+    under: &Path,
+    working_dir: &Path,
+) {
+    assert!(!pipeline.held_for_full_disk(JOB), "the job was let go");
+    pipeline.resume_full_disk_moves().await;
+    assert!(
+        pipeline.inflight_moves.contains(&JOB),
+        "its move goes on: {:?}",
+        job_status_for_assert(pipeline, JOB)
+    );
+    drive(pipeline, scenario, JOB, |_| false).await;
+    assert_eq!(
+        job_status_for_assert(pipeline, JOB),
+        Some(JobStatus::Complete)
+    );
+    let files = delivered(under);
+    assert_eq!(files.len(), 12, "each file once: {:?}", files.keys());
+    for (name, body) in twelve() {
+        assert_eq!(file_named(&files, &name), body.as_slice(), "{name}");
+    }
+    assert!(!working_dir.exists(), "the sources are gone");
+    assert!(!pipeline.waits_for_disk_room());
+}
+
+// A job of twelve files is moved to its destination, which fills after the
+// fifth: the job waits for room, shown waiting for disk space, and is not
+// failed. A part for it that finds no room in the spool meanwhile is
+// dropped, and does not fail it either. A reading with no more room keeps
+// it waiting. Once room is made the move goes on from what it left: the
+// file cut short is moved again whole, and the job completes with its
+// twelve files, each once, and its working directory gone.
+#[tokio::test]
+async fn a_final_move_whose_destination_fills_waits_for_room_and_delivers_every_file() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let posts = twelve()
+        .into_iter()
+        .map(|(name, body)| Post::plain(&name, body))
+        .collect();
+    let scenario = on_disk_posting(&room, posts);
+    let (_temp_dir, mut pipeline, complete_dir) = admit(&scenario).await;
+    let working_dir = pipeline.jobs[&JOB].working_dir.clone();
+    // The working directory carries the job's ownership marker, as every
+    // directory a job is added with does.
+    crate::jobs::working_dir::stamp_working_dir(&pipeline.intermediate_dir, &working_dir, JOB)
+        .await
+        .unwrap();
+    let output = Arc::clone(
+        pipeline
+            .storage_capacity
+            .reader(StorageRoot::Complete)
+            .ledger(),
+    );
+
+    destination_room(Some(5));
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    assert_move_held(&pipeline);
+    assert!(output.waited_on(), "it waits on the destination's disk");
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+    let whole = delivered(&complete_dir)
+        .iter()
+        .filter(|(_, bytes)| bytes.len() == ARTICLE)
+        .count();
+    assert_eq!(whole, 5, "five files moved before the disk filled");
+    assert!(working_dir.exists(), "the rest stays where it was");
+
+    // A part of the job finds no room in the spool: nothing reads it now.
+    pipeline.fail_job_for_disk_write(
+        crate::pipeline::decode::SegmentWriteError::new(
+            crate::jobs::ids::NzbFileId {
+                job_id: JOB,
+                file_index: 0,
+            },
+            std::io::Error::from(std::io::ErrorKind::StorageFull),
+        ),
+        "UU spool write failed",
+    );
+    assert_move_held(&pipeline);
+
+    hears(&mut pipeline, &room, StorageRoot::Complete, 0);
+    assert_move_held(&pipeline);
+
+    destination_room(None);
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    assert!(!output.waited_on());
+    move_goes_on(&mut pipeline, &scenario, &complete_dir, &working_dir).await;
+}
+
+// The job's category delivers to a folder on a disk of its own, which
+// fills during the move: the job waits on that folder's disk, which is read
+// only while the job waits on it. Room on the complete folder's disk does
+// not let it go; room on its own does.
+#[tokio::test]
+async fn a_final_move_to_a_folder_on_its_own_disk_waits_on_that_disk() {
+    let room = Arc::new(AtomicU64::new(PLENTY));
+    let library_room = Arc::new(AtomicU64::new(0));
+    let posts = twelve()
+        .into_iter()
+        .map(|(name, body)| Post::plain(&name, body))
+        .collect();
+    let scenario = on_disk_posting(&room, posts);
+    let (probe_room, probe_library) = (Arc::clone(&room), Arc::clone(&library_room));
+    let (temp_dir, mut pipeline, _) =
+        super::harness::admit_with(&scenario, move |pipeline, temp| {
+            let library = temp.join("library-disk");
+            std::fs::create_dir_all(&library).unwrap();
+            crate::runtime::fs::test_devices::assign(&pipeline.intermediate_dir, 1);
+            crate::runtime::fs::test_devices::assign(&pipeline.complete_dir, 2);
+            crate::runtime::fs::test_devices::assign(&library, 3);
+            pipeline.config.try_write().unwrap().categories =
+                vec![crate::categories::CategoryConfig {
+                    id: 0,
+                    name: "library".to_string(),
+                    dest_dir: Some(library.display().to_string()),
+                    aliases: String::new(),
+                }];
+            let roots = [
+                pipeline.script_data_dir.clone(),
+                pipeline.intermediate_dir.clone(),
+                pipeline.complete_dir.clone(),
+            ];
+            let probe = Arc::new(move |path: &Path| {
+                let room = if path.starts_with(&library) {
+                    &probe_library
+                } else {
+                    &probe_room
+                };
+                Ok(DiskSpace {
+                    total_bytes: RESERVE * 8,
+                    available_bytes: RESERVE + room.load(Ordering::Acquire),
+                })
+            });
+            let capacity = StorageCapacity::with_probe(roots, NEVER, probe);
+            for root in StorageRoot::ALL {
+                capacity.wait_for_probes(root, 1);
+            }
+            pipeline.storage_capacity = Arc::new(capacity);
+        })
+        .await;
+    let library = temp_dir.path().join("library-disk");
+    pipeline.jobs.get_mut(&JOB).unwrap().spec.category = Some("library".to_string());
+    let working_dir = pipeline.jobs[&JOB].working_dir.clone();
+    // The working directory carries the job's ownership marker, as every
+    // directory a job is added with does.
+    crate::jobs::working_dir::stamp_working_dir(&pipeline.intermediate_dir, &working_dir, JOB)
+        .await
+        .unwrap();
+    let output = Arc::clone(
+        pipeline
+            .storage_capacity
+            .reader(StorageRoot::Complete)
+            .ledger(),
+    );
+    assert_eq!(pipeline.storage_capacity.waited_paths(), 0);
+
+    destination_room(Some(5));
+    drive(&mut pipeline, &scenario, JOB, |pipeline| {
+        pipeline.held_for_full_disk(JOB)
+    })
+    .await;
+    assert_move_held(&pipeline);
+    assert_eq!(
+        pipeline.storage_capacity.waited_paths(),
+        1,
+        "the folder's disk is read while the job waits on it"
+    );
+    assert!(
+        !output.waited_on() && !working(&pipeline).waited_on(),
+        "it waits on neither root's disk"
+    );
+    destination_room(None);
+
+    // The folder's disk is read with the complete root: its first reading
+    // since the failure is all the job has to compare with.
+    hears(&mut pipeline, &room, StorageRoot::Complete, 2 * PLENTY);
+    assert_move_held(&pipeline);
+    // The roots read more room still; the folder's disk reads none made.
+    hears(&mut pipeline, &room, StorageRoot::Intermediate, 4 * PLENTY);
+    hears(&mut pipeline, &room, StorageRoot::Complete, 4 * PLENTY);
+    assert_move_held(&pipeline);
+
+    library_room.store(2 * PLENTY, Ordering::Release);
+    hears(&mut pipeline, &room, StorageRoot::Complete, 4 * PLENTY);
+    assert_eq!(
+        pipeline.storage_capacity.waited_paths(),
+        0,
+        "no one waits on the folder's disk, and it is read no more"
+    );
+    move_goes_on(&mut pipeline, &scenario, &library, &working_dir).await;
+}

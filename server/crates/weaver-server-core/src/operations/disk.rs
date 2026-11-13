@@ -1544,6 +1544,67 @@ impl PublishedCapacity {
     }
 }
 
+// A path on none of the roots' disks that a job waits for room on after a
+// write there found it full. It is read with the complete root, each pass,
+// from the first wait on it to the end of the last.
+#[derive(Debug)]
+struct HeldPath {
+    path: PathBuf,
+    holds: usize,
+    // The probes of the path begun, and which of them took `free`.
+    begun: u64,
+    published: u64,
+    // The free bytes its latest probe read: `None` before one, and after
+    // one that failed.
+    free: Option<u64>,
+    // As a root's: each failure met while a probe ran, and what it read.
+    straddling: Vec<(u64, Option<u64>)>,
+}
+
+#[derive(Debug, Default)]
+struct HeldPaths {
+    // How many paths are listed, so a pass with none takes no lock.
+    listed: std::sync::atomic::AtomicUsize,
+    list: Mutex<Vec<HeldPath>>,
+}
+
+impl HeldPaths {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<HeldPath>> {
+        self.list
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    // One pass over the listed paths: each is probed with no lock held.
+    // Whoever waits hears that the paths were read.
+    fn sample(&self, probe: &ProbeFn, ledger: &DiskLedger) {
+        let paths: Vec<PathBuf> = self
+            .lock()
+            .iter_mut()
+            .map(|held| {
+                held.begun += 1;
+                held.path.clone()
+            })
+            .collect();
+        for path in paths {
+            let free = probe(&path).ok().map(|space| space.available_bytes);
+            let mut list = self.lock();
+            if let Some(held) = list.iter_mut().find(|held| held.path == path) {
+                held.published = held.begun;
+                held.free = free;
+                let probe = held.begun;
+                for (running, figure) in &mut held.straddling {
+                    if *running == probe {
+                        *figure = free;
+                    }
+                }
+            }
+        }
+        ledger.counts.rings.fetch_add(1, Ordering::Release);
+        ledger.readings.notify_one();
+    }
+}
+
 #[derive(Debug)]
 struct RootSlot {
     root: StorageRoot,
@@ -1589,6 +1650,8 @@ pub struct StorageCapacity {
     readings: Arc<tokio::sync::Notify>,
     // Every other path asked after, looked at on demand.
     paths: Arc<Mutex<PathCache>>,
+    // The paths off the roots' disks that jobs wait for room on.
+    held: Arc<HeldPaths>,
     interval: Duration,
     probe: SharedProbeFn,
     clock: Arc<Clock>,
@@ -1683,6 +1746,7 @@ impl StorageCapacity {
                 }
             })
         });
+        let held = Arc::new(HeldPaths::default());
         for slot in &slots {
             // The sampler waits on its own slot's condition variable, so
             // the gate opening has to wake it there.
@@ -1694,10 +1758,18 @@ impl StorageCapacity {
             let thread_slot = Arc::clone(slot);
             let thread_probe: SharedProbeFn = Arc::clone(&probe);
             let thread_gate = startup_disk_work.clone();
+            // The complete root's thread reads the held paths with it.
+            let thread_held = (slot.root == StorageRoot::Complete).then(|| Arc::clone(&held));
             let spawned = std::thread::Builder::new()
                 .name(format!("{SAMPLER_THREAD}{}", slot.root.label()))
                 .spawn(move || {
-                    run_root_sampler(&thread_slot, interval, thread_probe, &thread_gate)
+                    run_root_sampler(
+                        &thread_slot,
+                        interval,
+                        thread_probe,
+                        &thread_gate,
+                        thread_held.as_deref(),
+                    )
                 });
             if let Err(error) = spawned {
                 warn!(
@@ -1711,6 +1783,7 @@ impl StorageCapacity {
             slots,
             readings,
             paths: Arc::default(),
+            held,
             interval,
             probe,
             clock,
@@ -2158,6 +2231,89 @@ impl StorageCapacity {
             .map(|reading| (probe, reading))
     }
 
+    // A write on `path`, which lies on none of the roots' disks, failed now
+    // for want of room, and a job waits on it: the path is read with the
+    // complete root from here, and a reading is asked for now. What
+    // `failed_at` tells of a root, for the path.
+    pub(crate) fn hold_path(&self, path: &Path) -> (u64, Option<u64>) {
+        let failed = {
+            let mut list = self.held.lock();
+            let at = match list.iter().position(|held| held.path == path) {
+                Some(at) => at,
+                None => {
+                    list.push(HeldPath {
+                        path: path.to_path_buf(),
+                        holds: 0,
+                        begun: 0,
+                        published: 0,
+                        free: None,
+                        straddling: Vec::new(),
+                    });
+                    self.held.listed.store(list.len(), Ordering::Release);
+                    list.len() - 1
+                }
+            };
+            let held = &mut list[at];
+            held.holds += 1;
+            if held.published < held.begun {
+                held.straddling.push((held.begun, None));
+                (held.begun, None)
+            } else {
+                (held.begun, held.free)
+            }
+        };
+        self.slot(StorageRoot::Complete).request_refresh();
+        failed
+    }
+
+    // What `straddled` tells of a root, for a held path.
+    pub(crate) fn path_straddled(&self, path: &Path, begun: u64) -> Option<u64> {
+        self.held
+            .lock()
+            .iter()
+            .find(|held| held.path == path)?
+            .straddling
+            .iter()
+            .find(|(running, _)| *running == begun)
+            .and_then(|(_, figure)| *figure)
+    }
+
+    // A held path's latest probe, by its count, and the free bytes it read
+    // (`None` when it failed), when that probe began after `begun` had.
+    pub(crate) fn path_reading_after(&self, path: &Path, begun: u64) -> Option<(u64, Option<u64>)> {
+        let list = self.held.lock();
+        let held = list.iter().find(|held| held.path == path)?;
+        (held.published > begun).then_some((held.published, held.free))
+    }
+
+    // A job no longer waits on `path` for the failure counted at `begun`:
+    // the path leaves the list with its last wait.
+    pub(crate) fn release_path(&self, path: &Path, begun: u64) {
+        let mut list = self.held.lock();
+        let Some(at) = list.iter().position(|held| held.path == path) else {
+            return;
+        };
+        let held = &mut list[at];
+        if let Some(straddle) = held
+            .straddling
+            .iter()
+            .position(|(running, _)| *running == begun)
+        {
+            held.straddling.swap_remove(straddle);
+        }
+        held.holds = held.holds.saturating_sub(1);
+        if held.holds == 0 {
+            list.swap_remove(at);
+            self.held.listed.store(list.len(), Ordering::Release);
+        }
+    }
+
+    // How many paths off the roots' disks are being read for a wait.
+    #[cfg(test)]
+    pub(crate) fn waited_paths(&self) -> usize {
+        self.held.listed.load(Ordering::Acquire)
+    }
+
     // Ask `root`'s thread to probe again without waiting out its interval.
     // A request made while a probe is running is served after it finishes.
     pub fn request_refresh(&self, root: StorageRoot) {
@@ -2272,6 +2428,7 @@ fn run_root_sampler(
     interval: Duration,
     probe: SharedProbeFn,
     startup_disk_work: &StartupDiskGate,
+    held: Option<&HeldPaths>,
 ) {
     // Hold the first probe until the startup disk work is done. Stopping the
     // storage meanwhile ends the wait as well.
@@ -2319,6 +2476,13 @@ fn run_root_sampler(
         let mark = slot.ledger.mark();
         let sampler = sampler.as_mut().expect("a sampler for the current path");
         let capacity = sampler.refresh();
+        // The paths jobs wait on off the roots' disks are read in the same
+        // pass: with none listed, this is one look at a count.
+        if let Some(held) = held
+            && held.listed.load(Ordering::Acquire) > 0
+        {
+            held.sample(&*probe, &slot.ledger);
+        }
         let mut state = slot.lock();
         // A retarget while the probe ran makes this reading the old
         // directory's; the thread probes the new one straight away.

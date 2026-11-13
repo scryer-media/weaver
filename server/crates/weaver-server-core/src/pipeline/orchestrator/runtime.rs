@@ -321,6 +321,7 @@ impl Pipeline {
             disk_unadmitted: std::collections::BTreeSet::new(),
             full_disk: std::collections::BTreeMap::new(),
             full_disk_highs: std::collections::BTreeMap::new(),
+            full_disk_moves: Vec::new(),
             #[cfg(test)]
             full_disk_sweeps: Vec::new(),
             nntp_handoff_draining: false,
@@ -1121,6 +1122,7 @@ impl Pipeline {
                 break;
             }
             self.run_queue_intents().await;
+            self.resume_full_disk_moves().await;
             turn_timer.phase(PipelinePhase::ReadyResults);
             // Whether this turn was woken by, or found, anything other than a
             // periodic tick. Only such a turn can have changed what the job
