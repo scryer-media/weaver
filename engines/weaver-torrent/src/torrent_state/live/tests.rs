@@ -7237,6 +7237,46 @@ async fn a_block_copied_into_memory_takes_no_blocking_permit_and_the_piece_check
     assert!(h.have(0));
 }
 
+// The check of a piece whose last block landed belongs to the torrent, not
+// to the connection that sent the block: the connection ends while the check
+// waits for a blocking permit, and the piece is checked and had all the same
+// (libtorrent `torrent::verify_piece` hands the hash job to the disk thread
+// bound to the torrent, `shared_from_this()`, and `torrent::on_piece_verified`
+// takes its verdict whatever became of the sender). Here piece 1 is had, so
+// the torrent completes once piece 0 is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_piece_whose_connection_ends_before_its_check_is_checked_all_the_same() {
+    let storage = HeldStorageFactory::default();
+    let h = Harness::build_on(
+        "check_outlives_connection",
+        0x40,
+        isolated_session_opts(false),
+        storage.clone_box(),
+    )
+    .await;
+    let (owner, _owner_rx) = h.peer("127.0.0.1:6881");
+    h.take(&owner, 0);
+    let last = CHUNKS_PER_PIECE - 1;
+    for chunk in 0..last {
+        h.send(&owner, (0, chunk), false).await.unwrap();
+    }
+    let semaphore = h.live.shared.spawner.semaphore();
+    let permits = u32::try_from(semaphore.available_permits()).unwrap();
+    let taken = semaphore.acquire_many_owned(permits).await.unwrap();
+
+    // The last block lands, and its piece's check waits for a permit when
+    // the connection reading it ends.
+    let mut arrival = Box::pin(h.send(&owner, (0, last), false));
+    assert!(futures::poll!(arrival.as_mut()).is_pending());
+    assert!(h.missing_chunks(0).is_empty());
+    drop(arrival);
+    assert!(!h.have(0));
+
+    drop(taken);
+    h.handle().wait_until_completed().await.unwrap();
+    assert!(h.have(0));
+}
+
 // Idle torrents cost the session's rate tick nothing: with `n` torrents
 // and no peer, the tick samples none however long the clock runs; once one
 // torrent has a live peer, the tick samples that torrent alone (libtorrent
