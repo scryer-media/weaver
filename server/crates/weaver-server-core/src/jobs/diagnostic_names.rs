@@ -398,6 +398,7 @@ mod tests {
                 completed_at: 2,
                 metadata: Some(r#"[["request","History Attribute"]]"#.to_string()),
                 server_attribution: None,
+                files_removed_at: None,
             },
         )
         .unwrap();

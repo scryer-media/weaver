@@ -138,6 +138,7 @@ fn history_report_carries_the_outcome_and_no_names() {
             completed_at: 1_767_000_090,
             metadata: Some(format!("[[\"{SENTINEL}\",\"{SENTINEL}\"]]")),
             server_attribution: attribution.to_storage_json(),
+            files_removed_at: None,
         },
     )
     .unwrap();
@@ -304,6 +305,7 @@ fn history_row(id: u64, status: &str) -> JobHistoryRow {
         completed_at: 1_767_000_090,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     }
 }
 

@@ -28,12 +28,13 @@ export const NEXT_HISTORY_PAGE_QUERY = gql`
         category
         createdAt
         completedAt
+        filesRemovedAt
         deleteOperation {
-          operationId
           state
           locked
-          deleteFiles
+          action
           errorMessage
+          filesRemovalOutcome
         }
       }
       totalCount

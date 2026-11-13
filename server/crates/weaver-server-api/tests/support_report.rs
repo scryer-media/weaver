@@ -91,6 +91,7 @@ fn seed_history_job_with_facts(h: &TestHarness, job_id: u64, facts: Option<Strin
             completed_at: 1_767_000_010,
             metadata: None,
             server_attribution: None,
+            files_removed_at: None,
         },
     )
     .unwrap();

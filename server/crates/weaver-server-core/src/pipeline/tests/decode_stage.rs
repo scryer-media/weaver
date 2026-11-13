@@ -1281,28 +1281,27 @@ async fn fail_job_clears_write_backlog_accounting() {
         checkpoint_plan: weaver_yenc::CheckpointPlan::None,
     };
     let parked_len = data.len();
-    pipeline
-        .unanchored_parked
-        .entry(file_id)
-        .or_default()
-        .insert(
-            1,
-            crate::pipeline::UnanchoredPart {
-                result: parked,
-                bytes: crate::pipeline::ParkedBytes::Memory(DecodedChunk::from(data)),
-                source: SegmentSource {
-                    source_server_idx: None,
-                    exclude_servers: Vec::new(),
-                },
+    pipeline.unanchored_parked.insert(
+        file_id,
+        1,
+        crate::pipeline::UnanchoredPart {
+            result: parked,
+            bytes: crate::pipeline::ParkedBytes::Memory(DecodedChunk::from(data)),
+            source: SegmentSource {
+                source_server_idx: None,
+                exclude_servers: Vec::new(),
             },
-        );
+        },
+    );
     pipeline.note_write_buffered(parked_len, 1);
+    assert_eq!(pipeline.unanchored_parked.parts(), 1);
 
     pipeline.fail_job(job_id, "forced failure".to_string());
 
     settle_failed_releases(&mut pipeline).await;
 
     assert!(!pipeline.unanchored_parked.contains_key(&file_id));
+    assert_eq!(pipeline.unanchored_parked.parts(), 0);
     assert_eq!(pipeline.write_buffered_bytes, 0);
     assert_eq!(pipeline.write_buffered_segments, 0);
     assert_eq!(

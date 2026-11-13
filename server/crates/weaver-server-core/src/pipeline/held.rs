@@ -290,11 +290,15 @@ impl Pipeline {
                     self.note_uu_parked_segment();
                 }
                 Some(result) => {
-                    let parked = self.unanchored_parked.entry(file_id).or_default();
-                    if parked.contains_key(&ordinal) {
+                    if self
+                        .unanchored_parked
+                        .get(&file_id)
+                        .is_some_and(|parked| parked.contains_key(&ordinal))
+                    {
                         continue;
                     }
-                    parked.insert(
+                    self.unanchored_parked.insert(
+                        file_id,
                         ordinal,
                         UnanchoredPart {
                             result: *result,

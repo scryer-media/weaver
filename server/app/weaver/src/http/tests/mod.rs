@@ -170,6 +170,7 @@ fn nzbget_history_row(
         completed_at,
         metadata,
         server_attribution: None,
+        files_removed_at: None,
     }
 }
 
@@ -219,6 +220,7 @@ fn test_config() -> SharedConfig {
         max_download_speed: None,
         cleanup_after_extract: None,
         delete_failed_job_files: None,
+        history_retention_days: None,
         propagation_delay_secs: None,
         max_concurrent_nzbs: None,
         watch_folder: weaver_server_core::watch_folder::WatchFolderConfig::default(),

@@ -332,12 +332,14 @@ async fn giving_up_a_predecessor_retires_the_articles_held_behind_it() {
     let buffered = pipeline.write_buffered_bytes;
     deliver_unanchored(&mut pipeline, file_id, 1, b"bbbb").await;
     deliver_unanchored(&mut pipeline, file_id, 2, b"cccc").await;
+    assert_eq!(pipeline.unanchored_parked.parts(), 2);
     let head = SegmentId {
         file_id,
         segment_number: 0,
     };
     pipeline.book_terminal_segment(head, SegmentTerminalState::Missing);
     assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.unanchored_parked.parts(), 0);
     assert_eq!(pipeline.write_buffered_bytes, buffered);
     for number in [1, 2] {
         assert_eq!(
@@ -388,6 +390,78 @@ async fn an_article_that_cannot_be_held_is_requeued_until_the_file_stalls() {
     // The file moved on, so the count starts over rather than accumulating.
     assert_eq!(pipeline.unanchored_requeues.get(&segment), Some(&(1, 1)));
     assert!(!pipeline.segment_terminal_states.contains_key(&segment));
+}
+
+// The park holds only so many articles across every file. One past that is
+// asked for again without retry budget, exactly as one past its file's share
+// is, while a copy of a part already held still takes its place and an
+// article that states its own start is placed as always. Once the run's head
+// lands, the park drains and the refused article is placed behind it.
+#[tokio::test]
+async fn an_article_past_the_parks_total_is_requeued_without_retry_budget() {
+    let temp = tempfile::tempdir().unwrap();
+    let (mut pipeline, file_id, path) = setup(&temp, 40243, &[16, 16, 16, 16]).await;
+    pipeline.unanchored_park_max_parts = 1;
+    let refused = SegmentId {
+        file_id,
+        segment_number: 3,
+    };
+    let queued = |pipeline: &Pipeline| {
+        pipeline.jobs[&file_id.job_id]
+            .articles
+            .active()
+            .unwrap()
+            .download_queue
+            .len()
+    };
+    let buffered = pipeline.write_buffered_bytes;
+    let buffered_segments = pipeline.write_buffered_segments;
+
+    deliver_unanchored(&mut pipeline, file_id, 1, b"bbbb").await;
+    assert_eq!(pipeline.unanchored_parked.parts(), 1);
+    assert!(pipeline.unanchored_parked[&file_id].len() < pipeline.uu_park_max_segments);
+
+    deliver_unanchored(&mut pipeline, file_id, 3, b"dddd").await;
+    assert_eq!(pipeline.unanchored_parked.parts(), 1);
+    assert!(!pipeline.unanchored_parked[&file_id].contains_key(&3));
+    assert_eq!(pipeline.unanchored_requeues.get(&refused), Some(&(1, 0)));
+    assert!(!pipeline.decode_retries.contains_key(&refused));
+    assert!(!pipeline.segment_terminal_states.contains_key(&refused));
+    assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 0);
+    assert_eq!(queued(&pipeline), 1);
+    let _ = pipeline
+        .jobs
+        .get_mut(&file_id.job_id)
+        .unwrap()
+        .articles
+        .active_mut()
+        .unwrap()
+        .download_queue
+        .drain_all();
+
+    // A second copy of the held part replaces it, its charge with it.
+    deliver_unanchored(&mut pipeline, file_id, 1, b"bbbb").await;
+    assert_eq!(pipeline.unanchored_parked.parts(), 1);
+    assert_eq!(pipeline.write_buffered_bytes, buffered + 4);
+    assert_eq!(pipeline.write_buffered_segments, buffered_segments + 1);
+    assert_eq!(queued(&pipeline), 0);
+
+    // An article that states its start never meets the park.
+    deliver(&mut pipeline, file_id, 2, 8, b"cccc", true).await;
+    assert!(article_in_hand(&pipeline, file_id, 2));
+    assert_eq!(pipeline.unanchored_parked.parts(), 1);
+
+    deliver(&mut pipeline, file_id, 0, 0, b"aaaa", true).await;
+    assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.unanchored_parked.parts(), 0);
+    assert_eq!(pipeline.write_buffered_bytes, buffered);
+
+    deliver_unanchored(&mut pipeline, file_id, 3, b"dddd").await;
+    assert_eq!(std::fs::read(path).unwrap(), b"aaaabbbbccccdddd");
+    assert!(in_hand(&pipeline, file_id));
+    assert!(!pipeline.decode_retries.contains_key(&refused));
+    assert_eq!(pipeline.metrics.decode_errors.load(Ordering::Relaxed), 0);
+    assert_eq!(queued(&pipeline), 0);
 }
 
 // An article arriving after the part it follows was given up is retired at
@@ -600,6 +674,7 @@ async fn an_article_without_a_start_waits_for_its_predecessor() {
     let buffered = pipeline.write_buffered_bytes;
     deliver_unanchored(&mut pipeline, file_id, 1, b"tail").await;
     assert!(pipeline.unanchored_parked[&file_id].contains_key(&1));
+    assert_eq!(pipeline.unanchored_parked.parts(), 1);
     assert_eq!(pipeline.write_buffered_bytes, buffered + 4);
     assert!(pipeline.unanchored_requeues.is_empty());
     assert!(!pipeline.decode_retries.contains_key(&segment));
@@ -617,6 +692,7 @@ async fn an_article_without_a_start_waits_for_its_predecessor() {
     deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
     assert_eq!(std::fs::read(path).unwrap(), b"headtail");
     assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.unanchored_parked.parts(), 0);
     assert_eq!(pipeline.write_buffered_bytes, buffered);
     let file = pipeline.jobs[&file_id.job_id]
         .articles
@@ -646,9 +722,11 @@ async fn a_run_of_held_articles_releases_behind_its_head() {
     deliver_unanchored(&mut pipeline, file_id, 2, b"cccc").await;
     deliver_unanchored(&mut pipeline, file_id, 1, b"bbbb").await;
     assert_eq!(pipeline.unanchored_parked[&file_id].len(), 2);
+    assert_eq!(pipeline.unanchored_parked.parts(), 2);
     deliver(&mut pipeline, file_id, 0, 0, b"aaaa", true).await;
     assert_eq!(std::fs::read(path).unwrap(), b"aaaabbbbcccc");
     assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.unanchored_parked.parts(), 0);
     let file = pipeline.jobs[&file_id.job_id]
         .articles
         .active()
@@ -792,6 +870,7 @@ async fn a_run_held_behind_settled_damage_releases_in_order() {
     pipeline.release_settled_unanchored_runs().await;
 
     assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.unanchored_parked.parts(), 0);
     assert_eq!(std::fs::read(&path).unwrap(), b"aa\0\0bbbbcccc");
     let file = pipeline.jobs[&file_id.job_id]
         .articles
@@ -1147,6 +1226,8 @@ async fn an_article_held_across_a_pause_is_placed_without_being_fetched_again() 
     ));
     assert_eq!(pipeline.write_buffered_bytes, buffered);
     assert_eq!(pipeline.uu_spooled_bytes, 4);
+    // Spilling moves the part; it is still one part held.
+    assert_eq!(pipeline.unanchored_parked.parts(), 1);
 
     pipeline.resume_job_runtime(job_id).unwrap();
     crate::pipeline::tests::activate_job(&mut pipeline, job_id).await;
@@ -1170,6 +1251,7 @@ async fn an_article_held_across_a_pause_is_placed_without_being_fetched_again() 
         .drain_all();
     deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
     assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.unanchored_parked.parts(), 0);
     assert_eq!(pipeline.uu_spooled_bytes, 0);
     assert_eq!(pipeline.write_buffered_bytes, buffered);
     pipeline.check_job_completion(job_id).await;
@@ -1272,6 +1354,8 @@ async fn an_article_held_across_a_restart_is_placed_without_being_fetched_again(
         .extend_segment_ids(&mut asked);
     assert_eq!(asked, std::collections::HashSet::from([head]));
     assert_eq!(pipeline.uu_spooled_bytes, 4);
+    // The restarted pipeline counts the part it took back.
+    assert_eq!(pipeline.unanchored_parked.parts(), 1);
 
     let _ = pipeline
         .jobs
@@ -1285,6 +1369,7 @@ async fn an_article_held_across_a_restart_is_placed_without_being_fetched_again(
     let buffered = pipeline.write_buffered_bytes;
     deliver(&mut pipeline, file_id, 0, 0, b"head", true).await;
     assert!(pipeline.unanchored_parked.is_empty());
+    assert_eq!(pipeline.unanchored_parked.parts(), 0);
     assert_eq!(pipeline.uu_spooled_bytes, 0);
     assert_eq!(pipeline.write_buffered_bytes, buffered);
     assert!(!spool.exists());

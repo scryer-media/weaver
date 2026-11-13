@@ -296,6 +296,7 @@ mod tests {
                 .unwrap(),
             ),
             server_attribution: None,
+            files_removed_at: None,
         })
         .unwrap();
         db

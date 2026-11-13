@@ -83,6 +83,7 @@ mod deep;
 mod delivery;
 mod depth;
 mod disk_wait;
+mod download_summary;
 mod embedded;
 mod encrypted_hex;
 mod first_article_sample;

@@ -2,6 +2,7 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::StateError;
+use crate::history::output_files::OutputFileListing;
 use crate::history::record::{IntegrationEventRow, JobHistoryRow};
 use crate::history::{parse_history_metadata, public_history_attributes};
 use crate::jobs::ids::JobId;
@@ -173,8 +174,8 @@ impl Database {
                              optional_recovery_bytes, optional_recovery_downloaded_bytes,
                              failed_bytes, health, category, output_dir, nzb_path,
                              created_at, completed_at, metadata, server_attribution, release_name,
-                             search_key)
-                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
+                             search_key, files_removed_at)
+                         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})
                          ON CONFLICT(job_id) DO UPDATE SET
                             job_hash = excluded.job_hash,
                             name = excluded.name,
@@ -194,10 +195,20 @@ impl Database {
                             metadata = excluded.metadata,
                             release_name = excluded.release_name,
                             search_key = excluded.search_key,
+                            files_removed_at = excluded.files_removed_at,
+                            removed_file_count = CASE WHEN excluded.files_removed_at IS NULL
+                                THEN NULL ELSE job_history.removed_file_count END,
+                            removed_file_bytes = CASE WHEN excluded.files_removed_at IS NULL
+                                THEN NULL ELSE job_history.removed_file_bytes END,
                             server_attribution = COALESCE(excluded.server_attribution, job_history.server_attribution)",
                         &args,
                     )
                     .await?;
+                    // An entry written with its files keeps no record of
+                    // removed ones.
+                    if attribute_entry.files_removed_at.is_none() {
+                        clear_history_removed_files_tx(tx, attribute_entry.job_id as i64).await?;
+                    }
                     replace_job_history_attributes_tx(tx, &attribute_entry).await?;
                     crate::jobs::duplicate_persistence::transition_duplicate_snapshot_for_history_tx(
                         tx,
@@ -359,6 +370,180 @@ impl Database {
 // returns those ids. Each chunk runs one `IN (...)` statement per table; the
 // `script_output_state` lock is taken once, first, in the same order as
 // insertion takes it.
+impl Database {
+    // Keeps the record of what each entry's output folder held, read before
+    // its removal: the totals and the first files, in one transaction. Only
+    // an entry with neither a stamp nor a record takes one, so a retry after
+    // a removal that failed part way keeps the record of the whole folder.
+    // The record is shown only once the entry is stamped.
+    pub(crate) fn record_history_removed_files(
+        &self,
+        records: &[(JobId, OutputFileListing)],
+    ) -> Result<(), StateError> {
+        if records.is_empty() {
+            return Ok(());
+        }
+        let records = records
+            .iter()
+            .map(|(job_id, listing)| {
+                i64::try_from(job_id.0)
+                    .map(|id| (id, listing.clone()))
+                    .map_err(|_| StateError::Database("job id is too large".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let job_ids = records.iter().map(|(id, _)| *id as u64).collect::<Vec<_>>();
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "record_history_removed_files", |tx| {
+                let records = records.clone();
+                Box::pin(async move { record_history_removed_files_tx(tx, &records).await })
+            })
+            .await
+        })?;
+        self.invalidate_job_history_cache_for(&job_ids);
+        Ok(())
+    }
+
+    // Says that the files of each entry were removed at `removed_at`, epoch
+    // seconds, in one transaction. An entry that already says so keeps its
+    // first time; the record kept before the removal is left as it is.
+    pub(crate) fn stamp_history_files_removed(
+        &self,
+        job_ids: &[JobId],
+        removed_at: i64,
+    ) -> Result<(), StateError> {
+        if job_ids.is_empty() {
+            return Ok(());
+        }
+        let ids = job_ids
+            .iter()
+            .map(|job_id| {
+                i64::try_from(job_id.0)
+                    .map_err(|_| StateError::Database("job id is too large".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let datastore = self.datastore();
+        self.run_sql_blocking(async move {
+            SqlRuntime::run_in_transaction(&datastore, "stamp_history_files_removed", |tx| {
+                let ids = ids.clone();
+                Box::pin(async move {
+                    for chunk in ids.chunks(max_rows_for_tx(tx, 1).saturating_sub(1).max(1)) {
+                        let placeholders = vec!["{}"; chunk.len()].join(", ");
+                        let mut args = Vec::with_capacity(chunk.len() + 1);
+                        args.push(SqlArg::I64(removed_at));
+                        args.extend(chunk.iter().map(|id| SqlArg::I64(*id)));
+                        tx.execute(
+                            &format!(
+                                "UPDATE job_history SET files_removed_at = {{}}
+                                  WHERE job_id IN ({placeholders})
+                                    AND files_removed_at IS NULL"
+                            ),
+                            &args,
+                        )
+                        .await?;
+                    }
+                    Ok(())
+                })
+            })
+            .await
+        })?;
+        let job_ids = job_ids.iter().map(|id| id.0).collect::<Vec<_>>();
+        self.invalidate_job_history_cache_for(&job_ids);
+        Ok(())
+    }
+}
+
+// The totals and the kept files of every entry with neither a stamp nor a
+// record: one update per chunk of entries, then one insert per chunk of
+// files, only for the entries the update took.
+async fn record_history_removed_files_tx(
+    tx: &mut SqlTx<'_>,
+    records: &[(i64, OutputFileListing)],
+) -> Result<(), StateError> {
+    let mut recorded = std::collections::BTreeSet::new();
+    for chunk in records.chunks(max_rows_for_tx(tx, 3).max(1)) {
+        let values =
+            vec!["(CAST({} AS BIGINT), CAST({} AS BIGINT), CAST({} AS BIGINT))"; chunk.len()]
+                .join(", ");
+        let mut args = Vec::with_capacity(chunk.len() * 3);
+        for (job_id, listing) in chunk {
+            args.push(SqlArg::I64(*job_id));
+            args.push(SqlArg::I64(
+                i64::try_from(listing.total_count).unwrap_or(i64::MAX),
+            ));
+            args.push(SqlArg::I64(
+                i64::try_from(listing.total_bytes).unwrap_or(i64::MAX),
+            ));
+        }
+        let rows = tx
+            .fetch_all(
+                &format!(
+                    "WITH removal (removal_id, file_count, file_bytes) AS (VALUES {values})
+                     UPDATE job_history
+                        SET removed_file_count = removal.file_count,
+                            removed_file_bytes = removal.file_bytes
+                       FROM removal
+                      WHERE job_history.job_id = removal.removal_id
+                        AND job_history.files_removed_at IS NULL
+                        AND job_history.removed_file_count IS NULL
+                  RETURNING job_id"
+                ),
+                &args,
+            )
+            .await?;
+        for row in rows {
+            recorded.insert(row.i64("job_id")?);
+        }
+    }
+
+    let files = records
+        .iter()
+        .filter(|(job_id, _)| recorded.contains(job_id))
+        .flat_map(|(job_id, listing)| {
+            listing
+                .files
+                .iter()
+                .enumerate()
+                .map(move |(ordinal, file)| (*job_id, ordinal as i64, file))
+        })
+        .collect::<Vec<_>>();
+    for chunk in files.chunks(max_rows_for_tx(tx, 4)) {
+        let values = vec!["({}, {}, {}, {})"; chunk.len()].join(", ");
+        let mut args = Vec::with_capacity(chunk.len() * 4);
+        for (job_id, ordinal, file) in chunk {
+            args.push(SqlArg::I64(*job_id));
+            args.push(SqlArg::I64(*ordinal));
+            args.push(SqlArg::Text(file.rel_path.clone()));
+            args.push(SqlArg::I64(
+                i64::try_from(file.size_bytes).unwrap_or(i64::MAX),
+            ));
+        }
+        tx.execute(
+            &format!(
+                "INSERT INTO job_history_removed_files (job_id, ordinal, rel_path, size_bytes)
+                 VALUES {values}"
+            ),
+            &args,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+// Forgets the removal record of `job_id`: its kept files and its totals. A
+// job that finishes again has its files again.
+pub(crate) async fn clear_history_removed_files_tx(
+    tx: &mut SqlTx<'_>,
+    job_id: i64,
+) -> Result<(), StateError> {
+    tx.execute(
+        "DELETE FROM job_history_removed_files WHERE job_id = {}",
+        &[SqlArg::I64(job_id)],
+    )
+    .await?;
+    Ok(())
+}
+
 pub(crate) async fn delete_job_history_bundles_tx(
     tx: &mut SqlTx<'_>,
     job_ids: &[JobId],
@@ -402,7 +587,11 @@ pub(crate) async fn delete_job_history_bundles_tx(
         }
         let placeholders = vec!["{}"; present.len()].join(", ");
         let args = present.iter().copied().map(SqlArg::I64).collect::<Vec<_>>();
-        for table in ["job_events", "job_history_attributes"] {
+        for table in [
+            "job_events",
+            "job_history_attributes",
+            "job_history_removed_files",
+        ] {
             tx.execute(
                 &format!("DELETE FROM {table} WHERE job_id IN ({placeholders})"),
                 &args,
@@ -447,5 +636,6 @@ fn job_history_args(entry: &JobHistoryRow) -> Vec<SqlArg> {
         SqlArg::OptText(entry.server_attribution.clone()),
         SqlArg::Text(release_name),
         SqlArg::Text(search_key),
+        SqlArg::OptI64(entry.files_removed_at),
     ]
 }

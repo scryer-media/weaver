@@ -1125,10 +1125,7 @@ impl Pipeline {
             if !self.admit_spool_bytes(bytes) {
                 continue;
             }
-            let Some(parked) = self.unanchored_parked.get_mut(&file_id) else {
-                continue;
-            };
-            let Some(mut part) = parked.remove(&ordinal) else {
+            let Some(mut part) = self.unanchored_parked.remove(file_id, ordinal) else {
                 continue;
             };
             let ParkedBytes::Memory(data) = part.bytes else {
@@ -1138,10 +1135,7 @@ impl Pipeline {
             self.release_write_buffered(bytes, 1);
             part.bytes = spilled?;
             self.note_uu_spooled(bytes, 1);
-            self.unanchored_parked
-                .entry(file_id)
-                .or_default()
-                .insert(ordinal, part);
+            self.unanchored_parked.insert(file_id, ordinal, part);
         }
         Ok(())
     }
@@ -1323,15 +1317,20 @@ impl Pipeline {
             .write_buffered_bytes
             .saturating_sub(replaced.unwrap_or(0))
             .saturating_add(bytes);
+        // A copy of a held part takes its place; anything else needs room in
+        // its file's share and in the park as a whole.
         let fits = (resident as u64) < write_soft
-            && (replaced.is_some() || parked_parts < self.uu_park_max_segments);
+            && (replaced.is_some()
+                || (parked_parts < self.uu_park_max_segments
+                    && self.unanchored_parked.parts() < self.unanchored_park_max_parts));
         if !fits {
             self.requeue_segment_awaiting_predecessor(segment_id);
             return;
         }
         let data = std::mem::replace(&mut result.data, DecodedChunk::from(Vec::<u8>::new()));
         self.note_write_buffered(bytes, 1);
-        let replaced = self.unanchored_parked.entry(file_id).or_default().insert(
+        let replaced = self.unanchored_parked.insert(
+            file_id,
             ordinal,
             UnanchoredPart {
                 result,
@@ -1382,15 +1381,11 @@ impl Pipeline {
         if !anchored {
             return None;
         }
-        let parked = self.unanchored_parked.get_mut(&file_id)?;
         let UnanchoredPart {
             mut result,
             bytes,
             source,
-        } = parked.remove(&successor)?;
-        if parked.is_empty() {
-            self.unanchored_parked.remove(&file_id);
-        }
+        } = self.unanchored_parked.remove(file_id, successor)?;
         match self.take_parked_bytes(file_id, bytes).await {
             Ok(data) => {
                 result.data = data;
@@ -1419,20 +1414,17 @@ impl Pipeline {
     // after it has lost its only way to be placed.
     pub(crate) fn take_unanchored_dependents(&mut self, segment_id: SegmentId) -> Vec<SegmentId> {
         let file_id = segment_id.file_id;
-        let Some(parked) = self.unanchored_parked.get_mut(&file_id) else {
+        if !self.unanchored_parked.contains_key(&file_id) {
             return Vec::new();
-        };
+        }
         let mut released = Vec::new();
         let mut next = segment_id.segment_number;
         while let Some(ordinal) = next.checked_add(1) {
-            let Some(part) = parked.remove(&ordinal) else {
+            let Some(part) = self.unanchored_parked.remove(file_id, ordinal) else {
                 break;
             };
             released.push(part);
             next = ordinal;
-        }
-        if parked.is_empty() {
-            self.unanchored_parked.remove(&file_id);
         }
         released
             .into_iter()

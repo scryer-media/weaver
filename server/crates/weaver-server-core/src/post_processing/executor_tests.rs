@@ -1154,6 +1154,7 @@ async fn a_waited_script_that_cannot_start_is_listed_among_the_jobs_runs() {
         completed_at: 1,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     })
     .unwrap();
     // The job waits for a script the scripts directory does not hold.

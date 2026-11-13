@@ -9,9 +9,6 @@ const FACADE_QUEUE_ITEM_FIELDS = `
     name
     displayTitle
     originalTitle
-    parsedRelease {
-      ...ParsedReleaseFields
-    }
     status: state
     downloadWaitReason
     downloadRetryAtEpochMs
@@ -86,9 +83,6 @@ export const FACADE_HISTORY_ITEM_FIELDS = `
     name
     displayTitle
     originalTitle
-    parsedRelease {
-      ...ParsedReleaseFields
-    }
     status: state
     progressPercent
     totalBytes
@@ -137,42 +131,45 @@ export const HISTORY_TABLE_ITEM_FIELDS = `
   }
 `;
 
-export const PARSED_RELEASE_FIELDS = `
-  fragment ParsedReleaseFields on ParsedRelease {
-    normalizedTitle
-    releaseGroup
-    languagesAudio
-    languagesSubtitles
-    year
-    quality
-    source
-    videoCodec
-    videoEncoding
-    audio
-    audioCodecs
-    audioChannels
-    isDualAudio
-    isAtmos
-    isDolbyVision
-    detectedHdr
-    isHdr10Plus
-    isHlg
-    fps
-    isProperUpload
-    isRepack
-    isRemux
-    isBdDisk
-    isAiEnhanced
-    isHardcodedSubs
-    streamingService
-    edition
-    animeVersion
-    parseConfidence
-    episode {
-      season
-      episodeNumbers
-      absoluteEpisode
-      raw
+const DOWNLOAD_SUMMARY_FIELDS = `
+  fragment DownloadSummaryFields on DownloadSummary {
+    layout
+    nodes {
+      id
+      parentId
+      kind
+      name
+      volumes
+      extracted
+      givenUp
+      reason
+      encrypted
+      encryptedHeaders
+      passwordNeeded
+      passwordOrigin
+    }
+    nodeCount
+    maxDepth
+    recovery {
+      kind
+      outcome
+      sets {
+        blocksReachable
+        damagedSlices
+        outcome
+        slicesRepaired
+      }
+      setCount
+    }
+    recoveryCount
+    post {
+      files
+      articles
+      missingArticles
+      failedArticles
+      oldestPost
+      newestPost
+      groups
     }
   }
 `;
@@ -431,8 +428,8 @@ export const CREATE_DIRECTORY_MUTATION = gql`
 `;
 
 export const JOB_OUTPUT_FILES_QUERY = gql`
-  query JobOutputFiles($jobId: Int!) {
-    jobOutputFiles(jobId: $jobId) {
+  query JobOutputFiles($jobId: Int!, $first: Int, $after: String) {
+    jobOutputFiles(jobId: $jobId, first: $first, after: $after) {
       outputDir
       files {
         name
@@ -440,6 +437,51 @@ export const JOB_OUTPUT_FILES_QUERY = gql`
         sizeBytes
       }
       totalBytes
+      totalCount
+      removed
+      nextCursor
+    }
+  }
+`;
+
+/** A later page of a job's output files: the totals came with the first. */
+export const JOB_OUTPUT_FILES_PAGE_QUERY = gql`
+  query JobOutputFilesPage($jobId: Int!, $first: Int, $after: String) {
+    jobOutputFiles(jobId: $jobId, first: $first, after: $after) {
+      files {
+        name
+        path
+        sizeBytes
+      }
+      nextCursor
+    }
+  }
+`;
+
+/** The first files of a job as the queue inspector lists them, and how many there are. */
+export const JOB_OUTPUT_FILES_INSPECTOR_QUERY = gql`
+  query JobOutputFilesInspector($jobId: Int!, $first: Int) {
+    jobOutputFiles(jobId: $jobId, first: $first) {
+      outputDir
+      files {
+        name
+        path
+        sizeBytes
+      }
+      totalCount
+    }
+  }
+`;
+
+/** One page of a job's older events, before an event's cursor. */
+export const JOB_EVENTS_BEFORE_QUERY = gql`
+  query JobEventsBefore($jobId: Int!, $before: String, $limit: Int) {
+    jobEvents(jobId: $jobId, before: $before, limit: $limit) {
+      kind
+      fileId
+      message
+      timestamp
+      cursor
     }
   }
 `;
@@ -451,6 +493,7 @@ const GENERAL_SETTINGS_FIELDS = `
     completeDir
     cleanupAfterExtract
     deleteFailedJobFiles
+    historyRetentionDays
     maxDownloadSpeed
     maxRetries
     propagationDelaySecs
@@ -781,6 +824,11 @@ export const JOB_QUERY = gql`
         ...FacadeHistoryItemFields
         error
         failedForMemory
+        filesRemovedAt
+        deleteOperation {
+          action
+          filesRemovalOutcome
+        }
       }
       jobTimeline {
         ...JobTimelineFields
@@ -791,17 +839,22 @@ export const JOB_QUERY = gql`
         fileId
         message
         timestamp
+        cursor
       }
+      jobEventCount
       serverAttribution {
         serverId
         serverHost
         articles
         wireBytes
       }
+      downloadSummary {
+        ...DownloadSummaryFields
+      }
     }
   }
   ${JOB_TIMELINE_FIELDS}
-  ${PARSED_RELEASE_FIELDS}
+  ${DOWNLOAD_SUMMARY_FIELDS}
   ${FACADE_QUEUE_ITEM_FIELDS}
   ${FACADE_HISTORY_ITEM_FIELDS}
 `;
@@ -869,6 +922,11 @@ export const JOB_DETAIL_UPDATES_SUBSCRIPTION = gql`
         ...FacadeHistoryItemFields
         error
         failedForMemory
+        filesRemovedAt
+        deleteOperation {
+          action
+          filesRemovalOutcome
+        }
       }
       jobTimeline {
         ...JobTimelineFields
@@ -879,17 +937,22 @@ export const JOB_DETAIL_UPDATES_SUBSCRIPTION = gql`
         fileId
         message
         timestamp
+        cursor
       }
+      jobEventCount
       serverAttribution {
         serverId
         serverHost
         articles
         wireBytes
       }
+      downloadSummary {
+        ...DownloadSummaryFields
+      }
     }
   }
   ${JOB_TIMELINE_FIELDS}
-  ${PARSED_RELEASE_FIELDS}
+  ${DOWNLOAD_SUMMARY_FIELDS}
   ${FACADE_QUEUE_ITEM_FIELDS}
   ${FACADE_HISTORY_ITEM_FIELDS}
 `;
@@ -1085,7 +1148,6 @@ export const DELETE_HISTORY_MUTATION = gql`
       ...FacadeHistoryItemFields
     }
   }
-  ${PARSED_RELEASE_FIELDS}
   ${FACADE_HISTORY_ITEM_FIELDS}
 `;
 
@@ -1095,7 +1157,6 @@ export const DELETE_HISTORY_BATCH_MUTATION = gql`
       ...FacadeHistoryItemFields
     }
   }
-  ${PARSED_RELEASE_FIELDS}
   ${FACADE_HISTORY_ITEM_FIELDS}
 `;
 
@@ -1105,7 +1166,6 @@ export const DELETE_ALL_HISTORY_MUTATION = gql`
       ...FacadeHistoryItemFields
     }
   }
-  ${PARSED_RELEASE_FIELDS}
   ${FACADE_HISTORY_ITEM_FIELDS}
 `;
 
@@ -1114,6 +1174,17 @@ export const ACCEPT_HISTORY_DELETE_MUTATION = gql`
     acceptHistoryDelete(input: $input) {
       operationId
       totalTargets
+    }
+  }
+`;
+
+export const REMOVE_HISTORY_FILES_MUTATION = gql`
+  mutation RemoveHistoryFiles($ids: [Int!]!) {
+    removeHistoryFiles(ids: $ids) {
+      results {
+        id
+        outcome
+      }
     }
   }
 `;
@@ -1172,7 +1243,6 @@ export const QUEUE_EVENTS_SUBSCRIPTION = gql`
       }
     }
   }
-  ${PARSED_RELEASE_FIELDS}
   ${FACADE_QUEUE_ITEM_FIELDS}
   ${DOWNLOAD_BLOCK_FIELDS}
 `;
@@ -2452,8 +2522,3 @@ export const SET_UNACCEPTABLE_EXTENSIONS_MUTATION = gql`
   }
 `;
 
-export const VALIDATED_ARCHIVE_PASSWORD_QUERY = gql`
-  query ValidatedArchivePassword($id: Int!) {
-    validatedArchivePassword(id: $id)
-  }
-`;

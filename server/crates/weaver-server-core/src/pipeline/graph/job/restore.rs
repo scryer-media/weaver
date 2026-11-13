@@ -117,7 +117,7 @@ impl GraphJob {
             works: super::works::Works::new(runs.scope(), runs.mail(), runs.hardware())
                 .timed(runs.clock()),
             runs,
-            passwords: Passwords::new(storage.passwords),
+            passwords: Passwords::from_candidates(storage.passwords),
             reported: snapshot.root.reported,
             pending: Pending::default(),
             mail_owed: None,

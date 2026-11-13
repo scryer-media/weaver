@@ -35,6 +35,59 @@ fn exported_schema_has_no_trailing_whitespace() {
     }
 }
 
+// No field a client reads returns a password. Inputs may take one; every
+// field of an output type that names a password says only whether there is
+// one, except the settings' password-file path, the settings object
+// (which carries only `hasPasswords` and that path), and the closed enum
+// naming where an archive's password came from.
+#[test]
+fn no_output_field_returns_a_password() {
+    let sdl = export_schema_sdl();
+    let mut output = false;
+    let mut doc = false;
+    let mut offenders = Vec::new();
+    for line in sdl.lines() {
+        if line.trim() == "\"\"\"" {
+            doc = !doc;
+            continue;
+        }
+        if doc {
+            continue;
+        }
+        if line.starts_with("type ") || line.starts_with("interface ") {
+            output = true;
+            continue;
+        }
+        if line.starts_with("input ") || line.starts_with('}') {
+            output = false;
+            continue;
+        }
+        let Some(field) = line.strip_prefix('\t') else {
+            continue;
+        };
+        if !output || field.starts_with('"') || field.starts_with('\t') {
+            continue;
+        }
+        let name = field.split(['(', ':']).next().unwrap_or("").trim();
+        let returns = field.rsplit(':').next().unwrap_or("").trim();
+        if name.to_ascii_lowercase().contains("password")
+            && returns != "Boolean!"
+            && returns != "ArchivePasswordOrigin"
+            && !matches!(
+                name,
+                "passwordFile" | "archivePasswordSettings" | "updateArchivePasswordSettings"
+            )
+        {
+            offenders.push(field.to_owned());
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "fields returning a password: {offenders:?}"
+    );
+    assert!(!sdl.contains("validatedArchivePassword"));
+}
+
 #[test]
 fn script_declarations_do_not_replace_the_queue_subscription_event_type() {
     // The runtime deliberately disables introspection; inspect the public SDL.

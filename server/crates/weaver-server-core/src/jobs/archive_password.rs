@@ -2,8 +2,8 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 use crate::history::attributes::VALIDATED_ARCHIVE_PASSWORD_ATTRIBUTE_KEY;
-use crate::persistence::encryption::{decrypt_value, encrypt_value};
-use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
+use crate::persistence::encryption::encrypt_value;
+use crate::persistence::sql_runtime::SqlRuntime;
 use crate::{Database, StateError};
 
 impl Database {
@@ -34,7 +34,15 @@ impl Database {
             .map_err(|_| StateError::Conflict("could not encrypt archive password".into()))
     }
 
-    pub fn validated_archive_password(&self, job_id: u64) -> Result<Option<String>, StateError> {
+    // The opened password, unsealed. Only tests read it back, to prove it
+    // was sealed; no API serves a job's password.
+    #[cfg(test)]
+    pub(crate) fn validated_archive_password(
+        &self,
+        job_id: u64,
+    ) -> Result<Option<String>, StateError> {
+        use crate::persistence::encryption::decrypt_value;
+        use crate::persistence::sql_runtime::SqlArg;
         let datastore = self.datastore();
         let job_id =
             i64::try_from(job_id).map_err(|_| StateError::Conflict("invalid job id".into()))?;

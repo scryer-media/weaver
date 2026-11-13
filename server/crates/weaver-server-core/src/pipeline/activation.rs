@@ -462,7 +462,7 @@ impl Pipeline {
     // start ahead of the ordinal they follow.
     fn held_parts(
         uu_files: &HashMap<NzbFileId, UuFileAssembly>,
-        unanchored_parked: &HashMap<NzbFileId, BTreeMap<u32, UnanchoredPart>>,
+        unanchored_parked: &UnanchoredPark,
         job_id: JobId,
     ) -> HashSet<SegmentId> {
         let uu = uu_files

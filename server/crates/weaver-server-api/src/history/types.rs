@@ -49,6 +49,10 @@ pub struct HistoryItem {
     pub delete_operation: Option<HistoryDeleteRowState>,
     #[serde(default)]
     pub duplicate_summary: Option<DuplicateSummaryInfo>,
+    /// When the entry's files were removed and the entry kept; null while
+    /// they are still there.
+    #[serde(default)]
+    pub files_removed_at: Option<DateTime<Utc>>,
     // The job's stored record of full file names, read only when a query
     // selects `fullFileNames`.
     #[graphql(skip)]
@@ -134,13 +138,29 @@ pub enum HistoryDeleteOperationState {
     CompletedWithErrors,
 }
 
+/// What a history operation does with its entries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
+pub enum HistoryOperationAction {
+    /// Deletes the entry, with or without its files.
+    Delete,
+    /// Removes the entry's files and keeps the entry.
+    RemoveFiles,
+}
+
+/// The history operation an entry is waiting on, or the last one that
+/// failed for it. A files removal that succeeded shows here no more; the
+/// entry's `filesRemovedAt` says so instead.
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject, Serialize, Deserialize)]
 pub struct HistoryDeleteRowState {
     pub operation_id: u64,
     pub state: HistoryDeleteRowStateKind,
     pub locked: bool,
+    pub action: HistoryOperationAction,
     pub delete_files: bool,
     pub error_message: Option<String>,
+    /// How a failed files removal ended; null for a delete, and while the
+    /// removal waits or runs.
+    pub files_removal_outcome: Option<HistoryFilesRemovalOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
@@ -154,6 +174,112 @@ pub struct HistoryDeleteOperation {
     pub completed_targets: u32,
     pub failed_targets: u32,
     pub requested_at: DateTime<Utc>,
+}
+
+/// What removing one history entry's files did. The entry stays either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
+pub enum HistoryFilesRemovalOutcome {
+    /// Folders Weaver manages were removed.
+    Removed,
+    /// Nothing was on disk, or the files were already removed.
+    AlreadyGone,
+    /// A folder of the job is not one Weaver manages and was left as it is.
+    NotManaged,
+    /// The job is in the queue or another history operation holds it.
+    Busy,
+    /// There is no history entry with this id.
+    NotFound,
+    /// Removing stopped on an error. Nothing is stamped and a retry is safe.
+    Failed,
+}
+
+impl From<weaver_server_core::HistoryFilesRemovalOutcome> for HistoryFilesRemovalOutcome {
+    fn from(outcome: weaver_server_core::HistoryFilesRemovalOutcome) -> Self {
+        use weaver_server_core::HistoryFilesRemovalOutcome as Core;
+        match outcome {
+            Core::Removed => Self::Removed,
+            Core::AlreadyGone => Self::AlreadyGone,
+            Core::NotManaged => Self::NotManaged,
+            Core::Busy => Self::Busy,
+            Core::NotFound => Self::NotFound,
+            Core::Failed => Self::Failed,
+        }
+    }
+}
+
+/// What a files removal request answered for one id, before any disk work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
+pub enum HistoryFilesRemovalAcceptOutcome {
+    /// Queued: the files are removed in the background.
+    Accepted,
+    /// There is no history entry and no job with this id.
+    NotFound,
+    /// Another history operation holds the entry, or the job is in the
+    /// queue again.
+    Busy,
+    /// The job is in the queue and has not finished.
+    NotFinished,
+    /// The entry already says its files were removed.
+    AlreadyRemoved,
+}
+
+impl From<weaver_server_core::HistoryFilesRemovalAcceptOutcome>
+    for HistoryFilesRemovalAcceptOutcome
+{
+    fn from(outcome: weaver_server_core::HistoryFilesRemovalAcceptOutcome) -> Self {
+        use weaver_server_core::HistoryFilesRemovalAcceptOutcome as Core;
+        match outcome {
+            Core::Accepted => Self::Accepted,
+            Core::NotFound => Self::NotFound,
+            Core::Busy => Self::Busy,
+            Core::NotFinished => Self::NotFinished,
+            Core::AlreadyRemoved => Self::AlreadyRemoved,
+        }
+    }
+}
+
+/// One id's answer to a files removal request.
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct HistoryFilesRemovalAcceptResult {
+    pub id: u64,
+    pub outcome: HistoryFilesRemovalAcceptOutcome,
+}
+
+/// The answer to a files removal request. The accepted ids are removed in
+/// the background; each entry then shows `filesRemovedAt` once its files
+/// are gone, or a failed `deleteOperation` with `action: REMOVE_FILES`.
+#[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
+pub struct HistoryFilesRemovalAcceptance {
+    /// The operation holding the accepted ids; null when none was accepted.
+    pub operation_id: Option<u64>,
+    pub accepted_ids: Vec<u64>,
+    pub total_targets: u32,
+    /// One result per distinct id, in the order given.
+    pub results: Vec<HistoryFilesRemovalAcceptResult>,
+}
+
+impl HistoryFilesRemovalAcceptance {
+    pub(crate) fn from_core(acceptance: weaver_server_core::HistoryFilesRemovalAcceptance) -> Self {
+        let results = acceptance
+            .results
+            .into_iter()
+            .map(|(id, outcome)| HistoryFilesRemovalAcceptResult {
+                id,
+                outcome: outcome.into(),
+            })
+            .collect::<Vec<_>>();
+        let accepted_ids = results
+            .iter()
+            .filter(|result| result.outcome == HistoryFilesRemovalAcceptOutcome::Accepted)
+            .map(|result| result.id)
+            .collect::<Vec<_>>();
+        Self {
+            operation_id: acceptance.operation_id,
+            total_targets: accepted_ids.len() as u32,
+            accepted_ids,
+            results,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
@@ -241,13 +367,18 @@ pub struct JobEvent {
     pub file_id: Option<String>,
     pub message: String,
     pub timestamp: f64,
+    /// Pass as `jobEvents(before:)` to read the events older than this one.
+    #[serde(default)]
+    pub cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SimpleObject)]
+#[graphql(complex)]
 pub struct JobDetailSnapshot {
     pub queue_item: Option<crate::jobs::types::QueueItem>,
     pub history_item: Option<HistoryItem>,
     pub job_timeline: Option<JobTimeline>,
+    /// The job's newest events, oldest first: at most 100.
     pub job_events: Vec<JobEvent>,
     /// Which servers served this job's articles, highest count first.
     ///
@@ -257,6 +388,44 @@ pub struct JobDetailSnapshot {
     /// that finished before the counters existed.
     #[serde(default)]
     pub server_attribution: Vec<crate::jobs::types::JobServerContribution>,
+    #[graphql(skip)]
+    #[serde(skip)]
+    pub(crate) job_id: u64,
+}
+
+#[async_graphql::ComplexObject]
+impl JobDetailSnapshot {
+    /// How many events the job has in all, however many `jobEvents` holds.
+    async fn job_event_count(
+        &self,
+        ctx: &async_graphql::Context<'_>,
+    ) -> async_graphql::Result<u64> {
+        let db = ctx.data::<weaver_server_core::Database>()?.clone();
+        let job_id = self.job_id;
+        tokio::task::spawn_blocking(move || db.count_job_events(job_id))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))
+    }
+
+    /// How the download went: its archive tree, recovery and post. Null
+    /// while the job is queued, and for an entry that finished before
+    /// Weaver kept it.
+    async fn download_summary(
+        &self,
+        ctx: &async_graphql::Context<'_>,
+    ) -> async_graphql::Result<Option<crate::history::download_summary::DownloadSummary>> {
+        if self.history_item.is_none() {
+            return Ok(None);
+        }
+        let db = ctx.data::<weaver_server_core::Database>()?.clone();
+        let job_id = weaver_server_core::JobId(self.job_id);
+        let summary = tokio::task::spawn_blocking(move || db.history_download_summary(job_id))
+            .await
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?
+            .map_err(|e| async_graphql::Error::new(e.to_string()))?;
+        Ok(summary.map(Into::into))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -420,7 +589,18 @@ pub(crate) fn job_event_from_core(event: weaver_server_core::JobEvent) -> Option
         file_id: event.file_id,
         message: event.message,
         timestamp: event.timestamp as f64,
+        cursor: None,
     })
+}
+
+// A stored event, with the cursor that pages back from it.
+pub(crate) fn job_event_from_record(
+    record: weaver_server_core::history::timeline::JobEventRecord,
+) -> Option<JobEvent> {
+    let id = record.id;
+    let mut event = job_event_from_core(record.event)?;
+    event.cursor = Some(crate::jobs::types::encode_event_cursor(id as i64));
+    Some(event)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
@@ -606,6 +786,7 @@ fn history_item_from_display(
         attention: attention_for_history_row(row, state),
         delete_operation,
         duplicate_summary: None,
+        files_removed_at: row.files_removed_at.map(secs_to_datetime),
         full_file_names_record: weaver_server_core::ingest::full_file_names_record(metadata)
             .map(str::to_string),
         failed_over_ceiling: weaver_server_core::history::attributes::failed_for_memory(metadata),
@@ -624,8 +805,15 @@ pub fn history_delete_row_state_from_core(row: CoreHistoryDeleteRowState) -> His
             }
         },
         locked: row.locked,
+        action: match row.action {
+            weaver_server_core::HistoryOperationAction::Delete => HistoryOperationAction::Delete,
+            weaver_server_core::HistoryOperationAction::RemoveFiles => {
+                HistoryOperationAction::RemoveFiles
+            }
+        },
         delete_files: row.delete_files,
         error_message: row.error_message,
+        files_removal_outcome: row.files_removal_outcome.map(Into::into),
     }
 }
 

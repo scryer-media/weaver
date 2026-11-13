@@ -158,6 +158,7 @@ fn history_args(history: &history::JobHistoryRow, job_id: JobId) -> Vec<SqlArg> 
         SqlArg::OptText(history.server_attribution.clone()),
         SqlArg::I64(job_id.0 as i64),
         SqlArg::I64(job_id.0 as i64),
+        SqlArg::I64(job_id.0 as i64),
     ]
 }
 
@@ -214,7 +215,8 @@ async fn archive_job_sql(
                   optional_recovery_bytes, optional_recovery_downloaded_bytes,
                   failed_bytes, health, category, output_dir, nzb_path,
                   created_at, completed_at, metadata, release_name, search_key,
-                  post_processing_summary, script_results_json, server_attribution, support_facts)
+                  post_processing_summary, script_results_json, server_attribution, support_facts,
+                  files_removed_at, download_summary)
                  VALUES ({}, COALESCE({}, (SELECT nzb_hash FROM active_jobs WHERE job_id = {})),
                          {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {},
                          COALESCE({}, (SELECT nzb_path FROM active_jobs WHERE job_id = {})),
@@ -222,7 +224,9 @@ async fn archive_job_sql(
                          COALESCE((SELECT post_processing_summary FROM active_jobs WHERE job_id = {}), 'not_run'),
                          (SELECT script_results_json FROM active_jobs WHERE job_id = {}),
                          COALESCE({}, (SELECT server_attribution FROM active_jobs WHERE job_id = {})),
-                         (SELECT support_facts FROM active_jobs WHERE job_id = {}))
+                         (SELECT support_facts FROM active_jobs WHERE job_id = {}),
+                         NULL,
+                         (SELECT download_summary FROM active_jobs WHERE job_id = {}))
                  ON CONFLICT(job_id) DO UPDATE SET
                     job_hash = excluded.job_hash,
                     name = excluded.name,
@@ -247,17 +251,25 @@ async fn archive_job_sql(
                     server_attribution =
                         COALESCE(excluded.server_attribution, job_history.server_attribution),
                     support_facts =
-                        COALESCE(excluded.support_facts, job_history.support_facts)
+                        COALESCE(excluded.support_facts, job_history.support_facts),
+                    -- A job that finishes again has its files again.
+                    files_removed_at = NULL,
+                    removed_file_count = NULL,
+                    removed_file_bytes = NULL,
+                    -- Built afresh each time the job finishes.
+                    download_summary = excluded.download_summary
                  RETURNING job_id, job_hash, name, status, error_message, total_bytes, downloaded_bytes,
                     optional_recovery_bytes, optional_recovery_downloaded_bytes,
                     failed_bytes, health, category, output_dir, nzb_path,
-                    created_at, completed_at, metadata, server_attribution",
+                    created_at, completed_at, metadata, server_attribution, files_removed_at",
                 &args,
             )
             .await?
             .map(history::queries::job_history_row_from_sql)
             .transpose()?;
             if let Some(row) = &archived {
+                crate::history::persistence::clear_history_removed_files_tx(tx, job_id.0 as i64)
+                    .await?;
                 // Set on every archive so a re-archived job never keeps the
                 // kind of an earlier failure.
                 tx.execute(

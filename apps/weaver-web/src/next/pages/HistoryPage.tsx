@@ -23,7 +23,7 @@ import { Pagination } from "../components/Pagination";
 import { CheckBox, SecondaryButton, TextField } from "../components/controls";
 import { Icon } from "../components/icons";
 import { Menu, MenuItem } from "../components/Menu";
-import { GridHeader, GridRow } from "../components/rows";
+import { GridHeader, GridRow, RowIconButton } from "../components/rows";
 import { StorageMounts, storageMounts, type StorageVolume } from "../components/storage";
 import { Tabs } from "../components/Tabs";
 import { useStartOfToday } from "../data/clock";
@@ -42,7 +42,7 @@ import {
 import { WV } from "../data/palette";
 import { countLabel } from "../i18n/labels";
 import { useStatusLabel } from "../data/status";
-import { testIds } from "@/next/testids";
+import { jobIds, testIds } from "@/next/testids";
 import { NextShell, RailBlock } from "../shell/NextShell";
 import { CategoryListBlock } from "../shell/rail-blocks";
 import {
@@ -55,6 +55,15 @@ import {
 import { useNextData } from "../data/next-data";
 import { describeDeleteProgress } from "../data/history-deletes";
 import { useHistoryDeletes } from "../data/use-history-deletes";
+import {
+  describeFailedRemoval,
+  describeFilesRemoval,
+  rowDeletes,
+  rowOperationKind,
+  rowRemovesFiles,
+  type HistoryRowOperation,
+} from "../data/history-files";
+import { useFilesRemoval } from "../data/use-files-removal";
 import { useHistoryLiveRefresh } from "../data/use-history-live-refresh";
 
 /**
@@ -74,11 +83,12 @@ import { useHistoryLiveRefresh } from "../data/use-history-live-refresh";
 /** The row tracks, shared by the column header and every row. */
 // Release and outcome are what this screen is for, so they are the two that
 // never drop; size joins them once there is room, and the finished-at stack
-// last, at the width the handoff was drawn for.
+// last, at the width the handoff was drawn for. The row's own two actions
+// sit before the open mark at every width.
 const COLUMNS = {
-  base: "26px minmax(0, 1fr) 76px 14px",
-  sm: "26px minmax(0, 2fr) minmax(96px, 1fr) 64px 14px",
-  lg: "26px minmax(0, 2.4fr) minmax(112px, 1.1fr) 64px 84px 14px",
+  base: "26px minmax(0, 1fr) 76px 58px 14px",
+  sm: "26px minmax(0, 2fr) minmax(96px, 1fr) 64px 58px 14px",
+  lg: "26px minmax(0, 2.4fr) minmax(112px, 1.1fr) 64px 84px 58px 14px",
 };
 const PAGE_SIZES = [25, 50, 100] as const;
 /** Deep enough to cover a busy day, cheap enough to ask for on every visit. */
@@ -123,7 +133,15 @@ interface HistoryRow {
   category: string | null;
   createdAt: string | number | null;
   completedAt: string | number | null;
-  deleteOperation: { state: string; locked: boolean } | null;
+  /** When the entry's files were removed, or null while they are kept. */
+  filesRemovedAt: string | number | null;
+  deleteOperation: HistoryRowOperation | null;
+}
+
+/** What a confirm dialog acts on, and the note it shows for them. */
+interface ConfirmTargets {
+  ids: number[];
+  note: string;
 }
 
 interface HistoryPageResponse {
@@ -205,7 +223,10 @@ export function HistoryPage() {
   const [pageSize, setPageSize] = useState<number>(50);
   const [picked, setPicked] = useState<ReadonlySet<number>>(() => new Set());
   const [facets, setFacets] = useState<ReadonlySet<string>>(NO_FACETS);
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  // The entries a confirm dialog acts on: the picked ones, or one row's own.
+  const [confirmDelete, setConfirmDelete] = useState<ConfirmTargets | null>(null);
+  const [confirmRemoveFiles, setConfirmRemoveFiles] = useState<ConfirmTargets | null>(null);
+  const [removeFilesError, setRemoveFilesError] = useState<string | null>(null);
   const [retryAction, setRetryAction] = useState<"redownload" | "reprocess" | null>(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -261,6 +282,7 @@ export function HistoryPage() {
   const [, redownloadJob] = useMutation(REDOWNLOAD_JOB_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [, rerunPostProcessing] = useMutation(RERUN_POST_PROCESSING_MUTATION);
+  const requestFilesRemoval = useFilesRemoval();
 
   const page = data?.historyPage;
   const pageRows = useMemo(() => page?.items ?? [], [page?.items]);
@@ -401,17 +423,44 @@ export function HistoryPage() {
     refresh();
   };
 
-  const deletePicked = async (deleteFiles: boolean) => {
-    const ids = [...picked];
+  // The bulk delete and a row's own run this, with the picked ids or the row's.
+  const deleteEntries = async (ids: readonly number[], deleteFiles: boolean) => {
     setDeleteError(null);
-    const error = await deletes.accept(ids, deleteFiles);
+    const error = await deletes.accept([...ids], deleteFiles);
     if (error !== null) {
       setDeleteError(error);
       return;
     }
-    setConfirmDelete(false);
+    setConfirmDelete(null);
     setReport(null);
     setPicked((current) => new Set([...current].filter((id) => !ids.includes(id))));
+  };
+
+  // An entry whose files are already gone is not offered for removal again.
+  const filesGoneIds = useMemo(
+    () => new Set(rows.filter((row) => row.filesRemovedAt !== null).map((row) => row.id)),
+    [rows],
+  );
+  const removableIds = [...picked].filter((id) => !filesGoneIds.has(id));
+
+  // The bulk removal and a row's own run this, with the picked ids or the row's.
+  const removeFilesOf = async (ids: readonly number[]) => {
+    setRemoveFilesError(null);
+    setBusy(true);
+    const { results, refused } = await requestFilesRemoval(ids);
+    setBusy(false);
+    if (refused !== null && results.length === 0) {
+      setRemoveFilesError(refused);
+      return;
+    }
+    setConfirmRemoveFiles(null);
+    // Answered entries leave the selection; entries no call answered for
+    // stay picked, so they can be sent again.
+    const answered = new Set(results.map((result) => result.id));
+    setPicked((current) => new Set([...current].filter((id) => !answered.has(id))));
+    const summary = describeFilesRemoval(t, results, ids.length);
+    setReport(refused === null ? summary : `${summary} · ${refused}`);
+    refresh();
   };
 
   const actionsBusy = busy || deletes.accepting;
@@ -443,10 +492,25 @@ export function HistoryPage() {
       <BulkButton
         icon="remove"
         tone="danger"
+        testId={jobIds.historyRemoveFiles}
+        disabled={actionsBusy || removableIds.length === 0}
+        onClick={() => {
+          setRemoveFilesError(null);
+          setConfirmRemoveFiles({
+            ids: removableIds,
+            note: t("bulk.selected", { count: removableIds.length }),
+          });
+        }}
+      >
+        {t("next.filesRemoval.action")}
+      </BulkButton>
+      <BulkButton
+        icon="remove"
+        tone="danger"
         disabled={actionsBusy}
         onClick={() => {
           setDeleteError(null);
-          setConfirmDelete(true);
+          setConfirmDelete({ ids: [...picked], note: t("bulk.selected", { count: picked.size }) });
         }}
       >
         {t("action.delete")}
@@ -643,6 +707,7 @@ export function HistoryPage() {
                 {t("next.completed.done")}
               </span>,
               "",
+              "",
             ]}
             cellClassNames={[undefined, undefined, undefined, "hidden sm:block", "hidden lg:block"]}
           />
@@ -688,7 +753,12 @@ export function HistoryPage() {
               {day.rows.map((row) => {
                 const token = statusToken(row.status);
                 const failed = token === "failed";
-                const removing = row.deleteOperation !== null;
+                const operation = rowOperationKind(row.deleteOperation);
+                const pending = operation === "deleting" || operation === "removingFiles";
+                const removalFailed =
+                  operation === "removalFailed" && row.deleteOperation
+                    ? describeFailedRemoval(t, row.deleteOperation)
+                    : null;
                 const locked = lockedIds.has(row.id);
                 const finished = millis(row.completedAt);
                 const elapsed = elapsedMs(row);
@@ -699,11 +769,9 @@ export function HistoryPage() {
                     columns={COLUMNS}
                     selected={picked.has(row.id)}
                     onClick={() => navigate(`/jobs/${row.id}`)}
-                    title={
-                      row.error
-                        ? `${formatJobReleaseName(row)}\n${row.error}`
-                        : formatJobReleaseName(row)
-                    }
+                    title={[formatJobReleaseName(row), row.error, removalFailed]
+                      .filter(Boolean)
+                      .join("\n")}
                     className={cn(
                       "border-b border-wv-hairline px-4 sm:px-[22px] py-[11px]",
                       locked && "opacity-60",
@@ -720,15 +788,29 @@ export function HistoryPage() {
                       {row.hasPassword ? (
                         <Icon name="lock" size={11} className="ml-[6px] inline-block align-[-1px] text-wv-muted" />
                       ) : null}
+                      {row.filesRemovedAt !== null ? (
+                        <span
+                          data-testid={jobIds.historyFilesRemoved(row.id)}
+                          className="ml-[8px] font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-faint uppercase"
+                        >
+                          {t("next.filesRemoval.mark")}
+                        </span>
+                      ) : removalFailed !== null ? (
+                        <span className="ml-[8px] font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-error-text uppercase">
+                          {removalFailed}
+                        </span>
+                      ) : null}
                     </div>
                     <div className="flex min-w-0 items-center gap-[7px]">
                       <Square
-                        color={removing ? WV.idle : failed ? WV.error : WV.accent}
+                        color={pending ? WV.idle : failed ? WV.error : WV.accent}
                       />
                       <span className="truncate text-[12.5px] text-wv-secondary">
-                        {removing
+                        {operation === "deleting"
                           ? t("next.completed.deleting")
-                          : token === "completed"
+                          : operation === "removingFiles"
+                            ? t("next.filesRemoval.pending")
+                            : token === "completed"
                             ? t("next.completed.complete")
                             : failed
                               ? t("status.failed")
@@ -745,6 +827,34 @@ export function HistoryPage() {
                       <span className="font-wv-mono text-[10.5px] whitespace-nowrap text-wv-faint">
                         {elapsed === null ? EM_DASH : t("next.completed.took", { span: formatElapsed(elapsed) })}
                       </span>
+                    </div>
+                    <div className="flex items-center justify-end gap-0.5">
+                      {rowRemovesFiles(row) ? (
+                        <RowIconButton
+                          icon="removeFiles"
+                          label={t("next.filesRemoval.action")}
+                          danger
+                          disabled={actionsBusy}
+                          testId={jobIds.historyRowRemoveFiles(row.id)}
+                          onClick={() => {
+                            setRemoveFilesError(null);
+                            setConfirmRemoveFiles({ ids: [row.id], note: formatJobReleaseName(row) });
+                          }}
+                        />
+                      ) : null}
+                      {rowDeletes(row) ? (
+                        <RowIconButton
+                          icon="remove"
+                          label={t("action.delete")}
+                          danger
+                          disabled={actionsBusy}
+                          testId={jobIds.historyRowDelete(row.id)}
+                          onClick={() => {
+                            setDeleteError(null);
+                            setConfirmDelete({ ids: [row.id], note: formatJobReleaseName(row) });
+                          }}
+                        />
+                      ) : null}
                     </div>
                     <div className="flex justify-end text-wv-dim">
                       <Icon name="open" size={14} />
@@ -765,9 +875,9 @@ export function HistoryPage() {
           void runOnPicked("requeued", (id) => retryAction === "redownload" ? redownloadJob({ id, password }) : reprocessJob({ id, password }));
         }} /> : null}
       <ConfirmDialog
-        open={confirmDelete}
+        open={confirmDelete !== null}
         title={t("action.delete")}
-        note={t("bulk.selected", { count: picked.size })}
+        note={confirmDelete?.note}
         busy={actionsBusy}
         body={
           <>
@@ -777,10 +887,31 @@ export function HistoryPage() {
             )}
           </>
         }
-        alternative={{ label: t("next.job.deleteSaveFiles"), onConfirm: () => void deletePicked(false) }}
+        alternative={{
+          label: t("next.job.deleteSaveFiles"),
+          onConfirm: () => void deleteEntries(confirmDelete?.ids ?? [], false),
+        }}
         confirmLabel={t("action.delete")}
-        onConfirm={() => void deletePicked(true)}
-        onDismiss={() => setConfirmDelete(false)}
+        onConfirm={() => void deleteEntries(confirmDelete?.ids ?? [], true)}
+        onDismiss={() => setConfirmDelete(null)}
+      />
+      <ConfirmDialog
+        open={confirmRemoveFiles !== null}
+        testId={testIds.dialog("removeHistoryFiles")}
+        title={t("next.filesRemoval.title")}
+        note={confirmRemoveFiles?.note}
+        busy={actionsBusy}
+        body={
+          <>
+            {confirmRemoveFiles?.ids.length === 1 ? t("next.filesRemoval.jobBody") : t("next.filesRemoval.body")}
+            {removeFilesError === null ? null : (
+              <span className="mt-3 block text-wv-error-text">{removeFilesError}</span>
+            )}
+          </>
+        }
+        confirmLabel={t("next.filesRemoval.action")}
+        onConfirm={() => void removeFilesOf(confirmRemoveFiles?.ids ?? [])}
+        onDismiss={() => setConfirmRemoveFiles(null)}
       />
     </NextShell>
   );

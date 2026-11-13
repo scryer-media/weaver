@@ -165,6 +165,7 @@ fn sample_config() -> Config {
         max_concurrent_nzbs: None,
         cleanup_after_extract: Some(true),
         delete_failed_job_files: None,
+        history_retention_days: None,
         watch_folder: crate::watch_folder::WatchFolderConfig::default(),
         duplicate_policy: Default::default(),
         direct_store: None,
@@ -195,6 +196,7 @@ fn populate_source_db(db: &Database) {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     })
     .unwrap();
 }
@@ -697,6 +699,7 @@ async fn sqlite_export_snapshot_stays_closed_while_history_grows_concurrently() 
                     completed_at: 2,
                     metadata: None,
                     server_attribution: None,
+                    files_removed_at: None,
                 })
                 .unwrap();
             writer_db
@@ -1186,6 +1189,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             delete_failed_job_files: None,
+            history_retention_days: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
@@ -1210,6 +1214,7 @@ async fn restore_requires_category_remap_for_external_paths() {
             max_concurrent_nzbs: None,
             cleanup_after_extract: Some(true),
             delete_failed_job_files: None,
+            history_retention_days: None,
             watch_folder: crate::watch_folder::WatchFolderConfig::default(),
             duplicate_policy: Default::default(),
             direct_store: None,
@@ -2248,6 +2253,7 @@ fn finished_job(job_id: u64) -> JobHistoryRow {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     }
 }
 

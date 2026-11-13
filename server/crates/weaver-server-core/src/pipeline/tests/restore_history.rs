@@ -371,7 +371,7 @@ async fn a_restart_from_history_takes_the_job_s_left_working_directories() {
     };
     let delivered = complete_dir.join("Lantern");
     std::fs::create_dir_all(&delivered).unwrap();
-    crate::jobs::working_dir::mark_weaver_owned_output_dir(&delivered).unwrap();
+    crate::jobs::working_dir::mark_weaver_owned_output_dir(&delivered, job_id).unwrap();
     let left = intermediate_dir.join("Lantern");
     mark(&left);
     let staging = crate::pipeline::queue::staging_dir_for(&complete_dir, job_id);

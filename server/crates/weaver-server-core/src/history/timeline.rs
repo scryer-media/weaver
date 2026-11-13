@@ -95,6 +95,28 @@ async fn bulk_insert_job_events_tx(
     Ok(())
 }
 
+// The events window read: the job's events newest first, a range of the
+// job's index from `before` down when there is one.
+fn job_events_window_sql(
+    job_id: u64,
+    limit: u32,
+    skip_newest: u32,
+    before: Option<u64>,
+) -> (String, Vec<SqlArg>) {
+    let mut sql = String::from(
+        "SELECT id, timestamp, kind, message, file_id FROM job_events WHERE job_id = {}",
+    );
+    let mut args = vec![SqlArg::I64(job_id as i64)];
+    if let Some(before) = before {
+        sql.push_str(" AND id < {}");
+        args.push(SqlArg::I64(i64::try_from(before).unwrap_or(i64::MAX)));
+    }
+    sql.push_str(" ORDER BY id DESC LIMIT {} OFFSET {}");
+    args.push(SqlArg::I64(i64::from(limit)));
+    args.push(SqlArg::I64(i64::from(skip_newest)));
+    (sql, args)
+}
+
 fn build_job_events_pg_sql(row_count: usize) -> String {
     let mut values = String::new();
     for row in 0..row_count {
@@ -250,35 +272,61 @@ impl Database {
         limit: u32,
         skip_newest: u32,
     ) -> Result<Vec<JobEvent>, StateError> {
+        Ok(self
+            .get_job_event_records_window(job_id, limit, skip_newest, None)?
+            .into_iter()
+            .map(|record| record.event)
+            .collect())
+    }
+
+    // Up to `limit` of a job's events with their row ids, oldest-first,
+    // ending `skip_newest` events before the newest one older than `before`
+    // (a row id), or than none. Each row id is fixed, so paging by `before`
+    // stays put while events are added.
+    pub fn get_job_event_records_window(
+        &self,
+        job_id: u64,
+        limit: u32,
+        skip_newest: u32,
+        before: Option<u64>,
+    ) -> Result<Vec<JobEventRecord>, StateError> {
         let datastore = self.datastore();
         self.run_sql_blocking_read(async move {
-            let mut rows = SqlRuntime::fetch_all(
-                datastore.read_exec(),
-                "SELECT job_id, timestamp, kind, message, file_id
-                   FROM job_events
-                  WHERE job_id = {}
-                  ORDER BY id DESC
-                  LIMIT {} OFFSET {}",
-                &[
-                    SqlArg::I64(job_id as i64),
-                    SqlArg::I64(i64::from(limit)),
-                    SqlArg::I64(i64::from(skip_newest)),
-                ],
-            )
-            .await?;
+            let (sql, args) = job_events_window_sql(job_id, limit, skip_newest, before);
+            let mut rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
             // Restore ascending (oldest-first) order after the descending fetch.
             rows.reverse();
             rows.into_iter()
                 .map(|row| {
-                    Ok(JobEvent {
-                        job_id: row.i64("job_id")? as u64,
-                        timestamp: row.i64("timestamp")?,
-                        kind: row.text("kind")?,
-                        message: row.text("message")?,
-                        file_id: row.opt_text("file_id")?,
+                    Ok(JobEventRecord {
+                        id: row.i64("id")? as u64,
+                        event: JobEvent {
+                            job_id,
+                            timestamp: row.i64("timestamp")?,
+                            kind: row.text("kind")?,
+                            message: row.text("message")?,
+                            file_id: row.opt_text("file_id")?,
+                        },
                     })
                 })
                 .collect()
+        })
+    }
+
+    // How many events a job has.
+    pub fn count_job_events(&self, job_id: u64) -> Result<u64, StateError> {
+        let datastore = self.datastore();
+        self.run_sql_blocking_read(async move {
+            let row = SqlRuntime::fetch_optional(
+                datastore.read_exec(),
+                "SELECT COUNT(*) AS events FROM job_events WHERE job_id = {}",
+                &[SqlArg::I64(job_id as i64)],
+            )
+            .await?;
+            Ok(match row {
+                Some(row) => row.i64("events")?.max(0) as u64,
+                None => 0,
+            })
         })
     }
 
@@ -605,6 +653,77 @@ mod event_window_tests {
         let window = db.get_job_events_window(1, 5, 8).unwrap();
         assert_eq!(kinds(&window), ["K0", "K1"]);
         assert!(db.get_job_events_window(1, 5, 10).unwrap().is_empty());
+    }
+
+    // Paging back by row id returns every event once, in order, even with
+    // events added between the pages; the count is all of them.
+    #[test]
+    fn paging_before_a_row_id_holds_while_events_are_added() {
+        let db = Database::open_in_memory().unwrap();
+        for at in 0..10 {
+            db.insert_job_event(1, at, &format!("K{at}"), "", None)
+                .unwrap();
+            db.insert_job_event(2, at, "OTHER", "", None).unwrap();
+        }
+        let newest = db.get_job_event_records_window(1, 4, 0, None).unwrap();
+        assert_eq!(
+            kinds(&newest.iter().map(|r| r.event.clone()).collect::<Vec<_>>()),
+            ["K6", "K7", "K8", "K9"]
+        );
+        let mut seen = newest.clone();
+        let mut before = newest.first().map(|record| record.id);
+        let mut added = 10;
+        while let Some(oldest) = before {
+            // A live job keeps writing between the requests.
+            db.insert_job_event(1, added, &format!("K{added}"), "", None)
+                .unwrap();
+            added += 1;
+            let page = db
+                .get_job_event_records_window(1, 4, 0, Some(oldest))
+                .unwrap();
+            before = page.first().map(|record| record.id);
+            let mut older = page;
+            older.extend(seen);
+            seen = older;
+        }
+        assert_eq!(
+            kinds(&seen.iter().map(|r| r.event.clone()).collect::<Vec<_>>()),
+            (0..10).map(|at| format!("K{at}")).collect::<Vec<_>>()
+        );
+        assert!(seen.windows(2).all(|pair| pair[0].id < pair[1].id));
+        assert_eq!(db.count_job_events(1).unwrap(), added as u64);
+        assert_eq!(db.count_job_events(2).unwrap(), 10);
+        assert_eq!(db.count_job_events(3).unwrap(), 0);
+    }
+
+    // The events page is a range of the job's index read in row id order,
+    // with and without `before`, and sorts nothing.
+    #[test]
+    fn the_events_page_is_served_by_the_job_index() {
+        let db = Database::open_in_memory().unwrap();
+        for before in [None, Some(5_000)] {
+            let (sql, args) = job_events_window_sql(7, 100, 0, before);
+            let sql = format!("EXPLAIN QUERY PLAN {sql}");
+            let datastore = db.datastore();
+            let detail = db
+                .run_sql_blocking_read(async move {
+                    let rows = SqlRuntime::fetch_all(datastore.read_exec(), &sql, &args).await?;
+                    rows.iter()
+                        .map(|row| row.text("detail"))
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap()
+                .join("; ");
+            println!("events page plan, before {before:?}: {detail}");
+            assert!(
+                detail.contains("SEARCH job_events USING INDEX idx_job_events_job_id (job_id=?"),
+                "{detail}"
+            );
+            if before.is_some() {
+                assert!(detail.contains("rowid<?"), "{detail}");
+            }
+            assert!(!detail.contains("TEMP B-TREE"), "{detail}");
+        }
     }
 
     // An id list past one statement's bind budget reads the same rows as a

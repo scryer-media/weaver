@@ -26,6 +26,7 @@ fn history(created_at: i64, completed_at: i64) -> JobHistoryRow {
         completed_at,
         metadata: None,
         server_attribution: None,
+        files_removed_at: None,
     }
 }
 

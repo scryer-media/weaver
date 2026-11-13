@@ -4,7 +4,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { JobScriptResults } from "@/next/components/JobScriptResults";
 import { Link, useNavigate, useParams } from "react-router";
-import { useMutation, useQuery, useSubscription } from "urql";
+import { useClient, useMutation, useQuery, useSubscription } from "urql";
 import {
   ACCEPT_HISTORY_DELETE_MUTATION,
   CANCEL_JOB_MUTATION,
@@ -12,6 +12,8 @@ import {
   DUPLICATE_SNAPSHOT_QUERY,
   FORGET_DUPLICATE_IDENTITY_MUTATION,
   JOB_DETAIL_UPDATES_SUBSCRIPTION,
+  JOB_EVENTS_BEFORE_QUERY,
+  JOB_OUTPUT_FILES_PAGE_QUERY,
   JOB_OUTPUT_FILES_QUERY,
   JOB_QUERY,
   PAUSE_JOB_MUTATION,
@@ -37,10 +39,9 @@ import {
   PanelGrid,
   Square,
   StateChip,
-  Tag,
 } from "../components/chrome";
 import { ConfirmDialog } from "../components/ConfirmDialog";
-import { ArchivePassword, ArchivePasswordDialog } from "../components/ArchivePassword";
+import { ArchivePasswordDialog } from "../components/ArchivePassword";
 import { DangerButton, SecondaryButton } from "../components/controls";
 import { Icon } from "../components/icons";
 import { PhaseBars, useJobProgress } from "../components/PhaseBars";
@@ -49,6 +50,7 @@ import { Waterfall } from "../components/Waterfall";
 import {
   EM_DASH,
   formatClockSeconds,
+  formatCount,
   formatDuration,
   formatRate,
   formatSize,
@@ -57,7 +59,6 @@ import {
 import { useNow } from "../data/clock";
 import { statusColor, WV } from "../data/palette";
 import { ratePhase } from "../data/phase-bars";
-import { releaseFields, releaseFlags } from "../data/release";
 import { eventTone, useStatusLabel } from "../data/status";
 import { buildTimelineView, downloadingMs, type JobTimelineData } from "../data/timeline";
 import { useNextData } from "../data/next-data";
@@ -65,14 +66,20 @@ import { useSharedStructure } from "../data/share";
 import { usePageVisible } from "../data/timers";
 import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
+import { describeFailedRemoval, describeFilesRemoval, rowOperationKind } from "../data/history-files";
+import { useFilesRemoval } from "../data/use-files-removal";
+import { extendKept, LIST_PAGE_SIZE, prependOlder, showsMore } from "../data/list-pages";
+import { jobIds, testIds } from "@/next/testids";
 import { SupportReportActions } from "../features/SupportReportActions";
+import { DownloadSummaryPanel } from "../components/DownloadSummary";
+import type { DownloadSummaryData } from "../data/download-summary";
 
 /**
  * One job, end to end.
  *
  * The screen is a single scroller of blocks — what happened, how long each
- * stage took, what came out, what the engine said, and what weaver understood
- * about the release — because a job is a story with an order, and tabs would
+ * stage took, what came out, what the engine said, and how the download
+ * itself went — because a job is a story with an order, and tabs would
  * let you miss the part that explains the part you are looking at.
  *
  * It reads `jobDetailSnapshot`, which answers for a queued job and a finished
@@ -113,6 +120,8 @@ interface JobEvent {
   fileId: string | null;
   message: string;
   timestamp: number;
+  /** Where the log pages back from: `jobEvents(before:)`. */
+  cursor?: string | null;
 }
 
 /** One provider's share of a job, as the engine attributed it. */
@@ -128,14 +137,44 @@ interface JobSnapshot {
   queueItem?: GraphqlJobData | null;
   historyItem?: GraphqlJobData | null;
   jobTimeline?: JobTimelineData | null;
+  /** The newest events, oldest first: one page. */
   jobEvents?: JobEvent[];
+  /** Every event the job has, however many `jobEvents` holds. */
+  jobEventCount?: number;
   serverAttribution?: ServerContribution[];
+  /** Null while queued, and for an entry from before it was kept. */
+  downloadSummary?: DownloadSummaryData | null;
 }
 
 interface OutputFile {
   name: string;
   path: string;
   sizeBytes: number;
+}
+
+/** One page of a job's output files, with the totals of all of them. */
+interface OutputFilesPage {
+  outputDir: string | null;
+  files: OutputFile[];
+  totalBytes: number;
+  totalCount: number;
+  /** The files are gone; the list is the record kept of them. */
+  removed: boolean;
+  nextCursor: string | null;
+}
+
+/** The files loaded past the first page, and the page they continue. */
+interface MoreFiles {
+  first: OutputFilesPage;
+  files: OutputFile[];
+  nextCursor: string | null;
+}
+
+/** The log once older events were asked for: every event kept, oldest first. */
+interface PagedEvents {
+  kept: JobEvent[];
+  /** An older page came back empty. */
+  exhausted: boolean;
 }
 
 interface DuplicateSnapshot {
@@ -162,6 +201,27 @@ const NO_JOB: Pick<JobData, "id" | "status" | "phaseProgress"> = {
 function sentenceCase(value: string): string {
   const text = value.replace(/_/g, " ").toLowerCase();
   return text.charAt(0).toUpperCase() + text.slice(1);
+}
+
+/** The control under a list that loads its next page. */
+function ShowMore({
+  label,
+  testId,
+  disabled,
+  onClick,
+}: {
+  label: string;
+  testId: string;
+  disabled: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <div className="flex justify-center border-t border-wv-hairline pt-[9px]">
+      <SecondaryButton size="compact" testId={testId} disabled={disabled} onClick={onClick}>
+        {label}
+      </SecondaryButton>
+    </div>
+  );
 }
 
 /**
@@ -218,9 +278,16 @@ function JobDetailContent() {
     variables,
     pause: connection.isDisconnected || !Number.isFinite(jobId) || !visible,
   });
+  const client = useClient();
+  const filesVariables = useMemo(() => ({ jobId, first: LIST_PAGE_SIZE }), [jobId]);
   const [{ data: filesData }, refetchFiles] = useQuery<{
-    jobOutputFiles: { outputDir: string | null; files: OutputFile[]; totalBytes: number } | null;
-  }>({ query: JOB_OUTPUT_FILES_QUERY, variables: { jobId }, pause: !Number.isFinite(jobId) });
+    jobOutputFiles: OutputFilesPage | null;
+  }>({ query: JOB_OUTPUT_FILES_QUERY, variables: filesVariables, pause: !Number.isFinite(jobId) });
+  // Pages past the first load only when asked for; a fresh first page
+  // drops them.
+  const [moreFiles, setMoreFiles] = useState<MoreFiles | null>(null);
+  const [pagedEvents, setPagedEvents] = useState<PagedEvents | null>(null);
+  const [loadingMore, setLoadingMore] = useState<"files" | "events" | null>(null);
   const [{ data: duplicateData }, refetchDuplicate] = useQuery<{
     duplicateSnapshot: DuplicateSnapshot | null;
   }>({ query: DUPLICATE_SNAPSHOT_QUERY, variables, pause: !Number.isFinite(jobId) });
@@ -230,13 +297,14 @@ function JobDetailContent() {
   const [, rerunPostProcessing] = useMutation(RERUN_POST_PROCESSING_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [, acceptHistoryDelete] = useMutation(ACCEPT_HISTORY_DELETE_MUTATION);
+  const requestFilesRemoval = useFilesRemoval();
   const [, forgetDuplicateIdentity] = useMutation(FORGET_DUPLICATE_IDENTITY_MUTATION);
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
 
-  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "cancel" | "forget" | null>(null);
+  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "removeFiles" | "cancel" | "forget" | null>(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -260,8 +328,43 @@ function JobDetailContent() {
       refetchFiles({ requestPolicy: "network-only" });
     }
   }, [jobStatus, refetchFiles]);
+  // Files are removed in the background; the listing is read again once,
+  // when the pushed entry first says they are gone. Undefined until the job
+  // is known, so the first snapshot is not taken for a change.
+  const filesRemovedAt = job ? (job.filesRemovedAt ?? null) : undefined;
+  const listedRemovedAt = useRef(filesRemovedAt);
+  useEffect(() => {
+    const previous = listedRemovedAt.current;
+    listedRemovedAt.current = filesRemovedAt;
+    if (previous === null && filesRemovedAt != null) {
+      refetchFiles({ requestPolicy: "network-only" });
+    }
+  }, [filesRemovedAt, refetchFiles]);
+  // A history operation the entry waits on, or the files removal that last failed for it.
+  const operation = !inQueue && job ? rowOperationKind(job.deleteOperation) : null;
+  // The snapshot carries the newest page of the log. Once older pages were
+  // read, every event seen is kept, so the newest page moving on leaves no
+  // gap between what was read and what arrives. A snapshot that moved past
+  // the kept events altogether (a burst, or a tab in the background) would
+  // leave a hole, so the log drops back to the snapshot and pages from there.
+  const liveEvents = snapshot?.jobEvents;
+  useEffect(() => {
+    if (!liveEvents) return;
+    setPagedEvents((paged) => {
+      if (!paged) return paged;
+      const kept = extendKept(paged.kept, liveEvents);
+      if (kept === null) return null;
+      return kept === paged.kept ? paged : { ...paged, kept };
+    });
+  }, [liveEvents]);
+  const keptEvents = useMemo(
+    () =>
+      (pagedEvents ? extendKept(pagedEvents.kept, liveEvents ?? []) : null) ?? liveEvents ?? [],
+    [liveEvents, pagedEvents],
+  );
   // The engine appends; the log reads newest first, like every other log here.
-  const events = useMemo(() => [...(snapshot?.jobEvents ?? [])].reverse(), [snapshot?.jobEvents]);
+  const events = useMemo(() => [...keptEvents].reverse(), [keptEvents]);
+  const eventTotal = Math.max(snapshot?.jobEventCount ?? 0, events.length);
   // Shares are of the payload that *was* attributed, not of the job's bytes:
   // an article whose serving provider could not be named is left out of the
   // ledger rather than charged to the wrong one, so these add to 100% of a
@@ -286,12 +389,18 @@ function JobDetailContent() {
     [job?.status, now, snapshot?.jobTimeline, t],
   );
 
-  // The two dot-files weaver drops to mark a job's own directory are
-  // bookkeeping, not output: listing them offers a download the server refuses.
-  const files = (filesData?.jobOutputFiles?.files ?? []).filter(
-    (file) => file.name !== ".weaver-job-dir" && file.name !== ".weaver-output-dir",
+  // The server leaves weaver's own marker files out of the listing and its
+  // totals. Pages read past the first belong to the first they continue.
+  const firstFiles = filesData?.jobOutputFiles ?? null;
+  const more = moreFiles && moreFiles.first === firstFiles ? moreFiles : null;
+  const files = useMemo(
+    () => [...(firstFiles?.files ?? []), ...(more?.files ?? [])],
+    [firstFiles, more],
   );
-  const outputDir = filesData?.jobOutputFiles?.outputDir || job?.outputDir || null;
+  const nextFilesCursor = more ? more.nextCursor : (firstFiles?.nextCursor ?? null);
+  const fileTotal = Math.max(firstFiles?.totalCount ?? 0, files.length);
+  const filesRemoved = firstFiles?.removed ?? false;
+  const outputDir = firstFiles?.outputDir || job?.outputDir || null;
   const duplicate = duplicateData?.duplicateSnapshot ?? null;
 
   if (!Number.isFinite(jobId) || (!job && !fetching)) {
@@ -411,6 +520,16 @@ function JobDetailContent() {
     setReport(t("next.job.fileSaving", { name: file.name }));
   };
 
+  // The entry stays; its files are queued for removal. The page reads the
+  // entry again so the pending removal shows; the push says when they are gone.
+  const removeFiles = async () => {
+    setBusy(true);
+    const { results, refused } = await requestFilesRemoval([jobId]);
+    setBusy(false);
+    setReport(refused ?? describeFilesRemoval(t, results));
+    void refetch({ requestPolicy: "network-only" });
+  };
+
   const copyLog = () => {
     const text = events
       .map(
@@ -421,6 +540,51 @@ function JobDetailContent() {
     void copyText(text).then((taken) =>
       setReport(taken ? countLabel(t, "next.job.copiedEvents", events.length) : t("next.system.copyFailed")),
     );
+  };
+
+  // The next page of files, after the last one loaded.
+  const loadMoreFiles = async () => {
+    if (!firstFiles || !nextFilesCursor) return;
+    setLoadingMore("files");
+    const result = await client
+      .query<{ jobOutputFiles: Pick<OutputFilesPage, "files" | "nextCursor"> | null }>(
+        JOB_OUTPUT_FILES_PAGE_QUERY,
+        { jobId, first: LIST_PAGE_SIZE, after: nextFilesCursor },
+        { requestPolicy: "network-only" },
+      )
+      .toPromise();
+    if (!active.current) return;
+    setLoadingMore(null);
+    const page = result.data?.jobOutputFiles;
+    if (result.error) setReport(result.error.message);
+    if (!page) return;
+    setMoreFiles((previous) => {
+      const held = previous && previous.first === firstFiles ? previous.files : [];
+      return { first: firstFiles, files: [...held, ...page.files], nextCursor: page.nextCursor };
+    });
+  };
+
+  // The page of events before the oldest one loaded.
+  const loadOlderEvents = async () => {
+    const shown = keptEvents;
+    const oldest = shown[0]?.cursor;
+    if (!oldest) return;
+    setLoadingMore("events");
+    const result = await client
+      .query<{ jobEvents: JobEvent[] }>(
+        JOB_EVENTS_BEFORE_QUERY,
+        { jobId, before: oldest, limit: LIST_PAGE_SIZE },
+        { requestPolicy: "network-only" },
+      )
+      .toPromise();
+    if (!active.current) return;
+    setLoadingMore(null);
+    const older = result.data?.jobEvents;
+    if (result.error) setReport(result.error.message);
+    if (!older) return;
+    // The page goes in front of the events shown when it was asked for; the
+    // snapshot extends them on each render, or replaces them if it moved past.
+    setPagedEvents({ kept: prependOlder(shown, older), exhausted: older.length === 0 });
   };
 
   return (
@@ -545,6 +709,34 @@ function JobDetailContent() {
                     {t("next.job.retryNoLimit")}
                   </SecondaryButton>
                 ) : null}
+                {inQueue ? null : job.filesRemovedAt ? (
+                  <span
+                    data-testid={jobIds.jobFilesRemoved}
+                    className="font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-faint uppercase"
+                  >
+                    {t("next.filesRemoval.mark")}
+                  </span>
+                ) : (
+                  <>
+                    {operation === "removalFailed" && job.deleteOperation ? (
+                      <span className="font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-error-text uppercase">
+                        {describeFailedRemoval(t, {
+                          ...job.deleteOperation,
+                          action: "REMOVE_FILES",
+                        })}
+                      </span>
+                    ) : null}
+                    <DangerButton
+                      icon="remove"
+                      size="compact"
+                      disabled={busy || (operation !== null && operation !== "removalFailed")}
+                      testId={jobIds.jobRemoveFiles}
+                      onClick={() => setConfirm("removeFiles")}
+                    >
+                      {operation === "removingFiles" ? t("next.filesRemoval.pending") : t("next.filesRemoval.action")}
+                    </DangerButton>
+                  </>
+                )}
                 <DangerButton icon="remove" size="compact" disabled={busy} onClick={() => setConfirm("delete")}>
                   {t("next.job.deleteSaveFiles")}
                 </DangerButton>
@@ -685,9 +877,9 @@ function JobDetailContent() {
           id="files"
           title={t("next.job.outputFiles")}
           note={
-            files.length === 0
+            fileTotal === 0
               ? t("next.job.nothingWritten")
-              : `${countLabel(t, "next.job.fileCount", files.length)} · ${formatSize(filesData?.jobOutputFiles?.totalBytes ?? 0)}`
+              : `${countLabel(t, "next.job.fileCount", fileTotal)} · ${formatSize(firstFiles?.totalBytes ?? 0)}`
           }
           right={outputDir ?? undefined}
         >
@@ -696,7 +888,8 @@ function JobDetailContent() {
               {t("next.job.filesAppear")}
             </span>
           ) : (
-            files.map((file) => (
+            <>
+            {files.map((file) => (
               <GridRow
                 key={file.path}
                 columns={FILE_COLUMNS}
@@ -710,42 +903,75 @@ function JobDetailContent() {
                 <div className="text-right font-wv-mono text-[12px] text-wv-muted">
                   {formatSize(file.sizeBytes)}
                 </div>
-                <button
-                  type="button"
-                  title={t("next.job.downloadFileTitle", { name: file.name })}
-                  onClick={() => downloadOutputFile(file)}
-                  className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg"
-                >
-                  {t("next.job.download")}
-                </button>
-                <button
-                  type="button"
-                  title={t("next.job.copyPathTitle")}
-                  onClick={() => {
-                    void copyText(file.path).then((taken) =>
-                      setReport(
-                        taken ? t("next.job.copiedPath", { name: file.name }) : t("next.system.copyFailed"),
-                      ),
-                    );
-                  }}
-                  className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg"
-                >
-                  {t("next.job.copy")}
-                </button>
+                {/* A removed file is only a record: nothing to fetch. */}
+                {filesRemoved ? (
+                  <span
+                    data-testid={jobIds.jobFileRemoved}
+                    className="text-right font-wv-mono text-[11px] whitespace-nowrap text-wv-muted uppercase"
+                  >
+                    {t("next.job.fileRemoved")}
+                  </span>
+                ) : (
+                  <button
+                    type="button"
+                    title={t("next.job.downloadFileTitle", { name: file.name })}
+                    onClick={() => downloadOutputFile(file)}
+                    className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg"
+                  >
+                    {t("next.job.download")}
+                  </button>
+                )}
+                {/* Nor a path to copy: nothing is there any more. */}
+                {filesRemoved ? (
+                  <span aria-hidden="true" />
+                ) : (
+                  <button
+                    type="button"
+                    title={t("next.job.copyPathTitle")}
+                    onClick={() => {
+                      void copyText(file.path).then((taken) =>
+                        setReport(
+                          taken ? t("next.job.copiedPath", { name: file.name }) : t("next.system.copyFailed"),
+                        ),
+                      );
+                    }}
+                    className="cursor-pointer text-right text-[12.5px] whitespace-nowrap text-wv-dim hover:text-wv-fg"
+                  >
+                    {t("next.job.copy")}
+                  </button>
+                )}
               </GridRow>
-            ))
+            ))}
+            {showsMore(fileTotal, files.length, nextFilesCursor !== null) ? (
+              <ShowMore
+                label={t("next.job.showMore")}
+                testId={jobIds.jobFilesShowMore}
+                disabled={loadingMore !== null}
+                onClick={() => {
+                  void loadMoreFiles();
+                }}
+              />
+            ) : null}
+            </>
           )}
         </DetailBlock>
 
         <DetailBlock
           id="log"
           title={t("next.job.eventLog")}
-          note={countLabel(t, "next.job.eventCount", events.length)}
+          note={countLabel(t, "next.job.eventCount", eventTotal)}
           right={
             events.length === 0 ? undefined : (
               <button
                 type="button"
                 onClick={copyLog}
+                title={
+                  events.length < eventTotal
+                    ? countLabel(t, "next.job.copyLoadedEvents", events.length, {
+                        count: formatCount(events.length),
+                      })
+                    : undefined
+                }
                 className="cursor-pointer text-wv-dim hover:text-wv-fg"
               >
                 {t("next.job.copyAsText")}
@@ -758,9 +984,10 @@ function JobDetailContent() {
               {t("next.job.noEvents")}
             </span>
           ) : (
-            events.map((event) => (
+            <>
+            {events.map((event) => (
               <GridRow
-                key={`${event.timestamp}-${event.kind}-${event.fileId ?? ""}-${event.message}`}
+                key={event.cursor ?? `${event.timestamp}-${event.kind}-${event.fileId ?? ""}-${event.message}`}
                 columns={EVENT_COLUMNS}
                 className="items-baseline border-t border-wv-hairline py-[7px]"
               >
@@ -778,35 +1005,25 @@ function JobDetailContent() {
                   {event.message}
                 </span>
               </GridRow>
-            ))
+            ))}
+            {showsMore(eventTotal, events.length, !(pagedEvents?.exhausted ?? false)) ? (
+              <ShowMore
+                label={t("next.job.showMore")}
+                testId={jobIds.jobEventsShowMore}
+                disabled={loadingMore !== null}
+                onClick={() => {
+                  void loadOlderEvents();
+                }}
+              />
+            ) : null}
+            </>
           )}
         </DetailBlock>
 
         <JobScriptResults key={`${job.id}-${job.status}`} jobId={job.id} />
 
         <PanelGrid>
-          <DetailBlock id="release" title={t("next.completed.release")} tone="panel" bodyClassName="gap-[13px]">
-            <div
-              className="grid gap-x-4 gap-y-[13px]"
-              style={{ gridTemplateColumns: "repeat(auto-fit, minmax(104px, 1fr))" }}
-            >
-              {releaseFields(t, job.parsedRelease, job.category).map((field) => (
-                <Field
-                  key={field.label}
-                  label={field.label}
-                  value={field.value}
-                  title={field.value}
-                />
-              ))}
-            </div>
-            {releaseFlags(t, job.parsedRelease).length === 0 ? null : (
-              <div className="flex flex-wrap gap-1.5">
-                {releaseFlags(t, job.parsedRelease).map((flag) => (
-                  <Tag key={flag}>{flag}</Tag>
-                ))}
-              </div>
-            )}
-          </DetailBlock>
+          <DownloadSummaryPanel inQueue={inQueue} summary={snapshot?.downloadSummary} />
 
           <DetailBlock
             id="identity"
@@ -849,7 +1066,6 @@ function JobDetailContent() {
           </DetailBlock>
 
           <DetailBlock id="metadata" title={t("next.job.metadata")} tone="panel" bodyClassName="gap-[11px]">
-            {job.hasPassword ? <Field variant="stacked" label={t("next.archivePasswords.password")} value={<ArchivePassword id={job.id} />} /> : null}
             <Field variant="stacked" label={t("next.job.jobId")} value={String(job.id)} />
             <Field
               variant="stacked"
@@ -967,6 +1183,21 @@ function JobDetailContent() {
           />
         );
       })}
+
+      <ConfirmDialog
+        open={confirm === "removeFiles"}
+        testId={testIds.dialog("removeHistoryFiles")}
+        title={t("next.filesRemoval.title")}
+        note={job.displayTitle || job.name}
+        busy={busy}
+        confirmLabel={t("next.filesRemoval.action")}
+        body={t("next.filesRemoval.jobBody")}
+        onDismiss={() => setConfirm(null)}
+        onConfirm={() => {
+          setConfirm(null);
+          void removeFiles();
+        }}
+      />
 
       {retryAction ? <ArchivePasswordDialog
         title={t(retryAction === "redownload" ? "next.completed.redownload"

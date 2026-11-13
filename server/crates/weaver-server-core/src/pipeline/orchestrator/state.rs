@@ -120,7 +120,7 @@ impl Pipeline {
                 .retain(|segment_id| segment_id.file_id != file_id);
             for part in self
                 .unanchored_parked
-                .remove(&file_id)
+                .remove_file(file_id)
                 .into_iter()
                 .flat_map(BTreeMap::into_values)
             {

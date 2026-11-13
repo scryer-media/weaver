@@ -15,7 +15,8 @@ pub mod recovery;
 pub use async_ops::{
     AsyncOperationState, AsyncOperationTargetState, HistoryDeleteOperationInsertError,
     HistoryDeleteOperationPayload, HistoryDeleteOperationRow, HistoryDeleteOperationSummary,
-    HistoryDeleteRowState, HistoryDeleteTargetWork,
+    HistoryDeleteRowState, HistoryDeleteTargetWork, HistoryFilesRemovalAcceptOutcome,
+    HistoryFilesRemovalAcceptance, HistoryFilesRemovalSettlement, HistoryOperationAction,
 };
 pub use backup::{
     BackupArtifact, BackupInspectResult, BackupManifest, BackupService, BackupServiceError,

@@ -913,7 +913,7 @@ async fn run_move_to_claimed_destination(
 
     let output_dir = dest.clone();
     match crate::runtime::panic_trap::spawn_blocking(move || {
-        mark_weaver_owned_output_dir(&output_dir)
+        mark_weaver_owned_output_dir(&output_dir, job_id)
     })
     .await
     {

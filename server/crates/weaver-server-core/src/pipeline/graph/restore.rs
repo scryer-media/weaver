@@ -440,15 +440,14 @@ fn restore_passwords(
     db: &crate::Database,
     job_id: JobId,
     spec_password: Option<&str>,
-) -> Result<Vec<String>, LoadError> {
+) -> Result<Vec<crate::jobs::ArchivePasswordCandidate>, LoadError> {
     let (carried, _) = read_job_password_candidates(db, job_id)?;
     let global = db.global_archive_password_candidates()?;
-    Ok(
-        assemble_archive_password_candidates(spec_password, &carried, &global)
-            .iter()
-            .map(|candidate| candidate.value().to_owned())
-            .collect(),
-    )
+    Ok(assemble_archive_password_candidates(
+        spec_password,
+        &carried,
+        &global,
+    ))
 }
 
 #[cfg(test)]

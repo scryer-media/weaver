@@ -15,7 +15,13 @@ pub(crate) async fn clear_restart_artifacts(
     // alone are never permission to remove an arbitrary directory.
     crate::post_processing::events::wait_for_job_events_stopped(&resources.db, id.0).await?;
     if tokio::fs::try_exists(working_dir).await? {
-        if working_dir.starts_with(&resources.intermediate_dir) {
+        // A folder the job delivered to is never taken for its working
+        // directory, even when the complete folder is the intermediate one.
+        let delivered = crate::history::delete_files::is_delivery_dir(
+            working_dir,
+            &resources.staging_roots().await,
+        );
+        if working_dir.starts_with(&resources.intermediate_dir) && !delivered {
             use crate::jobs::working_dir::{
                 HistoryWorkingDir, prepare_history_working_dir, remove_job_working_dir,
             };
@@ -38,18 +44,22 @@ pub(crate) async fn clear_restart_artifacts(
                 ));
             }
         } else {
+            // A marker naming another job refuses; one from before markers
+            // named their job is the job's own output, as it always was here.
             let path = working_dir.to_path_buf();
-            let owned = tokio::task::spawn_blocking(move || {
-                crate::jobs::working_dir::is_weaver_owned_output_dir(&path)
+            tokio::task::spawn_blocking(move || {
+                if !crate::jobs::working_dir::output_dir_owner(&path)
+                    .is_some_and(|owner| owner.admits(id, true))
+                {
+                    return Err(SchedulerError::Conflict(
+                        "restart output directory has no valid ownership marker of the job".into(),
+                    ));
+                }
+                crate::jobs::working_dir::remove_owned_output_dir(&path)
+                    .map_err(SchedulerError::from)
             })
             .await
-            .map_err(|error| SchedulerError::Internal(error.to_string()))?;
-            if !owned {
-                return Err(SchedulerError::Conflict(
-                    "restart output directory has no valid ownership marker".into(),
-                ));
-            }
-            tokio::fs::remove_dir_all(working_dir).await?;
+            .map_err(|error| SchedulerError::Internal(error.to_string()))??;
         }
     }
     clear_left_working_dirs(&resources.intermediate_dir, id, working_dir).await?;
@@ -668,6 +678,149 @@ impl Queue {
             SchedulerError::Internal(format!("history delete worker failed: {error}"))
         })?
     }
+
+    // Removes the files of history entries and keeps the entries, under the
+    // same hold a history delete takes. An id in the queue, being admitted,
+    // or held by another history operation is busy and nothing of it is
+    // touched.
+    #[cfg(test)]
+    pub(crate) async fn remove_history_files(
+        self: Arc<Self>,
+        ids: BTreeSet<JobId>,
+        now: i64,
+    ) -> Result<BTreeMap<JobId, crate::HistoryFilesRemoval>, SchedulerError> {
+        self.remove_history_files_keeping(
+            ids,
+            now,
+            crate::history::output_files::REMOVED_FILES_KEPT,
+        )
+        .await
+    }
+
+    // `remove_history_files`, keeping the record of at most `keep` files of
+    // each removed output directory.
+    #[cfg(test)]
+    pub(crate) async fn remove_history_files_keeping(
+        self: Arc<Self>,
+        ids: BTreeSet<JobId>,
+        now: i64,
+        keep: usize,
+    ) -> Result<BTreeMap<JobId, crate::HistoryFilesRemoval>, SchedulerError> {
+        self.remove_history_files_settling(ids, now, keep, None)
+            .await
+    }
+
+    // The removal, and with `operation` the settling of that files removal
+    // operation's target of every id with its outcome. The targets are
+    // written before the hold is released, so the revision the release
+    // rings finds them; when every id is busy and no hold is taken, the
+    // revision is rung once they are written.
+    pub(crate) async fn remove_history_files_settling(
+        self: Arc<Self>,
+        ids: BTreeSet<JobId>,
+        now: i64,
+        keep: usize,
+        operation: Option<u64>,
+    ) -> Result<BTreeMap<JobId, crate::HistoryFilesRemoval>, SchedulerError> {
+        let mut resources = self
+            .resources
+            .get()
+            .cloned()
+            .ok_or(SchedulerError::ChannelClosed)?;
+        if let Some(paths) = self.read(|inner| inner.globals.runtime_paths.clone()) {
+            resources.intermediate_dir = paths.intermediate;
+        }
+        let (accepted, mut outcomes) = self.write(|inner| {
+            let mut accepted = BTreeSet::new();
+            let mut busy = BTreeMap::new();
+            for id in ids {
+                let message = if inner.contains_job(id) || inner.admissions.contains(&id) {
+                    "the job is in the queue"
+                } else if !inner.history_operations.insert(id) {
+                    "another history operation is running"
+                } else {
+                    accepted.insert(id);
+                    continue;
+                };
+                busy.insert(
+                    id,
+                    crate::HistoryFilesRemoval::new(
+                        crate::HistoryFilesRemovalOutcome::Busy,
+                        None,
+                        Some(message.into()),
+                    ),
+                );
+            }
+            Change::unchanged((accepted, busy))
+        });
+        if accepted.is_empty() {
+            if let Some(operation) = operation {
+                settle_files_removal(&resources.db, operation, &outcomes).await?;
+                self.write(|_| Change::changed(()));
+            }
+            return Ok(outcomes);
+        }
+        let guard = HistoryOperation {
+            queue: self.clone(),
+            ids: accepted.clone(),
+        };
+        tokio::spawn(async move {
+            let _guard = guard;
+            self.wait_for_cleanup(&accepted).await;
+            let removed = crate::history::delete_files::remove_history_files(
+                &resources.db,
+                &resources.intermediate_dir,
+                &resources.staging_roots().await,
+                accepted,
+                now,
+                keep,
+            )
+            .await?;
+            outcomes.extend(removed);
+            if let Some(operation) = operation {
+                settle_files_removal(&resources.db, operation, &outcomes).await?;
+            }
+            // Releasing the hold rings the queue revision, as a history
+            // edit's does, so the history list reads the stamp and the
+            // settled targets again.
+            Ok(outcomes)
+        })
+        .await
+        .map_err(|error| {
+            SchedulerError::Internal(format!("history files removal worker failed: {error}"))
+        })?
+    }
+}
+
+// Writes each id's outcome on its target of the files removal `operation`:
+// an entry left with nothing to remove completes, every other one fails
+// with its message, which the entry shows until a later removal settles it.
+async fn settle_files_removal(
+    db: &crate::Database,
+    operation: u64,
+    outcomes: &BTreeMap<JobId, crate::HistoryFilesRemoval>,
+) -> Result<(), SchedulerError> {
+    use crate::AsyncOperationTargetState as State;
+    let settled = outcomes
+        .iter()
+        .map(|(id, removal)| crate::HistoryFilesRemovalSettlement {
+            target_id: id.0,
+            state: if removal.outcome.settles() {
+                State::Completed
+            } else {
+                State::Failed
+            },
+            outcome: removal.outcome,
+            message: removal.message.clone(),
+        })
+        .collect::<Vec<_>>();
+    let db = db.clone();
+    tokio::task::spawn_blocking(move || {
+        db.settle_history_files_removal_targets(operation, &settled)
+    })
+    .await
+    .map_err(|error| SchedulerError::Internal(error.to_string()))?
+    .map_err(SchedulerError::State)
 }
 
 #[cfg(all(test, unix))]
