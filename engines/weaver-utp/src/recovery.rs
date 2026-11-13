@@ -227,13 +227,30 @@ impl Recovery {
         } = context;
         self.receiver_supports_sack |= header.extensions.selective_ack.is_some();
 
-        match &mut self.phase {
-            RecoveryPhase::IgnoringUntilRecoveryPoint { recovery_point, .. } => {
-                if header.ack_nr.is_at_or_after(*recovery_point) {
-                    event!(RECOVERY_TRACING_LOG_LEVEL, ?recovery_point, ?header.ack_nr, "exiting IgnoringUntilRecoveryPoint");
-                    self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 }
-                }
+        // An ACK that reaches the recovery point ends the phase, and is then
+        // read for losses like any other: its SACK may already show a new
+        // hole with more than `SACK_DUP_THRESH` packets past it, and nothing
+        // may follow to show it again. libtorrent reads every SACK for
+        // losses, whatever came before (parse_sack, utp_stream.cpp
+        // v2.0.15:1234-1238, 1286-1320).
+        match &self.phase {
+            RecoveryPhase::IgnoringUntilRecoveryPoint { recovery_point, .. }
+                if header.ack_nr.is_at_or_after(*recovery_point) =>
+            {
+                event!(RECOVERY_TRACING_LOG_LEVEL, ?recovery_point, ?header.ack_nr, "exiting IgnoringUntilRecoveryPoint");
+                self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 };
             }
+            RecoveryPhase::Recovering(rec) if header.ack_nr.is_at_or_after(rec.recovery_point) => {
+                // A full acknowledgement: LEDBAT keeps the window the loss left.
+                event!(RECOVERY_TRACING_LOG_LEVEL, ?rec.recovery_point, ?header.ack_nr, prev_cwnd=rec.cwnd,
+                    ?congestion_controller, ?rec.total_retransmitted_segments, ?rtt, "exited recovery");
+                self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 };
+            }
+            _ => {}
+        }
+
+        match &mut self.phase {
+            RecoveryPhase::IgnoringUntilRecoveryPoint { .. } | RecoveryPhase::Recovering(_) => {}
             RecoveryPhase::CountingDuplicates { dup_acks } => {
                 // HighAck is the last sequence number fully consumed by receiver.
                 let high_ack = match tx_segs.first_seq_nr() {
@@ -287,14 +304,6 @@ impl Recovery {
                 event!(RECOVERY_TRACING_LOG_LEVEL, ?rec.recovery_point, ?high_ack, high_data=?last_sent_seq_nr, ack_nr=?header.ack_nr, ?pipe_estimate, ?cwnd, ?rtt, "entered recovery");
                 self.phase = RecoveryPhase::Recovering(rec);
             }
-            RecoveryPhase::Recovering(rec) => {
-                if header.ack_nr.is_at_or_after(rec.recovery_point) {
-                    // A full acknowledgement: LEDBAT keeps the window the loss left.
-                    event!(RECOVERY_TRACING_LOG_LEVEL, ?rec.recovery_point, ?header.ack_nr, prev_cwnd=rec.cwnd,
-                        ?congestion_controller, ?rec.total_retransmitted_segments, ?rtt, "exited recovery");
-                    self.phase = RecoveryPhase::CountingDuplicates { dup_acks: 0 };
-                }
-            }
         }
     }
 
@@ -323,7 +332,7 @@ impl Default for Recovery {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::atomic::Ordering, time::Duration};
 
     use tokio::time::Instant;
 
@@ -480,6 +489,61 @@ mod tests {
             super::count_sack_duplicates(&sack(0..3), &advanced, 2, &stats),
             0
         );
+    }
+
+    // The ACK that ends a recovery may already name more than three packets
+    // past a new hole. That hole is lost on that ACK: it may be the last
+    // the sender hears before its timer.
+    #[test]
+    fn the_ack_that_ends_a_recovery_is_read_for_a_new_hole() {
+        let stats = UtpStats::default();
+        let now = Instant::now();
+        let mut segs = Segments::new(10.into());
+        for _ in 0..12 {
+            assert!(segs.enqueue(500, false));
+        }
+        for mut item in segs.iter_mut_for_sending(None) {
+            item.on_sent(now, &stats);
+        }
+        let mut cc = Ledbat::new(500, LedbatParams::default());
+        cc.set_remote_window(usize::MAX);
+        let mut recovery = Recovery::new();
+        let mut ack = |ack_nr: u16, last_sent_seq_nr: u16, recovery: &mut Recovery| {
+            let header = UtpHeader {
+                htype: Type::State,
+                ack_nr: ack_nr.into(),
+                wnd_size: 1 << 20,
+                extensions: crate::raw::Extensions {
+                    selective_ack: crate::raw::selective_ack::SelectiveAck::new_test(0..4),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let result = segs.remove_up_to_ack(now, &header);
+            recovery.on_ack(
+                &header,
+                &result,
+                &mut segs,
+                &mut cc,
+                super::AckContext {
+                    last_sent_seq_nr: last_sent_seq_nr.into(),
+                    next_seq_nr: (last_sent_seq_nr + 1).into(),
+                    now,
+                    rtt: Duration::from_millis(50),
+                    stats: &stats,
+                },
+            );
+        };
+
+        // 10 to 14 are out; 10 is lost and 11 to 14 arrive.
+        ack(9, 14, &mut recovery);
+        assert!(recovery.is_recovering());
+
+        // 15 to 21 went out since. The ACK for 10 to 15 passes the recovery
+        // point, and its SACK names 17 to 20 past a new hole, 16.
+        ack(15, 21, &mut recovery);
+        assert!(recovery.is_recovering(), "{recovery:?}");
+        assert_eq!(stats.recovery_enter_count.load(Ordering::Relaxed), 2);
     }
 
     #[test]

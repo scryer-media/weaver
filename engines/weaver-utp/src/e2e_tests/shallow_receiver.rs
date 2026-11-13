@@ -71,6 +71,10 @@ struct Counters {
     lost_on_path: u64,
     // The stream ended before every byte arrived.
     died: bool,
+    // The receiver's ACKs that only announced a reopened window.
+    window_updates: u64,
+    // The data packets the sender counted as sent.
+    sender_data_sent: u64,
 }
 
 // What the sender's retransmission timeouts came from, by cause.
@@ -388,6 +392,12 @@ struct Link {
 }
 
 impl Transport for Link {
+    // A kernel socket's shape: the streams' datagrams leave from the
+    // socket's one I/O task.
+    fn sends_from_one_task(&self) -> bool {
+        true
+    }
+
     async fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let (source, data) = poll_fn(|cx| {
             let mut model = self.network.model.lock();
@@ -616,9 +626,12 @@ async fn transfer_with(
     );
     let drains = received.map_or_else(|_| network.counters().drains, |(_, drains)| drains);
     let stats = sender.stats();
+    let receiver_stats = receiver.stats();
     let counters = Counters {
         died,
         drains,
+        window_updates: receiver_stats.window_update_acks.load(Ordering::Relaxed),
+        sender_data_sent: stats.data_packets_sent.load(Ordering::Relaxed),
         rtos: stats.rto_timeouts_count.load(Ordering::Relaxed),
         refused: stats.send_poll_pending.load(Ordering::Relaxed),
         fast_resends: stats
@@ -682,16 +695,21 @@ fn report(case: &str, (counters, causes): &(Counters, Causes)) {
 // and packets are lost, as they are for libtorrent there. A hole followed
 // by enough delivered packets to show it lost is resent on SACK evidence,
 // never by the retransmission timer. Only a hole in the transfer's last
-// packets may wait for the timer: nothing after it arrived, or only one or
-// two packets, fewer than the SACK rule needs. libtorrent resends a hole
+// packets may wait for the timer: nothing after it arrived, or only one, two
+// or three packets, fewer than the SACK rule needs. libtorrent resends a hole
 // only once more than three later packets are acked (utp_stream.cpp
 // v2.0.15:140, 1288-1318) and sends no tail-loss probe, so its timer finds
 // such a tail too (utp_stream.cpp v2.0.15:3389, 3553). Whether the last
-// flight meets an overflow depends on where the transfer ends, so several
-// lengths run, some ending in one and some not. A run the timer did not
-// touch also resends every lost packet on SACK evidence, and the receiver
-// gets at least half of what it can drain: 24 full packets for every
-// millisecond it reads.
+// flight meets an overflow depends on where the transfer ends, so lengths
+// from 3.4 MB to 5.3 MB run 41 kB apart, some ending in one and most not;
+// any change of timing moves which. A run the timer did not
+// touch also resends every lost packet on SACK evidence. The receiver
+// acknowledges once per drain, as libtorrent does (utp_socket_manager.cpp
+// v2.0.15:255-271, utp_stream.cpp v2.0.15:3026-3033), and each SACK resends
+// at most five holes, as libtorrent's does (utp_stream.cpp v2.0.15:1228,
+// 1269-1272): a drain that overflows costs a millisecond of recovery for
+// every five packets it lost. The receiver still gets 13 full packets for
+// every millisecond it reads.
 #[tokio::test(start_paused = true)]
 async fn a_short_path_resends_on_sack_evidence_and_times_out_only_on_its_tail() {
     let shallow = Shallow {
@@ -699,12 +717,21 @@ async fn a_short_path_resends_on_sack_evidence_and_times_out_only_on_its_tail() 
         drain_every: Duration::from_millis(1),
     };
     let mut tail_timeouts = 0;
-    for bytes in [3_477_000, 4_110_000, 4 * 1024 * 1024, 5_165_000] {
+    let lengths = [3_477_000, 4_110_000, 4 * 1024 * 1024, 5_035_000, 5_165_000];
+    for bytes in lengths
+        .into_iter()
+        .chain((0..48).map(|i| 3_400_000 + i * 41_000))
+    {
         for one_way in [Duration::from_micros(500), Duration::from_micros(50)] {
             let run = transfer(bytes, one_way, Some(shallow)).await;
             report(&format!("{bytes} bytes, one way {one_way:?}"), &run);
             let (counters, causes) = run;
             assert!(!counters.died, "{bytes}, {one_way:?}: {counters:?}");
+            // Every data packet on the wire is counted, resends included.
+            assert_eq!(
+                counters.sender_data_sent, counters.data_sent,
+                "{counters:?}"
+            );
             assert!(
                 counters.data_sent as usize >= bytes / PACKET_PAYLOAD,
                 "{counters:?}"
@@ -721,6 +748,7 @@ async fn a_short_path_resends_on_sack_evidence_and_times_out_only_on_its_tail() 
                         ExpiryCause::TailNoProbeRecovering
                             | ExpiryCause::OneLaterArrived
                             | ExpiryCause::TwoLaterArrived
+                            | ExpiryCause::ThreeLaterArrived
                     ),
                     "{bytes}, {one_way:?}: a timeout not on the tail: {causes:?}"
                 );
@@ -729,7 +757,7 @@ async fn a_short_path_resends_on_sack_evidence_and_times_out_only_on_its_tail() 
             if counters.rtos == 0 {
                 assert!(counters.fast_resends >= counters.dropped, "{counters:?}");
                 assert!(
-                    bytes / PACKET_PAYLOAD >= 24 * counters.drains as usize,
+                    bytes / PACKET_PAYLOAD >= 13 * counters.drains as usize,
                     "{bytes}, {one_way:?}: {counters:?}"
                 );
             }
@@ -860,6 +888,10 @@ async fn a_writer_in_pieces_fills_every_packet() {
     }
     for (case, counters) in results {
         assert_eq!(counters.dropped, 0, "{case}: {counters:?}");
+        // The window never falls below what any packet needs, so a reader
+        // that frees buffer sends nothing of its own: the ACKs the data
+        // draws carry the window.
+        assert_eq!(counters.window_updates, 0, "{case}: {counters:?}");
         // Short packets are the probes that find the path's size and the
         // last tail: one in a hundred at most.
         assert!(
@@ -870,7 +902,7 @@ async fn a_writer_in_pieces_fills_every_packet() {
 }
 
 // An upload capped at 20 MB/s, a second's quota written at once, to the
-// same receiver 1 ms away: about one datagram in eight is lost. Through a
+// same receiver 1 ms away: about one datagram in fifteen is lost. Through a
 // sender socket that takes 48 datagrams every 2 ms, many sends are
 // refused as well. The stream never dies and every byte arrives; only the
 // tail of a lump waits for the retransmission timer.
@@ -912,7 +944,7 @@ async fn a_capped_upload_through_a_full_socket_never_dies() {
             assert!(counters.refused > 0, "{case}: {counters:?}");
         } else {
             assert!(
-                counters.dropped * 10 > counters.data_sent,
+                counters.dropped * 20 > counters.data_sent,
                 "{case}: {counters:?}"
             );
         }

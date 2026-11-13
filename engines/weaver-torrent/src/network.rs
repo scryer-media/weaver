@@ -316,6 +316,13 @@ impl Transport for DatagramTransport {
         self.0.sender()
     }
 
+    // Every send and receive of a kernel socket happens on the uTP
+    // socket's one I/O task, as libtorrent makes them all on its network
+    // thread; a tunnel's streams keep the sender of their own.
+    fn sends_from_one_task(&self) -> bool {
+        true
+    }
+
     fn shutdown(&self) -> impl Future<Output = io::Result<()>> + Send {
         self.0.shutdown()
     }

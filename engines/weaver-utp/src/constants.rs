@@ -12,6 +12,9 @@ pub const IPV6_HEADER: u16 = 40;
 
 pub const UDP_HEADER: u16 = 8;
 pub const UTP_HEADER: u16 = 20;
+// The most payload one UDP datagram carries: no uTP packet's payload is
+// larger.
+pub const MAX_UDP_PAYLOAD: u32 = 65_535 - UDP_HEADER as u32 - IPV4_HEADER as u32;
 
 /// Default per-stream receive capacity, in bytes.
 pub const RX_BUF_SIZE_PER_VSOCK_DEFAULT: NonZeroUsize = non_zero_const!(1024 * 1024);
@@ -26,12 +29,6 @@ pub const TX_BUF_SIZE_PER_VSOCK_MAX_DEFAULT: NonZeroUsize = non_zero_const!(1024
 
 // Delayed ACK timer. Linux has 40ms, so we set to it too.
 pub const ACK_DELAY: Duration = Duration::from_millis(40);
-
-/// This HUGELY impacts perf. The higher this number, the better the perf, as a lot of CPU is
-/// spent to send ACKs.
-/// However if N * mss happens to exceed cwnd, the performance would tank as we'll start sending
-/// delayed ACKs only, and the pipeline would be stalling.
-pub const IMMEDIATE_ACK_EVERY_RMSS: usize = 2;
 
 pub const SYNACK_RESEND_INTERNAL: Duration = Duration::from_millis(200);
 

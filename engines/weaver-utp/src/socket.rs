@@ -45,6 +45,10 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod mapped_endpoint_tests;
 #[cfg(test)]
+mod outbox_tests;
+#[cfg(test)]
+mod receive_batch_tests;
+#[cfg(test)]
 mod send_handle_tests;
 #[cfg(test)]
 mod udp_error_tests;
@@ -55,8 +59,10 @@ use crate::{
         DEFAULT_REMOTE_INACTIVITY_TIMEOUT, DEFAULT_SYN_RESENDS, IPV4_HEADER,
         RX_BUF_SIZE_PER_VSOCK_DEFAULT, UDP_HEADER, UTP_HEADER,
     },
+    ingress::SendFault,
     message::UtpMessage,
     mtu::MtuCeiling,
+    outbox::{Batch, Outbox},
     raw::{Type, UtpHeader},
     seq_nr::SeqNr,
     stream_dispatch::{StreamArgs, UtpStreamStarter},
@@ -392,6 +398,9 @@ const RESETS_PER_INTERVAL: usize = 16;
 const RESET_INTERVAL: Duration = Duration::from_millis(100);
 // Streams that ended whose send ids the socket remembers.
 const TOMBSTONES_MAX: usize = 256;
+// Datagrams read in one go before the socket's other work gets a turn:
+// libtorrent reads 50 at a time (v2.0.15 session_impl.cpp:2618).
+const RECEIVE_BATCH: usize = 50;
 
 pub(crate) struct RegisteredStream {
     tx: crate::ingress::Sender,
@@ -506,6 +515,144 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     next_connection_id: SeqNr,
     tombstones: Tombstones,
     reset_budget: ResetBudget,
+    // The stream holding packets of the current read that were neither
+    // marked nor woken yet.
+    unflushed: Option<StreamRecvKey>,
+    // The streams' datagrams taken from the outbox, sent from the front.
+    outgoing: Outgoing,
+}
+
+#[derive(Default)]
+struct Outgoing {
+    batch: Batch,
+    gate: SendGate,
+    // Datagrams sent or given up, the outbox's tickets they cover.
+    sent: u64,
+}
+
+// Sends the datagrams the streams queued, in queue order, until none is
+// left or the transport refuses one. Each is stamped as it goes, as
+// libtorrent stamps a packet just before its send (v2.0.15
+// utp_stream.cpp:1793-1810, 2021-2045). Ready when any was sent.
+fn poll_outgoing<T: Transport, E: UtpEnvironment>(
+    outgoing: &mut Outgoing,
+    socket: &SocketState<T, E>,
+    transport: &T,
+    env: &E,
+    streams: &BTreeMap<StreamRecvKey, RegisteredStream>,
+    cx: &mut std::task::Context<'_>,
+) -> Poll<()> {
+    let Some(outbox) = socket.outbox.as_ref() else {
+        return Poll::Pending;
+    };
+    let start = outgoing.sent;
+    'batches: loop {
+        if outgoing.batch.is_drained() && !outbox.take(&mut outgoing.batch, cx.waker()) {
+            break;
+        }
+        while let Some((buf, queued)) = outgoing.batch.front() {
+            let now = env.now();
+            let stamp = (now - socket.created).as_micros() as u32;
+            if let Some(timestamp) = buf.get_mut(4..8) {
+                timestamp.copy_from_slice(&stamp.to_be_bytes());
+            }
+            let fragmenting = queued.fragmenting;
+            let sent =
+                socket.poll_send_gated(&mut outgoing.gate, cx, true, |cx| match fragmenting {
+                    None => transport.poll_send_to(cx, buf, queued.addr),
+                    Some(fragmenting) => transport.poll_send_to_vectored_fragmenting(
+                        cx,
+                        &[IoSlice::new(buf)],
+                        queued.addr,
+                        fragmenting,
+                    ),
+                });
+            let fault = match sent {
+                // The runtime's per-task budget ran out, not the socket's
+                // room: the runtime has already woken the task to go on.
+                // Nothing is refused and no full socket is counted.
+                Some(Poll::Pending) if !tokio::task::coop::has_budget_remaining() => {
+                    break 'batches;
+                }
+                None | Some(Poll::Pending) => {
+                    if sent.is_some() {
+                        socket.stats.send_poll_pending.increment(1);
+                        debug_every_ms!(5000, "UDP socket full, could not send packet");
+                    }
+                    outbox.stall();
+                    outbox.set_sent(outgoing.sent);
+                    return if outgoing.sent == start {
+                        Poll::Pending
+                    } else {
+                        Poll::Ready(())
+                    };
+                }
+                Some(Poll::Ready(Ok(len))) => {
+                    if len != buf.len() {
+                        warn!(
+                            actual_len = len,
+                            expected_len = buf.len(),
+                            "sent a broken packet"
+                        );
+                    }
+                    None
+                }
+                Some(Poll::Ready(Err(error)))
+                    if fragmenting.is_none() && crate::is_message_size_error(&error) =>
+                {
+                    // Sent again at once without don't-fragment, as
+                    // libtorrent resends a refused probe (utp_stream.cpp
+                    // v2.0.15:1814-1836); the stream cuts smaller from now.
+                    queued.fragmenting = Some(Fragmenting::Allowed);
+                    debug!(
+                        len = buf.len(),
+                        "the host refused a packet as too large: {error:#}"
+                    );
+                    // Only a data packet tells its stream to cut smaller: a
+                    // control packet's size says nothing of its segments.
+                    if queued.departures.is_some() {
+                        let payload = buf.len().saturating_sub(UTP_HEADER as usize);
+                        report_fault(streams, queued, SendFault::TooLarge(payload));
+                    }
+                    continue;
+                }
+                Some(Poll::Ready(Err(error))) => {
+                    socket.stats.send_errors.increment(1);
+                    debug!(
+                        "error sending to UDP socket addr={}, len={}: {error:#}",
+                        queued.addr,
+                        buf.len()
+                    );
+                    Some(SendFault::Failed(error))
+                }
+            };
+            if let Some(departures) = &queued.departures {
+                departures.push(fault.is_none().then_some(now));
+            }
+            if let Some(fault) = fault {
+                report_fault(streams, queued, fault);
+            }
+            outgoing.batch.advance();
+            outgoing.sent += 1;
+        }
+    }
+    if outgoing.sent == start {
+        return Poll::Pending;
+    }
+    outbox.set_sent(outgoing.sent);
+    // Room was made: the streams the outbox refused try again.
+    socket.send_waker.wake_by_ref();
+    Poll::Ready(())
+}
+
+fn report_fault(
+    streams: &BTreeMap<StreamRecvKey, RegisteredStream>,
+    queued: &crate::outbox::Queued,
+    fault: SendFault,
+) {
+    if let Some(stream) = streams.get(&(queued.addr, queued.recv_id)) {
+        stream.tx.report_send_fault(fault);
+    }
 }
 
 fn poll_control_sends(
@@ -658,31 +805,84 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             if self.socket.cancellation_token.is_cancelled() {
                 return Ok(());
             }
-            if let Err(e) = self.run_once(&mut read_buf, &mut receive_errors).await {
-                warn!("error running dispatcher: {e:#}");
-                return Err(e);
-            }
+            let cut = match self.run_once(&mut read_buf, &mut receive_errors).await {
+                Ok(cut) => cut,
+                Err(e) => {
+                    warn!("error running dispatcher: {e:#}");
+                    return Err(e);
+                }
+            };
             completions += 1;
-            if completions == 64 {
+            if cut || completions == 64 {
                 // A transport may repeatedly complete without yielding, for
-                // errors or packets alike. Give cancellation and peers a turn.
+                // errors or packets alike, and a read cut at the batch limit
+                // leaves more waiting. Give cancellation and peers a turn.
                 tokio::task::yield_now().await;
                 completions = 0;
             }
         }
     }
 
+    // One pass over the datagrams the streams queued, without waiting.
+    async fn send_outgoing(&mut self) -> crate::Result<()> {
+        if self.socket.outbox.is_none() {
+            return Ok(());
+        }
+        let transport = self.transport.as_deref().ok_or(Error::DispatcherDead)?;
+        poll_fn(|cx| {
+            let _ = poll_outgoing(
+                &mut self.outgoing,
+                &self.socket,
+                transport,
+                &self.env,
+                &self.streams,
+                cx,
+            );
+            Poll::Ready(())
+        })
+        .await;
+        Ok(())
+    }
+
+    // True when a read of the socket stopped at the batch limit.
     async fn run_once(
         &mut self,
         read_buf: &mut [u8],
         receive_errors: &mut usize,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<bool> {
         let retirements = Arc::clone(&self.socket.retirements);
         let retired = retirements.notifications().notified();
         tokio::pin!(retired);
         retired.as_mut().enable();
         self.reap_retired();
         self.cleanup_accept_queue()?;
+        self.send_outgoing().await?;
+
+        if self.unflushed.is_some() {
+            // A read cut at the batch limit goes on before anything waits,
+            // but the socket's other work that is ready runs first, one
+            // item a turn, so a socket that never empties holds back no
+            // connect, accept, control send or retirement for longer than
+            // one read of RECEIVE_BATCH datagrams each.
+            tokio::select! {
+                biased;
+                accept = self.accept_queue.rx.recv(), if self.accept_queue.next_available_acceptor.is_none() => {
+                    let accept = accept.unwrap();
+                    self.accept_queue.next_available_acceptor = Some(accept);
+                }
+                request = self.connect_rx.recv() => {
+                    if let Some(request) = request { self.admit_connect(request); }
+                },
+                _ = &mut retired => {},
+                completion = poll_fn(|cx| poll_control_sends(&mut self.connecting, &mut self.control_sends, cx)) => {
+                    self.finish_send(completion)?;
+                },
+                () = std::future::ready(()) => {
+                    return self.read_batch(read_buf, receive_errors, 0).await;
+                }
+            }
+            return Ok(false);
+        }
 
         tokio::select! {
             accept = self.accept_queue.rx.recv(), if self.accept_queue.next_available_acceptor.is_none() => {
@@ -696,41 +896,114 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             completion = poll_fn(|cx| poll_control_sends(&mut self.connecting, &mut self.control_sends, cx)) => {
                 self.finish_send(completion)?;
             },
+            () = poll_fn(|cx| match self.transport.as_deref() {
+                Some(transport) => poll_outgoing(
+                    &mut self.outgoing,
+                    &self.socket,
+                    transport,
+                    &self.env,
+                    &self.streams,
+                    cx,
+                ),
+                None => Poll::Pending,
+            }), if self.socket.outbox.is_some() => {},
             recv = self.transport.as_deref().ok_or(Error::DispatcherDead)?.recv_from(read_buf) => {
                 let received = self.env.now();
-                let (len, addr) = match recv {
-                    Ok(received) => {
-                        *receive_errors = 0;
-                        received
-                    }
-                    Err(error) if crate::udp_error::is_recoverable_receive_error(&error) => {
-                        *receive_errors += 1;
-                        if *receive_errors >= CONSECUTIVE_RECEIVE_ERRORS_MAX {
-                            return Err(Error::Recv(error));
-                        }
-                        trace!(%error, "recoverable datagram receive error");
-                        return Ok(());
-                    }
-                    Err(error) => return Err(Error::Recv(error)),
-                };
-                if len >= read_buf.len() {
-                    self.socket.stats.invalid_packets.increment(1);
-                    trace!(len, ?addr, "dropping datagram at receive buffer limit");
-                    return Ok(());
-                }
-                let message = match UtpMessage::deserialize(&read_buf[..len], received) {
-                    Some(msg) => msg,
-                    None => {
-                        self.socket.stats.invalid_packets.increment(1);
-                        trace!(len, ?addr, "error deserializing and validating UTP message");
-                        return Ok(())
-                    }
-                };
-                self.on_recv(addr, message).await?;
+                self.on_datagram(recv, received, read_buf, receive_errors).await?;
+                return self.read_batch(read_buf, receive_errors, 1).await;
             }
         }
 
-        Ok(())
+        Ok(false)
+    }
+
+    // Reads the socket until it would block, as libtorrent does
+    // (v2.0.15 session_impl.cpp:2616-2677), at most RECEIVE_BATCH
+    // datagrams at a time so the socket's other work and its streams get a
+    // turn. Once the socket is empty the stream that took the last packets
+    // is marked and woken, which is when it sends the ACK it owes
+    // (session_impl.cpp:2727, utp_socket_manager.cpp:255-261). At the limit
+    // that stream is only woken; the read goes on after a yield.
+    async fn read_batch(
+        &mut self,
+        read_buf: &mut [u8],
+        receive_errors: &mut usize,
+        mut read: usize,
+    ) -> crate::Result<bool> {
+        while read < RECEIVE_BATCH {
+            let recv = {
+                let transport = self.transport.as_deref().ok_or(Error::DispatcherDead)?;
+                let mut next = std::pin::pin!(transport.recv_from(read_buf));
+                poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
+            };
+            let Poll::Ready(recv) = recv else {
+                if self.unflushed.is_some() {
+                    self.socket.stats.receive_drains.increment(1);
+                }
+                self.flush_unflushed();
+                return Ok(false);
+            };
+            read += 1;
+            let received = self.env.now();
+            if let Err(error) = self
+                .on_datagram(recv, received, read_buf, receive_errors)
+                .await
+            {
+                // libtorrent drains on a fatal error too
+                // (session_impl.cpp:2719).
+                self.flush_unflushed();
+                return Err(error);
+            }
+        }
+        if let Some(stream) = self.unflushed.and_then(|key| self.streams.get(&key)) {
+            stream.tx.wake();
+        }
+        Ok(true)
+    }
+
+    async fn on_datagram(
+        &mut self,
+        recv: std::io::Result<(usize, SocketAddr)>,
+        received: Instant,
+        read_buf: &[u8],
+        receive_errors: &mut usize,
+    ) -> crate::Result<()> {
+        let (len, addr) = match recv {
+            Ok(received) => {
+                *receive_errors = 0;
+                received
+            }
+            Err(error) if crate::udp_error::is_recoverable_receive_error(&error) => {
+                *receive_errors += 1;
+                if *receive_errors >= CONSECUTIVE_RECEIVE_ERRORS_MAX {
+                    return Err(Error::Recv(error));
+                }
+                trace!(%error, "recoverable datagram receive error");
+                return Ok(());
+            }
+            Err(error) => return Err(Error::Recv(error)),
+        };
+        if len >= read_buf.len() {
+            self.socket.stats.invalid_packets.increment(1);
+            trace!(len, ?addr, "dropping datagram at receive buffer limit");
+            return Ok(());
+        }
+        let message = match UtpMessage::deserialize(&read_buf[..len], received) {
+            Some(msg) => msg,
+            None => {
+                self.socket.stats.invalid_packets.increment(1);
+                trace!(len, ?addr, "error deserializing and validating UTP message");
+                return Ok(());
+            }
+        };
+        self.on_recv(addr, message).await
+    }
+
+    // Marks and wakes the stream holding packets of the current read.
+    fn flush_unflushed(&mut self) {
+        if let Some(stream) = self.unflushed.take().and_then(|key| self.streams.get(&key)) {
+            stream.tx.flush();
+        }
     }
 
     // Get into a state where we can't match acceptors with cached SYNs anymore.
@@ -1081,12 +1354,22 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let addr = canonical_socket_addr(addr);
         let key = (addr, message.header.connection_id.0);
 
+        // A packet for another stream than the last one's sends that
+        // stream's owed ACK first (libtorrent v2.0.15
+        // utp_socket_manager.cpp:158-173), so its packets are marked here.
+        if self.unflushed.is_some_and(|last| last != key) {
+            self.socket.stats.stream_switch_marks.increment(1);
+            self.flush_unflushed();
+        }
         if let Some(stream) = self.streams.get(&key) {
-            if stream.tx.send(message).is_err() {
+            if stream.tx.push(message).is_ok() {
+                self.unflushed = Some(key);
+            } else {
                 trace!(
                     ?key,
                     "stream dead, but wasn't cleaned up yet, this is probably a race"
                 );
+                self.unflushed = None;
                 if let Some(stream) = self.streams.remove(&key) {
                     self.tombstones.bury(key, stream.send_id);
                 }
@@ -1232,6 +1515,9 @@ pub(crate) struct SocketState<T, E> {
     // writable wake reaches every stream it refused.
     send_wake: Arc<SendWake>,
     send_waker: Waker,
+    // Where streams without a sender of their own queue their datagrams
+    // for the dispatcher to send, when the transport asks for it.
+    pub(crate) outbox: Option<Outbox>,
 
     // Why each retransmission timeout of the socket's streams came.
     #[cfg(test)]
@@ -1269,6 +1555,39 @@ impl Wake for SendWake {
 #[derive(Debug, Default)]
 pub(crate) struct SendGate {
     refused_at: Option<u64>,
+    // The stream's receive id, its key at the socket with its remote.
+    recv_id: u16,
+    // The outbox ticket of the stream's last queued datagram.
+    queued_through: u64,
+    // When the I/O task sent the data packets the stream queued.
+    departures: std::sync::Arc<crate::outbox::Departures>,
+    // The last data packet was queued for the I/O task, not sent.
+    data_queued: bool,
+}
+
+impl SendGate {
+    pub(crate) fn for_stream(recv_id: u16) -> Self {
+        Self {
+            recv_id,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the data packet just accepted was queued for the I/O task,
+    /// which records its departure, rather than sent.
+    pub(crate) fn take_data_queued(&mut self) -> bool {
+        std::mem::take(&mut self.data_queued)
+    }
+
+    /// Moves the departures of the data packets queued into `into`.
+    pub(crate) fn take_departures(&self, into: &mut std::collections::VecDeque<Option<Instant>>) {
+        self.departures.take(into);
+    }
+
+    /// The next departure recorded wakes `waker`.
+    pub(crate) fn wake_on_departure(&self, waker: &std::task::Waker) {
+        self.departures.wake_on_next(waker);
+    }
 }
 
 impl<T: Transport, E: UtpEnvironment> std::fmt::Debug for UtpSocket<T, E> {
@@ -1347,6 +1666,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
         let validated_opts = opts.validate()?;
         let local_addr = transport.bind_addr();
         let link_mtu = transport.link_mtu();
+        let sends_from_one_task = transport.sends_from_one_task();
         let transport = Arc::new(transport);
         let runtime = Runtime::new(transport, &opts.cancellation_token);
 
@@ -1374,6 +1694,7 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             mtu_ceiling: Default::default(),
             send_waker: Waker::from(send_wake.clone()),
             send_wake,
+            outbox: sends_from_one_task.then(Outbox::new),
             #[cfg(test)]
             expiry_causes: Default::default(),
         });
@@ -1391,6 +1712,8 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             control_sends: Vec::new(),
             tombstones: Tombstones::default(),
             reset_budget: ResetBudget::default(),
+            unflushed: None,
+            outgoing: Outgoing::default(),
             socket: state,
             transport: None,
             env,
@@ -1596,19 +1919,74 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
         gate.refused_at = None;
         let sent = send(&mut std::task::Context::from_waker(&self.send_waker));
         if sent.is_pending() {
-            gate.refused_at = Some(epoch);
-            {
-                let mut waiters = self.send_wake.waiters.lock();
-                if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
-                    waiters.push(cx.waker().clone());
-                }
-            }
-            // A wake between the refusal and the line above found no waiter.
-            if self.send_wake.epoch.load(Ordering::SeqCst) != epoch {
-                cx.waker().wake_by_ref();
-            }
+            self.wait_for_wake(gate, epoch, cx);
         }
         Some(sent)
+    }
+
+    // A send refused in `epoch` waits for the next writable wake.
+    fn wait_for_wake(&self, gate: &mut SendGate, epoch: u64, cx: &mut std::task::Context<'_>) {
+        gate.refused_at = Some(epoch);
+        {
+            let mut waiters = self.send_wake.waiters.lock();
+            if !waiters.iter().any(|w| w.will_wake(cx.waker())) {
+                waiters.push(cx.waker().clone());
+            }
+        }
+        // A wake between the refusal and the line above found no waiter.
+        if self.send_wake.epoch.load(Ordering::SeqCst) != epoch {
+            cx.waker().wake_by_ref();
+        }
+    }
+
+    // Queues a datagram for the dispatcher. Refused, as a full socket
+    // refuses, while the dispatcher holds datagrams the transport refused
+    // or the outbox is full; the stream then waits for the next writable
+    // wake or for the dispatcher to make room. Returns true when refused.
+    fn queue_send(
+        &self,
+        outbox: &Outbox,
+        gate: &mut SendGate,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[IoSlice<'_>],
+        addr: SocketAddr,
+        data: bool,
+    ) -> bool {
+        let epoch = self.send_wake.epoch.load(Ordering::SeqCst);
+        if gate.refused_at == Some(epoch) {
+            return true;
+        }
+        gate.refused_at = None;
+        let departures = data.then_some(&gate.departures);
+        match outbox.try_queue(bufs, addr, gate.recv_id, departures) {
+            Some(ticket) => {
+                gate.queued_through = ticket;
+                gate.data_queued = data;
+                false
+            }
+            None => {
+                self.stats.send_poll_pending.increment(1);
+                debug_every_ms!(5000, "UDP socket full, could not send packet");
+                self.wait_for_wake(gate, epoch, cx);
+                true
+            }
+        }
+    }
+
+    // A send of the stream's own goes after every datagram it queued, so
+    // its packets leave in the order it sent them. True while one waits.
+    fn queued_ahead(&self, gate: &mut SendGate, cx: &mut std::task::Context<'_>) -> bool {
+        let Some(outbox) = self.outbox.as_ref() else {
+            return false;
+        };
+        let epoch = self.send_wake.epoch.load(Ordering::SeqCst);
+        if outbox.sent() >= gate.queued_through {
+            return false;
+        }
+        if gate.refused_at != Some(epoch) {
+            self.wait_for_wake(gate, epoch, cx);
+        }
+        true
     }
 
     /// Returns true if saw Poll::Pending
@@ -1622,6 +2000,9 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
         addr: SocketAddr,
     ) -> std::io::Result<bool> {
         let shared = sender.is_none();
+        if shared && let Some(outbox) = self.outbox.as_ref() {
+            return Ok(self.queue_send(outbox, gate, cx, &[IoSlice::new(buf)], addr, false));
+        }
         let sent = self.poll_send_gated(gate, cx, shared, |cx| match sender {
             Some(sender) => sender.poll_send_to(cx, buf, addr),
             None => transport.poll_send_to(cx, buf, addr),
@@ -1668,6 +2049,17 @@ impl<T: Transport, Env: UtpEnvironment> SocketState<T, Env> {
     ) -> std::io::Result<bool> {
         let total_len: usize = bufs.iter().map(|buf| buf.len()).sum();
         let shared = sender.is_none();
+        if shared && let Some(outbox) = self.outbox.as_ref() {
+            // A size probe, or a packet given up on as too large, is sent
+            // by the stream itself, so the host's size refusal reaches it
+            // at once; only after the datagrams it queued before.
+            if fragmenting.is_none() {
+                return Ok(self.queue_send(outbox, gate, cx, bufs, addr, true));
+            }
+            if self.queued_ahead(gate, cx) {
+                return Ok(true);
+            }
+        }
         let sent = self.poll_send_gated(gate, cx, shared, |cx| match (sender, fragmenting) {
             (Some(sender), None) => sender.poll_send_to_vectored(cx, bufs, addr),
             (None, None) => transport.poll_send_to_vectored(cx, bufs, addr),
@@ -1960,7 +2352,7 @@ mod tests {
                 receivers[index].try_recv().unwrap().message.payload(),
                 payload
             );
-            assert!(receivers.iter_mut().all(|rx| rx.try_recv().is_err()));
+            assert!(receivers.iter_mut().all(|rx| rx.try_recv().is_none()));
         }
 
         dispatcher
@@ -1971,7 +2363,7 @@ mod tests {
             .on_recv(ADDR_2, packet(32768, b"removed"))
             .await
             .unwrap();
-        assert!(receivers.iter_mut().all(|rx| rx.try_recv().is_err()));
+        assert!(receivers.iter_mut().all(|rx| rx.try_recv().is_none()));
         dispatcher
             .on_recv(other, packet(32768, b"still routed"))
             .await

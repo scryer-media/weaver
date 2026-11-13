@@ -128,6 +128,17 @@ pub struct Segments {
     // SND.UNA - the sequence number of first unacknowledged segment.
     // If all acknowledged, this is the same as SND.NEXT.
     snd_una: SeqNr,
+
+    // The flight size kept as it changes, so a send pass or an ACK reads it
+    // without walking the segments: `flight_end` segments from the front
+    // are counted, and `flight_bytes` is the payload of those among them
+    // not delivered. `calc_flight_size` moves the end to the watermark it
+    // is given, walking only the segments it crosses.
+    flight_end: usize,
+    flight_bytes: usize,
+
+    // The payload of segments a SACK reported delivered and still queued.
+    delivered_bytes: usize,
 }
 
 pub struct SegmentForSending<'a> {
@@ -308,8 +319,55 @@ impl Segments {
             removed_offset: 0,
             sack_depth: 0,
             snd_una,
+            flight_end: 0,
+            flight_bytes: 0,
+            delivered_bytes: 0,
         }
     }
+
+    // Takes the segment at the back off the counted prefix and the
+    // delivered total, before it is popped.
+    fn uncount_back(&mut self) {
+        let Some(segment) = self.segments.back() else {
+            return;
+        };
+        if self.flight_end == self.segments.len() {
+            self.flight_end -= 1;
+            if !segment.is_delivered {
+                self.flight_bytes -= segment.payload_size;
+            }
+        }
+        if segment.is_delivered {
+            self.delivered_bytes -= segment.payload_size;
+        }
+    }
+
+    // The flight size counted over the first `take` segments, by walking
+    // them.
+    fn walk_flight_size(&self, take: usize) -> usize {
+        self.segments
+            .iter()
+            .take(take)
+            .map(|s| if s.is_delivered { 0 } else { s.payload_size })
+            .sum()
+    }
+
+    // The running totals match a walk of the segments.
+    #[cfg(test)]
+    fn check_running_totals(&self) {
+        assert!(self.flight_end <= self.segments.len());
+        assert_eq!(self.flight_bytes, self.walk_flight_size(self.flight_end));
+        let delivered: usize = self
+            .segments
+            .iter()
+            .filter(|s| s.is_delivered)
+            .map(|s| s.payload_size)
+            .sum();
+        assert_eq!(self.delivered_bytes, delivered);
+    }
+
+    #[cfg(not(test))]
+    fn check_running_totals(&self) {}
 
     pub fn acked_seq_nr(&self) -> SeqNr {
         self.snd_una - 1
@@ -328,6 +386,28 @@ impl Segments {
         self.snd_una + self.segments.len() as u16
     }
 
+    /// The send numbered `sends` of `seq_nr` left the socket at `at`, after
+    /// it was queued for the socket's I/O task: that send is timed from
+    /// then. Nothing changes when the segment is acknowledged already or
+    /// was sent again since.
+    pub fn set_departure(&mut self, seq_nr: SeqNr, sends: usize, at: Instant) {
+        let Some(segment) = seq_nr
+            .signed_offset_from(self.snd_una)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .and_then(|offset| self.segments.get_mut(offset))
+        else {
+            return;
+        };
+        if segment.send_count() != sends {
+            return;
+        }
+        match &mut segment.sent {
+            SentStatus::NotSent => {}
+            SentStatus::SentTime(sent) => *sent = at,
+            SentStatus::Retransmitted { last_send_ts, .. } => *last_send_ts = at,
+        }
+    }
+
     /// Drops the segments never sent, all at the back, and returns how many
     /// bytes they held. Sent segments stay until acknowledged.
     pub fn drop_unsent(&mut self) -> usize {
@@ -337,10 +417,12 @@ impl Segments {
                 break;
             }
             dropped += segment.payload_size;
+            self.uncount_back();
             self.segments.pop_back();
         }
         self.offset -= dropped as u64;
         self.len_bytes -= dropped;
+        self.check_running_totals();
         dropped
     }
 
@@ -391,13 +473,7 @@ impl Segments {
     // The bytes of segments not yet delivered, sent or not: those a SACK
     // reported delivered are out of the network.
     pub fn undelivered_bytes(&self) -> usize {
-        self.len_bytes
-            - self
-                .segments
-                .iter()
-                .filter(|s| s.is_delivered)
-                .map(|s| s.payload_size)
-                .sum::<usize>()
+        self.len_bytes - self.delivered_bytes
     }
 
     pub fn sack_depth(&self) -> usize {
@@ -434,17 +510,16 @@ impl Segments {
 
     pub fn pop_mtu_probe(&mut self, seq_nr: SeqNr) -> bool {
         let last_segment_seq_nr = self.snd_una + self.segments.len() as u16 - 1;
-        match self.segments.pop_back() {
+        match self.segments.back() {
             Some(s) if last_segment_seq_nr == seq_nr && s.is_mtu_probe && !s.is_delivered => {
+                self.uncount_back();
+                let s = self.segments.pop_back().unwrap();
                 self.len_bytes -= s.payload_size;
                 self.offset = s.payload_offset_absolute;
+                self.check_running_totals();
                 true
             }
-            Some(s) => {
-                self.segments.push_back(s);
-                false
-            }
-            None => false,
+            _ => false,
         }
     }
 
@@ -500,6 +575,15 @@ impl Segments {
         {
             let drain_count = (offset as usize + 1).min(self.segments.len());
             for segment in self.segments.drain(0..drain_count) {
+                if self.flight_end > 0 {
+                    self.flight_end -= 1;
+                    if !segment.is_delivered {
+                        self.flight_bytes -= segment.payload_size;
+                    }
+                }
+                if segment.is_delivered {
+                    self.delivered_bytes -= segment.payload_size;
+                }
                 if !segment.is_delivered {
                     covers_resend |= segment.retransmit_count() > 0;
                     segment.update_rtt(now, &mut new_rtt);
@@ -522,7 +606,8 @@ impl Segments {
                 let sack_start_offset =
                     2 - first_seq_nr.forward_distance_from(ack_header.ack_nr) as isize;
 
-                let mut process_sack = |segment: &mut Segment, is_sacked: bool| {
+                // Returns the payload of a segment this SACK newly delivered.
+                let mut process_sack = |segment: &mut Segment, is_sacked: bool| -> usize {
                     if !segment.is_delivered && is_sacked && segment.send_count() > 0 {
                         segment.is_delivered = true;
                         covers_resend |= segment.retransmit_count() > 0;
@@ -533,25 +618,37 @@ impl Segments {
                         }
                         newly_sacked_segment_count += 1;
                         newly_sacked_byte_count += segment.payload_size;
+                        segment.payload_size
+                    } else {
+                        0
                     }
                 };
 
+                let mut on_delivered = |index: usize, delivered: usize| {
+                    self.delivered_bytes += delivered;
+                    if index < self.flight_end {
+                        self.flight_bytes -= delivered;
+                    }
+                };
                 if sack_start_offset >= 0 {
-                    for (segment, acked) in self
+                    let skip = sack_start_offset as usize;
+                    for (index, (segment, acked)) in self
                         .segments
                         .iter_mut()
-                        .skip(sack_start_offset as usize)
+                        .skip(skip)
                         .zip(sack.iter())
+                        .enumerate()
                     {
-                        process_sack(segment, acked);
+                        on_delivered(skip + index, process_sack(segment, acked));
                     }
                 } else {
-                    for (segment, acked) in self
+                    for (index, (segment, acked)) in self
                         .segments
                         .iter_mut()
                         .zip(sack.iter().skip((-sack_start_offset) as usize))
+                        .enumerate()
                     {
-                        process_sack(segment, acked);
+                        on_delivered(index, process_sack(segment, acked));
                     }
                 }
             }
@@ -566,9 +663,13 @@ impl Segments {
             removed += 1;
             payload_size += segment.payload_size;
             self.len_bytes -= segment.payload_size;
+            self.delivered_bytes -= segment.payload_size;
+            // Delivered, so it adds nothing to the flight bytes.
+            self.flight_end = self.flight_end.saturating_sub(1);
             self.snd_una += 1;
             self.segments.pop_front().unwrap();
         }
+        self.check_running_totals();
 
         self.removed_offset += payload_size as u64;
         if covers_resend {
@@ -585,19 +686,43 @@ impl Segments {
         }
     }
 
-    // The total payload of sent and unacked segments.
-    pub fn calc_flight_size(&self, last_sent_seq_nr: SeqNr) -> usize {
+    fn flight_take(&self, last_sent_seq_nr: SeqNr) -> usize {
         // On RTO, we rewind back last_sent_seq_nr, however we don't reset the "sent" status
-        // of packets. So instead of using "is_sent", just iterate up to last_sent_seq_nr, and pretend we
+        // of packets. So instead of using "is_sent", just count up to last_sent_seq_nr, and pretend we
         // never sent them.
-        let take = last_sent_seq_nr
+        last_sent_seq_nr
             .signed_offset_from(self.snd_una)
-            .map_or(0, |offset| (offset + 1).max(0) as usize);
-        self.segments
-            .iter()
-            .take(take)
-            .map(|s| if s.is_delivered { 0 } else { s.payload_size })
-            .sum()
+            .map_or(0, |offset| (offset + 1).max(0) as usize)
+            .min(self.segments.len())
+    }
+
+    // The total payload of sent and unacked segments. The counted prefix
+    // moves to the watermark: forward over segments sent since the last
+    // call, back only when the watermark was rewound.
+    pub fn calc_flight_size(&mut self, last_sent_seq_nr: SeqNr) -> usize {
+        let take = self.flight_take(last_sent_seq_nr);
+        while self.flight_end < take {
+            let segment = &self.segments[self.flight_end];
+            if !segment.is_delivered {
+                self.flight_bytes += segment.payload_size;
+            }
+            self.flight_end += 1;
+        }
+        while self.flight_end > take {
+            self.flight_end -= 1;
+            let segment = &self.segments[self.flight_end];
+            if !segment.is_delivered {
+                self.flight_bytes -= segment.payload_size;
+            }
+        }
+        self.check_running_totals();
+        self.flight_bytes
+    }
+
+    // The flight size up to a watermark other than the one sends follow,
+    // walked without moving the counted prefix.
+    pub fn walk_flight_size_to(&self, last_sent_seq_nr: SeqNr) -> usize {
+        self.walk_flight_size(self.flight_take(last_sent_seq_nr))
     }
 
     // Pipe is the estimate of how much outstanding data is in the network.
@@ -1238,5 +1363,92 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![]
         );
+    }
+
+    // The flight size and the delivered total, kept as segments are sent,
+    // acknowledged, SACKed, rewound over by the timer, dropped unsent and
+    // popped as probes, equal a walk of the segments after every change.
+    // The sequence numbers wrap during the run.
+    #[test]
+    fn running_flight_size_equals_the_walk_through_loss_sacks_and_timeouts() {
+        // splitmix64, seeded: the same run every time.
+        let mut state: u64 = 0x5eed_f11e;
+        let mut next = move |bound: u64| {
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            (z ^ (z >> 31)) % bound
+        };
+        let stats = UtpStats::default();
+        let now = Instant::now();
+        let mut segs = Segments::new(65_000.into());
+        let mut last_sent = segs.acked_seq_nr();
+        let (mut sacked, mut rewinds, mut dropped, mut probes_popped, mut acked) = (0, 0, 0, 0, 0);
+
+        for _ in 0..50_000 {
+            match next(100) {
+                0..30 => {
+                    let probe = next(20) == 0;
+                    let _ = segs.enqueue(1 + next(1400) as usize, probe);
+                }
+                30..60 => {
+                    if let Some(mut seg) = segs.iter_mut_for_sending(Some(last_sent + 1)).next() {
+                        seg.on_sent(now, &stats);
+                        last_sent = seg.seq_nr();
+                    }
+                }
+                60..72 => {
+                    let ahead = last_sent.forward_distance_from(segs.acked_seq_nr());
+                    if ahead > 0 && ahead < 0x8000 {
+                        let ack = segs.acked_seq_nr() + next(u64::from(ahead) + 1) as u16;
+                        acked += segs
+                            .remove_up_to_ack(now, &make_sack_header(ack.0, []))
+                            .acked_segments_count;
+                    }
+                }
+                72..87 => {
+                    let ack = segs.acked_seq_nr();
+                    let bits: Vec<usize> = (0..64).filter(|_| next(3) == 0).collect();
+                    sacked += segs
+                        .remove_up_to_ack(now, &make_sack_header(ack.0, bits))
+                        .newly_sacked_segment_count;
+                }
+                87..92 => {
+                    // The timer resends from the oldest: the watermark goes
+                    // back to it.
+                    if let Some(seg) = segs.iter_mut_for_sending(None).next()
+                        && seg.send_count() > 0
+                    {
+                        last_sent = seg.seq_nr();
+                        rewinds += 1;
+                    }
+                }
+                92..95 => dropped += segs.drop_unsent(),
+                95..98 => {
+                    if segs.pop_mtu_probe(segs.next_seq_nr() - 1) {
+                        probes_popped += 1;
+                        if last_sent.is_at_or_after(segs.next_seq_nr()) {
+                            last_sent = segs.next_seq_nr() - 1;
+                        }
+                    }
+                }
+                _ => {
+                    let _ = segs.expire_mtu_probe(true, 0);
+                }
+            }
+            if next(2) == 0 {
+                assert_eq!(
+                    segs.calc_flight_size(last_sent),
+                    segs.walk_flight_size_to(last_sent)
+                );
+            }
+        }
+        assert!(
+            sacked > 0 && rewinds > 0 && dropped > 0 && probes_popped > 0 && acked > 0,
+            "sacked={sacked} rewinds={rewinds} dropped={dropped} probes_popped={probes_popped} acked={acked}"
+        );
+        // More removed from the front than lie before the wrap.
+        assert!(acked > usize::from(u16::MAX - 65_000), "acked={acked}");
     }
 }

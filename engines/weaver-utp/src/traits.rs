@@ -78,6 +78,15 @@ pub trait Transport: PollSendToVectored + Send + Sync + Unpin + 'static {
         None
     }
 
+    /// Whether the socket's streams hand their datagrams to the one task
+    /// that also receives on the transport, which sends them in order. A
+    /// kernel socket shared by many streams wants this: sends from many
+    /// threads at once contend for the socket in the kernel. A stream with
+    /// its own [`Transport::sender`] sends through that instead.
+    fn sends_from_one_task(&self) -> bool {
+        false
+    }
+
     /// Stop and join work owned by this transport after its streams stop.
     fn shutdown(&self) -> impl Future<Output = std::io::Result<()>> + Send {
         async { Ok(()) }

@@ -157,6 +157,12 @@ impl LinkEnd {
 }
 
 impl Transport for LinkEnd {
+    // A kernel socket's shape: the streams' datagrams leave from the
+    // socket's one I/O task.
+    fn sends_from_one_task(&self) -> bool {
+        true
+    }
+
     async fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         let (_at, from, data) = poll_fn(|cx| self.rx.lock().poll_recv(cx))
             .await

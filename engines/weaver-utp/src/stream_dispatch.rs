@@ -7,6 +7,7 @@
 mod tests;
 
 use std::{
+    collections::VecDeque,
     future::Future,
     io::IoSlice,
     net::SocketAddr,
@@ -25,12 +26,12 @@ use crate::{
     DatagramSend, Error,
     congestion::{DelaySample, ledbat::Ledbat},
     constants::{
-        ACK_DELAY, FAST_RESENDS_PER_ACK, IMMEDIATE_ACK_EVERY_RMSS, RECOVERY_TRACING_LOG_LEVEL,
+        ACK_DELAY, FAST_RESENDS_PER_ACK, MAX_UDP_PAYLOAD, RECOVERY_TRACING_LOG_LEVEL,
         RTTE_TRACING_LOG_LEVEL, SEQUENCE_HALF_SPACE, SYNACK_RESEND_INTERNAL, UTP_HEADER,
         calc_pipe_expiry,
     },
     delay::DelayTracker,
-    ingress::{Event as IngressEvent, Receiver as IngressReceiver},
+    ingress::{Event as IngressEvent, Receiver as IngressReceiver, Stop},
     mtu::{SegmentSizes, SegmentSizesConfig, packet_mtu},
     pacer::Pacer,
     raw::{Type, UtpHeader},
@@ -194,6 +195,8 @@ struct VirtualSocket<T, Env> {
     resend_refused: bool,
     // Where the stream is in its socket's writable wakes.
     send_gate: crate::socket::SendGate,
+    // Data packets queued for the socket's I/O task, until their sends.
+    departing: Departing,
 
     // The remote has sent a packet other than its SYN: it is there, not a
     // spoofed address. A stream that is not fails on its first timeout.
@@ -231,9 +234,13 @@ struct VirtualSocket<T, Env> {
 
     last_sent_window: u32,
 
-    // How many bytes we have consumed but not sent an ACK yet.
-    // Used for immediate ACKs on 2 * RMSS threshold.
-    consumed_but_unacked_bytes: usize,
+    // A DATA or FIN packet arrived that no packet sent since acknowledges.
+    // Like libtorrent's deferred ACK (v2.0.15 utp_stream.cpp:1430-1438), it
+    // goes out once the socket's receive loop drained what it read, or
+    // with the next packet sent, or at the delayed-ACK timer.
+    ack_deferred: bool,
+    // The receive loop drained with an ACK deferred: send it now.
+    ack_due: bool,
 
     // Incoming queue. The main UDP socket writes here, and we need to consume these
     // as fast as possible.
@@ -300,14 +307,16 @@ pub(crate) enum ExpiryCause {
     TailNoProbeTailIsMtuProbe,
     TailNoProbeNoRttSample,
     TailNoProbeTimerFirst,
-    // The head's first send is lost and only one or two packets sent after
-    // it arrived: too few for the three the SACK rule needs.
+    // The head's first send is lost and only one, two or three packets
+    // sent after it arrived: too few for the more than three the SACK rule
+    // needs.
     OneLaterArrived,
     TwoLaterArrived,
-    // Three or more later packets arrived; the head is lost and unsent,
+    ThreeLaterArrived,
+    // Four or more later packets arrived; the head is lost and unsent,
     // or, when they were not counted since, not yet lost.
     LostNotResent,
-    ThreeLaterArrivedNotLost,
+    FourLaterArrivedNotLost,
     // Nothing of the head is known; our FIN is what is out.
     Fin,
 }
@@ -325,6 +334,13 @@ struct ThisPoll {
     transport_pending: bool,
 
     restart: bool,
+
+    // Ingress stopped at a drain mark; the pass runs again for the next read.
+    drained: bool,
+
+    // A valid packet from the remote was processed since the timer last
+    // restarted on one.
+    heard_remote: bool,
 
     // A segment never sent that the host refused as too large this poll.
     refused_unsent: Option<SeqNr>,
@@ -350,7 +366,8 @@ macro_rules! on_packet_sent {
         // Each packet sent can act as ACK so update related state.
         $self.last_sent_ack_nr = $header.ack_nr;
         $self.last_sent_window = $header.wnd_size;
-        $self.consumed_but_unacked_bytes = 0;
+        $self.ack_deferred = false;
+        $self.ack_due = false;
         $self.timers.ack_delay_timer.turn_off("ACK sent");
     }};
 }
@@ -423,6 +440,7 @@ macro_rules! send_data {
             // hold it under its sequence number. That send counts as one
             // the path dropped, and the packet waits for its resend as a
             // lost one does.
+            let accepted = refused.is_none();
             if let Some(source) = refused {
                 let payload_size = $segment_iter_item.payload_size();
                 debug!(
@@ -446,6 +464,9 @@ macro_rules! send_data {
             // calculate recovery pipe (estimate of how many packets are in transit).
             $segment_iter_item.on_sent($self.env.now(), &$self.socket.stats);
             $self.totals.packets_sent += 1;
+            if accepted {
+                $self.socket.stats.data_packets_sent.increment(1);
+            }
             on_packet_sent!($self, $header);
 
             if $segment_iter_item.seq_nr().is_after($self.last_sent_seq_nr) {
@@ -459,12 +480,26 @@ macro_rules! send_data {
             }
 
             // Data sent: start the timer if it is not running.
+            let timer_idle = $self.timers.retransmit.poll_at().is_none();
             $self.timers.retransmit.arm(
                 $self.this_poll.now,
                 $self.rtte.retransmission_timeout(),
                 false,
                 "data sent",
             );
+            if $self.send_gate.take_data_queued() {
+                let timer = $self
+                    .timers
+                    .retransmit
+                    .poll_at()
+                    .filter(|_| timer_idle)
+                    .map(|expires_at| (expires_at, $self.rtte.retransmission_timeout()));
+                $self.departing.queued(
+                    $segment_iter_item.seq_nr(),
+                    $segment_iter_item.send_count(),
+                    timer,
+                );
+            }
 
             $self.timers.remote_inactivity_timer.arm(
                 $self.this_poll.now,
@@ -579,7 +614,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let mut paced = None;
 
         // Retransmit timer expired, rewind state backwards.
-        if self.timers.retransmit.expired(self.this_poll.now) {
+        if self.timers.retransmit.expired(self.this_poll.now) && !self.timer_awaits_departure() {
             trace!("retransmit timer expired");
             self.socket.stats.rto_timeouts_count.increment(1);
 
@@ -610,12 +645,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     let timeouts = self.rtte.timeouts() as usize + 1;
                     if timeouts > self.socket_opts.num_resends || !self.confirmed {
                         debug!(timeouts, confirmed = self.confirmed, "timed out");
+                        self.socket.stats.streams_given_up.increment(1);
                         restrict(&self.socket, seg.payload_size());
                         return Err(Error::TimedOut);
                     }
                 }
                 if seg.counted_sends() >= self.socket_opts.num_resends {
                     self.socket.stats.max_retransmissions_reached.increment(1);
+                    self.socket.stats.streams_given_up.increment(1);
                     let (seq_nr, sends, evidence_resends) =
                         (seg.seq_nr(), seg.send_count(), seg.evidence_resends());
                     restrict(&self.socket, seg.payload_size());
@@ -625,7 +662,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         evidence_resends,
                         rto = ?self.rtte.retransmission_timeout(),
                         cwnd = self.congestion_controller.window(),
-                        in_flight = self.user_tx_segments.calc_flight_size(self.highest_sent_seq_nr),
+                        in_flight = self.user_tx_segments.walk_flight_size_to(self.highest_sent_seq_nr),
                         peer_window = self.last_remote_window,
                         since_peer_packet = ?self
                             .this_poll
@@ -693,6 +730,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                             || self.fin_sends >= self.socket_opts.fin_resends
                         {
                             debug!(timeouts, self.fin_sends, "FIN unacknowledged, giving up");
+                            self.socket.stats.streams_given_up.increment(1);
                             return Err(Error::TimedOut);
                         }
                         trace!("RTO: rewinding self.last_sent_seq_nr to retransmit FIN");
@@ -1092,24 +1130,30 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     }
 
     fn maybe_send_ack(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
-        if self.immediate_ack_to_transmit() {
-            self.socket.stats.immediate_acks.increment(1);
-            return self.send_ack(cx);
+        if self.ack_due {
+            return self.send_due_ack(cx);
         }
         if self.should_send_window_update() {
-            return self.send_ack(cx);
+            let sent = self.send_ack(cx)?;
+            if sent {
+                self.socket.stats.window_update_acks.increment(1);
+            }
+            return Ok(sent);
         }
         if self.timers.ack_delay_timer.expired(self.this_poll.now) {
-            if self.ack_to_transmit() {
-                self.socket.stats.delayed_acks.increment(1);
+            if self.ack_deferred {
                 trace!("delayed ack expired, sending ACK");
-                return self.send_ack(cx);
+                let sent = self.send_ack(cx)?;
+                if sent {
+                    self.socket.stats.delayed_acks.increment(1);
+                }
+                return Ok(sent);
             } else {
                 self.timers
                     .ack_delay_timer
                     .turn_off("delayed ACK expired but nothing to send");
             }
-        } else if self.consumed_but_unacked_bytes > 0 {
+        } else if self.ack_deferred {
             self.timers
                 .ack_delay_timer
                 .arm(self.this_poll.now, ACK_DELAY, false, "delayed ACK");
@@ -1117,8 +1161,70 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         Ok(false)
     }
 
+    // A datagram the socket's I/O task sent for the stream failed. One the
+    // host refused as too large went again without don't-fragment; the
+    // segments cut from now are smaller, as for a refusal of the stream's
+    // own send. A failure for good ends the stream as its own send would.
+    fn on_send_fault(&mut self) -> crate::Result<()> {
+        match self.rx.take_send_fault() {
+            None => Ok(()),
+            Some(crate::ingress::SendFault::TooLarge(payload_size)) => {
+                debug!(
+                    payload_size,
+                    "the host refused a queued packet as too large"
+                );
+                self.segment_sizes.on_send_too_large(payload_size);
+                Ok(())
+            }
+            Some(crate::ingress::SendFault::Failed(source)) => Err(Error::Send(source)),
+        }
+    }
+
     fn on_packet_sent(&mut self, header: &UtpHeader) {
         on_packet_sent!(self, header)
+    }
+
+    // The data packets queued for the socket's I/O task that it has sent
+    // since: each send is timed from when it left, as libtorrent times a
+    // packet from its send (v2.0.15 utp_stream.cpp:1792, 2223), and a
+    // retransmission timer one of them started runs from that send
+    // (utp_stream.cpp:1866-1868). Constant work for each packet.
+    fn take_departures(&mut self) {
+        self.send_gate.take_departures(&mut self.departing.taken);
+        while let Some(at) = self.departing.taken.pop_front() {
+            let Some((seq_nr, sends)) = self.departing.awaiting.pop_front() else {
+                self.departing.taken.clear();
+                break;
+            };
+            self.departing.resolved += 1;
+            if let Some(at) = at {
+                self.user_tx_segments.set_departure(seq_nr, sends, at);
+            }
+            let resolved = self.departing.resolved;
+            if let Some(timer) = self.departing.timer.take_if(|t| t.index == resolved)
+                && let Some(at) = at
+                && self.timers.retransmit.poll_at() == Some(timer.expires_at)
+            {
+                self.timers.retransmit.set(at + timer.delay);
+            }
+        }
+    }
+
+    // The retransmission timer ran out, but the packet whose send started
+    // it still waits for the socket's I/O task: it has not been sent, so
+    // its time has not started. The timer waits another timeout and is
+    // moved to run from the send once that is known.
+    fn timer_awaits_departure(&mut self) -> bool {
+        let Some(timer) = self.departing.timer.as_mut() else {
+            return false;
+        };
+        if self.timers.retransmit.poll_at() != Some(timer.expires_at) {
+            self.departing.timer = None;
+            return false;
+        }
+        timer.expires_at = self.this_poll.now + timer.delay;
+        self.timers.retransmit.set(timer.expires_at);
+        true
     }
 
     fn send_control_packet(
@@ -1167,7 +1273,21 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     fn send_ack(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
         let mut header = self.outgoing_header();
         header.extensions.selective_ack = self.user_rx.selective_ack();
-        self.send_control_packet(cx, &header)
+        let sent = self.send_control_packet(cx, &header)?;
+        if sent {
+            self.socket.stats.ack_packets_sent.increment(1);
+        }
+        Ok(sent)
+    }
+
+    // Sends the ACK owed when the receive loop drained: libtorrent's
+    // send_deferred_ack (v2.0.15 utp_stream.cpp:252-258).
+    fn send_due_ack(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
+        let sent = self.send_ack(cx)?;
+        if sent {
+            self.socket.stats.immediate_acks.increment(1);
+        }
+        Ok(sent)
     }
 
     fn maybe_send_fin(&mut self, cx: &mut std::task::Context<'_>) -> crate::Result<bool> {
@@ -1461,13 +1581,31 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         let mut processed: usize = 0;
 
         while *remaining > 0 {
-            let Poll::Ready(msg) = self.rx.poll_recv(cx) else {
+            let Poll::Ready(msg) = self.rx.poll_next(cx) else {
                 break;
             };
-            *remaining -= 1;
             let msg = match msg {
-                Some(msg) => msg,
-                None => {
+                Ok(msg) => {
+                    *remaining -= 1;
+                    msg
+                }
+                Err(Stop::DrainMark) => {
+                    // The packets of one read are taken; the ACK they owe
+                    // goes after this pass's sends, which may carry it.
+                    if self.ack_deferred && !self.socket_opts_benchmark_delayed_acks() {
+                        if self.rx.has_packets_queued() {
+                            self.socket
+                                .stats
+                                .drain_marks_with_packets_queued
+                                .increment(1);
+                        }
+                        self.ack_due = true;
+                        self.this_poll.drained = true;
+                        break;
+                    }
+                    continue;
+                }
+                Err(Stop::Closed) => {
                     // This could happen only when we were removed from socket.streams(), of if socket dispatcher is dead.
                     // This should not have happened!
                     // But if it did, we won't be able to receive any more messages.
@@ -1484,7 +1622,13 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             };
             result.update(&self.process_incoming_message(cx, msg)?);
             processed += 1;
-            if self.state_is_closed() || self.this_poll.transport_pending {
+            if self.state_is_closed() {
+                // No later drain reaches a closed stream: the ACK it owes,
+                // such as for the remote's FIN, goes in this pass.
+                self.ack_due |= self.ack_deferred;
+                break;
+            }
+            if self.this_poll.transport_pending {
                 break;
             }
         }
@@ -1554,6 +1698,24 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             trace!(?result.on_ack_result, "removed ACKed tx messages");
         }
 
+        // Any valid packet from the remote ends the run of timeouts and
+        // restarts the timer, after its ACKs are taken: libtorrent v2.0.15
+        // utp_stream.cpp:2807-2810. The timer runs from when the stream
+        // takes the packet, as the restart on new data acknowledged does;
+        // only the RTT sample uses the packet's receive time. While the
+        // remote is heard, the head is resent on its loss evidence, not on
+        // the timer.
+        if std::mem::take(&mut self.this_poll.heard_remote)
+            && self.timers.retransmit.poll_at().is_some()
+        {
+            self.timers.retransmit.arm(
+                self.this_poll.now,
+                self.rtte.retransmission_timeout(),
+                true,
+                "remote heard",
+            );
+        }
+
         if processed > 0 {
             let grant = processed.saturating_mul(FAST_RESENDS_PER_ACK);
             self.fast_resend_budget = if self.resend_refused {
@@ -1585,15 +1747,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 .reorder_at;
         }
 
+        Ok(())
+    }
+
+    fn socket_opts_benchmark_delayed_acks(&self) -> bool {
         #[cfg(test)]
         if self.socket_opts.benchmark_delayed_acks {
-            return Ok(());
+            return true;
         }
-        if !self.this_poll.transport_pending && self.ack_to_transmit() {
-            self.force_immediate_ack("receive queue drained");
-        }
-
-        Ok(())
+        false
     }
 
     fn process_incoming_message(
@@ -1767,7 +1929,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         self.confirmed = true;
         self.last_remote_packet = self.this_poll.now;
         self.rtte.on_valid_packet();
+        self.this_poll.heard_remote = true;
 
+        // An ACK may report a packet whose send was recorded since the
+        // poll began; it is timed from that send.
+        self.take_departures();
         let in_flight_before = self
             .user_tx_segments
             .calc_flight_size(self.last_sent_seq_nr);
@@ -1839,8 +2005,11 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             },
         );
 
+        if msg.header.get_type() == Data {
+            self.socket.stats.data_packets_received.increment(1);
+        }
         if payload_dropped {
-            self.force_immediate_ack("inbox payload refused");
+            self.defer_ack("inbox payload refused");
             return Ok(result);
         }
 
@@ -1856,7 +2025,7 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                         %self.last_consumed_remote_seq_nr,
                         "ignoring message, we already processed it. There might be packet loss, resending ACK."
                     );
-                    self.force_immediate_ack("duplicate ST_DATA");
+                    self.defer_ack("duplicate ST_DATA");
                     self.socket.stats.redundant_packets.increment(1);
                     self.socket
                         .stats
@@ -1894,9 +2063,6 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
                         self.restart_remote_inactivity_timer();
                         self.last_consumed_remote_seq_nr += sequence_numbers as u16;
-                        self.consumed_but_unacked_bytes =
-                            self.consumed_but_unacked_bytes.saturating_add(bytes);
-                        trace!(self.consumed_but_unacked_bytes);
                     }
                     AssemblerAddRemoveResult::Unavailable => {
                         debug_every_ms!(500, header=%hdr.short_repr(), offset,
@@ -1908,23 +2074,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     }
                 }
 
-                // Send an immediate ACK when either:
-                //  1) an out-of-order segment is received, or
-                //  2) a segment arrives that fills in all or part of a gap in sequence space.
-                if !self.user_rx.assembler_empty() || !assembler_was_empty {
-                    trace!(
-                        assembler_not_empty = !self.user_rx.assembler_empty(),
-                        assembler_was_empty,
-                        immediate_ack_to_transmit = self.immediate_ack_to_transmit(),
-                        "forcing immediate ACK"
-                    );
-
-                    self.force_immediate_ack("out of order or filled gap");
-
-                    // Send right away so that we send an ACK per segment. This is necessary so that
-                    // the reciever gets duplicate ACKs as soon as possible to repair loss.
-                    self.send_ack(cx)?;
-                }
+                // Every DATA packet, in order or not, defers its ACK to
+                // the drain of the receive loop; the ACK then carries the
+                // SACK of what arrived out of order (libtorrent v2.0.15
+                // utp_stream.cpp:3004-3034, 3197).
+                trace!(
+                    out_of_order = !self.user_rx.assembler_empty() || !assembler_was_empty,
+                    "deferring ACK"
+                );
+                self.defer_ack("ST_DATA received");
             }
             State => {}
             Reset => return Err(Error::StResetReceived),
@@ -1933,7 +2091,8 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                     debug!("remote closed with {close_reason:?}");
                 }
 
-                self.force_immediate_ack("ST_FIN received");
+                // libtorrent v2.0.15 utp_stream.cpp:2892.
+                self.defer_ack("ST_FIN received");
 
                 if !previously_seen_remote_fin && offset >= 0 {
                     self.last_consumed_remote_seq_nr = hdr.seq_nr;
@@ -1953,11 +2112,15 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         }
         // A remote sends only whole packets into the window we last
         // advertised, so announce a window that closed, opened from zero, or
-        // grew by a packet since.
+        // grew by a packet since it was too small for a packet of any size.
+        // Above that, the remote can send, and the ACKs its packets draw
+        // carry the window, as libtorrent's do: it sends nothing when its
+        // reader frees buffer (utp_stream.cpp v2.0.15:599-731).
         let current = self.rx_window();
         let mss = u32::from(self.segment_sizes.mss());
         let changed = (current == 0) ^ (self.last_sent_window == 0)
-            || current.saturating_sub(self.last_sent_window) >= mss;
+            || (self.last_sent_window < MAX_UDP_PAYLOAD
+                && current.saturating_sub(self.last_sent_window) >= mss);
         if changed {
             trace!(
                 self.last_sent_window,
@@ -1969,20 +2132,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
         false
     }
 
-    /// Return whether to send ACK immediately due to the amount of unacknowledged data.
-    fn immediate_ack_to_transmit(&self) -> bool {
-        self.consumed_but_unacked_bytes
-            >= IMMEDIATE_ACK_EVERY_RMSS * self.segment_sizes.mss() as usize
-    }
-
-    fn force_immediate_ack(&mut self, reason: &'static str) {
-        trace!(reason, "forcing immedaite ACK");
-        self.consumed_but_unacked_bytes = usize::MAX;
-    }
-
-    fn ack_to_transmit(&self) -> bool {
-        self.last_consumed_remote_seq_nr
-            .is_after(self.last_sent_ack_nr)
+    fn defer_ack(&mut self, reason: &'static str) {
+        trace!(reason, "deferring ACK");
+        self.ack_deferred = true;
     }
 
     fn restart_remote_inactivity_timer(&mut self) {
@@ -1996,9 +2148,16 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
 
     // When do we need to poll next time based on timers expiring
     // Whether the flight's tail may be probed: it is outstanding, nothing
-    // new waits behind it, no probe went out for this flight, and neither
-    // recovery nor the retransmission timer is resending.
+    // new waits behind it, no probe went out for this flight, neither
+    // recovery nor the retransmission timer is resending, and every packet
+    // queued for the socket's I/O task is known to have left.
     fn tail_probe_due(&self) -> bool {
+        self.departing.awaiting.is_empty() && self.tail_probe_due_once_sent()
+    }
+
+    // The same, whether or not packets still wait for the socket's I/O
+    // task.
+    fn tail_probe_due_once_sent(&self) -> bool {
         self.confirmed
             && self.rto_retransmissions == 0
             && self.tail_probe_seq_nr.is_none()
@@ -2023,8 +2182,9 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             0 => {}
             1 => return ExpiryCause::OneLaterArrived,
             2 => return ExpiryCause::TwoLaterArrived,
+            3 => return ExpiryCause::ThreeLaterArrived,
             _ if head.is_lost => return ExpiryCause::LostNotResent,
-            _ => return ExpiryCause::ThreeLaterArrivedNotLost,
+            _ => return ExpiryCause::FourLaterArrivedNotLost,
         }
         if self.tail_probe_seq_nr.is_some() {
             return ExpiryCause::TailProbeLost;
@@ -2188,6 +2348,14 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
     /// Arms the timer for the earliest timer-driven poll. Every return of
     /// Pending calls this, a send the transport could not take included.
     fn arm_next_poll(&mut self, cx: &mut std::task::Context<'_>) {
+        // A flight's tail still with the socket's I/O task: its send wakes
+        // the stream, so the tail-loss probe runs from that send. One wake
+        // for each batch of departures, and none while more data follows,
+        // whose ACKs wake the stream anyway; the retransmission timer is
+        // moved to the send on the next poll whatever wakes it.
+        if !self.departing.awaiting.is_empty() && self.tail_probe_due_once_sent() {
+            self.send_gate.wake_on_departure(cx.waker());
+        }
         if let Some(instant) = self.next_timer_to_poll() {
             let duration = instant - self.this_poll.now;
             trace!(?duration, "will repoll in");
@@ -2243,13 +2411,17 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
             self.this_poll.now = self.env.now();
             self.this_poll.restart = false;
 
+            bail_if_err!(self.on_send_fault());
+            self.take_departures();
+
             // If this is an incoming connection, send back an ACK.
             pending_if_cannot_send!(self.maybe_send_syn_ack(cx));
 
-            // We must send an immediate ACK per out-of-order segment. If the loop stopped last
-            // time on transport pending this will try again without consuming the RX queue.
-            if self.immediate_ack_to_transmit() {
-                pending_if_cannot_send!(self.send_ack(cx).map(|_| ()));
+            // An ACK owed at the last drain goes before the next packets
+            // are taken, as libtorrent sends a deferred ACK first when the
+            // socket is writable again (v2.0.15 utp_stream.cpp:1089-1102).
+            if self.ack_due {
+                pending_if_cannot_send!(self.send_due_ack(cx).map(|_| ()));
             }
 
             // Read incoming stream.
@@ -2311,6 +2483,12 @@ impl<T: Transport, Env: UtpEnvironment> VirtualSocket<T, Env> {
                 );
             }
 
+            if std::mem::take(&mut self.this_poll.drained) && self.rx.poll_ready(cx) {
+                // The pass stopped at a drain mark; take the next read.
+                self.this_poll.restart = true;
+                continue;
+            }
+
             self.update_tail_probe_timer();
             self.arm_next_poll(cx);
 
@@ -2347,6 +2525,8 @@ impl<T, E> Drop for VirtualSocket<T, E> {
 // See field descriptions / meanings in struct VirtualSocket
 pub struct StreamArgs {
     conn_id_send: SeqNr,
+    // The id the remote sends with: the stream's key at its socket.
+    conn_id_recv: SeqNr,
     last_remote_timestamp: u32,
     last_remote_received: Instant,
 
@@ -2376,6 +2556,7 @@ impl StreamArgs {
         let conn_id = remote_ack.connection_id;
         Self {
             conn_id_send: conn_id + 1,
+            conn_id_recv: conn_id,
             last_remote_timestamp: remote_ack.timestamp_microseconds,
             last_remote_received: ack_received_ts,
             remote_window: remote_ack.wnd_size,
@@ -2400,6 +2581,7 @@ impl StreamArgs {
     pub fn new_incoming(next_seq_nr: SeqNr, remote_syn: &UtpHeader, received: Instant) -> Self {
         Self {
             conn_id_send: remote_syn.connection_id,
+            conn_id_recv: remote_syn.connection_id + 1,
             last_remote_timestamp: remote_syn.timestamp_microseconds,
             last_remote_received: received,
             remote_window: 0, // remote_syn.wnd_size should be 0 anyway. We can't send anything first.
@@ -2483,6 +2665,7 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
     ) -> Self {
         let StreamArgs {
             conn_id_send,
+            conn_id_recv,
             last_remote_timestamp,
             last_remote_received,
             seq_nr,
@@ -2576,7 +2759,8 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             fast_resend_seq_nr: seq_nr,
             fast_resend_budget: 0,
             resend_refused: false,
-            send_gate: Default::default(),
+            send_gate: crate::socket::SendGate::for_stream(conn_id_recv.0),
+            departing: Departing::default(),
             confirmed: !matches!(
                 state,
                 VirtualSocketState::SynReceived | VirtualSocketState::SynAckSent { .. }
@@ -2584,7 +2768,8 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
             last_remote_packet: last_remote_received,
             fin_sends: 0,
             idle_since: None,
-            consumed_but_unacked_bytes: 0,
+            ack_deferred: false,
+            ack_due: false,
             rx,
             user_tx_segments: Segments::new(seq_nr),
             user_tx,
@@ -2606,6 +2791,8 @@ impl<T: Transport, E: UtpEnvironment> UtpStreamStarter<T, E> {
                 tmp_buf: vec![0u8; (ss.max_ss() + UTP_HEADER) as usize],
                 transport_pending: false,
                 restart: false,
+                drained: false,
+                heard_remote: false,
                 refused_unsent: None,
                 unsegmented_data: 0,
             },
@@ -2758,6 +2945,43 @@ impl<const NAME: u8> Timer<NAME> {
                 }
             }
         };
+    }
+}
+
+// Data packets the stream queued for its socket's I/O task, until the
+// stream learns when each was sent.
+#[derive(Default)]
+struct Departing {
+    // Sequence number and send count of each, in the order queued.
+    awaiting: VecDeque<(SeqNr, usize)>,
+    // Scratch the departures are taken into.
+    taken: VecDeque<Option<Instant>>,
+    // Packets ever queued, and ever matched to a departure.
+    queued: u64,
+    resolved: u64,
+    // The retransmission timer was idle when a queued packet was sent: it
+    // runs from that packet's send.
+    timer: Option<DepartureTimer>,
+}
+
+struct DepartureTimer {
+    // The packet's place among those ever queued, counted from 1.
+    index: u64,
+    expires_at: Instant,
+    delay: Duration,
+}
+
+impl Departing {
+    fn queued(&mut self, seq_nr: SeqNr, sends: usize, timer: Option<(Instant, Duration)>) {
+        self.queued += 1;
+        self.awaiting.push_back((seq_nr, sends));
+        if let Some((expires_at, delay)) = timer {
+            self.timer = Some(DepartureTimer {
+                index: self.queued,
+                expires_at,
+                delay,
+            });
+        }
     }
 }
 

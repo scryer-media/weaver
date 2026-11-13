@@ -3,7 +3,9 @@
 
 // The tail-loss probe: a flight's tail unacknowledged for two round trips,
 // with nothing new to send, is resent once (RFC 8985 section 7). The probe
-// leaves the window and the count toward giving up as they are.
+// leaves the window and the count toward giving up as they are. Each test
+// runs on a transport the stream sends on itself, and on one whose
+// dispatcher sends for its streams from one task.
 
 use std::{sync::atomic::Ordering, task::Poll, time::Duration};
 
@@ -13,8 +15,10 @@ use crate::{
     Error, SocketOpts,
     raw::{Type::*, UtpHeader},
     rtte::RttEstimator,
-    stream_dispatch::tests::{TestVsock, calc_mtu_for_mss, make_test_vsock},
-    test_util::setup_test_logging,
+    stream_dispatch::tests::{TestVsock, calc_mtu_for_mss, make_test_vsock_on, test_stream_args},
+    test_util::{
+        ADDR_1, env::MockUtpEnvironment, setup_test_logging, transport::RememberingTransport,
+    },
 };
 
 const ROUND_TRIP: Duration = Duration::from_millis(50);
@@ -22,17 +26,26 @@ const MIN_TIMEOUT: Duration = Duration::from_millis(500);
 
 // A stream of four 100-byte packets in flight, 101 to 104. With `measured`,
 // the round trip is a measured 50 ms; without, no round trip was measured.
-// The timer waits 500 ms either way.
-async fn four_in_flight(measured: bool) -> TestVsock {
+// The timer waits 500 ms either way. With `outbox`, the socket's
+// dispatcher sends for the stream.
+async fn four_in_flight(measured: bool, outbox: bool) -> TestVsock {
     setup_test_logging();
-    let mut t = make_test_vsock(
+    let transport = RememberingTransport::new(ADDR_1);
+    if outbox {
+        transport.set_sends_from_one_task();
+    }
+    let env = MockUtpEnvironment::new();
+    let args = test_stream_args(&env, false);
+    let mut t = make_test_vsock_on(
+        transport,
         SocketOpts {
             disable_nagle: true,
             link_mtu: Some(calc_mtu_for_mss(100)),
             min_timeout: Some(MIN_TIMEOUT),
             ..Default::default()
         },
-        false,
+        args,
+        env,
     );
     t.vsock.rtte = RttEstimator::new(MIN_TIMEOUT);
     t.vsock.rtte.confirm();
@@ -80,6 +93,7 @@ async fn step_until_sent(t: &mut TestVsock) -> (Vec<u16>, Duration) {
         t.env.increment_now(Duration::from_millis(1));
         waited += Duration::from_millis(1);
         t.poll_once_assert_pending().await;
+        t.send_queued().await;
         let sent: Vec<u16> = t
             .take_sent()
             .iter()
@@ -92,9 +106,8 @@ async fn step_until_sent(t: &mut TestVsock) -> (Vec<u16>, Duration) {
     }
 }
 
-#[tokio::test]
-async fn a_lost_tail_is_resent_before_the_timer() {
-    let mut t = four_in_flight(true).await;
+async fn a_lost_tail_is_resent_before_the_timer(outbox: bool) {
+    let mut t = four_in_flight(true, outbox).await;
     let window = t.vsock.congestion_controller.window();
 
     // 101 to 103 arrive; 104, the tail, is lost.
@@ -121,9 +134,8 @@ async fn a_lost_tail_is_resent_before_the_timer() {
     assert_eq!(rtos(&t), 0);
 }
 
-#[tokio::test]
-async fn a_tail_merely_late_costs_one_duplicate() {
-    let mut t = four_in_flight(true).await;
+async fn a_tail_merely_late_costs_one_duplicate(outbox: bool) {
+    let mut t = four_in_flight(true, outbox).await;
     let window = t.vsock.congestion_controller.window();
     let resends = || {
         t.vsock
@@ -159,9 +171,8 @@ async fn a_tail_merely_late_costs_one_duplicate() {
     assert_eq!(t.vsock.congestion_controller.window(), window);
 }
 
-#[tokio::test]
-async fn one_probe_per_flight_and_it_does_not_count_toward_giving_up() {
-    let mut t = four_in_flight(true).await;
+async fn one_probe_per_flight_and_it_does_not_count_toward_giving_up(outbox: bool) {
+    let mut t = four_in_flight(true, outbox).await;
     t.env.increment_now(ROUND_TRIP);
     ack(&mut t, 103);
     t.poll_once_assert_pending().await;
@@ -199,6 +210,7 @@ async fn run_to_death(t: &mut TestVsock) -> (Error, u64, usize) {
         t.env.increment_now(Duration::from_millis(1));
         match t.poll_once().await {
             Poll::Pending => {
+                t.send_queued().await;
                 sent += t
                     .take_sent()
                     .iter()
@@ -210,13 +222,12 @@ async fn run_to_death(t: &mut TestVsock) -> (Error, u64, usize) {
     }
 }
 
-#[tokio::test]
-async fn a_dead_path_gives_up_after_the_same_timer_expiries() {
+async fn a_dead_path_gives_up_after_the_same_timer_expiries(outbox: bool) {
     // Without a measured round trip no probe goes out.
-    let mut control = four_in_flight(false).await;
+    let mut control = four_in_flight(false, outbox).await;
     let (control_error, control_rtos, control_sent) = run_to_death(&mut control).await;
 
-    let mut probed = four_in_flight(true).await;
+    let mut probed = four_in_flight(true, outbox).await;
     let (error, expiries, sent) = run_to_death(&mut probed).await;
 
     assert_eq!(
@@ -227,3 +238,28 @@ async fn a_dead_path_gives_up_after_the_same_timer_expiries() {
     assert_eq!(expiries, control_rtos);
     assert_eq!(sent, control_sent + 1, "one probe more");
 }
+
+// Each test above on both transports.
+macro_rules! on_both_transports {
+    ($($name:ident),*) => {
+        mod on_its_own_sends {
+            $(#[tokio::test]
+            async fn $name() {
+                super::$name(false).await
+            })*
+        }
+        mod on_the_dispatcher {
+            $(#[tokio::test]
+            async fn $name() {
+                super::$name(true).await
+            })*
+        }
+    };
+}
+
+on_both_transports!(
+    a_lost_tail_is_resent_before_the_timer,
+    a_tail_merely_late_costs_one_duplicate,
+    one_probe_per_flight_and_it_does_not_count_toward_giving_up,
+    a_dead_path_gives_up_after_the_same_timer_expiries
+);

@@ -16,6 +16,7 @@ use crate::{
         ADDR_1, ADDR_2, env::MockUtpEnvironment, setup_test_logging,
         transport::RememberingTransport,
     },
+    traits::UtpEnvironment,
 };
 
 // A remote silent longer than these tests wait is not yet inactive.
@@ -70,6 +71,7 @@ async fn data_is_sent_three_times_then_the_stream_gives_up() {
     let stats = t._socket.stats().snapshot();
     assert_eq!(stats.timeouts, 3);
     assert_eq!(stats.packets_lost, 0);
+    assert_eq!(stats.streams_given_up, 1);
 }
 
 // The remote hears at once that the stream gave up, with the id it knows
@@ -300,4 +302,130 @@ async fn an_idle_window_decays_by_a_third_per_timeout() {
         after.abs_diff(before * 4 / 9) <= 2,
         "{after} should be four ninths of {before}"
     );
+}
+
+// Sends one packet and returns the instant it went. The round trip is
+// short, so the timeout is libtorrent's floor, 500 ms (utp_min_timeout,
+// settings_pack.cpp v2.0.15:341). The tail probe Weaver sends before the
+// first timeout does not count toward giving up.
+async fn one_packet_out(t: &mut super::TestVsock) -> tokio::time::Instant {
+    for _ in 0..100 {
+        t.vsock.rtte.sample(Duration::from_millis(10));
+    }
+    open_window(t);
+    t.stream.as_mut().unwrap().write_all(b"x").await.unwrap();
+    t.poll_once_assert_pending().await;
+    assert_eq!(t.take_sent().len(), 1);
+    t.env.now()
+}
+
+fn timeouts(t: &super::TestVsock) -> u64 {
+    t._socket.stats().snapshot().timeouts
+}
+
+// Moves the clock to `at` after `start`, polling a millisecond before:
+// the timer has not run out by then.
+async fn up_to(t: &mut super::TestVsock, start: tokio::time::Instant, at: Duration) {
+    let before = timeouts(t);
+    let now = t.env.now();
+    t.env
+        .increment_now(start + at - Duration::from_millis(1) - now);
+    t.poll_once_assert_pending().await;
+    assert_eq!(timeouts(t), before, "no timeout before {at:?}");
+    t.take_sent();
+    t.env.increment_now(Duration::from_millis(1));
+}
+
+// libtorrent's timer runs out at the floor, then a second more, then two
+// more (packet_timeout, utp_stream.cpp v2.0.15:3381-3382), and the packet
+// sent num_resends (3) times ends the stream at the third
+// (utp_stream.cpp:3523-3545): resends at 0.5 s and 2 s, the end at 4.5 s.
+#[tokio::test]
+async fn timeouts_come_at_libtorrents_instants_and_the_third_ends_the_stream() {
+    setup_test_logging();
+    let mut t = make_test_vsock(patient(), false);
+    let start = one_packet_out(&mut t).await;
+
+    for (n, at) in [(1, 500), (2, 2000)] {
+        up_to(&mut t, start, Duration::from_millis(at)).await;
+        t.poll_once_assert_pending().await;
+        assert_eq!(timeouts(&t), n);
+        let sent = t.take_sent();
+        assert_eq!(sent.len(), 1, "a resend at {at} ms");
+        assert_eq!(sent[0].header.htype, Data);
+    }
+    up_to(&mut t, start, Duration::from_millis(4500)).await;
+    assert_eq!(t._socket.stats().snapshot().streams_given_up, 0);
+    assert!(matches!(
+        t.poll_once_assert_ready().await,
+        Err(Error::MaxRetransmissionsReached)
+    ));
+    assert!(t.take_sent().iter().all(|m| m.header.htype != Data));
+    assert_eq!(timeouts(&t), 3);
+    assert_eq!(t._socket.stats().snapshot().streams_given_up, 1);
+}
+
+// While the remote's packets keep coming, the timer restarts from each
+// (utp_stream.cpp v2.0.15:2807-2810), and the stream lives on. Here the
+// remote sends data of its own that acknowledges nothing new, every 400 ms
+// for ten seconds. Once it falls silent, the timer runs out at the floor.
+#[tokio::test]
+async fn a_remote_still_heard_keeps_the_timer_from_running_out() {
+    setup_test_logging();
+    let mut t = make_test_vsock(patient(), false);
+    one_packet_out(&mut t).await;
+    for seq_nr in 2..27u16 {
+        t.env.increment_now(Duration::from_millis(400));
+        t.send_data(seq_nr, 100, "y");
+        t.poll_once_assert_pending().await;
+    }
+    assert_eq!(timeouts(&t), 0);
+    t.take_sent();
+
+    let silent = t.env.now();
+    up_to(&mut t, silent, Duration::from_millis(500)).await;
+    t.poll_once_assert_pending().await;
+    assert_eq!(timeouts(&t), 1);
+    assert!(t.take_sent().iter().any(|m| m.header.htype == Data));
+}
+
+// An ACK after two resends, just before the stream would end, keeps it:
+// the run of timeouts ends, the timer is back at the floor, and data still
+// flows.
+#[tokio::test]
+async fn a_late_ack_before_the_end_revives_the_stream() {
+    setup_test_logging();
+    let mut t = make_test_vsock(patient(), false);
+    let start = one_packet_out(&mut t).await;
+    for at in [500, 2000] {
+        up_to(&mut t, start, Duration::from_millis(at)).await;
+        t.poll_once_assert_pending().await;
+        t.take_sent();
+    }
+    up_to(&mut t, start, Duration::from_millis(4499)).await;
+    t.send_msg(
+        UtpHeader {
+            htype: State,
+            seq_nr: 1.into(),
+            ack_nr: 101.into(),
+            wnd_size: 1024 * 1024,
+            ..Default::default()
+        },
+        "",
+    );
+    t.poll_once_assert_pending().await;
+    assert!(t.vsock.user_tx_segments.is_empty());
+    assert_eq!(
+        t.vsock.rtte.retransmission_timeout(),
+        Duration::from_millis(500)
+    );
+
+    t.env.increment_now(Duration::from_secs(10));
+    t.poll_once_assert_pending().await;
+    t.stream.as_mut().unwrap().write_all(b"z").await.unwrap();
+    t.poll_once_assert_pending().await;
+    let sent = t.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].header.seq_nr, 102.into());
+    assert_eq!(timeouts(&t), 2);
 }

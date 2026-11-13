@@ -497,6 +497,12 @@ struct ModelTransport {
 }
 
 impl Transport for ModelTransport {
+    // A kernel socket's shape: the streams' datagrams leave from the
+    // socket's one I/O task.
+    fn sends_from_one_task(&self) -> bool {
+        true
+    }
+
     async fn recv_from<'a>(&'a self, buf: &'a mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let packet = poll_fn(|cx| {
             let (result, wakes) = {

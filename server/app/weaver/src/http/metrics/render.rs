@@ -2768,6 +2768,57 @@ fn render_torrent_sessions(out: &mut Encoder, routes: &[SessionSeries]) {
         (&f::TORRENT_UTP_REDUNDANT_PACKETS, |s: &SessionSeries| {
             s.utp.redundant_packets
         }),
+        (&f::TORRENT_UTP_IMMEDIATE_ACKS, |s: &SessionSeries| {
+            s.utp.immediate_acks
+        }),
+        (&f::TORRENT_UTP_DELAYED_ACKS, |s: &SessionSeries| {
+            s.utp.delayed_acks
+        }),
+        (&f::TORRENT_UTP_WINDOW_UPDATE_ACKS, |s: &SessionSeries| {
+            s.utp.window_update_acks
+        }),
+        (&f::TORRENT_UTP_ACK_PACKETS_SENT, |s: &SessionSeries| {
+            s.utp.ack_packets_sent
+        }),
+        (
+            &f::TORRENT_UTP_DATA_PACKETS_RECEIVED,
+            |s: &SessionSeries| s.utp.data_packets_received,
+        ),
+        (&f::TORRENT_UTP_DATA_PACKETS_SENT, |s: &SessionSeries| {
+            s.utp.data_packets_sent
+        }),
+        (&f::TORRENT_UTP_CONTROL_PACKETS_SENT, |s: &SessionSeries| {
+            s.utp.sent_control_packets
+        }),
+        (
+            &f::TORRENT_UTP_SEND_WINDOW_EXHAUSTED,
+            |s: &SessionSeries| s.utp.send_window_exhausted,
+        ),
+        (&f::TORRENT_UTP_DATA_RETRANSMISSIONS, |s: &SessionSeries| {
+            s.utp.data_retransmissions
+        }),
+        (&f::TORRENT_UTP_DUPLICATE_ACKS, |s: &SessionSeries| {
+            s.utp.duplicate_acks_received
+        }),
+        (&f::TORRENT_UTP_OUT_OF_ORDER_PACKETS, |s: &SessionSeries| {
+            s.utp.out_of_order_packets
+        }),
+        (&f::TORRENT_UTP_STREAMS_GIVEN_UP, |s: &SessionSeries| {
+            s.utp.streams_given_up
+        }),
+        (&f::TORRENT_UTP_RECEIVE_DRAINS, |s: &SessionSeries| {
+            s.utp.receive_drains
+        }),
+        (&f::TORRENT_UTP_STREAM_SWITCH_MARKS, |s: &SessionSeries| {
+            s.utp.stream_switch_marks
+        }),
+        (
+            &f::TORRENT_UTP_DRAIN_MARKS_WITH_PACKETS_QUEUED,
+            |s: &SessionSeries| s.utp.drain_marks_with_packets_queued,
+        ),
+        (&f::TORRENT_UTP_MAX_CWND, |s: &SessionSeries| {
+            s.utp.max_congestion_window_bytes
+        }),
     ] {
         for session in sessions() {
             out.sample(

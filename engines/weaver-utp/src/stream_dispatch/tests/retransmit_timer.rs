@@ -100,7 +100,8 @@ async fn retransmit_timer_idle_when_all_data_acked() {
         }
     }
 
-    // ACK the first packet again. Retransmit timer should not change.
+    // ACK the first packet again. Any valid packet restarts the timer from
+    // its arrival, as libtorrent's (v2.0.15 utp_stream.cpp:2807-2810).
     t.env.increment_now(Duration::from_millis(100));
     t.send_msg(
         UtpHeader {
@@ -115,7 +116,12 @@ async fn retransmit_timer_idle_when_all_data_acked() {
     t.poll_once_assert_pending().await;
     t.assert_sent_empty();
 
-    assert_eq!(t.vsock.timers.retransmit, timer_1);
+    match (timer_1, t.vsock.timers.retransmit) {
+        (Timer::Armed { expires_at: e1, .. }, Timer::Armed { expires_at: e2, .. }) => {
+            assert_eq!(e2 - e1, Duration::from_millis(100));
+        }
+        (timer_1, timer_2) => panic!("expected a restart: {timer_1:?} then {timer_2:?}"),
+    }
 
     // ACK the second packet. Retransmit timer should reset.
     t.env.increment_now(Duration::from_millis(100));
