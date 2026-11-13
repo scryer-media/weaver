@@ -4423,12 +4423,29 @@ impl PeerHandler {
             spawner.block_in_place_with_semaphore(land).await
         }
         .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
+        // The piece is out of flight and out of the queue from here until its
+        // verdict, so its check belongs to the torrent, not to this
+        // connection: it runs on a task of its own, which this connection
+        // waits for, and which goes on when the connection ends while it
+        // waits for a blocking permit (libtorrent `torrent::verify_piece`
+        // posts the hash job bound to the torrent, `shared_from_this()`, and
+        // `torrent::on_piece_verified` takes its verdict whatever became of
+        // the sender).
         if let Some((time, senders)) = landed {
-            spawner
-                .block_in_place_with_semaphore(|| {
-                    check_landed_piece(state, self.addr, &self.counters, &chunk_info, time, senders)
-                })
+            let state = self.state.clone();
+            let addr = self.addr;
+            let counters = self.counters.clone();
+            let check = async move {
+                let spawner = state.shared.spawner.clone();
+                spawner
+                    .block_in_place_with_semaphore(|| {
+                        check_landed_piece(&state, addr, &counters, &chunk_info, time, senders)
+                    })
+                    .await
+            };
+            tokio::task::spawn(check.in_current_span())
                 .await
+                .context("the piece check ended")?
                 .with_context(|| format!("error processing received chunk {chunk_info:?}"))?;
         }
 
