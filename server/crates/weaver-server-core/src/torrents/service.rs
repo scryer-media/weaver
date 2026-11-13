@@ -5199,6 +5199,17 @@ impl TorrentService {
     // before the session lets it go. Its tee stays with it, and writes its
     // own checkpoint when that is due, as it does in a session.
     async fn detach(&self, torrent: &mut Live) {
+        self.leave(torrent, false).await;
+    }
+
+    // `detach` for a route move: the torrent goes on in another session, so
+    // its trackers hear no `stopped`, and the session it joins goes on from
+    // where its announces stand.
+    async fn move_out(&self, torrent: &mut Live) {
+        self.leave(torrent, true).await;
+    }
+
+    async fn leave(&self, torrent: &mut Live, moving: bool) {
         let job_id = torrent.record.job_id;
         let now = self.inner.clock.now_ms();
         if self.inner.signal.take_unsaved_one(job_id)
@@ -5213,6 +5224,9 @@ impl TorrentService {
             .then(|| self.queue_resume(torrent, now, true))
             .flatten();
         if let Some(attached) = torrent.attached.take() {
+            if moving {
+                attached.handle.hand_over();
+            }
             let id = TorrentIdOrHash::Id(attached.handle.id());
             if let Err(error) = attached.session.delete(id, false).await {
                 tracing::debug!(error = %error, "a torrent was already gone from its session");
@@ -6390,7 +6404,7 @@ impl TorrentService {
             torrent.record.category_id = category_id;
             let moved = before != settings.scope(category_id, rule);
             if moved {
-                self.detach(torrent).await;
+                self.move_out(torrent).await;
                 torrent.route = None;
                 torrent.held = None;
             }
@@ -6764,7 +6778,7 @@ impl TorrentService {
                                 .is_some_and(|open| Arc::ptr_eq(open, &attached.session))
                     })
                 {
-                    self.detach(torrent).await;
+                    self.move_out(torrent).await;
                     // A torrent placed on another route reads as that route
                     // from here, opening, while the torrents before it take
                     // their turn. One whose route's session could not be

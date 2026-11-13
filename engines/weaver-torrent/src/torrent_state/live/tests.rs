@@ -4026,6 +4026,51 @@ async fn a_private_torrent_added_with_every_discovery_on_does_none() {
     );
 }
 
+// BEP 27: a private torrent's connections never send a peer exchange
+// message, even to a peer that advertises ut_pex while another peer it could
+// list is connected, past the minute of libtorrent's `ut_pex_plugin::tick`
+// (libtorrent `create_ut_pex_plugin` adds no plugin to a private torrent).
+#[tokio::test]
+async fn a_private_torrent_sends_no_pex_to_a_peer_that_speaks_it() {
+    let name = "private_sends_no_pex";
+    let out = TempDir::with_prefix(name).unwrap();
+    let session = Session::new_with_opts(out.path().into(), isolated_session_opts(false))
+        .await
+        .unwrap();
+    let mut torrent = TestTorrent::new(name, (PIECES * PIECE_LENGTH) as usize, PIECE_LENGTH)
+        .await
+        .unwrap();
+    torrent.torrent = crate::tests::e2e_tracker_announces::made_private(&torrent.torrent).unwrap();
+    let add = AddTorrentOptions {
+        storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+        disable_pex: false,
+        ..Default::default()
+    };
+    let have = BF::from_boxed_slice(vec![0x00].into());
+    let h = Harness::adding(session, out, torrent, crate::Checkpoint::pieces(have), add).await;
+    assert!(h.live.metadata.info.info().private);
+    tokio::time::pause();
+
+    // A peer listening on 6881 to list, and one that speaks PEX to tell.
+    let (listed, _listed_rx) = h.peer("203.0.113.1:50001");
+    let mut hs = ExtendedHandshake::new();
+    hs.p = Some(6881);
+    (&listed).on_extended_handshake(&hs).unwrap();
+    let (told, mut told_rx) = h.peer("203.0.113.2:50002");
+    let senders = told.tx.strong_count();
+    let mut hs = ExtendedHandshake::new();
+    hs.m.ut_pex = Some(1);
+    (&told).on_extended_handshake(&hs).unwrap();
+    assert!(h.advertised(&told).ut_pex.is_none());
+    // No PEX sender holds the connection's queue, so none can ever send.
+    assert_eq!(told.tx.strong_count(), senders);
+
+    tokio::time::advance(Duration::from_secs(120)).await;
+    while let Ok(request) = told_rx.try_recv() {
+        assert!(!matches!(request, WriterRequest::UtPex(_)));
+    }
+}
+
 /// A handshake from a peer, with the DHT bit when `dht` holds.
 fn handshake(dht: bool) -> Handshake {
     Handshake::new(Id20::default(), Id20::new([9; 20])).offering_dht(dht)

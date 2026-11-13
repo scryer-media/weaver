@@ -68,6 +68,7 @@ async fn test_a_sessions_dht_is_weavers_whatever_client_it_goes_as() -> anyhow::
             user_agent: crate::tracker::qbittorrent::USER_AGENT.into(),
             tracker_ids: Default::default(),
             completion: Default::default(),
+            announcing: Default::default(),
             shape: &crate::tracker::qbittorrent::SHAPE,
         },
         crate::Identity::default(),

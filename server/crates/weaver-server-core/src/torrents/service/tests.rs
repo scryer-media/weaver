@@ -9983,10 +9983,10 @@ async fn a_paused_and_resumed_torrent_keeps_its_key_and_peer_id() {
     rig.service.stop().await;
 }
 
-// A torrent whose route changes while its old leg stands says `stopped`
-// over the old leg and `started` over the new one as the same torrent, and
-// its counters go on from where they were: the new session's totals are the
-// old session's, and the trackers hear them so.
+// A torrent whose route changes while its old leg stands goes on over the
+// new one as the same torrent: no `stopped` over the old leg, no `started`
+// again over the new one, and its counters go on from where they were: the
+// new session's totals are the old session's, and the trackers hear them so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_moved_to_a_new_route_keeps_its_identity_and_counters() {
     let data: Vec<u8> = (0..65_536u32).map(|at| (at % 251) as u8).collect();
@@ -10022,26 +10022,22 @@ async fn a_torrent_moved_to_a_new_route_keeps_its_identity_and_counters() {
     rig.routes.route(TorrentScope::Default, 2);
     rig.service.follow_routes().await;
 
-    // The old session's `stopped` and the new one's `started`, in either
-    // order; a `completed` the old session sent first says nothing here.
-    let mut moved = Vec::new();
-    while moved.len() < 2 {
-        let heard = next_event(&mut announces).await;
+    // A move is not a start: the old session sends no `stopped`, and the
+    // new one, its tracker having answered `started`, goes on with a plain
+    // announce counted on from the same start. A `completed` the old
+    // session sent says nothing here.
+    let again = loop {
+        let heard = announces.recv().await.unwrap();
         if heard.event.as_deref() != Some("completed") {
-            moved.push(heard);
+            break heard;
         }
-    }
-    moved.sort_by(|a, b| a.event.cmp(&b.event));
-    let [again, stopped] = <[Heard; 2]>::try_from(moved).unwrap();
-    assert_eq!(again.event.as_deref(), Some("started"));
-    assert_eq!(stopped.event.as_deref(), Some("stopped"));
-    for heard in [&again, &stopped] {
-        assert_eq!(heard.identity(), started.identity());
-        assert_eq!(
-            (heard.downloaded, heard.uploaded),
-            (before.downloaded_bytes, before.uploaded_bytes)
-        );
-    }
+    };
+    assert_eq!(again.event, None);
+    assert_eq!(again.identity(), started.identity());
+    assert_eq!(
+        (again.downloaded, again.uploaded),
+        (before.downloaded_bytes, before.uploaded_bytes)
+    );
 
     // The new session starts from the old one's totals as they ended; only
     // the bytes of its own connections move after, and no payload does.
@@ -10061,12 +10057,25 @@ async fn a_torrent_moved_to_a_new_route_keeps_its_identity_and_counters() {
     );
     assert!(now.fetched_protocol_bytes >= ended.fetched_protocol_bytes);
     assert!(now.uploaded_protocol_bytes >= ended.uploaded_protocol_bytes);
+
+    // Its one `stopped` is the shutdown's, from the new session, counted on;
+    // the stop waits for every session's, so all are heard by now.
     rig.service.stop().await;
+    let mut stopped = Vec::new();
+    while let Ok(heard) = announces.try_recv() {
+        if heard.event.as_deref() == Some("stopped") {
+            stopped.push(heard);
+        }
+    }
+    let [stopped] = <[Heard; 1]>::try_from(stopped).unwrap();
+    assert_eq!(stopped.identity(), started.identity());
+    assert_eq!(stopped.downloaded, before.downloaded_bytes);
 }
 
 // A torrent whose route changes while its old leg is out of quota says
-// nothing more over that leg: the tracker hears the new session's `started`
-// as the same torrent, and no `stopped` until the torrent is removed.
+// nothing more over that leg: the tracker hears the new session go on as the
+// same torrent, with no second `started`, and no `stopped` until the torrent
+// is removed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_moved_off_a_spent_leg_sends_no_stopped_over_it() {
     let (url, mut announces) = heard_tracker(&[]).await;
@@ -10085,12 +10094,15 @@ async fn a_torrent_moved_off_a_spent_leg_sends_no_stopped_over_it() {
     rig.service.resume(job_id).await.unwrap();
     let started = next_event(&mut announces).await;
     assert_eq!(started.event.as_deref(), Some("started"));
+    started_accepted(&rig.service, job_id).await;
 
+    // A move is not a start: the tracker answered `started`, so the new
+    // session goes on with a plain announce.
     rig.routes.spend(0);
     rig.routes.route(TorrentScope::Default, 2);
     rig.service.follow_routes().await;
-    let again = next_event(&mut announces).await;
-    assert_eq!(again.event.as_deref(), Some("started"));
+    let again = announces.recv().await.unwrap();
+    assert_eq!(again.event, None);
     assert_eq!(again.identity(), started.identity());
     started_accepted(&rig.service, job_id).await;
 
@@ -10108,9 +10120,9 @@ async fn a_torrent_moved_off_a_spent_leg_sends_no_stopped_over_it() {
 
 // A torrent whose leg is revoked under its session, as saving its proxy's
 // profile again revokes it, moves to a session on the leg its route has now:
-// the tracker hears the new session's `started` as the same torrent, and no
-// `stopped` from the old session, which the revocation withheld, until the
-// torrent is removed. The old leg's sockets still reach the tracker, so a
+// the tracker hears the new session go on as the same torrent, with no second
+// `started`, and no `stopped` from the old session, which the revocation
+// withheld, until the torrent is removed. The old leg's sockets still reach the tracker, so a
 // `stopped` the old session sent would be heard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_torrent_moved_off_a_revoked_leg_sends_no_stopped_over_it() {
@@ -10136,8 +10148,8 @@ async fn a_torrent_moved_off_a_revoked_leg_sends_no_stopped_over_it() {
 
     save_again(&db, &network).await;
     rig.service.follow_routes().await;
-    let again = next_event(&mut announces).await;
-    assert_eq!(again.event.as_deref(), Some("started"));
+    let again = announces.recv().await.unwrap();
+    assert_eq!(again.event, None);
     assert_eq!(again.identity(), started.identity());
     assert!(!Arc::ptr_eq(
         &session_of(&rig.service, job_id).await,

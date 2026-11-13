@@ -3493,6 +3493,15 @@ impl Session {
             let span = debug_span!(parent: self.rs(), "torrent", id);
             let peer_opts = self.merge_peer_opts(opts.peer_opts);
             let metadata = Arc::new(metadata);
+            // Where the announces of the session a route move took the
+            // torrent from stood: its first run goes on from there. One
+            // that joins paused starts when it is resumed.
+            let handed_from = if opts.paused || opts.list_only {
+                identity.announcing.forget();
+                None
+            } else {
+                identity.announcing.take_from()
+            };
             let minfo = Arc::new(ManagedTorrentShared {
                 id,
                 span,
@@ -3535,11 +3544,13 @@ impl Session {
                 user_agent: identity.user_agent.clone(),
                 tracker_ids: identity.tracker_ids.clone(),
                 completion: identity.completion.clone(),
+                announcing: identity.announcing.clone(),
                 announce_shape: identity.shape,
                 last_run: Default::default(),
                 ending_run: Default::default(),
                 moved: parking_lot::Mutex::new(opts.totals),
-                announced_from: Default::default(),
+                announced_from: parking_lot::Mutex::new(handed_from.unwrap_or(opts.totals)),
+                handed_over: handed_from.is_some().into(),
                 web_seeds: Arc::new(WebSeeds::of_torrent(&metadata, &opts.web_seeds)),
                 ssl,
                 run: Default::default(),
@@ -4295,7 +4306,7 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
                 return Default::default();
             }
         };
-        let from = mt.shared().announced_from.lock().unwrap_or_default();
+        let from = *mt.shared().announced_from.lock();
         tracker_stats(&self.session, mt, &from)
     }
 
@@ -4306,7 +4317,7 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
         // begins before its connections have closed.
         let from = torrent
             .as_ref()
-            .map(|t| t.shared().announced_from.lock().unwrap_or_default());
+            .map(|t| *t.shared().announced_from.lock());
         let ending = torrent
             .as_ref()
             .and_then(|t| t.shared().ending_run.lock().clone());

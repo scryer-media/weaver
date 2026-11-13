@@ -383,6 +383,9 @@ pub struct ManagedTorrentShared {
     /// Whether a tracker was told the torrent completed, kept with the
     /// identity.
     pub(crate) completion: crate::Completion,
+    /// Where its announces stood when a route move took it from its last
+    /// session, kept with the identity.
+    pub(crate) announcing: crate::Announcing,
     /// How the torrent's announces are written.
     pub(crate) announce_shape: &'static crate::tracker::AnnounceShape,
 
@@ -400,12 +403,16 @@ pub struct ManagedTorrentShared {
     pub(crate) moved: parking_lot::Mutex<TorrentTotals>,
 
     /// What the torrent had moved when its running run, or its last, began
-    /// announcing; None before its first run. Its announces count from there
-    /// (libtorrent `torrent::start_announcing` clears `m_stat`, failed and
-    /// redundant bytes, torrent.cpp:10343-10353, v2.0.15). The first run
-    /// counts from the totals the torrent was added with taken as nothing,
-    /// so a torrent another session ran goes on from what that one reported.
-    pub(crate) announced_from: parking_lot::Mutex<Option<TorrentTotals>>,
+    /// announcing. Its announces count from there (libtorrent
+    /// `torrent::start_announcing` clears `m_stat`, failed and redundant
+    /// bytes, torrent.cpp:10343-10353, v2.0.15). Before its first run, the
+    /// totals it was added with; or, when a route move handed its announces
+    /// over, where they counted from in the session it left.
+    pub(crate) announced_from: parking_lot::Mutex<TorrentTotals>,
+    /// A route move handed the torrent's announces over and no run of it has
+    /// begun since: its first run goes on from `announced_from`, as a move is
+    /// not a start.
+    pub(crate) handed_over: std::sync::atomic::AtomicBool,
 
     /// The torrent's web seeds, kept across its runs.
     pub(crate) web_seeds: Arc<live::web_seed::WebSeeds>,
@@ -445,6 +452,7 @@ impl ManagedTorrentShared {
             user_agent: self.user_agent.clone(),
             tracker_ids: self.tracker_ids.clone(),
             completion: self.completion.clone(),
+            announcing: self.announcing.clone(),
             shape: self.announce_shape,
         }
     }
@@ -1011,14 +1019,15 @@ impl ManagedTorrent {
                     // makes for it now, as it starts.
                     let peer_rx = peer_rx.or_else(|| session.peer_source_managed_torrent(t, true));
                     let paused = g.state.take().assert_paused();
-                    // The run's announces count from here; the first counts
-                    // from what the torrent was added with.
+                    // The run's announces count from here, unless it is the
+                    // first after a route move handed them over: those go on.
+                    if !t
+                        .shared
+                        .handed_over
+                        .swap(false, std::sync::atomic::Ordering::Relaxed)
                     {
-                        let mut from = t.shared.announced_from.lock();
-                        *from = Some(match *from {
-                            None => TorrentTotals::default(),
-                            Some(_) => *t.shared.moved.lock(),
-                        });
+                        *t.shared.announced_from.lock() = *t.shared.moved.lock();
+                        t.shared.announcing.forget();
                     }
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     let live = TorrentStateLive::new(paused, tx, token.clone())?;
@@ -1149,6 +1158,30 @@ impl ManagedTorrent {
     /// brings a new table.
     pub fn tracker_status(&self) -> Option<crate::tracker::TrackerStatus> {
         self.locked.read().trackers.clone()
+    }
+
+    /// A route move is about to take the torrent out of this session to add
+    /// it to another under its identity. A move is not a start: its
+    /// announcing trackers are sent no `stopped` as it leaves, and the
+    /// session it is added to goes on from where its announces stand, its
+    /// counters running on and no `started` sent again to a tracker that
+    /// answered one. A torrent not announcing hands nothing over: its next
+    /// run is a start. Call it just before removing the torrent from this
+    /// session.
+    pub fn hand_over(&self) {
+        let started = self
+            .locked
+            .read()
+            .trackers
+            .as_ref()
+            .and_then(|trackers| trackers.hand_over());
+        match started {
+            Some(started) => {
+                let from = *self.shared.announced_from.lock();
+                self.shared.announcing.hand_over(from, started);
+            }
+            None => self.shared.announcing.forget(),
+        }
     }
 
     /// Asks a tracker of the latest live run for the swarm's counts now; see

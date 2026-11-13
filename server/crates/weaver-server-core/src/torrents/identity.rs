@@ -6,7 +6,7 @@
 use weaver_torrent::core::Id20;
 use weaver_torrent::core::peer_id::url_random;
 use weaver_torrent::tracker::AnnounceShape;
-use weaver_torrent::{Completion, Identity, TrackerIds};
+use weaver_torrent::{Announcing, Completion, Identity, TrackerIds};
 
 /// A client's Azureus-style peer-id prefix, the User-Agent of its HTTP
 /// announces, the `v` of its extended handshake and the shape of its
@@ -103,6 +103,7 @@ impl ClientIdentity {
             user_agent: self.user_agent.to_owned(),
             tracker_ids: own.tracker_ids.clone(),
             completion: own.completion.clone(),
+            announcing: own.announcing.clone(),
             shape: self.shape,
         }
     }
@@ -126,6 +127,7 @@ pub struct TorrentIdentity {
     tracker_key: u32,
     tracker_ids: TrackerIds,
     completion: Completion,
+    announcing: Announcing,
 }
 
 impl TorrentIdentity {
@@ -139,6 +141,7 @@ impl TorrentIdentity {
             tracker_key: u32::from_le_bytes(key),
             tracker_ids: TrackerIds::default(),
             completion: Completion::default(),
+            announcing: Announcing::default(),
         }
     }
 }
