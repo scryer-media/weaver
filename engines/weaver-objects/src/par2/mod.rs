@@ -421,12 +421,109 @@ impl Par2 {
         }
     }
 
-    // Damaged slices the evidence shows for the set, over its members.
-    fn damaged_seen(&self, key: &[u8; 16]) -> u64 {
+    // The slices the evidence shows the set needs a block for, over its
+    // members: those the checksums say are damaged, and those a refusal
+    // says will never come. The two never overlap: a damaged slice was
+    // folded, so its bytes are held, and a refused one counts only while
+    // they are not.
+    fn needs_seen(&self, key: &[u8; 16]) -> (u64, u64) {
         self.evidence
             .range((*key, MemberId(0))..=(*key, MemberId(u32::MAX)))
-            .map(|(_, evidence)| evidence.damaged())
-            .sum()
+            .fold((0, 0), |(damaged, lost), (_, evidence)| {
+                (damaged + evidence.damaged(), lost + evidence.lost())
+            })
+    }
+
+    // Mark the slices of the set's `file`, bound to `member`, that a refused
+    // range touches, so the set asks for their blocks while the rest of the
+    // payload still comes, as `refused_slices` counts them for its ruling: a
+    // slice whose checksums an alike slice of the set carries, one held and
+    // not damaged, is copied from it and needs none. Each slice is weighed
+    // once, when a refusal first touches it; what its fold says later moves
+    // it in and out of the count.
+    fn mark_refused(&mut self, key: [u8; 16], file: FileId, member: MemberId, range: ByteRange) {
+        let Some(state) = self.sets.get(&key) else {
+            return;
+        };
+        let Some(index) = state.usable().filter(|index| index.slice_size > 0) else {
+            return;
+        };
+        let Some(length) = index.file_description(&file).map(|found| found.length) else {
+            return;
+        };
+        let Some(range) = range
+            .intersect(ByteRange::new(0, length))
+            .filter(|range| !range.is_empty())
+        else {
+            return;
+        };
+        let Some(evidence) = self.evidence.get(&(key, member)) else {
+            return;
+        };
+        let slice = index.slice_size;
+        let extent =
+            |at: u64, length: u64| ByteRange::new(at * slice, (at * slice + slice).min(length));
+        let holds = |other: FileId, at: u64, own: u64| {
+            if other == file && at == own {
+                return false;
+            }
+            let (Some(&holder), Some(described)) =
+                (state.members().get(&other), index.file_description(&other))
+            else {
+                return false;
+            };
+            let bytes = extent(at, described.length);
+            let damaged = self
+                .evidence
+                .get(&(key, holder))
+                .is_some_and(|evidence| evidence.damaged_at(at));
+            let refused = self.shown.refusals.get(&holder).is_some_and(|ranges| {
+                ranges
+                    .iter()
+                    .any(|refused| refused.intersect(bytes).is_some_and(|hit| !hit.is_empty()))
+            });
+            !damaged && (!refused || self.grid.fold(holder, slice, at, bytes).is_some())
+        };
+        let marks: Vec<(usize, bool)> = (range.start / slice..=(range.end - 1) / slice)
+            .filter(|at| !evidence.marked(*at as usize))
+            .filter(|at| {
+                !state
+                    .alike(file, *at)
+                    .iter()
+                    .any(|&(other, other_at)| holds(other, other_at, *at))
+            })
+            .map(|at| {
+                let held = self
+                    .grid
+                    .fold(member, slice, at, extent(at, length))
+                    .is_some();
+                (at as usize, held)
+            })
+            .collect();
+        if let Some(evidence) = self.evidence.get_mut(&(key, member)) {
+            for (at, held) in marks {
+                evidence.refuse(at, held);
+            }
+        }
+    }
+
+    // Mark what was refused of each member the set binds, as a fold builds
+    // its evidence afresh.
+    fn mark_set_refused(&mut self, key: [u8; 16]) {
+        let Some(state) = self.sets.get(&key) else {
+            return;
+        };
+        let refused: Vec<(FileId, MemberId, ByteRange)> = state
+            .members()
+            .iter()
+            .filter_map(|(file, member)| Some((*file, *member, self.shown.refusals.get(member)?)))
+            .flat_map(|(file, member, ranges)| {
+                ranges.iter().map(move |range| (file, member, *range))
+            })
+            .collect();
+        for (file, member, range) in refused {
+            self.mark_refused(key, file, member, range);
+        }
     }
 
     // Fold every bound member of the set afresh: its index, its bindings or
@@ -457,6 +554,7 @@ impl Par2 {
                 )
             });
         }
+        self.mark_set_refused(key);
     }
 
     // The volume a described set waits on for the slice checksums it lacks:
@@ -1038,9 +1136,23 @@ impl Recovery for Par2 {
 
     // Kept for every member of the namespace, bound or not: a set bound to
     // it later counts what was refused before.
+    // Each set binding the member marks the slices the range touches, so it
+    // asks for their blocks now rather than after its first repair.
     fn refused(&mut self, member: MemberId, range: ByteRange) {
-        if self.shown.refused(member, range) == Refusal::Damage {
+        let refusal = self.shown.refused(member, range);
+        if refusal == Refusal::Damage {
             self.damage_shown();
+        }
+        if refusal == Refusal::Known {
+            return;
+        }
+        let binding: Vec<([u8; 16], FileId)> = self
+            .sets
+            .iter()
+            .filter_map(|(key, state)| Some((*key, state.bound(member)?)))
+            .collect();
+        for (key, file) in binding {
+            self.mark_refused(key, file, member, range);
         }
     }
 
@@ -1116,7 +1228,21 @@ impl Recovery for Par2 {
                 }
                 continue;
             }
-            let wanted = state.short_of().unwrap_or(0).max(self.damaged_seen(&key));
+            // What was refused counts only while the set has not settled,
+            // and while the blocks it can reach, known, may cover it: a
+            // repair that rebuilt it, or a set the refusals put beyond
+            // reach, needs no block for it.
+            let (damaged, lost) = self.needs_seen(&key);
+            let lost = match lost {
+                0 => 0,
+                lost if state.concluded().is_none()
+                    && self.reach(&key).is_some_and(|reach| lost <= reach) =>
+                {
+                    lost
+                }
+                _ => 0,
+            };
+            let wanted = state.short_of().unwrap_or(0).max(damaged + lost);
             let mut shortfall = wanted.saturating_sub(state.recovery.len() as u64);
             for index in &order {
                 if shortfall == 0 {

@@ -162,7 +162,7 @@ mod tests {
             completed_at,
             metadata: None,
             server_attribution: None,
-            files_removed_at: None,
+            archived_at: None,
         }
     }
 

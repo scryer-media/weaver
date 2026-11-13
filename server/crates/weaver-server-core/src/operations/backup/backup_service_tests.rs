@@ -196,7 +196,7 @@ fn populate_source_db(db: &Database) {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     })
     .unwrap();
 }
@@ -699,7 +699,7 @@ async fn sqlite_export_snapshot_stays_closed_while_history_grows_concurrently() 
                     completed_at: 2,
                     metadata: None,
                     server_attribution: None,
-                    files_removed_at: None,
+                    archived_at: None,
                 })
                 .unwrap();
             writer_db
@@ -2253,7 +2253,7 @@ fn finished_job(job_id: u64) -> JobHistoryRow {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     }
 }
 

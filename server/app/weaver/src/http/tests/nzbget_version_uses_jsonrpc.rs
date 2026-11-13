@@ -1421,7 +1421,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
         completed_at: 1_700_000_100,
         metadata: Some(metadata),
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     })
     .unwrap();
     db.insert_job_history(&weaver_server_core::JobHistoryRow {
@@ -1443,7 +1443,7 @@ async fn nzbget_history_returns_arr_status_fields_and_drone_parameter() {
         completed_at: 1_700_000_200,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     })
     .unwrap();
     let app = nzbget_test_router(
@@ -1516,7 +1516,7 @@ async fn nzbget_history_reports_the_folder_named_after_the_original_title() {
         completed_at: 1_700_000_100,
         metadata: Some(serde_json::to_string(&metadata).unwrap()),
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     })
     .unwrap();
     let app = nzbget_test_router(
@@ -4346,7 +4346,7 @@ async fn job_nzb_download_handler_returns_uncompressed_history_nzb() {
                 .unwrap(),
             ),
             server_attribution: None,
-            files_removed_at: None,
+            archived_at: None,
         },
     )
     .unwrap();
@@ -4421,7 +4421,7 @@ async fn job_output_file_download_handler_streams_history_file() {
         completed_at: 1_700_000_100,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     })
     .unwrap();
     let app = job_nzb_test_router(db, handle.handle.clone());
@@ -5834,7 +5834,7 @@ async fn nzbget_listgroups_and_history_never_carry_a_job_password() {
         completed_at: 1_700_000_100,
         metadata: Some(metadata),
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     })
     .unwrap();
     let app = nzbget_test_router(

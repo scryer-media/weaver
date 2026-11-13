@@ -5,6 +5,9 @@
 // one, or a share over the network. Read from the filesystem the directory
 // is on and, for a local disk, whether its block device rotates. What
 // cannot be read is unknown, and is written to as a spinning disk would be.
+//
+// Only the disk owner, [`super::StorageCapacity`], reads it: a root's kind on
+// its own thread, a folder's in its look. Everything else asks the owner.
 
 use std::path::Path;
 
@@ -32,7 +35,7 @@ impl StorageKind {
 
 // The kind of storage `path` lies on, read at the nearest of its ancestors
 // that exists.
-pub(crate) fn storage_kind(path: &Path) -> StorageKind {
+pub(super) fn storage_kind(path: &Path) -> StorageKind {
     let Some(existing) = path.ancestors().find(|at| at.exists()) else {
         return StorageKind::Unknown;
     };

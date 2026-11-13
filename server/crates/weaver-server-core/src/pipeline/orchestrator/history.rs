@@ -177,7 +177,7 @@ impl Pipeline {
                 serde_json::to_string(&state.spec.metadata).ok()
             },
             server_attribution: state.server_attribution.to_storage_json(),
-            files_removed_at: None,
+            archived_at: None,
         };
 
         let (optional_recovery_bytes, optional_recovery_downloaded_bytes) =

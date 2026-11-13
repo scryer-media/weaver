@@ -101,7 +101,7 @@ fn postgres_sample_history(job_id: crate::jobs::ids::JobId) -> JobHistoryRow {
         completed_at: 1_700_000_100,
         metadata: Some("[[\"engine\",\"postgres\"]]".to_string()),
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     }
 }
 
@@ -2626,7 +2626,7 @@ async fn postgres_runtime_smoke_when_configured() {
             completed_at: 1_700_000_100,
             metadata: Some("[[\"engine\",\"postgres\"]]".to_string()),
             server_attribution: None,
-            files_removed_at: None,
+            archived_at: None,
         },
     )
     .unwrap();
@@ -2853,7 +2853,7 @@ async fn postgres_post_processing_roundtrip_when_configured() {
         completed_at: 2,
         metadata: None,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     })
     .unwrap();
     let results = vec![crate::post_processing::model::ScriptResult {

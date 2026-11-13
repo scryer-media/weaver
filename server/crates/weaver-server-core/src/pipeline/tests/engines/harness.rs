@@ -656,9 +656,7 @@ impl Scenario {
         self
     }
 
-    // Every pipeline the scenario prepares is set this way, last. Only the
-    // rows that lend windows set it, and only where windows are mapped.
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    // Every pipeline the scenario prepares is set this way, last.
     pub(in crate::pipeline::tests) fn setup(
         mut self,
         setup: impl Fn(&mut Pipeline) + Send + Sync + 'static,

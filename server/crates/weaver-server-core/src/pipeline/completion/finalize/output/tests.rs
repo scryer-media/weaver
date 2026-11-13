@@ -851,6 +851,9 @@ async fn a_job_stages_on_the_device_its_category_delivers_to() {
     crate::runtime::fs::test_devices::assign(&complete, 2);
     crate::runtime::fs::test_devices::assign(&movies, 3);
     crate::runtime::fs::test_devices::assign(&beside, 1);
+    // The roots read their devices at each look; the pipeline's first looks
+    // came before the devices above were assigned.
+    pipeline.storage_capacity.reread_roots();
     pipeline.config.write().await.categories = vec![
         staging_category("movies", Some(&movies)),
         staging_category("beside", Some(&beside)),
@@ -919,6 +922,9 @@ async fn a_category_change_still_delivers_into_the_new_folder() {
     crate::runtime::fs::test_devices::assign(&complete, 2);
     crate::runtime::fs::test_devices::assign(&movies, 3);
     crate::runtime::fs::test_devices::assign(&shows, 4);
+    // The roots read their devices at each look; the pipeline's first looks
+    // came before the devices above were assigned.
+    pipeline.storage_capacity.reread_roots();
     pipeline.config.write().await.categories = vec![
         staging_category("movies", Some(&movies)),
         staging_category("shows", Some(&shows)),

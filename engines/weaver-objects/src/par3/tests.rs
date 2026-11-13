@@ -887,3 +887,192 @@ fn a_file_refused_whole_is_copied_from_the_file_holding_its_blocks() {
     assert!(job.store.members[&again] == data);
     assert!(job.store.members[&first] == data);
 }
+
+// The index whole and each recovery volume's head in hand, the member
+// arriving but for `lost`, whose bytes the store holds as zeros.
+fn par3_downloading(
+    one: &[u8],
+    files: &[(String, Vec<u8>)],
+    lost: ByteRange,
+) -> (Job<Par3>, MemberId, Vec<VolumeIndex>) {
+    const HEAD: usize = 64;
+    let mut job = job(&files[..1]);
+    let mut volumes = Vec::new();
+    for (name, bytes) in &files[1..] {
+        let volume = job.name(name, bytes);
+        job.object.deliver(
+            Delivery {
+                volume,
+                offset: 0,
+                bytes: &weaver_graph::Evidenced::from(bytes[..HEAD].to_vec()),
+                provenance: Provenance::Fresh,
+            },
+            &mut |_, _| false,
+            &mut Vec::new(),
+        );
+        volumes.push(volume);
+    }
+    let member = job.namespace.announce("one.bin", Some(one.len() as u64));
+    let mut held = one.to_vec();
+    held[lost.as_range().start as usize..lost.end as usize].fill(0);
+    job.store.members.insert(member, held);
+    job.arrive(member, 0, &one[..lost.start as usize], Provenance::Fresh);
+    job.arrive(
+        member,
+        lost.end,
+        &one[lost.end as usize..],
+        Provenance::Fresh,
+    );
+    bind(&mut job);
+    (job, member, volumes)
+}
+
+fn now(job: &Job<Par3>) -> Vec<VolumeIndex> {
+    let mut seeks = Vec::new();
+    Recovery::wants(&job.object, &mut seeks);
+    seeks
+        .iter()
+        .filter(|seek| seek.when == weaver_graph::When::Now)
+        .map(|seek| seek.volume)
+        .collect()
+}
+
+// The blocks the raised volumes' names say they bring.
+fn named(job: &Job<Par3>, raised: &[VolumeIndex]) -> Vec<u64> {
+    raised
+        .iter()
+        .map(|volume| job.object.volumes[volume.0 as usize].named_blocks.unwrap())
+        .collect()
+}
+
+// Exactly enough: the raised volumes bring `needed` blocks, and without the
+// largest of them they would not.
+fn assert_exactly_enough(job: &Job<Par3>, raised: &[VolumeIndex], needed: u64) {
+    let named = named(job, raised);
+    let total: u64 = named.iter().sum();
+    let largest = named.iter().copied().max().unwrap_or(0);
+    assert!(total >= needed, "{named:?} short of {needed}");
+    assert!(total - largest < needed, "{named:?} past {needed}");
+}
+
+// Brings the rest of every raised volume and closes it.
+fn bring(
+    job: &mut Job<Par3>,
+    raised: &[VolumeIndex],
+    volumes: &[VolumeIndex],
+    files: &[(String, Vec<u8>)],
+) {
+    for (volume, (_, bytes)) in volumes.iter().zip(&files[1..]) {
+        if !raised.contains(volume) {
+            continue;
+        }
+        deliver(job, *volume, bytes, ByteRange::new(64, bytes.len() as u64));
+        job.object.volume_closed(*volume, &mut Vec::new());
+    }
+}
+
+// Whole blocks that will never come raise, before any repair, the fewest
+// recovery volumes that bring as many blocks, smallest first, and leave the
+// others parked; with them in hand the first repair rebuilds, and the
+// object asks for nothing more. Nothing refused, nothing raised.
+#[test]
+fn refused_blocks_raise_the_recovery_volumes_before_the_first_repair() {
+    let one = payload(71, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 7);
+    let lost = ByteRange::new(2 * BLOCK, 4 * BLOCK);
+
+    let (mut job, member, volumes) = par3_downloading(&one, &files, lost);
+    assert!(volumes.len() > 2, "{} volumes", volumes.len());
+    assert!(now(&job).is_empty(), "nothing refused, nothing raised");
+    Recovery::refused(&mut job.object, member, lost);
+    assert_eq!(job.object.refused_blocks, 2);
+    let early = now(&job);
+    assert_exactly_enough(&job, &early, 2);
+    assert!(
+        early.len() < volumes.len(),
+        "a recovery volume stays parked"
+    );
+    bring(&mut job, &early, &volumes, &files);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 2 }
+    );
+    assert!(job.store.members[&member] == one);
+    assert!(now(&job).is_empty(), "a rebuilt object asks for no more");
+}
+
+// A block one of whose articles was refused and another came damaged is one
+// block: the refusals count it once, overlapping refusals of it too, and the
+// one block raised rebuilds it in the first repair.
+#[test]
+fn a_refused_block_that_also_came_damaged_is_counted_once() {
+    let one = payload(73, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 7);
+    let half = BLOCK / 2;
+    let lost = ByteRange::new(2 * BLOCK, 2 * BLOCK + half);
+    let (mut job, member, volumes) = par3_downloading(&one, &files, lost);
+    let mut wrong = one.clone();
+    let at = (2 * BLOCK + half + 10) as usize;
+    wrong[at] ^= 0x42;
+    job.store.members.get_mut(&member).unwrap()[at] = wrong[at];
+    job.arrive(
+        member,
+        at as u64 - 10,
+        &wrong[at - 10..at + 10],
+        Provenance::Damaged,
+    );
+    Recovery::refused(&mut job.object, member, lost);
+    Recovery::refused(
+        &mut job.object,
+        member,
+        ByteRange::new(2 * BLOCK + 8, 2 * BLOCK + half),
+    );
+    assert_eq!(job.object.refused_blocks, 1);
+    let early = now(&job);
+    assert_exactly_enough(&job, &early, 1);
+    bring(&mut job, &early, &volumes, &files);
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Repaired { slices: 1 }
+    );
+    assert!(job.store.members[&member] == one);
+}
+
+// PAR3 proves a block only by reading it back, so bytes that came damaged
+// raise no volume while the payload downloads: the first repair finds them
+// and asks, as before. Refusals are the only early path.
+#[test]
+fn damaged_bytes_raise_no_volume_before_a_repair_reads_them() {
+    let one = payload(74, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 7);
+    let (mut job, member, _) = par3_downloading(&one, &files, ByteRange::new(0, 0));
+    let mut wrong = one.clone();
+    wrong[5000] ^= 0x42;
+    job.store.members.insert(member, wrong.clone());
+    job.arrive(member, 4900, &wrong[4900..5100], Provenance::Damaged);
+    assert!(now(&job).is_empty());
+    assert_eq!(
+        job.object
+            .repair(&mut job.store, weaver_graph::Budget::default()),
+        RepairOutcome::Waiting
+    );
+    assert!(!now(&job).is_empty());
+}
+
+// More blocks refused than every volume can bring: the object rules
+// impossible as it did, and raises nothing.
+#[test]
+fn refused_blocks_past_every_volume_raise_nothing() {
+    let one = payload(72, 9000);
+    let files = par3_set("set", &[("one.bin", &one)], BLOCK, 3);
+    let lost = ByteRange::new(0, 8 * BLOCK);
+    let (mut job, member, _) = par3_downloading(&one, &files, lost);
+    Recovery::refused(&mut job.object, member, lost);
+    assert!(now(&job).is_empty());
+    assert!(matches!(
+        job.object.outcome(),
+        Some(RepairOutcome::Impossible { .. })
+    ));
+}

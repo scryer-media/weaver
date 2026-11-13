@@ -204,30 +204,71 @@ impl JobsSubscription {
             .map_err(|message| graphql_error("CURSOR_INVALID", message))?;
         let replay = ctx.data::<crate::jobs::replay::QueueEventReplay>()?.clone();
         let db = ctx.data::<Database>()?.clone();
-        let mut rx = replay.subscribe();
+        let rx = replay.subscribe();
         let initial = replay
             .replay_after(after)
             .await
             .map_err(|error| graphql_error("CURSOR_EXPIRED", error.to_string()))?;
-        let filter_for_stream = filter.clone();
+        Ok(queue_event_stream(replay, rx, db, after, filter, initial))
+    }
+}
 
-        Ok(async_stream::stream! {
-            let mut last_seen = after.unwrap_or(0);
-            let prepared_filter = PreparedQueueFilter::new(filter_for_stream.as_ref());
+// The events after `after`: the `initial` replay, then each live event. A
+// subscriber that falls behind is caught up from the replay buffer; one that
+// fell further behind than the buffer holds is told with one CURSOR_EXPIRED
+// error, so it reads its state again, and the stream goes on from the oldest
+// event still held. It never ends quietly with the subscriber waiting on
+// events that will not come.
+fn queue_event_stream(
+    replay: crate::jobs::replay::QueueEventReplay,
+    mut rx: tokio::sync::broadcast::Receiver<crate::jobs::replay::ReplayNotification>,
+    db: Database,
+    after: Option<i64>,
+    filter: Option<QueueFilterInput>,
+    initial: Vec<crate::jobs::replay::ReplayNotification>,
+) -> impl Stream<Item = Result<QueueEvent>> {
+    async_stream::stream! {
+        let mut last_seen = after.unwrap_or(0);
+        let prepared_filter = PreparedQueueFilter::new(filter.as_ref());
 
-            for notification in initial {
-                if notification.id <= last_seen {
-                    continue;
-                }
-                last_seen = notification.id;
-                if matches_queue_event_filter_prepared(&notification.event, prepared_filter.as_ref()) {
-                    yield enrich_queue_event(db.clone(), notification.event).await;
-                }
+        for notification in initial {
+            if notification.id <= last_seen {
+                continue;
             }
+            last_seen = notification.id;
+            if matches_queue_event_filter_prepared(&notification.event, prepared_filter.as_ref()) {
+                yield enrich_queue_event(db.clone(), notification.event).await;
+            }
+        }
 
-            loop {
-                match rx.recv().await {
-                    Ok(notification) => {
+        loop {
+            match rx.recv().await {
+                Ok(notification) => {
+                    if notification.id <= last_seen {
+                        continue;
+                    }
+                    last_seen = notification.id;
+                    if matches_queue_event_filter_prepared(&notification.event, prepared_filter.as_ref()) {
+                        yield enrich_queue_event(db.clone(), notification.event).await;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::debug!(
+                        skipped,
+                        "queue event subscription lagged; replaying from bounded buffer"
+                    );
+                    let notifications = match replay.replay_after(Some(last_seen)).await {
+                        Ok(notifications) => notifications,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "queue event subscription cursor expired while recovering from lag; the subscriber is told and the stream goes on"
+                            );
+                            yield Err(graphql_error("CURSOR_EXPIRED", error.to_string()));
+                            replay.replay_after(None).await.unwrap_or_default()
+                        }
+                    };
+                    for notification in notifications {
                         if notification.id <= last_seen {
                             continue;
                         }
@@ -236,36 +277,10 @@ impl JobsSubscription {
                             yield enrich_queue_event(db.clone(), notification.event).await;
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::debug!(
-                            skipped,
-                            "queue event subscription lagged; replaying from bounded buffer"
-                        );
-                        match replay.replay_after(Some(last_seen)).await {
-                            Ok(notifications) => {
-                                for notification in notifications {
-                                    if notification.id <= last_seen {
-                                        continue;
-                                    }
-                                    last_seen = notification.id;
-                                    if matches_queue_event_filter_prepared(&notification.event, prepared_filter.as_ref()) {
-                                        yield enrich_queue_event(db.clone(), notification.event).await;
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    error = %error,
-                                    "queue event subscription cursor expired while recovering from lag"
-                                );
-                                break;
-                            }
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
             }
-        })
+        }
     }
 }
 
@@ -393,5 +408,66 @@ fn snapshot_triggers(
             last_sent = tokio::time::Instant::now();
             yield trigger;
         }
+    }
+}
+
+#[cfg(test)]
+mod lag_tests {
+    use super::*;
+    use crate::jobs::replay::QueueEventReplay;
+    use crate::{PersistedQueueEvent, QueueEventKind};
+    use tokio_stream::StreamExt;
+
+    fn removed(id: u64) -> PersistedQueueEvent {
+        PersistedQueueEvent {
+            occurred_at_ms: 0,
+            kind: QueueEventKind::ItemRemoved,
+            item_id: Some(id),
+            item: None,
+            state: None,
+            previous_state: None,
+            attention: None,
+            global_state: None,
+        }
+    }
+
+    // A subscriber that fell further behind than the buffer holds is told
+    // once, with CURSOR_EXPIRED, and then receives every event still held and
+    // the live ones after them: the stream does not end.
+    #[tokio::test]
+    async fn a_subscriber_past_the_buffer_is_told_and_the_stream_goes_on() {
+        let replay = QueueEventReplay::new(4);
+        let rx = replay.subscribe();
+        let db = Database::open_in_memory().unwrap();
+        let stream = queue_event_stream(replay.clone(), rx, db, None, None, Vec::new());
+        // More events than the channel and the buffer hold, all before the
+        // subscriber reads one.
+        for id in 1..=300 {
+            replay.append(removed(id)).await;
+        }
+        let mut stream = Box::pin(stream);
+
+        let first = stream.next().await.expect("an item");
+        let error = first.expect_err("the gap is reported");
+        assert_eq!(
+            error.extensions.as_ref().and_then(|ext| ext.get("code")),
+            Some(&async_graphql::Value::from("CURSOR_EXPIRED"))
+        );
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(
+                stream
+                    .next()
+                    .await
+                    .expect("an item")
+                    .expect("an event")
+                    .item_id,
+            );
+        }
+        assert_eq!(held, [Some(297), Some(298), Some(299), Some(300)]);
+
+        replay.append(removed(301)).await;
+        let live = stream.next().await.expect("an item").expect("an event");
+        assert_eq!(live.item_id, Some(301));
     }
 }

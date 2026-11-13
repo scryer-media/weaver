@@ -532,7 +532,7 @@ impl Pipeline {
             // before the cancel: the servers did the work, and the
             // row is the only place left to say so.
             server_attribution: state.server_attribution.to_storage_json(),
-            files_removed_at: None,
+            archived_at: None,
         };
         Ok((
             row,
@@ -594,7 +594,7 @@ impl Pipeline {
                 serde_json::to_string(&info.metadata).ok()
             },
             server_attribution: None,
-            files_removed_at: None,
+            archived_at: None,
         };
         Ok((
             row,
