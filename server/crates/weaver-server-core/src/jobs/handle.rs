@@ -893,12 +893,12 @@ pub struct HistoryDeleteBatchOutcome {
     pub refused: BTreeMap<JobId, SchedulerError>,
 }
 
-// What removing one history entry's files did. The entry stays either way.
+// What archiving one history entry did. The entry stays either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HistoryFilesRemovalOutcome {
-    // Folders Weaver manages were on disk and are gone.
-    Removed,
-    // Nothing was on disk, or the entry already says its files were removed.
+pub enum ArchiveHistoryOutcome {
+    // Archived: folders Weaver manages were on disk and are gone.
+    Archived,
+    // Archived with nothing on disk, or the entry was already archived.
     AlreadyGone,
     // A folder of the job is on disk without proof that Weaver manages it,
     // so it is left as it is. Folders that are proven the job's still go.
@@ -911,11 +911,11 @@ pub enum HistoryFilesRemovalOutcome {
     Failed,
 }
 
-impl HistoryFilesRemovalOutcome {
+impl ArchiveHistoryOutcome {
     // The code an operation target keeps for the outcome.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Removed => "removed",
+            Self::Archived => "archived",
             Self::AlreadyGone => "already_gone",
             Self::NotManaged => "not_managed",
             Self::Busy => "busy",
@@ -925,10 +925,10 @@ impl HistoryFilesRemovalOutcome {
     }
 
     // The outcome a kept code names; `None` for any other code, such as a
-    // removal a delete superseded.
+    // archive a delete superseded.
     pub fn parse(code: &str) -> Option<Self> {
         Some(match code {
-            "removed" => Self::Removed,
+            "archived" => Self::Archived,
             "already_gone" => Self::AlreadyGone,
             "not_managed" => Self::NotManaged,
             "busy" => Self::Busy,
@@ -942,27 +942,27 @@ impl HistoryFilesRemovalOutcome {
     // completes. Every other outcome fails the target, which the entry then
     // shows.
     pub fn settles(self) -> bool {
-        matches!(self, Self::Removed | Self::AlreadyGone | Self::NotFound)
+        matches!(self, Self::Archived | Self::AlreadyGone | Self::NotFound)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HistoryFilesRemoval {
-    pub outcome: HistoryFilesRemovalOutcome,
-    // When the entry's files were removed, in epoch seconds, once it says so.
-    pub files_removed_at: Option<i64>,
+pub struct ArchiveHistoryResult {
+    pub outcome: ArchiveHistoryOutcome,
+    // When the entry was archived, in epoch seconds, once it says so.
+    pub archived_at: Option<i64>,
     pub message: Option<String>,
 }
 
-impl HistoryFilesRemoval {
+impl ArchiveHistoryResult {
     pub(crate) fn new(
-        outcome: HistoryFilesRemovalOutcome,
-        files_removed_at: Option<i64>,
+        outcome: ArchiveHistoryOutcome,
+        archived_at: Option<i64>,
         message: Option<String>,
     ) -> Self {
         Self {
             outcome,
-            files_removed_at,
+            archived_at,
             message,
         }
     }
@@ -1447,26 +1447,26 @@ impl SchedulerHandle {
             .await
     }
 
-    // Remove the files of a batch of history entries for the queued files
-    // removal `operation_id`, keeping the entries. `now` is the stamp, in
-    // epoch seconds, written on every entry whose files are gone. Each id's
+    // Archive a batch of history entries for the queued archive
+    // `operation_id`: remove their files and keep the entries. `now` is the
+    // stamp, in epoch seconds, written on every entry whose files are gone. Each id's
     // target is settled with its outcome before the hold on the entries is
     // released, so the queue revision that release rings finds the result
     // written. Callers holding more than `HISTORY_DELETE_BATCH_SIZE` ids send
     // them in batches of that size.
-    pub async fn remove_history_files_for_operation(
+    pub async fn archive_history_for_operation(
         &self,
         operation_id: u64,
         job_ids: BTreeSet<JobId>,
         now: i64,
-    ) -> Result<BTreeMap<JobId, HistoryFilesRemoval>, SchedulerError> {
+    ) -> Result<BTreeMap<JobId, ArchiveHistoryResult>, SchedulerError> {
         self.state
             .queue
             .clone()
-            .remove_history_files_settling(
+            .archive_history_settling(
                 job_ids,
                 now,
-                crate::history::output_files::REMOVED_FILES_KEPT,
+                crate::history::output_files::ARCHIVED_HISTORY_FILES_KEPT,
                 Some(operation_id),
             )
             .await

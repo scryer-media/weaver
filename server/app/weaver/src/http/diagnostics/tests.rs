@@ -239,7 +239,7 @@ fn archive_seeded(db: &Database, id: u64, name: &str, metadata: Option<String>) 
             completed_at: 2,
             metadata,
             server_attribution: None,
-            files_removed_at: None,
+            archived_at: None,
         },
     )
     .expect("archive job");

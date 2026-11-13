@@ -23,19 +23,19 @@ export const jobIds = {
   scriptRun: "script-run",
   scriptRunStatus: (status: string) => `script-run-status-${status}`,
 
-  // Removing a history entry's files: the action, and the mark on an entry whose files are gone.
-  historyRemoveFiles: "history-remove-files",
-  historyFilesRemoved: (jobId: string | number) => `history-files-removed-${jobId}`,
+  // Archiving a history entry: the action, and the mark on an archived entry.
+  historyArchive: "history-archive",
+  historyArchived: (jobId: string | number) => `history-archived-${jobId}`,
   // A history row's own actions, keyed by the job's id. Not under the row's
   // `history-row-` prefix, which finds rows.
-  historyRowRemoveFiles: (jobId: string | number) => `history-entry-remove-files-${jobId}`,
+  historyRowArchive: (jobId: string | number) => `history-entry-archive-${jobId}`,
   historyRowDelete: (jobId: string | number) => `history-entry-delete-${jobId}`,
-  jobRemoveFiles: "job-remove-files",
-  jobFilesRemoved: "job-files-removed",
+  jobArchive: "job-archive",
+  jobArchived: "job-archived",
 
   // A job page's lists past one page: the control that loads the next, and a file kept only as a record.
   jobFilesShowMore: "job-files-show-more",
-  jobFileRemoved: "job-file-removed",
+  jobFileArchived: "job-file-archived",
   jobEventsShowMore: "job-events-show-more",
 
   // A job page's download panel: the panel, its archive lines keyed by node id, and a password's source group.

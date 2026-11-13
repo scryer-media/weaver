@@ -679,49 +679,48 @@ impl Queue {
         })?
     }
 
-    // Removes the files of history entries and keeps the entries, under the
+    // Archives history entries: removes their files and keeps the entries, under the
     // same hold a history delete takes. An id in the queue, being admitted,
     // or held by another history operation is busy and nothing of it is
     // touched.
     #[cfg(test)]
-    pub(crate) async fn remove_history_files(
+    pub(crate) async fn archive_history(
         self: Arc<Self>,
         ids: BTreeSet<JobId>,
         now: i64,
-    ) -> Result<BTreeMap<JobId, crate::HistoryFilesRemoval>, SchedulerError> {
-        self.remove_history_files_keeping(
+    ) -> Result<BTreeMap<JobId, crate::ArchiveHistoryResult>, SchedulerError> {
+        self.archive_history_keeping(
             ids,
             now,
-            crate::history::output_files::REMOVED_FILES_KEPT,
+            crate::history::output_files::ARCHIVED_HISTORY_FILES_KEPT,
         )
         .await
     }
 
-    // `remove_history_files`, keeping the record of at most `keep` files of
-    // each removed output directory.
+    // `archive_history`, keeping the record of at most `keep` files of
+    // each archived entry's output directory.
     #[cfg(test)]
-    pub(crate) async fn remove_history_files_keeping(
+    pub(crate) async fn archive_history_keeping(
         self: Arc<Self>,
         ids: BTreeSet<JobId>,
         now: i64,
         keep: usize,
-    ) -> Result<BTreeMap<JobId, crate::HistoryFilesRemoval>, SchedulerError> {
-        self.remove_history_files_settling(ids, now, keep, None)
-            .await
+    ) -> Result<BTreeMap<JobId, crate::ArchiveHistoryResult>, SchedulerError> {
+        self.archive_history_settling(ids, now, keep, None).await
     }
 
-    // The removal, and with `operation` the settling of that files removal
+    // The archive, and with `operation` the settling of that archive
     // operation's target of every id with its outcome. The targets are
     // written before the hold is released, so the revision the release
     // rings finds them; when every id is busy and no hold is taken, the
     // revision is rung once they are written.
-    pub(crate) async fn remove_history_files_settling(
+    pub(crate) async fn archive_history_settling(
         self: Arc<Self>,
         ids: BTreeSet<JobId>,
         now: i64,
         keep: usize,
         operation: Option<u64>,
-    ) -> Result<BTreeMap<JobId, crate::HistoryFilesRemoval>, SchedulerError> {
+    ) -> Result<BTreeMap<JobId, crate::ArchiveHistoryResult>, SchedulerError> {
         let mut resources = self
             .resources
             .get()
@@ -744,8 +743,8 @@ impl Queue {
                 };
                 busy.insert(
                     id,
-                    crate::HistoryFilesRemoval::new(
-                        crate::HistoryFilesRemovalOutcome::Busy,
+                    crate::ArchiveHistoryResult::new(
+                        crate::ArchiveHistoryOutcome::Busy,
                         None,
                         Some(message.into()),
                     ),
@@ -755,7 +754,7 @@ impl Queue {
         });
         if accepted.is_empty() {
             if let Some(operation) = operation {
-                settle_files_removal(&resources.db, operation, &outcomes).await?;
+                settle_archive_history(&resources.db, operation, &outcomes).await?;
                 self.write(|_| Change::changed(()));
             }
             return Ok(outcomes);
@@ -767,7 +766,7 @@ impl Queue {
         tokio::spawn(async move {
             let _guard = guard;
             self.wait_for_cleanup(&accepted).await;
-            let removed = crate::history::delete_files::remove_history_files(
+            let archived = crate::history::delete_files::archive_history(
                 &resources.db,
                 &resources.intermediate_dir,
                 &resources.staging_roots().await,
@@ -776,9 +775,9 @@ impl Queue {
                 keep,
             )
             .await?;
-            outcomes.extend(removed);
+            outcomes.extend(archived);
             if let Some(operation) = operation {
-                settle_files_removal(&resources.db, operation, &outcomes).await?;
+                settle_archive_history(&resources.db, operation, &outcomes).await?;
             }
             // Releasing the hold rings the queue revision, as a history
             // edit's does, so the history list reads the stamp and the
@@ -787,40 +786,38 @@ impl Queue {
         })
         .await
         .map_err(|error| {
-            SchedulerError::Internal(format!("history files removal worker failed: {error}"))
+            SchedulerError::Internal(format!("history archive worker failed: {error}"))
         })?
     }
 }
 
-// Writes each id's outcome on its target of the files removal `operation`:
+// Writes each id's outcome on its target of the archive `operation`:
 // an entry left with nothing to remove completes, every other one fails
-// with its message, which the entry shows until a later removal settles it.
-async fn settle_files_removal(
+// with its message, which the entry shows until a later archive settles it.
+async fn settle_archive_history(
     db: &crate::Database,
     operation: u64,
-    outcomes: &BTreeMap<JobId, crate::HistoryFilesRemoval>,
+    outcomes: &BTreeMap<JobId, crate::ArchiveHistoryResult>,
 ) -> Result<(), SchedulerError> {
     use crate::AsyncOperationTargetState as State;
     let settled = outcomes
         .iter()
-        .map(|(id, removal)| crate::HistoryFilesRemovalSettlement {
+        .map(|(id, archive)| crate::ArchiveHistorySettlement {
             target_id: id.0,
-            state: if removal.outcome.settles() {
+            state: if archive.outcome.settles() {
                 State::Completed
             } else {
                 State::Failed
             },
-            outcome: removal.outcome,
-            message: removal.message.clone(),
+            outcome: archive.outcome,
+            message: archive.message.clone(),
         })
         .collect::<Vec<_>>();
     let db = db.clone();
-    tokio::task::spawn_blocking(move || {
-        db.settle_history_files_removal_targets(operation, &settled)
-    })
-    .await
-    .map_err(|error| SchedulerError::Internal(error.to_string()))?
-    .map_err(SchedulerError::State)
+    tokio::task::spawn_blocking(move || db.settle_archive_history_targets(operation, &settled))
+        .await
+        .map_err(|error| SchedulerError::Internal(error.to_string()))?
+        .map_err(SchedulerError::State)
 }
 
 #[cfg(all(test, unix))]
