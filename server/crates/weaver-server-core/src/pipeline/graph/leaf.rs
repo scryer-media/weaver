@@ -37,6 +37,15 @@ impl LeafError {
             source,
         }
     }
+
+    // Whether the file system refused the name itself: too long for it, or
+    // one it never takes. A full disk, a permission or a read-only volume
+    // is another error.
+    pub(crate) fn names_unusable(&self) -> bool {
+        match self {
+            LeafError::Io { source, .. } => source.kind() == io::ErrorKind::InvalidFilename,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -843,6 +852,25 @@ mod tests {
         std::os::unix::fs::symlink("loop", dir.path().join("loop")).unwrap();
         let mut leaf = Leaf::at(dir.path(), "loop");
         assert!(leaf.truncate().is_err());
+    }
+
+    // A name the file system will not take is told apart from a full disk
+    // and every other error, and nothing is made for it.
+    #[test]
+    fn a_refused_name_is_told_apart_from_other_write_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = format!("{}.mkv", "a".repeat(300));
+        let mut leaf = Leaf::at(dir.path(), &name);
+        let error = leaf.write(0, b"lantern", None).unwrap_err();
+        assert!(error.names_unusable(), "{error}");
+        assert!(!leaf.on_disk());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+        let mut full = Leaf::at(dir.path(), "full.bin");
+        counting::fill_after(Some(0));
+        let error = full.write(0, b"lantern", None).unwrap_err();
+        counting::fill_after(None);
+        assert!(!error.names_unusable(), "{error}");
     }
 
     #[test]

@@ -329,7 +329,7 @@ impl GraphJob {
     }
 
     #[cfg(test)]
-    pub(crate) fn held_loans(&mut self) -> Vec<(NodeId, u64, Box<dyn weaver_graph::Object>)> {
+    pub(crate) fn held_loans(&mut self) -> Vec<works::HeldLoan> {
         self.works.take_held()
     }
 
@@ -338,14 +338,14 @@ impl GraphJob {
     #[cfg(test)]
     pub(crate) fn return_loan(
         &mut self,
-        (node, serial, mut object): (NodeId, u64, Box<dyn weaver_graph::Object>),
+        (node, serial, mut object, stop): works::HeldLoan,
         slots: &mut RepairSlots,
         limit: usize,
     ) -> Result<(), GraphError> {
         let mut said = Vec::new();
         {
             let _decoding = self.works.decoding();
-            object.work(&mut said);
+            object.work_until(&stop, &mut said);
         }
         let said = super::engine::Said {
             scope: self.works.scope(),
@@ -445,6 +445,7 @@ impl GraphJob {
     pub(in crate::pipeline) fn request_stop(&self) {
         self.runs.request_stop();
         self.loans.request_stop();
+        self.works.request_stop();
     }
 
     // The pipeline is going down. Every run stops where it stands and keeps
