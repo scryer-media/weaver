@@ -310,7 +310,13 @@ impl Pipeline {
             }
         }
         for (job_id, intents, apply_pause) in pending {
-            if intents.cancelled.is_some() || !self.jobs.contains_key(&job_id) {
+            if intents.cancelled.is_some() {
+                // A cancelled job's stored resume goes with it: the id may
+                // come back from history before its row is seen to leave.
+                self.resumes_stored.remove(&job_id);
+                continue;
+            }
+            if !self.jobs.contains_key(&job_id) {
                 continue;
             }
             if intents.cancel_post_processing {
