@@ -15,6 +15,7 @@ mod ownership;
 mod pressure;
 mod refill;
 mod spawn;
+mod volume_pace;
 
 pub(in crate::pipeline::download) use leases::{BlockedBy, ServableWork, ServableWorkFilter};
 pub(in crate::pipeline) use refill::HeldDownloadRefill;
