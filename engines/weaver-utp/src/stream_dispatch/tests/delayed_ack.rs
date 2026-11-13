@@ -135,16 +135,16 @@ async fn out_of_order_packets_are_acked_once_at_the_drain_with_a_sack() {
     assert_eq!(t._socket.stats().immediate_acks.load(Ordering::Relaxed), 2);
 }
 
-// Packets taken with no drain after them, as a read cut at the batch
-// limit leaves them, owe an ACK that the delayed-ACK timer sends.
+// Packets taken with no drain mark after them, as a stream that runs while
+// the read that queued them goes on finds them, owe an ACK that the
+// delayed-ACK timer sends if no mark comes.
 #[tokio::test(start_paused = true)]
 async fn the_timer_sends_an_owed_ack_when_no_drain_comes() {
     let mut t = make_test_vsock(Default::default(), false);
     let ack_nr = t.vsock.seq_nr - 1;
     t.send_data(1, ack_nr, "a");
     t.send_data(2, ack_nr, "b");
-    // Woken without a drain mark.
-    t.tx.wake();
+    // Queued, with no drain mark yet.
     assert!(poll_without_drain(&mut t).await.is_pending());
     assert_eq!(t.vsock.rx.len(), 0, "both packets are taken");
     t.assert_sent_empty_msg("no drain yet");

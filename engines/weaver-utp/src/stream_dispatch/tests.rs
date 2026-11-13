@@ -80,7 +80,7 @@ impl TestVsock {
         message.received = self.env.now();
         // Like one socket read: the packets queued before the next poll
         // form one drain.
-        self.tx.push(message).unwrap()
+        self.tx.push(message).unwrap();
     }
 
     fn send_data(&mut self, seq_nr: impl Into<SeqNr>, ack_nr: impl Into<SeqNr>, payload: &str) {

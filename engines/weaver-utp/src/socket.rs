@@ -585,10 +585,15 @@ pub(crate) struct Dispatcher<T: Transport, E: UtpEnvironment> {
     next_connection_id: SeqNr,
     tombstones: Tombstones,
     reset_budget: ResetBudget,
-    // The stream holding packets of the current read that were neither
-    // marked nor woken yet, with its queue: a run of packets for one stream
-    // finds it here without a lookup. Cleared as that stream leaves the map.
-    unflushed: Option<(StreamRecvKey, crate::ingress::Queue)>,
+    // The stream that took the last packet, with its queue: a run of
+    // packets for one stream finds it here without a lookup. Cleared as
+    // that stream leaves the map.
+    last_stream: Option<(StreamRecvKey, crate::ingress::Queue)>,
+    // The queues of the streams that took packets in the current read,
+    // each once: marked and woken when the read ends. Empty between reads.
+    unflushed: Vec<crate::ingress::Queue>,
+    // The last read stopped at the batch limit, not at an empty socket.
+    read_cut: bool,
     // The streams' datagrams taken from the outbox, sent from the front.
     outgoing: Outgoing,
 }
@@ -930,7 +935,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         self.cleanup_accept_queue()?;
         self.send_outgoing().await?;
 
-        if self.unflushed.is_some() {
+        if self.read_cut {
             // A read cut at the batch limit goes on before anything waits,
             // but the socket's other work that is ready runs first, one
             // item a turn, so a socket that never empties holds back no
@@ -992,10 +997,15 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
     // Reads the socket until it would block, as libtorrent does
     // (v2.0.15 session_impl.cpp:2616-2677), at most RECEIVE_BATCH
     // datagrams at a time so the socket's other work and its streams get a
-    // turn. Once the socket is empty the stream that took the last packets
-    // is marked and woken, which is when it sends the ACK it owes
-    // (session_impl.cpp:2727, utp_socket_manager.cpp:255-261). At the limit
-    // that stream is only woken; the read goes on after a yield.
+    // turn. When the read ends, at an empty socket or at the limit, every
+    // stream that took packets in it is marked and woken once, which is
+    // when it sends the ACK it owes (session_impl.cpp:2727,
+    // utp_socket_manager.cpp:255-261). libtorrent holds one deferred ACK
+    // and so sends it as soon as a packet for another stream comes
+    // (utp_socket_manager.cpp:163-172); here each stream's ACK waits for
+    // the end of the read, so streams whose packets arrive mixed send one
+    // ACK a read each, not one a packet. After a read cut at the limit the
+    // read goes on after a yield.
     async fn read_batch(
         &mut self,
         read_buf: &mut RecvBufs,
@@ -1009,9 +1019,10 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
                 poll_fn(|cx| Poll::Ready(next.as_mut().poll(cx))).await
             };
             let Poll::Ready(recv) = recv else {
-                if self.unflushed.is_some() {
+                if !self.unflushed.is_empty() {
                     self.socket.stats.receive_drains.increment(1);
                 }
+                self.read_cut = false;
                 self.flush_unflushed();
                 return Ok(false);
             };
@@ -1023,13 +1034,13 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             {
                 // libtorrent drains on a fatal error too
                 // (session_impl.cpp:2719).
+                self.read_cut = false;
                 self.flush_unflushed();
                 return Err(error);
             }
         }
-        if let Some((_, tx)) = &self.unflushed {
-            tx.wake();
-        }
+        self.read_cut = true;
+        self.flush_unflushed();
         Ok(true)
     }
 
@@ -1071,18 +1082,26 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         self.on_recv(addr, message).await
     }
 
-    // Marks and wakes the stream holding packets of the current read.
+    // Marks and wakes each stream holding packets of the current read.
     fn flush_unflushed(&mut self) {
-        if let Some((_, tx)) = self.unflushed.take() {
-            tx.flush();
+        let streams = self.unflushed.len() as u64;
+        if streams > 1 {
+            self.socket
+                .stats
+                .stream_switch_marks
+                .increment(streams - 1);
+        }
+        for queue in self.unflushed.drain(..) {
+            queue.flush();
         }
     }
 
     // A stream leaving the map, or one put in its place, is no longer the
-    // one the current read holds packets for.
+    // one that took the last packet. A mark its queue is still owed is
+    // made at the end of the read, and does a closed queue no harm.
     fn forget_unflushed(&mut self, key: &StreamRecvKey) {
-        if self.unflushed.as_ref().is_some_and(|(last, _)| last == key) {
-            self.unflushed = None;
+        if self.last_stream.as_ref().is_some_and(|(last, _)| last == key) {
+            self.last_stream = None;
         }
     }
 
@@ -1146,13 +1165,13 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             return;
         }
         let tombstones = &mut self.tombstones;
-        let unflushed = &mut self.unflushed;
+        let last_stream = &mut self.last_stream;
         self.streams.retain(|key, stream| {
             let live = !stream.retired.is_retired();
             if !live {
                 tombstones.bury(*key, stream.send_id);
-                if unflushed.as_ref().is_some_and(|(last, _)| last == key) {
-                    *unflushed = None;
+                if last_stream.as_ref().is_some_and(|(last, _)| last == key) {
+                    *last_stream = None;
                 }
             }
             live
@@ -1449,36 +1468,40 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
         let addr = canonical_socket_addr(addr);
         let key = (addr, message.header.connection_id.0);
 
-        // A packet for another stream than the last one's sends that
-        // stream's owed ACK first (libtorrent v2.0.15
-        // utp_socket_manager.cpp:158-173), so its packets are marked here.
-        match &self.unflushed {
-            Some((last, queue)) if *last == key => {
-                // The same stream as the packet before: no lookup.
-                #[cfg(test)]
-                assert!(
-                    self.streams
-                        .get(&key)
-                        .is_some_and(|stream| queue.is_of(&stream.tx)),
-                    "the held queue is not the stream's"
-                );
-                if queue.push(message).is_ok() {
-                    return Ok(());
+        // A stream's first packet of a read lists its queue for the mark
+        // and the wake the end of the read owes it.
+        if let Some((last, queue)) = &self.last_stream
+            && *last == key
+        {
+            // The same stream as the packet before: no lookup.
+            #[cfg(test)]
+            assert!(
+                self.streams
+                    .get(&key)
+                    .is_some_and(|stream| queue.is_of(&stream.tx)),
+                "the held queue is not the stream's"
+            );
+            return match queue.push(message) {
+                Ok(true) => {
+                    self.unflushed.push(queue.share());
+                    Ok(())
                 }
-                return self.on_dead_stream(key);
-            }
-            Some(_) => {
-                self.socket.stats.stream_switch_marks.increment(1);
-                self.flush_unflushed();
-            }
-            None => {}
+                Ok(false) => Ok(()),
+                Err(_) => self.on_dead_stream(key),
+            };
         }
         if let Some(stream) = self.streams.get(&key) {
-            if stream.tx.push(message).is_ok() {
-                self.unflushed = Some((key, stream.tx.queue()));
-                return Ok(());
-            }
-            return self.on_dead_stream(key);
+            return match stream.tx.push(message) {
+                Ok(first) => {
+                    let queue = stream.tx.queue();
+                    if first {
+                        self.unflushed.push(queue.share());
+                    }
+                    self.last_stream = Some((key, queue));
+                    Ok(())
+                }
+                Err(_) => self.on_dead_stream(key),
+            };
         }
 
         trace!(?key, "no matching live streams");
@@ -1507,7 +1530,7 @@ impl<T: Transport, E: UtpEnvironment> Dispatcher<T, E> {
             ?key,
             "stream dead, but wasn't cleaned up yet, this is probably a race"
         );
-        self.unflushed = None;
+        self.forget_unflushed(&key);
         if let Some(stream) = self.streams.remove(&key) {
             self.tombstones.bury(key, stream.send_id);
         }
@@ -1837,7 +1860,9 @@ impl<T: Transport, Env: UtpEnvironment> UtpSocket<T, Env> {
             control_sends: Vec::new(),
             tombstones: Tombstones::default(),
             reset_budget: ResetBudget::default(),
-            unflushed: None,
+            last_stream: None,
+            unflushed: Vec::new(),
+            read_cut: false,
             outgoing: Outgoing::default(),
             socket: state,
             transport: None,

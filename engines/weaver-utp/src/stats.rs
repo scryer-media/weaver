@@ -53,7 +53,8 @@ pub struct UtpStats {
     /// Reads of the socket that ended with it empty after taking packets
     /// for a stream, each marking that stream's packets as drained.
     pub receive_drains: AtomicU64,
-    /// Marks made because the next packet read was for another stream.
+    /// Marks made at the end of a read for streams beyond the first that
+    /// took packets in it.
     pub stream_switch_marks: AtomicU64,
     /// Drain marks a stream reached with more of its packets already
     /// queued behind the mark.

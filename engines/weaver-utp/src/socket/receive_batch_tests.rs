@@ -2,10 +2,11 @@
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
 // The receive loop reads the UDP socket until it would block, at most
-// RECEIVE_BATCH datagrams between yields, and marks the end of each
-// stream's packets where libtorrent sends its deferred ACK: when the socket
-// is drained, or when a packet for another stream arrives
-// (v2.0.15 utp_socket_manager.cpp:158-173, 255-271).
+// RECEIVE_BATCH datagrams between yields. When a read ends, each stream
+// that took packets in it is marked once, which is where it sends the ACK
+// it owes: libtorrent's deferred ACK at the drain
+// (v2.0.15 utp_socket_manager.cpp:255-271), kept for every stream of the
+// read and not only the last.
 
 use std::net::SocketAddr;
 
@@ -122,8 +123,11 @@ async fn one_read_of_one_stream_is_marked_once_at_the_drain() {
     assert_eq!(stats.receive_drains, 1);
 }
 
+// Packets of two streams arrive mixed: each stream gets one mark, at the
+// end of the read, so each owes one ACK for the read and not one for every
+// turn from one stream to the other.
 #[tokio::test(start_paused = true)]
-async fn a_packet_for_another_stream_marks_the_one_before() {
+async fn streams_whose_packets_arrive_mixed_are_each_marked_once_a_read() {
     let mut rig = Rig::new();
     let mut a = rig.stream(ID_A);
     let mut b = rig.stream(ID_B);
@@ -131,16 +135,41 @@ async fn a_packet_for_another_stream_marks_the_one_before() {
     rig.arrive(ID_A, 2);
     rig.arrive(ID_B, 1);
     rig.arrive(ID_A, 3);
+    rig.arrive(ID_B, 2);
+    rig.arrive(ID_A, 4);
 
     assert!(!rig.turn().await);
-    assert_eq!(a.shape(), "PP|P|");
-    assert_eq!(b.shape(), "P|");
-    assert_eq!(payloads(&mut a), [1, 2, 3]);
-    assert_eq!(payloads(&mut b), [1]);
-    // Two marks for a switch of stream, one for the drain.
+    assert_eq!(a.shape(), "PPPP|");
+    assert_eq!(b.shape(), "PP|");
+    assert_eq!(payloads(&mut a), [1, 2, 3, 4]);
+    assert_eq!(payloads(&mut b), [1, 2]);
+    // One read, two streams marked: one mark beyond the first.
     let stats = rig._socket.stats().snapshot();
-    assert_eq!(stats.stream_switch_marks, 2);
+    assert_eq!(stats.stream_switch_marks, 1);
     assert_eq!(stats.receive_drains, 1);
+
+    // The next read marks only the stream that took packets in it.
+    rig.arrive(ID_B, 3);
+    assert!(!rig.turn().await);
+    assert_eq!(a.shape(), "");
+    assert_eq!(b.shape(), "P|");
+    assert_eq!(rig._socket.stats().snapshot().stream_switch_marks, 1);
+}
+
+// A stream that ends while a read holds its packets leaves nothing behind:
+// the read ends with no queue held, and the other stream's mark is made.
+#[tokio::test(start_paused = true)]
+async fn a_stream_dropped_mid_read_does_not_hold_up_the_others_mark() {
+    let mut rig = Rig::new();
+    let a = rig.stream(ID_A);
+    let b = rig.stream(ID_B);
+    rig.arrive(ID_A, 1);
+    rig.arrive(ID_B, 1);
+    drop(a);
+
+    assert!(!rig.turn().await);
+    assert_eq!(b.shape(), "P|");
+    assert!(rig.dispatcher.unflushed.is_empty());
 }
 
 #[tokio::test(start_paused = true)]
@@ -152,16 +181,25 @@ async fn a_read_past_the_batch_limit_goes_on_after_a_yield_and_loses_nothing() {
         rig.arrive(ID_A, seq_nr);
     }
 
-    // The first two turns stop at the limit: the stream is woken for what
-    // it holds, but the socket is not drained, so no mark yet.
+    // The first two turns stop at the limit: the stream is marked for what
+    // it holds, so a socket that never empties still has its ACKs sent,
+    // one for each read.
+    let batch = format!("{}|", "P".repeat(RECEIVE_BATCH));
     assert!(rig.turn().await);
-    assert_eq!(a.shape(), "P".repeat(RECEIVE_BATCH));
+    assert_eq!(a.shape(), batch);
     assert!(rig.turn().await);
-    assert_eq!(a.shape(), "P".repeat(2 * RECEIVE_BATCH));
+    assert_eq!(a.shape(), batch.repeat(2));
     assert_eq!(rig._socket.stats().snapshot().receive_drains, 0);
     // The last turn reads the rest and finds the socket empty.
     assert!(!rig.turn().await);
-    assert_eq!(a.shape(), format!("{}|", "P".repeat(ARRIVED as usize)));
+    assert_eq!(
+        a.shape(),
+        format!(
+            "{}{}|",
+            batch.repeat(2),
+            "P".repeat(ARRIVED as usize - 2 * RECEIVE_BATCH)
+        )
+    );
     assert_eq!(payloads(&mut a), (1..=ARRIVED).collect::<Vec<_>>());
     assert_eq!(rig._socket.stats().snapshot().receive_drains, 1);
 }

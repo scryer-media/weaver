@@ -3,8 +3,9 @@
 
 // A stream's inbox. The socket's receive loop queues the datagrams of one
 // read of the UDP socket without waking the stream, then marks where that
-// read ended and wakes it once. The mark is where the stream sends the ACK
-// it owes, as libtorrent sends its deferred ACK when the socket is drained
+// read ended and wakes it once, however its packets were mixed with other
+// streams'. The mark is where the stream sends the ACK it owes, as
+// libtorrent sends its deferred ACK when the socket is drained
 // (v2.0.15 utp_socket_manager.cpp:255-261, session_impl.cpp:2727).
 
 use std::{
@@ -119,10 +120,9 @@ struct Inbox {
     // Packets ever queued, and ever taken.
     pushed: u64,
     taken: u64,
-    // Drain marks, each the count of packets queued when the receive loop
-    // read the UDP socket empty or turned to another stream's packet. A
-    // mark follows at least one packet, so there is at most one more mark
-    // than packets queued, and the budget bounds both.
+    // Drain marks, each the count of packets queued when a read of the UDP
+    // socket ended. A mark follows at least one packet, so there is at most
+    // one more mark than packets queued, and the budget bounds both.
     marks: VecDeque<u64>,
     // A packet was queued since the last drain mark.
     unmarked: bool,
@@ -227,8 +227,10 @@ impl Drop for Sender {
 impl Shared {
     // Queues a packet without waking the stream. Full inboxes drop
     // datagrams rather than blocking the shared socket. A refused DATA
-    // payload can still carry its peer's ACK and window.
-    fn push(&self, mut message: UtpMessage) -> Result<(), Closed> {
+    // payload can still carry its peer's ACK and window. True when the
+    // packet is the first queued since the last mark: the stream then owes
+    // a flush at the end of the read.
+    fn push(&self, mut message: UtpMessage) -> Result<bool, Closed> {
         let budget = &self.budget;
         let (reservation, payload_dropped) = if message.header.htype == Type::Data {
             match budget.reserve(message.data.len(), true) {
@@ -250,7 +252,7 @@ impl Shared {
             if self.inbox.lock().receiver_closed {
                 return Err(Closed);
             }
-            return Ok(());
+            return Ok(false);
         };
         let event = Event {
             message,
@@ -265,8 +267,7 @@ impl Shared {
         }
         inbox.items.push_back(event);
         inbox.pushed += 1;
-        inbox.unmarked = true;
-        Ok(())
+        Ok(!std::mem::replace(&mut inbox.unmarked, true))
     }
 
     // Marks the end of the packets queued so far and wakes the stream.
@@ -285,20 +286,6 @@ impl Shared {
             waker.wake();
         }
     }
-
-    // Wakes the stream to take what is queued, without a mark.
-    fn wake(&self) {
-        let waker = {
-            let mut inbox = self.inbox.lock();
-            if inbox.items.is_empty() && inbox.marks.is_empty() {
-                return;
-            }
-            inbox.waker.take()
-        };
-        if let Some(waker) = waker {
-            waker.wake();
-        }
-    }
 }
 
 /// A stream's queue as the socket's read holds it between packets: it
@@ -307,17 +294,19 @@ impl Shared {
 pub(crate) struct Queue(Arc<Shared>);
 
 impl Queue {
-    pub fn push(&self, message: UtpMessage) -> Result<(), Closed> {
+    // True when the packet is the stream's first since its last mark.
+    pub fn push(&self, message: UtpMessage) -> Result<bool, Closed> {
         self.0.push(message)
+    }
+
+    pub fn share(&self) -> Queue {
+        Queue(Arc::clone(&self.0))
     }
 
     pub fn flush(&self) {
         self.0.flush();
     }
 
-    pub fn wake(&self) {
-        self.0.wake();
-    }
     // Whether this is the queue `sender` sends to.
     #[cfg(test)]
     pub fn is_of(&self, sender: &Sender) -> bool {
@@ -329,7 +318,7 @@ impl Sender {
     // Queues a packet without waking the stream. Full inboxes drop
     // datagrams rather than blocking the shared socket. A refused DATA
     // payload can still carry its peer's ACK and window.
-    pub fn push(&self, message: UtpMessage) -> Result<(), Closed> {
+    pub fn push(&self, message: UtpMessage) -> Result<bool, Closed> {
         self.shared.push(message)
     }
 
@@ -337,12 +326,6 @@ impl Sender {
     #[cfg(test)]
     pub fn flush(&self) {
         self.shared.flush();
-    }
-
-    // Wakes the stream to take what is queued, without a mark.
-    #[cfg(test)]
-    pub fn wake(&self) {
-        self.shared.wake();
     }
 
     pub fn queue(&self) -> Queue {
@@ -377,7 +360,7 @@ impl Sender {
     // One packet read alone: queued, marked and woken.
     #[cfg(test)]
     pub fn send(&self, message: UtpMessage) -> Result<(), Closed> {
-        self.push(message)?;
+        self.shared.push(message)?;
         self.flush();
         Ok(())
     }
@@ -700,7 +683,6 @@ mod tests {
         tx.flush();
         assert_eq!(rx.shape(), "");
         tx.push(message(Type::Data, b"a")).unwrap();
-        tx.wake();
         assert_eq!(rx.shape(), "P");
         tx.push(message(Type::Data, b"b")).unwrap();
         tx.flush();
