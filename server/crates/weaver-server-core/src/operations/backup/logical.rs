@@ -2449,11 +2449,11 @@ mod logical_reader_tests {
         assert_eq!(next, 8);
     }
 
-    // A bundle carries a files removal (stamp, totals and the record of the
-    // files) and a finished job's download summary, and an import restores
-    // them as they were.
+    // A bundle carries an archived history entry (its stamp, totals and the
+    // record of its files) and a finished job's download summary, and an
+    // import restores them as they were.
     #[test]
-    fn a_files_removal_and_a_download_summary_round_trip_through_a_bundle() {
+    fn an_archived_entry_and_a_download_summary_round_trip_through_a_bundle() {
         use crate::history::output_files::{OutputFile, OutputFileListing};
         use crate::jobs::download_summary::{DOWNLOAD_SUMMARY_VERSION, DownloadSummary, Layout};
         use crate::persistence::sql_runtime::{SqlArg, SqlRuntime};
@@ -2480,7 +2480,7 @@ mod logical_reader_tests {
                 completed_at: 2,
                 metadata: None,
                 server_attribution: None,
-                files_removed_at: None,
+                archived_at: None,
             })
             .unwrap();
         let summary = DownloadSummary {
@@ -2523,15 +2523,15 @@ mod logical_reader_tests {
             total_bytes: 30,
         };
         source
-            .record_history_removed_files(&[(JobId(77), listing)])
+            .record_archived_history_files(&[(JobId(77), listing)])
             .unwrap();
         source
-            .stamp_history_files_removed(&[JobId(77)], 1_800_000_000)
+            .stamp_history_archived(&[JobId(77)], 1_800_000_000)
             .unwrap();
 
         let archive = source.export_logical_backup().unwrap();
         let tables = archive.staging.path().join("tables");
-        assert_eq!(archive.tables["job_history_removed_files"].rows, 2);
+        assert_eq!(archive.tables["job_history_archived_files"].rows, 2);
 
         let target = Database::open_in_memory().unwrap();
         target
@@ -2542,15 +2542,15 @@ mod logical_reader_tests {
             .unwrap()
             .remove(&JobId(77))
             .unwrap();
-        assert_eq!(state.files_removed_at, Some(1_800_000_000));
-        assert_eq!(state.removed_file_count, Some(3));
-        assert_eq!(state.removed_file_bytes, Some(30));
+        assert_eq!(state.archived_at, Some(1_800_000_000));
+        assert_eq!(state.archived_file_count, Some(3));
+        assert_eq!(state.archived_file_bytes, Some(30));
         assert_eq!(
-            target.list_history_removed_files(77, 0, 10).unwrap(),
-            source.list_history_removed_files(77, 0, 10).unwrap()
+            target.list_archived_history_files(77, 0, 10).unwrap(),
+            source.list_archived_history_files(77, 0, 10).unwrap()
         );
         assert_eq!(
-            target.list_history_removed_files(77, 0, 10).unwrap().len(),
+            target.list_archived_history_files(77, 0, 10).unwrap().len(),
             2
         );
         assert_eq!(

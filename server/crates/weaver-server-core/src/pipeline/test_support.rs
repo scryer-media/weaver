@@ -129,22 +129,21 @@ pub async fn seed_job(pipeline: &mut Pipeline, job: crate::JobInfo) {
     });
 }
 
-/// Say a history entry's files were removed at `removed_at`, with `listing`
-/// as the record of them, as a files removal writes it.
-pub fn stamp_files_removed(
+/// Mark a history entry archived at `archived_at`, with `listing` as the
+/// record of its files, as archiving it writes them.
+pub fn mark_entry_archived(
     db: &crate::Database,
     job_id: crate::JobId,
     listing: crate::history::output_files::OutputFileListing,
-    removed_at: i64,
+    archived_at: i64,
 ) {
-    db.record_history_removed_files(&[(job_id, listing)])
+    db.record_archived_history_files(&[(job_id, listing)])
         .unwrap();
-    db.stamp_history_files_removed(&[job_id], removed_at)
-        .unwrap();
+    db.stamp_history_archived(&[job_id], archived_at).unwrap();
 }
 
-/// Put `summary` on a finished job's history row, as the archive copies it
-/// from the active row.
+/// Put `summary` on a finished job's history row, as moving the job into
+/// history copies it from the active row.
 pub fn put_history_download_summary(
     db: &crate::Database,
     job_id: crate::JobId,

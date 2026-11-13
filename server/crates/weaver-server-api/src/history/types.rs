@@ -49,10 +49,10 @@ pub struct HistoryItem {
     pub delete_operation: Option<HistoryDeleteRowState>,
     #[serde(default)]
     pub duplicate_summary: Option<DuplicateSummaryInfo>,
-    /// When the entry's files were removed and the entry kept; null while
-    /// they are still there.
+    /// When the entry was archived: its files removed and the entry kept.
+    /// Null while it is not archived.
     #[serde(default)]
-    pub files_removed_at: Option<DateTime<Utc>>,
+    pub archived_at: Option<DateTime<Utc>>,
     // The job's stored record of full file names, read only when a query
     // selects `fullFileNames`.
     #[graphql(skip)]
@@ -143,13 +143,13 @@ pub enum HistoryDeleteOperationState {
 pub enum HistoryOperationAction {
     /// Deletes the entry, with or without its files.
     Delete,
-    /// Removes the entry's files and keeps the entry.
-    RemoveFiles,
+    /// Archives the entry: removes its files and keeps the entry.
+    Archive,
 }
 
 /// The history operation an entry is waiting on, or the last one that
-/// failed for it. A files removal that succeeded shows here no more; the
-/// entry's `filesRemovedAt` says so instead.
+/// failed for it. An archive that succeeded shows here no more; the
+/// entry's `archivedAt` says so instead.
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject, Serialize, Deserialize)]
 pub struct HistoryDeleteRowState {
     pub operation_id: u64,
@@ -158,9 +158,9 @@ pub struct HistoryDeleteRowState {
     pub action: HistoryOperationAction,
     pub delete_files: bool,
     pub error_message: Option<String>,
-    /// How a failed files removal ended; null for a delete, and while the
-    /// removal waits or runs.
-    pub files_removal_outcome: Option<HistoryFilesRemovalOutcome>,
+    /// How a failed archive ended; null for a delete, and while the
+    /// archive waits or runs.
+    pub archive_outcome: Option<ArchiveHistoryOutcome>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
@@ -176,12 +176,12 @@ pub struct HistoryDeleteOperation {
     pub requested_at: DateTime<Utc>,
 }
 
-/// What removing one history entry's files did. The entry stays either way.
+/// What archiving one history entry did. The entry stays either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum, Serialize, Deserialize)]
-pub enum HistoryFilesRemovalOutcome {
-    /// Folders Weaver manages were removed.
-    Removed,
-    /// Nothing was on disk, or the files were already removed.
+pub enum ArchiveHistoryOutcome {
+    /// Archived: the folders Weaver manages were removed.
+    Archived,
+    /// Archived with nothing on disk to remove, or already archived.
     AlreadyGone,
     /// A folder of the job is not one Weaver manages and was left as it is.
     NotManaged,
@@ -189,15 +189,15 @@ pub enum HistoryFilesRemovalOutcome {
     Busy,
     /// There is no history entry with this id.
     NotFound,
-    /// Removing stopped on an error. Nothing is stamped and a retry is safe.
+    /// Archiving stopped on an error. Nothing is stamped and a retry is safe.
     Failed,
 }
 
-impl From<weaver_server_core::HistoryFilesRemovalOutcome> for HistoryFilesRemovalOutcome {
-    fn from(outcome: weaver_server_core::HistoryFilesRemovalOutcome) -> Self {
-        use weaver_server_core::HistoryFilesRemovalOutcome as Core;
+impl From<weaver_server_core::ArchiveHistoryOutcome> for ArchiveHistoryOutcome {
+    fn from(outcome: weaver_server_core::ArchiveHistoryOutcome) -> Self {
+        use weaver_server_core::ArchiveHistoryOutcome as Core;
         match outcome {
-            Core::Removed => Self::Removed,
+            Core::Archived => Self::Archived,
             Core::AlreadyGone => Self::AlreadyGone,
             Core::NotManaged => Self::NotManaged,
             Core::Busy => Self::Busy,
@@ -207,10 +207,10 @@ impl From<weaver_server_core::HistoryFilesRemovalOutcome> for HistoryFilesRemova
     }
 }
 
-/// What a files removal request answered for one id, before any disk work.
+/// What an archive request answered for one id, before any disk work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Enum)]
-pub enum HistoryFilesRemovalAcceptOutcome {
-    /// Queued: the files are removed in the background.
+pub enum ArchiveHistoryAcceptOutcome {
+    /// Queued: the entry is archived in the background.
     Accepted,
     /// There is no history entry and no job with this id.
     NotFound,
@@ -219,58 +219,56 @@ pub enum HistoryFilesRemovalAcceptOutcome {
     Busy,
     /// The job is in the queue and has not finished.
     NotFinished,
-    /// The entry already says its files were removed.
-    AlreadyRemoved,
+    /// The entry is already archived.
+    AlreadyArchived,
 }
 
-impl From<weaver_server_core::HistoryFilesRemovalAcceptOutcome>
-    for HistoryFilesRemovalAcceptOutcome
-{
-    fn from(outcome: weaver_server_core::HistoryFilesRemovalAcceptOutcome) -> Self {
-        use weaver_server_core::HistoryFilesRemovalAcceptOutcome as Core;
+impl From<weaver_server_core::ArchiveHistoryAcceptOutcome> for ArchiveHistoryAcceptOutcome {
+    fn from(outcome: weaver_server_core::ArchiveHistoryAcceptOutcome) -> Self {
+        use weaver_server_core::ArchiveHistoryAcceptOutcome as Core;
         match outcome {
             Core::Accepted => Self::Accepted,
             Core::NotFound => Self::NotFound,
             Core::Busy => Self::Busy,
             Core::NotFinished => Self::NotFinished,
-            Core::AlreadyRemoved => Self::AlreadyRemoved,
+            Core::AlreadyArchived => Self::AlreadyArchived,
         }
     }
 }
 
-/// One id's answer to a files removal request.
+/// One id's answer to an archive request.
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
-pub struct HistoryFilesRemovalAcceptResult {
+pub struct ArchiveHistoryAcceptResult {
     pub id: u64,
-    pub outcome: HistoryFilesRemovalAcceptOutcome,
+    pub outcome: ArchiveHistoryAcceptOutcome,
 }
 
-/// The answer to a files removal request. The accepted ids are removed in
-/// the background; each entry then shows `filesRemovedAt` once its files
-/// are gone, or a failed `deleteOperation` with `action: REMOVE_FILES`.
+/// The answer to an archive request. The accepted ids are archived in the
+/// background; each entry then shows `archivedAt` once its files are gone,
+/// or a failed `deleteOperation` with `action: ARCHIVE`.
 #[derive(Debug, Clone, PartialEq, Eq, SimpleObject)]
-pub struct HistoryFilesRemovalAcceptance {
+pub struct ArchiveHistoryAcceptance {
     /// The operation holding the accepted ids; null when none was accepted.
     pub operation_id: Option<u64>,
     pub accepted_ids: Vec<u64>,
     pub total_targets: u32,
     /// One result per distinct id, in the order given.
-    pub results: Vec<HistoryFilesRemovalAcceptResult>,
+    pub results: Vec<ArchiveHistoryAcceptResult>,
 }
 
-impl HistoryFilesRemovalAcceptance {
-    pub(crate) fn from_core(acceptance: weaver_server_core::HistoryFilesRemovalAcceptance) -> Self {
+impl ArchiveHistoryAcceptance {
+    pub(crate) fn from_core(acceptance: weaver_server_core::ArchiveHistoryAcceptance) -> Self {
         let results = acceptance
             .results
             .into_iter()
-            .map(|(id, outcome)| HistoryFilesRemovalAcceptResult {
+            .map(|(id, outcome)| ArchiveHistoryAcceptResult {
                 id,
                 outcome: outcome.into(),
             })
             .collect::<Vec<_>>();
         let accepted_ids = results
             .iter()
-            .filter(|result| result.outcome == HistoryFilesRemovalAcceptOutcome::Accepted)
+            .filter(|result| result.outcome == ArchiveHistoryAcceptOutcome::Accepted)
             .map(|result| result.id)
             .collect::<Vec<_>>();
         Self {
@@ -786,7 +784,7 @@ fn history_item_from_display(
         attention: attention_for_history_row(row, state),
         delete_operation,
         duplicate_summary: None,
-        files_removed_at: row.files_removed_at.map(secs_to_datetime),
+        archived_at: row.archived_at.map(secs_to_datetime),
         full_file_names_record: weaver_server_core::ingest::full_file_names_record(metadata)
             .map(str::to_string),
         failed_over_ceiling: weaver_server_core::history::attributes::failed_for_memory(metadata),
@@ -807,13 +805,11 @@ pub fn history_delete_row_state_from_core(row: CoreHistoryDeleteRowState) -> His
         locked: row.locked,
         action: match row.action {
             weaver_server_core::HistoryOperationAction::Delete => HistoryOperationAction::Delete,
-            weaver_server_core::HistoryOperationAction::RemoveFiles => {
-                HistoryOperationAction::RemoveFiles
-            }
+            weaver_server_core::HistoryOperationAction::Archive => HistoryOperationAction::Archive,
         },
         delete_files: row.delete_files,
         error_message: row.error_message,
-        files_removal_outcome: row.files_removal_outcome.map(Into::into),
+        archive_outcome: row.archive_outcome.map(Into::into),
     }
 }
 

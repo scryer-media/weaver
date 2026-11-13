@@ -162,8 +162,8 @@ impl HistoryDeleteManager {
     }
 
     async fn process_operation(&self, operation: HistoryDeleteOperationRow) -> Result<()> {
-        if operation.action == HistoryOperationAction::RemoveFiles {
-            return self.process_files_removal(operation.id).await;
+        if operation.action == HistoryOperationAction::Archive {
+            return self.process_archive_history(operation.id).await;
         }
         if operation.delete_files && !operation.file_delete_authorized {
             const RESUBMIT_MESSAGE: &str =
@@ -218,10 +218,10 @@ impl HistoryDeleteManager {
         Ok(())
     }
 
-    // A files removal: its targets run in batches, each settled by the
+    // An archive: its targets run in batches, each settled by the
     // queue with its outcome before the hold on its entries is released, so
     // the revision that release rings finds the result written.
-    async fn process_files_removal(&self, operation_id: u64) -> Result<()> {
+    async fn process_archive_history(&self, operation_id: u64) -> Result<()> {
         let db = self.db.clone();
         let targets = tokio::task::spawn_blocking(move || {
             db.list_history_delete_operation_targets(operation_id, true)
@@ -249,24 +249,24 @@ impl HistoryDeleteManager {
                 .collect::<BTreeSet<_>>();
             let now = chrono::Utc::now().timestamp();
             // A batch the queue could not run fails each of its ids, as a
-            // delete batch does; a later removal of any of them is safe.
+            // delete batch does; a later archive of any of them is safe.
             if let Err(error) = self
                 .handle
-                .remove_history_files_for_operation(operation_id, job_ids, now)
+                .archive_history_for_operation(operation_id, job_ids, now)
                 .await
             {
                 let settled = batch
                     .iter()
-                    .map(|id| weaver_server_core::HistoryFilesRemovalSettlement {
+                    .map(|id| weaver_server_core::ArchiveHistorySettlement {
                         target_id: *id,
                         state: AsyncOperationTargetState::Failed,
-                        outcome: weaver_server_core::HistoryFilesRemovalOutcome::Failed,
+                        outcome: weaver_server_core::ArchiveHistoryOutcome::Failed,
                         message: Some(error.to_string()),
                     })
                     .collect::<Vec<_>>();
                 let db = self.db.clone();
                 tokio::task::spawn_blocking(move || {
-                    db.settle_history_files_removal_targets(operation_id, &settled)
+                    db.settle_archive_history_targets(operation_id, &settled)
                 })
                 .await
                 .map_err(|error| graphql_error("INTERNAL", error.to_string()))?
@@ -457,7 +457,7 @@ mod tests {
             completed_at: 2,
             metadata: None,
             server_attribution: None,
-            files_removed_at: None,
+            archived_at: None,
         }
     }
 
@@ -712,12 +712,12 @@ mod tests {
         );
     }
 
-    // Accepting a files removal touches no disk. A removal claimed before a
+    // Accepting an archive touches no disk. An archive claimed before a
     // restart is queued again and the worker then removes what Weaver owns,
     // stamps that entry, and fails the other with its outcome and message,
     // which the entry shows; the queue revision moves so lists read again.
     #[tokio::test]
-    async fn a_files_removal_survives_a_restart_and_settles_each_entry_on_the_worker() {
+    async fn an_archive_survives_a_restart_and_settles_each_entry_on_the_worker() {
         let db = Database::open_in_memory().unwrap();
         let output_root = tempfile::tempdir().unwrap();
         let owned = output_root.path().join("Owned");
@@ -737,7 +737,7 @@ mod tests {
             db.insert_job_history(&row).unwrap();
         }
 
-        let acceptance = db.accept_history_files_removal(&[30, 31]).unwrap();
+        let acceptance = db.accept_archive_history(&[30, 31]).unwrap();
         let operation_id = acceptance.operation_id.unwrap();
         assert!(owned.join("movie.mkv").is_file());
         let _claimed_before_restart = db.next_history_delete_operation().unwrap().unwrap();
@@ -756,24 +756,24 @@ mod tests {
             db.get_job_history(30)
                 .unwrap()
                 .unwrap()
-                .files_removed_at
+                .archived_at
                 .is_some()
         );
         assert!(
             db.get_job_history(31)
                 .unwrap()
                 .unwrap()
-                .files_removed_at
+                .archived_at
                 .is_none()
         );
         let states = db.list_history_delete_row_states(&[30, 31]).unwrap();
         assert!(!states.contains_key(&30));
         let failed = &states[&31];
         assert_eq!(failed.state, AsyncOperationTargetState::Failed);
-        assert_eq!(failed.action, HistoryOperationAction::RemoveFiles);
+        assert_eq!(failed.action, HistoryOperationAction::Archive);
         assert_eq!(
-            failed.files_removal_outcome,
-            Some(weaver_server_core::HistoryFilesRemovalOutcome::NotManaged)
+            failed.archive_outcome,
+            Some(weaver_server_core::ArchiveHistoryOutcome::NotManaged)
         );
         assert!(
             failed
@@ -785,12 +785,12 @@ mod tests {
         assert!(db.next_history_delete_operation().unwrap().is_none());
     }
 
-    // A files removal needs no pipeline turn, as a delete does not.
+    // An archive needs no pipeline turn, as a delete does not.
     #[tokio::test]
-    async fn a_files_removal_finishes_when_the_pipeline_has_stopped() {
+    async fn an_archive_finishes_when_the_pipeline_has_stopped() {
         let db = Database::open_in_memory().unwrap();
         db.insert_job_history(&history(32)).unwrap();
-        db.accept_history_files_removal(&[32]).unwrap();
+        db.accept_archive_history(&[32]).unwrap();
         let operation = db.next_history_delete_operation().unwrap().unwrap();
         let (manager, pipeline, _root) = manager_with_idle_pipeline(&db).await;
         drop(pipeline);
@@ -802,7 +802,7 @@ mod tests {
             db.get_job_history(32)
                 .unwrap()
                 .unwrap()
-                .files_removed_at
+                .archived_at
                 .is_some()
         );
         assert!(db.list_history_delete_row_states(&[32]).unwrap().is_empty());
@@ -907,10 +907,10 @@ mod tests {
         assert!(output_dir.join("payload.bin").is_file());
     }
 
-    // An entry whose files were removed keeps a record of them; age
+    // An archived entry keeps a record of its files; age
     // retention deletes that record with the entry.
     #[tokio::test]
-    async fn age_retention_deletes_the_record_of_removed_files() {
+    async fn age_retention_deletes_the_record_of_archived_files() {
         use weaver_server_core::history::output_files::{OutputFile, OutputFileListing};
         const DAY: i64 = 86_400;
         let now = 1_800_000_000;
@@ -927,13 +927,13 @@ mod tests {
             total_count: 1,
             total_bytes: 7,
         };
-        weaver_server_core::pipeline::test_support::stamp_files_removed(
+        weaver_server_core::pipeline::test_support::mark_entry_archived(
             &db,
             JobId(13),
             listing,
             now - 30 * DAY,
         );
-        assert_eq!(db.list_history_removed_files(13, 0, 10).unwrap().len(), 1);
+        assert_eq!(db.list_archived_history_files(13, 0, 10).unwrap().len(), 1);
 
         assert_eq!(db.prune_history_by_age(30, now).unwrap(), 1);
         let (manager, _pipeline, _root) = manager_with_idle_pipeline(&db).await;
@@ -942,6 +942,10 @@ mod tests {
         }
 
         assert!(db.get_job_history(13).unwrap().is_none());
-        assert!(db.list_history_removed_files(13, 0, 10).unwrap().is_empty());
+        assert!(
+            db.list_archived_history_files(13, 0, 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

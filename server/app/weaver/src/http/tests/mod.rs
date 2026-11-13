@@ -170,7 +170,7 @@ fn nzbget_history_row(
         completed_at,
         metadata,
         server_attribution: None,
-        files_removed_at: None,
+        archived_at: None,
     }
 }
 

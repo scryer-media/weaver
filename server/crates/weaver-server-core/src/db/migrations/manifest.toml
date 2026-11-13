@@ -1139,18 +1139,18 @@ scope = "all"
 
 [[migration]]
 version = 89
-description = "a history entry keeps when its files were removed; existing history upgrades with age retention off"
+description = "a history entry keeps when it was archived; existing history upgrades with age retention off"
 checksum_algo = "blake3"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0089_history_files_removed/sqlite.sql"
+file = "migrations/0089_history_archived/sqlite.sql"
 engine = "sqlite"
 scope = "all"
 
 [[migration.steps]]
 kind = "sql"
-file = "migrations/0089_history_files_removed/postgres.sql"
+file = "migrations/0089_history_archived/postgres.sql"
 engine = "postgres"
 scope = "all"
 

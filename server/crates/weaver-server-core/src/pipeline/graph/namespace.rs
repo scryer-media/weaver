@@ -306,6 +306,11 @@ pub(crate) struct NamespaceWriter {
     // The files each recovery set was last said to withhold, so the same
     // ones are said once.
     withheld_said: BTreeMap<NodeId, BTreeSet<MemberId>>,
+    // What the deliveries that bound members gave their new objects, while
+    // those members are handed over, innermost last: it is in each member's
+    // record and with its object, but in no file or hold, so the hand-over
+    // reads none of it from the member's file.
+    reached_now: Vec<(NodeId, MemberId, NodeId, ByteRange)>,
     // How many requests are being answered at once, and the most there
     // ever were.
     #[cfg(test)]
@@ -396,6 +401,7 @@ impl NamespaceWriter {
             again_held: Vec::new(),
             held_want: None,
             withheld_said: BTreeMap::new(),
+            reached_now: Vec::new(),
             #[cfg(test)]
             answering: (0, 0),
         }
@@ -825,6 +831,28 @@ impl NamespaceWriter {
         let given_back = effects
             .iter()
             .any(|effect| matches!(effect, Effect::GivenBack { .. }));
+        // What the delivery that bound a member gave its new object went to
+        // the object, not to the member's file or holds: the hand-over
+        // reads the file around it.
+        let reached: Vec<(NodeId, MemberId, NodeId, ByteRange)> = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                Effect::Reached {
+                    node,
+                    member,
+                    child,
+                    offset,
+                    bytes,
+                    ..
+                } if bound.contains(&(*node, *member, *child)) => Some((
+                    *node,
+                    *member,
+                    *child,
+                    ByteRange::at(*offset, bytes.len() as u64),
+                )),
+                _ => None,
+            })
+            .collect();
         for effect in effects.drain(..) {
             self.apply(tree, builder, segments, effect, write, out)?;
             self.apply_unnamed(tree, builder, segments, out)?;
@@ -832,9 +860,17 @@ impl NamespaceWriter {
         if given_back {
             self.prune(tree)?;
         }
+        let depth = self.reached_now.len();
+        self.reached_now.extend(reached);
+        let mut handed = Ok(());
         for (node, member, child) in bound {
-            self.hand_over(tree, builder, segments, (node, member), child, out)?;
+            handed = self.hand_over(tree, builder, segments, (node, member), child, out);
+            if handed.is_err() {
+                break;
+            }
         }
+        self.reached_now.truncate(depth);
+        handed?;
         for (node, copy, held) in folded {
             self.fold_over(tree, builder, segments, (node, copy), &held, out)?;
         }
@@ -2067,6 +2103,28 @@ impl NamespaceWriter {
             self.route_held_as_brought(tree, builder, segments, arrival, out)?;
         }
         Ok(())
+    }
+
+    // What of the member is out of its file and not for the file to give:
+    // its holds, and what the delivery that bound it gave its object, while
+    // that object still has the member. An object that gave the member up
+    // gave those bytes up with it, and whoever takes the member next reads
+    // them from the file like the rest.
+    fn not_in_file(&self, tree: &Tree, node: NodeId, member: MemberId) -> Vec<ByteRange> {
+        let owner = tree.child_of(node, member).map(|(child, _)| child);
+        let mut ranges = self
+            .files
+            .get(&node)
+            .map(|files| files.holds.held_ranges(held_volume(member)))
+            .unwrap_or_default();
+        ranges.extend(
+            self.reached_now
+                .iter()
+                .filter(|(at, of, child, _)| *at == node && *of == member && owner == Some(*child))
+                .map(|(_, _, _, range)| *range),
+        );
+        ranges.sort_by_key(|range| range.start);
+        ranges
     }
 
     // Held bytes go down again once the object their member is a volume of

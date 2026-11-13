@@ -703,3 +703,150 @@ async fn a_zip_with_a_drive_letter_member_delivers_every_member() {
 async fn a_tar_with_a_drive_letter_member_delivers_every_member() {
     a_drive_letter_member_beside_a_plain_one_delivers_both("lantern.tar", tar).await;
 }
+
+// The rows above again with members too large to be held: a member's tail
+// that arrives before its front goes to the member's own file, and the
+// object its front binds is handed that file. LARGE is past what a
+// namespace holds for one member, and FRAME keeps a row to a few thousand
+// articles.
+const LARGE: usize = 1_500_000;
+const FRAME: usize = 16 * 1024;
+
+type Compress = (&'static str, &'static str, fn(&[u8]) -> Vec<u8>);
+
+const STREAMS: [Compress; 6] = [
+    ("xz.bin.xz", "xz.bin", xz),
+    ("gz.bin.gz", "gz.bin", gzip),
+    ("bz.bin.bz2", "bz.bin", bzip2),
+    ("zst.bin.zst", "zst.bin", zstd),
+    ("br.bin.br", "br.bin", brotli),
+    ("raw.bin.deflate", "raw.bin", deflate),
+];
+
+fn store_of(kind: Kind, entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+    match kind {
+        Kind::Rar => rar(entries),
+        Kind::SevenZ => sevenz_of(entries),
+        Kind::Tar => tar(entries),
+        Kind::Zip => zip(entries),
+        _ => unreachable!("a store"),
+    }
+}
+
+// The post delivered `held` under `name` and nothing else, with no object
+// refused on the way, served in order and last article first.
+async fn large_row(posted: &str, store: Vec<u8>, name: &str, held: &[u8]) {
+    for backwards in [false, true] {
+        let scenario = Scenario::new(vec![Post::plain(posted, store.clone())]).framed(FRAME);
+        let scenario = if backwards {
+            scenario.backwards()
+        } else {
+            scenario
+        };
+        let (lines, guard) = Lines::capture();
+        let graph = run(&scenario).await;
+        drop(guard);
+        assert!(
+            lines.of("object refused").is_empty(),
+            "backwards={backwards}: {:?}",
+            lines.of("object refused")
+        );
+        assert_eq!(
+            summary(&graph),
+            format!("Some(Complete) [{name}]"),
+            "backwards={backwards}"
+        );
+        assert!(
+            graph.files[&delivered(name)] == held,
+            "backwards={backwards}: the bytes"
+        );
+    }
+}
+
+// One large stream of each kind as the one member of a store of `kind`.
+async fn large_stream_under(kind: Kind, posted: &str, stream: usize) {
+    let (member, name, compress) = STREAMS[stream];
+    let held = noise(LARGE + stream, 60 + stream as u64);
+    let store = store_of(kind, &[(member, compress(&held))]);
+    large_row(posted, store, name, &held).await;
+}
+
+macro_rules! large_streams {
+    ($($name:ident => $kind:expr, $posted:expr, $stream:expr;)*) => {
+        $(
+            #[tokio::test]
+            async fn $name() {
+                large_stream_under($kind, $posted, $stream).await;
+            }
+        )*
+    };
+}
+
+large_streams! {
+    a_large_xz_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 0;
+    a_large_gzip_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 1;
+    a_large_bzip2_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 2;
+    a_large_zstd_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 3;
+    a_large_brotli_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 4;
+    a_large_deflate_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", 5;
+    a_large_xz_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 0;
+    a_large_gzip_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 1;
+    a_large_bzip2_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 2;
+    a_large_zstd_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 3;
+    a_large_brotli_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 4;
+    a_large_deflate_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", 5;
+    a_large_xz_under_a_tar_delivers => Kind::Tar, "lantern.tar", 0;
+    a_large_gzip_under_a_tar_delivers => Kind::Tar, "lantern.tar", 1;
+    a_large_bzip2_under_a_tar_delivers => Kind::Tar, "lantern.tar", 2;
+    a_large_zstd_under_a_tar_delivers => Kind::Tar, "lantern.tar", 3;
+    a_large_brotli_under_a_tar_delivers => Kind::Tar, "lantern.tar", 4;
+    a_large_deflate_under_a_tar_delivers => Kind::Tar, "lantern.tar", 5;
+    a_large_xz_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 0;
+    a_large_gzip_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 1;
+    a_large_bzip2_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 2;
+    a_large_zstd_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 3;
+    a_large_brotli_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 4;
+    a_large_deflate_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", 5;
+}
+
+// One large container of kind `inner`, holding one file, as the one member
+// of a store of kind `outer`.
+async fn large_container_under(outer: Kind, posted: &str, inner: Kind, member: &str) {
+    let held = noise(LARGE, 90);
+    let store = store_of(outer, &[(member, inner.wrap(FILE, held.clone()))]);
+    large_row(posted, store, FILE, &held).await;
+}
+
+macro_rules! large_containers {
+    ($($name:ident => $outer:expr, $posted:expr, $inner:expr, $member:expr;)*) => {
+        $(
+            #[tokio::test]
+            async fn $name() {
+                large_container_under($outer, $posted, $inner, $member).await;
+            }
+        )*
+    };
+}
+
+large_containers! {
+    a_large_rar_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", Kind::Rar, "inner.rar";
+    a_large_7z_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", Kind::SevenZ, "inner.7z";
+    a_large_tar_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", Kind::Tar, "inner.tar";
+    a_large_tar_gz_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", Kind::TarGz, "inner.tar.gz";
+    a_large_zip_under_a_stored_rar_delivers => Kind::Rar, "lantern.rar", Kind::Zip, "inner.zip";
+    a_large_rar_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", Kind::Rar, "inner.rar";
+    a_large_7z_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", Kind::SevenZ, "inner.7z";
+    a_large_tar_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", Kind::Tar, "inner.tar";
+    a_large_tar_gz_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", Kind::TarGz, "inner.tar.gz";
+    a_large_zip_under_a_stored_7z_delivers => Kind::SevenZ, "lantern.7z", Kind::Zip, "inner.zip";
+    a_large_rar_under_a_tar_delivers => Kind::Tar, "lantern.tar", Kind::Rar, "inner.rar";
+    a_large_7z_under_a_tar_delivers => Kind::Tar, "lantern.tar", Kind::SevenZ, "inner.7z";
+    a_large_tar_under_a_tar_delivers => Kind::Tar, "lantern.tar", Kind::Tar, "inner.tar";
+    a_large_tar_gz_under_a_tar_delivers => Kind::Tar, "lantern.tar", Kind::TarGz, "inner.tar.gz";
+    a_large_zip_under_a_tar_delivers => Kind::Tar, "lantern.tar", Kind::Zip, "inner.zip";
+    a_large_rar_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", Kind::Rar, "inner.rar";
+    a_large_7z_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", Kind::SevenZ, "inner.7z";
+    a_large_tar_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", Kind::Tar, "inner.tar";
+    a_large_tar_gz_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", Kind::TarGz, "inner.tar.gz";
+    a_large_zip_under_a_stored_zip_delivers => Kind::Zip, "lantern.zip", Kind::Zip, "inner.zip";
+}

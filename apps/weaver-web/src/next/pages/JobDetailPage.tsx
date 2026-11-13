@@ -66,8 +66,8 @@ import { useSharedStructure } from "../data/share";
 import { usePageVisible } from "../data/timers";
 import { countLabel } from "../i18n/labels";
 import { NextShell } from "../shell/NextShell";
-import { describeFailedRemoval, describeFilesRemoval, rowOperationKind } from "../data/history-files";
-import { useFilesRemoval } from "../data/use-files-removal";
+import { describeFailedArchive, describeArchiveHistory, rowOperationKind } from "../data/history-archive";
+import { useArchiveHistory } from "../data/use-archive-history";
 import { extendKept, LIST_PAGE_SIZE, prependOlder, showsMore } from "../data/list-pages";
 import { jobIds, testIds } from "@/next/testids";
 import { SupportReportActions } from "../features/SupportReportActions";
@@ -158,8 +158,8 @@ interface OutputFilesPage {
   files: OutputFile[];
   totalBytes: number;
   totalCount: number;
-  /** The files are gone; the list is the record kept of them. */
-  removed: boolean;
+  /** The entry was archived; the list is the record kept of its files. */
+  archived: boolean;
   nextCursor: string | null;
 }
 
@@ -297,14 +297,14 @@ function JobDetailContent() {
   const [, rerunPostProcessing] = useMutation(RERUN_POST_PROCESSING_MUTATION);
   const [, reprocessJob] = useMutation(REPROCESS_JOB_MUTATION);
   const [, acceptHistoryDelete] = useMutation(ACCEPT_HISTORY_DELETE_MUTATION);
-  const requestFilesRemoval = useFilesRemoval();
+  const requestArchiveHistory = useArchiveHistory();
   const [, forgetDuplicateIdentity] = useMutation(FORGET_DUPLICATE_IDENTITY_MUTATION);
   const [, pauseJob] = useMutation(PAUSE_JOB_MUTATION);
   const [, resumeJob] = useMutation(RESUME_JOB_MUTATION);
   const [, cancelJob] = useMutation(CANCEL_JOB_MUTATION);
   const [, cancelPostProcessing] = useMutation(CANCEL_JOB_POST_PROCESSING_MUTATION);
 
-  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "removeFiles" | "cancel" | "forget" | null>(null);
+  const [confirm, setConfirm] = useState<"delete" | "deleteAll" | "archive" | "cancel" | "forget" | null>(null);
   const [report, setReport] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -328,19 +328,19 @@ function JobDetailContent() {
       refetchFiles({ requestPolicy: "network-only" });
     }
   }, [jobStatus, refetchFiles]);
-  // Files are removed in the background; the listing is read again once,
-  // when the pushed entry first says they are gone. Undefined until the job
+  // An entry is archived in the background; the listing is read again once,
+  // when the pushed entry first says it was archived. Undefined until the job
   // is known, so the first snapshot is not taken for a change.
-  const filesRemovedAt = job ? (job.filesRemovedAt ?? null) : undefined;
-  const listedRemovedAt = useRef(filesRemovedAt);
+  const archivedAt = job ? (job.archivedAt ?? null) : undefined;
+  const listedArchivedAt = useRef(archivedAt);
   useEffect(() => {
-    const previous = listedRemovedAt.current;
-    listedRemovedAt.current = filesRemovedAt;
-    if (previous === null && filesRemovedAt != null) {
+    const previous = listedArchivedAt.current;
+    listedArchivedAt.current = archivedAt;
+    if (previous === null && archivedAt != null) {
       refetchFiles({ requestPolicy: "network-only" });
     }
-  }, [filesRemovedAt, refetchFiles]);
-  // A history operation the entry waits on, or the files removal that last failed for it.
+  }, [archivedAt, refetchFiles]);
+  // A history operation the entry waits on, or the archive that last failed for it.
   const operation = !inQueue && job ? rowOperationKind(job.deleteOperation) : null;
   // The snapshot carries the newest page of the log. Once older pages were
   // read, every event seen is kept, so the newest page moving on leaves no
@@ -399,7 +399,7 @@ function JobDetailContent() {
   );
   const nextFilesCursor = more ? more.nextCursor : (firstFiles?.nextCursor ?? null);
   const fileTotal = Math.max(firstFiles?.totalCount ?? 0, files.length);
-  const filesRemoved = firstFiles?.removed ?? false;
+  const entryArchived = firstFiles?.archived ?? false;
   const outputDir = firstFiles?.outputDir || job?.outputDir || null;
   const duplicate = duplicateData?.duplicateSnapshot ?? null;
 
@@ -520,13 +520,13 @@ function JobDetailContent() {
     setReport(t("next.job.fileSaving", { name: file.name }));
   };
 
-  // The entry stays; its files are queued for removal. The page reads the
-  // entry again so the pending removal shows; the push says when they are gone.
-  const removeFiles = async () => {
+  // The entry stays; it is queued to be archived. The page reads the entry
+  // again so the pending archive shows; the push says when it is archived.
+  const archiveEntry = async () => {
     setBusy(true);
-    const { results, refused } = await requestFilesRemoval([jobId]);
+    const { results, refused } = await requestArchiveHistory([jobId]);
     setBusy(false);
-    setReport(refused ?? describeFilesRemoval(t, results));
+    setReport(refused ?? describeArchiveHistory(t, results));
     void refetch({ requestPolicy: "network-only" });
   };
 
@@ -709,31 +709,31 @@ function JobDetailContent() {
                     {t("next.job.retryNoLimit")}
                   </SecondaryButton>
                 ) : null}
-                {inQueue ? null : job.filesRemovedAt ? (
+                {inQueue ? null : job.archivedAt ? (
                   <span
-                    data-testid={jobIds.jobFilesRemoved}
+                    data-testid={jobIds.jobArchived}
                     className="font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-faint uppercase"
                   >
-                    {t("next.filesRemoval.mark")}
+                    {t("next.historyArchive.mark")}
                   </span>
                 ) : (
                   <>
-                    {operation === "removalFailed" && job.deleteOperation ? (
+                    {operation === "archiveFailed" && job.deleteOperation ? (
                       <span className="font-wv-mono text-[10.5px] tracking-[0.06em] text-wv-error-text uppercase">
-                        {describeFailedRemoval(t, {
+                        {describeFailedArchive(t, {
                           ...job.deleteOperation,
-                          action: "REMOVE_FILES",
+                          action: "ARCHIVE",
                         })}
                       </span>
                     ) : null}
                     <DangerButton
                       icon="remove"
                       size="compact"
-                      disabled={busy || (operation !== null && operation !== "removalFailed")}
-                      testId={jobIds.jobRemoveFiles}
-                      onClick={() => setConfirm("removeFiles")}
+                      disabled={busy || (operation !== null && operation !== "archiveFailed")}
+                      testId={jobIds.jobArchive}
+                      onClick={() => setConfirm("archive")}
                     >
-                      {operation === "removingFiles" ? t("next.filesRemoval.pending") : t("next.filesRemoval.action")}
+                      {operation === "archiving" ? t("next.historyArchive.pending") : t("next.historyArchive.action")}
                     </DangerButton>
                   </>
                 )}
@@ -903,10 +903,10 @@ function JobDetailContent() {
                 <div className="text-right font-wv-mono text-[12px] text-wv-muted">
                   {formatSize(file.sizeBytes)}
                 </div>
-                {/* A removed file is only a record: nothing to fetch. */}
-                {filesRemoved ? (
+                {/* A file of an archived entry is only a record: nothing to fetch. */}
+                {entryArchived ? (
                   <span
-                    data-testid={jobIds.jobFileRemoved}
+                    data-testid={jobIds.jobFileArchived}
                     className="text-right font-wv-mono text-[11px] whitespace-nowrap text-wv-muted uppercase"
                   >
                     {t("next.job.fileRemoved")}
@@ -922,7 +922,7 @@ function JobDetailContent() {
                   </button>
                 )}
                 {/* Nor a path to copy: nothing is there any more. */}
-                {filesRemoved ? (
+                {entryArchived ? (
                   <span aria-hidden="true" />
                 ) : (
                   <button
@@ -1185,17 +1185,17 @@ function JobDetailContent() {
       })}
 
       <ConfirmDialog
-        open={confirm === "removeFiles"}
-        testId={testIds.dialog("removeHistoryFiles")}
-        title={t("next.filesRemoval.title")}
+        open={confirm === "archive"}
+        testId={testIds.dialog("archiveHistory")}
+        title={t("next.historyArchive.title")}
         note={job.displayTitle || job.name}
         busy={busy}
-        confirmLabel={t("next.filesRemoval.action")}
-        body={t("next.filesRemoval.jobBody")}
+        confirmLabel={t("next.historyArchive.action")}
+        body={t("next.historyArchive.jobBody")}
         onDismiss={() => setConfirm(null)}
         onConfirm={() => {
           setConfirm(null);
-          void removeFiles();
+          void archiveEntry();
         }}
       />
 

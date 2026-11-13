@@ -8,8 +8,8 @@ export interface DeleteOperationData {
   deleteFiles: boolean;
   errorMessage?: string | null;
   /** Selected where it is read: the job page. */
-  action?: "DELETE" | "REMOVE_FILES";
-  filesRemovalOutcome?: "REMOVED" | "ALREADY_GONE" | "NOT_MANAGED" | "BUSY" | "NOT_FOUND" | "FAILED" | null;
+  action?: "DELETE" | "ARCHIVE";
+  archiveOutcome?: "ARCHIVED" | "ALREADY_GONE" | "NOT_MANAGED" | "BUSY" | "NOT_FOUND" | "FAILED" | null;
 }
 
 export type JobPhase = "DOWNLOADING" | "REPAIRING" | "EXTRACTING" | "MOVING";
@@ -54,8 +54,8 @@ export interface JobData {
   /** Failed for a decode window over the memory profile's ceiling; history rows only. */
   failedForMemory?: boolean;
   outputDir?: string | null;
-  /** When the entry's files were removed, or null while they are kept; history rows only. */
-  filesRemovedAt?: string | number | null;
+  /** When the entry was archived, or null while it is not; history rows only. */
+  archivedAt?: string | number | null;
   metadata: { key: string; value: string }[];
   deleteOperation?: DeleteOperationData | null;
 }

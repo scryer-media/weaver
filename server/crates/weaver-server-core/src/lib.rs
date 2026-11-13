@@ -48,17 +48,17 @@ pub use history::{
     split_history_metadata,
 };
 pub use jobs::{
-    ActiveJob, CallerScopedIdempotency, CancelJobsOutcome, DownloadBlockKind, DownloadBlockState,
-    DownloadState, DuplicateAction, DuplicateAdmission, DuplicateAdmissionRequest,
-    DuplicateBackfillEntry, DuplicateBackfillSource, DuplicateBackfillState, DuplicateDecision,
-    DuplicateJobLifecycle, DuplicateJobSummary, DuplicateMode, DuplicatePolicy, EgressQuotaBlock,
-    FieldUpdate, FileSpec, FingerprintEvidence, FingerprintKind, HISTORY_DELETE_BATCH_SIZE,
-    HardwareProfileInForce, HistoryDeleteBatchOutcome, HistoryDeleteOutcome, HistoryFilesRemoval,
-    HistoryFilesRemovalOutcome, JobFingerprint, JobId, JobInfo, JobPhase, JobPhaseProgress,
-    JobSpec, JobState, JobStatus, JobUpdate, MessageId, MessageIds, NntpRuntimeActivation,
-    NzbFileId, PhaseCounters, PostState, QueueMoveTarget, RecoveredJob, RestartRead,
-    RestoreJobRequest, RunState, SchedulerError, SchedulerHandle, SegmentId, SegmentSpec,
-    SemanticCandidateSnapshot, SemanticCandidateSource, SemanticCandidateState, SemanticDuplicate,
+    ActiveJob, ArchiveHistoryOutcome, ArchiveHistoryResult, CallerScopedIdempotency,
+    CancelJobsOutcome, DownloadBlockKind, DownloadBlockState, DownloadState, DuplicateAction,
+    DuplicateAdmission, DuplicateAdmissionRequest, DuplicateBackfillEntry, DuplicateBackfillSource,
+    DuplicateBackfillState, DuplicateDecision, DuplicateJobLifecycle, DuplicateJobSummary,
+    DuplicateMode, DuplicatePolicy, EgressQuotaBlock, FieldUpdate, FileSpec, FingerprintEvidence,
+    FingerprintKind, HISTORY_DELETE_BATCH_SIZE, HardwareProfileInForce, HistoryDeleteBatchOutcome,
+    HistoryDeleteOutcome, JobFingerprint, JobId, JobInfo, JobPhase, JobPhaseProgress, JobSpec,
+    JobState, JobStatus, JobUpdate, MessageId, MessageIds, NntpRuntimeActivation, NzbFileId,
+    PhaseCounters, PostState, QueueMoveTarget, RecoveredJob, RestartRead, RestoreJobRequest,
+    RunState, SchedulerError, SchedulerHandle, SegmentId, SegmentSpec, SemanticCandidateSnapshot,
+    SemanticCandidateSource, SemanticCandidateState, SemanticDuplicate,
     SemanticDuplicateLifecycleEvent, SemanticPromotionClaim, SemanticPromotionState,
     SemanticTerminalCause, ServerId, ServerTransportHealth, SharedPipelineState, SubmissionOrigin,
     classify_semantic_terminal_cause, derive_legacy_job_status, epoch_ms_now,
@@ -83,13 +83,13 @@ pub use operations::metrics::{
     Par3Stage, PipelineMetrics, SchedulerBlockClause, par3_memory_category_names,
 };
 pub use operations::{
+    ArchiveHistoryAcceptOutcome, ArchiveHistoryAcceptance, ArchiveHistorySettlement,
     AsyncOperationState, AsyncOperationTargetState, COUNTER_METRIC_KEYS, CounterRollupValue,
     GAUGE_METRIC_KEYS, GaugeRollupValue, HistoryDeleteOperationInsertError,
     HistoryDeleteOperationPayload, HistoryDeleteOperationRow, HistoryDeleteOperationSummary,
-    HistoryDeleteRowState, HistoryDeleteTargetWork, HistoryFilesRemovalAcceptOutcome,
-    HistoryFilesRemovalAcceptance, HistoryFilesRemovalSettlement, HistoryOperationAction,
-    JOB_STATUS_KEYS, MetricsHistoryChunkRow, MetricsHistoryQueryData, MetricsHistoryQueryResult,
-    MetricsHistoryTier, RawMetricsHistoryPoint, RollupMetricsHistoryPoint, StableStateExport,
+    HistoryDeleteRowState, HistoryDeleteTargetWork, HistoryOperationAction, JOB_STATUS_KEYS,
+    MetricsHistoryChunkRow, MetricsHistoryQueryData, MetricsHistoryQueryResult, MetricsHistoryTier,
+    RawMetricsHistoryPoint, RollupMetricsHistoryPoint, StableStateExport,
 };
 pub use persistence::{Database, LoadError, Refusal, StateError};
 pub use pipeline::Pipeline;

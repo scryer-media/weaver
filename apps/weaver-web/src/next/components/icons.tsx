@@ -147,7 +147,7 @@ export const ICONS = {
   add: Plus,
   edit: SquarePen,
   remove: Trash2,
-  removeFiles: FolderX,
+  archive: FolderX,
   forget: Eraser,
   cancelDownload: CircleX,
   stopScripts: CircleStop,

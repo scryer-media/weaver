@@ -44,10 +44,10 @@ pub use duplicate_persistence::{
 };
 pub use error::SchedulerError;
 pub use handle::{
-    AddJobOptions, CancelJobsOutcome, DownloadBlockKind, DownloadBlockState, EgressQuotaBlock,
-    FINISHED_JOBS_RUNTIME_CAP, HISTORY_DELETE_BATCH_SIZE, HardwareProfileInForce,
-    HistoryDeleteBatchOutcome, HistoryDeleteOutcome, HistoryFilesRemoval,
-    HistoryFilesRemovalOutcome, JobInfo, NntpRuntimeActivation, QueueMoveTarget, RestartRead,
+    AddJobOptions, ArchiveHistoryOutcome, ArchiveHistoryResult, CancelJobsOutcome,
+    DownloadBlockKind, DownloadBlockState, EgressQuotaBlock, FINISHED_JOBS_RUNTIME_CAP,
+    HISTORY_DELETE_BATCH_SIZE, HardwareProfileInForce, HistoryDeleteBatchOutcome,
+    HistoryDeleteOutcome, JobInfo, NntpRuntimeActivation, QueueMoveTarget, RestartRead,
     RestoreJobRequest, SchedulerHandle, ServerTransportHealth, SharedPipelineState,
 };
 pub use ids::{ConnectionId, JobId, MessageId, NzbFileId, SegmentId, ServerId};
