@@ -16,7 +16,7 @@ use rand::Rng;
 use serde::{Deserialize, Serialize, Serializer, ser::SerializeStruct};
 use tracing::{debug, trace};
 
-use crate::dht::INACTIVITY_TIMEOUT;
+use crate::dht::{INACTIVITY_TIMEOUT, SEARCH_MIN_SEEDS};
 
 // The nodes a bucket holds: BEP 5's k.
 const BUCKET_SIZE: usize = 8;
@@ -228,6 +228,17 @@ fn compute_split_start_end(
     ((start, new_left_end), (new_right_start, end_inclusive))
 }
 
+/// What [`RoutingTable::mark_outgoing_request`] marked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Marked {
+    /// A node of the table.
+    Node,
+    /// A node heard of, not asked before.
+    HeardOf,
+    /// Nothing: no such node, or one heard of and asked already.
+    Nothing,
+}
+
 #[derive(Debug)]
 pub enum InsertResult {
     WasExisting,
@@ -390,8 +401,19 @@ impl BucketTree {
         true
     }
 
-    // Marks the replacement `id` as asked; whether there was one.
+    // Marks the replacement `id` as asked; whether there was one not
+    // asked yet.
     fn mark_replacement_asked(&mut self, id: &Id20) -> bool {
+        self.set_replacement_asked(id, true)
+    }
+
+    // Marks the replacement `id` as not asked; whether there was one asked.
+    fn unmark_replacement_asked(&mut self, id: &Id20) -> bool {
+        self.set_replacement_asked(id, false)
+    }
+
+    // Whether there was a replacement `id` it changed.
+    fn set_replacement_asked(&mut self, id: &Id20, asked: bool) -> bool {
         let idx = self.get_leaf(id);
         match self
             .leaf_mut(idx)
@@ -399,11 +421,11 @@ impl BucketTree {
             .iter_mut()
             .find(|r| r.id == *id)
         {
-            Some(r) => {
-                r.asked = true;
+            Some(r) if r.asked != asked => {
+                r.asked = asked;
                 true
             }
-            None => false,
+            _ => false,
         }
     }
 
@@ -685,6 +707,11 @@ impl RoutingTableNode {
     pub fn is_confirmed(&self, now: Instant) -> bool {
         self.last_response.is_some() && self.status(now) != NodeStatus::Bad
     }
+
+    #[cfg(test)]
+    pub fn errors_in_a_row(&self) -> usize {
+        self.errors_in_a_row
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -703,6 +730,13 @@ pub struct RoutingTable {
     // Holds a permit once a node is heard of (see `heard_about`).
     #[serde(skip)]
     heard: Arc<tokio::sync::Notify>,
+    // How many of its nodes are confirmed (see `RoutingTableNode::
+    // is_confirmed`), kept as each is marked. A restored node is not.
+    #[serde(skip)]
+    confirmed: usize,
+    // Rings as `confirmed` reaches SEARCH_MIN_SEEDS.
+    #[serde(skip)]
+    seeded: Arc<tokio::sync::Notify>,
 }
 
 impl RoutingTable {
@@ -716,6 +750,8 @@ impl RoutingTable {
             entered: Default::default(),
             entries: 0,
             heard: Default::default(),
+            confirmed: 0,
+            seeded: Default::default(),
         }
     }
 
@@ -771,6 +807,16 @@ impl RoutingTable {
     /// Rings each time a node enters the table.
     pub fn entered(&self) -> Arc<tokio::sync::Notify> {
         self.entered.clone()
+    }
+    /// Whether the table holds SEARCH_MIN_SEEDS confirmed nodes: a search
+    /// from it does not lean on the routers.
+    pub fn is_seeded(&self) -> bool {
+        self.confirmed >= SEARCH_MIN_SEEDS
+    }
+    /// Rings as the table becomes seeded (see [`Self::is_seeded`]), once
+    /// each time its count of confirmed nodes reaches SEARCH_MIN_SEEDS.
+    pub fn seeded(&self) -> Arc<tokio::sync::Notify> {
+        self.seeded.clone()
     }
     pub fn id(&self) -> Id20 {
         self.id
@@ -844,37 +890,63 @@ impl RoutingTable {
         }
         res
     }
-    /// Marks the node `id` as asked; a node heard of but not in the table
-    /// is marked too, so it is not asked again for the table. Whether the
-    /// table holds `id`.
-    pub fn mark_outgoing_request(&mut self, id: &Id20, now: Instant) -> bool {
-        let r = match self.buckets.get_mut(id, None) {
-            Some(r) => r,
-            None => {
-                self.buckets.mark_replacement_asked(id);
-                return false;
-            }
+    // Applies `mark` to the node `id`, if the table holds it, keeping the
+    // count of confirmed nodes; `refresh`, if given, refreshes its bucket.
+    // Whether the table holds `id`.
+    fn mark(
+        &mut self,
+        id: &Id20,
+        refresh: Option<Instant>,
+        mark: impl FnOnce(&mut RoutingTableNode),
+    ) -> bool {
+        let Some(node) = self.buckets.get_mut(id, refresh) else {
+            return false;
         };
-        r.mark_outgoing_request(now);
+        let now = Instant::now();
+        let was = node.is_confirmed(now);
+        mark(node);
+        match (was, node.is_confirmed(now)) {
+            (false, true) => {
+                self.confirmed += 1;
+                if self.confirmed == SEARCH_MIN_SEEDS {
+                    self.seeded.notify_waiters();
+                }
+            }
+            (true, false) => self.confirmed -= 1,
+            _ => {}
+        }
         true
+    }
+
+    /// Marks the node `id` as asked; a node heard of but not in the table
+    /// is marked too, so it is not asked again for the table. What it
+    /// marked.
+    pub fn mark_outgoing_request(&mut self, id: &Id20, now: Instant) -> Marked {
+        if self.mark(id, None, |n| n.mark_outgoing_request(now)) {
+            Marked::Node
+        } else if self.buckets.mark_replacement_asked(id) {
+            Marked::HeardOf
+        } else {
+            Marked::Nothing
+        }
+    }
+
+    /// Takes back the mark [`Self::mark_outgoing_request`] gave the node
+    /// heard of `id` when it returned [`Marked::HeardOf`]: the question
+    /// was withdrawn and its answer never came, so it says nothing of the
+    /// node. It may be asked into the table again, so `heard` rings.
+    pub fn unmark_heard_of(&mut self, id: &Id20) {
+        if self.buckets.unmark_replacement_asked(id) {
+            self.heard.notify_one();
+        }
     }
 
     pub fn mark_response(&mut self, id: &Id20, now: Instant) -> bool {
-        let r = match self.buckets.get_mut(id, Some(now)) {
-            Some(r) => r,
-            None => return false,
-        };
-        r.mark_response(now);
-        true
+        self.mark(id, Some(now), |n| n.mark_response(now))
     }
 
     pub fn mark_error(&mut self, id: &Id20) -> bool {
-        let r = match self.buckets.get_mut(id, None) {
-            Some(r) => r,
-            None => return false,
-        };
-        r.mark_error();
-        true
+        self.mark(id, None, |n| n.mark_error())
     }
 
     pub fn mark_last_query(&mut self, id: &Id20, now: Instant) -> bool {
@@ -1301,5 +1373,44 @@ mod tests {
         let v6 = saved.of_family(false);
         assert_eq!(v6.len(), 1);
         assert!(v6.iter().all(|n| !super::is_v4_mapped(n.addr)));
+    }
+
+    // Nodes that are in the table but have not answered, as restored ones,
+    // do not seed it. It is seeded, and rings, as the third of them
+    // answers, though none entered then; a node that fails twice is no
+    // longer counted, and the table rings again as one more answers.
+    #[test]
+    fn test_the_table_is_seeded_as_its_third_node_answers() {
+        use crate::dht::SEARCH_MIN_SEEDS;
+        use futures::FutureExt;
+        use std::time::Instant;
+
+        let mut table = RoutingTable::new(Id20::new([0; 20]), None);
+        let ids: Vec<_> = (1..=4u8).map(|i| Id20::new([0x80 | i; 20])).collect();
+        for (i, id) in (1u8..).zip(&ids) {
+            table.add_node(*id, SocketAddr::from(([5, 6, i, 1], 6881)));
+        }
+        assert!(!table.is_seeded());
+        let seeded = table.seeded();
+        let now = Instant::now();
+        for id in &ids[..SEARCH_MIN_SEEDS - 1] {
+            table.mark_response(id, now);
+        }
+        assert!(!table.is_seeded());
+        let mut rang = std::pin::pin!(seeded.notified());
+        rang.as_mut().enable();
+        table.mark_response(&ids[SEARCH_MIN_SEEDS - 1], now);
+        assert!(table.is_seeded());
+        assert!(rang.as_mut().now_or_never().is_some());
+        // Answering again counts once.
+        table.mark_response(&ids[0], now);
+        let mut rang = std::pin::pin!(seeded.notified());
+        rang.as_mut().enable();
+        table.mark_error(&ids[0]);
+        table.mark_error(&ids[0]);
+        assert!(!table.is_seeded());
+        table.mark_response(&ids[3], now);
+        assert!(table.is_seeded());
+        assert!(rang.as_mut().now_or_never().is_some());
     }
 }

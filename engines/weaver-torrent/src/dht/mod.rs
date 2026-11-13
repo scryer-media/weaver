@@ -37,6 +37,10 @@ pub(crate) const RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 pub(crate) const DHT_ANNOUNCE_INTERVAL: Duration = Duration::from_secs(15 * 60);
 // After how long we consider a routing table node questionable.
 pub(crate) const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+// A search that starts from fewer nodes we can count on than this also asks
+// the routers (libtorrent `traversal_algorithm::start`); a table that holds
+// this many is seeded.
+pub(crate) const SEARCH_MIN_SEEDS: usize = 3;
 
 pub struct DhtBuilder {}
 

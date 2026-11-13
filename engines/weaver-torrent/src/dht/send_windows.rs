@@ -31,11 +31,16 @@ use tokio::time::Instant;
 
 use crate::dht::query_limiter::{QUERY_LIMIT, WINDOW};
 
-// The datagrams one address is sent in any WINDOW. libtorrent blocks at
-// QUERY_LIMIT; the 9 below it are left for what a node counts that is not
-// held here: replies to queries the node itself sends while its window is
-// full, which are counted but not held back.
-pub(crate) const SEND_LIMIT: usize = 40;
+// The datagrams one address is sent in any WINDOW: 49, the most a libtorrent
+// node takes in 10 seconds without ignoring the sender, which it does at its
+// QUERY_LIMIT-th (dos_blocker.cpp:76, v2.0.15). This leaves no headroom for
+// the replies Weaver sends that node: the node counts them, and Weaver
+// counts them here but never holds them back. So when queries have filled
+// an address's window and Weaver then answers a query from that address,
+// the node sees QUERY_LIMIT datagrams and ignores Weaver for 5 minutes.
+// The operator chose this limit on 2026-11-13, over a lower one that kept
+// room for those replies.
+pub(crate) const SEND_LIMIT: usize = 49;
 const _: () = assert!(SEND_LIMIT < QUERY_LIMIT as usize);
 
 // The least time between two sweeps of the closed windows.

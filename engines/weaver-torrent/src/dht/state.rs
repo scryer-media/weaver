@@ -18,14 +18,16 @@ use std::{
 
 use crate::bencode::ByteBufOwned;
 use crate::dht::{
-    DHT_ANNOUNCE_INTERVAL, Error, INACTIVITY_TIMEOUT, RESPONSE_TIMEOUT,
+    DHT_ANNOUNCE_INTERVAL, Error, INACTIVITY_TIMEOUT, RESPONSE_TIMEOUT, SEARCH_MIN_SEEDS,
     bprotocol::{
         self, AnnouncePeer, CompactNodeInfo, CompactNodeInfoOwned, ErrorDescription,
         FindNodeRequest, GetPeersRequest, Message, MessageKind, Node, PingRequest, Response, Want,
     },
     peer_store::{PEER_PURGE_INTERVAL, PeerStore},
     query_limiter::QueryLimiter,
-    routing_table::{InsertResult, NodeStatus, Refresh, RoutingTable, is_v4_mapped},
+    routing_table::{
+        InsertResult, Marked, NodeStatus, Refresh, RoutingTable, RoutingTableNode, is_v4_mapped,
+    },
     send_quota::{DHT_UPLOAD_RATE_LIMIT, SendQuota},
     send_windows::SendWindows,
 };
@@ -106,17 +108,23 @@ pub struct WorkerSendRequest {
     addr: SocketAddr,
 }
 
-// The requests one search keeps in flight: libtorrent's `dht_search_branching`.
+// The requests one search keeps in flight, all of them counted wherever
+// they are in its list: libtorrent's `dht_search_branching`.
 const SEARCH_BRANCHING: usize = 5;
+// How long a search's query may go unanswered, from the moment it is sent,
+// before the search asks one more node in its place; the query still waits
+// for its answer until RESPONSE_TIMEOUT (libtorrent `rpc_manager::tick`,
+// rpc_manager.cpp:396-459, v2.0.15).
+const SHORT_TIMEOUT: Duration = Duration::from_secs(1);
+// The most a search's branching may grow to with queries past SHORT_TIMEOUT:
+// libtorrent keeps its branch factor in an int8 (traversal_algorithm.cpp:380).
+const SEARCH_BRANCHING_MAX: usize = i8::MAX as usize;
 // The candidates one search keeps, closest first; libtorrent's traversal keeps
 // 100. A candidate pushed past the end is dropped, and since the kept ones only
 // get closer, it never comes back.
 const SEARCH_CANDIDATES: usize = 100;
 // k: a search is complete once the k closest candidates have answered.
 const SEARCH_K: usize = 8;
-// A search that starts from fewer nodes than this also asks the routers
-// (libtorrent `traversal_algorithm::start`).
-const SEARCH_MIN_SEEDS: usize = 3;
 // A table this many buckets deep no longer bootstraps again, and how often
 // it searches for our own id once it is (libtorrent `node::tick`,
 // node.cpp:654, v2.0.15).
@@ -156,6 +164,10 @@ enum CandidateState {
     Failed,
 }
 
+// A search's hold on one of its queries (see `RecursiveRequest::asking`):
+// dropped, the query is withdrawn.
+type Hold = tokio::sync::oneshot::Receiver<()>;
+
 #[derive(Debug)]
 struct Candidate {
     // None for a bootstrap address, whose id we do not know yet.
@@ -167,6 +179,31 @@ struct Candidate {
     // A deferred candidate's place in its address's line, while the search
     // may still ask it.
     lined_up: Option<LinedUp>,
+    // When it was first deferred.
+    deferred_at: Option<tokio::time::Instant>,
+    // Which of the search's queries went to it, counting from 0: its answer
+    // is the one to that query, never one to an earlier candidate at the
+    // same address.
+    asked: Option<usize>,
+    // The search's hold on its query, while it is in flight.
+    hold: Option<Hold>,
+    // In flight past SHORT_TIMEOUT: the search's branching counts one more
+    // for it until it answers or fails.
+    late: bool,
+}
+
+// The part of an address a search keeps one node of: its /24, or for IPv6
+// its first 64 bits (libtorrent `traversal_algorithm::add_entry`,
+// traversal_algorithm.cpp:191-226, v2.0.15, with `dht_restrict_search_ips`,
+// its default, settings_pack.cpp:230).
+fn search_prefix(ip: IpAddr) -> IpAddr {
+    match ip {
+        IpAddr::V4(a) => {
+            let [a, b, c, _] = a.octets();
+            IpAddr::V4(std::net::Ipv4Addr::new(a, b, c, 0))
+        }
+        IpAddr::V6(a) => IpAddr::V6(Ipv6Addr::from(u128::from(a) >> 64 << 64)),
+    }
 }
 
 // The nodes one search knows of, closest to its target first, the ones without
@@ -174,6 +211,13 @@ struct Candidate {
 struct Candidates {
     target: Id20,
     list: Vec<Candidate>,
+    // Fewer than SEARCH_MIN_SEEDS of the nodes it started from were nodes we
+    // can count on, so it asks the routers too (see `RecursiveRequest::start`).
+    leans_on_routers: bool,
+    // The queries the search has sent: each takes the next number.
+    queries: usize,
+    // The /24s and /64s of the nodes offered by an answer (see `offer`).
+    prefixes: std::collections::HashSet<IpAddr>,
 }
 
 impl Candidates {
@@ -181,6 +225,9 @@ impl Candidates {
         Self {
             target,
             list: Vec::new(),
+            leans_on_routers: false,
+            queries: 0,
+            prefixes: std::collections::HashSet::new(),
         }
     }
 
@@ -188,20 +235,29 @@ impl Candidates {
         (id.is_none(), id.map(|id| id.distance(&self.target)))
     }
 
-    // An IPv4 address written as IPv6 is never asked: it is no node.
-    fn offer(&mut self, id: Option<Id20>, addr: SocketAddr) {
+    // An IPv4 address written as IPv6 is never asked: it is no node. A node
+    // an answer names (not `initial`) is not offered when one offered before
+    // it was in its /24 or /64: an answer that names many nodes of one
+    // network, as a node can that wants us to send there, adds one of them
+    // (libtorrent `add_entry`, traversal_algorithm.cpp:191-226, v2.0.15,
+    // which applies this to every node but the ones a search starts from,
+    // `flag_initial`). Returns the candidate pushed past the end, if any.
+    fn offer(&mut self, id: Option<Id20>, addr: SocketAddr, initial: bool) -> Option<Candidate> {
         if is_v4_mapped(addr)
             || self
                 .list
                 .iter()
                 .any(|c| c.addr == addr || (id.is_some() && c.id == id))
         {
-            return;
+            return None;
+        }
+        if !initial && !self.prefixes.insert(search_prefix(addr.ip())) {
+            return None;
         }
         let rank = self.rank(id);
         let pos = self.list.partition_point(|c| self.rank(c.id) <= rank);
         if pos >= SEARCH_CANDIDATES {
-            return;
+            return None;
         }
         self.list.insert(
             pos,
@@ -211,66 +267,127 @@ impl Candidates {
                 state: CandidateState::Fresh,
                 token: None,
                 lined_up: None,
+                deferred_at: None,
+                asked: None,
+                hold: None,
+                late: false,
             },
         );
-        self.list.truncate(SEARCH_CANDIDATES);
-    }
-
-    // The closest candidate not asked yet that may be asked at `now`, unless
-    // the k closest that answered are all closer than it. A deferred one may
-    // be asked once its line says it may have room.
-    fn next_to_ask(&mut self, now: tokio::time::Instant) -> Option<&mut Candidate> {
-        let mut answered = 0;
-        for c in self.list.iter_mut() {
-            if answered == SEARCH_K {
-                return None;
-            }
-            match c.state {
-                CandidateState::Answered => answered += 1,
-                CandidateState::Fresh => return Some(c),
-                CandidateState::Deferred if c.lined_up.as_ref().is_some_and(|l| l.ready <= now) => {
-                    return Some(c);
-                }
-                CandidateState::Deferred | CandidateState::InFlight | CandidateState::Failed => {}
-            }
+        if self.list.len() > SEARCH_CANDIDATES {
+            self.list.pop()
+        } else {
+            None
         }
-        None
     }
 
-    // When the earliest deferred candidate the search may still ask may have
-    // room. A deferred candidate past the k closest that answered is never
-    // asked: it leaves its line.
-    fn next_wake(&mut self) -> Option<tokio::time::Instant> {
-        let mut answered = 0;
+    // Asks, through `ask`, the candidates the search wants in flight at
+    // `now`, and says whether the search is done and when it should look
+    // again for a deferred candidate (libtorrent
+    // `traversal_algorithm::add_requests`, traversal_algorithm.cpp:492-580,
+    // v2.0.15, as with `dht_aggressive_lookups` off: its loop runs while
+    // `m_invoke_count`, every request of the search in flight, is under the
+    // branch factor, 519-523). Closest first, while fewer than k have
+    // answered and fewer than `branching` of all its requests are in
+    // flight, each not asked yet is asked.
+    // So however many closer nodes an answer names, the search has at most
+    // `branching` in flight, SEARCH_BRANCHING and one more for each query
+    // past SHORT_TIMEOUT. One whose address's send window is full (see
+    // `SendGuard`) is deferred instead, holding no request in flight, and
+    // asked once its line says it may have room, if the search still wants
+    // it then; libtorrent fails a query it cannot send. One still deferred
+    // RESPONSE_TIMEOUT after it was first fails for this search, never for
+    // the table: an address that keeps its window full holds no search
+    // open. A deferred candidate past the k closest that answered is never
+    // asked: it leaves its line. The search is done once the k closest that
+    // answered have none in flight among or nearer than them, or once it
+    // has none in flight at all; in both cases with no deferred candidate
+    // nearer still to ask. Requests in flight to nodes farther than those k
+    // are not waited for.
+    fn add_requests(
+        &mut self,
+        guard: &Arc<SendGuard>,
+        branching: usize,
+        now: tokio::time::Instant,
+        mut ask: impl FnMut(&Candidate, SendSlot) -> Hold,
+    ) -> (bool, Option<tokio::time::Instant>) {
+        let mut results_target = SEARCH_K;
+        // In flight among the candidates walked so far.
+        let mut outstanding = 0;
+        let mut in_flight = self
+            .list
+            .iter()
+            .filter(|c| c.state == CandidateState::InFlight)
+            .count();
+        let mut queries = self.queries;
         let mut wake: Option<tokio::time::Instant> = None;
+        let mut wake_at = |at: tokio::time::Instant| {
+            wake = Some(wake.map_or(at, |w| w.min(at)));
+        };
+        let mut walked = 0;
         for c in self.list.iter_mut() {
-            if answered == SEARCH_K {
-                c.lined_up = None;
-                continue;
+            if results_target == 0 || in_flight >= branching {
+                break;
             }
+            walked += 1;
             match c.state {
-                CandidateState::Answered => answered += 1,
-                CandidateState::Deferred => {
-                    if let Some(l) = &c.lined_up {
-                        wake = Some(wake.map_or(l.ready, |w| w.min(l.ready)));
+                CandidateState::Answered => results_target -= 1,
+                CandidateState::InFlight => outstanding += 1,
+                CandidateState::Failed => {}
+                CandidateState::Fresh | CandidateState::Deferred => {
+                    // Asked at its turn in line, or failed if that turn
+                    // comes RESPONSE_TIMEOUT or more after it was deferred.
+                    let ready = c.lined_up.as_ref().map(|l| l.ready).filter(|r| *r > now);
+                    let slot = match ready {
+                        Some(ready) => Err(ready),
+                        None => match c.lined_up.take() {
+                            Some(lined_up) => lined_up.try_send(now),
+                            None => guard.try_send(c.addr.ip(), now),
+                        }
+                        .map_err(|lined_up| {
+                            let ready = lined_up.ready;
+                            c.lined_up = Some(lined_up);
+                            ready
+                        }),
+                    };
+                    match slot {
+                        Ok(slot) => {
+                            c.state = CandidateState::InFlight;
+                            c.asked = Some(queries);
+                            queries += 1;
+                            outstanding += 1;
+                            in_flight += 1;
+                            c.hold = Some(ask(c, slot));
+                        }
+                        Err(ready) => {
+                            let give_up = *c.deferred_at.get_or_insert(now) + RESPONSE_TIMEOUT;
+                            if give_up <= now {
+                                c.state = CandidateState::Failed;
+                                c.lined_up = None;
+                            } else {
+                                c.state = CandidateState::Deferred;
+                                wake_at(ready.min(give_up));
+                            }
+                        }
                     }
                 }
-                _ => {}
             }
         }
-        wake
+        self.queries = queries;
+        if results_target == 0 {
+            for c in &mut self.list[walked..] {
+                c.lined_up = None;
+            }
+        }
+        let done = wake.is_none() && ((results_target == 0 && outstanding == 0) || in_flight == 0);
+        (done, wake)
     }
 
-    fn settle(&mut self, addr: SocketAddr, state: CandidateState) {
-        if let Some(c) = self.list.iter_mut().find(|c| c.addr == addr) {
-            c.state = state;
-        }
-    }
-
-    fn give_token(&mut self, addr: SocketAddr, token: Option<ByteBufOwned>) {
-        if let Some(c) = self.list.iter_mut().find(|c| c.addr == addr) {
-            c.token = token;
-        }
+    // The candidate the search's query number `query` went to, while that
+    // query is in flight: none once it was pushed past the end.
+    fn in_flight(&mut self, query: usize) -> Option<&mut Candidate> {
+        self.list
+            .iter_mut()
+            .find(|c| c.asked == Some(query) && c.state == CandidateState::InFlight)
     }
 
     // The k closest nodes that answered with a write token: the ones a search
@@ -347,6 +464,11 @@ impl SearchOutcome {
     }
 }
 
+// How one of a search's queries ended, by its number (see
+// `RecursiveRequest::asking`): its answer, or None when the search withdrew
+// it before it was sent.
+type Asked = (usize, Option<crate::dht::Result<Response<ByteBufOwned>>>);
+
 // The outgoing rate limiter reads tokio's clock, the one every DHT deadline
 // runs on, so a wait on the limiter and the deadline that bounds it are measured
 // in the same time.
@@ -400,14 +522,6 @@ fn make_rate_limiter() -> RateLimiter {
 }
 
 trait RecursiveRequestCallbacks: Sized + Send + Sync + 'static {
-    fn on_request_start(&self, req: &RecursiveRequest<Self>, target_node: Id20, addr: SocketAddr);
-    fn on_request_end(
-        &self,
-        req: &RecursiveRequest<Self>,
-        target_node: Id20,
-        addr: SocketAddr,
-        resp: &crate::dht::Result<ResponseOrError>,
-    );
     // The queries a search sends as it ends, each to its node.
     fn on_search_end(
         &self,
@@ -422,19 +536,26 @@ struct RecursiveRequestCallbacksGetPeers {
     announce_port: Option<u16>,
 }
 
-// A search's request to a node, as the table sees it: a get_peers search
+// A search's query to a node, as the table sees it: a get_peers search
 // feeds the table as a find_node one does, as every reply that matches a
 // request reaches `node_seen` in libtorrent (rpc_manager.cpp:389, v2.0.15),
 // whatever the query. A node a search is told of enters the table only once
 // it answers (routing_table.cpp:816-822, 1085-1099: a node not yet pinged
 // never takes a place in a bucket). One the table holds already is marked as
-// asked. An error reply is no answer: it counts as a failure, as a timeout
-// does, and enters nothing (rpc_manager.cpp:316-350, where an error calls
-// the observer's `timeout`, and only a response reaches `node_seen`).
-fn table_asked(dht: &DhtState, target_node: Id20, addr: SocketAddr) {
+// asked as the query is sent. An error reply is no answer: it counts as a
+// failure, as a timeout does, and enters nothing (rpc_manager.cpp:316-350,
+// where an error calls the observer's `timeout`, and only a response reaches
+// `node_seen`). A query the search withdrew once it was sent still feeds the
+// table its answer, but its failure is no failure of the node, and a node
+// heard of that it marked as asked is as it was before. libtorrent marks
+// such a query done (traversal_algorithm.cpp:265, 455), so it never times
+// out; a reply to it reaches `node_seen` (rpc_manager.cpp:276-389) until the
+// next rpc_manager tick erases it, at most a second later
+// (rpc_manager.cpp:396-417).
+fn table_asked(dht: &DhtState, target_node: Id20, addr: SocketAddr) -> Marked {
     dht.get_table_for_addr(addr)
         .write()
-        .mark_outgoing_request(&target_node, now());
+        .mark_outgoing_request(&target_node, now())
 }
 
 fn table_answered(
@@ -442,32 +563,22 @@ fn table_answered(
     target_node: Id20,
     addr: SocketAddr,
     resp: &crate::dht::Result<ResponseOrError>,
+    withdrawn: bool,
+    marked: Marked,
 ) {
     let mut table = dht.get_table_for_addr(addr).write();
     if let Ok(ResponseOrError::Response(response)) = resp {
         // The node enters under the id it answered with.
         table.add_node(response.id, addr);
         table.mark_response(&response.id, now());
-    } else {
+    } else if !withdrawn {
         table.mark_error(&target_node);
+    } else if marked == Marked::HeardOf {
+        table.unmark_heard_of(&target_node);
     }
 }
 
 impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
-    fn on_request_start(&self, req: &RecursiveRequest<Self>, target_node: Id20, addr: SocketAddr) {
-        table_asked(&req.dht, target_node, addr);
-    }
-
-    fn on_request_end(
-        &self,
-        req: &RecursiveRequest<Self>,
-        target_node: Id20,
-        addr: SocketAddr,
-        resp: &crate::dht::Result<ResponseOrError>,
-    ) {
-        table_answered(&req.dht, target_node, addr, resp);
-    }
-
     // A search that ends announces us to the k closest nodes that gave it a
     // token (libtorrent `node::announce`, whose get_peers traversal ends in
     // `announce_fun`).
@@ -496,21 +607,7 @@ impl RecursiveRequestCallbacks for RecursiveRequestCallbacksGetPeers {
 }
 
 struct RecursiveRequestCallbacksFindNodes {}
-impl RecursiveRequestCallbacks for RecursiveRequestCallbacksFindNodes {
-    fn on_request_start(&self, req: &RecursiveRequest<Self>, target_node: Id20, addr: SocketAddr) {
-        table_asked(&req.dht, target_node, addr);
-    }
-
-    fn on_request_end(
-        &self,
-        req: &RecursiveRequest<Self>,
-        target_node: Id20,
-        addr: SocketAddr,
-        resp: &crate::dht::Result<ResponseOrError>,
-    ) {
-        table_answered(&req.dht, target_node, addr, resp);
-    }
-}
+impl RecursiveRequestCallbacks for RecursiveRequestCallbacksFindNodes {}
 
 struct RecursiveRequest<C: RecursiveRequestCallbacks> {
     info_hash: Id20,
@@ -634,7 +731,14 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
     // `torrent::dht_announce` once a `dht_announce_interval`). A search due
     // while the table is empty and no router is known starts as the first
     // node enters the table or the first router becomes known, whichever is
-    // first. A search that fell short, fewer than k nodes answering it, as
+    // first. The first search, when the table held too few nodes we can
+    // count on and it leaned on the routers (see `start`), was made before
+    // the bootstrap seeded the table; if it fell short it is made again as
+    // soon as the table holds SEARCH_MIN_SEEDS such nodes, with one of the
+    // early turns a growth gives out, and EARLY_SEARCH_MIN does not apply
+    // to it. A router that names only nodes that do not answer, or does not
+    // answer a get_peers at all, leaves such a search with nothing to walk.
+    // A search that fell short, fewer than k nodes answering it, as
     // one made before the route carried datagrams or before the table
     // filled, searches again ahead of its turn once the table has grown
     // since it started (see `DhtState::grow`) and EARLY_SEARCH_MIN has
@@ -658,6 +762,7 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                 // when a short one is made again early.
                 let mut due = None;
                 let mut early = EARLY_SEARCH_MIN;
+                let mut first = true;
                 loop {
                     let mut next_entered = std::pin::pin!(entered.notified());
                     next_entered.as_mut().enable();
@@ -669,6 +774,9 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                         .acquire()
                         .await
                         .expect("the DHT's walk turns are never closed");
+                    // Before the search starts: a growth from here on is
+                    // one it did not start from.
+                    let seen = growth.generation.load(Ordering::Acquire);
                     let candidates = self.start(is_v4, std::iter::empty());
                     if candidates.list.is_empty() {
                         drop(turn);
@@ -678,18 +786,23 @@ impl RecursiveRequest<RecursiveRequestCallbacksGetPeers> {
                         }
                         continue;
                     }
-                    let seen = growth.generation.load(Ordering::Acquire);
+                    let reissue =
+                        std::mem::replace(&mut first, false) && candidates.leans_on_routers;
                     let outcome = self.walk(candidates).await?;
                     drop(turn);
                     trace!(?outcome, "search finished");
                     let now = tokio::time::Instant::now();
                     let due_at = *due.get_or_insert_with(|| now + wait);
                     let early_at = now + early;
-                    if outcome.is_short() && early_at < due_at {
-                        early *= 2;
+                    let reissue = reissue && outcome.is_short();
+                    if outcome.is_short() && (early_at < due_at || reissue) {
                         tokio::select! {
                             () = tokio::time::sleep_until(due_at) => {}
-                            () = growth.early_turn(seen, early_at) => continue,
+                            () = growth.early_turn(seen, early_at), if early_at < due_at => {
+                                early *= 2;
+                                continue;
+                            }
+                            () = self.dht.seeded_turn(is_v4), if reissue => continue,
                         }
                     } else {
                         tokio::time::sleep_until(due_at).await;
@@ -743,43 +856,57 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
     ) -> Candidates {
         let mut candidates = Candidates::new(self.info_hash);
         for (id, addr) in given {
-            candidates.offer(id, addr);
+            candidates.offer(id, addr, true);
         }
         let mut seeds = candidates.list.len();
         if candidates.list.is_empty() {
-            // Good nodes first, then questionable, unknown and bad, each
-            // tier nearest first.
+            // Good nodes first, then the other confirmed ones, then the
+            // questionable, unknown and bad ones not confirmed, each tier
+            // nearest first. So a table that holds SEARCH_MIN_SEEDS
+            // confirmed nodes, a seeded one (`RoutingTable::is_seeded`),
+            // gives at least that many, and the search does not lean on the
+            // routers.
             let table = self.table(is_v4).read();
             let now = now();
             let mut closest = Vec::with_capacity(SEARCH_K);
-            for tier in [
-                NodeStatus::Good,
-                NodeStatus::Questionable,
-                NodeStatus::Unknown,
-                NodeStatus::Bad,
+            for (confirmed, tier) in [
+                (true, Some(NodeStatus::Good)),
+                (true, None),
+                (false, Some(NodeStatus::Questionable)),
+                (false, Some(NodeStatus::Unknown)),
+                (false, Some(NodeStatus::Bad)),
             ] {
                 if closest.len() == SEARCH_K {
                     break;
                 }
+                // Good nodes are all confirmed: the second tier is the
+                // confirmed ones that are not good.
+                let in_tier = |n: &RoutingTableNode| {
+                    let status = n.status(now);
+                    n.is_confirmed(now) == confirmed
+                        && match tier {
+                            Some(tier) => status == tier,
+                            None => status != NodeStatus::Good,
+                        }
+                };
                 closest.extend(
                     table
-                        .closest(&self.info_hash, SEARCH_K - closest.len(), |n| {
-                            n.status(now) == tier
-                        })
+                        .closest(&self.info_hash, SEARCH_K - closest.len(), in_tier)
                         .iter()
                         .map(|n| (n.id(), n.addr(), n.is_confirmed(now))),
                 );
             }
             drop(table);
             for (id, addr, confirmed) in closest {
-                candidates.offer(Some(id), addr);
+                candidates.offer(Some(id), addr, true);
                 seeds += usize::from(confirmed);
             }
         }
         if seeds < SEARCH_MIN_SEEDS {
+            candidates.leans_on_routers = true;
             for router in self.dht.routers.read().iter() {
                 if router.is_ipv4() == is_v4 {
-                    candidates.offer(None, *router);
+                    candidates.offer(None, *router, true);
                 }
             }
         }
@@ -795,88 +922,83 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
         self.walk(self.start(is_v4, given)).await
     }
 
-    // Walk towards the target from `candidates`: ask the closest not asked
-    // yet, at most SEARCH_BRANCHING at a time, and offer the nodes each answer
-    // names as new candidates. A node that fails or does not answer in time is
-    // marked failed and skipped. A node named at an address it cannot be
-    // reached at is not offered. A node whose address's send window is full
-    // (see `SendGuard`) is deferred, holding no request in flight, and the
-    // walk asks the next candidate meanwhile; it is asked once its window
-    // has room, if the search still wants it then. The search ends when
-    // nothing is in flight and no candidate is left to ask, deferred ones
-    // past the k closest that answered included; with only deferred ones
-    // left, it waits for the first of them to have room. As it ends it sends
-    // what its callbacks ask for, each under the same limits.
+    // Walk towards the target from `candidates`: keep the closest not asked
+    // yet in flight, SEARCH_BRANCHING in all at a time, and offer the nodes
+    // each answer names as new candidates (see `Candidates::add_requests`
+    // and `offer`). A node that fails or does not answer in time is marked
+    // failed and skipped. A node named at an address it cannot be reached at
+    // is not offered. A query sent SHORT_TIMEOUT ago with no answer yet lets
+    // the walk ask one more node, up to SEARCH_BRANCHING_MAX in flight, and
+    // still waits for its answer, which the walk uses as any other; the
+    // extra room goes once it answers or fails (libtorrent
+    // `traversal_algorithm::failed` and `finished`,
+    // traversal_algorithm.cpp:322-408, v2.0.15). A query not sent yet,
+    // waiting on its window or the rate limiter, has no such timer. The
+    // query to a candidate pushed past the end is withdrawn (`add_entry`,
+    // 254-282): not sent yet, it is never sent; sent, its answer feeds only
+    // the table (see `table_answered`). The walk ends as `add_requests` says
+    // it is done: the queries still in flight then, to nodes farther than
+    // the k closest that answered, are withdrawn the same way, as
+    // libtorrent's `done` marks them (427-490), and wait for their answers
+    // apart from the walk, until RESPONSE_TIMEOUT. As it ends it sends what
+    // its callbacks ask for, each under the same limits.
     async fn walk(&self, mut candidates: Candidates) -> crate::dht::Result<SearchOutcome> {
         let mut in_flight = FuturesUnordered::new();
+        let (late_tx, mut late_rx) = unbounded_channel();
         let mut outcome = SearchOutcome::default();
+        let mut branching = SEARCH_BRANCHING;
         loop {
             let now = tokio::time::Instant::now();
-            while in_flight.len() < SEARCH_BRANCHING {
-                let Some(candidate) = candidates.next_to_ask(now) else {
-                    break;
-                };
-                let slot = match candidate.lined_up.take() {
-                    Some(lined_up) => lined_up.try_send(now),
-                    None => self.dht.send_guard.try_send(candidate.addr.ip(), now),
-                };
-                let slot = match slot {
-                    Ok(slot) => slot,
-                    Err(lined_up) => {
-                        candidate.state = CandidateState::Deferred;
-                        candidate.lined_up = Some(lined_up);
-                        continue;
-                    }
-                };
-                candidate.state = CandidateState::InFlight;
-                let (id, addr) = (candidate.id, candidate.addr);
-                in_flight.push(
-                    self.ask(id, addr, slot)
-                        .map(move |r| ((id, addr), r))
-                        .instrument(debug_span!("ask", addr = addr.to_string())),
-                );
+            let (done, wake) =
+                candidates.add_requests(&self.dht.send_guard, branching, now, |c, slot| {
+                    let (kept, hold) = tokio::sync::oneshot::channel();
+                    let query = c.asked.expect("a candidate is numbered as it is asked");
+                    in_flight.push(self.asking(query, c.id, c.addr, slot, kept, late_tx.clone()));
+                    hold
+                });
+            if done {
+                break;
             }
-            // A deferred candidate is looked at again when its window may
-            // have room, and only while a request may be added.
-            let wake = if in_flight.len() < SEARCH_BRANCHING {
-                candidates.next_wake()
-            } else {
-                None
-            };
-            let next = if in_flight.is_empty() {
-                None
-            } else {
-                tokio::select! {
-                    next = in_flight.next() => next,
-                    () = sleep_until_some(wake) => continue,
-                }
-            };
-            let Some(((id, addr), answer)) = next else {
-                if let Some(wake) = wake {
-                    tokio::time::sleep_until(wake).await;
+            let (query, answer) = tokio::select! {
+                biased;
+                Some(query) = late_rx.recv() => {
+                    if let Some(c) = candidates.in_flight(query)
+                        && !c.late
+                        && branching < SEARCH_BRANCHING_MAX
+                    {
+                        c.late = true;
+                        branching += 1;
+                    }
                     continue;
                 }
-                let at_end = self.callbacks.on_search_end(self, &candidates);
-                drop(candidates);
-                let mut sends = at_end
-                    .into_iter()
-                    .map(|(addr, request)| self.dht.send_unanswered(request, addr))
-                    .collect::<FuturesUnordered<_>>();
-                while sends.next().await.is_some() {}
-                return Ok(outcome);
+                Some(asked) = in_flight.next() => asked,
+                () = sleep_until_some(wake) => continue,
             };
+            // Withdrawn before it was sent.
+            let Some(answer) = answer else {
+                continue;
+            };
+            let Some(c) = candidates.in_flight(query) else {
+                continue;
+            };
+            c.hold = None;
+            if std::mem::take(&mut c.late) {
+                branching -= 1;
+            }
+            let addr = c.addr;
             let response = match answer {
                 Ok(response) => response,
                 Err(e) => {
                     debug!("{addr}: {e:#}");
                     outcome.failed += 1;
-                    candidates.settle(addr, CandidateState::Failed);
+                    c.state = CandidateState::Failed;
                     continue;
                 }
             };
             outcome.answered += 1;
-            outcome.nodes += usize::from(id.is_some());
-            candidates.settle(addr, CandidateState::Answered);
+            outcome.nodes += usize::from(c.id.is_some());
+            c.state = CandidateState::Answered;
+            c.token = response.token.clone();
             // A search that wants no peers (a bootstrap or a refresh) has no
             // receiver: a node that names peers anyway is still walked past,
             // never the end of the search.
@@ -885,37 +1007,106 @@ impl<C: RecursiveRequestCallbacks> RecursiveRequest<C> {
             }
             // The nodes named are heard of (libtorrent
             // traversal_algorithm.cpp:317, v2.0.15).
-            {
-                let mut table = self.dht.table(addr.is_ipv4()).write();
-                for (id, node) in named_nodes(&response, addr) {
-                    table.heard_about(id, node);
-                    candidates.offer(Some(id), node);
+            let mut table = self.dht.table(addr.is_ipv4()).write();
+            for (id, node) in named_nodes(&response, addr) {
+                table.heard_about(id, node);
+                if let Some(gone) = candidates.offer(Some(id), node, false)
+                    && gone.state == CandidateState::InFlight
+                    && gone.late
+                {
+                    branching -= 1;
                 }
             }
-            candidates.give_token(addr, response.token);
         }
+        let at_end = self.callbacks.on_search_end(self, &candidates);
+        // Withdraws the queries still in flight.
+        drop(candidates);
+        if !in_flight.is_empty() {
+            spawn_with_cancel(
+                debug_span!("withdrawn"),
+                "dht_withdrawn_queries",
+                self.dht.cancellation_token.clone(),
+                async move {
+                    while in_flight.next().await.is_some() {}
+                    Ok::<_, Error>(())
+                },
+            );
+        }
+        let mut sends = at_end
+            .into_iter()
+            .map(|(addr, request)| self.dht.send_unanswered(request, addr))
+            .collect::<FuturesUnordered<_>>();
+        while sends.next().await.is_some() {}
+        Ok(outcome)
     }
 
-    async fn ask(
+    // The search's query number `query` to the node `id` at `addr`, in
+    // `slot`, as the walk waits on it: the table is fed as it is sent and as
+    // it ends (see `table_asked` and `table_answered`), and `late` is told
+    // its number once SHORT_TIMEOUT has passed since it was sent with no
+    // answer yet; it still waits for one. A query that ends before it is
+    // sent has no such timer. `kept` is the walk's hold on it (see `Hold`):
+    // dropped before the query is sent, it is never sent; dropped after, the
+    // query is withdrawn.
+    fn asking(
         &self,
+        query: usize,
         id: Option<Id20>,
         addr: SocketAddr,
         slot: SendSlot,
-    ) -> crate::dht::Result<Response<ByteBufOwned>> {
-        if let Some(id) = id {
-            self.callbacks.on_request_start(self, id, addr);
-        }
-        let response = self.dht.request_in(slot, self.request.clone(), addr).await;
-        if let Some(id) = id {
-            self.callbacks.on_request_end(self, id, addr, &response);
-        }
-        match response? {
-            ResponseOrError::Response(r) => Ok(r),
-            ResponseOrError::Error(e) => {
-                debug!("error response: {e:?}");
-                Err(Error::ErrorResponse)
+        mut kept: tokio::sync::oneshot::Sender<()>,
+        late: UnboundedSender<usize>,
+    ) -> BoxFuture<'static, Asked> {
+        let dht = self.dht.clone();
+        let request = self.request.clone();
+        async move {
+            let marked = parking_lot::Mutex::new(Marked::Nothing);
+            let on_wire = AtomicBool::new(false);
+            let (sent_tx, sent_rx) = tokio::sync::oneshot::channel();
+            let mut sent_rx = sent_rx.fuse();
+            let ask = dht.request_in(slot, request, addr, |at| {
+                on_wire.store(true, Ordering::Relaxed);
+                if let Some(id) = id {
+                    *marked.lock() = table_asked(&dht, id, addr);
+                }
+                let _ = sent_tx.send(at);
+            });
+            let mut ask = std::pin::pin!(ask);
+            let mut late_at = None;
+            let mut told = false;
+            let answer = loop {
+                tokio::select! {
+                    biased;
+                    // Looked at before the query may go out on this turn.
+                    () = kept.closed(), if !on_wire.load(Ordering::Relaxed) => return (query, None),
+                    answer = &mut ask => break answer,
+                    sent = &mut sent_rx, if late_at.is_none() => {
+                        late_at = sent.ok().map(|at| at + SHORT_TIMEOUT);
+                    }
+                    () = sleep_until_some(late_at), if !told => {
+                        told = true;
+                        let _ = late.send(query);
+                    }
+                }
+            };
+            if let Some(id) = id {
+                // A query that never went out, held by the rate limiter to
+                // its deadline, is no failure of the node, as a withdrawn
+                // one is not.
+                let withdrawn = kept.is_closed() || !on_wire.load(Ordering::Relaxed);
+                table_answered(&dht, id, addr, &answer, withdrawn, *marked.lock());
             }
+            let answer = answer.and_then(|answer| match answer {
+                ResponseOrError::Response(r) => Ok(r),
+                ResponseOrError::Error(e) => {
+                    debug!("error response: {e:?}");
+                    Err(Error::ErrorResponse)
+                }
+            });
+            (query, Some(answer))
         }
+        .instrument(debug_span!("ask", addr = addr.to_string()))
+        .boxed()
     }
 }
 
@@ -1298,6 +1489,31 @@ impl DhtState {
         }
     }
 
+    // Resolves once the `is_v4` table holds SEARCH_MIN_SEEDS nodes we can
+    // count on, so that a search from it no longer leans on the routers
+    // (see `RecursiveRequest::start`), and an early turn is free; the turn
+    // is spent. Woken as the table becomes seeded, a node that answered
+    // after a restart too, whether or not the table grew, and never on a
+    // timer. Becoming seeded is a growth too (see `watch_growth`), which
+    // gives out the early turns.
+    async fn seeded_turn(&self, is_v4: bool) {
+        let seeded = self.table(is_v4).read().seeded();
+        loop {
+            let mut next = std::pin::pin!(seeded.notified());
+            next.as_mut().enable();
+            if self.table(is_v4).read().is_seeded() {
+                break;
+            }
+            next.await;
+        }
+        self.growth(is_v4)
+            .turns
+            .acquire()
+            .await
+            .expect("the early turns are never closed")
+            .forget();
+    }
+
     fn bootstrap_sent(&self, is_v4: bool) -> &Latch {
         if is_v4 {
             &self.bootstrap_sent_v4
@@ -1388,20 +1604,38 @@ impl DhtState {
     // it enter in its first seconds; a torrent's search that fell short
     // need not wait for the round's end. libtorrent searches again only at
     // a torrent's next turn (see `request_peers_forever`); the spacing is
-    // its node tick (dht_tracker.cpp:268-283, v2.0.15). Woken by the
-    // table's `entered`, never by a timer while nothing enters, and only the
-    // entry count is read per wake.
+    // its node tick (dht_tracker.cpp:268-283, v2.0.15). The table becoming
+    // seeded (see `RoutingTable::is_seeded`) is a growth too, the same way,
+    // though no node entered: nodes restored from an earlier run are in the
+    // table already and only answer. Woken by the table's `entered` and
+    // `seeded`, never by a timer while nothing enters, and only the entry
+    // count and whether it is seeded are read per wake.
     async fn watch_growth(&self, is_v4: bool) -> std::convert::Infallible {
-        let (entered, mut grown) = {
+        let (entered, seeded, mut grown, mut was_seeded) = {
             let table = self.table(is_v4).read();
-            (table.entered(), table.entries())
+            (
+                table.entered(),
+                table.seeded(),
+                table.entries(),
+                table.is_seeded(),
+            )
         };
         loop {
             let mut next_entered = std::pin::pin!(entered.notified());
             next_entered.as_mut().enable();
-            let entries = self.table(is_v4).read().entries();
-            if entries == grown {
-                next_entered.await;
+            let mut next_seeded = std::pin::pin!(seeded.notified());
+            next_seeded.as_mut().enable();
+            let (entries, is_seeded) = {
+                let table = self.table(is_v4).read();
+                (table.entries(), table.is_seeded())
+            };
+            let became_seeded = is_seeded && !was_seeded;
+            was_seeded = is_seeded;
+            if entries == grown && !became_seeded {
+                tokio::select! {
+                    () = next_entered => {}
+                    () = next_seeded => {}
+                }
                 continue;
             }
             grown = entries;
@@ -1589,22 +1823,27 @@ impl DhtState {
     }
 
     // A query to `addr`, once its send window has room. The wait for room
-    // comes before the request's own time starts: a node is not failed for
-    // our holding the query back.
+    // comes before the request's own time starts. The wait on the rate
+    // limiter does not (see `request_in`): a query the limiter holds to its
+    // deadline ends in ResponseTimeout though nothing was sent. A search's
+    // query then fails no node (see `asking`); a caller of this one sees
+    // only the timeout.
     async fn request(
         &self,
         request: Request,
         addr: SocketAddr,
     ) -> crate::dht::Result<ResponseOrError> {
         let slot = self.send_slot(addr.ip()).await;
-        self.request_in(slot, request, addr).await
+        self.request_in(slot, request, addr, |_| {}).await
     }
 
+    // A query in `slot`. `sent` is called as it is sent, with when.
     async fn request_in(
         &self,
         slot: SendSlot,
         request: Request,
         addr: SocketAddr,
+        sent: impl FnOnce(tokio::time::Instant),
     ) -> crate::dht::Result<ResponseOrError> {
         // A request lives RESPONSE_TIMEOUT from the moment it is issued: first
         // waiting on the rate limiter, then on the answer. It is outstanding
@@ -1624,6 +1863,7 @@ impl DhtState {
                 },
                 Some(slot),
             )?;
+            sent(tokio::time::Instant::now());
             answer.await.map_err(|_| Error::DhtDead)?
         };
         let response = tokio::time::timeout_at(deadline, send_and_wait)
@@ -2211,8 +2451,18 @@ impl DhtWorker {
                     futs.push(async move {
                         table.write().mark_outgoing_request(&id, now());
                         // An error reply is no answer (see
-                        // `RecursiveRequestCallbacksFindNodes`).
-                        match self.dht.request(Request::Ping, addr).await {
+                        // `RecursiveRequestCallbacksFindNodes`). A ping that
+                        // never went out, held by the rate limiter to its
+                        // deadline, is no failure of the node.
+                        let on_wire = AtomicBool::new(false);
+                        let slot = self.dht.send_slot(addr.ip()).await;
+                        let answer = self
+                            .dht
+                            .request_in(slot, Request::Ping, addr, |_| {
+                                on_wire.store(true, Ordering::Relaxed);
+                            })
+                            .await;
+                        match answer {
                             Ok(ResponseOrError::Response(_)) => {
                                 table.write().mark_response(&id, now());
                             },
@@ -2221,7 +2471,9 @@ impl DhtWorker {
                                 debug!(?e, "node refused the ping");
                             }
                             Err(e) => {
-                                table.write().mark_error(&id);
+                                if on_wire.load(Ordering::Relaxed) {
+                                    table.write().mark_error(&id);
+                                }
                                 debug!("error: {e:#}");
                             }
                         }
@@ -3086,45 +3338,543 @@ mod tests {
             .collect()
     }
 
+    // Node i, at its own /24 (see `walk_node`), answers at once naming the
+    // eight nodes just closer to the target than itself, unless it is a
+    // third one, which never answers. However many closer nodes the answers
+    // name, the walk never has more than SEARCH_BRANCHING queries in flight
+    // while no query is late (no time passes but in jumps of
+    // RESPONSE_TIMEOUT, past every short timeout): libtorrent with
+    // `dht_aggressive_lookups` off, traversal_algorithm.cpp:519-523,
+    // v2.0.15. It asks each node at most once, and ends.
     #[tokio::test(start_paused = true)]
     async fn test_search_keeps_at_most_branching_requests_in_flight_and_ends() {
-        use super::{SEARCH_BRANCHING, SearchOutcome};
+        use super::SEARCH_BRANCHING;
         use crate::dht::RESPONSE_TIMEOUT;
         use std::{collections::HashSet, task::Poll};
 
         let (dht, mut sent) = fixture_dht();
-        let nodes = silent_nodes(20);
         let req = get_peers_search(&dht);
-        let mut search = std::pin::pin!(req.search(true, nodes.clone().into_iter()));
+        let silent = |i: u8| i.is_multiple_of(3);
+        let given = (60..65u8).map(|i| {
+            let (id, addr) = walk_node(i);
+            (Some(id), addr)
+        });
+        let mut search = std::pin::pin!(req.search(true, given));
 
         let mut asked = HashSet::new();
         let mut most_in_flight = 0;
         let outcome = loop {
             let polled = futures::poll!(search.as_mut());
-            while let Ok(request) = sent.try_recv() {
-                assert!(asked.insert(request.addr), "{} asked twice", request.addr);
-            }
             let in_flight = dht.get_stats().outstanding_requests;
             assert!(in_flight <= SEARCH_BRANCHING, "{in_flight} in flight");
             most_in_flight = most_in_flight.max(in_flight);
             if let Poll::Ready(outcome) = polled {
                 break outcome.unwrap();
             }
-            // Nobody answers: the requests in flight run out their time.
-            tokio::time::advance(RESPONSE_TIMEOUT).await;
+            let mut answered = false;
+            while let Ok(request) = sent.try_recv() {
+                let i = walk_index(request.addr);
+                assert!(asked.insert(i), "{i} asked twice");
+                if !silent(i) {
+                    let closer: Vec<_> = (i.saturating_sub(8)..i)
+                        .map(|j| {
+                            let (id, addr) = walk_node(j);
+                            let SocketAddr::V4(addr) = addr else {
+                                unreachable!()
+                            };
+                            (id, addr)
+                        })
+                        .collect();
+                    reply(&dht, &request, walk_node(i).0, &closer, &[]);
+                    answered = true;
+                }
+            }
+            if !answered {
+                // The queries in flight run out their time.
+                tokio::time::advance(RESPONSE_TIMEOUT).await;
+            }
         };
 
         assert_eq!(most_in_flight, SEARCH_BRANCHING);
-        assert_eq!(asked, nodes.iter().map(|(_, addr)| *addr).collect());
-        assert_eq!(
-            outcome,
-            SearchOutcome {
-                answered: 0,
-                failed: 20,
-                nodes: 0
+        // It walked down to the nodes nearest the target.
+        assert!(asked.contains(&0) && asked.contains(&1));
+        // 38 asked: 25 answered, 12 silent ones failed, and one silent one,
+        // farther than the eight closest that answered, was withdrawn as
+        // the walk ended.
+        assert_eq!(asked.len(), 38);
+        assert_eq!((outcome.answered, outcome.failed), (25, 12));
+        assert_eq!(asked.iter().filter(|&&i| silent(i)).count(), 13);
+        assert_eq!(dht.get_stats().outstanding_requests, 1);
+    }
+
+    // The walk starts from five far nodes. One answers at once, naming eight
+    // nodes closer than all five; the other four stay silent, in flight. No
+    // time passes, so no query is late: the walk asks one more node, the
+    // closest, in the room the answer left, not five.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_answer_naming_closer_nodes_keeps_branching_in_flight() {
+        use super::SEARCH_BRANCHING;
+        use std::task::Poll;
+
+        let (dht, mut sent) = fixture_dht();
+        let req = get_peers_search(&dht);
+        let far: Vec<_> = (20..25u8)
+            .map(|i| {
+                let (id, addr) = walk_node(i);
+                (Some(id), addr)
+            })
+            .collect();
+        let mut search = std::pin::pin!(req.search(true, far.into_iter()));
+        assert!(matches!(futures::poll!(search.as_mut()), Poll::Pending));
+        let first: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok()).collect();
+        assert_eq!(first.len(), SEARCH_BRANCHING);
+
+        let closer: Vec<_> = (0..8u8)
+            .map(|i| {
+                let (id, addr) = walk_node(i);
+                let SocketAddr::V4(addr) = addr else {
+                    unreachable!()
+                };
+                (id, addr)
+            })
+            .collect();
+        let i = walk_index(first[0].addr);
+        reply(&dht, &first[0], walk_node(i).0, &closer, &[]);
+        assert!(matches!(futures::poll!(search.as_mut()), Poll::Pending));
+
+        let more: Vec<_> = std::iter::from_fn(|| sent.try_recv().ok())
+            .map(|request| walk_index(request.addr))
+            .collect();
+        assert_eq!(more, vec![0]);
+        assert_eq!(dht.get_stats().outstanding_requests, SEARCH_BRANCHING);
+    }
+
+    // A node `d` from the target [0x22; 20], at `addr`.
+    fn node_at(d: u32, addr: [u8; 4]) -> (crate::core::hash_id::Id20, std::net::SocketAddrV4) {
+        let mut id = [0x22; 20];
+        for (b, x) in id[16..].iter_mut().zip(d.to_be_bytes()) {
+            *b ^= x;
+        }
+        (
+            crate::core::hash_id::Id20::new(id),
+            std::net::SocketAddrV4::new(addr.into(), 6881),
+        )
+    }
+
+    fn given(
+        nodes: impl IntoIterator<Item = (crate::core::hash_id::Id20, std::net::SocketAddrV4)>,
+    ) -> impl Iterator<Item = (Option<crate::core::hash_id::Id20>, SocketAddr)> {
+        nodes
+            .into_iter()
+            .map(|(id, addr)| (Some(id), SocketAddr::V4(addr)))
+    }
+
+    // A node answers naming 50 nodes of one /24, as one could that wants us
+    // to send there: the walk asks one of them, the first named
+    // (libtorrent `dht_restrict_search_ips`, traversal_algorithm.cpp:
+    // 191-226, v2.0.15).
+    #[tokio::test(start_paused = true)]
+    async fn test_an_answer_naming_many_nodes_of_one_network_adds_one_of_them() {
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::task::Poll;
+
+        let (dht, mut sent) = fixture_dht();
+        let req = get_peers_search(&dht);
+        let first = node_at(1000, [10, 0, 0, 1]);
+        let hostile: Vec<_> = (0..50u8)
+            .map(|i| node_at(u32::from(i) + 1, [10, 5, 0, i + 1]))
+            .collect();
+        let mut search = std::pin::pin!(req.search(true, given([first])));
+        let mut asked = Vec::new();
+        let outcome = loop {
+            let polled = futures::poll!(search.as_mut());
+            let mut answered = false;
+            while let Ok(request) = sent.try_recv() {
+                asked.push(request.addr);
+                if request.addr == SocketAddr::V4(first.1) {
+                    reply(&dht, &request, first.0, &hostile, &[]);
+                    answered = true;
+                }
             }
+            if let Poll::Ready(outcome) = polled {
+                break outcome.unwrap();
+            }
+            if !answered {
+                tokio::time::advance(RESPONSE_TIMEOUT).await;
+            }
+        };
+        assert_eq!(
+            asked,
+            vec![SocketAddr::V4(first.1), SocketAddr::V4(hostile[0].1)]
         );
+        assert_eq!((outcome.answered, outcome.failed), (1, 1));
+    }
+
+    // A chain of nodes, each answering with a token and naming one node
+    // closer than itself, as long as the list of candidates the walk keeps.
+    // The answer to the hundredth query names eight nodes closer to the
+    // target than any asked. They are asked all the same: the walk has no
+    // count of queries to spend, and ends as libtorrent's does, once the
+    // eight closest it knows have answered (traversal_algorithm.cpp:519-523,
+    // v2.0.15). It announces to those eight.
+    #[tokio::test(start_paused = true)]
+    async fn test_closer_nodes_named_by_the_hundredth_answer_are_asked() {
+        use super::SEARCH_CANDIDATES;
+        use std::{collections::BTreeSet, task::Poll};
+
+        let (dht, mut sent) = fixture_dht();
+        let info_hash = crate::core::hash_id::Id20::new([0x22; 20]);
+        let req = super::RecursiveRequest::get_peers(
+            dht.clone(),
+            info_hash,
+            Some(6881),
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        let chain = |n: u32| {
+            let [_, _, a, b] = n.to_be_bytes();
+            node_at(1_000_000 - n, [10, a, b, 1])
+        };
+        let index = |addr: SocketAddr| match addr.ip() {
+            std::net::IpAddr::V4(a) => u32::from(a.octets()[1]) << 8 | u32::from(a.octets()[2]),
+            std::net::IpAddr::V6(_) => unreachable!(),
+        };
+        let last = u32::try_from(SEARCH_CANDIDATES).unwrap() - 1;
+        let closer: Vec<_> = (1..=8u8)
+            .map(|i| node_at(u32::from(i), [10, 200, i, 1]))
+            .collect();
+        let mut search = std::pin::pin!(req.search(true, given([chain(0)])));
+        let mut asked = 0;
+        let outcome = loop {
+            if let Poll::Ready(outcome) = futures::poll!(search.as_mut()) {
+                break outcome.unwrap();
+            }
+            let mut answered = false;
+            while let Ok(request) = sent.try_recv() {
+                asked += 1;
+                let n = index(request.addr);
+                if let Some(c) = closer.iter().find(|c| SocketAddr::V4(c.1) == request.addr) {
+                    answer(&dht, &request, c.0, Some(b"t"), &[]);
+                } else if n == last {
+                    answer(&dht, &request, chain(n).0, Some(b"t"), &closer);
+                } else {
+                    answer(&dht, &request, chain(n).0, Some(b"t"), &[chain(n + 1)]);
+                }
+                answered = true;
+            }
+            if !answered {
+                tokio::time::advance(Duration::from_millis(100)).await;
+            }
+        };
+        assert_eq!(asked, SEARCH_CANDIDATES + closer.len());
+        assert_eq!(
+            (outcome.answered, outcome.failed),
+            (SEARCH_CANDIDATES + closer.len(), 0)
+        );
+
+        let mut announced = BTreeSet::new();
+        while let Ok(request) = sent.try_recv() {
+            assert!(matches!(request.message.kind, MessageKind::AnnouncePeer(_)));
+            announced.insert(request.addr);
+        }
+        assert_eq!(
+            announced,
+            closer.iter().map(|c| SocketAddr::V4(c.1)).collect()
+        );
+    }
+
+    // The closest node's address has its send window kept full, by traffic
+    // that is not the walk's. Its query is deferred, and RESPONSE_TIMEOUT
+    // after that it fails for the walk, which then ends: the eight others
+    // answered at once.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_address_whose_window_stays_full_does_not_hold_a_walk_open() {
+        use crate::dht::{RESPONSE_TIMEOUT, send_windows::SEND_LIMIT};
+        use std::task::Poll;
+
+        let (dht, mut sent) = fixture_dht();
+        let full = walk_node(0).1;
+        let fill = || {
+            for _ in 0..SEND_LIMIT {
+                dht.send_guard.record(full.ip());
+            }
+        };
+        let req = get_peers_search(&dht);
+        let start = tokio::time::Instant::now();
+        let mut search = std::pin::pin!(req.search(
+            true,
+            (0..9).map(|i| {
+                let (id, addr) = walk_node(i);
+                (Some(id), addr)
+            })
+        ));
+        let outcome = loop {
+            fill();
+            let polled = futures::poll!(search.as_mut());
+            let mut answered = false;
+            while let Ok(request) = sent.try_recv() {
+                assert_ne!(request.addr, full, "sent past a full window");
+                let i = walk_index(request.addr);
+                reply(&dht, &request, walk_node(i).0, &[], &[]);
+                answered = true;
+            }
+            if let Poll::Ready(outcome) = polled {
+                break outcome.unwrap();
+            }
+            if !answered {
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+        };
+        assert_eq!((outcome.answered, outcome.failed), (8, 0));
+        assert_eq!(tokio::time::Instant::now() - start, RESPONSE_TIMEOUT);
+        assert_eq!(dht.send_guard.windows.lock().lined_up(full.ip()), 0);
+    }
+
+    // A walk keeps 100 candidates. The first of the five it asks answers
+    // naming 100 nodes closer than all of them, so the other four are
+    // pushed off while they wait on the rate limiter, one query a second:
+    // they are never sent. The walk ends with the queries it no longer
+    // needs still waiting, and those are never sent either.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_query_for_a_candidate_pushed_off_is_never_sent() {
+        use super::{RateLimiter, TokioClock};
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::{num::NonZeroU32, task::Poll};
+
+        let (mut state, mut sent) = fixture_state();
+        state.rate_limiter = RateLimiter::direct_with_clock(
+            governor::Quota::per_second(NonZeroU32::new(1).unwrap()),
+            TokioClock {
+                start: tokio::time::Instant::now(),
+            },
+        );
+        let dht = std::sync::Arc::new(state);
+        let far = |i: u8| node_at(0x1000 + u32::from(i), [10, 1, i, 1]);
+        let near: Vec<_> = (0..100u8)
+            .map(|j| node_at(0x100 + u32::from(j), [10, 2, j, 1]))
+            .collect();
+        let req = get_peers_search(&dht);
+        let mut search = std::pin::pin!(req.search(true, given((0..100).map(far))));
+        let mut asked = Vec::new();
+        let outcome = loop {
+            let polled = futures::poll!(search.as_mut());
+            let mut answered = false;
+            while let Ok(request) = sent.try_recv() {
+                asked.push(request.addr);
+                if request.addr == SocketAddr::V4(far(0).1) {
+                    reply(&dht, &request, far(0).0, &near, &[]);
+                } else {
+                    let n = near
+                        .iter()
+                        .find(|n| SocketAddr::V4(n.1) == request.addr)
+                        .expect("only far node 0 and the near ones are asked");
+                    reply(&dht, &request, n.0, &[], &[]);
+                }
+                answered = true;
+            }
+            if let Poll::Ready(outcome) = polled {
+                break outcome.unwrap();
+            }
+            if !answered {
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+        };
+        // The walk ended once the eight closest answered.
+        assert_eq!(outcome.answered, 9);
+        let mut want: Vec<_> = std::iter::once(far(0).1)
+            .chain(near[..8].iter().map(|n| n.1))
+            .map(SocketAddr::V4)
+            .collect();
+        want.sort();
+        asked.sort();
+        assert_eq!(asked, want);
+        for _ in 0..2 {
+            tokio::time::advance(RESPONSE_TIMEOUT).await;
+        }
+        assert!(sent.try_recv().is_err(), "a withdrawn query was sent");
         assert_eq!(dht.get_stats().outstanding_requests, 0);
+    }
+
+    // A query is sent to a node that is then pushed off the walk's list; a
+    // node named later at the same address, under another id, is asked in
+    // turn. The answer to the first query, which comes then, is not the
+    // second one's: the walk waits for that until it fails. The answer
+    // still reaches the table.
+    #[tokio::test(start_paused = true)]
+    async fn test_an_answer_to_a_withdrawn_query_is_not_credited_to_a_new_candidate_at_its_address()
+    {
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::task::Poll;
+
+        let (dht, mut sent) = fixture_dht();
+        let far = |i: u8| node_at(0x1000 + u32::from(i), [10, 1, i, 1]);
+        let near: Vec<_> = (0..100u8)
+            .map(|j| node_at(0x100 + u32::from(j), [10, 2, j, 1]))
+            .collect();
+        // At far node 0's address, closer than all.
+        let again = (node_at(0x10, [0; 4]).0, far(0).1);
+        let req = get_peers_search(&dht);
+        let mut search = std::pin::pin!(req.search(true, given((0..100).map(far))));
+        let drain = |sent: &mut tokio::sync::mpsc::UnboundedReceiver<super::WorkerSendRequest>| {
+            std::iter::from_fn(|| sent.try_recv().ok()).collect::<Vec<_>>()
+        };
+        let addrs = |requests: &[super::WorkerSendRequest]| {
+            let mut addrs: Vec<_> = requests.iter().map(|r| r.addr).collect();
+            addrs.sort();
+            addrs
+        };
+        let v4 = |nodes: &[(crate::core::hash_id::Id20, std::net::SocketAddrV4)]| {
+            let mut addrs: Vec<_> = nodes.iter().map(|n| SocketAddr::V4(n.1)).collect();
+            addrs.sort();
+            addrs
+        };
+
+        assert!(matches!(futures::poll!(search.as_mut()), Poll::Pending));
+        let first = drain(&mut sent);
+        assert_eq!(addrs(&first), v4(&(0..5).map(far).collect::<Vec<_>>()));
+        let old = first
+            .iter()
+            .find(|r| r.addr == SocketAddr::V4(far(0).1))
+            .unwrap();
+        let one = first
+            .iter()
+            .find(|r| r.addr == SocketAddr::V4(far(1).1))
+            .unwrap();
+        // Far nodes 0 and 2-4 are pushed off with their queries in flight.
+        reply(&dht, one, far(1).0, &near, &[]);
+        assert!(matches!(futures::poll!(search.as_mut()), Poll::Pending));
+
+        let second = drain(&mut sent);
+        assert_eq!(addrs(&second), v4(&near[..5]));
+        for request in &second {
+            let n = near
+                .iter()
+                .find(|n| SocketAddr::V4(n.1) == request.addr)
+                .unwrap();
+            let named: &[_] = if n == &near[0] { &[again] } else { &[] };
+            reply(&dht, request, n.0, named, &[]);
+        }
+        assert!(matches!(futures::poll!(search.as_mut()), Poll::Pending));
+
+        let third = drain(&mut sent);
+        let mut want = v4(&near[5..9]);
+        want.push(SocketAddr::V4(again.1));
+        want.sort();
+        assert_eq!(addrs(&third), want);
+        // The first query to that address is answered now, while the
+        // table's bucket for these ids still has room.
+        reply(&dht, old, far(0).0, &[], &[]);
+        assert!(matches!(futures::poll!(search.as_mut()), Poll::Pending));
+        assert!(
+            dht.routing_table_v4
+                .read()
+                .iter()
+                .any(|n| n.id() == far(0).0)
+        );
+        for request in third.iter().filter(|r| r.addr != SocketAddr::V4(again.1)) {
+            let n = near
+                .iter()
+                .find(|n| SocketAddr::V4(n.1) == request.addr)
+                .unwrap();
+            reply(&dht, request, n.0, &[], &[]);
+        }
+        assert!(matches!(futures::poll!(search.as_mut()), Poll::Pending));
+
+        tokio::time::advance(RESPONSE_TIMEOUT).await;
+        let Poll::Ready(outcome) = futures::poll!(search.as_mut()) else {
+            panic!("the walk did not end as the new candidate failed");
+        };
+        let outcome = outcome.unwrap();
+        // Far node 1 and near nodes 0-8 answered; the new candidate failed.
+        assert_eq!((outcome.answered, outcome.failed), (10, 1));
+    }
+
+    // Two of the ten nodes are still in flight when the walk ends: node 8,
+    // which answers after it ended, and node 9, heard of into the table
+    // before, which never does. Node 8's answer still enters it in the
+    // table (libtorrent rpc_manager.cpp:276-389, 413-417, v2.0.15). Node 9
+    // is not failed for the table and is no longer marked as asked as its
+    // query times out, so the table asks it again then. The two have ids
+    // near our own, in the bucket that has room once the eight closest
+    // have filled theirs.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_withdrawn_query_still_feeds_the_table() {
+        use super::SHORT_TIMEOUT;
+        use crate::core::hash_id::Id20;
+        use crate::dht::RESPONSE_TIMEOUT;
+
+        let (dht, mut sent) = fixture_dht();
+        let id_of = |i: u8| {
+            if i < 8 {
+                walk_node(i).0
+            } else {
+                let mut id = dht.id.0;
+                id[19] ^= i;
+                Id20::new(id)
+            }
+        };
+        let addr9 = walk_node(9).1;
+        assert!(dht.routing_table_v4.write().heard_about(id_of(9), addr9));
+        let slow = Duration::from_secs(2);
+        let held = std::sync::Mutex::new(None);
+        let req = get_peers_search(&dht);
+        let start = tokio::time::Instant::now();
+        let given: Vec<_> = (0..10).map(|i| (Some(id_of(i)), walk_node(i).1)).collect();
+        let search = tokio::spawn(async move { req.search(true, given.into_iter()).await });
+        let (outcome, log) = drive(
+            &mut sent,
+            search,
+            |i| match i {
+                0..5 => Some(slow),
+                5..9 => Some(Duration::ZERO),
+                _ => None,
+            },
+            |request| {
+                let i = walk_index(request.addr);
+                if i == 8 {
+                    *held.lock().unwrap() = Some(request.message.transaction_id.clone());
+                } else {
+                    reply(&dht, request, walk_node(i).0, &[], &[]);
+                }
+            },
+        )
+        .await;
+        assert_eq!(outcome.unwrap().answered, 8);
+        assert_eq!(tokio::time::Instant::now() - start, slow);
+        assert_eq!(dht.get_stats().outstanding_requests, 2);
+        assert_eq!(queried_at(&log, SHORT_TIMEOUT), (5..10).collect::<Vec<_>>());
+
+        let refresher = tokio::spawn(dht.clone().refresh_replacements(true));
+        let entered = dht.routing_table_v4.read().entered();
+        let mut rang = std::pin::pin!(entered.notified());
+        rang.as_mut().enable();
+        dht.on_received_message(
+            bprotocol::Message {
+                transaction_id: held.lock().unwrap().take().unwrap(),
+                version: None,
+                ip: None,
+                kind: MessageKind::Response(bprotocol::Response {
+                    id: id_of(8),
+                    ..Default::default()
+                }),
+            },
+            walk_node(8).1,
+        )
+        .unwrap();
+        rang.await;
+        assert!(
+            dht.routing_table_v4
+                .read()
+                .iter()
+                .any(|n| n.id() == id_of(8))
+        );
+
+        let request = sent.recv().await.unwrap();
+        assert_eq!(request.addr, addr9);
+        assert_eq!(
+            tokio::time::Instant::now() - start,
+            SHORT_TIMEOUT + RESPONSE_TIMEOUT
+        );
+        refresher.abort();
     }
 
     #[tokio::test(start_paused = true)]
@@ -3195,6 +3945,177 @@ mod tests {
                 nodes: 0
             }
         );
+        assert_eq!(dht.get_stats().outstanding_requests, 0);
+    }
+
+    // The pinger of `dht`'s IPv4 table, and the one Questionable node it
+    // pings at once: it answered, more than INACTIVITY_TIMEOUT ago.
+    async fn pinging_one_questionable_node(
+        dht: &Arc<DhtState>,
+    ) -> (
+        crate::core::hash_id::Id20,
+        impl std::future::Future<Output = crate::dht::Result<()>>,
+    ) {
+        use crate::core::net::{BoxFuture, Resolver};
+        use crate::dht::{INACTIVITY_TIMEOUT, routing_table::NodeStatus};
+
+        struct NoNames;
+        impl Resolver for NoNames {
+            fn resolve<'a>(
+                &'a self,
+                host: &'a str,
+                _port: u16,
+            ) -> BoxFuture<'a, std::io::Result<crate::core::net::Resolved>> {
+                panic!("unexpected name {host}")
+            }
+        }
+
+        let id = crate::core::hash_id::Id20::new([0x21; 20]);
+        let addr = SocketAddr::from(([10, 0, 1, 1], 6881));
+        {
+            let mut table = dht.routing_table_v4.write();
+            table.add_node(id, addr);
+            let then = std::time::Instant::now()
+                .checked_sub(INACTIVITY_TIMEOUT + Duration::from_secs(1))
+                .unwrap();
+            assert!(table.mark_response(&id, then));
+            let node = table.iter().find(|n| n.id() == id).unwrap();
+            assert_eq!(
+                node.status(std::time::Instant::now()),
+                NodeStatus::Questionable
+            );
+        }
+        let worker = super::DhtWorker {
+            socket: crate::test_support::loopback_udp().await,
+            resolver: Arc::new(NoNames),
+            dht: dht.clone(),
+        };
+        (id, async move { worker.pinger(true).await })
+    }
+
+    fn errors_of(dht: &DhtState, id: crate::core::hash_id::Id20) -> usize {
+        let table = dht.routing_table_v4.read();
+        table
+            .iter()
+            .find(|n| n.id() == id)
+            .unwrap()
+            .errors_in_a_row()
+    }
+
+    // The rate limiter holds the pinger's ping past its deadline, so it never
+    // goes out: the node is not failed for it.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_ping_the_limiter_holds_past_its_deadline_fails_no_table_node() {
+        use super::{RateLimiter, TokioClock};
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::num::NonZeroU32;
+
+        let (mut state, mut sent) = fixture_state();
+        // One request a minute, already spent.
+        state.rate_limiter = RateLimiter::direct_with_clock(
+            governor::Quota::per_minute(NonZeroU32::new(1).unwrap()),
+            TokioClock {
+                start: tokio::time::Instant::now(),
+            },
+        );
+        assert!(state.rate_limiter.check().is_ok());
+        let dht = Arc::new(state);
+        let (id, pinger) = pinging_one_questionable_node(&dht).await;
+        let mut pinger = std::pin::pin!(pinger);
+
+        // The pinger's turns come in no fixed order: it is polled until the
+        // ping is issued, and after its deadline until it has ended.
+        while dht.get_stats().outstanding_requests == 0 {
+            assert!(futures::poll!(pinger.as_mut()).is_pending());
+        }
+        tokio::time::advance(RESPONSE_TIMEOUT).await;
+        while dht.get_stats().outstanding_requests > 0 {
+            assert!(futures::poll!(pinger.as_mut()).is_pending());
+        }
+        assert!(sent.try_recv().is_err(), "sent past an empty limiter");
+        assert_eq!(errors_of(&dht, id), 0);
+    }
+
+    // A ping that went out and got no answer by its deadline fails the node
+    // once.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_ping_sent_and_not_answered_fails_its_table_node_once() {
+        use crate::dht::RESPONSE_TIMEOUT;
+
+        let (dht, mut sent) = fixture_dht();
+        let (id, pinger) = pinging_one_questionable_node(&dht).await;
+        let mut pinger = std::pin::pin!(pinger);
+
+        // The pinger's turns come in no fixed order: it is polled until the
+        // ping is out.
+        let ping = loop {
+            assert!(futures::poll!(pinger.as_mut()).is_pending());
+            if let Ok(ping) = sent.try_recv() {
+                break ping;
+            }
+        };
+        assert!(matches!(ping.message.kind, MessageKind::PingRequest(_)));
+        assert_eq!(errors_of(&dht, id), 0);
+        tokio::time::advance(RESPONSE_TIMEOUT).await;
+        while dht.get_stats().outstanding_requests > 0 {
+            assert!(futures::poll!(pinger.as_mut()).is_pending());
+        }
+        assert!(sent.try_recv().is_err());
+        assert_eq!(errors_of(&dht, id), 1);
+    }
+
+    // A node of the table, which has answered, is the one candidate of two
+    // searches in a row. The rate limiter holds each query past its deadline,
+    // so neither goes out. Each search counts it failed for itself, but the
+    // table counts no failure: its error count stays at 0 and it is still a
+    // node we can count on (two failures would make it bad).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_query_the_limiter_holds_past_its_deadline_fails_no_table_node() {
+        use super::{RateLimiter, TokioClock};
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::{num::NonZeroU32, task::Poll};
+
+        let (mut state, mut sent) = fixture_state();
+        // One request a minute, already spent: the queries wait longer than
+        // they live.
+        state.rate_limiter = RateLimiter::direct_with_clock(
+            governor::Quota::per_minute(NonZeroU32::new(1).unwrap()),
+            TokioClock {
+                start: tokio::time::Instant::now(),
+            },
+        );
+        assert!(state.rate_limiter.check().is_ok());
+        let dht = std::sync::Arc::new(state);
+        let id = crate::core::hash_id::Id20::new([0x21; 20]);
+        let addr = SocketAddr::from(([10, 0, 1, 1], 6881));
+        {
+            let mut table = dht.routing_table_v4.write();
+            table.add_node(id, addr);
+            assert!(table.mark_response(&id, std::time::Instant::now()));
+        }
+        let errors = || {
+            let table = dht.routing_table_v4.read();
+            let node = table.iter().find(|n| n.id() == id).unwrap();
+            (
+                node.errors_in_a_row(),
+                node.is_confirmed(std::time::Instant::now()),
+            )
+        };
+
+        for _ in 0..2 {
+            let req = get_peers_search(&dht);
+            let mut search = std::pin::pin!(req.search(true, std::iter::once((Some(id), addr))));
+            let outcome = loop {
+                let polled = futures::poll!(search.as_mut());
+                if let Poll::Ready(outcome) = polled {
+                    break outcome.unwrap();
+                }
+                tokio::time::advance(RESPONSE_TIMEOUT).await;
+            };
+            assert_eq!((outcome.answered, outcome.failed), (0, 1));
+            assert!(sent.try_recv().is_err(), "sent past an empty limiter");
+            assert_eq!(errors(), (0, true));
+        }
         assert_eq!(dht.get_stats().outstanding_requests, 0);
     }
 
@@ -3304,19 +4225,24 @@ mod tests {
         assert!(ping(stranger));
     }
 
-    // A node that answers every query we send it, as fast as a busy DHT asks
-    // one node, keeps being heard: its answers are counted, and they stay
-    // under the limit.
+    // A node that answers every query we send it, as fast as our send window
+    // lets us ask one node, keeps being heard: its answers are counted, and
+    // they stay under the limit.
     #[tokio::test(start_paused = true)]
     async fn test_a_node_answering_our_queries_is_never_ignored() {
-        use crate::dht::query_limiter::{QUERY_LIMIT, WINDOW};
+        use crate::dht::{
+            query_limiter::{QUERY_LIMIT, WINDOW},
+            send_windows::SEND_LIMIT,
+        };
         use std::task::Poll;
 
         let (dht, mut sent) = fixture_dht();
         let node = SocketAddr::from(([10, 0, 0, 1], 6881));
-        // Four a second, 40 of the 50 a window allows, for ten windows.
-        let per_window = 40;
+        // SEND_LIMIT a window, evenly spaced, for ten windows. The spacing is
+        // rounded up, so no window holds more than SEND_LIMIT.
+        let per_window = u32::try_from(SEND_LIMIT).unwrap();
         assert!(per_window < QUERY_LIMIT);
+        let step = WINDOW / per_window + Duration::from_nanos(1);
         for _ in 0..10 * per_window {
             let mut asked = std::pin::pin!(dht.request(super::Request::Ping, node));
             assert!(matches!(futures::poll!(asked.as_mut()), Poll::Pending));
@@ -3329,7 +4255,7 @@ mod tests {
                 futures::poll!(asked.as_mut()),
                 Poll::Ready(Ok(super::ResponseOrError::Response(_)))
             ));
-            tokio::time::advance(WINDOW / per_window).await;
+            tokio::time::advance(step).await;
         }
     }
 
@@ -3692,10 +4618,11 @@ mod tests {
     }
 
     // libtorrent `find_data::done` / `announce_fun`: nothing is announced while
-    // the search runs; at its end, the k closest nodes that answered with a
-    // token are announced to, with their token.
+    // the search runs; at its end, the closest nodes that had answered with
+    // a token by then, up to k, are announced to, with their token.
     #[tokio::test(start_paused = true)]
-    async fn test_a_search_announces_to_the_k_closest_token_holders_when_it_ends() {
+    async fn test_a_search_announces_to_the_closest_nodes_that_answered_with_a_token_when_it_ends()
+    {
         use crate::core::hash_id::Id20;
         use std::{collections::BTreeMap, net::IpAddr, task::Poll};
 
@@ -3747,9 +4674,9 @@ mod tests {
             }
         }
         asked.sort();
-        // 10 and 11 answered with a token too, but eight token holders are
-        // closer.
-        assert_eq!(asked, (0..12).collect::<Vec<_>>());
+        // The search ends as the eight closest have answered, before it
+        // sends to 10 and 11, which it would have asked next.
+        assert_eq!(asked, (0..10).collect::<Vec<_>>());
 
         let mut announced = BTreeMap::new();
         while let Ok(request) = sent.try_recv() {
@@ -3759,9 +4686,13 @@ mod tests {
             assert_eq!((a.info_hash, a.port), (info_hash, 6881));
             announced.insert(index(request.addr), a.token.as_ref().to_vec());
         }
+        // It announces as it ends, to the token holders among the nodes that
+        // had answered by then: 8 and 9 answer after the eight closest have,
+        // and the search no longer waits for them (libtorrent
+        // `find_data::done`, find_data.cpp:139-194, v2.0.15).
         assert_eq!(
             announced,
-            [0, 2, 4, 5, 6, 7, 8, 9]
+            [0, 2, 4, 5, 6, 7]
                 .into_iter()
                 .map(|i| (i, vec![i]))
                 .collect()
@@ -4620,18 +5551,19 @@ mod tests {
         );
     }
 
-    // A self-refresh round that walks for a minute, as one over a tunnel
-    // does: the router names two nodes near our id that answer at once and
-    // forty farther ones that never answer. The torrent's first search,
-    // asked only of the router, times out. The two nodes enter the table in
-    // the round's first moment, and the torrent searches again
+    // A self-refresh round that walks for longer than EARLY_SEARCH_MIN: the
+    // router answers it ROUTER_DELAY late, naming two nodes near our id that
+    // answer at once and 98 farther ones, each in its own /24, that never
+    // answer, so the round asks them five at a time and one more for each
+    // late one, and waits on each for RESPONSE_TIMEOUT. The torrent's first
+    // search, asked only of the router, is refused at once. The two nodes
+    // enter the table as the router answers, and the torrent searches again
     // EARLY_SEARCH_MIN after its first search ended, from them, while the
-    // round is still asking the silent nodes.
+    // round is still waiting on silent nodes.
     #[tokio::test(start_paused = true)]
     async fn test_a_short_search_searches_again_before_the_round_that_grew_the_table_ends() {
         use super::EARLY_SEARCH_MIN;
         use crate::core::hash_id::Id20;
-        use crate::dht::RESPONSE_TIMEOUT;
         use std::collections::BTreeMap;
 
         let (dht, mut sent) = fixture_dht();
@@ -4647,7 +5579,11 @@ mod tests {
                 )
             })
             .collect();
-        let silent: Vec<(Id20, std::net::SocketAddrV4)> = (1..=40u8)
+        let is_silent = |addr: SocketAddr| match addr.ip() {
+            std::net::IpAddr::V4(a) => a.octets()[..2] == [10, 1],
+            std::net::IpAddr::V6(_) => false,
+        };
+        let silent: Vec<(Id20, std::net::SocketAddrV4)> = (1..=98u8)
             .map(|i| {
                 let mut id = [0xc0; 20];
                 id[19] = i;
@@ -4657,6 +5593,7 @@ mod tests {
                 )
             })
             .collect();
+        const ROUTER_DELAY: Duration = Duration::from_secs(5);
         let named: Vec<_> = answering.iter().chain(&silent).copied().collect();
         let id_of = |addr: SocketAddr| {
             answering
@@ -4666,6 +5603,7 @@ mod tests {
         };
         let peer = SocketAddr::from(([10, 9, 9, 9], 51413));
         let info_hash = Id20::new([0x22; 20]);
+        assert!(super::announce_slot(&info_hash) > EARLY_SEARCH_MIN);
         let (peer_tx, mut peers) = tokio::sync::mpsc::unbounded_channel();
         let req = Arc::new(super::RecursiveRequest::get_peers(
             dht.clone(),
@@ -4688,6 +5626,144 @@ mod tests {
         let mut first = first.into_iter();
         let mut searched = BTreeMap::<Duration, usize>::new();
         let mut silent_asked = 0;
+        // The router's answer to the round, until ROUTER_DELAY.
+        let mut held = None;
+        let (found, found_at) = loop {
+            let request = match first.next() {
+                Some(request) => request,
+                None => tokio::select! {
+                    biased;
+                    found = peers.recv() => {
+                        break (found.unwrap(), tokio::time::Instant::now() - start);
+                    }
+                    () = super::sleep_until_some(held.as_ref().map(|_| start + ROUTER_DELAY)) => {
+                        let request = held.take().unwrap();
+                        reply(&dht, &request, Id20::new([0x99; 20]), &named, &[]);
+                        continue;
+                    }
+                    request = sent.recv() => request.unwrap(),
+                },
+            };
+            match request.message.kind {
+                MessageKind::FindNodeRequest(_) if request.addr == router => {
+                    assert!(held.replace(request).is_none());
+                }
+                MessageKind::FindNodeRequest(_) => match id_of(request.addr) {
+                    Some(id) => reply(&dht, &request, id, &[], &[]),
+                    None => silent_asked += 1,
+                },
+                MessageKind::GetPeersRequest(_) => {
+                    if request.addr == router {
+                        *searched
+                            .entry(tokio::time::Instant::now() - start)
+                            .or_default() += 1;
+                        refuse(&dht, &request);
+                    } else {
+                        let id = id_of(request.addr).unwrap();
+                        reply(&dht, &request, id, &[], &[peer]);
+                    }
+                }
+                ref kind => panic!("unexpected {kind:?}"),
+            }
+        };
+        task.abort();
+        // The round is still waiting on silent nodes: it has not ended.
+        let waiting = dht
+            .inflight_by_transaction_id
+            .iter()
+            .filter(|e| is_silent(e.key().1))
+            .count();
+        refresh.abort();
+
+        assert_eq!(found, peer);
+        assert_eq!(found_at, EARLY_SEARCH_MIN);
+        assert_eq!(
+            searched,
+            BTreeMap::from([(Duration::ZERO, 1), (EARLY_SEARCH_MIN, 1)])
+        );
+        assert!(waiting > 0);
+        assert!(silent_asked > 0);
+        assert_eq!(dht.routing_table_v4.read().len(), answering.len());
+    }
+
+    // The routers of a fresh DHT as they were met on a public swarm: one
+    // never answers a get_peers, though it names nodes to a find_node; the
+    // other names one node that never answers, eight times over, to
+    // anything. The torrent's first search, made before any node answered,
+    // has only the routers and that silent node to ask, and ends short as
+    // their timeouts run out. The bootstrap has by then put
+    // SEARCH_MIN_SEEDS nodes that answer in the table, so the search is made
+    // again at once, from them, not EARLY_SEARCH_MIN later, and finds the
+    // peer; the round that seeded the table is still asking silent nodes.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_first_search_made_from_the_routers_alone_searches_again_once_the_table_is_seeded()
+     {
+        use super::{EARLY_SEARCH_MIN, SEARCH_MIN_SEEDS};
+        use crate::core::hash_id::Id20;
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::collections::BTreeMap;
+
+        let seeds_u8 = u8::try_from(SEARCH_MIN_SEEDS).unwrap();
+        let (dht, mut sent) = fixture_dht();
+        let router = SocketAddr::from(ROUTER);
+        let echo = SocketAddr::from(([10, 200, 0, 2], 6881));
+        dht.add_routers(&[router, echo]);
+        let node = |id: [u8; 20], net: u8, i: u8| {
+            (
+                Id20::new(id),
+                std::net::SocketAddrV4::new([10, net, i, 1].into(), 6881),
+            )
+        };
+        // The nodes that answer are near our own id, so the round that
+        // looks for it asks them first.
+        let answering: Vec<_> = (1..=seeds_u8)
+            .map(|i| {
+                let mut id = dht.id.0;
+                id[19] ^= i;
+                node(id, 0, i)
+            })
+            .collect();
+        let silent: Vec<_> = (1..=40u8)
+            .map(|i| {
+                let mut id = [0xc0; 20];
+                id[19] = i;
+                node(id, 1, i)
+            })
+            .collect();
+        let echoed = vec![node([0xa0; 20], 2, 1); 8];
+        let named: Vec<_> = answering.iter().chain(&silent).copied().collect();
+        let id_of = |addr: SocketAddr| {
+            answering
+                .iter()
+                .find(|n| SocketAddr::from(n.1) == addr)
+                .map(|n| n.0)
+        };
+        let peer = SocketAddr::from(([10, 9, 9, 9], 51413));
+        let info_hash = Id20::new([0x22; 20]);
+        assert!(super::announce_slot(&info_hash) > RESPONSE_TIMEOUT + EARLY_SEARCH_MIN);
+        let (peer_tx, mut peers) = tokio::sync::mpsc::unbounded_channel();
+        let req = Arc::new(super::RecursiveRequest::get_peers(
+            dht.clone(),
+            info_hash,
+            None,
+            peer_tx,
+        ));
+        let start = tokio::time::Instant::now();
+        let refresh = tokio::spawn(dht.clone().refresh_self(true));
+        let task = req.request_peers_forever(true);
+
+        // Nothing answers until the round and the search have both asked
+        // both routers.
+        let mut first = Vec::new();
+        while first.len() < 4 {
+            let request = sent.recv().await.unwrap();
+            assert!(request.addr == router || request.addr == echo);
+            first.push(request);
+        }
+        let mut first = first.into_iter();
+        // Each get_peers by when it was sent and to whom.
+        let mut searched = BTreeMap::<Duration, Vec<SocketAddr>>::new();
+        let mut silent_asked = 0;
         let (found, found_at) = loop {
             let request = match first.next() {
                 Some(request) => request,
@@ -4700,6 +5776,9 @@ mod tests {
                 },
             };
             match request.message.kind {
+                MessageKind::FindNodeRequest(_) if request.addr == echo => {
+                    reply(&dht, &request, Id20::new([0x98; 20]), &echoed, &[]);
+                }
                 MessageKind::FindNodeRequest(_) if request.addr == router => {
                     reply(&dht, &request, Id20::new([0x99; 20]), &named, &[]);
                 }
@@ -4708,12 +5787,13 @@ mod tests {
                     None => silent_asked += 1,
                 },
                 MessageKind::GetPeersRequest(_) => {
-                    if request.addr == router {
-                        *searched
-                            .entry(tokio::time::Instant::now() - start)
-                            .or_default() += 1;
-                    } else {
-                        let id = id_of(request.addr).unwrap();
+                    searched
+                        .entry(tokio::time::Instant::now() - start)
+                        .or_default()
+                        .push(request.addr);
+                    if request.addr == echo {
+                        reply(&dht, &request, Id20::new([0x98; 20]), &echoed, &[]);
+                    } else if let Some(id) = id_of(request.addr) {
                         reply(&dht, &request, id, &[], &[peer]);
                     }
                 }
@@ -4721,15 +5801,343 @@ mod tests {
             }
         };
         task.abort();
+        // The round that seeded the table is still waiting on silent nodes.
+        let waiting = dht
+            .inflight_by_transaction_id
+            .iter()
+            .filter(|e| silent.iter().any(|n| SocketAddr::from(n.1) == e.key().1))
+            .count();
+        assert!(waiting > 0);
+        assert!(silent_asked > 0);
         refresh.abort();
 
-        let again = RESPONSE_TIMEOUT + EARLY_SEARCH_MIN;
         assert_eq!(found, peer);
-        assert_eq!(found_at, again);
-        assert_eq!(searched, BTreeMap::from([(Duration::ZERO, 1), (again, 1)]));
-        // The round has silent nodes left to ask: it has not ended.
-        assert!(silent_asked < silent.len(), "{silent_asked}");
-        assert_eq!(dht.routing_table_v4.read().len(), answering.len());
+        assert_eq!(found_at, RESPONSE_TIMEOUT);
+        let mut at_start = searched[&Duration::ZERO].clone();
+        at_start.sort();
+        let mut leaned = vec![router, echo, SocketAddr::from(echoed[0].1)];
+        leaned.sort();
+        assert_eq!(at_start, leaned);
+        // Made again from the table alone: it no longer leans on the routers.
+        let mut again = searched[&RESPONSE_TIMEOUT].clone();
+        again.sort();
+        let mut seeds: Vec<_> = answering.iter().map(|n| SocketAddr::from(n.1)).collect();
+        seeds.sort();
+        assert_eq!(again, seeds);
+        assert_eq!(searched.len(), 2);
+    }
+
+    // After a restart the table holds SEARCH_MIN_SEEDS nodes from the last
+    // run, none of which has answered yet, and a router that never does.
+    // The first search leans on the router, and the nodes answer it, which
+    // seeds the table without any node entering it. The search ends short
+    // as the router's query times out, and is made again at once, from the
+    // nodes alone.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_restored_table_that_becomes_seeded_without_growing_searches_again_at_once() {
+        use super::{EARLY_SEARCH_MIN, SEARCH_MIN_SEEDS};
+        use crate::core::hash_id::Id20;
+        use crate::dht::RESPONSE_TIMEOUT;
+
+        let (dht, mut sent) = fixture_dht();
+        let router = SocketAddr::from(ROUTER);
+        dht.add_routers(&[router]);
+        let restored: Vec<_> = (1..=u8::try_from(SEARCH_MIN_SEEDS).unwrap())
+            .map(|i| node_at(u32::from(i), [10, 0, i, 1]))
+            .collect();
+        {
+            let mut table = dht.routing_table_v4.write();
+            for (id, addr) in &restored {
+                table.add_node(*id, SocketAddr::V4(*addr));
+            }
+            assert!(!table.is_seeded());
+        }
+        let growth = {
+            let dht = dht.clone();
+            tokio::spawn(async move { dht.watch_growth(true).await })
+        };
+        let info_hash = Id20::new([0x22; 20]);
+        assert!(super::announce_slot(&info_hash) > RESPONSE_TIMEOUT + EARLY_SEARCH_MIN);
+        let req = Arc::new(super::RecursiveRequest::get_peers(
+            dht.clone(),
+            info_hash,
+            None,
+            tokio::sync::mpsc::unbounded_channel().0,
+        ));
+        let start = tokio::time::Instant::now();
+        let task = req.request_peers_forever(true);
+
+        let mut searched = Vec::new();
+        while searched.len() < 2 * SEARCH_MIN_SEEDS + 1 {
+            let request = sent.recv().await.unwrap();
+            assert!(matches!(
+                request.message.kind,
+                MessageKind::GetPeersRequest(_)
+            ));
+            searched.push((tokio::time::Instant::now() - start, request.addr));
+            if let Some((id, _)) = restored
+                .iter()
+                .find(|n| SocketAddr::V4(n.1) == request.addr)
+            {
+                reply(&dht, &request, *id, &[], &[]);
+            }
+        }
+        task.abort();
+        growth.abort();
+        assert!(dht.routing_table_v4.read().is_seeded());
+        let at = |when: Duration| {
+            let mut addrs: Vec<_> = searched
+                .iter()
+                .filter(|s| s.0 == when)
+                .map(|s| s.1)
+                .collect();
+            addrs.sort();
+            addrs
+        };
+        let mut nodes: Vec<_> = restored.iter().map(|n| SocketAddr::V4(n.1)).collect();
+        nodes.sort();
+        let mut leaned = nodes.clone();
+        leaned.push(router);
+        leaned.sort();
+        assert_eq!(at(Duration::ZERO), leaned);
+        assert_eq!(at(RESPONSE_TIMEOUT), nodes);
+    }
+
+    // 200 torrents start on a restored table of SEARCH_MIN_SEEDS nodes and a
+    // router, none of which answers. Every first search leans on the router,
+    // ends short and waits to be made again once the table is seeded. Then
+    // the three nodes answer, which seeds the table. Inside every limit:
+    // - that growth lets EARLY_SEARCHES_PER_GROWTH torrents search again, and
+    //   no more come before the next growth;
+    // - no more than WALKS_AT_ONCE walks run at once (each has all its
+    //   queries outstanding until it ends: four in the first searches,
+    //   three in the second);
+    // - every query waits on the global rate limiter, here 20 a second with
+    //   a burst of 20, so by any time t no more than 20 + t / 50 ms went;
+    // - no address is sent more than SEND_LIMIT in any WINDOW.
+    #[tokio::test(start_paused = true)]
+    async fn test_torrents_waiting_for_a_seeded_table_search_again_inside_every_limit() {
+        use super::{
+            EARLY_SEARCHES_PER_GROWTH, RateLimiter, SEARCH_MIN_SEEDS, TokioClock, WALKS_AT_ONCE,
+        };
+        use crate::core::hash_id::Id20;
+        use crate::dht::send_windows::SEND_LIMIT;
+        use std::{
+            collections::{BTreeSet, HashMap},
+            num::NonZeroU32,
+        };
+
+        const TORRENTS: u16 = 200;
+        let (mut state, mut sent) = fixture_state();
+        let start = tokio::time::Instant::now();
+        let per_second = 20;
+        state.rate_limiter = RateLimiter::direct_with_clock(
+            governor::Quota::per_second(NonZeroU32::new(per_second).unwrap()),
+            TokioClock { start },
+        );
+        let dht = Arc::new(state);
+        let router = SocketAddr::from(ROUTER);
+        dht.add_routers(&[router]);
+        let restored: Vec<_> = (1..=u8::try_from(SEARCH_MIN_SEEDS).unwrap())
+            .map(|i| node_at(u32::from(i), [10, 0, i, 1]))
+            .collect();
+        {
+            let mut table = dht.routing_table_v4.write();
+            for (id, addr) in &restored {
+                table.add_node(*id, SocketAddr::V4(*addr));
+            }
+            assert!(!table.is_seeded());
+        }
+        let growth = {
+            let dht = dht.clone();
+            tokio::spawn(async move { dht.watch_growth(true).await })
+        };
+        let tasks: Vec<_> = (0..TORRENTS)
+            .map(|i| {
+                let mut hash = [0xf0; 20];
+                hash[1..3].copy_from_slice(&i.to_be_bytes());
+                let info_hash = Id20::new(hash);
+                // The torrent's own turn is far past this test.
+                assert!(super::announce_slot(&info_hash) > Duration::from_secs(600));
+                Arc::new(super::RecursiveRequest::get_peers(
+                    dht.clone(),
+                    info_hash,
+                    None,
+                    tokio::sync::mpsc::unbounded_channel().0,
+                ))
+                .request_peers_forever(true)
+            })
+            .collect();
+        let record = |request: super::WorkerSendRequest| {
+            let MessageKind::GetPeersRequest(g) = request.message.kind else {
+                panic!("not a get_peers: {:?}", request.message.kind);
+            };
+            (tokio::time::Instant::now(), request.addr, g.info_hash)
+        };
+        let walks_ended = || {
+            dht.get_stats().outstanding_requests == 0
+                && dht.walks.available_permits() == WALKS_AT_ONCE
+        };
+
+        // The first searches: each asks the three nodes and the router.
+        let mut first = Vec::new();
+        let mut most_in_flight = 0;
+        while first.len() < 4 * usize::from(TORRENTS) {
+            first.push(record(sent.recv().await.unwrap()));
+            most_in_flight = most_in_flight.max(dht.get_stats().outstanding_requests);
+        }
+        while !walks_ended() {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            assert!(sent.try_recv().is_err());
+        }
+        assert_eq!(most_in_flight, 4 * WALKS_AT_ONCE);
+        let searched: BTreeSet<_> = first.iter().map(|s| s.2).collect();
+        assert_eq!(searched.len(), usize::from(TORRENTS));
+
+        // The three nodes answer: the table is seeded, which is a growth.
+        let seeded_at = tokio::time::Instant::now();
+        {
+            let mut table = dht.routing_table_v4.write();
+            for (id, _) in &restored {
+                assert!(table.mark_response(id, std::time::Instant::now()));
+            }
+            assert!(table.is_seeded());
+        }
+        let mut again = Vec::new();
+        let mut most_in_flight = 0;
+        while tokio::time::Instant::now() < seeded_at + Duration::from_secs(60) {
+            tokio::time::advance(Duration::from_millis(50)).await;
+            while let Ok(request) = sent.try_recv() {
+                again.push(record(request));
+            }
+            most_in_flight = most_in_flight.max(dht.get_stats().outstanding_requests);
+        }
+        assert!(walks_ended());
+        growth.abort();
+        for task in tasks {
+            task.abort();
+        }
+
+        // EARLY_SEARCHES_PER_GROWTH torrents searched again, each from the
+        // three nodes alone.
+        let mut by_torrent: HashMap<Id20, BTreeSet<SocketAddr>> = HashMap::new();
+        for (_, addr, info_hash) in &again {
+            assert!(by_torrent.entry(*info_hash).or_default().insert(*addr));
+        }
+        assert_eq!(by_torrent.len(), EARLY_SEARCHES_PER_GROWTH);
+        let nodes: BTreeSet<_> = restored.iter().map(|n| SocketAddr::V4(n.1)).collect();
+        assert!(by_torrent.values().all(|asked| *asked == nodes));
+        assert!(most_in_flight <= 3 * WALKS_AT_ONCE);
+
+        // The global rate limiter, over both phases.
+        // It held queries back: some went the moment its bucket allowed.
+        let all: Vec<_> = first.iter().chain(&again).collect();
+        let mut held = 0;
+        for (k, (at, _, _)) in all.iter().enumerate() {
+            let tokens =
+                per_second as u128 + (*at - start).as_millis() / (1000 / per_second as u128);
+            assert!((k as u128) < tokens, "query {k} at {:?}", *at - start);
+            held += usize::from(k as u128 + 1 == tokens);
+        }
+        assert!(held > 0);
+        // Each address's send window.
+        for addr in nodes.iter().chain([&router]) {
+            let times: Vec<_> = all.iter().filter(|s| s.1 == *addr).map(|s| s.0).collect();
+            assert!(most_in_any_window(&times) <= SEND_LIMIT);
+        }
+    }
+
+    // Only the first search is made again once the table is seeded: the
+    // routers name SEARCH_MIN_SEEDS nodes that answer a find_node but never
+    // a get_peers, and a fourth that answers from the second round on. The
+    // first search times out on the routers and is made again at once from
+    // the three; that one times out on them too, and the next search waits
+    // EARLY_SEARCH_MIN after it, as any short search does.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_search_made_again_once_the_table_is_seeded_that_falls_short_waits_early_search_min()
+     {
+        use super::{EARLY_SEARCH_MIN, SEARCH_MIN_SEEDS};
+        use crate::core::hash_id::Id20;
+        use crate::dht::RESPONSE_TIMEOUT;
+        use std::collections::BTreeSet;
+
+        let seeds_u8 = u8::try_from(SEARCH_MIN_SEEDS).unwrap();
+        let (dht, mut sent) = fixture_dht();
+        let router = SocketAddr::from(ROUTER);
+        dht.add_routers(&[router]);
+        let node = |i: u8| {
+            let mut id = [0x40; 20];
+            id[19] = i;
+            (
+                Id20::new(id),
+                std::net::SocketAddrV4::new([10, 0, i, 1].into(), 6881),
+            )
+        };
+        let id_of = |addr: SocketAddr| {
+            (1..=seeds_u8 + 1)
+                .map(node)
+                .find(|n| SocketAddr::from(n.1) == addr)
+                .map(|n| n.0)
+        };
+        let info_hash = Id20::new([0x22; 20]);
+        let ends = 2 * RESPONSE_TIMEOUT + EARLY_SEARCH_MIN;
+        assert!(super::announce_slot(&info_hash) > ends);
+        let req = Arc::new(super::RecursiveRequest::get_peers(
+            dht.clone(),
+            info_hash,
+            None,
+            tokio::sync::mpsc::unbounded_channel().0,
+        ));
+        let start = tokio::time::Instant::now();
+        let refresh = tokio::spawn(dht.clone().refresh_self(true));
+        let task = req.request_peers_forever(true);
+
+        let mut first = Vec::new();
+        while first.len() < 2 {
+            let request = sent.recv().await.unwrap();
+            assert_eq!(request.addr, router);
+            first.push(request);
+        }
+        let mut first = first.into_iter();
+        let mut searched = BTreeSet::<Duration>::new();
+        loop {
+            let request = match first.next() {
+                Some(request) => request,
+                None => sent.recv().await.unwrap(),
+            };
+            let at = tokio::time::Instant::now() - start;
+            match request.message.kind {
+                MessageKind::FindNodeRequest(_) if request.addr == router => {
+                    let named: Vec<_> = (1..=seeds_u8).map(node).collect();
+                    reply(&dht, &request, Id20::new([0x99; 20]), &named, &[]);
+                }
+                // From the round after the first search ended, the nodes
+                // name a fourth: the table grows while the search made
+                // again is walking.
+                MessageKind::FindNodeRequest(_) => {
+                    let named = if at > RESPONSE_TIMEOUT {
+                        vec![node(seeds_u8 + 1)]
+                    } else {
+                        Vec::new()
+                    };
+                    reply(&dht, &request, id_of(request.addr).unwrap(), &named, &[]);
+                }
+                MessageKind::GetPeersRequest(_) => {
+                    searched.insert(at);
+                    if at >= ends {
+                        break;
+                    }
+                }
+                ref kind => panic!("unexpected {kind:?}"),
+            }
+        }
+        task.abort();
+        refresh.abort();
+
+        assert_eq!(
+            searched,
+            BTreeSet::from([Duration::ZERO, RESPONSE_TIMEOUT, ends])
+        );
     }
 
     // Many nodes entering at once are one growth, and the nodes that enter
@@ -5840,6 +7248,319 @@ mod tests {
         assert_eq!(outcome.answered, 8);
         assert_eq!(tokio::time::Instant::now(), start);
         assert_eq!(dht.send_guard.windows.lock().lined_up(full.ip()), 0);
+    }
+
+    // Node i of a walk test: i + 1 from the target [0x22; 20], at 10.0.i.1.
+    fn walk_node(i: u8) -> (crate::core::hash_id::Id20, SocketAddr) {
+        let mut id = [0x22; 20];
+        id[19] ^= i + 1;
+        (
+            crate::core::hash_id::Id20::new(id),
+            SocketAddr::from(([10, 0, i, 1], 6881)),
+        )
+    }
+
+    fn walk_index(addr: SocketAddr) -> u8 {
+        match addr.ip() {
+            std::net::IpAddr::V4(a) => a.octets()[2],
+            std::net::IpAddr::V6(_) => unreachable!(),
+        }
+    }
+
+    // What `drive` saw sent: to which node, whether it was an announce, and
+    // when, from the start.
+    type Sent = Vec<(u8, bool, Duration)>;
+
+    // Runs `search` to its end, answering each query `delay` says to,
+    // through `respond`, that long after it was sent; `delay` None leaves it
+    // unanswered. Returns the search's result and every datagram sent.
+    async fn drive<T: Send + 'static>(
+        sent: &mut tokio::sync::mpsc::UnboundedReceiver<super::WorkerSendRequest>,
+        mut search: tokio::task::JoinHandle<T>,
+        delay: impl Fn(u8) -> Option<Duration>,
+        respond: impl Fn(&super::WorkerSendRequest),
+    ) -> (T, Sent) {
+        use std::collections::BTreeMap;
+        let start = tokio::time::Instant::now();
+        let mut log = Vec::new();
+        let mut later = BTreeMap::new();
+        let mut seq = 0u64;
+        loop {
+            let due = later.keys().next().map(|&(at, _)| at);
+            tokio::select! {
+                biased;
+                () = super::sleep_until_some(due) => {
+                    let (_, request) = later.pop_first().unwrap();
+                    respond(&request);
+                }
+                request = sent.recv() => {
+                    let request = request.unwrap();
+                    let i = walk_index(request.addr);
+                    let announce = matches!(request.message.kind, MessageKind::AnnouncePeer(_));
+                    let now = tokio::time::Instant::now();
+                    log.push((i, announce, now - start));
+                    match delay(i) {
+                        Some(_) if announce => {}
+                        Some(d) if d.is_zero() => respond(&request),
+                        Some(d) => {
+                            seq += 1;
+                            later.insert((now + d, seq), request);
+                        }
+                        None => {}
+                    }
+                }
+                done = &mut search => return (done.unwrap(), log),
+            }
+        }
+    }
+
+    // The queries of `log` sent at `at`, by node.
+    fn queried_at(log: &Sent, at: Duration) -> Vec<u8> {
+        let mut nodes: Vec<_> = log
+            .iter()
+            .filter(|&&(_, announce, when)| !announce && when == at)
+            .map(|&(i, _, _)| i)
+            .collect();
+        nodes.sort();
+        nodes
+    }
+
+    // The five closest nodes never answer. A query unanswered SHORT_TIMEOUT
+    // after it was sent lets the walk ask one more node, so the live nodes
+    // are asked, and their peers found, at SHORT_TIMEOUT, not as the five
+    // run out RESPONSE_TIMEOUT. The walk still waits for the five, closer
+    // than every node that answered, until they fail (libtorrent
+    // traversal_algorithm.cpp:353-408, 492-580, v2.0.15). Each node is asked
+    // once: 13 queries, as many as without the short timeout.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_walk_whose_five_closest_are_dead_reaches_live_nodes_after_the_short_timeout() {
+        use super::{SHORT_TIMEOUT, SearchOutcome};
+        use crate::core::hash_id::Id20;
+        use crate::dht::RESPONSE_TIMEOUT;
+
+        let (dht, mut sent) = fixture_dht();
+        let peer = SocketAddr::from(([10, 9, 9, 9], 51413));
+        let (peer_tx, mut peers) = tokio::sync::mpsc::unbounded_channel();
+        let req =
+            super::RecursiveRequest::get_peers(dht.clone(), Id20::new([0x22; 20]), None, peer_tx);
+        let start = tokio::time::Instant::now();
+        let search = tokio::spawn(async move {
+            let outcome = req
+                .search(
+                    true,
+                    (0..13).map(|i| {
+                        let (id, addr) = walk_node(i);
+                        (Some(id), addr)
+                    }),
+                )
+                .await;
+            (outcome, tokio::time::Instant::now())
+        });
+        let ((outcome, ended), log) = drive(
+            &mut sent,
+            search,
+            |i| (i >= 5).then_some(Duration::ZERO),
+            |request| {
+                reply(
+                    &dht,
+                    request,
+                    walk_node(walk_index(request.addr)).0,
+                    &[],
+                    &[peer],
+                )
+            },
+        )
+        .await;
+
+        assert_eq!(queried_at(&log, Duration::ZERO), (0..5).collect::<Vec<_>>());
+        assert_eq!(queried_at(&log, SHORT_TIMEOUT), (5..13).collect::<Vec<_>>());
+        assert_eq!(log.len(), 13);
+        assert_eq!(peers.try_recv().unwrap(), peer);
+        assert_eq!(ended - start, RESPONSE_TIMEOUT);
+        assert_eq!(
+            outcome.unwrap(),
+            SearchOutcome {
+                answered: 8,
+                failed: 5,
+                nodes: 8
+            }
+        );
+        assert_eq!(dht.get_stats().outstanding_requests, 0);
+    }
+
+    // The eight closest nodes answer 2 s after they are asked, the twelve
+    // farther ones at once. At SHORT_TIMEOUT the five asked first have not
+    // answered, so the walk may keep five more in flight: it asks the other
+    // three slow ones and farther fast ones, a fast one again as each
+    // answers, until eight have answered: nine fast ones in all. It ends as
+    // the slow ones, the closest, have all answered. 17 queries: without
+    // the short timeout the walk asked the slow ones five at a time and
+    // sent 12, the 5 more being farther nodes asked in the room the five
+    // late queries opened; a node is never asked twice.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_walk_asks_farther_nodes_only_in_the_room_its_late_queries_open() {
+        use super::{SHORT_TIMEOUT, SearchOutcome};
+
+        let (dht, mut sent) = fixture_dht();
+        let slow = Duration::from_secs(2);
+        let req = get_peers_search(&dht);
+        let start = tokio::time::Instant::now();
+        let search = tokio::spawn(async move {
+            let outcome = req
+                .search(
+                    true,
+                    (0..20).map(|i| {
+                        let (id, addr) = walk_node(i);
+                        (Some(id), addr)
+                    }),
+                )
+                .await;
+            (outcome, tokio::time::Instant::now())
+        });
+        let ((outcome, ended), log) = drive(
+            &mut sent,
+            search,
+            |i| Some(if i < 8 { slow } else { Duration::ZERO }),
+            |request| {
+                reply(
+                    &dht,
+                    request,
+                    walk_node(walk_index(request.addr)).0,
+                    &[],
+                    &[],
+                )
+            },
+        )
+        .await;
+
+        assert_eq!(queried_at(&log, Duration::ZERO), (0..5).collect::<Vec<_>>());
+        assert_eq!(queried_at(&log, SHORT_TIMEOUT), (5..17).collect::<Vec<_>>());
+        assert_eq!(log.len(), 17);
+        assert_eq!(ended - start, SHORT_TIMEOUT + slow);
+        assert_eq!(
+            outcome.unwrap(),
+            SearchOutcome {
+                answered: 17,
+                failed: 0,
+                nodes: 17
+            }
+        );
+    }
+
+    // The five closest nodes answer 2 s after they are asked, the next three
+    // at once, and the two farthest never. At SHORT_TIMEOUT the walk asks the
+    // other eight. Once the eight closest have answered, at 2 s, the walk
+    // ends without waiting for the two farther ones it still has in flight,
+    // and announces to the eight then, as libtorrent's `find_data::done`
+    // does (traversal_algorithm.cpp:492-580, find_data.cpp:139-194,
+    // v2.0.15). The two are withdrawn: they wait for their answers apart
+    // from the walk (see `test_a_withdrawn_query_still_feeds_the_table`).
+    #[tokio::test(start_paused = true)]
+    async fn test_a_walk_ends_once_the_k_closest_answer_with_farther_queries_in_flight() {
+        use super::SHORT_TIMEOUT;
+        use crate::core::hash_id::Id20;
+
+        let (dht, mut sent) = fixture_dht();
+        let slow = Duration::from_secs(2);
+        let req = super::RecursiveRequest::get_peers(
+            dht.clone(),
+            Id20::new([0x22; 20]),
+            Some(6881),
+            tokio::sync::mpsc::unbounded_channel().0,
+        );
+        let start = tokio::time::Instant::now();
+        let search = tokio::spawn(async move {
+            let outcome = req
+                .search(
+                    true,
+                    (0..10).map(|i| {
+                        let (id, addr) = walk_node(i);
+                        (Some(id), addr)
+                    }),
+                )
+                .await;
+            (outcome, tokio::time::Instant::now())
+        });
+        let ((outcome, ended), log) = drive(
+            &mut sent,
+            search,
+            |i| match i {
+                0..5 => Some(slow),
+                5..8 => Some(Duration::ZERO),
+                _ => None,
+            },
+            |request| {
+                let i = walk_index(request.addr);
+                answer(&dht, request, walk_node(i).0, Some(&[i]), &[]);
+            },
+        )
+        .await;
+
+        assert_eq!(queried_at(&log, Duration::ZERO), (0..5).collect::<Vec<_>>());
+        assert_eq!(queried_at(&log, SHORT_TIMEOUT), (5..10).collect::<Vec<_>>());
+        assert_eq!(ended - start, slow);
+        let outcome = outcome.unwrap();
+        assert_eq!((outcome.answered, outcome.failed), (8, 0));
+        let mut announced: Vec<_> = log
+            .iter()
+            .filter(|&&(_, announce, _)| announce)
+            .map(|&(i, _, at)| (i, at))
+            .collect();
+        announced.sort();
+        assert_eq!(announced, (0..8).map(|i| (i, slow)).collect::<Vec<_>>());
+        assert_eq!(dht.get_stats().outstanding_requests, 2);
+    }
+
+    // A node that answers after SHORT_TIMEOUT, here a find_node of a
+    // routing-table walk at 5 s, is not failed: its answer is used as any
+    // other, so the node it names is asked then, and enters the table as
+    // it answers.
+    #[tokio::test(start_paused = true)]
+    async fn test_a_late_answer_is_still_used() {
+        use super::{RecursiveRequest, SearchOutcome};
+        use crate::core::hash_id::Id20;
+
+        let (dht, mut sent) = fixture_dht();
+        let late = Duration::from_secs(5);
+        let start = tokio::time::Instant::now();
+        let search = tokio::spawn(RecursiveRequest::find_node_for_routing_table(
+            dht.clone(),
+            Id20::new([0x22; 20]),
+            true,
+            std::iter::once(walk_node(0).1),
+        ));
+        let named = |i: u8| {
+            let (id, addr) = walk_node(i);
+            let SocketAddr::V4(addr) = addr else {
+                unreachable!()
+            };
+            (id, addr)
+        };
+        let (outcome, log) = drive(
+            &mut sent,
+            search,
+            |i| Some(if i == 0 { late } else { Duration::ZERO }),
+            |request| {
+                let i = walk_index(request.addr);
+                let nodes: Vec<_> = (i == 0).then(|| named(1)).into_iter().collect();
+                reply(&dht, request, walk_node(i).0, &nodes, &[]);
+            },
+        )
+        .await;
+
+        assert_eq!(log, vec![(0, false, Duration::ZERO), (1, false, late)]);
+        assert_eq!(
+            outcome.unwrap(),
+            SearchOutcome {
+                answered: 2,
+                failed: 0,
+                nodes: 1
+            }
+        );
+        assert_eq!(tokio::time::Instant::now() - start, late);
+        // The node the late answer named answered and entered the table; the
+        // first was given by address only, as a router is.
+        assert_eq!(dht.routing_table_v4.read().len(), 1);
     }
 
     // Queries lined up for a full window go as it opens, one as each datagram
