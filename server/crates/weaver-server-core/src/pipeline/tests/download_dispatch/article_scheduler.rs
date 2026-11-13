@@ -1044,7 +1044,7 @@ async fn the_share_counts_articles_already_out_on_lanes() {
     add_job(&mut pipeline, hot, "Half Fetched Pack", 10_000).await;
 
     assert_eq!(pipeline.lane_share_of_job(hot, 8), 100);
-    pipeline.active_downloads_by_job.insert(hot, 10_000);
+    pipeline.articles_in_flight_by_job.insert(hot, 10_000);
     assert_eq!(
         pipeline.lane_share_of_job(hot, 8),
         200,

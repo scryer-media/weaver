@@ -789,7 +789,7 @@ impl ServiceInner {
         let draining = (life.phase == Some(SpeedTestPhase::Draining)).then(|| {
             self.handle
                 .pipeline_metrics()
-                .active_downloads
+                .articles_in_flight
                 .load(Ordering::Acquire)
         });
         SpeedTestRun {

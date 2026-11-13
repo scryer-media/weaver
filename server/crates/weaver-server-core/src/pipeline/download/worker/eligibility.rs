@@ -190,7 +190,7 @@ impl Pipeline {
             .iter()
             .chain(self.download_wait_by_job.keys())
             .chain(self.active_download_connections_by_job.keys())
-            .chain(self.active_downloads_by_job.keys())
+            .chain(self.articles_in_flight_by_job.keys())
             .chain(self.active_decodes_by_job.jobs())
             .chain(self.pending_released_download_results_by_job.keys())
             .copied()

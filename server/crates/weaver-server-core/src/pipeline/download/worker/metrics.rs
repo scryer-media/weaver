@@ -162,7 +162,7 @@ impl Pipeline {
         if !self.download_stall_recovery {
             return false;
         }
-        if self.active_downloads != 0
+        if self.articles_in_flight != 0
             || self.active_download_connections != 0
             || eligible_count == 0
         {
@@ -430,7 +430,7 @@ impl Pipeline {
                     stalled_secs = stalled_for.as_secs(),
                     eligible_count,
                     dispatchable_queue_depth,
-                    articles_in_lanes = self.active_downloads,
+                    articles_in_lanes = self.articles_in_flight,
                     active_connections = self.active_download_connections,
                     max_connections,
                     pressure_state = pressure.state.as_str(),
@@ -454,7 +454,7 @@ impl Pipeline {
                     rotation_hints_cleared,
                     eligible_count,
                     dispatchable_queue_depth,
-                    articles_in_lanes = self.active_downloads,
+                    articles_in_lanes = self.articles_in_flight,
                     active_connections = self.active_download_connections,
                     max_connections,
                     pressure_state = pressure.state.as_str(),
@@ -476,7 +476,7 @@ impl Pipeline {
         max_connections: usize,
         eligible_count: usize,
     ) {
-        if self.active_downloads != 0 || self.active_download_connections != 0 {
+        if self.articles_in_flight != 0 || self.active_download_connections != 0 {
             return;
         }
 
@@ -529,7 +529,7 @@ impl Pipeline {
                 status_allows_dispatch = Self::status_allows_download_dispatch(&state.status),
                 eligible_count,
                 dispatchable_queue_depth,
-                articles_in_lanes = self.active_downloads,
+                articles_in_lanes = self.articles_in_flight,
                 active_connections = self.active_download_connections,
                 max_connections,
                 pressure_state = pressure.state.as_str(),
@@ -539,7 +539,7 @@ impl Pipeline {
                 explained_wait_ms,
                 servers_available,
                 stall_recovery,
-                articles_in_lanes_by_job = backlog.active_downloads,
+                articles_in_lanes_by_job = backlog.articles_in_flight,
                 active_connections_by_job = backlog.active_connections,
                 active_decodes_by_job = backlog.active_decodes,
                 delayed_retries_by_job = backlog.delayed_retries,
@@ -552,7 +552,7 @@ impl Pipeline {
             warn!(
                 eligible_count,
                 dispatchable_queue_depth,
-                articles_in_lanes = self.active_downloads,
+                articles_in_lanes = self.articles_in_flight,
                 active_connections = self.active_download_connections,
                 max_connections,
                 pressure_state = pressure.state.as_str(),
@@ -599,7 +599,7 @@ impl Pipeline {
                 warn!(
                     retries,
                     window_secs = DOWNLOAD_DISPATCH_STALL_LOG_INTERVAL.as_secs(),
-                    articles_in_lanes = self.active_downloads,
+                    articles_in_lanes = self.articles_in_flight,
                     active_connections = self.active_download_connections,
                     articles_not_found_without_new_server = self
                         .metrics
@@ -681,7 +681,7 @@ impl Pipeline {
         debug!(
             dispatchable_queue_depth,
             active_connections = self.active_download_connections,
-            articles_in_lanes = self.active_downloads,
+            articles_in_lanes = self.articles_in_flight,
             max_connections,
             under_cap_for_ms = now.saturating_duration_since(since).as_millis() as u64,
             per_server_active_of_configured = ?per_server,

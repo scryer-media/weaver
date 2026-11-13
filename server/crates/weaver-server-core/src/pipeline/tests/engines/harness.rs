@@ -1961,7 +1961,7 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
                     work.segment_id.segment_number,
                 );
                 if article.0 == held {
-                    *pipeline.active_downloads_by_job.entry(JOB).or_insert(0) += 1;
+                    *pipeline.articles_in_flight_by_job.entry(JOB).or_insert(0) += 1;
                     out.push(work);
                     continue;
                 }
@@ -2022,7 +2022,7 @@ pub(in crate::pipeline::tests) async fn run_holding(scenario: &Scenario, held: u
         .map(|set| set.outcome)
         .collect();
 
-    pipeline.active_downloads_by_job.insert(JOB, 0);
+    pipeline.articles_in_flight_by_job.insert(JOB, 0);
     for work in std::mem::take(&mut out) {
         let article = (
             work.segment_id.file_id.file_index,

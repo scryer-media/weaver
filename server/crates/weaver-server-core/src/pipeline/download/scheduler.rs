@@ -336,7 +336,7 @@ impl Pipeline {
             .get(&job_id)
             .map_or(0, |state| state.articles.queued_download_len());
         let out_on_lanes = self
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .get(&job_id)
             .copied()
             .unwrap_or(0);

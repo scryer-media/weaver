@@ -134,7 +134,7 @@ fn batch_complete(
 
 fn in_flight(pipeline: &Pipeline, job_id: JobId) -> usize {
     pipeline
-        .active_downloads_by_job
+        .articles_in_flight_by_job
         .get(&job_id)
         .copied()
         .unwrap_or(0)
@@ -265,7 +265,7 @@ async fn a_lease_that_names_an_article_twice_owes_one_result() {
     let segment_id = work.segment_id;
     let lease = lease_works_to_new_lane(&mut pipeline, job_id, vec![work.clone(), work]);
     assert_eq!(in_flight(&pipeline, job_id), 1);
-    assert_eq!(pipeline.active_downloads, 1);
+    assert_eq!(pipeline.articles_in_flight, 1);
 
     pipeline
         .handle_download_done(transport_failure(lease.lane_id, segment_id))
@@ -274,7 +274,7 @@ async fn a_lease_that_names_an_article_twice_owes_one_result() {
         .handle_download_done(transport_failure(lease.lane_id, segment_id))
         .await;
     assert_eq!(in_flight(&pipeline, job_id), 0);
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_gauges_match_lanes(&pipeline);
 }
 
@@ -308,7 +308,7 @@ async fn a_result_for_a_cancelled_job_is_refused_and_nothing_is_owed() {
     pipeline
         .handle_download_done(transport_failure(lease.lane_id, held))
         .await;
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_gauges_match_lanes(&pipeline);
 }
 
@@ -405,7 +405,7 @@ async fn a_stopped_lease_hands_back_everything_it_held() {
     pipeline.restore_stopped_owned_lane_lease(lease);
 
     assert_eq!(in_flight(&pipeline, job_id), 0);
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert_eq!(pipeline.active_download_connections, 0);
     assert_eq!(queued(&pipeline, job_id), 3);
     assert!(!pipeline.download_lane_owners.contains_key(&lane_id));
@@ -597,8 +597,11 @@ async fn the_lane_holdings_audit_fails_on_an_article_no_lane_holds() {
     )
     .await;
     assert_gauges_match_lanes(&pipeline);
-    pipeline.active_downloads += 1;
-    *pipeline.active_downloads_by_job.entry(job_id).or_default() += 1;
+    pipeline.articles_in_flight += 1;
+    *pipeline
+        .articles_in_flight_by_job
+        .entry(job_id)
+        .or_default() += 1;
     assert_eq!(pipeline.lane_holdings_discrepancies().len(), 2);
 
     pipeline.dispatch_downloads();

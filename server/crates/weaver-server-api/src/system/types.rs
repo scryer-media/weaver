@@ -158,10 +158,10 @@ pub struct Metrics {
     /// Articles still to fetch across every queued job, recovery articles
     /// and jobs outside the queue window included; not connections or jobs.
     pub download_queue_depth: u32,
-    /// Articles the download lanes hold right now: being fetched, or handed
-    /// to a lane and waiting their turn on its connection. Not connections;
-    /// a pipelining lane holds several, so this can pass the connection count.
-    pub active_downloads: u32,
+    /// Articles the download lanes hold right now: sent or about to be sent
+    /// to a server and not yet answered. Roughly busy connections times
+    /// pipeline depth. Not the number of jobs or files downloading.
+    pub articles_in_flight: u32,
     pub active_decodes: u32,
     pub decode_pending: u32,
     pub decode_pending_bytes: u64,
@@ -316,7 +316,7 @@ impl From<&weaver_server_core::MetricsSnapshot> for Metrics {
             bytes_decoded: m.bytes_decoded,
             bytes_committed: m.bytes_committed,
             download_queue_depth: m.download_queue_depth as u32,
-            active_downloads: m.active_downloads as u32,
+            articles_in_flight: m.articles_in_flight as u32,
             active_decodes: m.active_decodes as u32,
             decode_pending: m.decode_pending as u32,
             decode_pending_bytes: m.decode_pending_bytes,

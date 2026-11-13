@@ -104,7 +104,7 @@ impl Pipeline {
             return true;
         }
         if self
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .get(&job_id)
             .is_some_and(|n| *n > 0)
             || self

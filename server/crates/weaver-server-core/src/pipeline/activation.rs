@@ -547,7 +547,7 @@ impl Pipeline {
         self.graph_jobs
             .get(&job_id)
             .is_some_and(|graph| graph.rewalks_owed() || graph.working())
-            || counted(&self.active_downloads_by_job)
+            || counted(&self.articles_in_flight_by_job)
             || counted(&self.pending_released_download_results_by_job)
             || self
                 .active_decodes_by_job

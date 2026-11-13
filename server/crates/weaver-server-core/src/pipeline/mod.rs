@@ -1669,12 +1669,12 @@ pub struct Pipeline {
     // was last stored: a reorder among parked jobs is stored too.
     pub(super) stored_queue_order: Vec<JobId>,
     // Number of in-flight article downloads (primary + recovery).
-    pub(super) active_downloads: usize,
+    pub(super) articles_in_flight: usize,
     // Number of NNTP connection tasks currently fetching articles.
     pub(super) active_download_connections: usize,
     // Active connection lanes carrying completion-critical PAR2 work.
     pub(super) active_completion_critical_connections: usize,
-    // Number of in-flight recovery downloads (subset of active_downloads).
+    // Number of in-flight recovery downloads (subset of articles_in_flight).
     pub(super) active_recovery: usize,
     // Runtime-only per-server BODY depth explorers. Seeded from the persisted
     // depth on first observation; the measurements themselves never persist.
@@ -1728,14 +1728,14 @@ pub struct Pipeline {
     // Estimated decoded/raw bytes held by released results that are not committed yet.
     pub(super) pending_released_download_result_bytes_by_job: HashMap<JobId, u64>,
     // In-flight article download count per job.
-    pub(super) active_downloads_by_job: HashMap<JobId, usize>,
+    pub(super) articles_in_flight_by_job: HashMap<JobId, usize>,
     // In-flight NNTP connection task count per job.
     pub(super) active_download_connections_by_job: HashMap<JobId, usize>,
     // Completion-critical connection lanes per job. Kept separately from
     // article counts because pipelined lanes can carry several articles.
     pub(super) active_completion_critical_connections_by_job: HashMap<JobId, usize>,
     // In-flight article download count per file.
-    pub(super) active_downloads_by_file: HashMap<NzbFileId, usize>,
+    pub(super) articles_in_flight_by_file: HashMap<NzbFileId, usize>,
     // In-flight decode task count per job.
     pub(super) active_decodes_by_job: decode::ActiveDecodes,
     // In-flight decode task count per file.

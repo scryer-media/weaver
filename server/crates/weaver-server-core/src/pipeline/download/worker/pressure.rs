@@ -5,7 +5,7 @@ use super::*;
 
 impl DownloadPipelineBacklog {
     pub(in crate::pipeline::download::worker) fn has_durable_catch_up_work(self) -> bool {
-        self.active_downloads != 0
+        self.articles_in_flight != 0
             || self.active_decodes != 0
             || self.released_results != 0
             || self.pending_decodes != 0
@@ -312,7 +312,7 @@ impl Pipeline {
         let durable_floor = self.durable_download_floor_bytes_for_job(job_id);
         let accepted_bytes = state.downloaded_bytes.saturating_sub(durable_floor);
         let speculative_active_items = self
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .get(&job_id)
             .copied()
             .unwrap_or(0)
@@ -346,8 +346,8 @@ impl Pipeline {
         #[cfg(not(test))]
         let pending_decodes = 0;
         DownloadPipelineBacklog {
-            active_downloads: self
-                .active_downloads_by_job
+            articles_in_flight: self
+                .articles_in_flight_by_job
                 .get(&job_id)
                 .copied()
                 .unwrap_or(0),

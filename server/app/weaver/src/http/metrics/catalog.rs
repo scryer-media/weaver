@@ -124,8 +124,8 @@ metric_families! {
     // ---- queues and buffers ---------------------------------------------
     DOWNLOAD_QUEUE_DEPTH = ("weaver_pipeline_download_queue_depth", Gauge, [],
         "Articles still to fetch across every queued job, recovery articles and jobs outside the queue window included; not connections or jobs.");
-    ACTIVE_DOWNLOADS = ("weaver_pipeline_active_downloads", Gauge, [],
-        "Articles the download lanes hold right now: being fetched, or handed to a lane and waiting their turn on its connection. Not connections; a pipelining lane holds several.");
+    ARTICLES_IN_FLIGHT = ("weaver_pipeline_articles_in_flight", Gauge, [],
+        "Articles the download lanes hold right now: sent or about to be sent to a server and not yet answered. Roughly busy connections times pipeline depth. Not the number of jobs or files downloading.");
     ACTIVE_DECODES = ("weaver_pipeline_active_decodes", Gauge, [],
         "Active decode tasks.");
     DECODE_PENDING = ("weaver_pipeline_decode_pending", Gauge, [],

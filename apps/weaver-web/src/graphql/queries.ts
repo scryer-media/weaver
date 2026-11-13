@@ -542,7 +542,7 @@ const METRICS_FIELDS = `
     bytesDecoded
     bytesCommitted
     downloadQueueDepth
-    activeDownloads
+    articlesInFlight
     activeDecodes
     decodePending
     decodePendingBytes

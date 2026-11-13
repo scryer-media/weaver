@@ -887,7 +887,7 @@ async fn the_liveness_stall_counts_promoted_recovery_and_not_parked() {
     let _capture = tracing::subscriber::set_default(lines.clone());
     let t0 = Instant::now();
     pipeline.dispatch_downloads_at(t0);
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     let heard = lines.take();
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert_eq!(field(&heard[0], "job_id"), Some("40011"), "{}", heard[0]);
@@ -913,7 +913,7 @@ async fn the_liveness_stall_counts_promoted_recovery_and_not_parked() {
     }
     let t1 = t0 + DOWNLOAD_DISPATCH_STALL_KICK_AFTER;
     pipeline.dispatch_downloads_at(t1);
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     let heard = lines.take();
     assert_eq!(heard.len(), 1, "{heard:?}");
     assert_eq!(field(&heard[0], "job_id"), Some("40010"), "{}", heard[0]);

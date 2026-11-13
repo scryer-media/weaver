@@ -251,15 +251,15 @@ async fn shutdown_drain_consumes_inflight_download_results() {
 
     pipeline.drain().await;
 
-    assert_eq!(pipeline.active_downloads, 0);
+    assert_eq!(pipeline.articles_in_flight, 0);
     assert!(
         !pipeline
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .contains_key(&segment_id.file_id.job_id)
     );
     assert!(
         !pipeline
-            .active_downloads_by_file
+            .articles_in_flight_by_file
             .contains_key(&segment_id.file_id)
     );
 }
@@ -2928,7 +2928,7 @@ async fn download_pass_finishes_when_only_optional_recovery_queue_remains() {
     }
 
     pipeline.active_download_passes.insert(job_id);
-    pipeline.active_downloads_by_job.insert(job_id, 0);
+    pipeline.articles_in_flight_by_job.insert(job_id, 0);
 
     assert!(!pipeline.pending_completion_checks.contains(&job_id));
     assert!(!pipeline.job_has_pending_download_pipeline_work(job_id));
@@ -3030,7 +3030,7 @@ async fn released_result_books_its_own_job_after_its_lane_owner_is_gone() {
         "the result that closes a lane retires its owner before the job is booked"
     );
     assert!(
-        !pipeline.active_downloads_by_job.contains_key(&job_id),
+        !pipeline.articles_in_flight_by_job.contains_key(&job_id),
         "the result's own job is what the in-flight count is charged back to"
     );
     assert!(

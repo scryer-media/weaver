@@ -32,7 +32,7 @@ enum DispatchAttempt {
 
 #[derive(Debug, Default, Clone, Copy)]
 struct DownloadPipelineBacklog {
-    active_downloads: usize,
+    articles_in_flight: usize,
     active_connections: usize,
     active_decodes: usize,
     delayed_retries: usize,
@@ -640,7 +640,7 @@ impl Pipeline {
 
     pub(crate) fn maybe_finish_download_pass(&mut self, job_id: JobId) {
         let in_flight = self
-            .active_downloads_by_job
+            .articles_in_flight_by_job
             .get(&job_id)
             .copied()
             .unwrap_or(0);
@@ -701,7 +701,7 @@ impl Pipeline {
             || self.shared_state.schedule_replay_paused()
             || self.rate_limiter.should_wait()
         {
-            if self.active_downloads == 0 {
+            if self.articles_in_flight == 0 {
                 debug!(
                     global_paused = self.global_paused,
                     rate_wait = self.rate_limiter.should_wait(),
@@ -723,7 +723,7 @@ impl Pipeline {
         let pressure = self.refresh_download_pressure();
         if pressure.is_hard() {
             self.update_queue_metrics();
-            if self.active_downloads == 0 {
+            if self.articles_in_flight == 0 {
                 debug!(
                     pressure_state = pressure.state.as_str(),
                     pressure_reason = pressure.reason.as_str(),
@@ -744,7 +744,7 @@ impl Pipeline {
                 .is_some_and(|ready_at| ready_at > now)
             {
                 self.update_queue_metrics();
-                if self.active_downloads == 0 {
+                if self.articles_in_flight == 0 {
                     debug!(
                         pressure_state = pressure.state.as_str(),
                         pressure_reason = pressure.reason.as_str(),
@@ -769,7 +769,7 @@ impl Pipeline {
         // but could not be placed is retried on the tick.
         // A probe batch still waiting for a seat is retried the same way.
         self.download_dispatch_retry = !eligible.is_empty() || !self.post_probes.waiting.is_empty();
-        if eligible.is_empty() && self.active_downloads == 0 {
+        if eligible.is_empty() && self.articles_in_flight == 0 {
             // Only a job holding a slot can download, so only those are
             // looked at one by one; the jobs waiting for a slot are one
             // condition, reported once a window below. Collected rather than
@@ -907,7 +907,7 @@ impl Pipeline {
             }
         }
 
-        if !eligible.is_empty() && self.active_downloads == 0 {
+        if !eligible.is_empty() && self.articles_in_flight == 0 {
             debug!(
                 eligible_count = eligible.len(),
                 max,

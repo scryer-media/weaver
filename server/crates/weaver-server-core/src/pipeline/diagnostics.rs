@@ -29,7 +29,7 @@ pub struct PipelineDiagnostics {
     pub pressure: PressureDiagnostics,
     pub global_paused: bool,
     pub scheduled_pause: bool,
-    pub active_downloads: usize,
+    pub articles_in_flight: usize,
     pub active_download_connections: usize,
     pub active_completion_critical_connections: usize,
     pub active_recovery: usize,
@@ -94,7 +94,7 @@ pub struct JobPipelineDiagnostics {
     pub status: JobStatus,
     pub download_queue_len: usize,
     pub recovery_queue_len: usize,
-    pub active_downloads: usize,
+    pub articles_in_flight: usize,
     pub active_download_connections: usize,
     pub active_decodes: usize,
     pub pending_retries: usize,
@@ -305,8 +305,8 @@ impl Pipeline {
                     status: state.status.clone(),
                     download_queue_len: state.articles.queued_download_len(),
                     recovery_queue_len: state.articles.queued_recovery_len(),
-                    active_downloads: self
-                        .active_downloads_by_job
+                    articles_in_flight: self
+                        .articles_in_flight_by_job
                         .get(job_id)
                         .copied()
                         .unwrap_or(0),
@@ -445,7 +445,7 @@ impl Pipeline {
             },
             global_paused: self.global_paused,
             scheduled_pause: self.scheduled_pause,
-            active_downloads: self.active_downloads,
+            articles_in_flight: self.articles_in_flight,
             active_download_connections: self.active_download_connections,
             active_completion_critical_connections: self.active_completion_critical_connections,
             active_recovery: self.active_recovery,

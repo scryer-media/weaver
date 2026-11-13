@@ -1704,11 +1704,11 @@ type Metrics {
 	"""
 	downloadQueueDepth: Int!
 	"""
-	Articles the download lanes hold right now: being fetched, or handed
-	to a lane and waiting their turn on its connection. Not connections;
-	a pipelining lane holds several, so this can pass the connection count.
+	Articles the download lanes hold right now: sent or about to be sent
+	to a server and not yet answered. Roughly busy connections times
+	pipeline depth. Not the number of jobs or files downloading.
 	"""
-	activeDownloads: Int!
+	articlesInFlight: Int!
 	activeDecodes: Int!
 	decodePending: Int!
 	decodePendingBytes: Int!

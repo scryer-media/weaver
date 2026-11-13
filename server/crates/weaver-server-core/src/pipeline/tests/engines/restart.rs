@@ -2122,7 +2122,7 @@ impl Reopened {
         // A blocked job holds no articles until its restore goes through.
         assert!(pipeline.jobs[&JOB].articles.active().is_none());
         pipeline.dispatch_downloads();
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         // The pause goes on the job's writer lane.
         pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
@@ -2177,7 +2177,7 @@ impl Reopened {
         );
         assert!(pipeline.jobs[&JOB].articles.active().is_none());
         pipeline.dispatch_downloads();
-        assert_eq!(pipeline.active_downloads, 0);
+        assert_eq!(pipeline.articles_in_flight, 0);
         pipeline.db.flush_write_queue().await.unwrap();
         let row = pipeline
             .db

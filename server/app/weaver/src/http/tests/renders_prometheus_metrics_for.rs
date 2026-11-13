@@ -47,7 +47,7 @@ fn renders_prometheus_metrics_for_pipeline_and_jobs() {
 
     assert!(rendered.contains("weaver_pipeline_paused 1"));
     assert!(rendered.contains("weaver_pipeline_current_download_speed_bytes_per_second 19"));
-    assert!(rendered.contains("weaver_pipeline_active_downloads 6"));
+    assert!(rendered.contains("weaver_pipeline_articles_in_flight 6"));
     assert!(rendered.contains("weaver_pipeline_decode_pending_bytes 4096"));
     assert!(rendered.contains("weaver_pipeline_download_pressure_state{state=\"soft\"} 1"));
     assert!(rendered.contains("weaver_pipeline_download_pressure_reason{reason=\"decode\"} 1"));
@@ -200,7 +200,7 @@ fn renders_prometheus_download_observed_limiter_states() {
         bytes_decoded: 0,
         bytes_committed: 0,
         download_queue_depth: 10,
-        active_downloads: 20,
+        articles_in_flight: 20,
         active_decodes: 0,
         decode_pending: 0,
         decode_pending_bytes: 0,
@@ -386,7 +386,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     snapshot.decode_rate_mbps = 0.0;
     snapshot.download_queue_depth = 10;
     snapshot.recovery_queue_depth = 0;
-    snapshot.active_downloads = 0;
+    snapshot.articles_in_flight = 0;
     snapshot.parked_infrastructure_work = 10;
     snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Soft;
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::Write;
@@ -420,7 +420,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     // Parked work alongside live downloads is an ordinary busy pipeline, not an
     // outage: the new value must not mask it.
     snapshot.download_queue_depth = 10;
-    snapshot.active_downloads = 4;
+    snapshot.articles_in_flight = 4;
     snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Clear;
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::None;
     let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[], 0);
@@ -440,7 +440,7 @@ fn renders_prometheus_download_observed_limiter_states() {
     snapshot.download_pressure_state = weaver_server_core::DownloadPressureState::Clear;
     snapshot.download_pressure_reason = weaver_server_core::DownloadPressureReason::None;
     snapshot.download_queue_depth = 0;
-    snapshot.active_downloads = 0;
+    snapshot.articles_in_flight = 0;
     let rendered = metrics::render_prometheus_metrics(&snapshot, &[], false, &unblocked, &[], 0);
     assert!(rendered.contains("weaver_pipeline_download_observed_limiter{limiter=\"idle\"} 1"));
 

@@ -300,7 +300,7 @@ async fn decode_failure_drains_backlog_and_keeps_commands_responsive() {
         },
         segment_number: 0,
     };
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     let raw = Bytes::from_static(b"not a yenc article");
     let raw_size = raw.len() as u64;
     pipeline
@@ -408,7 +408,7 @@ async fn decode_failure_retries_excluding_actual_source_server() {
         },
         segment_number: 0,
     };
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
@@ -491,7 +491,7 @@ async fn a_decoded_article_leaves_its_jobs_report_to_the_tick_until_the_last() {
             file_id: NzbFileId { job_id, file_index },
             segment_number: 0,
         };
-        pipeline.active_downloads += 1;
+        pipeline.articles_in_flight += 1;
         pipeline
             .handle_download_done(DownloadResult {
                 lane_id: 0,
@@ -600,7 +600,7 @@ async fn streamed_decode_failure_retries_excluding_actual_source_server() {
         },
         segment_number: 0,
     };
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,
@@ -734,7 +734,7 @@ async fn fused_yenc_layout_mismatch_retries_before_decode_acceptance() {
         segment_number: 0,
     };
     let mut events = pipeline.event_tx.subscribe();
-    pipeline.active_downloads += 1;
+    pipeline.articles_in_flight += 1;
     pipeline
         .handle_download_done(DownloadResult {
             lane_id: 0,

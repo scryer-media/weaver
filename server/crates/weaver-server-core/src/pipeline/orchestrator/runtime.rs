@@ -308,7 +308,7 @@ impl Pipeline {
             pipeline_failure_stages: HashMap::new(),
             job_order: Vec::new(),
             stored_queue_order: Vec::new(),
-            active_downloads: 0,
+            articles_in_flight: 0,
             active_download_connections: 0,
             active_completion_critical_connections: 0,
             active_recovery: 0,
@@ -326,10 +326,10 @@ impl Pipeline {
             jobs_finalizing_download: HashSet::new(),
             pending_released_download_results_by_job: HashMap::new(),
             pending_released_download_result_bytes_by_job: HashMap::new(),
-            active_downloads_by_job: HashMap::new(),
+            articles_in_flight_by_job: HashMap::new(),
             active_download_connections_by_job: HashMap::new(),
             active_completion_critical_connections_by_job: HashMap::new(),
-            active_downloads_by_file: HashMap::new(),
+            articles_in_flight_by_file: HashMap::new(),
             active_decodes_by_job: Default::default(),
             active_decodes_by_file: HashMap::new(),
             active_decode_bytes: HashMap::new(),
@@ -855,7 +855,7 @@ impl Pipeline {
                 }
 
                 let in_flight = self
-                    .active_downloads_by_job
+                    .articles_in_flight_by_job
                     .get(job_id)
                     .copied()
                     .unwrap_or(0);
@@ -914,7 +914,7 @@ impl Pipeline {
         if !self.pending_decode.is_empty() {
             return true;
         }
-        self.active_downloads > 0
+        self.articles_in_flight > 0
             || !self.active_download_connections_by_job.is_empty()
             || !self.active_decodes_by_job.is_empty()
             || !self.held_download_refills.is_empty()
@@ -1405,7 +1405,7 @@ impl Pipeline {
                                     .map(|s| (s.spec.total_bytes.saturating_sub(s.failed_bytes) * 1000 / s.spec.total_bytes) as u32)
                                     .min()).flatten();
                                 debug!(
-                                    active = self.active_downloads,
+                                    active = self.articles_in_flight,
                                     queue = snapshot.download_queue_depth,
                                     speed_mbps = format!("{:.1}", snapshot.current_download_speed as f64 / (1024.0 * 1024.0)),
                                     downloaded_mb = snapshot.bytes_downloaded / (1024 * 1024),
@@ -1430,7 +1430,7 @@ impl Pipeline {
                                 count_periodic_tick();
                                 // A stall needs a transfer in flight; with none the
                                 // walk over every job would find nothing.
-                                idle_tick = self.active_downloads_by_job.is_empty();
+                                idle_tick = self.articles_in_flight_by_job.is_empty();
                                 if !idle_tick {
                                     self.auto_pause_stalled_downloads();
                                 }
@@ -1861,9 +1861,9 @@ impl Pipeline {
         }
         self.checkpoint_graph_holds();
 
-        if self.active_downloads > 0 || self.has_queued_or_active_decode() {
+        if self.articles_in_flight > 0 || self.has_queued_or_active_decode() {
             warn!(
-                active_downloads = self.active_downloads,
+                articles_in_flight = self.articles_in_flight,
                 active_decodes = self.active_decodes_by_job.total(),
                 "shutdown drain ended with in-flight pipeline work"
             );
@@ -1871,9 +1871,9 @@ impl Pipeline {
             info!("shutdown drain completed active download/decode work");
         }
 
-        if self.active_downloads > 0 {
+        if self.articles_in_flight > 0 {
             info!(
-                active = self.active_downloads,
+                active = self.articles_in_flight,
                 "draining in-flight downloads"
             );
         }
@@ -1915,7 +1915,7 @@ impl Pipeline {
     }
 
     fn has_download_or_decode_drain_work(&self) -> bool {
-        self.active_downloads > 0 || self.has_decode_drain_work()
+        self.articles_in_flight > 0 || self.has_decode_drain_work()
     }
 
     async fn drain_inflight_download_and_decode_work(&mut self) {
@@ -1925,10 +1925,10 @@ impl Pipeline {
         while self.has_download_or_decode_drain_work() {
             let event = tokio::time::timeout(Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT, async {
                 tokio::select! {
-                    result = self.download_done_rx.recv(), if self.active_downloads > 0 => {
+                    result = self.download_done_rx.recv(), if self.articles_in_flight > 0 => {
                         result.map(ShutdownDrainEvent::Download)
                     }
-                    result = self.owned_download_lane_event_rx.recv(), if self.active_downloads > 0 => {
+                    result = self.owned_download_lane_event_rx.recv(), if self.articles_in_flight > 0 => {
                         result.map(ShutdownDrainEvent::OwnedDownload)
                     }
                     result = self.decode_done_rx.recv(), if self.has_decode_drain_work() => {
@@ -1966,7 +1966,7 @@ impl Pipeline {
                 }
                 Err(_) => {
                     warn!(
-                        active_downloads = self.active_downloads,
+                        articles_in_flight = self.articles_in_flight,
                         active_decodes = self.active_decodes_by_job.total(),
                         decode_pending = self.metrics.decode_pending.load(Ordering::Relaxed),
                         idle_timeout_secs = Self::SHUTDOWN_DRAIN_IDLE_TIMEOUT.as_secs(),

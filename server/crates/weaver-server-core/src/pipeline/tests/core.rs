@@ -1520,7 +1520,7 @@ async fn sparse_article_numbers_commit_cleanly_with_dense_ordinals() {
             total_size,
         );
 
-        pipeline.active_downloads += 1;
+        pipeline.articles_in_flight += 1;
         pipeline
             .handle_download_done(DownloadResult {
                 lane_id: 0,
