@@ -17,7 +17,7 @@ use weaver_server_core::jobs::handle::{DownloadBlockKind, DownloadBlockState};
 use weaver_server_core::operations::instrumentation::{
     DbRuntimeMetricsSnapshot, DiskSpaceSnapshot, HistogramSnapshot, HttpMetricsSnapshot,
     JobLifecycleMetricsSnapshot, PipelineHistogramsSnapshot, ProcessMetricsSnapshot,
-    ServerMetricsSnapshot,
+    ServerMetricsSnapshot, VolumeSnapshot,
 };
 use weaver_server_core::operations::metrics_store::{JOB_STATUS_KEYS, JobStatusCounts};
 use weaver_server_core::persistence::WalCheckpointMetricsSnapshot;
@@ -96,6 +96,8 @@ pub(crate) struct PrometheusRenderInput<'a> {
     pub(crate) wal_checkpoint: Option<&'a WalCheckpointMetricsSnapshot>,
     pub(crate) process: Option<&'a ProcessMetricsSnapshot>,
     pub(crate) disk_space: &'a [DiskSpaceSnapshot],
+    // One row per volume the download side writes to.
+    pub(crate) volumes: &'a [VolumeSnapshot],
     pub(crate) http_metrics: Option<&'a HttpMetricsSnapshot>,
 }
 
@@ -143,6 +145,7 @@ impl<'a> PrometheusRenderInput<'a> {
             wal_checkpoint: None,
             process: None,
             disk_space: &[],
+            volumes: &[],
             http_metrics: None,
         }
     }
@@ -200,6 +203,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         wal_checkpoint,
         process,
         disk_space,
+        volumes,
         http_metrics,
     } = *input;
 
@@ -280,6 +284,7 @@ pub(crate) fn render_prometheus_metrics_input(input: &PrometheusRenderInput<'_>)
         render_process(&mut out, process, start_time_seconds);
     }
     render_disk_space(&mut out, disk_space);
+    render_volumes(&mut out, volumes);
     if let Some(http) = http_metrics {
         render_http(&mut out, http);
     }
@@ -1542,6 +1547,23 @@ fn render_disk_space(out: &mut Encoder, disk_space: &[DiskSpaceSnapshot]) {
         let labels: &[(&str, &str)] = &[("role", disk.role), ("path", disk.path.as_str())];
         out.sample(&f::DISK_TOTAL_BYTES, labels, disk.total_bytes);
         out.sample(&f::DISK_AVAILABLE_BYTES, labels, disk.available_bytes);
+    }
+}
+
+fn render_volumes(out: &mut Encoder, volumes: &[VolumeSnapshot]) {
+    for volume in volumes {
+        let labels: &[(&str, &str)] = &[("volume", volume.label.as_str())];
+        out.sample(&f::VOLUME_WRITTEN_BYTES, labels, volume.written_bytes);
+        out.sample_f64(
+            &f::VOLUME_WRITE_SECONDS,
+            labels,
+            volume.write_nanos as f64 / 1e9,
+        );
+        // Zero is "not measured", which is told by the series being absent.
+        if volume.write_rate > 0 {
+            out.sample(&f::VOLUME_WRITE_RATE, labels, volume.write_rate);
+        }
+        out.sample(&f::VOLUME_BUFFERED_BYTES, labels, volume.buffered_bytes);
     }
 }
 

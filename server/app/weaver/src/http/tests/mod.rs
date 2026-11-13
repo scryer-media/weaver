@@ -1415,6 +1415,30 @@ fn sample_disk_space() -> Vec<instr::DiskSpaceSnapshot> {
     ]
 }
 
+fn sample_volumes() -> Vec<instr::VolumeSnapshot> {
+    vec![
+        instr::VolumeSnapshot {
+            label: "/mnt/nas".to_string(),
+            kind: "network",
+            device: Some(41),
+            written_bytes: 8_000_000,
+            write_nanos: 2_500_000_000,
+            write_rate: 3_200_000,
+            buffered_bytes: 65_536,
+        },
+        // Seen, never written to: its rate is not measured.
+        instr::VolumeSnapshot {
+            label: "/mnt/scratch".to_string(),
+            kind: "unknown",
+            device: None,
+            written_bytes: 0,
+            write_nanos: 0,
+            write_rate: 0,
+            buffered_bytes: 0,
+        },
+    ]
+}
+
 fn sample_http_metrics() -> instr::HttpMetricsSnapshot {
     instr::HttpMetricsSnapshot {
         requests: vec![
@@ -1446,6 +1470,7 @@ struct CollectionFixtures {
     wal_checkpoint: weaver_server_core::persistence::WalCheckpointMetricsSnapshot,
     process: instr::ProcessMetricsSnapshot,
     disk_space: Vec<instr::DiskSpaceSnapshot>,
+    volumes: Vec<instr::VolumeSnapshot>,
     http_metrics: instr::HttpMetricsSnapshot,
 }
 
@@ -1459,6 +1484,7 @@ impl CollectionFixtures {
             wal_checkpoint: sample_wal_checkpoint(),
             process: sample_process_metrics(),
             disk_space: sample_disk_space(),
+            volumes: sample_volumes(),
             http_metrics: sample_http_metrics(),
         }
     }
@@ -1473,6 +1499,7 @@ impl CollectionFixtures {
         input.wal_checkpoint = Some(&self.wal_checkpoint);
         input.process = Some(&self.process);
         input.disk_space = &self.disk_space;
+        input.volumes = &self.volumes;
         input.http_metrics = Some(&self.http_metrics);
     }
 }

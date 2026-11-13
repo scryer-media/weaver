@@ -1371,5 +1371,22 @@ pub struct DiskSpaceSnapshot {
     pub available_bytes: u64,
 }
 
+// One volume's write figures, as its writer and the rate sampler left them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VolumeSnapshot {
+    // The mount path or drive root.
+    pub label: String,
+    // `ssd`, `platter`, `network` or `unknown`.
+    pub kind: &'static str,
+    pub device: Option<u64>,
+    pub written_bytes: u64,
+    // Time spent inside write calls.
+    pub write_nanos: u64,
+    // Bytes per second inside write calls; zero until measured.
+    pub write_rate: u64,
+    // Bytes waiting in memory for the volume's writer.
+    pub buffered_bytes: u64,
+}
+
 #[cfg(test)]
 mod tests;

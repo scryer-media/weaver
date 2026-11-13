@@ -616,6 +616,18 @@ metric_families! {
     DISK_AVAILABLE_BYTES = ("weaver_disk_available_bytes", Gauge, ["role", "path"],
         "Space available to this process on the filesystem backing a configured directory role.");
 
+    // ---- volume writes -------------------------------------------------------------------------
+    // One series per volume the download side writes to, labelled by its
+    // mount path or drive root. Each is an atomic read at scrape time.
+    VOLUME_WRITTEN_BYTES = ("weaver_volume_written_bytes_total", Counter, ["volume"],
+        "Bytes written to a volume by its writer.");
+    VOLUME_WRITE_SECONDS = ("weaver_volume_write_seconds_total", Counter, ["volume"],
+        "Time a volume's writer has spent inside write calls.");
+    VOLUME_WRITE_RATE = ("weaver_volume_write_rate_bytes_per_second", Gauge, ["volume"],
+        "What a volume takes while a write call is inside it, over the last 30 seconds that had writes. Conditional: emitted only once the volume has been measured.");
+    VOLUME_BUFFERED_BYTES = ("weaver_volume_buffered_bytes", Gauge, ["volume"],
+        "Bytes waiting in memory for a volume's writer.");
+
     // ---- PAR3 recovery -----------------------------------------------------------------------------
     // Every series here is fed from `MetricsSnapshot::par3`, which is a plain
     // fixed-size struct copy taken on the pipeline's own snapshot tick. The

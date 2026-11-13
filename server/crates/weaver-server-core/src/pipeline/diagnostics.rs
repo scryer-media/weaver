@@ -40,6 +40,9 @@ pub struct PipelineDiagnostics {
     pub pool: Vec<PoolServerDiagnostics>,
     pub lanes: LaneDiagnostics,
     pub memory: MemoryDiagnostics,
+    // Absent from older packets, which read as no volume.
+    #[serde(default)]
+    pub volumes: Vec<VolumeDiagnostics>,
 }
 
 // Tuner-owned concurrency parameters and the connection ceiling they respect.
@@ -170,6 +173,25 @@ pub struct MemoryDiagnostics {
     pub lane_inflight_bytes: u64,
     pub jobs_eligible: usize,
     pub jobs_hot: usize,
+}
+
+// One volume the download side writes to, as the disk owner holds it: no
+// disk is looked at for a packet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeDiagnostics {
+    // The mount path or drive root.
+    pub label: String,
+    // `ssd`, `platter`, `network` or `unknown`.
+    pub storage_kind: String,
+    pub device: Option<u64>,
+    // Bytes per second inside write calls over the last window; zero until
+    // measured.
+    pub write_rate_bytes_per_second: u64,
+    // Bytes waiting in memory for the volume's writer.
+    pub buffered_bytes: u64,
+    pub written_bytes_total: u64,
+    // Time spent inside write calls.
+    pub write_seconds_total: f64,
 }
 
 // Download lane occupancy, taken from the published lane counters.
@@ -476,6 +498,20 @@ impl Pipeline {
                 jobs_eligible: metrics.download_jobs_eligible,
                 jobs_hot: metrics.download_jobs_hot,
             },
+            volumes: self
+                .storage_capacity
+                .volume_snapshots()
+                .into_iter()
+                .map(|volume| VolumeDiagnostics {
+                    label: volume.label,
+                    storage_kind: volume.kind.to_string(),
+                    device: volume.device,
+                    write_rate_bytes_per_second: volume.write_rate,
+                    buffered_bytes: volume.buffered_bytes,
+                    written_bytes_total: volume.written_bytes,
+                    write_seconds_total: volume.write_nanos as f64 / 1e9,
+                })
+                .collect(),
         }
     }
 }
