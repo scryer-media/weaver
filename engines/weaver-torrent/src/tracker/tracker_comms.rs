@@ -87,12 +87,13 @@ pub enum TrackerCommsStatsState {
     Live,
 }
 
-/// What an announce reports of the torrent (BEP 3). Its corrupt and
-/// redundant bytes are the torrent's own counts: an HTTP announce reports
-/// what they grew by since that tracker last heard `started`.
+/// What an announce reports of the torrent (BEP 3). Its byte counts are
+/// those since the run began announcing (libtorrent
+/// `torrent::start_announcing`); an HTTP announce reports the corrupt and
+/// redundant bytes as they grew since that tracker last heard `started`.
 #[derive(Default, Clone, Copy, Debug)]
 pub struct TrackerCommsStats {
-    /// Payload bytes sent to peers during this run.
+    /// Payload bytes sent to peers since the run began announcing.
     pub uploaded_bytes: u64,
     /// Payload bytes received from peers, less the corrupt and redundant
     /// bytes (see `TorrentTotals::announced_downloaded`).
@@ -113,10 +114,10 @@ pub struct TrackerCommsStats {
     pub private: bool,
     pub torrent_state: TrackerCommsStatsState,
     /// The torrent lacked a piece when its current run began, whichever
-    /// pieces were wanted then, and is a seed now. Each tracker hears
-    /// `completed` (BEP 3) once for such a run; a torrent that was already a
-    /// seed when it started never sends it, and neither does one that has
-    /// only its selected files.
+    /// pieces were wanted then, and is a seed now: its trackers are due at
+    /// once (libtorrent `torrent::completed`). Whether one is owed
+    /// `completed` (BEP 3) is the torrent's [`crate::Completion`], which
+    /// outlasts the run.
     pub completed_during_run: bool,
     /// The encryption the torrent's peer connections are made under, which
     /// an HTTP announce tells the tracker.
@@ -147,13 +148,14 @@ pub trait TorrentStatsProvider: Send + Sync {
         futures::future::pending().boxed()
     }
 
-    /// Resolves once every connection of the run that just ended has
-    /// closed and counted what it dropped, so a `stopped` announce reports
-    /// it (libtorrent `torrent::do_pause` disconnects every peer before
-    /// `stop_announcing`). Asked as the run's announcing stops. The default
-    /// resolves at once.
-    fn run_ended(&self) -> BoxFuture<'static, ()> {
-        futures::future::ready(()).boxed()
+    /// What the run that just ended reports with `stopped`, once every
+    /// connection of it has closed and counted what it dropped (libtorrent
+    /// `torrent::do_pause` disconnects every peer before
+    /// `stop_announcing`), counted from where that run began whatever run
+    /// begins meanwhile. Asked as the run's announcing stops. The default
+    /// reads [`Self::get`] at once.
+    fn run_ended(&self) -> BoxFuture<'static, TrackerCommsStats> {
+        futures::future::ready(self.get()).boxed()
     }
 }
 
@@ -417,8 +419,9 @@ impl Entry {
 struct TrackerList {
     /// In tier order.
     entries: Vec<Entry>,
-    /// A tracker accepted `completed` (libtorrent `torrent::m_complete_sent`).
-    complete_sent: bool,
+    /// Whether a tracker accepted `completed`, the torrent's across its
+    /// runs and hashes (libtorrent `torrent::m_complete_sent`).
+    completion: crate::Completion,
     /// Trackers forced one at a time, announced to on the next turn when
     /// they may be, whatever the walk would pick (libtorrent
     /// `torrent::announce_tracker_now`).
@@ -433,7 +436,12 @@ struct TrackerList {
 impl TrackerList {
     /// A tracker named twice is kept where it is first named (libtorrent
     /// `tracker_list::add_tracker`).
-    fn new(tiers: &[Vec<SupportedTracker>], now: Instant, shape: &'static AnnounceShape) -> Self {
+    fn new(
+        tiers: &[Vec<SupportedTracker>],
+        now: Instant,
+        shape: &'static AnnounceShape,
+        completion: crate::Completion,
+    ) -> Self {
         let mut entries: Vec<Entry> = Vec::new();
         let mut named = HashSet::new();
         for (tier, trackers) in tiers.iter().enumerate() {
@@ -446,7 +454,7 @@ impl TrackerList {
         }
         Self {
             entries,
-            complete_sent: false,
+            completion,
             forced: Vec::new(),
             announcing: true,
             shape,
@@ -568,7 +576,7 @@ impl TrackerList {
         port: ToldPorts,
         stats: &TrackerCommsStats,
     ) -> Vec<(SupportedTracker, Option<TrackerRequestEvent>)> {
-        let seed = stats.completed_during_run;
+        let seed = stats.completed_during_run || self.owes_completed(stats);
         // A tracker forced alone goes now if it may, else the walk and the
         // timer reach it (libtorrent `torrent::announce_tracker_now`); one
         // waiting for an answer is not asked twice.
@@ -607,19 +615,27 @@ impl TrackerList {
             .collect()
     }
 
+    /// The torrent is a seed and no tracker has accepted `completed` from it
+    /// (libtorrent `!m_complete_sent && is_seed()`, torrent.cpp:3327-3329,
+    /// v2.0.15): a run that began as a seed after a pause or a move still
+    /// owes the `completed` no tracker answered before it.
+    fn owes_completed(&self, stats: &TrackerCommsStats) -> bool {
+        stats.is_completed() && !self.completion.is_sent()
+    }
+
     /// The event a regular announce to `entry` carries (libtorrent
-    /// `torrent::send_tracker_request`): `started` until it accepts one, then
-    /// `completed` once the torrent became a seed during this run, unless a
-    /// tracker has accepted `completed` already, and `paused` while it has
-    /// every piece it wants and is not a seed (`torrent::announce_with_tracker`).
-    /// A shape that says `paused` first says it in place of `started` too.
+    /// `torrent::announce_with_tracker`, torrent.cpp:3323-3333, v2.0.15):
+    /// `started` until it accepts one, then `completed` while the torrent
+    /// owes one, and `paused` while it has every piece it wants and is not a
+    /// seed. A shape that says `paused` first says it in place of `started`
+    /// too.
     fn event(&self, entry: &Entry, stats: &TrackerCommsStats) -> Option<TrackerRequestEvent> {
         let paused = stats.finished && !stats.is_completed();
         if paused && self.shape.paused_first {
             Some(TrackerRequestEvent::Paused)
         } else if !entry.start_sent {
             Some(TrackerRequestEvent::Started)
-        } else if stats.completed_during_run && !self.complete_sent && !entry.complete_sent {
+        } else if self.owes_completed(stats) && !entry.complete_sent {
             Some(TrackerRequestEvent::Completed)
         } else if paused {
             Some(TrackerRequestEvent::Paused)
@@ -675,7 +691,7 @@ impl TrackerList {
             Some(TrackerRequestEvent::Started) => entry.start_sent = true,
             Some(TrackerRequestEvent::Completed) => {
                 entry.complete_sent = true;
-                self.complete_sent = true;
+                self.completion.sent();
             }
             Some(TrackerRequestEvent::Stopped | TrackerRequestEvent::Paused) | None => {}
         }
@@ -711,10 +727,15 @@ impl TrackerList {
 
     /// The run stops announcing (libtorrent `torrent::stop_announcing`): no
     /// tracker is due again, and the trackers owed `stopped` are the walk
-    /// over those that accepted `started`, each of them due.
+    /// over those that accepted `started`, each of them due, less any whose
+    /// last announce still waits for its answer
+    /// (`announce_infohash::can_announce` with `updating`, as
+    /// `torrent::announce_with_tracker` asks it for `stopped` too,
+    /// torrent.cpp:3308, v2.0.15). A working tracker passed over still
+    /// stands for its tier.
     fn stop(&mut self) -> Vec<SupportedTracker> {
         self.announcing = false;
-        self.walk(|e| e.start_sent, |_| true)
+        self.walk(|e| e.start_sent, |e| !e.updating)
             .into_iter()
             .map(|i| self.entries[i].tracker.clone())
             .collect()
@@ -1874,10 +1895,10 @@ impl TrackerComms {
     /// is tried again after a delay that grows with each failure
     /// (`retry_delay`).
     ///
-    /// Each tracker is sent `started`, then `completed` if the torrent
-    /// becomes a seed during this run (see
-    /// [`TrackerCommsStats::completed_during_run`]) and no tracker has
-    /// accepted it yet, and `stopped` when the returned stream is dropped. `stopped` is bounded
+    /// Each tracker is sent `started`, then `completed` once the torrent is
+    /// a seed while no tracker has accepted one (see
+    /// [`crate::Completion`]), and `stopped` when the returned stream is
+    /// dropped. `stopped` is bounded
     /// and tracked by `stopped`. Each announce, `stopped` included, is
     /// recorded in the returned [`TrackerStatus`]. `listen_port` is the port peers reach this
     /// session on, None when it accepts no connections; when it changes, each
@@ -1946,7 +1967,12 @@ impl TrackerComms {
                     reachable: reachable.clone(),
                     udp_client: udp_client.clone(),
                     allow_idna,
-                    list: Mutex::new(TrackerList::new(&tiers, Instant::now(), identity.shape)),
+                    list: Mutex::new(TrackerList::new(
+                        &tiers,
+                        Instant::now(),
+                        identity.shape,
+                        identity.completion.clone(),
+                    )),
                     started_at: Default::default(),
                     status: status.clone(),
                     poke: tokio::sync::Notify::new(),
@@ -2021,7 +2047,12 @@ impl TrackerComms {
             reachable: self.reachable.clone(),
             udp_client: self.udp_client.clone(),
             allow_idna: self.allow_idna,
-            list: Mutex::new(TrackerList::new(tiers, Instant::now(), self.identity.shape)),
+            list: Mutex::new(TrackerList::new(
+                tiers,
+                Instant::now(),
+                self.identity.shape,
+                self.identity.completion.clone(),
+            )),
             started_at: Default::default(),
             status: self.status.clone(),
             poke: tokio::sync::Notify::new(),
@@ -2060,10 +2091,13 @@ impl TrackerComms {
                 let _running = running;
                 // The counters once the run's connections have counted what
                 // they dropped; within their bound, as they are if not.
-                if tokio::time::timeout(run_end, ended).await.is_err() {
-                    debug!(?run_end, "the run's connections did not close in time");
-                }
-                let stats = comms.stats.get();
+                let stats = match tokio::time::timeout(run_end, ended).await {
+                    Ok(stats) => stats,
+                    Err(_) => {
+                        debug!(?run_end, "the run's connections did not close in time");
+                        comms.stats.get()
+                    }
+                };
                 let announces = trackers.into_iter().map(|tracker| {
                     comms.announce_recorded(tracker, Some(TrackerRequestEvent::Stopped), stats)
                 });
@@ -2758,7 +2792,26 @@ mod tests {
             .iter()
             .map(|tier| tier.iter().map(|name| http(name)).collect())
             .collect::<Vec<_>>();
-        TrackerList::new(&tiers, now, &crate::tracker::AnnounceShape::WEAVER)
+        TrackerList::new(
+            &tiers,
+            now,
+            &crate::tracker::AnnounceShape::WEAVER,
+            short_of_a_seed(),
+        )
+    }
+
+    /// The completion of a torrent its check found short of a seed.
+    fn short_of_a_seed() -> crate::Completion {
+        let completion = crate::Completion::default();
+        completion.checked(false, false);
+        completion
+    }
+
+    /// The completion of a torrent its check found a seed.
+    fn checked_a_seed() -> crate::Completion {
+        let completion = crate::Completion::default();
+        completion.checked(true, false);
+        completion
     }
 
     fn order(list: &TrackerList) -> Vec<SupportedTracker> {
@@ -3074,7 +3127,9 @@ mod tests {
             [(http("a"), Some(TrackerRequestEvent::Paused))]
         );
         list.on_success(&http("a"), Some(TrackerRequestEvent::Paused), t1, &ANSWERED);
-        // A seed announces without an event, and one still fetching too.
+        // A seed whose trackers heard it complete announces without an
+        // event, and one still fetching too.
+        list.completion.sent();
         let t2 = t1 + ANSWERED.regular;
         assert_eq!(
             list.start_due(t2, ToldPorts::default(), &live(0, 0, false)),
@@ -3095,8 +3150,12 @@ mod tests {
     #[test]
     fn as_qbittorrent_a_finished_torrent_says_paused_before_started() {
         let t0 = Instant::now();
-        let mut list =
-            TrackerList::new(&[vec![http("a")]], t0, &crate::tracker::qbittorrent::SHAPE);
+        let mut list = TrackerList::new(
+            &[vec![http("a")]],
+            t0,
+            &crate::tracker::qbittorrent::SHAPE,
+            short_of_a_seed(),
+        );
         let selection_done = TrackerCommsStats {
             finished: true,
             ..live(60, 30, false)
@@ -3135,8 +3194,11 @@ mod tests {
 
     #[test]
     fn a_torrent_complete_from_the_start_never_sends_completed() {
+        // libtorrent torrent::files_checked presets m_complete_sent for a
+        // torrent its check finds a seed.
         let t0 = Instant::now();
         let mut list = list(&[&["a"]], t0);
+        list.completion = checked_a_seed();
         let seeding = live(0, 0, false);
         assert!(!may_complete(&seeding));
         assert_eq!(
@@ -3197,6 +3259,28 @@ mod tests {
         // Then b, the tracker in use in its tier, is.
         list.on_success(&http("b"), STARTED, t0, &ANSWERED);
         assert_eq!(list.stop(), [http("b"), http("c")]);
+    }
+
+    #[test]
+    fn stopped_passes_over_a_tracker_whose_announce_waits_for_its_answer() {
+        // libtorrent torrent::stop_announcing walks the trackers through
+        // announce_infohash::can_announce, false while `updating`
+        // (announce_entry.cpp:123-134, torrent.cpp:3308, v2.0.15).
+        let t0 = Instant::now();
+        let mut list = list(&[&["a", "b"], &["c"]], t0);
+        let stats = live(0, 90, false);
+        list.start_due(t0, ToldPorts::default(), &stats);
+        list.on_success(&http("a"), STARTED, t0, &ANSWERED);
+        list.on_success(&http("c"), STARTED, t0, &ANSWERED);
+        list.force(t0, None, true);
+        let t1 = t0 + Duration::from_secs(1);
+        assert_eq!(
+            list.start_due(t1, ToldPorts::default(), &stats),
+            [(http("a"), None), (http("c"), None)]
+        );
+        // c answers, a does not: only c hears `stopped`.
+        list.on_success(&http("c"), None, t1, &ANSWERED);
+        assert_eq!(list.stop(), [http("c")]);
     }
 
     #[test]
@@ -3556,12 +3640,14 @@ mod tests {
             super::TorrentStatsProvider::get(&self.stats)
         }
 
-        fn run_ended(&self) -> BoxFuture<'static, ()> {
+        fn run_ended(&self) -> BoxFuture<'static, TrackerCommsStats> {
             let mut rx = self.ended.subscribe();
             let waiting = self.waiting.clone();
+            let stats = self.stats.clone();
             async move {
                 waiting.send_replace(true);
                 let _ = rx.wait_for(|e| *e).await;
+                super::TorrentStatsProvider::get(&stats)
             }
             .boxed()
         }
@@ -3723,6 +3809,7 @@ mod tests {
             version: "Test 1.0".into(),
             user_agent: "Test/1.0".into(),
             tracker_ids: Default::default(),
+            completion: Default::default(),
             shape: &crate::tracker::AnnounceShape::WEAVER,
         }
     }
@@ -3913,16 +4000,6 @@ mod tests {
         )
         .peers;
 
-        // Drive the peer stream while waiting for the tracker to be called.
-        macro_rules! announce {
-            () => {
-                tokio::select! {
-                    _ = peers.next() => panic!("the tracker sent no peers"),
-                    q = next_announce(&listener) => q,
-                }
-            };
-        }
-
         // The torrent completes only once `started` is answered: an answer
         // that comes in after it completed puts the next announce, and with
         // it `completed`, an interval away (libtorrent
@@ -3942,7 +4019,14 @@ mod tests {
             ..live(90, 0, true)
         };
         stats.completed.send_replace(true);
-        let q = announce!();
+        // Its answer is taken in before the run ends: a tracker still
+        // waiting is owed no `stopped`.
+        let q = answer_with_a_peer(
+            &listener,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
         assert_eq!(query_param(&q, "event"), Some("completed"));
         assert_eq!(query_param(&q, "left"), Some("0"));
 
@@ -4094,20 +4178,6 @@ mod tests {
         )
         .peers;
 
-        // Drive the peer stream while the tracker answers with `body`.
-        macro_rules! announce {
-            ($body:expr) => {
-                tokio::select! {
-                    _ = peers.next() => panic!("the tracker sent no peers"),
-                    q = async {
-                        let (conn, q) = read_announce(&listener).await;
-                        respond(conn, $body).await;
-                        q
-                    } => q,
-                }
-            };
-        }
-
         let q = answer_with_a_peer(
             &listener,
             &mut peers,
@@ -4121,7 +4191,14 @@ mod tests {
         // The next announce carries the id back; an answer without one keeps it.
         *stats.stats.lock() = live(90, 0, true);
         stats.completed.send_replace(true);
-        let q = announce!("d8:intervali1800e5:peers0:e");
+        // Its answer is taken in before the run ends: a tracker still
+        // waiting is owed no `stopped`.
+        let q = answer_with_a_peer(
+            &listener,
+            &mut peers,
+            "d8:intervali1800e5:peers6:\x7f\0\0\x01\x1aAe",
+        )
+        .await;
         assert_eq!(query_param(&q, "event"), Some("completed"));
         assert_eq!(query_param(&q, "numwant"), Some("200"));
         assert_eq!(query_param(&q, "trackerid"), Some("t-1"));
@@ -5922,7 +5999,7 @@ mod tests {
         }
         TrackerList {
             entries,
-            complete_sent: false,
+            completion: short_of_a_seed(),
             forced: Vec::new(),
             announcing: true,
             shape: &crate::tracker::AnnounceShape::WEAVER,
@@ -5965,7 +6042,7 @@ mod tests {
         now: Instant,
         stats: &TrackerCommsStats,
     ) -> Vec<(SupportedTracker, Option<TrackerRequestEvent>)> {
-        let seed = stats.completed_during_run;
+        let seed = stats.completed_during_run || list.owes_completed(stats);
         let port = ToldPorts::default();
         let forced = std::mem::take(&mut list.forced)
             .into_iter()
@@ -6029,7 +6106,12 @@ mod tests {
         for run in 0..30 {
             let mut now = Instant::now();
             let first = tiers(&mut next);
-            let mut sets = TrackerList::new(&first, now, &crate::tracker::AnnounceShape::WEAVER);
+            let mut sets = TrackerList::new(
+                &first,
+                now,
+                &crate::tracker::AnnounceShape::WEAVER,
+                short_of_a_seed(),
+            );
             let mut walked = listed_new(&first, now);
             assert_eq!(format!("{sets:?}"), format!("{walked:?}"), "run {run}");
             for step in 0..300 {
@@ -6367,6 +6449,9 @@ mod tests {
         let (conn, q) = driving!(read_announce(&a));
         assert_eq!(query_param(&q, "event"), None);
         respond(conn, "d8:intervali1800e5:peers0:e").await;
+        // Its answer is taken in: a tracker still waiting is owed no
+        // `stopped`.
+        table_once(&status, &mut peers, |t| !t[0].in_flight).await;
 
         drop(peers);
         next_announce(&a).await;

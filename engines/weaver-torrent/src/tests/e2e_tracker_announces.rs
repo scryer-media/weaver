@@ -159,6 +159,8 @@ async fn test_resumed_torrent_announces_only_this_runs_bytes() -> anyhow::Result
     assert_eq!(param(&query, "downloaded"), Some(missing.as_str()));
     assert_eq!(param(&query, "left"), Some("0"));
     respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    // Its answer is taken in: a tracker still waiting is owed no `stopped`.
+    announce_ended(&handle, |l| l.result.is_ok()).await?;
 
     // The run's counters, as it ended, go out with `stopped`.
     session.pause(&handle).await?;
@@ -584,6 +586,8 @@ async fn test_a_run_that_began_with_nothing_wanted_completes_once_it_is_a_seed()
     assert_eq!(param(&query, "event"), Some("completed"));
     assert_eq!(param(&query, "left"), Some("0"));
     respond(conn, "d8:intervali1800e5:peers0:e").await?;
+    // Its answer is taken in: a tracker still waiting is owed no `stopped`.
+    announce_ended(&handle, |l| l.result.is_ok()).await?;
 
     // Once: the next announce is the run's `stopped`.
     session.pause(&handle).await?;
@@ -1706,5 +1710,313 @@ async fn test_a_tracker_id_outlives_the_run_and_the_session() -> anyhow::Result<
     respond(conn, "d8:intervali1800e5:peers0:e").await?;
     let status = again.tracker_status().context("a live run has a table")?;
     status.subscribe().wait_for(|a| a[0].last.is_some()).await?;
+    Ok(())
+}
+
+/// A torrent added with 4 of its 10 pieces, its tracker and a seeder, run up
+/// to its `completed` announce, which is handed back unanswered.
+struct Completing {
+    t: TestTorrent,
+    _seeder: std::sync::Arc<Session>,
+    tracker: TcpListener,
+    url: String,
+    session: std::sync::Arc<Session>,
+    handle: crate::torrent_state::ManagedTorrentHandle,
+    completed: TcpStream,
+}
+
+async fn run_to_completed(name: &str, out: &TempDir) -> anyhow::Result<Completing> {
+    const PIECE_LENGTH: u32 = 1024;
+    const PIECES: usize = 10;
+    let t = TestTorrent::new(name, PIECES * PIECE_LENGTH as usize, PIECE_LENGTH).await?;
+    let (seeder, seeder_addr) = t.seed().await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+    let mut have = BF::from_boxed_slice(vec![0u8; PIECES.div_ceil(8)].into_boxed_slice());
+    for p in 0..4 {
+        have.set(p, true);
+    }
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![url.clone()]),
+                checkpoint: Some(crate::Checkpoint::pieces(have)),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    respond_bytes(conn, &answer_with_peer(seeder_addr)?).await?;
+    let (completed, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("completed"));
+    Ok(Completing {
+        t,
+        _seeder: seeder,
+        tracker,
+        url,
+        session,
+        handle,
+        completed,
+    })
+}
+
+/// Waits until the announce table of `handle`'s run says its tracker's last
+/// announce ended and `done` holds of it.
+async fn announce_ended(
+    handle: &crate::torrent_state::ManagedTorrentHandle,
+    done: impl Fn(&crate::LastAnnounce) -> bool,
+) -> anyhow::Result<()> {
+    handle
+        .tracker_status()
+        .context("a live run has a table")?
+        .subscribe()
+        .wait_for(|a| !a[0].in_flight && a[0].last.as_ref().is_some_and(&done))
+        .await?;
+    Ok(())
+}
+
+const ANSWER: &str = "d8:intervali1800e5:peers0:e";
+
+// libtorrent keeps `m_complete_sent` across a pause and sets it only when a
+// tracker answers `completed` (torrent.cpp:3604-3613, v2.0.15); a regular
+// announce carries `completed` while `!m_complete_sent && is_seed()`
+// (torrent.cpp:3323-3330). A `completed` the tracker refused before a pause
+// goes after the resumed run's `started`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_completed_refused_before_a_pause_goes_after_the_resumed_started()
+-> anyhow::Result<()> {
+    setup_test_logging();
+    let out = TempDir::with_prefix("test_completed_refused_out")?;
+    let c = run_to_completed("test_completed_refused", &out).await?;
+    respond(c.completed, REFUSED).await?;
+    announce_ended(&c.handle, |l| l.result.is_err()).await?;
+
+    c.session.pause(&c.handle).await?;
+    let (conn, query) = read_announce_query(&c.tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    respond(conn, ANSWER).await?;
+
+    c.session.unpause(&c.handle).await?;
+    let (conn, query) = read_announce_query(&c.tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "left"), Some("0"));
+    respond(conn, ANSWER).await?;
+    announce_ended(&c.handle, |l| l.result.is_ok()).await?;
+    c.handle.force_reannounce(Duration::ZERO, None, true);
+    let (conn, query) = read_announce_query(&c.tracker).await?;
+    assert_eq!(param(&query, "event"), Some("completed"));
+    respond(conn, ANSWER).await?;
+    Ok(())
+}
+
+// libtorrent `torrent::stop_announcing` walks the trackers through
+// `announce_infohash::can_announce`, which passes over one whose announce
+// still waits for its answer (announce_entry.cpp:123-134, torrent.cpp:3308,
+// v2.0.15): a pause while `completed` is unanswered sends that tracker no
+// `stopped`, and the `completed` it never answered goes after the resumed
+// run's `started`.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_pause_while_completed_waits_sends_no_stopped_and_owes_completed()
+-> anyhow::Result<()> {
+    setup_test_logging();
+    let out = TempDir::with_prefix("test_completed_unanswered_out")?;
+    let c = run_to_completed("test_completed_unanswered", &out).await?;
+
+    // The tracker never answers it.
+    c.session.pause(&c.handle).await?;
+    c.session.unpause(&c.handle).await?;
+    let (conn, query) = read_announce_query(&c.tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    respond(conn, ANSWER).await?;
+    drop(c.completed);
+    announce_ended(&c.handle, |l| l.result.is_ok()).await?;
+    c.handle.force_reannounce(Duration::ZERO, None, true);
+    let (conn, query) = read_announce_query(&c.tracker).await?;
+    assert_eq!(param(&query, "event"), Some("completed"));
+    respond(conn, ANSWER).await?;
+    Ok(())
+}
+
+// Once a tracker answered `completed`, no later run sends another
+// (libtorrent `m_complete_sent`, torrent.cpp:3604-3613, v2.0.15).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_completed_answered_before_a_pause_is_not_sent_again() -> anyhow::Result<()> {
+    setup_test_logging();
+    let out = TempDir::with_prefix("test_completed_answered_out")?;
+    let c = run_to_completed("test_completed_answered", &out).await?;
+    respond(c.completed, ANSWER).await?;
+    announce_ended(&c.handle, |l| l.result.is_ok()).await?;
+
+    c.session.pause(&c.handle).await?;
+    let (conn, query) = read_announce_query(&c.tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    respond(conn, ANSWER).await?;
+
+    c.session.unpause(&c.handle).await?;
+    let (conn, query) = read_announce_query(&c.tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    respond(conn, ANSWER).await?;
+    announce_ended(&c.handle, |l| l.result.is_ok()).await?;
+    c.handle.force_reannounce(Duration::ZERO, None, true);
+    let (conn, query) = read_announce_query(&c.tracker).await?;
+    assert_eq!(param(&query, "event"), None);
+    respond(conn, ANSWER).await?;
+    Ok(())
+}
+
+// A torrent taken from one session and added to another under the same
+// identity, as a category or route move does, still owes the `completed` no
+// tracker accepted; one added under a new identity, as after a restart, is
+// taken to have sent it (libtorrent `torrent::files_checked`,
+// torrent.cpp:8807-8820, v2.0.15, with no `m_complete_sent` in resume data).
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_completed_owed_goes_with_the_torrent_to_another_session() -> anyhow::Result<()> {
+    setup_test_logging();
+    let out = TempDir::with_prefix("test_completed_moved_out")?;
+    let c = run_to_completed("test_completed_moved", &out).await?;
+    respond(c.completed, REFUSED).await?;
+    announce_ended(&c.handle, |l| l.result.is_err()).await?;
+    let identity = c.handle.shared().identity();
+    c.session
+        .delete(crate::api::TorrentIdOrHash::Id(c.handle.id()), false)
+        .await?;
+    let (conn, query) = read_announce_query(&c.tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    respond(conn, ANSWER).await?;
+
+    let add = |identity: Option<crate::Identity>| -> anyhow::Result<AddTorrentOptions> {
+        Ok(AddTorrentOptions {
+            output_folder: Some(c.t.dir.path().to_str().context("utf-8 path")?.to_owned()),
+            overwrite: true,
+            trackers: Some(vec![c.url.clone()]),
+            identity,
+            ..Default::default()
+        })
+    };
+    for (identity, owed) in [(Some(identity), true), (None, false)] {
+        let session =
+            Session::new_with_opts(c.t.dir.path().into(), tracker_session_opts()?).await?;
+        let handle = session
+            .add_torrent(
+                AddTorrent::from_bytes(c.t.torrent.clone()),
+                Some(add(identity)?),
+            )
+            .await?
+            .into_handle()
+            .context("expected a handle")?;
+        let (conn, query) = read_announce_query(&c.tracker).await?;
+        assert_eq!(param(&query, "event"), Some("started"));
+        assert_eq!(param(&query, "left"), Some("0"));
+        respond(conn, ANSWER).await?;
+        announce_ended(&handle, |l| l.result.is_ok()).await?;
+        handle.force_reannounce(Duration::ZERO, None, true);
+        let (conn, query) = read_announce_query(&c.tracker).await?;
+        assert_eq!(
+            param(&query, "event"),
+            owed.then_some("completed"),
+            "owed: {owed}"
+        );
+        respond(conn, ANSWER).await?;
+        announce_ended(&handle, |l| l.result.is_ok()).await?;
+        session
+            .delete(crate::api::TorrentIdOrHash::Id(handle.id()), false)
+            .await?;
+        let (conn, query) = read_announce_query(&c.tracker).await?;
+        assert_eq!(param(&query, "event"), Some("stopped"));
+        respond(conn, ANSWER).await?;
+    }
+    Ok(())
+}
+
+// libtorrent `torrent::start_announcing` clears `m_stat` and the failed and
+// redundant bytes (torrent.cpp:10343-10353, v2.0.15): a resumed run's
+// `started` reports nothing moved, and its later announces count from it.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_a_resumed_run_announces_from_its_own_start() -> anyhow::Result<()> {
+    setup_test_logging();
+    const PIECE_LENGTH: u32 = 1024;
+    const FILE: usize = 4 * PIECE_LENGTH as usize;
+    let dir = create_default_random_dir_with_torrents(2, FILE, Some("own_start"));
+    let torrent = create_torrent(
+        dir.path(),
+        CreateTorrentOptions {
+            name: None,
+            piece_length: Some(PIECE_LENGTH),
+            ..Default::default()
+        },
+        &BlockingSpawner::new(1),
+    )
+    .await?
+    .as_bytes()?;
+    let t = TestTorrent {
+        dir,
+        torrent,
+        content: Vec::new(),
+    };
+    let (_seeder, seeder_addr) = t.seed().await?;
+    let tracker = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+    let url = format!("http://{}/announce", tracker.local_addr()?);
+
+    let out = TempDir::with_prefix("test_own_start_out")?;
+    let session = Session::new_with_opts(out.path().into(), tracker_session_opts()?).await?;
+    let handle = session
+        .add_torrent(
+            AddTorrent::from_bytes(t.torrent.clone()),
+            Some(AddTorrentOptions {
+                storage_factory: Some(MemoryStorageFactory::default().clone_box()),
+                trackers: Some(vec![url]),
+                file_priorities: Some(vec![FilePriority::Normal, FilePriority::Ignored]),
+                ..Default::default()
+            }),
+        )
+        .await?
+        .into_handle()
+        .context("expected a handle")?;
+    let file = FILE.to_string();
+
+    // Run 1 fetches the first file and stops having reported it.
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "downloaded"), Some("0"));
+    respond_bytes(conn, &answer_with_peer(seeder_addr)?).await?;
+    handle.wait_until_completed().await?;
+    session.pause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    assert_eq!(param(&query, "downloaded"), Some(file.as_str()));
+    respond(conn, ANSWER).await?;
+
+    // Run 2 starts from nothing moved.
+    session.unpause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("started"));
+    assert_eq!(param(&query, "downloaded"), Some("0"));
+    assert_eq!(param(&query, "uploaded"), Some("0"));
+    assert_eq!(param(&query, "corrupt"), Some("0"));
+    assert_eq!(param(&query, "left"), Some(file.as_str()));
+    // It wants the second file now, from a seeder it has not met: the first
+    // one it may have let go as a peer it wanted nothing of.
+    handle.set_file_priorities(&[(1, FilePriority::Normal)])?;
+    let (_second_seeder, second_addr) = t.seed().await?;
+    respond_bytes(conn, &answer_with_peer(second_addr)?).await?;
+
+    // Its second file is all it reports fetching.
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("completed"));
+    assert_eq!(param(&query, "downloaded"), Some(file.as_str()));
+    assert_eq!(param(&query, "left"), Some("0"));
+    respond(conn, ANSWER).await?;
+    announce_ended(&handle, |l| l.result.is_ok()).await?;
+    session.pause(&handle).await?;
+    let (conn, query) = read_announce_query(&tracker).await?;
+    assert_eq!(param(&query, "event"), Some("stopped"));
+    assert_eq!(param(&query, "downloaded"), Some(file.as_str()));
+    respond(conn, ANSWER).await?;
     Ok(())
 }

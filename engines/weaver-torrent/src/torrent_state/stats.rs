@@ -92,6 +92,26 @@ impl TorrentTotals {
     }
 }
 
+impl TorrentTotals {
+    /// What was moved since the torrent had moved `from`.
+    pub(crate) fn since(&self, from: &Self) -> Self {
+        Self {
+            uploaded_bytes: self.uploaded_bytes.saturating_sub(from.uploaded_bytes),
+            downloaded_bytes: self.downloaded_bytes.saturating_sub(from.downloaded_bytes),
+            fetched_bytes: self.fetched_bytes.saturating_sub(from.fetched_bytes),
+            fetched_protocol_bytes: self
+                .fetched_protocol_bytes
+                .saturating_sub(from.fetched_protocol_bytes),
+            uploaded_protocol_bytes: self
+                .uploaded_protocol_bytes
+                .saturating_sub(from.uploaded_protocol_bytes),
+            failed_bytes: self.failed_bytes.saturating_sub(from.failed_bytes),
+            redundant_bytes: self.redundant_bytes.saturating_sub(from.redundant_bytes),
+            cut_short_bytes: self.cut_short_bytes.saturating_sub(from.cut_short_bytes),
+        }
+    }
+}
+
 impl std::ops::Add for TorrentTotals {
     type Output = Self;
 

@@ -3513,10 +3513,12 @@ impl Session {
                 client_name_and_version: identity.version.clone(),
                 user_agent: identity.user_agent.clone(),
                 tracker_ids: identity.tracker_ids.clone(),
+                completion: identity.completion.clone(),
                 announce_shape: identity.shape,
                 last_run: Default::default(),
                 ending_run: Default::default(),
                 moved: parking_lot::Mutex::new(opts.totals),
+                announced_from: Default::default(),
                 web_seeds: Arc::new(WebSeeds::of_torrent(&metadata, &opts.web_seeds)),
                 ssl,
                 run: Default::default(),
@@ -4272,81 +4274,38 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
                 return Default::default();
             }
         };
-        let live = mt.live();
-
-        use crate::torrent_state::stats::TorrentStatsState as TS;
-        use crate::tracker::TrackerCommsStatsState as S;
-
-        let torrent_state = match mt.stats().state {
-            TS::Initializing { .. } => S::Initializing,
-            TS::Live => S::Live,
-            TS::Paused | TS::NeedsCertificate => S::Paused,
-            TS::Error => S::None,
-        };
-        // What the torrent has moved, the running run's bytes included.
-        let last_run = *mt.shared().last_run.lock();
-        let totals = mt.totals();
-        // What the whole torrent still lacks, whatever is selected, so a
-        // torrent that has its selected files but not every piece never reads
-        // as a seed (libtorrent `torrent::bytes_left`). Once the pieces are
-        // gone with the torrent, what its run recorded as it ended.
-        let left_bytes = mt
-            .with_chunk_tracker(|c| c.bytes_left())
-            .ok()
-            .or(last_run.map(|r| r.left_bytes));
-        // No wanted piece is missing (libtorrent `torrent::is_finished`).
-        let finished = mt
-            .with_chunk_tracker(|c| c.get_hns().needed_bytes == 0)
-            .unwrap_or(false);
-        let private = mt.with_metadata(|m| m.info.info().private).unwrap_or(false);
-        crate::tracker::TrackerCommsStats {
-            private,
-            uploaded_bytes: totals.uploaded_bytes,
-            downloaded_bytes: totals.announced_downloaded(),
-            corrupt_bytes: totals.failed_bytes,
-            redundant_bytes: totals.redundant_bytes,
-            left_bytes,
-            finished,
-            torrent_state,
-            // `completed` is for becoming a seed, not for finishing a
-            // selection (libtorrent `torrent::finished` calls `completed`
-            // only when `is_seed`), and only for a run that began short of
-            // one, whatever was wanted when it began: a torrent added as a
-            // seed sends none (`torrent::files_checked` presets `m_complete_sent`).
-            completed_during_run: left_bytes == Some(0) && live.is_some_and(|l| !l.seed_at_start()),
-            // The policy the torrent's connections are made under, as the
-            // connector reads it for each one.
-            encryption: self
-                .session
-                .upgrade()
-                .map_or(Default::default(), |session| {
-                    mt.shared()
-                        .options
-                        .peer_opts
-                        .encryption_under(session.connector.encryption())
-                }),
-        }
+        let from = mt.shared().announced_from.lock().unwrap_or_default();
+        tracker_stats(&self.session, mt, &from)
     }
 
-    fn run_ended(&self) -> BoxFuture<'static, ()> {
+    fn run_ended(&self) -> BoxFuture<'static, crate::tracker::TrackerCommsStats> {
         let torrent = self.torrent().cloned();
+        let session = self.session.clone();
+        // The run that ended counts from where it began, whatever run
+        // begins before its connections have closed.
+        let from = torrent
+            .as_ref()
+            .map(|t| t.shared().announced_from.lock().unwrap_or_default());
         let ending = torrent
             .as_ref()
             .and_then(|t| t.shared().ending_run.lock().clone());
         async move {
-            let (Some(torrent), Some(tasks)) = (torrent, ending) else {
-                return;
+            let (Some(torrent), Some(from)) = (torrent, from) else {
+                return Default::default();
             };
-            tasks.wait().await;
-            // The run's tasks have all ended: the torrent forgets them,
-            // unless a later run's end has named its own since.
-            let mut ending = torrent.shared().ending_run.lock();
-            if ending
-                .as_ref()
-                .is_some_and(|named| tokio_util::task::TaskTracker::ptr_eq(named, &tasks))
-            {
-                *ending = None;
+            if let Some(tasks) = ending {
+                tasks.wait().await;
+                // The run's tasks have all ended: the torrent forgets them,
+                // unless a later run's end has named its own since.
+                let mut ending = torrent.shared().ending_run.lock();
+                if ending
+                    .as_ref()
+                    .is_some_and(|named| tokio_util::task::TaskTracker::ptr_eq(named, &tasks))
+                {
+                    *ending = None;
+                }
             }
+            tracker_stats(&session, &torrent, &from)
         }
         .boxed()
     }
@@ -4378,6 +4337,65 @@ impl crate::tracker::TorrentStatsProvider for PeerRxTorrentInfo {
             }
         }
         .boxed()
+    }
+}
+
+/// What `mt`'s announces report, counted from `from`: what it had moved when
+/// its run began announcing.
+fn tracker_stats(
+    session: &std::sync::Weak<Session>,
+    mt: &ManagedTorrentHandle,
+    from: &TorrentTotals,
+) -> crate::tracker::TrackerCommsStats {
+    let live = mt.live();
+
+    use crate::torrent_state::stats::TorrentStatsState as TS;
+    use crate::tracker::TrackerCommsStatsState as S;
+
+    let torrent_state = match mt.stats().state {
+        TS::Initializing { .. } => S::Initializing,
+        TS::Live => S::Live,
+        TS::Paused | TS::NeedsCertificate => S::Paused,
+        TS::Error => S::None,
+    };
+    // What the torrent has moved since its run began announcing, the
+    // running run's bytes included.
+    let last_run = *mt.shared().last_run.lock();
+    let totals = mt.totals().since(from);
+    // What the whole torrent still lacks, whatever is selected, so a
+    // torrent that has its selected files but not every piece never reads
+    // as a seed (libtorrent `torrent::bytes_left`). Once the pieces are
+    // gone with the torrent, what its run recorded as it ended.
+    let left_bytes = mt
+        .with_chunk_tracker(|c| c.bytes_left())
+        .ok()
+        .or(last_run.map(|r| r.left_bytes));
+    // No wanted piece is missing (libtorrent `torrent::is_finished`).
+    let finished = mt
+        .with_chunk_tracker(|c| c.get_hns().needed_bytes == 0)
+        .unwrap_or(false);
+    let private = mt.with_metadata(|m| m.info.info().private).unwrap_or(false);
+    crate::tracker::TrackerCommsStats {
+        private,
+        uploaded_bytes: totals.uploaded_bytes,
+        downloaded_bytes: totals.announced_downloaded(),
+        corrupt_bytes: totals.failed_bytes,
+        redundant_bytes: totals.redundant_bytes,
+        left_bytes,
+        finished,
+        torrent_state,
+        // Becoming a seed, not finishing a selection (libtorrent
+        // `torrent::finished` calls `completed` only when `is_seed`), in a
+        // run that began short of one, whatever was wanted when it began.
+        completed_during_run: left_bytes == Some(0) && live.is_some_and(|l| !l.seed_at_start()),
+        // The policy the torrent's connections are made under, as the
+        // connector reads it for each one.
+        encryption: session.upgrade().map_or(Default::default(), |session| {
+            mt.shared()
+                .options
+                .peer_opts
+                .encryption_under(session.connector.encryption())
+        }),
     }
 }
 

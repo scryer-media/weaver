@@ -1,7 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) The Weaver authors. Part of Weaver: https://github.com/scryer-media/weaver
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
+};
 
 use parking_lot::Mutex;
 use url::Url;
@@ -30,6 +36,8 @@ pub struct Identity {
     pub user_agent: String,
     /// What each HTTP tracker gave it to be known by.
     pub tracker_ids: TrackerIds,
+    /// Whether a tracker has been told it completed.
+    pub completion: Completion,
     /// How its announces are written.
     pub shape: &'static AnnounceShape,
 }
@@ -62,6 +70,71 @@ impl PartialEq for TrackerIds {
 
 impl Eq for TrackerIds {}
 
+/// Whether the torrent's trackers have been told it completed (libtorrent
+/// `torrent::m_complete_sent`). Kept as [`TrackerIds`] is: every copy of an
+/// identity holds the same one, so a `completed` no tracker accepted before a
+/// pause or a move to another session is still owed after it. It does not
+/// outlast the process, as libtorrent writes no `m_complete_sent` to resume
+/// data. Two identities compare equal whatever theirs hold.
+#[derive(Clone, Default)]
+pub struct Completion(Arc<AtomicU8>);
+
+/// No check of the torrent's pieces has ended under this identity.
+const UNCHECKED: u8 = 0;
+/// A check found the torrent short of a seed, and no tracker has accepted
+/// `completed` since: once a seed, it owes one.
+const UNSENT: u8 = 1;
+/// A tracker accepted `completed`, or a check found a seed.
+const SENT: u8 = 2;
+
+impl Completion {
+    /// A tracker accepted `completed`, or none need be told it
+    /// (libtorrent `m_complete_sent`). Until a check of its pieces ends a
+    /// torrent has sent none, as libtorrent's starts false.
+    pub(crate) fn is_sent(&self) -> bool {
+        self.0.load(Ordering::Relaxed) == SENT
+    }
+
+    /// A tracker accepted `completed` (libtorrent `torrent::tracker_response`,
+    /// torrent.cpp:3608-3613, v2.0.15): no tracker is sent another.
+    pub(crate) fn sent(&self) {
+        self.0.store(SENT, Ordering::Relaxed);
+    }
+
+    /// A check of the torrent's pieces ended and found it a `seed` or not;
+    /// `full` when it trusted nothing saved (a forced recheck, or the
+    /// restart after an error). A seed found by the first check, or by a
+    /// full one, is taken to have sent `completed` when it finished
+    /// (libtorrent `torrent::files_checked`, torrent.cpp:8807-8820, v2.0.15).
+    /// Any other check keeps what came before: a torrent added to another
+    /// session under this identity still owes the `completed` it owed.
+    pub(crate) fn checked(&self, seed: bool, full: bool) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |state| match state {
+                _ if seed && (full || state == UNCHECKED) => Some(SENT),
+                UNCHECKED => Some(UNSENT),
+                _ => None,
+            });
+    }
+}
+
+impl PartialEq for Completion {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Completion {}
+
+impl std::fmt::Debug for Completion {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Completion")
+            .field(&self.0.load(Ordering::Relaxed))
+            .finish()
+    }
+}
+
 impl std::fmt::Debug for TrackerIds {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_tuple("TrackerIds")
@@ -84,6 +157,7 @@ impl Identity {
             version: self.version.clone(),
             user_agent: self.user_agent.clone(),
             tracker_ids: TrackerIds::default(),
+            completion: Completion::default(),
             shape: self.shape,
         }
     }
@@ -98,6 +172,7 @@ impl Default for Identity {
             version: crate::client_name_and_version().to_owned(),
             user_agent: crate::client_name_and_version().to_owned(),
             tracker_ids: TrackerIds::default(),
+            completion: Completion::default(),
             shape: &AnnounceShape::WEAVER,
         }
     }
@@ -115,6 +190,7 @@ mod tests {
             version: "qBittorrent/5.2.3".into(),
             user_agent: "qBittorrent/5.2.3".into(),
             tracker_ids: TrackerIds::default(),
+            completion: Completion::default(),
             shape: &crate::tracker::qbittorrent::SHAPE,
         };
         let same = identity.same_client();

@@ -6,7 +6,7 @@
 use weaver_torrent::core::Id20;
 use weaver_torrent::core::peer_id::url_random;
 use weaver_torrent::tracker::AnnounceShape;
-use weaver_torrent::{Identity, TrackerIds};
+use weaver_torrent::{Completion, Identity, TrackerIds};
 
 /// A client's Azureus-style peer-id prefix, the User-Agent of its HTTP
 /// announces, the `v` of its extended handshake and the shape of its
@@ -102,6 +102,7 @@ impl ClientIdentity {
             version: self.version.to_owned(),
             user_agent: self.user_agent.to_owned(),
             tracker_ids: own.tracker_ids.clone(),
+            completion: own.completion.clone(),
             shape: self.shape,
         }
     }
@@ -116,14 +117,15 @@ impl ClientIdentity {
 
 /// Who a torrent is to its peers and trackers for as long as it is kept in
 /// this process: the bytes of its peer id after the client's prefix, its
-/// tracker key, and the `tracker id` each tracker gave it. A pause, a
-/// session reopening or a route change keeps it; a restart or a remove and
-/// add again makes another.
+/// tracker key, the `tracker id` each tracker gave it, and whether a tracker
+/// was told it completed. A pause, a session reopening or a route change
+/// keeps it; a restart or a remove and add again makes another.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TorrentIdentity {
     peer_id: [u8; 12],
     tracker_key: u32,
     tracker_ids: TrackerIds,
+    completion: Completion,
 }
 
 impl TorrentIdentity {
@@ -136,6 +138,7 @@ impl TorrentIdentity {
             peer_id,
             tracker_key: u32::from_le_bytes(key),
             tracker_ids: TrackerIds::default(),
+            completion: Completion::default(),
         }
     }
 }
