@@ -242,11 +242,17 @@ async fn serve(body: Vec<u8>) -> String {
 async fn a_magnet_or_an_infohash_goes_to_the_torrent_client() {
     let rig = rig().await;
     let hash = "0123456789abcdef0123456789abcdef01234567";
-    // The offline route refuses it in the client's own words.
-    for text in [format!("magnet:?xt=urn:btih:{hash}"), hash.to_owned()] {
-        let response = rig.submit_text(&text).await;
-        assert_eq!(code(&response).as_deref(), Some("NO_NETWORK"), "{text}");
-    }
+    // The client takes a magnet whatever its route's state: on the offline
+    // route the torrent is held, not refused.
+    let response = rig.submit_text(&format!("magnet:?xt=urn:btih:{hash}")).await;
+    assert_no_errors(&response);
+    let data = response_data(&response)["submit"].clone();
+    assert_eq!(data["accepted"], true);
+    let id = data["jobId"].as_u64().unwrap();
+    assert!(rig.torrents.torrent(JobId(id)).await.is_some());
+    // A bare infohash names the same torrent, in the client's own words.
+    let response = rig.submit_text(hash).await;
+    assert_eq!(code(&response).as_deref(), Some("DUPLICATE"));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

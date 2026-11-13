@@ -224,7 +224,7 @@ async fn a_duplicate_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_magnet_is_refused_without_a_network() {
+async fn a_magnet_is_added_without_a_network() {
     let rig = rig().await;
     let response = rig
         .execute(
@@ -233,7 +233,14 @@ async fn a_magnet_is_refused_without_a_network() {
             }) { id } }"#,
         )
         .await;
-    assert_eq!(code(&response).as_deref(), Some("NO_NETWORK"));
+    // The add does not wait on its route: the torrent is held until the
+    // route opens.
+    assert!(response.errors.is_empty(), "{:?}", response.errors);
+    assert!(
+        response.data.into_json().unwrap()["submitTorrent"]["id"]
+            .as_u64()
+            .is_some()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
