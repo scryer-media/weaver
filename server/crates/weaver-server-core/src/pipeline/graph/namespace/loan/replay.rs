@@ -223,6 +223,7 @@ impl NamespaceWriter {
                 diagnostics: Vec::new(),
                 scratch: None,
                 shutdown: Shutdown::default(),
+                withheld: std::collections::BTreeSet::new(),
             };
             let mut seen = BTreeSet::new();
             for member in volumes.values() {

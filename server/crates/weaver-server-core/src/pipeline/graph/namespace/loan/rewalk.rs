@@ -136,6 +136,7 @@ impl NamespaceWriter {
             diagnostics: Vec::new(),
             scratch: None,
             shutdown: Shutdown::default(),
+            withheld: BTreeSet::new(),
         };
         let mut seen = BTreeSet::new();
         for (volume, member) in volumes {

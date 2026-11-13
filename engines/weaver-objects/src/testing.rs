@@ -7,7 +7,7 @@
 
 pub(crate) mod replay;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use weaver_graph::recovery::MemberAccess;
@@ -299,9 +299,15 @@ pub(crate) struct Store {
     // A directory lent for work on files, as a namespace that keeps them
     // lends one.
     pub(crate) scratch: Option<PathBuf>,
+    // Members the namespace has no room to rebuild.
+    pub(crate) withheld: BTreeSet<MemberId>,
 }
 
 impl MemberAccess for Store {
+    fn withheld(&self, member: MemberId) -> bool {
+        self.withheld.contains(&member)
+    }
+
     fn read(&mut self, member: MemberId, range: ByteRange, into: &mut Vec<u8>) -> bool {
         self.reads += 1;
         let Some(bytes) = self.members.get(&member) else {

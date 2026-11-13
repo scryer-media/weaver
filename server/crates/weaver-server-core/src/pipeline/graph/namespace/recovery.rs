@@ -604,9 +604,11 @@ impl NamespaceWriter {
     // it is due rules on members still arriving and volumes it has not read,
     // and its verdict stands. Each goes out of the tree with what its reads
     // reach, so it repairs off the loop while the tree goes on; a due check
-    // meanwhile finds it out and does not take it again.
+    // meanwhile finds it out and does not take it again. A PAR3 set over
+    // the posts goes without the files that never arrived the disk has no
+    // room to rebuild.
     pub(super) fn repair(
-        &self,
+        &mut self,
         tree: &mut Tree,
         node: NodeId,
         due: &[NodeId],
@@ -616,7 +618,12 @@ impl NamespaceWriter {
             if !lender.admit() {
                 break;
             }
-            if let Some(loan) = self.lend(tree, node, set)? {
+            let withheld = match node == NodeId::ROOT {
+                true => self.withheld(tree, set),
+                false => BTreeSet::new(),
+            };
+            if let Some(mut loan) = self.lend(tree, node, set)? {
+                loan.withhold(withheld);
                 lender.lend(loan);
             }
         }
@@ -724,6 +731,17 @@ impl NamespaceWriter {
             self.diagnostics.push(diagnostic);
         }
         self.read_backs += reads;
+        // What a PAR3 set wrote into a post none of whose bytes arrived is
+        // held to the disk reserve before any of it lands; what a repair
+        // wrote into an object's output is held to the job's limits as it
+        // lands, as that output always is.
+        if node == NodeId::ROOT
+            && tree.kind(set) == Some(Kind::Par3)
+            && let Err(error) = self.admit_repaired(tree, repaired.sizes())
+        {
+            let _ = repaired.remove();
+            return Err(error);
+        }
         // The set binds what it ruled before its bytes land: a member it
         // rebuilds takes the length it describes, so the slices that reach
         // that length close the file there. A repair reads members back, so

@@ -723,6 +723,105 @@ async fn a_file_a_par3_set_describes_and_the_post_withholds_is_rebuilt() {
     assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 2 }], 2);
 }
 
+// Every disk the job reads at `RESERVE` and `room` bytes over it, the
+// job held to keep `RESERVE` free.
+fn disk_with_room(posts: Vec<Post>, room: u64) -> Scenario {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::operations::{DiskSpace, StorageCapacity, StorageRoot};
+
+    const RESERVE: u64 = 1 << 30;
+    const NEVER: std::time::Duration = std::time::Duration::from_secs(365 * 24 * 60 * 60);
+    Scenario::new(posts)
+        .limits(super::caps::limits(|limits| {
+            limits.min_free_bytes = RESERVE
+        }))
+        .setup(move |pipeline| {
+            let roots = [
+                pipeline.script_data_dir.clone(),
+                pipeline.intermediate_dir.clone(),
+                pipeline.complete_dir.clone(),
+            ];
+            let probe = Arc::new(move |_: &Path| {
+                Ok(DiskSpace {
+                    total_bytes: RESERVE * 8,
+                    available_bytes: RESERVE + room,
+                })
+            });
+            let capacity = StorageCapacity::with_probe(roots, NEVER, probe);
+            for root in StorageRoot::ALL {
+                capacity.wait_for_probes(root, 1);
+            }
+            pipeline.storage_capacity = Arc::new(capacity);
+        })
+}
+
+// `beacon.mkv` is described by the set and never posted, and `lantern.mkv`
+// arrives with an article damaged; the set holds blocks enough for both.
+// With room on the disk for `beacon.mkv` the set rebuilds it and repairs
+// `lantern.mkv`, and the job completes. Without room, the set goes out
+// without it: it repairs `lantern.mkv`, writes nothing of `beacon.mkv`, and
+// says it could not repair what it covers; it is not run again, and the job
+// ends Partial with `lantern.mkv` delivered whole.
+#[tokio::test]
+async fn a_never_posted_file_the_disk_has_no_room_for_is_withheld_and_the_job_ends_partial() {
+    let lantern = payload(3 * ARTICLE, 85);
+    let beacon = payload(2 * ARTICLE, 86);
+    let posts = || {
+        let mut posts = vec![Post::plain("lantern.mkv", lantern.clone())];
+        posts.extend(par3_set(
+            "lantern",
+            &[("lantern.mkv", &lantern), ("beacon.mkv", &beacon)],
+            4,
+        ));
+        posts
+    };
+
+    let room = disk_with_room(posts(), beacon.len() as u64).damaged(0, 1);
+    let graph = run(&room).await;
+    assert_delivers(
+        &graph,
+        &[("lantern.mkv", &lantern), ("beacon.mkv", &beacon)],
+    );
+    assert_repaired_and_announced(&graph, &[RepairOutcome::Repaired { slices: 3 }], 3);
+
+    let short = disk_with_room(posts(), beacon.len() as u64 - 1).damaged(0, 1);
+    let graph = run(&short).await;
+    assert_eq!(
+        graph.status,
+        Some(JobStatus::Partial),
+        "{:?} {:?} {:?} {:?}",
+        graph.failure,
+        repair_and_terminal_events(&graph),
+        graph.claims,
+        graph.files.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(graph.failure_kind, Some(HistoryFailureKind::Repair));
+    assert!(
+        graph.files[&delivered("lantern.mkv")] == lantern,
+        "{:?}",
+        graph.files.keys()
+    );
+    for files in [&graph.files, &graph.retained_files] {
+        assert!(
+            !files.keys().any(|name| name.ends_with("beacon.mkv")),
+            "{:?}",
+            files.keys()
+        );
+    }
+    let outcomes = &graph.graph().outcomes;
+    assert!(
+        matches!(
+            outcomes.as_slice(),
+            [Some(RepairOutcome::Impossible { .. })]
+        ),
+        "{outcomes:?}"
+    );
+    // No repair is announced, and the job ends once.
+    assert_eq!(repair_and_terminal_events(&graph), ["JobCompleted"]);
+}
+
 // A set written under FFT Reed-Solomon, one cohort, two adjacent articles
 // damaged: the FFT recovery blocks are reachable and rebuild them.
 #[tokio::test]

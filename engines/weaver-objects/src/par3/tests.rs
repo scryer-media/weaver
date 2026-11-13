@@ -6,6 +6,7 @@ mod elimination;
 mod facts;
 mod indexes;
 mod readback;
+mod rebuild_absent;
 mod recovery_contracts;
 
 #[test]

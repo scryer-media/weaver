@@ -261,6 +261,19 @@ pub(super) fn repair_set(
         }
         rewrite.insert(index);
     }
+    // A file the namespace has no room to rebuild is solved as any other,
+    // since the set's recovery blocks span it, but nothing is written into
+    // it, and the set then says it could not repair what it covers.
+    let withheld: BTreeSet<usize> = rewrite
+        .iter()
+        .copied()
+        .filter(|&file| member_of(set, bound, file).is_some_and(|member| access.withheld(member)))
+        .collect();
+    if !withheld.is_empty() {
+        for (member, _) in &mut unproven {
+            *member = member.filter(|member| !access.withheld(*member));
+        }
+    }
     let memory = budget.memory_or(super::REPAIR_MEMORY_LIMIT);
     let copied = copy_held(&held, &unproven, memory.max(READ), access);
     proven.retain(|(member, range)| !copied.contains(&(*member, range.start, range.end)));
@@ -301,6 +314,22 @@ pub(super) fn repair_set(
         }
         return failed(count, available.len() as u64, &proven, access);
     }
+    let unwritten = SetRepair {
+        outcome: RepairOutcome::Impossible {
+            damaged: withheld
+                .iter()
+                .filter_map(|&file| layout.files().get(file))
+                .flat_map(|shape| shape.extents.iter().filter_map(|extent| block(&extent)))
+                .collect::<BTreeSet<u64>>()
+                .len() as u64,
+            reachable: available.len() as u64,
+        },
+        lost: count,
+    };
+    let writes: BTreeSet<usize> = rewrite.difference(&withheld).copied().collect();
+    if writes.is_empty() {
+        return unwritten;
+    }
     let rows = match &matrix {
         Some((_, Matrix::Cauchy)) => &available[..lost.len()],
         _ => &available[..],
@@ -311,7 +340,7 @@ pub(super) fn repair_set(
         volumes,
         layout: &layout,
         bound,
-        rewrite: &rewrite,
+        rewrite: &writes,
         carried: &carried,
         lost: &lost,
         rows,
@@ -336,7 +365,10 @@ pub(super) fn repair_set(
     if solved.is_none() {
         return failed(count, available.len() as u64, &proven, access);
     }
-    write_tails(&layout, set, bound, &rewrite, access);
+    write_tails(&layout, set, bound, &writes, access);
+    if !withheld.is_empty() {
+        return unwritten;
+    }
     SetRepair {
         outcome: RepairOutcome::Repaired { slices: rebuilt },
         lost: count,
