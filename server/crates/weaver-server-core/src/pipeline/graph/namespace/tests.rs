@@ -369,6 +369,10 @@ struct Seen {
     between: Option<Box<dyn FnMut() + Send>>,
     // What of its volume it asks to hear again once restored.
     again: Option<ByteRange>,
+    // Whether it says it is a PAR3 set rather than a PAR2 one.
+    par3: bool,
+    // Whether the member it fixes was withheld from it when it repaired.
+    withheld: Option<bool>,
 }
 
 // The repair the pretend set makes: read the named member, write a fix.
@@ -413,7 +417,10 @@ impl Object for Par {
     fn unposted(&mut self, _: weaver_graph::VolumeIndex, _: weaver_graph::ByteRange) {}
 
     fn kind(&self) -> Kind {
-        Kind::Par2
+        match self.seen.lock().unwrap().par3 {
+            true => Kind::Par3,
+            false => Kind::Par2,
+        }
     }
 
     fn deliver(
@@ -547,6 +554,14 @@ impl Par {
         let (Some(fix), Some(member)) = (self.fix, self.fixing) else {
             return RepairOutcome::Clean;
         };
+        let withheld = access.withheld(member);
+        self.seen.lock().unwrap().withheld = Some(withheld);
+        if withheld {
+            return RepairOutcome::Impossible {
+                damaged: 1,
+                reachable: 1,
+            };
+        }
         let mut bytes = Vec::new();
         if access.read(member, fix.read, &mut bytes) {
             self.seen.lock().unwrap().read = Some(bytes);
@@ -4056,6 +4071,195 @@ fn a_disk_reserve_refusal_says_the_disk_is_out_of_space() {
             output.display()
         )
     );
+}
+
+// A job held to a reserve of `RESERVE`, whose disk has what `free` holds
+// free each time it is read, with the pretend set, PAR3 or PAR2, and its
+// fix.
+const RESERVE: u64 = 1 << 30;
+
+fn reserved(free: &Arc<std::sync::atomic::AtomicU64>, par3: bool, fix: Fix) -> Job {
+    use crate::operations::disk::{Capacity, CapacityReading};
+
+    let mut job = Job::new(PLENTY);
+    let dir = job.dir.path().to_path_buf();
+    let free = Arc::clone(free);
+    let reader = CapacityReader::from_fn(move || {
+        Capacity::Known(CapacityReading {
+            available_bytes: free.load(std::sync::atomic::Ordering::SeqCst),
+            total_bytes: u64::MAX,
+            sampled_at: std::time::Instant::now(),
+            stale: false,
+        })
+    });
+    job.writer = job
+        .writer
+        .capped(Caps::new(
+            Arc::new(reserve_limits(RESERVE)),
+            crate::pipeline::graph::limits::known_policy(Default::default()),
+            Vec::new(),
+        ))
+        .delivering_to(dir, reader);
+    job.par.lock().unwrap().par3 = par3;
+    job.with_set(Some(fix))
+}
+
+// How many of the repair's staged outputs are left in the job's folder.
+fn staged(job: &Job) -> usize {
+    let internal = job.dir.path().join(weaver_graph::names::INTERNAL_DIR);
+    std::fs::read_dir(&internal)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".repaired"))
+        .count()
+}
+
+// A PAR3 set that describes a post none of whose bytes arrived goes out
+// without it when a declared length would leave less than the reserve
+// free: the job is not refused, the set is told the post is withheld, and
+// it reads and writes nothing of it. The same length on a disk with room
+// for it goes out to be rebuilt. A PAR2 set is not judged, and rebuilds the
+// post whatever the disk holds.
+#[test]
+fn a_rebuild_the_disk_has_no_room_for_is_withheld_from_a_par3_set() {
+    const DECLARED: u64 = 4 << 40;
+    for (par3, free, withheld) in [
+        (true, 1 << 40, true),
+        (true, DECLARED + RESERVE - 1, true),
+        (true, DECLARED + RESERVE, false),
+        (false, 1 << 40, false),
+    ] {
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(free));
+        let mut job = reserved(
+            &free,
+            par3,
+            Fix {
+                name: "video.mkv",
+                read: ByteRange::new(0, 8),
+                fix: (0, b"OK"),
+            },
+        );
+        job.member("video.mkv", Some(DECLARED));
+        assert!(job.writer.refusal().is_none());
+
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        let mut lent = Inline::default();
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        assert!(job.writer.refusal().is_none(), "the job is not refused");
+        assert_eq!(lent.0.len(), 1, "the set goes out");
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        let seen = job.par.lock().unwrap();
+        assert_eq!(seen.withheld, Some(withheld), "par3 {par3}, free {free:?}");
+        if withheld {
+            assert!(seen.read.is_none(), "nothing is read");
+            assert_eq!(staged(&job), 0, "nothing is written");
+        }
+        drop(seen);
+        if withheld {
+            let mut build = job.build();
+            let result = job.writer.returned(
+                &mut job.tree,
+                &mut build,
+                &Source,
+                &weaver_objects::Objects::default(),
+                returned,
+                &mut job.out,
+            );
+            assert!(result.is_ok());
+            assert!(job.writer.refusal().is_none());
+            assert!(!job.dir.path().join("video.mkv").exists());
+            assert_eq!(staged(&job), 0);
+        }
+    }
+}
+
+// What a PAR3 set wrote into a post none of whose bytes arrived is held to
+// the reserve again as it lands, against the disk as it is then: a rebuild
+// that would now leave less than the reserve free is refused, nothing of
+// the post is written and the staged output goes; one that leaves the
+// reserve free lands. A repair of a post that arrived writes over room the
+// post holds, and lands with less than the reserve free, before and after.
+// A PAR2 set's rebuild is not held to the reserve, and lands with less than
+// it free, before and after.
+#[test]
+fn a_repair_into_the_posts_is_held_to_the_disk_reserve() {
+    use crate::pipeline::extraction::ExtractionRejectionReason;
+
+    for (par3, arrived, (before, after), lands) in [
+        (true, false, (4 * RESERVE, RESERVE + 7), false),
+        (true, false, (4 * RESERVE, RESERVE + 8), true),
+        (true, true, (RESERVE / 2, RESERVE / 2), true),
+        (false, false, (RESERVE / 2, RESERVE / 2), true),
+    ] {
+        let free = Arc::new(std::sync::atomic::AtomicU64::new(before));
+        let fix = match arrived {
+            true => (2, &b"OK"[..]),
+            false => (0, &b"goOKgood"[..]),
+        };
+        let mut job = reserved(
+            &free,
+            par3,
+            Fix {
+                name: "video.mkv",
+                read: ByteRange::new(0, 8),
+                fix,
+            },
+        );
+        let member = job.member("video.mkv", Some(8));
+        if arrived {
+            job.send(member, 0, b"go", Provenance::Fresh);
+            job.send(member, 2, b"XX", Provenance::Damaged);
+            job.send(member, 4, b"good", Provenance::Fresh);
+        } else {
+            job.send(member, 0, &[0; 8], Provenance::Lost);
+        }
+        assert!(job.writer.refusal().is_none(), "the posts are not charged");
+
+        let mut build = job.build();
+        let due = job.tree.recovery_nodes(NodeId::ROOT);
+        let mut lent = Inline::default();
+        job.writer
+            .repair(&mut job.tree, NodeId::ROOT, &due, &mut lent)
+            .unwrap();
+        let returned = lent
+            .0
+            .pop()
+            .unwrap()
+            .run(weaver_graph::Budget::default(), &Default::default());
+        free.store(after, std::sync::atomic::Ordering::SeqCst);
+        let result = job.writer.returned(
+            &mut job.tree,
+            &mut build,
+            &Source,
+            &weaver_objects::Objects::default(),
+            returned,
+            &mut job.out,
+        );
+        if lands {
+            assert_eq!(result.unwrap(), Some(1));
+            assert!(job.writer.refusal().is_none());
+            assert_eq!(job.file("video.mkv"), b"goOKgood");
+        } else {
+            assert!(result.is_err());
+            let refusal = job
+                .writer
+                .refusal()
+                .expect("the reserve refused the repair");
+            assert_eq!(refusal.reason(), ExtractionRejectionReason::DiskReserve);
+            assert!(
+                !job.dir.path().join("video.mkv").exists(),
+                "nothing of the post is written"
+            );
+            assert_eq!(staged(&job), 0, "the staged output goes with the refusal");
+        }
+    }
 }
 
 // The stated checksum is checked whatever shape the writes left the fold

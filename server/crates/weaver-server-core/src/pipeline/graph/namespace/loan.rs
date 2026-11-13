@@ -130,6 +130,12 @@ impl Returned {
 }
 
 impl Loan {
+    // The members the repair is to write nothing into: the disk has no room
+    // for them.
+    pub(super) fn withhold(&mut self, members: BTreeSet<MemberId>) {
+        self.access.withheld = members;
+    }
+
     // Run the repair, where it is not in anyone's way, within `budget`. A
     // repair given after `shutdown` started, or after the job's working
     // directory went, reads nothing, and one going when either happens
@@ -280,6 +286,8 @@ struct Lent {
     scratch: Option<PathBuf>,
     // The pipeline's shutdown: once it starts, no read is answered.
     shutdown: Shutdown,
+    // The members the disk has no room for the repair to rebuild.
+    withheld: BTreeSet<MemberId>,
 }
 
 // What a repair rewrote: runs of members in the order written, each one's
@@ -376,6 +384,11 @@ impl Repaired {
         self.failed.take()
     }
 
+    // Each run's member and how many bytes it holds, in the order written.
+    pub(crate) fn sizes(&self) -> impl Iterator<Item = (MemberId, u64)> + '_ {
+        self.runs.iter().map(|(member, _, at)| (*member, at.len()))
+    }
+
     pub(crate) fn members(&self) -> impl Iterator<Item = MemberId> + '_ {
         self.runs.iter().map(|(member, _, _)| *member)
     }
@@ -444,6 +457,7 @@ impl NamespaceWriter {
             diagnostics: Vec::new(),
             scratch: None,
             shutdown: Shutdown::default(),
+            withheld: BTreeSet::new(),
         };
         let mut seen = BTreeSet::new();
         self.take_namespace(tree, namespace, &mut access, &mut seen);
@@ -890,6 +904,10 @@ impl MemberAccess for Lent {
     fn length(&self, member: MemberId) -> Option<u64> {
         self.note((self.namespace, member), None);
         self.members.get(&(self.namespace, member))?.length
+    }
+
+    fn withheld(&self, member: MemberId) -> bool {
+        self.withheld.contains(&member)
     }
 
     fn arrived(&self, member: MemberId, range: ByteRange, out: &mut Vec<ByteRange>) {

@@ -616,6 +616,50 @@ impl Caps {
                 return Err(self.breach(reason, detail));
             }
         }
+        self.reserve(grown, (folder, capacity, device))?;
+        self.written[was] = self.written[was].saturating_sub(moved);
+        self.written[level] = written;
+        self.extents
+            .insert((node, member), (extent.max(end), level));
+        Ok(())
+    }
+
+    // Bytes a repair writes into the posts. The posts are under none of the
+    // job's limits, but what a repair writes into them takes room on their
+    // disk as any output does, so it is held to the reserve.
+    pub(crate) fn admit_repaired(
+        &mut self,
+        bytes: u64,
+        (folder, capacity, device): (&Path, Capacity, Device),
+    ) -> Result<(), ExtractionFailure> {
+        if bytes == 0 {
+            return Ok(());
+        }
+        self.check()?;
+        self.reserve(bytes, (folder, capacity, device))
+    }
+
+    // How many bytes the device `device` names can take before less than
+    // the reserve is left free, against its latest reading less what was
+    // admitted since. `None` when no reading holds it to the reserve: none
+    // was taken, or the last is stale, and a write is then never refused.
+    pub(crate) fn room(&mut self, (capacity, device): (Capacity, Device)) -> Option<u64> {
+        let reading = self.debits[device as usize].apply(capacity).reading()?;
+        (!reading.stale).then(|| {
+            reading
+                .available_bytes
+                .saturating_sub(self.limits.min_free_bytes)
+        })
+    }
+
+    // `grown` more bytes on the device under `folder`, which `device`
+    // names, against its latest reading less what was admitted since: a
+    // write that would leave less than the reserve free is refused.
+    fn reserve(
+        &mut self,
+        grown: u64,
+        (folder, capacity, device): (&Path, Capacity, Device),
+    ) -> Result<(), ExtractionFailure> {
         let device = device as usize;
         if grown > 0
             && let Some(reading) = self.debits[device].apply(capacity).reading()
@@ -632,10 +676,6 @@ impl Caps {
             }
             self.debits[device].debit(grown);
         }
-        self.written[was] = self.written[was].saturating_sub(moved);
-        self.written[level] = written;
-        self.extents
-            .insert((node, member), (extent.max(end), level));
         Ok(())
     }
 
