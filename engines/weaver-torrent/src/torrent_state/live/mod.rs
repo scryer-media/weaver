@@ -475,7 +475,8 @@ impl TorrentStateLive {
             .allowing_multiple_connections_per_ip(Arc::clone(
                 &session.allow_multiple_connections_per_ip,
             ))
-            .sharing_session_bans(Arc::clone(&session.bad_data_bans)),
+            .sharing_session_bans(Arc::clone(&session.bad_data_bans))
+            .ordering_connects_by(session.connect_order()),
             _locked: RwLock::new(TorrentStateLocked {
                 pieces: Some(PieceTracker::new(paused.chunk_tracker)),
                 fatal_errors_tx: Some(fatal_errors_tx),

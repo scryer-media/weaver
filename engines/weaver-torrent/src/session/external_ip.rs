@@ -243,6 +243,15 @@ impl ExternalIps {
         })
     }
 
+    /// Our address of one family, IPv6 when `ipv6`, when we know it.
+    pub(crate) fn of_family(&self, ipv6: bool) -> Option<IpAddr> {
+        if ipv6 {
+            self.v6.lock().address
+        } else {
+            self.v4.lock().address
+        }
+    }
+
     /// Our addresses, IPv4 first, of the families we know one for.
     pub(crate) fn get(&self) -> Vec<IpAddr> {
         [self.v4.lock().address, self.v6.lock().address]
