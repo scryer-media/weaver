@@ -719,13 +719,12 @@ impl Pipeline {
             self.applied_random_read_iops = Some(iops);
             self.tuner.set_random_read_iops(iops);
         }
-        let write_mbps = self
-            .shared_state
-            .queue
-            .read(|inner| inner.globals.sequential_write_mbps);
-        if let Some(write_mbps) =
-            write_mbps.filter(|mbps| self.applied_sequential_write_mbps != Some(*mbps))
-        {
+        // Extractions write what they unpack under the working directory, so
+        // its volume's live write rate is the one extraction admission reads.
+        // Zero is "not measured" and is applied as such: the directory may
+        // have moved to a volume nothing has been written to yet.
+        let write_mbps = self.storage_capacity.write_mbps(&self.intermediate_dir);
+        if self.applied_sequential_write_mbps != Some(write_mbps) {
             self.applied_sequential_write_mbps = Some(write_mbps);
             self.tuner.set_sequential_write_mbps(write_mbps);
         }

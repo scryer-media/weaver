@@ -530,21 +530,20 @@ pub(crate) async fn run(
                 Err(error) => {
                     warn!(error = %error, "disk probe task failed; using fallback IOPS");
                     weaver_server_core::runtime::DiskMeasurement {
-                        sequential_write_mbps: 0.0,
                         random_read_iops: 10_000.0,
                     }
                 }
             };
             drop(opener);
-            match handle.update_disk_measurement(measurement).await {
+            match handle
+                .update_random_read_iops(measurement.random_read_iops)
+                .await
+            {
                 Ok(()) => {
                     let mut profile = system_profile
                         .write()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                     profile.disk.random_read_iops = measurement.random_read_iops;
-                    if measurement.sequential_write_mbps > 0.0 {
-                        profile.disk.sequential_write_mbps = measurement.sequential_write_mbps;
-                    }
                 }
                 Err(error) => {
                     warn!(error = %error, "failed to apply startup disk measurement");

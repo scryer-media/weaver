@@ -15,8 +15,12 @@ use crate::runtime::StartupDiskGate;
 use crate::runtime::system_profile::{FilesystemType, StorageClass};
 
 mod storage_kind;
+pub(crate) mod volume;
+mod volume_seam;
+mod volume_view;
 
 pub(crate) use storage_kind::StorageKind;
+pub use volume_view::VolumeWriteRate;
 
 // Capacity for the filesystem backing a path.
 #[derive(Debug, Clone, Copy)]

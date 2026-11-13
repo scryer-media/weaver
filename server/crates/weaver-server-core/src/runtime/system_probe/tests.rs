@@ -128,13 +128,12 @@ fn parse_startup_iops_override() {
 }
 
 // A stored measurement stands in for the probe, so this reads the host's
-// facts without writing hundreds of megabytes to the test machine's disk.
+// facts without writing the probe file to the test machine's disk.
 #[test]
 fn detect_returns_valid_profile() {
     let dir = tempfile::tempdir().unwrap();
     let stored = StoredDiskMeasurement {
         measured_at: unix_seconds(SystemTime::now()),
-        sequential_write_mbps: 420.0,
         random_read_iops: 3_000.0,
     };
     write_stored_disk_measurement(&dir.path().join(DISK_PROBE_RECORD), &stored).unwrap();
@@ -144,7 +143,6 @@ fn detect_returns_valid_profile() {
     assert!(profile.cpu.physical_cores > 0);
     assert!(profile.memory.total_bytes > 0);
     if startup_iops_override().is_none() {
-        assert_eq!(profile.disk.sequential_write_mbps, 420.0);
         assert_eq!(profile.disk.random_read_iops, 3_000.0);
     }
 }
@@ -173,11 +171,9 @@ fn no_probe(_: &Path) -> Option<DiskMeasurement> {
 fn a_fresh_stored_measurement_skips_the_probe_and_an_old_one_is_retaken() {
     let dir = tempfile::tempdir().unwrap();
     let first = DiskMeasurement {
-        sequential_write_mbps: 420.0,
         random_read_iops: 3_000.0,
     };
     let second = DiskMeasurement {
-        sequential_write_mbps: 90.0,
         random_read_iops: 180.0,
     };
 
@@ -203,6 +199,28 @@ fn a_fresh_stored_measurement_skips_the_probe_and_an_old_one_is_retaken() {
     );
 }
 
+// A record an earlier version stored also holds a write throughput. Its read
+// IOPS are still used and the write figure is not read.
+#[test]
+fn a_record_with_the_old_write_figure_keeps_its_read_iops() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join(DISK_PROBE_RECORD),
+        format!(
+            r#"{{"measured_at":{MEASURED_AT},"sequential_write_mbps":42.0,"random_read_iops":3000.0}}"#
+        ),
+    )
+    .unwrap();
+
+    let measured = stored_or_measured_disk_profile(dir.path(), || at(MEASURED_AT + DAY), no_probe);
+    assert_eq!(
+        measured,
+        DiskMeasurement {
+            random_read_iops: 3_000.0
+        }
+    );
+}
+
 // A record that cannot be read, or one dated after the clock, is measured
 // again rather than trusted.
 #[test]
@@ -210,7 +228,6 @@ fn an_unreadable_or_future_record_is_measured_again() {
     let dir = tempfile::tempdir().unwrap();
     let record = dir.path().join(DISK_PROBE_RECORD);
     let measured = DiskMeasurement {
-        sequential_write_mbps: 250.0,
         random_read_iops: 8_000.0,
     };
 
@@ -222,7 +239,6 @@ fn an_unreadable_or_future_record_is_measured_again() {
 
     let future = StoredDiskMeasurement {
         measured_at: MEASURED_AT + DAY,
-        sequential_write_mbps: 1.0,
         random_read_iops: 1.0,
     };
     write_stored_disk_measurement(&record, &future).unwrap();
@@ -239,7 +255,6 @@ fn a_failed_probe_falls_back_and_stores_nothing() {
     let dir = tempfile::tempdir().unwrap();
 
     let fallback = stored_or_measured_disk_profile(dir.path(), || at(MEASURED_AT), |_| None);
-    assert_eq!(fallback.sequential_write_mbps, 0.0, "writes unmeasured");
     assert_eq!(fallback.random_read_iops, DISK_PROBE_FALLBACK_IOPS);
     assert!(!dir.path().join(DISK_PROBE_RECORD).exists());
 }
@@ -258,7 +273,7 @@ fn the_probe_file_is_removed_when_its_guard_drops() {
 
 #[test]
 fn probe_reads_stay_aligned_inside_what_was_written() {
-    let written = (PROBE_CHUNK_BYTES * PROBE_WRITE_REPEATS[0]) as u64;
+    let written = PROBE_FILE_BYTES as u64;
     let offsets = probe_read_offsets(written);
     assert_eq!(offsets.len(), PROBE_READ_COUNT);
     for offset in offsets {

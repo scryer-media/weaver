@@ -58,7 +58,8 @@ pub struct DiskProfile {
     pub storage_class: StorageClass,
     // Detected filesystem type.
     pub filesystem: FilesystemType,
-    // Sequential write throughput in MB/s (from startup benchmark).
+    // Write throughput in MB/s of the volume the working directory is on,
+    // from that volume's live write rate. Zero until measured.
     pub sequential_write_mbps: f64,
     // Random 4K read IOPS (from startup benchmark).
     pub random_read_iops: f64,
